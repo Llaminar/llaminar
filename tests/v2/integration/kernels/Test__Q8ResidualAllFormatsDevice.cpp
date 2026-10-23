@@ -1,12 +1,14 @@
 /**
  * @file Test__Q8ResidualAllFormatsDevice.cpp
- * @brief Actual original-format native-pool TwoTerm capture and independent
+ * @brief Actual original-format native-pool counted/TwoTerm capture and independent
  * FP64 tests.
  *
  * Preparation uses existing LoadOrchestrator/WeightVRAMPool/store
  * infrastructure. Source/stateless coefficient decoding and FP64 dots never
  * call GEMM reduction helpers. Host copies and joins are diagnostic
- * setup/terminal boundaries only.
+ * setup/terminal boundaries only. Counted SingleQ8 regressions additionally
+ * retain exact live output, activation-byte, scale and sums extents across
+ * full/partial/empty replay; empty work cannot write native partial scratch.
  */
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/PerfStatsCollector.h"
@@ -16,18 +18,27 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
+#include "execution/compute_stages/ComputeStageUtils.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "kernels/common/Q8ResidualGroupedGeometry.h"
 #include "kernels/common/Q8ResidualShortKGeometry.h"
 #include "transfer/TransferEngine.h"
+#ifdef HAVE_CUDA
+#include "kernels/cuda/gemm/CUDAQuantisedActivationProducers.h"
+#endif
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/ROCmQuantisedActivationProducers.h"
+#endif
 #include <cstdlib>
 #include <string>
 #include <future>
 #include <gtest/gtest.h>
 #include <iostream>
 #include <optional>
+#include <map>
+#include <tuple>
 using namespace llaminar2;
 namespace {
 namespace oracle = test::q8_all_formats;
@@ -984,3 +995,351 @@ TEST(Q8ResidualAllFormatsDevice, ROCmConcurrentColdIQ) {
         false, true);
 }
 #endif
+
+
+namespace {
+/** @brief Distinct public production adapters sharing the counted native row authority. */
+enum class CountedNativeOperation {Plain,Bias,SwiGLU,Fused};
+/** @brief Poison and authenticate one actual named activation publication surface. */
+struct CountedNativeBank {
+ std::string name;size_t elementBytes,rowWidth,logicalElements;bool cudaBlockMajor;bool emptyOnly;
+ std::vector<uint8_t> poison,gold;
+};
+/** @brief Prove exact live output/publication extent through original prepared native adapters.
+ * @param device Exact CUDA/HIP participant.
+ * @param format Actual original source format; canonical source factories own its blocks.
+ * @param m Captured physical rows, including M1 where counted zero is meaningful.
+ * @param operation Plain stage, fused SwiGLU stage or shared-input projection bundle.
+ * @details Full-active native witnesses authenticate live bytes. This focused
+ * regression certifies count/extent preservation, not a second mathematical
+ * projection oracle. Twenty replays poison all consumed publication capacities.
+ */
+void proveCountedNativeExtent(DeviceId device,const test::QuantizedVerifierFormatCase&format,
+ int m,CountedNativeOperation operation,const test::QuantizedVerifierFormatCase* secondFormat=nullptr) {
+ constexpr int n=65,n2=97,k=256;
+ auto*backend=getBackendFor(device);require(backend&&backend->deviceCount()>device.ordinal,"Counted native backend unavailable");
+ auto&worker=GPUDeviceContextPool::instance().getContext(device);auto context=IDeviceContext::create(device,1);
+ worker.submitAsync([&] {
+  SCOPED_TRACE(::testing::Message()<<device.toString()<<" format="<<format.label<<" M="<<m<<" operation="<<int(operation));
+  Storage s{device,backend,ExplicitGPUStream(worker.defaultStream()).get()};
+  auto source=oracle::source(format,n,k),source2=oracle::source(secondFormat?*secondFormat:format,n2,k);
+  auto prepared=test::makeGpuPreparedGemm(source.get(),device,"counted.native.first",ModelContextId{884001});
+  test::GpuPreparedGemm prepared2;
+  if(operation==CountedNativeOperation::Fused)
+   prepared2=test::makeGpuPreparedGemm(source2.get(),device,"counted.native.second",ModelContextId{884002});
+  auto*kernel=prepared.kernel;auto*second=operation==CountedNativeOperation::Fused?prepared2.kernel:prepared.kernel;
+  require(kernel&&second,"Counted native prepared engines absent");kernel->setGPUStream(s.stream);second->setGPUStream(s.stream);
+  FP32Tensor input({size_t(m+1),size_t(k)},DeviceId::cpu()),gate({size_t(m+1),size_t(k)},DeviceId::cpu()),bias({size_t(n)},DeviceId::cpu());
+  for(int i=0;i<n;++i)bias.mutable_data()[i]=float(i%11-5)*.03125f;
+  std::array<std::unique_ptr<FP32Tensor>,2> output,output2;
+  for(int side=0;side<2;++side) {
+   output[side]=std::make_unique<FP32Tensor>(std::vector<size_t>{size_t(m+1),size_t(n)},DeviceId::cpu());
+   output2[side]=std::make_unique<FP32Tensor>(std::vector<size_t>{size_t(m+1),size_t(n2)},DeviceId::cpu());
+  }
+  for(size_t i=0;i<input.numel();++i) {
+   // Inactive rows remain finite so the original defective producer yields
+   // localized bank failures rather than a device trap before observation.
+   input.mutable_data()[i]=.125f+std::sin(float(i*7+11))*.31f;
+   gate.mutable_data()[i]=-.375f+std::cos(float(i*13+3))*.27f;
+  }
+  auto*count=s.allocate<int32_t>(1);const auto counted=DeviceRowRange::deviceCounted(m,count);
+  auto*consumer=dynamic_cast<IWorkspaceConsumer*>(kernel);auto*secondConsumer=dynamic_cast<IWorkspaceConsumer*>(second);
+  require(consumer&&secondConsumer,"Counted native workspace consumers absent");
+  auto requirements=consumer->getWorkspaceRequirements(m,n,k);
+  if(operation==CountedNativeOperation::SwiGLU)consumer->appendSwiGLUWorkspaceRequirements(requirements,m,k);
+  if(operation==CountedNativeOperation::Fused) {
+   requirements.merge(secondConsumer->getWorkspaceRequirements(m,n2,k));
+   const std::array columns{n,n2};consumer->appendFusedProjectionWorkspaceRequirements(requirements,m,columns,k);
+   // Match the actual fused-stage contract, including ordinary M1 side slots.
+   addCudaConcurrentDecodeGemvSideStreamWorkspace(requirements,device,m,columns.size());
+   require(kernel->prepareFusedProjectionGraphCapture(columns.size()),"Counted fused capture preparation failed");
+  }
+  std::array<std::unique_ptr<Workspace>,2> workspace;
+  std::array<std::unique_ptr<GEMMStage>,2> stage;
+  std::unique_ptr<GEMMStage> ordinaryBiasStage;
+  for(int side=0;side<2;++side) {
+   workspace[side]=std::make_unique<Workspace>(device,requirements);
+   if(operation!=CountedNativeOperation::Fused) {
+    stage[side]=std::make_unique<GEMMStage>(GEMMStage::Params{
+     .device_id=device,.A=&input,.B=source.get(),.C=output[side].get(),.m=m,.n=n,.k=k,
+     .bias_tensor=operation==CountedNativeOperation::Bias?&bias:nullptr,
+     .gate_input=operation==CountedNativeOperation::SwiGLU?&gate:nullptr,
+     .do_swiglu=operation==CountedNativeOperation::SwiGLU,
+     .a_buffer_id=BufferId::NORMALIZED,.gate_buffer_id=BufferId::GATE_PROJ,.c_buffer_id=BufferId::ATTN_OUTPUT,
+     .force_decode_equivalent_verifier_prefill=true,
+     .verifier_row_range=side==0?counted:DeviceRowRange::fullyActive(m),
+     .prepared_ref=prepared.ref,.prepared_store=prepared.store.get()});
+    stage[side]->setGPUStream(s.stream);stage[side]->bindWorkspace(workspace[side]->value.get());
+   }
+  }
+  /** @brief End borrowed bindings after graph retirement and before manager release. */
+  struct Borrows {std::array<std::unique_ptr<GEMMStage>,2>&stage;std::unique_ptr<GEMMStage>&ordinary;
+   ~Borrows(){if(ordinary)ordinary->unbindWorkspace();for(auto&s:stage)if(s)s->unbindWorkspace();}} borrows{stage,ordinaryBiasStage};
+  /** @brief Retire graph work before releasing borrowed engine workspace state. */
+  struct FusedBorrows {
+   IWorkspaceConsumer* first;IWorkspaceConsumer* second;bool active;
+   ~FusedBorrows(){if(active){first->unbindWorkspace();if(second!=first)second->unbindWorkspace();}}
+  } fusedBorrows{consumer,secondConsumer,operation==CountedNativeOperation::Fused};
+  // Binding is setup, outside capture. Each graph retains its side's addresses
+  // by value; replay does not rebind or mutate the native workspace topology.
+  const auto prepareFusedSide=[&](int side) {
+   if(operation!=CountedNativeOperation::Fused)return;
+   consumer->bindWorkspace(workspace[side]->value.get());
+   secondConsumer->bindWorkspace(workspace[side]->value.get());
+   kernel->setGPUStream(s.stream);second->setGPUStream(s.stream);
+  };
+  std::vector<CountedNativeBank> banks;
+  const auto addBank=[&](const char*name,size_t bytesPerElement,size_t rowWidth,bool blockMajor=false,bool emptyOnly=false) {
+   const auto bytes=workspace[0]->value->getBufferSize(name);if(!bytes)return;
+   require(bytes%bytesPerElement==0,"Counted native bank has fractional elements");
+   CountedNativeBank bank{name,bytesPerElement,rowWidth,size_t(m)*rowWidth,blockMajor,emptyOnly};
+   bank.poison.resize(bytes);
+   if(bytesPerElement==1)std::fill(bank.poison.begin(),bank.poison.end(),uint8_t{91});
+   else {const uint32_t word=0xc706d720u;for(size_t offset=0;offset<bytes;offset+=4)std::memcpy(bank.poison.data()+offset,&word,4);}
+   banks.push_back(std::move(bank));
+  };
+  addBank(GemmWorkspaceBuffers::QUANT_A,1,k);
+  addBank(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,sizeof(float),k/32);
+  // CUDA's established sums ABI is block-major; HIP's is row-major.
+  addBank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,sizeof(int32_t),k/32,device.is_cuda());
+  require(banks.size()>=2,"Counted native primary publication banks absent");
+  // Empty work has no consumed partials at all, independent of backend layout.
+  // Partial-row KPAR packing is not inferred from allocation capacity.
+  for(const auto*name:{GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED,
+      GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS,
+      GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS})
+   addBank(name,sizeof(float),1,false,true);
+  // Original ordinary M1 tensor calls, with actual bias, are an independent
+  // live-output witness: neither expected value passes through GEMMStage.
+  std::vector<std::unique_ptr<FP32Tensor>> biasInputs,biasOutputs;
+  FP32Tensor unbiasedWitness({1u,size_t(n)},DeviceId::cpu()),ordinaryBiasOutput({1u,size_t(n)},DeviceId::cpu());
+  if(operation==CountedNativeOperation::Bias)for(int row=0;row<m;++row) {
+   auto in=std::make_unique<FP32Tensor>(std::vector<size_t>{1u,size_t(k)},DeviceId::cpu());
+   auto out=std::make_unique<FP32Tensor>(std::vector<size_t>{1u,size_t(n)},DeviceId::cpu());
+   std::copy_n(input.data()+size_t(row)*k,k,in->mutable_data());
+   biasInputs.push_back(std::move(in));biasOutputs.push_back(std::move(out));
+  }
+  std::unique_ptr<IGPUGraphCapture> fullGraph,ordinaryM1Graph,biasOracleGraph;
+  CapturedWorkRetirement retirement(s);
+  for(auto*t:std::vector<TensorBase*>{&input,&gate,&bias,output[0].get(),output[1].get(),output2[0].get(),output2[1].get()}) {
+   TransferEngine::prepareDeviceInput(t,device,s.stream);TransferEngine::requireDeviceInput(t,device,s.stream);
+  }
+  if(operation==CountedNativeOperation::Bias) {
+   for(int row=0;row<m;++row)for(auto*t:std::array<TensorBase*,2>{biasInputs[row].get(),biasOutputs[row].get()}) {
+    TransferEngine::prepareDeviceInput(t,device,s.stream);TransferEngine::requireDeviceInput(t,device,s.stream);
+   }
+   for(auto*t:std::array<TensorBase*,2>{&unbiasedWitness,&ordinaryBiasOutput}) {
+    TransferEngine::prepareDeviceInput(t,device,s.stream);TransferEngine::requireDeviceInput(t,device,s.stream);
+   }
+   auto ordinaryParams=stage[1]->getParams();ordinaryParams.A=biasInputs[0].get();ordinaryParams.C=&ordinaryBiasOutput;
+   ordinaryParams.m=1;ordinaryParams.force_decode_equivalent_verifier_prefill=false;ordinaryParams.verifier_row_range.reset();
+   ordinaryBiasStage=std::make_unique<GEMMStage>(ordinaryParams);
+   ordinaryBiasStage->setGPUStream(s.stream);ordinaryBiasStage->bindWorkspace(workspace[1]->value.get());
+   // Workspace binding clears adapter stream state; direct oracle calls borrow
+   // the exact fixture stream after binding, just as a production stage does.
+   kernel->setGPUStream(s.stream);
+   biasOracleGraph=worker.createGraphCapture(s.stream);
+   {ScopedBackendGraphCapture recording(worker,*biasOracleGraph,"Independent ordinary biased M1 witnesses");
+    require(recording.begin(),"Bias witness capture failed");
+    for(int row=0;row<m;++row)
+     require(kernel->multiply_tensor(biasInputs[row].get(),biasOutputs[row].get(),1,n,k,false,1.f,0.f,&bias,
+        nullptr,device.ordinal,workspace[1]->value.get()),"Ordinary biased row witness rejected");
+    require(kernel->multiply_tensor(biasInputs[0].get(),&unbiasedWitness,1,n,k,false,1.f,0.f,nullptr,
+       nullptr,device.ordinal,workspace[1]->value.get()),"Ordinary unbiased sensitivity witness rejected");
+    require(ordinaryBiasStage->execute(context.get()),"Ordinary biased GEMMStage witness rejected");
+    recording.finish();
+   }
+   require(biasOracleGraph->instantiate(),"Bias witness instantiate failed");
+  }
+  s.upload(count,std::vector<int32_t>{m});
+  const auto submit=[&](int side) {
+   if(operation==CountedNativeOperation::Fused) {
+    const auto rows=side==0?counted:DeviceRowRange::fullyActive(m);
+    auto scope=kernel->beginVerifierDecodeEquivalentScope(rows);
+    const std::vector<ITensorGemm::TensorProjectionDesc>projections{
+     {kernel,output[side].get(),n,nullptr,"counted.first"},{second,output2[side].get(),n2,nullptr,"counted.second"}};
+    require(kernel->multiply_fused_verifier_rows_decode_equivalent(&input,projections,m,k,nullptr,workspace[side]->value.get()),"Counted fused native adapter rejected");
+   } else require(stage[side]->execute(context.get()),"Counted native stage adapter rejected");
+  };
+  std::array<std::vector<GPUGraphKernelNodeInfo>,2> inventory;
+  const auto capture=[&](std::unique_ptr<IGPUGraphCapture>&graph,int side) {
+   prepareFusedSide(side);
+   graph=worker.createGraphCapture(s.stream);ScopedBackendGraphCapture recording(worker,*graph,"Counted native projection extent");
+   require(recording.begin(),"Counted native capture begin failed");submit(side);recording.finish();
+   require(graph->instantiate(),"Counted native instantiate failed");std::string error;
+   require(graph->inspectKernelNodes(inventory[side],&error),"Counted native kernel inspection failed");
+   ASSERT_FALSE(inventory[side].empty());EXPECT_EQ(graph->nodeCount(),inventory[side].size());
+   for(const auto&node:inventory[side]) {
+    ASSERT_TRUE(node.name_resolved);EXPECT_EQ(node.local_memory_bytes_per_thread,0u);
+    std::cout<<"COUNTED_NATIVE_KERNEL,"<<device.toString()<<','<<format.label<<','<<m<<','<<int(operation)<<','<<side<<','
+     <<node.name<<','<<node.grid_x<<','<<node.grid_y<<','<<node.grid_z<<','<<node.block_x<<','<<node.block_y<<','<<node.block_z<<'\n';
+   }
+  };
+  capture(s.graph,0);capture(fullGraph,1);
+  if(secondFormat&&device.is_rocm()) {
+   // A mixed prepared bundle must reach the mixed raw bridge, rather than two
+   // separately accepted single-format calls hiding its M1 admission boundary.
+   EXPECT_TRUE(std::any_of(inventory[0].begin(),inventory[0].end(),[](const auto&node){
+    return node.name.find("gemv_native_vnni_small_m_batched_shared_mixed_kernel_t")!=std::string::npos;
+   }))<<"Counted M1 mixed bundle did not exercise the mixed producer";
+  }
+  const auto quantizers=std::count_if(inventory[0].begin(),inventory[0].end(),[](const auto&node){
+   return node.name.find("quantize")!=std::string::npos;
+  });
+  bool ordinaryM1Same=true;
+  if(m==1) {
+   prepareFusedSide(1);
+   ordinaryM1Graph=worker.createGraphCapture(s.stream);
+   {ScopedBackendGraphCapture recording(worker,*ordinaryM1Graph,"Literal ordinary M1 inventory");
+    require(recording.begin(),"Ordinary M1 capture failed");
+    if(operation==CountedNativeOperation::Fused) {
+     const std::vector<ITensorGemm::TensorProjectionDesc>projections{
+      {kernel,output[1].get(),n,nullptr,"ordinary.first"},{second,output2[1].get(),n2,nullptr,"ordinary.second"}};
+     require(kernel->multiply_fused_tensor(&input,projections,1,k,nullptr,workspace[1]->value.get()),"Ordinary M1 fused rejected");
+    } else if(operation==CountedNativeOperation::Bias) {
+     // The verifier stage submits one fused projection. Its ordinary peer has
+     // the same operation boundary: HIP's multiply_tensor uses a different
+     // established bias epilogue. Independent multiply_tensor output bytes are
+     // checked by biasOracleGraph above, without conflating the two inventories.
+     const std::vector<ITensorGemm::TensorProjectionDesc>projections{
+      {kernel,output[1].get(),n,&bias,"ordinary.biased"}};
+     require(kernel->multiply_fused_tensor(&input,projections,1,k,nullptr,workspace[1]->value.get()),"Ordinary M1 biased fused projection rejected");
+    } else if(operation==CountedNativeOperation::SwiGLU)
+     require(kernel->multiply_tensor_with_fused_swiglu(&gate,&input,output[1].get(),1,n,k,1.f,0.f,workspace[1]->value.get()),"Ordinary M1 SwiGLU rejected");
+    else require(kernel->multiply_tensor(&input,output[1].get(),1,n,k,false,1.f,0.f,
+       operation==CountedNativeOperation::Bias?&bias:nullptr,nullptr,device.ordinal,workspace[1]->value.get()),"Ordinary M1 projection rejected");
+    recording.finish();
+   }
+   require(ordinaryM1Graph->instantiate(),"Ordinary M1 instantiate failed");
+   std::vector<GPUGraphKernelNodeInfo>ordinary;std::string error;
+   require(ordinaryM1Graph->inspectKernelNodes(ordinary,&error),"Ordinary M1 inventory failed");
+   EXPECT_EQ(ordinaryM1Graph->nodeCount(),ordinary.size());
+   using Key=std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t>;
+   std::map<Key,int>literal,explicitFull;
+   const auto add=[](auto&counts,const auto&nodes){for(const auto&node:nodes)
+    ++counts[Key{node.function_identity,node.grid_x,node.grid_y,node.grid_z,node.block_x,node.block_y,node.block_z}];};
+   add(literal,ordinary);add(explicitFull,inventory[1]);
+   ordinaryM1Same=literal==explicitFull;
+  }
+  constexpr float poison=-34567.125f;
+  const auto dirtyOutputs=[&](int side) {
+   s.upload(static_cast<float*>(output[side]->gpu_data_ptr()),std::vector<float>(output[side]->numel(),poison));
+   s.upload(static_cast<float*>(output2[side]->gpu_data_ptr()),std::vector<float>(output2[side]->numel(),poison));
+  };
+  dirtyOutputs(1);require(fullGraph->launch(),"Counted native full witness replay failed");
+  auto full=s.download(static_cast<const float*>(output[1]->gpu_data_ptr()),output[1]->numel());
+  if(operation==CountedNativeOperation::Bias) {
+   require(biasOracleGraph->launch(),"Ordinary biased witness replay failed");
+   std::vector<float> independent(full.size(),poison);
+   for(int row=0;row<m;++row) {
+    auto expected=s.download(static_cast<const float*>(biasOutputs[row]->gpu_data_ptr()),n);
+    std::copy(expected.begin(),expected.end(),independent.begin()+size_t(row)*n);
+   }
+   auto noBias=s.download(static_cast<const float*>(unbiasedWitness.gpu_data_ptr()),n);
+   ASSERT_NE(std::memcmp(independent.data(),noBias.data(),size_t(n)*sizeof(float)),0)
+    <<"Actual typed bias must change the ordinary native witness";
+   auto ordinary=s.download(static_cast<const float*>(ordinaryBiasOutput.gpu_data_ptr()),n);
+   EXPECT_EQ(std::memcmp(ordinary.data(),independent.data(),size_t(n)*sizeof(float)),0)
+    <<"Ordinary M1 GEMMStage discarded or changed actual bias";
+   ASSERT_EQ(std::memcmp(full.data(),independent.data(),full.size()*sizeof(float)),0)
+    <<"Full verifier GEMMStage discarded or changed actual bias";
+   full=std::move(independent);
+  }
+  const auto full2=s.download(static_cast<const float*>(output2[1]->gpu_data_ptr()),output2[1]->numel());
+  // Full counted publication is the extent witness, not a second quantizer.
+  // Its live projection bytes must first match the independent uncounted call.
+  dirtyOutputs(0);for(auto&bank:banks)s.upload(static_cast<uint8_t*>(workspace[0]->value->getBuffer(bank.name)),bank.poison);
+  require(s.graph->launch(),"Counted native full-count replay failed");
+  auto first=s.download(static_cast<const float*>(output[0]->gpu_data_ptr()),output[0]->numel());
+  ASSERT_EQ(std::memcmp(first.data(),full.data(),full.size()*sizeof(float)),0);
+  if(operation==CountedNativeOperation::Fused) {
+   auto secondOutput=s.download(static_cast<const float*>(output2[0]->gpu_data_ptr()),output2[0]->numel());
+   ASSERT_EQ(std::memcmp(secondOutput.data(),full2.data(),full2.size()*sizeof(float)),0);
+  }
+  for(auto&bank:banks)bank.gold=s.download(static_cast<const uint8_t*>(workspace[0]->value->getBuffer(bank.name)),bank.poison.size());
+  for(int replay=0;replay<20;++replay) {
+   const int live=replay%4==0?m:replay%4==1?0:replay%4==2?std::min(m,1):std::max(0,m-1);
+   SCOPED_TRACE(::testing::Message()<<"replay="<<replay<<" live="<<live);
+   dirtyOutputs(0);for(auto&bank:banks)s.upload(static_cast<uint8_t*>(workspace[0]->value->getBuffer(bank.name)),bank.poison);
+   s.upload(count,std::vector<int32_t>{live});require(s.graph->launch(),"Counted native replay failed");
+   const auto checkOutput=[&](const char*name,FP32Tensor&value,const std::vector<float>&gold,int width) {
+    auto got=s.download(static_cast<const float*>(value.gpu_data_ptr()),value.numel());
+    for(size_t i=0;i<got.size();++i) {
+     const float expected=i<size_t(live)*width?gold[i]:poison;
+     uint32_t actualBits,expectedBits;std::memcpy(&actualBits,&got[i],4);std::memcpy(&expectedBits,&expected,4);
+     ASSERT_EQ(actualBits,expectedBits)<<name<<" word="<<i<<" row="<<i/width;
+    }
+   };
+   checkOutput("first",*output[0],full,n);
+   if(operation==CountedNativeOperation::Fused)checkOutput("second",*output2[0],full2,n2);
+   for(const auto&bank:banks) {
+    if(bank.emptyOnly&&live>0)continue;
+    auto got=s.download(static_cast<const uint8_t*>(workspace[0]->value->getBuffer(bank.name)),bank.poison.size());
+    for(size_t element=0;element<got.size()/bank.elementBytes;++element) {
+     const size_t row=bank.cudaBlockMajor?element%size_t(m):element/bank.rowWidth;
+     const bool active=!bank.emptyOnly&&element<bank.logicalElements&&row<size_t(live);
+     const auto&gold=active?bank.gold:bank.poison;const auto offset=element*bank.elementBytes;
+     ASSERT_EQ(std::memcmp(got.data()+offset,gold.data()+offset,bank.elementBytes),0)
+      <<bank.name<<" element="<<element<<" row="<<row<<" active="<<active;
+    }
+   }
+   ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+  EXPECT_EQ(quantizers,1)<<"Counted adapters must capture one shared row-aware publication";
+  EXPECT_TRUE(ordinaryM1Same)<<"Null-count/full-active M1 must retain the literal ordinary native route";
+  for(const auto&bank:banks)if(bank.name==GemmWorkspaceBuffers::QUANT_A||bank.name==GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)
+   EXPECT_NE(bank.gold,bank.poison)<<bank.name<<" full counted publication was not exercised";
+  s.retire();fullGraph.reset();ordinaryM1Graph.reset();biasOracleGraph.reset();
+ }).get();
+}
+/** @brief Exercise original source totality with small, non-tile-aligned output widths. */
+void proveCountedNativeAllFormats(DeviceId device,CountedNativeOperation operation) {
+ for(const auto&format:test::quantizedVerifierFormats())for(int m:{1,3,9,17}) {
+   proveCountedNativeExtent(device,format,m,operation);
+   if(::testing::Test::HasFailure())return;
+ }
+}
+}
+
+#ifdef HAVE_CUDA
+/** @test Counted M1/grouped CUDA Plain leaves inactive output/publication bytes untouched. */
+TEST(Q8ResidualAllFormatsDevice,CUDACountedNativePlain){proveCountedNativeAllFormats(DeviceId::cuda(0),CountedNativeOperation::Plain);}
+/** @test Counted M1/grouped CUDA Bias leaves inactive output/publication bytes untouched. */
+TEST(Q8ResidualAllFormatsDevice,CUDACountedNativeBias){proveCountedNativeAllFormats(DeviceId::cuda(0),CountedNativeOperation::Bias);}
+/** @test Counted M1/grouped CUDA SwiGLU leaves inactive output/publication bytes untouched. */
+TEST(Q8ResidualAllFormatsDevice,CUDACountedNativeSwiGLU){proveCountedNativeAllFormats(DeviceId::cuda(0),CountedNativeOperation::SwiGLU);}
+/** @test Counted M1/grouped CUDA Fused leaves inactive output/publication bytes untouched. */
+TEST(Q8ResidualAllFormatsDevice,CUDACountedNativeFused){proveCountedNativeAllFormats(DeviceId::cuda(0),CountedNativeOperation::Fused);}
+/** @test Distinct source formats reach the count-owned M1 shared projection bundle. */
+TEST(Q8ResidualAllFormatsDevice,CUDACountedNativeMixedFusedM1) {
+ const auto&first=test::quantizedVerifierFormat("Q4_0");
+ const auto&second=test::quantizedVerifierFormat("IQ4_NL");
+ proveCountedNativeExtent(DeviceId::cuda(0),first,1,CountedNativeOperation::Fused,&second);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/** @test Counted M1/grouped ROCm Plain leaves inactive output/publication bytes untouched. */
+TEST(Q8ResidualAllFormatsDevice,ROCmCountedNativePlain){proveCountedNativeAllFormats(DeviceId::rocm(0),CountedNativeOperation::Plain);}
+/** @test Counted M1/grouped ROCm Bias leaves inactive output/publication bytes untouched. */
+TEST(Q8ResidualAllFormatsDevice,ROCmCountedNativeBias){proveCountedNativeAllFormats(DeviceId::rocm(0),CountedNativeOperation::Bias);}
+/** @test Grouped bias publication preserves inactive rows independently of M1 admission. */
+TEST(Q8ResidualAllFormatsDevice,ROCmCountedBiasEpilogue) {
+ for(const auto&format:test::quantizedVerifierFormats()) {
+  proveCountedNativeExtent(DeviceId::rocm(0),format,3,CountedNativeOperation::Bias);
+  if(::testing::Test::HasFailure())return;
+ }
+}
+/** @test Counted M1/grouped ROCm SwiGLU leaves inactive output/publication bytes untouched. */
+TEST(Q8ResidualAllFormatsDevice,ROCmCountedNativeSwiGLU){proveCountedNativeAllFormats(DeviceId::rocm(0),CountedNativeOperation::SwiGLU);}
+/** @test Counted M1/grouped ROCm Fused leaves inactive output/publication bytes untouched. */
+TEST(Q8ResidualAllFormatsDevice,ROCmCountedNativeFused){proveCountedNativeAllFormats(DeviceId::rocm(0),CountedNativeOperation::Fused);}
+/** @test Distinct source formats reach the count-owned M1 shared projection bundle. */
+TEST(Q8ResidualAllFormatsDevice,ROCmCountedNativeMixedFusedM1) {
+ const auto&first=test::quantizedVerifierFormat("Q4_0");
+ const auto&second=test::quantizedVerifierFormat("IQ4_NL");
+ proveCountedNativeExtent(DeviceId::rocm(0),first,1,CountedNativeOperation::Fused,&second);
+}
+#endif
+
+#include "CountedActivationProducerRegression.h"

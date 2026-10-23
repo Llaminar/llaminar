@@ -33,6 +33,7 @@
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
+#include "CUDAQuantisedActivationProducers.h"
 #include "kernels/common/NativeEmbeddingIQTables.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "CUDAQuantisedGemmKernel.h"
@@ -89,45 +90,11 @@ namespace llaminar2
         extern "C"
         {
             // Quantize FP32 activations to INT8 with per-block-of-32 scales
-            bool cudaQuantGemm_quantizeActivationsBlockwise(
-                const float *d_A_fp32,       // [M x K]
-                int8_t *d_A_int8,            // [M x K] output
-                float *d_scales_A_blockwise, // [M x (K/32)] output
-                int M, int K,
-                int cuda_device_id,
-                void *stream = nullptr);
-
-            bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
-                const float *d_A_fp32,       // [M x K]
-                int8_t *d_A_int8,            // [M x K] output
-                float *d_scales_A_blockwise, // [M x (K/32)] output
-                int32_t *d_sums_A_blockwise, // [(K/32) x M] block-major output
-                int M, int K,
-                int cuda_device_id,
-                void *stream = nullptr);
 
             // Free device memory
             void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
 
             // Fused SwiGLU + blockwise quantization (from CUDAFusedOpsKernels.cu)
-            bool cudaOps_fused_swiglu_quantize_blockwise(
-                const float *gate,
-                const float *up,
-                int8_t *A_int8,
-                float *scales_A_blockwise,
-                int M, int K,
-                int device_idx,
-                void *stream);
-
-            bool cudaOps_fused_swiglu_quantize_blockwise_with_sums(
-                const float *gate,
-                const float *up,
-                int8_t *A_int8,
-                float *scales_A_blockwise,
-                int32_t *sums_A_blockwise,
-                int M, int K,
-                int device_idx,
-                void *stream);
 
             // Concurrent prefill stream/event helpers (from CUDAQuantisedGemmKernel_CUTLASS.cu)
             bool cudaQuantGemm_createStream(void **out_stream, int cuda_device_id);
@@ -426,6 +393,67 @@ namespace llaminar2
              * enter this exact M=1 reduction contract.
              */
             return true;
+        }
+
+
+        /** @brief Submit quantization with the enclosing immutable prefix authority.
+         * Ordinary work retains its original ABI and count-free native kernel.
+         * Counted work owns every input read and every scratch write by live row.
+         */
+        bool cudaQuantGemm_quantizeActivationsBlockwiseScoped(const float *input, int8_t *quant, float *scales, int m, int k, int device, void *stream)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            if (rows && rows->countOwner())
+                return cudaQuantGemm_quantizeActivationsBlockwise_rows(input, quant, scales, m, k, device, stream, rows);
+            return cudaQuantGemm_quantizeActivationsBlockwise(input, quant, scales, m, k, device, stream);
+        }
+
+        /** @brief Submit quantization with the enclosing immutable prefix authority.
+         * Ordinary work retains its original ABI and count-free native kernel.
+         * Counted work owns every input read and every scratch write by live row.
+         */
+        bool cudaQuantGemm_quantizeActivationsBlockwiseWithSumsScoped(const float *input, int8_t *quant, float *scales, int32_t *sums, int m, int k, int device, void *stream)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            if (rows && rows->countOwner())
+                return cudaQuantGemm_quantizeActivationsBlockwiseWithSums_rows(input, quant, scales, sums, m, k, device, stream, rows);
+            return cudaQuantGemm_quantizeActivationsBlockwiseWithSums(input, quant, scales, sums, m, k, device, stream);
+        }
+
+        /** @brief Submit quantization with the enclosing immutable prefix authority.
+         * Ordinary work retains its original ABI and count-free native kernel.
+         * Counted work owns every input read and every scratch write by live row.
+         */
+        bool cudaOps_fused_swiglu_quantize_blockwiseScoped(const float *gate, const float *up, int8_t *quant, float *scales, int m, int k, int device, void *stream)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            if (rows && rows->countOwner())
+                return cudaOps_fused_swiglu_quantize_blockwise_rows(gate, up, quant, scales, m, k, device, stream, rows);
+            return cudaOps_fused_swiglu_quantize_blockwise(gate, up, quant, scales, m, k, device, stream);
+        }
+
+        /** @brief Submit quantization with the enclosing immutable prefix authority.
+         * Ordinary work retains its original ABI and count-free native kernel.
+         * Counted work owns every input read and every scratch write by live row.
+         */
+        bool cudaOps_fused_swiglu_quantize_blockwise_with_sumsScoped(const float *gate, const float *up, int8_t *quant, float *scales, int32_t *sums, int m, int k, int device, void *stream)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            if (rows && rows->countOwner())
+                return cudaOps_fused_swiglu_quantize_blockwise_with_sums_rows(gate, up, quant, scales, sums, m, k, device, stream, rows);
+            return cudaOps_fused_swiglu_quantize_blockwise_with_sums(gate, up, quant, scales, sums, m, k, device, stream);
+        }
+
+        /**
+         * @brief Select counted M1 without changing the ordinary decode route.
+         * The descriptor is immutable recording metadata; its device count is
+         * consumed only by submitted kernels. Geometry validation remains owned
+         * by VerifierKernelModeScope, including rejection of request-hole scopes.
+         */
+        bool countedVerifierRows(int m)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            return rows && rows->countOwner();
         }
 
         bool explicitSmallMVerifierScopeActive()
@@ -2539,7 +2567,7 @@ namespace llaminar2
             }
 
             const bool explicit_small_m_verifier =
-                explicitSmallMVerifierScopeActive() && m > 1;
+                explicitSmallMVerifierScopeActive() && (m > 1 || countedVerifierRows(m));
             if (explicit_small_m_verifier)
             {
                 LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
@@ -2671,7 +2699,7 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!cudaQuantGemm_quantizeActivationsBlockwise(
+                if (!cudaQuantGemm_quantizeActivationsBlockwiseScoped(
                         d_input,
                         d_A_int8,
                         d_scales_A_blockwise,
@@ -3061,10 +3089,10 @@ namespace llaminar2
 
                 // Blockwise quantize activations ONCE (shared across all projections)
                 const bool quantized = d_sums_A_blockwise
-                                           ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+                                           ? cudaQuantGemm_quantizeActivationsBlockwiseWithSumsScoped(
                                                  d_input, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
                                                  m, k, cuda_device_id_, execution_stream)
-                                           : cudaQuantGemm_quantizeActivationsBlockwise(
+                                           : cudaQuantGemm_quantizeActivationsBlockwiseScoped(
                                                  d_input, d_A_int8, d_scales_A_blockwise,
                                                  m, k, cuda_device_id_, execution_stream);
                 if (!quantized)
@@ -3713,7 +3741,7 @@ namespace llaminar2
 
             const bool verifier_small_m =
                 explicitSmallMVerifierScopeActive() &&
-                (m > 1) &&
+                (m > 1 || countedVerifierRows(m)) &&
                 (k % 32 == 0) &&
                 canUseNativeVNNIBlockwise(impl_.get(), 1, k);
             const bool use_blockwise =
@@ -3747,7 +3775,7 @@ namespace llaminar2
                      * every row against M=1 serial decode, so this grouped route
                      * must be mathematically identical, not just close.
                      */
-                    if (!cudaOps_fused_swiglu_quantize_blockwise(
+                    if (!cudaOps_fused_swiglu_quantize_blockwiseScoped(
                             d_gate,
                             d_up,
                             d_A_int8,
@@ -3787,10 +3815,10 @@ namespace llaminar2
 
                 // Fused SwiGLU + blockwise quantization: replaces separate SwiGLU + quant kernels
                 const bool quantized = d_sums_A_blockwise
-                                           ? cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+                                           ? cudaOps_fused_swiglu_quantize_blockwise_with_sumsScoped(
                                                  d_gate, d_up, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
                                                  m, k, cuda_device_id_, execution_stream)
-                                           : cudaOps_fused_swiglu_quantize_blockwise(
+                                           : cudaOps_fused_swiglu_quantize_blockwiseScoped(
                                                  d_gate, d_up, d_A_int8, d_scales_A_blockwise,
                                                  m, k, cuda_device_id_, execution_stream);
                 if (!quantized)
@@ -3976,7 +4004,7 @@ namespace llaminar2
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Null input or output");
                 return false;
             }
-            if (m <= 1 || n <= 0 || k <= 0)
+            if (m <= 0 || n <= 0 || k <= 0)
             {
                 return false;
             }
@@ -4012,7 +4040,7 @@ namespace llaminar2
             float *d_scales_A_blockwise =
                 static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
 
-            if (!cudaQuantGemm_quantizeActivationsBlockwise(
+            if (!cudaQuantGemm_quantizeActivationsBlockwiseScoped(
                     d_A,
                     d_A_int8,
                     d_scales_A_blockwise,
@@ -4054,7 +4082,7 @@ namespace llaminar2
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Null input, scale, or output");
                 return false;
             }
-            if (m <= 1 || n <= 0 || k <= 0 || (k % 32) != 0)
+            if (m <= 0 || n <= 0 || k <= 0 || (k % 32) != 0)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Invalid dimensions: M="
                           << m << " N=" << n << " K=" << k);
@@ -4331,7 +4359,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (explicitSmallMVerifierScopeActive() && m > 1)
+            if (explicitSmallMVerifierScopeActive() && (m > 1 || countedVerifierRows(m)))
             {
                 if (multiply_fp32_to_fp32_small_m_gemv(
                         d_A, d_C, nullptr, m, n, k, alpha, beta))
@@ -4366,10 +4394,10 @@ namespace llaminar2
 
                 // Step 1: Blockwise quantize activations
                 const bool quantized = d_sums_A_blockwise
-                                           ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+                                           ? cudaQuantGemm_quantizeActivationsBlockwiseWithSumsScoped(
                                                  d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
                                                  m, k, cuda_device_id_, execution_stream)
-                                           : cudaQuantGemm_quantizeActivationsBlockwise(
+                                           : cudaQuantGemm_quantizeActivationsBlockwiseScoped(
                                                  d_A, d_A_int8, d_scales_A_blockwise,
                                                  m, k, cuda_device_id_, execution_stream);
                 if (!quantized)
@@ -4458,7 +4486,7 @@ namespace llaminar2
             }
 
             if (explicitSmallMVerifierScopeActive() &&
-                m > 1 &&
+                (m > 1 || countedVerifierRows(m)) &&
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, d_bias, m, n, k, alpha, beta))
             {
@@ -4482,10 +4510,10 @@ namespace llaminar2
                 {
                     CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::QUANTIZE_ACTIVATIONS, execution_stream);
                     const bool quantized = d_sums_A_blockwise
-                                               ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+                                               ? cudaQuantGemm_quantizeActivationsBlockwiseWithSumsScoped(
                                                      d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
                                                      m, k, cuda_device_id_, execution_stream)
-                                               : cudaQuantGemm_quantizeActivationsBlockwise(
+                                               : cudaQuantGemm_quantizeActivationsBlockwiseScoped(
                                                      d_A, d_A_int8, d_scales_A_blockwise,
                                                      m, k, cuda_device_id_, execution_stream);
                     if (!quantized)
@@ -4824,7 +4852,7 @@ namespace llaminar2
             std::span<const int> projection_columns,
             int k)
         {
-            if (m <= 1 || projection_columns.size() <= 1)
+            if (m <= 0 || projection_columns.size() <= 1)
                 return;
             if (k <= 0)
             {

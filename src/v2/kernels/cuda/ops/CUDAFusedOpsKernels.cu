@@ -10,9 +10,14 @@
  * avoiding writing intermediate FP32 tensors to global memory.
  * Quantized activations and scales are row-major; optional integer block sums
  * use the same block-major representation as the ordinary CUDA quantizer.
+ * Counted producers retain immutable DeviceRowRange metadata by value. Their
+ * compile-time specialization rejects inactive rows before source/scratch access;
+ * ordinary kernels compile out every live-count read and predicate.
  */
 
 #include "CUDAHelpers.cuh"
+#include "kernels/cuda/gemm/CUDAQuantisedActivationProducers.h"
+#include <stdexcept>
 #include <cstdint>
 #include <cstdio>
 
@@ -43,18 +48,28 @@
  * @param sums_A_blockwise Optional block-major K/32 by M INT32 sum destination.
  * @param M Positive physical row count shared with the consuming graph.
  * @param K Positive input width divisible by 32.
- */
+  * @tparam Counted Read the device row authority only in the counted specialization.
+ * @param activeRows Immutable physical/live descriptor copied into this launch.
+*/
+template<bool Counted>
 __global__ void fused_swiglu_quantize_blockwise_kernel(
     const float *__restrict__ gate,         // [M × K]
     const float *__restrict__ up,           // [M × K]
     int8_t *__restrict__ A_int8,            // [M × K] output
     float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
     int32_t *__restrict__ sums_A_blockwise, // [num_blocks × M] optional quantized sums
-    int M, int K)
+    int M, int K, llaminar2::DeviceRowRange activeRows)
 {
     const int row = blockIdx.y;
     if (row >= M)
         return;
+    // Whole row/quantization subgroup agrees before any load, store or barrier.
+    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    if constexpr (Counted)
+    {
+        if (row >= activeRows.activeRows())
+            return;
+    }
 
     constexpr int BLOCK_SIZE = 32;
     const int num_blocks = K / BLOCK_SIZE;
@@ -355,23 +370,46 @@ __global__ void fused_residual_rmsnorm_fp16_kernel(
 // Extern "C" Wrapper Functions
 // =========================================================================
 
+/**
+ * @brief Reject invalid immutable producer admission before any runtime submit.
+ * @param m Positive retained physical row count.
+ * @param k Positive original input width.
+ * @param stream Exact ordinary stream; native legacy/per-thread sentinels reject.
+ * @param rows Optional immutable descriptor; its live count is never host-read.
+ */
+static void validateCUDAActivationProducer(int m,int k,void* stream,const llaminar2::DeviceRowRange* rows)
+{
+    if (m <= 0 || k <= 0)
+        throw std::invalid_argument("Activation producer requires positive M and K");
+    const auto native = static_cast<cudaStream_t>(stream);
+    if (!native || native == cudaStreamLegacy || native == cudaStreamPerThread)
+        throw std::invalid_argument("Activation producer requires an explicit non-default stream");
+    if (rows && rows->physicalRows() != m)
+        throw std::invalid_argument("Counted quantizer row extent differs from physical matrix");
+}
+
 extern "C"
 {
 
     // =====================================================================
     // Fused SwiGLU + Blockwise Quantization
     // =====================================================================
-
-    bool cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+    bool cudaOps_fused_swiglu_quantize_blockwise_rows(
         const float *gate,
         const float *up,
         int8_t *A_int8,
         float *scales_A_blockwise,
-        int32_t *sums_A_blockwise,
         int M, int K,
         int device_idx,
-        void *stream);
+        void *stream, const llaminar2::DeviceRowRange* rowRange)
+    {
 
+        return cudaOps_fused_swiglu_quantize_blockwise_with_sums_rows(
+            gate, up, A_int8, scales_A_blockwise, nullptr,
+            M, K, device_idx, stream, rowRange);
+    }
+
+    /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
     bool cudaOps_fused_swiglu_quantize_blockwise(
         const float *gate,
         const float *up,
@@ -381,12 +419,9 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        return cudaOps_fused_swiglu_quantize_blockwise_with_sums(
-            gate, up, A_int8, scales_A_blockwise, nullptr,
-            M, K, device_idx, stream);
+        return cudaOps_fused_swiglu_quantize_blockwise_rows(gate, up, A_int8, scales_A_blockwise, M, K, device_idx, stream, nullptr);
     }
-
-    bool cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+    bool cudaOps_fused_swiglu_quantize_blockwise_with_sums_rows(
         const float *gate,
         const float *up,
         int8_t *A_int8,
@@ -394,8 +429,12 @@ extern "C"
         int32_t *sums_A_blockwise,
         int M, int K,
         int device_idx,
-        void *stream)
+        void *stream, const llaminar2::DeviceRowRange* rowRange)
     {
+        validateCUDAActivationProducer(M, K, stream, rowRange);
+        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
+        const bool countedRows = rowRange && rowRange->countOwner();
+
         cudaSetDevice(device_idx);
 
         // 2D grid: blockIdx.x distributes K-blocks, blockIdx.y distributes rows.
@@ -411,17 +450,36 @@ extern "C"
         dim3 grid(grid_x, M);
         dim3 block(BLOCK_SIZE);
 
-        fused_swiglu_quantize_blockwise_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
-            gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K);
+        if (countedRows) {
+            fused_swiglu_quantize_blockwise_kernel<true><<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+                gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K, rowAuthority);
+        } else {
+            fused_swiglu_quantize_blockwise_kernel<false><<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+                gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K, rowAuthority);
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[CUDAFusedOps] fused_swiglu_quantize_blockwise launch failed: %s\n",
-                    cudaGetErrorString(err));
+                cudaGetErrorString(err));
             return false;
         }
         return true;
+    }
+
+    /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
+    bool cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+        const float *gate,
+        const float *up,
+        int8_t *A_int8,
+        float *scales_A_blockwise,
+        int32_t *sums_A_blockwise,
+        int M, int K,
+        int device_idx,
+        void *stream)
+    {
+        return cudaOps_fused_swiglu_quantize_blockwise_with_sums_rows(gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K, device_idx, stream, nullptr);
     }
 
     // =====================================================================

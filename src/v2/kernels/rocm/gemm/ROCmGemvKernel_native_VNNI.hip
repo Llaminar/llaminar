@@ -7141,9 +7141,10 @@ bool rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
     }
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    if (M < 2)
+    if (M <= 0 || (M == 1 && (!row_range || !row_range->countOwner())) ||
+        (row_range && row_range->physicalRows() != M))
     {
-        fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] M must be at least 2 (M=%d N=%d K=%d)\n", M, N, K);
+        fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] M requires positive rows and an explicit count owner at M1 (M=%d N=%d K=%d)\n", M, N, K);
         return false;
     }
     if ((K % 32) != 0)
@@ -7336,9 +7337,10 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
         return false;
     }
 
-    if (M < 2)
+    if (M <= 0 || (M == 1 && (!row_range || !row_range->countOwner())) ||
+        (row_range && row_range->physicalRows() != M))
     {
-        fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_fp32] M must be at least 2 (M=%d K=%d projections=%d)\n",
+        fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_fp32] M requires positive rows and an explicit count owner at M1 (M=%d K=%d projections=%d)\n",
                 M, K, num_projections);
         return false;
     }
@@ -7525,9 +7527,10 @@ static bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy_imp
         return false;
     }
 
-    if (M < 2)
+    if (M <= 0 || (M == 1 && (!row_range || !row_range->countOwner())) ||
+        (row_range && row_range->physicalRows() != M))
     {
-        fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] M must be at least 2 (M=%d K=%d projections=%d)\n",
+        fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] M requires positive rows and an explicit count owner at M1 (M=%d K=%d projections=%d)\n",
                 M, K, num_projections);
         return false;
     }

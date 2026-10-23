@@ -71,6 +71,7 @@
 #include <nlohmann/json.hpp>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 using namespace llaminar2;
 namespace {
@@ -1037,6 +1038,11 @@ void measure(const MeasureOptions &o) {
  * initialization precedes parsing. */
 int main(int argc, char **argv) {
   try {
+    for (int index=1;index<argc;++index)
+      if (std::string_view(argv[index]).starts_with("--gtest_filter=")) {
+        ::testing::InitGoogleTest(&argc,argv);
+        return RUN_ALL_TESTS();
+      }
     if (llaminar2::test::recorded_gdn::requested(argc, argv))
       return llaminar2::test::recorded_gdn::run(argc, argv);
     if (llaminar2::test::recorded_head::requested(argc, argv))

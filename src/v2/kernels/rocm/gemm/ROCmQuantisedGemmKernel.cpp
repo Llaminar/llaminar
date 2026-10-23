@@ -27,6 +27,8 @@
  * @see ROCmDenseProductionPrefillOverlay.h
  */
 
+#include "ROCmQuantisedActivationProducers.h"
+#include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
@@ -91,6 +93,88 @@ namespace llaminar2
             constexpr int ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP =
                 quantized_gemm_workspace::kScatterKBlockCapacity;
             thread_local bool g_rocm_native_vnni_decode_equivalent_scope = false;
+
+            /**
+             * @brief Apply the original epilogue using the enclosing row authority.
+             * @param output Exact persistent projection destination [m,n].
+             * @param bias Optional original FP32 bias/view native address [n].
+             * @param m Captured physical row count.
+             * @param n Captured output width.
+             * @param alpha Original output multiplier.
+             * @param device Exact owning ROCm ordinal.
+             * @param stream Exact projection stream, already ordered after its producer.
+             * @return Result of the selected count-owned or count-free native specialization.
+             */
+            bool applyFp32EpilogueScoped(float* output,const float* bias,int m,int n,
+                float alpha,int device,void* stream)
+            {
+                const auto* rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+                if (rows && rows->countOwner())
+                    return rocmQuantGemm_applyFp32Epilogue_rows(output,bias,m,n,alpha,device,stream,rows);
+                return rocmQuantGemm_applyFp32Epilogue(output,bias,m,n,alpha,device,stream);
+            }
+
+
+
+        /** @brief Submit quantization with the enclosing immutable prefix authority.
+         * Ordinary work retains its original ABI and count-free native kernel.
+         * Counted work owns every input read and every scratch write by live row.
+         */
+        bool rocmQuantGemm_quantizeActivationsBlockwiseScoped(const float *input, int8_t *quant, float *scales, int m, int k, int device, void *stream, int block_size = 32)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            if (rows && rows->countOwner())
+                return rocmQuantGemm_quantizeActivationsBlockwise_rows(input, quant, scales, m, k, device, stream, block_size, rows);
+            return rocmQuantGemm_quantizeActivationsBlockwise(input, quant, scales, m, k, device, stream, block_size);
+        }
+
+        /** @brief Submit quantization with the enclosing immutable prefix authority.
+         * Ordinary work retains its original ABI and count-free native kernel.
+         * Counted work owns every input read and every scratch write by live row.
+         */
+        bool rocmQuantGemm_quantizeActivationsBlockwiseWithSumsScoped(const float *input, int8_t *quant, float *scales, int32_t *sums, int m, int k, int device, void *stream, int block_size = 32)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            if (rows && rows->countOwner())
+                return rocmQuantGemm_quantizeActivationsBlockwiseWithSums_rows(input, quant, scales, sums, m, k, device, stream, block_size, rows);
+            return rocmQuantGemm_quantizeActivationsBlockwiseWithSums(input, quant, scales, sums, m, k, device, stream, block_size);
+        }
+
+        /** @brief Submit quantization with the enclosing immutable prefix authority.
+         * Ordinary work retains its original ABI and count-free native kernel.
+         * Counted work owns every input read and every scratch write by live row.
+         */
+        bool hipOps_fused_swiglu_quantize_blockwiseScoped(const float *gate, const float *up, int8_t *quant, float *scales, int m, int k, int device, void *stream)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            if (rows && rows->countOwner())
+                return hipOps_fused_swiglu_quantize_blockwise_rows(gate, up, quant, scales, m, k, device, stream, rows);
+            return hipOps_fused_swiglu_quantize_blockwise(gate, up, quant, scales, m, k, device, stream);
+        }
+
+        /** @brief Submit quantization with the enclosing immutable prefix authority.
+         * Ordinary work retains its original ABI and count-free native kernel.
+         * Counted work owns every input read and every scratch write by live row.
+         */
+        bool hipOps_fused_swiglu_quantize_blockwise_with_sumsScoped(const float *gate, const float *up, int8_t *quant, float *scales, int32_t *sums, int m, int k, int device, void *stream)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            if (rows && rows->countOwner())
+                return hipOps_fused_swiglu_quantize_blockwise_with_sums_rows(gate, up, quant, scales, sums, m, k, device, stream, rows);
+            return hipOps_fused_swiglu_quantize_blockwise_with_sums(gate, up, quant, scales, sums, m, k, device, stream);
+        }
+
+        /**
+         * @brief Select counted M1 without changing the ordinary decode route.
+         * The descriptor is immutable recording metadata; its device count is
+         * consumed only by submitted kernels. Geometry validation remains owned
+         * by VerifierKernelModeScope, including rejection of request-hole scopes.
+         */
+        bool countedVerifierRows(int m)
+        {
+            const auto *rows = ITensorGemm::VerifierKernelModeScope::rowsFor(m);
+            return rows && rows->countOwner();
+        }
 
             int computeNativeVNNISmallMBatchedKBForValidation(
                 const std::array<int, 8> &Ns,
@@ -158,22 +242,6 @@ namespace llaminar2
         extern "C"
         {
             // Blockwise quantize FP32 activations to INT8 with per-block scales (common .hip)
-            bool rocmQuantGemm_quantizeActivationsBlockwise(
-                const float *d_A_fp32,     // [M x K]
-                int8_t *d_A_int8,          // [M x K] output
-                float *d_scales_blockwise, // [M x blocks_per_row] output
-                int M, int K,
-                int rocm_device_id, void *stream,
-                int block_size = 32);
-
-            bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
-                const float *d_A_fp32,       // [M x K]
-                int8_t *d_A_int8,            // [M x K] output
-                float *d_scales_blockwise,   // [M x blocks_per_row] output
-                int32_t *d_sums_blockwise,   // [M x blocks_per_row] output
-                int M, int K,
-                int rocm_device_id, void *stream,
-                int block_size = 32);
 
             // Allocate INT8 buffer (common .hip)
             bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id);
@@ -207,13 +275,6 @@ namespace llaminar2
                 float alpha, float beta,
                 const float *d_C_existing,
                 const float *d_bias,
-                int rocm_device_id, void *stream);
-
-            bool rocmQuantGemm_applyFp32Epilogue(
-                float *d_output,
-                const float *d_bias,
-                int M, int N,
-                float alpha,
                 int rocm_device_id, void *stream);
 
             bool rocmQuantGemm_applyFp32CombineEpilogue(
@@ -2645,7 +2706,7 @@ namespace llaminar2
             // Handles optional bias in a single fused kernel launch.
             // =========================================================================
             if (g_rocm_native_vnni_decode_equivalent_scope &&
-                m > 1)
+                (m > 1 || countedVerifierRows(m)))
             {
                 ensureWeightsConverted();
 
@@ -2710,7 +2771,7 @@ namespace llaminar2
 
 
                 const bool supports_native_small_m =
-                    impl_->has_native_vnni && m >= 2;
+                    impl_->has_native_vnni && (m >= 2 || countedVerifierRows(m));
                 if (supports_native_small_m &&
                     !gemv_output_needs_copyout && beta == 0.0f)
                 {
@@ -2721,7 +2782,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (!rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+                    if (!rocmQuantGemm_quantizeActivationsBlockwiseWithSumsScoped(
                             d_input,
                             impl_->d_A_int8,
                             impl_->d_scales_A_blockwise,
@@ -2759,7 +2820,7 @@ namespace llaminar2
 
                     if (alpha != 1.0f || d_bias)
                     {
-                        if (!rocmQuantGemm_applyFp32Epilogue(
+                        if (!applyFp32EpilogueScoped(
                                 d_output,
                                 d_bias,
                                 m,
@@ -2814,7 +2875,7 @@ namespace llaminar2
                     float *d_output_row = d_output + static_cast<size_t>(row) * n;
                     float *d_gemv_output = gemv_output_needs_copyout ? impl_->d_C_fp32 : d_output_row;
 
-                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                    if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                             d_input_row,
                             impl_->d_A_int8,
                             impl_->d_scales_A_blockwise,
@@ -2936,7 +2997,7 @@ namespace llaminar2
                 return true;
             }
 
-            if (m == 1)
+            if (m == 1 && !countedVerifierRows(m))
             {
                 // Ensure weights are on device
                 ensureWeightsConverted();
@@ -3030,7 +3091,7 @@ namespace llaminar2
                     // =====================================================================
                     if (impl_->has_native_vnni)
                     {
-                        if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                        if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                                 d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI blockwise activation quantization failed");
@@ -3106,7 +3167,7 @@ namespace llaminar2
                     // Use INT8 scatter+reduce GEMV when VNNI weights are available.
                     if (d_weights_vnni)
                     {
-                        if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                        if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                                 d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 blockwise activation quantization failed");
@@ -3256,7 +3317,7 @@ namespace llaminar2
                 phase_start = std::chrono::high_resolution_clock::now();
             {
                 const int act_block_k = rocmGemv_int8_vnni_get_act_block_k();
-                if (!rocmQuantGemm_quantizeActivationsBlockwise(d_A_fp32_src, d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_, act_block_k))
+                if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(d_A_fp32_src, d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_, act_block_k))
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to blockwise-quantize activations");
                     return false;
@@ -3597,15 +3658,15 @@ namespace llaminar2
 
                 const bool needs_block_sums =
                     g_rocm_native_vnni_decode_equivalent_scope &&
-                    all_projections_native_vnni && m >= 2 && (k % 32) == 0;
+                    all_projections_native_vnni && (m >= 2 || countedVerifierRows(m)) && (k % 32) == 0;
                 const bool quant_ok = needs_block_sums
-                    ? rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+                    ? rocmQuantGemm_quantizeActivationsBlockwiseWithSumsScoped(
                           const_cast<float *>(d_input),
                           impl_->d_A_int8,
                           impl_->d_scales_A_blockwise,
                           impl_->d_sums_A_blockwise,
                           m, k, rocm_device_id_, gpu_stream_)
-                    : rocmQuantGemm_quantizeActivationsBlockwise(
+                    : rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                           const_cast<float *>(d_input),
                           impl_->d_A_int8,
                           impl_->d_scales_A_blockwise,
@@ -3757,7 +3818,7 @@ namespace llaminar2
 #ifdef HAVE_ROCM
             const bool small_m_native_verifier_fused =
                 g_rocm_native_vnni_decode_equivalent_scope &&
-                all_projections_native_vnni && m >= 2;
+                all_projections_native_vnni && (m >= 2 || countedVerifierRows(m));
             if (m > 2 && projections.size() >= 2 &&
                 fused_uses_blockwise_shared_quant &&
                 all_projections_native_vnni &&
@@ -4775,7 +4836,7 @@ namespace llaminar2
             // Ordinary direct-device M1 owns a static grouped-reduction implementation.
             // Mapped destinations retain their existing serialized copy-out transaction:
             // its one shared d_C_fp32 cannot back simultaneous pending producers.
-            const bool direct_native_m1 = m==1 && projections.size()>=2 && all_projections_native_vnni &&
+            const bool direct_native_m1 = m==1 && !countedVerifierRows(m) && projections.size()>=2 && all_projections_native_vnni &&
                 std::all_of(projections.begin(),projections.end(),[](const auto &p)
                 {
                     const auto *output=dynamic_cast<const FP32Tensor *>(p.output);
@@ -5029,7 +5090,7 @@ namespace llaminar2
                 //
                 // Result: 1 kernel instead of 3, eliminating ~3.6ms/token pipeline overhead.
                 // =========================================================================
-                if (m == 1)
+                if (m == 1 && !countedVerifierRows(m))
                 {
                     int8_t *d_vnni = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_int8_vnni : nullptr;
                     if (!rocm_kernel->impl_->has_native_vnni && !d_vnni)
@@ -5176,7 +5237,7 @@ namespace llaminar2
 
                 const bool supports_native_small_m =
                     g_rocm_native_vnni_decode_equivalent_scope &&
-                    native_vnni_fused && m >= 2;
+                    native_vnni_fused && (m >= 2 || countedVerifierRows(m));
                 if (supports_native_small_m)
                 {
                     if ((k % 32) != 0)
@@ -5228,7 +5289,7 @@ namespace llaminar2
 
                     if (d_bias)
                     {
-                        if (!rocmQuantGemm_applyFp32Epilogue(
+                        if (!applyFp32EpilogueScoped(
                                 d_prefill_output,
                                 d_bias,
                                 m,
@@ -6330,15 +6391,6 @@ namespace llaminar2
             bool hipOps_swiglu_fp32(
                 const float *gate, const float *up, float *output,
                 int size, int device_idx, void *stream);
-            bool hipOps_fused_swiglu_quantize_blockwise(
-                const float *gate, const float *up,
-                int8_t *A_int8, float *scales_A_blockwise,
-                int M, int K, int device_idx, void *stream);
-            bool hipOps_fused_swiglu_quantize_blockwise_with_sums(
-                const float *gate, const float *up,
-                int8_t *A_int8, float *scales_A_blockwise,
-                int32_t *sums_A_blockwise,
-                int M, int K, int device_idx, void *stream);
         }
 
         bool ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu(
@@ -6415,7 +6467,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (m > 1)
+            if (m > 1 || countedVerifierRows(m))
             {
                 // M>1 PREFILL: Fused SwiGLU + blockwise quantize → INT8 GEMM
                 if (!impl_->d_A_int8 || !impl_->d_scales_A_blockwise)
@@ -6428,14 +6480,14 @@ namespace llaminar2
                 // Step 1: Fused SwiGLU + blockwise quantize → d_A_int8 + d_scales_A_blockwise
                 const bool needs_block_sums =
                     g_rocm_native_vnni_decode_equivalent_scope &&
-                    impl_->has_native_vnni && m >= 2 && (k % 32) == 0;
+                    impl_->has_native_vnni && (m >= 2 || countedVerifierRows(m)) && (k % 32) == 0;
                 const bool swiglu_quant_ok = needs_block_sums
-                    ? hipOps_fused_swiglu_quantize_blockwise_with_sums(
+                    ? hipOps_fused_swiglu_quantize_blockwise_with_sumsScoped(
                           d_gate, d_up,
                           impl_->d_A_int8, impl_->d_scales_A_blockwise,
                           impl_->d_sums_A_blockwise,
                           m, k, rocm_device_id_, gpu_stream_)
-                    : hipOps_fused_swiglu_quantize_blockwise(
+                    : hipOps_fused_swiglu_quantize_blockwiseScoped(
                           d_gate, d_up,
                           impl_->d_A_int8, impl_->d_scales_A_blockwise,
                           m, k, rocm_device_id_, gpu_stream_);
@@ -6451,7 +6503,7 @@ namespace llaminar2
                 // grouped decode-equivalent kernel instead of generic prefill.
                 const bool supports_native_small_m =
                     g_rocm_native_vnni_decode_equivalent_scope &&
-                    impl_->has_native_vnni && m >= 2 &&
+                    impl_->has_native_vnni && (m >= 2 || countedVerifierRows(m)) &&
                     alpha == 1.0f && beta == 0.0f;
                 if (supports_native_small_m)
                 {
@@ -6652,7 +6704,7 @@ namespace llaminar2
                                                                                       << " d_bias=" << static_cast<const void *>(d_bias));
 
             // DECODE FAST PATH: M=1 GEMV with fused bias
-            if (m == 1)
+            if (m == 1 && !countedVerifierRows(m))
             {
                 ensureWeightsConverted();
                 // Option B: weights are VNNI and/or ratio-VNNI on device
@@ -6673,7 +6725,7 @@ namespace llaminar2
                     // Native-VNNI path: lossless Q4/IQ4 decode, typed block metadata, then optional alpha/beta/bias epilogue.
                     if (impl_->has_native_vnni)
                     {
-                        if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                        if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                                 d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI blockwise activation quantization failed");
@@ -6742,7 +6794,7 @@ namespace llaminar2
                     // Bias handled inside scatter reduce kernel
                     if (alpha == 1.0f && beta == 0.0f && d_vnni)
                     {
-                        if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                        if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                                 d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 blockwise activation quantization failed");
@@ -6769,7 +6821,7 @@ namespace llaminar2
                     }
 
                     // Fallback: blockwise quantize → blockwise GEMV for non-standard alpha/beta
-                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                    if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                             d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Activation quantization failed");
@@ -6830,7 +6882,7 @@ namespace llaminar2
             validateWorkspace();
 
             // Step 1: Quantize FP32 activations to INT8 (blockwise)
-            if (!rocmQuantGemm_quantizeActivationsBlockwise(
+            if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                     d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Blockwise activation quantization failed");

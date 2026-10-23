@@ -663,3 +663,192 @@ can copy inactive redirect capacity in existing floating paths; it needs its
 own negative regression and symmetric row-aware TransferEngine repair. The
 full-live mapped test above does not qualify that case, and it is not an
 observed failure in this A1 model run.
+
+### HC fusion control calibration and counted-row defect
+
+The first HC103 step adds independent frozen activation, TwoTerm publication
+and residual-read programs to the existing CPU/GPU test and performance
+targets. Both complete chains retain the actual prepared down/up engines;
+the unchanged up projection is a shared boundary, not an independently frozen
+projection oracle. The separate frozen GPU bank witness is outside component
+timing. No fusion production change has been applied at this checkpoint.
+
+The original calibration against production `71267dfa1` failed 3 of 10
+registrations; the original receipt is retained in
+`hc103-original-calibration-r1`. CPU Default/AVX2, the target-selection unit
+and both GPU all-format M3 controls passed. The two GPU chain tests found an
+inactive-output overwrite at physical M1 with zero live rows on both CUDA and
+ROCm. Source diagnosis confirms that the stage carries the count, but native
+adapter predicates exclude M1 from counted execution. The ordinary quantizer
+and projection then process the row despite the zero count. This is an
+existing counted execution defect, not a demonstrated ordinary A1 model
+accuracy failure. Source review additionally found that counted M>1 consumers
+mask outputs while several quantizers still process inactive input and scratch.
+
+The scalar failure was a test admission mistake: NativeVNNI's original
+participant geometry supports AVX2/AVX512 and deliberately rejects Scalar.
+The corrected scalar registration proves actual scalar activation/read
+arithmetic and the precise NativeVNNI rejection. It does not fabricate an
+AVX2 workspace or claim a scalar NativeVNNI chain. All five corrected CPU
+registrations pass in `hc103-original-cpu-calibration-r2` (12.43 s), retaining
+all frozen arithmetic. The initial build's namespace ambiguity and its fixed
+build receipt are retained separately.
+
+Before fusion qualification, preserve ordinary full-active decode and correct
+the explicit counted operation on both GPU backends. Forward one row authority
+through quantization and projection, guard inactive input/bank accesses,
+retain capture-safe device counts, and test plain, fused and SwiGLU paths over
+all admitted source formats. Explicit count-aware bridge APIs preserve the
+existing ordinary bridge ABI; compile-time kernel specialization must keep
+ordinary execution free of count reads. Focused tests must check scratch as
+well as final output across full/small/empty replay histories and be registered
+in production preflight. The focused implementation and results follow below.
+
+Component timing uses ordinary full-active down projection, matching QFN's
+non-MTP production context. Counted verifier down remains a separate
+correctness scenario. The initial fixture's forced-verifier timing policy was
+corrected before collecting timings; no performance result from that mismatched
+policy is accepted.
+
+### Counted-row repair: focused qualification
+
+The [final focused run](../../../../parity-results/qwen-flash-next/counted104-final-focused-r2/result.json)
+passes **27/27** registrations in **78.71 seconds**, with clean driver and native
+retirement checks. Integration compilation includes CUDA SM80/86/89/90 and HIP
+gfx906 with mandatory spill checks. This is a focused repair qualification;
+the rebuilt [complete Unit suite](../../../../parity-results/qwen-flash-next/counted104-unit-r3/result.json)
+also passes **776/776** in **117.19 seconds**. Release model accuracy passes
+as detailed below; matched performance checks remain in progress. L102 remains
+the accepted model-throughput checkpoint.
+
+The reduced original regressions independently exposed four production faults:
+
+- Both GPU adapters excluded physical M1 from the device-counted path, allowing
+  empty retained replays to overwrite output and activation scratch.
+- Several activation quantizers processed inactive rows even when their grouped
+  projection consumers masked those rows.
+- Ordinary and verifier `GEMMStage` calls dropped typed bias on CPU, CUDA and
+  ROCm. Independent ordinary calls and a small exact CPU calculation reproduce
+  the lost bias without using the defective stage to create expectations.
+- The ROCm grouped bias epilogue wrote inactive output rows. A separate M3
+  regression exposed this after bias forwarding, independently of M1 admission.
+
+The repair carries `DeviceRowRange` through explicit quantizer and epilogue
+bridges, copied into native arguments. Inactive accesses are rejected before
+input reads or scratch/output writes. Count-free specialization retains the
+ordinary ABI and arithmetic. Raw native grouped entrypoints now admit physical
+M1 only with an actual device count owner. CUDA uses the existing two-row DP4A
+tile with the second lane masked, retaining the original serial family and K
+partitions. Its canonical generator, strict refresh parser and installed policy
+agree; a compiled test checks every registry-supported codebook and both
+eager/captured selectors. CUDA M1 fused side slots are now explicitly declared
+in workspace requirements. Bias forwarding preserves the original typed tensor
+or view and rejects incompatible metadata before execution.
+
+The new native suite covers all 21 source formats at M1/3/9/17, plain, biased,
+SwiGLU and fused projections, plus mixed Q4_0/IQ4_NL M1. Twenty dirty replay
+histories check full, partial and empty outputs, quantized values, scales, sums,
+empty partial banks and guard capacity. Direct producer cases cover malformed
+admission, CUDA sums/no-sums, ROCm variants 1–6, tail widths, aligned/unaligned
+inputs and generic 64/128-element blocks. Captured inventories prove the actual
+optimized producers execute and expose zero local memory. Independent HC
+original-control chains now pass on both GPUs.
+
+The retained negative receipts are `counted104-original-negative-r1/r2/r3`,
+`counted104-original-cpu-negative-r1` and
+`counted104-direct-and-epilogue-r1`. The intermediate
+`counted104-native-candidate-focused-r2` passed 19/20: its remaining assertion
+compared HIP's distinct ordinary single and single-projection fused bias APIs.
+The corrected inventory compares the same operation boundary while retaining
+the independent ordinary biased output witness and every byte assertion.
+Earlier fused-fixture workspace/stream setup corrections are retained with
+their failed receipts. None is presented as an observed ordinary A1 model error.
+
+The first complete Unit run passed 774/776. Its two failures were maintenance
+contracts: the unchanged codebook validator interpreted a new comment as a
+format label, and an old source check still required rejection of counted M1.
+The generator now emits the comment inside the branch, its refresh regression
+runs the real validator, and the source check proves admission requires a real
+device count owner. No dispatch statements or numerical expectations changed.
+
+The [adjacent native run](../../../../parity-results/qwen-flash-next/counted104-neighbor-focused-r1/result.json)
+passed every GEMM numerical check: canonical partial overwrite, captured bias,
+CUDA/ROCm original output slices, grouped dense/local-TP projections, ROCm
+prefill bucket invariance and both TwoTerm all-format sweeps. Its sole failing
+registration was an old quantizer invalid-stream test expecting `false` instead
+of the canonical pre-launch exception. That test now uses the canonical bridge
+declaration and rejects null, legacy and per-thread default streams; the entire
+registration passes in the final focused run. Original failed receipts remain
+retained. These results do not replace complete ProductionTestPreflight.
+
+A final documentation-only change adds the required generated-file Doxygen
+header and keeps it in canonical emission/refresh. The Unit closure was rebuilt
+and the full suite rerun afterward; the native policy statements are unchanged.
+The [final Release build](../../../../parity-results/qwen-flash-next/counted104-release-build-r2/result.json)
+passes for SM80/86/89/90 and gfx906 with spill enforcement enabled. The immutable
+original component archive also [passes both backend controls](../../../../parity-results/qwen-flash-next/counted104-control-component-r1/result.json).
+Its labels H2560/R320 mean down-projection **K10240** (four residual branches)
+and up-projection K320; K2560 profiling describes a different projection shape.
+
+The frozen [Release accuracy panel](../../../../parity-results/qwen-flash-next/counted104-release-accuracy-r1/report.json)
+passes its unchanged required groups in **100.72 seconds**, with normal native
+retirement and unchanged source/runtime metadata. All [26 final-logit files /
+185 rows](../../../../parity-results/qwen-flash-next/counted104-release-accuracy-r1/logit-byte-comparison.json)
+are byte-identical to accepted L102, including heldout histories and reset.
+The original four-participant KV geometry and resolved four-worker policy are
+also verified. This is the existing A1 diagnostic panel, not complete topology
+or image certification.
+
+The [matched four-arm model comparison](../../../../parity-results/qwen-flash-next/counted104-model-comparison.json)
+passes all original lifecycle, loader, driver and resource checks. All twelve
+measured 256-token output sequences match. Six samples per implementation give
+control **815.180504 prefill / 37.420065 decode tok/s** and candidate
+**815.121374 / 37.459859**: **−0.007254% / +0.106344%**. Both ranges overlap
+(prefill 814.056–815.596 versus 813.086–815.528; decode 37.267–37.657 versus
+37.331–37.632). This supports unchanged throughput for this correctness repair,
+not a new performance win. The workload, arithmetic, four-worker policy and
+sharded vocabulary remain the accepted A1 configuration.
+
+The [four-process component follow-up](../../../../parity-results/qwen-flash-next/counted104-component-abba-r1/REVIEW.md)
+retains all original observations. An initial approximately 3% CUDA M512 shift
+reversed on the repeat; equal-weight process medians differ by **+0.102%** for
+the production chain. CUDA M1/M9 differ by +0.084%/+0.215%; ROCm M1/M9/M512 by
++0.344%/−0.001%/−0.176%. These are descriptive component observations. The
+within-process frozen primitive side shares the binary's quantizer and prepared
+projection, so equal movement on both sides cannot rule out a production cost.
+Native quantizer geometry and recorded register/LDS/local-memory resources are
+unchanged.
+
+The [completed ROCm profile matrix](../../../../parity-results/qwen-flash-next/counted104-profile-summary-r1/REVIEW.md)
+contains **40 isolated runs**: M1/M512, K10240, sums/no-sums, ordinary/counted,
+and five separate hardware counters. Each run validates 96 actual dispatches in
+six retained 16-node graph replays and joins its counter to occurrence 81 after
+warmup. Source, runtime, loader, driver and retirement checks pass. M1 uses
+320 blocks of 32 threads; M512 uses 10,240 blocks of 128 threads. Allocated
+VGPR/SGPR counts remain 8/48 or 16/48 at M1, and 16/32 or 20/32 at M512,
+depending on sums. The counted M512 compiler demand adds two SGPRs but stays
+within the same allocated granule. LDS, private scratch and register spills are
+zero. Vector-lane utilization is 46.9–47.1% for the half-wave M1 program and
+94.2–95.2% for M512. This measures active lanes, not achieved CU occupancy.
+
+All eight dispatched specializations join the same bounded loaded code-object
+extraction. Its [26 quantizer/epilogue specializations](../../../../parity-results/qwen-flash-next/counted104-quantizer-static-inventory-r1/report.json)
+have zero native spills/scratch. The separately
+[inspected fused SwiGLU producers](../../../../parity-results/qwen-flash-next/counted104-fused-producer-static-r2/report.json)
+also have zero spills/scratch: 28 VGPRs, 46/48 compiler SGPRs for
+ordinary/counted. That inspection is compiled-object evidence; it is not a
+hardware counter measurement of those fused producers. CUDA resource inspection
+and the Release SM80/86/89/90 spill guard pass; no CUDA profiler was attached.
+Profile intervals and cache-sensitive traffic counters are diagnostic only;
+the unprofiled component/model runs above own performance acceptance.
+
+Two failed collector receipts remain retained. The first filter missed the
+demangler's leading `void`; the second used a noncapturing regex group that the
+pinned SDK's custom parser does not support. The corrected capturing group
+preserves the exact family/template and occurrence-81 checks. No numerical,
+graph, lifecycle or counter assertion was weakened. The first additional static
+SwiGLU collection expected four specializations incorrectly; inspection confirms
+two counted specializations with a runtime optional sums pointer, and the final
+receipt checks that exact pair. These were diagnostic collector corrections,
+not production failures. L104 is a focused correctness checkpoint with unchanged
+model throughput; complete ProductionTestPreflight remains G60.

@@ -767,10 +767,11 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
             old, grouped_rows=8,
             candidate_id="cuda.nvnni.decode.verifier.inherit_serial_m1.r8",
         )
-        added = dataclasses.replace(fresh, codebook=4)
+        supported_codebooks = sorted({spec.gpu_execution_codebook_id for spec in FORMAT_SPECS})
+        added_entries = [dataclasses.replace(fresh, codebook=cb) for cb in supported_codebooks if cb != 0]
         with mock.patch.object(module, "fit_generic_policy", side_effect=AssertionError("unexpected fit")):
             result, receipt = module.retain_grouped_exact_dispatch(
-                base, [fresh, added], corpus_digest="sha256:new", registry_digest="sha256:registry",
+                base, [fresh, *added_entries], corpus_digest="sha256:new", registry_digest="sha256:registry",
             )
         marker = "#define LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2 1"
         self.assertEqual(result[result.index("#pragma once"):result.index(marker)],
@@ -780,29 +781,43 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
         self.assertIn(module._grouped_entry_line(retained), result)
         self.assertNotIn(module._grouped_entry_line(old), result)
         self.assertEqual((receipt["replaced_keys"], receipt["retained_keys"], receipt["output_keys"]),
-                         (1, 1, 3))
+                         (1, 1, len(supported_codebooks)+1))
         self.assertEqual(receipt["output_sha256"], "sha256:" + hashlib.sha256(result.encode()).hexdigest())
         again, second = module.retain_grouped_exact_dispatch(
-            result, [fresh, added], corpus_digest="sha256:new", registry_digest="sha256:registry",
+            result, [fresh, *added_entries], corpus_digest="sha256:new", registry_digest="sha256:registry",
         )
         self.assertEqual(result, again)
-        self.assertEqual(second["replaced_keys"], 2)
+        self.assertEqual(second["replaced_keys"], len(supported_codebooks))
         source = "\n".join((
             "enum class NativeGemvShape { WIDE, KPAR, DIRECT, ROWPAR, FUSED_KPAR };",
             result, "int main() { GeneratedGroupedTuning t{};",
             "if (!selectGeneratedGroupedTuning<0>(true,16,512,1024,t) || t.grouped_rows!=8) return 1;",
             "if (!selectGeneratedGroupedTuning<0>(true,3,512,1024,t) || t.grouped_rows!=16) return 2;",
             "if (!selectGeneratedGroupedTuning<4>(true,16,512,1024,t) || t.grouped_rows!=8) return 3;",
+            "if (!selectGeneratedGroupedTuning<0>(true,1,65,256,t) || t.grouped_rows!=2 || t.kernel!=GeneratedGroupedKernel::Dp4aRows) return 4;",
+            "if (!selectGeneratedGroupedTuning<4>(false,1,97,256,t) || t.grouped_rows!=2 || t.kernel!=GeneratedGroupedKernel::Dp4aRows) return 5;",
+            "if (selectGeneratedGroupedTuning<0>(true,0,65,256,t)) return 6;",
+            "if (selectGeneratedGroupedTuning<255>(true,1,65,256,t)) return 7;",
+            *(f"if (!selectGeneratedGroupedTuning<{cb}>({mode},1,65,256,t) || t.grouped_rows!=2 || t.kernel!=GeneratedGroupedKernel::Dp4aRows) return 8;"
+              for cb in supported_codebooks for mode in ("false", "true")),
             "return 0; }",
         ))
         with tempfile.TemporaryDirectory() as directory:
             binary = str(Path(directory) / "grouped-refresh")
+            compact_include = Path(directory) / "grouped-refresh.inc"
+            compact_include.write_text(result)
+            validated = subprocess.run(
+                [sys.executable, str(KERNEL_PERF_ROOT / "validate_native_vnni_generated_dispatch_ids.py"), str(compact_include)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
             compiled = subprocess.run(["g++", "-std=c++20", "-x", "c++", "-", "-o", binary],
                                       input=source, text=True, capture_output=True, check=False)
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
             self.assertEqual(subprocess.run([binary], check=False).returncode, 0)
         for malformed in (
             base.replace("GeneratedGroupedKernel kernel", "GeneratedGroupedKernel changed"),
+            base.replace("GeneratedGroupedKernel::Dp4aRows, 2};", "GeneratedGroupedKernel::Dp4aRows, 4};"),
             base.replace(generic, "\n    const long long changed ="),
             base.replace(module._grouped_entry_line(old), "            doSomething();"),
             base.replace(module._grouped_entry_line(old), module._grouped_entry_line(retained)),

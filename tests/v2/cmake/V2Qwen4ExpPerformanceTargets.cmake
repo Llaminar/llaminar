@@ -69,3 +69,26 @@ if(HAVE_ROCM)
     set_target_properties(v2_perf_qwen4exp_branch_norm PROPERTIES
         HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
 endif()
+
+# Same independently frozen HC control fixture in the existing Release component.
+# Disabled normal GTest filters alone authorize complete-chain event timing.
+if(HAVE_CUDA OR HAVE_ROCM)
+    target_sources(v2_perf_q8_residual_prepared_projection PRIVATE
+        "${_qfn_test_sources}/integration/kernels/Test__Q8ResidualCorrectionDevice.cpp")
+    foreach(_hc103_backend CUDA ROCm)
+        if((_hc103_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (_hc103_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            if(_hc103_backend STREQUAL "CUDA")
+                set(_hc103_oracle "${_qfn_test_sources}/integration/kernels/qwen4exp/CUDAHC103Original.cu")
+                set(_hc103_language CUDA)
+            else()
+                set(_hc103_oracle "${_qfn_test_sources}/integration/kernels/qwen4exp/ROCmHC103Original.hip")
+                set(_hc103_language HIP)
+            endif()
+            set_source_files_properties("${_hc103_oracle}" PROPERTIES LANGUAGE ${_hc103_language})
+            target_sources(v2_perf_q8_residual_prepared_projection PRIVATE "${_hc103_oracle}")
+            set_target_properties(v2_perf_q8_residual_prepared_projection PROPERTIES
+                ${_hc103_language}_STANDARD 20 ${_hc103_language}_STANDARD_REQUIRED ON)
+        endif()
+    endforeach()
+endif()

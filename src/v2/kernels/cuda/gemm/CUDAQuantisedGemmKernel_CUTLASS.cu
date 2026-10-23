@@ -14,9 +14,14 @@
  * Activation scales remain row-major. Optional INT32 block sums are stored
  * block-major so a tensor-core consumer reads adjacent rows coalescently;
  * the producer writes that single representation directly, without a transpose.
+ * Counted producers retain immutable DeviceRowRange metadata by value. Their
+ * compile-time specialization rejects inactive rows before source/scratch access;
+ * ordinary kernels compile out every live-count read and predicate.
  */
 
 #include <cuda_runtime.h>
+#include "kernels/cuda/gemm/CUDAQuantisedActivationProducers.h"
+#include <stdexcept>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -106,17 +111,27 @@ namespace
      * @param sums_A_blockwise Optional block-major INT32 sums, K/32 by M.
      * @param M Positive physical row count, also the sum buffer's row pitch.
      * @param K Positive input width divisible by 32.
-     */
+          * @tparam Counted Read the device row authority only in the counted specialization.
+     * @param activeRows Immutable physical/live descriptor copied into this launch.
+    */
+    template<bool Counted>
     __global__ void quantize_activations_blockwise_kernel(
         const float *__restrict__ A_fp32,       // [M × K]
         int8_t *__restrict__ A_int8,            // [M × K] output
         float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
         int32_t *__restrict__ sums_A_blockwise, // [num_blocks × M] optional quantized activation sums
-        int M, int K)
+        int M, int K, llaminar2::DeviceRowRange activeRows)
     {
         const int row = blockIdx.y;
         if (row >= M)
             return;
+        // Whole row/quantization subgroup agrees before any load, store or barrier.
+        // Counted invalid publications trap in DeviceRowRange::activeRows().
+        if constexpr (Counted)
+        {
+            if (row >= activeRows.activeRows())
+                return;
+        }
 
         const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
         const int lane = threadIdx.x & 31;
@@ -183,6 +198,24 @@ namespace
 // Extern "C" API for .cpp adapter
 // =========================================================================
 
+/**
+ * @brief Reject invalid immutable producer admission before any runtime submit.
+ * @param m Positive retained physical row count.
+ * @param k Positive original input width.
+ * @param stream Exact ordinary stream; native legacy/per-thread sentinels reject.
+ * @param rows Optional immutable descriptor; its live count is never host-read.
+ */
+static void validateCUDAActivationProducer(int m,int k,void* stream,const llaminar2::DeviceRowRange* rows)
+{
+    if (m <= 0 || k <= 0)
+        throw std::invalid_argument("Activation producer requires positive M and K");
+    const auto native = static_cast<cudaStream_t>(stream);
+    if (!native || native == cudaStreamLegacy || native == cudaStreamPerThread)
+        throw std::invalid_argument("Activation producer requires an explicit non-default stream");
+    if (rows && rows->physicalRows() != m)
+        throw std::invalid_argument("Counted quantizer row extent differs from physical matrix");
+}
+
 extern "C"
 {
 
@@ -200,21 +233,25 @@ extern "C"
     /**
      * @brief Quantize FP32 activations to INT8 with per-block-of-32 scales
      */
-    bool cudaQuantGemm_quantizeActivationsBlockwise(
+    bool cudaQuantGemm_quantizeActivationsBlockwise_rows(
         const float *d_A_fp32,
         int8_t *d_A_int8,
         float *d_scales_A_blockwise,
         int M, int K,
         int cuda_device_id,
-        void *stream)
+        void *stream, const llaminar2::DeviceRowRange* rowRange)
     {
+        validateCUDAActivationProducer(M, K, stream, rowRange);
+        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
+        const bool countedRows = rowRange && rowRange->countOwner();
+
         if (!d_A_fp32 || !d_A_int8 || !d_scales_A_blockwise)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm::quantizeActivationsBlockwise] Null pointer: "
-                << "d_A_fp32=" << (void *)d_A_fp32
-                << " d_A_int8=" << (void *)d_A_int8
-                << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise;
+            << "d_A_fp32=" << (void *)d_A_fp32
+            << " d_A_int8=" << (void *)d_A_int8
+            << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise;
             throw std::runtime_error(oss.str());
         }
 
@@ -233,20 +270,37 @@ extern "C"
         dim3 block(BLOCK_SIZE);
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
-            d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K);
+        if (countedRows) {
+            quantize_activations_blockwise_kernel<true><<<grid, block, 0, cuda_stream>>>(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K, rowAuthority);
+        } else {
+            quantize_activations_blockwise_kernel<false><<<grid, block, 0, cuda_stream>>>(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K, rowAuthority);
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm] blockwise quantize kernel launch failed: "
-                << cudaGetErrorString(err)
-                << " (M=" << M << ", K=" << K << ")";
+            << cudaGetErrorString(err)
+            << " (M=" << M << ", K=" << K << ")";
             throw std::runtime_error(oss.str());
         }
 
         return true;
+    }
+
+    /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
+    bool cudaQuantGemm_quantizeActivationsBlockwise(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_A_blockwise,
+        int M, int K,
+        int cuda_device_id,
+        void *stream)
+    {
+        return cudaQuantGemm_quantizeActivationsBlockwise_rows(d_A_fp32, d_A_int8, d_scales_A_blockwise, M, K, cuda_device_id, stream, nullptr);
     }
 
     /**
@@ -261,36 +315,41 @@ extern "C"
      * @param stream Exact caller-owned execution stream.
      * @return True after successfully submitting the quantization kernel.
      */
-    bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+    bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums_rows(
         const float *d_A_fp32,
         int8_t *d_A_int8,
         float *d_scales_A_blockwise,
         int32_t *d_sums_A_blockwise,
         int M, int K,
         int cuda_device_id,
-        void *stream)
+        void *stream, const llaminar2::DeviceRowRange* rowRange)
     {
+
         if (!d_sums_A_blockwise)
         {
-            return cudaQuantGemm_quantizeActivationsBlockwise(
+            return cudaQuantGemm_quantizeActivationsBlockwise_rows(
                 d_A_fp32, d_A_int8, d_scales_A_blockwise,
-                M, K, cuda_device_id, stream);
+                M, K, cuda_device_id, stream, rowRange);
         }
+        validateCUDAActivationProducer(M, K, stream, rowRange);
+        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
+        const bool countedRows = rowRange && rowRange->countOwner();
+
         if (!d_A_fp32 || !d_A_int8 || !d_scales_A_blockwise)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm::quantizeActivationsBlockwiseWithSums] Null pointer: "
-                << "d_A_fp32=" << (void *)d_A_fp32
-                << " d_A_int8=" << (void *)d_A_int8
-                << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise
-                << " d_sums_A_blockwise=" << (void *)d_sums_A_blockwise;
+            << "d_A_fp32=" << (void *)d_A_fp32
+            << " d_A_int8=" << (void *)d_A_int8
+            << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise
+            << " d_sums_A_blockwise=" << (void *)d_sums_A_blockwise;
             throw std::runtime_error(oss.str());
         }
         if ((K % BLOCKWISE_BLOCK_SIZE) != 0)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm::quantizeActivationsBlockwiseWithSums] K=" << K
-                << " is not divisible by " << BLOCKWISE_BLOCK_SIZE;
+            << " is not divisible by " << BLOCKWISE_BLOCK_SIZE;
             throw std::runtime_error(oss.str());
         }
 
@@ -306,20 +365,38 @@ extern "C"
         dim3 grid(grid_x, M);
         dim3 block(BLOCK_SIZE);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
-            d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K);
+        if (countedRows) {
+            quantize_activations_blockwise_kernel<true><<<grid, block, 0, cuda_stream>>>(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, rowAuthority);
+        } else {
+            quantize_activations_blockwise_kernel<false><<<grid, block, 0, cuda_stream>>>(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, rowAuthority);
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm] blockwise quantize-with-sums kernel launch failed: "
-                << cudaGetErrorString(err)
-                << " (M=" << M << ", K=" << K << ")";
+            << cudaGetErrorString(err)
+            << " (M=" << M << ", K=" << K << ")";
             throw std::runtime_error(oss.str());
         }
 
         return true;
+    }
+
+    /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
+    bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_A_blockwise,
+        int32_t *d_sums_A_blockwise,
+        int M, int K,
+        int cuda_device_id,
+        void *stream)
+    {
+        return cudaQuantGemm_quantizeActivationsBlockwiseWithSums_rows(d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, cuda_device_id, stream, nullptr);
     }
 
     // NOTE: cudaQuantGemm_blockwiseGemm removed — NativeVNNI-only mode.

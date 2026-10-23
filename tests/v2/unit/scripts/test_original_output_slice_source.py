@@ -3,6 +3,8 @@
 
 These architecture tests complement the real CPU byte sweep. They do not
 certify CUDA/ROCm execution or replace captured all-format/model qualification.
+Count-owned M1 uses the verifier policy without changing ordinary M1 source
+selection; the gate must retain both its mode and actual device-count authority.
 """
 from pathlib import Path
 import unittest
@@ -29,7 +31,13 @@ def method(text, signature):
 
 def require_rocm_group(test, text):
     """Require the real verifier gate and projection-local explicit source query."""
-    test.assertIn("g_rocm_native_vnni_decode_equivalent_scope &&\n                all_projections_native_vnni && m >= 2", text)
+    gate = ("g_rocm_native_vnni_decode_equivalent_scope && "
+            "all_projections_native_vnni && (m >= 2 || countedVerifierRows(m))")
+    test.assertTrue(gate in " ".join(text.split()),
+                    "Native verifier grouping lost its mode, format or counted-M1 gate")
+    authority = method(text, "bool countedVerifierRows(int m)")
+    test.assertIn("VerifierKernelModeScope::rowsFor(m)", authority)
+    test.assertIn("return rows && rows->countOwner();", authority)
     begin = text.index("struct GeneratedGroupPolicy")
     end = text.index("if (!generated_grouping_available)", begin)
     grouping = text[begin:end]
@@ -112,7 +120,9 @@ class OriginalOutputSliceSource(unittest.TestCase):
         text = source("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp")
         require_rocm_group(self, text)
         for bad in (text.replace("auto original_scope = projections[i].beginOriginalOutputSliceScope();", ""),
-                    text.replace("rocmGemv_native_vnni_query_serial_m1_config_with_policy(", "wrong_query(")):
+                    text.replace("rocmGemv_native_vnni_query_serial_m1_config_with_policy(", "wrong_query("),
+                    text.replace("(m >= 2 || countedVerifierRows(m))", "m >= 1"),
+                    text.replace("return rows && rows->countOwner();", "return rows != nullptr;")):
             with self.assertRaises(AssertionError):
                 require_rocm_group(self, bad)
         entry = method(text, "bool ROCmQuantisedGemmKernel::multiply_fused_tensor(")

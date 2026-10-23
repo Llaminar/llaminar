@@ -553,3 +553,44 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     ASSERT_NE(merged, nullptr);
     EXPECT_EQ(merged->size_bytes, large->size_bytes);
 }
+
+/**
+ * @brief Count-owned M1 fused callers declare every concurrent reduction slot.
+ * The public prepared-engine boundary cannot depend on a graph-stage helper
+ * having added the ordinary M1 envelope. Existing model-stage composition is
+ * already larger, so merging this precise requirement must not grow that BOM.
+ */
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       CountedM1FusedRequirementsDeclareExactSideSlots)
+{
+    auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, 104);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+    const std::vector<int> columns{10240, 6144, 48, 48};
+    constexpr int k = 2560;
+    WorkspaceRequirements direct;
+    kernel.appendFusedProjectionWorkspaceRequirements(direct, 1, columns, k);
+    const auto *side = direct.find(
+        GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+    ASSERT_NE(side, nullptr);
+    // Stream zero uses the original serial arena. Each of the other three
+    // streams owns its exact width; these extents are already 256-byte aligned.
+    constexpr size_t expected = size_t(80) * (6144 + 48 + 48) * sizeof(float);
+    EXPECT_EQ(side->size_bytes, expected);
+    EXPECT_EQ(side->alignment, 256u);
+    EXPECT_EQ(side->regime, WorkspaceExecutionRegime::CompactDecodeOnly);
+
+    auto stage = kernel.getWorkspaceRequirements(1, columns.front(), k);
+    addCudaConcurrentDecodeGemvSideStreamWorkspace(
+        stage, DeviceId::cuda(kFakeCudaDeviceId), 1, columns.size());
+    const size_t original_stage_bytes = stage.find(
+        GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS)->size_bytes;
+    kernel.appendFusedProjectionWorkspaceRequirements(stage, 1, columns, k);
+    EXPECT_EQ(stage.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS)
+                  ->size_bytes, original_stage_bytes);
+
+    WorkspaceRequirements prefill;
+    kernel.appendFusedProjectionWorkspaceRequirements(prefill, 512, columns, k);
+    ASSERT_NE(prefill.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS), nullptr);
+    EXPECT_GE(prefill.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS)
+                  ->size_bytes, expected);
+}

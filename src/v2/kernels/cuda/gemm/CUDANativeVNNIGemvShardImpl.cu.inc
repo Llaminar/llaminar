@@ -4251,7 +4251,8 @@ extern "C"
     {
         if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
             return false;
-        if (M < 2 || N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
+        if (M <= 0 || (M == 1 && (!row_range || !row_range->countOwner())) ||
+            N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
             return false;
         if ((codebook_id == 11 || codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook) && !d_mins)
             return false;

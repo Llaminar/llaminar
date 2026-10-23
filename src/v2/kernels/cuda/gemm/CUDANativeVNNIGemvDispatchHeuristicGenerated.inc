@@ -1,3 +1,15 @@
+/**
+ * @file CUDANativeVNNIGemvDispatchHeuristicGenerated.inc
+ * @brief Generated CUDA NativeVNNI arithmetic and grouped-row launch policy.
+ *
+ * Measured exact entries and retained generic rules select immutable launch
+ * geometry. Grouped rows retain the canonical serial-M1 arithmetic family and
+ * ordered K partitions; device-owned counts mask live work without changing
+ * physical scratch strides. Missing policy keys fail rather than choosing a
+ * substitute. Corpus and certification comments below retain their own scope.
+ * Regenerate through the canonical analyzer; exact refresh preserves this
+ * file documentation together with the retained selector program.
+ */
 // Exact refresh corpus digest: sha256:e7210f6db95498574ae19c7b3adb73d9a891246f08ba96f72b079f62ebdb1434
 // Exact refresh registry digest: sha256:7983f517d933815740c14cdb3ac3520ca54d7feb39ee9582b4e5e77c21f8a592
 // Exact refresh shape manifest digest: sha256:aa32f0858c642c2c6584bb48219452e0bacf79e516563edda6923200798c62ad
@@ -4633,7 +4645,7 @@ inline bool selectGeneratedGroupedTuning(
     bool graph_captured, int m, int n, int k,
     GeneratedGroupedTuning &tuning)
 {
-    if (m < 2 || n <= 0 || k <= 0)
+    if (m <= 0 || n <= 0 || k <= 0)
         return false;
     tuning = GeneratedGroupedTuning{};
     const bool exact_key_representable =
@@ -4642,6 +4654,14 @@ inline bool selectGeneratedGroupedTuning(
         graph_captured, m, n, k);
     if constexpr (CB == 0)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=0 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=0.9773%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=0 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=14.0671%
@@ -7402,6 +7422,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 4)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=4 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=3.8537%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=4 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=2.5113%
@@ -10162,6 +10190,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 5)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=5 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=1.6596%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=5 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=1.9677%
@@ -12922,6 +12958,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 6)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=6 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=1.4714%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=6 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=1.8964%
@@ -15682,6 +15726,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 7)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=7 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=4.7683%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=7 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=2.3196%
@@ -18442,6 +18494,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 8)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=8 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=1.3991%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=8 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.tensor_core_mma16 0.5B_AttnOut max-regret=0.0000% max-cv=2.5824%
@@ -21202,6 +21262,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 9)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=9 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=1.3283%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=9 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.tensor_core_mma16 0.5B_AttnOut max-regret=0.0000% max-cv=1.2984%
@@ -23962,6 +24030,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 10)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=10 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=2.3833%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=10 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=0.8416%
@@ -26722,6 +26798,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 11)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=11 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=2.9968%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=11 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.tensor_core_mma16 0.5B_AttnOut max-regret=0.0000% max-cv=2.0900%
@@ -29482,6 +29566,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 12)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=12 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=3.1387%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=12 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.tensor_core_mma16 0.5B_AttnOut max-regret=0.0000% max-cv=0.8210%
@@ -32242,6 +32334,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 13)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=13 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=1.9855%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=13 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.tensor_core_mma16 0.5B_AttnOut max-regret=0.0000% max-cv=1.3035%
@@ -35002,6 +35102,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 14)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=14 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=3.4722%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=14 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.tensor_core_mma16 0.5B_AttnOut max-regret=0.0000% max-cv=1.2191%
@@ -37762,6 +37870,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 15)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=15 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=2.5654%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=15 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=3.4786%
@@ -40522,6 +40638,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 16)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=16 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=2.3899%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=16 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=1.5183%
@@ -43282,6 +43406,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 17)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=17 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=3.0673%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::Dp4aRows, 2}}, // CB=17 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.inherit_serial_m1.r2 0.5B_AttnOut max-regret=0.0000% max-cv=1.0522%
@@ -46042,6 +46174,14 @@ inline bool selectGeneratedGroupedTuning(
     }
     if constexpr (CB == 19)
     {
+        if (m == 1)
+        {
+            // Counted physical M1 has one real row; the second tile lane is
+            // masked by DeviceRowRange. Preserve the generated serial-M1 family
+            // and K partitions; row reuse is the existing smallest DP4A tile.
+            tuning = GeneratedGroupedTuning{GeneratedGroupedKernel::Dp4aRows, 2};
+            return true;
+        }
         static constexpr GeneratedGroupedDispatchEntry kTable[] = {
             {0x0200002000000800ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=19 mode=eager M=2 2048x512 cuda.nvnni.decode.verifier.tensor_core_mma16 35BMoE_Expert_Down max-regret=0.0000% max-cv=3.1843%
             {0x0200003800000380ULL, {GeneratedGroupedKernel::TensorCoreMma16, 16}}, // CB=19 mode=eager M=2 896x896 cuda.nvnni.decode.verifier.tensor_core_mma16 0.5B_AttnOut max-regret=0.0000% max-cv=3.5285%

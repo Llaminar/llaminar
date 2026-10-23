@@ -6,7 +6,8 @@
  * This focused producer proof complements, rather than replaces, the existing
  * all-codebook prepared GEMM tests. Replays change inputs without recapture,
  * check partial quantization blocks and guard words, and independently sum the
- * published bytes. No relaxed floating-point tolerance is used.
+ * published bytes. The canonical producer ABI rejects invalid stream metadata
+ * before device submission. No relaxed floating-point tolerance is used.
  */
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
@@ -14,6 +15,7 @@
 #include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
+#include "kernels/rocm/gemm/ROCmQuantisedActivationProducers.h"
 
 #include <algorithm>
 #include <array>
@@ -26,13 +28,6 @@
 #include "../../../utils/Q8ScaleUnderflowFixture.h"
 #include <stdexcept>
 #include <vector>
-
-extern "C" {
-    bool rocmQuantGemm_quantizeActivationsBlockwise(
-        const float *, int8_t *, float *, int, int, int, void *, int);
-    bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
-        const float *, int8_t *, float *, int32_t *, int, int, int, void *, int);
-}
 
 namespace {
 /** @brief Report native failure at its origin before inspecting output bytes. */
@@ -229,9 +224,11 @@ TEST(ROCmActivationQuantization, RejectsDefaultStream) {
     Storage<float> input(32), scales(1);
     Storage<int8_t> output(32);
     Storage<int32_t> sums(1);
-    EXPECT_FALSE(rocmQuantGemm_quantizeActivationsBlockwise(
-        input.data,output.data,scales.data,1,32,0,nullptr,32));
-    EXPECT_FALSE(rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
-        input.data,output.data,scales.data,sums.data,1,32,0,nullptr,32));
+    for (hipStream_t stream : {hipStream_t{}, hipStreamLegacy, hipStreamPerThread}) {
+        EXPECT_THROW(rocmQuantGemm_quantizeActivationsBlockwise(
+            input.data,output.data,scales.data,1,32,0,stream,32), std::invalid_argument);
+        EXPECT_THROW(rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+            input.data,output.data,scales.data,sums.data,1,32,0,stream,32), std::invalid_argument);
+    }
 }
 } // namespace

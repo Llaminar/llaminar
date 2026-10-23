@@ -1,6 +1,7 @@
 /** @file GEMMStage.h
  * @brief GEMM stage: C = alpha * A * B + beta * C
  * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
+ * Typed bias retains its original tensor/view through ordinary and verifier dispatch.
  */
 
 #pragma once
@@ -75,7 +76,7 @@ namespace llaminar2
             const float *bias = nullptr;
 
             /**
-             * @brief Bias tensor (preferred interface)
+             * @brief Original FP32 bias tensor/view, retained through ordinary and verifier execution.
              */
             const ITensor *bias_tensor = nullptr;
 

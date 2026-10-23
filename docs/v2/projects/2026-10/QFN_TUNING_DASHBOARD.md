@@ -1,6 +1,24 @@
 # QFN tuning dashboard
 
-**L102 floating projection bindings are qualified** at **815.053 prefill /
+**L104 counted-row and typed-bias correctness is qualified** at **815.121 prefill /
+37.460 decode tok/s** on A1. Matched L102 measures **815.181 / 37.420**;
+the changes are **−0.007% / +0.106%**, with overlapping ranges. Throughput is
+effectively unchanged. All **776 Unit** tests, **27 focused registrations**,
+**185 byte-identical logit rows** and **twelve identical generated sequences**
+pass. The fixes protect inactive rows in quantizer/output publication, admit
+device-counted M1 on both GPUs, forward typed bias, and declare CUDA fused-M1
+workspace. No precision or ordinary decode policy changes.
+
+The [matched model comparison](../../../../parity-results/qwen-flash-next/counted104-model-comparison.json),
+[component ABBA](../../../../parity-results/qwen-flash-next/counted104-component-abba-r1/REVIEW.md)
+and [40 isolated ROCm counter runs](../../../../parity-results/qwen-flash-next/counted104-profile-summary-r1/REVIEW.md)
+record the evidence. Static ISA and native resources show zero spills/scratch
+and unchanged allocated registers for the measured producers. See
+[qualification and retained failures](QFN_TP_COMPUTE_SCALING.md#hc-fusion-control-calibration-and-counted-row-defect).
+Complete production preflight remains G60. HC activation/publication fusion is
+the next private candidate; the **42.959 tok/s** Castagna decode target remains open.
+
+**L102 is the preceding floating projection checkpoint** at **815.053 prefill /
 37.424 decode tok/s** on A1. The fresh control, carrying the same cold hipBLAS
 workspace fix, measures **814.156 / 37.134**: **+0.110% / +0.781%**.
 Decode ranges do not overlap (control 37.014–37.210; candidate 37.360–37.504);
@@ -13,6 +31,20 @@ and [qualification details](QFN_TP_COMPUTE_SCALING.md#floating-projections-immut
 record the settings, exact arithmetic, resources and regression coverage.
 Complete production preflight remains G60. Next measure the HC activation and
 two-term Q8 publication fusion; the 42.959 tok/s Castagna decode target remains open.
+
+The HC fusion's independent control calibration exposed the existing counted-row
+and typed-bias defects before fusion was installed. L104's repair passes
+[27 focused registrations](../../../../parity-results/qwen-flash-next/counted104-final-focused-r2/result.json)
+on CPU, CUDA and ROCm. This includes all 21 quantized source formats, mixed-format
+fused M1, full/partial/empty retained replays, independent typed-bias witnesses,
+all six ROCm quantizer variants and generated dispatch refresh. The original
+failures and intermediate test corrections remain recorded. The rebuilt
+[complete Unit suite](../../../../parity-results/qwen-flash-next/counted104-unit-r3/result.json)
+passes **776/776**, and the adjacent GEMM checks pass. The
+[Release model panel](../../../../parity-results/qwen-flash-next/counted104-release-accuracy-r1/report.json)
+passes, with [all 185 logit rows byte-identical to L102](../../../../parity-results/qwen-flash-next/counted104-release-accuracy-r1/logit-byte-comparison.json).
+Matched performance qualification is complete; HC fusion remains private and
+has no measured gain.
 
 **L101 is the preceding branch-normalization checkpoint** at **814.610 prefill / 37.088
 decode tok/s** on A1. Matched L100 measures **814.645 / 37.103**: **−0.004% /
@@ -147,7 +179,7 @@ and routes while measuring TP1/TP2/TP4 against cumulative targets of 1.85×/3.6�
 The
 [KV coverage plan](QFN_TP4_KV_COVERAGE_PLAN.md) records the separate duplication work.
 
-Updated: 2026-10-23; **L102 is the current A1 checkpoint** at **815.053 / 37.424 tok/s**, versus matched cold-workspace-fixed control **814.156 / 37.134** (**+0.110% / +0.781%**). Decode sample ranges do not overlap; prefill is effectively unchanged. All 185 logit rows and twelve generated sequences remain exact. L101 remains the preceding branch-normalization checkpoint. **L100 is the preceding model-throughput win** at **814.527 / 37.063 tok/s**. Its matched archived L97 control measures **814.133 / 36.824**, giving **+0.048% / +0.648%** with nonoverlapping decode ranges. L97 remains the preceding native-format checkpoint. L96 remains the preceding floating-reduction checkpoint. A94 Automatic remains the preceding policy checkpoint. L95 is the preceding compact-KV checkpoint. Its historical explicit-Four control measures **786.251 prefill / 36.746 decode tok/s**. L90 independently measured the Four-worker gain against same-source Serial at **785.821 / 34.982 tok/s**. L84 remains the preceding vocabulary-sharded checkpoint at **786.235 / 35.056**; the [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) retains its matched comparison and final-source85 regressions. Automatic terminal ownership now shards the qualified ordinary MI50 TP4 family; the compiled partition policy now defaults to Automatic, selecting Four only within the measured domain. Use the exact settings recorded below. Complete production preflight remains pending. Local KV-head duplication is removed in the qualified ordinary TP domain; short-context indexer-query work remains a separate opportunity.
+Updated: 2026-10-23; **L104 is the current A1 checkpoint** at **815.121 / 37.460 tok/s**, versus matched L102 **815.181 / 37.420** (**−0.007% / +0.106%**, overlapping ranges). This counted-row/typed-bias repair preserves model throughput; all 185 logit rows and twelve generated sequences remain exact. L102 is the preceding floating projection checkpoint at **815.053 / 37.424**, a matched **+0.781% decode** gain. L101 remains the preceding branch-normalization checkpoint. **L100 is the preceding model-throughput win** at **814.527 / 37.063 tok/s**. Its matched archived L97 control measures **814.133 / 36.824**, giving **+0.048% / +0.648%** with nonoverlapping decode ranges. L97 remains the preceding native-format checkpoint. L96 remains the preceding floating-reduction checkpoint. A94 Automatic remains the preceding policy checkpoint. L95 is the preceding compact-KV checkpoint. Its historical explicit-Four control measures **786.251 prefill / 36.746 decode tok/s**. L90 independently measured the Four-worker gain against same-source Serial at **785.821 / 34.982 tok/s**. L84 remains the preceding vocabulary-sharded checkpoint at **786.235 / 35.056**; the [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) retains its matched comparison and final-source85 regressions. Automatic terminal ownership now shards the qualified ordinary MI50 TP4 family; the compiled partition policy now defaults to Automatic, selecting Four only within the measured domain. Use the exact settings recorded below. Complete production preflight remains pending. Local KV-head duplication is removed in the qualified ordinary TP domain; short-context indexer-query work remains a separate opportunity.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 
@@ -380,7 +412,7 @@ its actual prepared route must be represented explicitly in coverage.
 
 | ID | Topology / actual work placement | Ngrams | Reference engine | Accuracy | Llaminar prefill | Reference prefill | Strata prefill | Llaminar decode | Reference decode | Strata decode | Next action |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 L102† Release required groups; L95 prefix restore; latest complete topology gate [G60][a1] | 815.053 L102† | 467.821 F62§ | — | 37.424 L102† | 42.959 F62§ | — | Four remains the qualified default. L102 removes custom floating pointer staging: +0.781% matched decode, unchanged arithmetic and effectively unchanged prefill. Next measure HC activation/publication fusion. Full preflight remains pending. |
+| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 L104† Release required groups; L95 prefix restore; latest complete topology gate [G60][a1] | 815.121 L104† | 467.821 F62§ | — | 37.460 L104† | 42.959 F62§ | — | Four remains the qualified default. L104 fixes counted-row and typed-bias behavior with effectively unchanged throughput and exact logits. Next measure HC activation/publication fusion. Full preflight remains pending. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |
@@ -392,7 +424,7 @@ Use the exact policy names in subsequent four-GPU records. The dense-compute pol
 
 | ID | Dense-compute policy | Expert policy | QFN accuracy | Llaminar prefill | Castagna prefill | Llaminar decode | Castagna decode | Status |
 |---|---|---|---|---:|---:|---:|---:|---|
-| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L102† Release required groups; L95 prefix restore | 815.053 | 467.821 | 37.424 | 42.959 | Explicit `VocabularySharded` head, Automatic-resolved Four-worker owner gate/up and compact K/V plus grouped ordered M1 reducers, exact-order branch normalization and direct captured floating bindings; 185 identical logit rows and all twelve matching sequences. |
+| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L104† Release required groups; L95 prefix restore | 815.121 | 467.821 | 37.460 | 42.959 | Explicit `VocabularySharded` head, Automatic-resolved Four-worker owner gate/up and compact K/V plus grouped ordered M1 reducers, exact-order branch normalization and direct captured floating bindings; 185 identical logit rows and all twelve matching sequences. |
 | A1.1 | `TensorParallel` | `Apportioned` | 🟢 L64† Release required groups | 561.867 | 467.821 | 30.515 | 42.959 | Accuracy, corrected SnapshotAdmission and timing passed; slower than current A1 in both phases. |
 | A1.2 | `PrefillTensorParallelDecodeReplicated` | `GateUpOwnedDownColumns` | 🔴 L65† Release short decode row KL | — | 467.821 | — | 42.959 | Admission and native execution passed; one forced decode row KL 1.119 exceeds the unchanged 1.0 ceiling. Diagnose before promotion. Timing pending. |
 | A1.3 | `PrefillTensorParallelDecodeReplicated` | `Apportioned` | 🟢 L65† Release required groups | 382.757 | 467.821 | 30.761 | 42.959 | Retained **Ornith** arrangement; admission, accuracy and timing passed, but both phases are slower than the current A1 control and Castagna. |

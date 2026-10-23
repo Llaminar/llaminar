@@ -6,6 +6,8 @@
  * exact stream ordering. Fused SwiGLU consumes two [M,K] operands before the
  * projection produces [M,N]. Diagnostic descriptors preserve those distinct
  * dimensions so a stage dump cannot truncate or overread the gate operand.
+ * Typed bias remains the same source tensor through ordinary and verifier
+ * dispatch; unsupported typed fused bias declarations fail before submission.
  */
 
 #include "GEMMStage.h"
@@ -109,6 +111,24 @@ namespace llaminar2
                 LOG_ERROR("[" << caller << "] PreparedWeightRef was provided but no GEMM kernel was found in PreparedWeightStore");
             }
             return gemm;
+        }
+
+        /** @brief Resolve the sole typed bias authority without reading its value.
+         * @param params Frozen typed projection operands.
+         * @param columns Actual local output width consumed by this projection.
+         * @return Original FP32 tensor/view, or null when no bias is declared.
+         * @throws std::invalid_argument For typed fused-SwiGLU or malformed bias.
+         */
+        const TensorBase* typedProjectionBias(const GEMMStage::Params& params,int columns)
+        {
+            const auto* bias=params.bias_tensor?requireTensorBase(params.bias_tensor,"projection bias"):nullptr;
+            if(params.bias_required&&!bias&&!params.bias)
+                throw std::invalid_argument("GEMMStage requires its declared typed bias tensor");
+            if(bias&&(params.gate_input||params.do_swiglu))
+                throw std::invalid_argument("GEMMStage fused SwiGLU API cannot represent an added bias");
+            if(bias&&(columns<=0||bias->native_type()!=TensorType::FP32||bias->numel()<static_cast<size_t>(columns)))
+                throw std::invalid_argument("GEMMStage bias_tensor requires the actual local FP32 output width");
+            return bias;
         }
 
         /**
@@ -248,6 +268,7 @@ namespace llaminar2
         if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8&&
             params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::TwoTermQ8)
             throw std::invalid_argument("GEMM activation operand precision is invalid");
+        (void)typedProjectionBias(params_,params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size()));
         initializeHCUpSubmissionIdentities();
         if(params_.request_rows) {
             params_.validate();
@@ -644,7 +665,7 @@ namespace llaminar2
                 params_.m, effective_n, params_.k,
                 effective_transpose_B,
                 params_.alpha, params_.beta,
-                nullptr, // bias
+                typedProjectionBias(params_,effective_n),
                 params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
                 getWorkspace());
 
@@ -709,7 +730,7 @@ namespace llaminar2
         else
         {
             std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                {gemm, C_base, effective_n, nullptr, "gemm"}};
+                {gemm, C_base, effective_n, typedProjectionBias(params_,effective_n), "gemm"}};
             success = gemm->multiply_fused_verifier_rows_decode_equivalent(
                 A_base,
                 projections,
@@ -869,9 +890,8 @@ namespace llaminar2
         // OUTPUT buffer
         reqs.addOutput("C", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, c_type);
 
-        // Optional bias (check both raw pointer and tensor)
-        const float *bias_data = params_.getBiasData();
-        if (bias_data)
+        // Metadata-only admission: do not fetch bias values while computing the BOM.
+        if (params_.bias_tensor || params_.bias)
         {
             reqs.addWeight("bias", {static_cast<size_t>(params_.n)}, BufferTensorType::FP32);
         }
