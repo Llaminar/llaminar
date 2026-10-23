@@ -25018,8 +25018,12 @@ add_v2_test(V2_Integration_ROCm_VnniRepackKernels
 )
 
 if(HAVE_ROCM)
+    set_source_files_properties(
+        integration/kernels/rocm/ROCmOriginalM1ReducerOracle.hip
+        PROPERTIES LANGUAGE HIP)
     add_executable(v2_integration_rocm_expert_tier_weight_kernels
-        integration/kernels/rocm/Test__ROCmExpertTierWeightKernels.cpp)
+        integration/kernels/rocm/Test__ROCmExpertTierWeightKernels.cpp
+        integration/kernels/rocm/ROCmOriginalM1ReducerOracle.hip)
     target_include_directories(
         v2_integration_rocm_expert_tier_weight_kernels
         PRIVATE ${CMAKE_SOURCE_DIR})
@@ -25041,6 +25045,8 @@ if(HAVE_ROCM)
     set(V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS)
     set(V2_ROCM_EXPERT_TIER_WEIGHT_GTESTS
         PreparedServiceViewsIsolateAllQuantizedExecutionBindings
+        CapturedOrdinaryM1DeferredReductionsAllFormats
+        CapturedOrdinaryM1ReductionSlotWavesAndBias
         PreparedServiceViewsIsolateAllFloatingExecutionBindings
         PersistentTransferExecutionPoolIsBoundedAndIdempotent
         SharedPersistentExecutionLanePreservesConcurrentTransfersByteExactly
@@ -31299,6 +31305,12 @@ if(NOT V2_PERF_TESTS_ONLY)
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GraphCapture;ComputeIsolation;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedComputeIsolationContract)
+    add_v2_test(V2_Integration_NativeM1DeferredReductionContract
+        COMMAND $<TARGET_FILE:v2_unit_captured_compute_isolation>
+            --gtest_filter=NativeM1Reduction.*
+        LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeM1DeferredReductionContract)
     add_v2_test(V2_Integration_RecordedGDNIsolationContract
         COMMAND $<TARGET_FILE:v2_unit_captured_compute_isolation>
             --gtest_filter=CapturedComputeIsolation.GDNBundle*

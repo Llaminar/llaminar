@@ -34,6 +34,7 @@
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "ROCmQuantisedGemmWorkspaceContract.h"
 #include "ROCmNativeVNNISerialGeometry.h"
+#include "ROCmNativeM1Reduction.h"
 #include "transfer/TransferEngine.h"
 #include "../ROCmKernelBase.h"
 #include "ROCmWeightPacker.h"     // packWeightsToROCm, packNativeVNNI
@@ -60,6 +61,7 @@
 #include "utils/WeightLoadingProfiler.h"
 
 #include <stdexcept>
+#include <limits>
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -3556,7 +3558,14 @@ namespace llaminar2
             {
                 auto *rk = dynamic_cast<ROCmQuantisedGemmKernel *>(projections[pi].kernel);
                 if (rk)
+                {
                     rk->ensureWeightsConverted();
+                    // Reject foreign original shapes before even shared activation
+                    // quantization can read an invalid K extent.
+                    if(m==1 && projections.size()>=2 && rk->impl_ && rk->impl_->has_native_vnni &&
+                        (rk->rocm_device_id_!=rocm_device_id_ || rk->N_!=projections[pi].n || rk->K_!=k))
+                        throw std::invalid_argument("Fused M1 original prepared device/N/K differs from its descriptor");
+                }
             }
 
             // Step 4: Quantize activations ONCE (shared across all projections)
@@ -4762,6 +4771,120 @@ namespace llaminar2
                 }
             }
 #endif // HAVE_ROCM
+
+            // Ordinary direct-device M1 owns a static grouped-reduction implementation.
+            // Mapped destinations retain their existing serialized copy-out transaction:
+            // its one shared d_C_fp32 cannot back simultaneous pending producers.
+            const bool direct_native_m1 = m==1 && projections.size()>=2 && all_projections_native_vnni &&
+                std::all_of(projections.begin(),projections.end(),[](const auto &p)
+                {
+                    const auto *output=dynamic_cast<const FP32Tensor *>(p.output);
+                    return output && !output->isMapped();
+                });
+            if(direct_native_m1)
+            {
+                constexpr std::size_t slots=quantized_gemm_workspace::kFusedProjectionStreamCapacity;
+                constexpr std::size_t capacity=quantized_gemm_workspace::kScatterKBlockCapacity;
+                std::array<std::size_t,slots> widths{},offsets{};
+                const auto slot_count=std::min(projections.size(),slots);
+                // Original modulo-slot assignment is the workspace ABI, independent
+                // of format/geometry buckets selected later by reduction submission.
+                for(std::size_t i=0;i<projections.size();++i)
+                {
+                    if(projections[i].n<=0)throw std::invalid_argument("Grouped M1 projection width must be positive");
+                    widths[i%slot_count]=std::max(widths[i%slot_count],std::size_t(projections[i].n));
+                }
+                std::size_t required=0;
+                for(std::size_t slot=0;slot<slot_count;++slot)
+                {
+                    offsets[slot]=required;
+                    const auto bytes=quantized_gemm_workspace::checkedProduct(
+                        quantized_gemm_workspace::checkedProduct(capacity,widths[slot],"M1 slot columns"),sizeof(float),"M1 slot bytes");
+                    if(bytes>std::numeric_limits<std::size_t>::max()-required)
+                        throw std::invalid_argument("Grouped M1 partial slot prefix overflows");
+                    required+=bytes;
+                }
+                const auto workspace_name=scatterPartialBatchedBufferName();
+                if(!impl_->d_scatter_partial_batched || !workspace_ || workspace_->getBufferSize(workspace_name)<required)
+                    throw std::invalid_argument("Grouped M1 requires its complete canonical partial slot arena");
+                join_projection_biases_to_root("GroupedM1Reduction");
+                const auto interval=[](const void *pointer,std::size_t bytes)
+                {
+                    const auto address=reinterpret_cast<std::uintptr_t>(pointer);
+                    if(!address || !bytes || bytes>std::numeric_limits<std::uintptr_t>::max()-address)
+                        throw std::invalid_argument("Grouped M1 live operand interval is absent or overflows");
+                    return std::pair{address,address+bytes};
+                };
+                const auto overlaps=[](auto a,auto b){return a.first<b.second && b.first<a.second;};
+                const auto partial_bank=interval(impl_->d_scatter_partial_batched,required);
+                // Prove the entire output/bias closure before any producer runs.
+                for(std::size_t i=0;i<projections.size();++i)
+                {
+                    const auto &p=projections[i];
+                    auto *kernel=dynamic_cast<ROCmQuantisedGemmKernel *>(p.kernel);
+                    if(!kernel || !kernel->impl_ || !kernel->impl_->has_native_vnni ||
+                        kernel->rocm_device_id_!=rocm_device_id_ || kernel->N_!=p.n || kernel->K_!=k ||
+                        p.output->size_bytes()<std::size_t(p.n)*sizeof(float))
+                        throw std::invalid_argument("Grouped M1 requires complete original prepared/output owners");
+                    const auto output_device=p.output->current_device();
+                    if(output_device && output_device->is_gpu() && *output_device!=target_device)
+                        throw std::invalid_argument("Grouped M1 output belongs to another device");
+                    TransferEngine::requireDeviceOutput(p.output,target_device,gpu_stream_);
+                    const auto output=interval(p.output->gpu_data_ptr(),std::size_t(p.n)*sizeof(float));
+                    if(overlaps(output,partial_bank))throw std::invalid_argument("Grouped M1 output aliases its partial arena");
+                    for(std::size_t j=0;j<projections.size();++j)
+                    {
+                        const auto &other=projections[j];
+                        if(i!=j && overlaps(output,interval(other.output->gpu_data_ptr(),std::size_t(other.n)*sizeof(float))))
+                            throw std::invalid_argument("Grouped M1 output owners alias");
+                        if(other.bias)
+                        {
+                            if(other.bias->size_bytes()<std::size_t(other.n)*sizeof(float))
+                                throw std::invalid_argument("Grouped M1 bias owner is truncated");
+                            const auto bias=interval(other.bias->gpu_data_ptr(),std::size_t(other.n)*sizeof(float));
+                            if(overlaps(output,bias) || overlaps(partial_bank,bias))
+                                throw std::invalid_argument("Grouped M1 output/partial writers alias immutable bias");
+                        }
+                    }
+                    kernel->validateWorkspace();
+                }
+                for(std::size_t first=0;first<projections.size();first+=slot_count)
+                {
+                    // Tickets cannot move/copy, and die only after explicit submission.
+                    // Retire every wave's reducers before reusing any original slot.
+                    std::array<NativeM1ReductionTicket,slots> tickets;
+                    const auto count=std::min(slot_count,projections.size()-first);
+                    for(std::size_t local=0;local<count;++local)
+                    {
+                        const auto &p=projections[first+local];
+                        auto original_scope=p.beginOriginalOutputSliceScope();
+                        auto *kernel=static_cast<ROCmQuantisedGemmKernel *>(p.kernel);
+                        auto *partial=reinterpret_cast<float *>(reinterpret_cast<unsigned char *>(impl_->d_scatter_partial_batched)+offsets[local]);
+                        if(!enqueueNativeM1Producer(tickets[local],impl_->d_A_int8,
+                            kernel->impl_->d_weights_native_vnni,kernel->impl_->d_weights_native_scales,
+                            kernel->impl_->d_weights_native_mins,kernel->impl_->d_weights_native_emins,
+                            static_cast<float *>(p.output->gpu_data_ptr()),impl_->d_scales_A,partial,p.n,k,
+                            kernel->impl_->native_vnni_codebook_id,
+                            requireNativeVNNIArithmeticPolicyCodebook(kernel->impl_->native_vnni_codebook_id,kernel->impl_->native_source_identity),
+                            rocm_device_id_,gpu_stream_,fused_uses_blockwise_shared_quant?impl_->d_scales_A_blockwise:nullptr))
+                            throw std::runtime_error("Grouped M1 original producer submission failed");
+                    }
+                    if(!submitNativeM1Reductions(std::span(tickets.data(),count),rocm_device_id_,gpu_stream_))
+                        throw std::runtime_error("Grouped M1 reduction submission failed");
+                    // Preserve the original standalone bias operation AFTER publication;
+                    // no fused +0 or changed association enters the ordinary RN fold.
+                    for(std::size_t local=0;local<count;++local)
+                    {
+                        const auto &p=projections[first+local];
+                        if(p.bias && !rocmQuantGemm_biasAdd(static_cast<float *>(p.output->gpu_data_ptr()),
+                            static_cast<const float *>(p.bias->gpu_data_ptr()),1,p.n,rocm_device_id_,gpu_stream_))return false;
+                    }
+                }
+                if(PerfStatsCollector::isDomainEnabled("kernel"))
+                    PerfStatsCollector::addCounter("kernel","rocm_native_m1_grouped_reduction_calls",1.0,"gemm",
+                        "rocm:"+std::to_string(rocm_device_id_),PerfStatsCollector::Tags{{"projections",std::to_string(projections.size())}});
+                publish_projection_outputs();return true;
+            }
 
             for (size_t i = 0; i < projections.size() && all_success; ++i)
             {

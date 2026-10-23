@@ -1,14 +1,16 @@
 # QFN captured compute scaling
 
-Updated: 2026-10-22. The recorded vocabulary-projection local-shape and concurrent
-TP1/TP2/TP4 measurements are green. Other kernel families remain in progress.
-The accepted A1 checkpoint is L97, 814.368 prefill / 36.727 decode tok/s
-on four MI50s, including [profiled native-format specialization](QFN_FLOATING_REDUCTION_TUNING.md#native-source-format-specialization-candidate97).
-See the [dashboard](QFN_TUNING_DASHBOARD.md) for its exact settings and matched
-comparison with L96. Prefill improves 2.254%; decode is 0.229% lower with
-overlapping ranges. [Recorded-input GDN decode scaling](#recorded-gdn-projection-measurements)
-now measures only 1.388–1.392× at TP2 and 1.733–1.749× at TP4. Both targets
-remain missed; the original output bytes pass at every decode participant.
+Updated: 2026-10-23. The accepted A1 checkpoint is **L100**, **814.527 prefill /
+37.063 decode tok/s**, versus matched archived L97 **814.133 / 36.824**:
+**+0.048% / +0.648%**, with nonoverlapping decode ranges. The original precision,
+arithmetic and placement settings remain fixed; all 185 final-logit rows and
+twelve natural sequences match exactly. See the [dashboard](QFN_TUNING_DASHBOARD.md)
+and [matched Release comparison](../../../../parity-results/qwen-flash-next/reducer100-model-comparison.json).
+The grouped-reducer [recorded GDN decode bundle](#grouped-ordinary-m1-reducers-l100)
+improves TP1/TP2/TP4 latency 5.019%/5.684%/3.125%, but its matched concurrent
+scaling remains **1.304× TP2 / 1.710× TP4**, missing both targets. The recorded
+vocabulary-projection local-shape and concurrent TP1/TP2/TP4 measurements remain
+green. Full production preflight remains pending; G60 is the last complete gate.
 
 The user selected **preserve recorded inputs and expert routes**. The diagnostic
 will measure the original production compute without executing communication
@@ -198,10 +200,115 @@ stores can report zero video-memory write traffic within a dispatch, so that
 counter is not an output-store count. Do not sum leaf medians into a model
 critical path or use profiled times as canonical throughput.
 
-The next bounded candidates preserve the original producer/reduction order:
-combine existing per-projection reducer launches using distinct admitted
-partial slots, and evaluate a wave-local half reduction without LDS barriers.
-Neither candidate is installed or has a performance claim at this checkpoint.
+The first one-wave half candidates are rejected on measured economics. Four
+original stride256 accumulators per lane preserve the original tree without
+LDS or barriers, but scalar loads introduce additional memory waits. Native
+ISA inspection also exposed a numerical defect in the initial candidate:
+the actual HALF oracle requires activation-before-weight FMACs and
+low-before-high additions, including NaN priority. Its contract differs from
+the earlier FP32-activation helper. Explicit native operand order restores
+every exact-byte test without relaxing comparison.
+
+| Recorded decode0 bundle candidate | Matched TP4 control µs | Candidate µs | Latency change |
+|---|---:|---:|---:|
+| Corrected one-wave scalar loads | 51.200 | 65.120 | +27.187% |
+| Unconditional full chunks, checked final tail | 51.600 | 70.560 | +36.744% |
+
+Both corrected variants pass all six focused native registrations. The first
+also loses at TP1/TP2 by 12.522%/10.545%; TP2 samples retain their wider spread.
+These are unprofiled A/B/B/A concurrent bundle measurements, 31 rounds per
+arm, using the immutable original Release control. Every original output byte,
+dirty replay and native retirement check passes. Evidence is
+`half-wave99-component-abba-r1` and `half-wave99-component-abba-r2`; the
+second disposition and source patch remain in `half-wave99-retired-scalar-r1`.
+No full-model benchmark was run for these losing candidates.
+
+The corrected scalar kernel alone measures 18.88 µs under the isolated TP4
+trace, versus the original 7.52 µs, despite nearly identical fetched memory
+(125.250 versus 125.750 KiB). It has zero LDS/scratch but eight scalar loads
+and eight waits per generic K-loop iteration. Removing guards reduces loop
+instruction count from 105 to 85 yet serializes those loads further. The
+original uses two packed loads per wave and one wait per wave. High active-lane
+utilization does not establish GPU-wide saturation.
+
+The original half kernel remains in production. Expanded actual-half tests
+retain K2559/2560/2561, signed-zero and paired-NaN reduction-edge witnesses,
+raw half encodings and exact captured replay.
+
+### Grouped ordinary M1 reducers (L100)
+
+L100 retains the original activation quantizer, QKV/Z producers, source
+formats, conversion policies, K partitions and per-column ascending-partition
+FP32 additions. Typed deferred tickets retain the existing four admitted
+partial slots; ordered waves retire reducers and bias before slot reuse.
+Only compatible original tile geometries share a reducer. Explicit concurrent
+execution keeps precedence, and mapped destinations keep their original
+serialized publication. CUDA's existing fused-KPAR path is unchanged; this
+measured opportunity concerns ordinary direct-output ROCm M1.
+
+The [unprofiled recorded decode0 ABBA](../../../../parity-results/qwen-flash-next/grouped-reducer100-component-abba-r1/result.json)
+uses the immutable frozen98 component archive (original L97 arithmetic),
+31 complete matched rounds per arm after eight warmups, original output-byte
+oracles and twenty dirty/composed histories. Latencies are medians of each
+round's slowest actual participant; every raw sample is retained.
+
+| Degree | Matched original µs | L100 µs | Latency change |
+|---|---:|---:|---:|
+| TP1 | 89.280 | 84.799 | −5.019% |
+| TP2 | 68.960 | 65.040 | −5.684% |
+| TP4 | 51.200 | 49.600 | −3.125% |
+
+L100's T1/T2=1.304× and T1/T4=1.710× still miss 1.85×/3.6×. These are a
+new matched cohort, not replacements for the earlier recorded98 samples;
+TP2 retains wider variability. The graph has six kernels instead of seven:
+the separate QKV/Z reductions become one grid32/block128 launch at TP4.
+Intervals exclude restoration and communication but include native graph
+scheduling gaps. No leaf-median sum is a model critical path.
+
+The [isolated grouped-reducer profile](../../../../parity-results/qwen-flash-next/grouped-reducer100-profile-summary-r1/report.json)
+selects exact `nativeM1GroupedReduce<128,1>` with grid[32,1,1], block[128,1,1].
+Its instrumented median is 7.040 µs (6.880–8.320), allocated VGPR24/SGPR48,
+LDS 0/scratch 0, 64 waves and 256.125 KiB fetched. The native occupancy query
+reports a potential maximum of 16 active 128-thread blocks per multiprocessor;
+the actual grid has only 32 blocks. Active VALU utilization 98.785% is not
+achieved occupancy. Source-bound gfx906 static inspection of all five
+compiled TN/CPT leaves confirms zero SGPR/VGPR spills and zero private/LDS bytes,
+with original native add operand order. This does not certify another GPU
+architecture or turn instrumented leaf time into model savings.
+
+The [final focused gate](../../../../parity-results/qwen-flash-next/grouped-reducer100-native-r2/result.json)
+passes 12 registrations, including the all-format captured original-native
+partial oracle, dirty histories, mapped outputs, bias, aliases and 2/4/5/8-slot
+waves; [complete Unit](../../../../parity-results/qwen-flash-next/grouped-reducer100-unit-r1/result.json)
+passes 776. The subsequent [all-five scoped-Q8 grouped capture extension](../../../../parity-results/qwen-flash-next/grouped-reducer100-scoped-native-r1/result.json)
+and slot/bias neighbor pass in 6.57 seconds. Every compiled geometry is exercised
+at K32 direct publication, K640 with six empty KB16 planes and K2560 with a
+populated tree, including odd output tails, output/partial guards, actual
+native launch inventory and retained replay after the diagnostic scope retires.
+NaN, infinity and signed-zero witnesses preserve the frozen original RN fold.
+This is a test-only extension: [all four production source pins and all 57
+immutable runtime metadata entries](../../../../parity-results/qwen-flash-next/grouped-reducer100-test-extension-production-identity.json)
+still match the accepted model observation; the production binary was not rebuilt.
+The [Release build](../../../../parity-results/qwen-flash-next/grouped-reducer100-release-build-r1/result.json)
+retains the spill guard. The current CMake ROCm target set is gfx906, which was
+compiled and inspected; CUDA kernel source is unchanged.
+
+The separate [full-model Release ABBA](../../../../parity-results/qwen-flash-next/reducer100-model-comparison.json)
+uses the actual archived L97 serving runtime and its original accuracy/source
+receipt, not the component-only frozen98 archive. Four clean arms retain twelve
+identical natural 256-token sequences; [26 logit files / 185 rows](../../../../parity-results/qwen-flash-next/reducer100-release-accuracy-r1/logit-byte-comparison.json)
+are byte-identical. Candidate 814.527/37.063 versus control 814.133/36.824 tok/s
+is +0.048% prefill / +0.648% decode; decode ranges 36.931–37.230 and 36.810–36.907
+do not overlap. Model, source precision, activation arithmetic, FP16 K/V,
+Automatic-resolved Four policy, vocabulary-sharded terminal ownership, RAM
+ngrams, no MTP/prefix cache, context 4096, 512/256 workload and 28 physical host cores match.
+Complete preflight remains pending; G60 is the last complete gate. The [full
+captured-decode trace](../../../../parity-results/qwen-flash-next/reducer100-fulltrace-r1/result.json)
+completed before the test-only extension, preserving all 256 generated IDs,
+four retained M512 participants and clean retirement. Graph attribution remains
+in progress; no new overlap or critical-path claim is made. Historical fulltrace
+inflation (~125 ms versus ~27 ms unprofiled) makes
+collective waits unusable as removable latency.
 
 The original **nine-row prefill** passes at TP1 and TP4, measuring 470.241 and
 426.560 µs. TP2 fails the original-output byte gate at alpha row0/column0:

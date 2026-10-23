@@ -12,6 +12,8 @@
 #include "loaders/WeightSlicer.h"
 #include "models/qwen35/Qwen35Schema.h"
 #include <gtest/gtest.h>
+#include <type_traits>
+#include "kernels/rocm/gemm/ROCmNativeM1Reduction.h"
 
 namespace
 {
@@ -225,4 +227,48 @@ TEST(CapturedComputeIsolation,GDNBundleQ8AllocationRetainsImmutablePoolContract)
     EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
     bad=native;bad.codebook_id=23;
     EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+}
+
+/** @brief Unequal live tile intervals cover every column exactly once without capacity work. */
+TEST(NativeM1Reduction,LiveTilesRetainOriginalGeometryAndPartitionCounts)
+{
+    using namespace llaminar2::rocm;
+    for(const int tile:{64,128,256})for(const int cpt:{1,2})
+    {
+        if(tile==64 && cpt==2)continue;
+        const std::array<NativeM1ReductionShape,4> shapes={{{1,2,tile,cpt},
+            {tile-1,16,tile,cpt},{tile+1,3,tile,cpt},{3*tile+7,64,tile,cpt}}};
+        const auto grid=nativeM1ReductionGrid(shapes);
+        EXPECT_EQ(grid.tiles,8);
+        std::array<std::vector<int>,4> seen;
+        for(std::size_t p=0;p<4;++p)seen[p].resize(shapes[p].columns);
+        for(int global=0;global<grid.tiles;++global)
+        {
+            int p=0;for(int i=1;i<grid.count;++i)if(global>=grid.offsets[i])p=i;
+            const int local=global-grid.offsets[p];
+            EXPECT_EQ(grid.partitions[p],shapes[p].partitions);
+            for(int lane=0;lane<tile/cpt;++lane)for(int c=0;c<cpt;++c)
+            {
+                const int column=local*tile+lane*cpt+c;
+                if(column<grid.columns[p])++seen[p][column];
+            }
+        }
+        for(const auto &projection:seen)for(const auto owners:projection)EXPECT_EQ(owners,1);
+    }
+}
+/** @brief Malformed bundles fail before any native submission authority is consumed. */
+TEST(NativeM1Reduction,RejectsMissingMixedAndInventedGeometry)
+{
+    using namespace llaminar2::rocm;
+    EXPECT_THROW(nativeM1ReductionGrid({}),std::invalid_argument);
+    const NativeM1ReductionShape good{256,16,128,1};
+    for(const auto bad:std::array<NativeM1ReductionShape,5>{{{0,16,128,1},{256,1,128,1},
+        {256,65,128,1},{256,16,96,1},{256,16,64,2}}})
+        EXPECT_THROW(nativeM1ReductionGrid(std::span(&bad,1)),std::invalid_argument);
+    const std::array<NativeM1ReductionShape,2> mixed={good,NativeM1ReductionShape{256,16,256,1}};
+    EXPECT_THROW(nativeM1ReductionGrid(mixed),std::invalid_argument);
+    const std::array<NativeM1ReductionShape,5> too_many={good,good,good,good,good};
+    EXPECT_THROW(nativeM1ReductionGrid(too_many),std::invalid_argument);
+    static_assert(!std::is_copy_constructible_v<NativeM1ReductionTicket>);
+    static_assert(!std::is_move_constructible_v<NativeM1ReductionTicket>);
 }

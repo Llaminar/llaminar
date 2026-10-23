@@ -61,6 +61,7 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
+#include "kernels/rocm/gemm/ROCmNativeM1Reduction.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../utils/PrefillGraphBucketDefaults.h"
@@ -4283,13 +4284,22 @@ __global__ void moe_grouped_native_vnni_down_descriptor_reduce_kernel(
 //
 // Grid: dim3((N + TILE_N - 1) / TILE_N), Block: dim3(TILE_N / CPT)
 // ============================================================================
+/**
+ * @brief Fold one original tile in the unchanged ascending-KB explicit-RN order.
+ * @tparam TILE_N Original reducer tile width.
+ * @tparam CPT Original independent columns per lane.
+ * @param d_partial_fp32 Original producer's distinct [KB][N] partial bank.
+ * @param d_C_fp32 Original output owner.
+ * @param N Original physical width.
+ * @param kblocks Original resolved arithmetic partition count.
+ * @param tile Projection-local output tile.
+ * @param lane Original workgroup lane.
+ */
 template <int TILE_N, int CPT>
-__global__ void gemv_native_vnni_reduce_kernel_t(
-    const float* __restrict__ d_partial_fp32,    // [KB × N] partial buffer
-    float* __restrict__ d_C_fp32,                // [N] output
-    int N, int kblocks)
+__device__ __forceinline__ void nativeM1FoldColumns(const float *d_partial_fp32,
+    float *d_C_fp32,int N,int kblocks,unsigned tile,unsigned lane)
 {
-    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const int n_base = tile * TILE_N + lane * CPT;
 
     #pragma unroll
     for (int c = 0; c < CPT; ++c)
@@ -4307,6 +4317,63 @@ __global__ void gemv_native_vnni_reduce_kernel_t(
         d_C_fp32[n] = sum;
     }
 }
+
+template <int TILE_N, int CPT>
+__global__ void gemv_native_vnni_reduce_kernel_t(const float *__restrict__ partials,
+    float *__restrict__ output,int N,int partitions)
+{
+    nativeM1FoldColumns<TILE_N,CPT>(partials,output,N,partitions,blockIdx.x,threadIdx.x);
+}
+
+/** @brief Concatenate original live reducer tiles without extending any projection. */
+template <int TILE_N,int CPT>
+__global__ void nativeM1GroupedReduce(llaminar2::rocm::NativeM1ReductionGrid group)
+{
+    int p=0;
+    #pragma unroll
+    for(int i=1;i<4;++i)if(i<group.count && int(blockIdx.x)>=group.offsets[i])p=i;
+    nativeM1FoldColumns<TILE_N,CPT>(group.partials[p],group.outputs[p],group.columns[p],
+        group.partitions[p],blockIdx.x-group.offsets[p],threadIdx.x);
+}
+
+namespace llaminar2::rocm
+{
+/** @brief Only native producer submission can issue a pending reduction authority. */
+struct NativeM1ReductionIssuer
+{
+    /** @brief Reject reuse before any GPU submission. */
+    static void requireEmpty(const NativeM1ReductionTicket &ticket)
+    {
+        if(ticket.state_!=NativeM1ReductionTicket::State::Empty)
+            throw std::invalid_argument("M1 producer ticket was already issued");
+    }
+    /** @brief Publish a ticket only after the exact original producer launch succeeded. */
+    static void issue(NativeM1ReductionTicket &ticket,const float *partials,float *output,
+        int n,int kb,int tile,int cpt,int device,void *stream)
+    {
+        requireEmpty(ticket);
+        ticket.shape_={n,kb,tile,cpt};ticket.partials_=partials;ticket.output_=output;
+        ticket.device_=device;ticket.stream_=stream;
+        ticket.state_=kb>1?NativeM1ReductionTicket::State::Pending:NativeM1ReductionTicket::State::Direct;
+    }
+};
+}
+
+/** @brief Retain ordinary submission or issue its exact successful producer ticket. */
+template <int TN,int CPT>
+void finishNativeM1Producer(float *partials,float *output,int n,int kb,int device,void *stream,
+    llaminar2::rocm::NativeM1ReductionTicket *deferred)
+{
+    if(deferred)
+    {
+        if(hipPeekAtLastError()!=hipSuccess)throw std::runtime_error("M1 deferred producer submission failed");
+        llaminar2::rocm::NativeM1ReductionIssuer::issue(*deferred,partials,output,n,kb,TN,CPT,device,stream);
+    }
+    else if(kb>1)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<TN,CPT>),
+            dim3(1+(n-1)/TN),dim3(TN/CPT),0,static_cast<hipStream_t>(stream),partials,output,n,kb);
+}
+
 
 
 namespace
@@ -4428,7 +4495,8 @@ void launchNativeVNNISerialGeometry(
     const uint16_t *mins, const uint32_t *emins, float *output, float *partials,
     const float *scale_a, const float *block_scales, int N, int K, int kb,
     uint8_t arithmetic_policy, int device, void *stream,
-    llaminar2::rocm::NativeQ8SerialGeometry geometry)
+    llaminar2::rocm::NativeQ8SerialGeometry geometry,
+    llaminar2::rocm::NativeM1ReductionTicket *deferred=nullptr)
 {
     static_assert(CPT == 1 || CPT == 2);
     static_assert(TN % CPT == 0);
@@ -4442,10 +4510,7 @@ void launchNativeVNNISerialGeometry(
         g_native_q8_serial_launch.reset();
         throw std::runtime_error("native-VNNI serial producer submission failed");
     }
-    if (kb > 1)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<TN, CPT>),
-            dim3(grid_n, 1, 1), block, 0, static_cast<hipStream_t>(stream),
-            partials, output, N, kb);
+    finishNativeM1Producer<TN,CPT>(partials,output,N,kb,device,stream,deferred);
     if (g_native_q8_serial_scope && hipPeekAtLastError() != hipSuccess)
     {
         g_native_q8_serial_launch.reset();
@@ -4472,7 +4537,7 @@ void launchNativeVNNISerialGeometry(
             .partial_elements = kb > 1 ? std::size_t(kb) * N : 0u,
             .stream = stream,
             .producer = launch(symbols.producer, symbols.producer_name, kb),
-            .reducer = kb > 1 ? launch(symbols.reducer, symbols.reducer_name, 1)
+            .reducer = kb > 1 && !deferred ? launch(symbols.reducer, symbols.reducer_name, 1)
                 : llaminar2::rocm::NativeQ8SerialKernelLaunch{}};
     }
 }
@@ -7588,7 +7653,7 @@ bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
  * codebook owns generated occupancy and split-K reduction order. These IDs
  * differ after compact CPU weights are promoted into expanded codebook 23.
  */
-bool rocmGemv_native_vnni_fp32_with_policy(
+static bool nativeM1WithReduction(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
     const void* d_block_scales,  // __half* (FP16 scale d)
@@ -7601,8 +7666,12 @@ bool rocmGemv_native_vnni_fp32_with_policy(
     uint8_t codebook_id,
     uint8_t arithmetic_policy_codebook_id,
     int device_id, void* stream,
-    const float* d_scale_A_blockwise)
+    const float* d_scale_A_blockwise,
+    llaminar2::rocm::NativeM1ReductionTicket *deferred)
 {
+    if(reinterpret_cast<std::uintptr_t>(stream)<=2 || device_id<0 || N<=0 || K<=0 || !d_A_int8 || !d_payload || !d_block_scales || !d_C_fp32)
+        throw std::invalid_argument("Native M1 submission requires exact non-null operands, device and stream");
+    if(deferred)llaminar2::rocm::NativeM1ReductionIssuer::requireEmpty(*deferred);
     llaminar2::rocm::clearNativeQ8SerialLaunch();
     if (g_native_q8_serial_scope)
     {
@@ -7819,24 +7888,14 @@ bool rocmGemv_native_vnni_fp32_with_policy(
 
         dim3 block(IQ_THREADS, 1, 1);
 
-        #define LAUNCH_IQ_LDS(FMT_TAG)                                                       \
-            if (kb <= 1) {                                                                    \
-                hipLaunchKernelGGL(                                                           \
-                    HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
-                    dim3(grid_n, 1), block, 0, static_cast<hipStream_t>(stream),              \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
-                    d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, 1);       \
-            } else {                                                                          \
-                hipLaunchKernelGGL(                                                           \
-                    HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
-                    dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),             \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
-                    d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb);      \
-                hipLaunchKernelGGL(                                                           \
-                    HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<IQ_TN, 1>),              \
-                    dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),                 \
-                    d_partial_fp32, d_C_fp32, N, kb);                                         \
-            }
+        #define LAUNCH_IQ_LDS(FMT_TAG) \
+            do { \
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN,FMT_TAG>), \
+                    dim3(grid_n,kb),block,0,static_cast<hipStream_t>(stream), \
+                    d_A_int8,d_payload,d_scales_u16,d_mins_u16,d_emins_u32, \
+                    d_C_fp32,d_partial_fp32,d_scale_A,d_scale_A_blockwise,N,K,kb); \
+                finishNativeM1Producer<IQ_TN,1>(d_partial_fp32,d_C_fp32,N,kb,device_id,stream,deferred); \
+            } while(false)
 
         switch (static_cast<NativeVNNIFormat>(codebook_id))
         {
@@ -7929,7 +7988,7 @@ bool rocmGemv_native_vnni_fp32_with_policy(
             launchNativeVNNISerialGeometry<TN, CPT, FMT_TAG>( \
                 d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, \
                 d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb, \
-                arithmetic_policy_codebook_id, device_id, stream, serial_geometry)
+                arithmetic_policy_codebook_id, device_id, stream, serial_geometry,deferred)
 
         switch (static_cast<NativeVNNIFormat>(codebook_id))
         {
@@ -7957,7 +8016,7 @@ bool rocmGemv_native_vnni_fp32_with_policy(
             launchNativeVNNISerialGeometry<TILE, COLUMNS, NVNNI_Q8_0>( \
                 d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, \
                 d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb, \
-                arithmetic_policy_codebook_id, device_id, stream, serial_geometry)
+                arithmetic_policy_codebook_id, device_id, stream, serial_geometry,deferred)
             switch (serial_geometry)
             {
             case G::TN64CPT1: LAUNCH_NATIVE_Q8_GEOMETRY(64, 1); break;
@@ -8004,6 +8063,16 @@ bool rocmGemv_native_vnni_fp32_with_policy(
     }
 
     return true;
+}
+
+/** @brief Preserve the public immediate-reduction ABI through the shared original dispatcher. */
+bool rocmGemv_native_vnni_fp32_with_policy(const int8_t *A,const uint8_t *payload,
+    const void *scales,const void *mins,const void *emins,float *output,const float *scale_a,
+    float *partials,int n,int k,uint8_t execution,uint8_t policy,int device,void *stream,
+    const float *block_scales)
+{
+    return nativeM1WithReduction(A,payload,scales,mins,emins,output,scale_a,partials,
+        n,k,execution,policy,device,stream,block_scales,nullptr);
 }
 
 /** @brief Execute serial GEMV for self-describing weight bytes. */
@@ -8097,4 +8166,87 @@ extern "C" bool rocmNativeEmbeddingIQTableView(
     if (hipGetSymbolAddress(&address, HIP_SYMBOL(d_iq1s_grid)) != hipSuccess) return false;
     tables->iq1s = static_cast<const uint64_t *>(address);
     return true;
+}
+
+namespace llaminar2::rocm
+{
+bool enqueueNativeM1Producer(NativeM1ReductionTicket &ticket,const std::int8_t *A,
+    const std::uint8_t *payload,const void *scales,const void *mins,const void *emins,
+    float *output,const float *scale_a,float *partials,int n,int k,std::uint8_t execution,
+    std::uint8_t policy,int device,void *stream,const float *block_scales)
+{
+    return nativeM1WithReduction(A,payload,scales,mins,emins,output,scale_a,partials,
+        n,k,execution,policy,device,stream,block_scales,&ticket);
+}
+
+bool submitNativeM1Reductions(std::span<NativeM1ReductionTicket> tickets,int device,void *stream)
+{
+    if(reinterpret_cast<std::uintptr_t>(stream)<=2 || device<0 || tickets.empty() || tickets.size()>4)
+        throw std::invalid_argument("M1 reduction wave requires exact stream/device and one to four tickets");
+    // Validate all authorities before submitting any reducer or consuming any ticket.
+    for(const auto &t:tickets)
+        if((t.state_!=NativeM1ReductionTicket::State::Pending && t.state_!=NativeM1ReductionTicket::State::Direct) ||
+            t.device_!=device || t.stream_!=stream)
+            throw std::invalid_argument("M1 reduction ticket is absent, consumed or foreign");
+    const auto interval=[](const void *p,std::size_t bytes)
+    {
+        const auto address=reinterpret_cast<std::uintptr_t>(p);
+        if(!address || !bytes || bytes>std::numeric_limits<std::uintptr_t>::max()-address)
+            throw std::invalid_argument("M1 reduction operand extent is absent or overflows");
+        return std::pair{address,address+bytes};
+    };
+    const auto overlap=[](auto a,auto b){return a.first<b.second && b.first<a.second;};
+    for(std::size_t i=0;i<tickets.size();++i)
+    {
+        const auto &a=tickets[i];const auto out=interval(a.output_,std::size_t(a.shape_.columns)*sizeof(float));
+        for(std::size_t j=0;j<tickets.size();++j)
+        {
+            const auto &b=tickets[j];
+            if(i!=j && overlap(out,interval(b.output_,std::size_t(b.shape_.columns)*sizeof(float))))
+                throw std::invalid_argument("M1 reduction outputs alias");
+            if(b.state_==NativeM1ReductionTicket::State::Pending &&
+                overlap(out,interval(b.partials_,std::size_t(b.shape_.columns)*b.shape_.partitions*sizeof(float))))
+                throw std::invalid_argument("M1 output aliases pending partial storage");
+            if(i!=j && a.state_==NativeM1ReductionTicket::State::Pending && b.state_==NativeM1ReductionTicket::State::Pending &&
+                overlap(interval(a.partials_,std::size_t(a.shape_.columns)*a.shape_.partitions*sizeof(float)),
+                    interval(b.partials_,std::size_t(b.shape_.columns)*b.shape_.partitions*sizeof(float))))
+                throw std::invalid_argument("M1 pending producers share partial storage");
+        }
+    }
+    if(static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device))!=hipSuccess)return false;
+    std::array<bool,4> selected{};
+    for(std::size_t first=0;first<tickets.size();++first)
+    {
+        if(selected[first])continue;
+        auto &leader=tickets[first];
+        if(leader.state_==NativeM1ReductionTicket::State::Direct){selected[first]=true;continue;}
+        std::array<NativeM1ReductionShape,4> shapes{};std::array<std::size_t,4> indices{};std::size_t count=0;
+        for(std::size_t i=first;i<tickets.size();++i)
+            if(!selected[i] && tickets[i].state_==NativeM1ReductionTicket::State::Pending &&
+                tickets[i].shape_.tile_columns==leader.shape_.tile_columns &&
+                tickets[i].shape_.columns_per_thread==leader.shape_.columns_per_thread)
+            {selected[i]=true;indices[count]=i;shapes[count++]=tickets[i].shape_;}
+        auto grid=nativeM1ReductionGrid(std::span(shapes.data(),count));
+        for(std::size_t i=0;i<count;++i){grid.partials[i]=tickets[indices[i]].partials_;grid.outputs[i]=tickets[indices[i]].output_;}
+#define LAUNCH_M1_REDUCTION(TN,CPT) \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(nativeM1GroupedReduce<TN,CPT>),dim3(grid.tiles),dim3(TN/CPT),0,static_cast<hipStream_t>(stream),grid)
+        switch(leader.shape_.tile_columns*10+leader.shape_.columns_per_thread)
+        {
+        case 641: LAUNCH_M1_REDUCTION(64,1);break;
+        case 1281: LAUNCH_M1_REDUCTION(128,1);break;
+        case 1282: LAUNCH_M1_REDUCTION(128,2);break;
+        case 2561: LAUNCH_M1_REDUCTION(256,1);break;
+        case 2562: LAUNCH_M1_REDUCTION(256,2);break;
+        default:throw std::invalid_argument("M1 reduction ticket has no compiled geometry");
+        }
+#undef LAUNCH_M1_REDUCTION
+        if(hipPeekAtLastError()!=hipSuccess)
+        {
+            for(auto &t:tickets)t.state_=NativeM1ReductionTicket::State::Consumed;
+            return false;
+        }
+    }
+    for(auto &t:tickets)t.state_=NativeM1ReductionTicket::State::Consumed;
+    return true;
+}
 }
