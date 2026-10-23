@@ -1,6 +1,25 @@
 # QFN tuning dashboard
 
-**Latest attention experiment151 is qualified** with separate prefill/decode
+**Attention checkpoint160 is green:** **818.413 prefill /40.111 decode tok/s**,
+versus frozen151's818.354 /40.108. The +0.007% /+0.009% differences have
+overlapping ranges: whole-model throughput is effectively unchanged.
+All nine timed sequences and185 final-logit rows match. All19 native tests,
+eight independent numerical exports, and **832 Unit/affected registrations**
+pass. The complete Unit label contains776 tests; the other56 registrations
+cover affected CPU/CUDA/ROCm execution, admission, capture and arithmetic.
+
+The native attention pair improves from16.503 to**15.446µs at512**,22.083 to
+**20.179µs at64K**, and97.741 to**88.597µs for M16/64K**. Isolated rocprof and
+source-bound ISA show V0/V1 loads overlapping computation and a smaller PV
+read-ahead window, with64 VGPRs and zero spills. The wider-window159 trial's
+grouped slowdown is fixed. The [qualification record](QFN_ATTENTION_STRUCTURE_COMPARISON.md#fresh-rocprof-comparison-and-rejected-two-head-schedule152)
+retains profiles, rejected candidates, the corrected temporary export-comparison
+error, exact numerical evidence and matched model settings. The fork's14.424µs
+short-context pair and42.959tok/s model target remain open. This is an explicit
+FP16 phase8/33 experiment; defaults and complete preflightG60 are unchanged.
+The next held candidate is K1 load overlap; it is not implemented here.
+
+**Earlier phase-schedule checkpoint151 is qualified** with separate prefill/decode
 programs: **818.579 prefill / 40.110 decode tok/s**, versus the matched uniform8
 control's **818.788 / 39.884**. Decode improves **0.566%**; prefill is effectively
 unchanged. All nine timed token sequences match, the required model accuracy
@@ -10,8 +29,21 @@ KL from0.000368 to0.000210. Complete Unit plus affected registrations pass
 The [phase qualification record](QFN_ATTENTION_STRUCTURE_COMPARISON.md#phase-schedule151-focused-model-qualification)
 records settings, top-1/top-5 and limitations. This remains an explicit FP16
 experiment; production defaults and complete preflightG60 are unchanged.
-The next decode candidate tests smaller cooperative head groups with isolated
-rocprof evidence. Castagna's42.959tok/s target remains open.
+The smaller-head-group candidate152 is byte-exact but rejected for speed:
+20.672µs versus16.503µs at context512. Fresh isolated rocprof profiles of both
+engines show extra producer instruction work, with no spills or measured LDS
+bank conflicts. The [profile comparison](QFN_ATTENTION_STRUCTURE_COMPARISON.md#fresh-rocprof-comparison-and-rejected-two-head-schedule152)
+records actual head geometries and resource limits. Castagna's42.959tok/s target
+remains open.
+
+The subsequent copy-address and V0-prefetch candidates155/157 preserve all185
+qualified final-logit rows and pass all19 focused native tests. Candidate157
+reduces the measured post-RoPE attention pair to **15.878µs at512** and
+**21.481µs at64K**; the pinned fork's512 pair is **14.424µs**. Isolated rocprof
+and exact ISA show zero spills and partly overlapped V loads; premature waits
+remain a tuning target. These component results do not replace151's measured
+whole-model throughput or its complete Unit/affected qualification. See the
+[profile and candidate record](QFN_ATTENTION_STRUCTURE_COMPARISON.md#fresh-rocprof-comparison-and-rejected-two-head-schedule152).
 
 **L106 split load scheduling is qualified** at **815.992 prefill / 39.274 decode
 tok/s** on A1. Its matched immutable HC103 control measures **815.330 / 37.520**:
@@ -580,6 +612,7 @@ its actual prepared route must be represented explicitly in coverage.
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
 | A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 L106† Release required groups; L95 prefix restore; latest complete topology gate [G60][a1] | 815.992 L106† | 467.821 F62§ | — | 39.274 L106† | 42.959 F62§ | — | L106 schedules FP32 loads by captured geometry: +4.676% matched decode with unchanged prefill and exact logits. Next qualify packed FP16 attention/KV sharing. Full preflight remains pending. |
 | A1.E151 | Same A1 topology; explicit FP16 attention with `prefill8_decode33`, native FP16 KV; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 832 Unit/affected registrations; boundary panel diagnostic | 818.579 E151† | 467.821 F62§ | — | 40.110 E151† | 42.959 F62§ | — | +0.566% decode versus same-binary uniform8. Tune decode head grouping; retain prefill. Experimental arithmetic; no new complete preflight or default promotion. |
+| A1.E160 | Same A1 topology; explicit FP16 `prefill8_decode33`, V0/V1 overlap and PV unroll2; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 832 Unit/affected registrations | 818.413 E160† | 467.821 F62§ | — | 40.111 E160† | 42.959 F62§ | — | Matched model throughput is flat versus frozen151. Native M1/512 pair15.446µs and M16/64K88.597µs. Experimental arithmetic; full preflight/default promotion remain open. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |

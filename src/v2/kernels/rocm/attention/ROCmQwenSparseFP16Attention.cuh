@@ -1,11 +1,11 @@
 /**
  * @file ROCmQwenSparseFP16Attention.cuh
- * @brief Explicit FP16 sparse-attention experiment with shared native KV tiles.
+ * @brief Native FP16 sparse attention with fixed phase-specific shared KV tiles.
  *
- * Four fixed global query heads share each selected KV tile. One wave owns a
+ * The 8-part program shares each KV tile across four fixed heads; phase33 uses six. One wave owns a
  * head and one lane owns a complete QK score, using ordered packed-half dots
- * with FP32 accumulation. Production retains eight immutable interleaved tile
- * streams; the explicit test-native33 program assigns one64-token tile per part.
+ * with FP32 accumulation. The 8-part program retains eight immutable interleaved tile
+ * streams; the explicit phase33 program assigns one 64-token tile per part.
  * Each program has fixed arithmetic for every admitted M and compact TP shard. Tile-local half
  * PV chains widen into FP32 online totals, so long contexts cannot overflow a
  * persistent half accumulator. All storage is caller-owned or static LDS.
@@ -25,6 +25,21 @@ struct alignas(16) SparseHalfVector
     half2 pairs[4];
 };
 static_assert(sizeof(SparseHalfVector) == 16);
+
+/**
+ * @brief Thread-private V-panel vectors reused across second-panel QK and first PV.
+ * @details G6 uses 384 cooperative threads for 1024 vectors. The first 256
+ * threads own three vectors and the remaining 128 own two. Unused slots are
+ * initialized but never published. V0 dies at LDS publication before the same
+ * bank is reused for V1. This is intended to scalarize into registers;
+ * compiler spill/resource and ISA gates must prove that physical realization.
+ * It adds no workspace, allocation or native memory transfer.
+ */
+struct SparseHalfValuePrefetch
+{
+    SparseHalfVector first, second, third;
+};
+static_assert(sizeof(SparseHalfValuePrefetch) == 48);
 
 /** @brief Two packed-half pairs; both split-half inputs use exact8-byte transfers. */
 struct alignas(8) SparseHalfDuo
@@ -76,15 +91,15 @@ __device__ __forceinline__ float2 rotateSparseHalfSplitPair(
  * @brief Load one selected 64-token, 128-coordinate key panel into padded LDS.
  * @tparam Transform Whether the admitted native key bank is stored before RoPE.
  * @tparam Coordinate First coordinate of this immutable 128-coordinate panel.
- * @tparam LoadUnroll Vector-transfer scheduling factor: original1 or diagnostic4.
+ * @tparam LoadUnroll Vector-transfer scheduling factor: original1 or phase33 factor4.
  * @tparam FullPanel True only when the wrapper proves all64 key tokens live.
  * @tparam Threads Immutable cooperative copy stride: 256 for G4 or 384 for G6.
+ * @tparam IdentityAddressing Use validated original ordinals instead of selected IDs.
  * @param p Original immutable attention bindings and native cache policy.
  * @param r Authenticated original replay, including absolute position origin.
  * @param selected Sorted selected indices at this tile's first logical token.
  * @param count Live tile tokens, from one through64; padding is never read.
  * @param logicalBegin Original selected ordinal of this panel's first token.
- * @param allVisible Row-uniform identity proof, enabled only for diagnostic33.
  * @param kvHead Owned local native KV head shared by this CTA's query heads.
  * @param origin Canonical physical ring origin for the current query row.
  * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
@@ -96,10 +111,10 @@ __device__ __forceinline__ float2 rotateSparseHalfSplitPair(
  * Sparse lists retain selected-ID loads; physical ring mapping and absolute
  * RoPE positions are unchanged. Production8 always passes constant false.
  */
-template<bool Transform, int Coordinate, int LoadUnroll, bool FullPanel, int Threads>
+template<bool Transform, int Coordinate, int LoadUnroll, bool FullPanel, int Threads, bool IdentityAddressing=false>
 __device__ __forceinline__ void copySparseHalfKeysPanel(
     const QwenSparseAttention& p, const QwenSparseReplay& r,
-    const std::int32_t* selected, int count, int logicalBegin, bool allVisible,
+    const std::int32_t* selected, int count, int logicalBegin,
     int kvHead, int origin, int capacity, half2* tile)
 {
     static_assert(LoadUnroll==1 || LoadUnroll==4,"Closed native tile-load schedule");
@@ -126,7 +141,7 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
                 }
                 if (FullPanel || token < count)
                 {
-                    const int logical = allVisible ? logicalBegin + token : selected[token];
+                    const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
                     const int physical = detail::physicalRow(logical, origin, capacity);
                     const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
                         std::size_t(physical) * p.kv.keys.token_stride_bytes +
@@ -155,7 +170,7 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
         for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
         if (FullPanel || token < count)
         {
-            const int logical = allVisible ? logicalBegin + token : selected[token];
+            const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
             const int physical = detail::physicalRow(logical, origin, capacity);
             const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
                 std::size_t(physical) * p.kv.keys.token_stride_bytes +
@@ -179,7 +194,7 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
  * @param selected Sorted selected indices at this tile's first logical token.
  * @param count Live tile tokens, from one through64; padding is never read.
  * @param logicalBegin Original selected ordinal of this panel's first token.
- * @param allVisible Row-uniform identity proof, enabled only for diagnostic33.
+ * @param allVisible Row-uniform identity proof, enabled only for the explicit phase33 program.
  * @param kvHead Owned local native KV head shared by this CTA's query heads.
  * @param origin Canonical physical ring origin for the current query row.
  * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
@@ -200,57 +215,151 @@ __device__ __forceinline__ void loadSparseHalfKeys(
     int kvHead, int origin, int capacity, half2* tile)
 {
     if constexpr (AllowFullPanel)
-        if (count == 64)
+    {
+        // Resolve the row-uniform address proof once per panel, outside every
+        // unrolled vector transfer. Both routes retain the same copy body.
+        if (allVisible)
         {
-            copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, true, Threads>(p,r,selected,count,logicalBegin,allVisible,kvHead,origin,capacity,tile);
+            if (count == 64)
+                copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, true, Threads, true>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+            else
+                copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, false, Threads, true>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile);
             return;
         }
-    copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, false, Threads>(p,r,selected,count,logicalBegin,allVisible,kvHead,origin,capacity,tile);
+        if (count == 64)
+        {
+            copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, true, Threads>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+            return;
+        }
+    }
+    copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, false, Threads>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+}
+
+/**
+ * @brief One guarded native V-vector source, prepared before the value is loaded.
+ * @details An inactive source owns no native read. Only the preparation helper
+ * creates live sources, after the original count, selected-ID and ring logic.
+ * This thread-private descriptor is neither model state nor workspace.
+ */
+struct SparseHalfValueVectorSource
+{
+    const SparseHalfVector* data = nullptr;
+    bool live = false;
+};
+
+/**
+ * @brief Resolve the original native V-vector address without reading its payload.
+ * @tparam FullPanel True only after proving all 32 value tokens live.
+ * @tparam IdentityAddressing Use the original validated identity membership.
+ * @param p Original immutable native FP16 value binding.
+ * @param selected Sorted selected indices at this value panel's first token.
+ * @param count Live panel tokens; zero admits no native address or selected read.
+ * @param logicalBegin Original selected ordinal of the panel's first token.
+ * @param kvHead Original owned native KV head.
+ * @param origin Original physical ring origin.
+ * @param capacity Original ring capacity, or zero for contiguous KV.
+ * @param vector Admitted panel vector in [0,1024); callers own that bound.
+ * @return Live native source or a neutral inactive source, with no payload read.
+ * @details This is the single selected/ring/stride authority shared by direct
+ * copies and prefetch. Preparing all three prefetch sources first gives the
+ * compiler a chance to finish selected-ID waits before issuing native loads.
+ */
+template<bool FullPanel, bool IdentityAddressing>
+__device__ __forceinline__ SparseHalfValueVectorSource prepareSparseHalfValueVector(
+    const QwenSparseAttention& p, const std::int32_t* selected, int count,
+    int logicalBegin, int kvHead, int origin, int capacity, int vector)
+{
+    const int token = vector / 32, pair = (vector % 32) * 4;
+    SparseHalfValueVectorSource source{};
+    if (FullPanel || token < count)
+    {
+        const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
+        const int physical = detail::physicalRow(logical, origin, capacity);
+        const auto* bytes = static_cast<const unsigned char*>(p.kv.values.data) +
+            std::size_t(physical) * p.kv.values.token_stride_bytes +
+            std::size_t(kvHead) * p.kv.values.head_stride_bytes + std::size_t(pair) * sizeof(half2);
+        source.data = reinterpret_cast<const SparseHalfVector*>(bytes);
+        source.live = true;
+    }
+    return source;
+}
+
+/**
+ * @brief Read one prepared native vector or construct the original neutral bits.
+ * @param source Thread-private source from the original count/address proof.
+ * @return The exact raw16-byte value or four original positive-zero half pairs.
+ * @details This single payload-load authority serves ordinary copies and each
+ * fixed prefetch field. It adds no arithmetic, conversion or padded native read.
+ */
+__device__ __forceinline__ SparseHalfVector readSparseHalfValueVector(
+    const SparseHalfValueVectorSource& source)
+{
+    SparseHalfVector value;
+#pragma unroll
+    for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
+    if (source.live) value = *source.data;
+    return value;
 }
 
 /**
  * @brief Load32 selected value rows into the shared key/value panel.
- * @tparam LoadUnroll Vector-transfer scheduling factor: original1 or diagnostic4.
+ * @tparam LoadUnroll Vector-transfer scheduling factor: original1 or phase33 factor4.
  * @tparam FullPanel True only when the wrapper proves all32 value tokens live.
  * @tparam Threads Immutable cooperative copy stride: 256 for G4 or 384 for G6.
+ * @tparam IdentityAddressing Use validated original ordinals instead of selected IDs.
+ * @tparam Prefetch Return typed V-panel register vectors instead of publishing LDS.
  * @param p Original immutable native FP16 value binding.
  * @param selected Sorted selected indices at this value panel's first token.
  * @param count Live tokens in the panel; zero produces only neutral LDS values.
  * @param logicalBegin Original selected ordinal of this panel's first token.
- * @param allVisible Row-uniform identity proof, enabled only for diagnostic33.
  * @param kvHead Owned native KV head shared by all CTA consumers.
  * @param origin Canonical physical ring origin.
  * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
  * @param tile Exclusive32-by128 packed-half panel, reused after key retirement.
+ * @return A thread-private register bank for Prefetch, otherwise void.
  * @details Vector loads read only live selected values. The caller owns the
  * publication and retirement barriers, so this helper never synchronizes.
  * Identity rows use validated original ordinals; sparse rows read selected IDs.
  * Count-zero panels read neither route. Both preserve the original ring map.
  */
-template<int LoadUnroll, bool FullPanel, int Threads>
-__device__ __forceinline__ void copySparseHalfValuesPanel(
+template<int LoadUnroll, bool FullPanel, int Threads, bool IdentityAddressing=false, bool Prefetch=false>
+__device__ __forceinline__ auto copySparseHalfValuesPanel(
     const QwenSparseAttention& p, const std::int32_t* selected, int count,
-    int logicalBegin, bool allVisible, int kvHead, int origin, int capacity, half2* tile)
+    int logicalBegin, int kvHead, int origin, int capacity, half2* tile)
 {
     static_assert(LoadUnroll==1 || LoadUnroll==4,"Closed native tile-load schedule");
     static_assert(Threads==256 || Threads==384,"Closed cooperative tile-copy geometry");
-#pragma unroll(LoadUnroll)
-    for (int vector = int(threadIdx.x); vector < 32 * 32; vector += Threads)
+    static_assert(!Prefetch || Threads==384,"Value register prefetch requires G6 ownership");
+    if constexpr (Prefetch)
     {
-        const int token = vector / 32, pair = (vector % 32) * 4;
-        SparseHalfVector value;
-#pragma unroll
-        for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
-        if (FullPanel || token < count)
+        const int vector = int(threadIdx.x);
+        const auto first = prepareSparseHalfValueVector<FullPanel, IdentityAddressing>(
+            p,selected,count,logicalBegin,kvHead,origin,capacity,vector);
+        const auto second = prepareSparseHalfValueVector<FullPanel, IdentityAddressing>(
+            p,selected,count,logicalBegin,kvHead,origin,capacity,vector + Threads);
+        SparseHalfValueVectorSource third{};
+        if (vector + 2 * Threads < 32 * 32)
+            third = prepareSparseHalfValueVector<FullPanel, IdentityAddressing>(
+                p,selected,count,logicalBegin,kvHead,origin,capacity,vector + 2 * Threads);
+        // Distinct aggregate fields expose independent SSA results, without a
+        // dynamic slot or reused payload temporary. Actual ISA must prove
+        // that the compiler keeps their native loads outstanding across QK.
+        return SparseHalfValuePrefetch{
+            readSparseHalfValueVector(first),
+            readSparseHalfValueVector(second),
+            readSparseHalfValueVector(third)};
+    }
+    else
+    {
+#pragma unroll(LoadUnroll)
+        for (int vector = int(threadIdx.x); vector < 32 * 32; vector += Threads)
         {
-            const int logical = allVisible ? logicalBegin + token : selected[token];
-            const int physical = detail::physicalRow(logical, origin, capacity);
-            const auto* bytes = static_cast<const unsigned char*>(p.kv.values.data) +
-                std::size_t(physical) * p.kv.values.token_stride_bytes +
-                std::size_t(kvHead) * p.kv.values.head_stride_bytes + std::size_t(pair) * sizeof(half2);
-            value = *reinterpret_cast<const SparseHalfVector*>(bytes);
+            const int token = vector / 32, pair = (vector % 32) * 4;
+            const auto source = prepareSparseHalfValueVector<FullPanel, IdentityAddressing>(
+                p,selected,count,logicalBegin,kvHead,origin,capacity,vector);
+            const auto value = readSparseHalfValueVector(source);
+            *reinterpret_cast<SparseHalfVector*>(tile + token * 128 + pair) = value;
         }
-        *reinterpret_cast<SparseHalfVector*>(tile + token * 128 + pair) = value;
     }
 }
 
@@ -259,15 +368,17 @@ __device__ __forceinline__ void copySparseHalfValuesPanel(
  * @tparam LoadUnroll Existing vector scheduling factor, independent of permission.
  * @tparam AllowFullPanel True only for the explicit Parts33 producer.
  * @tparam Threads Exact CTA size shared by copy wrappers and their panel body.
+ * @tparam Prefetch Return G6 V-panel register vectors without writing LDS.
  * @param p Original immutable native FP16 value binding.
  * @param selected Sorted selected indices at this value panel's first token.
  * @param count Live tokens in the panel; zero produces only neutral LDS values.
  * @param logicalBegin Original selected ordinal of this panel's first token.
- * @param allVisible Row-uniform identity proof, enabled only for diagnostic33.
+ * @param allVisible Row-uniform identity proof, enabled only for the explicit phase33 program.
  * @param kvHead Owned native KV head shared by all CTA consumers.
  * @param origin Canonical physical ring origin.
  * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
  * @param tile Exclusive32-by128 packed-half panel, reused after key retirement.
+ * @return A thread-private register bank for Prefetch, otherwise void.
  * @details Vector loads read only live selected values. The caller owns the
  * publication and retirement barriers, so this helper never synchronizes.
  * Identity rows use validated original ordinals; sparse rows read selected IDs.
@@ -275,23 +386,68 @@ __device__ __forceinline__ void copySparseHalfValuesPanel(
  * Only permitted full32 panels specialize the shared body. Zero and partial
  * counts always retain the original guard and perform no padded native read.
  */
-template<int LoadUnroll=1, bool AllowFullPanel=false, int Threads=256>
-__device__ __forceinline__ void loadSparseHalfValues(
+template<int LoadUnroll=1, bool AllowFullPanel=false, int Threads=256, bool Prefetch=false>
+__device__ __forceinline__ auto loadSparseHalfValues(
     const QwenSparseAttention& p, const std::int32_t* selected, int count,
     int logicalBegin, bool allVisible, int kvHead, int origin, int capacity, half2* tile)
 {
+    static_assert(!Prefetch || (AllowFullPanel && Threads==384),
+                  "Only the admitted33 G6 value panel may prefetch");
     if constexpr (AllowFullPanel)
+    {
+        // Identity and sparse addressing specialize the shared body only after
+        // the caller's original membership validation has completed.
+        if (allVisible)
+        {
+            if (count == 32)
+                return copySparseHalfValuesPanel<LoadUnroll, true, Threads, true, Prefetch>(p,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+            else
+                return copySparseHalfValuesPanel<LoadUnroll, false, Threads, true, Prefetch>(p,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+        }
         if (count == 32)
         {
-            copySparseHalfValuesPanel<LoadUnroll, true, Threads>(p,selected,count,logicalBegin,allVisible,kvHead,origin,capacity,tile);
-            return;
+            return copySparseHalfValuesPanel<LoadUnroll, true, Threads, false, Prefetch>(p,selected,count,logicalBegin,kvHead,origin,capacity,tile);
         }
-    copySparseHalfValuesPanel<LoadUnroll, false, Threads>(p,selected,count,logicalBegin,allVisible,kvHead,origin,capacity,tile);
+    }
+    return copySparseHalfValuesPanel<LoadUnroll, false, Threads, false, Prefetch>(p,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+}
+
+/**
+ * @brief Publish one admitted cooperative value vector into its original LDS slot.
+ * @param value Exact raw value retained in a fixed register-bank field.
+ * @param vector Original cooperative vector index, proven in [0,1024).
+ * @param tile The original shared V panel, after all K readers have retired.
+ * @details Publication owns no barrier; the caller retains the original edge.
+ */
+__device__ __forceinline__ void publishSparseHalfValueVector(
+    const SparseHalfVector& value, int vector, half2* tile)
+{
+    const int token = vector / 32, pair = (vector % 32) * 4;
+    *reinterpret_cast<SparseHalfVector*>(tile + token * 128 + pair) = value;
+}
+
+/**
+ * @brief Publish fixed G6 value fields after prior LDS readers retire.
+ * @param prefetched Typed thread-private raw values retained by the corresponding prefetch.
+ * @param tile The original shared panel after its prior readers have retired.
+ * @details First and second fields cover every thread. Only the first256
+ * threads own the third field; the others never load or publish that slot.
+ * The original publication barrier remains the consumer edge before PV.
+ */
+__device__ __forceinline__ void publishSparseHalfValuePrefetch(
+    const SparseHalfValuePrefetch& prefetched, half2* tile)
+{
+    const int vector = int(threadIdx.x);
+    publishSparseHalfValueVector(prefetched.first, vector, tile);
+    publishSparseHalfValueVector(prefetched.second, vector + 384, tile);
+    if (vector + 2 * 384 < 32 * 32)
+        publishSparseHalfValueVector(prefetched.third, vector + 2 * 384, tile);
 }
 
 /**
  * @brief Accumulate one parity owner's value panel without changing half-FMA order.
  * @tparam FullTile True only after proving the original selected tile has 64 tokens.
+ * @tparam TokenUnroll Physical PV scheduling width: original4 or phase33 width2.
  * @param probabilities Published 64-token probability row of this original head.
  * @param tile Published 32-token native FP16 value panel shared by this CTA.
  * @param chunk Original value-panel ordinal, zero or one within the 64-token tile.
@@ -303,12 +459,13 @@ __device__ __forceinline__ void loadSparseHalfValues(
  * the partial specialization preserves every guard and signed-zero boundary.
  * The caller owns all LDS publication/retirement and this helper never fences.
  */
-template<bool FullTile>
+template<bool FullTile, int TokenUnroll=4>
 __device__ __forceinline__ void accumulateSparseHalfValuePanel(
     const half* probabilities,const half2* tile,int chunk,int lane,int count,
     half2 (&weighted)[4])
 {
-#pragma unroll 4
+    static_assert(TokenUnroll==2 || TokenUnroll==4,"Closed PV token scheduling width");
+#pragma unroll(TokenUnroll)
     for (int token = 0; token < 16; ++token)
     {
         const int selected = 2 * token + lane / 32;
@@ -342,27 +499,30 @@ __device__ __forceinline__ void accumulateSparseHalfValues(
     const half* probabilities,const half2* tile,int chunk,int lane,int count,
     half2 (&weighted)[4])
 {
+    // This permission is true only for Parts33. Scheduling changes the load
+    // window, never the ascending token/coordinate half-FMA dependencies.
+    constexpr int TokenUnroll = AllowFullTile ? 2 : 4;
     if constexpr (AllowFullTile)
         if (count == 64)
         {
-            accumulateSparseHalfValuePanel<true>(probabilities,tile,chunk,lane,count,weighted);
+            accumulateSparseHalfValuePanel<true, TokenUnroll>(probabilities,tile,chunk,lane,count,weighted);
             return;
         }
-    accumulateSparseHalfValuePanel<false>(probabilities,tile,chunk,lane,count,weighted);
+    accumulateSparseHalfValuePanel<false, TokenUnroll>(probabilities,tile,chunk,lane,count,weighted);
 }
 
 /**
  * @brief Produce fixed batch-invariant FP16 tile streams over native sparse KV.
  * @tparam Transform Whether selected keys require the declared pre-RoPE transform.
- * @tparam Parts Fixed arithmetic streams: production8 or explicit test-native33.
- * @details The33 experiment uses one64-token virtual tile per nonempty part;
+ * @tparam Parts Fixed arithmetic streams: the 8-part or explicit phase33 program.
+ * @details The phase33 program uses one 64-token virtual tile per nonempty part;
  * its original first recurrence, parity and publication are not simplified.
  * Its admitted selected extent fits 33 tiles, so each nonempty part executes
  * exactly once. The explicit trip count exposes that invariant to the compiler
  * without changing the literal recurrence or the production 8 stream traversal.
  * @param p Persistent original row, head, cache, selection and partial bindings.
  * @details The grid uses rows, intersected canonical head groups and Parts
- * streams. Groups own four heads for production 8 and six for diagnostic 33.
+ * streams. Groups own four heads for production 8 and six for the explicit phase33 program.
  * A64-token tile belongs to (tile_index moduloParts), independent of row capacity,
  * live M, head-shard width or scheduling. The two half-waves accumulate even
  * and odd PV tokens separately, then merge their FP32 totals in that fixed
@@ -374,9 +534,9 @@ __device__ __forceinline__ void accumulateSparseHalfValues(
 template<bool Transform,int Parts=QwenSparsePartitions>
 __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttentionFP16Tiles(QwenSparseAttention p)
 {
-    static_assert(Parts==8 || Parts==33,"Closed FP16 partition experiment");
+    static_assert(Parts==8 || Parts==33,"Closed FP16 partition program");
     // Each wave retains one original head's arithmetic. Canonical six-head
-    // groups divide each 12-head KV interval, so the 33-part diagnostic shares
+    // groups divide each 12-head KV interval, so the phase33 program shares
     // each native panel across six head slots without crossing a KV owner.
     // Production 8 retains four-head groups and the original unroll1 copy hint.
     constexpr int GroupHeads = Parts == 33 ? 6 : 4;
@@ -476,6 +636,14 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
         __syncthreads(); // Every QK reader retires before the second panel replaces K.
         loadSparseHalfKeys<Transform, 128, LoadUnroll, (Parts == 33), Threads>(p, r, indices + begin, count, begin, allVisible, kvHead, origin, capacity, tile);
         __syncthreads();
+        SparseHalfValuePrefetch prefetchedValues;
+        if constexpr (Parts == 33)
+            // All original membership/ring validation and both K publications
+            // have completed. Read V0 now without touching the live K LDS bank;
+            // its registers span the unchanged second QK/softmax arithmetic.
+            prefetchedValues = loadSparseHalfValues<LoadUnroll, true, Threads, true>(
+                p, indices + begin, min(32, count), begin,
+                allVisible, kvHead, origin, capacity, tile);
         float tileMaximum = 0.0f, tileDenominator = 0.0f;
         if (owned)
         {
@@ -508,10 +676,21 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
 #pragma unroll
         for (int chunk = 0; chunk < 2; ++chunk)
         {
-            loadSparseHalfValues<LoadUnroll, (Parts == 33), Threads>(p, indices + begin + min(chunk * 32, count),
+            if constexpr (Parts == 33)
+                publishSparseHalfValuePrefetch(prefetchedValues, tile);
+            if constexpr (Parts != 33)
+                loadSparseHalfValues<LoadUnroll, (Parts == 33), Threads>(p, indices + begin + min(chunk * 32, count),
                 max(0, min(32, count - chunk * 32)), begin + min(chunk * 32, count),
                 allVisible, kvHead, origin, capacity, tile);
             __syncthreads();
+            if constexpr (Parts == 33)
+                if (chunk == 0)
+                    // V0 fields died at publication above. Reuse that bank for
+                    // V1 while unchanged PV0 consumes only the published LDS.
+                    // V1 reaches LDS only after the original V0 retirement edge.
+                    prefetchedValues = loadSparseHalfValues<LoadUnroll, true, Threads, true>(
+                        p, indices + begin + min(32, count), max(0, min(32, count - 32)),
+                        begin + min(32, count), allVisible, kvHead, origin, capacity, tile);
             if (owned)
             {
                 accumulateSparseHalfValues<(Parts == 33)>(

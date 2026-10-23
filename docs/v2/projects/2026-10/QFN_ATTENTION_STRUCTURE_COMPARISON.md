@@ -609,6 +609,271 @@ an omitted outer CPU-affinity binding before launching inference; its failure
 is retained, and the successful retry uses the unchanged workload and required
 CPU mask. This is a focused checkpoint, not a refreshed complete preflight.
 
+### Fresh rocprof comparison and rejected two-head schedule152
+
+The qualified phase schedule is checkpointed as `7842f9a70`. Candidate152
+changes only the33-part producer from six heads/384 threads to two heads/128
+threads per CTA. All19 native tests and eight output/partial byte comparisons
+pass. It is uneconomical and its source is removed: the post-RoPE pair takes
+20.672µs at512 versus151's16.503µs;640/768 are21.426/21.506µs rather than
+17.270/17.310µs. At64K it takes28.429µs, and groupedM16 takes214.884µs rather
+than approximately97.6µs. No model qualification or default change follows.
+
+Fresh isolated rocprof launches profile both producer and merge for frozen151
+and the unchanged pinned Castagna core. Each process selects one kernel, shape,
+counter and retained occurrence. The rejected152 producer is also profiled at
+512 and64K. All runs retain source, loaded-library, physical-device, native
+graph, SDK symbol/dispatch/counter and normal-retirement evidence.
+
+| M1/context512 | Llaminar151 producer | Rejected152 producer | Castagna producer | Llaminar151 merge | Castagna merge |
+|---|---:|---:|---:|---:|---:|
+| Local query heads | 6 | 6 | 12 | 6 | 12 |
+| Launched waves | 198 | 198 | 96 | 24 | 48 |
+| Vector instructions per wave | 186.374 | 254.818 | 642.000 | 95.250 | 213.500 |
+| Measured fetch, KiB | 520.438 | 520.438 | 525.938 | 52.063 | 96.813 |
+| Native reported registers / descriptor VGPRs | 51 / 52 | 47 / 88 | 83 / 84 | 70 / 72 | 26 / 28 |
+| Static LDS bytes | 21248 | 18688 | 20000 | 708 | 0 |
+| Dynamic LDS bytes | 0 | 0 | 0 | 0 | 64 |
+| Private scratch bytes | 0 | 0 | 0 | 0 | 0 |
+
+Both Llaminar producers and Castagna's producer report zero LDS bank conflicts.
+At64K,152 executes948.152 vector instructions per wave versus151's674.374,
+while both fetch2062.438KiB. Thus smaller sharing groups increase instruction
+work by36.7% at512 and40.6% at64K without increasing measured external fetch
+volume. Source-level repeated KV copies are not equivalent to repeated HBM
+reads. Register attributes and descriptor reservations are reported separately;
+theoretical resource limits do not measure achieved occupancy.
+
+Normalizing only for the distinct per-device head/layer work,151's producer
+executes about1.198× Castagna's vector instructions, its merge about0.446×,
+and their combined work about1.090×. These are instruction-work ratios, not
+latency ratios: the engines have different active participants per layer.
+The remaining producer cost deserves attention; repeating the rejected smaller
+grouping would not address it.
+
+Evidence: `attention151-frozen-joined-profile-r1.json`,
+`attention152-g2-joined-profile-r1.json`,
+`attention152-castagna-profile-comparison.json`,
+`attention152-engine-profile-comparison-r1.json` and
+`attention152-g2-events-r1.json`. Profiler durations never enter timing scores.
+The fresh fork merge join separately checks its64-byte dynamic allocation:
+the SDK CSV's LDS column describes rounded static storage, while the dispatch
+reports total shared storage. An initial parser assertion conflating those
+quantities failed; the corrected join retains both exact checks without
+rerunning or discarding native observations.
+
+The follow-up153 inspects the exact code-object slices rather than proposing
+vectorization from source appearance. Both151 and the pinned fork already use
+16-byte LDS loads for Q/K followed by four ordered packed-half dots. No153
+source candidate is implemented. Fresh producer counters at512 normalize to
+1293.33 versus1304 LDS instructions per head, but3664 versus1536 scalar ALU
+instructions per head. This is work attribution, not measured cycle latency.
+The151/fork counters are retained in
+`attention153-baseline151-joined-profile-r1.json` and
+`attention153-castagna-profile-comparison.json`.
+
+The152 code object also explains its register discrepancy: metadata reports47
+used VGPRs, whereas the final descriptor reserves88. The compiler pads the
+reservation to the LDS-limited wave capacity; this does not represent a spill.
+The final ELF descriptor and exact native attributes remain separate evidence.
+
+Physical-slot candidate154 is also rejected. It independently evaluates the
+same33 logical partials through16 physical CTAs, retaining the necessary shared
+panel retirement barriers. All19 native tests and eight numerical comparisons
+pass, but512/64K/M16-64K pair times are17.704/33.853/146.573µs. Fewer launched
+waves do not yield a speedup. Exact producer profiles show96 waves,80 used and
+allocated VGPRs,21248 bytes LDS, zero scratch and zero measured LDS conflicts.
+At512 its415.604 vector instructions per wave imply more total instruction
+work than151 despite the lower wave count. At64K the fixed16 schedule also
+reduces parallelism. Its source is removed; retained evidence is
+`attention154-physical16-functional-r1`,
+`attention154-physical16-events-r1.json` and
+`attention154-physical16-joined-profile-r1.json`.
+
+Candidate155 addresses an emitted control-flow cost:151 retests the same
+row-uniform identity-address flag for each unrolled vector transfer. The new
+copy wrappers choose the identity/sparse template once per panel, retaining
+every full/partial guard, original index validation, ring/rotary mapping and
+barrier. The8-part program still instantiates only its original sparse route.
+All19 native tests and eight exact metadata/output/partial comparisons pass.
+
+| Captured pair, microseconds | 512 | 640 | 768 | 2048 | 65536 | M16 /65536 |
+|---|---:|---:|---:|---:|---:|---:|
+| Copy-address specialization155 | 16.186 | 16.940 | 16.980 | 20.041 | 21.633 | 96.632 |
+
+Fresh profiles retain51 used /52 allocated VGPRs,21248 bytes LDS, zero scratch
+and zero LDS bank conflicts. At512 scalar instructions per wave fall from
+111.030 to105.697; vector instructions are185.808 versus186.374. At64K the new
+vector count is679.869 versus674.374, so the timing gain is not a universal
+instruction-count decrease. Native read ownership is unchanged; measured fetch
+is529.500KiB at512 and2062.438KiB at64K. These component observations are in
+`attention155-copy-unswitch-events-r1.json` and
+`attention155-copy-unswitch-joined-profile-r1.json`. The canonical required
+model groups now pass in `attention155-copy-unswitch-model-fp16-r1`, with all
+26 final-logit files /185 rows byte-identical to151, exact reset replay, actual
+phase/program proof on four devices, unchanged source/runtime and clean
+retirement. Its runtime is frozen. Matched model throughput and a refreshed
+complete Unit/affected gate remain separate from these focused observations.
+
+Candidate157 retains the first V panel in thread-private registers while the
+second QK panel and softmax execute, then publishes those same values to LDS
+at the original publication point. All original membership guards, native
+read extents, arithmetic and barriers remain. The eight-part prefill program
+does not use this prefetch. All19 native tests pass; all eight saved output
+and numerical-partial exports are byte-identical to155.
+
+| Captured pair, microseconds | 512 | 640 | 768 | 2048 | 65536 | M16 /65536 |
+|---|---:|---:|---:|---:|---:|---:|
+| V0 register prefetch157 | 15.878 | 16.703 | 16.729 | 19.804 | 21.481 | 96.065 |
+
+The diagnostic pre-RoPE cases measure17.606µs at512 and23.703µs at65536;
+the latter is1.42% slower than155, while remaining faster than151. The native
+model uses post-RoPE keys. Fresh producer profiles report63 used /64 allocated
+VGPRs,21248 bytes LDS, zero scratch and zero measured LDS bank conflicts.
+Its512 scalar/vector counts are104.535/190.818 per wave, and measured fetch
+is529.313KiB. These are instruction and traffic observations, not latency
+attribution. The exact ISA proves that the final V vector load overlaps the
+64-dot second QK chain, but earlier vectors are waited on while moving into
+the register bank. The prefetch is therefore only partly overlapped; source
+placement alone does not establish asynchronous execution.
+
+The canonical required model groups pass in
+`attention157-v0-prefetch-model-fp16-r1`: all26 final-logit files /185 rows
+remain byte-identical to151, including reset rows. Actual phase/program
+observations, unchanged source/runtime, driver checks and normal retirement
+pass. The frozen runtime retains this model-qualified binary and its native
+fixture. Component and exact profile records are
+`attention157-v0-prefetch-events-r1.json` and
+`attention157-v0-prefetch-joined-profile-r1.json`. Whole-model throughput,
+the refreshed complete Unit/affected gate and default promotion remain
+unqualified for155/157;151 remains the latest measured whole-model slice.
+
+Candidate158 replaces the indexed prefetch bank with three named raw-vector
+fields and prepares every guarded address before issuing the value loads.
+Direct copies and prefetch share the original count, selected-index, ring and
+stride logic. No arithmetic, read extent, barrier or workspace changes.
+The exact source-bound ISA now shows all valid first-panel value loads issued
+before the second QK chain, with no payload wait until the original retirement
+barrier after softmax. This also covers the last128 cooperative threads, which
+own two vectors rather than three. The compiler still uses63 VGPRs, with64
+allocated,21248 bytes LDS and zero scratch/spills. This is evidence of available
+overlap, not a measurement of how many memory-latency cycles are hidden.
+
+| Captured pair, microseconds | 512 | 640 | 768 | 2048 | 65536 | M16 /65536 |
+|---|---:|---:|---:|---:|---:|---:|
+| Fixed V0 fields158 | 15.675 | 16.474 | 16.513 | 19.511 | 20.819 | 92.572 |
+
+Both diagnostic pre-RoPE cells also improve, to17.381/22.998µs at512/65536.
+At512 the fresh producer profiles report187.263 vector and104.485 scalar
+instructions per wave,529.313KiB fetch and zero LDS bank conflicts. At64K they
+report688.919/288.808 instructions per wave and2062.438KiB fetch. The19 native
+tests and all eight exact output/partial exports pass. The canonical model
+gate in `attention158-fixed-v0-model-fp16-r1` passes every required group and
+actual phase/program proof; all26 files /185 final-logit rows remain
+byte-identical to151. Runtime/source identities, reset replay, driver checks
+and normal retirement pass. Evidence is retained in
+`attention158-fixed-v0-events-r1.json` and
+`attention158-fixed-v0-joined-profile-r1.json`; the source-bound ISA and CFG
+proof are in `attention158-fixed-v0-isa-r1`.
+
+The private158 export generator initially pointed its old and new roots at
+the same directory. That comparison was invalid; its original summary is
+retained as `attention158-fixed-v0-events-r1-original-self-comparison.json`.
+All eight original native exports have now been compared against the separate
+frozen157 files, with distinct paths/inodes and unchanged metadata. Every output
+and numerical-partial byte matches. The corrected summary names both files
+for every comparison; future wrappers reject aliased controls. No native
+timing was discarded or rerun. The independent151-versus158 model-logit
+comparison always used different directories and is unaffected.
+
+The unprofiled Release A/B/A now passes with nine identical natural token
+sequences. Both roles use explicit FP16 Prefill8/Decode33, the same fullTP4
+four-MI50 topology, sharded vocabulary, RAM ngrams,28 physical NUMA1 workers,
+512 original prompt tokens,256 emitted tokens /255 decode forwards, context4096,
+native post-RoPE FP16 KV, and disabled MTP/prefix cache. Each arm has one warmup
+and three measured requests. Frozen151 controls measure818.243 prefill /
+40.137 decode tok/s;158 measures818.795 /40.196. The differences are
++0.067% /+0.145%, with overlapping ranges: **whole-model performance is
+effectively unchanged**, despite the component gains. All arms retain source,
+runtime, resource, driver and retirement checks. The full receipt is
+`attention158-fixed-v0-model-throughput-comparison-r1.json`. The refreshed
+complete Unit/affected qualification remains pending; complete preflight
+remains G60 and defaults are unchanged.
+
+The second-panel trial159 reuses that register bank after V0 publication and
+prefetches V1 across the original PV0 arithmetic. All19 native tests and eight
+independent numerical exports pass. M1 improves to15.263µs at512 and20.006µs
+at64K, but M16/64K regresses from92.572 to117.425µs, consistently across all
+12 samples while the old-eight controls remain stable. It is not qualified.
+Registers rise from63 used /64 allocated to68 /68, with unchanged LDS and zero
+scratch. Both report a theoretical two-block resource limit; these observations
+do not establish achieved occupancy or a specific occupancy collapse.
+
+The exact M16 profiles in `attention159-m16-profile-comparison-r1.json` show
+slightly fewer vector/scalar instructions, nearly identical6370KiB fetch, and
+similar97% active-lane utilization. Memory-unit busy/stalled percentages fall
+from29.30/0.865 to20.32/0.520. Those counters do not by themselves attribute
+the slowdown to memory or register residency. The concrete ISA pressure is a
+20-word PV read-ahead window coexisting with12 prefetched words and four half
+accumulators. The shifted QK register numbers alone are not a liveness proof.
+A smaller PV scheduling window is the next isolated experiment; no arithmetic,
+barrier or precision change is proposed. Native events and M1 profiles remain
+in `attention159-v1-prefetch-events-r1.json` and
+`attention159-v1-prefetch-joined-profile-r1.json`.
+
+Candidate160 keeps V0/V1 prefetch and narrows only the33-part PV token unroll
+from four to two. The8-part program retains its original four-token window.
+The ordered half-FMA body, guards, reads and barriers remain unchanged. All19
+native tests and eight independent numerical comparisons against frozen158
+pass. The source-bound ISA shows two probability words plus two128-bit value
+loads before eight ordered half-FMAs: a10-word window instead of20. V1 loads
+still overlap PV0. Register use/allocation falls to64/64, with unchanged21248
+bytes LDS and zero scratch/spills.
+
+| Captured pair, microseconds | 512 | 640 | 768 | 2048 | 65536 | M16 /65536 |
+|---|---:|---:|---:|---:|---:|---:|
+| V0/V1 prefetch with PV unroll2,160 | 15.446 | 16.235 | 16.274 | 19.064 | 20.179 | 88.597 |
+
+Both diagnostic pre-RoPE cells improve over158, to17.225/22.078µs. M16/64K
+now improves over both159's117.425µs and158's92.572µs. The exact M16 profiles
+report713.768 vector /305.083 scalar instructions per wave,6370.688KiB fetch,
+and27.84% memory-unit busy time. More instructions are compatible with better
+latency here; these observations do not independently measure achieved
+occupancy. The event and profile receipts are
+`attention160-pv2-events-r1.json`,
+`attention160-pv2-joined-profile-r1.json` and
+`attention160-pv2-m16-profile-r1.json`. The source-bound ISA/CFG proof is in
+`attention160-pv2-isa-r1`. The canonical Release model gate now passes in
+`attention160-pv2-model-fp16-r1`: all26 final-logit files /185 rows remain
+byte-identical to151, so its measured KL, top-1 and top-5 are unchanged. Actual
+phase/program observations, reset replay, source/runtime identity, driver checks
+and normal retirement pass. The complete Unit/affected gate also passes
+**832/832 registrations** in191.449 seconds: all776 tests carrying the Unit
+label plus56 affected registrations. There are no CTest failures/skips;
+existing opt-in profiling skips inside broad native GTest suites are not
+reclassified. Source and driver windows are clean. Its receipt is
+`attention160-pv2-unit-native-r1/result.json`, following the56.984-second
+Integration build. Both configured builds retain CUDA80/86/89/90 and HIPgfx906,
+matching the current canonical architecture set, with the spill guard enabled.
+The final unprofiled A/B/A passes with all nine natural token sequences
+identical and the same settings as158 above. Frozen151 controls measure
+**818.354 prefill /40.108 decode tok/s**, versus160's
+**818.413 /40.111**. The differences are **+0.007% /+0.009%** with overlapping
+ranges: whole-model throughput is effectively unchanged. The native pairs
+improve over151 by6.4% at M1/512,8.6% at M1/64K and9.4% at M16/64K; those
+component gains are not an end-to-end speedup. Every arm passes runtime/source
+identity, driver/resource checks and normal retirement. The final receipt is
+`attention160-pv2-model-throughput-comparison-r1.json`. This is a focused green
+checkpoint; full preflight remains G60 and production defaults are unchanged.
+The pinned Castagna512
+pair remains14.424µs, so the short-context component target is still open.
+
+The next held design is K1 load overlap across QK0, reusing the same register
+bank after each original publication/retirement edge. It has no implementation
+in this checkpoint. Its different64-by16 vector layout and key strides must
+remain explicit, and its register pressure, grouped economics and model
+accuracy require the same native/profile/model gates.
+
 The per-GPU normalization above is a **work comparison**, not a request-latency
 identity. The fork rounds attention tensor slices to whole 12-query-head GQA
 groups and rotates ownership by attention-layer ordinal. Each attention layer
