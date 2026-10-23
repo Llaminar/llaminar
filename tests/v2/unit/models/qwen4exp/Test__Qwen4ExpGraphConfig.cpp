@@ -7,6 +7,8 @@
  * widening attention/expert GEMMs or the vocabulary head.
  */
 #include "Qwen4ExpMetadataFixture.h"
+#include "models/qwen4exp/Qwen4ExpGraph.h"
+#include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
 #include "models/qwen4exp/Qwen4ExpSchema.h"
 #include "models/GraphTypes.h"
@@ -16,6 +18,31 @@
 
 namespace llaminar2::test
 {
+/** @test Actual model hook retains parent state and its base snapshot after setup reload. */
+TEST(Qwen4ExpGraphConfig, AttentionBasePrefixIdentitySurvivesSetupReload)
+{
+    using A=qwen4exp::QwenSparseAttentionArithmetic;
+    auto &setup=mutableDebugEnv().attention;
+    struct Restore { AttentionConfig &setup; AttentionConfig previous; ~Restore(){setup=previous;} } restore{setup,setup};
+    GraphConfig config;config.default_device=DeviceId::rocm(0);
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false),config);
+    config.attention_phase_schedule=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+    setup.qfn_sparse_attention=A::FixedFP32;Qwen4ExpGraph ordinary(config);
+    setup.qfn_sparse_attention=A::TileFP16WithFP32Totals;Qwen4ExpGraph candidate(config);
+    PrefixFingerprintMaterial before;candidate.appendPrefixCacheFingerprintMaterial(before);
+    setup.reload();setup.qfn_sparse_attention=A::FixedFP32;
+    PrefixFingerprintMaterial after,control,parent;
+    candidate.appendPrefixCacheFingerprintMaterial(after);
+    ordinary.appendPrefixCacheFingerprintMaterial(control);
+    candidate.Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(parent);
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime",before.runtime),hashPrefixFingerprintFields("runtime",after.runtime));
+    EXPECT_NE(hashPrefixFingerprintFields("runtime",after.runtime),hashPrefixFingerprintFields("runtime",control.runtime));
+    ASSERT_FALSE(parent.moe.empty());ASSERT_EQ(after.moe.size(),parent.moe.size());
+    for(std::size_t i=0;i<parent.moe.size();++i) {
+        EXPECT_EQ(after.moe[i].name,parent.moe[i].name);EXPECT_EQ(after.moe[i].value,parent.moe[i].value);
+    }
+}
+
 /** @brief An admitted graph owns its policy even if a later diagnostic changes setup. */
 TEST(Qwen4ExpGraphConfig, HCUpActivationPolicyIsFrozenForPlanningAndReplay)
 {

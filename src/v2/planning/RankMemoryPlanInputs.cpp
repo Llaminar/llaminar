@@ -169,6 +169,7 @@ namespace llaminar2
             DevicePlanConfig cfg;
             cfg.world_rank = current_rank;
             cfg.device = device;
+            cfg.attention_phase_schedule = request.plan.runtime.attention_phase_schedule;
             cfg.qfn_hc_up_activation = profile.flash_next
                 ? debugEnv().gemm.qfn_hc_up_activation
                 : QuantizedActivationOperandPrecision::SingleQ8;

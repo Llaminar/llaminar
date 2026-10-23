@@ -27304,7 +27304,7 @@ endforeach()
 if(TARGET v2_test_rocm_qwen_sparse_attention)
     add_v2_test(V2_Integration_ROCm_QwenSparseFP16TileArithmetic
         COMMAND $<TARGET_FILE:v2_test_rocm_qwen_sparse_attention>
-            --gtest_filter=ROCmQwenSparseAttention.FP16NativeKeyEncodingsGroupedSerialDirtyReplay:ROCmQwenSparseAttention.FP16CompactHeadsSharedReadsAndReadOnlyInputs:ROCmQwenSparseAttention.FP16UniformScoresExtremeFiniteValues
+            --gtest_filter=ROCmQwenSparseAttention.FP16NativeKeyEncodingsGroupedSerialDirtyReplay:ROCmQwenSparseAttention.FP16CompactHeadsSharedReadsAndReadOnlyInputs:ROCmQwenSparseAttention.FP16UniformScoresExtremeFiniteValues:ROCmQwenSparseAttention.FP16Virtual33NativeKeyEncodingsGroupedSerialDirtyReplay:ROCmQwenSparseAttention.FP16Virtual33CompactHeadsSharedReadsAndReadOnlyInputs:ROCmQwenSparseAttention.FP16Virtual33UniformExtremeFiniteAndSignedZero:ROCmQwenSparseAttention.FP16Virtual33EmptyTailPreservesSignedZero
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;Attention;Capture;ByteExact;Regression"
         ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
@@ -29914,6 +29914,55 @@ add_v2_test(V2_Integration_QwenSparseAttentionArithmeticPolicy
     MPI_PROCS 1 NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseAttentionArithmeticPolicy)
+
+# Phase33 policy/byte ownership is setup-only; no accelerator is initialized.
+add_v2_test(V2_Integration_QwenSparsePhase33Policy
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseAttentionStage.Phase33NamesAndUnsupportedBackends:QwenSparseAttentionStage.Phase33CaptureExtentAndColdAdmission:Qwen4ExpSparseAttentionBuilder.Phase33ResolvesExactPhaseAndCanonicalRetainedFamily:Qwen4ExpSparseAttentionBuilder.Phase33ColdRejectionLeavesGraphUnchanged
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Capture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+add_v2_test(V2_Integration_QwenSparsePhase33Arena
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+        --gtest_filter=Qwen4ExpBufferLayout.Phase33EnvelopeIsExactAndSharedWithCanonicalBOM:Qwen4ExpBufferLayout.Phase33EnvelopeRejectsForeignFamiliesAndOverflow:Qwen4ExpBufferLayout.Phase33EstimatorAndAllocatorAdaptersAgree
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Admission;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparsePhase33Policy V2_Integration_QwenSparsePhase33Arena)
+add_v2_test(V2_Integration_QwenSparsePhase33SetupPropagation
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=NgramExecutionProvision.AttentionPhaseScheduleWireRoundTripRejectsUnknownAndOldVersion:NgramExecutionProvision.AttentionPhaseScheduleIsPartOfConsumerAndRestoreIdentity:RankMemoryPlanInputs.AttentionPhaseScheduleSnapshotSurvivesDebugReloadAndAdapterCopies
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Planning;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparsePhase33SetupPropagation)
+add_v2_test(V2_Integration_QwenSparsePhase33PrefixIdentity
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.QFNAttentionPhaseScheduleDefaultAndSplitIdentityAreStable:Test__PrefixCacheFingerprint.QFNAttentionPhaseScheduleRejectsUnknownAndDuplicateAuthority
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;PrefixCache;Capture;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparsePhase33PrefixIdentity)
+
+# QFN base attention identity is graph-owned and must survive setup reload.
+add_v2_test(V2_Integration_QwenSparseAttentionBasePrefixIdentity
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.QFNAttentionBaseIdentityIsStableAndRejectsInvalidAuthority
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;PrefixCache;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+add_v2_test(V2_Integration_QwenSparseAttentionFrozenBasePrefixIdentity
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+        --gtest_filter=Qwen4ExpGraphConfig.AttentionBasePrefixIdentitySurvivesSetupReload
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;PrefixCache;Capture;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_QwenSparseAttentionBasePrefixIdentity
+    V2_Integration_QwenSparseAttentionFrozenBasePrefixIdentity)
+
+
+
 
 # Explicit bounded CPU selection and typed capture-policy admission.
 add_v2_test(V2_Integration_QwenSparseBoundedPolicyCPU

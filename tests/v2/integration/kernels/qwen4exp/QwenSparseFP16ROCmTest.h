@@ -87,7 +87,7 @@ struct FP16Run final:FixedRun
         const bool transform=args.kv.key_policy.encoding==attention::AttentionKeyCacheEncoding::PreRotaryDeviceTransform;
         const std::string label=std::string("candidate_fp16_")+(transform?"pre_rotary_":"post_rotary_")+(args.observations?"on":"off");
         capture.record([&]{rocmQwenSparseAttention(args,capture.stream);},
-            transform?"selectedAttentionFP16TilesILb1EE":"selectedAttentionFP16TilesILb0EE","reduceAttentionPartitions",
+            transform?"selectedAttentionFP16TilesILb1ELi8EE":"selectedAttentionFP16TilesILb0ELi8EE","reduceAttentionPartitions",
             dim3(args.row_capacity,groups,8),dim3(args.row_capacity,args.query_heads,1),256,256,label.c_str());
     }
 };

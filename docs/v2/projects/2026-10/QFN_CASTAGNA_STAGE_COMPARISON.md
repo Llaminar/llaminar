@@ -33,6 +33,37 @@ recorded kernels participate in the same overlap sweep. The report retains
 sums, unions and exclusive intervals separately; no GPU times are added.
 Broader wrapper and complete attention-block attribution remain unresolved.
 
+The subsequent source audit explains the different participation: the fork
+rounds attention slices to whole 12-query-head GQA groups and rotates their
+owners by full-attention-layer ordinal. With four equal devices and two KV
+heads, only two devices own attention slices in each layer; the active pairs
+alternate. Llaminar uses four six-query-head slices in every attention layer.
+The table above measures GPU work and must not be read as a request-latency
+ratio.
+
+A read-only follow-up accounts for the union of core kernel intervals across
+all four devices, counting overlapping intervals once. It authenticates the
+same dispatch inventory and all 255 decode steps, using the original graph
+windows for Llaminar and revalidated vocabulary-head endpoints for Castagna.
+
+| Recorded all-device core-active union | Llaminar124 | Castagna |
+|---|---:|---:|
+| Prefill, µs per prompt row | 15.403832 | 15.715459 |
+| Decode, ms per after-prefill step | 1.660075 | 0.649616 |
+
+These are additional **instrumented active-time diagnostics**, not unprofiled
+attention latency or removable request time. Instrumentation changes scheduling
+and has different overhead in the two engines. First-to-last spans include
+intervening non-core work and are retained separately. Exact per-layer spans
+remain unavailable because the retained traces lack an executed node-to-layer
+identity map; layer IDs are not inferred from timestamp clusters.
+
+[All-device accounting](../../../../parity-results/qwen-flash-next/attention124-all-device-core-accounting-r1/result.json)
+retains the separate GPU-work, union, span and per-step results. The bounded
+reader makes one core-family scan per original immutable database, creates no
+index and does not parse the full JSON traces. This is a refinement of the124
+diagnosis, not a new trace or qualification of the later component candidates.
+
 Both engines execute72 query-head/layer instances per GPU: Llaminar Q6×12,
 Castagna Q12×6. The complete measured prefill is512 rows, split as320+188+4
 by the fork, and decode contains255 forwards. Strict geometry/count checks

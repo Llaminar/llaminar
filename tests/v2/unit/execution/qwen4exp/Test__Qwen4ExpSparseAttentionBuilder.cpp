@@ -481,3 +481,41 @@ TEST(Qwen4ExpSparseAttentionBuilder, AttentionArithmeticDefaultForwardingAndCold
         }
     }
 }
+
+/** @test The original typed phase selects8/33; M1 prompt and grouped Decode never alias phase semantics. */
+TEST(Qwen4ExpSparseAttentionBuilder, Phase33ResolvesExactPhaseAndCanonicalRetainedFamily)
+{
+    using A=qwen4exp::QwenSparseAttentionArithmetic;using S=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    using P=ForwardExecutionPhase;
+    for(const auto phase:{P::Prefill,P::Decode})for(int rows:{1,2,16,17,512,1024,2048})for(int retained:{0,1,16,2048}) {
+        EXPECT_EQ(Builder::attentionArithmeticForInvocation(phase,DeviceId::rocm(0),rows,1,retained,A::TileFP16WithFP32Totals,S::Uniform),A::TileFP16WithFP32Totals);
+        if(phase==P::Decode && rows>std::max(1,retained)) {
+            EXPECT_THROW(Builder::attentionArithmeticForInvocation(phase,DeviceId::rocm(0),rows,1,retained,A::TileFP16WithFP32Totals,S::Prefill8Decode33),std::invalid_argument);
+        } else EXPECT_EQ(Builder::attentionArithmeticForInvocation(phase,DeviceId::rocm(0),rows,1,retained,A::TileFP16WithFP32Totals,S::Prefill8Decode33),
+            phase==P::Prefill?A::TileFP16WithFP32Totals:A::TileFP16WithFP32Totals33);
+    }
+    for(int ordinal:{0,1,2})EXPECT_EQ(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId(DeviceType::CPU,ordinal),1,1,0,A::FixedFP32,S::Uniform),A::FixedFP32);
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId(DeviceType::ROCm,-1),DeviceId::invalid()})
+        EXPECT_THROW(Builder::attentionArithmeticForInvocation(P::Decode,device,1,1,0,A::TileFP16WithFP32Totals,S::Prefill8Decode33),std::invalid_argument);
+    for(const auto base:{A::FixedFP32,A::TileFP16WithFP32Totals33,static_cast<A>(255)})
+        EXPECT_THROW(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId::rocm(0),1,1,0,base,S::Prefill8Decode33),std::invalid_argument);
+    EXPECT_THROW(Builder::attentionArithmeticForInvocation(static_cast<P>(255),DeviceId::rocm(0),1,1,0,A::TileFP16WithFP32Totals,S::Prefill8Decode33),std::invalid_argument);
+    for(int bad:{0,-1})EXPECT_THROW(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId::rocm(0),bad,1,0,A::TileFP16WithFP32Totals,S::Prefill8Decode33),std::invalid_argument);
+    EXPECT_THROW(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId::rocm(0),1,2,16,A::TileFP16WithFP32Totals,S::Prefill8Decode33),std::invalid_argument);
+    EXPECT_THROW(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId::rocm(0),1,1,-1,A::TileFP16WithFP32Totals,S::Prefill8Decode33),std::invalid_argument);
+    EXPECT_THROW(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId::rocm(0),1,1,0,A::TileFP16WithFP32Totals,static_cast<S>(255)),std::invalid_argument);
+}
+/** @test Invalid/foreign33 construction cannot publish even the first projection node. */
+TEST(Qwen4ExpSparseAttentionBuilder, Phase33ColdRejectionLeavesGraphUnchanged)
+{
+    Fixture f;using A=qwen4exp::QwenSparseAttentionArithmetic;
+    auto p=f.policy();p.attentionArithmetic=A::TileFP16WithFP32Totals33;
+    p.executionPhase=ForwardExecutionPhase::Decode;p.retainedMtpCandidateRows=Fixture::rows;
+    for(bool requestsEntry:{false,true}) {
+        ComputeGraph g;f.seed(g);
+        if(requestsEntry)EXPECT_THROW(Builder::appendRequests(g,f.consumer(),p,f.weights(),
+            DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}}),std::invalid_argument);
+        else EXPECT_THROW(Builder::append(g,f.consumer(),p,f.weights(),f.buffers()),std::invalid_argument);
+        EXPECT_EQ(g.size(),1u);
+    }
+}

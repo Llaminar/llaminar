@@ -245,6 +245,9 @@ namespace llaminar2
             // Common Configuration
             // =================================================================
 
+            /// Frozen plan scalar shared by LocalTP and copied pipeline children.
+            qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+
             /// Maximum sequence length
             size_t max_seq_len = 4096;
 

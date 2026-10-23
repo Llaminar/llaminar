@@ -589,3 +589,50 @@ TEST(NgramExecutionProvision, FixedHeadRejectsForeignTopologyCoordinatesSourceAn
     // All current replicated/Auto source cells retain their original discriminator.
     EXPECT_EQ(ImmutableRowTablePolicy{}.distribution,ImmutableRowTableDistribution::Replicated);
 }
+
+/**
+ * @test The exact admitted phase schedule survives wire7 and rejects old/unknown schemas.
+ * @details Only metadata and the existing canonical provision run. A unique full
+ * common-geometry word sequence identifies the field to corrupt; no payload or
+ * native allocator is created and no hard-coded byte offset guesses a consumer.
+ */
+TEST(NgramExecutionProvision, AttentionPhaseScheduleWireRoundTripRejectsUnknownAndOldVersion)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());const auto& profile=source.metadata().memoryProfile();
+    for(const auto schedule:{Schedule::Uniform,Schedule::Prefill8Decode33}){
+        auto c=consumer(DeviceType::ROCm,ImmutableRowStoragePreference::MemoryMapped);c.attention_phase_schedule=schedule;
+        const auto q=request(profile,{c});const std::array requests{q};const auto wire=serializeImmutableRowTableAdmissionRequests(requests);
+        const auto decoded=parseImmutableRowTableAdmissionRequests(wire,0,&profile);
+        ASSERT_EQ(decoded.size(),1u);ASSERT_TRUE(decoded.front().execution_provision);
+        EXPECT_EQ(decoded.front().execution_provision->consumers(),q.execution_provision->consumers());
+        const auto& consumers=q.execution_provision->consumers();ASSERT_EQ(consumers.size(),1u);
+        const auto& a=consumers.front().activation;EXPECT_EQ(a.attention_phase_schedule,schedule);
+        auto prior=wire;prior.at(4)=6;EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(prior,0,&profile),std::invalid_argument);
+        std::vector<std::uint8_t> words;
+        for(const auto value:{std::uint32_t(a.local_d_ff),std::uint32_t(a.local_n_heads),std::uint32_t(a.local_n_kv_heads),std::uint32_t(a.local_vocab),
+            std::uint32_t(a.replicated_dense_decode),std::uint32_t(a.routed_compute_policy),std::uint32_t(a.mtp_terminal_logits_layout),std::uint32_t(schedule)})
+            for(int shift=0;shift<32;shift+=8)words.push_back(std::uint8_t(value>>shift));
+        const auto found=std::search(wire.begin(),wire.end(),words.begin(),words.end());ASSERT_NE(found,wire.end());
+        ASSERT_EQ(std::search(found+1,wire.end(),words.begin(),words.end()),wire.end());
+        const auto offset=std::size_t(found-wire.begin())+words.size()-4;
+        for(const std::uint32_t invalid:{2u,255u,256u,0x7fffffffu}){
+            auto bad=wire;for(int byte=0;byte<4;++byte)bad.at(offset+byte)=std::uint8_t(invalid>>(8*byte));
+            try{(void)parseImmutableRowTableAdmissionRequests(bad,0,&profile);FAIL()<<"Unknown schedule accepted";}
+            catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("attention phase schedule"),std::string::npos);}
+        }
+    }
+}
+/** @test Consumer identity includes schedule and restore rejects unknown typed enum values. */
+TEST(NgramExecutionProvision, AttentionPhaseScheduleIsPartOfConsumerAndRestoreIdentity)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());const auto& profile=source.metadata().memoryProfile();
+    auto c=consumer(DeviceType::ROCm,ImmutableRowStoragePreference::MemoryMapped);const auto q=request(profile,{c});
+    const auto original=q.execution_provision->consumers();ASSERT_FALSE(original.empty());auto changed=original;
+    changed.front().activation.attention_phase_schedule=Schedule::Prefill8Decode33;
+    EXPECT_FALSE(changed.front()==original.front());
+    changed.front().activation.attention_phase_schedule=static_cast<Schedule>(255);
+    EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,changed,
+        q.execution_provision->executionPlan(),q.execution_provision->requiredBase()),std::invalid_argument);
+}

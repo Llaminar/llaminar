@@ -50,6 +50,7 @@ struct ActivationGraphMemoryGeometry
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
     int generation_request_capacity = 1; ///< Retained sampler request rows, including disabled MTP capacity.
     int ngram_fixed_head_participants = 0; ///< Source-declared native cohort P2/4/8; zero outside fixed-head lookup.
+    qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform; ///< Same frozen scalar as actual graph dimensions.
 };
 
 /** @brief Sizes stable activation owners used by captured inference graphs. */

@@ -259,6 +259,9 @@ struct DevicePlanConfig
      */
     bool runtime_device_policy_available = false;
 
+    /// Exact admitted attention phase schedule; source is the owning rank runtime snapshot.
+    qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+
     /// Setup-frozen arithmetic that changes named HC-up activation scratch only.
     QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
     /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.

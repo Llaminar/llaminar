@@ -33,14 +33,20 @@ void rocmQwenSparseSelectPools(const QwenSparseIndexer &params, hipStream_t stre
 void rocmQwenSparseAttention(const QwenSparseAttention &params, hipStream_t stream);
 /**
  * @brief Explicit experimental FP16 tiled attention with FP32 online totals.
- * @param params Native FP16 banks and the original eight-partition arena binding.
+ * @param params Native FP16 banks and the sealed eight- or33-partition arena binding.
  * @param stream Exact non-default HIP stream ordering all borrowed storage.
+ * @pre Canonical graph admission or the owning native fixture proves naturally
+ * aligned storage for row_capacity*query_heads*program_parts partial records.
+ * This raw native boundary receives a pointer, not its byte extent; it checks
+ * scratch presence while its caller owns the checked program-specific capacity.
  * @throws std::invalid_argument For non-FP16 banks, invalid vector alignment,
  * unsupported rotary width, missing scratch or invalid stream/bindings.
  * @throws std::runtime_error For an immediate native launch failure.
  * @details This entry never substitutes another policy. It admits post-RoPE
  * FP16 keys or the declared64-coordinate pre-RoPE policy, and shares selected
- * KV across four global query heads. Default serving remains unchanged.
+ * KV across four (eight parts) or six (33 parts) global query heads.
+ * Each program preserves its arithmetic across serial/grouped rows; graph setup
+ * selects the phase program and admits its exact scratch. Default serving is unchanged.
  */
 void rocmQwenSparseFP16Attention(const QwenSparseAttention &params, hipStream_t stream);
 /** @brief Enqueue accepted raw-tail publication without changing the canonical frontier.

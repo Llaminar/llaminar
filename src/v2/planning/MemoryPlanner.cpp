@@ -508,7 +508,8 @@ NgramModeMemory ngramModeMemory(const ModelMemoryProfile &profile, const DeviceP
             .generation_request_capacity = cfg.generation_request_capacity,
             .ngram_fixed_head_participants = storage==ImmutableRowLookupExecution::FixedHeadShardGPU
                 ? (cfg.ngram_table_placement ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
-                   : fixedHeadParticipants(profile,cfg)) : 0}, cfg.device);
+                   : fixedHeadParticipants(profile,cfg)) : 0,
+            .attention_phase_schedule = cfg.attention_phase_schedule}, cfg.device);
     if(storage==ImmutableRowLookupExecution::AdaptiveGPUCache)
         return {arena,0u,GPUGraphMemoryContract::reservationBytesPerExecutable(cfg.device)};
     if (immutableRowLookupUsesNativeDeviceStorage(storage) || !cfg.device.is_gpu()) return {arena, 0u, 0u};
@@ -554,7 +555,8 @@ ActivationGraphMemoryGeometry continuationActivationGeometry(const ModelMemoryPr
         .generation_request_capacity=cfg.generation_request_capacity,
         .ngram_fixed_head_participants=storage==ImmutableRowLookupExecution::FixedHeadShardGPU
             ? (cfg.ngram_table_placement ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
-               : fixedHeadParticipants(profile,cfg)) : 0};
+               : fixedHeadParticipants(profile,cfg)) : 0,
+        .attention_phase_schedule = cfg.attention_phase_schedule};
 }
 /**
  * @brief Project one source-owned mandatory execution alternative.
@@ -2412,6 +2414,9 @@ std::shared_ptr<const ImmutableRowTableExecutionProvision> MemoryPlanner::restor
                 return c.sameAllocator(identity.resource); }))
             throw std::invalid_argument("Remote ngram provision has invalid or foreign graph geometry");
         const auto &a=identity.activation;
+        if(a.attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform &&
+           a.attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33)
+            throw std::invalid_argument("Remote ngram attention phase schedule is invalid");
         if(a.ngram_lookup || a.ngram_fixed_head_participants!=0 || a.batch_size!=identity.batch || a.resident_graph_rows!=identity.rows ||
             a.context_tokens!=identity.context || a.first_layer!=identity.first_layer || a.last_layer!=identity.last_layer ||
             a.total_shards!=identity.shards || a.mtp_target_query_rows!=identity.mtp_rows ||

@@ -7,6 +7,7 @@
  * the exact canonical per-row mapping produced earlier on the executor DAG.
  */
 #include "QwenSparseAttentionStage.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
 #include "../../../../kernels/KernelFactory.h"
 #include "../../../../tensors/Tensors.h"
 #include "../../../../transfer/TransferEngine.h"
@@ -151,7 +152,13 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
         },
         [&](const SelectedAttention &a) {
             qwen4exp::validateQwenSparseAttentionArithmetic(a.arithmetic,device().type);
-            if(a.arithmetic==qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals)
+            if(a.executionPhase)require(*a.executionPhase==ForwardExecutionPhase::Prefill || *a.executionPhase==ForwardExecutionPhase::Decode,
+                "QSA selected stage requires a known original execution phase");
+            const int decodeRows=qwen4exp::qwenSparseAttentionDecodeRowCapacity(a.retainedMtpCandidateRows);
+            if(a.arithmetic==qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
+                require(a.executionPhase==ForwardExecutionPhase::Decode && m<=static_cast<std::size_t>(decodeRows),
+                    "QSA33 requires explicit Decode within the canonical ordinary-token/retained-verifier envelope");
+            if(a.arithmetic!=qwen4exp::QwenSparseAttentionArithmetic::FixedFP32)
                 require(a.native.cache.k_precision()==ActivationPrecision::FP16 && a.native.cache.v_precision()==ActivationPrecision::FP16 &&
                     (!a.native.keyPolicy.transformsOnRead() || a.keyRotaryDim==64),
                     "QSA fp16_tile requires native FP16 K/V and the explicit 64-coordinate pre-RoPE policy");
@@ -168,7 +175,7 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             add(a.output,bytes(m,a.queryHeads*256),Access::Output,"output");
             if (a.gate) add(*a.gate,bytes(m,a.queryHeads*256),Access::Input,"gate");
             if (a.rowParameters) add(*a.rowParameters,bytes(m,sizeof(attention::AttentionDeviceParams)/4),Access::Input,"row_params");
-            if (a.gpuPartials) add(*a.gpuPartials,bytes(m,a.queryHeads*8*sizeof(qwen4exp::QwenSparseAttentionPartial)/4),Access::Output,"partials");
+            if (a.gpuPartials) add(*a.gpuPartials,bytes(m,std::size_t(a.queryHeads)*qwen4exp::qwenSparseAttentionPartialCount(a.arithmetic)*sizeof(qwen4exp::QwenSparseAttentionPartial)/4),Access::Output,"partials");
             if (a.observations) {
                 require(a.observations->byteOffset%alignof(qwen4exp::QwenSparseAttentionObservation)==0,"QSA observations require native uint64 alignment");
                 add(*a.observations,bytes(m,a.queryHeads*sizeof(qwen4exp::QwenSparseAttentionObservation)/4),Access::Output,"observations");
@@ -223,7 +230,10 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             {{"policy",std::string(qwen4exp::qwenSparseAttentionArithmeticName(attention->arithmetic))},
              {"rows",std::to_string(params_.rowCapacity)},{"query_heads",std::to_string(attention->queryHeads)},
              {"kv_heads",std::to_string(attention->kvHeads)},{"query_head_start",std::to_string(attention->queryHeadStart)},
-             {"kv_head_start",std::to_string(attention->kvHeadStart)}});
+             {"kv_head_start",std::to_string(attention->kvHeadStart)},
+             {"phase",attention->executionPhase ? (*attention->executionPhase==ForwardExecutionPhase::Prefill ? "prefill" : "decode") : "unspecified"},
+             {"program",std::string(qwen4exp::qwenSparseAttentionArithmeticName(attention->arithmetic))},
+             {"parts",std::to_string(qwen4exp::qwenSparseAttentionPartialCount(attention->arithmetic))}});
     }
 }
 
@@ -500,6 +510,8 @@ uint64_t QwenSparseAttentionStage::graphCaptureVariantSignature() const
         // it does not acquire a GPU view or read mutable ring/request state.
         mix(static_cast<uint64_t>(device().type));mix(device().ordinal);
         mix(static_cast<uint64_t>(attention->arithmetic));
+        mix(attention->executionPhase ? static_cast<uint64_t>(*attention->executionPhase)+1 : 0);
+        mix(attention->retainedMtpCandidateRows);
         mix(reinterpret_cast<std::uintptr_t>(&attention->native.cache));
         mix(attention->native.layer);mix(attention->native.sequence);
         mix(static_cast<uint64_t>(attention->native.keyPolicy.encoding));
@@ -635,8 +647,12 @@ StageDumpInfo QwenSparseAttentionStage::buildDumpInfoImpl() const
     for (const auto &weight : weights_) result.addWeight(weight.name,weight.tensor,1,weight.elements,"FP32");
     result.addScalarInt("admitted_rows",params_.rowCapacity);
     result.addScalarInt("native_token_capacity",params_.tokenCapacity);
-    if(const auto *attention=std::get_if<SelectedAttention>(&params_.operation))
+    if(const auto *attention=std::get_if<SelectedAttention>(&params_.operation)) {
         result.addScalarInt("attention_arithmetic_policy",static_cast<int>(attention->arithmetic));
+        result.addScalarInt("attention_arithmetic_parts",qwen4exp::qwenSparseAttentionPartialCount(attention->arithmetic));
+        result.addScalarInt("attention_execution_phase",attention->executionPhase ? static_cast<int>(*attention->executionPhase) : -1);
+        result.addScalarInt("attention_retained_candidate_rows",attention->retainedMtpCandidateRows);
+    }
     return result;
 }
 } // namespace llaminar2

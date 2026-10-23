@@ -50,6 +50,22 @@ namespace llaminar2
         }
     } // namespace
 
+    void appendQwen4ExpAttentionBaseFingerprintFields(
+        std::vector<PrefixFingerprintField> &fields,
+        qwen4exp::QwenSparseAttentionArithmetic arithmetic)
+    {
+        using Arithmetic = qwen4exp::QwenSparseAttentionArithmetic;
+        if (arithmetic != Arithmetic::FixedFP32 && arithmetic != Arithmetic::TileFP16WithFP32Totals)
+            throw std::invalid_argument("QFN prefix identity requires a concrete setup base attention program");
+        if (std::any_of(fields.begin(), fields.end(), [](const auto &field) {
+                return field.name == "qfn_sparse_attention_arithmetic";
+            }))
+            throw std::invalid_argument("Duplicate QFN base attention fingerprint authority");
+        if (arithmetic != Arithmetic::FixedFP32)
+            fields.push_back({"qfn_sparse_attention_arithmetic",
+                std::string(qwen4exp::qwenSparseAttentionArithmeticName(arithmetic))});
+    }
+
     void appendProjectionArithmeticFingerprintFields(
         std::vector<PrefixFingerprintField> &fields,
         GDNProjectionArithmetic gdn,
@@ -78,8 +94,12 @@ namespace llaminar2
         QuantizedActivationOperandPrecision hc_up,
         QuantizedActivationOperandPrecision gdn_output,
         QuantizedActivationOperandPrecision fa_output,
-        QuantizedActivationOperandPrecision gdn_qkv)
+        QuantizedActivationOperandPrecision gdn_qkv,
+        qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule)
     {
+        if(attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform &&
+           attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33)
+            throw std::invalid_argument("Invalid Flash Next attention phase schedule fingerprint");
         const std::string name(quantizedActivationOperandPrecisionName(hc_up));
         const std::string gdn_name(quantizedActivationOperandPrecisionName(gdn_output));
         const std::string fa_name(quantizedActivationOperandPrecisionName(fa_output));
@@ -88,7 +108,8 @@ namespace llaminar2
             if (field.name == "qfn_hc_up_activation" || field.name == "qfn_hc_up_activation_revision" ||
                 field.name == "qfn_gdn_output_activation" || field.name == "qfn_gdn_output_activation_revision" ||
                 field.name == "qfn_fa_output_activation" || field.name == "qfn_fa_output_activation_revision" ||
-                field.name == "qfn_gdn_qkv_activation" || field.name == "qfn_gdn_qkv_activation_revision")
+                field.name == "qfn_gdn_qkv_activation" || field.name == "qfn_gdn_qkv_activation_revision" ||
+                field.name == "qfn_attention_phase_schedule")
                 throw std::invalid_argument("Duplicate Flash Next projection arithmetic authority");
         fields.push_back({"qfn_hc_up_activation", name});
         fields.push_back({"qfn_hc_up_activation_revision", "native-primary-residual-folds-v2"});
@@ -107,6 +128,10 @@ namespace llaminar2
             fields.push_back({"qfn_gdn_qkv_activation", qkv_name});
             fields.push_back({"qfn_gdn_qkv_activation_revision", "main-gdn-native-primary-residual-folds-v1"});
         }
+        // Uniform emits exactly the historical field sequence. The selected
+        // schedule is a copied admission value, never a reloadable setup read.
+        if(attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform)
+            fields.push_back({"qfn_attention_phase_schedule",std::to_string(static_cast<unsigned>(attention_phase_schedule))});
     }
 
     uint64_t hashPrefixFingerprintFields(

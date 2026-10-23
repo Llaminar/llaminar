@@ -15,12 +15,14 @@
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
+#include "planning/ActivationMemoryEstimator.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
 #include <set>
+#include <limits>
 
 namespace llaminar2::test
 {
@@ -128,7 +130,7 @@ TEST(Qwen4ExpBufferLayout, FlatRowsAndRequestCursorsAreIndependentAndUseOneShare
                     requests*sizeof(qwen4exp::QwenSparseReplay)/4+
                     (device.is_gpu()?rows*sizeof(attention::AttentionDeviceParams)/4:0));
                 EXPECT_EQ(resolver.custom_formulas.at("qfn_partial_words"),device.is_gpu()
-                    ?12u*qwen4exp::QwenSparsePartitions*sizeof(qwen4exp::QwenSparseAttentionPartial)/4:0u);
+                    ?std::size_t(rows)*12u*qwen4exp::QwenSparsePartitions*sizeof(qwen4exp::QwenSparseAttentionPartial)/4:0u);
             }
 }
 } // namespace llaminar2::test
@@ -294,3 +296,115 @@ TEST(Qwen4ExpBufferLayout, RuntimeProjectionsPreserveRequestedAndResolvedNgramPo
     }
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+/** @test Selected33 shares one exact phase envelope; Uniform bytes and every other arena owner stay unchanged. */
+TEST(Qwen4ExpBufferLayout, Phase33EnvelopeIsExactAndSharedWithCanonicalBOM)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+        for(int rows:{1,16,512,1024,2048})for(int retained:{0,1,16,2048})for(int heads:{1,3,6,12,24}) {
+            GraphConfig model;model.default_device=device;model.max_activation_rows=rows;
+            model.max_seq_len=65536;model.max_request_count=1;
+            Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(),model);
+            model.local_n_heads=heads;
+            auto d=dimensions(model,std::nullopt);d.retained_mtp_candidate_rows=retained;
+            const auto geometry=Qwen4ExpMemoryGeometry::fromConfig(*model.flash_next);
+            GraphResolverConfig resolver;resolver.seq_len=rows;resolver.d_model=model.d_model;resolver.local_n_heads=heads;
+            auto baselineResolver=resolver;applyQwen4ExpBufferGeometry(baselineResolver,geometry,d);
+            const std::size_t oldWords=std::size_t(rows)*heads*8*sizeof(qwen4exp::QwenSparseAttentionPartial)/4;
+            EXPECT_EQ(baselineResolver.custom_formulas.at("qfn_partial_words"),oldWords);
+            if(device.is_cuda())continue; // Explicit experiment remains unsupported, never reserves33 on CUDA.
+            const auto base=qwen4ExpArenaExtensionBytes(GraphSchema{},resolver,geometry,d);
+            d.attention_phase_schedule=Schedule::Prefill8Decode33;
+            auto selectedResolver=resolver;applyQwen4ExpBufferGeometry(selectedResolver,geometry,d);
+            const std::size_t recordCount=std::size_t(heads)*std::max(std::size_t{8}*rows,std::size_t{33}*std::max(1,retained));
+            const auto exactWords=recordCount*sizeof(qwen4exp::QwenSparseAttentionPartial)/4;
+            EXPECT_EQ(selectedResolver.custom_formulas.at("qfn_partial_words"),exactWords);
+            for(const auto &[name,value]:baselineResolver.custom_formulas)
+                if(name!="qfn_partial_words")EXPECT_EQ(selectedResolver.custom_formulas.at(name),value)<<name;
+            GraphSchema schema;applyQwen4ExpBufferLayout(schema,geometry,d);
+            const auto spec=std::find_if(schema.layer_buffers.begin(),schema.layer_buffers.end(),[](const auto& s){return s.name=="qfn_qsa_partials";});
+            ASSERT_NE(spec,schema.layer_buffers.end());
+            const auto resolved=BufferAllocator::resolve(*spec,selectedResolver);
+            ASSERT_EQ(resolved.shape.size(),1u);EXPECT_EQ(resolved.shape.front(),exactWords);
+            EXPECT_EQ(qwen4ExpArenaExtensionBytes(GraphSchema{},resolver,geometry,d)-base,4*(exactWords-oldWords));
+        }
+}
+/** @test Unknown/foreign or concurrent diagnostic envelopes reject cold; overflow never wraps allocator words. */
+TEST(Qwen4ExpBufferLayout, Phase33EnvelopeRejectsForeignFamiliesAndOverflow)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    GraphConfig model;model.default_device=DeviceId::rocm(0);model.max_activation_rows=1;
+    model.max_seq_len=65536;model.max_request_count=1;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(),model);model.local_n_heads=6;
+    auto d=dimensions(model,std::nullopt);d.attention_phase_schedule=Schedule::Prefill8Decode33;
+    const auto geometry=Qwen4ExpMemoryGeometry::fromConfig(*model.flash_next);
+    GraphResolverConfig resolver;resolver.seq_len=1;resolver.d_model=model.d_model;resolver.local_n_heads=6;
+    for(const auto device:{DeviceId::cpu(),DeviceId(DeviceType::CPU,1),DeviceId::cuda(0)}) {
+        auto bad=d;bad.device=device;EXPECT_THROW(applyQwen4ExpBufferGeometry(resolver,geometry,bad),std::invalid_argument);
+    }
+    auto bad=d;bad.request_capacity=2;EXPECT_THROW(applyQwen4ExpBufferGeometry(resolver,geometry,bad),std::invalid_argument);
+    bad=d;bad.attention_phase_schedule=static_cast<Schedule>(255);EXPECT_THROW(applyQwen4ExpBufferGeometry(resolver,geometry,bad),std::invalid_argument);
+    bad=d;bad.retained_mtp_candidate_rows=-1;EXPECT_THROW(applyQwen4ExpBufferGeometry(resolver,geometry,bad),std::invalid_argument);
+    bad=d;bad.local_query_heads=std::numeric_limits<int>::max();bad.flattened_rows=std::numeric_limits<int>::max();
+    bad.retained_mtp_candidate_rows=std::numeric_limits<int>::max();
+    auto large=resolver;large.local_n_heads=bad.local_query_heads;large.seq_len=bad.flattened_rows;
+    EXPECT_THROW(applyQwen4ExpBufferGeometry(large,geometry,bad),std::overflow_error);
+}
+}
+
+namespace llaminar2::test
+{
+/** @test Public metadata estimation and actual GraphConfig allocation adapters copy the same phase schedule/R. */
+TEST(Qwen4ExpBufferLayout, Phase33EstimatorAndAllocatorAdaptersAgree)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    auto directory=qwen4MetadataFixture();
+    // Complete metadata-only FA/GDN projection geometry is required to enter
+    // the public hybrid estimator path; no tensor is materialized or executed.
+    directory.tensors.push_back({.name="blk.3.attn_q.weight",.dimensions={6144,2560},.type=GGUFTensorType::F16});
+    directory.tensors.push_back({.name="blk.3.attn_gate.weight",.dimensions={6144,2560},.type=GGUFTensorType::F16});
+    directory.tensors.push_back({.name="blk.0.attn_qkv.weight",.dimensions={10240,2560},.type=GGUFTensorType::F16});
+    directory.tensors.push_back({.name="blk.0.ssm_out.weight",.dimensions={2560,6144},.type=GGUFTensorType::F16});
+    directory.tensors.push_back({.name="blk.0.ssm_alpha.weight",.dimensions={48,2560},.type=GGUFTensorType::F16});
+    directory.tensors.push_back({.name="blk.0.ssm_beta.weight",.dimensions={48,2560},.type=GGUFTensorType::F16});
+    const auto profile=ModelMemoryProfile::fromGGUF(directory);
+    ASSERT_TRUE(profile.flash_next.has_value());
+    const auto inventory=qwen4ExpBufferDeclarations();
+    const auto spec=std::find_if(inventory.begin(),inventory.end(),[](const auto& d){return d.id==BufferId::QFN_QSA_PARTIALS;});
+    ASSERT_NE(spec,inventory.end());
+    for(const auto [flat,retained]:{std::pair{1,0},std::pair{1,16},std::pair{512,16}}) {
+        SCOPED_TRACE(flat);
+        SCOPED_TRACE(retained);
+        GraphConfig model;model.default_device=DeviceId::rocm(0);model.max_activation_rows=flat;
+        model.max_request_count=1;model.max_seq_len=65536;
+        Qwen4ExpGraphConfigBuilder::populateFromDirectory(directory,model);model.local_n_heads=6;
+        model.mtp.enabled=false;model.mtp.graph_capacity_draft_tokens=retained ? retained-1 : 0;
+        model.mtp.max_request_batch=1;admitQwen4ExpTestTable(model,ImmutableRowStoragePreference::VRAM);
+        ActivationGraphMemoryGeometry geometry;
+        geometry.batch_size=1;geometry.resident_graph_rows=flat;geometry.context_tokens=model.max_seq_len;
+        geometry.local_d_ff=160;geometry.local_n_heads=6;geometry.local_n_kv_heads=1;
+        geometry.first_layer=0;geometry.last_layer=47;geometry.total_shards=4;
+        geometry.mtp_target_query_rows=std::max(1,retained);geometry.retained_mtp_candidate_rows=retained;
+        geometry.generation_request_capacity=1;geometry.ngram_lookup=ImmutableRowLookupExecution::ResidentGPU;
+        std::size_t estimated[2]{},allocated[2]{};
+        for(int selected=0;selected<2;++selected) {
+            const auto schedule=selected ? Schedule::Prefill8Decode33 : Schedule::Uniform;
+            model.attention_phase_schedule=schedule;geometry.attention_phase_schedule=schedule;
+            estimated[selected]=ActivationMemoryEstimator::estimate(profile,geometry,model.default_device);
+            GraphResolverConfig resolver;resolver.seq_len=flat;resolver.d_model=model.d_model;resolver.local_n_heads=6;
+            applyQwen4ExpBufferGeometry(resolver,model); // Actual allocator adapter, not prebuilt dimensions.
+            const auto resolved=BufferAllocator::resolve(spec->spec,resolver);
+            ASSERT_EQ(resolved.shape.size(),1u);allocated[selected]=resolved.shape.front()*sizeof(std::int32_t);
+        }
+        const std::size_t oldRecords=std::size_t{6}*8*flat;
+        const std::size_t selectedRecords=std::size_t{6}*std::max(std::size_t{8}*flat,std::size_t{33}*std::max(1,retained));
+        EXPECT_EQ(allocated[0],oldRecords*sizeof(qwen4exp::QwenSparseAttentionPartial));
+        EXPECT_EQ(allocated[1],selectedRecords*sizeof(qwen4exp::QwenSparseAttentionPartial));
+        EXPECT_EQ(estimated[1]-estimated[0],allocated[1]-allocated[0]);
+        EXPECT_EQ(estimated[1]-estimated[0],(selectedRecords-oldRecords)*sizeof(qwen4exp::QwenSparseAttentionPartial));
+    }
+}
+}

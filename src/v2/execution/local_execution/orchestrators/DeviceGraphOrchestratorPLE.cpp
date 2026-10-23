@@ -160,6 +160,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         loop.minimum_draft_depth!=reference.minimum_draft_depth || loop.maximum_draft_depth!=reference.maximum_draft_depth ||
         loop.depth_policy_mode!=reference.depth_policy_mode ||
         cfg.activation_precision!=other.activation_precision || cfg.kv_cache_precision!=other.kv_cache_precision ||
+        cfg.attention_phase_schedule!=other.attention_phase_schedule ||
         cfg.qfn_hc_up_activation!=other.qfn_hc_up_activation || cfg.qfn_gdn_output_activation!=other.qfn_gdn_output_activation ||
         cfg.qfn_fa_output_activation!=other.qfn_fa_output_activation ||
         cfg.qfn_gdn_qkv_activation!=other.qfn_gdn_qkv_activation ||

@@ -46070,7 +46070,7 @@ namespace llaminar2
             resolveMoERouterArithmetic(debugEnv().gemm.moe_router_arithmetic, graph_builder_->architectureName()),
             debugEnv().gemm.cuda_moe_router_prefill);
         if (config.flash_next)
-            appendQwen4ExpArithmeticFingerprintFields(material.runtime, config.qfn_hc_up_activation, config.qfn_gdn_output_activation, config.qfn_fa_output_activation, config.qfn_gdn_qkv_activation);
+            appendQwen4ExpArithmeticFingerprintFields(material.runtime, config.qfn_hc_up_activation, config.qfn_gdn_output_activation, config.qfn_fa_output_activation, config.qfn_gdn_qkv_activation, config.attention_phase_schedule);
         material.topology = {
             {"first_layer_index", std::to_string(prefix_layout_.first_layer_index)},
             {"total_layers", std::to_string(prefix_layout_.total_layers)},

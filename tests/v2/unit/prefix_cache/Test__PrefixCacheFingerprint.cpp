@@ -737,3 +737,64 @@ TEST(Test__PrefixCacheFingerprint, QFNRouterDefaultResolvesBeforeIdentity)
         kDefaultGDNProjectionArithmetic, MoERouterArithmetic::ModelDefault), std::invalid_argument);
     EXPECT_TRUE(unresolved.empty());
 }
+
+/** @test Uniform preserves historical fields; the admitted split schedule changes identity across stable restarts. */
+TEST(Test__PrefixCacheFingerprint, QFNAttentionPhaseScheduleDefaultAndSplitIdentityAreStable)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    const auto single=QuantizedActivationOperandPrecision::SingleQ8;
+    const std::vector<PrefixFingerprintField> base{{"existing_runtime_authority","retained"}};
+    auto implicit=base;appendQwen4ExpArithmeticFingerprintFields(implicit,kDefaultQwen4ExpHCUpActivation);
+    auto uniform=base;appendQwen4ExpArithmeticFingerprintFields(uniform,kDefaultQwen4ExpHCUpActivation,single,single,single,Schedule::Uniform);
+    auto historical=base;
+    historical.push_back({"qfn_hc_up_activation",std::string(quantizedActivationOperandPrecisionName(kDefaultQwen4ExpHCUpActivation))});
+    historical.push_back({"qfn_hc_up_activation_revision","native-primary-residual-folds-v2"});
+    ASSERT_EQ(implicit.size(),historical.size());ASSERT_EQ(uniform.size(),historical.size());
+    for(std::size_t i=0;i<historical.size();++i){
+        EXPECT_EQ(implicit[i].name,historical[i].name);EXPECT_EQ(implicit[i].value,historical[i].value);
+        EXPECT_EQ(uniform[i].name,historical[i].name);EXPECT_EQ(uniform[i].value,historical[i].value);
+    }
+    auto split=base;appendQwen4ExpArithmeticFingerprintFields(split,kDefaultQwen4ExpHCUpActivation,single,single,single,Schedule::Prefill8Decode33);
+    ASSERT_EQ(split.size(),historical.size()+1);EXPECT_EQ(split.back().name,"qfn_attention_phase_schedule");
+    EXPECT_EQ(split.back().value,std::to_string(static_cast<unsigned>(Schedule::Prefill8Decode33)));
+    const auto ordinary_key=hashPrefixFingerprintFields("runtime",historical);
+    EXPECT_EQ(ordinary_key,hashPrefixFingerprintFields("runtime",uniform));
+    const auto selected_key=hashPrefixFingerprintFields("runtime",split);EXPECT_NE(selected_key,ordinary_key);
+    auto restarted=base;appendQwen4ExpArithmeticFingerprintFields(restarted,kDefaultQwen4ExpHCUpActivation,single,single,single,Schedule::Prefill8Decode33);
+    std::reverse(restarted.begin(),restarted.end());EXPECT_EQ(selected_key,hashPrefixFingerprintFields("runtime",restarted));
+}
+/** @test Unknown schedules and duplicate schedule authorities reject without mutating compatibility fields. */
+TEST(Test__PrefixCacheFingerprint, QFNAttentionPhaseScheduleRejectsUnknownAndDuplicateAuthority)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    const auto single=QuantizedActivationOperandPrecision::SingleQ8;
+    std::vector<PrefixFingerprintField> original{{"existing_runtime_authority","retained"}};
+    EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(original,single,single,single,single,static_cast<Schedule>(255)),std::invalid_argument);
+    ASSERT_EQ(original.size(),1u);EXPECT_EQ(original.front().name,"existing_runtime_authority");EXPECT_EQ(original.front().value,"retained");
+    for(const auto schedule:{Schedule::Uniform,Schedule::Prefill8Decode33}){
+        std::vector<PrefixFingerprintField> duplicate{{"qfn_attention_phase_schedule","foreign"}};
+        EXPECT_THROW(appendQwen4ExpArithmeticFingerprintFields(duplicate,single,single,single,single,schedule),std::invalid_argument);
+        ASSERT_EQ(duplicate.size(),1u);EXPECT_EQ(duplicate.front().name,"qfn_attention_phase_schedule");EXPECT_EQ(duplicate.front().value,"foreign");
+    }
+}
+
+/** @test Explicit FP16 base separates restart identity; default FP32 retains historical bytes. */
+TEST(Test__PrefixCacheFingerprint, QFNAttentionBaseIdentityIsStableAndRejectsInvalidAuthority)
+{
+    using A=qwen4exp::QwenSparseAttentionArithmetic;
+    std::vector<PrefixFingerprintField> original{{"existing", "retained"}};
+    auto fp32=original;appendQwen4ExpAttentionBaseFingerprintFields(fp32,A::FixedFP32);
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime",fp32),hashPrefixFingerprintFields("runtime",original));
+    auto fp16=original;appendQwen4ExpAttentionBaseFingerprintFields(fp16,A::TileFP16WithFP32Totals);
+    auto restart=original;appendQwen4ExpAttentionBaseFingerprintFields(restart,A::TileFP16WithFP32Totals);
+    EXPECT_NE(hashPrefixFingerprintFields("runtime",fp16),hashPrefixFingerprintFields("runtime",fp32));
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime",fp16),hashPrefixFingerprintFields("runtime",restart));
+    for(auto invalid:{A::TileFP16WithFP32Totals33,static_cast<A>(255)}) {
+        auto fields=original;EXPECT_THROW(appendQwen4ExpAttentionBaseFingerprintFields(fields,invalid),std::invalid_argument);
+        ASSERT_EQ(fields.size(),1u);EXPECT_EQ(fields.front().value,"retained");
+    }
+    for(auto policy:{A::FixedFP32,A::TileFP16WithFP32Totals}) {
+        auto duplicate=fp16;EXPECT_THROW(appendQwen4ExpAttentionBaseFingerprintFields(duplicate,policy),std::invalid_argument);
+        EXPECT_EQ(duplicate.size(),fp16.size());
+    }
+}

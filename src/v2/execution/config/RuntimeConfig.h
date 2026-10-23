@@ -2139,6 +2139,8 @@ namespace llaminar2
      */
     struct RuntimeConfig
     {
+        /// Setup snapshot copied into admission and graph allocation; never a live DebugEnv reference.
+        qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
         /// Maximum sequence length (buffer allocation sizing)
         int max_seq_len = 4096;
 
@@ -2218,7 +2220,25 @@ namespace llaminar2
         explicit RuntimeConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
 
         /**
-         * @brief Create RuntimeConfig by parsing raw strings from OrchestrationConfig
+         * @brief Parse the runtime policy and freeze its setup-only attention schedule.
+         * @param max_seq_len Admitted per-request logical context capacity.
+         * @param batch_size Requested batch before the existing MTP normalization.
+         * @param activation_precision_str Authored activation precision spelling.
+         * @param kv_cache_precision_str Authored native KV precision spelling.
+         * @param fused_backend Explicit ordinary fused-attention backend.
+         * @param routed_expert_compute_policy Typed routed-expert ownership policy.
+         * @param moe_hot_expert_cache Existing hot-expert cache configuration.
+         * @param moe_routed_prefill Existing routed-prefill execution configuration.
+         * @param moe_rebalance Existing expert rebalance configuration.
+         * @param prefix_cache Existing retained-prefix policy and capacity.
+         * @param mtp Existing captured speculative-generation policy.
+         * @param tp_allreduce_precision_override Existing explicit collective precision.
+         * @param ngram_table_policy Typed immutable-table admission policy.
+         * @return Value-owned runtime policy passed unchanged to planning/graph adapters.
+         * @throws std::exception For invalid authored precision, batch or table policy.
+         * @details Setup is read here once; later reloads cannot mutate the copied
+         * schedule in a retained runtime/admission. Arithmetic remains independently
+         * selected and must be compatible when the actual graph is constructed.
          */
         static RuntimeConfig fromOrchestrationConfig(
             int max_seq_len,
@@ -2236,6 +2256,9 @@ namespace llaminar2
             ImmutableRowTablePolicy ngram_table_policy = {})
         {
             RuntimeConfig rc;
+            // Freeze once, before planning. Later DebugEnv::reload cannot change
+            // the admitted value copied through participant and graph adapters.
+            rc.attention_phase_schedule = debugEnv().attention.qfn_sparse_attention_phase_schedule;
             rc.max_seq_len = max_seq_len;
             rc.batch_size = resolveRuntimeBatchSizeForMTP(batch_size, mtp);
             rc.activation_precision = parseActivationPrecision(activation_precision_str);

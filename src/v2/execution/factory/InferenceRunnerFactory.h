@@ -109,6 +109,8 @@ namespace llaminar2
     {
         int max_seq_len = 4096;
         int activation_seq_len = 0;
+        /// Original admitted schedule; copied into both graph-construction paths.
+        qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
         /** Authored ordinary output demand, frozen before factory materialization. */
         OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
         int batch_size = 1;
@@ -325,6 +327,7 @@ namespace llaminar2
             InferenceRunnerConfig config;
             config.max_seq_len = runtime.max_seq_len;
             config.activation_seq_len = runtime.resident_graph_rows;
+            config.attention_phase_schedule = runtime.attention_phase_schedule;
             config.ordinary_terminal_projection = runtime.ordinary_terminal_projection;
             config.batch_size = runtime.batch_size;
             config.activation_precision = runtime.activation_precision;

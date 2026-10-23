@@ -9,6 +9,7 @@
  */
 #include "Qwen4ExpGraph.h"
 #include "Qwen4ExpConfig.h"
+#include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "Qwen4ExpBufferLayout.h"
 #include "Qwen4ExpTrunkBinding.h"
 #include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
@@ -29,10 +30,20 @@ namespace llaminar2
 {
 Qwen4ExpGraph::Qwen4ExpGraph(const GraphConfig &config,std::shared_ptr<IMPIContext> mpi)
     :Qwen35MoEGraph(config,std::move(mpi)),
-     sparse_attention_arithmetic_(debugEnv().attention.qfn_sparse_attention)
+     sparse_attention_arithmetic_(debugEnv().attention.qfn_sparse_attention),
+     sparse_attention_phase_schedule_(config_.attention_phase_schedule)
 {
     if(!config_.flash_next)
         throw std::invalid_argument("Flash Next graph requires an authenticated exact GGUF configuration");
+    qwen4exp::validateQwenSparseAttentionPhaseSchedule(sparse_attention_phase_schedule_,config_.default_device.type);
+    if(sparse_attention_phase_schedule_==qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33 &&
+       (sparse_attention_arithmetic_!=qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals || config_.max_request_count!=1))
+        throw std::invalid_argument("QSA prefill8_decode33 requires explicit fp16_tile and the canonical single-request graph family");
+}
+void Qwen4ExpGraph::appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
+{
+    Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(material);
+    appendQwen4ExpAttentionBaseFingerprintFields(material.runtime, sparse_attention_arithmetic_);
 }
 GraphSchema Qwen4ExpGraph::getSchema() const
 {
@@ -480,6 +491,13 @@ std::optional<std::string> Qwen4ExpGraph::addModelAttentionConsumer(ComputeGraph
     const auto &input=modelForwardInput();
     if(!binding.cache || binding.requests!=1 || input.batch_size!=1)
         throw std::invalid_argument("Flash Next sparse consumer requires the supported canonical single-request lane");
+    // Resolve the exact immutable phase program before creating state/prior
+    // nodes. A generic multirow Decode outside the retained family must fail
+    // cold, rather than reuse the Prefill storage envelope or choose8 silently.
+    const int retainedRows=retainsMTPGraphCapacity(config_.mtp) ? resolveMTPRetainedTargetQueryRows(config_.mtp) : 0;
+    const auto arithmetic=Qwen4ExpSparseAttentionBuilder::attentionArithmeticForInvocation(
+        input.execution_phase,binding.device,binding.queryRows,config_.max_request_count,
+        retainedRows,sparse_attention_arithmetic_,sparse_attention_phase_schedule_);
     auto &owner=state(*binding.cache,input.device_state_publication_stream);
     const auto &pool=owner.sparse(binding.modelLayer,0);
     const auto &weights=layerWeightBindingsForGraph(binding.modelLayer).flash_next.indexer;
@@ -521,7 +539,8 @@ std::optional<std::string> Qwen4ExpGraph::addModelAttentionConsumer(ComputeGraph
             .publication=verifier ? Qwen4ExpSparsePublication::DeferredVerifierAcceptance : Qwen4ExpSparsePublication::AcceptAllLiveRows,
             .poolSelection=Qwen4ExpSparseAttentionBuilder::poolSelectionForInvocation(
                 input.execution_phase,binding.device,binding.queryRows),
-            .attentionArithmetic=sparse_attention_arithmetic_},
+            .attentionArithmetic=arithmetic,.executionPhase=input.execution_phase,
+            .retainedMtpCandidateRows=retainedRows},
         {projection(weights.query,binding.device),projection(weights.key,binding.device),gain(weights.query_norm),gain(weights.key_norm),{},{}},
         {replay,fp32(BufferId::QFN_QSA_QUERY),fp32(BufferId::QFN_QSA_RAW_KEY),
             pool.partialKeys,pool.pooledKeys,fp32(BufferId::QFN_QSA_PREPARED_QUERY),fp32(BufferId::QFN_QSA_SCORES),

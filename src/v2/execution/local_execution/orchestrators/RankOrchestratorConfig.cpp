@@ -227,6 +227,7 @@ namespace llaminar2
         // Runtime fields from pre-parsed RuntimeConfig
         config.max_seq_len = runtime.max_seq_len;
         config.resident_graph_rows = runtime.resident_graph_rows;
+        config.attention_phase_schedule = runtime.attention_phase_schedule;
         config.ordinary_terminal_projection = runtime.ordinary_terminal_projection;
         config.batch_size = runtime.batch_size;
         config.activation_precision = runtime.activation_precision;

@@ -63,7 +63,9 @@ struct Capture final
      * @param observation ON/OFF metadata label; it does not affect captured operations.
      * @throws std::runtime_error For repeated recording, native API failure, foreign
      * kernels, changed functions/geometry, or a broken producer/merge dependency chain.
-     * @details Every admitted repeat retains the same two function pointers and one
+     * @details Static role geometry declares the admitted block size; resource
+     * checks use that declared size without weakening exact native geometry.
+     * Every admitted repeat retains the same two function pointers and one
      * ordered graph chain. Failed recording ends capture and retires its abandoned
      * graph before rethrowing. All storage must already be bound and remain live
      * through the terminal join in this object's destructor.
@@ -85,11 +87,12 @@ struct Capture final
             require(kind==QSA_RT(GraphNodeTypeKernel),"Attention-only capture contains a non-kernel node");
             ObservationKernelParams p{};check(QSA_RT(GraphKernelNodeGetParams)(node,&p));
             const auto metadata=inspectObservationKernel(nodes[index],stream);
-            require(metadata.identity && metadata.registers>0 && metadata.local_bytes==0 && metadata.max_threads>=256 && metadata.resident_block_limit>0,
-                "Captured native function has invalid resources or private storage");
             const std::string& name=metadata.name;const bool isProducer=name.find(producer)!=std::string::npos;
             const bool isMerge=name.find(merge)!=std::string::npos;
             require(isProducer!=isMerge,"Captured kernel differs from exact attention pair");
+            const int expectedThreads=isProducer?producerThreads:mergeThreads;
+            require(metadata.identity && metadata.registers>0 && metadata.local_bytes==0 && metadata.max_threads>=expectedThreads && metadata.resident_block_limit>0,
+                "Captured native function has invalid resources or private storage");
             roles[index]=isProducer?0:1;
             const auto expectedGrid=isProducer?producerGrid:mergeGrid;
             if(expectedGrid.x)require(p.gridDim.x==expectedGrid.x&&p.gridDim.y==expectedGrid.y&&p.gridDim.z==expectedGrid.z&&
@@ -187,6 +190,9 @@ struct Inputs final
     }
 };
 
+/** @brief Explicit fixture-only scratch extent; production defaults remain eight. */
+enum class FixturePartialStorage { Original8=8, Virtual33=33 };
+
 /**
  * @brief Exclusive fixed-attention outputs and partials over shared immutable inputs.
  * @details Test-only schedule adapters may inherit these storage owners on the
@@ -202,14 +208,15 @@ struct FixedRun
      * @param s Exact fixture stream used for setup, recording and replay.
      * @param observed Whether the captured arguments publish logical work observations.
      * @param repeats Number of complete retained producer/merge pairs, from 1 to 256.
+     * @param storage Explicit fixture scratch layout; existing callers retain eight.
      * @throws std::runtime_error For invalid repeats or native allocation/copy failure.
-     * @details Each row/head owns 256 FP32 outputs and eight exclusive partials; a
+     * @details Each row/head owns 256 FP32 outputs and the declared exclusive partials; a
      * trailing 16-float output guard retains the existing poison bytes. The setup
      * upload joins before capture and timing. Capture is declared last, so its
      * terminal destructor join precedes destruction of every borrowed output bank.
      */
-    FixedRun(QwenSparseAttention a,QSA_STREAM s,bool observed=true,int repeats=1):poison(std::size_t(a.row_capacity)*a.query_heads*256+16,-817.25f),
-        initial_partials(std::size_t(a.row_capacity)*a.query_heads*8),output(poison.size()),partials(std::size_t(a.row_capacity)*a.query_heads*8),observations(std::size_t(a.row_capacity)*a.query_heads),args(a),capture(s,repeats){
+    FixedRun(QwenSparseAttention a,QSA_STREAM s,bool observed=true,int repeats=1,FixturePartialStorage storage=FixturePartialStorage::Original8):poison(std::size_t(a.row_capacity)*a.query_heads*256+16,-817.25f),
+        initial_partials(std::size_t(a.row_capacity)*a.query_heads*static_cast<int>(storage)),output(poison.size()),partials(initial_partials.size()),observations(std::size_t(a.row_capacity)*a.query_heads),args(a),capture(s,repeats){
         args.output=output.data;args.gpu_partials=partials.data;args.observations=observations.data;
         if(!observed)args.observations=nullptr;
         // Equal dirty payload makes empty-partition preservation comparable across

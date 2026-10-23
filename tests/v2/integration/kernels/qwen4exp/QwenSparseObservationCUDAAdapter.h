@@ -31,7 +31,7 @@ inline cudaError_t observationDependencies(ObservationNode node,ObservationNode*
  * @brief Inspect one original recorded CUDA node without launching it.
  * @param node Kernel node borrowed from the retained runtime graph.
  * @param stream Exact fixture stream; the graph and context must remain live.
- * @return Original captured identity, symbol, static resources and 256-thread resource-based resident-block limit (theoretical occupancy).
+ * @return Original captured identity, symbol, static resources and actual captured block resource-based resident-block limit (theoretical occupancy).
  * @throws std::runtime_error For missing identities or any Driver API failure.
  * @details Inspection occurs after capture and before timing. Handles remain
  * borrowed; this operation performs no synchronization or profiler attachment.
@@ -55,7 +55,11 @@ inline NativeKernelMetadata inspectObservationKernel(ObservationNode node,QSA_ST
     checked(driver.funcGetAttribute(&shared,CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,function));
     checked(driver.funcGetAttribute(&local,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,function));
     checked(driver.funcGetAttribute(&result.max_threads,CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,function));
-    checked(driver.occupancyMaxActiveBlocksPerMultiprocessor(&result.resident_block_limit,function,256,params.sharedMemBytes));
+    // Query the resource limit for this captured block, never achieved usage.
+    // Capture separately authenticates each role's static expected geometry.
+    const int threads=int(params.blockDimX*params.blockDimY*params.blockDimZ);
+    if(threads<=0)throw std::runtime_error("Observation CUDA node has no block threads");
+    checked(driver.occupancyMaxActiveBlocksPerMultiprocessor(&result.resident_block_limit,function,threads,params.sharedMemBytes));
     result.shared_bytes=static_cast<std::size_t>(shared);result.local_bytes=static_cast<std::size_t>(local);return result;
 }
 }

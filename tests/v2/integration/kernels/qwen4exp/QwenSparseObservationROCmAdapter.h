@@ -29,7 +29,7 @@ inline hipError_t observationDependencies(ObservationNode node,ObservationNode* 
  * @brief Inspect one retained HIP kernel node without replay or a terminal join.
  * @param node Borrowed native node; its retained graph must remain live.
  * @param stream Exact fixture stream used to resolve the original symbol.
- * @return Captured identity, symbol, native static resources and 256-thread resource-based resident-block limit (theoretical occupancy).
+ * @return Captured identity, symbol, native static resources and actual captured block resource-based resident-block limit (theoretical occupancy).
  * @throws std::runtime_error For native metadata failure or an empty symbol.
  */
 inline NativeKernelMetadata inspectObservationKernel(ObservationNode node,QSA_STREAM stream)
@@ -40,6 +40,10 @@ inline NativeKernelMetadata inspectObservationKernel(ObservationNode node,QSA_ST
     hipFuncAttributes attributes{};check(hipFuncGetAttributes(&attributes,params.func));
     NativeKernelMetadata result{.identity=params.func,.name=name,.registers=attributes.numRegs,
         .shared_bytes=attributes.sharedSizeBytes,.local_bytes=attributes.localSizeBytes,.max_threads=attributes.maxThreadsPerBlock};
-    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&result.resident_block_limit,params.func,256,params.sharedMemBytes));return result;
+    // Occupancy is a resource limit for the captured block, not achieved usage.
+    // Capture separately enforces each role's statically declared exact geometry.
+    const int threads=int(params.blockDim.x*params.blockDim.y*params.blockDim.z);
+    if(threads<=0)throw std::runtime_error("Observation HIP node has no block threads");
+    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&result.resident_block_limit,params.func,threads,params.sharedMemBytes));return result;
 }
 }

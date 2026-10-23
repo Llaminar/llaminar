@@ -4,8 +4,9 @@
  *
  * Four fixed global query heads share each selected KV tile. One wave owns a
  * head and one lane owns a complete QK score, using ordered packed-half dots
- * with FP32 accumulation. Eight immutable interleaved tile streams preserve
- * the arithmetic for every admitted M and compact TP shard. Tile-local half
+ * with FP32 accumulation. Production retains eight immutable interleaved tile
+ * streams; the explicit test-native33 program assigns one64-token tile per part.
+ * Each program has fixed arithmetic for every admitted M and compact TP shard. Tile-local half
  * PV chains widen into FP32 online totals, so long contexts cannot overflow a
  * persistent half accumulator. All storage is caller-owned or static LDS.
  *
@@ -75,10 +76,15 @@ __device__ __forceinline__ float2 rotateSparseHalfSplitPair(
  * @brief Load one selected 64-token, 128-coordinate key panel into padded LDS.
  * @tparam Transform Whether the admitted native key bank is stored before RoPE.
  * @tparam Coordinate First coordinate of this immutable 128-coordinate panel.
+ * @tparam LoadUnroll Vector-transfer scheduling factor: original1 or diagnostic4.
+ * @tparam FullPanel True only when the wrapper proves all64 key tokens live.
+ * @tparam Threads Immutable cooperative copy stride: 256 for G4 or 384 for G6.
  * @param p Original immutable attention bindings and native cache policy.
  * @param r Authenticated original replay, including absolute position origin.
  * @param selected Sorted selected indices at this tile's first logical token.
  * @param count Live tile tokens, from one through64; padding is never read.
+ * @param logicalBegin Original selected ordinal of this panel's first token.
+ * @param allVisible Row-uniform identity proof, enabled only for diagnostic33.
  * @param kvHead Owned local native KV head shared by this CTA's query heads.
  * @param origin Canonical physical ring origin for the current query row.
  * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
@@ -86,15 +92,20 @@ __device__ __forceinline__ float2 rotateSparseHalfSplitPair(
  * @details Each selected native element is read once per group. The original
  * readKeyAs rounding boundaries are retained before FP16 tile publication.
  * The caller publishes the entire panel with a CTA barrier before consuming it.
+ * All-visible addressing uses the independently validated original ordinal.
+ * Sparse lists retain selected-ID loads; physical ring mapping and absolute
+ * RoPE positions are unchanged. Production8 always passes constant false.
  */
-template<bool Transform, int Coordinate>
-__device__ __forceinline__ void loadSparseHalfKeys(
+template<bool Transform, int Coordinate, int LoadUnroll, bool FullPanel, int Threads>
+__device__ __forceinline__ void copySparseHalfKeysPanel(
     const QwenSparseAttention& p, const QwenSparseReplay& r,
-    const std::int32_t* selected, int count, int kvHead, int origin, int capacity,
-    half2* tile)
+    const std::int32_t* selected, int count, int logicalBegin, bool allVisible,
+    int kvHead, int origin, int capacity, half2* tile)
 {
-#pragma unroll 1
-    for (int vector = int(threadIdx.x); vector < 64 * 16; vector += 256)
+    static_assert(LoadUnroll==1 || LoadUnroll==4,"Closed native tile-load schedule");
+    static_assert(Threads==256 || Threads==384,"Closed cooperative tile-copy geometry");
+#pragma unroll(LoadUnroll)
+    for (int vector = int(threadIdx.x); vector < 64 * 16; vector += Threads)
     {
         const int token = vector / 16, columnVector = vector % 16;
         if constexpr (Transform && Coordinate == 0)
@@ -113,9 +124,9 @@ __device__ __forceinline__ void loadSparseHalfKeys(
                     low.pairs[item] = __float2half2_rn(0.0f);
                     high.pairs[item] = __float2half2_rn(0.0f);
                 }
-                if (token < count)
+                if (FullPanel || token < count)
                 {
-                    const int logical = selected[token];
+                    const int logical = allVisible ? logicalBegin + token : selected[token];
                     const int physical = detail::physicalRow(logical, origin, capacity);
                     const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
                         std::size_t(physical) * p.kv.keys.token_stride_bytes +
@@ -142,9 +153,10 @@ __device__ __forceinline__ void loadSparseHalfKeys(
         SparseHalfVector value;
 #pragma unroll
         for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
-        if (token < count)
+        if (FullPanel || token < count)
         {
-            const int physical = detail::physicalRow(selected[token], origin, capacity);
+            const int logical = allVisible ? logicalBegin + token : selected[token];
+            const int physical = detail::physicalRow(logical, origin, capacity);
             const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
                 std::size_t(physical) * p.kv.keys.token_stride_bytes +
                 std::size_t(kvHead) * p.kv.keys.head_stride_bytes +
@@ -156,31 +168,83 @@ __device__ __forceinline__ void loadSparseHalfKeys(
 }
 
 /**
+ * @brief Dispatch one shared key-copy body with explicit full-panel permission.
+ * @tparam Transform Whether the admitted native key bank is stored before RoPE.
+ * @tparam Coordinate First coordinate of this immutable 128-coordinate panel.
+ * @tparam LoadUnroll Existing vector scheduling factor, independent of permission.
+ * @tparam AllowFullPanel True only for the explicit Parts33 producer.
+ * @tparam Threads Exact CTA size shared by copy wrappers and their panel body.
+ * @param p Original immutable attention bindings and native cache policy.
+ * @param r Authenticated original replay, including absolute position origin.
+ * @param selected Sorted selected indices at this tile's first logical token.
+ * @param count Live tile tokens, from one through64; padding is never read.
+ * @param logicalBegin Original selected ordinal of this panel's first token.
+ * @param allVisible Row-uniform identity proof, enabled only for diagnostic33.
+ * @param kvHead Owned local native KV head shared by this CTA's query heads.
+ * @param origin Canonical physical ring origin for the current query row.
+ * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
+ * @param tile Exclusive panel storage with68 packed pairs per token.
+ * @details Each selected native element is read once per group. The original
+ * readKeyAs rounding boundaries are retained before FP16 tile publication.
+ * The caller publishes the entire panel with a CTA barrier before consuming it.
+ * Full64 panels specialize the body only with explicit permission; otherwise
+ * every original count guard remains. Dispatch adds no synchronization.
+ * All-visible addressing uses the independently validated original ordinal.
+ * Sparse lists retain selected-ID loads; physical ring mapping and absolute
+ * RoPE positions are unchanged. Production8 always passes constant false.
+ */
+template<bool Transform, int Coordinate, int LoadUnroll=1, bool AllowFullPanel=false, int Threads=256>
+__device__ __forceinline__ void loadSparseHalfKeys(
+    const QwenSparseAttention& p, const QwenSparseReplay& r,
+    const std::int32_t* selected, int count, int logicalBegin, bool allVisible,
+    int kvHead, int origin, int capacity, half2* tile)
+{
+    if constexpr (AllowFullPanel)
+        if (count == 64)
+        {
+            copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, true, Threads>(p,r,selected,count,logicalBegin,allVisible,kvHead,origin,capacity,tile);
+            return;
+        }
+    copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, false, Threads>(p,r,selected,count,logicalBegin,allVisible,kvHead,origin,capacity,tile);
+}
+
+/**
  * @brief Load32 selected value rows into the shared key/value panel.
+ * @tparam LoadUnroll Vector-transfer scheduling factor: original1 or diagnostic4.
+ * @tparam FullPanel True only when the wrapper proves all32 value tokens live.
+ * @tparam Threads Immutable cooperative copy stride: 256 for G4 or 384 for G6.
  * @param p Original immutable native FP16 value binding.
  * @param selected Sorted selected indices at this value panel's first token.
  * @param count Live tokens in the panel; zero produces only neutral LDS values.
+ * @param logicalBegin Original selected ordinal of this panel's first token.
+ * @param allVisible Row-uniform identity proof, enabled only for diagnostic33.
  * @param kvHead Owned native KV head shared by all CTA consumers.
  * @param origin Canonical physical ring origin.
  * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
  * @param tile Exclusive32-by128 packed-half panel, reused after key retirement.
  * @details Vector loads read only live selected values. The caller owns the
  * publication and retirement barriers, so this helper never synchronizes.
+ * Identity rows use validated original ordinals; sparse rows read selected IDs.
+ * Count-zero panels read neither route. Both preserve the original ring map.
  */
-__device__ __forceinline__ void loadSparseHalfValues(
+template<int LoadUnroll, bool FullPanel, int Threads>
+__device__ __forceinline__ void copySparseHalfValuesPanel(
     const QwenSparseAttention& p, const std::int32_t* selected, int count,
-    int kvHead, int origin, int capacity, half2* tile)
+    int logicalBegin, bool allVisible, int kvHead, int origin, int capacity, half2* tile)
 {
-#pragma unroll 1
-    for (int vector = int(threadIdx.x); vector < 32 * 32; vector += 256)
+    static_assert(LoadUnroll==1 || LoadUnroll==4,"Closed native tile-load schedule");
+    static_assert(Threads==256 || Threads==384,"Closed cooperative tile-copy geometry");
+#pragma unroll(LoadUnroll)
+    for (int vector = int(threadIdx.x); vector < 32 * 32; vector += Threads)
     {
         const int token = vector / 32, pair = (vector % 32) * 4;
         SparseHalfVector value;
 #pragma unroll
         for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
-        if (token < count)
+        if (FullPanel || token < count)
         {
-            const int physical = detail::physicalRow(selected[token], origin, capacity);
+            const int logical = allVisible ? logicalBegin + token : selected[token];
+            const int physical = detail::physicalRow(logical, origin, capacity);
             const auto* bytes = static_cast<const unsigned char*>(p.kv.values.data) +
                 std::size_t(physical) * p.kv.values.token_stride_bytes +
                 std::size_t(kvHead) * p.kv.values.head_stride_bytes + std::size_t(pair) * sizeof(half2);
@@ -191,11 +255,115 @@ __device__ __forceinline__ void loadSparseHalfValues(
 }
 
 /**
- * @brief Produce eight batch-invariant FP16 tile streams over native sparse KV.
+ * @brief Dispatch one shared value-copy body with explicit full-panel permission.
+ * @tparam LoadUnroll Existing vector scheduling factor, independent of permission.
+ * @tparam AllowFullPanel True only for the explicit Parts33 producer.
+ * @tparam Threads Exact CTA size shared by copy wrappers and their panel body.
+ * @param p Original immutable native FP16 value binding.
+ * @param selected Sorted selected indices at this value panel's first token.
+ * @param count Live tokens in the panel; zero produces only neutral LDS values.
+ * @param logicalBegin Original selected ordinal of this panel's first token.
+ * @param allVisible Row-uniform identity proof, enabled only for diagnostic33.
+ * @param kvHead Owned native KV head shared by all CTA consumers.
+ * @param origin Canonical physical ring origin.
+ * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
+ * @param tile Exclusive32-by128 packed-half panel, reused after key retirement.
+ * @details Vector loads read only live selected values. The caller owns the
+ * publication and retirement barriers, so this helper never synchronizes.
+ * Identity rows use validated original ordinals; sparse rows read selected IDs.
+ * Count-zero panels read neither route. Both preserve the original ring map.
+ * Only permitted full32 panels specialize the shared body. Zero and partial
+ * counts always retain the original guard and perform no padded native read.
+ */
+template<int LoadUnroll=1, bool AllowFullPanel=false, int Threads=256>
+__device__ __forceinline__ void loadSparseHalfValues(
+    const QwenSparseAttention& p, const std::int32_t* selected, int count,
+    int logicalBegin, bool allVisible, int kvHead, int origin, int capacity, half2* tile)
+{
+    if constexpr (AllowFullPanel)
+        if (count == 32)
+        {
+            copySparseHalfValuesPanel<LoadUnroll, true, Threads>(p,selected,count,logicalBegin,allVisible,kvHead,origin,capacity,tile);
+            return;
+        }
+    copySparseHalfValuesPanel<LoadUnroll, false, Threads>(p,selected,count,logicalBegin,allVisible,kvHead,origin,capacity,tile);
+}
+
+/**
+ * @brief Accumulate one parity owner's value panel without changing half-FMA order.
+ * @tparam FullTile True only after proving the original selected tile has 64 tokens.
+ * @param probabilities Published 64-token probability row of this original head.
+ * @param tile Published 32-token native FP16 value panel shared by this CTA.
+ * @param chunk Original value-panel ordinal, zero or one within the 64-token tile.
+ * @param lane Original 64-lane wave lane; its half-wave parity owns even or odd tokens.
+ * @param count Original selected tile count in [0,64]; no padded token is read.
+ * @param weighted Original four lane-private packed-half accumulators, borrowed.
+ * @details Both instantiations share the same ascending token/coordinate body.
+ * The full specialization omits only the impossible token-tail condition;
+ * the partial specialization preserves every guard and signed-zero boundary.
+ * The caller owns all LDS publication/retirement and this helper never fences.
+ */
+template<bool FullTile>
+__device__ __forceinline__ void accumulateSparseHalfValuePanel(
+    const half* probabilities,const half2* tile,int chunk,int lane,int count,
+    half2 (&weighted)[4])
+{
+#pragma unroll 4
+    for (int token = 0; token < 16; ++token)
+    {
+        const int selected = 2 * token + lane / 32;
+        // Partial tiles retain exactly the original real-token guard. Padded
+        // +0 updates would change underflowed negative-zero half accumulators.
+        if constexpr (!FullTile)
+            if (chunk * 32 + selected >= count) continue;
+        const half2 probability = __half2half2(probabilities[chunk * 32 + selected]);
+#pragma unroll
+        for (int coordinate = 0; coordinate < 4; ++coordinate)
+            weighted[coordinate] = __hfma2(probability,
+                tile[selected * 128 + (lane % 32) * 4 + coordinate], weighted[coordinate]);
+    }
+}
+
+/**
+ * @brief Admit the guard-free PV body only for an explicitly permitted full tile.
+ * @tparam AllowFullTile True only for the explicit Parts33 producer.
+ * @param probabilities Original head's published probability row.
+ * @param tile Original published native value panel.
+ * @param chunk Original panel ordinal, zero or one.
+ * @param lane Original 64-lane wave lane and parity owner.
+ * @param count Original tile count; only exactly 64 selects the full body.
+ * @param weighted Borrowed original four packed-half accumulators.
+ * @details This dispatch changes neither accumulator ownership nor operation
+ * order. Production 8 always instantiates the guarded body. Partial/zero tiles
+ * never enter the full body, and no host state or synchronization is consulted.
+ */
+template<bool AllowFullTile>
+__device__ __forceinline__ void accumulateSparseHalfValues(
+    const half* probabilities,const half2* tile,int chunk,int lane,int count,
+    half2 (&weighted)[4])
+{
+    if constexpr (AllowFullTile)
+        if (count == 64)
+        {
+            accumulateSparseHalfValuePanel<true>(probabilities,tile,chunk,lane,count,weighted);
+            return;
+        }
+    accumulateSparseHalfValuePanel<false>(probabilities,tile,chunk,lane,count,weighted);
+}
+
+/**
+ * @brief Produce fixed batch-invariant FP16 tile streams over native sparse KV.
  * @tparam Transform Whether selected keys require the declared pre-RoPE transform.
+ * @tparam Parts Fixed arithmetic streams: production8 or explicit test-native33.
+ * @details The33 experiment uses one64-token virtual tile per nonempty part;
+ * its original first recurrence, parity and publication are not simplified.
+ * Its admitted selected extent fits 33 tiles, so each nonempty part executes
+ * exactly once. The explicit trip count exposes that invariant to the compiler
+ * without changing the literal recurrence or the production 8 stream traversal.
  * @param p Persistent original row, head, cache, selection and partial bindings.
- * @details The grid is [rows,intersected global four-head groups,eight streams].
- * A64-token tile belongs to (tile_index modulo8), independent of row capacity,
+ * @details The grid uses rows, intersected canonical head groups and Parts
+ * streams. Groups own four heads for production 8 and six for diagnostic 33.
+ * A64-token tile belongs to (tile_index moduloParts), independent of row capacity,
  * live M, head-shard width or scheduling. The two half-waves accumulate even
  * and odd PV tokens separately, then merge their FP32 totals in that fixed
  * order. Probability scaling by exactly1/128 bounds every32-term half chain
@@ -203,29 +371,46 @@ __device__ __forceinline__ void loadSparseHalfValues(
  * scale. Inactive rows and unowned heads never publish storage. Empty streams
  * publish only zero-denominator metadata, leaving their payload unauthored.
  */
-template<bool Transform>
-__global__ __launch_bounds__(256, 2) void selectedAttentionFP16Tiles(QwenSparseAttention p)
+template<bool Transform,int Parts=QwenSparsePartitions>
+__global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttentionFP16Tiles(QwenSparseAttention p)
 {
+    static_assert(Parts==8 || Parts==33,"Closed FP16 partition experiment");
+    // Each wave retains one original head's arithmetic. Canonical six-head
+    // groups divide each 12-head KV interval, so the 33-part diagnostic shares
+    // each native panel across six head slots without crossing a KV owner.
+    // Production 8 retains four-head groups and the original unroll1 copy hint.
+    constexpr int GroupHeads = Parts == 33 ? 6 : 4;
+    constexpr int Threads = 64 * GroupHeads;
+    static_assert(12 % GroupHeads == 0, "Attention groups must not cross a KV head");
+    constexpr int LoadUnroll=Parts==33?4:1;
+    constexpr int QKUnroll = Parts == 33 ? 64 : 16;
+    static_assert(Parts != 33 || QwenSparseSelected <= Parts * 64,
+                  "The single-pass 33 schedule requires at most 33 selected tiles");
     const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
     const int row = int(blockIdx.x), lane = int(threadIdx.x) % 64;
     const int wave = int(threadIdx.x) / 64;
     if (row >= r.live_rows) return;
-    const int group = (p.query_head_start / 4 + int(blockIdx.y)) * 4;
+    const int group = (p.query_head_start / GroupHeads + int(blockIdx.y)) * GroupHeads;
     const int head = group + wave - p.query_head_start;
     const bool owned = head >= 0 && head < p.query_heads;
     // A whole wave owns one global head. Arithmetic can skip unowned waves,
-    // but all 256 threads retain cooperative KV transfers and CTA barriers.
+    // but all CTA threads retain cooperative KV transfers and CTA barriers.
     // Query and probability rows are wave-private, so no live head consumes
     // an unowned wave's unauthored arithmetic or probability storage.
     const int kvHead = group / 12 - p.kv_head_start;
     const int total = p.selected_count[row];
     require(total > 0 && total <= QwenSparseSelected);
+    // Valid sorted unique membership covering every visible token is identity.
+    // Every live ordinal is checked before the original key-publication barrier.
+    // Production8 folds this proof mode false and retains original sparse reads.
+    const int visible = r.prefix_tokens + row + 1;
+    const bool allVisible = Parts == 33 && total == visible;
     const int first = int(blockIdx.z) * 64;
     if (first >= total)
     {
         if (owned && lane == 0)
         {
-            auto& partial = p.gpu_partials[(std::size_t(row) * p.query_heads + head) * 8 + blockIdx.z];
+            auto& partial = p.gpu_partials[(std::size_t(row) * p.query_heads + head) * Parts + blockIdx.z];
             partial.maximum = -INFINITY;
             partial.denominator = 0.0f;
             partial.key_elements = partial.value_elements = 0;
@@ -238,9 +423,9 @@ __global__ __launch_bounds__(256, 2) void selectedAttentionFP16Tiles(QwenSparseA
         if (p.kv.key_rotary_source == QwenSparseRotarySource::TablePlanes)
             require(static_cast<long long>(r.position_origin) + r.prefix_tokens + row < p.kv.key_position_capacity);
 
-    __shared__ __align__(16) half2 queries[4][128];
+    __shared__ __align__(16) half2 queries[GroupHeads][128];
     __shared__ __align__(16) half2 tile[64 * 68];
-    __shared__ half probabilities[4][64];
+    __shared__ half probabilities[GroupHeads][64];
 #pragma unroll
     for (int part = 0; part < 2; ++part)
     {
@@ -260,37 +445,41 @@ __global__ __launch_bounds__(256, 2) void selectedAttentionFP16Tiles(QwenSparseA
     float2 totals[4]{};
     int consumed = 0;
     const auto* indices = p.selected + std::size_t(row) * QwenSparseSelected;
-    for (int begin = first; begin < total; begin += 8 * 64)
+    for (int begin = first, iteration = 0; Parts == 33 ? iteration == 0 : begin < total;
+         begin += Parts * 64, ++iteration)
     {
         const int count = min(64, total - begin);
         if (lane < count)
         {
             const int logical = indices[begin + lane];
-            require(logical >= 0 && logical < r.prefix_tokens + row + 1 &&
-                (begin + lane == 0 || logical > indices[begin + lane - 1]));
+            if (allVisible)
+                require(logical == begin + lane);
+            else
+                require(logical >= 0 && logical < r.prefix_tokens + row + 1 &&
+                    (begin + lane == 0 || logical > indices[begin + lane - 1]));
         }
         float score = 0.0f;
-        loadSparseHalfKeys<Transform, 0>(p, r, indices + begin, count, kvHead, origin, capacity, tile);
+        loadSparseHalfKeys<Transform, 0, LoadUnroll, (Parts == 33), Threads>(p, r, indices + begin, count, begin, allVisible, kvHead, origin, capacity, tile);
         __syncthreads();
         using NativePair = _Float16 __attribute__((ext_vector_type(2)));
         if (owned)
         {
             // A wider scheduling window exposes the next aligned LDS reads
             // before the dependent dot chain completes. Dot coordinates and
-            // their FP32 accumulation order remain unchanged; bounded unrolling
-            // limits register lifetimes compared with a fully expanded panel.
-#pragma unroll 16
+            // their FP32 accumulation order remain unchanged. The scheduling
+            // width is sealed by Parts; production8 retains its original16.
+#pragma unroll(QKUnroll)
             for (int pair = 0; pair < 64; ++pair)
                 score = __builtin_amdgcn_fdot2(__builtin_bit_cast(NativePair, queries[wave][pair]),
                     __builtin_bit_cast(NativePair, tile[lane * 68 + pair]), score, false);
         }
         __syncthreads(); // Every QK reader retires before the second panel replaces K.
-        loadSparseHalfKeys<Transform, 128>(p, r, indices + begin, count, kvHead, origin, capacity, tile);
+        loadSparseHalfKeys<Transform, 128, LoadUnroll, (Parts == 33), Threads>(p, r, indices + begin, count, begin, allVisible, kvHead, origin, capacity, tile);
         __syncthreads();
         float tileMaximum = 0.0f, tileDenominator = 0.0f;
         if (owned)
         {
-#pragma unroll 16
+#pragma unroll(QKUnroll)
             for (int pair = 0; pair < 64; ++pair)
                 score = __builtin_amdgcn_fdot2(__builtin_bit_cast(NativePair, queries[wave][pair + 64]),
                     __builtin_bit_cast(NativePair, tile[lane * 68 + pair]), score, false);
@@ -319,30 +508,19 @@ __global__ __launch_bounds__(256, 2) void selectedAttentionFP16Tiles(QwenSparseA
 #pragma unroll
         for (int chunk = 0; chunk < 2; ++chunk)
         {
-            loadSparseHalfValues(p, indices + begin + min(chunk * 32, count),
-                max(0, min(32, count - chunk * 32)), kvHead, origin, capacity, tile);
+            loadSparseHalfValues<LoadUnroll, (Parts == 33), Threads>(p, indices + begin + min(chunk * 32, count),
+                max(0, min(32, count - chunk * 32)), begin + min(chunk * 32, count),
+                allVisible, kvHead, origin, capacity, tile);
             __syncthreads();
             if (owned)
             {
-#pragma unroll 4
-                for (int token = 0; token < 16; ++token)
-                {
-                    const int selected = 2 * token + lane / 32;
-                    // The branch is uniform within each logical32-lane PV owner.
-                    // Padded +0 updates would alter underflowed negative-zero sums;
-                    // only real selected tokens belong to the arithmetic chain.
-                    if (chunk * 32 + selected >= count) continue;
-                    const half2 probability = __half2half2(probabilities[wave][chunk * 32 + selected]);
-#pragma unroll
-                    for (int coordinate = 0; coordinate < 4; ++coordinate)
-                        weighted[coordinate] = __hfma2(probability,
-                            tile[selected * 128 + (lane % 32) * 4 + coordinate], weighted[coordinate]);
-                }
+                accumulateSparseHalfValues<(Parts == 33)>(
+                    probabilities[wave],tile,chunk,lane,count,weighted);
             }
             // Retire V readers only when a later writer reuses this panel.
             // This predicate is CTA-uniform and independent of owned heads; the
             // terminal tile's final panel has no later LDS reader or writer.
-            if (chunk == 0 || begin + 8 * 64 < total) __syncthreads();
+            if (chunk == 0 || begin + Parts * 64 < total) __syncthreads();
         }
         if (owned)
         {
@@ -373,7 +551,7 @@ __global__ __launch_bounds__(256, 2) void selectedAttentionFP16Tiles(QwenSparseA
             const float otherY = __shfl_xor(totals[coordinate].y, 32, 64);
             if (lane < 32)
             {
-                auto& partial = p.gpu_partials[(std::size_t(row) * p.query_heads + head) * 8 + blockIdx.z];
+                auto& partial = p.gpu_partials[(std::size_t(row) * p.query_heads + head) * Parts + blockIdx.z];
                 partial.weighted[(lane * 4 + coordinate) * 2] = totals[coordinate].x + otherX;
                 partial.weighted[(lane * 4 + coordinate) * 2 + 1] = totals[coordinate].y + otherY;
             }
@@ -381,7 +559,7 @@ __global__ __launch_bounds__(256, 2) void selectedAttentionFP16Tiles(QwenSparseA
     }
     if (owned && lane == 0)
     {
-        auto& partial = p.gpu_partials[(std::size_t(row) * p.query_heads + head) * 8 + blockIdx.z];
+        auto& partial = p.gpu_partials[(std::size_t(row) * p.query_heads + head) * Parts + blockIdx.z];
         partial.maximum = maximum;
         partial.denominator = denominator;
         // Shared native reads belong to the first actual consumer, once. These

@@ -35,7 +35,9 @@ struct Qwen4ExpSparseAttentionPolicy
     float ropeTheta = 10000.0f;
     Qwen4ExpSparsePublication publication = Qwen4ExpSparsePublication::AcceptAllLiveRows;
     qwen4exp::QwenSparsePoolSelection poolSelection = qwen4exp::QwenSparsePoolSelection::Installed; ///< Sealed native selector, independent of live prefix and row counts.
-    qwen4exp::QwenSparseAttentionArithmetic attentionArithmetic = qwen4exp::kDefaultQwenSparseAttentionArithmetic; ///< Explicit selected-core arithmetic; no runtime automatic selection.
+    qwen4exp::QwenSparseAttentionArithmetic attentionArithmetic = qwen4exp::kDefaultQwenSparseAttentionArithmetic; ///< Resolved selected-core arithmetic; no native phase decision.
+    std::optional<ForwardExecutionPhase> executionPhase; ///< Exact construction phase for diagnostic/capture identity; absent preserves legacy direct builders.
+    int retainedMtpCandidateRows = 0; ///< Original canonical retained R, copied from immutable setup geometry.
 };
 /** @brief Replicated production GGUF projection identities and immutable indexer gains/planes. */
 struct Qwen4ExpSparseAttentionWeights
@@ -91,6 +93,23 @@ public:
      */
     static qwen4exp::QwenSparsePoolSelection poolSelectionForInvocation(
         ForwardExecutionPhase phase,DeviceId device,int rowCapacity);
+    /**
+     * @brief Resolve a setup schedule using the original mathematical phase.
+     * @param phase Original forward phase; M1 Prefill and grouped Decode remain distinct.
+     * @param device Exact participant; no backend probe or host state is consulted.
+     * @param rowCapacity Immutable captured rows, never mutable live rows.
+     * @param requestCapacity Canonical admitted request capacity; split diagnostic requires1.
+     * @param retainedMtpCandidateRows Canonical retained R including disabled-but-reserved verifier capacity.
+     * @param base Original explicit arithmetic; split schedule requires native-FP16 tile8.
+     * @param schedule Immutable setup scalar shared by graph and BOM owners.
+     * @return Existing program for Uniform; tile8 Prefill or resolved tile33 Decode for the explicit diagnostic.
+     * @throws std::invalid_argument For malformed policy/backend/phase/capacity or Decode beyond max(1,R).
+     * @details No environment or live replay read, allocation, context heuristic or fallback occurs.
+     */
+    static qwen4exp::QwenSparseAttentionArithmetic attentionArithmeticForInvocation(
+        ForwardExecutionPhase phase,DeviceId device,int rowCapacity,int requestCapacity,
+        int retainedMtpCandidateRows,qwen4exp::QwenSparseAttentionArithmetic base,
+        qwen4exp::QwenSparseAttentionPhaseSchedule schedule);
     /** @brief Seal the canonical single-request verifier projection prefix, including M1.
      * @param device Exact participant owning the borrowed count word.
      * @param rows Admitted row capacity and optional native execution-authority count.

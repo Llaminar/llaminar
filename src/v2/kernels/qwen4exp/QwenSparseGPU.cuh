@@ -855,42 +855,151 @@ __global__ __launch_bounds__(256, 2) void selectedAttentionPartitions(QwenSparse
         partial.value_elements = static_cast<std::uint32_t>(count * 256);
     }
 }
-/** @brief Merge the same eight arithmetic partitions for serial and grouped execution. */
-template<TensorType ValueCodec>
-__global__ __launch_bounds__(256, 2) void reduceAttentionPartitions(QwenSparseAttention p)
+/**
+ * @brief Broadcast one FP32 operand within an active logical 32-lane subgroup.
+ * @param value Source lane's original FP32 bit pattern, without conversion.
+ * @param source Subgroup-local lane index in[0,31], fixed by the fold iteration.
+ * @return The selected source lane's FP32 operand in every participating lane.
+ * @pre Every lane of the aligned logical subgroup participates in this call.
+ * @details CUDA uses a complete warp mask. HIP width32 confines wave64 reads to
+ * the active lower half-wave. Callers consume register operands, not shared
+ * publications; this helper introduces no barrier or floating-point operation.
+ */
+__device__ __forceinline__ float broadcastAttentionLane32(float value,int source)
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
-    const int row = int(blockIdx.x), head = int(blockIdx.y), d = int(threadIdx.x);
-    const int kv_head = (p.query_head_start + head) / 12 - p.kv_head_start;
-    const auto *parts = p.gpu_partials + (std::size_t(row) * p.query_heads + head) * QwenSparsePartitions;
-    float *output = p.output + (std::size_t(row) * p.query_heads + head) * 256;
-    if (row >= r.live_rows)
+#if defined(__HIPCC__)
+    return __shfl(value,source,32);
+#else
+    return __shfl_sync(0xffffffffu,value,source,32);
+#endif
+}
+/**
+ * @brief Borrow one reducer CTA's shared metadata banks without owning storage.
+ * @details The kernel owns all four fixed-capacity banks once. Every runtime
+ * fold branch borrows the same arrays; no helper specialization allocates an
+ * independent bank. Only its FoldParts prefix is published and consumed.
+ * Production 8 never accesses these banks after compile-time specialization.
+ */
+struct QwenSparsePartialMetadataView
+{
+    float (&maximum)[33]; ///< Bit-exact cached original partial maxima.
+    float (&denominator)[33]; ///< Bit-exact cached original partial denominators.
+    std::uint32_t (&keys)[33]; ///< Original counters, authored only when observed.
+    std::uint32_t (&values)[33]; ///< Original counters, authored only when observed.
+};
+/**
+ * @brief Fold a fixed structural prefix of its admitted partial storage in order.
+ * @tparam FoldParts Closed compile-time prefix bound: 8, 16, 32 or 33 records.
+ * @tparam StorageParts Original arithmetic/storage program: production 8 or test 33.
+ * @param p Original read-only replay/selection and output-observation bindings.
+ * @param parts Original row/head partial base with the StorageParts record stride.
+ * @param scales Exclusive CTA shared storage for the selected prefix scales.
+ * @param denominator Exclusive CTA shared scalar published by output owner zero.
+ * @param row Original request-local row, used only for observation ownership.
+ * @param head Original participant-local query head.
+ * @param d Original output-coordinate owner in this 256-thread CTA.
+ * @param metadata Borrowed kernel-owned shared banks, used only by StorageParts33.
+ * @return Numerator after the ordered prefix and exact finite empty-tail effect.
+ * @details Every CTA thread invokes the same specialization. Storage8 retains
+ * its original owner-zero metadata fold. Storage33 distributes exponentials
+ * across one logical subgroup while every member retains the ordered maximum
+ * and denominator-FMA sequence; only owner zero publishes observations. The
+ * existing publication barrier precedes all weighted loads. The caller
+ * derives this bound from the immutable-in-flight device selected count, so
+ * omitted records are producer-authored empty virtual tiles. Production 8
+ * omits no records. At most two zero-product
+ * FMAs preserve their finite RN fixed point even with output-only FP32 flush.
+ */
+template<int FoldParts,int StorageParts>
+__device__ __forceinline__ float foldAttentionPrefix(
+    const QwenSparseAttention& p,const QwenSparseAttentionPartial* parts,
+    float* scales,float& denominator,int row,int head,int d,
+    QwenSparsePartialMetadataView metadata)
+{
+    static_assert((StorageParts==8 && FoldParts==8) ||
+                  (StorageParts==33 && (FoldParts==8 || FoldParts==16 || FoldParts==32 || FoldParts==33)),
+                  "Closed attention fold/storage geometry");
+    if constexpr (StorageParts == 33)
     {
-        if (d == 0 && p.observations) p.observations[row * p.query_heads + head] = {};
-        return;
+        if (d < FoldParts)
+        {
+            metadata.maximum[d] = parts[d].maximum;
+            metadata.denominator[d] = parts[d].denominator;
+            if (p.observations)
+            {
+                metadata.keys[d] = parts[d].key_elements;
+                metadata.values[d] = parts[d].value_elements;
+            }
+        }
+        // One writer per cached scalar; all CTA readers wait for publication.
+        // Unused capacity and unobserved counters remain unauthored/unread.
+        __syncthreads();
     }
-    __shared__ float scales[QwenSparsePartitions];
-    __shared__ float denominator;
-    __shared__ float rotated_values[256];
+    if constexpr (StorageParts == 33)
+    {
+        // The first logical subgroup is complete on CUDA warp32 and the lower
+        // half of HIP wave64. All32 lanes reach every register broadcast below.
+        if (d < 32)
+        {
+            float maximum = -INFINITY;
+            for (int part = 0; part < FoldParts; ++part)
+                maximum = fmaxf(maximum, metadata.maximum[part]);
+            float localDenominator = 0.0f, localScale = 0.0f;
+            if (d < FoldParts)
+            {
+                localDenominator = metadata.denominator[d];
+                localScale = localDenominator == 0.0f ? 0.0f : expf(metadata.maximum[d] - maximum);
+                scales[d] = localScale;
+            }
+            float sum = 0.0f;
+            constexpr int SubgroupParts = FoldParts < 32 ? FoldParts : 32;
+            for (int part = 0; part < SubgroupParts; ++part)
+            {
+                const float partDenominator = broadcastAttentionLane32(localDenominator,part);
+                const float partScale = broadcastAttentionLane32(localScale,part);
+                sum = fmaf(partDenominator,partScale,sum);
+            }
+            if constexpr (FoldParts == 33)
+            {
+                // Replicated last-part evaluation appends the same33rd FMA in
+                // every lane; only owner0 publishes its shared scale slot.
+                const float partDenominator = metadata.denominator[32];
+                const float partScale = partDenominator == 0.0f ? 0.0f : expf(metadata.maximum[32] - maximum);
+                sum = fmaf(partDenominator,partScale,sum);
+                if (d == 0) scales[32] = partScale;
+            }
+            if (d == 0)
+            {
+                require(isfinite(sum) && sum > 0.0f);
+                denominator = sum;
+            }
+        }
+    }
     if (d == 0)
     {
-        float maximum = -INFINITY;
-        for (int part = 0; part < QwenSparsePartitions; ++part) maximum = fmaxf(maximum, parts[part].maximum);
-        float sum = 0.0f;
-        for (int part = 0; part < QwenSparsePartitions; ++part)
+        if constexpr (StorageParts == 8)
         {
-            scales[part] = parts[part].denominator == 0.0f ? 0.0f : expf(parts[part].maximum - maximum);
-            sum = fmaf(parts[part].denominator, scales[part], sum);
+            float maximum = -INFINITY;
+            for (int part = 0; part < FoldParts; ++part)
+                maximum = fmaxf(maximum, StorageParts == 33 ? metadata.maximum[part] : parts[part].maximum);
+            float sum = 0.0f;
+            for (int part = 0; part < FoldParts; ++part)
+            {
+                const float part_denominator = StorageParts == 33 ? metadata.denominator[part] : parts[part].denominator;
+                const float part_maximum = StorageParts == 33 ? metadata.maximum[part] : parts[part].maximum;
+                scales[part] = part_denominator == 0.0f ? 0.0f : expf(part_maximum - maximum);
+                sum = fmaf(part_denominator, scales[part], sum);
+            }
+            require(isfinite(sum) && sum > 0.0f);
+            denominator = sum;
         }
-        require(isfinite(sum) && sum > 0.0f);
-        denominator = sum;
         if (p.observations)
         {
             QwenSparseAttentionObservation observation;
-            for (int part = 0; part < QwenSparsePartitions; ++part)
+            for (int part = 0; part < FoldParts; ++part)
             {
-                observation.key_elements += parts[part].key_elements;
-                observation.value_elements += parts[part].value_elements;
+                observation.key_elements += StorageParts == 33 ? metadata.keys[part] : parts[part].key_elements;
+                observation.value_elements += StorageParts == 33 ? metadata.values[part] : parts[part].value_elements;
             }
             observation.selected_tokens = p.selected_count[row];
             p.observations[row * p.query_heads + head] = observation;
@@ -898,11 +1007,64 @@ __global__ __launch_bounds__(256, 2) void reduceAttentionPartitions(QwenSparseAt
     }
     __syncthreads();
     float result = 0.0f;
-    for (int part = 0; part < QwenSparsePartitions; ++part)
+    for (int part = 0; part < FoldParts; ++part)
     {
-        const float weighted = parts[part].denominator == 0.0f ? 0.0f : parts[part].weighted[d];
+        const float part_denominator = StorageParts == 33 ? metadata.denominator[part] : parts[part].denominator;
+        const float weighted = part_denominator == 0.0f ? 0.0f : parts[part].weighted[d];
         result = fmaf(weighted, scales[part], result);
     }
+    if constexpr (FoldParts < StorageParts) result = fmaf(0.0f, 0.0f, result);
+    if constexpr (FoldParts + 1 < StorageParts) result = fmaf(0.0f, 0.0f, result);
+    return result;
+}
+/**
+ * @brief Merge the same fixed arithmetic partitions for serial and grouped execution.
+ * @tparam ValueCodec Original native value codec and optional output rotation.
+ * @tparam Parts Production8 or the explicit FP16 test-native33 arithmetic program.
+ * @param p Original row/head bindings and partial storage for that exact program.
+ * @details Production 8 keeps its original fold. The explicit 33-part program selects
+ * a fixed structural prefix and retains the finite RN effect of its omitted
+ * empty tail. This is not universal old 8-part rounding or signed-zero equivalence.
+ */
+template<TensorType ValueCodec,int Parts=QwenSparsePartitions>
+__global__ __launch_bounds__(256, 2) void reduceAttentionPartitions(QwenSparseAttention p)
+{
+    static_assert(Parts==8 || (Parts==33 && ValueCodec==TensorType::FP16),"Closed attention partial program");
+    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    const int row = int(blockIdx.x), head = int(blockIdx.y), d = int(threadIdx.x);
+    const int kv_head = (p.query_head_start + head) / 12 - p.kv_head_start;
+    const auto *parts = p.gpu_partials + (std::size_t(row) * p.query_heads + head) * Parts;
+    float *output = p.output + (std::size_t(row) * p.query_heads + head) * 256;
+    if (row >= r.live_rows)
+    {
+        if (d == 0 && p.observations) p.observations[row * p.query_heads + head] = {};
+        return;
+    }
+    __shared__ float scales[Parts];
+    __shared__ float denominator;
+    __shared__ float rotated_values[256];
+    __shared__ float cached_maximum[33], cached_denominator[33];
+    __shared__ std::uint32_t cached_keys[33], cached_values[33];
+    const QwenSparsePartialMetadataView metadata{
+        cached_maximum,cached_denominator,cached_keys,cached_values};
+    float result;
+    if constexpr (Parts == 33)
+    {
+        const int selected = p.selected_count[row];
+        require(selected > 0 && selected <= QwenSparseSelected);
+        // One immutable device count selects a CTA-uniform structural tile bound.
+        // The row/head storage stride remains 33 in every specialization.
+        if (selected <= 8 * 64)
+            result = foldAttentionPrefix<8,33>(p, parts, scales, denominator, row, head, d, metadata);
+        else if (selected <= 16 * 64)
+            result = foldAttentionPrefix<16,33>(p, parts, scales, denominator, row, head, d, metadata);
+        else if (selected <= 32 * 64)
+            result = foldAttentionPrefix<32,33>(p, parts, scales, denominator, row, head, d, metadata);
+        else
+            result = foldAttentionPrefix<33,33>(p, parts, scales, denominator, row, head, d, metadata);
+    }
+    else
+        result = foldAttentionPrefix<8,8>(p, parts, scales, denominator, row, head, d, metadata);
     result /= denominator;
     if constexpr (ValueCodec == TensorType::TQ4 || ValueCodec == TensorType::TQ8)
     {

@@ -8,6 +8,7 @@
  */
 #pragma once
 #include "../../memory/BufferId.h"
+#include "../../kernels/qwen4exp/QwenSparseAttentionArithmetic.h"
 #include "../../execution/local_execution/graph/GraphSchema.h"
 #include "../../planning/ModelMemoryProfile.h"
 #include "../../loaders/ImmutableRowTablePolicy.h"
@@ -33,6 +34,7 @@ struct Qwen4ExpBufferDimensions
     int local_query_heads = 0; ///< Physical participant-local attention heads.
     int retained_mtp_candidate_rows = 0; ///< Canonical flattened verifier envelope; zero omits the retained bank.
     DeviceId device; ///< Backend-specific declaration placement.
+    qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform; ///< Immutable canonical setup scalar; formulas never consult the environment.
     /** Concrete table tier; absent only in the planner's higher-priority base BOM.
      * The unresolved base excludes tier-specific native-row/protocol scratch.
      * Production graph allocation requires an admitted concrete placement. */

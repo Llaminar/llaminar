@@ -18,6 +18,8 @@
 
 namespace llaminar2
 {
+/** @brief Canonical construction-only phase; definition belongs to IGraphBuilder. */
+enum class ForwardExecutionPhase : std::uint8_t;
 /** @brief Packed prior codec binding; it cannot be reinterpreted as an FP32 arena tensor. */
 struct QwenSparseTransactionPriorBinding {
     Qwen4ExpIntBinding storage; ///< Exact admitted packed INT32 record, aligned to16 bytes.
@@ -82,7 +84,9 @@ public:
         int keyPositionCapacity = 0, keyRotaryDim = 64;
         int queryHeads = 24, kvHeads = 2, queryHeadStart = 0, kvHeadStart = 0;
         qwen4exp::QwenSparseRotarySource keyRotarySource = qwen4exp::QwenSparseRotarySource::TablePlanes;
-        qwen4exp::QwenSparseAttentionArithmetic arithmetic = qwen4exp::kDefaultQwenSparseAttentionArithmetic; ///< Immutable arithmetic, copied to native args and capture identity.
+        qwen4exp::QwenSparseAttentionArithmetic arithmetic = qwen4exp::kDefaultQwenSparseAttentionArithmetic; ///< Resolved immutable program; copied to native args and capture identity.
+        std::optional<ForwardExecutionPhase> executionPhase; ///< Original graph phase for cold admission/counters only; never forwarded as a native arithmetic switch.
+        int retainedMtpCandidateRows = 0; ///< Existing canonical retained R; proves33 Decode capacity without a new admission ledger.
     };
     /** @brief Publish only the accepted raw incomplete pool; frontier is published separately. */
     struct CommitPartial

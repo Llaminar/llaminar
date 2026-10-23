@@ -13,6 +13,7 @@
 #include "../../../local_execution/graph/IGraphBuilder.h"
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2
@@ -90,8 +91,12 @@ void validateRequestLeases(const AttentionConsumerBinding &consumer,
         add(b.preparedQuery,m*512*sizeof(float));add(b.scores,m*policy.blockCapacity*sizeof(float));
         add(b.selected,m*qwen4exp::QwenSparseSelected*sizeof(int));add(b.selectedCount,m*sizeof(int));
         if(b.rowParameters)add(*b.rowParameters,m*sizeof(attention::AttentionDeviceParams));
-        if(b.gpuPartials)add(*b.gpuPartials,m*consumer.queryHeads*qwen4exp::QwenSparsePartitions*
-            sizeof(qwen4exp::QwenSparseAttentionPartial));
+        if(b.gpuPartials) {
+            const auto width=std::size_t(consumer.queryHeads)*qwen4exp::qwenSparseAttentionPartialCount(policy.attentionArithmetic)*
+                sizeof(qwen4exp::QwenSparseAttentionPartial);
+            require(m<=std::numeric_limits<std::size_t>::max()/width,"QSA partial lease overflows native bytes");
+            add(*b.gpuPartials,m*width);
+        }
         if(b.observations)add(*b.observations,m*consumer.queryHeads*sizeof(qwen4exp::QwenSparseAttentionObservation));
         const std::size_t coreOffset=request*m*consumer.queryHeads*256*sizeof(float);
         add(Qwen4ExpFloatBinding(consumer.preparedQuery.tensor,consumer.preparedQuery.buffer,coreOffset),
@@ -155,6 +160,29 @@ qwen4exp::QwenSparsePoolSelection Qwen4ExpSparseAttentionBuilder::poolSelectionF
     return qwen4exp::QwenSparsePoolSelection::Installed;
 }
 
+qwen4exp::QwenSparseAttentionArithmetic Qwen4ExpSparseAttentionBuilder::attentionArithmeticForInvocation(
+    ForwardExecutionPhase phase,DeviceId device,int rowCapacity,int requestCapacity,int retainedMtpCandidateRows,
+    qwen4exp::QwenSparseAttentionArithmetic base,qwen4exp::QwenSparseAttentionPhaseSchedule schedule)
+{
+    using Arithmetic=qwen4exp::QwenSparseAttentionArithmetic;
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    require(device.is_valid() && device.ordinal>=0 && rowCapacity>0 && requestCapacity>0,
+        "QSA attention schedule requires an explicit participant and positive captured capacities");
+    require(phase==ForwardExecutionPhase::Prefill || phase==ForwardExecutionPhase::Decode,
+        "QSA attention schedule requires the original known execution phase");
+    qwen4exp::validateQwenSparseAttentionArithmetic(base,device.type);
+    qwen4exp::validateQwenSparseAttentionPhaseSchedule(schedule,device.type);
+    const int decodeRows=qwen4exp::qwenSparseAttentionDecodeRowCapacity(retainedMtpCandidateRows);
+    require(base!=Arithmetic::TileFP16WithFP32Totals33,"QSA setup base cannot be an already resolved33 program");
+    if(schedule==Schedule::Uniform)return base;
+    require(base==Arithmetic::TileFP16WithFP32Totals && requestCapacity==1,
+        "QSA prefill8_decode33 requires explicit fp16_tile and the canonical single-request family");
+    if(phase==ForwardExecutionPhase::Prefill)return base;
+    require(rowCapacity<=decodeRows,
+        "QSA33 Decode rows exceed the canonical ordinary-token/retained-verifier envelope");
+    return Arithmetic::TileFP16WithFP32Totals33;
+}
+
 std::optional<DeviceRowRange> Qwen4ExpSparseAttentionBuilder::verifierProjectionRows(
     DeviceId device,Qwen4ExpStageRows rows)
 {
@@ -206,6 +234,12 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
     // Reject policy corruption before preparing projections or publishing nodes.
     qwen4exp::validateQwenSparsePoolSelection(p.poolSelection, rows.rowsPerRequest());
     qwen4exp::validateQwenSparseAttentionArithmetic(p.attentionArithmetic,c.device.type);
+    if(p.executionPhase)require(*p.executionPhase==ForwardExecutionPhase::Prefill || *p.executionPhase==ForwardExecutionPhase::Decode,
+        "QSA builder requires a known original execution phase");
+    const int decodeRows=qwen4exp::qwenSparseAttentionDecodeRowCapacity(p.retainedMtpCandidateRows);
+    if(p.attentionArithmetic==qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
+        require(p.executionPhase==ForwardExecutionPhase::Decode && rows.requests()==1 && c.queryRows<=decodeRows,
+            "QSA33 builder requires explicit Decode in the admitted single-request retained envelope");
     validateRequestLeases(c,p,rows,requests);
     const auto &first=requests.front().buffers;
     const auto queryName=c.prefix+"qsa_query_proj",keyName=c.prefix+"qsa_key_proj";
@@ -256,6 +290,8 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
             Qwen4ExpFloatBinding(c.output.tensor,c.output.buffer,coreOffset),{},b.rowParameters,b.gpuPartials,b.observations,
             {},{},0,p.rotaryDimension,c.queryHeads,c.kvHeads,c.queryHeadStart,c.kvHeadStart};
         attention.arithmetic=p.attentionArithmetic;
+        attention.executionPhase=p.executionPhase;
+        attention.retainedMtpCandidateRows=p.retainedMtpCandidateRows;
         attention.keyRotarySource=p.rotarySource==qwen4exp::QwenSparseRotarySource::AnalyticTheta ?
             qwen4exp::QwenSparseRotarySource::CanonicalEngineTheta : p.rotarySource;
         if(c.keyPolicy.transformsOnRead() && p.rotarySource==qwen4exp::QwenSparseRotarySource::TablePlanes) {

@@ -231,6 +231,391 @@ retained locally. Evidence: `attention130-packed-merge-summary-r1.json`,
 `/tmp/qfn-attention125-packed-reducer-private` plus
 `/tmp/qfn-attention131-wave-uniform/final-source`.
 
+## Smaller decode head groups: exact, rejected for economy
+
+Diagnostic132 retained one wave per head and the original eight numeric streams,
+but shared each native tile across one or two heads instead of four. Cooperative
+loader strides, native capture geometry, source-read counters and occupancy
+queries were updated together. G1 passes15 native tests; G2 passes the three
+focused FP16 arithmetic tests, including both encodings, head shards1..8,
+serial/grouped dirty replay and finite-range witnesses. Both preserve every
+output and258-word numeric partial byte at the two decode contexts.
+
+| Complete M1/Q6 pair | G4 retained | G1 rejected | G2 rejected |
+|---|---:|---:|---:|
+|Context512, µs |20.1573 |36.2935 |25.62385 |
+|Context65536, µs |59.03335 |121.4355 |80.9233 |
+
+G1's compiler removes all hardware CTA barriers automatically, while preserving
+source ordering. This alone does not make the kernel faster. Isolated short-
+context counter records show849.5 /1947 /1316 vector instructions per wave for
+G4/G1/G2. FetchSize stays520.4375KiB for all three: duplicated native group-copy
+work must not be described as tripled external-memory traffic. Native G1
+metadata reports81 used VGPRs,18048B LDS and zero private scratch; rocprof's
+132 VGPR field describes padded descriptor allocation, not132 live registers.
+The SDK rounds LDS allocation to18432B. Detailed dispatch joins remain separate
+from these raw counter records; profiler durations are not timing scores.
+
+Neither smaller group is retained. Their complete fixture/core/source archives,
+exact numeric exports and native/event/profile receipts remain local under
+`attention132-*`; summary: `attention132-groups-summary-r1.json`. Production
+source returns to checkpoint128/G4. Decode tuning remains the priority, with
+prefill retained as a regression guard. The next comparison profiles the actual
+pinned Castagna producer and merge independently through their real launcher.
+
+## Direct decode profiles and partition bottleneck
+
+The isolated133 target calls the pinned fork's actual tile launcher through a
+bridge compiled inside its HIP backend. The only fork edit is the opt-in CMake
+hook; producer/merge source and launch selection are unchanged. Captured native
+functions, shapes, input/scratch pointers and pair edges are checked. Release
+uses the same explicit gfx906 SDK/header/bitcode roots and qualified HIP runtime.
+No model files are loaded or hashed. The target's real setup pair remains outside
+timing, followed by five warmups and12 unprofiled repeated-pair samples.
+
+| Visible context | Llaminar H6 pair, µs | Castagna H12 pair, µs | Llaminar H6×12 estimate, µs | Castagna H12×6 estimate, µs |
+|---|---:|---:|---:|---:|
+|512 |20.1573 |14.42435 |241.8876 |86.5461 |
+|640 |32.4813 |15.22065 |389.7756 |91.3239 |
+|768 |32.4638 |15.22130 |389.5656 |91.3278 |
+
+Both observed model layouts perform72 head-layer instances per GPU, but these
+are different per-call shapes and original arithmetic. The normalization above
+is a repeated-bank component estimate, not a full4GPU attention-stage result.
+The640 fork cell has physical768 KV with128 explicitly masked tail entries;
+its real G4 dispatch requires256-token physical alignment. Llaminar's fixed
+logical view has640 physical entries. Original FP32 coordinate generators match;
+each engine performs its own native half conversion, so cross-engine input/output
+byte equality is not claimed.
+
+Twenty isolated counter launches authenticate the exact SDK counter callback,
+kernel descriptor, dispatch/correlation, graph pair, occurrence and physical
+MI50. The fork selects occurrence7 after its real eager setup and five graph
+warmups; Llaminar selects6 after five graph warmups. Each profiler process records
+one role/counter/shape. Counter durations are excluded from throughput scores.
+
+| Producer fact | Llaminar512 | Castagna512 | Llaminar768 | Castagna768 |
+|---|---:|---:|---:|---:|
+| Physical partitions |8 |8 |8 |12 |
+| Dispatched waves |64 |96 |64 |144 |
+| VALU instructions/wave |849.5 |642 |1228 |642 |
+| Reported FetchSize, KiB |520.4375 |525.25 |not sampled |not sampled |
+| LDS bank conflicts |0 |0 |not sampled |not sampled |
+| Used / allocated VGPR |75 /76 |83 /84 |75 /76 |83 /84 |
+
+The512 producer has16 vs24 CTAs; at768 it remains16 while the fork launches36.
+Our fixed eight streams process a second64-token tile once512 tokens are crossed;
+the fork keeps one tile per physical partition at these contexts. This is a
+measured decode scheduling bottleneck. The paired merge is also profiled:
+Llaminar reports111 vector instructions/wave and52.0625KiB FetchSize versus
+213.5 and96.8125KiB for the fork's twice-as-many output heads. Neither reports
+private scratch. Raw per-wave figures must not be compared as equal total work.
+
+The SDK defines VALUInsts as total vector instructions divided by wave count;
+FetchSize already sums memory read-request bytes and must not be multiplied by
+waves. Combining separately isolated, matched source/shape runs reconstructs
+about1.76× and1.70× more producer vector work for Llaminar after the observed
+layer multiplicities at512 and768. FetchSize includes cache and extra-fetch
+effects; it does not measure source-level gather operations or LDS copy count.
+
+Evidence: `attention133-events-comparison.json`,
+`attention133-profile-comparison.json`, `attention133-castagna-build-r1` and the
+individual133 native/event/profile receipts. The decoder-focused successor
+uses33 logical64-token parts as a new arithmetic program, independently from
+future physical scheduling. It first enters a test-only exact-span fixture;
+production remains8 until numerical, economy and typed scratch/capture gates
+qualify it. Prefill optimization remains parked.
+
+A separate G6 sharing probe134 preserves old8 arithmetic and passes the three
+focused native tests. Its M1 pair is19.7606 /31.2469 /58.79005µs at512 /768 /65536;
+short/long saved output/partial bytes match G4 exactly. This modest scheduling
+candidate is archived, not promoted; it does not remove the partition cliff.
+
+## Fixed logical decode tiles: component qualification
+
+Prototype135 assigns each of the at most 33 selected 64-token tiles its own
+arithmetic part. The test-only entry receives an exact span of 33 partials per
+row/head; production dispatch, graph planning and prefill still use eight.
+This changes the long-context reduction program and therefore requires fresh
+model KL qualification before production use. Serial/grouped execution within
+the new program must remain byte-identical.
+
+All 18 native tests pass, including both key encodings, every M from 1 to 16,
+compact head shards for device degrees 1 through 8, dirty replays, inactive
+rows, finite extremes and signed zeros. Eight saved component exports cover
+post-RoPE M1 at 512/640/768/2048/65536, M16 at 65536, and pre-RoPE M1 at
+512/65536. Subsequent candidates compare every output and numerical partial
+byte against those exports; this does not assert old-eight/new-33 equivalence.
+
+| Visible context | Same-build eight-part pair, µs | 33-part pair, µs |
+|---|---:|---:|
+| 512 | 20.3175 | 25.24625 |
+| 640 | 32.65875 | 25.3575 |
+| 768 | 32.6475 | 25.48875 |
+| 2048 | 57.6038 | 29.28 |
+| 65536 | 59.975 | 29.575 |
+
+The long-context cliff is reduced, but short-context merge overhead prevents
+promotion. Authenticated isolated profiles show 69 used / 72 allocated VGPRs
+for the 33-part reducer, versus 19 / 20 for eight. The 33-part producer launches
+264 waves, including empty parts; its 222.606 instructions/wave at 512 must not
+be compared with the old producer's 849.5 without accounting for those waves.
+All sampled kernels have zero scratch.
+
+Candidate136 bounds only metadata loops to live parts and keeps all 33 weighted
+FMAs. It passes all native tests and export comparisons, but is rejected:
+512 rises to 27.02605 µs and 65536 to 39.4422 µs. Fewer short-context vector
+instructions (238.25 to 194 per reducer wave) do not imply lower latency;
+register allocation stays unchanged and the dynamic loops lose performance.
+The original reducer is restored.
+
+Candidate137 exposes the producer's proven single iteration while preserving
+its literal first recurrence. All 18 native tests and eight export comparisons
+pass. Used VGPRs fall from 75 to 48, descriptor allocation from 76 to 68, and
+the long-context vector count from 824.424242 to 815.939394 per wave. LDS still
+limits residence to three blocks, and event times remain effectively unchanged
+(25.1748 / 29.3461 µs at 512 / 65536). It provides register headroom for the
+next load-scheduling experiment, not a claimed throughput win.
+
+Evidence: `attention135-parts33-*`, `attention136-live-metadata-events-r1.json`,
+`attention137-one-pass-events-r1.json`, and the independently joined
+`attention{135,136,137}-sdk-join-r1.json` reports. Each join authenticates the
+sixth retained producer/merge transaction, native symbol/geometry, SDK callback,
+counter, code-object provenance and physical MI50. No profiled duration enters
+the event timing table. Full-model KL, phase-aware scratch admission and actual
+TP4 attention-stage qualification remain open for this new program.
+
+Further isolated trials retain the same 33-part numerical exports:
+
+| Candidate and change | M1 / 512 pair, µs | M1 / 65536 pair, µs | M16 / 65536 pair, µs |
+|---|---:|---:|---:|
+| 139: four independent vector loads exposed per thread | 25.03615 | 29.1674 | 130.6055 |
+| 138: dynamic weighted prefix, over producer139 | 23.94115 | 30.30365 | 131.47 |
+| 140: identity addresses for fully visible selections, over139 | 23.45365 | 29.39615 | 131.431 |
+| 142: cooperative metadata loads, over producer140 | 22.61115 | 28.5787 | 127.682 |
+
+Each trial passes all 18 native tests and all eight output/partial export
+comparisons. Candidate138 is removed because its dynamic loop exchanges a
+short-context gain for a long-context loss. It preserves at most two trailing
+zero-product FMAs, sufficient to reach the finite RN fixed point even with
+output-only denormal flushing. Static inspection of copied final code objects
+binds both exact reducer descriptors to their function entries: RN arithmetic,
+preserved FP32 subnormals, and no mode-changing instructions or indirect calls
+in the inspected bodies. Those observations supplement the native byte checks.
+
+Candidate140 validates identity membership before deriving contiguous logical
+addresses; sparse selections retain their original selected IDs and ring map.
+Candidate142 adds one necessary publication barrier after cooperative max,
+denominator and optional observation-counter loads, then retains every original
+ordered fold. Its shared allocation is 708 bytes, with 71 used / 72 allocated
+VGPRs and zero scratch. The old-eight specialization still uses its original
+metadata path. These trials do not introduce a new model default. In142,
+the same-build old-eight pair remains faster at512 (20.3262 µs), so short decode
+still needs work despite the long-context improvement over old-eight's60.0299 µs.
+
+Artifacts: `attention{138,139,140,142}-*-events-r1.json`, the corresponding
+native/profile receipts and SDK joins, and
+`attention138-weighted-prefix-fp-mode-r2`. The142 runtime is retained for paired
+follow-ups. Structural fixed-bound folds are the next independent merge trial.
+
+Candidate141's four fixed fold bounds recover the short pair (20.24495 µs)
+but regress65536 to34.55615 µs. Exact disassembly shows both long loops already
+unrolled; the new kernel repeats coordinate shifts and grows from9444 to25664
+code bytes. This supports investigating generated addressing and code layout,
+not assuming a missing-unroll problem.
+
+Combining the fixed folds with cooperative metadata in143 retains every saved
+numerical byte and recovers the long-context performance. M1 pairs at
+512/640/768/2048/65536 are19.0698 /20.34605 /20.4998 /26.4635 /28.8222 µs;
+the same-build old-eight controls are20.30105 /32.6559 /32.63345 /57.63825 /
+60.0845 µs. M16/65536 is127.91 versus138.251 µs. The reducer reports71 used /
+72 allocated VGPRs,708 bytes static LDS and zero scratch. These are component
+gains, still short of a Castagna win and not yet model-KL qualification.
+
+All **19 native tests** pass, including the new explicitly registered
+`FP16Virtual33EmptyTailPreservesSignedZero`. It authors an exactly representable
+score of−103 and a half numerator that makes the final weighted FMA underflow
+to−0. A real old-eight control proves that sensitivity on the native device.
+The 33-part program must produce+0 when empty tail parts remain, and−0 when
+the final33rd part is live. The test covers512/1024/2048/2051 selected tokens,
+M1/M16, identity/sparse addressing and independent captured serial replays.
+
+Evidence: `attention141-fixed-fold-*`, `attention143-fixed-cooperative-*`,
+their SDK joins, and the retained143 runtime.
+
+The two-bound merge145 preserves all bytes and passes19 native tests, but loses
+about12% at640/768 (22.86105 /23.05105 µs) without a meaningful long-context
+gain. It is rejected and the four-bound143 merge restored. Full-panel copy
+specialization144 also passes19 native tests and all eight export comparisons.
+It removes count guards only when a complete64-key or32-value panel is live;
+partial panels, signed-zero-sensitive PV guards and the old-eight program stay
+unchanged. Its pairs are19.2699 /20.5774 /20.73115 /26.7974 /28.6149 µs at
+512/640/768/2048/65536, with M16/65536 at127.3595 µs: effectively flat overall,
+not an additional qualified throughput win.
+
+Exact producer profiles for144 report190.909091 /701.515152 vector
+instructions per wave at512 /65536, compared with204.727273 /756.787879 for140.
+Used / allocated VGPRs are53 /68, static LDS19968 bytes, and private scratch0.
+Fewer instructions again do not establish a latency gain by themselves. The
+sixth captured transaction, native function, geometry, SDK callback, code
+object and MI50 identity are joined in `attention144-full-panel-profile-joined-r1.json`.
+The unchanged33 logical program is next tested with six-head cooperative groups;
+that changes physical copy ownership, not numerical partial layout or order.
+
+Candidate146 uses one six-wave block per canonical six-head group. All19 native
+tests and eight numerical export comparisons pass; metadata explicitly admits
+only the physical group-width change4→6. M1 pairs at512/640/768/2048/65536 are
+18.7737 /20.0549 /20.2128 /25.2349 /26.98865 µs, and M16/65536 is109.726 µs.
+The native occupancy query now uses the actual captured block size (384 for
+this producer), while independent fixture assertions still require the declared
+geometry. CUDA's observation adapter receives the same actual-block correction.
+Exact profiles report52 used/allocated VGPRs,21248 bytes static LDS, zero private
+scratch and zero LDS bank conflicts. The198-wave producer's vector counts are
+214.010101 /784.919192 per wave at512 /65536; these averages use fewer waves
+than G4 and are not direct total-work ratios. Reported512 FetchSize remains
+520.4375 KiB, so fewer source-level copy owners do not establish fewer HBM bytes.
+
+Candidate147 adds a shared full-tile PV specialization: only an explicitly
+admitted33-part tile with64 live tokens can omit the original per-token guard.
+Partial tiles and Parts8 retain it; half-FMA order and signed-zero boundaries
+stay unchanged. All19 native tests and eight byte comparisons pass. Pairs fall
+to17.2374 /18.50865 /18.6474 /23.6874 /25.43365 µs at512/640/768/2048/65536,
+with M16/65536 at101.9045 µs. Used/allocated registers and LDS stay52/52 and
+21248 bytes, with zero scratch; vector counts fall to190.979798 /692.797980
+per wave. Evidence is in `attention{146,147}-*-events-r1.json` and the exact
+SDK/profile joins. Both remain component experiments, without new model KL or
+a Castagna performance win. The next QK scheduling candidates preserve literal
+dot order while measuring whether the reduced register footprint permits wider
+load scheduling.
+
+Both148 QK schedules pass19 native tests and all eight numerical exports.
+Unroll64 wins over32 in every measured pair:512 /65536 /M16-65536 are
+17.03865 /25.2574 /101.1335 µs, versus17.3174 /25.54365 /101.7245 µs for32.
+The original production8 still uses unroll16. Exact profiles give51 used /
+52 allocated VGPRs for64, versus54 /56 for32; both have21248 bytes LDS and
+zero scratch. The64 vector counts are186.373737 /674.373737 per wave at
+512 /65536, below32's189.040404 /685.040404. This is a small component gain;
+Castagna remains ahead at short context and full-model qualification is open.
+
+The proposed149 one-wave index validation is rejected before implementation.
+Other waves could read invalid sparse indices before the existing post-copy
+barrier. Keeping every required pre-load validation edge takes precedence over
+removing that duplicated work. No native result or performance claim exists
+for149.
+
+Candidate150 parallelizes the merge's per-part scale calculation while retaining
+the exact ascending maximum and denominator FMA order. A logical32-lane group
+computes scales, broadcasts each original ordered contribution, and handles the
+33rd term explicitly. It adds no reduction tree or barrier; the weighted fold,
+signed-zero-sensitive empty tail and original eight-part program are unchanged.
+All19 native tests and eight saved numerical output/partial comparisons pass.
+
+| Unprofiled captured pair, microseconds | 512 | 640 | 768 | 2048 | 65536 | M16 /65536 |
+|---|---:|---:|---:|---:|---:|---:|
+| Retained148 unroll64 | 17.03865 | 18.3349 | 18.49365 | 23.51615 | 25.2574 | 101.1335 |
+| Parallel scales150 | 16.53615 | 17.24745 | 17.28365 | 20.29615 | 22.04615 | 97.60345 |
+| Same-build original eight parts | 20.19115 | 32.3949 | 32.38115 | 57.10845 | 59.4473 | 137.4435 |
+
+Exact isolated merge profiles report70 used /72 allocated VGPRs,708 bytes LDS,
+zero private scratch, zero LDS bank conflicts at64K, and95.25 /350.25 vector
+instructions per wave at512 /64K. The64K memory-unit-busy counter is7.938428%.
+Each counter joins the sixth retained transaction, native captured function,
+SDK symbol/code object and physical MI50. Profiler durations are excluded from
+timing scores. The producer retains148's51 used /52 allocated VGPRs and21248
+bytes LDS. Evidence: `attention150-parallel-scales-events-r1.json` and
+`attention150-parallel-scales-joined-profile-r1.json`; source/runtime150 is frozen.
+
+Castagna's pinned short-context pairs remain14.42435 /15.22065 /15.22130 µs
+at512 /640 /768. These are different local head geometries, not an equivalent
+request-latency comparison.150 has not beaten that component baseline. The typed
+experimental schedule now has focused model qualification: eight parts
+for the original Prefill phase,33 for ordinary or retained verifier Decode.
+Its shared scratch uses `heads * max(8 * resident_rows, 33 * max(1, retained_rows))`
+records; Uniform retains its original byte count. The production default remains
+FP32; the measured FP16 schedule is an explicit experiment.
+
+Integration151 now routes33 through the ordinary ROCm dispatcher and retires
+the test-only launcher. Its setup-only opt-in is
+`LLAMINAR_QFN_SPARSE_ATTENTION=fp16_tile` with
+`LLAMINAR_QFN_SPARSE_ATTENTION_PHASE_SCHEDULE=prefill8_decode33`.
+The schedule is snapshotted once into runtime configuration, copied through
+admission and wire7, and resolved from the original typed execution phase.
+Unsupported backends or Decode rows beyond the admitted retained family reject
+before graph publication. Uniform keeps its previous scratch byte count.
+
+The complete Unit namespace and affected native/admission registrations pass
+**832/832**, with a clean driver window and unchanged source during execution
+(`attention151-unit-native-r1`). This includes exact estimator/allocator deltas,
+phase/program capture identity, immutable setup propagation, wire validation,
+and prefix identity. The initial build's three test-only compile defects were
+corrected without removing assertions; the successful rebuild is retained as
+`attention151-phase-integration-build-r2`. Full production preflight is not
+refreshed by this focused run.
+
+Review also found that the older Uniform FP16 experiment lacked a distinct base
+attention prefix identity. The existing model metadata hook now publishes the
+graph's frozen base arithmetic, preserving parent MoE fields and historical
+FP32 identity. Actual graph-hook and pure-field regressions prove that later
+debug reloads cannot relabel cached state. No payload hashing, planner ledger,
+new live setting read or additional transfer was introduced.
+
+### Phase schedule151: focused model qualification
+
+The Release build passes the spill guards for CUDA80/86/89/90 and HIPgfx906.
+All19 native functional tests pass through the ordinary production dispatcher;
+all eight output/partial exports remain byte-identical to the original33-part
+program, including both key encodings, short boundaries,64K and groupedM16.
+The native pair measures16.503µs at512, below the old-eight20.198µs control,
+but still above Castagna's14.424µs at its different local head geometry.
+
+The canonical required QFN groups pass with exact reset replay, unchanged
+source/runtime, clean drivers and normal retirement. Actual phase/program
+counters are verified on all four devices in this accuracy run. Against
+uniform8 checkpoint128,176 of185 final-logit rows are byte-identical; the only
+changed rows are the nine boundary-diagnostic decode observations. That
+diagnostic is not a calibrated required acceptance group.
+
+| Panel / phase | Rows | Uniform8 mean KL | Prefill8/Decode33 mean KL | Split top-1 | Split top-5 overlap |
+|---|---:|---:|---:|---:|---:|
+| Main prefill | 16 | 0.025613694 | 0.025613694 | 93.75% | 92.50% |
+| Main decode | 96 | 0.028276396 | 0.028276396 | 95.83% | 92.29% |
+| Held-out prefill | 8 | 0.014910553 | 0.014910553 | 100% | 95.00% |
+| Held-out decode | 48 | 0.004552875 | 0.004552875 | 100% | 91.67% |
+| Boundary diagnostic prefill | 1 | 0.000168082 | 0.000168082 | 100% | 100% |
+| Boundary diagnostic decode | 9 | 0.000367672 | 0.000209866 | 100% | 93.33% |
+
+Matched unprofiled Release A/B/A uses the same binary: fullTP4 on fourMI50s,
+`TensorParallel + GateUpOwnedDownColumns`, sharded vocabulary, RAM ngrams,
+28 physical NUMA1 workers,512 prompt tokens and256 emitted tokens, context4096,
+native FP16 KV, MTP/prefix cache off. Each arm has one warmup and three measured
+iterations. PerfStats is disabled for these timings; the same-binary accuracy
+run above supplies actual phase/program proof. All nine generated256-token
+sequences match, and source/runtime/driver/retirement checks pass.
+
+| Throughput, tok/s | Uniform8, six control samples | Prefill8/Decode33, three samples | Change |
+|---|---:|---:|---:|
+| Prefill median | 818.788 | 818.579 | -0.026% |
+| Decode median | 39.884 | 40.110 | +0.566% |
+| Decode range | 39.741–39.971 | 40.052–40.124 | Nonoverlapping |
+
+The closing control drifted lower; this is a modest descriptive gain, not a
+general confidence-bound claim. Castagna's42.959tok/s target remains open.
+Evidence: `attention151-phase-model-fp16-r1`,
+`attention151-phase-mean-metrics-r1.json`,
+`attention151-phase-model-throughput-comparison-r2.json`,
+`attention151-phase-native-functional-r1` and
+`attention151-phase-native-events-r1.json`. The first benchmark wrapper rejected
+an omitted outer CPU-affinity binding before launching inference; its failure
+is retained, and the successful retry uses the unchanged workload and required
+CPU mask. This is a focused checkpoint, not a refreshed complete preflight.
+
+The per-GPU normalization above is a **work comparison**, not a request-latency
+identity. The fork rounds attention tensor slices to whole 12-query-head GQA
+groups and rotates ownership by attention-layer ordinal. Each attention layer
+therefore has two active GPUs, whereas Llaminar has four six-head participants.
+All-device interval unions and authenticated per-layer spans must remain
+separate from per-GPU sums/medians when assessing the actual stage latency.
+
 ## Primary source map
 
 All Castagna references below are pinned to the compared revision:

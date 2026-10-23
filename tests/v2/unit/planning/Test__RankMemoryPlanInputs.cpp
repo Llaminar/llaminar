@@ -10,6 +10,8 @@
  * supported head degree without loading model tensors or initializing GPUs.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "planning/KVCacheMemoryEstimator.h"
@@ -698,4 +700,33 @@ TEST(RankMemoryPlanInputs, QueryConsumerSourceMatchesCanonicalAssignmentEveryDeg
             EXPECT_EQ(cfg.local_kv_heads,expected.kv_head_count);
         }
     }
+}
+
+/**
+ * @test Mutable setup reload cannot change the already admitted schedule scalar.
+ * @details Runtime construction is the only setup read. Rank planning and both
+ * runner/config adapters receive copies after setup changes, without allocating
+ * a graph or initializing any backend. Incoming mutable attention setup is restored.
+ */
+TEST(RankMemoryPlanInputs, AttentionPhaseScheduleSnapshotSurvivesDebugReloadAndAdapterCopies)
+{
+    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    struct RestoreAttention final {
+        AttentionConfig original;
+        /** @brief Restore the exact incoming test setup after all assertions/unwinding. */
+        ~RestoreAttention(){mutableDebugEnv().attention=std::move(original);}
+    } restore{mutableDebugEnv().attention};
+    mutableDebugEnv().attention.qfn_sparse_attention_phase_schedule=Schedule::Prefill8Decode33;
+    const auto frozen=RuntimeConfig::fromOrchestrationConfig(4096,1,"fp32","fp16");
+    EXPECT_EQ(frozen.attention_phase_schedule,Schedule::Prefill8Decode33);
+    mutableDebugEnv().attention.reload();
+    mutableDebugEnv().attention.qfn_sparse_attention_phase_schedule=Schedule::Uniform;
+    Fixture fixture(DeviceType::ROCm,4);fixture.plan.runtime=frozen;
+    const auto inputs=buildRankMemoryPlanInputs(fixture.request());ASSERT_EQ(inputs.size(),4u);
+    for(const auto& input:inputs)EXPECT_EQ(input.attention_phase_schedule,Schedule::Prefill8Decode33);
+    const auto rank=RankOrchestrator::Config::fromRuntime(frozen);
+    const auto runner=InferenceRunnerConfig::fromRuntime(frozen);
+    EXPECT_EQ(rank.attention_phase_schedule,Schedule::Prefill8Decode33);
+    EXPECT_EQ(runner.attention_phase_schedule,Schedule::Prefill8Decode33);
+    EXPECT_EQ(frozen.attention_phase_schedule,Schedule::Prefill8Decode33);
 }

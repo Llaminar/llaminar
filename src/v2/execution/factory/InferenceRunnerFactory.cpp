@@ -3143,6 +3143,7 @@ namespace llaminar2
         graph_config.ngram_table_placement = config.ngram_table_placement;
         graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
+        graph_config.attention_phase_schedule = config.attention_phase_schedule;
         LOG_DEBUG("[InferenceRunner] KV cache scale: K=" << graph_config.kv_cache_scale_k
                                                          << ", V=" << graph_config.kv_cache_scale_v);
         LOG_DEBUG("[InferenceRunner] KV cache precision mode: "
@@ -4260,6 +4261,7 @@ namespace llaminar2
         graph_config.ngram_table_placement = config.ngram_table_placement;
         graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
+        graph_config.attention_phase_schedule = config.attention_phase_schedule;
 
         // TurboQuant context for TQ4/TQ KV cache
         std::shared_ptr<TurboQuantContext> turboquant_ctx;

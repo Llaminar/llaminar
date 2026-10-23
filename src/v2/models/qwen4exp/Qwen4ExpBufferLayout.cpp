@@ -68,7 +68,7 @@ const std::vector<Qwen4ExpBufferDeclaration> declarations{
     {BufferId::QFN_QSA_SCORES, {"qfn_qsa_scores", {"seq_len", "qfn_pools"}, "fp32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::Sparse},
     {BufferId::QFN_QSA_SELECTED, {"qfn_qsa_selected", {"seq_len", "2051"}, "int32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::Sparse},
     {BufferId::QFN_QSA_SELECTED_COUNT, {"qfn_qsa_selected_count", {"seq_len", "1"}, "int32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::Sparse},
-    {BufferId::QFN_QSA_PARTIALS, {"qfn_qsa_partials", {"seq_len", "qfn_partial_words"}, "int32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::SparseGPU},
+    {BufferId::QFN_QSA_PARTIALS, {"qfn_qsa_partials", {"qfn_partial_words"}, "int32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::SparseGPU},
     {BufferId::QFN_QSA_OBSERVATIONS, {"qfn_qsa_observations", {"seq_len", "qfn_observation_words"}, "int32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::Sparse},
     {BufferId::QFN_QSA_REPLAY, {"qfn_qsa_replay", {"qfn_replay_words"}, "int32", BufferSemantic::InOut}, Qwen4ExpBufferPlacement::Sparse},
     {BufferId::QFN_QSA_POOLED_KEYS, {"qfn_qsa_pooled_keys", {"qfn_qsa_requests", "qfn_pools", "128"}, "fp32", BufferSemantic::InOut}, Qwen4ExpBufferPlacement::Sparse},
@@ -94,6 +94,10 @@ void validatePlacement(const Qwen4ExpMemoryGeometry &geometry, const Qwen4ExpBuf
         geometry.residual_width != product(geometry.residual_branches, dimensions.compute_width) ||
         geometry.compression_ratio == 0 || geometry.ple_heads == 0 || geometry.ple_table_row_bytes == 0)
         throw std::invalid_argument("Flash Next arena requires exact main-layer, branch, row, request and native geometry");
+    qwen4exp::validateQwenSparseAttentionPhaseSchedule(dimensions.attention_phase_schedule,dimensions.device.type);
+    if(dimensions.attention_phase_schedule==qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33 &&
+       dimensions.request_capacity!=1)
+        throw std::invalid_argument("QSA prefill8_decode33 arena requires the canonical single-request family");
     if (dimensions.ngram_lookup)
     {
         switch (*dimensions.ngram_lookup)
@@ -143,7 +147,7 @@ Qwen4ExpBufferDimensions dimensionsFor(const GraphConfig &model, int flattened_r
         .flattened_rows = flattened_rows, .local_query_heads = model.local_n_heads,
         .retained_mtp_candidate_rows = retainsMTPGraphCapacity(model.mtp)
             ? resolveMTPRetainedTargetQueryRows(model.mtp) : 0,
-        .device = model.default_device, .ngram_lookup = storage,
+        .device = model.default_device, .attention_phase_schedule=model.attention_phase_schedule, .ngram_lookup = storage,
         .ngram_fixed_head_participants = storage==ImmutableRowLookupExecution::FixedHeadShardGPU
             ? static_cast<int>(model.ngram_table_placement->consumers().size()) : 0};
 }
@@ -276,8 +280,17 @@ void applyQwen4ExpBufferGeometry(GraphResolverConfig &resolver, const Qwen4ExpMe
     resolver.custom_formulas["qfn_qsa_prior_words"] = sizeof(qwen4exp::QwenSparseTransactionPrior)/sizeof(std::int32_t);
     resolver.custom_formulas["qfn_mtp_candidate_rows"] = static_cast<std::size_t>(dimensions.retained_mtp_candidate_rows);
     resolver.custom_formulas["qfn_qsa_requests"] = product(sparse_layers, requests);
+    // One scalar bank is shared by mutually exclusive phase graphs and layers.
+    // Keep existing8F bytes for Uniform. The explicit diagnostic adds only the
+    // canonical33D alternative, not33F and not a separate allocation ledger.
+    const auto prefill_records=product(static_cast<std::size_t>(dimensions.flattened_rows),std::size_t{8});
+    auto records_per_head=prefill_records;
+    if(dimensions.attention_phase_schedule==qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33)
+        records_per_head=std::max(records_per_head,product(std::size_t{33},
+            static_cast<std::size_t>(qwen4exp::qwenSparseAttentionDecodeRowCapacity(dimensions.retained_mtp_candidate_rows))));
+    static_assert(sizeof(qwen4exp::QwenSparseAttentionPartial)%sizeof(std::int32_t)==0);
     resolver.custom_formulas["qfn_partial_words"] = dimensions.device.is_gpu()
-        ? product(heads, qwen4exp::QwenSparsePartitions * sizeof(qwen4exp::QwenSparseAttentionPartial) / sizeof(std::int32_t)) : 0;
+        ? product(product(heads,records_per_head),sizeof(qwen4exp::QwenSparseAttentionPartial)/sizeof(std::int32_t)) : 0;
     resolver.custom_formulas["qfn_observation_words"] =
         product(heads, sizeof(qwen4exp::QwenSparseAttentionObservation) / sizeof(std::int32_t));
     // Request cursors are independent of graph row capacity. CPU kernels never

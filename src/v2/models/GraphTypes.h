@@ -120,6 +120,9 @@ namespace llaminar2
         /// Exact Flash Next metadata contract. Null denotes the ordinary single residual stream.
         std::shared_ptr<const Qwen4ExpConfig> flash_next;
 
+        /// Exact runtime/admission schedule; model/schema construction must not re-read DebugEnv.
+        qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+
         /// Frozen HC-up activation arithmetic; ordinary models never consume it.
         QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
         /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.

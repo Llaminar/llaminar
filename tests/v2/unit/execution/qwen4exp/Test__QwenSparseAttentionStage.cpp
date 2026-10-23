@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/qwen4exp/QwenSparseAttentionStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/local_execution/graph/StageVerifier.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
@@ -814,5 +815,72 @@ TEST(QwenSparseAttentionStage, AttentionArithmeticROCmTileCaptureAndColdAdmissio
     EXPECT_THROW((Stage(transform)),std::invalid_argument);
     auto unknown=tile;std::get<Stage::SelectedAttention>(unknown.operation).arithmetic=static_cast<SparseArithmetic>(255);
     EXPECT_THROW((Stage(unknown)),std::invalid_argument);
+}
+#endif
+
+/** @test New setup schedule and resolved33 tag are distinct, closed and device-free. */
+TEST(QwenSparseAttentionStage, Phase33NamesAndUnsupportedBackends)
+{
+    using namespace qwen4exp;using A=QwenSparseAttentionArithmetic;using S=QwenSparseAttentionPhaseSchedule;
+    EXPECT_EQ(qwenSparseAttentionPartialCount(A::FixedFP32),8);
+    EXPECT_EQ(qwenSparseAttentionPartialCount(A::TileFP16WithFP32Totals),8);
+    EXPECT_EQ(qwenSparseAttentionPartialCount(A::TileFP16WithFP32Totals33),33);
+    EXPECT_EQ(qwenSparseAttentionArithmeticName(A::TileFP16WithFP32Totals33),"fp16_tile_33");
+    EXPECT_EQ(parseQwenSparseAttentionPhaseSchedule("prefill8_decode33"),S::Prefill8Decode33);
+    EXPECT_EQ(parseQwenSparseAttentionPhaseSchedule("uniform"),S::Uniform);
+    EXPECT_THROW(parseQwenSparseAttentionArithmetic("fp16_tile_33"),std::invalid_argument); // Resolved tag is not an unresolved setup spelling.
+    for(const auto text:{"","auto","Prefill8Decode33","prefill8_decode33 "})EXPECT_THROW(parseQwenSparseAttentionPhaseSchedule(text),std::invalid_argument);
+    EXPECT_THROW(qwenSparseAttentionPartialCount(static_cast<A>(255)),std::invalid_argument);
+    EXPECT_THROW(qwenSparseAttentionPhaseScheduleName(static_cast<S>(255)),std::invalid_argument);
+    for(auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::Vulkan,DeviceType::Metal,static_cast<DeviceType>(255)})
+        EXPECT_THROW(validateQwenSparseAttentionArithmetic(A::TileFP16WithFP32Totals33,backend),std::invalid_argument);
+    EXPECT_NO_THROW(validateQwenSparseAttentionArithmetic(A::TileFP16WithFP32Totals33,DeviceType::ROCm));
+    QwenSparseAttention empty;empty.arithmetic=A::TileFP16WithFP32Totals33;
+    EXPECT_THROW(cpuQwenSparseAttention(empty),std::invalid_argument); // No native binding is touched on CPU.
+}
+#ifdef HAVE_ROCM
+/** @test Real33 stage admission seals exact phase/R/program/extents without executing a native function. */
+TEST(QwenSparseAttentionStage, Phase33CaptureExtentAndColdAdmission)
+{
+    using A=qwen4exp::QwenSparseAttentionArithmetic;using P=ForwardExecutionPhase;
+    MPIContext mpi(0,1,MPI_COMM_WORLD);SparseArithmeticMetadataCache cache(mpi);SparseArithmeticCaptureFixture f;
+    INT32Tensor large{{4*24*33*sizeof(qwen4exp::QwenSparseAttentionPartial)/4}};
+    auto p=f.params(cache,DeviceId::rocm(0));auto& a=std::get<Stage::SelectedAttention>(p.operation);
+    a.arithmetic=A::TileFP16WithFP32Totals33;a.executionPhase=P::Decode;a.retainedMtpCandidateRows=3;
+    a.gpuPartials=Int(large,BufferId::QFN_QSA_PARTIALS);
+    const auto signature=sparseArithmeticSignature(p);ASSERT_NE(signature,0u);
+    auto other=p;std::get<Stage::SelectedAttention>(other.operation).retainedMtpCandidateRows=4;
+    EXPECT_NE(sparseArithmeticSignature(other),signature);
+    auto old=p;std::get<Stage::SelectedAttention>(old.operation).arithmetic=A::TileFP16WithFP32Totals;
+    EXPECT_NE(sparseArithmeticSignature(old),signature);
+    auto prompt=old;std::get<Stage::SelectedAttention>(prompt.operation).executionPhase=P::Prefill;
+    EXPECT_NE(sparseArithmeticSignature(prompt),sparseArithmeticSignature(old));
+    Stage admitted(p);const auto dump=admitted.getDumpInfoSnapshot();
+    for(const auto [name,value]:{std::pair{"attention_arithmetic_parts",33},std::pair{"attention_execution_phase",int(P::Decode)}}) {
+        const auto field=std::find_if(dump.scalars.begin(),dump.scalars.end(),[&](const auto& s){return std::string_view(s.name)==name;});
+        ASSERT_NE(field,dump.scalars.end());EXPECT_EQ(field->value,value);
+    }
+    {
+        auto bad=p;std::get<Stage::SelectedAttention>(bad.operation).gpuPartials=Int(f.partials,BufferId::QFN_QSA_PARTIALS);
+        EXPECT_THROW((Stage(bad)),std::invalid_argument); // Existing8 bank is insufficient for3*24*33 records.
+    }
+    {
+        auto bad=p;std::get<Stage::SelectedAttention>(bad.operation).executionPhase.reset();
+        EXPECT_THROW((Stage(bad)),std::invalid_argument);
+    }
+    {
+        auto bad=p;std::get<Stage::SelectedAttention>(bad.operation).executionPhase=P::Prefill;
+        EXPECT_THROW((Stage(bad)),std::invalid_argument);
+    }
+    {
+        auto bad=p;std::get<Stage::SelectedAttention>(bad.operation).retainedMtpCandidateRows=2;
+        EXPECT_THROW((Stage(bad)),std::invalid_argument);
+    }
+    {
+        auto bad=p;std::get<Stage::SelectedAttention>(bad.operation).executionPhase=static_cast<P>(255);
+        EXPECT_THROW((Stage(bad)),std::invalid_argument);
+    }
+    cache.keys=ActivationPrecision::BF16;EXPECT_THROW((Stage(p)),std::invalid_argument);cache.keys=ActivationPrecision::FP16;
+    cache.values=ActivationPrecision::BF16;EXPECT_THROW((Stage(p)),std::invalid_argument);
 }
 #endif

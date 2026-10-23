@@ -1,5 +1,18 @@
 # QFN tuning dashboard
 
+**Latest attention experiment151 is qualified** with separate prefill/decode
+programs: **818.579 prefill / 40.110 decode tok/s**, versus the matched uniform8
+control's **818.788 / 39.884**. Decode improves **0.566%**; prefill is effectively
+unchanged. All nine timed token sequences match, the required model accuracy
+panels are unchanged, and the nine boundary-diagnostic decode rows improve mean
+KL from0.000368 to0.000210. Complete Unit plus affected registrations pass
+**832/832**; all19 Release native tests and eight numerical exports pass.
+The [phase qualification record](QFN_ATTENTION_STRUCTURE_COMPARISON.md#phase-schedule151-focused-model-qualification)
+records settings, top-1/top-5 and limitations. This remains an explicit FP16
+experiment; production defaults and complete preflightG60 are unchanged.
+The next decode candidate tests smaller cooperative head groups with isolated
+rocprof evidence. Castagna's42.959tok/s target remains open.
+
 **L106 split load scheduling is qualified** at **815.992 prefill / 39.274 decode
 tok/s** on A1. Its matched immutable HC103 control measures **815.330 / 37.520**:
 **+0.081% prefill / +4.676% decode**. Decode ranges do not overlap; prefill is
@@ -75,6 +88,46 @@ slower at decode and was removed. The next candidates target smaller decode
 head groups. Per user direction, prefill tuning is parked: preserve its current
 lead and qualify separate prefill/decode physical regimes, including byte-exact
 serial/grouped decode. Castagna attention performance remains the target.
+
+Direct decode profiling133 now joins20 isolated producer/merge counter runs
+for both engines. Our pair rises20.157→32.481µs from512→640 visible tokens,
+while the fork rises14.424→15.221µs at its different H12 shape: our eight
+partitions start a second tile, while the fork increases its partition count.
+The [source/profile comparison](QFN_ATTENTION_STRUCTURE_COMPARISON.md#direct-decode-profiles-and-partition-bottleneck)
+records exact shapes, multiplicity normalization and scope. G1/G2 sharing were
+byte-exact but slower and removed; G6 has only a small gain and remains archived.
+The33-logical-tile decode prototype is undergoing focused native qualification;
+production and prefill still use the retained eight-stream program.
+Its first 18 native tests pass. At M1, the component pair falls from
+59.975 to 29.575 µs at 64K, but rises from 20.3175 to 25.24625 µs at 512;
+short-context merge overhead remains unresolved. The live-metadata reducer
+trial136 is byte-exact but slower and has been removed. A single-pass
+producer137 reduces used registers from 75 to 48 without a meaningful timing
+gain. Both candidates retain all saved 33-part output/partial bytes. These
+are component findings; the new reduction program has no model-KL or
+production-default qualification yet. See the
+[decode qualification record](QFN_ATTENTION_STRUCTURE_COMPARISON.md#fixed-logical-decode-tiles-component-qualification).
+Subsequent load/address and fixed-fold cooperative-metadata trials retain all
+checked bytes and bring the33-part M1 pair to **19.070 /28.822 µs at512 /65536**,
+with M16/65536 at127.910 µs. The same-build old-eight controls are20.301 /
+60.085 /138.251 µs respectively. All19 native tests pass, including an
+independent native signed-zero underflow regression. The two-bound merge145
+loses about12% at640/768 and is removed; full-panel copy144 is byte-exact and
+effectively flat despite fewer profiled vector instructions. Six-head sharing146
+and full-tile PV guards147 improve this to **17.237 /25.434 µs at512 /65536**,
+with M16/65536 at101.905 µs. Their19 native tests and eight numerical exports
+pass; exact profiles show zero scratch and unchanged52 used/allocated registers
+between146 and147. Unroll64 in148 and parallel scale calculation in150 further
+reduce the pair to **16.536 /22.046 µs at512 /65536**, with M16/65536 at97.603 µs.
+All19 native tests and eight saved output/partial byte comparisons still pass.
+The retained producer uses51/52 VGPRs;150's merge uses70/72, with zero scratch
+and zero measured LDS bank conflicts. Castagna's pinned512 pair is14.424 µs,
+so a short-context component win remains open. The explicit Prefill8/Decode33
+schedule now passes the focused model qualification151 above; the component
+measurements remain separate from whole-model accuracy and throughput. Source review
+also confirms that the fork has two active whole-KV-head owners per attention
+layer versus Llaminar's four query-head shards; per-GPU work ratios are not
+request-latency ratios.
 
 The shared attention fixture now proves old/current output and partial bytes
 on both GPUs at M1/M16 and 512/65536 context. The initial CUDA M16/512
@@ -526,6 +579,7 @@ its actual prepared route must be represented explicitly in coverage.
 | ID | Topology / actual work placement | Ngrams | Reference engine | Accuracy | Llaminar prefill | Reference prefill | Strata prefill | Llaminar decode | Reference decode | Strata decode | Next action |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
 | A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 L106† Release required groups; L95 prefix restore; latest complete topology gate [G60][a1] | 815.992 L106† | 467.821 F62§ | — | 39.274 L106† | 42.959 F62§ | — | L106 schedules FP32 loads by captured geometry: +4.676% matched decode with unchanged prefill and exact logits. Next qualify packed FP16 attention/KV sharing. Full preflight remains pending. |
+| A1.E151 | Same A1 topology; explicit FP16 attention with `prefill8_decode33`, native FP16 KV; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 832 Unit/affected registrations; boundary panel diagnostic | 818.579 E151† | 467.821 F62§ | — | 40.110 E151† | 42.959 F62§ | — | +0.566% decode versus same-binary uniform8. Tune decode head grouping; retain prefill. Experimental arithmetic; no new complete preflight or default promotion. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |

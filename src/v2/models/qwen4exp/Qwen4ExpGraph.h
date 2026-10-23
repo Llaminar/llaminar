@@ -37,6 +37,13 @@ public:
     ComputeGraph buildMTPGraph(int depth,const MTPDepthWeights &weights,
         const MTPForwardInput &input,MTPForwardOutput &output);
     std::string architectureName() const override { return "qwen4exp"; }
+    /**
+     * @brief Retain shared MoE provenance and authenticate this graph's frozen attention base.
+     * @param material Prefix identity being assembled before any cached payload is restored.
+     * @throws std::invalid_argument For an invalid base snapshot or duplicate identity authority.
+     * @note Uses the same construction-time snapshot as sparse stage wiring; setup reload cannot relabel it.
+     */
+    void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const override;
     /** @brief Extend the actual common schema using the single typed QFN buffer inventory. */
     GraphSchema getSchema() const override;
     /** @brief Resolve exact branch, lexical and sparse geometry over the admitted common envelope. */
@@ -74,7 +81,8 @@ protected:
     /** @copydoc QwenGraphBase::addModelAttentionConsumer */
     std::optional<std::string> addModelAttentionConsumer(ComputeGraph &graph,const AttentionConsumerBinding &binding) override;
 private:
-  const qwen4exp::QwenSparseAttentionArithmetic sparse_attention_arithmetic_; ///< Setup snapshot retained across every prefill/decode/verifier graph.
+  const qwen4exp::QwenSparseAttentionArithmetic sparse_attention_arithmetic_; ///< Existing explicit base arithmetic snapshot.
+  const qwen4exp::QwenSparseAttentionPhaseSchedule sparse_attention_phase_schedule_; ///< Canonical immutable setup scalar shared with arena planning; no DebugEnv reread.
   /**
    * @brief Project only the existing helper-authenticated original query count's arena role.
    * @param input Complete actual main/verifier invocation, including typed prefill/request producers.
