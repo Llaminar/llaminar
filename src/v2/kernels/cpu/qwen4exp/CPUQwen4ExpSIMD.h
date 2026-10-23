@@ -6,10 +6,13 @@
  * never turns a serial scalar tail into a vector lane. AVX2 uses the engine's
  * established exponential polynomial; AVX512 evaluates the same FP32 polynomial
  * with the same FMA order. ISA selection changes width, never reduction order.
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 #pragma once
 #include "../simd/AVX2Helpers.h"
 #include "../../../utils/CPUFeatures.h"
+#include <cmath>
 
 namespace llaminar2::qwen4exp::cpu_detail
 {
@@ -45,5 +48,37 @@ inline int vectorWidth()
     if (activeISALevel() >= ISALevel::AVX2) return 8;
 #endif
     return 1;
+}
+/** @brief Apply the original ISA-specific /4 SiLU program to a channel interval.
+ * @param input Original row base; exact output alias is permitted.
+ * @param output Retained activated row base.
+ * @param begin First admitted channel.
+ * @param end One-past-last admitted channel.
+ * @param vectorWidth Actual preselected CPU vector width, not a new dispatch.
+ */
+inline void residualDownChannels(const float* input,float* output,int begin,int end,int vectorWidth)
+{
+            int channel = begin;
+#if defined(__AVX512F__)
+            if (vectorWidth == 16)
+                for (; channel + 16 <= end; channel += 16)
+                {
+                    const auto value = _mm512_mul_ps(_mm512_loadu_ps(input + channel), _mm512_set1_ps(0.25f));
+                    _mm512_storeu_ps(output + channel, _mm512_mul_ps(value, cpu_detail::sigmoid(value)));
+                }
+#endif
+#if defined(__AVX2__)
+            if (vectorWidth >= 8)
+                for (; channel + 8 <= end; channel += 8)
+                {
+                    const auto value = _mm256_mul_ps(_mm256_loadu_ps(input + channel), _mm256_set1_ps(0.25f));
+                    _mm256_storeu_ps(output + channel, avx2::fast_silu(value));
+                }
+#endif
+            for (; channel < end; ++channel)
+            {
+                const float scaled = input[channel] * 0.25f;
+                output[channel] = scaled * (1.0f / (1.0f + std::exp(-scaled)));
+            }
 }
 } // namespace llaminar2::qwen4exp::cpu_detail

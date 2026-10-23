@@ -406,8 +406,21 @@ namespace llaminar2
         // Immortal: heap-allocated and never destroyed to avoid static
         // destruction order issues during process exit.
         std::mutex &g_ptr_registry_mutex = *new std::mutex();
-        std::unordered_map<void *, ROCmPointerOwnerInfo> &g_active_ptrs =
-            *new std::unordered_map<void *, ROCmPointerOwnerInfo>();
+        /** @brief Canonical HIP live record; diagnostic copies do not borrow storage. */
+        struct ROCmNativeAllocationRecord : ROCmPointerOwnerInfo {
+            std::shared_ptr<const NativeAllocationCaptureIdentity> capture_identity;
+        };
+        std::unordered_map<void *, ROCmNativeAllocationRecord> &g_active_ptrs =
+            *new std::unordered_map<void *, ROCmNativeAllocationRecord>();
+        /** @brief Validate native retirement under lifecycle then pointer-registry locks. */
+        void requireHIPNativeRelease(const void* pointer, int device_id) {
+            std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+            const auto record = g_active_ptrs.find(const_cast<void*>(pointer));
+            if (record == g_active_ptrs.end() || record->second.device_id != device_id)
+                throw std::invalid_argument("HIP native free requires its exact live allocation base/device");
+            NativeAllocationCaptureLease::requireUnborrowed(record->second.capture_identity);
+        }
+
         std::deque<PointerEvent> &g_ptr_events = *new std::deque<PointerEvent>();
         uint64_t g_ptr_sequence = 0;
         constexpr size_t kMaxPointerEvents = 512;
@@ -4457,6 +4470,9 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Create setup-only record identity before native bytes exist.
+        auto capture_identity = std::make_shared<const NativeAllocationCaptureIdentity>();
+
         // Set device before allocation
         HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
@@ -4507,7 +4523,8 @@ namespace llaminar2
 
         {
             std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
-            ROCmPointerOwnerInfo info;
+            ROCmNativeAllocationRecord info;
+            info.capture_identity = std::move(capture_identity);
             info.base_ptr = ptr;
             info.size_bytes = bytes;
             info.device_id = device_id;
@@ -4707,6 +4724,24 @@ namespace llaminar2
         }
     }
 
+    NativeAllocationCaptureLease ROCmBackend::retainNativeAllocation(
+        const void* pointer, size_t bytes, int device_id)
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            throw std::invalid_argument("HIP captured allocation needs an exact existing device");
+        std::lock_guard<std::mutex> lifecycle(rocmRuntimeResourceLifecycleMutex());
+        std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        for (const auto& [base, record] : g_active_ptrs) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(base);
+            if (address >= begin && address - begin < record.size_bytes)
+                return NativeAllocationCaptureLease::acquire(record.capture_identity,
+                    base, record.size_bytes, DeviceId::rocm(record.device_id),
+                    pointer, bytes, DeviceId::rocm(device_id));
+        }
+        throw std::invalid_argument("HIP captured span is not a live native allocation");
+    }
+
     void ROCmBackend::free(void *ptr, int device_id)
     {
         std::lock_guard<std::mutex> lifecycle_lock(
@@ -4718,27 +4753,21 @@ namespace llaminar2
 
         if (device_id >= device_count_ || device_id < 0)
         {
-            LOG_ERROR("[ROCmBackend] Invalid device ID " << device_id << " for hipFree");
-            return;
+            throw std::invalid_argument("HIP native free requires an existing allocator device");
         }
+
+        // Borrow acquisition and native retirement share this lifecycle lock.
+        // Do not send mapped aliases or foreign allocator bytes to hipFree.
+        requireHIPNativeRelease(ptr, device_id);
 
         // Set device before freeing
         HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
-            // During shutdown, hipSetDevice may fail - this is expected
-            if (err == hipErrorDeinitialized || err == hipErrorContextIsDestroyed)
-            {
-                LOG_DEBUG("[ROCmBackend] hipSetDevice failed during shutdown (expected): "
-                          << hipGetErrorString(err));
-            }
-            else
-            {
-                LOG_ERROR("[ROCmBackend] Failed to set device " << device_id << " before hipFree: "
-                                                                << hipGetErrorString(err));
-            }
-            return;
+            // Preserve the original record and caller's storage metadata.
+            throw std::runtime_error(std::string("HIP native free could not select its owner: ") +
+                hipGetErrorString(err));
         }
 
         size_t recorded_size = 0;
@@ -4754,18 +4783,9 @@ namespace llaminar2
         err = hipFree(ptr);
         if (err != hipSuccess)
         {
-            // During shutdown, hipFree may fail with "invalid argument" if the memory
-            // was already cleaned up by the HIP runtime or the pointer is stale.
-            // Also handle explicit deinitialization errors.
-            if (err == hipErrorDeinitialized || err == hipErrorContextIsDestroyed ||
-                err == hipErrorInvalidValue)
-            {
-                LOG_TRACE("[ROCmBackend] hipFree skipped (driver shutting down or memory already freed)");
-            }
-            else
-            {
-                LOG_ERROR("[ROCmBackend] hipFree failed: " << hipGetErrorString(err));
-            }
+            // A failed free cannot retire accounting or clear a tensor pointer.
+            throw std::runtime_error(std::string("HIP native free failed; allocation remains owned: ") +
+                hipGetErrorString(err));
         }
         else
         {

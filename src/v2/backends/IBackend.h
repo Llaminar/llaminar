@@ -20,6 +20,7 @@
 #include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "DeviceType.h"
+#include "backends/NativeAllocationCaptureLease.h"
 #include "GenerationPenaltyHistory.h"
 #include "kernels/common/GenerationLogicalState.h"
 #include "kernels/common/DeviceGenerationInitialization.h"
@@ -560,6 +561,20 @@ namespace llaminar2
          * **Thread Safety**: Caller must ensure device is set before calling
          */
         virtual void free(void *ptr, int device_id) = 0;
+
+        /** @brief Borrow a positive span from the exact existing native allocation record.
+         * @param pointer First consumed byte, including legal interior views.
+         * @param bytes Consumed retained extent.
+         * @param device_id Exact backend-local allocator ordinal.
+         * @return Immutable allocation-record borrow, without device work.
+         * @throws std::logic_error If this backend has no native GPU allocation authority.
+         * @throws std::invalid_argument If the span is missing, foreign or undersized.
+         */
+        virtual NativeAllocationCaptureLease retainNativeAllocation(
+            const void* pointer, size_t bytes, int device_id) {
+            (void)pointer; (void)bytes; (void)device_id;
+            throw std::logic_error("Backend has no captured native-allocation authority");
+        }
 
         /**
          * @brief Set device memory to a byte value

@@ -25,6 +25,8 @@
  *
  * @see ROCmQuantisedGemmWorkspaceContract.h
  * @see ROCmDenseProductionPrefillOverlay.h
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 
 #include "ROCmQuantisedActivationProducers.h"
@@ -1561,6 +1563,66 @@ namespace llaminar2
                  static_cast<float *>(requireBank(kGPUProjectionPrimaryQ8Scales, scales)),
                  static_cast<float *>(requireBank(kGPUProjectionResidualQ8Scales, scales))},
                 stream, impl_->residual_iq_tables);
+            publishROCmTensorWrite(*output, rocm_device_id_, stream);
+        }
+
+        /** @brief Retain original native source admission while fusing HC input publication. */
+        void ROCmQuantisedGemmKernel::multiply_q8_residual_corrected(HCResidualDownInput hc,
+                                                                     TensorBase *output, DeviceRowRange rows,
+                                                                     int n, int k,
+                                                                     DeviceWorkspaceManager *workspace)
+        {
+            const auto*input=&hc.raw;auto*activated=&hc.activated;
+            validateHCResidualDownRows(rows,rows.physicalRows());
+            validateQ8ResidualCorrectionGeometry(rows.physicalRows(), n, k);
+            const DeviceId target = DeviceId::rocm(rocm_device_id_);
+            if (!workspace || workspace->device() != target || !input || !output || input == output ||
+                input->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32 ||
+                output->isMapped() || n != static_cast<int>(N_) || k != static_cast<int>(K_) ||
+                !weights_converted())
+                throw std::invalid_argument("Two-term ROCm Q8 requires prepared FP32 tensor operands, exact "
+                                            "participant workspace and immutable native weights");
+            validateQ8ResidualTensorCapacities(rows.physicalRows(), n, k, input->numel(), output->numel());
+            void *stream = gpu_stream_;
+            if (!stream)
+                throw std::invalid_argument("Two-term ROCm Q8 requires its exact producer stream");
+            if (q8ResidualNeedsIQTables(impl_->native_vnni_codebook_id))
+            {
+                auto *backend = getROCmBackend();
+                const auto generation = impl_->residual_iq_generation.load(std::memory_order_acquire);
+                if (!backend || !generation || backend->deviceRuntimeGeneration(rocm_device_id_) != generation)
+                    throw std::logic_error("TwoTerm ROCm IQ execution requires its original cold prepared generation");
+            }
+            DeviceNativeVNNIMatrixDesc weights;
+            if (!exportNativeVNNIMatrixDesc(weights))
+                throw std::logic_error("Prepared two-term ROCm Q8 source export failed");
+            (void)requireQ8ResidualNativeMatrix(weights, rows.physicalRows(), n, k);
+            TransferEngine::requireDeviceInput(const_cast<TensorBase *>(input), target, stream);
+            if(activated==output||activated->native_type()!=TensorType::FP32||activated->isMapped()||
+               activated->numel()<static_cast<std::size_t>(rows.physicalRows())*k)
+                throw std::invalid_argument("HC GPU requires its retained prepared FP32 activation output");
+            TransferEngine::requireDeviceOutput(activated,target,stream);
+            TransferEngine::requireDeviceOutput(output, target, stream);
+            const auto values = static_cast<std::size_t>(rows.physicalRows()) * k,
+                       scales = values / 32 * sizeof(float);
+            const auto requireBank = [&](const std::string &name, std::size_t bytes) -> void * {
+                auto *pointer = workspace->getBuffer(name);
+                if (!pointer || workspace->getBufferSize(name) < bytes)
+                    throw std::logic_error(
+                        "Two-term ROCm Q8 invocation lacks an admitted named activation bank");
+                return pointer;
+            };
+            rocmHCResidualDownQ8Projection(
+                {{weights, rows, Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal,
+                 static_cast<const float *>(input->gpu_data_ptr()),
+                 static_cast<float *>(output->gpu_data_ptr()),
+                 static_cast<signed char *>(requireBank(kGPUProjectionPrimaryQ8, values)),
+                 static_cast<signed char *>(requireBank(kGPUProjectionResidualQ8, values)),
+                 static_cast<float *>(requireBank(kGPUProjectionPrimaryQ8Scales, scales)),
+                 static_cast<float *>(requireBank(kGPUProjectionResidualQ8Scales, scales))},
+                 static_cast<float*>(activated->gpu_data_ptr())},
+                stream, impl_->residual_iq_tables);
+            publishROCmTensorWrite(*activated, rocm_device_id_, stream);
             publishROCmTensorWrite(*output, rocm_device_id_, stream);
         }
 

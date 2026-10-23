@@ -1,5 +1,24 @@
 # QFN tuning dashboard
 
+**HC103's focused qualification is green** at **815.461 prefill / 37.576 decode
+tok/s** on A1. The matched L104 control measures **814.723 / 37.439**:
+**+0.091% / +0.367%**, with overlapping ranges. The fusion preserves all 185
+final-logit rows byte for byte and twelve generated sequences; all 776 Unit
+tests and the final 23 focused registrations pass. These are small descriptive
+gains. The mixed-build CPU AVX2 one-worker component regression remains an
+explicit limitation; separately compiled AVX2 and default socket measurements
+are recorded independently. Complete production preflight remains G60.
+
+The [matched model evidence](../../../../parity-results/qwen-flash-next/hc103-model-comparison.json)
+and [qualification details](QFN_TP_COMPUTE_SCALING.md#hc-fusion-control-calibration-and-counted-row-defect)
+record the activation/publication fusion, native allocation capture leases,
+counted CPU row fixes and retained failures. Fresh Castagna/Llaminar stage
+attribution is recorded in the [paired stage comparison](QFN_CASTAGNA_STAGE_COMPARISON.md).
+Castagna's second fresh repeat is **453.233 / 42.468
+tok/s**, following an earlier **465.370 / 38.192** repeat. Both are retained;
+the historical **42.959 decode tok/s** target remains open. The variation is
+not resolved by selecting the lower reference.
+
 **L104 counted-row and typed-bias correctness is qualified** at **815.121 prefill /
 37.460 decode tok/s** on A1. Matched L102 measures **815.181 / 37.420**;
 the changes are **−0.007% / +0.106%**, with overlapping ranges. Throughput is
@@ -459,7 +478,7 @@ A1.1's [uninstrumented benchmark](../../../../parity-results/qwen-flash-next/pol
 | Graphs explicitly disabled | 463.898 | 33.393 | 462.698–465.584 | 33.065–33.470 | [F61 disabled](../../../../parity-results/qwen-flash-next/tp4-baseline61-castagna-graphs-disabled/result.json) |
 | Graphs enabled, 28 workers / NUMA1 | 467.821 | 42.959 | 466.864–471.550 | 42.866–43.374 | [F62 host28](../../../../parity-results/qwen-flash-next/tp4-baseline62-castagna-host28/result.json) |
 
-Each profile ran one full warmup and three measured requests with 512 prompt tokens, zero cached prompt tokens, 256 output tokens and 255 after-prefill decode steps. Source/runtime identities, driver windows and requested graceful native retirement passed. The synthetic repeated-token prompt produced the same output sequence on every request. These establish throughput, not numerical model qualification. The fork's 320+192 physical prefill split and within-expert partition differ from Llaminar's M512/expert ownership.
+Each profile ran one full warmup and three measured requests with 512 prompt tokens, zero cached prompt tokens, 256 output tokens and 255 after-prefill decode steps. Source/runtime identities, driver windows and requested graceful native retirement passed. The synthetic repeated-token prompt produced the same output sequence on every request. These establish throughput, not numerical model qualification. The fork's within-expert partition differs from Llaminar's M512/expert ownership. Later fresh source/native evidence corrects the previously inferred320+192 physical prefill split to checkpointed320+188+4; see the [paired stage comparison](QFN_CASTAGNA_STAGE_COMPARISON.md).
 
 `L62` ([result](../../../../parity-results/qwen-flash-next/tp4-baseline62-llaminar-host28/result.json), [native benchmark](../../../../parity-results/qwen-flash-next/tp4-baseline62-llaminar-host28/benchmark.json)) is the corrected canonical **28-worker/NUMA1** observation with ordinary MPI bootstrap and cores/close. Its three-iteration medians are **779.493454** prefill and **29.679393** after-prefill decode tok/s, ranges **778.155–780.401** and **29.385–29.706**. These are iteration medians, not the different aggregate rate. Normal exit0, source/runtime/driver checks, MTP off and PerfStats disabled all passed. Against F62's 467.821296/42.958858, current medians show about **1.67× prefill throughput** and **31% lower decode throughput**. This is a same-hardware/GGUF/28-core-NUMA1 end-to-end observation, with the disclosed expert partition, physical prefill split and host-control binding differences; it is not an algorithm-matched kernel speedup or a win in both phases.
 

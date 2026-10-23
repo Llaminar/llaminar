@@ -7,6 +7,8 @@
  * terms. Independent increasing-K FP32 folds are added exactly once. All
  * pointers and physical geometry are immutable captured operands; live counts
  * remain on device and inactive input/output/scratch bytes are untouched.
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 #pragma once
 #if defined(Q8_RESIDUAL_CUDA)
@@ -14,6 +16,7 @@
 #include <cuda_fp16.h>
 #define Q8R_STREAM cudaStream_t
 #define Q8R_FACTORY cudaQ8ResidualCorrectedProjection
+#define Q8R_HC_FACTORY cudaHCResidualDownQ8Projection
 #define Q8R_COLUMN_REFERENCE cudaQ8ResidualOriginalColumnReference
 #define Q8R_NAMESPACE cuda_q8_residual
 #define Q8R_ERROR cudaGetLastError
@@ -26,6 +29,7 @@
 #include "kernels/rocm/ops/ROCmSwiGLUDecodeEquivalentMath.h"
 #define Q8R_STREAM hipStream_t
 #define Q8R_FACTORY rocmQ8ResidualCorrectedProjection
+#define Q8R_HC_FACTORY rocmHCResidualDownQ8Projection
 #define Q8R_COLUMN_REFERENCE rocmQ8ResidualOriginalColumnReference
 #define Q8R_NAMESPACE rocm_q8_residual
 #define Q8R_ERROR hipGetLastError
@@ -49,6 +53,7 @@
 #include <cstdint>
 #include <climits>
 #include <string>
+#include <type_traits>
 namespace llaminar2 {
 namespace Q8R_NAMESPACE {
 /** @brief Native signed four-byte integer dot without any floating operand. */
@@ -101,6 +106,35 @@ __global__ __launch_bounds__(256,2) void publish(GPUQ8ResidualCorrectionArgs a) 
  if(task>=static_cast<std::uint64_t>(live)*bpr)return;
  const unsigned lane=threadIdx.x%32;const auto offset=task*32+lane;
  const float value=a.input[offset];if(!isfinite(value))invalidActivation();float maximum=fabsf(value);
+ for(int distance=16;distance;distance/=2)maximum=fmaxf(maximum,Q8R_SHFL(maximum,distance));
+ const float stored=blockScale(maximum);
+ const int primary=quantizedValue(value,stored);
+ a.primary[offset]=static_cast<signed char>(primary);
+ const float residual=device_fp32_contract::add(value,-device_fp32_contract::multiply(stored,static_cast<float>(primary)));
+ if(!isfinite(residual))invalidActivation();
+ float residualMaximum=fabsf(residual);
+ for(int distance=16;distance;distance/=2)residualMaximum=fmaxf(residualMaximum,Q8R_SHFL(residualMaximum,distance));
+ const float residualScale=blockScale(residualMaximum);
+ a.residual[offset]=static_cast<signed char>(quantizedValue(residual,residualScale));
+ if(lane==0){a.primaryScales[task]=stored;a.residualScales[task]=residualScale;}
+}
+/** @brief Original HC /4 SiLU and two-term publication with one input load.
+ * @param hc Complete original projection and retained activated FP32 destination.
+ * @details Every32-lane subgroup loads its own source values before its same-index store;
+ * exact input/activated alias needs no cross-subgroup ordering. Inactive groups
+ * leave every FP32 and Q8 bank byte untouched.
+ */
+__global__ __launch_bounds__(256,2) void publishHCResidualDown(GPUHCResidualDownPublication hc) {
+ const auto a=hc.projection;
+ const std::uint64_t task=static_cast<std::uint64_t>(blockIdx.x)*8+threadIdx.x/32;
+ const auto bpr=a.weights.blocks_per_row;
+ const int live=a.rows.activeRows();
+ if(task>=static_cast<std::uint64_t>(live)*bpr)return;
+ const unsigned lane=threadIdx.x%32;const auto offset=task*32+lane;
+ const float scaled=a.input[offset]*0.25f;
+ const float value=scaled*(1.0f/(1.0f+expf(-scaled)));
+ hc.activated[offset]=value;
+ if(!isfinite(value))invalidActivation();float maximum=fabsf(value);
  for(int distance=16;distance;distance/=2)maximum=fmaxf(maximum,Q8R_SHFL(maximum,distance));
  const float stored=blockScale(maximum);
  const int primary=quantizedValue(value,stored);
@@ -259,7 +293,8 @@ __global__ __launch_bounds__(128, 2) void projectNative(GPUQ8ResidualCorrectionA
                 device_fp32_contract::add(primary[r], residual[r]);
 }
 /** @brief Validate only static prepared identities and admitted pointer geometry. */
-inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbeddingIQTables tables)
+inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbeddingIQTables tables,
+                           const GPUHCResidualDownPublication* hc=nullptr)
 {
     validateQ8ResidualCorrectionGeometry(a.rows.physicalRows(), a.weights.n, a.weights.k);
     const auto native = static_cast<Q8R_STREAM>(stream);
@@ -285,14 +320,15 @@ inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, N
         Q8ResidualStorageSpan{a.output, outputValues * sizeof(float), alignof(float)},
         Q8ResidualStorageSpan{a.primary, values, 16}, Q8ResidualStorageSpan{a.residual, values, 16},
         Q8ResidualStorageSpan{a.primaryScales, values / 32 * sizeof(float), alignof(float)},
-        Q8ResidualStorageSpan{a.residualScales, values / 32 * sizeof(float), alignof(float)}};
+        Q8ResidualStorageSpan{a.residualScales, values / 32 * sizeof(float), alignof(float)},
+        Q8ResidualStorageSpan{hc?hc->activated:nullptr,hc?values*sizeof(float):0,alignof(float)}};
     const bool grids = q8ResidualNeedsIQTables(a.weights.codebook_id);
     if (grids &&
         (!tables.iq3s || !tables.iq3xxs || !tables.iq2s || !tables.iq2xs || !tables.iq2xxs || !tables.iq1s))
         throw std::invalid_argument(
             "TwoTerm native IQ projection requires its cold generation-bound original table view");
     const std::array reads{
-        Q8ResidualStorageSpan{a.input, values * sizeof(float), alignof(float)},
+        Q8ResidualStorageSpan{a.input,hc&&hc->activated==a.input?0:values*sizeof(float),alignof(float)},
         // A reusable weight slot owns its full declared payload capacity even
         // when this invocation decodes a compact prefix. Scratch may not alias it.
         Q8ResidualStorageSpan{a.weights.payload,
@@ -313,6 +349,7 @@ inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, N
         Q8ResidualStorageSpan{tables.iq2xs, grids ? 512 * sizeof(std::uint64_t) : 0, alignof(std::uint64_t)},
         Q8ResidualStorageSpan{tables.iq2xxs, grids ? 256 * sizeof(std::uint64_t) : 0, alignof(std::uint64_t)},
         Q8ResidualStorageSpan{tables.iq1s, grids ? 2048 * sizeof(std::uint64_t) : 0, alignof(std::uint64_t)}};
+    if(hc&&!hc->activated)throw std::invalid_argument("HC GPU requires its retained FP32 activation output");
     validateQ8ResidualStorage(writes, reads);
     return native;
 }
@@ -345,6 +382,8 @@ inline void launchOrderedShortK(const GPUQ8ResidualCorrectionArgs &a,
  * @param a Original source/banks, immutable physical shape and device-owned live extent.
  * @param stream Exact non-default native stream retaining all captured owners.
  * @param tables Already cold-declared immutable IQ tables when the source needs them.
+ * @param publication Typed already-activated or HC producer declaration.
+ * @tparam Publication Compile-time semantic operation; no prepublished-bank mode exists.
  * @throws std::invalid_argument Before publication for invalid source, storage or geometry.
  * @throws std::runtime_error After a native submission error; failed calls are never counted.
  * @note The optional PerfStats record counts accepted host calls, including capture
@@ -352,9 +391,13 @@ inline void launchOrderedShortK(const GPUQ8ResidualCorrectionArgs &a,
  * submissions issue this record, using the same immutable launch/storage geometry.
  * Disabled collection does not construct tags or inspect device state.
  */
-void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbeddingIQTables tables)
+template<class Publication>
+static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, void *stream,
+                                       NativeEmbeddingIQTables tables,const Publication& publication)
 {
-    const auto native = Q8R_NAMESPACE::validate(a, stream, tables);
+    const GPUHCResidualDownPublication* hc=nullptr;
+    if constexpr(std::is_same_v<Publication,GPUHCResidualDownPublication>)hc=&publication;
+    const auto native = Q8R_NAMESPACE::validate(a, stream, tables,hc);
     const auto tasks = static_cast<std::uint64_t>(a.rows.physicalRows()) * a.weights.blocks_per_row;
 #if defined(Q8_RESIDUAL_CUDA)
     const auto geometry =
@@ -375,7 +418,15 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbed
     const auto grid = shortGeometry ? shortGeometry->blocks : geometry.blocks;
     if ((tasks + 7) / 8 > INT_MAX || grid > INT_MAX)
         throw std::invalid_argument("Two-term GPU Q8 retained launch grid exceeds native capacity");
-    Q8R_NAMESPACE::publish<<<static_cast<unsigned>((tasks + 7) / 8), 256, 0, native>>>(a);
+    if constexpr(std::is_same_v<Publication,GPUHCResidualDownPublication>)
+        Q8R_NAMESPACE::publishHCResidualDown<<<static_cast<unsigned>((tasks + 7) / 8),256,0,native>>>(publication);
+    else
+        Q8R_NAMESPACE::publish<<<static_cast<unsigned>((tasks + 7) / 8), 256, 0, native>>>(a);
+    // The consumer is submitted only after the exact producer enqueue succeeds.
+    // Both native nodes retain the same immutable bank/row tuple and stream.
+    const auto publicationError=Q8R_ERROR();
+    if(publicationError!=Q8R_SUCCESS)
+        throw std::runtime_error(std::string("Two-term Q8 publication failed: ")+Q8R_ERROR_TEXT(publicationError));
     if (shortGeometry)
         Q8R_NAMESPACE::launchOrderedShortK(a, *shortGeometry, native);
     else visitQ8ResidualNativeCodebook(a.weights.codebook_id, [&]<std::uint8_t C>() {
@@ -425,6 +476,14 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbed
             {"static_shared_bytes", std::to_string(shortGeometry->shared_bytes)}});
     }
 }
+/** @brief Original activated input retains its original publication and projection. */
+void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs& a,void* stream,NativeEmbeddingIQTables tables) {
+ submitQ8ResidualProjection(a,stream,tables,a);
+}
+/** @brief HC input earns publication in the same invocation before the unchanged projection. */
+void Q8R_HC_FACTORY(const GPUHCResidualDownPublication& hc,void* stream,NativeEmbeddingIQTables tables) {
+ submitQ8ResidualProjection(hc.projection,stream,tables,hc);
+}
 /**
  * @brief Submit the immutable original-column M1 arithmetic as a diagnostic reference.
  * @param a Original signed-Q8 prepared source, physicalM1 row authority and admitted banks.
@@ -457,6 +516,7 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream)
 }
 #undef Q8R_STREAM
 #undef Q8R_FACTORY
+#undef Q8R_HC_FACTORY
 #undef Q8R_COLUMN_REFERENCE
 #undef Q8R_NAMESPACE
 #undef Q8R_ERROR

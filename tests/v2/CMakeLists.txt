@@ -30528,7 +30528,7 @@ if(NOT V2_PERF_TESTS_ONLY)
         if(V2_TT_ISA STREQUAL "AVX2")
             list(APPEND V2_TT_CPU_ENV "LLAMINAR_ISA_LEVEL=avx2")
         endif()
-        foreach(V2_TT_CPU_CASE IN ITEMS NativeRowsThreadsAndLargeSmallReuse NativeLargeTiledRows HC103OriginalPreparedControlChain HC103OriginalPrimitiveTailsAndPublicationAdmission)
+        foreach(V2_TT_CPU_CASE IN ITEMS NativeRowsThreadsAndLargeSmallReuse NativeLargeTiledRows HC103OriginalPreparedControlChain HC103OriginalPrimitiveTailsAndPublicationAdmission HC103FusedStageAndTypedOverload HC103TypedAdmissionAndStageIdentity HC103TypedBuilderAllFormats CountedNativeVerifierExtent CountedNativeVerifierRowGeometry CountedNativeVerifierFusedBankAdmission)
             set(V2_TT_ALIAS V2_Integration_CPU_TwoTermAllFormats_${V2_TT_ISA}_${V2_TT_CPU_CASE})
             add_v2_test(${V2_TT_ALIAS}
                 COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
@@ -31750,6 +31750,26 @@ if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmBranchNormHistoricalTree)
 endif()
 
+add_v2_test(V2_Integration_CapturedNativeAllocationOwnership
+    COMMAND $<TARGET_FILE:v2_unit_device_workspace_manager>
+        --gtest_filter=Test__CapturedNativeAllocation.*
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;Ownership;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+if(TEST V2_Integration_CapturedNativeAllocationOwnership)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedNativeAllocationOwnership)
+endif()
+
+# Typed HC composition is a tiny device-free API regression, independent of native calibration.
+add_v2_test(V2_Integration_HC103ComposerWiring
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=Qwen4ExpHyperconnectionBuilder.UpRowsAdmitEveryOriginalQuantizedSource:Qwen4ExpHyperconnectionBuilder.HC103SingleQ8ComposerRemainsUnfused:Qwen4ExpHyperconnectionBuilder.QuantizedPolicyPreservesActualFloatingSourceArithmetic
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Qwen4Exp;TwoTermQ8;Graph;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+if(TEST V2_Integration_HC103ComposerWiring)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HC103ComposerWiring)
+endif()
+
 # HC103 calibration retains original arithmetic before any production extraction.
 foreach(V2_HC103_BACKEND CUDA ROCm)
     if((V2_HC103_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
@@ -31769,7 +31789,7 @@ foreach(V2_HC103_BACKEND CUDA ROCm)
             set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES
                 ${V2_HC103_LANGUAGE}_STANDARD 20 ${V2_HC103_LANGUAGE}_STANDARD_REQUIRED ON)
         endif()
-        foreach(V2_HC103_CASE OriginalControlChain OriginalAllFormats)
+        foreach(V2_HC103_CASE OriginalControlChain OriginalAllFormats CapturedStorageOwnership TypedBuilderChain TypedAllFormats)
             add_v2_test(V2_Integration_${V2_HC103_BACKEND}_HC103${V2_HC103_CASE}
                 COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                     --gtest_filter=Q8ResidualCorrectionDevice.${V2_HC103_BACKEND}HC103${V2_HC103_CASE}
@@ -32090,5 +32110,35 @@ foreach(V2_HC103_PERF_BACKEND CUDA ROCm)
             LABELS "V2;Performance;${V2_HC103_PERF_BACKEND};Qwen4Exp;TwoTermQ8;ComponentTiming"
             ENVIRONMENT ${V2_HC103_PERF_ENV}
             MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        # One exact source/M per opt-in process; same helper, event boundaries
+        # and balanced31 raw pairs as the original selector above.
+        foreach(V2_HC103_PERF_ROWS 1 512)
+            add_v2_test(V2_Perf_${V2_HC103_PERF_BACKEND}_HC103CandidateM${V2_HC103_PERF_ROWS}PairedChain
+                COMMAND $<TARGET_FILE:v2_perf_q8_residual_prepared_projection>
+                    --gtest_also_run_disabled_tests
+                    --gtest_filter=Q8ResidualCorrectionDevice.DISABLED_${V2_HC103_PERF_BACKEND}HC103CandidateM${V2_HC103_PERF_ROWS}PairedChainEvents
+                LABELS "V2;Performance;${V2_HC103_PERF_BACKEND};Qwen4Exp;TwoTermQ8;ComponentTiming"
+                ENVIRONMENT ${V2_HC103_PERF_ENV}
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        endforeach()
     endif()
+endforeach()
+
+# Explicit CPU component measurements; correctness aliases remain unchanged.
+foreach(V2_HC103_CPU_ISA Default AVX2)
+    set(V2_HC103_CPU_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_DYNAMIC=false;OMP_PLACES=cores;OMP_PROC_BIND=close")
+    if(V2_HC103_CPU_ISA STREQUAL "AVX2")
+        list(APPEND V2_HC103_CPU_ENV "LLAMINAR_ISA_LEVEL=avx2")
+    endif()
+    foreach(V2_HC103_CPU_ROWS 1 512)
+        foreach(V2_HC103_CPU_WORKERS One Socket)
+            add_v2_test(V2_Perf_CPU_${V2_HC103_CPU_ISA}_HC103CandidateM${V2_HC103_CPU_ROWS}${V2_HC103_CPU_WORKERS}PairedChain
+                COMMAND $<TARGET_FILE:v2_perf_q8_residual_prepared_projection>
+                    --gtest_also_run_disabled_tests
+                    --gtest_filter=Q8ResidualAllFormatsCPU.DISABLED_HC103CandidateM${V2_HC103_CPU_ROWS}${V2_HC103_CPU_WORKERS}PairedChainEvents
+                LABELS "V2;Performance;CPU;Qwen4Exp;TwoTermQ8;ComponentTiming"
+                ENVIRONMENT ${V2_HC103_CPU_ENV}
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        endforeach()
+    endforeach()
 endforeach()

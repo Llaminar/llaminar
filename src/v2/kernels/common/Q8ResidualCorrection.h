@@ -7,6 +7,8 @@
  * integer dots retain ascending K-block folds and are added once at output.
  * Scratch is instance-owned and contributed to the existing workspace/PMA BOM;
  * no residual FP32 matrix, output matrix or new weight copy is required.
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 #pragma once
 #include "QuantizedActivationOperandPrecision.h"
@@ -22,6 +24,18 @@
 #include <stdexcept>
 #include <string>
 namespace llaminar2 {
+class TensorBase;
+struct NativeEmbeddingIQTables;
+/** @brief Original HC bottleneck values and the retained result of /4 SiLU.
+ * @details References prohibit missing operands. Engines validate native FP32
+ * geometry, exact alias or disjoint storage, and ownership before submission.
+ * The activated tensor is authored even when it aliases raw exactly.
+ */
+struct HCResidualDownInput {
+ const TensorBase& raw; ///< Existing down projection, with no new representation.
+ TensorBase& activated; ///< Original FP32 activated arena output.
+};
+
 /** @brief Stable participant-owned second activation bank for CPU native blocks. */
 inline const std::string kCPUProjectionResidualQ8="cpu_projection_residual_q8";
 /** @brief Stable GPU secondary signed-byte bank; primary uses the normal input bank. */
@@ -125,6 +139,17 @@ inline void validateQ8ResidualStorage(std::span<const Q8ResidualStorageSpan> wri
    throw std::invalid_argument("Two-term Q8 output or activation bank overlaps a consumed immutable input");
  }
 }
+/** @brief Admit the same complete prefix authority as original HC primitives.
+ * @param rows Original physical/live prefix, never a request-hole or expanded tile.
+ * @param physicalRows Exact stage/native FP32 row extent.
+ * @throws std::invalid_argument For a partial, shifted or expanded authority.
+ */
+inline void validateHCResidualDownRows(DeviceRowRange rows,int physicalRows) {
+ const auto identity=rows.captureIdentity();
+ if(identity.physical_rows!=physicalRows||identity.count_capacity!=physicalRows||
+    identity.first_physical_row!=0||identity.repeats_per_row!=1)
+  throw std::invalid_argument("HC publication requires its complete original prefix authority");
+}
 /** @brief Existing canonical primary signed-byte bank, retained as one stable name. */
 inline const std::string kGPUProjectionPrimaryQ8=GemmWorkspaceBuffers::QUANT_A;
 /** @brief Existing canonical primary scale bank, avoiding per-invocation string allocation. */
@@ -176,6 +201,23 @@ struct GPUQ8ResidualCorrectionArgs {
  signed char *primary,*residual; ///< Persistent independently owned signed-byte Q8 banks.
  float *primaryScales,*residualScales; ///< Backend-native stored scales per physical row/Kblock.
 };
+/** @brief Native HC producer declaration, retaining the existing projection operands. */
+struct GPUHCResidualDownPublication {
+ GPUQ8ResidualCorrectionArgs projection; ///< Same weights, rows, banks and destination.
+ float* activated; ///< Retained FP32 /4 SiLU output; exact input alias is permitted.
+};
+/** @brief Fuse original HC activation and Q8 publication, then the unchanged CUDA projection.
+ * @param args Complete original projection and retained activation destination.
+ * @param stream Exact non-default producer/consumer stream.
+ * @param tables Original cold generation-bound native IQ tables.
+ */
+void cudaHCResidualDownQ8Projection(const GPUHCResidualDownPublication& args,void* stream,NativeEmbeddingIQTables tables);
+/** @brief Fuse original HC activation and Q8 publication, then the unchanged HIP projection.
+ * @param args Complete original projection and retained activation destination.
+ * @param stream Exact non-default producer/consumer stream.
+ * @param tables Original cold generation-bound native IQ tables.
+ */
+void rocmHCResidualDownQ8Projection(const GPUHCResidualDownPublication& args,void* stream,NativeEmbeddingIQTables tables);
 /** @brief Launch CUDA publication and paired integer dots on an exact non-default stream.
  * @param args Prepared source, admitted scratch and borrowed live geometry.
  * @param stream Exact ordered native CUDA stream; null/default is rejected.

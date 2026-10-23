@@ -7,6 +7,8 @@
  * and residualWrite applies /4 before 2*sigmoid. Read and injection projections
  * may overlap block compute only through explicit graph dependencies. No
  * collective, activation allocation, packing or backend selection is hidden in this builder.
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 #include "Qwen4ExpHyperconnectionBuilder.h"
 #include "models/qwen4exp/Qwen4ExpHCUpArithmetic.h"
@@ -175,9 +177,27 @@ std::vector<PendingNode> readNodes(const Qwen4ExpHyperconnectionContext &c,
     nodes.push_back({norm,std::make_unique<Stage>(Stage::Params{.device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
         .operation=Stage::BranchRMSNorm{c.hidden,c.epsilon,b.trunk,w.norm,b.normalized}}),dependencies});
     nodes.push_back({down,projection(c,w.down,b.normalized,b.down,c.lowRank,4*c.hidden),{norm}});
-    nodes.push_back({activation,std::make_unique<Stage>(Stage::Params{.device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
-        .operation=Stage::ResidualDown{c.lowRank,b.down,b.activatedDown}}),{down}});
-    nodes.push_back({up,projection(c,w.up,b.activatedDown,b.readLogits,4*c.hidden,c.lowRank,up_precision),{activation}});
+    if(up_arithmetic==Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8) {
+        w.up.requireGeometry(4*c.hidden,c.lowRank);
+        require(w.up.ref().device==c.device && b.down.byteOffset==0 &&
+                    b.activatedDown.byteOffset==0 && b.readLogits.byteOffset==0,
+                "HC fused publication requires exact participant and zero-offset FP32 matrices");
+        // One prepared up invocation owns activation, both banks and projection.
+        // The same original row authority is validated above before graph mutation.
+        nodes.push_back({up,std::make_unique<GEMMStage>(GEMMStage::Params{
+            .device_id=c.device,.mpi_ctx=c.mpi,.A=b.down.tensor,.B=w.up.tensor(),.C=b.readLogits.tensor,
+            .hc_residual_down=GEMMStage::HCResidualDownPublication{b.activatedDown.tensor,b.activatedDown.buffer},
+            .m=c.rows.capacity,.n=4*c.hidden,.k=c.lowRank,.alpha=1.f,.beta=0.f,
+            .a_buffer_id=b.down.buffer,.c_buffer_id=b.readLogits.buffer,
+            .force_decode_equivalent_verifier_prefill=c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
+            .verifier_row_range=c.upProjectionRows?c.upProjectionRows:c.projectionRows,
+            .prepared_ref=w.up.ref(),.prepared_store=&w.up.store(),
+            .quantized_operand_precision=QuantizedActivationOperandPrecision::TwoTermQ8}),{down}});
+    } else {
+        nodes.push_back({activation,std::make_unique<Stage>(Stage::Params{.device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
+            .operation=Stage::ResidualDown{c.lowRank,b.down,b.activatedDown}}),{down}});
+        nodes.push_back({up,projection(c,w.up,b.activatedDown,b.readLogits,4*c.hidden,c.lowRank,up_precision),{activation}});
+    }
     nodes.push_back({read,std::make_unique<Stage>(Stage::Params{.device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
         .operation=Stage::ResidualRead{c.hidden,b.normalized,b.readLogits,b.mixed}}),{up,norm}});
     return nodes;

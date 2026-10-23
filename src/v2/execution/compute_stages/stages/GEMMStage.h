@@ -2,11 +2,16 @@
  * @brief GEMM stage: C = alpha * A * B + beta * C
  * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  * Typed bias retains its original tensor/view through ordinary and verifier dispatch.
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 
 #pragma once
 
 #include <array>
+#include <vector>
+#include "tensors/TensorType.h"
+#include "execution/local_execution/device/WorkspaceBufferLease.h"
 #include "utils/PerfStatsCollector.h"
 
 #include "kernels/common/DeviceRowRange.h"
@@ -25,6 +30,7 @@
 
 namespace llaminar2
 {
+    class CapturedDeviceStorageLease;
 
     // Forward declarations
     class ITensorGemm;
@@ -52,6 +58,11 @@ namespace llaminar2
     class GEMMStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
+        /** @brief Retained FP32 result of HC /4 SiLU, produced before two-term projection. */
+        struct HCResidualDownPublication {
+            TensorBase* activated; ///< Existing arena result, never a new allocation.
+            BufferId buffer; ///< Exact output coherence authority.
+        };
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -60,6 +71,7 @@ namespace llaminar2
             const ITensor *A = nullptr; ///< Input activation tensor [m, k]
             const ITensor *B = nullptr; ///< Weight tensor [k, n] (may be quantized)
             ITensor *C = nullptr;       ///< Output tensor [m, n]
+            std::optional<HCResidualDownPublication> hc_residual_down; ///< Typed raw-down input transform; valid only for TwoTermQ8.
             int m = 0, n = 0, k = 0;    ///< Matrix dimensions
             float alpha = 1.0f;         ///< Scale factor for A*B
             float beta = 0.0f;          ///< Scale factor for existing C
@@ -181,10 +193,25 @@ namespace llaminar2
          * Uncounted SingleQ8 stages keep their established zero variant. Explicit
          * prefix/request selections and TwoTermQ8 hash complete immutable row
          * metadata and arithmetic policy; count values are never host-observed.
-         * The executor's existing prepared-weight/workspace identity remains the
-         * sole authority for those generations and embedded allocation addresses.
+         * HC compares its frozen native binding as a validation side effect;
+         * addresses/leases never change the signature during materialization.
+         * Existing prepared/arena ownership remains the allocation authority.
          */
         uint64_t graphCaptureVariantSignature() const override;
+        /** @brief Freeze HC native operands after the executor's allocation-only prebind.
+         * @param ctx Exact participant context; no GPU query or work is issued.
+         * @param stream Exact non-default recording stream.
+         * @return True after first binding or identical preparatory reentry.
+         * @details Retains only the four original TwoTerm workspace allocations
+         * through existing PMA-backed leases; it does not allocate GPU storage.
+         * @throws std::logic_error On any postbind operand/workspace replacement.
+         */
+        bool prepareGraphLaunch(IDeviceContext* ctx,void* stream) override;
+        /** @brief HC metadata binds only for capture; ordinary GEMMs retain no preparation. */
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override {
+            return params_.hc_residual_down&&params_.device_id.is_gpu()
+                ? GraphLaunchPreparationPolicy::CaptureOnly : GraphLaunchPreparationPolicy::None;
+        }
         void resetSessionState() override;
         void resetSessionStatePreservingCapturedReplay() override;
         void resetSessionStatePreservingLazyInitialization() override;
@@ -212,6 +239,35 @@ namespace llaminar2
 
     private:
         Params params_;
+        /** @brief Exact address/geometry identity; contains no live GPU values. */
+        struct HCNativePublicationIdentity {
+            std::array<const void*,7> pointers{}; ///< Raw A, activated, C, then the four consumed banks.
+            std::array<size_t,7> bytes{}; ///< Complete retained tensor/bank extents.
+            std::array<TensorType,3> types{}; ///< Original tensor storage representations.
+            std::array<const void*,4> weight_planes{}; ///< Prepared payload/scales/mins/emins.
+            std::array<uint64_t,12> weight_geometry{}; ///< Every nonpointer native descriptor field.
+            uint64_t workspace_id=0; ///< Original manager instance, never a new epoch counter.
+            ITensorGemm* engine=nullptr; ///< Original prepared engine resolved from the store.
+            friend bool operator==(const HCNativePublicationIdentity&,const HCNativePublicationIdentity&)=default;
+        };
+        /** @brief Immutable captured ownership, published once after allocation prebind. */
+        struct HCNativePublicationBinding {
+            HCNativePublicationIdentity identity;
+            std::array<std::vector<size_t>,3> shapes; ///< Exact complete tensor shapes, copied only at setup.
+            std::array<std::shared_ptr<const CapturedDeviceStorageLease>,3> operands; ///< Original mutable activation allocation borrows.
+            std::array<std::shared_ptr<const WorkspaceBufferLease>,4> banks; ///< Original PMA-owned allocation leases.
+            void* stream=nullptr; ///< Exact recording stream; preparatory reentry cannot replace it.
+        };
+        std::optional<HCNativePublicationBinding> hc_native_binding_; ///< Survives data reset; only stage destruction retires it.
+        /** @brief Inspect immutable addresses/descriptors without GPU work or host value reads.
+         * @return Complete consumed native identity; no ownership is created here.
+         * @throws std::logic_error For incomplete, foreign or unprepared operands/banks.
+         */
+        HCNativePublicationIdentity currentHCNativePublicationIdentity() const;
+        /** @brief Reject unbound/replaced native identity, shape or bank ownership before capture/replay.
+         * @throws std::logic_error For any stale pointer, extent, source, shape, stream or generation.
+         */
+        void requireHCNativePublicationBinding() const;
 
         // === Cached kernel pointers (avoid KernelFactory mutex per execute) ===
         // These are populated on first execute() and reused thereafter.

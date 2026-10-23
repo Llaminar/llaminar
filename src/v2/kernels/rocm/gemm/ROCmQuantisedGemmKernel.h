@@ -91,6 +91,8 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 
 #pragma once
@@ -741,6 +743,9 @@ namespace llaminar2
             WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const override;
             /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
             void multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,
+                DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace) override;
+            /** @copydoc ITensorGemm::multiply_q8_residual_corrected(HCResidualDownInput,TensorBase*,DeviceRowRange,int,int,DeviceWorkspaceManager*) */
+            void multiply_q8_residual_corrected(HCResidualDownInput input,TensorBase*output,
                 DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace) override;
 
             bool exportNativeVNNISourceIdentity(

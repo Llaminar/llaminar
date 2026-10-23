@@ -6,6 +6,8 @@
  * Kernels are created by tensors via createGemm(), createRoPE(), etc.
  *
  * @author David Sanftenberg
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 
 #pragma once
@@ -1830,6 +1832,19 @@ namespace llaminar2
         { (void)input;(void)output;(void)rows;(void)n;(void)k;(void)workspace;
           throw std::logic_error("Selected prepared GEMM does not implement two-term Q8 arithmetic"); }
 
+        /** @brief Original HC /4 SiLU, paired-Q8 publication and native projection.
+         * @param input Raw bottleneck and retained activated FP32 destination.
+         * @param output Original distinct FP32 projection output.
+         * @param rows Original complete physical/live authority.
+         * @param n Exact prepared output width.
+         * @param k Exact prepared bottleneck width in complete32 blocks.
+         * @param workspace Existing invocation-owned activation banks.
+         * @throws std::logic_error For a source lacking this explicitly selected operation.
+         */
+        virtual void multiply_q8_residual_corrected(HCResidualDownInput input,TensorBase*output,
+            DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace)
+        { (void)input;(void)output;(void)rows;(void)n;(void)k;(void)workspace;
+          throw std::logic_error("Selected prepared GEMM does not implement HC down two-term publication"); }
 
     };
 

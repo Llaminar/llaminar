@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -1125,9 +1126,46 @@ namespace llaminar2
     ///   GPU → GPU same vendor            → DEVICE_TO_DEVICE_SAME_BACKEND
     ///   GPU → GPU cross-vendor           → HOST_STAGED
     ///
+    /** @brief Retained allocation authority for mutable captured tensor bytes.
+     * Native records reject physical release while borrowed. Mapped storage
+     * retains its original region owner; no new mapping or PMA claim exists.
+     * Graph/executable completion must retire before the final lease is dropped.
+     */
+    class CapturedDeviceStorageLease final {
+    private:
+        friend class TransferEngine;
+        /** @brief TransferEngine alone publishes admitted native or mapped ownership. */
+        CapturedDeviceStorageLease() = default;
+        std::optional<NativeAllocationCaptureLease> native_;
+        std::shared_ptr<MappedHostTransferRegion> mapped_;
+        const void* pointer_ = nullptr;
+        size_t bytes_ = 0;
+        DeviceId device_ = DeviceId::invalid();
+    };
+
     class TransferEngine
     {
     public:
+        /** @brief Retain existing physical tensor storage during cold graph preparation.
+         * @param tensor Original tensor/view whose current bytes are captured.
+         * @param device Exact consumer GPU.
+         * @param bytes Positive consumed span within the tensor.
+         * @return Native-record borrower or original mapped-region owner.
+         * @throws std::logic_error During capture or for foreign/unmaterialized storage.
+         * @throws std::invalid_argument For missing or insufficient physical ownership.
+         */
+        [[nodiscard]] std::shared_ptr<const CapturedDeviceStorageLease>
+        retainCapturedDeviceStorage(const TensorBase& tensor, DeviceId device, size_t bytes) const;
+
+        /** @brief Validate retained identity without allocation, device queries or transfers.
+         * @param lease Setup-retained original authority.
+         * @param tensor Current tensor/view binding.
+         * @param device Exact consumer GPU.
+         * @param bytes Exact originally consumed span.
+         * @throws std::logic_error If storage or original ownership changed.
+         */
+        void requireCapturedDeviceStorage(const CapturedDeviceStorageLease& lease,
+            const TensorBase& tensor, DeviceId device, size_t bytes) const;
         TransferEngine() = default;
 
         /// Construct a TransferEngine with an injected backend resolver

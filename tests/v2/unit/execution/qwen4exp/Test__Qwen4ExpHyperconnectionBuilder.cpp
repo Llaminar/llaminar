@@ -224,6 +224,11 @@ TEST(Qwen4ExpHyperconnectionBuilder, QuantizedPolicyPreservesActualFloatingSourc
         EXPECT_EQ(up->getParams().B,&f.up);
         EXPECT_EQ(up->getParams().prepared_ref->binding_id,f.upBinding.prepared->binding_id);
         EXPECT_EQ(up->getParams().quantized_operand_precision,QuantizedActivationOperandPrecision::SingleQ8);
+        EXPECT_FALSE(up->getParams().hc_residual_down);
+        EXPECT_EQ(up->getParams().A,&f.activated);
+        ASSERT_NE(graph.getNode("hc.read_activation"),nullptr);
+        EXPECT_EQ(graph.getNode("hc.read_up")->dependencies,std::vector<std::string>{"hc.read_activation"});
+        EXPECT_EQ(graph.size(),6u); // Includes the unchanged seed node.
         CPUDeviceContext context(DeviceId::cpu(),1);
         for(auto *stage:graph.getExecutionStages())ASSERT_TRUE(stage->execute(&context));
         if(policy==QuantizedActivationOperandPrecision::SingleQ8)
@@ -370,9 +375,48 @@ TEST(Qwen4ExpHyperconnectionBuilder, UpRowsAdmitEveryOriginalQuantizedSource)
         const auto *up=dynamic_cast<const GEMMStage *>(node->stage.get());ASSERT_NE(up,nullptr);
         EXPECT_EQ(up->getParams().B,f.originalUp.get());
         EXPECT_EQ(up->getParams().quantized_operand_precision,QuantizedActivationOperandPrecision::TwoTermQ8);
+        EXPECT_EQ(graph.size(),4u);
+        EXPECT_EQ(graph.getNode("hc.read_activation"),nullptr);
+        EXPECT_EQ(node->dependencies,std::vector<std::string>{"hc.read_down"});
+        EXPECT_EQ(graph.getNode("hc.read")->dependencies,(std::vector<std::string>{"hc.read_up","hc.branch_norm"}));
+        EXPECT_EQ(up->getParams().A,&f.bottleneck);
+        ASSERT_TRUE(up->getParams().hc_residual_down);
+        EXPECT_EQ(up->getParams().hc_residual_down->activated,&f.activated);
+        EXPECT_EQ(up->getParams().hc_residual_down->buffer,BufferId::K_PROJ);
+        const auto contract=up->bufferContract();
+        EXPECT_TRUE(std::any_of(contract.inputs.begin(),contract.inputs.end(),[](const auto &b){return b.id==BufferId::Q_PROJ;}));
+        EXPECT_TRUE(std::any_of(contract.outputs.begin(),contract.outputs.end(),[](const auto &b){return b.id==BufferId::K_PROJ;}));
+        EXPECT_TRUE(std::any_of(contract.outputs.begin(),contract.outputs.end(),[](const auto &b){return b.id==BufferId::GATE_PROJ;}));
         ASSERT_TRUE(up->getParams().verifier_row_range);
         EXPECT_EQ(up->getParams().verifier_row_range->captureIdentity(),context.upProjectionRows->captureIdentity());
         const auto captured=up->graphCaptureVariantSignature();
         for(int next:{0,1,3}){live=next;EXPECT_EQ(up->graphCaptureVariantSignature(),captured);}
     }
+}
+
+/** @test Explicit quantized SingleQ8 preserves the original standalone activation and dependencies. */
+TEST(Qwen4ExpHyperconnectionBuilder, HC103SingleQ8ComposerRemainsUnfused)
+{
+    llaminar::v2::ThreadCountGuard workers(1);
+    QuantizedRowFixture f;
+    auto context=f.context();context.rows.capacity=3;
+    context.upOperandPrecision=QuantizedActivationOperandPrecision::SingleQ8;
+    ComputeGraph graph;
+    (void)Builder::appendFinalRead(graph,context,f.readWeights(),f.buffers(),{});
+    ASSERT_EQ(graph.size(),5u);
+    const auto *activation=graph.getNode("hc.read_activation");ASSERT_NE(activation,nullptr);
+    EXPECT_EQ(activation->dependencies,std::vector<std::string>{"hc.read_down"});
+    const auto *primitive=dynamic_cast<const Stage*>(activation->stage.get());ASSERT_NE(primitive,nullptr);
+    EXPECT_TRUE(std::holds_alternative<Stage::ResidualDown>(primitive->getParams().operation));
+    const auto *node=graph.getNode("hc.read_up");ASSERT_NE(node,nullptr);
+    EXPECT_EQ(node->dependencies,std::vector<std::string>{"hc.read_activation"});
+    const auto *up=dynamic_cast<const GEMMStage*>(node->stage.get());ASSERT_NE(up,nullptr);
+    EXPECT_FALSE(up->getParams().hc_residual_down);
+    EXPECT_EQ(up->getParams().A,&f.activated);
+    EXPECT_EQ(up->getParams().B,f.originalUp.get());
+    EXPECT_EQ(up->getParams().quantized_operand_precision,QuantizedActivationOperandPrecision::SingleQ8);
+    const auto contract=up->bufferContract();
+    EXPECT_TRUE(std::any_of(contract.inputs.begin(),contract.inputs.end(),[](const auto &b){return b.id==BufferId::K_PROJ;}));
+    EXPECT_FALSE(std::any_of(contract.outputs.begin(),contract.outputs.end(),[](const auto &b){return b.id==BufferId::K_PROJ;}));
+    EXPECT_EQ(graph.getNode("hc.read")->dependencies,(std::vector<std::string>{"hc.read_up","hc.branch_norm"}));
 }

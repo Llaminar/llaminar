@@ -852,3 +852,294 @@ two counted specializations with a runtime optional sums pointer, and the final
 receipt checks that exact pair. These were diagnostic collector corrections,
 not production failures. L104 is a focused correctness checkpoint with unchanged
 model throughput; complete ProductionTestPreflight remains G60.
+
+## HC activation and publication fusion: unqualified candidate
+
+Counted104 is committed and pushed as `5cb59baeae971ab415038ac1a40a7a65099fa1b3`.
+The subsequent local HC candidate combines the original /4 SiLU activation and
+TwoTerm Q8 publication in the prepared up operation on CPU, CUDA and ROCm.
+Its declarative TwoTerm graph has norm, down, up and read; up retains the
+activated FP32 output and both original Q8 terms. Original projection and
+reduction arithmetic are unchanged. Removing one activation dispatch at each
+of the 97 measured HC sites is a structural opportunity, not a measured gain.
+
+Cold preparation retains the original native allocation records for captured
+operands, the original mapped-region owner where applicable, and the existing
+workspace bank leases. Borrow acquisition and native free share the existing
+backend lifecycle lock. A borrowed allocation cannot be freed or recycled;
+there is no additional memory ledger or GPU allocation. Stage destruction
+releases these leases only after the existing graph retirement boundary.
+Invalid public tensor release may perform its existing coherence work before
+native free rejects; this does not claim a new concurrent tensor-coherence
+protocol.
+
+The [first Integration rebuild](../../../../parity-results/qwen-flash-next/hc103-captured-ownership-build-r1/result.json)
+passes in **552.63 seconds**, including SM80/86/89/90 and gfx906 spill enforcement.
+The [ownership and original-control slice](../../../../parity-results/qwen-flash-next/hc103-captured-ownership-focused-r1/result.json)
+passes **7/7 in 22.99 seconds**, with clean drivers and normal retirement.
+CUDA/ROCm captured-storage cases compare twenty rejection histories with twenty
+ordinary replays from identical finite input, checking exact output bytes,
+unchanged allocation count/bytes and pointer retention. Mapped ownership and
+device-free span/identity admission are covered. Original GPU control chains
+and all-format calibration remain green.
+
+The separate actual-builder calibration extension is applied but unqualified.
+It compares retained activation, both Q8 banks/scales, up and final read against
+the frozen original controls, including all 21 formats, M1/M512, aliases and
+dirty full/partial/empty histories. Its
+[first native calibration](../../../../parity-results/qwen-flash-next/hc103-calibration-focused-r1/result.json)
+passes **5/11 in 38.45 seconds**, with clean drivers and normal retirement.
+The fused CPU stage/typed-overload and admission cases pass on both default and
+AVX2 ISAs, as does declarative composer coverage. Both CPU actual-builder cases
+fail retained activation bytes at Q4_0, M1, exact alias, replay 2 with zero live
+rows. All four CUDA/ROCm actual-builder registrations fail prepared-binding
+admission before numerical execution. These failing receipts remain retained;
+diagnosis must preserve production admission and exact arithmetic assertions.
+Component performance, full Unit and model gates remain outstanding. L104
+remains the accepted performance checkpoint.
+
+The CPU failure identifies a production counted-row defect in the ordinary
+grouped-verifier down projection: its CPU adapter processes physical capacity
+without consuming the scoped live-row descriptor. Empty work can therefore
+overwrite the retained aliased activation before the correctly guarded fused
+up stage runs. A narrow live-row repair and direct regression are in progress.
+The GPU fixture passed its original caller registration metadata, whose
+prepared ref is absent; consuming the exact store-owned bindings preserves the
+builder's production admission contract. After that fixture repair,
+[both GPU all-format registrations pass](../../../../parity-results/qwen-flash-next/hc103-gpu-binding-focused-r1/result.json).
+The other two registrations expose a second fixture error: a null-stream
+setter already rejects before the test's later preparation assertion. The
+corrected test asserts rejection at the public setter and unchanged retained
+identity. The failed aggregate remains retained (**2/4**, 50.83 seconds,
+clean drivers); it is not a complete green candidate slice.
+
+The [corrected GPU builder slice](../../../../parity-results/qwen-flash-next/hc103-stream-assertion-focused-r1/result.json)
+passes **2/2 in 13.45 seconds**, including exact captured activation, publication,
+up and read bytes and the retained identity/admission negatives. Together with
+the preceding two all-format passes, this closes the GPU fixture failures.
+
+The first [CPU counted-row repair slice](../../../../parity-results/qwen-flash-next/hc103-cpu-counted105-focused-r1/result.json)
+passes **10/12 in 63.45 seconds**, including both formerly failing actual HC
+builders, all-format live-row histories, typed admission and row geometry on
+default and AVX2. The two failures are in a new partial-bank fixture: N64/K32768
+is below the canonical planner's 16M FLOP K-parallel threshold, so the fixture
+incorrectly expects shared partials. N64/K131072 with three workers and two
+members exercises the real shared-bank path; the corrected test asserts that
+route before checking one-float-short rejection without publication or output
+mutation. Production planning thresholds are unchanged.
+
+A separate [negative control](../../../../parity-results/qwen-flash-next/hc103-cpu-two-term-negative-r1/result.json)
+reproduces ordinary CPU TwoTerm's rejection of valid count-free expanded/sliced
+rows on both ISAs. The implementation used expanded physical capacity as its
+logical count. The one-line correction consumes `countCapacity()` through the
+existing `activeRowsFor()` authority. The regression checks exact output and
+both Q8 block banks across fixed and twenty changing counted histories. Its
+failing receipt is retained; the corrected final focused and complete Unit
+gates remain pending. Neither CPU fix changes the projection arithmetic.
+
+The combined [focused slice](../../../../parity-results/qwen-flash-next/hc103-final-focused-r1/result.json)
+then passes **50/50 in 204.43 seconds**, including both real shared-bank
+admission cases. The first complete Unit run passes **775/776**; its sole
+failure is the stream-presence source guard. The new HC binding queried
+`gpuStream()` as a Boolean even though that accessor throws when a GPU stage
+is unbound. This also prevents legitimate identity inspection after session
+reset. Presence now uses `hasGPUStream()` and required execution bindings use
+`requireGPUStream()`; unbound prepare/execute remain fatal.
+
+The native ownership regression rotates all three reset APIs after actual
+capture, verifies unchanged retained identity without a host stream, rejects
+unbound prepare/execute, and rebinds the original exact stream. Both twenty-run
+histories still replay the same graph and compare final activation/output
+bytes. The [narrow follow-up](../../../../parity-results/qwen-flash-next/hc103-final-focused-r2/result.json)
+passes **9/9 in 32.05 seconds**, including the architecture guard, CUDA/ROCm
+reset/ownership and builder cases, CPU functional paths, composer wiring and
+scalar boundary. The [complete Unit rerun](../../../../parity-results/qwen-flash-next/hc103-unit-r2/result.json)
+passes **776/776 in 116.32 seconds**. All successful native slices have clean
+driver windows and normal retirement. Release component/model qualification
+remains pending; complete ProductionTestPreflight remains G60.
+
+The first Release build was interrupted by session termination; its receipt
+records SIGTERM and complete retirement without surviving processes. The
+[incremental continuation](../../../../parity-results/qwen-flash-next/hc103-release-build-r2/result.json)
+passes in **477.76 seconds**, including all four CUDA architectures and gfx906.
+The [component results](../../../../parity-results/qwen-flash-next/hc103-component-summary-r2/report.json)
+contain eighteen clean processes and 558 alternating candidate/control pairs.
+Both GPU M1/M512 chains and every CPU byte check pass. Initial complete-chain
+latency changes are CUDA −4.60%/−0.55% and ROCm −1.97%/−0.59% at M1/M512.
+CPU AVX512 socket-wide M1 improves 5.61–5.74% across three fresh processes,
+but runtime AVX2 M1 regresses 2.34–3.60% with one worker and 4.66–4.95% across
+the socket. These AVX2 measurements use the AVX512 build's runtime ISA override;
+they do not certify a separately compiled AVX2 image. The regression must be
+resolved before accepting the CPU economics. No model gain is qualified yet.
+
+The [isolated ROCm publisher matrix](../../../../parity-results/qwen-flash-next/hc103-publisher-profile-summary-r1/report.json)
+passes ten runs: two shapes and five separate counters. Actual graph and dispatch
+joins prove 37 candidate, 37 reference and one independent witness replay per
+process. M1 has two 256-thread blocks; M512 has 640. Both use the same loaded
+kernel: compiler demand is 17 VGPRs/36 SGPRs, allocated granules are 20/48,
+and LDS, private scratch and register spills are zero. VALU lane utilization
+is about 90.7%; this is not achieved CU occupancy. Cache-sensitive traffic
+counters do not represent logical output-byte accounting. No CUDA profiler was
+attached, and profiled times are excluded from performance acceptance.
+
+CPU exact-chain counters initially fail with permission denied under the normal
+user. Four fresh observations through the existing privileged path then pass
+without changing `perf_event_paranoid=4`, using the authenticated 28 physical
+cores on socket 1. All required counters report 100% running time. AVX2's fused
+chain retires more instructions than its reference, while AVX512 retires fewer.
+The interval includes normal OpenMP work and waiting, so these observations
+alone do not identify an arithmetic loop as the cause. Source investigation and
+the unprofiled repetitions own the next CPU tuning decision.
+
+The next CPU candidate retains the original 256-channel activation grain inside
+the fused workshare. K320 has two publication owners instead of one row owner,
+and each owner publishes its original complete Q8 blocks. The existing explicit
+preflight regression now also covers K512 on every source format and multiworker
+K320 partial tiles, including aliases and changing live prefixes. Its Release
+build passes in 109.98 seconds. Initial paired byte checks pass; the socket-wide
+AVX2 timing difference shrinks to 1.63%, while one-worker AVX2 remains 2.67%.
+
+These CPU timings subsequently expose a benchmark-boundary defect: the reference
+calls frozen header-only activation/read oracles, which omit production public
+validation and compile in the test executable; the candidate calls compiled
+production primitives. Matching output bytes does not make those timings a
+matched production comparison. Retain the earlier samples and counters as
+diagnostics, but do not use their gains or regressions for CPU performance
+acceptance. The next timing control must execute the production unfused chain;
+both production chains must still match the independent frozen byte oracle
+outside all timed/counter regions. GPU captured-event measurements have a
+separate kernel-only boundary and are not changed by this CPU finding.
+
+The final CPU timing control now calls the production unfused primitives; both
+timed chains independently match the frozen original byte oracle outside the
+measurement. Publication uses complete 256-channel tiles, and both paths call
+one compiled projection workshare after their existing publication barrier.
+This retains the source-format dispatch, Q8 bank ownership, reduction order and
+one OpenMP team. The actual test executable's ISA confirms the shared call
+target; a core-library-only disassembly would not establish that executable's
+template binding.
+
+The [final component summary](../../../../parity-results/qwen-flash-next/hc103-cpu-final-component-summary-r1/report.json)
+retains all 248 alternating pairs from eight processes. On the AVX512 build,
+default M1 latency is unchanged with one worker and improves 6.29% with the
+physical socket. Its runtime AVX2 override improves 2.37% with the socket but
+still regresses 3.80% with one worker. A separate CPU-only AVX2 Release build
+passes all measured byte checks: latency changes are −0.19%/−1.91% at M1 and
+−0.06%/−0.68% at M512 for one/socket workers. These are component observations,
+not a universal CPU performance win or full-stage timing proof. In particular,
+the mixed-build AVX2 one-worker regression remains visible. CPU publication is
+a no-op in the fused GPU-publication helper; missing CPU publication is not an
+explanation for the control difference.
+
+The final [focused regression slice](../../../../parity-results/qwen-flash-next/hc103-final-focused-r3/result.json)
+passes **23/23 in 93.79 seconds**, including expanded all-format CPU publication
+tiles, counted-row admission and GPU capture/reset/builder cases. The final
+[complete Unit suite](../../../../parity-results/qwen-flash-next/hc103-unit-r3/result.json)
+passes **776/776 in 117.18 seconds**. The archived Release runtime passes its
+[canonical accuracy group](../../../../parity-results/qwen-flash-next/hc103-release-accuracy-r1/report.json)
+and preserves **all 185 final-logit rows across 26 files byte for byte** against
+accepted L104, including the sparse-indexer boundary and reset cases. These
+receipts qualify the stated focused scope; complete ProductionTestPreflight
+still refers to G60. Matched model ABBA timing and paired traces follow with
+the source and runtime archives frozen.
+
+The [completed model ABBA](../../../../parity-results/qwen-flash-next/hc103-model-comparison.json)
+retains all twelve measured sequences and their original source/runtime proofs.
+All generated IDs match. Median control throughput is **814.723 prefill /
+37.439 decode tok/s**; HC103 measures **815.461 / 37.576**, changes of
+**+0.091% / +0.367%**. Both phase ranges overlap: this is a small descriptive
+improvement, not a decisive model-throughput win. Select the qualified HC103
+runtime for the subsequent stage trace, while retaining L104 and the original
+Castagna target. No precision change contributes to the difference.
+
+## Next: paired Castagna and Llaminar stage attribution
+
+After the HC fusion's numerical, component and matched model decision, compare
+the accepted Llaminar runtime with the pinned Castagna F62 A1 configuration.
+Use the comparison skill's existing matched Release workflow and retained
+512-token prompt, 256-token output, four MI50s, 28 physical workers on NUMA1,
+context, cache and arithmetic declarations. Refresh unprofiled measurements
+before diagnostic tracing; profiled throughput is not the acceptance result.
+
+Authenticate prefill and decode windows from actual graph/token evidence and
+retain every physical prefill batch. Fresh source/native evidence proves
+Castagna's checkpointed320+188+4 split, correcting the earlier320+192 assumption.
+Compare projections and reductions, HC, attention/indexing, GDN/convolution,
+expert routing/GEMM, normalization, ngrams, vocabulary head, sampling/control,
+state/layout and communication. Keep indivisible fusions intact. Report summed,
+union and exposed intervals with overlap and no-kernel time accounted for;
+do not add per-card or overlapping times into a supposed request latency.
+
+Rank the largest paired exposed-time deficits, then inspect the corresponding
+exact kernels' source, arithmetic/precision, ownership/sharding, launch geometry,
+memory traffic, registers, spills and occupancy. Follow with isolated ROCm
+counter/ISA measurements and a matched unprofiled model decision. The goal is
+to identify which Castagna kernels are faster and why, while distinguishing
+kernel architecture from the engines' different expert partitioning and host
+control. Existing CUDA profiler restrictions remain in force. This is the next
+investigation, not an assertion that paired stage evidence is already complete.
+
+The [fresh Castagna F62 repeat](../../../../parity-results/qwen-flash-next/castagna-f62-repeat-r1/result.json)
+passes normal retirement, driver and resource checks. Its warmup and all three
+measured requests reproduce the retained 256 generated IDs with no prefix-cache
+tokens. Measured medians are **465.370 tok/s prefill and 38.192 tok/s decode**;
+decode samples are 39.600, 38.192 and 38.147 tok/s, below the retained 42.959
+tok/s reference. No new Llaminar win may be inferred by pairing that repeat with
+historical Llaminar throughput. Fresh matched arms and diagnostic perturbation
+checks remain required.
+
+The [second independent Castagna repeat](../../../../parity-results/qwen-flash-next/castagna-f62-repeat-r3/result.json)
+also passes with identical original generated IDs, clean driver/resource checks
+and normal retirement. Its medians are **453.233 tok/s prefill / 42.468 tok/s
+decode**; decode samples are 42.468, 42.396 and 42.481. This is close to the
+historical decode target. Both fresh observations remain visible; their
+variation is unexplained and the lower first repeat does not replace the target.
+The selected HC103 trace likewise passes its native workload and retirement
+checks. Its instrumented 10.355 decode tok/s is diagnostic, never a replacement
+for the unprofiled 37.576 tok/s ABBA result.
+
+Source review identifies two comparison details to authenticate in fresh traces.
+Castagna rotates two active full-attention participants per layer because its
+GQA sharding grain is 3072 channels; each card participates in six of twelve
+full-attention layers. Its persistent HC kernel can also absorb router, shared
+expert and input-projection work through runtime extension parameters that are
+not encoded in the kernel name. Keep those fused boundaries whole until their
+actual extension membership is proven.
+
+Llaminar's short-context sparse indexer already skips score dot products and
+ranking, but still projects and prepares indexer queries that those rows never
+consume. Ranking first becomes necessary at **2052 visible tokens**: 512 complete
+four-token pools and up to three tail tokens still fit before that frontier.
+The 512-prompt/255-after-prefill workload stays below it. Compare the actual
+indexer-query cohort in the traces before implementing an optimization. Raw-key
+projection, incremental prepared pools, accepted tails and ascending selected
+indices remain necessary for correct later crossings. A future predicate must
+be typed and device-owned, handle mixed request/grouped suffixes, and update
+diagnostic liveness rather than mutating global live-row counts or fabricating
+unused query values. Existing main-attention arithmetic must remain unchanged.
+
+The [fresh paired stage comparison](QFN_CASTAGNA_STAGE_COMPARISON.md) now records
+all four physical GPU pairings, complete native trace joins, source-semantic
+cohorts and explicit unresolved callers. Its strongest next precision-preserving
+target is the N4/K10240 FP32 HC injection projection: median per-GPU diagnostic
+kernel work is1.927ms per decode step versus Castagna's0.763ms. Source review
+identifies a candidate that reduces three barriers to one while retaining the
+original arithmetic tree. Attention and GDN also have larger differences, but
+their precision and fused preconditioning boundaries require separate treatment.
+
+Final Default-ISA M512 CPU component checks pass byte equality in both physical
+worker configurations. The one-worker medians are60712.6/60942.9us
+(control/candidate,+0.379% latency); socket medians are4764.04/4736.13us
+(−0.586%). These single-process31-pair observations do not remove the separately
+reported mixed-build AVX2 M1 one-worker regression.
+
+The additional [pure AVX2 Release functional slice](../../../../parity-results/qwen-flash-next/hc103-pure-avx2-functional-r1/result.json)
+passes **8/8 in 29.95 seconds**, including all-format HC controls, fused/stage
+builders, typed admission, live-row geometry and shared-bank rejection. The
+Release-only tree has no Integration executable target; an attempted build of
+that target fails before compilation and its receipt is retained. The follow-up
+executes the eight original canonical selectors through their already compiled
+common fixture in the Release performance binary, with unchanged test filters,
+environment and timeouts. JUnit and actual native command/test counts both prove
+eight executed tests. This is additional ISA coverage, not a replacement full
+Integration or ProductionTestPreflight run.

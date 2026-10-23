@@ -7,6 +7,8 @@
  * their explicit numerical policy and reduction order. A shared prepared
  * engine never retains another participant's workspace binding: the owning
  * stage supplies admitted activation scratch with each invocation.
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 
 #pragma once
@@ -208,6 +210,25 @@ namespace llaminar2::cpu::native_vnni
             auto primary=CPUInvocationWorkspace::require<Q8_1Block>(workspace,kCPUProjectionQ8,cpuProjectionQ8Blocks(rows.physicalRows(),k));
             auto residual=CPUInvocationWorkspace::require<Q8_1Block>(workspace,kCPUProjectionResidualQ8,cpuProjectionQ8Blocks(rows.physicalRows(),k));
             cpuQ8ResidualCorrectedProjection(packed_,input->data(),output->mutable_data(),rows,primary,residual);
+        }
+
+        /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
+        void multiply_q8_residual_corrected(HCResidualDownInput hc,TensorBase*output,DeviceRowRange rows,
+            int n,int k,DeviceWorkspaceManager*workspace) override {
+            const auto*input=&hc.raw;auto*activated=&hc.activated;
+            validateHCResidualDownRows(rows,rows.physicalRows());
+            cpu::native_vnni::validateCPUQ8ResidualSource(packed_,rows.physicalRows(),n,k);
+            if(activation_rotation_)throw std::invalid_argument("Two-term quantized activation requires its unrotated prepared source");
+            if(!input||!output||input->native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
+                !input->isHostValid()||!output->isHostValid())
+                throw std::invalid_argument("Two-term CPU Q8 requires prepared host-owned FP32 tensors");
+            validateQ8ResidualTensorCapacities(rows.physicalRows(),n,k,input->numel(),output->numel());
+            auto primary=CPUInvocationWorkspace::require<Q8_1Block>(workspace,kCPUProjectionQ8,cpuProjectionQ8Blocks(rows.physicalRows(),k));
+            auto residual=CPUInvocationWorkspace::require<Q8_1Block>(workspace,kCPUProjectionResidualQ8,cpuProjectionQ8Blocks(rows.physicalRows(),k));
+            if(activated==output||activated->native_type()!=TensorType::FP32||!activated->isHostValid()||
+               activated->numel()<static_cast<std::size_t>(rows.physicalRows())*k)
+                throw std::invalid_argument("HC CPU requires its prepared FP32 activation output");
+            cpuHCResidualDownQ8Projection(packed_,input->data(),activated->mutable_data(),output->mutable_data(),rows,primary,residual);
         }
 
         // -------------------------------------------------------------------
@@ -613,6 +634,15 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
+            const int live_rows = verifierLiveRows(m);
+            // The arena remains admitted for physical m, including empty calls.
+            auto swiglu_scratch = CPUInvocationWorkspace::require<float>(
+                workspace, kCPUSwiGLUInput, input_size);
+            auto shared_q8 = q8Workspace(workspace, m, k);
+            (void)partialWorkspace(workspace, m);
+            if (activation_rotation_)
+                (void)CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation, input_size);
+            const auto live_input_size = static_cast<size_t>(live_rows) * k;
             const float *gate_fp32 = gate->data();
             const float *up_fp32 = up->data();
             float *output_fp32 = output->mutable_data();
@@ -622,8 +652,7 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
-            auto swiglu_scratch = CPUInvocationWorkspace::require<float>(
-                workspace, kCPUSwiGLUInput, input_size);
+            if (live_rows == 0) return true;
             const bool perf_enabled =
                 PerfStatsCollector::isDomainEnabled("kernel");
             auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
@@ -635,7 +664,7 @@ namespace llaminar2::cpu::native_vnni
                     gate_fp32,
                     up_fp32,
                     swiglu_scratch.data(),
-                    static_cast<int>(input_size));
+                    static_cast<int>(live_input_size));
             }
             else
             {
@@ -643,32 +672,31 @@ namespace llaminar2::cpu::native_vnni
                     gate_fp32,
                     up_fp32,
                     swiglu_scratch.data(),
-                    static_cast<int>(input_size));
+                    static_cast<int>(live_input_size));
             }
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_swiglu_compute",
                 perf_start,
-                m,
+                live_rows,
                 n,
                 k,
                 1);
 
-            const float *gemm_input = maybe_rotate_activation(swiglu_scratch.data(), m, k, workspace);
+            const float *gemm_input = maybe_rotate_activation(swiglu_scratch.data(), live_rows, k, workspace);
             const int K_blocks = (k + 31) / 32;
-            auto shared_q8 = q8Workspace(workspace, m, k);
             perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                       : PerfStatsCollector::Clock::time_point{};
             quantize_activations_to_q8_1(
                 gemm_input,
                 shared_q8.data(),
-                m,
+                live_rows,
                 k,
                 K_blocks,
                 numerical_policy_);
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_activation_quantize",
                 perf_start,
-                m,
+                live_rows,
                 n,
                 k,
                 1);
@@ -678,17 +706,17 @@ namespace llaminar2::cpu::native_vnni
             // One verifier row belongs to the existing decode schedule, not
             // the M>=2 grouped policy table. Consume the already-published Q8
             // bank once; no tensor API reentry or activation requantization.
-            if (m == 1)
+            if (live_rows == 1)
                 gemv_native_vnni_preq(packed_, shared_q8.data(), output_fp32,
                     partialWorkspace(workspace, m));
             else
                 gemm_native_vnni_preq_decode_equivalent_rows(
                     packed_, shared_q8.data(), output_fp32,
-                    partialWorkspace(workspace, m), m, n);
+                    partialWorkspace(workspace, m), live_rows, n);
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_swiglu_down_gemv",
                 perf_start,
-                m,
+                live_rows,
                 n,
                 k,
                 1);
@@ -701,7 +729,7 @@ namespace llaminar2::cpu::native_vnni
                     "gemm",
                     "cpu",
                     PerfStatsCollector::Tags{
-                        {"m", std::to_string(m)},
+                        {"m", std::to_string(live_rows)},
                         {"n", std::to_string(n)},
                         {"k", std::to_string(k)}});
             }
@@ -940,25 +968,73 @@ namespace llaminar2::cpu::native_vnni
                     return false;
             }
 
+            std::array<FusedVerifierRowsDesc, kMaxGroupedProjections>
+                fused_descs = {};
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                const auto &proj = projections[i];
+                float *out_data = outputs[i];
+
+                fused_descs[i] = {
+                    &vnni_kernels[i]->packed_,
+                    out_data,
+                    biases[i],
+                    proj.n,
+                    proj.n};
+                fused_descs[i].policy_n = proj.original_output_slice
+                    ? proj.original_output_slice->policyColumns() : 0;
+            }
+
+            const int live_rows = verifierLiveRows(m);
+            auto shared_q8 = q8Workspace(workspace, m, k);
+            if (projections.size() == 1)
+            {
+                auto original_scope = projections.front().beginOriginalOutputSliceScope();
+                (void)vnni_kernels.front()->partialWorkspace(workspace, m);
+            }
+            std::span<float> fused_partials;
+            if (projections.size() >= 2)
+            {
+                fused_partials = fusedPartialWorkspace(workspace);
+                // The complete physical admission and current live plan share
+                // original per-leaf policy_n; neither may overrun this arena.
+                const auto descriptors = std::span<const FusedVerifierRowsDesc>(
+                    fused_descs.data(), projections.size());
+                const auto physical_plan = planNativeVNNIFusedRows(
+                    descriptors, m, nativeVNNIInvocationWorkerCount(), ISAPath::AUTO);
+                auto required = physical_plan.sharedPartialFloats();
+                if (live_rows > 0 && live_rows != m)
+                {
+                    const auto live_plan = planNativeVNNIFusedRows(
+                        descriptors, live_rows, nativeVNNIInvocationWorkerCount(), ISAPath::AUTO);
+                    required = std::max(required, live_plan.sharedPartialFloats());
+                }
+                if (fused_partials.size() < required)
+                    throw std::runtime_error("CPU fused projection requires admitted ordered-partial storage");
+            }
+            if (activation_rotation_)
+                (void)CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation,
+                    static_cast<size_t>(m) * k);
+            if (live_rows == 0) return true;
+
             const bool perf_enabled =
                 PerfStatsCollector::isDomainEnabled("kernel");
             auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                            : PerfStatsCollector::Clock::time_point{};
-            input_data = maybe_rotate_activation(input_data, m, k, workspace);
+            input_data = maybe_rotate_activation(input_data, live_rows, k, workspace);
 
             const int K_blocks = (k + 31) / 32;
-            auto shared_q8 = q8Workspace(workspace, m, k);
             quantize_activations_to_q8_1(
                 input_data,
                 shared_q8.data(),
-                m,
+                live_rows,
                 k,
                 K_blocks,
                 numerical_policy_);
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_projection_activation_quantize",
                 perf_start,
-                m,
+                live_rows,
                 /*n=*/0,
                 k,
                 static_cast<int>(projections.size()));
@@ -975,37 +1051,20 @@ namespace llaminar2::cpu::native_vnni
              */
             if (projections.size() >= 2)
             {
-                std::array<FusedVerifierRowsDesc, kMaxGroupedProjections>
-                    fused_descs = {};
-                for (size_t i = 0; i < projections.size(); ++i)
-                {
-                    const auto &proj = projections[i];
-                    float *out_data = outputs[i];
-
-                    fused_descs[i] = {
-                        &vnni_kernels[i]->packed_,
-                        out_data,
-                        biases[i],
-                        proj.n,
-                        proj.n};
-                    fused_descs[i].policy_n = proj.original_output_slice
-                        ? proj.original_output_slice->policyColumns() : 0;
-                }
-
                 perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                           : PerfStatsCollector::Clock::time_point{};
                 if (gemm_native_vnni_fused_verifier_rows_preq(
                         shared_q8.data(),
                         fused_descs.data(),
-                        fusedPartialWorkspace(workspace),
+                        fused_partials,
                         static_cast<int>(projections.size()),
-                        m,
+                        live_rows,
                         K_blocks))
                 {
                     recordVerifierTiming(
                         "cpu_native_vnni_verifier_projection_fused_gemv",
                         perf_start,
-                        m,
+                        live_rows,
                         /*n=*/0,
                         k,
                         static_cast<int>(projections.size()));
@@ -1018,7 +1077,7 @@ namespace llaminar2::cpu::native_vnni
                             "gemm",
                             "cpu",
                             PerfStatsCollector::Tags{
-                                {"m", std::to_string(m)},
+                                {"m", std::to_string(live_rows)},
                                 {"k", std::to_string(k)},
                                 {"projections", std::to_string(projections.size())}});
                     }
@@ -1031,7 +1090,7 @@ namespace llaminar2::cpu::native_vnni
                 recordVerifierTiming(
                     "cpu_native_vnni_verifier_projection_fused_gemv_rejected",
                     perf_start,
-                    m,
+                    live_rows,
                     /*n=*/0,
                     k,
                     static_cast<int>(projections.size()));
@@ -1051,24 +1110,24 @@ namespace llaminar2::cpu::native_vnni
                 // The single-descriptor M1 transaction uses its actual
                 // prepared decode scheduler. Multi-row transactions retain
                 // the grouped scheduler and its unchanged M>=2 contract.
-                if (m == 1)
+                if (live_rows == 1)
                     gemv_native_vnni_preq(vnni->packed_, shared_q8.data(), out_data,
                         vnni->partialWorkspace(workspace, m));
                 else
                     gemm_native_vnni_preq_decode_equivalent_rows(
                         vnni->packed_, shared_q8.data(), out_data,
-                        vnni->partialWorkspace(workspace, m), m, proj.n);
+                        vnni->partialWorkspace(workspace, m), live_rows, proj.n);
                 recordVerifierTiming(
                     "cpu_native_vnni_verifier_projection_per_gemv",
                     perf_start,
-                    m,
+                    live_rows,
                     proj.n,
                     k,
                     1);
 
                 if (proj.bias)
                 {
-                    apply_bias_epilogue(out_data, biases[i], m, proj.n, proj.n);
+                    apply_bias_epilogue(out_data, biases[i], live_rows, proj.n, proj.n);
                 }
             }
 
@@ -1081,7 +1140,7 @@ namespace llaminar2::cpu::native_vnni
                     "gemm",
                     "cpu",
                     PerfStatsCollector::Tags{
-                        {"m", std::to_string(m)},
+                        {"m", std::to_string(live_rows)},
                         {"k", std::to_string(k)},
                         {"projections", std::to_string(projections.size())}});
             }
@@ -1655,6 +1714,27 @@ namespace llaminar2::cpu::native_vnni
         }
 
     private:
+        /**
+         * @brief Resolve only the canonical host-owned CPU live prefix.
+         * @param physical_rows Immutable matrix capacity used by tensor/workspace admission.
+         * @return Valid active rows; absent count means every physical row.
+         * @throws std::invalid_argument If the host count is outside its admitted extent.
+         * @throws std::logic_error If enclosing row geometry belongs to another matrix.
+         *
+         * CPU request state is host-owned. This read is not a GPU count readback.
+         * Scheduling retains the original serial K tree; no inactive activation,
+         * Q8 block (including half scales/sums), bias, or output row is touched.
+         */
+        static int verifierLiveRows(int physical_rows)
+        {
+            const auto* rows = ITensorGemm::VerifierKernelModeScope::rowsFor(physical_rows);
+            if (!rows) return physical_rows;
+            const int count = rows->countOwner() ? *rows->countOwner() : rows->countCapacity();
+            const int live = rows->activeRowsFor(count);
+            if (live < 0)
+                throw std::invalid_argument("CPU verifier live count exceeds its admitted row extent");
+            return live;
+        }
         /** @return The invocation's declared slab; the fused plan checks its used prefix. */
         static std::span<float> fusedPartialWorkspace(DeviceWorkspaceManager *workspace)
         {

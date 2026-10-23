@@ -14,6 +14,10 @@
  */
 #include <gtest/gtest.h>
 #include "qwen4exp/HC103OriginalGPU.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
+#include "execution/local_execution/graph/ComputeGraph.h"
+#include <map>
+#include <tuple>
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/Q8ResidualAllFormatOracle.h"
 #include "../../utils/Qwen4ExpFAOutputStageFixture.h"
@@ -41,6 +45,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <vector>
 using namespace llaminar2;
 namespace {
@@ -545,7 +550,37 @@ void proveCancellationRead(DeviceId device)
     }).get();
 }
 /** @brief Freeze a complete original HC read chain before installing103. */
-void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,bool timing=false,const test::QuantizedVerifierFormatCase *format=nullptr) {
+/** @brief Explicit original or typed production graph selection. */
+enum class HC103Path {Control,Typed};
+/** @brief Correctness or the existing disabled paired-chain event observation. */
+enum class HC103Observation {Correctness,Paired};
+/** @brief Test-only native-address substitution without transferring allocation ownership. */
+class HC103AddressTensor final:public FP32Tensor {
+public:
+ using FP32Tensor::FP32Tensor;
+ /** @brief Replace only the diagnostic virtual binding; the real allocation remains owned.
+  * @param address Another admitted native address, or null to restore the original.
+  */
+ void substitute(void* address){substitute_=address;}
+ /** @return Native address visible to consumers; no device query occurs. */
+ void* gpu_data_ptr() override{return substitute_?substitute_:FP32Tensor::gpu_data_ptr();}
+ /** @return Same diagnostic address for const and mutable admission. */
+ const void* gpu_data_ptr()const override{return substitute_?substitute_:FP32Tensor::gpu_data_ptr();}
+private:void* substitute_=nullptr;
+};
+/** @brief Compare original calibration or actual typed HC builder using the same frozen oracle.
+ * @param device Exact native participant and worker.
+ * @param m Original physical row capacity; live replay count stays device-owned.
+ * @param hidden Per-branch width; the real trunk/up width is four times this.
+ * @param lowRank Complete source-admitted HC bottleneck width.
+ * @param alias Whether raw down and activated use the exact same tensor.
+ * @param path Original public chain or the actual declarative typed builder.
+ * @param observation Correctness histories or existing opt-in paired events.
+ * @param format Original registry source; null retains the historical Q8_0 case.
+ */
+void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC103Path path,
+ HC103Observation observation=HC103Observation::Correctness,const test::QuantizedVerifierFormatCase *format=nullptr) {
+ const bool timing=observation==HC103Observation::Paired;const bool ordinaryDown=observation!=HC103Observation::Correctness;const bool typed=path==HC103Path::Typed;
  auto *backend=getBackendFor(device);require(backend&&backend->deviceCount()>device.ordinal,"HC103 backend unavailable");
  auto &worker=GPUDeviceContextPool::instance().getContext(device);auto context=IDeviceContext::create(device,1);
  worker.submitAsync([&]{
@@ -566,10 +601,13 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
   DeviceNativeVNNIMatrixDesc originalUp;require(upEngine->exportNativeVNNIMatrixDesc(originalUp),"HC103 original prepared source missing");
   FP32Tensor normalized({std::size_t(m+1),std::size_t(trunk)},DeviceId::cpu());
   std::array<std::unique_ptr<FP32Tensor>,2> rawDown,activated,up,read;
+  FP32Tensor branchInput({std::size_t(m+1),std::size_t(trunk)},DeviceId::cpu());
+  FP32Tensor normGain({std::size_t(trunk)},DeviceId::cpu());
+  std::fill_n(normGain.mutable_data(),trunk,1.f);
   for(int side=0;side<2;++side) {
-   rawDown[side]=std::make_unique<FP32Tensor>(std::vector<std::size_t>{std::size_t(m+1),std::size_t(lowRank)},DeviceId::cpu());
-   activated[side]=std::make_unique<FP32Tensor>(std::vector<std::size_t>{std::size_t(m+1),std::size_t(lowRank)},DeviceId::cpu());
-   up[side]=std::make_unique<FP32Tensor>(std::vector<std::size_t>{std::size_t(m+1),std::size_t(trunk)},DeviceId::cpu());
+   rawDown[side]=std::make_unique<HC103AddressTensor>(std::vector<std::size_t>{std::size_t(m+1),std::size_t(lowRank)},DeviceId::cpu());
+   activated[side]=std::make_unique<HC103AddressTensor>(std::vector<std::size_t>{std::size_t(m+1),std::size_t(lowRank)},DeviceId::cpu());
+   up[side]=std::make_unique<HC103AddressTensor>(std::vector<std::size_t>{std::size_t(m+1),std::size_t(trunk)},DeviceId::cpu());
    read[side]=std::make_unique<FP32Tensor>(std::vector<std::size_t>{std::size_t(m+1),std::size_t(hidden)},DeviceId::cpu());
   }
   auto *count=s.allocate<int32_t>(1);const auto rows=DeviceRowRange::deviceCounted(m,count);
@@ -583,8 +621,8 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
   for(int side=0;side<2;++side) {
    auto *raw=alias?activated[side].get():rawDown[side].get();
    GEMMStage::Params downParams{.device_id=device,.A=&normalized,.B=downSource.get(),.C=raw,.m=m,.n=lowRank,.k=trunk,.transpose_B=false,
-    .a_buffer_id=BufferId::NORMALIZED,.c_buffer_id=BufferId::GATE_PROJ,.force_decode_equivalent_verifier_prefill=!timing,
-    .verifier_row_range=timing?std::nullopt:std::optional{rows},.prepared_ref=downPrepared.ref,.prepared_store=downPrepared.store.get()};
+    .a_buffer_id=BufferId::NORMALIZED,.c_buffer_id=BufferId::GATE_PROJ,.force_decode_equivalent_verifier_prefill=!ordinaryDown,
+    .verifier_row_range=ordinaryDown?std::nullopt:std::optional{rows},.prepared_ref=downPrepared.ref,.prepared_store=downPrepared.store.get()};
    downStages[side]=std::make_unique<GEMMStage>(downParams);downStages[side]->setGPUStream(s.stream);
    downWorkspace[side]=std::make_unique<Workspace>(device,downStages[side]->getWorkspaceRequirements(m,lowRank,trunk));
    downStages[side]->bindWorkspace(downWorkspace[side]->value.get());
@@ -608,10 +646,133 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
   auto *frozenPrimary=s.allocate<signed char>(banks),*frozenResidual=s.allocate<signed char>(banks);
   auto *frozenPrimaryScales=s.allocate<float>(scales),*frozenResidualScales=s.allocate<float>(scales);
   std::unique_ptr<IGPUGraphCapture> referenceGraph,witnessGraph;
+  std::unique_ptr<ComputeGraph> builder;
+  std::array<GEMMStage*,2> actualDown{downStages[0].get(),downStages[1].get()},actualUp{upStages[0].get(),upStages[1].get()};
+  /** @brief Clear builder stage borrows after terminal graph retirement, before workspaces. */
+  struct BuilderBorrows {
+   std::unique_ptr<ComputeGraph>&graph;
+   ~BuilderBorrows(){if(graph)for(const auto&name:graph->getExecutionOrder())
+    if(auto*stage=dynamic_cast<IWorkspaceConsumer*>(graph->getNode(name)->stage.get()))stage->unbindWorkspace();}
+  } builderBorrows{builder};
   // This final scope drains every graph before all stage/tensor/source owners.
   CapturedWorkRetirement retirement(s);
-  for(auto *tensor:std::vector<TensorBase*>{&normalized,rawDown[0].get(),rawDown[1].get(),activated[0].get(),activated[1].get(),up[0].get(),up[1].get(),read[0].get(),read[1].get()}) {
-   TransferEngine::prepareDeviceInput(tensor,device,s.stream);TransferEngine::requireDeviceInput(tensor,device,s.stream);
+  const auto prepareOperands=[&] {
+   for(auto *tensor:std::vector<TensorBase*>{&normalized,rawDown[0].get(),rawDown[1].get(),activated[0].get(),activated[1].get(),up[0].get(),up[1].get(),read[0].get(),read[1].get()}) {
+    std::fill_n(tensor->mutable_data(),tensor->numel(),0.125f);
+    TransferEngine::prepareDeviceInput(tensor,device,s.stream);TransferEngine::requireDeviceInput(tensor,device,s.stream);
+   }
+  };
+  if(!typed)prepareOperands();
+  if(typed) {
+   std::fill_n(branchInput.mutable_data(),branchInput.numel(),0.125f);
+   for(auto*tensor:std::array<TensorBase*,2>{&branchInput,&normGain}) {
+    TransferEngine::prepareDeviceInput(tensor,device,s.stream);TransferEngine::requireDeviceInput(tensor,device,s.stream);
+   }
+   using F=Qwen4ExpFloatBinding;builder=std::make_unique<ComputeGraph>();
+   const Qwen4ExpHyperconnectionContext hc{.device=device,.prefix="hc103_",
+    .rows={m,Qwen4ExpIntInput{Qwen4ExpNativeIntInput{device,count,1}}},.hidden=hidden,.lowRank=lowRank,.epsilon=1e-6f,
+    .arithmetic=ordinaryDown?Qwen4ExpProjectionArithmetic::Ordinary:Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
+    .projectionRows=ordinaryDown?std::nullopt:std::optional{rows},
+    .upOperandPrecision=QuantizedActivationOperandPrecision::TwoTermQ8,.upProjectionRows=rows};
+   auto*raw=alias?activated[0].get():rawDown[0].get();
+   const Qwen4ExpHyperconnectionReadBuffers buffers{F(branchInput,BufferId::RESIDUAL),F(normalized,BufferId::NORMALIZED),
+    F(*raw,BufferId::GATE_PROJ),F(*activated[0],alias?BufferId::GATE_PROJ:BufferId::UP_PROJ),
+    F(*up[0],BufferId::ATTN_OUTPUT),F(*read[0],BufferId::HIDDEN_STATE)};
+   // Registration accepts a const caller binding and publishes its prepared
+   // reference in the store-owned copy. The builder consumes that exact frozen
+   // binding, rather than the caller's still-unprepared registration metadata.
+   const auto downBinding=downPrepared.store->binding(downPrepared.ref);
+   const auto upBinding=upPrepared.store->binding(upPrepared.ref);
+   require(downBinding&&upBinding,"HC103 actual builder lost its stored prepared bindings");
+   Qwen4ExpHyperconnectionBuilder::appendFinalRead(*builder,hc,
+    {Qwen4ExpImmutableWeightBinding(normGain),Qwen4ExpPreparedProjection(*downBinding,*downPrepared.store,device),
+     Qwen4ExpPreparedProjection(*upBinding,*upPrepared.store,device)},buffers,{});
+   ASSERT_EQ(builder->getNode("hc103_read_activation"),nullptr);
+   ASSERT_EQ(builder->getExecutionOrder().size(),4u);
+   actualDown[0]=dynamic_cast<GEMMStage*>(builder->getNode("hc103_read_down")->stage.get());
+   actualUp[0]=dynamic_cast<GEMMStage*>(builder->getNode("hc103_read_up")->stage.get());
+   require(actualDown[0]&&actualUp[0],"HC103 actual builder lost prepared GEMM stages");
+   ASSERT_TRUE(actualUp[0]->getParams().hc_residual_down.has_value());
+   EXPECT_EQ(actualUp[0]->getParams().A,raw);EXPECT_EQ(actualUp[0]->getParams().hc_residual_down->activated,activated[0].get());
+   actualDown[0]->bindWorkspace(downWorkspace[0]->value.get());actualUp[0]->bindWorkspace(upWorkspace[0]->value.get());
+   for(const auto&name:builder->getExecutionOrder())builder->getNode(name)->stage->setGPUStream(s.stream);
+   const auto before=actualUp[0]->graphCaptureVariantSignature();
+   // Native addresses are materialized after the declarative signature exists.
+   // First preparation seals those allocations without changing the cache key.
+   prepareOperands();
+   EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
+   ASSERT_TRUE(actualUp[0]->prepareGraphLaunch(context.get(),s.stream));
+   EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
+   ASSERT_TRUE(actualUp[0]->prepareGraphLaunch(context.get(),s.stream));
+   EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
+   if(!format&&m==3&&hidden==8&&!alias&&observation==HC103Observation::Correctness) {
+    const auto valid=actualUp[0]->getParams();
+    auto malformed=valid;malformed.output_range={0,1};
+    EXPECT_THROW((void)GEMMStage(malformed),std::invalid_argument);
+    malformed=valid;malformed.verifier_row_range=DeviceRowRange::fullyActive(1);
+    EXPECT_THROW((void)GEMMStage(malformed),std::invalid_argument);
+    malformed=valid;malformed.verifier_row_range=DeviceRowRange::deviceCounted(m+1,count).slice(1,m);
+    EXPECT_THROW((void)GEMMStage(malformed),std::invalid_argument);
+    malformed=valid;malformed.prepared_ref=downPrepared.ref;malformed.prepared_store=downPrepared.store.get();
+    EXPECT_THROW((void)GEMMStage(malformed),std::invalid_argument);
+    malformed=valid;malformed.hc_residual_down=GEMMStage::HCResidualDownPublication{up[0].get(),BufferId::ATTN_OUTPUT};
+    EXPECT_THROW((void)GEMMStage(malformed),std::invalid_argument);
+    EXPECT_THROW(actualUp[0]->prepareGraphLaunch(context.get(),nullptr),std::invalid_argument);
+    for(auto operands:std::array{std::pair{rawDown[0].get(),rawDown[1].get()},
+       std::pair{activated[0].get(),activated[1].get()},std::pair{up[0].get(),up[1].get()}}) {
+     auto* address=dynamic_cast<HC103AddressTensor*>(operands.first);
+     require(address,"HC103 diagnostic operand missing");
+     address->substitute(operands.second->gpu_data_ptr());
+     EXPECT_THROW(actualUp[0]->graphCaptureVariantSignature(),std::logic_error);
+     EXPECT_THROW(actualUp[0]->prepareGraphLaunch(context.get(),s.stream),std::logic_error);
+     address->substitute(nullptr);
+     EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
+    }
+    // A different admitted tensor address is legal for a fresh stage only.
+    auto* address=dynamic_cast<HC103AddressTensor*>(activated[0].get());
+    address->substitute(activated[1]->gpu_data_ptr());
+    {
+     GEMMStage fresh(valid);fresh.setGPUStream(s.stream);fresh.bindWorkspace(upWorkspace[0]->value.get());
+     EXPECT_NO_THROW((void)fresh.prepareGraphLaunch(context.get(),s.stream));fresh.unbindWorkspace();
+    }
+    address->substitute(nullptr);
+    EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
+    Workspace replacement(device,actualUp[0]->getWorkspaceRequirements(m,trunk,lowRank));
+    actualUp[0]->bindWorkspace(replacement.value.get());
+    EXPECT_THROW(actualUp[0]->graphCaptureVariantSignature(),std::logic_error);
+    EXPECT_THROW(actualUp[0]->prepareGraphLaunch(context.get(),s.stream),std::logic_error);
+    {
+     GEMMStage fresh(valid);fresh.setGPUStream(s.stream);fresh.bindWorkspace(replacement.value.get());
+     EXPECT_NO_THROW((void)fresh.prepareGraphLaunch(context.get(),s.stream));fresh.unbindWorkspace();
+    }
+    actualUp[0]->bindWorkspace(upWorkspace[0]->value.get());
+    EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
+    // Restore the exact tuple before any real graph is recorded or replayed.
+    // The public stage API rejects null before changing the retained stream.
+    EXPECT_THROW(actualUp[0]->setGPUStream(nullptr),std::invalid_argument);
+    EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
+    EXPECT_NO_THROW((void)actualUp[0]->prepareGraphLaunch(context.get(),s.stream));
+    void* changedStream=worker.getOrCreateAuxiliaryStream("hc103_identity_changed_stream");
+    require(changedStream&&changedStream!=s.stream,"HC103 distinct identity stream unavailable");
+    actualUp[0]->setGPUStream(changedStream);
+    EXPECT_THROW(actualUp[0]->prepareGraphLaunch(context.get(),changedStream),std::logic_error);
+    actualUp[0]->setGPUStream(s.stream);
+    EXPECT_NO_THROW((void)actualUp[0]->prepareGraphLaunch(context.get(),s.stream));
+    for(auto precision:{QuantizedActivationOperandPrecision::SingleQ8,QuantizedActivationOperandPrecision::TwoTermQ8}) {
+     auto ordinary=valid;ordinary.hc_residual_down.reset();ordinary.A=activated[0].get();
+     ordinary.a_buffer_id=BufferId::UP_PROJ;
+     ordinary.quantized_operand_precision=precision;
+     GEMMStage unchanged(ordinary);const auto identity=unchanged.graphCaptureVariantSignature();
+     unchanged.setGPUStream(s.stream);unchanged.bindWorkspace(upWorkspace[0]->value.get());
+     EXPECT_TRUE(unchanged.prepareGraphLaunch(context.get(),s.stream));
+     EXPECT_EQ(unchanged.graphCaptureVariantSignature(),identity);
+     unchanged.resetSessionState();EXPECT_EQ(unchanged.graphCaptureVariantSignature(),identity);
+     unchanged.unbindWorkspace();
+    }
+   }
+   const auto contract=actualUp[0]->bufferContract();
+   EXPECT_EQ(contract.prepared_weights.size(),1u);
+   EXPECT_EQ(contract.outputs.size(),alias?1u:2u);EXPECT_EQ(contract.inouts.size(),alias?1u:0u);
   }
   auto originalDown=[&](qwen4exp::ResidualDownArgs a) {
 #ifdef HAVE_CUDA
@@ -632,6 +793,14 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
    throw std::runtime_error("HC103 frozen read unavailable");
   };
   auto chain=[&](int side) {
+   if(typed) {
+    if(side==0) {
+     for(const auto&name:builder->getExecutionOrder())require(builder->getNode(name)->stage->execute(context.get()),"HC103 actual builder recording rejected");
+     return;
+    }
+    // Norm is unchanged by103; both paths retain its exact production operation.
+    require(builder->getNode("hc103_branch_norm")->stage->execute(context.get()),"HC103 reference norm rejected");
+   }
    require(downStages[side]->execute(context.get()),"HC103 prepared down rejected");
    const qwen4exp::RowExtent extent{m,count};
    qwen4exp::ResidualDownArgs activation{extent,lowRank,static_cast<const float*>((alias?activated[side]:rawDown[side])->gpu_data_ptr()),static_cast<float*>(activated[side]->gpu_data_ptr())};
@@ -641,12 +810,13 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
    if(side==0)primitives->residualRead(mix,s.stream);else originalRead(mix);
   };
   const int copies=timing&&m==1?32:1;
+  std::array<std::vector<GPUGraphKernelNodeInfo>,2> inventory;
   auto capture=[&](std::unique_ptr<IGPUGraphCapture>&graph,int side) {
    graph=worker.createGraphCapture(s.stream);ScopedBackendGraphCapture recording(worker,*graph,"HC103 original complete control chain");
    require(recording.begin(),"HC103 capture begin failed");for(int copy=0;copy<copies;++copy)chain(side);recording.finish();
    require(graph->instantiate(),"HC103 graph instantiate failed");
    std::vector<GPUGraphKernelNodeInfo> nodes;std::string error;require(graph->inspectKernelNodes(nodes,&error),"HC103 graph inventory failed");
-   EXPECT_EQ(graph->nodeCount(),nodes.size());for(const auto&node:nodes) {
+   inventory[side]=nodes;EXPECT_EQ(graph->nodeCount(),nodes.size());for(const auto&node:nodes) {
     EXPECT_EQ(node.local_memory_bytes_per_thread,0u);require(node.name_resolved,"HC103 unresolved native kernel");
     std::cout<<"HC103_CONTROL_KERNEL,"<<side<<','<<node.name<<','<<node.grid_x<<','<<node.grid_y<<','<<node.grid_z
      <<','<<node.block_x<<','<<node.block_y<<','<<node.block_z<<','<<node.registers_per_thread<<','<<node.static_shared_memory_bytes<<','<<node.local_memory_bytes_per_thread<<'\n';
@@ -655,6 +825,29 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
   };
   s.upload(count,std::vector<int32_t>{m});
   capture(s.graph,0);capture(referenceGraph,1);
+  if(typed) {
+   ASSERT_EQ(inventory[0].size()+copies,inventory[1].size());
+   using Key=std::tuple<std::string,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned>;
+   std::array<std::map<Key,int>,2> remaining;
+   int fused=0,originalDownCount=0,originalPublish=0;
+   std::array<int,2> readCounts{};
+   for(int side=0;side<2;++side)for(const auto&node:inventory[side]) {
+    const bool fusedProducer=node.name.find("publishHCResidualDown")!=std::string::npos;
+    const bool frozenDown=node.name.find("downKernel")!=std::string::npos&&node.name.find("original")!=std::string::npos;
+    const bool plainPublish=node.name.find("publish")!=std::string::npos&&node.name.find("q8_residual")!=std::string::npos&&!fusedProducer;
+    const bool readNode=node.name.find("readKernel")!=std::string::npos;
+    if(fusedProducer) {
+     ASSERT_EQ(side,0);++fused;EXPECT_EQ(node.grid_x,unsigned((std::size_t(m)*lowRank+255)/256));
+     EXPECT_EQ(node.grid_y,1u);EXPECT_EQ(node.grid_z,1u);EXPECT_EQ(node.block_x,256u);EXPECT_EQ(node.block_y,1u);EXPECT_EQ(node.block_z,1u);
+    } else if(frozenDown){ASSERT_EQ(side,1);++originalDownCount;}
+    else if(plainPublish){ASSERT_EQ(side,1);++originalPublish;}
+    else if(readNode)++readCounts[side];
+    else ++remaining[side][Key{node.name,node.grid_x,node.grid_y,node.grid_z,node.block_x,node.block_y,node.block_z}];
+   }
+   EXPECT_EQ(fused,copies);EXPECT_EQ(originalDownCount,copies);EXPECT_EQ(originalPublish,copies);
+   EXPECT_EQ(readCounts[0],copies);EXPECT_EQ(readCounts[1],copies);
+   EXPECT_EQ(remaining[0],remaining[1]);
+  }
   GPUQ8ResidualCorrectionArgs frozen{originalUp,rows,device.is_cuda()?Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal:Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal,
    static_cast<const float*>(activated[1]->gpu_data_ptr()),static_cast<float*>(up[1]->gpu_data_ptr()),frozenPrimary,frozenResidual,frozenPrimaryScales,frozenResidualScales};
   witnessGraph=worker.createGraphCapture(s.stream);{
@@ -669,16 +862,16 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
   }require(witnessGraph->instantiate(),"HC103 witness instantiate failed");
   std::vector<GPUGraphKernelNodeInfo>witnessNodes;std::string witnessError;require(witnessGraph->inspectKernelNodes(witnessNodes,&witnessError),"HC103 witness inventory failed");
   ASSERT_EQ(witnessGraph->nodeCount(),1u);ASSERT_EQ(witnessNodes.size(),1u);EXPECT_EQ(witnessNodes[0].local_memory_bytes_per_thread,0u);
-  const std::array downSignatures{downStages[0]->graphCaptureVariantSignature(),downStages[1]->graphCaptureVariantSignature()};
-  const std::array upSignatures{upStages[0]->graphCaptureVariantSignature(),upStages[1]->graphCaptureVariantSignature()};
+  const std::array downSignatures{actualDown[0]->graphCaptureVariantSignature(),actualDown[1]->graphCaptureVariantSignature()};
+  const std::array upSignatures{actualUp[0]->graphCaptureVariantSignature(),actualUp[1]->graphCaptureVariantSignature()};
   const auto retainedOwners=s.owners->size();
-  for(int replay=0;replay<(timing?1:20);++replay) {
+  for(int replay=0;replay<(observation==HC103Observation::Correctness?20:1);++replay) {
    const int live=timing||replay%4==0?m:replay%4==1?std::min(m,1):replay%4==2?0:std::max(0,m-1);
-   SCOPED_TRACE(::testing::Message()<<"HC103 replay="<<replay<<" live="<<live);
+   SCOPED_TRACE(::testing::Message()<<"replay="<<replay<<" live="<<live);
    std::vector<float> input(std::size_t(m+1)*trunk);
    for(int row=0;row<=m;++row)for(int c=0;c<trunk;++c)input[std::size_t(row)*trunk+c]=row<live?
     (c%32==0?float(1+row%7)*3.125f:std::sin(float(row*11+c*7))*.37f):std::numeric_limits<float>::quiet_NaN();
-   s.upload(static_cast<float*>(normalized.gpu_data_ptr()),input);s.upload(count,std::vector<int32_t>{live});
+   s.upload(static_cast<float*>(typed?branchInput.gpu_data_ptr():normalized.gpu_data_ptr()),input);s.upload(count,std::vector<int32_t>{live});
    const float poison=-84931.25f-replay;
    for(int side=0;side<2;++side) {
     for(auto *tensor:{rawDown[side].get(),activated[side].get(),up[side].get(),read[side].get()})
@@ -715,8 +908,8 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
     }
    }
    for(int side=0;side<2;++side) {
-    EXPECT_EQ(downStages[side]->graphCaptureVariantSignature(),downSignatures[side]);
-    EXPECT_EQ(upStages[side]->graphCaptureVariantSignature(),upSignatures[side]);
+    EXPECT_EQ(actualDown[side]->graphCaptureVariantSignature(),downSignatures[side]);
+    EXPECT_EQ(actualUp[side]->graphCaptureVariantSignature(),upSignatures[side]);
    }
    EXPECT_EQ(s.owners->size(),retainedOwners);
    DeviceNativeVNNIMatrixDesc after;require(upEngine->exportNativeVNNIMatrixDesc(after),"HC103 original source vanished");
@@ -724,16 +917,206 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
    EXPECT_EQ(after.source_codebook_id,originalUp.source_codebook_id);
    ASSERT_FALSE(::testing::Test::HasFailure());
   }
-  if(timing) {
+  if(observation!=HC103Observation::Correctness) {
    struct Events {IBackend*b;int device;void*stream;void*first;void*last;/** @brief Drain pending event use before release on every exception path. */ ~Events(){if(!b->synchronizeStream(stream,device))std::terminate();if(last)b->destroyEvent(last,device);if(first)b->destroyEvent(first,device);}} events{backend,device.ordinal,s.stream,backend->createTimingEvent(device.ordinal),backend->createTimingEvent(device.ordinal)};
    require(events.first&&events.last,"HC103 timing event creation failed");
    auto sample=[&](IGPUGraphCapture &graph){require(backend->recordEvent(events.first,device.ordinal,s.stream),"HC103 start event failed");require(graph.launch(),"HC103 timed replay failed");require(backend->recordEvent(events.last,device.ordinal,s.stream),"HC103 stop event failed");require(backend->waitForEvent(events.last,device.ordinal),"HC103 terminal timing observation failed");float ms=0;require(backend->eventElapsedTimeMs(events.first,events.last,device.ordinal,&ms),"HC103 elapsed event failed");require(std::isfinite(ms)&&ms>0,"HC103 invalid event duration");return ms*1000.f/copies;};
    for(int warm=0;warm<5;++warm){(void)sample(*s.graph);(void)sample(*referenceGraph);}
-   for(int pair=0;pair<31;++pair){float a,b;if(pair&1){b=sample(*referenceGraph);a=sample(*s.graph);}else{a=sample(*s.graph);b=sample(*referenceGraph);}std::cout<<"HC103_CONTROL_PAIR,"<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<pair<<','<<a<<','<<b<<'\n';}
+   if(typed)std::cout<<"HC103_CANDIDATE_CASE,"<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<alias<<','<<copies
+    <<",actual_typed_builder_vs_frozen_original,ordinary_full_down,counted_two_term_up\n";
+   for(int pair=0;pair<31;++pair){float a,b;if(pair&1){b=sample(*referenceGraph);a=sample(*s.graph);}else{a=sample(*s.graph);b=sample(*referenceGraph);}std::cout<<(typed?"HC103_CANDIDATE_PAIR,":"HC103_CONTROL_PAIR,")<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<pair<<','<<a<<','<<b<<'\n';}
   }
   s.retire();referenceGraph.reset();witnessGraph.reset();for(int side=0;side<2;++side){downStages[side]->unbindWorkspace();upStages[side]->unbindWorkspace();}
  }).get();
 }
+/** @brief Preserve every original control selector while sharing candidate fixture plumbing.
+ * @param device Exact participant.
+ * @param m Physical rows.
+ * @param hidden Per-branch width.
+ * @param lowRank HC rank.
+ * @param alias Exact raw/activated alias selection.
+ * @param timing Existing disabled event observation selection.
+ * @param format Optional unchanged original format override.
+ */
+void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,bool timing=false,
+ const test::QuantizedVerifierFormatCase* format=nullptr) {
+ proveHC103Chain(device,m,hidden,lowRank,alias,HC103Path::Control,
+  timing?HC103Observation::Paired:HC103Observation::Correctness,format);
+}
+/** @brief Exercise actual HC preparation and native/map retirement boundaries.
+ * @param device Exact backend participant; no projection arithmetic is substituted.
+ * Repeated preparation/reset retains original native records. Invalid release
+ * must fail before native free; valid retirement occurs only after the stage.
+ */
+void proveHC103CapturedStorageOwnership(DeviceId device) {
+ auto* backend=getBackendFor(device);require(bool(backend),"HC ownership backend missing");
+ auto& worker=GPUDeviceContextPool::instance().getContext(device);
+ auto context=IDeviceContext::create(device,1);
+ worker.submitAsync([&] {
+  const auto stream=ExplicitGPUStream(worker.defaultStream()).get();
+  // Exercise actual backend record lookup, including interior spans. The
+  // owner precedes every borrow so exceptional unwinding retires borrowers first.
+  auto release=[&](void* pointer){if(pointer)backend->free(pointer,device.ordinal);};
+  std::unique_ptr<void,decltype(release)> allocation(backend->allocate(256,device.ordinal),release);
+  require(bool(allocation),"HC native span witness missing");
+  auto* base=static_cast<std::byte*>(allocation.get());
+  {
+   auto interior=backend->retainNativeAllocation(base+32,64,device.ordinal);
+   auto identical=backend->retainNativeAllocation(base+32,64,device.ordinal);
+   EXPECT_TRUE(interior.sameStorage(identical));
+   EXPECT_THROW(backend->retainNativeAllocation(base+224,64,device.ordinal),std::invalid_argument);
+   EXPECT_THROW(backend->retainNativeAllocation(base,0,device.ordinal),std::invalid_argument);
+   EXPECT_THROW(backend->retainNativeAllocation(base,64,backend->deviceCount()),std::invalid_argument);
+   EXPECT_THROW(backend->free(base+32,device.ordinal),std::invalid_argument);
+   EXPECT_THROW(backend->free(base,device.ordinal),std::logic_error);
+  }
+  allocation.reset();
+  auto sourceBytes=nativeWeights(32,32);Q8_0Tensor source({32,32},sourceBytes);
+  auto prepared=test::makeGpuPreparedGemm(&source,device,"hc103.ownership",ModelContextId{803107});
+  // Mapped activated/C are outside the admitted API; mapped raw stays supported.
+  for(const auto [mapped,alias]:std::array{std::pair{false,false},std::pair{false,true},std::pair{true,false}}) {
+   FP32Tensor nativeRaw({1,32},DeviceId::cpu()),activated({1,32},DeviceId::cpu()),output({1,32},DeviceId::cpu());
+   auto mappedRaw=mapped?FP32Tensor::createMapped({1,32},device):nullptr;
+   require(!mapped||bool(mappedRaw),"HC mapped raw owner allocation failed");
+   TensorBase* raw=mapped?mappedRaw.get():alias?&activated:&nativeRaw;
+   // One physical host upload source is initialized/published only once, even
+   // when the typed raw input is exactly the activated output object.
+   std::vector<TensorBase*> distinct{raw};
+   if(raw!=&activated)distinct.push_back(&activated);
+   distinct.push_back(&output);
+   for(auto* tensor:distinct)
+    if(!tensor->isMapped())TransferEngine::allocateDeviceStorage(tensor,device);
+   GEMMStage::Params params{.device_id=device,.A=raw,.B=&source,.C=&output,
+    .hc_residual_down=GEMMStage::HCResidualDownPublication{&activated,BufferId::GATE_PROJ},
+    .m=1,.n=32,.k=32,.transpose_B=false,
+    .a_buffer_id=alias?BufferId::GATE_PROJ:BufferId::NORMALIZED,.c_buffer_id=BufferId::ATTN_OUTPUT,
+    .prepared_ref=prepared.ref,.prepared_store=prepared.store.get(),
+    .quantized_operand_precision=QuantizedActivationOperandPrecision::TwoTermQ8};
+   auto stage=std::make_unique<GEMMStage>(params);stage->setGPUStream(stream);
+   Workspace workspace(device,stage->getWorkspaceRequirements(1,32,32));
+   /** @brief Close the engine borrow before workspace retirement on every exit. */
+   struct Unbind { std::unique_ptr<GEMMStage>& stage;
+    ~Unbind(){if(stage)stage->unbindWorkspace();}
+   } unbind{stage};
+   stage->bindWorkspace(workspace.value.get());
+   const auto signature=stage->graphCaptureVariantSignature();
+   require(stage->prepareGraphLaunch(context.get(),stream),"HC ownership first prepare failed");
+   Storage captured{device,backend,stream};
+   CapturedWorkRetirement retirement(captured);
+   const auto initializeFinite=[&] {
+    // Called only before capture or after an explicit terminal observation.
+    // Each distinct host source remains immutable until its upload completes.
+    for(auto* tensor:distinct) {
+     std::fill_n(tensor->mutable_data(),32,0.125f);
+     TransferEngine::prepareDeviceInput(tensor,device,stream);
+     TransferEngine::requireDeviceInput(tensor,device,stream);
+    }
+   };
+   initializeFinite();
+   captured.graph=worker.createGraphCapture(stream);
+   require(bool(captured.graph),"HC ownership graph missing");
+   {
+    ScopedBackendGraphCapture recording(worker,*captured.graph,"HC retained storage ownership");
+    require(recording.begin(),"HC ownership capture begin failed");
+    require(stage->execute(context.get()),"HC ownership actual typed stage failed");
+    recording.finish();
+   }
+   require(captured.graph->instantiate(),"HC ownership graph instantiate failed");
+   std::vector<GPUGraphKernelNodeInfo> nodes;std::string inventoryError;
+   require(captured.graph->inspectKernelNodes(nodes,&inventoryError),"HC ownership graph inventory failed");
+   EXPECT_FALSE(nodes.empty());EXPECT_EQ(captured.graph->nodeCount(),nodes.size());
+   const auto observeBytes=[&] {
+    return std::array{
+     captured.download(static_cast<const std::uint8_t*>(activated.gpu_data_ptr()),32*sizeof(float)),
+     captured.download(static_cast<const std::uint8_t*>(output.gpu_data_ptr()),32*sizeof(float))};
+   };
+   // Reset clears the host stream, not the retained graph/storage identity.
+   // Unbound submission must still reject before a kernel can be launched.
+   const auto resetAndRebind=[&](int history) {
+    switch(history%3) {
+     case 0:stage->resetSessionState();break;
+     case 1:stage->resetSessionStatePreservingCapturedReplay();break;
+     case 2:stage->resetSessionStatePreservingLazyInitialization();break;
+    }
+    EXPECT_FALSE(stage->hasGPUStream());
+    EXPECT_EQ(stage->graphCaptureVariantSignature(),signature);
+    EXPECT_THROW(stage->prepareGraphLaunch(context.get(),stream),std::logic_error);
+    EXPECT_THROW(stage->execute(context.get()),std::logic_error);
+    stage->setGPUStream(stream);
+    require(stage->prepareGraphLaunch(context.get(),stream),"HC reset exact rebind failed");
+    EXPECT_EQ(stage->graphCaptureVariantSignature(),signature);
+   };
+   // Same retained graph, same finite starting bytes, same number of replays:
+   // first observe the valid history without rejected retirement attempts.
+   for(int history=0;history<20;++history) {
+    require(captured.graph->launch(),"HC no-rejection retained replay failed");
+    EXPECT_EQ(stage->graphCaptureVariantSignature(),signature);
+    require(stage->prepareGraphLaunch(context.get(),stream),"HC no-rejection reprepare failed");
+    resetAndRebind(history);
+   }
+   const auto noRejection=observeBytes();
+   initializeFinite();
+   const auto originalAccounting=backend->deviceAllocationAccounting(device.ordinal);
+   require(originalAccounting.supported,"HC canonical allocation accounting unavailable");
+   const auto requireSameAccounting=[&] {
+    const auto current=backend->deviceAllocationAccounting(device.ordinal);
+    EXPECT_TRUE(current.supported);
+    EXPECT_EQ(current.active_allocations,originalAccounting.active_allocations);
+    EXPECT_EQ(current.active_bytes,originalAccounting.active_bytes);
+   };
+   for(int history=0;history<20;++history) {
+    require(captured.graph->launch(),"HC ownership retained replay failed");
+    EXPECT_EQ(stage->graphCaptureVariantSignature(),signature);
+    require(stage->prepareGraphLaunch(context.get(),stream),"HC ownership reprepare failed");
+    for(auto* tensor:distinct) {
+     const void* original=tensor->gpu_data_ptr();
+     if(tensor->isMapped()) {
+      EXPECT_THROW(backend->free(tensor->gpu_data_ptr(),device.ordinal),std::invalid_argument);
+     } else {
+      EXPECT_THROW(backend->free(tensor->gpu_data_ptr(),device.ordinal),std::logic_error);
+     }
+     EXPECT_EQ(tensor->gpu_data_ptr(),original);
+     requireSameAccounting();
+    }
+    // Native borrowers reject their actual allocation base; mapped aliases are
+    // excluded by the same native-map membership boundary before runtime free.
+    resetAndRebind(history);
+   }
+   // Terminal byte observation proves rejected native retirement did not
+   // change valid numerical state; this is a lifecycle metamorphic witness,
+   // not an independent arithmetic oracle or a timing measurement.
+   EXPECT_EQ(observeBytes(),noRejection);
+   requireSameAccounting();
+   captured.retire();
+   // Public Tensor release can observe/download values or retire an event before
+   // its final native-free rejection. Exercise that invalid operation only
+   // after captured work retires: physical ownership and pointers must survive,
+   // but no zero-side-effect concurrent coherence guarantee is claimed.
+   for(auto* tensor:distinct) {
+    const void* original=tensor->gpu_data_ptr();
+    if(tensor->isMapped()) {
+     EXPECT_THROW(tensor->releaseDeviceMemory(),std::invalid_argument);
+    } else {
+     EXPECT_THROW(tensor->releaseDeviceMemory(),std::logic_error);
+    }
+    EXPECT_EQ(tensor->gpu_data_ptr(),original);
+    requireSameAccounting();
+   }
+   stage->unbindWorkspace();stage.reset();
+   for(auto* tensor:{static_cast<TensorBase*>(&nativeRaw),static_cast<TensorBase*>(&activated),static_cast<TensorBase*>(&output)})
+    if(tensor->gpu_data_ptr())EXPECT_TRUE(tensor->releaseDeviceMemory());
+  }
+  // Retaining a mapped input preserves its original owner even if the tensor
+  // object retires. No submitted GPU work remains in this lifecycle witness.
+  auto mapped=FP32Tensor::createMapped({1,32},device);
+  require(bool(mapped),"HC mapped retention witness missing");
+  std::weak_ptr<MappedHostTransferRegion> originalRegion=mapped->mappedHostTransferRegion();
+  auto retained=TransferEngine{}.retainCapturedDeviceStorage(*mapped,device,mapped->size_bytes());
+  mapped.reset();EXPECT_FALSE(originalRegion.expired());
+  retained.reset();EXPECT_TRUE(originalRegion.expired());
+ }).get();
+}
+
 /** @brief Calibrate grouped rows, real HC shape and exact alias before extraction. */
 void proveHC103Backend(DeviceId device) {
  for(int m:{1,3,9,17,33,513})for(bool alias:{false,true})proveHC103Control(device,m,8,32,alias);
@@ -770,4 +1153,69 @@ TEST(Q8ResidualCorrectionDevice,ROCmHC103OriginalControlChain){proveHC103Backend
 TEST(Q8ResidualCorrectionDevice,ROCmHC103OriginalAllFormats){for(const auto &f:test::quantizedVerifierFormats())for(bool alias:{false,true})proveHC103Control(DeviceId::rocm(0),3,64,256,alias,false,&f);}
 /** @test Explicit Release complete-chain A/A calibration, all raw balanced samples. */
 TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHC103OriginalPairedChainEvents){for(int m:{1,9,512})proveHC103Control(DeviceId::rocm(0),m,2560,320,false,true);}
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Actual CUDA HC stage pins native records and existing mapped raw owners. */
+TEST(Q8ResidualCorrectionDevice,CUDAHC103CapturedStorageOwnership){proveHC103CapturedStorageOwnership(DeviceId::cuda(0));}
+#endif
+#ifdef HAVE_ROCM
+/** @test Actual HIP HC stage pins native records and existing mapped raw owners. */
+TEST(Q8ResidualCorrectionDevice,ROCmHC103CapturedStorageOwnership){proveHC103CapturedStorageOwnership(DeviceId::rocm(0));}
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Actual declarative HC TwoTerm path preserves original odd/live/reset bytes. */
+TEST(Q8ResidualCorrectionDevice,CUDAHC103TypedBuilderChain) {
+ for(int m:{1,3,9,17,33,513})for(bool alias:{false,true})
+  proveHC103Chain(DeviceId::cuda(0),m,8,32,alias,HC103Path::Typed);
+ for(int m:{1,9,512})proveHC103Chain(DeviceId::cuda(0),m,2560,320,false,HC103Path::Typed);
+}
+/** @test Every original registry source executes M1/M512 and exact alias/disjoint typed publication. */
+TEST(Q8ResidualCorrectionDevice,CUDAHC103TypedAllFormats) {
+ for(const auto& format:test::quantizedVerifierFormats())for(bool alias:{false,true})for(int m:{1,3,512})
+  proveHC103Chain(DeviceId::cuda(0),m,64,256,alias,HC103Path::Typed,HC103Observation::Correctness,&format);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/** @test Actual declarative HC TwoTerm path preserves original odd/live/reset bytes. */
+TEST(Q8ResidualCorrectionDevice,ROCmHC103TypedBuilderChain) {
+ for(int m:{1,3,9,17,33,513})for(bool alias:{false,true})
+  proveHC103Chain(DeviceId::rocm(0),m,8,32,alias,HC103Path::Typed);
+ for(int m:{1,9,512})proveHC103Chain(DeviceId::rocm(0),m,2560,320,false,HC103Path::Typed);
+}
+/** @test Every original registry source executes M1/M512 and exact alias/disjoint typed publication. */
+TEST(Q8ResidualCorrectionDevice,ROCmHC103TypedAllFormats) {
+ for(const auto& format:test::quantizedVerifierFormats())for(bool alias:{false,true})for(int m:{1,3,512})
+  proveHC103Chain(DeviceId::rocm(0),m,64,256,alias,HC103Path::Typed,HC103Observation::Correctness,&format);
+}
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Opt-in one-shape actual builder/frozen-original complete-chain native events. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_CUDAHC103CandidateM1PairedChainEvents) {
+ proveHC103Chain(DeviceId::cuda(0),1,2560,320,false,HC103Path::Typed,HC103Observation::Paired);
+}
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Opt-in one-shape actual builder/frozen-original complete-chain native events. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_CUDAHC103CandidateM512PairedChainEvents) {
+ proveHC103Chain(DeviceId::cuda(0),512,2560,320,false,HC103Path::Typed,HC103Observation::Paired);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/** @test Opt-in one-shape actual builder/frozen-original complete-chain native events. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHC103CandidateM1PairedChainEvents) {
+ proveHC103Chain(DeviceId::rocm(0),1,2560,320,false,HC103Path::Typed,HC103Observation::Paired);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/** @test Opt-in one-shape actual builder/frozen-original complete-chain native events. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHC103CandidateM512PairedChainEvents) {
+ proveHC103Chain(DeviceId::rocm(0),512,2560,320,false,HC103Path::Typed,HC103Observation::Paired);
+}
 #endif

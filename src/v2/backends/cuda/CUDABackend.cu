@@ -62,6 +62,7 @@ namespace llaminar2
         {
             size_t bytes = 0u; ///< Exact cudaMalloc byte count.
             int device_id = -1; ///< Owning CUDA ordinal.
+            std::shared_ptr<const NativeAllocationCaptureIdentity> capture_identity; ///< Original record token.
         };
 
         /** CUDA host allocation or registration whose aliases die on reset. */
@@ -91,6 +92,14 @@ namespace llaminar2
             static auto *allocations =
                 new std::unordered_map<void *, CUDADeviceAllocationRecord>();
             return *allocations;
+        }
+
+        /** @brief Validate native retirement while the CUDA lifecycle lock is held. */
+        void requireCUDANativeRelease(const void* pointer, int device_id) {
+            const auto record = cudaTrackedDeviceAllocations().find(const_cast<void*>(pointer));
+            if (record == cudaTrackedDeviceAllocations().end() || record->second.device_id != device_id)
+                throw std::invalid_argument("CUDA native free requires its exact live allocation base/device");
+            NativeAllocationCaptureLease::requireUnborrowed(record->second.capture_identity);
         }
 
         /** @return Exact live CUDA host allocations and registrations. */
@@ -853,6 +862,10 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Mint only host identity before creating native bytes; allocation
+        // failure cannot leave a newly added identity operation owning VRAM.
+        auto capture_identity = std::make_shared<const NativeAllocationCaptureIdentity>();
+
         // Set device before allocation
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
@@ -899,6 +912,7 @@ namespace llaminar2
             CUDADeviceAllocationRecord{
                 .bytes = bytes,
                 .device_id = device_id,
+                .capture_identity = std::move(capture_identity),
             });
         if (vramBomEnabled())
         {
@@ -916,6 +930,23 @@ namespace llaminar2
         return ptr;
     }
 
+    NativeAllocationCaptureLease CUDABackend::retainNativeAllocation(
+        const void* pointer, size_t bytes, int device_id)
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            throw std::invalid_argument("CUDA captured allocation needs an exact existing device");
+        std::lock_guard<std::mutex> lock(cudaRuntimeResourceLifecycleMutex());
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        for (const auto& [base, record] : cudaTrackedDeviceAllocations()) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(base);
+            if (address >= begin && address - begin < record.bytes)
+                return NativeAllocationCaptureLease::acquire(record.capture_identity,
+                    base, record.bytes, DeviceId::cuda(record.device_id),
+                    pointer, bytes, DeviceId::cuda(device_id));
+        }
+        throw std::invalid_argument("CUDA captured span is not a live native allocation");
+    }
+
     void CUDABackend::free(void *ptr, int device_id)
     {
         std::lock_guard<std::mutex> lifecycle_lock(
@@ -927,18 +958,20 @@ namespace llaminar2
 
         if (device_id >= device_count_ || device_id < 0)
         {
-            LOG_ERROR("[CUDABackend] Invalid device ID " << device_id << " for cudaFree");
-            return;
+            throw std::invalid_argument("CUDA native free requires an existing allocator device");
         }
+
+        // Exact base membership is the native allocator's release authority.
+        // Mapped aliases and foreign pointers are not native allocation bases.
+        requireCUDANativeRelease(ptr, device_id);
 
         // Set device before freeing
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
         {
-            // Benign during process exit — driver is already shutting down
-            LOG_DEBUG("[CUDABackend] Failed to set device " << device_id << " before cudaFree: "
-                                                            << cudaGetErrorString(err));
-            return;
+            // Leave the original record and caller's tensor pointer intact.
+            throw std::runtime_error(std::string("CUDA native free could not select its owner: ") +
+                cudaGetErrorString(err));
         }
 
         const std::string bom_ptr =
@@ -946,8 +979,10 @@ namespace llaminar2
         err = cudaFree(ptr);
         if (err != cudaSuccess)
         {
-            LOG_DEBUG("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec
-                                                               << " on device " << device_id << ": " << cudaGetErrorString(err));
+            // Failure is not retirement: retain record/claim and stop the caller
+            // before it can clear its logical storage metadata.
+            throw std::runtime_error(std::string("CUDA native free failed; allocation remains owned: ") +
+                cudaGetErrorString(err));
         }
         else
         {

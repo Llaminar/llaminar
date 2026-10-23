@@ -854,6 +854,57 @@ namespace llaminar2
         }
     }
 
+    std::shared_ptr<const CapturedDeviceStorageLease>
+    TransferEngine::retainCapturedDeviceStorage(
+        const TensorBase& tensor, DeviceId device, size_t bytes) const
+    {
+        if (isGraphCaptureActive())
+            throw std::logic_error("Captured storage ownership must be acquired before capture");
+        const auto* owner = tensor.transferStorageOwner();
+        const void* pointer = tensor.gpu_data_ptr();
+        if (!owner || !device.is_gpu() || tensor.current_device() != std::optional{device} ||
+            !pointer || !bytes || bytes > tensor.size_bytes())
+            throw std::invalid_argument("Captured tensor has no exact materialized device span");
+        auto lease = std::shared_ptr<CapturedDeviceStorageLease>(new CapturedDeviceStorageLease());
+        lease->pointer_ = pointer; lease->bytes_ = bytes; lease->device_ = device;
+        if (owner->isMapped()) {
+            lease->mapped_ = owner->mappedHostTransferRegion();
+            if (!lease->mapped_ || !lease->mapped_->hasDevice(device))
+                throw std::logic_error("Captured mapped tensor lost its original region owner");
+            const auto base = reinterpret_cast<std::uintptr_t>(lease->mapped_->deviceAlias(device));
+            const auto span = reinterpret_cast<std::uintptr_t>(pointer);
+            if (span < base || span-base > lease->mapped_->sizeBytes() ||
+                bytes > lease->mapped_->sizeBytes()-(span-base))
+                throw std::invalid_argument("Captured mapped tensor exceeds its original region");
+        } else {
+            auto* backend = resolveBackend(device);
+            if (!backend) throw std::logic_error("Captured tensor backend is unavailable");
+            lease->native_.emplace(backend->retainNativeAllocation(pointer, bytes, device.gpu_ordinal()));
+        }
+        return lease;
+    }
+
+    void TransferEngine::requireCapturedDeviceStorage(
+        const CapturedDeviceStorageLease& lease, const TensorBase& tensor,
+        DeviceId device, size_t bytes) const
+    {
+        const auto* owner = tensor.transferStorageOwner();
+        if (!owner || device != lease.device_ || bytes != lease.bytes_ ||
+            tensor.current_device() != std::optional{device} ||
+            tensor.gpu_data_ptr() != lease.pointer_ || bytes > tensor.size_bytes())
+            throw std::logic_error("Captured tensor storage binding changed after preparation");
+        if (lease.mapped_) {
+            if (!owner->isMapped() || owner->mappedHostTransferRegion() != lease.mapped_ ||
+                !lease.mapped_->hasDevice(device))
+                throw std::logic_error("Captured mapped storage owner was replaced");
+        } else {
+            auto* backend = resolveBackend(device);
+            if (!backend || owner->isMapped() || !lease.native_ ||
+                !backend->retainNativeAllocation(lease.pointer_, bytes, device.gpu_ordinal()).sameStorage(*lease.native_))
+                throw std::logic_error("Captured native allocation identity was replaced");
+        }
+    }
+
     void DeviceTransferBuffer::bind(IBackend *backend)
     {
         if (!backend)

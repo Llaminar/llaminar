@@ -8,10 +8,14 @@
  * dimensions so a stage dump cannot truncate or overread the gate operand.
  * Typed bias remains the same source tensor through ordinary and verifier
  * dispatch; unsupported typed fused bias declarations fail before submission.
+ * HC two-term input publication retains the original activated FP32 value,
+ * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 
 #include "GEMMStage.h"
 #include "kernels/common/FloatingProjectionRows.h"
+#include "kernels/common/GPUQ8ResidualNative.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
@@ -282,6 +286,26 @@ namespace llaminar2
                 !validateMatrixExtent(dynamic_cast<const TensorBase *>(params_.C),"counted output C",params_.m,params_.n))
                 throw std::invalid_argument("Counted floating projection exceeds admitted source/output matrix");
         }
+        if(params_.hc_residual_down) {
+            // HC's builder supplies the already-local source/ref. Resolving a
+            // generic output slice could create a new prepared kernel during
+            // address-only capture preparation, so this typed operation rejects it.
+            if(!params_.output_range.empty())
+                throw std::invalid_argument("HC publication requires already-local prepared weights; output_range is unsupported");
+            const auto& hc=*params_.hc_residual_down;
+            const auto binding=params_.prepared_store&&params_.prepared_ref
+                ?params_.prepared_store->binding(*params_.prepared_ref):std::nullopt;
+            if(!binding||binding->tensor!=params_.B||params_.prepared_ref->device!=params_.device_id)
+                throw std::invalid_argument("HC publication requires its exact prepared source/ref participant");
+            validateHCResidualDownRows(params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m)),params_.m);
+            if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::TwoTermQ8||
+               !hc.activated||hc.activated->native_type()!=TensorType::FP32||!params_.a_buffer_id||
+               !params_.c_buffer_id||params_.request_rows||params_.transpose_B||params_.do_swiglu||
+               hc.activated==params_.C||hc.buffer==*params_.c_buffer_id||
+               ((hc.activated==params_.A)!=(hc.buffer==*params_.a_buffer_id))||
+               !validateMatrixExtent(hc.activated,"HC activated",params_.m,params_.k))
+                throw std::invalid_argument("HC publication requires exact TwoTerm geometry and unambiguous arena ownership");
+        }
         if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::TwoTermQ8) {
             validateQ8ResidualCorrectionGeometry(params_.m,params_.n,params_.k);
             if(!params_.A||!params_.B||!params_.C||params_.A==params_.C||params_.gate_input||params_.bias||params_.bias_tensor||
@@ -309,10 +333,112 @@ namespace llaminar2
         }
     }
 
+    GEMMStage::HCNativePublicationIdentity GEMMStage::currentHCNativePublicationIdentity() const
+    {
+        if(!params_.hc_residual_down||!params_.device_id.is_gpu())
+            throw std::logic_error("HC native binding requires its declared GPU operation");
+        auto* workspace=getWorkspace();
+        if(!workspace||workspace->device()!=params_.device_id||!workspace->isAllocated())
+            throw std::logic_error("HC native binding requires its admitted participant workspace");
+        const auto source=params_.prepared_store&&params_.prepared_ref
+            ?params_.prepared_store->binding(*params_.prepared_ref):std::nullopt;
+        if(!source||!source->immutable||source->tensor!=params_.B||params_.prepared_ref->device!=params_.device_id)
+            throw std::logic_error("HC native binding lost its original immutable prepared source");
+        HCNativePublicationIdentity result;result.workspace_id=workspace->id();
+        // Constructor admission guarantees already-local geometry. This direct
+        // lookup cannot populate the generic sliced-kernel cache.
+        result.engine=params_.prepared_store->gemmKernel(*params_.prepared_ref);
+        if(!result.engine)throw std::logic_error("HC native binding lost its prepared engine");
+        DeviceNativeVNNIMatrixDesc weights;
+        if(!result.engine->inspectPreparedNativeVNNIMatrixDesc(weights))
+            throw std::logic_error("HC native binding requires already prepared native source planes");
+        const int columns=params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size());
+        (void)requireQ8ResidualNativeMatrix(weights,params_.m,columns,params_.k);
+        result.weight_planes={weights.payload,weights.scales,weights.mins,weights.emins};
+        result.weight_geometry={static_cast<uint64_t>(weights.n),static_cast<uint64_t>(weights.k),
+            weights.blocks_per_row,weights.codebook_id,weights.allocation_payload_bytes_per_block,
+            weights.allocation_has_mins,weights.allocation_has_emins,weights.source_codebook_id,
+            weights.source_is_superblock,weights.source_identity_present,weights.reserved,weights.reserved_tail};
+        const std::array<const TensorBase*,3> tensors{dynamic_cast<const TensorBase*>(params_.A),
+            params_.hc_residual_down->activated,dynamic_cast<const TensorBase*>(params_.C)};
+        for(size_t i=0;i<tensors.size();++i) {
+            const auto* tensor=tensors[i];
+            if(!tensor||tensor->current_device()!=std::optional{params_.device_id}||!tensor->gpu_data_ptr())
+                throw std::logic_error("HC native operand was not allocation-prebound");
+            result.pointers[i]=tensor->gpu_data_ptr();result.bytes[i]=tensor->size_bytes();result.types[i]=tensor->native_type();
+        }
+        const std::array names{&kGPUProjectionPrimaryQ8,&kGPUProjectionResidualQ8,
+            &kGPUProjectionPrimaryQ8Scales,&kGPUProjectionResidualQ8Scales};
+        const size_t values=static_cast<size_t>(params_.m)*params_.k;
+        for(size_t i=0;i<names.size();++i) {
+            result.pointers[i+3]=workspace->getBuffer(*names[i]);result.bytes[i+3]=workspace->getBufferSize(*names[i]);
+            if(!result.pointers[i+3]||result.bytes[i+3]<(i<2?values:values/32*sizeof(float)))
+                throw std::logic_error("HC native binding has incomplete admitted banks");
+        }
+        return result;
+    }
+
+    void GEMMStage::requireHCNativePublicationBinding() const
+    {
+        if(!hc_native_binding_||hc_native_binding_->identity!=currentHCNativePublicationIdentity())
+            throw std::logic_error("HC captured publication operands changed after launch preparation");
+        // Session reset may clear the host execution stream without changing a
+        // retained graph. A subsequent non-null binding must remain exact.
+        if(hasGPUStream()&&requireGPUStream()!=hc_native_binding_->stream)
+            throw std::logic_error("HC captured publication changed its recording stream");
+        const std::array<const TensorBase*,3> tensors{dynamic_cast<const TensorBase*>(params_.A),
+            params_.hc_residual_down->activated,dynamic_cast<const TensorBase*>(params_.C)};
+        for(size_t i=0;i<tensors.size();++i) {
+            if(tensors[i]->shape()!=hc_native_binding_->shapes[i] || !hc_native_binding_->operands[i])
+                throw std::logic_error("HC captured publication tensor shape/owner changed after preparation");
+            TransferEngine{}.requireCapturedDeviceStorage(*hc_native_binding_->operands[i],
+                *tensors[i],params_.device_id,hc_native_binding_->identity.bytes[i]);
+        }
+        for(size_t i=0;i<hc_native_binding_->banks.size();++i) {
+            const auto& lease=hc_native_binding_->banks[i];
+            if(!lease||lease->device()!=params_.device_id||lease->data()!=hc_native_binding_->identity.pointers[i+3]||
+               lease->sizeBytes()!=hc_native_binding_->identity.bytes[i+3])
+                throw std::logic_error("HC captured publication lost its original workspace allocation lease");
+        }
+    }
+
+    bool GEMMStage::prepareGraphLaunch(IDeviceContext* ctx,void* stream)
+    {
+        if(!params_.hc_residual_down||!params_.device_id.is_gpu())return true;
+        (void)ExplicitGPUStream(stream);
+        if(!ctx||ctx->deviceId()!=params_.device_id||requireGPUStream()!=stream||isGraphCaptureActive())
+            throw std::logic_error("HC launch preparation requires the exact context outside capture");
+        if(hc_native_binding_) {
+            requireHCNativePublicationBinding();
+            if(hc_native_binding_->stream!=stream)
+                throw std::logic_error("HC launch preparation cannot replace its retained recording stream");
+            return true;
+        }
+        HCNativePublicationBinding binding;binding.identity=currentHCNativePublicationIdentity();binding.stream=stream;
+        const std::array<const TensorBase*,3> tensors{dynamic_cast<const TensorBase*>(params_.A),
+            params_.hc_residual_down->activated,dynamic_cast<const TensorBase*>(params_.C)};
+        for(size_t i=0;i<tensors.size();++i) {
+            binding.shapes[i]=tensors[i]->shape();
+            binding.operands[i]=TransferEngine{}.retainCapturedDeviceStorage(
+                *tensors[i],params_.device_id,binding.identity.bytes[i]);
+        }
+        const std::array names{&kGPUProjectionPrimaryQ8,&kGPUProjectionResidualQ8,
+            &kGPUProjectionPrimaryQ8Scales,&kGPUProjectionResidualQ8Scales};
+        for(size_t i=0;i<names.size();++i)
+            binding.banks[i]=getWorkspace()->retainBuffer(*names[i],0,binding.identity.bytes[i+3]);
+        // Publish once only after every metadata check and ownership acquisition
+        // succeeded. Leases reuse original allocation/PMA owners, never new bytes.
+        hc_native_binding_.emplace(std::move(binding));
+        requireHCNativePublicationBinding();
+        return true;
+    }
+
     uint64_t GEMMStage::graphCaptureVariantSignature() const
     {
         if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::SingleQ8 &&
            !params_.verifier_row_range && !params_.request_rows)return 0;
+        if(params_.hc_residual_down&&params_.device_id.is_gpu()&&hc_native_binding_)
+            requireHCNativePublicationBinding();
         // Preserve the qualified HC quantizer/scalars, then identify one sealed
         // row alternative. Count pointer/geometry are immutable recording data;
         // execution-owned count values never enter graph identity.
@@ -326,6 +452,15 @@ namespace llaminar2
         mix(params_.m);mix(params_.n);mix(params_.k);mix(params_.output_range.start);mix(params_.output_range.end);
         mix(reinterpret_cast<std::uintptr_t>(params_.A));mix(reinterpret_cast<std::uintptr_t>(params_.B));
         mix(reinterpret_cast<std::uintptr_t>(params_.C));mix(params_.force_decode_equivalent_verifier_prefill);
+        if(params_.hc_residual_down) {
+            mix(0x4843444f574e0001ULL);
+            const auto& hc=*params_.hc_residual_down;
+            mix(reinterpret_cast<std::uintptr_t>(hc.activated));mix(static_cast<uint64_t>(hc.buffer));
+            // This variant is immutable before/after arena materialization.
+            // CaptureOnly preparation freezes exact native identity separately.
+            // Its validation above throws on replacement, never mutates this
+            // variant or asks the executor to recapture stale addresses.
+        }
         if(params_.request_rows) {
             mix(2);mix(FloatingProjectionRows::requestRecordingIdentity(*params_.request_rows));
         } else {
@@ -600,8 +735,19 @@ namespace llaminar2
             if(params_.gate_input||params_.bias_tensor||params_.bias||params_.alpha!=1.f||params_.beta!=0.f)
                 throw std::logic_error("Two-term Q8 projection requires plain alpha1,beta0 without gate/bias epilogues");
             bindStageStream(gemm);
-            gemm->multiply_q8_residual_corrected(A_extent,C_extent,
-                params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m)),effective_n,params_.k,getWorkspace());
+            const auto rows=params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m));
+            if(params_.hc_residual_down) {
+                auto* activated=params_.hc_residual_down->activated;
+                if(params_.device_id.is_gpu()) {
+                    requireHCNativePublicationBinding();
+                    if(requireGPUStream()!=hc_native_binding_->stream)
+                        throw std::logic_error("HC execute changed its prepared recording stream");
+                }
+                gemm->multiply_q8_residual_corrected(HCResidualDownInput{*A_extent,*activated},C_extent,
+                    rows,effective_n,params_.k,getWorkspace());
+                publishStageOutput(activated);
+                traceOutput("HC_activated",activated);
+            } else gemm->multiply_q8_residual_corrected(A_extent,C_extent,rows,effective_n,params_.k,getWorkspace());
             publishStageOutput(C_extent);
             recordHCUpSubmission(effective_n, HCUpSubmissionOperation::ResidualCorrected);
             traceOutput("C",params_.C);
@@ -855,6 +1001,8 @@ namespace llaminar2
             info.addInput("gate_input", params_.gate_input, params_.m, params_.k);
         }
 
+        if(params_.hc_residual_down)
+            info.addOutput("HC_activated",params_.hc_residual_down->activated,params_.m,params_.k);
         // Scalar params
         info.addScalarInt("m", params_.m);
         info.addScalarInt("n", params_.n);
@@ -890,6 +1038,8 @@ namespace llaminar2
         // OUTPUT buffer
         reqs.addOutput("C", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, c_type);
 
+        if(params_.hc_residual_down)
+            reqs.addOutput("HC_activated",{static_cast<size_t>(params_.m),static_cast<size_t>(params_.k)},BufferTensorType::FP32);
         // Metadata-only admission: do not fetch bias values while computing the BOM.
         if (params_.bias_tensor || params_.bias)
         {
@@ -937,8 +1087,13 @@ namespace llaminar2
         if (!params_.a_buffer_id || !params_.c_buffer_id)
             return {};
 
-        auto contract = StageBufferContract::build()
-            .addInput(*params_.a_buffer_id);
+        auto contract = StageBufferContract::build();
+        if(params_.hc_residual_down&&params_.hc_residual_down->buffer==*params_.a_buffer_id)
+            contract.addPreallocatedInOut(*params_.a_buffer_id);
+        else {
+            contract.addInput(*params_.a_buffer_id);
+            if(params_.hc_residual_down)contract.addOutput(params_.hc_residual_down->buffer);
+        }
         if (params_.gate_input && params_.gate_buffer_id)
             contract.addInput(*params_.gate_buffer_id);
         contract.addOutput(*params_.c_buffer_id);

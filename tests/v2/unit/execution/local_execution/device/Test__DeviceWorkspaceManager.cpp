@@ -20,6 +20,7 @@
 #include "execution/local_execution/device/AlignedWorkspaceSlices.h"
 #include "execution/moe/MoERuntimePointerWorkspaceOwners.h"
 #include "backends/BackendManager.h"
+#include "backends/NativeAllocationCaptureLease.h"
 #include "kernels/common/DeviceResidentRouterGateCache.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -1735,4 +1736,35 @@ TEST_F(Test__DeviceWorkspaceManager, DeviceReturnsCorrectValue)
         EXPECT_TRUE(mgr.device().is_rocm());
         EXPECT_EQ(mgr.device().ordinal, 1);
     }
+}
+
+/** @test Retained storage spans reject foreign/empty/overflowed geometry without a device. */
+TEST(Test__CapturedNativeAllocation, SpanAdmissionAndRetirement) {
+    alignas(256) std::byte bytes[256];
+    auto identity=std::make_shared<const NativeAllocationCaptureIdentity>();
+    const auto device=DeviceId::cuda(0);
+    EXPECT_NO_THROW(NativeAllocationCaptureLease::requireUnborrowed(identity));
+    {
+        auto lease=NativeAllocationCaptureLease::acquire(identity,bytes,sizeof(bytes),device,bytes+32,64,device);
+        auto second=NativeAllocationCaptureLease::acquire(identity,bytes,sizeof(bytes),device,bytes+32,64,device);
+        EXPECT_TRUE(lease.sameStorage(second));
+        EXPECT_THROW(NativeAllocationCaptureLease::requireUnborrowed(identity),std::logic_error);
+        EXPECT_THROW(NativeAllocationCaptureLease::acquire(identity,bytes,sizeof(bytes),device,bytes,257,device),std::invalid_argument);
+        EXPECT_THROW(NativeAllocationCaptureLease::acquire(identity,bytes,sizeof(bytes),device,bytes,0,device),std::invalid_argument);
+        EXPECT_THROW(NativeAllocationCaptureLease::acquire(identity,bytes,sizeof(bytes),device,bytes,1,DeviceId::cuda(1)),std::invalid_argument);
+        EXPECT_THROW(NativeAllocationCaptureLease::acquire(identity,bytes,sizeof(bytes),device,bytes+256,1,device),std::invalid_argument);
+    }
+    EXPECT_NO_THROW(NativeAllocationCaptureLease::requireUnborrowed(identity));
+}
+/** @test Same-address record replacement cannot impersonate the original physical allocation. */
+TEST(Test__CapturedNativeAllocation, SameAddressReuseHasDistinctIdentity) {
+    alignas(256) std::byte bytes[256];
+    auto original=std::make_shared<const NativeAllocationCaptureIdentity>();
+    auto successor=std::make_shared<const NativeAllocationCaptureIdentity>();
+    const auto device=DeviceId::rocm(0);
+    auto stale=NativeAllocationCaptureLease::acquire(original,bytes,sizeof(bytes),device,bytes,32,device);
+    auto fresh=NativeAllocationCaptureLease::acquire(successor,bytes,sizeof(bytes),device,bytes,32,device);
+    EXPECT_FALSE(stale.sameStorage(fresh));
+    EXPECT_THROW(NativeAllocationCaptureLease::requireUnborrowed(original),std::logic_error);
+    EXPECT_THROW(NativeAllocationCaptureLease::requireUnborrowed(successor),std::logic_error);
 }
