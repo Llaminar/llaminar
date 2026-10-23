@@ -1,6 +1,10 @@
 # QFN captured compute scaling
 
-Updated: 2026-10-23. The accepted A1 checkpoint is **L100**, **814.527 prefill /
+Updated: 2026-10-23. Current A1 checkpoint **L101** measures **814.610 prefill /
+37.088 decode tok/s**, effectively unchanged versus matched L100 **814.645 /
+37.103**. Its exact-order branch norm improves component M1 latency 2.794%; see
+[qualification below](#branch-normalization-original-reduction-order-with-fewer-barriers).
+The preceding throughput win is **L100**, **814.527 prefill /
 37.063 decode tok/s**, versus matched archived L97 **814.133 / 36.824**:
 **+0.048% / +0.648%**, with nonoverlapping decode ranges. The original precision,
 arithmetic and placement settings remain fixed; all 185 final-logit rows and
@@ -305,10 +309,16 @@ ngrams, no MTP/prefix cache, context 4096, 512/256 workload and 28 physical host
 Complete preflight remains pending; G60 is the last complete gate. The [full
 captured-decode trace](../../../../parity-results/qwen-flash-next/reducer100-fulltrace-r1/result.json)
 completed before the test-only extension, preserving all 256 generated IDs,
-four retained M512 participants and clean retirement. Graph attribution remains
-in progress; no new overlap or critical-path claim is made. Historical fulltrace
-inflation (~125 ms versus ~27 ms unprofiled) makes
-collective waits unusable as removable latency.
+four retained M512 participants and clean retirement. The
+[completed attribution](../../../../parity-results/qwen-flash-next/reducer100-fulltrace-analysis-r1/REPORT.md)
+joins every graph/correlation count and all 255 measured forwards per rank;
+131 measured kernel names are classified, with none unclassified. The current
+instrumented envelope is 108.882–108.883 ms/forward versus 26.981 ms/token
+unprofiled. Collective waits and idle intervals cannot be subtracted as savings.
+Each rank executes 100 branch norms and 120 floating pointer-setup calls per
+forward. L101 reduces the norm's synchronization while preserving its original
+arithmetic tree; its component gain leaves model throughput effectively unchanged.
+Pointer setup remains a separate candidate without measured results.
 
 The original **nine-row prefill** passes at TP1 and TP4, measuring 470.241 and
 426.560 µs. TP2 fails the original-output byte gate at alpha row0/column0:
@@ -468,3 +478,61 @@ exported FINAL_NORM/LM_HEAD records are byte-identical to the earlier mirrored
 run (`vocabulary93-auto-snapshot-comparison-r1.json`). This focused qualification
 and the archived matched result are not a new full production-preflight
 certificate.
+
+### Branch normalization: original reduction order with fewer barriers
+
+Candidate101a retains 256 threads per row/branch and the original FP32 FMA
+loop and 128/64/32/.../1 addition tree. On HIP, the last six edges run in wave64
+registers; a final CTA barrier publishes the sum to every output lane. This
+reduces nine barriers to three without changing the inverse, gain arithmetic,
+input precision, launch geometry or CUDA/CPU paths. The independent frozen
+original GPU kernel first passed calibration against the archived L100 core.
+
+The [final paired native-event run](../../../../parity-results/qwen-flash-next/branch-norm101-paired-final-r1/result.json)
+retains 62 samples per implementation and shape, balanced across 31 ABBA rounds.
+Each captured sample contains 128 normalization calls; timings below are per
+call. These are component measurements, not model throughput estimates.
+
+| Rows / hidden width | Original median µs | Candidate101a median µs | Latency change |
+|---|---:|---:|---:|
+| 1 / 2560 | 6.890 | 6.698 | −2.794% |
+| 512 / 2560 | 121.513 | 121.401 | −0.092% |
+| 1 / 2559 | 6.813 | 6.621 | −2.817% |
+| 1 / 2561 | 7.250 | 7.057 | −2.655% |
+
+The isolated production profile records grid four CTAs, block256, 16 wavefronts,
+12 allocated VGPRs, 32 allocated SGPRs, 1 KiB LDS and zero scratch. Native ISA
+inspection preserves every reduction operand order, epilogue and floating-mode
+descriptor; there are no register spills. The 99.853% VALU utilization counter
+measures active lanes, not achieved occupancy. Profiling overhead is excluded
+from the event timings. Evidence: `branch-norm101-Wavefronts-final-r1`,
+`branch-norm101-VALU-final-r1` and `branch-norm101-FetchSize-final-r1`.
+
+The independent captured regression covers odd widths and reduction boundaries,
+partial and empty replays, exact input/output aliasing, inactive/guard bytes,
+signed zero, subnormals, infinities and paired NaN payloads. It is explicitly
+registered in production preflight as
+`V2_Integration_ROCmBranchNormHistoricalTree`. Both backend primitive suites
+and the new regression pass; [complete Unit](../../../../parity-results/qwen-flash-next/branch-norm101-unit-final-r2/result.json)
+passes 776/776 after extending the performance-target inventory assertion.
+The first failed Unit receipt is retained. Release and Integration retain the
+spill guard, gfx906 and CUDA SM80/86/89/90 compilation targets.
+
+The [canonical Release panel](../../../../parity-results/qwen-flash-next/branch-norm101-release-accuracy-r1/report.json)
+passes, and [all 26 files / 185 final-logit rows](../../../../parity-results/qwen-flash-next/branch-norm101-release-accuracy-r1/logit-byte-comparison.json)
+are byte-identical to L100. The [complete matched Release ABBA](../../../../parity-results/qwen-flash-next/branch-norm101-model-comparison.json)
+passes all four arms and preserves all twelve natural 256-token sequences.
+Candidate **814.610 prefill / 37.088 decode tok/s** versus actual L100 control
+**814.645 / 37.103** gives **−0.004% / −0.041%**, with overlapping ranges in
+both phases. Decode ranges are 37.047–37.157 versus 37.025–37.203. This is a
+qualified component optimization with unchanged model throughput, not an
+end-to-end speedup. It adds no precision mode, workspace or runtime selector.
+All model/runtime/topology settings remain the A1 settings above. Driver,
+resource, source/runtime identity and native retirement checks pass. Complete
+production preflight remains at G60.
+
+The separate physical64-thread candidate101b is retired. After correcting
+compiler-commuted NaN operands it passed the same byte gate, but decode-shape
+latency increased from 6.885 to 18.139 µs and M512 increased 3.946%. Its result
+is retained in `branch-norm101b-paired-r1`; none of that candidate remains in
+production source.

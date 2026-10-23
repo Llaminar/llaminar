@@ -131,7 +131,8 @@ endforeach()
                         expected.append("v2_perf_cuda_qwen_sparse_selection")
                     if rocm:
                         expected += ["v2_perf_rocm_qwen_sparse_selection",
-                                     "v2_perf_rocm_floating_reduction"]
+                                     "v2_perf_rocm_floating_reduction",
+                                     "v2_perf_qwen4exp_branch_norm"]
                     extra = f"""
 enable_testing()
 set(HAVE_CUDA {"ON" if cuda else "OFF"})
@@ -143,21 +144,31 @@ add_library(hip::host INTERFACE IMPORTED)
 include("{QFN_PERFORMANCE.as_posix()}")
 include("{QFN_PERFORMANCE.as_posix()}")
 if(HAVE_ROCM)
-    get_target_property(native_sources v2_perf_rocm_floating_reduction SOURCES)
-    get_target_property(native_standard v2_perf_rocm_floating_reduction HIP_STANDARD)
-    if(NOT native_standard EQUAL 20)
-        message(FATAL_ERROR "Floating reduction lost its native HIP language contract")
-    endif()
-    foreach(source IN LISTS native_sources)
-        get_source_file_property(language "${{source}}" LANGUAGE)
-        if(NOT language STREQUAL "HIP")
-            message(FATAL_ERROR "Floating reduction source is not native HIP")
+    foreach(native_target IN ITEMS v2_perf_rocm_floating_reduction
+                                   v2_perf_qwen4exp_branch_norm)
+        get_target_property(native_sources ${{native_target}} SOURCES)
+        get_target_property(native_standard ${{native_target}} HIP_STANDARD)
+        if(NOT native_standard EQUAL 20)
+            message(FATAL_ERROR "${{native_target}} lost its native HIP language contract")
         endif()
-        # This metadata-only fixture has no HIP compiler. After authenticating
-        # the production declaration, omit compilation from the generated stub.
-        set_source_files_properties("${{source}}" PROPERTIES HEADER_FILE_ONLY TRUE)
+        set(native_source_count 0)
+        foreach(source IN LISTS native_sources)
+            if(source MATCHES "[.]hip$")
+                math(EXPR native_source_count "${{native_source_count}} + 1")
+                get_source_file_property(language "${{source}}" LANGUAGE)
+                if(NOT language STREQUAL "HIP")
+                    message(FATAL_ERROR "${{native_target}} source is not native HIP")
+                endif()
+                # This metadata-only fixture has no HIP compiler. Authenticate
+                # the native oracle before omitting it from the generated stub.
+                set_source_files_properties("${{source}}" PROPERTIES HEADER_FILE_ONLY TRUE)
+            endif()
+        endforeach()
+        if(NOT native_source_count EQUAL 1)
+            message(FATAL_ERROR "${{native_target}} lost its independent native source")
+        endif()
+        set_target_properties(${{native_target}} PROPERTIES LINKER_LANGUAGE CXX)
     endforeach()
-    set_target_properties(v2_perf_rocm_floating_reduction PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 get_property(all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 list(FILTER all_targets INCLUDE REGEX "^v2_perf_")

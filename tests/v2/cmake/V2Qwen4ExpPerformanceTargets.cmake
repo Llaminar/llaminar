@@ -49,3 +49,19 @@ foreach(_qfn_backend IN ITEMS CUDA ROCm)
             llaminar2_core GTest::gtest_main)
     endif()
 endforeach()
+
+# Reuse the existing primitive fixture and independent native oracle in Release.
+# Only explicit disabled GTest filters execute timing or single-family profiling.
+if(HAVE_ROCM)
+    set_source_files_properties(
+        "${_qfn_test_sources}/integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip"
+        PROPERTIES LANGUAGE HIP)
+    add_executable(v2_perf_qwen4exp_branch_norm EXCLUDE_FROM_ALL
+        "${_qfn_test_sources}/integration/kernels/qwen4exp/Test__Qwen4ExpDevicePrimitives.cpp"
+        "${_qfn_test_sources}/integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip")
+    target_include_directories(v2_perf_qwen4exp_branch_norm PRIVATE "${_qfn_test_sources}")
+    target_link_libraries(v2_perf_qwen4exp_branch_norm PRIVATE
+        llaminar2_core GTest::gtest_main hip::host ${CMAKE_DL_LIBS})
+    set_target_properties(v2_perf_qwen4exp_branch_norm PROPERTIES
+        HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+endif()

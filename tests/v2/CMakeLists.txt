@@ -887,6 +887,21 @@ if(HAVE_CUDA OR HAVE_ROCM)
         integration/kernels/qwen4exp/Test__DiagnosticSnapshotCopy.cpp
         integration/kernels/qwen4exp/Test__QwenSparseDeviceStages.cpp)
     target_link_libraries(v2_test_qwen4exp_device_primitives PRIVATE llaminar2_core GTest::gtest_main)
+    if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
+        set_source_files_properties(integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip
+            PROPERTIES LANGUAGE HIP)
+        target_sources(v2_test_qwen4exp_device_primitives PRIVATE
+            integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip)
+        target_link_libraries(v2_test_qwen4exp_device_primitives PRIVATE hip::host ${CMAKE_DL_LIBS})
+        set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        add_v2_test(V2_Integration_ROCmBranchNormHistoricalTree
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Qwen4ExpDevicePrimitives.ROCmBranchNormHistoricalTree
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;Capture;ByteExact;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    endif()
 endif()
 foreach(V2_QFN_BACKEND IN ITEMS CUDA ROCm)
     if((V2_QFN_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
@@ -31645,6 +31660,10 @@ add_v2_test(V2_Integration_ROCmMoEAutomaticOwnerConfiguration
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Build;MoE;Policy;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEAutomaticOwnerConfiguration)
 
+if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmBranchNormHistoricalTree)
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
@@ -31816,6 +31835,16 @@ if(HAVE_ROCM)
             --gtest_also_run_disabled_tests
             --gtest_filter=ROCmFloatingReduction.DISABLED_ExactShapePairedEvents
         LABELS "V2;Performance;ROCm;FloatingReduction;NativeEvents"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+endif()
+
+# Explicit branch-norm event timing is excluded from Unit and preflight.
+if(HAVE_ROCM)
+    add_v2_test(V2_Perf_ROCmBranchNormExactShape
+        COMMAND $<TARGET_FILE:v2_perf_qwen4exp_branch_norm>
+            --gtest_also_run_disabled_tests
+            --gtest_filter=Qwen4ExpDevicePrimitives.DISABLED_ROCmBranchNormPairedEvents
+        LABELS "V2;Performance;ROCm;Qwen4Exp;NativeEvents"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
 endif()
 

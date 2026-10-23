@@ -8,9 +8,18 @@
  * without replacing pointers or recapturing, checking inactive-byte guards,
  * every candidate rejection boundary, EOS context and chronological nine-row
  * history. Resource inspection rejects hidden copies, callbacks or local spills.
+ * A separate frozen original HIP norm certifies fixed-tree changes with raw
+ * bytes, all-wave epilogues and twenty dirty retained histories. Disabled native
+ * event tests retain paired timings and exact one-family profiler selection.
  * Real RAM/mmap service-worker affinity is observed by exact-inode libc delegation.
  */
 #include <gtest/gtest.h>
+#include <bit>
+#include <cmath>
+#include <cstdint>
+#include <span>
+#include <filesystem>
+#include <dlfcn.h>
 #include "utils/ImmutableLookupWorkerAffinityObservation.h"
 #include "backends/BackendManager.h"
 #include "backends/ExplicitGPUStream.h"
@@ -57,6 +66,10 @@ extern "C" bool cudaGDN_gated_rmsnorm(const float *,const float *,const float *,
 /** @brief Production native gate kernel used only as the serial-row diagnostic oracle. */
 extern "C" bool rocmGDN_gated_rmsnorm(const float *,const float *,const float *,float *,int,int,int,int,
     float,bool,GatedNormActivation,int,void *);
+#endif
+#ifdef HAVE_ROCM
+/** @brief Independently frozen native norm oracle; test-only exact-stream launch. */
+extern "C" bool testOriginalBranchRMSNorm(BranchRMSNormArgs,void *);
 #endif
 namespace
 {
@@ -1023,6 +1036,235 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
         }
     }).get();
 }
+#ifdef HAVE_ROCM
+/** @brief Explicit fixture-only execution demand; no production dispatch policy changes. */
+enum class BranchNormRun { Functional,Paired,ProfileOriginal,ProfileProduction };
+/** @brief A raw source override is owned by the setup fixture, not captured code. */
+struct BranchNormWord
+{
+    enum class Source { Input,Gain } source; ///< Original source binding to modify.
+    std::size_t index; ///< Element offset within one branch.
+    std::uint32_t bits; ///< Exact FP32 encoding, never normalized by host arithmetic.
+};
+/** @brief Own timing events until their exact stream retires, including exceptional paths. */
+struct BranchNormEvents
+{
+    IBackend *backend; DeviceId device; void *stream;
+    void *first=nullptr,*last=nullptr;
+    /** @brief Admit timing resources before any measured captured replay. */
+    BranchNormEvents(IBackend *b,DeviceId d,void *s):backend(b),device(d),stream(s)
+    {
+        first=backend->createTimingEvent(device.ordinal);
+        last=backend->createTimingEvent(device.ordinal);
+        if(!first || !last)
+        {
+            if(first)backend->destroyEvent(first,device.ordinal);
+            if(last)backend->destroyEvent(last,device.ordinal);
+            throw std::runtime_error("Branch norm timing event allocation failed");
+        }
+    }
+    /** @brief Retire pending event use before resource destruction on every exit. */
+    ~BranchNormEvents()
+    {
+        (void)backend->synchronizeStream(stream,device.ordinal);
+        backend->destroyEvent(last,device.ordinal);backend->destroyEvent(first,device.ordinal);
+    }
+    /** @brief Observe one retained batched graph, excluding host submit-loop time. */
+    float sample(IGPUGraphCapture &graph,int copies)
+    {
+        require(backend->recordEvent(first,device.ordinal,stream),"Branch norm start event failed");
+        require(graph.launch(),"Branch norm timed replay failed");
+        require(backend->recordEvent(last,device.ordinal,stream),"Branch norm stop event failed");
+        require(backend->waitForEvent(last,device.ordinal),"Branch norm terminal event failed");
+        float ms=0;
+        require(backend->eventElapsedTimeMs(first,last,device.ordinal,&ms),"Branch norm elapsed observation failed");
+        require(std::isfinite(ms) && ms>0,"Branch norm invalid timing");
+        return ms*1000.0f/static_cast<float>(copies);
+    }
+};
+/** @brief Compare independent native trees on captured production dispatch and optional paired events.
+ * @details All borrowed upload/download sources outlive both stream-draining Storage owners.
+ * Exact input/output alias receives a distinct restored input bank on each side.
+ */
+void branchNormCase(IWorkerGPUContext &worker,IBackend *backend,DeviceId device,
+    int hidden,int rows,bool alias,int histories,std::span<const BranchNormWord> words={},BranchNormRun run=BranchNormRun::Functional)
+{
+    const bool timing=run==BranchNormRun::Paired;
+    const bool profile=run==BranchNormRun::ProfileOriginal || run==BranchNormRun::ProfileProduction;
+    const bool profileOriginal=run==BranchNormRun::ProfileOriginal;
+    ::testing::Message witness;
+    for(const auto &word:words)
+        witness << " source=" << static_cast<int>(word.source) << " index=" << word.index
+                << " bits=" << word.bits;
+    SCOPED_TRACE(witness);
+    constexpr int copies=128;
+    constexpr std::size_t guard=16;
+    const std::size_t count=static_cast<std::size_t>(rows)*4*hidden,total=count+2*guard;
+    const float poison=std::bit_cast<float>(std::uint32_t{0x4b123456});
+    // Host owners precede Storage: an exception after async submission cannot
+    // destroy borrowed sources/destinations before terminal stream retirement.
+    std::vector<float> seed(total,poison),gain(static_cast<std::size_t>(hidden)*4),
+        outputPoison(total,poison),got(total),gold(total);
+    std::vector<int> hostLive(1,rows);
+    Storage production{device,backend,ExplicitGPUStream(worker.defaultStream()).get(),{}, {}};
+    Storage original{device,backend,production.stream,{}, {}};
+    auto kernel=createROCmQwen4ExpKernels();
+    auto *x=production.allocate<float>(total),*oldX=original.allocate<float>(total);
+    auto *g=production.allocate<float>(gain.size());
+    auto *y=alias?x:production.allocate<float>(total);
+    auto *oldY=alias?oldX:original.allocate<float>(total);
+    auto *live=production.allocate<int>(1);
+    const RowExtent extent{rows,histories==1?nullptr:live};
+    const BranchRMSNormArgs current{extent,hidden,1e-6f,x+guard,g,y+guard};
+    const BranchRMSNormArgs prior{extent,hidden,1e-6f,oldX+guard,g,oldY+guard};
+    /** Capture once and prove exact native geometry/resource inventory. */
+    const auto capture=[&](Storage &s,bool historical,int copies) {
+        s.graph=worker.createGraphCapture(s.stream);
+        require(bool(s.graph),"Branch norm graph allocation failed");
+        ScopedBackendGraphCapture recording(worker,*s.graph,"Branch RMSNorm historical tree");
+        require(recording.begin(),"Branch norm capture failed");
+        for(int i=0;i<copies;++i)
+        {
+            if(historical)require(testOriginalBranchRMSNorm(prior,s.stream),"Original branch norm launch failed");
+            else kernel->branchRMSNorm(current,s.stream);
+        }
+        recording.finish();
+        std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;
+        require(s.graph->inspectKernelNodes(nodes,&detail),detail.c_str());
+        require(s.graph->nodeCount()==static_cast<std::size_t>(copies),
+            "Branch norm captured hidden non-kernel work");
+        require(nodes.size()==static_cast<std::size_t>(copies),"Branch norm unexpected captured work");
+        for(const auto &node:nodes)
+        {
+            require(node.valid() && node.name_resolved,"Branch norm incomplete native inventory");
+            require(node.grid_x==static_cast<unsigned>(rows)*4 && node.grid_y==1 && node.grid_z==1 &&
+                node.block_x==256 && node.block_y==1 && node.block_z==1 &&
+                node.static_shared_memory_bytes==1024u &&
+                node.dynamic_shared_memory_bytes==0 && node.local_memory_bytes_per_thread==0,
+                "Branch norm changed geometry or private storage");
+            require(node.name.find(historical?"originalBranchRMSNorm":"normKernel")!=std::string::npos,
+                "Branch norm foreign captured kernel");
+        }
+        const auto &n=nodes.front();
+        std::cout<<"BRANCH_NORM_INVENTORY,"<<(historical?"original":"production")<<','<<rows<<','<<hidden<<','
+            <<copies<<','<<alias<<','<<n.name<<','<<n.grid_x<<','<<n.block_x<<','<<n.registers_per_thread<<','
+            <<n.static_shared_memory_bytes<<','<<n.local_memory_bytes_per_thread<<','<<n.max_active_blocks_per_sm<<'\n';
+        require(s.graph->instantiate(),"Branch norm instantiate failed");
+    };
+    // Captured kernels consume initialized, admitted pointers/counts only.
+    production.upload(live,hostLive);
+    if(profile)capture(profileOriginal?original:production,profileOriginal,copies);
+    else {capture(production,false,1);capture(original,true,1);}
+    for(int history=0;history<histories;++history)
+    {
+        static constexpr std::array<int,10> liveHistory{1025,513,17,1,0,1,17,0,513,1025};
+        const int active=histories==1?rows:std::min(rows,liveHistory[history%liveHistory.size()]);
+        hostLive[0]=active;
+        for(std::size_t i=0;i<count;++i)
+        {
+            // Full mantissas/mixed exponents: a binary-rational near-exact sum
+            // is not a useful reduction-association witness. Squares themselves
+            // are nonnegative; alternating signs do not create cancellation.
+            const std::uint32_t mix=static_cast<std::uint32_t>(i*747796405u+history*2891336453u+277803737u);
+            seed[guard+i]=std::bit_cast<float>((mix&0x807fffffu)|((121u+(mix>>24)%13u)<<23));
+        }
+        for(std::size_t i=0;i<gain.size();++i)
+            gain[i]=std::bit_cast<float>((static_cast<std::uint32_t>(i*1664525u)&0x807fffffu)|(126u<<23));
+        for(const auto &word:words)
+        {
+            require(word.index<static_cast<std::size_t>(hidden),"Branch norm witness outside H");
+            for(int branch=0;branch<4;++branch)
+            {
+                const auto index=static_cast<std::size_t>(branch)*hidden+word.index;
+                (word.source==BranchNormWord::Source::Input?seed[guard+index]:gain[index])=std::bit_cast<float>(word.bits);
+            }
+        }
+        production.upload(x,seed);original.upload(oldX,seed);production.upload(g,gain);production.upload(live,hostLive);
+        if(!alias){production.upload(y,outputPoison);original.upload(oldY,outputPoison);}
+        if(profile)break; // Profiling admits only the chosen family, including setup/warmup.
+        require(production.graph->launch(),"Production branch norm replay failed");
+        require(original.graph->launch(),"Original branch norm replay failed");
+        require(backend->deviceToHostOnStream(got.data(),y,total*sizeof(float),device.ordinal,production.stream),"Branch norm collection failed");
+        require(backend->deviceToHostOnStream(gold.data(),oldY,total*sizeof(float),device.ordinal,production.stream),"Original norm collection failed");
+        require(backend->synchronizeStream(production.stream,device.ordinal),"Branch norm terminal observation failed");
+        EXPECT_EQ(std::memcmp(got.data(),gold.data(),total*sizeof(float)),0)
+            <<"H="<<hidden<<" M="<<rows<<" active="<<active<<" history="<<history<<" alias="<<alias;
+        const auto &untouched=alias?seed:outputPoison;
+        EXPECT_EQ(std::memcmp(got.data(),untouched.data(),guard*sizeof(float)),0);
+        const auto inactive=guard+static_cast<std::size_t>(active)*4*hidden;
+        EXPECT_EQ(std::memcmp(got.data()+inactive,untouched.data()+inactive,(total-inactive)*sizeof(float)),0);
+    }
+    if(!timing && !profile)return;
+    require(!::testing::Test::HasFailure(),"Branch norm byte proof failed before timing");
+    require(!alias && words.empty(),"Timing requires stable finite nonalias inputs");
+    if(!profile)
+    {
+        production.graph.reset();original.graph.reset();
+        capture(production,false,copies);capture(original,true,copies);
+    }
+    BranchNormEvents events(backend,device,production.stream);
+    for(int warm=0;warm<8;++warm)
+    {
+        if(profile)(void)events.sample(profileOriginal?*original.graph:*production.graph,copies);
+        else {(void)events.sample(*original.graph,copies);(void)events.sample(*production.graph,copies);}
+    }
+    for(int round=0;round<31;++round)
+        for(int slot=0;slot<(profile?1:4);++slot)
+        {
+            const bool historical=profile?profileOriginal:((slot==0 || slot==3) != bool(round&1));
+            auto &graph=historical?*original.graph:*production.graph;
+            const float us=events.sample(graph,copies);
+            std::cout<<"BRANCH_NORM_EVENT,"<<rows<<','<<hidden<<','<<round<<','<<slot<<','
+                <<(historical?"original":"production")<<','<<copies<<','<<us<<'\n';
+        }
+}
+/** @brief Native independent-oracle sweep; timing stays disabled outside its explicit filter. */
+void proveHistoricalBranchNorm(BranchNormRun run)
+{
+    const auto device=DeviceId::rocm(0);auto *backend=getBackendFor(device);
+    if(!backend || backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"ROCm unavailable";
+    Dl_info loader{};
+    require(dladdr(reinterpret_cast<void *>(&createROCmQwen4ExpKernels),&loader)!=0 && loader.dli_fname,
+        "Branch norm native core loader identity unavailable");
+    std::cout<<"BRANCH_NORM_LOADER,"<<std::filesystem::canonical(loader.dli_fname).string()<<'\n';
+    auto &worker=GPUDeviceContextPool::instance().getContext(device);
+    worker.submitAsync([&] {
+        if(run==BranchNormRun::ProfileOriginal || run==BranchNormRun::ProfileProduction)
+        {branchNormCase(worker,backend,device,2560,1,false,1,{},run);return;}
+        if(run==BranchNormRun::Paired)
+        {
+            for(const auto shape:std::array{std::array{2560,1},std::array{2560,512},std::array{2559,1},std::array{2561,1}})
+                branchNormCase(worker,backend,device,shape[0],shape[1],false,1,{},BranchNormRun::Paired);
+            return;
+        }
+        for(int h:{1,63,64,65,127,128,129,191,192,193,255,256,257,2559,2560,2561})
+            branchNormCase(worker,backend,device,h,1,false,1);
+        for(int m:{3,17,512,513})branchNormCase(worker,backend,device,2560,m,false,1);
+        branchNormCase(worker,backend,device,2560,1025,false,20);
+        branchNormCase(worker,backend,device,2560,17,true,20);
+        branchNormCase(worker,backend,device,257,1,true,1);
+        using Source=BranchNormWord::Source;
+        for(auto bits:{0u,0x80000000u,1u,0x007fffffu,0x00800000u,0x7f7fffffu,
+                      0x7f800000u,0xff800000u,0x7fc01234u,0xffc05678u,0x7f801234u,0xff805678u})
+        {
+            const std::array words{BranchNormWord{Source::Input,256,bits}};
+            branchNormCase(worker,backend,device,257,1,false,1,words);
+            branchNormCase(worker,backend,device,1,1,false,1,
+                std::array{BranchNormWord{Source::Input,0,bits}});
+            const std::array gainWord{BranchNormWord{Source::Gain,128,bits}};
+            branchNormCase(worker,backend,device,257,1,false,1,gainWord);
+        }
+        for(unsigned stride:{128u,64u,32u,16u,8u,4u,2u,1u,256u})
+            for(bool swap:{false,true})for(bool sign:{false,true})
+            {
+                const auto a=0x7fc01234u|(sign?0x80000000u:0u),b=0x7fc05678u|(sign?0u:0x80000000u);
+                const std::array words{BranchNormWord{Source::Input,0,swap?b:a},BranchNormWord{Source::Input,stride,swap?a:b}};
+                branchNormCase(worker,backend,device,257,1,false,1,words);
+            }
+    }).get();
+}
+#endif
+
 } // namespace
 #ifdef HAVE_CUDA
 /** @test Real retained CUDA GR/PLE kernels preserve serial arithmetic and live extents. */
@@ -1069,4 +1311,19 @@ TEST(Qwen4ExpDevicePrimitives, CUDAOwnedLookupWorkerAffinity)
 TEST(Qwen4ExpDevicePrimitives, ROCmOwnedLookupWorkerAffinity)
 { proveLookup(DeviceId::rocm(0), false, LookupFrontierProof::ExistingProtocol, LookupWorkerPlacementProof::ActualOwnedWorker); }
 
+#endif
+
+#ifdef HAVE_ROCM
+/** @test Actual captured dispatch preserves the independent historical RMS tree and dirty live extents. */
+TEST(Qwen4ExpDevicePrimitives, ROCmBranchNormHistoricalTree)
+{ proveHistoricalBranchNorm(BranchNormRun::Functional); }
+/** @test Opt-in balanced exact-shape original/production native event comparison. */
+TEST(Qwen4ExpDevicePrimitives, DISABLED_ROCmBranchNormPairedEvents)
+{ proveHistoricalBranchNorm(BranchNormRun::Paired); }
+/** @test Isolate only the frozen original M1/H2560 family in one profiler launch. */
+TEST(Qwen4ExpDevicePrimitives, DISABLED_ROCmBranchNormOriginalM1H2560)
+{ proveHistoricalBranchNorm(BranchNormRun::ProfileOriginal); }
+/** @test Isolate only production M1/H2560 dispatch in one profiler launch. */
+TEST(Qwen4ExpDevicePrimitives, DISABLED_ROCmBranchNormProductionM1H2560)
+{ proveHistoricalBranchNorm(BranchNormRun::ProfileProduction); }
 #endif

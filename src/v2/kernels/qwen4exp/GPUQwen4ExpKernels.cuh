@@ -8,6 +8,9 @@
  * CPU-owned immutable bindings are checked before launch, while live counts
  * and acceptance decisions are validated exclusively on device. No allocation,
  * synchronization, transfer or callback appears in this execution boundary.
+ * HIP branch normalization retains the exact 256-lane arithmetic tree while
+ * its wave64 register tail avoids six redundant CTA barriers. The final sum
+ * is explicitly republished to every output lane; CUDA keeps its shared tree.
  */
 #pragma once
 #include "Qwen4ExpKernels.h"
@@ -76,7 +79,13 @@ __device__ inline int acceptedRows(const AcceptedPrefix &prefix)
 }
 /** @brief Deterministic per-row FP32 sigmoid; no batch-dependent vector route. */
 __device__ inline float sigmoid(float value) { return 1.0f / (1.0f + expf(-value)); }
-/** @brief One fixed-order branch RMSNorm with branch-specific actual gain. */
+/**
+ * @brief One fixed-order branch RMSNorm with branch-specific actual gain.
+ * @param a Immutable row extent, original input/gain and admitted output storage.
+ * @details Every row/branch owns one 256-thread CTA. HIP's wave64 tail changes
+ * storage of the original reduction edges, never their operands or RN order.
+ * All output lanes consume the final shared sum after a collective barrier.
+ */
 __global__ __launch_bounds__(kThreads, 2) void normKernel(BranchRMSNormArgs a)
 {
     const auto task = static_cast<std::size_t>(blockIdx.x);
@@ -92,12 +101,36 @@ __global__ __launch_bounds__(kThreads, 2) void normKernel(BranchRMSNormArgs a)
     __shared__ float sums[kThreads];
     sums[lane] = partial;
     __syncthreads();
+#if defined(QFN_ROCM)
+    // Publish edge128 across waves before wave0 reads both sides of edge64.
+    // Keep the original left/right operand priority at each shared-memory edge.
+    if (lane < 128) sums[lane] = __fadd_rn(sums[lane], sums[lane + 128]);
+    __syncthreads();
+    if (lane < 64)
+    {
+        // Edge64 now lives in the owning wave's registers. Every lane executes
+        // each shuffle, but only the original edge owners perform RN additions;
+        // this preserves the full 128/64/32/.../1 tree, including NaN operands.
+        float sum = __fadd_rn(sums[lane], sums[lane + 64]);
+#pragma unroll
+        for (unsigned stride = 32; stride > 0; stride /= 2)
+        {
+            const float partner = __shfl_down(sum, stride, 64);
+            if (lane < stride) sum = __fadd_rn(sum, partner);
+        }
+        if (lane == 0) sums[0] = sum;
+    }
+    // Unlike a lane0-only projection reducer, normalization has consumers in
+    // all four waves. Publish lane0's result before any output lane reads it.
+    __syncthreads();
+#else
 #pragma unroll
     for (unsigned stride = kThreads / 2; stride > 0; stride /= 2)
     {
         if (lane < stride) sums[lane] = __fadd_rn(sums[lane], sums[lane + stride]);
         __syncthreads();
     }
+#endif
     const float inverse = 1.0f / sqrtf(sums[0] / static_cast<float>(a.hidden) + a.epsilon);
     const auto gainBase = (task % 4) * a.hidden;
     for (unsigned channel = lane; channel < static_cast<unsigned>(a.hidden); channel += kThreads)
