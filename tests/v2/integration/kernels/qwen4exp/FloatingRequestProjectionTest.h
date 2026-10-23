@@ -85,7 +85,9 @@ void verifyRequestProjection(int type)
     // Boundaries 173/346 cut through both four- and eight-row shared CUDA tiles.
     RequestStorage<float> a(size_t(m)*k),b(size_t(n)*k),out(size_t(m)*n),gold(size_t(m)*n);
     RequestStorage<int32_t> counts(requests);
+#if !defined(__HIPCC__)
     RequestStorage<const float*> aa(1),bb(1); RequestStorage<float*> cc(1);
+#endif
     RT(Stream_t) stream=nullptr; requestChecked(RT(StreamCreateWithFlags)(&stream,RT(StreamNonBlocking)));
     std::vector<float> input(size_t(m)*k),weights(size_t(n)*k),expected(size_t(m)*n),actual(expected.size());
     std::vector<uint16_t> native(weights.size()); uint32_t rng=1977;
@@ -97,10 +99,12 @@ void verifyRequestProjection(int type)
     }
     requestChecked(RT(MemcpyAsync)(a.data,input.data(),input.size()*4,RT(MemcpyHostToDevice),stream));
     requestChecked(RT(MemcpyAsync)(b.data,type==0?static_cast<const void*>(weights.data()):native.data(),weights.size()*(type==0?4:2),RT(MemcpyHostToDevice),stream));
+#if !defined(__HIPCC__)
     const float* ap=a.data; const float* bp=b.data; float* cp=out.data;
     requestChecked(RT(MemcpyAsync)(aa.data,&ap,sizeof(ap),RT(MemcpyHostToDevice),stream));
     requestChecked(RT(MemcpyAsync)(bb.data,&bp,sizeof(bp),RT(MemcpyHostToDevice),stream));
     requestChecked(RT(MemcpyAsync)(cc.data,&cp,sizeof(cp),RT(MemcpyHostToDevice),stream));
+#endif
     requestLegacy<<<dim3(n,m),256,0,stream>>>(a.data,b.data,gold.data,n,k,type);
     requestChecked(RT(GetLastError)());
     requestChecked(RT(MemcpyAsync)(expected.data(),gold.data,expected.size()*4,RT(MemcpyDeviceToHost),stream));
@@ -108,11 +112,21 @@ void verifyRequestProjection(int type)
     const auto rows=llaminar2::DeviceRequestRowRanges::deviceCounted(requests,stride,counts.data);
     RT(Graph_t) graph=nullptr; RT(GraphExec_t) exec=nullptr;
     requestChecked(RT(StreamBeginCapture)(stream,RT(StreamCaptureModeThreadLocal)));
+#if defined(__HIPCC__)
+    const bool launched=type==0 ? FP32_LAUNCH(
+        llaminar2::FixedFP32ProjectionGroup::single(a.data,b.data,out.data),m,n,k,0,stream,nullptr,&rows)
+        : FP16_LAUNCH(llaminar2::FixedFP32x16ProjectionGroup::single(
+            a.data,reinterpret_cast<const std::uint16_t *>(b.data),out.data),m,n,k,type-1,0,stream,nullptr,&rows);
+#else
     const bool launched=type==0 ? FP32_LAUNCH(aa.data,bb.data,cc.data,m,n,k,1,0,stream,nullptr,&rows)
         : FP16_LAUNCH(aa.data,bb.data,cc.data,m,n,k,1,type-1,0,stream,nullptr,&rows);
+#endif
     requestChecked(RT(StreamEndCapture)(stream,&graph)); ASSERT_TRUE(launched);
     requestChecked(RT(GraphInstantiate)(&exec,graph,nullptr,nullptr,0));
-#if !defined(__HIPCC__)
+#if defined(__HIPCC__)
+    // Exactly the unchanged custom consumer remains; no pointer staging node.
+    size_t nodes=0; requestChecked(hipGraphGetNodes(graph,nullptr,&nodes)); ASSERT_EQ(nodes,1u);
+#else
     size_t nodes=0; requestChecked(cudaGraphGetNodes(graph,nullptr,&nodes)); ASSERT_EQ(nodes,1u);
     cudaGraphNode_t node=nullptr; requestChecked(cudaGraphGetNodes(graph,&node,&nodes));
     cudaKernelNodeParams params{}; requestChecked(cudaGraphKernelNodeGetParams(node,&params));

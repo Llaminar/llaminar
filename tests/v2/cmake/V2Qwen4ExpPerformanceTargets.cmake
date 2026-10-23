@@ -15,8 +15,12 @@ if(HAVE_ROCM)
     set_source_files_properties(
         "${_qfn_test_sources}/performance/kernels/rocm/Perf__FloatingReduction.hip"
         PROPERTIES LANGUAGE HIP)
+    set_source_files_properties("${_qfn_test_sources}/integration/kernels/rocm/ROCmOriginalFloatingPointerOracle.hip"
+        PROPERTIES LANGUAGE HIP)
     add_executable(v2_perf_rocm_floating_reduction EXCLUDE_FROM_ALL
-        "${_qfn_test_sources}/performance/kernels/rocm/Perf__FloatingReduction.hip")
+        "${_qfn_test_sources}/performance/kernels/rocm/Perf__FloatingReduction.hip"
+        "${_qfn_test_sources}/integration/kernels/rocm/ROCmOriginalFloatingPointerOracle.hip"
+        "${_qfn_test_sources}/integration/kernels/rocm/ROCmFloatingPointerRegression.cpp")
     target_link_libraries(v2_perf_rocm_floating_reduction PRIVATE
         llaminar2_core GTest::gtest GTest::gtest_main hip::host)
     set_target_properties(v2_perf_rocm_floating_reduction PROPERTIES

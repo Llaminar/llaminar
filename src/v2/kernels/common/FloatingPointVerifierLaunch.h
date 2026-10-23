@@ -12,6 +12,7 @@
 
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/FixedHalfProjectionGroup.h"
+#include "kernels/common/FixedFloatingProjectionGroup.h"
 
 extern "C"
 {
@@ -103,13 +104,10 @@ extern "C"
 
     /**
      * @brief Enqueue fixed-order floating projections.
-     * @param d_A_array Persistent device pointers to FP32 input matrices [M,K].
-     * @param d_B_array Persistent device pointers to native weight matrices [N,K].
-     * @param d_C_array Persistent device pointers to FP32 result matrices [M,N].
+     * @param projections Checked immutable typed A/B/C addresses copied into native arguments.
      * @param M Physical matrix rows; independent of the device live count.
      * @param N Output columns.
      * @param K Reduction width.
-     * @param batch_count Number of independent projections.
      * @param device_id Owning backend device ordinal.
      * @param stream Exact non-null producer/consumer stream.
      * @param row_range Borrowed launch metadata, or null for fully active physical rows.
@@ -117,13 +115,10 @@ extern "C"
      * @return Whether validation and asynchronous submission succeeded.
      */
     bool rocmFp32_small_n_batched_projection(
-        const float *const *d_A_array,
-        const float *const *d_B_array,
-        float *const *d_C_array,
+        llaminar2::FixedFP32ProjectionGroup projections,
         int M,
         int N,
         int K,
-        int batch_count,
         int device_id,
         void *stream,
         const llaminar2::DeviceRowRange *row_range = nullptr,
@@ -131,13 +126,10 @@ extern "C"
 
     /**
      * @brief Enqueue fixed-order floating projections.
-     * @param d_A_array Persistent device pointers to FP32 input matrices [M,K].
-     * @param d_B_array Persistent device pointers to native weight matrices [N,K].
-     * @param d_C_array Persistent device pointers to FP32 result matrices [M,N].
+     * @param projections Checked immutable typed A/B/C addresses copied into native arguments.
      * @param M Physical matrix rows; independent of the device live count.
      * @param N Output columns.
      * @param K Reduction width.
-     * @param batch_count Number of independent projections.
      * @param weight_dtype Native weight encoding: FP16=0, BF16=1.
      * @param device_id Owning backend device ordinal.
      * @param stream Exact non-null producer/consumer stream.
@@ -146,13 +138,10 @@ extern "C"
      * @return Whether validation and asynchronous submission succeeded.
      */
     bool rocmFp32x16_batched_projection(
-        const float *const *d_A_array,
-        const float *const *d_B_array,
-        float *const *d_C_array,
+        llaminar2::FixedFP32x16ProjectionGroup projections,
         int M,
         int N,
         int K,
-        int batch_count,
         int weight_dtype,
         int device_id,
         void *stream,

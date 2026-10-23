@@ -13568,6 +13568,12 @@ add_v2_test(V2_Unit_MTPVerifierPolicy
     LABELS "V2;Unit;MTP;VerifierPolicy;Rollback"
     MPI_PROCS 1
 )
+# Immutable custom floating addresses are a device-free capture ownership gate.
+add_v2_test(V2_Integration_FixedFloatingProjectionBindings
+    COMMAND $<TARGET_FILE:v2_test_mtp_verifier_policy>
+        --gtest_filter=Test__MTPVerifierPolicy.FixedFloatingProjectionBindingsAreTypedBoundedValueSnapshots
+    LABELS "V2;Integration;ProductionTestPreflight;FloatingProjection;GraphCapture;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MTPFixedDepthRetainedVerifierFamily
     COMMAND $<TARGET_FILE:v2_test_mtp_verifier_policy>
         --gtest_filter=Test__MTPVerifierPolicy.RetainedVerifierFamilyCoversEveryRequestWidth:Test__MTPVerifierPolicy.FixedDepthOvercapacityRetainsExactVerifierMembers
@@ -26500,8 +26506,12 @@ endif()
 if(HAVE_ROCM)
     set_source_files_properties(integration/kernels/rocm/Test__FloatingRequestProjection.hip
         PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(integration/kernels/rocm/ROCmOriginalFloatingPointerOracle.hip
+        PROPERTIES LANGUAGE HIP)
     add_executable(v2_integration_rocm_floating_request_projection
-        integration/kernels/rocm/Test__FloatingRequestProjection.hip)
+        integration/kernels/rocm/Test__FloatingRequestProjection.hip
+        integration/kernels/rocm/ROCmOriginalFloatingPointerOracle.hip
+        integration/kernels/rocm/ROCmFloatingPointerRegression.cpp)
     target_link_libraries(v2_integration_rocm_floating_request_projection PRIVATE
         llaminar2_core GTest::gtest GTest::gtest_main hip::host)
     # SDK binding, configured architecture set and mandatory spill guard are
@@ -26518,7 +26528,31 @@ if(TARGET v2_integration_rocm_floating_request_projection)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP32;FP16;BF16;Capture;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFloatingReductionHistoricalTree)
+    add_v2_test(V2_Integration_ROCmFloatingPointerImmediateOriginal
+        COMMAND $<TARGET_FILE:v2_integration_rocm_floating_request_projection>
+            --gtest_filter=ROCmFloatingPointer.ImmediateOriginalStagedPipelineCapturedByteExact:ROCmFloatingPointer.MixedActualTableConsumersRemainCaptured --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP32;FP16;BF16;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFloatingPointerImmediateOriginal)
+    # This separate process must enter its first real BLAS operation in capture;
+    # preceding tests or eager warmups would conceal vendor-pool retirement bugs.
+    add_v2_test(V2_Integration_ROCmHipBLASColdCapturedWorkspace
+        COMMAND $<TARGET_FILE:v2_integration_rocm_floating_request_projection>
+            --gtest_filter=ROCmFloatingPointer.MixedActualTableConsumersRemainCaptured --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;hipBLAS;Capture;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmHipBLASColdCapturedWorkspace)
+    add_v2_test(V2_Integration_ROCmFloatingProjectionPreparedInputs
+        COMMAND $<TARGET_FILE:v2_test_hipblas_gemm>
+            --gtest_filter=Test__ROCmFloatingPointGemmKernel.BatchedFusedProjectionVerifierRowsM234MatchSerialDecodeRows
+            --gtest_repeat=20 --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP32;ByteExact;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFloatingProjectionPreparedInputs)
 endif()
+
+# Append after the canonical preflight inventory declaration.
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FixedFloatingProjectionBindings)
 
 # Device-free aliases: NO_MODELS, MPI_PROCS1; append each alias to the explicit
 # V2_PRODUCTION_TEST_PREFLIGHT_TESTS inventory as well as these registrations.
@@ -31835,6 +31869,14 @@ if(HAVE_ROCM)
             --gtest_also_run_disabled_tests
             --gtest_filter=ROCmFloatingReduction.DISABLED_ExactShapePairedEvents
         LABELS "V2;Performance;ROCm;FloatingReduction;NativeEvents"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+endif()
+
+if(HAVE_ROCM)
+    add_v2_test(V2_Perf_ROCmFloatingPointerPipeline
+        COMMAND $<TARGET_FILE:v2_perf_rocm_floating_reduction>
+            --gtest_also_run_disabled_tests --gtest_filter=ROCmFloatingPointer.DISABLED_ExactShapePairedPipelineEvents
+        LABELS "V2;Performance;ROCm;FloatingProjection;NativeEvents"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
 endif()
 

@@ -8,6 +8,8 @@
  * hipBLAS shape-dependent accumulation changes in publication-sensitive state.
  * Each output column has the same 256-lane K reduction regardless of physical
  * output width, so narrow shards and a mirrored full vocabulary remain exact.
+ * Custom FP32/native16 consumers retain immutable matrix addresses by value;
+ * pointer-table publication remains only for genuine table consumers.
  * Explicit half activation specializations read only live rows from the existing
  * retained half bank; serial and verifier dispatch share the same arithmetic.
  */
@@ -180,9 +182,7 @@ namespace
 
     __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
         void fp32_small_n_batched_projection_kernel(
-            const float *const *__restrict__ d_A_array,
-            const float *const *__restrict__ d_B_array,
-            float *const *__restrict__ d_C_array,
+            llaminar2::FixedFP32ProjectionGroup projections,
             int M,
             int N,
             int K,
@@ -194,9 +194,9 @@ namespace
         if (!row_range.rowIsActive(m) || n >= N)
             return;
 
-        const float *A = d_A_array[batch];
-        const float *B = d_B_array[batch];
-        float *C = d_C_array[batch];
+        const float *A = projections.input(batch);
+        const float *B = projections.weight(batch);
+        float *C = projections.output(batch);
         if (!A || !B || !C)
             return;
 
@@ -227,9 +227,7 @@ namespace
     template<SmallProjectionWeightDtype WeightDtype>
     __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
         void fp32x16_batched_projection_kernel(
-            const float *const *__restrict__ d_A_array,
-            const float *const *__restrict__ d_B_array,
-            float *const *__restrict__ d_C_array,
+            llaminar2::FixedFP32x16ProjectionGroup projections,
             int M,
             int N,
             int K,
@@ -243,9 +241,9 @@ namespace
         if (!row_range.rowIsActive(m) || n >= N)
             return;
 
-        const float *A = d_A_array[batch];
-        const uint16_t *B = reinterpret_cast<const uint16_t *>(d_B_array[batch]);
-        float *C = d_C_array[batch];
+        const float *A = projections.input(batch);
+        const uint16_t *B = projections.weight(batch);
+        float *C = projections.output(batch);
         if (!A || !B || !C)
             return;
 
@@ -555,24 +553,21 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
  * The former N<=64 restriction described a caller, not a kernel limitation.
  */
 extern "C" bool rocmFp32_small_n_batched_projection(
-    const float *const *d_A_array,
-    const float *const *d_B_array,
-    float *const *d_C_array,
+    llaminar2::FixedFP32ProjectionGroup projections,
     int M,
     int N,
     int K,
-    int batch_count,
     int device_id,
     void *stream,
     const llaminar2::DeviceRowRange *row_range,
     const llaminar2::DeviceRequestRowRanges *request_rows)
 {
+    const int batch_count = projections.size();
     if (M<=0 || (row_range && request_rows) ||
         (row_range && row_range->physicalRows()!=M) ||
         (request_rows && request_rows->physicalRows()!=M))return false;
     const auto rows=llaminar2::FloatingProjectionRows::bind(M,row_range,request_rows);
-    if (!d_A_array || !d_B_array || !d_C_array ||
-        M <= 0 ||
+    if (M <= 0 ||
         N <= 0 ||
         K <= 0 ||
         batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
@@ -608,9 +603,7 @@ extern "C" bool rocmFp32_small_n_batched_projection(
         block,
         0,
         hip_stream,
-        d_A_array,
-        d_B_array,
-        d_C_array,
+        projections,
         M,
         N,
         K,
@@ -620,25 +613,22 @@ extern "C" bool rocmFp32_small_n_batched_projection(
 }
 
 extern "C" bool rocmFp32x16_batched_projection(
-    const float *const *d_A_array,
-    const float *const *d_B_array,
-    float *const *d_C_array,
+    llaminar2::FixedFP32x16ProjectionGroup projections,
     int M,
     int N,
     int K,
-    int batch_count,
     int weight_dtype,
     int device_id,
     void *stream,
     const llaminar2::DeviceRowRange *row_range,
     const llaminar2::DeviceRequestRowRanges *request_rows)
 {
+    const int batch_count = projections.size();
     if (M<=0 || (row_range && request_rows) ||
         (row_range && row_range->physicalRows()!=M) ||
         (request_rows && request_rows->physicalRows()!=M))return false;
     const auto rows=llaminar2::FloatingProjectionRows::bind(M,row_range,request_rows);
-    if (!d_A_array || !d_B_array || !d_C_array ||
-        M <= 0 ||
+    if (M <= 0 ||
         N <= 0 ||
         K <= 0 ||
         batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
@@ -682,9 +672,7 @@ extern "C" bool rocmFp32x16_batched_projection(
             block,
             0,
             hip_stream,
-            d_A_array,
-            d_B_array,
-            d_C_array,
+            projections,
             M,
             N,
             K,
@@ -698,9 +686,7 @@ extern "C" bool rocmFp32x16_batched_projection(
             block,
             0,
             hip_stream,
-            d_A_array,
-            d_B_array,
-            d_C_array,
+            projections,
             M,
             N,
             K,

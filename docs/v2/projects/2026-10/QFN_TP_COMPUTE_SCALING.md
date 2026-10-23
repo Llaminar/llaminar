@@ -1,6 +1,14 @@
 # QFN captured compute scaling
 
-Updated: 2026-10-23. Current A1 checkpoint **L101** measures **814.610 prefill /
+Updated: 2026-10-23. Current A1 checkpoint **L102** measures **815.053 prefill /
+37.424 decode tok/s** against matched **814.156 / 37.134**: **+0.110% /
++0.781%**, with nonoverlapping decode ranges and effectively unchanged prefill.
+All 185 final-logit rows and twelve generated sequences remain byte-identical;
+all 776 Unit and focused native gates pass. See the
+[captured floating bindings qualification](#floating-projections-immutable-captured-bindings-l102).
+Complete production preflight remains G60.
+
+The preceding checkpoint **L101** measures **814.610 prefill /
 37.088 decode tok/s**, effectively unchanged versus matched L100 **814.645 /
 37.103**. Its exact-order branch norm improves component M1 latency 2.794%; see
 [qualification below](#branch-normalization-original-reduction-order-with-fewer-barriers).
@@ -536,3 +544,122 @@ compiler-commuted NaN operands it passed the same byte gate, but decode-shape
 latency increased from 6.885 to 18.139 µs and M512 increased 3.946%. Its result
 is retained in `branch-norm101b-paired-r1`; none of that candidate remains in
 production source.
+
+### Floating projections: immutable captured bindings (L102)
+
+The custom ROCm FP32 and native FP16/BF16 projections now receive a bounded,
+typed value containing their original A/B/C addresses. Capture retains those
+addresses directly. Their original FMA order, native weight conversion,
+256-lane K ownership, reduction tree, row guards and launch geometry remain
+unchanged. Real hipBLAS and physical-half table consumers still stage their
+required tables. No model precision, prepared weights, workspace allocation,
+host count readback or request-time transfer is introduced.
+
+The independent immediate-original HIP oracle first calibrated against the
+old implementation. The fresh control archive includes the same cold hipBLAS
+workspace fix as the candidate, so the matched timing isolates the projection
+binding change. The historical norm101 archive is not relabeled as this control.
+
+The [paired unprofiled native-event measurement](../../../../parity-results/qwen-flash-next/pointer102-paired-release-r1/paired-summary.json)
+uses twelve balanced pairs per shape. Original timing includes its real
+pointer-publication kernel and consumer; candidate timing includes the new
+consumer. These synthetic component pipelines do not establish model savings.
+
+| Weight / M / N / K | Original µs | Candidate µs | Latency change |
+|---|---:|---:|---:|
+| FP32 / 1 / 4 / 10240 | 11.830 | 10.365 | −12.386% |
+| FP32 / 512 / 4 / 10240 | 138.800 | 140.320 | +1.095% |
+| BF16 / 1 / 128 / 2560 | 6.604 | 5.251 | −20.494% |
+| BF16 / 512 / 128 / 2560 | 674.719 | 668.079 | −0.984% |
+| BF16 / 1 / 512 / 2560 | 47.612 | 46.033 | −3.316% |
+| BF16 / 512 / 512 / 2560 | 2588.320 | 2559.280 | −1.122% |
+
+The HC prefill component loss remains visible; whole-model prefill is
+effectively unchanged. The additional K2560 FP32 diagnostic shapes remain in
+the raw paired summary and are not presented as actual HC model geometry.
+
+[Isolated profiles](../../../../parity-results/qwen-flash-next/pointer102-profile-summary-r1/summary.json)
+authenticate twelve shape/side traces and sixty consumer counter runs, each
+selecting one exact warmed kernel occurrence. Five separate counter runs
+measure the removed publication. The first BF16 counter attempt collected no
+counter because its selector depended on formatted-name punctuation; the
+corrected family selector passes the same exact dispatched-symbol, format,
+ordinal, geometry and code-object checks. Both receipts remain recorded.
+Profiler timings are excluded from the table and the model comparison.
+
+[Native ISA inspection](../../../../parity-results/qwen-flash-next/pointer102-profile-summary-r1/isa-REVIEW.md)
+finds the same 73-instruction reduction region and FMA operand order in all
+three formats, including NaN priority and floating-mode descriptors. FP32/BF16
+retain allocated VGPR12/SGPR32; FP16 retains VGPR16/SGPR32. All retain 1 KiB
+LDS, zero private bytes and zero spills. FP16 sibling inspection is static,
+with separate captured functional coverage; the isolated QFN timing/counter
+shapes use FP32 and BF16. Consumer kernarg size grows **88→264 bytes**, while
+the separate original 220-byte publication launch is removed. This is an
+explicit argument-layout tradeoff, not a scratch allocation.
+
+Block size remains 256, with N×M CTAs and four wave64 wavefronts per CTA.
+Counters match those launched-wave counts, show zero LDS bank conflicts, and
+show essentially unchanged payload fetches at M1. HC fetches 201.75 KiB on both
+sides; key fetches 650.375 KiB; query fetches 2570.375 KiB. Candidate VALU active
+lanes are 99.919% for FP32 and 99.767% for BF16. These are lane-utilization
+measurements, not achieved occupancy. Register/LDS limits are unchanged; the
+M1 HC launch has only four CTAs, so at most four of the 60 CUs can participate.
+No dynamic occupancy or bandwidth-saturation claim follows from these counters.
+The removed publication is one wave with 7.031% active lanes and 0.5 KiB fetched.
+
+The captured regression covers all three source formats, groups 1–8 and an
+8/8/3 split, distinct/shared inputs, prefix counts and request holes, twenty
+dirty full/partial/empty histories, guard bytes, signed zero, subnormals,
+infinities and competing NaN payloads. Full-live mapped output, actual BLAS
+table consumers and physical-half table consumers are retained. The new
+preflight registrations are `V2_Integration_ROCmFloatingPointerImmediateOriginal`,
+`V2_Integration_FixedFloatingProjectionBindings`,
+`V2_Integration_ROCmHipBLASColdCapturedWorkspace` and
+`V2_Integration_ROCmFloatingProjectionPreparedInputs`.
+
+Two setup defects were exposed and fixed. First-use captured hipBLAS attempted
+to free its initial vendor workspace when binding the admitted arena. Context
+initialization now retires that initial allocation before publication; every
+real arithmetic submission still binds its admitted workspace. The fresh-process
+regression enters its first real BLAS call inside capture without an eager
+warmup. Separately, an older direct-kernel test uploaded on a different stream
+without joining its event to the consumer. It failed on iteration 17 of 20 after
+the incidental pointer-launch delay disappeared. The fixture now uses exact-stream
+`TransferEngine::prepareDeviceInput` and output preparation; its 20-repeat
+regression passes. This was a test ordering defect, not observed model drift.
+
+[Complete Unit](../../../../parity-results/qwen-flash-next/pointer102-unit-r1/result.json)
+passes 776/776. The [final focused run](../../../../parity-results/qwen-flash-next/pointer102-candidate-focused-r2/result.json)
+passes 16 registrations plus its driver fixture. The heavier CUDA and ROCm GDN
+capture tests passed in the earlier run on the same production implementation;
+that run's overall failure is retained because of the subsequently fixed test
+ordering defect. Release and Integration retain mandatory spill checks, gfx906
+and the configured CUDA SM80/86/89/90 targets.
+
+The [Release accuracy panel](../../../../parity-results/qwen-flash-next/pointer102-release-accuracy-r1/report.json)
+passes its required groups. All [26 files / 185 final-logit rows](../../../../parity-results/qwen-flash-next/pointer102-release-accuracy-r1/logit-byte-comparison.json)
+are byte-identical to the fresh control, including retained diagnostic rows and
+reset replay. The [matched model ABBA](../../../../parity-results/qwen-flash-next/pointer102-model-comparison.json)
+passes all four native lifetimes with twelve identical 256-token sequences:
+**815.053 prefill / 37.424 decode tok/s**, versus **814.156 / 37.134**
+(**+0.110% / +0.781%**). Decode ranges do not overlap: 37.360–37.504 versus
+37.014–37.210. Prefill ranges overlap and its small change is not a separate win.
+
+Settings remain QFN UD-Q4_K_XL, four MI50s, `TensorParallel` plus
+`GateUpOwnedDownColumns`, static GPU experts, Automatic-resolved Four workers,
+sharded vocabulary head, RAM ngrams, FP32 activations/FP16 KV, FP16 router and
+MoE alpha/beta, TwoTerm HC-up with the other recorded projections SingleQ8,
+context 4096, M512, 512 prompt tokens and 256 emitted tokens, greedy seed 42,
+28 physical NUMA1 cores, and MTP/prefix cache disabled. All source/runtime,
+driver, resource and native-retirement checks pass. This is a focused A1
+qualification; complete production preflight remains G60.
+
+Remaining work includes broader kernel scaling and the 42.959 tok/s Castagna
+decode target. The next component candidate fuses HC activation with TwoTerm
+publication inside the existing prepared GEMM stage; the prior trace records 97
+of each per forward/rank. Its potential 97-launch removal has no measured speed
+claim yet. A separate source audit found that counted mapped-output publication
+can copy inactive redirect capacity in existing floating paths; it needs its
+own negative regression and symmetric row-aware TransferEngine repair. The
+full-live mapped test above does not qualify that case, and it is not an
+observed failure in this A1 model run.

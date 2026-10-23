@@ -13,6 +13,7 @@
 #include "execution/mtp/MTPMainForwardPolicy.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/FixedHalfProjectionGroup.h"
+#include "kernels/common/FixedFloatingProjectionGroup.h"
 #include "kernels/common/DeviceRowWorkGrid.h"
 #include "tensors/TensorKernels.h"
 #include <algorithm>
@@ -524,4 +525,44 @@ TEST(Test__MTPVerifierPolicy, ShortHalfProjectionBindingsAreBoundedAndNonempty)
     auto limit=FixedHalfProjectionGroup::single(&input,weights,outputs,std::numeric_limits<int>::max());
     EXPECT_THROW(limit.append(weights+1,outputs+1,1),std::overflow_error);
     EXPECT_EQ(limit.totalColumns(),std::numeric_limits<int>::max()); EXPECT_EQ(limit.size(),1);
+}
+
+/** @test Custom floating arguments retain exact typed addresses without device tables or host lifetimes. */
+TEST(Test__MTPVerifierPolicy, FixedFloatingProjectionBindingsAreTypedBoundedValueSnapshots)
+{
+    using llaminar2::FixedFP32ProjectionGroup;
+    using llaminar2::FixedFP32x16ProjectionGroup;
+    static_assert(!std::is_same_v<FixedFP32ProjectionGroup,FixedFP32x16ProjectionGroup>);
+    static_assert(!std::is_convertible_v<FixedFP32ProjectionGroup,FixedFP32x16ProjectionGroup>);
+    float inputs[9]{},weights[9]{},outputs[9]{};
+    std::uint16_t native[9]{};
+    EXPECT_THROW((void)FixedFP32ProjectionGroup::single(nullptr,weights,outputs),std::invalid_argument);
+    EXPECT_THROW((void)FixedFP32ProjectionGroup::single(inputs,nullptr,outputs),std::invalid_argument);
+    EXPECT_THROW((void)FixedFP32ProjectionGroup::single(inputs,weights,nullptr),std::invalid_argument);
+    auto wide=FixedFP32ProjectionGroup::single(inputs,weights,outputs);
+    auto narrow=FixedFP32x16ProjectionGroup::single(inputs,native,outputs);
+    const auto frozen=wide;
+    for (int i=1;i<8;++i) {
+        wide.append(inputs+i,weights+i,outputs+i);
+        narrow.append(inputs+i,native+i,outputs+i);
+    }
+    for (int i=0;i<8;++i) {
+        EXPECT_EQ(wide.input(i),inputs+i);
+        EXPECT_EQ(wide.weight(i),weights+i);
+        EXPECT_EQ(wide.output(i),outputs+i);
+        EXPECT_EQ(narrow.input(i),inputs+i);
+        EXPECT_EQ(narrow.weight(i),native+i);
+        EXPECT_EQ(narrow.output(i),outputs+i);
+    }
+    EXPECT_EQ(wide.size(),8);
+    EXPECT_EQ(narrow.size(),8);
+    EXPECT_EQ(frozen.size(),1);
+    EXPECT_EQ(frozen.weight(0),weights);
+    EXPECT_THROW(wide.append(inputs+8,weights+8,outputs+8),std::length_error);
+    EXPECT_THROW(narrow.append(inputs+8,native+8,outputs+8),std::length_error);
+    auto partial=FixedFP32ProjectionGroup::single(inputs,weights,outputs);
+    EXPECT_THROW(partial.append(nullptr,weights,outputs),std::invalid_argument);
+    EXPECT_THROW(partial.append(inputs,nullptr,outputs),std::invalid_argument);
+    EXPECT_THROW(partial.append(inputs,weights,nullptr),std::invalid_argument);
+    EXPECT_EQ(partial.size(),1);
 }

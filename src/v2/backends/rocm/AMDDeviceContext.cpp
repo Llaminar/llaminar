@@ -8,6 +8,10 @@
  * - hipBLAS handle creation and management
  * - Stream and event creation/destruction
  *
+ * Context setup retires hipBLAS's initial vendor-owned workspace before the
+ * context is published. Every arithmetic submission subsequently binds its
+ * admitted stage arena, so first-use capture never frees that initial pool.
+ *
  * @author David Sanftenberg
  * @date February 2026
  */
@@ -247,6 +251,15 @@ namespace llaminar2
         LOG_TRACE("[AMDDeviceContext] Worker loop exited for device " << device_ordinal_);
     }
 
+    /**
+     * @brief Create unpublished native resources on their owning device worker.
+     * @return True after library handles, streams and dependency events are ready.
+     *
+     * Retire the initial rocBLAS allocation here, outside graph capture. A null
+     * workspace leaves rocBLAS in its managed state with no allocation; it does
+     * not disable vendor allocation globally. HipBLASGemmKernel must bind the
+     * admitted non-null arena before every arithmetic submission.
+     */
     bool AMDDeviceContext::initializeOnWorker()
     {
         LOG_TRACE("[AMDDeviceContext] Initializing HIP on worker thread for device "
@@ -269,6 +282,18 @@ namespace llaminar2
         if (hipblas_status != HIPBLAS_STATUS_SUCCESS)
         {
             LOG_ERROR("[AMDDeviceContext] hipblasCreate failed: " << hipblas_status);
+            return false;
+        }
+
+        // Replacing the initial vendor pool during first-use graph recording
+        // would call hipFree inside capture. Retire it before publication; the
+        // arithmetic adapters still require their real stage-owned workspace.
+        hipblas_status = hipblasSetWorkspace(hipblas_handle_, nullptr, 0);
+        if (hipblas_status != HIPBLAS_STATUS_SUCCESS)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipblasSetWorkspace(nullptr, 0) failed "
+                      "while retiring the initial vendor allocation: " << hipblas_status);
+            cleanupOnWorker();
             return false;
         }
 
