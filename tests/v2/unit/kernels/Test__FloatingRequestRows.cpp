@@ -1,8 +1,11 @@
 /**
  * @file Test__FloatingRequestRows.cpp
- * @brief Device-free proof of canonical request selection, scope isolation and exact skinny extents.
+ * @brief Device-free proof of request selection, scope isolation and exact skinny extents.
+ *
+ * Immutable ROCm floating-grid scheduling is also checked without native setup.
  */
 #include "kernels/common/FloatingProjectionRows.h"
+#include "kernels/rocm/gemm/ROCmFP32ProjectionLoadPolicy.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include <gtest/gtest.h>
 #include <array>
@@ -125,4 +128,46 @@ TEST(FloatingRequestRows, RecordingIdentityTracksGeometryAndOwnerButNeverMutable
     EXPECT_NE(original,FloatingProjectionRows::requestRecordingIdentity(DeviceRequestRowRanges::deviceCounted(5,3,a)));
     EXPECT_NE(original,FloatingProjectionRows::requestRecordingIdentity(DeviceRequestRowRanges::fullyActiveRequests(3,5)));
     static_assert(!std::is_convertible_v<FloatingProjectionRows,DeviceRowRange>);
+}
+
+/** @test Captured grid shape, including each actual chunk, selects bounded scheduling. */
+TEST(FloatingRequestRows, ROCmFP32LoadPolicyUsesExactCapturedGridWithoutOverflow) {
+    using P = rocm::FP32ProjectionLoadPairs;
+    using rocm::selectFP32ProjectionLoadPairs;
+    for (const auto shape : {std::array{1,64,1}, std::array{16,4,1}, std::array{8,4,2}})
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(shape[0],shape[1],shape[2],10240),P::Eight);
+    for (const auto shape : {std::array{1,65,1}, std::array{1,256,1}, std::array{64,4,1},
+                            std::array{8,4,3}, std::array{8,4,8}, std::array{3,64,1}})
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(shape[0],shape[1],shape[2],10240),P::Four);
+    for (const auto shape : {std::array{1,257,1}, std::array{65,4,1}, std::array{16,4,5}})
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(shape[0],shape[1],shape[2],10240),P::Scalar);
+    // An outer 17-projection group records chunks 8/8/1, with independent modes.
+    EXPECT_EQ(selectFP32ProjectionLoadPairs(8,4,8,10240),P::Four);
+    EXPECT_EQ(selectFP32ProjectionLoadPairs(8,4,1,10240),P::Eight);
+    for (int k : {1,1023}) {
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(1,4,1,k),P::Scalar);
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(17,4,1,k),P::Scalar);
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(65,4,1,k),P::Scalar);
+    }
+    for (int k : {1024,2047}) {
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(1,4,1,k),P::Four);
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(17,4,1,k),P::Four);
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(65,4,1,k),P::Scalar);
+    }
+    EXPECT_EQ(selectFP32ProjectionLoadPairs(1,4,1,2048),P::Eight);
+    EXPECT_EQ(selectFP32ProjectionLoadPairs(17,4,1,2048),P::Four);
+    EXPECT_EQ(selectFP32ProjectionLoadPairs(65,4,1,2048),P::Scalar);
+    constexpr int limit=std::numeric_limits<int>::max();
+    for (const auto shape : {std::array{limit,limit,limit}, std::array{limit,1,1},
+                            std::array{1,limit,1}, std::array{1,1,limit}})
+        EXPECT_EQ(selectFP32ProjectionLoadPairs(shape[0],shape[1],shape[2],limit),P::Scalar);
+    for (int invalid : {0,-1,std::numeric_limits<int>::min()}) {
+        EXPECT_THROW((void)selectFP32ProjectionLoadPairs(invalid,4,1,2048),std::invalid_argument);
+        EXPECT_THROW((void)selectFP32ProjectionLoadPairs(1,invalid,1,2048),std::invalid_argument);
+        EXPECT_THROW((void)selectFP32ProjectionLoadPairs(1,4,invalid,2048),std::invalid_argument);
+        EXPECT_THROW((void)selectFP32ProjectionLoadPairs(1,4,1,invalid),std::invalid_argument);
+    }
+    static_assert(selectFP32ProjectionLoadPairs(16,4,1,2048)==P::Eight);
+    static_assert(selectFP32ProjectionLoadPairs(64,4,1,2048)==P::Four);
+    static_assert(selectFP32ProjectionLoadPairs(limit,limit,limit,limit)==P::Scalar);
 }

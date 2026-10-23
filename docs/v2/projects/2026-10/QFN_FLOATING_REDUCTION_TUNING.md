@@ -306,3 +306,90 @@ selected candidate97. Its paired-NaN regressions remain. Retained evidence:
 `floating97b-candidate-native-r1` (initial failure), `floating97c-native-r1`
 (corrected bytes), `floating97c-component-comparison-r1.json`,
 `floating97c-hc-confirm-r1` and `floating97c-profile-summary-r1.json`.
+
+## L106: overlap loads while preserving each original dot product
+
+The Castagna comparison identified a different, measurable limitation in the
+FP32 HC injection. The original gfx906 loop issues one A/B pair, waits for
+memory, and updates its accumulator before requesting the next pair. L106
+loads four or eight original stride-256 pairs ahead, then consumes them in the
+same ascending order. It retains one accumulator, the original FP32 FMA operand
+order, all three reduction barriers, the exact scalar K tail, and live-row
+ownership. It does not copy Castagna's different float4 product grouping.
+
+The complete eight-load experiment passes the original native byte gates and
+all 185 canonical final-logit rows, but its isolated M512 latency is 3.86% higher.
+The final implementation therefore has scalar, four-load and eight-load
+compiled schedules. Dispatch uses the immutable number of actual CTAs in each
+native chunk (`M*N*chunkProjections`), rather than an M lookup or mutable live
+count: at most 64 selects eight, at most 256 selects four, otherwise scalar.
+K below 2048 caps the choice at four; below 1024 selects scalar because no full
+prefetch group exists. Division guards prevent overflow even at INT_MAX.
+No stream, graph lifecycle, binding, allocation, transfer or precision policy
+changes. Existing M/N/K/chunk identity determines the retained kernel choice.
+
+The [crossover sweep](../../../../parity-results/qwen-flash-next/injection106-crossover-r1.json)
+supports eight loads through M16, four at M32/M64, and scalar at large prefills
+for N4/K10240. Extra width and short-K controls support the dispatch; this is
+measured coverage, not a claim that every unmeasured N/K shape is optimal.
+
+Final [unprofiled component ABBA](../../../../parity-results/qwen-flash-next/injection106-split-component-comparison-r1.json)
+uses the same frozen Release fixture and immediate scalar production control.
+Each process contributes 12 event pairs; two processes per role are retained.
+The historical nine-barrier oracle verifies bytes but is not the timing control.
+
+| HC shape N4/K10240 | Original scalar us | Selected schedule us | Speedup |
+|---|---:|---:|---:|
+| M1, eight loads | 10.39905 | 4.637805 | 2.242× |
+| M32, four loads | 12.19340 | 8.475935 | 1.439× |
+| M512, scalar | 113.55300 | 113.421000 | 1.001× |
+
+The [isolated profiles and ISA](../../../../parity-results/qwen-flash-next/injection106-split-profile-summary-r1.json)
+authenticate actual dispatched modes 8/4/1, exact core ownership and retained
+graphs. Allocated VGPR/SGPR counts are 24/48, 16/32 and 12/32 respectively; all
+retain 1024 B LDS, three barriers, zero register spills and zero private storage.
+The shipped ROCm target is gfx906. Static used-register counts are recorded
+separately from native allocation. All three measured schedules have zero LDS
+bank conflicts. FetchSize is 201.94 KiB at M1, 1440.38 KiB at M32 and 20865.94 KiB
+at M512. The original M1 control was 201.75 KiB: fewer bytes do not explain the
+decode win. VALUUtilization measures active lanes, not GPU occupancy; the
+four-CTA M1 launch still occupies at most four CUs. Counters and instrumented
+durations are diagnostic and do not replace the event or model timings.
+
+All [six focused registrations](../../../../parity-results/qwen-flash-next/injection106-split-focused-r1/result.json)
+and [776 Unit tests](../../../../parity-results/qwen-flash-next/injection106-split-unit-r1/result.json)
+pass. The new explicit preflight registration compares independent frozen
+native arithmetic at load-group tails, cancellation and NaN payload boundaries.
+Captured graph inspection also authenticates each real chunk's mode, including
+partial final chunks, request holes and 20 dirty full/partial/empty replays.
+Device-free policy tests cover K/CTA boundaries, factorization and overflow.
+The final split's fresh [canonical model panel](../../../../parity-results/qwen-flash-next/injection106-split-release-accuracy-r1/report.json)
+passes, with [all 26 files / 185 final-logit rows byte-identical](../../../../parity-results/qwen-flash-next/injection106-split-release-accuracy-r1/logit-byte-comparison.json)
+to the immutable HC103 control. These are the final split's own observations;
+the all-eight candidate's prior pass is retained separately.
+
+The [matched Release ABBA](../../../../parity-results/qwen-flash-next/injection106-split-model-comparison.json)
+uses the unchanged four-MI50 A1 topology, native dependencies, precision and
+host placement: `TensorParallel` + `GateUpOwnedDownColumns`, static GPU experts,
+sharded vocabulary, Automatic-resolved Four workers, RAM ngrams, FP32 model
+activations and FP16 KV, context 4096, M512, no MTP or prefix cache, and 28
+physical NUMA1 host cores. Each process has one warmup and three measured
+requests of 512 prompt tokens / 256 emitted tokens / 255 after-prefill forwards.
+
+| Phase | HC103 control median | L106 split median | Change | Control range | Candidate range |
+|---|---:|---:|---:|---:|---:|
+| Prefill, tok/s | 815.330 | 815.992 | +0.081% | 806.490–816.660 | 815.451–816.255 |
+| Decode, tok/s | 37.520 | 39.274 | +4.676% | 37.480–37.635 | 39.186–39.415 |
+
+All twelve natural generated sequences match exactly. Source/runtime and actual
+loader identities, driver windows and normal retirement pass in all four arms.
+Both candidate process medians improve decode, with nonoverlapping pooled
+decode ranges; prefill is effectively unchanged. No sample is discarded,
+including the slower control prefill. This is a measured decode improvement,
+not completion of the historical Castagna 42.959 tok/s target. Complete
+ProductionTestPreflight remains G60.
+
+The selector's INT_MAX tests prove bounded dispatch arithmetic only. Source
+review also records a pre-existing native signed-loop limit near INT_MAX K;
+that extreme traversal is not certified by these selector tests or by the
+measured K range through 10240.

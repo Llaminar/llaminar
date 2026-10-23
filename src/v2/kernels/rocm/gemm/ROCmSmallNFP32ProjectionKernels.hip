@@ -19,6 +19,7 @@
 
 #include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/common/FloatingProjectionRows.h"
+#include "kernels/rocm/gemm/ROCmFP32ProjectionLoadPolicy.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -180,6 +181,21 @@ namespace
         d_C_array[batch] = ptrs.C[batch];
     }
 
+    /**
+     * @brief Project FP32 operands with the original lane and reduction ownership.
+     * @param projections Immutable input, weight and output bindings per projection.
+     * @param M Admitted physical input/output rows.
+     * @param N Output columns owned by this participant.
+     * @param K Number of original FP32 products in each dot product.
+     * @param row_range Device-owned live-row selection for this invocation.
+     *
+     * @tparam LOAD_PAIRS Compiled scalar, four-pair or eight-pair scheduling.
+     * Each lane consumes k=lane+256*j in ascending order with one accumulator.
+     * Complete load groups expose independent operand requests; scalar tails
+     * preserve partial K without padded reads. Scalar scheduling retains the
+     * original loop. Selection depends only on the immutable captured CTA grid.
+     */
+    template<int LOAD_PAIRS>
     __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
         void fp32_small_n_batched_projection_kernel(
             llaminar2::FixedFP32ProjectionGroup projections,
@@ -200,11 +216,43 @@ namespace
         if (!A || !B || !C)
             return;
 
+        static_assert(LOAD_PAIRS == 1 || LOAD_PAIRS == 4 || LOAD_PAIRS == 8);
         float sum = 0.0f;
-        for (int k = static_cast<int>(threadIdx.x); k < K; k += SMALL_N_FP32_BLOCK)
+        if constexpr (LOAD_PAIRS == 1)
         {
-            sum += A[static_cast<size_t>(m) * K + k] *
-                   B[static_cast<size_t>(n) * K + k];
+            for (int k = static_cast<int>(threadIdx.x); k < K; k += SMALL_N_FP32_BLOCK)
+            {
+                sum += A[static_cast<size_t>(m) * K + k] *
+                       B[static_cast<size_t>(n) * K + k];
+            }
+        }
+        else
+        {
+            const float *input_row = A + static_cast<size_t>(m) * K;
+            const float *weight_row = B + static_cast<size_t>(n) * K;
+            int k = static_cast<int>(threadIdx.x);
+            constexpr int LOAD_GROUP = LOAD_PAIRS * SMALL_N_FP32_BLOCK;
+            const int grouped_end = K - K % LOAD_GROUP;
+            for (; k < grouped_end; k += LOAD_GROUP)
+            {
+                float input[LOAD_PAIRS];
+                float weight[LOAD_PAIRS];
+#pragma unroll
+                for (int pair = 0; pair < LOAD_PAIRS; ++pair)
+                {
+                    input[pair] = input_row[k + pair * SMALL_N_FP32_BLOCK];
+                    weight[pair] = weight_row[k + pair * SMALL_N_FP32_BLOCK];
+                }
+                // One ordered chain, not independent partial accumulators: grouped rows
+                // and serial decode must retain every original FP32 rounding step.
+#pragma unroll
+                for (int pair = 0; pair < LOAD_PAIRS; ++pair)
+                    sum += input[pair] * weight[pair];
+            }
+            for (; k < K; k += SMALL_N_FP32_BLOCK)
+            {
+                sum += input_row[k] * weight_row[k];
+            }
         }
 
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
@@ -320,7 +368,7 @@ namespace
         float first = 0.0f;
         float second = 0.0f;
         int j = 2 * lane;
-        #pragma unroll
+    #pragma unroll
         for (; j + 1 < k; j += SMALL_N_FP32_BLOCK)
         {
             uint32_t aw;
@@ -392,7 +440,7 @@ namespace
                               reinterpret_cast<uintptr_t>(b)) & 3u) == 0;
         float first = 0.0f, second = 0.0f;
         int j = 2 * lane;
-        #pragma unroll
+    #pragma unroll
         for (; j + 1 < k; j += 256)
         {
             uint32_t aw, bw;
@@ -597,17 +645,19 @@ extern "C" bool rocmFp32_small_n_batched_projection(
 
     dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
     dim3 block(SMALL_N_FP32_BLOCK);
-    hipLaunchKernelGGL(
-        fp32_small_n_batched_projection_kernel,
-        grid,
-        block,
-        0,
-        hip_stream,
-        projections,
-        M,
-        N,
-        K,
-        rows);
+    // The actual chunk cardinality is already sealed in projections. Mutable
+    // live rows cannot change the retained function or dispatch geometry.
+    const auto launch = [&]<int LoadPairs>() {
+        hipLaunchKernelGGL((fp32_small_n_batched_projection_kernel<LoadPairs>),
+            grid, block, 0, hip_stream, projections, M, N, K, rows);
+    };
+    using LoadPairs = llaminar2::rocm::FP32ProjectionLoadPairs;
+    switch (llaminar2::rocm::selectFP32ProjectionLoadPairs(M, N, batch_count, K))
+    {
+    case LoadPairs::Eight: launch.template operator()<8>(); break;
+    case LoadPairs::Four: launch.template operator()<4>(); break;
+    case LoadPairs::Scalar: launch.template operator()<1>(); break;
+    }
 
     return complete_kernel_launch(hip_stream, "rocmFp32_small_n_batched_projection");
 }

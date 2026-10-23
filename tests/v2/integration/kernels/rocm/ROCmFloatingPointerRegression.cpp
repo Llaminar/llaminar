@@ -8,6 +8,8 @@
  */
 #include "ROCmFloatingRegressionSupport.h"
 #include "ROCmOriginalFloatingPointerOracle.h"
+#include "kernels/rocm/gemm/ROCmFP32ProjectionLoadPolicy.h"
+#include <cxxabi.h>
 #include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -46,13 +48,13 @@ float sample(std::size_t i,unsigned seed) {
  * @param graph Retained graph under inspection.
  * @param expectedZ Exact consumer-grid z multiset; includes every independent binding.
  * @param expectedPublications Original staged nodes, zero for value-only custom graphs.
- * @param n Original columns. @param m Original physical rows.
+ * @param n Original columns. @param m Original physical rows. @param k Immutable dot width.
  * @param original Require every kernel to belong to the separately prefixed frozen oracle.
  * @param type Original FP32/native16 consumer family.
  * @param copyTarget Optional exact mapped output destination.
  * @param copySource Optional exact original HBM redirect source.
  */
-void inspect(Captured &graph,std::vector<unsigned> expectedZ,int expectedPublications,int n,int m,
+void inspect(Captured &graph,std::vector<unsigned> expectedZ,int expectedPublications,int n,int m,int k,
  bool original,int type,void *copyTarget=nullptr,void *copySource=nullptr) {
  std::size_t count=0;checked(hipGraphGetNodes(graph.graph,nullptr,&count));
  std::vector<hipGraphNode_t> nodes(count);checked(hipGraphGetNodes(graph.graph,nodes.data(),&count));
@@ -78,6 +80,20 @@ void inspect(Captured &graph,std::vector<unsigned> expectedZ,int expectedPublica
   } else {
    ASSERT_NE(name.find(type==0?"fp32_small_n_batched_projection_kernel":"fp32x16_batched_projection_kernel"),std::string::npos)<<name;
    EXPECT_EQ(params.blockDim.x,256u);EXPECT_EQ(params.gridDim.x,unsigned(n));EXPECT_EQ(params.gridDim.y,unsigned(m));
+   if(!original && type==0) {
+    // Graph topology is proof: validate the actual mode of this native chunk,
+    // including partial final chunks, without inspecting mutable live counts.
+    std::string readable=name;
+    if(name.starts_with("_Z")) {
+     int status=0;
+     std::unique_ptr<char,decltype(&std::free)> decoded(
+      abi::__cxa_demangle(name.c_str(),nullptr,nullptr,&status),&std::free);
+     ASSERT_EQ(status,0)<<name;ASSERT_NE(decoded.get(),nullptr);readable=decoded.get();
+    }
+    const int mode=static_cast<int>(rocm::selectFP32ProjectionLoadPairs(m,n,int(params.gridDim.z),k));
+    const std::string expected="fp32_small_n_batched_projection_kernel<"+std::to_string(mode)+">";
+    ASSERT_NE(readable.find(expected),std::string::npos)<<readable<<" expected "<<expected;
+   }
    actualZ.push_back(params.gridDim.z);
   }
  }
@@ -87,7 +103,7 @@ void inspect(Captured &graph,std::vector<unsigned> expectedZ,int expectedPublica
 }
 /** @brief Authored source witnesses; never an alternate production arithmetic policy. */
 enum class Witness : unsigned {
- Finite, SourceNaNs, ActivationNaNs, SignedZeros, SubnormalInputs, NativeSpecialWords, DualNaNs
+ Finite, SourceNaNs, ActivationNaNs, SignedZeros, SubnormalInputs, NativeSpecialWords, DualNaNs, OrderedDotOne
 };
 /** @brief Diagnostic graph selected after independent byte proof; never serving policy. */
 enum class ProfileSide { None, Candidate, Original };
@@ -152,6 +168,22 @@ void run(int type,int m,int n,int k,int count,Options options={}) {
    hostB[p][i]=sample(i,91u+unsigned(p)*37);
    native[p][i]=type==1?std::uint16_t(0x3800u+((i*17+p*31)&1023u)):
     std::uint16_t(std::bit_cast<unsigned>(hostB[p][i])>>16);
+  }
+  if(pattern==Witness::OrderedDotOne) {
+   if(type!=0 || k<768)throw std::invalid_argument("Ordered-dot witness requires FP32 and three lane iterations");
+   std::fill(hostA[p].begin(),hostA[p].end(),0x1p12f);
+   std::fill(hostB[p].begin(),hostB[p].end(),0.f);
+   // The last live 256-coordinate bank may have only one lane. Keep every
+   // authored word in bounds, and retain one lane's original iteration order.
+   const int lanes=std::min(64,(k-1)%256+1),origin=((k-1)/256-2)*256;
+   for(int column=0;column<n;++column) {
+    const int lane=(p*7+column*13)%lanes;
+    const bool negative=(p+column)&1;
+    const std::size_t base=std::size_t(column)*k+origin+lane;
+    hostB[p][base]=negative?-0x1p12f:0x1p12f;
+    hostB[p][base+256]=negative?0x1p12f:-0x1p12f;
+    hostB[p][base+512]=0x1p-12f;
+   }
   }
   if((pattern==Witness::SourceNaNs||pattern==Witness::DualNaNs) && k>=129) {
    if(type==0){hostB[p][0]=std::bit_cast<float>(0x7fc23456u+unsigned(p));hostB[p][128]=std::bit_cast<float>(0xffc65432u+unsigned(p));}
@@ -254,9 +286,9 @@ void run(int type,int m,int n,int k,int count,Options options={}) {
   };
   const auto originalZ=chunks((independent&&!direct)||mapped);
   const auto candidateZ=(direct&&QFN_POINTER102_VALUE_ABI)?std::vector<unsigned>{unsigned(count)}:chunks(independent||mapped);
-  inspect(candidate,candidateZ,QFN_POINTER102_VALUE_ABI?0:int(candidateZ.size()),n,m,false,type,mapped?c[0]:nullptr,
+  inspect(candidate,candidateZ,QFN_POINTER102_VALUE_ABI?0:int(candidateZ.size()),n,m,k,false,type,mapped?c[0]:nullptr,
    mapped?workspace.getBuffer(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT):nullptr);
-  inspect(oracle,originalZ,int(originalZ.size()),n,m,true,type);
+  inspect(oracle,originalZ,int(originalZ.size()),n,m,k,true,type);
  }
  for(int replay=0;replay<(timing?1:20);++replay) {
   lengths=holes?(replay%5==0?std::array<std::int32_t,3>{m/3,m/3,m/3}:
@@ -287,7 +319,11 @@ void run(int type,int m,int n,int k,int count,Options options={}) {
    ASSERT_EQ(std::memcmp(actual[p].data(),gold[p].data(),outSize*4),0)<<"replay="<<replay<<" projection="<<p;
    for(int row=0;row<=m;++row) {
     const bool active=row<m&&(holes?row%(m/3)<lengths[row/(m/3)]:row<lengths[0]);
-    if(!active)ASSERT_EQ(std::memcmp(actual[p].data()+std::size_t(row)*n,dirty[p].data()+std::size_t(row)*n,std::size_t(n)*4),0);
+    if(!active) {
+     ASSERT_EQ(std::memcmp(actual[p].data()+std::size_t(row)*n,dirty[p].data()+std::size_t(row)*n,std::size_t(n)*4),0);
+    } else if(pattern==Witness::OrderedDotOne) {
+     for(int column=0;column<n;++column)ASSERT_EQ(gold[p][std::size_t(row)*n+column],1.f);
+    }
    }
   }
  }
@@ -340,6 +376,39 @@ TEST(ROCmFloatingPointer,ImmediateOriginalStagedPipelineCapturedByteExact) {
   }
   for(int m:{1,512})for(auto shape:{std::array{0,4,10240},std::array{2,128,2560},std::array{2,512,2560}})
    run(shape[0],m,shape[1],shape[2],1);
+ });
+}
+/** @test FP32 grouped tile/tail chains and special operands remain original through dirty captured replay. */
+TEST(ROCmFloatingPointer,FP32LoadAheadGroupedOriginalChainCapturedByteExact) {
+ using namespace qfn_pointer102_regression;
+ onWorker([] {
+  for(int k:{1023,1024,1025,2047,2048,2049,10240})for(int m:{1,3})
+   run(0,m,4,k,2,{.witness=Witness::OrderedDotOne});
+  // K clamping and each CTA-selected scheduling region use immutable geometry.
+  for(int k:{1023,1024,2047,2048})for(int m:{1,17,65})
+   for(auto witness:{Witness::Finite,Witness::OrderedDotOne})
+    run(0,m,4,k,1,{.witness=witness});
+  // Both exact CTA boundaries and nearby M/N factorizations execute actual
+  // templated kernels. All witnesses retain the fixture's 20 dirty histories.
+  for(auto shape:{std::array{1,64,1},std::array{1,65,1},std::array{1,256,1},std::array{1,257,1},
+                 std::array{3,21,1},std::array{3,22,1},std::array{3,85,1},std::array{3,86,1},
+                 std::array{1,8,8},std::array{1,13,5},std::array{1,32,8},std::array{1,37,7},
+                 std::array{3,8,17},std::array{3,11,9}})
+   for(auto witness:{Witness::Finite,Witness::OrderedDotOne,Witness::SourceNaNs,
+                    Witness::ActivationNaNs,Witness::DualNaNs})
+    run(0,shape[0],shape[1],4097,shape[2],{.witness=witness});
+  // A request-hole capture whose first eight-projection chunk selects scalar
+  // and final one-projection chunk selects eight loads retains those modes
+  // through full, partial, empty and large-to-small live-count publications.
+  run(0,3,11,4097,9,{.holes=true,.witness=Witness::OrderedDotOne});
+  // Existing companion gates retain the full cardinality and native16 sweep.
+  // These cases add sensitivity at descriptor capacity and request/chunk edges.
+  run(0,3,4,1025,8,{.independent=true,.witness=Witness::OrderedDotOne,.direct=true});
+  run(0,9,4,2049,19,{.holes=true,.witness=Witness::OrderedDotOne});
+  for(int k:{1025,2049})
+   for(auto witness:{Witness::SourceNaNs,Witness::ActivationNaNs,Witness::DualNaNs,
+                    Witness::SignedZeros,Witness::SubnormalInputs,Witness::NativeSpecialWords})
+    run(0,3,17,k,2,{.witness=witness});
  });
 }
 /** @test Native events compare entire staged-original versus actual public candidate captured pipelines. */

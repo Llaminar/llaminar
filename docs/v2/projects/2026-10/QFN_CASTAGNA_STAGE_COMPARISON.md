@@ -89,12 +89,13 @@ private scratch; Llaminar's trace proves zero scratch/LDS 1024 but does not
 provide its register counts. These are architectural differences, not proof
 that any single one causes the whole timing gap.
 
-A candidate can retain Llaminar's exact tree: after one publication barrier,
-wave 0 computes the original RN(s[i]+s[i+128]) and RN(s[i+64]+s[i+192]) pairs,
-then their original rounded sum and the unchanged shuffle tree. This removes
-two barriers without copying the fork's different arithmetic. It remains
-unimplemented and requires byte tests, isolated resource/counter evidence and
-matched Release timing.
+The earlier [one-barrier experiment](QFN_FLOATING_REDUCTION_TUNING.md#deferred-one-barrier-experiment)
+already tested those original pairs in wave 0. It needed explicit native
+operand ordering to preserve NaN payloads, and its HC timing was inconclusive.
+That history supersedes the initial recommendation to try it again. The current
+load-scheduling work instead retains all three barriers and the original FMA
+chain, while overlapping independent operand loads. Its scalar, four-load and
+eight-load candidates are measured separately for decode and prefill.
 
 **Attention buys speed partly with lower precision.** Llaminar retains FP32
 queries, eight fixed 257-index partitions, fixed FP32 QK trees and ascending

@@ -224,9 +224,15 @@ struct NativeSourceWord {
     size_t index; ///< Original flat source coordinate, never a byte offset.
     uint32_t bits; ///< Exact FP32 word or zero-extended FP16/BF16 word.
 };
-/** @brief Borrow a small immutable authored source list only during synchronous setup. */
+/** @brief Setup-only backgrounds independent of either native arithmetic implementation. */
+enum class SourceBackground {
+    MixedFinite, ///< Original random full-mantissa source data.
+    OrderedDotOne ///< A=4096, up=1, B=0; authored words make the old serial dot exactly one.
+};
+/** @brief Borrow authored native weights and input background during synchronous setup. */
 struct NativeSourceOverrides {
     std::span<const NativeSourceWord> words{}; ///< No owner retained by captured execution.
+    SourceBackground background=SourceBackground::MixedFinite; ///< Never a captured runtime policy.
 };
 /** @brief Exercise original production symbols against literal historical native arithmetic. */
 inline void runCase(int type,bool fused,int m,int n,int k,int pattern,bool timing=false,int rawWord=-1,
@@ -246,6 +252,12 @@ inline void runCase(int type,bool fused,int m,int n,int k,int pattern,bool timin
     };
     for(size_t i=0;i<elements;++i){a[i]=sample(i,0x159a73du);u[i]=sample(i,0x792a45bu);}
     for(size_t i=0;i<weights;++i)w[i]=sample(i,0x24ba8d3u);
+    if(overrides.background==SourceBackground::OrderedDotOne){
+        // Exact powers of two construct products +2^24,-2^24,+1 without
+        // implementing a second reduction or dot-product oracle on the host.
+        std::fill(a.begin(),a.end(),0x1p12f);std::fill(u.begin(),u.end(),1.f);
+        std::fill(w.begin(),w.end(),0.f);
+    }
     // Cases separate cancellation, signed zero, finite extremes and canonical
     // nonfinites so a NaN case does not conceal the finite/subnormal witnesses.
     if(pattern==1){for(size_t i=0;i<elements;++i)a[i]=(i&1)?-0.f:0.f;}
@@ -341,6 +353,10 @@ inline void runCase(int type,bool fused,int m,int n,int k,int pattern,bool timin
         checked(hipMemcpyAsync(gold.data(),expected.p,outputs*4,hipMemcpyDeviceToHost,oracle.stream));
         checked(hipStreamSynchronize(candidate.stream));checked(hipStreamSynchronize(oracle.stream));
         ASSERT_EQ(std::memcmp(got.data(),gold.data(),outputs*4),0)<<"type="<<type<<" fused="<<fused<<" M/N/K="<<m<<'/'<<n<<'/'<<k<<" pattern="<<pattern<<" raw16="<<rawWord<<" replay="<<iteration;
+        // Large and opposite products cancel in the original lane's ordered
+        // dot before +1 arrives. Two accidentally zero outputs cannot pass.
+        if(live>0 && overrides.background==SourceBackground::OrderedDotOne)
+            ASSERT_EQ(gold[0],1.f);
         // Tiny-source witnesses must remain observable in the native oracle;
         // matching zero outputs would not prove preservation of their bits.
         if(rawWord>=0 && k==1 && live>0)ASSERT_NE(got[0],0.0f);
@@ -425,6 +441,44 @@ TEST(ROCmFloatingReduction,HistoricalTreeCapturedByteExact){
         if(!fused)for(size_t word=2;word<8;++word)
             runCase(type,false,3,4,1,0,false,words[word]);
     }
+}
+/** @test FP32 load groups preserve the original serial accumulator across tiles and scalar tails. */
+TEST(ROCmFloatingReduction,FP32LoadAheadOriginalChainCapturedByteExact){
+    using namespace qfn_reduction_regression;checked(hipSetDevice(0));proveAssociationSensitivity();
+    for(int k:{1023,1024,1025,2047,2048,2049,10240})for(int m:{1,3}){
+        // Full-mantissa finite source remains independently byte checked too.
+        runCase(0,false,m,4,k,0);
+        for(bool negative:{false,true})for(bool last:{false,true}){
+            const size_t unit=last?static_cast<size_t>(k-1):512u;
+            const uint32_t positive=0x45800000u,opposite=0xc5800000u;
+            const std::array<NativeSourceWord,3> words{{
+                {unit-512,negative?opposite:positive},
+                {unit-256,negative?positive:opposite},{unit,0x39800000u}}};
+            SCOPED_TRACE(::testing::Message()<<"FP32 load ahead M="<<m<<" K="<<k
+                <<" unit="<<unit<<" negative="<<negative);
+            // A=4096 and weights +/-4096,2^-12 yield +/-2^24,+1.
+            // All three authored coordinates belong to the SAME stride256
+            // lane. The last-coordinate cases cross complete-tile/scalar-tail
+            // boundaries at K1025/2049 and reach the final HC iteration.
+            runCase(0,false,m,4,k,0,false,-1,
+                NativeSourceOverrides{words,SourceBackground::OrderedDotOne});
+        }
+    }
+    // Existing special-value fixtures must actually enter the new 1024 tile.
+    for(int k:{1025,2049})for(int pattern=1;pattern<=6;++pattern)
+        runCase(0,false,3,4,k,pattern);
+    // Reuse the existing payload-pair input recipe at a complete tile and a
+    // tile-plus-tail shape. The old K256 recipe never entered the new body.
+    for(int k:{1024,1025,2048,2049})for(auto edge:{std::pair{0,128},std::pair{64,192},std::pair{0,64}})
+        for(unsigned signs=0;signs<4;++signs)for(bool reverse:{false,true}){
+            const uint32_t left=(reverse?0x7fc54321u:0x7fc12345u)|((signs&1u)?0x80000000u:0u);
+            const uint32_t right=(reverse?0x7fc12345u:0x7fc54321u)|((signs&2u)?0x80000000u:0u);
+            const std::array<NativeSourceWord,2> words{{
+                {static_cast<size_t>(edge.first),left},{static_cast<size_t>(edge.second),right}}};
+            SCOPED_TRACE(::testing::Message()<<"FP32 tiled payload K="<<k<<" edge="<<edge.first<<'/'<<edge.second
+                <<" signs="<<signs<<" reverse="<<reverse);
+            runCase(0,false,1,1,k,0,false,-1,NativeSourceOverrides{words});
+        }
 }
 /** @brief Opt-in exact-shape paired native-event timings; excluded from functional gate. */
 TEST(ROCmFloatingReduction,DISABLED_ExactShapePairedEvents){

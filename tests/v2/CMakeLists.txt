@@ -26528,6 +26528,14 @@ if(TARGET v2_integration_rocm_floating_request_projection)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP32;FP16;BF16;Capture;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFloatingReductionHistoricalTree)
+    # FP32 load-ahead arithmetic must retain the original lane accumulator
+    # across 1024/2048 tile boundaries and the unchanged scalar tail.
+    add_v2_test(V2_Integration_ROCmFP32LoadAheadOriginalChain
+        COMMAND $<TARGET_FILE:v2_integration_rocm_floating_request_projection>
+            --gtest_filter=ROCmFloatingReduction.FP32LoadAheadOriginalChainCapturedByteExact:ROCmFloatingPointer.FP32LoadAheadGroupedOriginalChainCapturedByteExact --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP32;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFP32LoadAheadOriginalChain)
     add_v2_test(V2_Integration_ROCmFloatingPointerImmediateOriginal
         COMMAND $<TARGET_FILE:v2_integration_rocm_floating_request_projection>
             --gtest_filter=ROCmFloatingPointer.ImmediateOriginalStagedPipelineCapturedByteExact:ROCmFloatingPointer.MixedActualTableConsumersRemainCaptured --gtest_brief=1

@@ -1,5 +1,22 @@
 # QFN tuning dashboard
 
+**L106 split load scheduling is qualified** at **815.992 prefill / 39.274 decode
+tok/s** on A1. Its matched immutable HC103 control measures **815.330 / 37.520**:
+**+0.081% prefill / +4.676% decode**. Decode ranges do not overlap; prefill is
+effectively unchanged. All **776 Unit tests**, **six focused registrations**,
+**185 byte-identical final-logit rows** and **twelve identical generated
+sequences** pass. The immutable CTA/K geometry selects scalar, four-load or
+eight-load schedules while retaining the original FP32 dot/reduction order.
+The decode HC component is **2.242× faster**, with M512 unchanged. Exact native
+profiles and gfx906 ISA show zero spills/private storage for every schedule.
+
+The [matched comparison](../../../../parity-results/qwen-flash-next/injection106-split-model-comparison.json)
+and [arithmetic, dispatch and profile evidence](QFN_FLOATING_REDUCTION_TUNING.md#l106-overlap-loads-while-preserving-each-original-dot-product)
+record the workload and every sample. The **42.959 tok/s** Castagna decode
+target remains open. Next qualify packed FP16 selected attention and shared
+K/V loads with fixed arithmetic across serial/grouped rows; unused short-context
+indexer queries remain a separate opportunity. Complete preflight remains G60.
+
 **HC103's focused qualification is green** at **815.461 prefill / 37.576 decode
 tok/s** on A1. The matched L104 control measures **814.723 / 37.439**:
 **+0.091% / +0.367%**, with overlapping ranges. The fusion preserves all 185
@@ -431,7 +448,7 @@ its actual prepared route must be represented explicitly in coverage.
 
 | ID | Topology / actual work placement | Ngrams | Reference engine | Accuracy | Llaminar prefill | Reference prefill | Strata prefill | Llaminar decode | Reference decode | Strata decode | Next action |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 L104† Release required groups; L95 prefix restore; latest complete topology gate [G60][a1] | 815.121 L104† | 467.821 F62§ | — | 37.460 L104† | 42.959 F62§ | — | Four remains the qualified default. L104 fixes counted-row and typed-bias behavior with effectively unchanged throughput and exact logits. Next measure HC activation/publication fusion. Full preflight remains pending. |
+| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 L106† Release required groups; L95 prefix restore; latest complete topology gate [G60][a1] | 815.992 L106† | 467.821 F62§ | — | 39.274 L106† | 42.959 F62§ | — | L106 schedules FP32 loads by captured geometry: +4.676% matched decode with unchanged prefill and exact logits. Next qualify packed FP16 attention/KV sharing. Full preflight remains pending. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |
@@ -443,7 +460,7 @@ Use the exact policy names in subsequent four-GPU records. The dense-compute pol
 
 | ID | Dense-compute policy | Expert policy | QFN accuracy | Llaminar prefill | Castagna prefill | Llaminar decode | Castagna decode | Status |
 |---|---|---|---|---:|---:|---:|---:|---|
-| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L104† Release required groups; L95 prefix restore | 815.121 | 467.821 | 37.460 | 42.959 | Explicit `VocabularySharded` head, Automatic-resolved Four-worker owner gate/up and compact K/V plus grouped ordered M1 reducers, exact-order branch normalization and direct captured floating bindings; 185 identical logit rows and all twelve matching sequences. |
+| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L106† Release required groups; L95 prefix restore | 815.992 | 467.821 | 39.274 | 42.959 | Explicit `VocabularySharded` head, Automatic-resolved Four-worker owner gate/up, compact K/V, HC activation/publication fusion and geometry-selected FP32 load schedules; 185 identical logit rows and all twelve matching sequences. |
 | A1.1 | `TensorParallel` | `Apportioned` | 🟢 L64† Release required groups | 561.867 | 467.821 | 30.515 | 42.959 | Accuracy, corrected SnapshotAdmission and timing passed; slower than current A1 in both phases. |
 | A1.2 | `PrefillTensorParallelDecodeReplicated` | `GateUpOwnedDownColumns` | 🔴 L65† Release short decode row KL | — | 467.821 | — | 42.959 | Admission and native execution passed; one forced decode row KL 1.119 exceeds the unchanged 1.0 ceiling. Diagnose before promotion. Timing pending. |
 | A1.3 | `PrefillTensorParallelDecodeReplicated` | `Apportioned` | 🟢 L65† Release required groups | 382.757 | 467.821 | 30.761 | 42.959 | Retained **Ornith** arrangement; admission, accuracy and timing passed, but both phases are slower than the current A1 control and Castagna. |

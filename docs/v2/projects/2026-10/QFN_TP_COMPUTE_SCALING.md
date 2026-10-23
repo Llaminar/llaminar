@@ -1123,8 +1123,10 @@ all four physical GPU pairings, complete native trace joins, source-semantic
 cohorts and explicit unresolved callers. Its strongest next precision-preserving
 target is the N4/K10240 FP32 HC injection projection: median per-GPU diagnostic
 kernel work is1.927ms per decode step versus Castagna's0.763ms. Source review
-identifies a candidate that reduces three barriers to one while retaining the
-original arithmetic tree. Attention and GDN also have larger differences, but
+identified a one-barrier idea already covered by the deferred97 experiment;
+its HC timing was inconclusive. The subsequent candidate instead overlaps
+operand loads without changing the original FMA chain or three-barrier tree.
+Attention and GDN also have larger differences, but
 their precision and fused preconditioning boundaries require separate treatment.
 
 Final Default-ISA M512 CPU component checks pass byte equality in both physical
