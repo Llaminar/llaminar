@@ -64,6 +64,7 @@ void cudaQwenSparseSelectPools(const QwenSparseIndexer &p, cudaStream_t stream)
 
 void cudaQwenSparseAttention(const QwenSparseAttention &p, cudaStream_t stream)
 {
+    validateQwenSparseAttentionArithmetic(p.arithmetic,DeviceType::CUDA);
     requireStream(stream);
     validateQwenSparseAttention(p);
     if (!p.gpu_partials) throw std::invalid_argument("CUDA Qwen sparse attention requires admitted fixed-partition scratch");

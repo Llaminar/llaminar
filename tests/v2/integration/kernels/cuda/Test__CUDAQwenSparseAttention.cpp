@@ -22,3 +22,6 @@ extern "C" bool cudaOps_rope_fp32_decode_v3(float *,float *,const float *,int,in
 #define QSA_TRANSFER llaminar2::qwen4exp::cudaQwenStateTransfer
 #define QSA_SUITE CUDAQwenSparseAttention
 #include "../qwen4exp/QwenSparseDeviceTest.h"
+
+#include "../qwen4exp/QwenSparseObservationCUDAAdapter.h"
+#include "../qwen4exp/QwenSparseObservationPerfTest.h"

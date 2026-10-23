@@ -187,6 +187,131 @@ struct Fixture
     void launch() { check(QSA_RT(GraphLaunch)(executable, stream)); }
 };
 
+/**
+ * @brief Prove optional observations leave every FP32 attention intermediate unchanged.
+ * @details Compare the production captured ON result with a captured OFF launch
+ * over the identical selected rows and immutable native codec buffers. Counter
+ * fields are intentionally excluded: OFF leaves nonempty diagnostic storage
+ * untouched, while empty partitions always retire their metadata.
+ * @param f Fixture whose observed production graph has completed its last replay.
+ */
+void expectObservationNeutralAttention(Fixture &f)
+{
+    const auto expected_output = f.output.download(f.stream);
+    const auto expected_partials = f.partials.download(f.stream);
+    auto unobserved = f.attention;
+    unobserved.observations = nullptr;
+    QSA_GRAPH graph = nullptr; QSA_EXEC executable = nullptr;
+    check(QSA_RT(StreamBeginCapture)(f.stream, QSA_RT(StreamCaptureModeThreadLocal)));
+    QSA_ATTENTION(unobserved, f.stream);
+    check(QSA_RT(StreamEndCapture)(f.stream, &graph));
+    check(QSA_RT(GraphInstantiate)(&executable, graph, nullptr, nullptr, 0));
+    check(QSA_RT(GraphLaunch)(executable, f.stream));
+    const auto actual_output = f.output.download(f.stream);
+    const auto actual_partials = f.partials.download(f.stream);
+    EXPECT_EQ(std::memcmp(actual_output.data(), expected_output.data(), actual_output.size() * sizeof(float)), 0);
+    for (std::size_t i = 0; i < actual_partials.size(); ++i)
+    {
+        EXPECT_EQ(std::memcmp(&actual_partials[i].maximum, &expected_partials[i].maximum, sizeof(float)), 0);
+        EXPECT_EQ(std::memcmp(&actual_partials[i].denominator, &expected_partials[i].denominator, sizeof(float)), 0);
+        EXPECT_EQ(std::memcmp(actual_partials[i].weighted, expected_partials[i].weighted, 256 * sizeof(float)), 0);
+    }
+    check(QSA_RT(GraphExecDestroy)(executable)); check(QSA_RT(GraphDestroy)(graph));
+}
+
+/**
+ * @test Retained observation modes preserve exact partial/output bytes across
+ * partition boundaries, empty rows and large-to-small request reset.
+ * @details Existing all-codec and pre-RoPE cases independently cover decoded
+ * coordinate totals and the CPU attention oracle; this case stresses lifecycle
+ * transitions with deliberately dirty inactive payload and metadata.
+ */
+TEST(QSA_SUITE, CapturedObservationNeutralPartialBytesAndRetainedReset)
+{
+    for (int rows = 1; rows <= 16; ++rows)
+    for (bool transform : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << "M=" << rows << " transform=" << transform);
+        Fixture on(rows, 2050, 4096, QwenSparseScalar::FP16);
+        Fixture off(rows, 2050, 4096, QwenSparseScalar::FP16);
+        if (transform)
+            for (auto *f : {&on, &off})
+            {
+                f->attention.kv.key_policy = {.encoding = attention::AttentionKeyCacheEncoding::PreRotaryDeviceTransform,
+                    .rope_theta = 10000.0f, .partial_rotary_factor = 0.25f};
+                f->attention.kv.key_cosine = f->cos.data; f->attention.kv.key_sine = f->sin.data;
+                f->attention.kv.key_rotary_dim = 64; f->attention.kv.key_position_capacity = f->positions;
+            }
+        off.attention.observations = nullptr;
+        on.capture(); off.capture();
+        // Keep both exact graph identities while changing only published replay
+        // data. Zero live rows must leave all arithmetic payload untouched.
+        for (auto replay : {QwenSparseReplay{2050, rows, 17}, QwenSparseReplay{256, rows, 17},
+                            QwenSparseReplay{255, rows, 17}, QwenSparseReplay{257, 1, 17},
+                            QwenSparseReplay{0, 0, 17}, QwenSparseReplay{0, 1, 17}})
+        {
+            SCOPED_TRACE(::testing::Message() << "prefix=" << replay.prefix_tokens << " live=" << replay.live_rows);
+            std::vector<QwenSparseAttentionPartial> dirty(on.partials.size);
+            for (auto &p : dirty)
+            {
+                p.maximum = 123.0f; p.denominator = 456.0f;
+                std::fill(std::begin(p.weighted), std::end(p.weighted), -789.0f);
+                p.key_elements = p.value_elements = 0xdeadbeefu;
+            }
+            for (auto *f : {&on, &off})
+            {
+                f->replay = replay; f->state.upload(&f->replay, f->stream);
+                f->partials.upload(dirty.data(), f->stream);
+                f->output.upload(f->host_core_query.data(), f->stream);
+                f->launch();
+            }
+            const auto a = on.partials.download(on.stream), b = off.partials.download(off.stream);
+            const auto output = on.output.download(on.stream), unobserved = off.output.download(off.stream);
+            EXPECT_EQ(std::memcmp(output.data(), unobserved.data(), output.size() * sizeof(float)), 0);
+            const auto counts = on.count.download(on.stream);
+            const auto observations = on.observations.download(on.stream);
+            for (int row = 0; row < rows; ++row)
+            for (int head = 0; head < 24; ++head)
+            {
+                std::uint64_t key_coordinates = 0, value_coordinates = 0;
+                for (int part = 0; part < QwenSparsePartitions; ++part)
+                {
+                    const auto i = (row * 24 + head) * QwenSparsePartitions + part;
+                    EXPECT_EQ(std::memcmp(&a[i].maximum, &b[i].maximum, sizeof(float)), 0);
+                    EXPECT_EQ(std::memcmp(&a[i].denominator, &b[i].denominator, sizeof(float)), 0);
+                    EXPECT_EQ(std::memcmp(a[i].weighted, b[i].weighted, sizeof(a[i].weighted)), 0);
+                    if (row >= replay.live_rows)
+                    {
+                        EXPECT_EQ(std::memcmp(&a[i], &dirty[i], sizeof(a[i])), 0);
+                        continue;
+                    }
+                    // Independent coordinate enumeration models logical decoder
+                    // calls, including pre-RoPE partners, rather than the kernel
+                    // count formula or any physical codec traffic estimate.
+                    std::uint32_t keys = 0, values = 0;
+                    for (int token = part * QwenSparsePartitionTokens;
+                         token < counts[row] && token < (part + 1) * QwenSparsePartitionTokens; ++token)
+                        for (int d = 0; d < 256; ++d)
+                        {
+                            ++keys; ++values;
+                            if (transform && d < 64) ++keys;
+                        }
+                    EXPECT_EQ(a[i].key_elements, keys); EXPECT_EQ(a[i].value_elements, values);
+                    key_coordinates += keys; value_coordinates += values;
+                    if (!values)
+                    {
+                        EXPECT_EQ(a[i].maximum, -INFINITY); EXPECT_EQ(a[i].denominator, 0.0f);
+                        EXPECT_EQ(std::memcmp(a[i].weighted, dirty[i].weighted, sizeof(a[i].weighted)), 0);
+                    }
+                }
+                EXPECT_EQ(observations[row * 24 + head].key_elements, key_coordinates);
+                EXPECT_EQ(observations[row * 24 + head].value_elements, value_coordinates);
+                EXPECT_EQ(observations[row * 24 + head].selected_tokens, row < replay.live_rows ? counts[row] : 0);
+            }
+        }
+    }
+}
+
 /** @test One retained graph republishes exact preappend rows and copies only live tail words. */
 TEST(QSA_SUITE, CapturedPreAppendReplayAndCheckpointExtents)
 {
@@ -334,6 +459,7 @@ TEST(QSA_SUITE, CapturedGroupedMatchesSerialBytesAndAcceptanceRollback)
     const auto grouped_selected = f.selected.download(f.stream);
     const auto grouped_count = f.count.download(f.stream);
     const auto grouped_output = f.output.download(f.stream);
+    const auto grouped_partials = f.partials.download(f.stream);
     const auto grouped_prepared = f.prepared.download(f.stream);
     auto indexer = f.indexer;
     auto attention = f.attention;
@@ -357,6 +483,17 @@ TEST(QSA_SUITE, CapturedGroupedMatchesSerialBytesAndAcceptanceRollback)
         const auto actual_selected = f.selected.download(f.stream);
         const auto actual_prepared = f.prepared.download(f.stream);
         const auto actual_output = f.output.download(f.stream);
+        const auto serial_partials = f.partials.download(f.stream);
+        for (int head = 0; head < 24; ++head)
+        for (int part = 0; part < QwenSparsePartitions; ++part)
+        {
+            const auto &expected = grouped_partials[(row * 24 + head) * QwenSparsePartitions + part];
+            const auto &actual = serial_partials[head * QwenSparsePartitions + part];
+            EXPECT_EQ(std::memcmp(&actual.maximum, &expected.maximum, sizeof(float)), 0);
+            EXPECT_EQ(std::memcmp(&actual.denominator, &expected.denominator, sizeof(float)), 0);
+            if (expected.denominator > 0.0f)
+                EXPECT_EQ(std::memcmp(actual.weighted, expected.weighted, sizeof(actual.weighted)), 0);
+        }
         ASSERT_EQ(actual_count[0], grouped_count[row]);
         EXPECT_EQ(std::memcmp(actual_selected.data(), grouped_selected.data() + row * QwenSparseSelected, actual_count[0] * sizeof(std::int32_t)), 0);
         EXPECT_EQ(std::memcmp(actual_prepared.data(), grouped_prepared.data() + row * 512, 512 * sizeof(float)), 0);
@@ -433,6 +570,7 @@ TEST(QSA_SUITE, EveryNativeCodecAndQ16BlockUsesCanonicalDeviceRingAndBasis)
                     EXPECT_EQ(observations[row * 24 + head].key_elements, std::uint64_t(count[row]) * 256);
                     EXPECT_EQ(observations[row * 24 + head].value_elements, std::uint64_t(count[row]) * 256);
                 }
+            expectObservationNeutralAttention(f);
             for (int row = 0; row < 2; ++row)
             {
                 f.replay = {5 + row, 1, 17}; f.state.upload(&f.replay, f.stream);
@@ -512,6 +650,7 @@ TEST(QSA_SUITE, FloatingPreRotaryTransformsOnlySelectedKeys)
             EXPECT_EQ(observations[row * 24 + head].key_elements, std::uint64_t(count[row]) * (256 + 64));
             EXPECT_EQ(observations[row * 24 + head].value_elements, std::uint64_t(count[row]) * 256);
         }
+    expectObservationNeutralAttention(f);
 }
 
 /** @test Selected pre-RoPE keys use the actual ordinary-RoPE invariant producer at long positions. */
@@ -933,14 +1072,22 @@ TEST(QSA_SUITE, BoundedCandidateFullIndexerAndAttentionBytes)
                        QwenSparsePoolSelection::Bounded512_512,
                        QwenSparsePoolSelection::Bounded1024_1024})
         for (auto representation : {QwenSparseScalar::FP32, QwenSparseScalar::FP16, QwenSparseScalar::BF16})
+        for(int context:{4102,65536})
         {
-            Fixture installed(9, 4093, 4102, representation);
+            if(context==65536 && representation!=QwenSparseScalar::FP32)continue;
+            const int rows=context==65536?1:9,prefix=context-rows;
+            Fixture installed(rows,prefix,context,representation);
             BoundedPipelineRetirement installedRetirement{installed.stream};
-            Fixture candidate(9, 4093, 4102, representation);
+            Fixture candidate(rows,prefix,context,representation);
             BoundedPipelineRetirement candidateRetirement{candidate.stream};
             candidate.indexer.pool_selection = policy;
+            if(context==65536)for(auto* fixture:{&installed,&candidate}){
+                fixture->indexer.rotary_source=QwenSparseRotarySource::AnalyticTheta;fixture->indexer.rope_theta=10000000.f;
+                fixture->indexer.inverse_frequencies=makeQwenSparsePowerFrequencies(10000000.f,64);
+                fixture->indexer.cosine=fixture->indexer.sine=nullptr;
+            }
             installed.capture(); candidate.capture();
-            for (int live : {9, 1, 0, 5})
+            for (int live : {rows,1,0,std::min(rows,5),rows})
             {
                 installed.replay.live_rows = live; candidate.replay.live_rows = live;
                 installed.state.upload(&installed.replay, installed.stream);

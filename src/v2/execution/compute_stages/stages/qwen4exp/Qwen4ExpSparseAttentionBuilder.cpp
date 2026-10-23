@@ -10,6 +10,7 @@
 #include "../GEMMStage.h"
 #include "../../../../models/GraphTypes.h"
 #include "../../../local_execution/graph/ComputeGraph.h"
+#include "../../../local_execution/graph/IGraphBuilder.h"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -132,6 +133,28 @@ void validateNodes(const ComputeGraph &graph,const std::vector<Pending> &nodes)
     }
 }
 }
+qwen4exp::QwenSparsePoolSelection Qwen4ExpSparseAttentionBuilder::poolSelectionForInvocation(
+    ForwardExecutionPhase phase,DeviceId device,int rowCapacity)
+{
+    require(device.is_valid() && rowCapacity>0,
+        "QSA pool selection requires an exact participant and positive captured row capacity");
+    switch(phase){
+    case ForwardExecutionPhase::Prefill:
+    case ForwardExecutionPhase::Decode:break;
+    default:throw std::invalid_argument("QSA pool selection requires a known forward phase");}
+    switch(device.type){
+    case DeviceType::CPU:
+    case DeviceType::CUDA:
+    case DeviceType::ROCm:
+    case DeviceType::Vulkan:
+    case DeviceType::Metal:break;
+    default:throw std::invalid_argument("QSA pool selection requires a known participant backend");}
+    if(phase==ForwardExecutionPhase::Decode && device.is_rocm() &&
+        rowCapacity<=attention::kMaxGroupedVerifierAttentionRows)
+        return qwen4exp::QwenSparsePoolSelection::Bounded1024_1024;
+    return qwen4exp::QwenSparsePoolSelection::Installed;
+}
+
 std::optional<DeviceRowRange> Qwen4ExpSparseAttentionBuilder::verifierProjectionRows(
     DeviceId device,Qwen4ExpStageRows rows)
 {
@@ -180,6 +203,9 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
         "Counted QSA projections require an explicitly selected decode-equivalent floating policy");
     require(p.publication==Qwen4ExpSparsePublication::AcceptAllLiveRows ||
         p.publication==Qwen4ExpSparsePublication::DeferredVerifierAcceptance,"QSA publication policy is invalid");
+    // Reject policy corruption before preparing projections or publishing nodes.
+    qwen4exp::validateQwenSparsePoolSelection(p.poolSelection, rows.rowsPerRequest());
+    qwen4exp::validateQwenSparseAttentionArithmetic(p.attentionArithmetic,c.device.type);
     validateRequestLeases(c,p,rows,requests);
     const auto &first=requests.front().buffers;
     const auto queryName=c.prefix+"qsa_query_proj",keyName=c.prefix+"qsa_key_proj";
@@ -222,12 +248,14 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
             .rowCapacity=rowCapacity,.tokenCapacity=p.tokenCapacity,.replay=b.replay,
             .operation=Stage::Indexer{b.query,b.rawKey,b.priorPartial,b.pooledKeys,w.queryNorm,w.keyNorm,w.cosine,w.sine,
                 b.preparedQuery,b.scores,b.selected,b.selectedCount,p.blockCapacity,p.positionCapacity,p.rotaryDimension,
-                p.epsilon,p.representation,p.rotarySource,p.ropeTheta,b.retained ? std::optional{b.retained->transactionPrior} : std::nullopt}}),{queryName,keyName,b.replayReady}});
+                p.epsilon,p.representation,p.rotarySource,p.ropeTheta,b.retained ? std::optional{b.retained->transactionPrior} : std::nullopt,
+                p.poolSelection}}),{queryName,keyName,b.replayReady}});
         const auto coreOffset=firstRow*c.queryHeads*256*sizeof(float);
         Stage::SelectedAttention attention{{*c.cache,c.cacheLayer,request.sequence,c.keyPolicy},
             Qwen4ExpFloatBinding(c.preparedQuery.tensor,c.preparedQuery.buffer,coreOffset),b.selected,b.selectedCount,
             Qwen4ExpFloatBinding(c.output.tensor,c.output.buffer,coreOffset),{},b.rowParameters,b.gpuPartials,b.observations,
             {},{},0,p.rotaryDimension,c.queryHeads,c.kvHeads,c.queryHeadStart,c.kvHeadStart};
+        attention.arithmetic=p.attentionArithmetic;
         attention.keyRotarySource=p.rotarySource==qwen4exp::QwenSparseRotarySource::AnalyticTheta ?
             qwen4exp::QwenSparseRotarySource::CanonicalEngineTheta : p.rotarySource;
         if(c.keyPolicy.transformsOnRead() && p.rotarySource==qwen4exp::QwenSparseRotarySource::TablePlanes) {

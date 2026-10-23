@@ -16,6 +16,7 @@
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
+#include "kernels/qwen4exp/QwenSparseAttentionArithmetic.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "collective/AllreducePrecisionPolicy.h"
 
@@ -853,6 +854,13 @@ namespace llaminar2
      */
     struct AttentionConfig
     {
+        /**
+         * @brief Setup-only LLAMINAR_QFN_SPARSE_ATTENTION=fp32|fp16_tile.
+         * QFN graph construction freezes this explicit arithmetic before capture.
+         * The FP16 tile experiment admits ROCm attention with native FP16 KV;
+         * CPU/CUDA reject it. Unset selects the unchanged fixed FP32 program.
+         */
+        qwen4exp::QwenSparseAttentionArithmetic qfn_sparse_attention = qwen4exp::kDefaultQwenSparseAttentionArithmetic;
         bool fp32_scores = false; ///< Use FP32 for Q·K score computation (default: integer)
 
         bool debug_effective_kv_snapshot = false;             ///< Capture effective K/V tensors when LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT is non-zero.
@@ -902,6 +910,9 @@ namespace llaminar2
 
         void reload()
         {
+            const char *qfn_sparse = std::getenv("LLAMINAR_QFN_SPARSE_ATTENTION");
+            qfn_sparse_attention = qfn_sparse ? qwen4exp::parseQwenSparseAttentionArithmetic(qfn_sparse) :
+                qwen4exp::kDefaultQwenSparseAttentionArithmetic;
             const char *fp32_scores_env = std::getenv("LLAMINAR_Q8_ATTENTION_FP32_SCORES");
             if (fp32_scores_env)
             {

@@ -10,6 +10,7 @@
  */
 #pragma once
 #include "Qwen4ExpStateIO.h"
+#include "QwenSparseAttentionArithmetic.h"
 #include "QwenSparseTransactionPrior.h"
 #include "../common/AcceptedRequestPrefixes.h"
 
@@ -45,8 +46,9 @@ static_assert(sizeof(QwenSparsePowerFrequencies)==32*sizeof(float) && alignof(Qw
 QwenSparsePowerFrequencies makeQwenSparsePowerFrequencies(float theta,int rotaryDimension);
 
 /**
- * @brief Explicit private selector experiment; Installed preserves existing dispatch.
- * @details Bounded geometries are candidates, not a serving/precision default.
+ * @brief Immutable backend-neutral pool selection policy; Installed preserves current dispatch.
+ * @details Every bounded geometry has an explicit native implementation. Declarative
+ * graph callers must select it before construction; the default remains Installed.
  */
 enum class QwenSparsePoolSelection : std::uint8_t
 {
@@ -55,6 +57,21 @@ enum class QwenSparsePoolSelection : std::uint8_t
     Bounded512_512,
     Bounded1024_1024
 };
+
+/**
+ * @brief Reject an unknown immutable selector policy before graph construction or enqueue.
+ * @param policy Explicit backend-neutral selector implementation.
+ * @throws std::invalid_argument If the value is outside the closed supported enum.
+ * @details This check reads no execution-owned state and performs no device operation.
+ */
+void validateQwenSparsePoolSelection(QwenSparsePoolSelection policy);
+/**
+ * @brief Admit an explicit selector against immutable invocation row capacity.
+ * @param policy Closed native selection policy, independent of live replay bytes.
+ * @param rowCapacity Positive admitted rows, not the device-owned live count.
+ * @throws std::invalid_argument For unknown policy or nonpositive admitted capacity.
+ */
+void validateQwenSparsePoolSelection(QwenSparsePoolSelection policy, int rowCapacity);
 
 /**
  * @brief Optional row-local diagnostic work, published only after selection.
@@ -209,6 +226,7 @@ struct QwenSparseAttention
     int kv_heads = 2; ///< Participant-local native KV heads.
     int query_head_start = 0; ///< First global Q head in this participant's contiguous shard.
     int kv_head_start = 0; ///< First global KV head stored in the native banks.
+    QwenSparseAttentionArithmetic arithmetic = kDefaultQwenSparseAttentionArithmetic; ///< Sealed arithmetic, independent of row/context geometry.
 };
 
 /** @brief Validate static pointer/geometry bindings without reading device state.

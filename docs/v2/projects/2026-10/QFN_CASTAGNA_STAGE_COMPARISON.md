@@ -1,8 +1,61 @@
 # QFN: Castagna and Llaminar stage comparison
 
-## Qualified workload and throughput
+## Attention124: current matched core comparison
 
-The current comparison uses the HC103 Llaminar Release archive and Castagna
+The same four-MI50 workload now measures **817.871 prefill /39.754 decode
+tok/s** for Llaminar's explicit FP16 tile policy, versus **816.092 /39.390**
+for its same-build FP32 A/B/A control. The fresh pinned Castagna baseline is
+**462.166 /42.657**. All natural 256-token trajectories match. These are
+unprofiled Release results; Llaminar's +0.925% decode improvement does not
+establish an attention-stage win against the fork.
+
+Both fresh admitted traces pass driver, runtime, source, workload and retirement
+checks. Llaminar's executed producer is `selectedAttentionFP16Tiles<false>` on
+all four GPUs: this native FP16 cache stores post-RoPE keys. The earlier
+pre-RoPE component timings are not production-stage timings. Actual allocation
+metadata reports68 vector registers,19968 bytes LDS and zero private scratch.
+
+| Complete attention core, median of four per-GPU observations | Llaminar | Castagna |
+|---|---:|---:|
+| Prefill, µs per prompt row | 12.2255 | 3.9578 |
+| Decode, ms per after-prefill step | 0.581918 | 0.162666 |
+
+Llaminar still spends **3.089×** the recorded prefill core time and **3.577×**
+the decode core time. Decode ranges are0.563831–0.614159ms and
+0.161527–0.162802ms respectively. These ratios compare different arithmetic
+programs and physical layouts; they are diagnostic, not equal-arithmetic kernel
+benchmarks or predictions of removable request latency.
+
+The boundary contains each complete producer and ordered merge, including the
+fork's dense prefill preparation/compute/merge. It excludes external RoPE,
+cache publication, projections, output gating and indexer work. All other
+recorded kernels participate in the same overlap sweep. The report retains
+sums, unions and exclusive intervals separately; no GPU times are added.
+Broader wrapper and complete attention-block attribution remain unresolved.
+
+Both engines execute72 query-head/layer instances per GPU: Llaminar Q6×12,
+Castagna Q12×6. The complete measured prefill is512 rows, split as320+188+4
+by the fork, and decode contains255 forwards. Strict geometry/count checks
+authenticate24/48 prefill core launches and6120/3060 decode core launches per
+GPU respectively. All original graph-to-dispatch counts match.
+
+[Core comparison](../../../../parity-results/qwen-flash-next/attention124-core-comparison-r1/attention-core.json)
+retains the derived joins, intervals, classifier outputs and comparison source.
+[Unprofiled comparison](../../../../parity-results/qwen-flash-next/attention124-fresh-engine-comparison-r1.json)
+retains the distinct throughput authority. Castagna's first fresh trace remains
+rejected for an AMD restore-userptr workqueue warning; the admitted repeat is
+`attention124-castagna-trace-r2`, with no new driver diagnostics. Llaminar's
+admitted trace is `attention124-stage-trace-r1`.
+
+The [actual kernel source comparison](QFN_ATTENTION_STRUCTURE_COMPARISON.md)
+separates the fork's wider prefill KV reuse, independent score chains, loop
+scheduling and packed merge from its different partition/PV/denominator
+arithmetic. The first arithmetic-preserving QK unroll8 trial improves measured
+post-RoPE component time by4–6%; no new whole-model speed is claimed for it.
+
+## Historical HC103 workload and throughput
+
+The earlier comparison uses the HC103 Llaminar Release archive and Castagna
 commit `3483d462715d61f21ed5877836be35a724446359`, on the same four MI50s.
 The GGUF is Qwen3.8-Flash-Next UD-Q4_K_XL, with FP16 KV, RAM ngrams, context
 4096, 28 physical NUMA1 workers, 512 repetitions of token 1228, and 256 emitted

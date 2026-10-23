@@ -13,9 +13,86 @@ profiles and gfx906 ISA show zero spills/private storage for every schedule.
 The [matched comparison](../../../../parity-results/qwen-flash-next/injection106-split-model-comparison.json)
 and [arithmetic, dispatch and profile evidence](QFN_FLOATING_REDUCTION_TUNING.md#l106-overlap-loads-while-preserving-each-original-dot-product)
 record the workload and every sample. The **42.959 tok/s** Castagna decode
-target remains open. Next qualify packed FP16 selected attention and shared
-K/V loads with fixed arithmetic across serial/grouped rows; unused short-context
-indexer queries remain a separate opportunity. Complete preflight remains G60.
+target remains open. The [subsequent attention and selector experiments](QFN_PACKED_ATTENTION_TUNING.md)
+rejected the packed FP16 implementation for speed. The retained bounded
+selector improves the measured ROCm ranking work; CUDA keeps its prior default
+because the bounded winner depends on score distribution. Cheaper observation
+counting saves 1.52–3.97% in the measured MI50 attention component, while the
+matched model run remains effectively unchanged at **814.979 / 39.208 tok/s**
+versus **815.694 / 39.239** for its controls. All nine generated sequences and
+185 final-logit rows remain exact; the cleaned tree passes **776 Unit plus45
+focused Integration tests**, without skips. These experiments are not yet a
+new checkpoint or a refreshed full preflight. Current work targets matched
+attention-stage time below Castagna, with FP16 arithmetic admitted only after
+measuring final-logit KL and prefill/decode top-1 and top-5 agreement. Unused
+short-context indexer queries remain a separately owned implementation.
+Complete preflight remains G60.
+
+The new [shared-tile FP16 attention candidate123](QFN_PACKED_ATTENTION_TUNING.md#same-build-final-logit-precision-comparison)
+passes the unchanged required QFN numerical groups against a fresh same-build
+FP32 control. Main-group mean KL changes from **0.033536 to 0.025614 prefill**
+and **0.032070 to 0.028276 decode**; held-out means change from **0.009691 to
+0.014911** and **0.003838 to 0.004553**. Top-1/top-5 trade-offs are retained in
+the comparison table. The user accepted this accuracy trade-off. Measured
+selected-RoPE attention-pair component time falls from **71.173 to 23.868 µs**
+at M1/context512 and **11730.900 to 3983.325 µs** at M512/context65536. The
+M1/65536 sample is still 0.67% slower. These historical component cells use
+pre-RoPE keys; the model's native FP16 cache uses post-RoPE keys. The corrected
+fixture now requires/reports that distinction, authenticates the actual native
+specialization and tests both through grouped/serial dirty replay. Model
+accuracy used the real graph and is unaffected. Removing
+redundant barriers and unowned-head arithmetic in124 retains all185 FP16 logit
+rows exactly and passes all825 Unit/affected registrations. The matched
+same-runtime A/B/A now measures **817.871 prefill /39.754 decode tok/s** for
+FP16 versus **816.092 /39.390** for FP32: **+0.218% /+0.925%**. Decode ranges
+do not overlap; prefill ranges overlap. All nine natural token sequences match.
+The fresh pinned Castagna repeat is **462.166 prefill /42.657 decode tok/s**,
+with the same generated trajectory and passing runtime/driver checks. The
+candidate retains **1.770×** its prefill rate and is **6.804% behind** in decode.
+The42.959 historical target remains open. Fresh production-specialization
+profiling confirms post-RoPE execution and zero private scratch. The complete
+core still takes **0.582ms/GPU/decode step versus0.163ms** for Castagna, and
+**12.2255 versus3.9578µs/prompt row** in prefill. These instrumented core times
+exclude external wrapper work; broader stage attribution remains open.
+Corrected post-RoPE components expose an11.76% M1/64K regression versus FP32;
+default promotion is held while this is tuned. The
+[actual source comparison](QFN_ATTENTION_STRUCTURE_COMPARISON.md) identifies
+wider prefill reuse and decode loop scheduling. The QK unroll16 winner128
+improves seven component cells by4.4–8.5%, preserving every output/numerical-
+partial byte and passing15 native tests; the long M1 regression shrinks to1.71%.
+Its exact ISA/profiles show load-ahead scheduling, unchanged fetch volume,
+zero spills and zero LDS conflicts. Unroll32 was slower and is not retained.
+The retained128 model panel passes all required groups and keeps all185
+final-logit rows byte-identical; the refreshed825-registration Unit/device gate
+passes. Its source-frozen A/B/A measures **818.838 prefill /39.987 decode tok/s**
+versus **816.165 /39.283** for the FP32 controls: **+0.328% /+1.792%**. Decode
+ranges do not overlap and all nine generated256-token sequences are identical.
+The same prompt512/decode256/context4096 workload uses fullTP4, sharded
+vocabulary,28 physical NUMA-local workers, RAM ngrams, native post-RoPE FP16 KV,
+and disabled MTP/prefix cache. This is a focused checkpoint, not a refreshed
+full preflight; full preflight remains G60. A packed-merge trial was exact but
+slower at decode and was removed. The next candidates target smaller decode
+head groups. Per user direction, prefill tuning is parked: preserve its current
+lead and qualify separate prefill/decode physical regimes, including byte-exact
+serial/grouped decode. Castagna attention performance remains the target.
+
+The shared attention fixture now proves old/current output and partial bytes
+on both GPUs at M1/M16 and 512/65536 context. The initial CUDA M16/512
+regression is fixed by retaining query values across selected tokens: the
+case improves from its original63.792 µs to55.634 µs. All twelve additional
+M512/1024/2048 comparisons also remain byte-exact, with14–18% lower CUDA
+attention time and no ROCm regression. The [GDN recurrence candidate](QFN_GDN_RECURRENCE_TUNING.md)
+passes 32 geometry checks and preserves all 185 model-logit rows exactly.
+It reduces recurrence time by 3.88%/5.61% at the TP4 M1/M16 shapes, with a
+3.83% regression at the larger DK128/DV128/H48/M16 shape. Its matched model
+benchmark is neutral at **815.850 / 39.237 tok/s** against **815.592 / 39.255**;
+all nine generated sequences match. Neither experiment is a new qualified
+throughput win. The refreshed gate passes all 823 CTest registrations: 776 Unit,
+46 affected Integration and one setup registration. The subsequent model check
+preserves all 185 final-logit rows byte for byte. The independently expanded
+GDN historical test also passes normalized and scale-only policies; further
+GDN kernel tuning is held while attention takes priority. Full preflight
+remains G60.
 
 **HC103's focused qualification is green** at **815.461 prefill / 37.576 decode
 tok/s** on A1. The matched L104 control measures **814.723 / 37.439**:

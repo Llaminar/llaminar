@@ -128,9 +128,11 @@ endforeach()
                     if cuda or rocm:
                         expected += ["v2_perf_immutable_adaptive_lookup"]
                     if cuda:
-                        expected.append("v2_perf_cuda_qwen_sparse_selection")
+                        expected += ["v2_perf_cuda_qwen_sparse_selection",
+                                     "v2_perf_cuda_qwen_sparse_observations"]
                     if rocm:
                         expected += ["v2_perf_rocm_qwen_sparse_selection",
+                                     "v2_perf_rocm_qwen_sparse_observations",
                                      "v2_perf_rocm_floating_reduction",
                                      "v2_perf_qwen4exp_branch_norm"]
                     extra = f"""
@@ -141,6 +143,7 @@ add_library(llaminar2_core INTERFACE)
 add_library(GTest::gtest INTERFACE IMPORTED)
 add_library(GTest::gtest_main INTERFACE IMPORTED)
 add_library(hip::host INTERFACE IMPORTED)
+add_library(CUDA::cudart INTERFACE IMPORTED)
 include("{QFN_PERFORMANCE.as_posix()}")
 include("{QFN_PERFORMANCE.as_posix()}")
 if(HAVE_CUDA)

@@ -11,6 +11,7 @@
 #include "../qwen35moe/Qwen35MoEGraph.h"
 #include "../../execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "../../execution/qwen4exp/Qwen4ExpAuxiliaryState.h"
+#include "../../kernels/qwen4exp/QwenSparseAttentionArithmetic.h"
 
 namespace llaminar2
 {
@@ -73,6 +74,7 @@ protected:
     /** @copydoc QwenGraphBase::addModelAttentionConsumer */
     std::optional<std::string> addModelAttentionConsumer(ComputeGraph &graph,const AttentionConsumerBinding &binding) override;
 private:
+  const qwen4exp::QwenSparseAttentionArithmetic sparse_attention_arithmetic_; ///< Setup snapshot retained across every prefill/decode/verifier graph.
   /**
    * @brief Project only the existing helper-authenticated original query count's arena role.
    * @param input Complete actual main/verifier invocation, including typed prefill/request producers.

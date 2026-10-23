@@ -8,6 +8,7 @@
 #include "../../qwen4exp/QwenSparseReplay.h"
 #include "ROCmQwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseGPU.cuh"
+#include "ROCmQwenSparseFP16Attention.cuh"
 #include <stdexcept>
 #include <string>
 namespace llaminar2::qwen4exp
@@ -65,6 +66,11 @@ void rocmQwenSparseSelectPools(const QwenSparseIndexer &p, hipStream_t stream)
 void rocmQwenSparseAttention(const QwenSparseAttention &p, hipStream_t stream)
 {
     requireStream(stream);
+    validateQwenSparseAttentionArithmetic(p.arithmetic,DeviceType::ROCm);
+    if(p.arithmetic==QwenSparseAttentionArithmetic::TileFP16WithFP32Totals) {
+        rocmQwenSparseFP16Attention(p,stream);
+        return;
+    }
     validateQwenSparseAttention(p);
     if (!p.gpu_partials) throw std::invalid_argument("ROCm Qwen sparse attention requires admitted fixed-partition scratch");
     if (detail::isRotated(p.kv.keys))
@@ -83,6 +89,28 @@ void rocmQwenSparseAttention(const QwenSparseAttention &p, hipStream_t stream)
     });
     checkLaunch();
 }
+void rocmQwenSparseFP16Attention(const QwenSparseAttention& p, hipStream_t stream)
+{
+    requireStream(stream);
+    if(p.arithmetic!=QwenSparseAttentionArithmetic::TileFP16WithFP32Totals)
+        throw std::invalid_argument("ROCm FP16 tiled entry requires the sealed fp16_tile arithmetic policy");
+    validateQwenSparseAttention(p);
+    if (!p.gpu_partials || p.kv.keys.codec != TensorType::FP16 || p.kv.values.codec != TensorType::FP16)
+        throw std::invalid_argument("ROCm FP16 tiled attention requires native FP16 KV and original eight-partition scratch");
+    for (const auto* bank : {&p.kv.keys, &p.kv.values})
+        if (reinterpret_cast<std::uintptr_t>(bank->data) % 16 || bank->token_stride_bytes % 16 || bank->head_stride_bytes % 16)
+            throw std::invalid_argument("ROCm FP16 tiled attention requires16-byte aligned native bank rows");
+    if (p.kv.key_policy.transformsOnRead() && p.kv.key_rotary_dim != 64)
+        throw std::invalid_argument("ROCm FP16 tiled attention requires the explicit64-coordinate pre-RoPE policy");
+    const dim3 grid(p.row_capacity, (p.query_head_start % 4 + p.query_heads + 3) / 4, QwenSparsePartitions);
+    if (p.kv.key_policy.transformsOnRead())
+        rocm_sparse_detail::selectedAttentionFP16Tiles<true><<<grid, 256, 0, stream>>>(p);
+    else rocm_sparse_detail::selectedAttentionFP16Tiles<false><<<grid, 256, 0, stream>>>(p);
+    checkLaunch();
+    rocm_sparse_detail::reduceAttentionPartitions<TensorType::FP16><<<dim3(p.row_capacity, p.query_heads), 256, 0, stream>>>(p);
+    checkLaunch();
+}
+
 void rocmQwenSparseSnapshotPrior(const QwenSparsePriorSnapshot& p,void* rawStream)
 {
     const auto stream=static_cast<hipStream_t>(rawStream);

@@ -20,6 +20,7 @@
 #include "../../backends/ExplicitGPUStream.h"
 #include "../../tensors/Tensors.h"
 #include "../../transfer/TransferEngine.h"
+#include "../../utils/DebugEnv.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -27,7 +28,8 @@
 namespace llaminar2
 {
 Qwen4ExpGraph::Qwen4ExpGraph(const GraphConfig &config,std::shared_ptr<IMPIContext> mpi)
-    :Qwen35MoEGraph(config,std::move(mpi))
+    :Qwen35MoEGraph(config,std::move(mpi)),
+     sparse_attention_arithmetic_(debugEnv().attention.qfn_sparse_attention)
 {
     if(!config_.flash_next)
         throw std::invalid_argument("Flash Next graph requires an authenticated exact GGUF configuration");
@@ -516,7 +518,10 @@ std::optional<std::string> Qwen4ExpGraph::addModelAttentionConsumer(ComputeGraph
             .projectionRows=verifier ? Qwen4ExpSparseAttentionBuilder::verifierProjectionRows(binding.device,
                 modelExtensionRows(binding.queryRows,binding.device)) : std::nullopt,.mpi=mpi_ctx_.get(),
             .rotarySource=qwen4exp::QwenSparseRotarySource::AnalyticTheta,.ropeTheta=config_.rope_theta,
-            .publication=verifier ? Qwen4ExpSparsePublication::DeferredVerifierAcceptance : Qwen4ExpSparsePublication::AcceptAllLiveRows},
+            .publication=verifier ? Qwen4ExpSparsePublication::DeferredVerifierAcceptance : Qwen4ExpSparsePublication::AcceptAllLiveRows,
+            .poolSelection=Qwen4ExpSparseAttentionBuilder::poolSelectionForInvocation(
+                input.execution_phase,binding.device,binding.queryRows),
+            .attentionArithmetic=sparse_attention_arithmetic_},
         {projection(weights.query,binding.device),projection(weights.key,binding.device),gain(weights.query_norm),gain(weights.key_norm),{},{}},
         {replay,fp32(BufferId::QFN_QSA_QUERY),fp32(BufferId::QFN_QSA_RAW_KEY),
             pool.partialKeys,pool.pooledKeys,fp32(BufferId::QFN_QSA_PREPARED_QUERY),fp32(BufferId::QFN_QSA_SCORES),

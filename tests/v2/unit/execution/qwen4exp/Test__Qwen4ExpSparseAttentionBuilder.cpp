@@ -11,6 +11,7 @@
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpSparseAttentionBuilder.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/qwen4exp/QwenSparseMath.h"
@@ -20,6 +21,8 @@
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 #include "utils/OpenMPUtils.h"
+#include <algorithm>
+#include <array>
 #include <limits>
 #include "../../../utils/PreparedWeightTestHarness.h"
 
@@ -343,4 +346,138 @@ TEST(Qwen4ExpSparseAttentionBuilder, VerifierProjectionRowsPreserveM1NativeAutho
     }
     count=1;EXPECT_FALSE(Builder::verifierProjectionRows(DeviceId::cpu(),{1,Qwen4ExpNativeIntInput{DeviceId::cpu(),&count,1}}));
     count=0;EXPECT_THROW(Builder::verifierProjectionRows(DeviceId::cpu(),{1,Qwen4ExpNativeIntInput{DeviceId::cpu(),&count,1}}),std::invalid_argument);
+}
+
+
+/** @test Both declarative entrypoints preserve each selector and reject corruption before graph mutation. */
+TEST(Qwen4ExpSparseAttentionBuilder, SelectorPolicyIsExplicitAndCaptureSealed)
+{
+    using Selection=qwen4exp::QwenSparsePoolSelection;
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture f;
+    EXPECT_EQ(f.policy().poolSelection,Selection::Installed);
+    constexpr std::array selections{Selection::Installed,Selection::Bounded256_512,
+        Selection::Bounded512_512,Selection::Bounded1024_1024};
+    std::vector<std::uint64_t> identities;
+    for(const auto selection:selections) {
+        SCOPED_TRACE(static_cast<int>(selection));
+        std::uint64_t singleIdentity=0;
+        for(const bool requestsEntry:{false,true}) {
+            SCOPED_TRACE(requestsEntry);
+            ComputeGraph graph;f.seed(graph);
+            auto policy=f.policy();policy.poolSelection=selection;
+            if(requestsEntry) {
+                const auto terminals=Builder::appendRequests(graph,f.consumer(),policy,f.weights(),
+                    DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}});
+                ASSERT_EQ(terminals.size(),1u);EXPECT_EQ(terminals.front(),"qsa.qsa_commit_partial");
+            } else {
+                EXPECT_EQ(Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()),"qsa.qsa_commit_partial");
+            }
+            ASSERT_EQ(graph.size(),6u);
+            const auto* node=graph.getNode("qsa.qsa_indexer");ASSERT_NE(node,nullptr);
+            const auto* stage=dynamic_cast<const QwenSparseAttentionStage*>(node->stage.get());ASSERT_NE(stage,nullptr);
+            EXPECT_EQ(std::get<QwenSparseAttentionStage::Indexer>(stage->getParams().operation).poolSelection,selection);
+            const auto identity=stage->graphCaptureVariantSignature();ASSERT_NE(identity,0u);
+            if(requestsEntry)EXPECT_EQ(identity,singleIdentity);
+            else singleIdentity=identity;
+        }
+        EXPECT_EQ(std::find(identities.begin(),identities.end(),singleIdentity),identities.end());
+        identities.push_back(singleIdentity);
+    }
+    ComputeGraph unchanged;f.seed(unchanged);
+    auto invalid=f.policy();invalid.poolSelection=static_cast<Selection>(255);
+    EXPECT_THROW(Builder::append(unchanged,f.consumer(),invalid,f.weights(),f.buffers()),std::invalid_argument);
+    EXPECT_EQ(unchanged.size(),1u);
+    EXPECT_THROW(Builder::appendRequests(unchanged,f.consumer(),invalid,f.weights(),
+        DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}}),std::invalid_argument);
+    EXPECT_EQ(unchanged.size(),1u);
+}
+
+/**
+ * @test Production selector declaration uses typed phase and backend at every decode capacity.
+ * @details Calling the pure helper does not create a native context or query hardware.
+ * In particular M1 Prefill and CPU/CUDA grouped Decode must remain Installed.
+ */
+TEST(Qwen4ExpSparseAttentionBuilder, ProductionPoolSelectionUsesTypedPhaseAndBackend)
+{
+    using Builder=Qwen4ExpSparseAttentionBuilder;
+    using Phase=ForwardExecutionPhase;
+    using Selection=qwen4exp::QwenSparsePoolSelection;
+    for(const auto type:std::array{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm,
+                                  DeviceType::Vulkan,DeviceType::Metal})
+        for(int ordinal:{0,3})
+        {
+            SCOPED_TRACE(int(type));
+            SCOPED_TRACE(ordinal);
+            const DeviceId device(type,ordinal);
+            for(int capacity=1;capacity<=16;++capacity)
+            {
+                SCOPED_TRACE(capacity);
+                EXPECT_EQ(Builder::poolSelectionForInvocation(Phase::Prefill,device,capacity),Selection::Installed);
+                if(type==DeviceType::ROCm)
+                    EXPECT_EQ(Builder::poolSelectionForInvocation(Phase::Decode,device,capacity),Selection::Bounded1024_1024);
+                else
+                    EXPECT_EQ(Builder::poolSelectionForInvocation(Phase::Decode,device,capacity),Selection::Installed);
+            }
+            for(int capacity:{17,33,512,1024,2048,std::numeric_limits<int>::max()})
+            {
+                SCOPED_TRACE(capacity);
+                EXPECT_EQ(Builder::poolSelectionForInvocation(Phase::Prefill,device,capacity),Selection::Installed);
+                EXPECT_EQ(Builder::poolSelectionForInvocation(Phase::Decode,device,capacity),Selection::Installed);
+            }
+        }
+}
+
+/** @test Invalid enum/participant/capacity inputs fail before the selected policy can be published. */
+TEST(Qwen4ExpSparseAttentionBuilder, ProductionPoolSelectionRejectsInvalidInvocation)
+{
+    using Builder=Qwen4ExpSparseAttentionBuilder;
+    using Phase=ForwardExecutionPhase;
+    for(const auto phase:{Phase::Prefill,Phase::Decode})
+    {
+        for(const auto device:std::array{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+            for(int capacity:{0,-1,std::numeric_limits<int>::min()})
+                EXPECT_THROW(Builder::poolSelectionForInvocation(phase,device,capacity),std::invalid_argument);
+        for(int capacity:{1,16,17})
+        {
+            EXPECT_THROW(Builder::poolSelectionForInvocation(phase,DeviceId::invalid(),capacity),std::invalid_argument);
+            EXPECT_THROW(Builder::poolSelectionForInvocation(phase,DeviceId(DeviceType::ROCm,-1),capacity),std::invalid_argument);
+            EXPECT_THROW(Builder::poolSelectionForInvocation(phase,DeviceId(static_cast<DeviceType>(255),0),capacity),std::invalid_argument);
+        }
+    }
+    for(const auto device:std::array{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+        for(int capacity:{1,16,17})
+            EXPECT_THROW(Builder::poolSelectionForInvocation(static_cast<Phase>(255),device,capacity),std::invalid_argument);
+}
+
+/** @test Both builder entrypoints forward the default and reject unsupported attention arithmetic before publishing nodes. */
+TEST(Qwen4ExpSparseAttentionBuilder, AttentionArithmeticDefaultForwardingAndColdRejection)
+{
+    using Arithmetic=qwen4exp::QwenSparseAttentionArithmetic;
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture f;
+    EXPECT_EQ(f.policy().attentionArithmetic,qwen4exp::kDefaultQwenSparseAttentionArithmetic);
+    EXPECT_EQ(f.policy().attentionArithmetic,Arithmetic::FixedFP32);
+    for(const bool requestsEntry:{false,true}) {
+        SCOPED_TRACE(requestsEntry);
+        ComputeGraph graph;f.seed(graph);
+        if(requestsEntry)
+            (void)Builder::appendRequests(graph,f.consumer(),f.policy(),f.weights(),
+                DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}});
+        else (void)Builder::append(graph,f.consumer(),f.policy(),f.weights(),f.buffers());
+        ASSERT_EQ(graph.size(),6u);
+        const auto *node=graph.getNode("qsa.attention");ASSERT_NE(node,nullptr);
+        const auto *stage=dynamic_cast<const QwenSparseAttentionStage *>(node->stage.get());ASSERT_NE(stage,nullptr);
+        EXPECT_EQ(std::get<QwenSparseAttentionStage::SelectedAttention>(stage->getParams().operation).arithmetic,Arithmetic::FixedFP32);
+        EXPECT_NE(stage->graphCaptureVariantSignature(),0u);
+        for(const auto arithmetic:{Arithmetic::TileFP16WithFP32Totals,static_cast<Arithmetic>(255)}) {
+            auto policy=f.policy();policy.attentionArithmetic=arithmetic;
+            ComputeGraph unchanged;f.seed(unchanged);
+            if(requestsEntry)
+                EXPECT_THROW(Builder::appendRequests(unchanged,f.consumer(),policy,f.weights(),
+                    DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}}),std::invalid_argument);
+            else EXPECT_THROW(Builder::append(unchanged,f.consumer(),policy,f.weights(),f.buffers()),std::invalid_argument);
+            EXPECT_EQ(unchanged.size(),1u);
+        }
+    }
 }

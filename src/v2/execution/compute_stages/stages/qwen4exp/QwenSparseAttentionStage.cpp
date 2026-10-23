@@ -116,6 +116,7 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             add(a.traffic,sizeof(qwen4exp::QwenSparsePriorTraffic),Access::Output,"prior_traffic");
         },
         [&](const Indexer &a) {
+            qwen4exp::validateQwenSparsePoolSelection(a.poolSelection, params_.rowCapacity);
             // The arena/cache contract owns one exact native bank per layer.
             // A larger containing allocation uses an exact byte subview; it
             // cannot silently enlarge the captured diagnostic state payload.
@@ -149,6 +150,11 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             add(a.selectedCount,bytes(m,1),Access::Output,"selected_count");
         },
         [&](const SelectedAttention &a) {
+            qwen4exp::validateQwenSparseAttentionArithmetic(a.arithmetic,device().type);
+            if(a.arithmetic==qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals)
+                require(a.native.cache.k_precision()==ActivationPrecision::FP16 && a.native.cache.v_precision()==ActivationPrecision::FP16 &&
+                    (!a.native.keyPolicy.transformsOnRead() || a.keyRotaryDim==64),
+                    "QSA fp16_tile requires native FP16 K/V and the explicit 64-coordinate pre-RoPE policy");
             require(a.queryHeads > 0 && a.kvHeads > 0 && a.queryHeadStart >= 0 && a.kvHeadStart >= 0 &&
                 a.queryHeadStart+a.queryHeads <= 24 && a.kvHeadStart+a.kvHeads <= 2 &&
                 a.queryHeadStart/12 >= a.kvHeadStart && (a.queryHeadStart+a.queryHeads-1)/12 < a.kvHeadStart+a.kvHeads,
@@ -210,6 +216,15 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
     },params_.operation);
     validateAliases();
     kernels_ = llaminar::v2::kernels::KernelFactory::createQwenSparseAttention(device());
+    if(const auto *attention=std::get_if<SelectedAttention>(&params_.operation)) {
+        // Setup observes the exact policy forwarded below. No replay counter,
+        // synchronization, environment read or device-state read occurs here.
+        PerfStatsCollector::addCounter("qsa","attention_arithmetic_policy",1.0,"setup",device().to_string(),
+            {{"policy",std::string(qwen4exp::qwenSparseAttentionArithmeticName(attention->arithmetic))},
+             {"rows",std::to_string(params_.rowCapacity)},{"query_heads",std::to_string(attention->queryHeads)},
+             {"kv_heads",std::to_string(attention->kvHeads)},{"query_head_start",std::to_string(attention->queryHeadStart)},
+             {"kv_head_start",std::to_string(attention->kvHeadStart)}});
+    }
 }
 
 void QwenSparseAttentionStage::addTransactionPrior(QwenSparseTransactionPriorBinding binding,Access access)
@@ -319,7 +334,8 @@ bool QwenSparseAttentionStage::execute(IDeviceContext *context)
                 .selected=pointer<std::int32_t>(a.selected,Access::Output),.selected_count=pointer<std::int32_t>(a.selectedCount,Access::Output),
                 .row_capacity=params_.rowCapacity,.token_capacity=params_.tokenCapacity,.block_capacity=a.blockCapacity,
                 .position_capacity=a.positionCapacity,.rotary_dim=a.rotaryDim,.norm_epsilon=a.epsilon,.representation=a.representation,.rotary_source=a.rotarySource,.rope_theta=a.ropeTheta,.inverse_frequencies=indexerFrequencies_,
-                .transaction_prior=a.transactionPrior ? transactionPrior(*a.transactionPrior) : nullptr},stream);
+                .transaction_prior=a.transactionPrior ? transactionPrior(*a.transactionPrior) : nullptr,
+                .pool_selection=a.poolSelection},stream);
         },
         [&](const SelectedAttention &a) {
             auto kv = a.native.cache.acquireSparseAttentionNativeView(a.native.layer,a.native.sequence,
@@ -335,7 +351,7 @@ bool QwenSparseAttentionStage::execute(IDeviceContext *context)
                 .gpu_partials=a.gpuPartials ? pointer<qwen4exp::QwenSparseAttentionPartial>(*a.gpuPartials,Access::Output) : nullptr,
                 .observations=a.observations ? pointer<qwen4exp::QwenSparseAttentionObservation>(*a.observations,Access::Output) : nullptr,
                 .row_capacity=params_.rowCapacity,.token_capacity=params_.tokenCapacity,.query_heads=a.queryHeads,.kv_heads=a.kvHeads,
-                .query_head_start=a.queryHeadStart,.kv_head_start=a.kvHeadStart},stream);
+                .query_head_start=a.queryHeadStart,.kv_head_start=a.kvHeadStart,.arithmetic=a.arithmetic},stream);
         },
         [&](const RetainCandidates &a) {
             if(a.terminalCounters)a.terminalCounters->requireRequest(device(),a.requestIndex);
@@ -455,8 +471,10 @@ uint64_t QwenSparseAttentionStage::graphCaptureVariantSignature() const
 {
     const auto* retained=std::get_if<RetainCandidates>(&params_.operation);
     const auto* indexer=std::get_if<Indexer>(&params_.operation);
-    if(!retained && !std::holds_alternative<SnapshotPrior>(params_.operation) &&
-        !(indexer && indexer->transactionPrior))return 0;
+    const auto* attention=std::get_if<SelectedAttention>(&params_.operation);
+    // Ordinary and verifier indexers both embed a native selector and static
+    // arithmetic geometry. Live replay bytes never select or repair that policy.
+    if(!retained && !std::holds_alternative<SnapshotPrior>(params_.operation) && !indexer && !attention)return 0;
     uint64_t signature=1469598103934665603ULL;
     const auto mix=[&](uint64_t word){signature^=word;signature*=1099511628211ULL;};
     mix(params_.operation.index());mix(params_.rowCapacity);mix(params_.tokenCapacity);
@@ -469,9 +487,30 @@ uint64_t QwenSparseAttentionStage::graphCaptureVariantSignature() const
     }
     for(const auto& input:nativeInputs_) {mix(reinterpret_cast<std::uintptr_t>(input.data));mix(input.capacity);}
     if(indexer) {
+        mix(static_cast<uint64_t>(device().type));mix(device().ordinal);
+        mix(static_cast<uint64_t>(indexer->poolSelection));mix(indexer->transactionPrior.has_value());
         mix(indexer->blockCapacity);mix(indexer->positionCapacity);mix(indexer->rotaryDim);
         mix(std::bit_cast<uint32_t>(indexer->epsilon));mix(std::bit_cast<uint32_t>(indexer->ropeTheta));
         mix(static_cast<uint64_t>(indexer->representation));mix(static_cast<uint64_t>(indexer->rotarySource));
+        for(const auto& weight:weights_){mix(reinterpret_cast<std::uintptr_t>(weight.tensor));mix(weight.elements);}
+    }
+    if(attention) {
+        // Native cache allocation generations remain under the canonical cache
+        // and graph owner. This seals every immutable selected-stage binding;
+        // it does not acquire a GPU view or read mutable ring/request state.
+        mix(static_cast<uint64_t>(device().type));mix(device().ordinal);
+        mix(static_cast<uint64_t>(attention->arithmetic));
+        mix(reinterpret_cast<std::uintptr_t>(&attention->native.cache));
+        mix(attention->native.layer);mix(attention->native.sequence);
+        mix(static_cast<uint64_t>(attention->native.keyPolicy.encoding));
+        mix(std::bit_cast<uint32_t>(attention->native.keyPolicy.rope_theta));
+        mix(std::bit_cast<uint32_t>(attention->native.keyPolicy.partial_rotary_factor));
+        mix(static_cast<uint64_t>(attention->native.cache.k_precision()));
+        mix(static_cast<uint64_t>(attention->native.cache.v_precision()));
+        mix(attention->queryHeads);mix(attention->kvHeads);
+        mix(attention->queryHeadStart);mix(attention->kvHeadStart);
+        mix(attention->keyPositionCapacity);mix(attention->keyRotaryDim);
+        mix(static_cast<uint64_t>(attention->keyRotarySource));
         for(const auto& weight:weights_){mix(reinterpret_cast<std::uintptr_t>(weight.tensor));mix(weight.elements);}
     }
     if(retained) {
@@ -596,6 +635,8 @@ StageDumpInfo QwenSparseAttentionStage::buildDumpInfoImpl() const
     for (const auto &weight : weights_) result.addWeight(weight.name,weight.tensor,1,weight.elements,"FP32");
     result.addScalarInt("admitted_rows",params_.rowCapacity);
     result.addScalarInt("native_token_capacity",params_.tokenCapacity);
+    if(const auto *attention=std::get_if<SelectedAttention>(&params_.operation))
+        result.addScalarInt("attention_arithmetic_policy",static_cast<int>(attention->arithmetic));
     return result;
 }
 } // namespace llaminar2

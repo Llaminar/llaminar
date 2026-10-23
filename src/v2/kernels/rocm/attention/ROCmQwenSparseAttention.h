@@ -31,6 +31,18 @@ void rocmQwenSparseSelectPools(const QwenSparseIndexer &params, hipStream_t stre
  * @throws std::invalid_argument For invalid bindings/stream; std::runtime_error on native launch failure.
  */
 void rocmQwenSparseAttention(const QwenSparseAttention &params, hipStream_t stream);
+/**
+ * @brief Explicit experimental FP16 tiled attention with FP32 online totals.
+ * @param params Native FP16 banks and the original eight-partition arena binding.
+ * @param stream Exact non-default HIP stream ordering all borrowed storage.
+ * @throws std::invalid_argument For non-FP16 banks, invalid vector alignment,
+ * unsupported rotary width, missing scratch or invalid stream/bindings.
+ * @throws std::runtime_error For an immediate native launch failure.
+ * @details This entry never substitutes another policy. It admits post-RoPE
+ * FP16 keys or the declared64-coordinate pre-RoPE policy, and shares selected
+ * KV across four global query heads. Default serving remains unchanged.
+ */
+void rocmQwenSparseFP16Attention(const QwenSparseAttention &params, hipStream_t stream);
 /** @brief Enqueue accepted raw-tail publication without changing the canonical frontier.
  * @param params Device-owned acceptance decision and persistent partial-key publication.
  * @param stream Exact non-default HIP producer/consumer stream.

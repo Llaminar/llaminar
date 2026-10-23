@@ -22,3 +22,10 @@ extern "C" bool hipOps_rope_fp32_decode(float *,float *,const float *,int,int,in
 #define QSA_TRANSFER llaminar2::qwen4exp::rocmQwenStateTransfer
 #define QSA_SUITE ROCmQwenSparseAttention
 #include "../qwen4exp/QwenSparseDeviceTest.h"
+
+#include "../qwen4exp/QwenSparseObservationROCmAdapter.h"
+#include "../qwen4exp/QwenSparseObservationPerfTest.h"
+
+#include "../qwen4exp/QwenSparseIndexerPolicyPerfROCmTest.h"
+
+#include "../qwen4exp/QwenSparseFP16ROCmTest.h"

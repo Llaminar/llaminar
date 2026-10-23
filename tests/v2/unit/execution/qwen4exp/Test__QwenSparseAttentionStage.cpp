@@ -14,6 +14,8 @@
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "kernels/qwen4exp/QwenSparseMath.h"
+#include "kernels/qwen4exp/QwenSparseAttentionArithmetic.h"
+#include <stdexcept>
 #include "tensors/Tensors.h"
 #include "tensors/TensorVerification.h"
 #include "tensors/GPUTensorVerification.h"
@@ -21,12 +23,14 @@
 #include "utils/MPIContext.h"
 #include "utils/OpenMPUtils.h"
 #include "../../../integration/kernels/qwen4exp/QwenSparseNativeCodecFixture.h"
+#include "../../../integration/kernels/qwen4exp/QwenSparseSelectionCases.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <string_view>
+#include <utility>
 
 using namespace llaminar2;
 namespace
@@ -469,3 +473,346 @@ TEST(QwenSparseAttentionStage, ObservedValidationCapacityRejectsCounterOverflowW
     extent.columns=1;extent.geometry.capacity=0;
     EXPECT_THROW(checkedTensorValidationElementCapacity(extent,TensorValidationDataType::FP32),std::invalid_argument);
 }
+
+
+/**
+ * @test Every explicit selector seals an ordinary/verifier indexer independently
+ * of live state, and every compiled backend carries the same typed contract.
+ * @details Construction uses host tensor metadata and empty kernel bundles only;
+ * GPU stages are never executed, materialized or probed in this Unit regression.
+ */
+TEST(QwenSparseAttentionStage, SelectorPolicySealsEveryIndexerCapture)
+{
+    using Selection=qwen4exp::QwenSparsePoolSelection;
+    constexpr int rows=3,tokens=8,positions=16;
+    constexpr std::array selections{Selection::Installed,Selection::Bounded256_512,
+        Selection::Bounded512_512,Selection::Bounded1024_1024};
+    FP32Tensor query({rows+1,512}),otherQuery({rows+1,512}),raw({rows,128}),partial({4,128}),pools({3,128}),
+        prepared({rows,512}),scores({rows,3}),gain({128}),otherGain({128}),cosine({positions,32}),sine({positions,32});
+    INT32Tensor replay({6}),selected({rows,2051}),counts({rows}),
+        prior({static_cast<int>(sizeof(qwen4exp::QwenSparseTransactionPrior)/sizeof(std::int32_t))});
+    const Stage::Indexer input{Float(query,BufferId::QFN_QSA_QUERY),Float(raw,BufferId::QFN_QSA_RAW_KEY),
+        Float(partial,BufferId::QFN_QSA_PARTIAL_KEYS),Float(pools,BufferId::QFN_QSA_POOLED_KEYS),
+        Weight(gain),Weight(gain),Weight(cosine),Weight(sine),Float(prepared,BufferId::QFN_QSA_PREPARED_QUERY),
+        Float(scores,BufferId::QFN_QSA_SCORES),Int(selected,BufferId::QFN_QSA_SELECTED),
+        Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),2,positions};
+    EXPECT_EQ(input.poolSelection,Selection::Installed);
+    const Stage::Params base{.device_id=DeviceId::cpu(),.rowCapacity=rows,.tokenCapacity=tokens,
+        .replay=Int(replay,BufferId::QFN_QSA_REPLAY),.operation=input};
+    const auto signature=[](Stage::Params params) {
+        Stage stage(std::move(params));
+        return stage.graphCaptureVariantSignature();
+    };
+    const auto baseline=signature(base);
+    ASSERT_NE(baseline,0u);
+    EXPECT_EQ(signature(base),baseline);
+    std::vector<DeviceId> devices{DeviceId::cpu()};
+#ifdef HAVE_CUDA
+    devices.push_back(DeviceId::cuda(0));devices.push_back(DeviceId::cuda(1));
+#endif
+#ifdef HAVE_ROCM
+    devices.push_back(DeviceId::rocm(0));devices.push_back(DeviceId::rocm(1));
+#endif
+    std::vector<std::uint64_t> identities;
+    for(const auto device:devices)for(const auto policy:selections)for(const bool retained:{false,true}) {
+        SCOPED_TRACE(device.to_string());
+        SCOPED_TRACE(static_cast<int>(policy));
+        SCOPED_TRACE(retained);
+        auto params=base;params.device_id=device;
+        auto& operation=std::get<Stage::Indexer>(params.operation);
+        operation.poolSelection=policy;
+        if(retained) {
+            operation.transactionPrior=QwenSparseTransactionPriorBinding{Int(prior,BufferId::QFN_QSA_TRANSACTION_PRIOR)};
+            params.replay=Int(prior,BufferId::QFN_QSA_TRANSACTION_PRIOR);
+        }
+        Stage stage(params);
+        EXPECT_EQ(std::get<Stage::Indexer>(stage.getParams().operation).poolSelection,policy);
+        const auto actual=stage.graphCaptureVariantSignature();
+        ASSERT_NE(actual,0u);
+        EXPECT_EQ(actual,signature(params));
+        EXPECT_EQ(std::find(identities.begin(),identities.end(),actual),identities.end());
+        identities.push_back(actual);
+    }
+    // Mutation of execution-owned bytes never mutates topology or selector policy.
+    auto* state=static_cast<std::int32_t*>(replay.raw_mutable_data());
+    state[0]=5;state[1]=0;state[2]=77;
+    std::fill_n(query.mutable_data(),query.numel(),std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(signature(base),baseline);
+    const auto changed=[&](auto alter) {
+        auto params=base;alter(params);
+        EXPECT_NE(signature(params),baseline);
+    };
+    changed([](auto& p){p.rowCapacity=2;});
+    changed([](auto& p){p.tokenCapacity=7;});
+    changed([](auto& p){p.tokenCapacity=12;std::get<Stage::Indexer>(p.operation).blockCapacity=3;});
+    changed([](auto& p){p.replay.byteOffset=sizeof(std::int32_t);});
+    changed([&](auto& p){std::get<Stage::Indexer>(p.operation).query=Float(otherQuery,BufferId::QFN_QSA_QUERY);});
+    changed([](auto& p){std::get<Stage::Indexer>(p.operation).query.byteOffset=sizeof(float);});
+    changed([&](auto& p){std::get<Stage::Indexer>(p.operation).queryNorm=Weight(otherGain);});
+    changed([](auto& p){std::get<Stage::Indexer>(p.operation).epsilon=2.0e-6f;});
+    changed([](auto& p){std::get<Stage::Indexer>(p.operation).ropeTheta=10000000.0f;});
+    changed([](auto& p){std::get<Stage::Indexer>(p.operation).positionCapacity=8;});
+    changed([](auto& p){std::get<Stage::Indexer>(p.operation).rotaryDim=32;});
+    changed([](auto& p){std::get<Stage::Indexer>(p.operation).representation=qwen4exp::QwenSparseScalar::FP16;});
+    changed([](auto& p){std::get<Stage::Indexer>(p.operation).representation=qwen4exp::QwenSparseScalar::BF16;});
+    changed([](auto& p){
+        auto& operation=std::get<Stage::Indexer>(p.operation);
+        operation.rotarySource=qwen4exp::QwenSparseRotarySource::AnalyticTheta;
+        operation.cosine.reset();operation.sine.reset();
+    });
+    auto invalid=base;
+    std::get<Stage::Indexer>(invalid.operation).poolSelection=static_cast<Selection>(255);
+    EXPECT_THROW((Stage(invalid)),std::invalid_argument);
+    EXPECT_THROW(qwen4exp::validateQwenSparsePoolSelection(static_cast<Selection>(255)),std::invalid_argument);
+
+}
+
+/**
+ * @test The real CPU Indexer stage retains exact policy outputs over full/partial/empty reuse.
+ * @details CPU has no native graph function inspector. GPU companion tests witness
+ * the common stage's exact selector forwarding; this counterpart proves actual
+ * CPU execution, independent produced-score membership and retained byte behavior.
+ * All four policies include exact8195/8196 and mixed live-row pool boundaries.
+ */
+TEST(QwenSparseAttentionStage, EveryCPUSelectorPolicyExecutesRetainedRows){
+    using namespace qwen4exp;llaminar::v2::ThreadCountGuard threads(1);CPUDeviceContext context(DeviceId::cpu(),1);
+    constexpr int rows=3,tokens=8320,blocks=tokens/4,positions=tokens+17;
+    FP32Tensor query({rows,512}),raw({rows,128}),prior({4,128}),pools({blocks,128}),prepared({rows,512}),scores({rows,blocks}),
+        gain({128}),cosine({positions,32}),sine({positions,32});INT32Tensor replay({3}),selected({rows,2051}),counts({rows});
+    for(auto* value:{&query,&raw,&prior,&pools})for(std::size_t i=0;i<value->numel();++i)value->mutable_data()[i]=float((i*13+7)%67)/41.f-0.8f;
+    std::fill_n(gain.mutable_data(),gain.numel(),1.f);std::fill_n(cosine.mutable_data(),cosine.numel(),1.f);std::fill_n(sine.mutable_data(),sine.numel(),0.f);
+    const std::vector<float> poolSeed(pools.data(),pools.data()+pools.numel());
+    struct Result{std::vector<float> pools,prepared,scores;std::vector<int> selected,counts;};std::vector<Result> reference;
+    const std::array policies{QwenSparsePoolSelection::Installed,QwenSparsePoolSelection::Bounded256_512,QwenSparsePoolSelection::Bounded512_512,QwenSparsePoolSelection::Bounded1024_1024};
+    // Prefix8194 with three live rows spans visible8195,8196,8197.
+    const std::array cases{std::pair{4096,rows},std::pair{4096,2},std::pair{2047,rows},std::pair{8194,1},std::pair{8195,1},
+        std::pair{8194,rows},std::pair{8195,2},std::pair{0,0},std::pair{0,1},std::pair{8195,rows}};
+    std::vector<std::uint64_t> signatures;
+    for(auto policy:policies){SCOPED_TRACE(static_cast<int>(policy));
+        Stage::Indexer input{Float(query,BufferId::QFN_QSA_QUERY),Float(raw,BufferId::QFN_QSA_RAW_KEY),Float(prior,BufferId::QFN_QSA_PARTIAL_KEYS),
+            Float(pools,BufferId::QFN_QSA_POOLED_KEYS),Weight(gain),Weight(gain),Weight(cosine),Weight(sine),
+            Float(prepared,BufferId::QFN_QSA_PREPARED_QUERY),Float(scores,BufferId::QFN_QSA_SCORES),Int(selected,BufferId::QFN_QSA_SELECTED),
+            Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),blocks,positions};input.poolSelection=policy;
+        Stage stage({.device_id=DeviceId::cpu(),.rowCapacity=rows,.tokenCapacity=tokens,.replay=Int(replay,BufferId::QFN_QSA_REPLAY),.operation=input});
+        const auto identity=stage.graphCaptureVariantSignature();ASSERT_NE(identity,0u);
+        EXPECT_EQ(std::find(signatures.begin(),signatures.end(),identity),signatures.end());signatures.push_back(identity);
+        for(std::size_t iteration=0;iteration<cases.size();++iteration){const auto[prefix,live]=cases[iteration];SCOPED_TRACE(iteration);
+            const std::array<int,3> words{prefix,live,0};std::copy(words.begin(),words.end(),static_cast<int*>(replay.raw_mutable_data()));
+            std::copy(poolSeed.begin(),poolSeed.end(),pools.mutable_data());std::fill_n(prepared.mutable_data(),prepared.numel(),-271.75f);
+            std::fill_n(scores.mutable_data(),scores.numel(),-8191.25f);std::fill_n(static_cast<int*>(selected.raw_mutable_data()),selected.numel(),-77);
+            std::fill_n(static_cast<int*>(counts.raw_mutable_data()),counts.numel(),-99);ASSERT_TRUE(stage.execute(&context));
+            const auto* actualIds=static_cast<const int*>(selected.raw_data());const auto* actualCounts=static_cast<const int*>(counts.raw_data());
+            EXPECT_TRUE(std::equal(words.begin(),words.end(),static_cast<const int*>(replay.raw_data())));
+            for(int row=0;row<rows;++row){const int visible=prefix+row+1,complete=visible/4;std::vector<std::int32_t> expected;
+                if(row<live){if(complete>512)for(int b=0;b<complete;++b)ASSERT_TRUE(std::isfinite(scores.data()[row*blocks+b])&&scores.data()[row*blocks+b]>=0.f);
+                    expected=selection_test::oracle(complete>512?scores.data()+row*blocks:nullptr,visible);}
+                ASSERT_EQ(actualCounts[row],int(expected.size()));for(int i=0;i<2051;++i)EXPECT_EQ(actualIds[row*2051+i],i<int(expected.size())?expected[std::size_t(i)]:-77);
+                for(int b=0;b<blocks;++b)if(row>=live||complete<=512||b>=complete)EXPECT_EQ(scores.data()[row*blocks+b],-8191.25f);
+                if(row>=live)for(int d=0;d<512;++d)EXPECT_EQ(prepared.data()[row*512+d],-271.75f);}
+            Result result{{pools.data(),pools.data()+pools.numel()},{prepared.data(),prepared.data()+prepared.numel()},{scores.data(),scores.data()+scores.numel()},
+                {actualIds,actualIds+selected.numel()},{actualCounts,actualCounts+counts.numel()}};
+            if(policy==QwenSparsePoolSelection::Installed)reference.push_back(result);else{const auto& expected=reference[iteration];
+                EXPECT_EQ(result.selected,expected.selected);EXPECT_EQ(result.counts,expected.counts);
+                EXPECT_EQ(std::memcmp(result.pools.data(),expected.pools.data(),pools.size_bytes()),0);
+                EXPECT_EQ(std::memcmp(result.prepared.data(),expected.prepared.data(),prepared.size_bytes()),0);
+                EXPECT_EQ(std::memcmp(result.scores.data(),expected.scores.data(),scores.size_bytes()),0);}
+            EXPECT_EQ(stage.graphCaptureVariantSignature(),identity);ASSERT_FALSE(::testing::Test::HasFailure());}
+    }
+    EXPECT_EQ(signatures.size(),policies.size());
+}
+
+namespace
+{
+using SparseArithmetic=qwen4exp::QwenSparseAttentionArithmetic;
+/** @brief Immutable cache metadata only; construction and identity must never probe live/native state. */
+class SparseArithmeticMetadataCache final : public CPURingKVCacheFP16
+{
+public:
+    ActivationPrecision keys=ActivationPrecision::FP16,values=ActivationPrecision::FP16;
+    /** @brief Reuse the real tiny host cache's geometry; no accelerator or native view is acquired. */
+    explicit SparseArithmeticMetadataCache(const IMPIContext &mpi) : CPURingKVCacheFP16(mpi,2,2,8,2,256) {}
+    /** @copydoc IKVCache::k_precision */
+    ActivationPrecision k_precision() const override { return keys; }
+    /** @copydoc IKVCache::v_precision */
+    ActivationPrecision v_precision() const override { return values; }
+    /** @copydoc IKVCache::get_cached_tokens */
+    int get_cached_tokens(int,int=0) const override { throw std::logic_error("Identity read live cache count"); }
+    /** @copydoc IKVCache::ring_head */
+    int ring_head(int,int=0) const override { throw std::logic_error("Identity read live cache cursor"); }
+    /** @copydoc IKVCache::get_kv */
+    bool get_kv(int,int,ITensor **,ITensor **,int * =nullptr) override { throw std::logic_error("Identity read KV payload"); }
+    /** @copydoc IKVCache::get_kv */
+    bool get_kv(int,int,const ITensor **,const ITensor **,int * =nullptr) const override { throw std::logic_error("Identity read KV payload"); }
+    /** @copydoc IKVCache::append */
+    bool append(int,int,const ITensor *,const ITensor *,int) override { throw std::logic_error("Identity executed cache append"); }
+    /** @copydoc IKVCache::acquireSparseAttentionNativeView */
+    qwen4exp::QwenSparseKV acquireSparseAttentionNativeView(int,int,
+        const attention::AttentionDeviceParams *,attention::AttentionKeyCachePolicy,void *) override
+    { throw std::logic_error("Identity probed native cache storage"); }
+};
+/** @brief Host-owned declaration fixtures; even ROCm cases construct no native storage or execution context. */
+struct SparseArithmeticCaptureFixture
+{
+    FP32Tensor query{{4,6144}},otherQuery{{4,6144}},output{{4,6144}},gate{{4,6144}},
+        cosine{{16,128}},sine{{16,128}},otherCosine{{16,128}};
+    INT32Tensor replay{{8+4*sizeof(attention::AttentionDeviceParams)/sizeof(std::int32_t)}},selected{{4,2051}},counts{{4}},
+        partials{{4*24*8*sizeof(qwen4exp::QwenSparseAttentionPartial)/sizeof(std::int32_t)}},
+        observations{{4*24*sizeof(qwen4exp::QwenSparseAttentionObservation)/sizeof(std::int32_t)}};
+    /** @return A fresh exact declaration borrowing the requested immutable cache object and participant. */
+    Stage::Params params(IKVCache &cache,DeviceId device=DeviceId::cpu())
+    {
+        Stage::SelectedAttention operation{{cache,0,0,{}},Float(query,BufferId::Q_PROJ),
+            Int(selected,BufferId::QFN_QSA_SELECTED),Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),
+            Float(output,BufferId::ATTN_OUTPUT),{},{},{},{}};
+        if(device.is_gpu()) {
+            operation.rowParameters=Int(replay,BufferId::QFN_QSA_REPLAY,8*sizeof(std::int32_t));
+            operation.gpuPartials=Int(partials,BufferId::QFN_QSA_PARTIALS);
+        }
+        return {.device_id=device,.rowCapacity=3,.tokenCapacity=8,
+            .replay=Int(replay,BufferId::QFN_QSA_REPLAY),.operation=operation};
+    }
+};
+/** @return The real stage's sealed signature; no execution or native cache acquisition is permitted. */
+std::uint64_t sparseArithmeticSignature(Stage::Params params)
+{
+    Stage stage(std::move(params));
+    const auto dump=stage.getDumpInfoSnapshot();
+    EXPECT_EQ(std::count_if(dump.scalars.begin(),dump.scalars.end(),[](const auto &scalar) {
+        return std::string_view(scalar.name)=="attention_arithmetic_policy";
+    }),1);
+    const auto policy=std::find_if(dump.scalars.begin(),dump.scalars.end(),[](const auto &scalar) {
+        return std::string_view(scalar.name)=="attention_arithmetic_policy";
+    });
+    if(policy!=dump.scalars.end()) {
+        EXPECT_EQ(policy->value,static_cast<int>(std::get<Stage::SelectedAttention>(stage.getParams().operation).arithmetic));
+        EXPECT_EQ(std::string_view(policy->dtype),"int");
+    }
+    return stage.graphCaptureVariantSignature();
+}
+}
+
+/** @test Typed names, parser, defaults and backend admission reject silent arithmetic substitution. */
+TEST(QwenSparseAttentionStage, AttentionArithmeticNamesDefaultsAndBackendAdmission)
+{
+    using namespace qwen4exp;
+    EXPECT_EQ(kDefaultQwenSparseAttentionArithmetic,SparseArithmetic::FixedFP32);
+    EXPECT_EQ(QwenSparseAttention{}.arithmetic,SparseArithmetic::FixedFP32);
+    EXPECT_EQ(parseQwenSparseAttentionArithmetic("fp32"),SparseArithmetic::FixedFP32);
+    EXPECT_EQ(parseQwenSparseAttentionArithmetic("fp16_tile"),SparseArithmetic::TileFP16WithFP32Totals);
+    EXPECT_EQ(std::string_view(qwenSparseAttentionArithmeticName(SparseArithmetic::FixedFP32)),"fp32");
+    EXPECT_EQ(std::string_view(qwenSparseAttentionArithmeticName(SparseArithmetic::TileFP16WithFP32Totals)),"fp16_tile");
+    for(const auto text:{"","FP32","fp16","fp16_tile ","automatic"})
+        EXPECT_THROW(parseQwenSparseAttentionArithmetic(text),std::invalid_argument) << text;
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm}) {
+        EXPECT_NO_THROW(validateQwenSparseAttentionArithmetic(SparseArithmetic::FixedFP32,backend));
+        EXPECT_THROW(validateQwenSparseAttentionArithmetic(static_cast<SparseArithmetic>(255),backend),std::invalid_argument);
+    }
+    EXPECT_NO_THROW(validateQwenSparseAttentionArithmetic(SparseArithmetic::TileFP16WithFP32Totals,DeviceType::ROCm));
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::Vulkan,DeviceType::Metal,static_cast<DeviceType>(255)})
+        EXPECT_THROW(validateQwenSparseAttentionArithmetic(SparseArithmetic::TileFP16WithFP32Totals,backend),std::invalid_argument);
+    for(const auto backend:{DeviceType::Vulkan,DeviceType::Metal,static_cast<DeviceType>(255)})
+        EXPECT_THROW(validateQwenSparseAttentionArithmetic(SparseArithmetic::FixedFP32,backend),std::invalid_argument);
+}
+
+/** @test CPU rejects the explicit ROCm arithmetic before dereferencing even an empty native argument record. */
+TEST(QwenSparseAttentionStage, AttentionArithmeticCPUEntryRejectsBeforeBindings)
+{
+    qwen4exp::QwenSparseAttention empty;
+    empty.arithmetic=SparseArithmetic::TileFP16WithFP32Totals;
+    try {
+        qwen4exp::cpuQwenSparseAttention(empty);
+        FAIL()<<"CPU entry accepted the explicit ROCm attention experiment";
+    } catch(const std::invalid_argument &error) {
+        EXPECT_NE(std::string_view(error.what()).find("ROCm"),std::string_view::npos)
+            <<"Backend admission must precede the incomplete native binding check";
+    }
+}
+
+/** @test Selected attention seals immutable CPU declarations while mutable payloads never enter capture identity. */
+TEST(QwenSparseAttentionStage, AttentionArithmeticSelectedCaptureSealsStaticIdentity)
+{
+    MPIContext mpi(0,1,MPI_COMM_WORLD);
+    SparseArithmeticMetadataCache cache(mpi),otherCache(mpi);
+    SparseArithmeticCaptureFixture f;
+    const auto base=f.params(cache);
+    EXPECT_EQ(std::get<Stage::SelectedAttention>(base.operation).arithmetic,SparseArithmetic::FixedFP32);
+    const auto baseline=sparseArithmeticSignature(base);
+    ASSERT_NE(baseline,0u);
+    EXPECT_EQ(sparseArithmeticSignature(base),baseline);
+    const auto changed=[&](auto alter) {
+        auto params=base;alter(params);
+        EXPECT_NE(sparseArithmeticSignature(params),baseline);
+    };
+    EXPECT_NE(sparseArithmeticSignature(f.params(otherCache)),baseline);
+    cache.keys=ActivationPrecision::BF16;EXPECT_NE(sparseArithmeticSignature(base),baseline);cache.keys=ActivationPrecision::FP16;
+    cache.values=ActivationPrecision::BF16;EXPECT_NE(sparseArithmeticSignature(base),baseline);cache.values=ActivationPrecision::FP16;
+    changed([](auto &p){p.rowCapacity=2;});
+    changed([](auto &p){p.tokenCapacity=7;});
+    changed([](auto &p){p.replay.byteOffset=4;});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).native.layer=1;});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).native.sequence=1;});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).native.keyPolicy.rope_theta=20000.f;});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).native.keyPolicy.partial_rotary_factor=.25f;});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).queryHeads=12;});
+    changed([](auto &p){auto &a=std::get<Stage::SelectedAttention>(p.operation);a.queryHeads=12;a.kvHeads=1;});
+    changed([](auto &p){auto &a=std::get<Stage::SelectedAttention>(p.operation);a.queryHeads=12;a.kvHeads=1;a.queryHeadStart=12;a.kvHeadStart=1;});
+    changed([&](auto &p){std::get<Stage::SelectedAttention>(p.operation).query=Float(f.otherQuery,BufferId::Q_PROJ);});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).query.byteOffset=4;});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).selected.byteOffset=4;});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).selectedCount.byteOffset=4;});
+    changed([](auto &p){std::get<Stage::SelectedAttention>(p.operation).output.byteOffset=4;});
+    changed([&](auto &p){std::get<Stage::SelectedAttention>(p.operation).gate=Float(f.gate,BufferId::GATE_PROJ);});
+    changed([&](auto &p){std::get<Stage::SelectedAttention>(p.operation).observations=Int(f.observations,BufferId::QFN_QSA_OBSERVATIONS);});
+    auto *state=static_cast<std::int32_t *>(f.replay.raw_mutable_data());state[0]=5;state[1]=0;state[2]=77;
+    std::fill_n(f.query.mutable_data(),f.query.numel(),std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(sparseArithmeticSignature(base),baseline);
+    for(const auto arithmetic:{SparseArithmetic::TileFP16WithFP32Totals,static_cast<SparseArithmetic>(255)}) {
+        auto bad=base;std::get<Stage::SelectedAttention>(bad.operation).arithmetic=arithmetic;
+        EXPECT_THROW((Stage(bad)),std::invalid_argument);
+    }
+    auto cuda=f.params(cache,DeviceId::cuda(0));
+    std::get<Stage::SelectedAttention>(cuda.operation).arithmetic=SparseArithmetic::TileFP16WithFP32Totals;
+    EXPECT_THROW((Stage(cuda)),std::invalid_argument); // Rejection precedes any backend factory or device access.
+}
+
+#ifdef HAVE_ROCM
+/** @test The ROCm tile policy is sealed without execution and rejects unsupported codecs/transform geometry cold. */
+TEST(QwenSparseAttentionStage, AttentionArithmeticROCmTileCaptureAndColdAdmission)
+{
+    MPIContext mpi(0,1,MPI_COMM_WORLD);
+    SparseArithmeticMetadataCache cache(mpi);
+    SparseArithmeticCaptureFixture f;
+    const auto base=f.params(cache,DeviceId::rocm(0));
+    const auto fp32=sparseArithmeticSignature(base);
+    auto tile=base;std::get<Stage::SelectedAttention>(tile.operation).arithmetic=SparseArithmetic::TileFP16WithFP32Totals;
+    const auto tileIdentity=sparseArithmeticSignature(tile);
+    ASSERT_NE(fp32,0u);ASSERT_NE(tileIdentity,0u);EXPECT_NE(tileIdentity,fp32);
+    EXPECT_EQ(sparseArithmeticSignature(tile),tileIdentity);
+    auto otherDevice=tile;otherDevice.device_id=DeviceId::rocm(1);
+    EXPECT_NE(sparseArithmeticSignature(otherDevice),tileIdentity);
+    auto otherParams=tile;std::get<Stage::SelectedAttention>(otherParams.operation).rowParameters->byteOffset+=sizeof(attention::AttentionDeviceParams);
+    EXPECT_NE(sparseArithmeticSignature(otherParams),tileIdentity);
+    auto otherPartials=tile;std::get<Stage::SelectedAttention>(otherPartials.operation).gpuPartials->byteOffset+=24*8*sizeof(qwen4exp::QwenSparseAttentionPartial);
+    EXPECT_NE(sparseArithmeticSignature(otherPartials),tileIdentity);
+    for(const auto precision:{ActivationPrecision::FP32,ActivationPrecision::BF16,ActivationPrecision::Q8_1}) {
+        cache.keys=precision;EXPECT_THROW((Stage(tile)),std::invalid_argument);cache.keys=ActivationPrecision::FP16;
+        cache.values=precision;EXPECT_THROW((Stage(tile)),std::invalid_argument);cache.values=ActivationPrecision::FP16;
+    }
+    auto transform=tile;auto &a=std::get<Stage::SelectedAttention>(transform.operation);
+    a.native.keyPolicy.encoding=attention::AttentionKeyCacheEncoding::PreRotaryDeviceTransform;
+    a.native.keyPolicy.partial_rotary_factor=.25f;
+    a.keyCosine=Weight(f.cosine);a.keySine=Weight(f.sine);a.keyPositionCapacity=16;
+    const auto transformIdentity=sparseArithmeticSignature(transform);
+    EXPECT_NE(transformIdentity,tileIdentity);
+    auto differentWeight=transform;std::get<Stage::SelectedAttention>(differentWeight.operation).keyCosine=Weight(f.otherCosine);
+    EXPECT_NE(sparseArithmeticSignature(differentWeight),transformIdentity);
+    auto theta=transform;auto &analytic=std::get<Stage::SelectedAttention>(theta.operation);
+    analytic.keyRotarySource=qwen4exp::QwenSparseRotarySource::CanonicalEngineTheta;
+    analytic.keyCosine.reset();analytic.keySine.reset();
+    EXPECT_NE(sparseArithmeticSignature(theta),transformIdentity);
+    a.keyRotaryDim=32;a.native.keyPolicy.partial_rotary_factor=.125f;
+    EXPECT_THROW((Stage(transform)),std::invalid_argument);
+    auto unknown=tile;std::get<Stage::SelectedAttention>(unknown.operation).arithmetic=static_cast<SparseArithmetic>(255);
+    EXPECT_THROW((Stage(unknown)),std::invalid_argument);
+}
+#endif

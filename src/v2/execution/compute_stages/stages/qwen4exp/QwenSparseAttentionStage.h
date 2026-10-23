@@ -58,6 +58,7 @@ public:
         qwen4exp::QwenSparseRotarySource rotarySource = qwen4exp::QwenSparseRotarySource::TablePlanes;
         float ropeTheta = 10000.0f;
         std::optional<QwenSparseTransactionPriorBinding> transactionPrior; ///< Original typed replay/tail source in verifier mode.
+        qwen4exp::QwenSparsePoolSelection poolSelection = qwen4exp::QwenSparsePoolSelection::Installed; ///< Immutable native selection implementation, sealed into capture identity.
     };
     /** @brief Immutable selected-read cache identity and explicit publication encoding. */
     struct NativeCache
@@ -81,6 +82,7 @@ public:
         int keyPositionCapacity = 0, keyRotaryDim = 64;
         int queryHeads = 24, kvHeads = 2, queryHeadStart = 0, kvHeadStart = 0;
         qwen4exp::QwenSparseRotarySource keyRotarySource = qwen4exp::QwenSparseRotarySource::TablePlanes;
+        qwen4exp::QwenSparseAttentionArithmetic arithmetic = qwen4exp::kDefaultQwenSparseAttentionArithmetic; ///< Immutable arithmetic, copied to native args and capture identity.
     };
     /** @brief Publish only the accepted raw incomplete pool; frontier is published separately. */
     struct CommitPartial
@@ -122,7 +124,7 @@ public:
     bool execute(IDeviceContext *context) override;
     /** @brief Semantic graph-stage operation tag. */
     ComputeStageType type() const override;
-    /** @brief Authenticate immutable prior codecs, native origins, geometry and producer-owned pointers. */
+    /** @brief Authenticate every indexer selector/geometry/binding and retained publication identity. */
     uint64_t graphCaptureVariantSignature() const override;
     /** @brief Arithmetic bound using admitted rows and actual selected-cap limit. */
     std::size_t estimatedFlops() const override;

@@ -11,7 +11,20 @@ add_executable(v2_perf_qwen_sparse_selection EXCLUDE_FROM_ALL
     "${_qfn_test_sources}/performance/kernels/cpu/attention/Perf__QwenSparseSelection.cpp")
 target_link_libraries(v2_perf_qwen_sparse_selection PRIVATE llaminar2_core GTest::gtest_main)
 
+if(HAVE_CUDA)
+    # Same native-event fixture and original graph metadata; no profiler attachment.
+    add_executable(v2_perf_cuda_qwen_sparse_observations EXCLUDE_FROM_ALL
+        "${_qfn_test_sources}/integration/kernels/cuda/Test__CUDAQwenSparseAttention.cpp")
+    target_link_libraries(v2_perf_cuda_qwen_sparse_observations PRIVATE
+        llaminar2_core GTest::gtest_main CUDA::cudart)
+endif()
+
 if(HAVE_ROCM)
+    # Reuse the native QSA fixture in Release; disabled filters alone run events.
+    add_executable(v2_perf_rocm_qwen_sparse_observations EXCLUDE_FROM_ALL
+        "${_qfn_test_sources}/integration/kernels/rocm/Test__ROCmQwenSparseAttention.cpp")
+    target_link_libraries(v2_perf_rocm_qwen_sparse_observations PRIVATE
+        llaminar2_core GTest::gtest_main hip::host)
     set_source_files_properties(
         "${_qfn_test_sources}/performance/kernels/rocm/Perf__FloatingReduction.hip"
         PROPERTIES LANGUAGE HIP)

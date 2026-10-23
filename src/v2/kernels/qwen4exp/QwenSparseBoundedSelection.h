@@ -13,8 +13,8 @@
  */
 #pragma once
 #include "QwenSparseMath.h"
+#include <climits>
 #include <cstdint>
-#include <limits>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define QSA_BOUNDED_HD __host__ __device__ __forceinline__
@@ -26,6 +26,92 @@ namespace llaminar2::qwen4exp::bounded_selection
 {
 inline constexpr int Keep = QwenSparseBlocks;
 inline constexpr int Radix = 256;
+
+
+/**
+ * @brief Proven row-body work bounds for the score-only radix implementation.
+ * @details These are mathematical source-work counts, never observed traffic,
+ * latency predictions or a dispatch policy. Output copying and inactive-row
+ * retirement are outside this bounded selection-body scope.
+ */
+struct WorkBound final
+{
+    std::uint64_t score_elements = 0; ///< Exact live score reads; zero when every pool is selected.
+    std::uint64_t source_scan_rounds = 0; ///< Exact 256-thread source filtering rounds.
+    std::uint64_t compactions_max = 0; ///< Tight maximum over valid score arrangements.
+    std::uint64_t compacted_keys_max = 0; ///< Tight summed compaction bank sizes.
+    std::uint64_t score_radix_passes_max = 0; ///< At most four score digits per compaction; may be zero in execution.
+    std::uint64_t score_radix_key_visits_max = 0; ///< Bank-key reads inside histogram passes, not bytes or atomic counts.
+    std::uint64_t compact_output_rounds_max = 0; ///< Tight maximum for stable tie-compaction rounds over aligned source segments.
+    std::uint64_t body_barriers_max = 0; ///< Bounded selection-body CTA barriers, excluding output copying.
+    /** @return Exact fieldwise source-bound equality, useful for admission witnesses. */
+    constexpr bool operator==(const WorkBound&) const = default;
+};
+
+/**
+ * @brief Bound exact supported selector geometries without reading any scores.
+ * @param policy One of the three explicit bounded implementations.
+ * @param completePools Nonnegative complete pools within native signed-int token geometry.
+ * @param result Published only on success; invalid admission leaves every field unchanged.
+ * @return False for another policy, negative pools, or pools beyond floor(INT_MAX/4).
+ * @details All supported Block values are multiples of256, and each Slack
+ * is a whole number of Blocks (or one Block for B1024). Initially every valid total key passes, so first regular compaction
+ * is after1024 pools for B256/S512 and B512/S512, or2048 for B1024/S1024.
+ * Each later regular call requires at least Slack new arrivals; a last partial
+ * group can instead force one final call. Ascending scores attain the count and
+ * W=N+512*(C-1). Every regular call ends at a whole Block, and Blocks
+ * contain whole256-thread rounds. For arrivals A_j since the prior compact,
+ * bank sizes are A_1 and512+A_j. Disjoint source segments L_j bound A_j;
+ * only the final segment may be partial, so sum ceil(A_j/256)<=ceil(N/256).
+ * Hence compact output rounds <=ceil(N/256)+2*(C-1), attained by ascending
+ * scores. A skipped redundant final call only omits rejected-only trailing
+ * source arrivals. Four score digits then bound histogram/compaction work. Admission bounds every intermediate well below
+ * uint64 overflow; this proves selector arithmetic, not all extreme-context
+ * native traversals. It does not choose a kernel or advertise an economic win.
+ */
+QSA_BOUNDED_HD constexpr bool workBound(QwenSparsePoolSelection policy,
+    std::int64_t completePools, WorkBound& result) noexcept
+{
+    static_assert(Keep == 512 && Radix == 256 && QwenSparsePool == 4);
+    if (completePools < 0 || completePools > INT_MAX / QwenSparsePool)
+        return false;
+    struct Geometry final { std::uint64_t block, slack; };
+    constexpr Geometry b256{256,512}, b512{512,512}, b1024{1024,1024};
+    static_assert(b256.slack % b256.block == 0 && b512.slack % b512.block == 0 &&
+        b1024.slack % b1024.block == 0);
+    static_assert(b256.block % 256 == 0 && b512.block % 256 == 0 && b1024.block % 256 == 0);
+    Geometry geometry{};
+    switch (policy)
+    {
+    case QwenSparsePoolSelection::Bounded256_512: geometry = b256; break;
+    case QwenSparsePoolSelection::Bounded512_512: geometry = b512; break;
+    case QwenSparsePoolSelection::Bounded1024_1024: geometry = b1024; break;
+    default: return false;
+    }
+    const auto trigger = std::uint64_t(Keep) + geometry.slack;
+    const auto first = (trigger / geometry.block + (trigger % geometry.block != 0)) * geometry.block;
+    const auto period = geometry.slack; // Proven whole-block interval by the static assertions above.
+    WorkBound bound;
+    const auto pools = static_cast<std::uint64_t>(completePools);
+    if (pools > static_cast<std::uint64_t>(Keep))
+    {
+        const auto remaining = pools > first ? pools - first : 0;
+        bound.score_elements = pools;
+        bound.source_scan_rounds = pools / 256 + (pools % 256 != 0);
+        bound.compactions_max = 1 + remaining / period + (remaining % period != 0);
+        bound.compacted_keys_max = pools + std::uint64_t(Keep) * (bound.compactions_max - 1);
+        bound.score_radix_passes_max = 4 * bound.compactions_max;
+        bound.score_radix_key_visits_max = 4 * bound.compacted_keys_max;
+        bound.compact_output_rounds_max = bound.source_scan_rounds +
+            (std::uint64_t(Keep) / 256) * (bound.compactions_max - 1);
+        // Per compact: 2 min/max + 3 per digit + 1 pivot + 4 per
+        // tie-compaction round + 2 retained-minimum publication barriers.
+        bound.body_barriers_max = 1 + 3 * bound.source_scan_rounds + 5 * bound.compactions_max +
+            3 * bound.score_radix_passes_max + 4 * bound.compact_output_rounds_max;
+    }
+    result = bound;
+    return true;
+}
 
 /** @brief Trivial lexical storage; native kernels place it in CTA shared memory. */
 template<int Block, int Slack>
@@ -61,6 +147,18 @@ QSA_BOUNDED_HD bool validScoreBits(std::uint32_t bits)
 }
 
 /**
+ * @brief Canonicalize only signed-zero encodings without changing any nonzero sign/domain.
+ * @param bits Original FP32 score bits; native score producers publish finite nonnegative values.
+ * @return Positive zero for either zero, otherwise the original unchanged encoding.
+ * @details This is not validation: callers retain validScoreBits and their existing
+ * failure contract. In particular a negative nonzero, NaN or infinity is never repaired.
+ */
+QSA_BOUNDED_HD std::uint32_t canonicalScoreBits(std::uint32_t bits)
+{
+    return (bits & 0x7fffffffu) == 0 ? 0u : bits;
+}
+
+/**
  * @brief Preserve FP32 value ordering and canonical lower original ID for ties.
  * @param bits Original immutable FP32 score encoding, already domain-validated.
  * @param id Original nonnegative complete-pool index, never a compact ordinal.
@@ -68,7 +166,7 @@ QSA_BOUNDED_HD bool validScoreBits(std::uint32_t bits)
  */
 QSA_BOUNDED_HD std::uint64_t key(std::uint32_t bits, std::uint32_t id)
 {
-    if ((bits & 0x7fffffffu) == 0) bits = 0;
+    bits = canonicalScoreBits(bits);
     return (std::uint64_t(bits) << 32) | std::uint64_t(UINT32_MAX - id);
 }
 
@@ -123,9 +221,11 @@ QSA_BOUNDED_HD void begin(Storage<Block, Slack> &storage)
  * @brief Exact scalar counterpart of bounded radix threshold and stable compaction.
  * @param storage Actual lexical bank, with unique keys in original-ID order.
  * @return False for malformed size or a non-512 retained frontier.
- * @details Histogram counts are bounded integers. A full selected bucket can
- * terminate early; stable compaction then computes the TRUE retained minimum,
- * preserving an exact monotone threshold even when low radix bytes were skipped.
+ * @details Radix visits score bytes only (shifts 56 through 32). Banks remain
+ * in ascending original-ID order, so a partial cutoff-score tie retains its
+ * earliest rank members without visiting ID bytes. Full-bucket termination
+ * remains valid at a coarse score lower bound. Stable compaction still computes
+ * the true minimum complete 64-bit key, preserving the exact scan threshold.
  */
 template<int Block, int Slack>
 inline bool compactScalar(Storage<Block, Slack> &storage)
@@ -140,9 +240,10 @@ inline bool compactScalar(Storage<Block, Slack> &storage)
         maximum = source[i] > maximum ? source[i] : maximum;
     }
     int shift = firstShift(minimum, maximum);
-    std::uint64_t prefix = maximum & prefixMask(shift);
+    // Equal score words differ only in their ID suffix. No histogram is needed.
+    std::uint64_t prefix = shift < 32 ? minimum & 0xffffffff00000000ULL : maximum & prefixMask(shift);
     int rank = Keep;
-    for (;; shift -= 8)
+    for (; shift >= 32; shift -= 8)
     {
         for (auto &count : storage.histogram) count = 0;
         const auto mask = prefixMask(shift);
@@ -159,14 +260,18 @@ inline bool compactScalar(Storage<Block, Slack> &storage)
         }
         if (bucket < 0) return false;
         prefix |= std::uint64_t(bucket) << shift;
-        if (rank == static_cast<int>(storage.histogram[bucket]) || shift == 0) break;
+        if (rank == static_cast<int>(storage.histogram[bucket]) || shift == 32) break;
     }
-    int written = 0;
+    int written = 0, tie_seen = 0;
     minimum = UINT64_MAX;
     for (int i = 0; i < storage.size; ++i)
     {
         const auto value = source[i];
-        if (value < prefix) continue;
+        const auto score = value & 0xffffffff00000000ULL;
+        const bool equal = score == prefix;
+        const bool keep = score > prefix || (equal && tie_seen < rank);
+        tie_seen += equal;
+        if (!keep) continue;
         if (written == Keep) return false;
         target[written++] = value;
         minimum = value < minimum ? value : minimum;

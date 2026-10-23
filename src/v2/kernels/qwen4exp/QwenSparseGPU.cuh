@@ -237,12 +237,12 @@ __global__ __launch_bounds__(256, 2) void selectPools(QwenSparseIndexer p)
         const std::uint32_t candidate = threshold | (std::uint32_t{1} << bit);
         int local = 0;
         for (int block = lane; block < blocks; block += 32)
-            local += detail::floatBits(scores[block]) >= candidate;
+            local += bounded_selection::canonicalScoreBits(detail::floatBits(scores[block])) >= candidate;
         if (sumCount(local) >= QwenSparseBlocks) threshold = candidate;
     }
     int greater = 0;
     for (int block = lane; block < blocks; block += 32)
-        greater += detail::floatBits(scores[block]) > threshold;
+        greater += bounded_selection::canonicalScoreBits(detail::floatBits(scores[block])) > threshold;
     const int tie_budget = QwenSparseBlocks - sumCount(greater);
     int tie_seen = 0;
     int written = 0;
@@ -250,7 +250,7 @@ __global__ __launch_bounds__(256, 2) void selectPools(QwenSparseIndexer p)
     for (int base = 0; base < blocks; base += 32)
     {
         const int block = base + lane;
-        const auto bits = block < blocks ? detail::floatBits(scores[block]) : 0xffffffffu;
+        const auto bits = block < blocks ? bounded_selection::canonicalScoreBits(detail::floatBits(scores[block])) : 0xffffffffu;
         const int equal = block < blocks && bits == threshold;
         const auto equals = ballot(equal);
         const int equal_before = __popc(equals & prior_lanes);
@@ -287,11 +287,23 @@ __device__ __forceinline__ int sumWide(int local, int *warps)
  * and population counts move between threads. This keeps a long-context M=1
  * transaction from scanning every score thirty-one times on one half-wave.
  */
-__global__ __launch_bounds__(256, 2) void selectPoolsWide(QwenSparseIndexer p)
+/** @brief Exact lexical storage for the Installed CTA-wide integer selector. */
+struct WideSelectionStorage final
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
-    require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
-    const int row = int(blockIdx.x), thread = int(threadIdx.x), lane = thread % 32, warp = thread / 32;
+    int counts[8], equals[8], chosen[8];
+};
+static_assert(sizeof(WideSelectionStorage) == 96);
+/**
+ * @brief Execute the Installed Wide row program on all 256 threads of its CTA.
+ * @param p Original native bindings and immutable arithmetic policy.
+ * @param r Authenticated device-owned replay; never a host-derived live frontier.
+ * @param row Unique physical row owned by this CTA.
+ * @param storage Exclusive lexical shared storage, initialized at each publication edge.
+ */
+__device__ __forceinline__ void selectPoolsWideRow(const QwenSparseIndexer& p,
+    const QwenSparseReplay& r, int row, WideSelectionStorage& storage)
+{
+    const int thread = int(threadIdx.x), lane = thread % 32, warp = thread / 32;
     if (row >= r.live_rows)
     {
         if (thread == 0) p.selected_count[row] = 0;
@@ -306,26 +318,26 @@ __global__ __launch_bounds__(256, 2) void selectPoolsWide(QwenSparseIndexer p)
         return;
     }
     const auto *scores = p.scores + std::size_t(row) * p.block_capacity;
-    __shared__ int counts[8];
-    __shared__ int equals[8];
-    __shared__ int chosen[8];
+    auto* counts = storage.counts;
+    auto* equals = storage.equals;
+    auto* chosen = storage.chosen;
     std::uint32_t threshold = 0;
     for (int bit = 30; bit >= 0; --bit)
     {
         const auto candidate = threshold | (std::uint32_t{1} << bit);
         int count = 0;
-        for (int block = thread; block < blocks; block += 256) count += detail::floatBits(scores[block]) >= candidate;
+        for (int block = thread; block < blocks; block += 256) count += bounded_selection::canonicalScoreBits(detail::floatBits(scores[block])) >= candidate;
         if (sumWide(count, counts) >= QwenSparseBlocks) threshold = candidate;
     }
     int greater = 0;
-    for (int block = thread; block < blocks; block += 256) greater += detail::floatBits(scores[block]) > threshold;
+    for (int block = thread; block < blocks; block += 256) greater += bounded_selection::canonicalScoreBits(detail::floatBits(scores[block])) > threshold;
     const int tie_budget = QwenSparseBlocks - sumWide(greater, counts);
     int tie_seen = 0, written = 0;
     const auto prior_lanes = (std::uint32_t{1} << lane) - 1u;
     for (int base = 0; base < blocks; base += 256)
     {
         const int block = base + thread;
-        const auto bits = block < blocks ? detail::floatBits(scores[block]) : 0xffffffffu;
+        const auto bits = block < blocks ? bounded_selection::canonicalScoreBits(detail::floatBits(scores[block])) : 0xffffffffu;
         const bool equal = block < blocks && bits == threshold;
         const auto equal_mask = ballot(equal);
         if (lane == 0) equals[warp] = __popc(equal_mask);
@@ -347,6 +359,14 @@ __global__ __launch_bounds__(256, 2) void selectPoolsWide(QwenSparseIndexer p)
     if (thread < visible % 4) output[2048 + thread] = blocks * 4 + thread;
     if (thread == 0) p.selected_count[row] = 2048 + visible % 4;
 }
+/** @brief Original Installed Wide entrypoint; geometry and static storage remain explicit. */
+__global__ __launch_bounds__(256, 2) void selectPoolsWide(QwenSparseIndexer p)
+{
+    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
+    __shared__ WideSelectionStorage storage;
+    selectPoolsWideRow(p, r, int(blockIdx.x), storage);
+}
 /** @brief Fixed32-lane unsigned key reduction, independent of wave32/wave64 scheduling. */
 __device__ __forceinline__ std::uint64_t reduceKey(std::uint64_t value, bool minimum)
 {
@@ -363,11 +383,95 @@ __device__ __forceinline__ std::uint64_t reduceKey(std::uint64_t value, bool min
 }
 
 /**
+ * @brief Publish the exact descending histogram pivot from one fixed 32-lane owner.
+ * @param storage Exclusive CTA bank after its histogram-ready publication barrier.
+ * @details Only the first logical group of 32 threads calls this helper, including
+ * the lower half of a HIP wave64. Each lane owns eight contiguous integer bins.
+ * A five-step suffix of lane totals locates the unique owning interval; its lane
+ * then scans at most eight bins. This adapts the pinned DeepSelect algorithm in
+ * common_parts.cuh::find_pivot_in_histogram (bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18).
+ * No vendor PTX is used. Histogram generation remains unchanged, so every count
+ * and their total are bounded by the admitted bank capacity, at most 2560 keys.
+ * The owner ballot consumes every lane's old rank before any state publication.
+ * There is no CTA barrier here: all 256 threads join the caller's final barrier.
+ */
+template<int Block, int Slack>
+__device__ __forceinline__ void selectBoundedHistogramPivot(
+    bounded_selection::Storage<Block, Slack> &storage)
+{
+    const int lane = int(threadIdx.x) % 32;
+    const std::uint32_t old_rank = static_cast<std::uint32_t>(storage.rank);
+    const int old_shift = storage.shift;
+    const std::uint64_t old_prefix = storage.prefix;
+    std::uint32_t counts[8];
+    std::uint32_t local_total = 0;
+    #pragma unroll
+    for (int index = 0; index < 8; ++index)
+    {
+        counts[index] = storage.histogram[lane * 8 + index];
+        local_total += counts[index];
+    }
+    std::uint32_t inclusive_suffix = local_total;
+    #pragma unroll
+    for (int distance = 1; distance <= 16; distance *= 2)
+    {
+#if defined(__HIPCC__)
+        const auto other = __shfl_down(inclusive_suffix, distance, 32);
+#else
+        const auto other = __shfl_down_sync(0xffffffffu, inclusive_suffix, distance, 32);
+#endif
+        if (lane + distance < 32) inclusive_suffix += other;
+    }
+#if defined(__HIPCC__)
+    const auto parent_total = __shfl(inclusive_suffix, 0, 32);
+#else
+    const auto parent_total = __shfl_sync(0xffffffffu, inclusive_suffix, 0, 32);
+#endif
+    require(old_rank >= 1u && old_rank <= parent_total &&
+        parent_total <= static_cast<std::uint32_t>(storage.size));
+    std::uint32_t greater = inclusive_suffix - local_total;
+    const bool owns = greater < old_rank && old_rank <= inclusive_suffix;
+    // CUDA's synchronized ballot and HIP's active logical half-wave consume all
+    // interval predicates before the sole publisher can change shared rank.
+    const auto owners = ballot(owns);
+    require(__popc(owners) == 1);
+    if (owns)
+    {
+        int selected_index = -1;
+        std::uint32_t residual = 0, population = 0;
+        // Constant unrolled accesses keep the eight counts register-addressable;
+        // a dynamic counts[selected_index] could introduce private-memory traffic.
+        #pragma unroll
+        for (int index = 7; index >= 0; --index)
+        {
+            if (selected_index < 0)
+            {
+                if (old_rank <= greater + counts[index])
+                {
+                    selected_index = index;
+                    residual = old_rank - greater;
+                    population = counts[index];
+                }
+                else greater += counts[index];
+            }
+        }
+        require(selected_index >= 0 && residual >= 1u && residual <= population);
+        ++storage.observation.radix_passes;
+        storage.prefix = old_prefix | (std::uint64_t(lane * 8 + selected_index) << old_shift);
+        storage.rank = static_cast<int>(residual);
+        storage.done = residual == population || old_shift == 32;
+        if (!storage.done) storage.shift = old_shift - 8;
+    }
+}
+
+/**
  * @brief Compact only a bounded shared bank, preserving original ascending IDs.
  * @param storage Exclusive CTA lexical storage; all256 threads must participate.
- * @details Common-prefix skipping and full selected-bucket termination shorten
- * radix work without weakening the true retained threshold. All exits converge
- * before a selected bank is published; integer histograms have no rounding/order.
+ * @details Only the four score bytes enter radix; stable ascending original-ID
+ * order resolves the remaining cutoff tie. Equal scores need no histogram.
+ * Histogram slots 0 through 7 become warp tie counts only after radix retires;
+ * shift becomes the cumulative tie count after that same CTA publication edge.
+ * The retained threshold remains the true minimum complete 64-bit key.
  */
 template<int Block, int Slack>
 __device__ __forceinline__ void compactBounded(bounded_selection::Storage<Block, Slack> &storage)
@@ -396,9 +500,10 @@ __device__ __forceinline__ void compactBounded(bounded_selection::Storage<Block,
             maximum = storage.warp_max[i] > maximum ? storage.warp_max[i] : maximum;
         }
         storage.shift = bounded_selection::firstShift(minimum, maximum);
-        storage.prefix = maximum & bounded_selection::prefixMask(storage.shift);
+        storage.prefix = storage.shift < 32 ? minimum & 0xffffffff00000000ULL :
+            maximum & bounded_selection::prefixMask(storage.shift);
         storage.rank = QwenSparseBlocks;
-        storage.done = 0;
+        storage.done = storage.shift < 32;
     }
     __syncthreads();
     while (!storage.done)
@@ -414,24 +519,14 @@ __device__ __forceinline__ void compactBounded(bounded_selection::Storage<Block,
                 atomicAdd(&storage.histogram[(value >> storage.shift) & 255u], 1u);
         }
         __syncthreads();
-        if (thread == 0)
-        {
-            ++storage.observation.radix_passes;
-            int bucket = 255;
-            for (; bucket >= 0; --bucket)
-            {
-                const auto count = static_cast<int>(storage.histogram[bucket]);
-                if (storage.rank <= count) break;
-                storage.rank -= count;
-            }
-            require(bucket >= 0);
-            storage.prefix |= std::uint64_t(bucket) << storage.shift;
-            storage.done = storage.rank == static_cast<int>(storage.histogram[bucket]) || storage.shift == 0;
-            if (!storage.done) storage.shift -= 8;
-        }
+        // One logical warp selects the pivot while all CTA participants retain
+        // the same existing histogram-ready and final publication barriers.
+        if (thread < 32) selectBoundedHistogramPivot(storage);
         __syncthreads();
     }
-    if (thread == 0) { storage.written = 0; storage.pivot = storage.prefix; }
+    // All histogram readers retired at the preceding radix publication edge.
+    // Reuse shift for tie_seen; rank is the residual cutoff-bucket budget.
+    if (thread == 0) { storage.written = 0; storage.pivot = storage.prefix; storage.shift = 0; }
     __syncthreads();
     minimum = UINT64_MAX;
     const auto prior_lanes = (std::uint32_t{1} << lane) - 1u;
@@ -439,7 +534,19 @@ __device__ __forceinline__ void compactBounded(bounded_selection::Storage<Block,
     {
         const int index = base + thread;
         const auto value = index < storage.size ? source[index] : 0;
-        const bool keep = index < storage.size && value >= storage.pivot;
+        const auto score = value & 0xffffffff00000000ULL;
+        const bool equal = index < storage.size && score == storage.pivot;
+        const auto equal_mask = ballot(equal);
+        if (lane == 0) storage.histogram[warp] = __popc(equal_mask);
+        __syncthreads();
+        int equal_before = __popc(equal_mask & prior_lanes), equal_total = 0;
+        for (int i = 0; i < 8; ++i)
+        {
+            if (i < warp) equal_before += storage.histogram[i];
+            equal_total += storage.histogram[i];
+        }
+        const bool keep = index < storage.size && (score > storage.pivot ||
+            (equal && storage.shift + equal_before < storage.rank));
         const auto mask = ballot(keep);
         if (lane == 0) storage.warp_counts[warp] = __popc(mask);
         __syncthreads();
@@ -456,7 +563,7 @@ __device__ __forceinline__ void compactBounded(bounded_selection::Storage<Block,
             minimum = value < minimum ? value : minimum;
         }
         __syncthreads();
-        if (thread == 0) storage.written += total;
+        if (thread == 0) { storage.written += total; storage.shift += equal_total; }
         __syncthreads();
     }
     minimum = reduceKey(minimum, true);
@@ -483,12 +590,18 @@ __device__ __forceinline__ void compactBounded(bounded_selection::Storage<Block,
  * there is no upstream randomized expected-work guarantee. Score arithmetic,
  * complete-pool visibility, canonical ties, tails and inactive storage are fixed.
  */
+/**
+ * @brief Execute one exact bounded scan/filter/compact row on all 256 CTA threads.
+ * @param p Original native inputs and exclusive selection outputs.
+ * @param r Authenticated execution-owned replay.
+ * @param row Unique physical row owned by this CTA.
+ * @param storage Exclusive initialized-lifetime lexical storage, with dirty payload permitted.
+ */
 template<int Block, int Slack>
-__global__ __launch_bounds__(256, 1) void selectPoolsBounded(QwenSparseIndexer p)
+__device__ __forceinline__ void selectPoolsBoundedRow(const QwenSparseIndexer& p,
+    const QwenSparseReplay& r, int row, bounded_selection::Storage<Block, Slack>& storage)
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
-    require(!p.transaction_prior || p.transaction_prior->row_capacity == p.row_capacity);
-    const int row = int(blockIdx.x), thread = int(threadIdx.x), lane = thread % 32, warp = thread / 32;
+    const int thread = int(threadIdx.x), lane = thread % 32, warp = thread / 32;
     if (row >= r.live_rows)
     {
         if (thread == 0)
@@ -510,7 +623,6 @@ __global__ __launch_bounds__(256, 1) void selectPoolsBounded(QwenSparseIndexer p
         }
         return;
     }
-    __shared__ bounded_selection::Storage<Block, Slack> storage;
     if (thread == 0) bounded_selection::begin(storage);
     __syncthreads();
     const auto *scores = p.scores + std::size_t(row) * p.block_capacity;
@@ -568,7 +680,15 @@ __global__ __launch_bounds__(256, 1) void selectPoolsBounded(QwenSparseIndexer p
         if (p.selection_observations) p.selection_observations[row] = storage.observation;
     }
 }
-
+/** @brief Original explicit bounded entrypoint; constant geometry and storage are unchanged. */
+template<int Block, int Slack>
+__global__ __launch_bounds__(256, 1) void selectPoolsBounded(QwenSparseIndexer p)
+{
+    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    require(!p.transaction_prior || p.transaction_prior->row_capacity == p.row_capacity);
+    __shared__ bounded_selection::Storage<Block, Slack> storage;
+    selectPoolsBoundedRow(p, r, int(blockIdx.x), storage);
+}
 /**
  * @brief Rotate TQ queries once into the caller's not-yet-published output row.
  *
@@ -597,7 +717,17 @@ __global__ __launch_bounds__(256, 2) void rotateQueries(QwenSparseAttention p)
         if (lane == 0) p.output[offset + output] = sum;
     }
 }
-/** @brief Selected native-KV attention with row-invariant fixed reduction topology. */
+/**
+ * @brief Compute one selected native-KV partition in a fixed arithmetic order.
+ * @tparam KeyCodec Immutable native key encoding selected before capture.
+ * @tparam ValueCodec Immutable native value encoding selected before capture.
+ * @tparam TransformKeys Whether the declared key bank requires selected-only RoPE.
+ * @param p Persistent storage and device-owned replay and selection bindings.
+ * @details Each CTA owns one row/head/partition. Every QK lane retains its eight
+ * query coordinates across selected tokens, avoiding repeated shared loads.
+ * QK coordinates, softmax reductions and PV tokens retain their original order.
+ * Empty partitions publish metadata only, and inactive rows publish nothing.
+ */
 template<TensorType KeyCodec, TensorType ValueCodec, bool TransformKeys>
 __global__ __launch_bounds__(256, 2) void selectedAttentionPartitions(QwenSparseAttention p)
 {
@@ -645,21 +775,33 @@ __global__ __launch_bounds__(256, 2) void selectedAttentionPartitions(QwenSparse
     __syncthreads();
     const int subgroup = d / 32;
     const int lane = d % 32;
-    int key_reads = 0;
+    // The query is immutable throughout this partition. Make each lane's query
+    // lifetime explicit across the selected-token loop rather than relying on
+    // compiler load hoisting. These are the same FP32 values, with no new
+    // arithmetic or workspace; native resource and timing gates check the trade.
+    float lane_query[QwenSparseHeadDim / 32];
+#pragma unroll
+    for (int step = 0; step < QwenSparseHeadDim / 32; ++step)
+        lane_query[step] = shared_query[lane + step * 32];
     for (int index = subgroup; index < count; index += 8)
     {
         const int logical = selected[index];
         const int physical = detail::physicalRow(logical, origin, capacity);
         float score = 0.0f;
-        for (int coordinate = lane; coordinate < 256; coordinate += 32)
+        // Each lane owns exactly eight ascending coordinates. Express that
+        // fixed trip count so unrelated observation code cannot make LLVM roll
+        // this loop into serialized key/query loads. The dependent FMA chain
+        // retains the original order; only independent loads can move ahead.
+#pragma unroll
+        for (int step = 0; step < QwenSparseHeadDim / 32; ++step)
         {
+            const int coordinate = lane + step * 32;
             // The immutable cache encoding is selected before capture. Native
             // post-RoPE banks must not pay registers for unused sine/exp code.
             float key;
             if constexpr(TransformKeys)key=detail::readKeyAs<KeyCodec>(p.kv,physical,logical,kv_head,coordinate,r.position_origin);
             else key=detail::readBankAs<KeyCodec,detail::BankRole::Key>(p.kv.keys,physical,kv_head,coordinate);
-            score=fmaf(shared_query[coordinate],key,score);
-            key_reads+=TransformKeys && coordinate<p.kv.key_rotary_dim ? 2 : 1;
+            score=fmaf(lane_query[step],key,score);
         }
         for (int distance = 16; distance; distance /= 2) score += shuffleDown(score, distance);
         if (lane == 0) logits[index] = score * 0.0625f;
@@ -692,42 +834,25 @@ __global__ __launch_bounds__(256, 2) void selectedAttentionPartitions(QwenSparse
     const float denominator = reduction[0];
     require(isfinite(denominator) && denominator > 0.0f);
     float result = 0.0f;
-    int value_reads = 0;
     for (int index = 0; index < count; ++index)
     {
         const int physical = detail::physicalRow(selected[index], origin, capacity);
         result = fmaf(logits[index],
                       detail::readBankAs<ValueCodec>(p.kv.values, physical, kv_head, d), result);
-        ++value_reads;
     }
     output[d] = result;
     if (d == 0) { partial.maximum = maximum; partial.denominator = denominator; }
-    if (p.observations)
+    if (d == 0 && p.observations)
     {
-        __syncthreads();
-        // Counts are bounded by 2051*256 and exactly represented in FP32;
-        // reusing dead reduction storage introduces no new arena requirement.
-        reduction[d] = static_cast<float>(key_reads);
-        __syncthreads();
-        for (int width = 128; width; width /= 2)
-        {
-            if (d < width) reduction[d] += reduction[d + width];
-            __syncthreads();
-        }
-        const int total_keys = static_cast<int>(reduction[0]);
-        __syncthreads();
-        reduction[d] = static_cast<float>(value_reads);
-        __syncthreads();
-        for (int width = 128; width; width /= 2)
-        {
-            if (d < width) reduction[d] += reduction[d + width];
-            __syncthreads();
-        }
-        if (d == 0)
-        {
-            partial.key_elements = static_cast<std::uint32_t>(total_keys);
-            partial.value_elements = static_cast<std::uint32_t>(reduction[0]);
-        }
+        // These are logical decoded coordinates, not physical transactions or
+        // codec bytes: every selected key contributes one coordinate per QK
+        // dimension and pre-RoPE coordinates additionally decode their partner.
+        // Each PV dimension decodes every selected value once. The unique
+        // metadata writer derives exact bounded integer totals without touching
+        // the FP32 reduction tree or synchronizing diagnostic-only work.
+        partial.key_elements = static_cast<std::uint32_t>(count *
+            (256 + (TransformKeys ? p.kv.key_rotary_dim : 0)));
+        partial.value_elements = static_cast<std::uint32_t>(count * 256);
     }
 }
 /** @brief Merge the same eight arithmetic partitions for serial and grouped execution. */

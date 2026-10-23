@@ -368,6 +368,7 @@ void cpuQwenSparseSelectPools(const QwenSparseIndexer &p)
 
 void cpuQwenSparseAttention(const QwenSparseAttention &p)
 {
+    validateQwenSparseAttentionArithmetic(p.arithmetic,DeviceType::CPU);
     validateQwenSparseAttention(p);
     const auto isa = nativeISA();
     validateReplay(*p.replay, p.row_capacity, p.token_capacity);

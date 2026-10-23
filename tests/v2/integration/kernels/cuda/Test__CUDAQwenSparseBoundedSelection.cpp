@@ -3,6 +3,7 @@
  * @brief CUDA actual captured bounded-selector correctness and paired timing.
  */
 #include "kernels/cuda/attention/CUDAQwenSparseAttention.h"
+#define QSB_CUDA_RUNTIME 1 // Backend identity stays explicit when both SDK headers are visible.
 #define QSB_RT(name) cuda##name
 #define QSB_STREAM cudaStream_t
 #define QSB_GRAPH cudaGraph_t

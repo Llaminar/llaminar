@@ -100,23 +100,33 @@ void validateQwenSparsePriorSnapshot(const QwenSparsePriorSnapshot& p)
             throw std::invalid_argument("QSA terminal counter words overlap immutable snapshot data");
     }
 }
+void validateQwenSparsePoolSelection(QwenSparsePoolSelection policy)
+{
+    switch (policy)
+    {
+    case QwenSparsePoolSelection::Installed:
+    case QwenSparsePoolSelection::Bounded256_512:
+    case QwenSparsePoolSelection::Bounded512_512:
+    case QwenSparsePoolSelection::Bounded1024_1024: return;
+    }
+    throw std::invalid_argument("QSA selection policy is unknown");
+}
+
+void validateQwenSparsePoolSelection(QwenSparsePoolSelection policy, int rows)
+{
+    validateQwenSparsePoolSelection(policy);
+    if (rows <= 0) throw std::invalid_argument("QSA selector requires positive admitted row capacity");
+}
+
 void validateQwenSparseSelection(const QwenSparseIndexer &p)
 {
     if (!p.replay || !p.scores || !p.selected || !p.selected_count ||
         p.row_capacity <= 0 || p.token_capacity <= 0 ||
         p.block_capacity < (std::int64_t(p.token_capacity) + 3) / QwenSparsePool)
         throw std::invalid_argument("QSA selection requires original replay, distinct banks and admitted geometry");
-    switch (p.pool_selection)
-    {
-    case QwenSparsePoolSelection::Installed:
-        if (p.selection_observations)
-            throw std::invalid_argument("QSA installed selector has no bounded-candidate observations");
-        break;
-    case QwenSparsePoolSelection::Bounded256_512:
-    case QwenSparsePoolSelection::Bounded512_512:
-    case QwenSparsePoolSelection::Bounded1024_1024: break;
-    default: throw std::invalid_argument("QSA selection policy is unknown");
-    }
+    validateQwenSparsePoolSelection(p.pool_selection, p.row_capacity);
+    if (p.pool_selection == QwenSparsePoolSelection::Installed && p.selection_observations)
+        throw std::invalid_argument("QSA Installed selector have no bounded-only observations");
     if (p.transaction_prior && (p.replay != &p.transaction_prior->replay))
         throw std::invalid_argument("QSA selection replay is foreign to immutable transaction prior");
     struct Span { std::uintptr_t begin; std::size_t bytes; };
@@ -171,6 +181,7 @@ void validateQwenSparseIndexer(const QwenSparseIndexer &p)
 }
 void validateQwenSparseAttention(const QwenSparseAttention &p)
 {
+    (void)qwenSparseAttentionArithmeticName(p.arithmetic);
     if (!p.replay || !p.query || !p.selected || !p.selected_count || !p.output || p.row_capacity <= 0 || p.token_capacity <= 0)
         throw std::invalid_argument("Qwen sparse attention: invalid native cache or selected-index binding");
     if (p.query_heads <= 0 || p.kv_heads <= 0 || p.query_head_start < 0 || p.kv_head_start < 0 ||

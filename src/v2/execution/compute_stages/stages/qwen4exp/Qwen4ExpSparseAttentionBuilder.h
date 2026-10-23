@@ -11,10 +11,13 @@
 #include "QwenSparseAttentionStage.h"
 #include "Qwen4ExpHyperconnectionBuilder.h"
 #include "../AttentionConsumerBinding.h"
+#include <cstdint>
 
 namespace llaminar2
 {
 class ComputeGraph;
+/** @brief Canonical invocation phase, defined by IGraphBuilder. */
+enum class ForwardExecutionPhase : std::uint8_t;
 /** @brief Explicit acceptance lifetime; ordinary rows commit now, verifier rows await the controller. */
 enum class Qwen4ExpSparsePublication { AcceptAllLiveRows, DeferredVerifierAcceptance };
 
@@ -31,6 +34,8 @@ struct Qwen4ExpSparseAttentionPolicy
     qwen4exp::QwenSparseRotarySource rotarySource = qwen4exp::QwenSparseRotarySource::TablePlanes;
     float ropeTheta = 10000.0f;
     Qwen4ExpSparsePublication publication = Qwen4ExpSparsePublication::AcceptAllLiveRows;
+    qwen4exp::QwenSparsePoolSelection poolSelection = qwen4exp::QwenSparsePoolSelection::Installed; ///< Sealed native selector, independent of live prefix and row counts.
+    qwen4exp::QwenSparseAttentionArithmetic attentionArithmetic = qwen4exp::kDefaultQwenSparseAttentionArithmetic; ///< Explicit selected-core arithmetic; no runtime automatic selection.
 };
 /** @brief Replicated production GGUF projection identities and immutable indexer gains/planes. */
 struct Qwen4ExpSparseAttentionWeights
@@ -69,6 +74,23 @@ struct Qwen4ExpSparseAttentionRequest
 class Qwen4ExpSparseAttentionBuilder final
 {
 public:
+    /**
+     * @brief Declare the native pool selector for one typed production invocation.
+     * @param phase Original forward phase; a one-row prefill remains Prefill.
+     * @param device Exact participant/backend owning this graph, without a live probe.
+     * @param rowCapacity Positive immutable captured query capacity, not a live-row count.
+     * @return Bounded1024_1024 for ROCm Decode with capacity 1 through 16;
+     * Installed for every other valid phase/backend/positive capacity combination.
+     * @throws std::invalid_argument For an unknown phase/backend, invalid participant
+     * ordinal, or nonpositive capacity, before any graph nodes are constructed.
+     * @details The declaration depends only on typed graph inputs. Native selection
+     * still reads device-owned causal context and directly publishes every visible
+     * ID when at most 512 pools exist; no context readback, host mirror, new kernel
+     * or context-switch graph is needed. The returned immutable enum already flows
+     * through Indexer admission and complete capture identity.
+     */
+    static qwen4exp::QwenSparsePoolSelection poolSelectionForInvocation(
+        ForwardExecutionPhase phase,DeviceId device,int rowCapacity);
     /** @brief Seal the canonical single-request verifier projection prefix, including M1.
      * @param device Exact participant owning the borrowed count word.
      * @param rows Admitted row capacity and optional native execution-authority count.

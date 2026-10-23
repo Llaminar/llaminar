@@ -21,6 +21,7 @@
 
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
+#include "ROCmGDNHistoricalRecurrentOracle.h"
 #include "kernels/rocm/gdn/ROCmShortConvolution.h"
 #include <hip/hip_runtime.h>
 #endif
@@ -4316,5 +4317,8 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceAdditiveEpsilonNearZeroCaptured)
         }
     }
 }
+
+#include "ROCmGDNPairedNormalizationTest.h"
+#include "ROCmGDNPairedNormalizationPerf.h"
 
 #endif

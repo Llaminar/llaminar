@@ -18984,12 +18984,39 @@ if(HAVE_ROCM)
     # Verifies effective-length recurrence and short-conv prefill preserve decode state.
     add_executable(v2_integration_rocm_gdn_padded_real_length
         integration/kernels/rocm/Test__ROCmGDNPaddedRealLength.cpp
+        integration/kernels/rocm/ROCmGDNHistoricalRecurrentOracle.hip
     )
     target_link_libraries(v2_integration_rocm_gdn_padded_real_length
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
     )
+    set_source_files_properties(integration/kernels/rocm/ROCmGDNHistoricalRecurrentOracle.hip PROPERTIES LANGUAGE HIP)
+    if(TARGET v2_integration_rocm_gdn_padded_real_length)
+        # Performance-only Release trees intentionally omit this integration target.
+        target_link_libraries(v2_integration_rocm_gdn_padded_real_length hip::host)
+        set_target_properties(v2_integration_rocm_gdn_padded_real_length PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+    endif()
+    # Opt-in performance executable reuses the literal native oracle and fixture.
+    # Sources belong to target creation so filtered Release integration targets
+    # are never referenced by unconditional target_sources/property mutations.
+    add_executable(v2_perf_rocm_gdn_paired_normalization
+        integration/kernels/rocm/Test__ROCmGDNPaddedRealLength.cpp
+        integration/kernels/rocm/ROCmGDNHistoricalRecurrentOracle.hip)
+    if(TARGET v2_perf_rocm_gdn_paired_normalization)
+        target_link_libraries(v2_perf_rocm_gdn_paired_normalization
+            llaminar2_core GTest::gtest GTest::gtest_main hip::host)
+        set_target_properties(v2_perf_rocm_gdn_paired_normalization
+            PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        v2_test_device_scope(v2_perf_rocm_gdn_paired_normalization DeclaredBackends)
+    endif()
+    add_v2_test(V2_Integration_ROCmGDNPairedQKHistorical
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.PairedQKNormalizationHistoricalGroupedBytes:Test__ROCmGDNPaddedRealLength.PairedQKNormalizationHistoricalScalarBytes
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+
     add_v2_test(V2_Integration_ROCmGDNPaddedRealLength
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
         LABELS "V2;Integration;ROCm;GatedDeltaNet;ShortConv;Padding;Phase6;RealLength;FP32;gfx906"
@@ -25665,6 +25692,7 @@ if(HAVE_ROCM)
     V2_Integration_ROCmFlashDecodeDimensionAndRingCursor
     V2_Integration_GDNLinkedStateReassembly_ROCm
     V2_Integration_GDNPrefillDecodeEquivalence_ROCm
+    V2_Integration_ROCmGDNPairedQKHistorical
     V2_Integration_GDNAdditiveEpsilon_ROCm
     V2_Integration_GPUDeviceContext_ROCm
     V2_Integration_RCCLRuntimeGenerationRetirement
@@ -27251,6 +27279,38 @@ foreach(QFN_ROLLBACK_BACKEND IN ITEMS CUDA ROCm)
             V2_Integration_${QFN_ROLLBACK_BACKEND}_QwenSparseGroupedRollbackAcceptance)
     endif()
 endforeach()
+
+# Optional logical-coordinate observations cannot alter captured FP32 arithmetic.
+foreach(QSA_OBSERVATION_BACKEND IN ITEMS CUDA ROCm)
+    string(TOLOWER "${QSA_OBSERVATION_BACKEND}" QSA_OBSERVATION_DIR)
+    if(TARGET v2_test_${QSA_OBSERVATION_DIR}_qwen_sparse_attention)
+        if(QSA_OBSERVATION_BACKEND STREQUAL "CUDA")
+            set(QSA_OBSERVATION_ENV "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+        else()
+            set(QSA_OBSERVATION_ENV "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+        endif()
+        add_v2_test(V2_Integration_${QSA_OBSERVATION_BACKEND}_QwenSparseObservationNeutrality
+            COMMAND $<TARGET_FILE:v2_test_${QSA_OBSERVATION_DIR}_qwen_sparse_attention>
+                --gtest_filter=${QSA_OBSERVATION_BACKEND}QwenSparseAttention.CapturedObservationNeutralPartialBytesAndRetainedReset:${QSA_OBSERVATION_BACKEND}QwenSparseAttention.EveryNativeCodecAndQ16BlockUsesCanonicalDeviceRingAndBasis:${QSA_OBSERVATION_BACKEND}QwenSparseAttention.FloatingPreRotaryTransformsOnlySelectedKeys:${QSA_OBSERVATION_BACKEND}QwenSparseAttention.CapturedGroupedMatchesSerialBytesAndAcceptanceRollback
+            LABELS "V2;Integration;ProductionTestPreflight;${QSA_OBSERVATION_BACKEND};Qwen4Exp;Capture;ByteExact;Regression"
+            ENVIRONMENT ${QSA_OBSERVATION_ENV} MPI_PROCS 1 NO_MODELS TIMEOUT 120
+            RESOURCE_LOCK ${QSA_OBSERVATION_DIR}_gpu_0)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_${QSA_OBSERVATION_BACKEND}_QwenSparseObservationNeutrality)
+    endif()
+endforeach()
+
+# Explicit FP16 tile arithmetic uses the same typed production attention entry.
+if(TARGET v2_test_rocm_qwen_sparse_attention)
+    add_v2_test(V2_Integration_ROCm_QwenSparseFP16TileArithmetic
+        COMMAND $<TARGET_FILE:v2_test_rocm_qwen_sparse_attention>
+            --gtest_filter=ROCmQwenSparseAttention.FP16NativeKeyEncodingsGroupedSerialDirtyReplay:ROCmQwenSparseAttention.FP16CompactHeadsSharedReadsAndReadOnlyInputs:ROCmQwenSparseAttention.FP16UniformScoresExtremeFiniteValues
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;Attention;Capture;ByteExact;Regression"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCm_QwenSparseFP16TileArithmetic)
+endif()
 
 # Cold output ownership and immutable publication authority regressions.
 target_sources(v2_test_qwen4exp_primitives PRIVATE
@@ -29828,6 +29888,67 @@ endif()
 # Existing V2_Integration_ROCm_GDNQKVTwoTermOriginalBundle is the focused
 # real-module inspection -> following corrected launch regression. Retain it.
 
+# Production selector choice is phase/backend explicit, including one-row prefill.
+add_v2_test(V2_Integration_QwenSparseProductionPoolSelection
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=Qwen4ExpSparseAttentionBuilder.ProductionPoolSelection*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Capture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseProductionPoolSelection)
+
+# Declarative selector propagation and capture-policy identity are device-free.
+add_v2_test(V2_Integration_QwenSparseSelectorPolicyCaptureIdentity
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseAttentionStage.SelectorPolicySealsEveryIndexerCapture:Qwen4ExpSparseAttentionBuilder.SelectorPolicyIsExplicitAndCaptureSealed
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Capture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseSelectorPolicyCaptureIdentity)
+
+# Typed selected-attention arithmetic and capture identity require no device startup.
+add_v2_test(V2_Integration_QwenSparseAttentionArithmeticPolicy
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseAttentionStage.AttentionArithmetic*:Qwen4ExpSparseAttentionBuilder.AttentionArithmeticDefaultForwardingAndColdRejection
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Attention;Capture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseAttentionArithmeticPolicy)
+
+# Explicit bounded CPU selection and typed capture-policy admission.
+add_v2_test(V2_Integration_QwenSparseBoundedPolicyCPU
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseBoundedSelection.CanonicalScoreBitsPreserveNumericZero:QwenSparseAttention.BoundedCandidateFullIndexerKeepsScoreBytes:QwenSparseAttentionStage.SelectorPolicySealsEveryIndexerCapture:Qwen4ExpSparseAttentionBuilder.SelectorPolicyIsExplicitAndCaptureSealed
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Capture;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseBoundedPolicyCPU)
+
+# Exact real-stage forwarding regression, distinct from direct-native selector tests.
+add_v2_test(V2_Integration_QwenSparseCPUStageSelectorForwarding
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseAttentionStage.EveryCPUSelectorPolicyExecutesRetainedRows
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseCPUStageSelectorForwarding)
+foreach(QSA_FORWARD_BACKEND IN ITEMS CUDA ROCm)
+    if((QSA_FORWARD_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR (QSA_FORWARD_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
+        if(QSA_FORWARD_BACKEND STREQUAL "CUDA")
+            set(QSA_FORWARD_ENV LLAMINAR_FORCE_CPU_ONLY_STARTUP=0 LLAMINAR_SKIP_CUDA_STARTUP=0 LLAMINAR_SKIP_ROCM_STARTUP=1)
+        else()
+            set(QSA_FORWARD_ENV LLAMINAR_FORCE_CPU_ONLY_STARTUP=0 LLAMINAR_SKIP_CUDA_STARTUP=1 LLAMINAR_SKIP_ROCM_STARTUP=0)
+        endif()
+        add_v2_test(V2_Integration_${QSA_FORWARD_BACKEND}_QwenSparseStageSelectorForwarding
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=QwenSparseDeviceStages.${QSA_FORWARD_BACKEND}SelectorPolicyForwarding
+            LABELS "V2;Integration;ProductionTestPreflight;${QSA_FORWARD_BACKEND};Qwen4Exp;Capture;NativeFunctionIdentity;ByteExact;Regression"
+            ENVIRONMENT ${QSA_FORWARD_ENV} MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${QSA_FORWARD_BACKEND}_QwenSparseStageSelectorForwarding)
+    endif()
+endforeach()
+
+
 # Exact bounded-selection candidates and their native focused regressions.
 if(TARGET v2_test_qwen4exp_primitives)
     target_sources(v2_test_qwen4exp_primitives PRIVATE unit/kernels/Test__QwenSparseBoundedSelection.cpp)
@@ -29838,6 +29959,47 @@ add_v2_test(V2_Integration_QwenSparseBoundedSelectionCPU
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseBoundedSelectionCPU)
+# Persistent frontier is a focused diagnostic-work witness, not a timing gate.
+add_v2_test(V2_Integration_QwenSparsePersistentFrontierCPU
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseBoundedSelection.PersistentFourDigitFrontierWork
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparsePersistentFrontierCPU)
+
+# Hot histogram frontier isolates concentration from the aligned digit/bank work.
+add_v2_test(V2_Integration_QwenSparseHotHistogramFrontierCPU
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseBoundedSelection.HotHistogramFrontierWork
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseHotHistogramFrontierCPU)
+
+# Score-only radix/tie reconstruction needs an independently selectable focused gate.
+add_v2_test(V2_Integration_QwenSparseScoreOnlyRadixCPU
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseBoundedSelection.ScoreOnlyRadixCanonicalTiesAndFourDigitBound
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseScoreOnlyRadixCPU)
+
+# Mathematical source-work bounds remain separate from hardware-time/default admission.
+add_v2_test(V2_Integration_QwenSparseBoundedWorkBoundsCPU
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseBoundedSelection.WorkBound*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseBoundedWorkBoundsCPU)
+
+# Explicit new selector invariants remain independently selectable in preflight.
+add_v2_test(V2_Integration_QwenSparseBoundedSelectionAdversarialCPU
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseBoundedSelection.AdversarialScoresAt64K:QwenSparseBoundedSelection.EveryGroupedMThrough16KeepsSerialBytes
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseBoundedSelectionAdversarialCPU)
 foreach(QSB_BACKEND IN ITEMS CUDA ROCm)
     if(QSB_BACKEND STREQUAL "CUDA")
         set(QSB_DIR cuda)
@@ -29849,7 +30011,7 @@ foreach(QSB_BACKEND IN ITEMS CUDA ROCm)
     if(TARGET v2_test_${QSB_DIR}_qwen_sparse_attention)
         target_sources(v2_test_${QSB_DIR}_qwen_sparse_attention PRIVATE
             integration/kernels/${QSB_DIR}/Test__${QSB_BACKEND}QwenSparseBoundedSelection.cpp)
-        foreach(QSB_CASE IN ITEMS ThresholdTiesAndEveryTail RetainedPartialEmptyAndPositiveDispatch GroupedSerialRowBytes BadBindingsAndStreamsBeforeEnqueue)
+        foreach(QSB_CASE IN ITEMS ThresholdTiesAndEveryTail RetainedPartialEmptyAndPositiveDispatch GroupedSerialRowBytes AdversarialScoresAt64K BadBindingsAndStreamsBeforeEnqueue InstalledSignedZeroCanonicalTies CapturedRepeatsRetainFullPartialEmpty ScoreOnlyRadixCanonicalTiesAndFourDigitBound ParallelHistogramEveryBucketOwner PersistentFourDigitFrontierWork HotHistogramFrontierWork)
             add_v2_test(V2_Integration_${QSB_BACKEND}_QwenSparseBounded_${QSB_CASE}
                 COMMAND $<TARGET_FILE:v2_test_${QSB_DIR}_qwen_sparse_attention>
                     --gtest_filter=${QSB_BACKEND}QwenSparseBoundedSelection.${QSB_CASE}

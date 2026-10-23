@@ -567,6 +567,31 @@ TEST(QwenSparseAttention, BoundedCandidateFullIndexerKeepsScoreBytes)
             EXPECT_EQ(installed.selected, candidate.selected); EXPECT_EQ(installed.count, candidate.count);
             EXPECT_EQ(std::memcmp(installed.prepared.data(), candidate.prepared.data(),
                 installed.prepared.size() * sizeof(float)), 0);
+            // Compact head0 is sufficient to witness that actual candidate
+            // membership feeds the unchanged real CPU attention consumer.
+            test::NativeCodecFixture keys(TensorType::FP16,4102),values(TensorType::FP16,4102);
+            std::vector<float> query(256,0.125f),a(query.size()),b(query.size());
+            QwenSparseReplay coreReplay=installed.replay;coreReplay.live_rows=1;
+            QwenSparseAttention attention{.replay=&coreReplay,.query=query.data(),
+                .kv={.keys=keys.bank(),.values=values.bank()},.selected=installed.selected.data(),
+                .selected_count=installed.count.data(),.output=a.data(),.row_capacity=1,.token_capacity=4102,.query_heads=1,.kv_heads=1};
+            ASSERT_NO_THROW(validateQwenSparseAttention(attention));
+            ASSERT_LE(coreReplay.prefix_tokens+attention.row_capacity,attention.token_capacity);
+            for(int live:{9,1,0,9}){
+                installed.replay.live_rows=candidate.replay.live_rows=live;
+                cpuQwenSparseIndexer(installed.p);cpuQwenSparseIndexer(candidate.p);
+                const int firstVisible=coreReplay.prefix_tokens+1;
+                const int firstCount=live?std::min(firstVisible/4,512)*4+firstVisible%4:0;
+                ASSERT_EQ(installed.count[0],firstCount);ASSERT_EQ(candidate.count[0],firstCount);
+                std::fill(a.begin(),a.end(),-77.f);std::fill(b.begin(),b.end(),-77.f);
+                coreReplay.live_rows=std::min(live,1);attention.selected=installed.selected.data();attention.selected_count=installed.count.data();attention.output=a.data();
+                cpuQwenSparseAttention(attention);
+                attention.selected=candidate.selected.data();attention.selected_count=candidate.count.data();attention.output=b.data();
+                cpuQwenSparseAttention(attention);
+                EXPECT_EQ(std::memcmp(a.data(),b.data(),a.size()*sizeof(float)),0);
+                if(!live){EXPECT_TRUE(std::all_of(a.begin(),a.end(),[](float value){return value==-77.f;}));
+                    EXPECT_TRUE(std::all_of(b.begin(),b.end(),[](float value){return value==-77.f;}));}
+            }
         }
 }
 } // namespace llaminar2::qwen4exp

@@ -14,6 +14,11 @@
  * host replay, global scratch or dynamic allocation is required. Capture-time
  * snapshot policy separates terminal-only publication from bounded row output.
  *
+ * The bounded recurrence uses128 threads and32 value columns per CTA while
+ * retaining four K-row splits. Its two physical wave64 groups preserve the
+ * historical four-wave normalization fold through explicit zero-only leaves.
+ * This is native geometry only: global state/snapshot extents do not change.
+ *
  * Key HIP differences from CUDA:
  * - 64-thread wavefronts (vs 32 warps), shuffle width adjusted
  * - hip_runtime.h / hip_fp16.h headers
@@ -65,7 +70,10 @@ void print_pointer_attrs(const char *label, const void *ptr)
 
 namespace { // anonymous namespace to avoid symbol conflicts with CUDA kernels
 
-constexpr int kGdnRecurrentThreads = 256;
+// Four K-row partitions each retain32 independent value columns. This doubles
+// CTA coverage for small local head sets without repartitioning a column's K
+// arithmetic or introducing cross-CTA reduction/state ownership.
+constexpr int kGdnRecurrentThreads = 128;
 constexpr int kGdnRecurrentRowSplit = 4;
 constexpr int kGdnRecurrentColumnsPerBlock =
     kGdnRecurrentThreads / kGdnRecurrentRowSplit;
@@ -94,14 +102,27 @@ enum class GdnPrefillSnapshots
  * speculative work bank is written only once after the final row rather than
  * being read twice and written once for every row.
  *
+ * Q and K normalization share publication edges, while their independent
+ * square/shuffle/four-wave-fold trees remain unchanged. K's four wave totals
+ * borrow the first reduce_kv words before that array's recurrent phase; the
+ * scale-publication barrier retires those reads. This removes three CTA waits
+ * per live row without adding LDS, workspace, a launch, or cross-CTA ordering.
+ *
  * The four-way key-row split, wave64 normalization reduction, gate expressions,
  * K-part reduction order, and state update expressions are deliberately the
  * same as scalar HIP decode. Register retention changes storage traffic, not
  * arithmetic order. The all-M captured publication sweep proves every grouped
  * output, selected snapshot, and continuation byte against serial M=1 decode.
  *
- * Grid X flattens request/head identity and grid Y owns independent value
- * columns. Snapshot rows use the flattened request-row namespace, so the launch
+ * Grid X flattens request/head identity and grid Y owns independent32-column
+ * tiles. Each physical wave holds two K splits; recurrence reductions still
+ * read split0,1,2,3 from LDS in the original order. Q/K normalization retains
+ * original lanes0..127 and their wave64 XOR trees. The two absent historical
+ * waves contained only +0 leaves at the admitted DK64/128, so their exact +0
+ * totals are explicitly stored before the existing publication barrier and
+ * the ascending four-wave scalar fold remains intact. No wait is added.
+ *
+ * Snapshot rows use the flattened request-row namespace, so the launch
  * publishes every possible accepted state without host replay.
  *
  * @tparam D_K Compile-time key width. Supported graph geometries select a
@@ -109,6 +130,8 @@ enum class GdnPrefillSnapshots
  *             are fixed properties of the captured launch.
  */
 template <int D_K>
+// HIP's second bound is waves per execution unit, not CUDA blocks per SM.
+// Preserve the original two-wave register constraint when shrinking the CTA.
 __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
 void rocm_gdn_recurrent_step_kernel(
     const float *__restrict__ q,
@@ -135,6 +158,8 @@ void rocm_gdn_recurrent_step_kernel(
     const int h = request_head - request * n_heads;
     if (request >= request_count || h >= n_heads) return;
 
+    // The missing historical norm waves are zero only for these closed widths.
+    static_assert(D_K == 64 || D_K == 128);
     static_assert(D_K % kGdnRecurrentRowSplit == 0);
     constexpr int kRowsPerSplit = D_K / kGdnRecurrentRowSplit;
     constexpr int kRegisterRowsPerSplit =
@@ -173,7 +198,9 @@ void rocm_gdn_recurrent_step_kernel(
     const float scale = rsqrtf(static_cast<float>(D_K));
     const int warp_id = tid / 64;
     const int lane_id = tid % 64;
-    constexpr int kWaveCount = kGdnRecurrentThreads / 64;
+    constexpr int kPhysicalWaveCount = kGdnRecurrentThreads / 64;
+    static_assert(kPhysicalWaveCount == 2);
+    constexpr int kWaveCount = 4; // Arithmetic leaves, including two explicit zero waves.
 
     /*
      * The bounded compile-time array is scalarized into VGPRs by clang. The
@@ -243,7 +270,8 @@ void rocm_gdn_recurrent_step_kernel(
             continue;
         }
 
-        // Preserve scalar decode's 256-thread Q/K normalization tree.
+        // Original norm lanes0..127 retain their input and physical wave64 rank.
+        // The two absent historical waves are published as exact +0 below.
         for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
         {
             q_local[i] = q_head[i];
@@ -253,48 +281,59 @@ void rocm_gdn_recurrent_step_kernel(
 
         if (use_qk_l2norm)
         {
+            // Q/K are independent. Keep each original wave64 sum and ascending
+            // four-wave fold, but publish them together. reduce_kv is idle until
+            // the later decay/K^T S pass, so its first four words can own K sums.
+            // The final scale-publication barrier retires every K-sum reader
+            // before recurrence may overwrite that same storage.
+            float *k_wave_sums = reduce_kv;
             float q_sum = 0.0f;
-            for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
-                q_sum += q_local[i] * q_local[i];
-            for (int offset = 32; offset > 0; offset >>= 1)
-                q_sum += __shfl_xor(q_sum, offset);
-            if (lane_id == 0)
-                wave_sums[warp_id] = q_sum;
-            __syncthreads();
-            if (tid == 0)
-            {
-                float total = 0.0f;
-                for (int wave = 0; wave < kWaveCount; ++wave)
-                    total += wave_sums[wave];
-                wave_sums[0] = total;
-            }
-            __syncthreads();
-            const float q_inv =
-                scale / sqrtf(wave_sums[0] + 1e-6f);
-            for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
-                q_local[i] *= q_inv;
-            __syncthreads();
-
             float k_sum = 0.0f;
             for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
+            {
+                q_sum += q_local[i] * q_local[i];
                 k_sum += k_local[i] * k_local[i];
+            }
             for (int offset = 32; offset > 0; offset >>= 1)
+            {
+                q_sum += __shfl_xor(q_sum, offset);
                 k_sum += __shfl_xor(k_sum, offset);
+            }
             if (lane_id == 0)
-                wave_sums[warp_id] = k_sum;
+            {
+                wave_sums[warp_id] = q_sum;
+                k_wave_sums[warp_id] = k_sum;
+                // Historical waves2/3 began at +0 and processed no DK64/128
+                // elements. Every XOR add therefore returned +0. These words
+                // must be refreshed for every live row before the four-leaf
+                // fold; they may contain prior gate/reduction data on replay.
+                wave_sums[warp_id + kPhysicalWaveCount] = 0.0f;
+                k_wave_sums[warp_id + kPhysicalWaveCount] = 0.0f;
+            }
             __syncthreads();
             if (tid == 0)
             {
-                float total = 0.0f;
+                float q_total = 0.0f;
+                float k_total = 0.0f;
                 for (int wave = 0; wave < kWaveCount; ++wave)
-                    total += wave_sums[wave];
-                wave_sums[0] = total;
+                {
+                    q_total += wave_sums[wave];
+                    k_total += k_wave_sums[wave];
+                }
+                wave_sums[0] = q_total;
+                k_wave_sums[0] = k_total;
             }
             __syncthreads();
-            const float k_inv =
-                1.0f / sqrtf(wave_sums[0] + 1e-6f);
+            // Preserve the old quotient/sqrt expressions and each operand's
+            // multiplication boundary. Do not combine scale with the square
+            // root or replace either expression with reciprocal sqrt.
+            const float q_inv = scale / sqrtf(wave_sums[0] + 1e-6f);
+            const float k_inv = 1.0f / sqrtf(k_wave_sums[0] + 1e-6f);
             for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
+            {
+                q_local[i] *= q_inv;
                 k_local[i] *= k_inv;
+            }
             __syncthreads();
         }
         else
