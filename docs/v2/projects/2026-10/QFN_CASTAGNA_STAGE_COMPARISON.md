@@ -1,5 +1,54 @@
 # QFN: Castagna and Llaminar stage comparison
 
+## Fresh checkpoint190 attribution, 2026-10-24
+
+The qualified ROCm ValueMajor default now has a fresh complete-request profile.
+The source/runtime, natural 256-token trajectory, driver and retirement checks
+pass. All 6,461,320 dispatches join, including 6,348,052 captured dispatches
+across 4,108 graph launches. Actual decode uses the ValueMajor DK128 vector
+endpoint recurrence on all four cards, with 36 calls per step per card.
+Both layout overrides remain absent. The comparison reauthenticates the same
+retained Castagna165 trace; it does not run a new fork benchmark.
+
+These are median per-card **instrumented kernel-union milliseconds per decode
+step**, not request latency or an estimate of removable time. Every measured
+request retains prompt512, emitted256 and 255 after-prefill steps. The report
+keeps per-card sums, unions, exclusive intervals and overlap separately.
+
+| Source-identified decode portion | Llaminar190 ms/step | Castagna ms/step |
+|---|---:|---:|
+| Guarded short-context indexer query projection/preparation nodes | 0.280 | No corresponding work |
+| Main attention core, producer and merge | 0.349 | 0.163 |
+| GDN convolution, recurrence and output norm | 0.814 | 0.690 |
+| Vocabulary projection and reducer | 0.300 | 0.260 |
+| HC injection projection | 0.657 | 0.759 |
+
+The paired GDN union gap falls from approximately 0.459 ms at180 to **0.126 ms**
+at190. The new largest selected cohort is the guarded query work at0.280 ms,
+followed by the attention gap at0.186 ms. The short-query nodes already skip
+matrix arithmetic and weight reads; the remaining measurement includes their
+captured dispatch and guards. Omitting them altogether requires a proved
+captured-graph policy with an authoritative demand bound, not a host live-count
+readback or hot recapture.
+
+Attention still uses Q6 across12 layers/card versus the fork's Q12 across6.
+The separate matched-Q12 component comparison remains the evidence about
+intrinsic kernel efficiency. GDN excludes projections/gates, and the fork's
+output norm also quantizes. Generic and fused kernels retain their native-family
+classification; the report does not claim complete semantic model-stage naming.
+The whole512-row prefill remains separately normalized, including every fork
+physical chunk. None of these category differences may be added into a
+predicted end-to-end speedup.
+
+Unprofiled production performance remains **820.777 prefill /41.562 decode
+tok/s**. The **42.959 decode target remains open**. Evidence:
+`gdn190-default-stage-trace-r1`, `gdn190-default-stage-join-r1`,
+`gdn190-default-stage-intervals-r1`,
+`gdn190-default-attention-core-comparison-r1`, and
+`gdn190-default-stage-comparison-r1/stages.json` under the QFN result root.
+The archived profile source reconstructs the qualified pre-commit tree exactly;
+it does not substitute later attention experiments for checkpoint190.
+
 ## Fresh checkpoint180 attribution, 2026-10-24
 
 The fresh four-MI50 capture of qualified checkpoint180 passes native exit,

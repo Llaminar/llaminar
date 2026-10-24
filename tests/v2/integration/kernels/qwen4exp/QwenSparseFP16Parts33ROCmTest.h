@@ -142,6 +142,107 @@ TEST(ROCmQwenSparseAttention,FP16Virtual33NativeKeyEncodingsGroupedSerialDirtyRe
         }
     }
 }
+/**
+ * @test Partial canonical head groups retain every neutral header across shrinking work.
+ * @details Each encoding, row capacity and head shard records one persistent
+ * producer/merge graph. Dirty nonzero counters expose a missing empty writer;
+ * inactive rows and empty weighted payloads retain their previous bytes. A
+ * separate full-head capture provides original-coordinate numerical witnesses.
+ * Fixture-owned staging outlives capture, and every observation download joins
+ * the exact stream before the next replay or any borrowed storage retires.
+ */
+TEST(ROCmQwenSparseAttention,FP16Virtual33PartialHeadNeutralMetadataDirtyReplay)
+{
+    using namespace fp16_attention;
+    for (bool transform : {false, true}) {
+        for (int rows : {1, 16}) {
+            Fixture f(rows, 2050, 4096, QwenSparseScalar::FP16);
+            Inputs fullInput(f, 0, 24, 0, 2);
+            auto fullArgs = fullInput.base();
+            fullArgs.kv.addressing = QwenSparseKVAddressing::FixedLogicalView;
+            fullArgs.kv.logical_view = {.logical_row_origin = 4095, .physical_row_capacity = f.capacity};
+            fullArgs.kv.row_parameters = nullptr;
+            if (transform) fullArgs = selectedKeyTransform(fullArgs, 10000000.0f, 4095, f.capacity);
+            FP16Run33 full(fullArgs, f.stream);
+            full.record();
+            for (const auto [first, heads] : {std::pair{1, 1}, std::pair{5, 7}, std::pair{11, 3}, std::pair{17, 7}}) {
+                SCOPED_TRACE(::testing::Message() << "transform=" << transform << " rows=" << rows
+                                                 << " first=" << first << " heads=" << heads);
+                const int firstKV = first / 12;
+                const int kvCount = (first + heads - 1) / 12 - firstKV + 1;
+                Inputs input(f, first, heads, firstKV, kvCount);
+                auto args = input.base();
+                args.kv.addressing = QwenSparseKVAddressing::FixedLogicalView;
+                args.kv.logical_view = {.logical_row_origin = 4095, .physical_row_capacity = f.capacity};
+                args.kv.row_parameters = nullptr;
+                if (transform) args = selectedKeyTransform(args, 10000000.0f, 4095, f.capacity);
+                FP16Run33 run(args, f.stream);
+                // Use the owner's retained host backing, never temporary upload staging.
+                for (auto& partial : run.initial_partials) {
+                    partial.key_elements = UINT32_MAX;
+                    partial.value_elements = 0x80000001u;
+                }
+                run.partials.upload(run.initial_partials.data(), f.stream);
+                check(hipStreamSynchronize(f.stream));
+                run.record();
+                auto previous = run.initial_partials;
+                auto previousOutput = run.poison;
+                for (const auto [prefix, live] : {std::pair{2050, rows}, std::pair{0, rows},
+                         std::pair{63, rows}, std::pair{64, rows}, std::pair{511, rows},
+                         std::pair{512, rows}, std::pair{768, rows}, std::pair{0, 0},
+                         std::pair{0, std::min(rows, 3)}, std::pair{2050, rows}}) {
+                    SCOPED_TRACE(::testing::Message() << "prefix=" << prefix << " live=" << live);
+                    const auto counts = publishReplayPosition(f, prefix, live, 65536);
+                    full.capture.launch();
+                    const auto expected = full.output.download(f.stream);
+                    run.capture.launch();
+                    const auto actual = run.output.download(f.stream);
+                    const auto parts = run.partials.download(f.stream);
+                    const auto observations = run.observations.download(f.stream);
+                    for (int row = 0; row < rows; ++row) {
+                        for (int head = 0; head < heads; ++head) {
+                            const auto outputIndex = (std::size_t(row) * heads + head) * 256;
+                            if (row < live) {
+                                ASSERT_EQ(std::memcmp(actual.data() + outputIndex,
+                                    expected.data() + (std::size_t(row) * 24 + first + head) * 256,
+                                    256 * sizeof(float)), 0);
+                            } else {
+                                ASSERT_EQ(std::memcmp(actual.data() + outputIndex,
+                                    previousOutput.data() + outputIndex, 256 * sizeof(float)), 0);
+                                const auto& observation = observations[row * heads + head];
+                                ASSERT_EQ(observation.key_elements, 0u);
+                                ASSERT_EQ(observation.value_elements, 0u);
+                                ASSERT_EQ(observation.selected_tokens, 0u);
+                            }
+                            for (int part = 0; part < 33; ++part) {
+                                const auto index = (std::size_t(row) * heads + head) * 33 + part;
+                                if (row >= live) {
+                                    ASSERT_EQ(std::memcmp(&parts[index], &previous[index], sizeof(parts[index])), 0);
+                                } else if (part * 64 >= counts[row]) {
+                                    ASSERT_EQ(detail::floatBits(parts[index].maximum), detail::floatBits(-INFINITY));
+                                    ASSERT_EQ(detail::floatBits(parts[index].denominator), 0u);
+                                    ASSERT_EQ(parts[index].key_elements, 0u);
+                                    ASSERT_EQ(parts[index].value_elements, 0u);
+                                    ASSERT_EQ(std::memcmp(parts[index].weighted, previous[index].weighted,
+                                        sizeof(parts[index].weighted)), 0);
+                                }
+                            }
+                        }
+                    }
+                    if (live == rows) {
+                        checkSharedReadOwners33(run, counts);
+                        ASSERT_FALSE(::testing::Test::HasFailure());
+                    }
+                    ASSERT_EQ(std::memcmp(actual.data() + std::size_t(rows) * heads * 256,
+                        run.poison.data() + std::size_t(rows) * heads * 256, 16 * sizeof(float)), 0);
+                    previous = parts;
+                    previousOutput = actual;
+                }
+            }
+        }
+    }
+}
+
 /** @test Global compact heads, canonical groups, read-only operands and observation neutrality. */
 TEST(ROCmQwenSparseAttention,FP16Virtual33CompactHeadsSharedReadsAndReadOnlyInputs)
 {

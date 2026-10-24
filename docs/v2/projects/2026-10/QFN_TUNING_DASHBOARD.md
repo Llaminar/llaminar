@@ -33,11 +33,15 @@ Fold12 reduces the matched complete boundary by 2.067% at 768 and preserves exac
 bytes. Long-context checks retain the measured +0.411% pre-rotary 64K cost; no
 whole-model gain is attributed to attention alone.
 
-The prior [checkpoint180 qualification](QFN_SCALAR_COLUMN_PUBLICATION_TUNING.md)
-remains retained at 819.594 / 41.030 tok/s, with its 823-entry Unit/affected gate.
-Its [fresh stage attribution](QFN_CASTAGNA_STAGE_COMPARISON.md#fresh-checkpoint180-attribution-2026-10-24)
-ranked GDN as the largest comparable deficit; it precedes 190 and must not be
-presented as current stage timing. The [GDN structure map](QFN_GDN_STRUCTURE_COMPARISON.md)
+The [fresh checkpoint190 attribution](QFN_CASTAGNA_STAGE_COMPARISON.md#fresh-checkpoint190-attribution-2026-10-24)
+shows the paired GDN gap shrinking from0.459 to0.126 ms/step/card. The largest
+remaining selected cohorts are guarded short-query nodes at0.280 ms and the
+attention gap at0.186 ms. These are instrumented kernel-union diagnostics, not
+removable request latency. All6.46million dispatches, the complete trajectory,
+source/runtime and driver/retirement checks pass. The prior
+[checkpoint180 qualification](QFN_SCALAR_COLUMN_PUBLICATION_TUNING.md) remains
+retained at819.594 /41.030 tok/s with its823-entry Unit/affected gate.
+The [GDN structure map](QFN_GDN_STRUCTURE_COMPARISON.md)
 explains which Castagna layout lessons preserve Llaminar's reduction order.
 The routed SwiGLU181 and HC publication182 component screens remain archived
 separately; neither changes the qualified model score. Complete preflight

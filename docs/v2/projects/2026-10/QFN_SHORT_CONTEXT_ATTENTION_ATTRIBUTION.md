@@ -1,5 +1,34 @@
 # QFN short-context attention attribution, 2026-10-24
 
+## Empty-header coalescing191: rejected
+
+Publishing the six neutral partition headers through six lanes of the first
+wave leaves all 396 producer waves intact. The matched Q12/M1/post-RoPE
+complete producer-plus-merge A/B/A screen measures **14.7900 versus14.756875
+µs at512 (+0.224%)** and **15.5100 versus15.428125 µs at768 (+0.531%)**.
+All outputs and numerical partials remain byte-identical. Four isolated
+counter launches and their strict joins pass: scalar instructions per wave
+fall from106.10101 to105.59596, only0.476%, while wave count remains396.
+This does not isolate the cause of the slight slowdown. The candidate is
+rejected without an unnecessary long-context or model rerun.
+
+The qualified190 production source is restored. Rebuilt Release ISA proves
+all six affected kernel bodies and resource tuples equal190, with spill
+guards intact. The useful partial-head regression remains: both key encodings,
+M1/M16, non-six-aligned head shards and long/short/inactive/partial/long dirty
+replays check neutral metadata, untouched payload and exact outputs.
+The canonical `V2_Integration_ROCm_QwenSparseFP16TileArithmetic` registration
+passes all ten GTests in8.279seconds on restored190. Its private wrapper
+initially misparsed ANSI color codes in case names; an independent audit of
+the unchanged log proves the exact ten-case set, clean driver window and
+normal retirement. The failed wrapper receipt remains preserved.
+
+Evidence: `attention191-empty-header-r1/events-short-screen.json`, the four
+`profile-*-producer-c512-*-retry-r2-joined.json` reports under that directory,
+`attention191-retained-tests-integration-r1/ansi-normalized-audit.json`, and
+`/tmp/qfn-attention191-restored-isa-r1/comparison.json`. This is focused native
+regression coverage; it does not claim another complete preflight run.
+
 ## Remaining matched-width gap
 
 The final matched Q12 producer-plus-merge measurement is **14.749183 versus
