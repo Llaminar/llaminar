@@ -9802,6 +9802,24 @@ add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillWorkspaceEnvelope
 if(HAVE_CUDA)
 add_executable(v2_integration_cuda_moe_kernel integration/kernels/cuda/Test__CUDAMoEKernel.cpp)
 target_link_libraries(v2_integration_cuda_moe_kernel v2_expert_transfer_parity_support GTest::gtest_main CUDA::cudart)
+# Release selects only performance executables. Compile the same captured
+# production fixture against the Release core so timing never mixes snapshot
+# ABIs or carries a second grouping/oracle implementation.
+if(V2_PERF_TESTS_ONLY)
+    add_executable(v2_perf_cuda_moe_grouping integration/kernels/cuda/Test__CUDAMoEKernel.cpp)
+    target_link_libraries(v2_perf_cuda_moe_grouping v2_expert_transfer_parity_support GTest::gtest_main CUDA::cudart)
+    set(V2_CUDA_GROUPING_PERF_TARGET v2_perf_cuda_moe_grouping)
+else()
+    set(V2_CUDA_GROUPING_PERF_TARGET v2_integration_cuda_moe_kernel)
+endif()
+add_v2_test(V2_Perf_CUDA_MoESmallGroupPrefix
+    COMMAND $<TARGET_FILE:${V2_CUDA_GROUPING_PERF_TARGET}>
+        --gtest_also_run_disabled_tests
+        --gtest_filter=Test__CUDAMoEKernel.DISABLED_SmallFloatGroupingProductionGeometryEvents
+        --gtest_brief=1
+    LABELS "V2;Performance;CUDA;MoE;GraphCapture;ByteExact"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf
+    ENVIRONMENT "LLAMINAR_TEST_SMALL_FLOAT_GROUP_GEOMETRY=512,1,10,10")
 # Original GGUF factors, actual fused expert transaction and fixed Q8 publications.
 add_v2_test(V2_Integration_CUDAIQ2SFusedMoEOriginalEquation
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
@@ -19950,6 +19968,23 @@ if(HAVE_ROCM)
         v2_expert_transfer_parity_support
         GTest::gtest_main
     )
+    # The production fixture is shared with Integration, but Release timing
+    # links a Release executable and core with the same snapshot ABI.
+    if(V2_PERF_TESTS_ONLY)
+        add_executable(v2_perf_rocm_moe_grouping integration/kernels/rocm/Test__ROCmMoEKernel.cpp)
+        target_link_libraries(v2_perf_rocm_moe_grouping v2_expert_transfer_parity_support GTest::gtest_main)
+        set(V2_ROCM_GROUPING_PERF_TARGET v2_perf_rocm_moe_grouping)
+    else()
+        set(V2_ROCM_GROUPING_PERF_TARGET v2_integration_rocm_moe_kernel)
+    endif()
+    add_v2_test(V2_Perf_ROCm_MoESmallGroupPrefix
+        COMMAND $<TARGET_FILE:${V2_ROCM_GROUPING_PERF_TARGET}>
+            --gtest_also_run_disabled_tests
+            --gtest_filter=Test__ROCmMoEKernel.DISABLED_SmallFloatGroupingProductionGeometryEvents
+            --gtest_brief=1
+        LABELS "V2;Performance;ROCm;MoE;GraphCapture;ByteExact"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf
+        ENVIRONMENT "LLAMINAR_TEST_SMALL_FLOAT_GROUP_GEOMETRY=512,1,10,10")
 # Original GGUF factors, actual fused expert transaction and fixed Q8 publications.
 add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
     COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
@@ -32217,6 +32252,47 @@ foreach(V2_QUERY_WORK_ISA AVX2 AVX512)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_QueryRowWork_${V2_QUERY_WORK_ISA})
     endif()
 endforeach()
+# Exact production compact grouping: integer policy, captured original arguments,
+# dirty replay and all guarded publications. Timing selectors remain separate.
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDA_MoESmallGroupPrefixExactPublications
+        COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.SmallFloatGroupingCapturedPublicationBoundaryTotality
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_MoESmallGroupPrefixExactPublications)
+endif()
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCm_MoESmallGroupPrefixExactPublications
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.SmallFloatGroupingCapturedPublicationBoundaryTotality
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_MoESmallGroupPrefixExactPublications)
+endif()
+
+# Poisoned full command publications must be byte deterministic on both GPUs.
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDA_MoERebalanceCommandBytes
+        COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.DeviceRebalanceControllerUsesExactLLEPGroupedLoadsForReplicaEconomy:Test__CUDAMoEKernel.DeviceRebalanceControllerPlansLLEPOwnershipTransfersWithoutHotCache
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;DeviceResident;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_MoERebalanceCommandBytes)
+endif()
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCm_MoERebalanceCommandBytes
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.DeviceRebalanceControllerUsesExactLLEPGroupedLoadsForReplicaEconomy:Test__ROCmMoEKernel.DeviceRebalanceControllerPlansLLEPOwnershipTransfersWithoutHotCache
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;DeviceResident;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_MoERebalanceCommandBytes)
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR

@@ -1,6 +1,19 @@
 # QFN tuning dashboard
 
-**Candidate177 passes the focused production-integration slice:** **819.876
+**Checkpoint179 passes scoped qualification:** **819.648 prefill / 40.656
+decode tok/s**, versus bracketed frozen177 controls at 819.665 / 40.295.
+Decode improves **0.897%** with non-overlapping sample ranges; prefill is flat.
+All nine generated sequences and all 185 canonical final-logit rows match.
+The complete **798-entry Unit/affected gate**, both Release counterparts,
+5,354 ROCm / 2,354 CUDA captured cells, final resource checks and isolated
+ROCm profiles pass. The short model trace proves 48 scan calls in every
+model graph. See the [settings and qualification record](QFN_SMALL_GROUP_PREFIX_TUNING.md).
+The **42.959 tok/s Castagna target remains open**. This uses explicit FP16
+attention Prefill8/Decode33; default promotion and complete preflight remain
+separate work. Next is a bounded existing-quantizer comparison through the
+unchanged complete HC-down projection.
+
+**Previous checkpoint177 passes the focused production-integration slice:** **819.876
 prefill / 40.328 decode tok/s**, versus frozen175 controls at 820.235 / 40.151.
 The measured +0.439% decode gain is small and the ranges narrowly overlap;
 the **42.959 tok/s Castagna target remains open**. All nine natural token
@@ -13,8 +26,18 @@ and ROCm while retaining exact recurrence arithmetic and state ownership.
 The final complete-boundary gains are 16.45% on MI50 and 26.05–30.09% on RTX3090;
 compiler/resource checks report zero spills. See the
 [qualification and benchmark settings](QFN_GDN_RECURRENCE_TUNING.md#scope-and-current-disposition).
-The next bounded experiment fuses NativeQ8 partial production with its exact
-ordered reduction; it has no measured result yet.
+The [NativeQ8 fusion trial 178](QFN_NATIVE_Q8_FOLD_TUNING.md) is rejected:
+all four exact-byte variants increase complete projection latency by 30–34%.
+ROCm counters show about 52% more vector instructions despite essentially
+unchanged fetched bytes. The private kernels are removed.
+The [small-group prefix checkpoint179](QFN_SMALL_GROUP_PREFIX_TUNING.md) measures
+**13.270→4.403 µs** for complete ten-route grouping on MI50, with exact bytes,
+88.2% fewer vector instruction issues and no spills. Final production builds
+and the 5,354-cell ROCm / 2,354-cell CUDA captured sweeps pass. Repairs for
+fixture-contract failures and unnamed rebalance-command padding now pass the
+complete **798-entry Unit/affected gate**, including both broad MoE suites and
+paired Release checks. Fresh production events and eight isolated ROCm counter
+runs also pass. Its qualified model accuracy and throughput are recorded above.
 
 **Previous candidate175 passes scoped regressions and the selected Release accuracy
 panel, but model decode throughput is unchanged.** The matched169/175 A/B/A
@@ -714,6 +737,7 @@ its actual prepared route must be represented explicitly in coverage.
 | A1.E160 | Same A1 topology; explicit FP16 `prefill8_decode33`, V0/V1 overlap and PV unroll2; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 832 Unit/affected registrations | 818.413 E160† | 467.821 F62§ | — | 40.111 E160† | 42.959 F62§ | — | Matched model throughput is flat versus frozen151. Native M1/512 pair15.446µs and M16/64K88.597µs. Experimental arithmetic; full preflight/default promotion remain open. |
 | A1.E164 | Same A1 topology; explicit FP16 `prefill8_decode33`, K1/V0/V1 overlap and QK64/32; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 832 Unit/affected plus new K1 oracle registration | 819.682 E164† | 467.821 F62§ | — | 40.265 E164† | 42.959 F62§ | — | Matched model ranges overlap frozen151. Native M1/512 pair15.086µs and M16/64K84.354µs. Experimental arithmetic; full preflight/default promotion remain open. |
 | A1.E165 | Same A1 topology; explicit FP16 `prefill8_decode33`, retained K0/K1 row addresses; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 20 native tests and 832 Unit/affected | 818.073 E165† | 467.821 F62§ | — | 40.190 E165† | 42.959 F62§ | — | Matched model ranges overlap frozen151. Native M1/51215.054µs, M1/64K19.127µs, M16/64K82.285µs. Fresh paired profiles identify merge as next target; default/full-preflight status unchanged. |
+| A1.E179 | Same A1 topology; explicit FP16 `prefill8_decode33`, merged GDN inputs and cooperative compact grouping; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 798 Unit/affected; final native/profile/path proofs | 819.648 E179† | 467.821 F62§ | — | 40.656 E179† | 42.959 F62§ | — | +0.897% matched decode versus frozen177 with non-overlapping ranges; prefill flat. All nine sequences match. Experimental attention arithmetic; default promotion and complete preflight remain open. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |

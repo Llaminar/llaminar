@@ -13,6 +13,7 @@
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/MoERebalanceController.h"
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <initializer_list>
 #include <iterator>
@@ -309,9 +310,9 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    // Version 16 authenticates complete-expert versus gate/up-only payloads
-    // without enlarging the generation-stamped transfer-slot records.
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 16u);
+    // Version 17 retains payload/lease identities and gives the former padding
+    // word explicit zero authority without enlarging the transport record.
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 17u);
     EXPECT_NE(DeviceMoERebalanceWaveLifecycle::PreparedForPublication,
               DeviceMoERebalanceWaveLifecycle::Applied);
     EXPECT_EQ(
@@ -325,6 +326,7 @@ TEST(Test__MoERebalanceController,
     EXPECT_EQ(plan.destination_previous_expert, kDeviceMoEInvalidSlot);
     EXPECT_EQ(plan.destination_generation, 0u);
     EXPECT_EQ(plan.destination_overlay_participant, -1);
+    EXPECT_EQ(plan.reserved, 0u);
 }
 
 /**
@@ -2655,4 +2657,33 @@ TEST(DeviceMoETransferFormats, IQ3SSourceTupleRetainsSecondaryCapacityAndIdentit
     EXPECT_EQ(destination.mins, destination_coefficient.data());
     EXPECT_EQ(destination.allocation_payload_bytes_per_block, 13);
     EXPECT_EQ(destination.allocation_has_mins, 1);
+}
+
+/** @brief All 64 wire bytes have field authority after poisoned host publication. */
+TEST(DeviceMoERebalanceCommandABI, ReservedWordAndWholeRepresentationAreDeterministic)
+{
+    using Entry = llaminar2::DeviceMoERebalancePlanEntry;
+    static_assert(sizeof(Entry) == 64);
+    static_assert(offsetof(Entry, reserved) == 52);
+    static_assert(offsetof(Entry, activation_count) == 56);
+    static_assert(std::has_unique_object_representations_v<Entry>);
+    Entry expected{};
+    expected.op = static_cast<uint32_t>(
+        llaminar2::DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    expected.expert = 3u;
+    expected.activation_count = 17u;
+    for (int repeat = 0; repeat < 20; ++repeat)
+    {
+        Entry source = expected;
+        source.reserved = 0xa5a5a5a5u; // Canonicalization may change no live field.
+        Entry output{};
+        std::memset(&output, repeat % 2 ? 0xa5 : 0x5a, sizeof(output));
+        uint32_t count = 0;
+        llaminar2::DeviceMoERebalanceStatus status{};
+        ASSERT_TRUE(llaminar2::deviceMoEAppendPlanEntry(
+            &output, &count, 1, source, &status));
+        ASSERT_EQ(count, 1u);
+        EXPECT_EQ(output.reserved, 0u);
+        EXPECT_EQ(std::memcmp(&output, &expected, sizeof(output)), 0);
+    }
 }

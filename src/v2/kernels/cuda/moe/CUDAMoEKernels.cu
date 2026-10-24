@@ -930,8 +930,16 @@ namespace
         uint32_t destination_previous_layer;
         uint32_t destination_previous_expert;
         uint32_t destination_generation;
+        uint32_t reserved; // Canonical zero word; no implicit wire padding.
         uint64_t activation_count;
     };
+    static_assert(std::is_standard_layout_v<DeviceMoERebalancePlanEntryView>);
+    static_assert(std::has_unique_object_representations_v<DeviceMoERebalancePlanEntryView>,
+                  "native command publication may not leave unnamed bytes");
+    static_assert(offsetof(DeviceMoERebalancePlanEntryView, reserved) ==
+                  llaminar2::moe_rebalance_abi::kPlanEntryReservedOffset);
+    static_assert(offsetof(DeviceMoERebalancePlanEntryView, activation_count) ==
+                  llaminar2::moe_rebalance_abi::kPlanEntryActivationCountOffset);
     static_assert(
         sizeof(DeviceMoERebalancePlanEntryView) ==
             llaminar2::moe_rebalance_abi::kPlanEntryBytes,
@@ -1931,6 +1939,7 @@ namespace
             return false;
         }
         plan_entries[index] = entry;
+        plan_entries[index].reserved = 0u; // Complete canonical command representation.
         *plan_count = index + 1u;
         if (status)
             ++status->planned_arrivals;
@@ -15680,21 +15689,214 @@ namespace
     }
 
     /**
-     * @brief Group a compact verifier route table in stable expert-major order.
+     * @brief Shared state for the verifier-sized expert prefix scan.
      *
-     * The compact MTP path has at most 64 route slots and 512 experts. One
-     * block therefore owns the complete grouping transaction. Each expert
-     * thread counts its own routes and computes its exact exclusive offset;
-     * each route thread then computes its stable rank among earlier routes to
-     * the same expert. Every output location has exactly one writer, so this
-     * implementation needs neither atomics nor a serial coordinator.
-     *
-     * Integer route counts and offsets are exact. More importantly, the
-     * grouped rows retain the same `(expert, original route slot)` order as
-     * serial decode. That ordering is part of the grouped-verifier bitwise
-     * equivalence contract because later gate/up and down kernels consume
-     * these arrays in order.
+     * The first scan component publishes each expert's stable route offset.
+     * The optional second component publishes its rank among active experts.
+     * Both use fixed warp order, so the result is identical to ascending serial
+     * traversal while avoiding the former quadratic shared-memory scan.
      */
+    struct RuntimeSmallGroupScanScratch
+    {
+        int count_warp_totals[(kDeviceMoEMaxExperts / 32)];
+        int count_warp_prefixes[(kDeviceMoEMaxExperts / 32)];
+        int active_warp_totals[(kDeviceMoEMaxExperts / 32)];
+        int active_warp_prefixes[(kDeviceMoEMaxExperts / 32)];
+        int total_active;
+        int first_invalid_expert;
+    };
+
+    /**
+     * @brief Compute deterministic block-wide count and active-list prefixes.
+     *
+     * Every lane must participate.  Each warp first scans its own values using
+     * shuffle instructions. Warp zero then scans the block's warp totals in
+     * ascending warp order. Integer addition is exact, and therefore this
+     * fixed two-level tree publishes the same offsets and active ranks as the
+     * serial expert-id traversal for every valid expert domain.
+     *
+     * @tparam ScanActive Whether to scan the active-expert predicate as well.
+     * @param count Number of local routes assigned to this lane's expert.
+     * @param scratch Block-owned scan state.
+     * @param count_prefix Receives the exclusive route-count prefix.
+     * @param active_prefix Receives the exclusive active-expert prefix.
+     * @param total_active Receives the total number of active experts.
+     */
+    template <bool ScanActive>
+    __device__ __forceinline__ void scan_runtime_small_group_experts(
+        int count,
+        RuntimeSmallGroupScanScratch &scratch,
+        int &count_prefix,
+        int &active_prefix,
+        int &total_active)
+    {
+        constexpr unsigned int kFullWarpMask = 0xffffffffu;
+        constexpr int kWarpSize = 32;
+        const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+        const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+        int count_inclusive = count;
+        int active_inclusive = count > 0 ? 1 : 0;
+
+#pragma unroll
+        for (int delta = 1; delta < kWarpSize; delta <<= 1)
+        {
+            const int prior_count =
+                __shfl_up_sync(kFullWarpMask, count_inclusive, delta);
+            if (lane >= delta)
+                count_inclusive += prior_count;
+            if constexpr (ScanActive)
+            {
+                const int prior_active =
+                    __shfl_up_sync(kFullWarpMask, active_inclusive, delta);
+                if (lane >= delta)
+                    active_inclusive += prior_active;
+            }
+        }
+
+        if (lane == kWarpSize - 1)
+        {
+            scratch.count_warp_totals[warp] = count_inclusive;
+            if constexpr (ScanActive)
+                scratch.active_warp_totals[warp] = active_inclusive;
+        }
+        __syncthreads();
+
+        if (warp == 0)
+        {
+            const int warp_count =
+                lane < static_cast<int>(blockDim.x) / kWarpSize
+                    ? scratch.count_warp_totals[lane]
+                    : 0;
+            const int warp_active =
+                ScanActive && lane < static_cast<int>(blockDim.x) / kWarpSize
+                    ? scratch.active_warp_totals[lane]
+                    : 0;
+            int count_warp_inclusive = warp_count;
+            int active_warp_inclusive = warp_active;
+#pragma unroll
+            for (int delta = 1; delta < kWarpSize; delta <<= 1)
+            {
+                const int prior_count = __shfl_up_sync(
+                    kFullWarpMask,
+                    count_warp_inclusive,
+                    delta);
+                if (lane >= delta)
+                    count_warp_inclusive += prior_count;
+                if constexpr (ScanActive)
+                {
+                    const int prior_active = __shfl_up_sync(
+                        kFullWarpMask,
+                        active_warp_inclusive,
+                        delta);
+                    if (lane >= delta)
+                        active_warp_inclusive += prior_active;
+                }
+            }
+
+            if (lane < static_cast<int>(blockDim.x) / kWarpSize)
+            {
+                scratch.count_warp_prefixes[lane] =
+                    count_warp_inclusive - warp_count;
+                if constexpr (ScanActive)
+                {
+                    scratch.active_warp_prefixes[lane] =
+                        active_warp_inclusive - warp_active;
+                }
+            }
+            if constexpr (ScanActive)
+            {
+                if (lane == static_cast<int>(blockDim.x) / kWarpSize - 1)
+                    scratch.total_active = active_warp_inclusive;
+            }
+        }
+        __syncthreads();
+
+        count_prefix = scratch.count_warp_prefixes[warp] +
+                       count_inclusive - count;
+        if constexpr (ScanActive)
+        {
+            const int active = count > 0 ? 1 : 0;
+            active_prefix = scratch.active_warp_prefixes[warp] +
+                            active_inclusive - active;
+            total_active = scratch.total_active;
+        }
+        else
+        {
+            active_prefix = 0;
+            total_active = 0;
+        }
+    }
+
+    /** @brief Exact integer-prefix implementations selected by admitted geometry. */
+    enum class SmallFloatGroupPrefixPolicy
+    {
+        IndependentExpert, ///< Short domains use independent ascending-expert prefixes.
+        CooperativeScan, ///< Larger domains share the existing two-level integer scan.
+    };
+
+    /** @brief Maximum expert extent admitted to the independent-prefix specialization. */
+    constexpr int kSmallFloatIndependentPrefixMaxExperts = 8;
+
+    /**
+     * @brief Select the prefix implementation before recording a complete operation.
+     * @param num_experts Positive admitted expert extent, at most kDeviceMoEMaxExperts.
+     * @return One fixed prefix policy for this immutable captured geometry.
+     */
+    constexpr SmallFloatGroupPrefixPolicy small_float_group_prefix_policy(int num_experts)
+    {
+        // Independent prefixes avoid cooperative-scan overhead for short domains;
+        // beyond this extent the parallel scan bounds shared integer prefix work.
+        return num_experts <= kSmallFloatIndependentPrefixMaxExperts
+            ? SmallFloatGroupPrefixPolicy::IndependentExpert
+            : SmallFloatGroupPrefixPolicy::CooperativeScan;
+    }
+
+    /**
+     * @brief Specialize shared storage so mutually exclusive prefixes own no unused bytes.
+     * @tparam PrefixPolicy One complete integer-prefix implementation.
+     */
+    template <SmallFloatGroupPrefixPolicy PrefixPolicy>
+    struct SmallFloatGroupPrefixScratch;
+
+    /** @brief Shared count publications read by independent ascending-expert prefixes. */
+    template <>
+    struct SmallFloatGroupPrefixScratch<SmallFloatGroupPrefixPolicy::IndependentExpert>
+    {
+        int counts[kSmallFloatIndependentPrefixMaxExperts]; ///< Only admitted expert lanes publish before readers.
+    };
+
+    /** @brief Exact existing scan storage with no independent-prefix count array. */
+    template <>
+    struct SmallFloatGroupPrefixScratch<SmallFloatGroupPrefixPolicy::CooperativeScan>
+    {
+        RuntimeSmallGroupScanScratch scan; ///< One block owns the existing two-level scan state.
+    };
+
+    /**
+     * @brief Publish one compact stable expert-major grouping operation.
+     *
+     * One complete block owns every publication. Valid IDs determine route counts,
+     * regardless of zero weight, and each route keeps its serial original-slot
+     * rank. Prefix implementations differ only in integer scheduling and internal
+     * shared storage; counts, offsets, maps, sentinels and copied weights have one
+     * common initialization, publication and stable scatter body.
+     *
+     * @tparam PrefixPolicy Compile-time prefix implementation selected before capture.
+     * @param routing_indices Original finite expert IDs.
+     * @param routing_weights Original FP32 weights copied without arithmetic.
+     * @param expert_counts Complete per-expert route-count publication.
+     * @param expert_offsets Complete per-expert exclusive-offset publication.
+     * @param grouped_token_indices Stable expert-major source token rows.
+     * @param original_to_grouped Original-slot to grouped-slot inverse map.
+     * @param original_expert_ids Original-slot valid expert IDs or minus one.
+     * @param grouped_weights Stable expert-major copied FP32 route weights.
+     * @param active_expert_ids Ascending active IDs with minus-one sentinels.
+     * @param total_slots Positive admitted original route slots, at most 64.
+     * @param num_experts Positive admitted expert extent, at most 512.
+     * @param top_k Positive admitted route width dividing total_slots.
+     * @param max_active_experts Declared active-list extent, at most min(total_slots, num_experts).
+     */
+    template <SmallFloatGroupPrefixPolicy PrefixPolicy>
     __global__ void group_tokens_small_float_kernel(
         const float *__restrict__ routing_indices,
         const float *__restrict__ routing_weights,
@@ -15711,10 +15913,9 @@ namespace
         int max_active_experts)
     {
         __shared__ int shared_route_experts[kDeviceMoESmallGroupMaxSlots];
-        __shared__ int shared_expert_counts[kDeviceMoEMaxExperts];
+        __shared__ SmallFloatGroupPrefixScratch<PrefixPolicy> prefix_scratch;
 
         const int tid = threadIdx.x;
-        shared_expert_counts[tid] = 0;
 
         if (tid < total_slots)
         {
@@ -15733,43 +15934,49 @@ namespace
             active_expert_ids[tid] = -1;
         __syncthreads();
 
-        /*
-         * Route-slot count is deliberately tiny. Assigning one expert to each
-         * lane avoids contended atomics and gives identical behavior on CUDA
-         * and ROCm, including experts with no selected rows.
-         */
+        // Counts follow valid IDs, including routes with positive or negative
+        // zero weights. Lanes outside the expert domain contribute zero.
+        int count = 0;
         if (tid < num_experts)
-        {
-            int count = 0;
             for (int slot = 0; slot < total_slots; ++slot)
                 count += shared_route_experts[slot] == tid ? 1 : 0;
-            shared_expert_counts[tid] = count;
-        }
-        __syncthreads();
 
-        /*
-         * Every expert independently derives its prefix from immutable shared
-         * counts. The small fixed upper bound makes this cheaper than a
-         * multi-kernel scan while avoiding the sixteen block barriers needed
-         * by an in-place Hillis-Steele scan over 256 lanes.
-         */
+        int offset = 0;
+        int active_rank = 0;
+        if constexpr (PrefixPolicy == SmallFloatGroupPrefixPolicy::IndependentExpert)
+        {
+            // The selected domain fits the independent-prefix scratch. Only those
+            // expert lanes write; every block lane still enters the barrier. This
+            // short domain saves one cooperative-scan barrier and shuffles.
+            if (tid < num_experts)
+                prefix_scratch.counts[tid] = count;
+            __syncthreads();
+            if (tid < num_experts)
+            {
+                for (int expert = 0; expert < tid; ++expert)
+                {
+                    const int preceding_count = prefix_scratch.counts[expert];
+                    offset += preceding_count;
+                    active_rank += preceding_count > 0 ? 1 : 0;
+                }
+            }
+        }
+        else
+        {
+            // Every block lane enters both scan barriers. Bounded integer sums are
+            // exact and preserve ascending expert order without quadratic reads.
+            int total_active = 0;
+            scan_runtime_small_group_experts<true>(
+                count, prefix_scratch.scan, offset, active_rank, total_active);
+        }
         if (tid < num_experts)
         {
-            int offset = 0;
-            int active_rank = 0;
-            for (int expert = 0; expert < tid; ++expert)
-            {
-                const int count = shared_expert_counts[expert];
-                offset += count;
-                active_rank += count > 0 ? 1 : 0;
-            }
-
-            const int count = shared_expert_counts[tid];
             expert_counts[tid] = count;
             expert_offsets[tid] = offset;
             if (count > 0 && active_rank < max_active_experts)
                 active_expert_ids[active_rank] = tid;
         }
+        // Both prefix policies publish offsets before route workers consume them.
         __syncthreads();
 
         if (tid < total_slots)
@@ -15893,145 +16100,6 @@ namespace
                (bank.resident_participant_mask[expert_id] & local_bit) != 0u &&
                desc.local_slot >= 0 &&
                llaminar2::deviceMoEExpertProjectionReady(desc, expected_projections);
-    }
-
-    /**
-     * @brief Shared state for the verifier-sized expert prefix scan.
-     *
-     * The first scan component publishes each expert's stable route offset.
-     * The optional second component publishes its rank among active experts.
-     * Both use fixed warp order, so the result is identical to ascending serial
-     * traversal while avoiding the former quadratic shared-memory scan.
-     */
-    struct RuntimeSmallGroupScanScratch
-    {
-        int count_warp_totals[(kDeviceMoEMaxExperts / 32)];
-        int count_warp_prefixes[(kDeviceMoEMaxExperts / 32)];
-        int active_warp_totals[(kDeviceMoEMaxExperts / 32)];
-        int active_warp_prefixes[(kDeviceMoEMaxExperts / 32)];
-        int total_active;
-        int first_invalid_expert;
-    };
-
-    /**
-     * @brief Compute deterministic block-wide count and active-list prefixes.
-     *
-     * Every lane must participate.  Each warp first scans its own values using
-     * shuffle instructions.  Warp zero then scans the eight warp totals in
-     * ascending warp order.  Integer addition is exact, and therefore this
-     * fixed two-level tree publishes the same offsets and active ranks as the
-     * serial expert-id traversal for every valid expert domain.
-     *
-     * @tparam ScanActive Whether to scan the active-expert predicate as well.
-     * @param count Number of local routes assigned to this lane's expert.
-     * @param scratch Block-owned scan state.
-     * @param count_prefix Receives the exclusive route-count prefix.
-     * @param active_prefix Receives the exclusive active-expert prefix.
-     * @param total_active Receives the total number of active experts.
-     */
-    template <bool ScanActive>
-    __device__ __forceinline__ void scan_runtime_small_group_experts(
-        int count,
-        RuntimeSmallGroupScanScratch &scratch,
-        int &count_prefix,
-        int &active_prefix,
-        int &total_active)
-    {
-        constexpr unsigned int kFullWarpMask = 0xffffffffu;
-        constexpr int kWarpSize = 32;
-        const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-        const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
-        int count_inclusive = count;
-        int active_inclusive = count > 0 ? 1 : 0;
-
-#pragma unroll
-        for (int delta = 1; delta < kWarpSize; delta <<= 1)
-        {
-            const int prior_count =
-                __shfl_up_sync(kFullWarpMask, count_inclusive, delta);
-            if (lane >= delta)
-                count_inclusive += prior_count;
-            if constexpr (ScanActive)
-            {
-                const int prior_active =
-                    __shfl_up_sync(kFullWarpMask, active_inclusive, delta);
-                if (lane >= delta)
-                    active_inclusive += prior_active;
-            }
-        }
-
-        if (lane == kWarpSize - 1)
-        {
-            scratch.count_warp_totals[warp] = count_inclusive;
-            if constexpr (ScanActive)
-                scratch.active_warp_totals[warp] = active_inclusive;
-        }
-        __syncthreads();
-
-        if (warp == 0)
-        {
-            const int warp_count =
-                lane < static_cast<int>(blockDim.x) / kWarpSize
-                    ? scratch.count_warp_totals[lane]
-                    : 0;
-            const int warp_active =
-                ScanActive && lane < static_cast<int>(blockDim.x) / kWarpSize
-                    ? scratch.active_warp_totals[lane]
-                    : 0;
-            int count_warp_inclusive = warp_count;
-            int active_warp_inclusive = warp_active;
-#pragma unroll
-            for (int delta = 1; delta < kWarpSize; delta <<= 1)
-            {
-                const int prior_count = __shfl_up_sync(
-                    kFullWarpMask,
-                    count_warp_inclusive,
-                    delta);
-                if (lane >= delta)
-                    count_warp_inclusive += prior_count;
-                if constexpr (ScanActive)
-                {
-                    const int prior_active = __shfl_up_sync(
-                        kFullWarpMask,
-                        active_warp_inclusive,
-                        delta);
-                    if (lane >= delta)
-                        active_warp_inclusive += prior_active;
-                }
-            }
-
-            if (lane < static_cast<int>(blockDim.x) / kWarpSize)
-            {
-                scratch.count_warp_prefixes[lane] =
-                    count_warp_inclusive - warp_count;
-                if constexpr (ScanActive)
-                {
-                    scratch.active_warp_prefixes[lane] =
-                        active_warp_inclusive - warp_active;
-                }
-            }
-            if constexpr (ScanActive)
-            {
-                if (lane == static_cast<int>(blockDim.x) / kWarpSize - 1)
-                    scratch.total_active = active_warp_inclusive;
-            }
-        }
-        __syncthreads();
-
-        count_prefix = scratch.count_warp_prefixes[warp] +
-                       count_inclusive - count;
-        if constexpr (ScanActive)
-        {
-            const int active = count > 0 ? 1 : 0;
-            active_prefix = scratch.active_warp_prefixes[warp] +
-                            active_inclusive - active;
-            total_active = scratch.total_active;
-        }
-        else
-        {
-            active_prefix = 0;
-            total_active = 0;
-        }
     }
 
     /**
@@ -22921,6 +22989,29 @@ extern "C"
         return finishLaunch("cudaMoE_scatter_tokens_deterministic");
     }
 
+    /**
+     * @brief Submit one complete grouping with a fixed geometry-selected integer prefix.
+     *
+     * Prefix selection changes only the compiled implementation. The original ABI,
+     * publications, fixed block geometry and single-operation capture remain the
+     * same, and an unsuccessful submission never tries another implementation.
+     * @param routing_indices Original finite expert-ID device array.
+     * @param routing_weights Original FP32 route-weight device array.
+     * @param expert_counts Complete per-expert route-count publication.
+     * @param expert_offsets Complete per-expert exclusive-offset publication.
+     * @param grouped_token_indices Stable expert-major source token rows.
+     * @param original_to_grouped Original-slot to grouped-slot inverse map.
+     * @param original_expert_ids Original-slot valid expert IDs or minus one.
+     * @param grouped_weights Stable expert-major copied FP32 weights.
+     * @param active_expert_ids Declared sorted active-ID publication and sentinels.
+     * @param total_slots Positive admitted route-slot count, at most 64.
+     * @param num_experts Positive expert extent, at most 512.
+     * @param top_k Positive route width under the existing kMaxTopK admission, dividing total_slots.
+     * @param max_active_experts Positive active extent, at most min(total_slots, num_experts).
+     * @param device_idx Exact native device owning the stream and buffers.
+     * @param stream Exact non-null stream retained until all borrowed buffers retire.
+     * @return True only after the selected native grouping launch succeeds.
+     */
     bool cudaMoE_group_tokens_small_float(
         const float *routing_indices,
         const float *routing_weights,
@@ -22958,10 +23049,25 @@ extern "C"
         }
 
         cudaSetDevice(device_idx);
-        group_tokens_small_float_kernel<<<1, llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts), 0, static_cast<cudaStream_t>(stream)>>>(
-            routing_indices, routing_weights, expert_counts, expert_offsets,
-            grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
-            active_expert_ids, total_slots, num_experts, top_k, max_active_experts);
+        const auto prefix_policy = small_float_group_prefix_policy(num_experts);
+        if (prefix_policy == SmallFloatGroupPrefixPolicy::IndependentExpert)
+        {
+            group_tokens_small_float_kernel<SmallFloatGroupPrefixPolicy::IndependentExpert><<<
+                1, llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts), 0,
+                static_cast<cudaStream_t>(stream)>>>(
+                routing_indices, routing_weights, expert_counts, expert_offsets,
+                grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
+                active_expert_ids, total_slots, num_experts, top_k, max_active_experts);
+        }
+        else
+        {
+            group_tokens_small_float_kernel<SmallFloatGroupPrefixPolicy::CooperativeScan><<<
+                1, llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts), 0,
+                static_cast<cudaStream_t>(stream)>>>(
+                routing_indices, routing_weights, expert_counts, expert_offsets,
+                grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
+                active_expert_ids, total_slots, num_experts, top_k, max_active_experts);
+        }
         return finishLaunch("cudaMoE_group_tokens_small_float");
     }
 

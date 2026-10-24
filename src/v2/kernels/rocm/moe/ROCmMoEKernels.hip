@@ -872,8 +872,16 @@ namespace
         uint32_t destination_previous_layer;
         uint32_t destination_previous_expert;
         uint32_t destination_generation;
+        uint32_t reserved; // Canonical zero word; no implicit wire padding.
         uint64_t activation_count;
     };
+    static_assert(std::is_standard_layout_v<DeviceMoERebalancePlanEntryView>);
+    static_assert(std::has_unique_object_representations_v<DeviceMoERebalancePlanEntryView>,
+                  "native command publication may not leave unnamed bytes");
+    static_assert(offsetof(DeviceMoERebalancePlanEntryView, reserved) ==
+                  llaminar2::moe_rebalance_abi::kPlanEntryReservedOffset);
+    static_assert(offsetof(DeviceMoERebalancePlanEntryView, activation_count) ==
+                  llaminar2::moe_rebalance_abi::kPlanEntryActivationCountOffset);
     static_assert(
         sizeof(DeviceMoERebalancePlanEntryView) ==
             llaminar2::moe_rebalance_abi::kPlanEntryBytes,
@@ -1934,6 +1942,7 @@ namespace
             return false;
         }
         plan_entries[index] = entry;
+        plan_entries[index].reserved = 0u; // Complete canonical command representation.
         *plan_count = index + 1u;
         if (status)
             ++status->planned_arrivals;
@@ -19496,214 +19505,6 @@ __global__ void rocm_moe_scatter_tokens_kernel(
 }
 
 /**
- * @brief Group a compact verifier route table in stable expert-major order.
- *
- * One 256/512-thread block owns every route and expert in this bounded operation.
- * Each expert thread computes its own exact count and exclusive offset, while
- * each route thread computes its rank among earlier routes to the same expert.
- * Unique destinations eliminate the atomic write-head race that previously
- * made grouped-row order scheduling-dependent.
- *
- * This is intentionally the same algorithm as CUDA. Stable expert-major route
- * order is required for grouped verifier rows to remain byte-identical to
- * serial decode on every GPU backend.
- */
-__global__ void rocm_moe_group_tokens_small_float_kernel(
-    const float *__restrict__ routing_indices,
-    const float *__restrict__ routing_weights,
-    int *__restrict__ expert_counts,
-    int *__restrict__ expert_offsets,
-    int *__restrict__ grouped_token_indices,
-    int *__restrict__ original_to_grouped,
-    int *__restrict__ original_expert_ids,
-    float *__restrict__ grouped_weights,
-    int *__restrict__ active_expert_ids,
-    int total_slots,
-    int num_experts,
-    int top_k,
-    int max_active_experts)
-{
-    __shared__ int shared_route_experts[kDeviceMoESmallGroupMaxSlots];
-    __shared__ int shared_expert_counts[kDeviceMoEMaxExperts];
-
-    const int tid = threadIdx.x;
-    shared_expert_counts[tid] = 0;
-
-    if (tid < total_slots)
-    {
-        grouped_token_indices[tid] = 0;
-        original_to_grouped[tid] = -1;
-        /*
-         * The small-M planner feeds two later grouped verifier contracts:
-         * ordered scatter needs route-slot -> grouped-slot, while parallel
-         * down publication needs route-slot -> expert-id.  Keep both maps
-         * authored by this single grouping kernel so verifier replay cannot
-         * accidentally consume stale scratch from a previous batch.
-         */
-        original_expert_ids[tid] = -1;
-        grouped_weights[tid] = 0.0f;
-
-        const int expert = static_cast<int>(routing_indices[tid]);
-        const int valid_expert =
-            (expert >= 0 && expert < num_experts) ? expert : -1;
-        shared_route_experts[tid] = valid_expert;
-        original_expert_ids[tid] = valid_expert;
-    }
-    if (tid < max_active_experts)
-        active_expert_ids[tid] = -1;
-    __syncthreads();
-
-    /*
-     * Route-slot count is deliberately tiny. One expert per lane replaces
-     * contended atomics with deterministic comparisons against shared route
-     * ids and gives the two GPU backends the same publication contract.
-     */
-    if (tid < num_experts)
-    {
-        int count = 0;
-        for (int slot = 0; slot < total_slots; ++slot)
-            count += shared_route_experts[slot] == tid ? 1 : 0;
-        shared_expert_counts[tid] = count;
-    }
-    __syncthreads();
-
-    /*
-     * Independent prefixes avoid a serial lane and need only immutable shared
-     * counts. At this bounded size the regular integer work costs less than a
-     * separate scan launch or a barrier-heavy in-place block scan.
-     */
-    if (tid < num_experts)
-    {
-        int offset = 0;
-        int active_rank = 0;
-        for (int expert = 0; expert < tid; ++expert)
-        {
-            const int count = shared_expert_counts[expert];
-            offset += count;
-            active_rank += count > 0 ? 1 : 0;
-        }
-
-        const int count = shared_expert_counts[tid];
-        expert_counts[tid] = count;
-        expert_offsets[tid] = offset;
-        if (count > 0 && active_rank < max_active_experts)
-            active_expert_ids[active_rank] = tid;
-    }
-    __syncthreads();
-
-    if (tid < total_slots)
-    {
-        const int expert = shared_route_experts[tid];
-        if (expert < 0 || expert >= num_experts)
-            return;
-
-        int stable_local_rank = 0;
-        for (int previous_slot = 0; previous_slot < tid; ++previous_slot)
-            stable_local_rank +=
-                shared_route_experts[previous_slot] == expert ? 1 : 0;
-
-        const int destination =
-            expert_offsets[expert] + stable_local_rank;
-        grouped_token_indices[destination] = tid / top_k;
-        original_to_grouped[tid] = destination;
-        grouped_weights[destination] = routing_weights[tid];
-    }
-}
-
-/**
- * @brief Publish singleton shared-expert routes from the device-owned live prefix.
- *
- * The whole captured capacity is initialized on every replay. Inactive inverse
- * entries stay invalid, so both compact and tiled consumers skip padded work
- * even when a preceding replay admitted a larger MTP depth.
- */
-__global__ void rocm_moe_prepare_shared_expert_group_kernel(
-    int *__restrict__ expert_offsets,
-    int *__restrict__ expert_counts,
-    int *__restrict__ grouped_token_indices,
-    int *__restrict__ original_to_grouped,
-    float *__restrict__ grouped_weights,
-    int *__restrict__ active_expert_ids,
-    llaminar2::DeviceRowRange rows)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int active_rows = rows.activeRows();
-    if (idx == 0)
-    {
-        expert_offsets[0] = 0;
-        expert_counts[0] = active_rows;
-        active_expert_ids[0] = active_rows > 0 ? 0 : -1;
-    }
-    if (idx < rows.physicalRows())
-    {
-        grouped_token_indices[idx] = idx;
-        original_to_grouped[idx] = idx < active_rows ? idx : -1;
-        grouped_weights[idx] = idx < active_rows ? 1.0f : 0.0f;
-    }
-}
-
-__global__ void rocm_moe_prefill_group_clear_kernel(
-    DeviceMoELayerRuntimeView *__restrict__ runtime,
-    int *__restrict__ original_to_grouped,
-    int max_slots, int num_experts, int clear_route_metadata)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (!runtime) return;
-
-    if (idx < num_experts && runtime->expert_counts && runtime->expert_offsets)
-    {
-        runtime->expert_counts[idx] = 0;
-        runtime->expert_offsets[idx] = 0;
-    }
-
-    if (idx < max_slots)
-    {
-        if (clear_route_metadata && runtime->route_expert_ids) runtime->route_expert_ids[idx] = -1;
-        if (clear_route_metadata && runtime->route_weights) runtime->route_weights[idx] = 0.0f;
-        if (clear_route_metadata && runtime->route_participant_ids) runtime->route_participant_ids[idx] = -1;
-        if (runtime->grouped_token_ids) runtime->grouped_token_ids[idx] = 0;
-        if (runtime->grouped_route_weights) runtime->grouped_route_weights[idx] = 0.0f;
-        if (original_to_grouped) original_to_grouped[idx] = -1;
-    }
-}
-
-/**
- * @brief Return whether a runtime-prefill route can be computed by this shard.
- *
- * StaticOwner LocalTP verifier prefill is intentionally a local partial.  The
- * router still produces global expert ids, but this participant must group
- * only experts whose active placement-bank descriptor is resident and marked
- * LocalCompute.  LLEP planning does not use this predicate during its first
- * grouping pass because it needs global route counts before assigning rows.
- */
-__device__ __forceinline__ bool rocm_moe_prefill_static_local_ready(
-    const DeviceMoELayerRuntimeView *__restrict__ runtime,
-    int expert_id,
-    int num_experts,
-    llaminar2::DeviceMoEProjectionSet expected_projections)
-{
-    const uint32_t execution_bank = runtime_execution_bank(runtime);
-    if (!runtime ||
-        expert_id < 0 ||
-        expert_id >= num_experts ||
-        expert_id >= kDeviceMoEMaxExperts ||
-        execution_bank > 1u)
-    {
-        return false;
-    }
-
-    const DeviceMoEPlacementBankView &bank =
-        runtime_placement_banks(runtime)[execution_bank];
-    const DeviceMoEExpertDescriptorView &desc = bank.experts[expert_id];
-    const uint32_t local_bit =
-        runtime_participant_bit(static_cast<int>(runtime->participant_id));
-    return bank.local_compute_mask[expert_id] != 0u &&
-           (bank.resident_participant_mask[expert_id] & local_bit) != 0u &&
-           desc.local_slot >= 0 &&
-           llaminar2::deviceMoEExpertProjectionReady(desc, expected_projections);
-}
-
-/**
  * @brief Shared state for the verifier-sized expert prefix scan.
  *
  * The first component publishes stable route offsets and the optional second
@@ -19828,6 +19629,277 @@ __device__ __forceinline__ void rocm_scan_runtime_small_group_experts(
         active_prefix = 0;
         total_active = 0;
     }
+}
+
+/** @brief Exact integer-prefix implementations selected by admitted geometry. */
+enum class SmallFloatGroupPrefixPolicy
+{
+    IndependentExpert, ///< Short domains use independent ascending-expert prefixes.
+    CooperativeScan, ///< Larger domains share the existing two-level integer scan.
+};
+
+/** @brief Maximum expert extent admitted to the independent-prefix specialization. */
+constexpr int kSmallFloatIndependentPrefixMaxExperts = 32;
+
+/**
+ * @brief Select the prefix implementation before recording a complete operation.
+ * @param num_experts Positive admitted expert extent, at most kDeviceMoEMaxExperts.
+ * @return One fixed prefix policy for this immutable captured geometry.
+ */
+constexpr SmallFloatGroupPrefixPolicy small_float_group_prefix_policy(int num_experts)
+{
+    // Independent prefixes avoid cooperative-scan overhead for short domains;
+    // beyond this extent the parallel scan bounds shared integer prefix work.
+    return num_experts <= kSmallFloatIndependentPrefixMaxExperts
+        ? SmallFloatGroupPrefixPolicy::IndependentExpert
+        : SmallFloatGroupPrefixPolicy::CooperativeScan;
+}
+
+/**
+ * @brief Specialize shared storage so mutually exclusive prefixes own no unused bytes.
+ * @tparam PrefixPolicy One complete integer-prefix implementation.
+ */
+template <SmallFloatGroupPrefixPolicy PrefixPolicy>
+struct SmallFloatGroupPrefixScratch;
+
+/** @brief Shared count publications read by independent ascending-expert prefixes. */
+template <>
+struct SmallFloatGroupPrefixScratch<SmallFloatGroupPrefixPolicy::IndependentExpert>
+{
+    int counts[kSmallFloatIndependentPrefixMaxExperts]; ///< Only admitted expert lanes publish before readers.
+};
+
+/** @brief Exact existing scan storage with no independent-prefix count array. */
+template <>
+struct SmallFloatGroupPrefixScratch<SmallFloatGroupPrefixPolicy::CooperativeScan>
+{
+    RuntimeSmallGroupScanScratch scan; ///< One block owns the existing two-level scan state.
+};
+
+/**
+ * @brief Publish one compact stable expert-major grouping operation.
+ *
+ * One complete block owns every publication. Valid IDs determine route counts,
+ * regardless of zero weight, and each route keeps its serial original-slot
+ * rank. Prefix implementations differ only in integer scheduling and internal
+ * shared storage; counts, offsets, maps, sentinels and copied weights have one
+ * common initialization, publication and stable scatter body.
+ *
+ * @tparam PrefixPolicy Compile-time prefix implementation selected before capture.
+ * @param routing_indices Original finite expert IDs.
+ * @param routing_weights Original FP32 weights copied without arithmetic.
+ * @param expert_counts Complete per-expert route-count publication.
+ * @param expert_offsets Complete per-expert exclusive-offset publication.
+ * @param grouped_token_indices Stable expert-major source token rows.
+ * @param original_to_grouped Original-slot to grouped-slot inverse map.
+ * @param original_expert_ids Original-slot valid expert IDs or minus one.
+ * @param grouped_weights Stable expert-major copied FP32 route weights.
+ * @param active_expert_ids Ascending active IDs with minus-one sentinels.
+ * @param total_slots Positive admitted original route slots, at most 64.
+ * @param num_experts Positive admitted expert extent, at most 512.
+ * @param top_k Positive original route width, at most 16.
+ * @param max_active_experts Declared active-list extent, at most min(total_slots, num_experts).
+ */
+template <SmallFloatGroupPrefixPolicy PrefixPolicy>
+__global__ void rocm_moe_group_tokens_small_float_kernel(
+    const float *__restrict__ routing_indices,
+    const float *__restrict__ routing_weights,
+    int *__restrict__ expert_counts,
+    int *__restrict__ expert_offsets,
+    int *__restrict__ grouped_token_indices,
+    int *__restrict__ original_to_grouped,
+    int *__restrict__ original_expert_ids,
+    float *__restrict__ grouped_weights,
+    int *__restrict__ active_expert_ids,
+    int total_slots,
+    int num_experts,
+    int top_k,
+    int max_active_experts)
+{
+    __shared__ int shared_route_experts[kDeviceMoESmallGroupMaxSlots];
+    __shared__ SmallFloatGroupPrefixScratch<PrefixPolicy> prefix_scratch;
+
+    const int tid = threadIdx.x;
+
+    if (tid < total_slots)
+    {
+        grouped_token_indices[tid] = 0;
+        original_to_grouped[tid] = -1;
+        /*
+         * The small-M planner feeds two later grouped verifier contracts:
+         * ordered scatter needs route-slot -> grouped-slot, while parallel
+         * down publication needs route-slot -> expert-id.  Keep both maps
+         * authored by this single grouping kernel so verifier replay cannot
+         * accidentally consume stale scratch from a previous batch.
+         */
+        original_expert_ids[tid] = -1;
+        grouped_weights[tid] = 0.0f;
+
+        const int expert = static_cast<int>(routing_indices[tid]);
+        const int valid_expert =
+            (expert >= 0 && expert < num_experts) ? expert : -1;
+        shared_route_experts[tid] = valid_expert;
+        original_expert_ids[tid] = valid_expert;
+    }
+    if (tid < max_active_experts)
+        active_expert_ids[tid] = -1;
+    __syncthreads();
+
+    // Counts follow valid IDs, including routes with positive or negative
+    // zero weights. Lanes outside the expert domain contribute zero.
+    int count = 0;
+    if (tid < num_experts)
+        for (int slot = 0; slot < total_slots; ++slot)
+            count += shared_route_experts[slot] == tid ? 1 : 0;
+
+    int offset = 0;
+    int active_rank = 0;
+    if constexpr (PrefixPolicy == SmallFloatGroupPrefixPolicy::IndependentExpert)
+    {
+        // The selected domain has at most 32 experts. Only those lanes write
+        // the 32-entry scratch; every block lane still enters the barrier. The
+        // short domain saves one cooperative-scan barrier and shuffles.
+        if (tid < num_experts)
+            prefix_scratch.counts[tid] = count;
+        __syncthreads();
+        if (tid < num_experts)
+        {
+            for (int expert = 0; expert < tid; ++expert)
+            {
+                const int preceding_count = prefix_scratch.counts[expert];
+                offset += preceding_count;
+                active_rank += preceding_count > 0 ? 1 : 0;
+            }
+        }
+    }
+    else
+    {
+        // Every block lane enters both scan barriers. Bounded integer sums are
+        // exact and preserve ascending expert order without quadratic reads.
+        int total_active = 0;
+        rocm_scan_runtime_small_group_experts<true>(
+            count, prefix_scratch.scan, offset, active_rank, total_active);
+    }
+    if (tid < num_experts)
+    {
+        expert_counts[tid] = count;
+        expert_offsets[tid] = offset;
+        if (count > 0 && active_rank < max_active_experts)
+            active_expert_ids[active_rank] = tid;
+    }
+    // Both prefix policies publish offsets before route workers consume them.
+    __syncthreads();
+
+    if (tid < total_slots)
+    {
+        const int expert = shared_route_experts[tid];
+        if (expert < 0 || expert >= num_experts)
+            return;
+
+        int stable_local_rank = 0;
+        for (int previous_slot = 0; previous_slot < tid; ++previous_slot)
+            stable_local_rank +=
+                shared_route_experts[previous_slot] == expert ? 1 : 0;
+
+        const int destination =
+            expert_offsets[expert] + stable_local_rank;
+        grouped_token_indices[destination] = tid / top_k;
+        original_to_grouped[tid] = destination;
+        grouped_weights[destination] = routing_weights[tid];
+    }
+}
+
+/**
+ * @brief Publish singleton shared-expert routes from the device-owned live prefix.
+ *
+ * The whole captured capacity is initialized on every replay. Inactive inverse
+ * entries stay invalid, so both compact and tiled consumers skip padded work
+ * even when a preceding replay admitted a larger MTP depth.
+ */
+__global__ void rocm_moe_prepare_shared_expert_group_kernel(
+    int *__restrict__ expert_offsets,
+    int *__restrict__ expert_counts,
+    int *__restrict__ grouped_token_indices,
+    int *__restrict__ original_to_grouped,
+    float *__restrict__ grouped_weights,
+    int *__restrict__ active_expert_ids,
+    llaminar2::DeviceRowRange rows)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int active_rows = rows.activeRows();
+    if (idx == 0)
+    {
+        expert_offsets[0] = 0;
+        expert_counts[0] = active_rows;
+        active_expert_ids[0] = active_rows > 0 ? 0 : -1;
+    }
+    if (idx < rows.physicalRows())
+    {
+        grouped_token_indices[idx] = idx;
+        original_to_grouped[idx] = idx < active_rows ? idx : -1;
+        grouped_weights[idx] = idx < active_rows ? 1.0f : 0.0f;
+    }
+}
+
+__global__ void rocm_moe_prefill_group_clear_kernel(
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int *__restrict__ original_to_grouped,
+    int max_slots, int num_experts, int clear_route_metadata)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!runtime) return;
+
+    if (idx < num_experts && runtime->expert_counts && runtime->expert_offsets)
+    {
+        runtime->expert_counts[idx] = 0;
+        runtime->expert_offsets[idx] = 0;
+    }
+
+    if (idx < max_slots)
+    {
+        if (clear_route_metadata && runtime->route_expert_ids) runtime->route_expert_ids[idx] = -1;
+        if (clear_route_metadata && runtime->route_weights) runtime->route_weights[idx] = 0.0f;
+        if (clear_route_metadata && runtime->route_participant_ids) runtime->route_participant_ids[idx] = -1;
+        if (runtime->grouped_token_ids) runtime->grouped_token_ids[idx] = 0;
+        if (runtime->grouped_route_weights) runtime->grouped_route_weights[idx] = 0.0f;
+        if (original_to_grouped) original_to_grouped[idx] = -1;
+    }
+}
+
+/**
+ * @brief Return whether a runtime-prefill route can be computed by this shard.
+ *
+ * StaticOwner LocalTP verifier prefill is intentionally a local partial.  The
+ * router still produces global expert ids, but this participant must group
+ * only experts whose active placement-bank descriptor is resident and marked
+ * LocalCompute.  LLEP planning does not use this predicate during its first
+ * grouping pass because it needs global route counts before assigning rows.
+ */
+__device__ __forceinline__ bool rocm_moe_prefill_static_local_ready(
+    const DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int expert_id,
+    int num_experts,
+    llaminar2::DeviceMoEProjectionSet expected_projections)
+{
+    const uint32_t execution_bank = runtime_execution_bank(runtime);
+    if (!runtime ||
+        expert_id < 0 ||
+        expert_id >= num_experts ||
+        expert_id >= kDeviceMoEMaxExperts ||
+        execution_bank > 1u)
+    {
+        return false;
+    }
+
+    const DeviceMoEPlacementBankView &bank =
+        runtime_placement_banks(runtime)[execution_bank];
+    const DeviceMoEExpertDescriptorView &desc = bank.experts[expert_id];
+    const uint32_t local_bit =
+        runtime_participant_bit(static_cast<int>(runtime->participant_id));
+    return bank.local_compute_mask[expert_id] != 0u &&
+           (bank.resident_participant_mask[expert_id] & local_bit) != 0u &&
+           desc.local_slot >= 0 &&
+           llaminar2::deviceMoEExpertProjectionReady(desc, expected_projections);
 }
 
 /**
@@ -22157,6 +22229,29 @@ bool hipMoE_build_runtime_original_to_grouped(
     return true;
 }
 
+/**
+ * @brief Submit one complete grouping with a fixed geometry-selected integer prefix.
+ *
+ * Prefix selection changes only the compiled implementation. The original ABI,
+ * publications, fixed block geometry and single-operation capture remain the
+ * same, and an unsuccessful submission never tries another implementation.
+ * @param routing_indices Original finite expert-ID device array.
+ * @param routing_weights Original FP32 route-weight device array.
+ * @param expert_counts Complete per-expert route-count publication.
+ * @param expert_offsets Complete per-expert exclusive-offset publication.
+ * @param grouped_token_indices Stable expert-major source token rows.
+ * @param original_to_grouped Original-slot to grouped-slot inverse map.
+ * @param original_expert_ids Original-slot valid expert IDs or minus one.
+ * @param grouped_weights Stable expert-major copied FP32 weights.
+ * @param active_expert_ids Declared sorted active-ID publication and sentinels.
+ * @param total_slots Positive admitted route-slot count, at most 64.
+ * @param num_experts Positive expert extent, at most 512.
+ * @param top_k Positive route width, at most 16, dividing total_slots.
+ * @param max_active_experts Positive active extent, at most min(total_slots, num_experts).
+ * @param device_idx Exact native device owning the stream and buffers.
+ * @param stream Exact non-null stream retained until all borrowed buffers retire.
+ * @return True only after the selected native grouping launch succeeds.
+ */
 bool hipMoE_group_tokens_small_float(
     const float *routing_indices, const float *routing_weights,
     int *expert_counts, int *expert_offsets,
@@ -22194,14 +22289,27 @@ bool hipMoE_group_tokens_small_float(
         return false;
     }
 
-    hipLaunchKernelGGL(rocm_moe_group_tokens_small_float_kernel,
-        dim3(1), dim3(llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts)), 0, static_cast<hipStream_t>(stream),
-        routing_indices, routing_weights,
-        expert_counts, expert_offsets,
-        grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
-        active_expert_ids,
-        total_slots, num_experts, top_k,
-        max_active_experts);
+    const auto prefix_policy = small_float_group_prefix_policy(num_experts);
+    if (prefix_policy == SmallFloatGroupPrefixPolicy::IndependentExpert)
+    {
+        hipLaunchKernelGGL(
+            (rocm_moe_group_tokens_small_float_kernel<SmallFloatGroupPrefixPolicy::IndependentExpert>),
+            dim3(1), dim3(llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts)),
+            0, static_cast<hipStream_t>(stream), routing_indices, routing_weights,
+            expert_counts, expert_offsets, grouped_token_indices, original_to_grouped,
+            original_expert_ids, grouped_weights, active_expert_ids,
+            total_slots, num_experts, top_k, max_active_experts);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            (rocm_moe_group_tokens_small_float_kernel<SmallFloatGroupPrefixPolicy::CooperativeScan>),
+            dim3(1), dim3(llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts)),
+            0, static_cast<hipStream_t>(stream), routing_indices, routing_weights,
+            expert_counts, expert_offsets, grouped_token_indices, original_to_grouped,
+            original_expert_ids, grouped_weights, active_expert_ids,
+            total_slots, num_experts, top_k, max_active_experts);
+    }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -24,7 +25,9 @@ namespace llaminar2::moe_rebalance_abi
      */
     // v16 uses compact format tags plus an explicit movable-projection tag.
     // Descriptor byte size is unchanged, but v15's field interpretation is not.
-    inline constexpr uint32_t kVersion = 16u;
+    // v17 gives the former plan alignment gap an explicit zero-reserved authority.
+    // Existing live-field offsets and the 64-byte command extent are unchanged.
+    inline constexpr uint32_t kVersion = 17u;
 
     /**
      * @brief Exact byte size of one device-owned rebalance command.
@@ -35,6 +38,10 @@ namespace llaminar2::moe_rebalance_abi
      * participant namespaces happen to use the same integer.
      */
     inline constexpr uint32_t kPlanEntryBytes = 64u;
+    /** Explicit zero word replacing implicit ABI padding, preserved across backends. */
+    inline constexpr uint32_t kPlanEntryReservedOffset = 52u;
+    /** Existing exact demand offset; unaffected by the named reserved word. */
+    inline constexpr uint32_t kPlanEntryActivationCountOffset = 56u;
     /** Immutable native admission proof travels with the existing command sideband. */
     inline constexpr uint32_t kCommandHeaderBytes = 128u;
     /** Authenticated wave completion, including actual payload bytes. */

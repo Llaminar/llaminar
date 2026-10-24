@@ -74,6 +74,7 @@
 #include "../moe/MoETransferStateMachineTestModel.h"
 #include "../moe/NativeVNNIExpertTransferParityTest.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
+#include "../moe/SharedSmallFloatGroupingCapturedRegression.h"
 
 #include <vector>
 #include <array>
@@ -967,6 +968,11 @@ namespace
             return hipSetDevice(device_ordinal_) == hipSuccess &&
                    graph_.launch();
         }
+
+        /** @brief Borrow the immutable native graph for exact captured-node inspection.
+         * @return Native graph owned until this test capture retires.
+         */
+        [[nodiscard]] hipGraph_t nativeGraphForInspection() const {return graph_.graph();}
 
     private:
         int device_ordinal_ = 0;
@@ -2922,10 +2928,12 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeVNNICodebo
         bool requires_emins;
     };
 
+    // IQ3_S (execution codebook 11) retains the original source nibble in the secondary
+    // plane. The descriptor must carry it even though it is not minimum math.
     const std::vector<CodebookCase> codebooks = {
         {0, false, false},  {4, false, false},  {5, true, false},
         {6, false, false},  {7, true, false},   {8, true, false},
-        {9, true, false},   {10, true, true},   {11, false, false},
+        {9, true, false},   {10, true, true},   {11, true, false},
         {12, false, false}, {13, true, false},  {14, true, false},
         {15, false, false}, {16, true, false},  {17, true, false},
         {19, false, false},
@@ -8026,6 +8034,8 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansLLEPOwnershipTransfersWi
 
     ROCmMoEKernel gpu_kernel(0);
     static_cast<IMoEKernel &>(gpu_kernel).setGPUStream(stream);
+    ASSERT_EQ(hipMemsetAsync(d_plan, 0xa5, sizeof(*d_plan), stream),
+              hipSuccess);
     ASSERT_TRUE(gpu_kernel.runDeviceRebalanceController(
         moeLaunchContext(stream),
         runtime_table.deviceLayerState(0),
@@ -8094,11 +8104,68 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansLLEPOwnershipTransfersWi
         .destination_previous_layer = 0u,
         .destination_previous_expert = 0u,
         .destination_generation = 0u,
+        .reserved = 0u,
+        .activation_count = 0u,
     };
     EXPECT_EQ(
         std::memcmp(&plan, &expected_plan, sizeof(plan)),
         0)
         << "the complete ROCm LLEP ownership command must remain byte exact";
+    EXPECT_EQ(plan.reserved, 0u);
+    // DeferRuntimeApply leaves the active runtime bank and immutable histograms
+    // unchanged. Reset only this fixture's controller lifecycle and all planner
+    // output scratch, then require all 64 bytes to be published again.
+    for (const int poison : {0x5a, 0xff, 0xa5})
+    {
+        ASSERT_EQ(hipMemcpyAsync(
+                      d_controller_state, &controller_state, sizeof(controller_state),
+                      hipMemcpyHostToDevice, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_status, 0, sizeof(*d_status), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(
+                      d_llep_layer_plans, 0, llepPlannerScratchBytes(config), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(
+                      d_placement_plan_scratch, 0, sizeof(*d_placement_plan_scratch), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_command_header, 0, sizeof(*d_command_header), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_wave_state, 0, sizeof(*d_wave_state), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_plan_count, 0, sizeof(*d_plan_count), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_plan, poison, sizeof(*d_plan), stream),
+                  hipSuccess);
+        ASSERT_TRUE(gpu_kernel.runDeviceRebalanceController(
+            moeLaunchContext(stream),
+            runtime_table.deviceLayerState(0),
+            d_gathered,
+            d_status,
+            config,
+            d_plan,
+            d_plan_count,
+            1,
+            1,
+            d_command_header,
+            d_wave_state,
+            d_controller_state,
+            1u,
+            nullptr,
+            0u,
+            d_llep_layer_plans,
+            d_placement_plan_scratch));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_EQ(hipMemcpy(&plan, d_plan, sizeof(plan), hipMemcpyDeviceToHost),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpy(&plan_count, d_plan_count, sizeof(plan_count),
+                             hipMemcpyDeviceToHost),
+                  hipSuccess);
+        ASSERT_EQ(plan_count, 1u);
+        EXPECT_EQ(plan.reserved, 0u);
+        EXPECT_EQ(std::memcmp(&plan, &expected_plan, sizeof(plan)), 0)
+            << "complete command changed after dirty replay poison=" << poison;
+    }
 
     EXPECT_EQ(hipFree(d_gathered), hipSuccess);
     EXPECT_EQ(hipFree(d_status), hipSuccess);
@@ -8398,6 +8465,8 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerUsesExactLLEPGroupedLoadsForR
 
     ROCmMoEKernel gpu_kernel(0);
     static_cast<IMoEKernel &>(gpu_kernel).setGPUStream(stream);
+    ASSERT_EQ(hipMemsetAsync(d_plan, 0xa5, sizeof(*d_plan), stream),
+              hipSuccess);
     ASSERT_TRUE(gpu_kernel.runDeviceRebalanceController(
         moeLaunchContext(stream),
         runtime_table.deviceLayerState(0),
@@ -8481,11 +8550,68 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerUsesExactLLEPGroupedLoadsForR
         .destination_previous_layer = 0u,
         .destination_previous_expert = 0u,
         .destination_generation = 0u,
+        .reserved = 0u,
+        .activation_count = 0u,
     };
     EXPECT_EQ(
         std::memcmp(&plan, &expected_plan, sizeof(plan)),
         0)
         << "the complete ROCm grouped-replica command must remain byte exact";
+    EXPECT_EQ(plan.reserved, 0u);
+    // DeferRuntimeApply leaves the active runtime bank and immutable histograms
+    // unchanged. Reset only this fixture's controller lifecycle and all planner
+    // output scratch, then require all 64 bytes to be published again.
+    for (const int poison : {0x5a, 0xff, 0xa5})
+    {
+        ASSERT_EQ(hipMemcpyAsync(
+                      d_controller_state, &controller_state, sizeof(controller_state),
+                      hipMemcpyHostToDevice, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_status, 0, sizeof(*d_status), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(
+                      d_llep_layer_plans, 0, llepPlannerScratchBytes(config), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(
+                      d_placement_plan_scratch, 0, sizeof(*d_placement_plan_scratch), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_command_header, 0, sizeof(*d_command_header), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_wave_state, 0, sizeof(*d_wave_state), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_plan_count, 0, sizeof(*d_plan_count), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_plan, poison, sizeof(*d_plan), stream),
+                  hipSuccess);
+        ASSERT_TRUE(gpu_kernel.runDeviceRebalanceController(
+            moeLaunchContext(stream),
+            runtime_table.deviceLayerState(0),
+            d_gathered,
+            d_status,
+            config,
+            d_plan,
+            d_plan_count,
+            1,
+            1,
+            d_command_header,
+            d_wave_state,
+            d_controller_state,
+            1u,
+            nullptr,
+            0u,
+            d_llep_layer_plans,
+            d_placement_plan_scratch));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_EQ(hipMemcpy(&plan, d_plan, sizeof(plan), hipMemcpyDeviceToHost),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpy(&plan_count, d_plan_count, sizeof(plan_count),
+                             hipMemcpyDeviceToHost),
+                  hipSuccess);
+        ASSERT_EQ(plan_count, 1u);
+        EXPECT_EQ(plan.reserved, 0u);
+        EXPECT_EQ(std::memcmp(&plan, &expected_plan, sizeof(plan)), 0)
+            << "complete command changed after dirty replay poison=" << poison;
+    }
 
     EXPECT_EQ(hipFree(d_gathered), hipSuccess);
     EXPECT_EQ(hipFree(d_status), hipSuccess);
@@ -19057,6 +19183,12 @@ void runGroupedExpertGateUpDecodeFormatMatch(
     }
 
     auto reqs = gate_kernels[0]->getWorkspaceRequirements(1, intermediate, d_model);
+    // The serial reference uses one fused gate/up bundle for every active
+    // route. Per-projection requirements omit the simultaneous partial slots;
+    // declare the exact ordered bundle through its production workspace owner.
+    const std::vector<int> fused_columns(static_cast<std::size_t>(num_active) * 2u, intermediate);
+    gate_kernels[0]->appendFusedProjectionWorkspaceRequirements(
+        reqs, 1, fused_columns, d_model);
     auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024 * 1024);
     ASSERT_TRUE(workspace->allocate(reqs));
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
@@ -21980,6 +22112,12 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen35RouteTable_Q4KQ5KMatchesCpuDequan
     sequential_reqs.merge(gate0_workspace->getWorkspaceRequirements(seq_len, intermediate, d_model));
     sequential_reqs.merge(up0_workspace->getWorkspaceRequirements(seq_len, intermediate, d_model));
     sequential_reqs.merge(down0_workspace->getWorkspaceRequirements(seq_len, d_model, intermediate));
+    // An expert with one routed row still executes the real fused M1 gate/up
+    // program. Its two simultaneous partial slots belong to the same canonical
+    // bundle contract used by MoEExpertComputeStage's prepared reference path.
+    const std::array<int, 2> fused_columns{intermediate, intermediate};
+    gate0_workspace->appendFusedProjectionWorkspaceRequirements(
+        sequential_reqs, seq_len, fused_columns, d_model);
     auto sequential_workspace = std::make_unique<DeviceWorkspaceManager>(device, 128 * 1024 * 1024);
     ASSERT_TRUE(sequential_workspace->allocate(sequential_reqs));
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
@@ -22261,6 +22399,12 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen36RouteTable_IQ2SGateUp_IQ4XSDownMa
     sequential_reqs.merge(gate0_workspace->getWorkspaceRequirements(seq_len, intermediate, d_model));
     sequential_reqs.merge(up0_workspace->getWorkspaceRequirements(seq_len, intermediate, d_model));
     sequential_reqs.merge(down0_workspace->getWorkspaceRequirements(seq_len, d_model, intermediate));
+    // An expert with one routed row still executes the real fused M1 gate/up
+    // program. Its two simultaneous partial slots belong to the same canonical
+    // bundle contract used by MoEExpertComputeStage's prepared reference path.
+    const std::array<int, 2> fused_columns{intermediate, intermediate};
+    gate0_workspace->appendFusedProjectionWorkspaceRequirements(
+        sequential_reqs, seq_len, fused_columns, d_model);
     auto sequential_workspace = std::make_unique<DeviceWorkspaceManager>(device, 128 * 1024 * 1024);
     ASSERT_TRUE(sequential_workspace->allocate(sequential_reqs));
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
@@ -23071,11 +23215,6 @@ TEST(Test__ROCmMoEKernel,
         {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
     auto weights = TestTensorFactory::createFP32(
         {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
-    ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
-    ASSERT_TRUE(gate->ensureOnDevice(device, stream));
-    ASSERT_TRUE(indices->ensureOnDevice(device, stream));
-    ASSERT_TRUE(weights->ensureOnDevice(device, stream));
-
     DeviceMoERuntimeTable::Config ledger_config;
     ledger_config.device_id = device;
     ledger_config.num_layers = 1;
@@ -23102,17 +23241,48 @@ TEST(Test__ROCmMoEKernel,
         .num_experts = num_experts,
         .top_k = top_k,
     };
+    std::vector<float> indices_host(indices->numel());
+    std::vector<float> weights_host(weights->numel());
+    std::vector<int32_t> retained_experts(indices->numel());
+    std::vector<int32_t> retained_participants(indices->numel());
+    HIPGraphCapture graph(stream, /*device_ordinal=*/0);
+    /**
+     * @brief Retire the exact stream before graphs and borrowed storage unwind.
+     *
+     * The nested capture transaction below closes first on every assertion or
+     * exception. This last owner then drains uploads, replay and host copies
+     * before graph, staging, workspace, ledger or tensor destruction can free
+     * bytes still borrowed by the stream.
+     */
+    struct RouterRetirement final
+    {
+        hipStream_t stream;
+        /** @brief Fail hard if the owning device or stream cannot retire. */
+        ~RouterRetirement() noexcept
+        {
+            if (hipSetDevice(0) != hipSuccess ||
+                hipStreamSynchronize(stream) != hipSuccess)
+                std::terminate();
+        }
+    } retirement{stream};
+
+    // Residency alone does not admit an external producer event into capture.
+    // Join both immutable inputs on the exact routing stream before recording;
+    // write-only outputs require stable storage, not uploaded initial values.
+    TransferEngine::prepareDeviceInput(hidden.get(), device, stream);
+    TransferEngine::prepareDeviceInput(gate.get(), device, stream);
+    TransferEngine::requireDeviceInput(hidden.get(), device, stream);
+    TransferEngine::requireDeviceInput(gate.get(), device, stream);
+    TransferEngine::prepareDeviceOutput(indices.get(), device, stream);
+    TransferEngine::prepareDeviceOutput(weights.get(), device, stream);
     ASSERT_TRUE(kernel.prepareRouteLaunch(gate.get(), launch_plan));
 
     PerfStatsCollector::reset();
-    hipGraph_t graph = nullptr;
-    ASSERT_EQ(
-        hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-        hipSuccess);
-    bool captured = false;
     {
-        GraphCaptureGuard capture_guard;
-        captured = kernel.routeVerifierRowsDecodeEquivalent(
+        ScopedBackendGraphCapture capture(
+            graph, "prepared Q8 verifier router without eager warmup");
+        ASSERT_TRUE(capture.begin());
+        ASSERT_TRUE(kernel.routeVerifierRowsDecodeEquivalent(
             hidden.get(),
             gate.get(),
             seq_len,
@@ -23123,24 +23293,12 @@ TEST(Test__ROCmMoEKernel,
             indices.get(),
             weights.get(),
             /*device_effective_seq_len=*/nullptr,
-            overlay_ledger.deviceLayerState(0));
+            overlay_ledger.deviceLayerState(0)));
+        capture.finish();
     }
-    const hipError_t capture_status = hipStreamEndCapture(stream, &graph);
-    ASSERT_TRUE(captured);
-    ASSERT_EQ(capture_status, hipSuccess) << hipGetErrorString(capture_status);
-    ASSERT_NE(graph, nullptr);
-
-    hipGraphExec_t executable = nullptr;
-    ASSERT_EQ(
-        hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
-        hipSuccess);
-    ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess);
+    ASSERT_TRUE(graph.instantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-
-    std::vector<float> indices_host(indices->numel());
-    std::vector<float> weights_host(weights->numel());
-    std::vector<int32_t> retained_experts(indices->numel());
-    std::vector<int32_t> retained_participants(indices->numel());
     ASSERT_EQ(
         hipMemcpyAsync(
             indices_host.data(),
@@ -23195,8 +23353,6 @@ TEST(Test__ROCmMoEKernel,
         << "only graph recording may invoke routing; preparation must not run an eager row";
     PerfStatsCollector::reset();
 
-    EXPECT_EQ(hipGraphExecDestroy(executable), hipSuccess);
-    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
 }
 
 TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)
@@ -24227,6 +24383,7 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
 #endif
 
     const DeviceId device = DeviceId::rocm(0);
+    const hipStream_t stream = rocmMoETestStream();
     constexpr int seq_len = 2;
     constexpr int d_model = 64;
     constexpr int intermediate = 32;
@@ -24289,12 +24446,11 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
     }
 
     auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024 * 1024);
-    ASSERT_TRUE(workspace->allocate(gate_kernels[0]->getWorkspaceRequirements(seq_len, intermediate, d_model)));
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
-        gate_kernels[expert_id]->bindWorkspace(workspace.get());
-        up_kernels[expert_id]->bindWorkspace(workspace.get());
-        down_kernels[expert_id]->bindWorkspace(workspace.get());
+        gate_kernels[expert_id]->setGPUStream(stream);
+        up_kernels[expert_id]->setGPUStream(stream);
+        down_kernels[expert_id]->setGPUStream(stream);
         gate_kernels[expert_id]->prepareWeights();
         up_kernels[expert_id]->prepareWeights();
         down_kernels[expert_id]->prepareWeights();
@@ -24302,7 +24458,8 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
 
     auto input = TestTensorFactory::createFP32Random(
         {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)}, -1.0f, 1.0f, 77);
-    ASSERT_TRUE(input->ensureOnDevice(device));
+    llaminar2::TransferEngine::prepareDeviceInput(input.get(), device, stream);
+    llaminar2::TransferEngine::requireDeviceInput(input.get(), device, stream);
 
     const float routing_indices_data[total_slots] = {
         0.0f, 1.0f,
@@ -24315,13 +24472,15 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
     auto routing_weights = TestTensorFactory::createFP32({static_cast<size_t>(total_slots), 1});
     std::copy(routing_indices_data, routing_indices_data + total_slots, routing_indices->mutable_data());
     std::copy(routing_weights_data, routing_weights_data + total_slots, routing_weights->mutable_data());
-    ASSERT_TRUE(routing_indices->ensureOnDevice(device));
-    ASSERT_TRUE(routing_weights->ensureOnDevice(device));
+    llaminar2::TransferEngine::prepareDeviceInput(routing_indices.get(), device, stream);
+    llaminar2::TransferEngine::requireDeviceInput(routing_indices.get(), device, stream);
+    llaminar2::TransferEngine::prepareDeviceInput(routing_weights.get(), device, stream);
+    llaminar2::TransferEngine::requireDeviceInput(routing_weights.get(), device, stream);
 
     auto reference_output = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
     auto fixed_output = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    ASSERT_TRUE(reference_output->ensureOnDevice(device));
-    ASSERT_TRUE(fixed_output->ensureOnDevice(device));
+    llaminar2::TransferEngine::prepareDeviceOutput(reference_output.get(), device, stream);
+    llaminar2::TransferEngine::prepareDeviceOutput(fixed_output.get(), device, stream);
 
     auto gate_exps = TestTensorFactory::createQ4_0Random(
         {static_cast<size_t>(num_experts * intermediate), static_cast<size_t>(d_model)}, 401);
@@ -24365,10 +24524,38 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
 
     ROCmDeviceContext ctx(device, 0);
 
+    /** @brief Join this test-only stage boundary before borrowed weights,
+     * workspace, runtime metadata or tensor owners can unwind on failure. */
+    struct ReleaseStageRetirement final
+    {
+        hipStream_t stream;
+        /** @brief Terminal observation only; failed native retirement is fatal. */
+        ~ReleaseStageRetirement() noexcept
+        {
+            if (hipStreamSynchronize(stream) != hipSuccess)
+                std::terminate();
+        }
+    };
     MoEExpertComputeStage reference_stage(make_params(reference_output.get(), nullptr));
+    // Admit the complete stage BOM, including MoE grouping and down scratch,
+    // before binding any projection; one gate matrix is not the stage envelope.
+    ASSERT_TRUE(workspace->allocate(
+        reference_stage.getWorkspaceRequirements(seq_len, d_model, intermediate)));
+    reference_stage.setGPUStream(stream);
     reference_stage.bindWorkspace(workspace.get());
+    ReleaseStageRetirement reference_retirement{stream};
     ASSERT_TRUE(reference_stage.execute(&ctx));
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    {
+        const auto records = PerfStatsCollector::snapshot({"kernel.rocm_moe_small_prefill_grouping_calls"});
+        double small_grouping_calls = 0.0;
+        for (const auto &record : records)
+            small_grouping_calls += record.value;
+        EXPECT_GT(small_grouping_calls, 0.0)
+            << "reference prefill should use compact small-M grouping";
+    }
+    PerfStatsCollector::reset();
 
     DeviceMoERuntimeTable::Config runtime_config;
     runtime_config.device_id = device;
@@ -24379,33 +24566,70 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
     runtime_config.prefill_token_capacity = seq_len;
     MoERuntimeTable runtime_table(runtime_config);
 
-    MoEExpertComputeStage fixed_stage(make_params(fixed_output.get(), &runtime_table));
-    ASSERT_TRUE(fixed_stage.isGraphCapturable());
-    fixed_stage.bindWorkspace(workspace.get());
-    ASSERT_TRUE(fixed_stage.execute(&ctx));
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    // StaticOwner grouping consumes a published resident bank, not merely
+    // allocated route scratch. Publish the exact already-prepared engines.
+    MoEPlacementUpdate placement;
+    placement.epoch = 1;
+    placement.expert_count = num_experts;
+    placement.participant_id = 0;
+    placement.participant_count = 1;
+    placement.experts.resize(num_experts);
+    placement.local_compute_mask.assign(num_experts, 1u);
+    placement.replica_role.assign(num_experts,
+        static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
-        const auto records = PerfStatsCollector::snapshot({"kernel.rocm_moe_small_prefill_grouping_calls"});
-        double small_grouping_calls = 0.0;
-        for (const auto &record : records)
-            small_grouping_calls += record.value;
-        EXPECT_GT(small_grouping_calls, 0.0)
-            << "verifier-sized fixed-topology prefill should use fused small-M grouping";
+        auto &descriptor = placement.experts[expert_id];
+        ASSERT_TRUE(exportDeviceMoEExpertWeightDescriptors(
+            gate_kernels[expert_id].get(), up_kernels[expert_id].get(), down_kernels[expert_id].get(),
+            d_model, intermediate, descriptor));
+        descriptor.logical_expert_id = expert_id;
+        descriptor.owner_participant = 0;
+        descriptor.local_slot = expert_id;
+        descriptor.flags = toMoEExpertFlags(
+            DeviceMoEExpertFlags::Valid |
+            DeviceMoEExpertFlags::Resident |
+            DeviceMoEExpertFlags::LocalCompute |
+            DeviceMoEExpertFlags::PreferredOwner);
     }
+    // This guard precedes the first asynchronous runtime publication so an
+    // assertion failure cannot destroy the table while its event is live.
+    ReleaseStageRetirement placement_retirement{stream};
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, placement));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, placement.epoch, stream));
+
+    MoEExpertComputeStage fixed_stage(make_params(fixed_output.get(), &runtime_table));
+    fixed_stage.setGPUStream(stream);
+    fixed_stage.bindWorkspace(workspace.get());
+    ReleaseStageRetirement runtime_retirement{stream};
+    // Readiness follows the public cold graph-preparation transition, not
+    // construction or an eager execution of the candidate's numerical path.
+    ASSERT_TRUE(fixed_stage.prepareGraphLaunch(&ctx, stream))
+        << fixed_stage.graphCaptureReadinessDebugString();
+    ASSERT_TRUE(fixed_stage.isGraphCapturable())
+        << fixed_stage.graphCaptureReadinessDebugString();
+    ASSERT_TRUE(fixed_stage.execute(&ctx));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     {
         const auto records = PerfStatsCollector::snapshot({"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
         double batch_invariant_calls = 0.0;
         for (const auto &record : records)
         {
-            batch_invariant_calls += record.value;
+            const auto grouping = record.tags.find("grouping");
+            const auto admission = record.tags.find("route_admission");
+            const auto down = record.tags.find("down_route");
+            if (grouping != record.tags.end() && grouping->second == "runtime" &&
+                admission != record.tags.end() && admission->second == "device_group_plan" &&
+                down != record.tags.end() && down->second == "direct_ordered_publish")
+                batch_invariant_calls += record.value;
         }
         EXPECT_GT(batch_invariant_calls, 0.0)
             << "verifier-sized fixed-topology prefill should use batch-invariant grouped publication";
     }
     PerfStatsCollector::reset();
 
-    ASSERT_TRUE(reference_output->ensureOnHost(rocmMoETestStream()));
-    ASSERT_TRUE(fixed_output->ensureOnHost(rocmMoETestStream()));
+    ASSERT_TRUE(reference_output->ensureOnHost(stream));
+    ASSERT_TRUE(fixed_output->ensureOnHost(stream));
     const float *reference = reference_output->data();
     const float *fixed = fixed_output->data();
     const size_t output_count = static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
@@ -29251,3 +29475,243 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCaptured512ExpertHighHalfAndDirtyReplay
     }
     ASSERT_EQ(hipStreamDestroy(stream_), hipSuccess);
 }
+
+#ifdef HAVE_ROCM
+namespace
+{
+    /** @brief Thin ROCM adapter; all numerical/oracle/dirty replay code is shared. */
+    struct SharedSmallFloatGroupingRocmBackend final
+    {
+        using Stream = hipStream_t;
+        using StreamOwner = ScopedHipDeviceStream;
+        using Graph = ScopedHipTestGraph;
+        /** @return Exact participant0 test device, matching the retained stream. */
+        static DeviceId device()
+        {
+            return DeviceId::rocm(0);
+        }
+        /** @param status Exact native operation result; errors cannot fall through. */
+        static void check(hipError_t status)
+        {
+            if (status != hipSuccess)
+                throw std::runtime_error(hipGetErrorString(status));
+        }
+        /** @param stream Borrowed exact stream. @return Native terminal status. */
+        static hipError_t sync(Stream stream)
+        {
+            return hipStreamSynchronize(stream);
+        }
+        /** @param stream Borrowed exact stream. @return Whether terminal retirement succeeded. */
+        static bool syncNoThrow(Stream stream) noexcept
+        {
+            return sync(stream) == hipSuccess;
+        }
+        /** @param dst Native destination. @param src Persistent host bytes.
+         * @param bytes Fixture publication extent. @param stream Exact ordered stream. */
+        static void upload(void *dst, const void *src, std::size_t bytes, Stream stream)
+        {
+            check(hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice, stream));
+        }
+        /** @param dst Persistent host observation. @param src Native bytes.
+         * @param bytes Guarded fixture extent. @param stream Exact ordered stream. */
+        static void download(void *dst, const void *src, std::size_t bytes, Stream stream)
+        {
+            check(hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost, stream));
+        }
+        /** @param dst Native publication. @param bytes Full guarded test extent.
+         * @param stream Exact ordered stream; poisoning is outside captured execution. */
+        static void poison(void *dst, std::size_t bytes, Stream stream)
+        {
+            check(hipMemsetAsync(dst, 0xa5, bytes, stream));
+        }
+        /** @brief Record exactly one real public grouping bridge, never a trial entry.
+         * @param stream Borrowed explicit stream. @param p Immutable original tuple.
+         * @param repetitions Exact positive original production kernel count in capture.
+         * @return Fully instantiated graph; local capture closes before exception propagation.
+         * @throws std::runtime_error For bridge/capture/instantiation failure. */
+        static std::unique_ptr<Graph>
+        capture(Stream stream,
+                const llaminar2::test::SharedSmallFloatGroupingCaptureInputs &p,
+                int repetitions)
+        {
+            auto graph =
+                std::make_unique<ScopedHipTestGraph>(0, stream, "production compact grouping");
+            for (int i = 0; i < repetitions; ++i)
+                if (!hipMoE_group_tokens_small_float(p.indices,
+                                                     p.weights,
+                                                     p.counts,
+                                                     p.offsets,
+                                                     p.tokens,
+                                                     p.inverse,
+                                                     p.experts,
+                                                     p.grouped_weights,
+                                                     p.active,
+                                                     p.slots,
+                                                     p.num_experts,
+                                                     p.top_k,
+                                                     p.max_active,
+                                                     0,
+                                                     stream))
+                    throw std::runtime_error("Public compact grouping capture failed");
+            if (!graph->finishAndInstantiate())
+                throw std::runtime_error("Public compact grouping instantiate failed");
+            return graph;
+        }
+        /** @brief Authenticate the sole production node, original 13arguments and policy.
+         * @param graph Fully instantiated capture owner. @param p Original tuple.
+         * @param stream Exact stream, used only for cold native symbol inspection.
+         * @param repetitions Exact capture kernel count (1functional or32events).
+         * @param emit Whether to publish diagnostic capture metadata outside timing.
+         * @throws std::runtime_error For any node, address, scalar, policy or geometry drift. */
+        static void inspect(Graph &graph,
+                            const llaminar2::test::SharedSmallFloatGroupingCaptureInputs &p,
+                            Stream stream,
+                            int repetitions,
+                            bool emit)
+        {
+            auto native = graph.nativeGraphForInspection();
+            std::size_t count = 0;
+            check(hipGraphGetNodes(native, nullptr, &count));
+            if (count != std::size_t(repetitions))
+                throw std::runtime_error("Grouping capture kernel count differs");
+            std::vector<hipGraphNode_t> nodes(count);
+            check(hipGraphGetNodes(native, nodes.data(), &count));
+            std::size_t roots = 0, edges = 0;
+            const void *function = nullptr;
+            for (auto node : nodes)
+            {
+                hipGraphNodeType type;
+                check(hipGraphNodeGetType(node, &type));
+                if (type != hipGraphNodeTypeKernel)
+                    throw std::runtime_error("Grouping captured a nonkernel operation");
+                count = 0;
+                check(hipGraphNodeGetDependencies(node, nullptr, &count));
+                if (count > 1)
+                    throw std::runtime_error("Grouping DAG branches");
+                roots += count == 0;
+                edges += count;
+                count = 0;
+                check(hipGraphNodeGetDependentNodes(node, nullptr, &count));
+                if (count > 1)
+                    throw std::runtime_error("Grouping DAG branches");
+                hipKernelNodeParams k{};
+                check(hipGraphKernelNodeGetParams(node, &k));
+                if (!function)
+                    function = k.func;
+                if (k.func != function)
+                    throw std::runtime_error("Grouping captured different native functions");
+                const unsigned block = p.num_experts <= 256 ? 256 : 512;
+                if (k.gridDim.x != 1 || k.gridDim.y != 1 || k.gridDim.z != 1 ||
+                    k.blockDim.x != block || k.blockDim.y != 1 || k.blockDim.z != 1 ||
+                    k.sharedMemBytes || !k.func || !k.kernelParams || k.extra)
+                    throw std::runtime_error("Grouping native geometry/argument authority drift");
+                const void *pointers[] = {p.indices,
+                                          p.weights,
+                                          p.counts,
+                                          p.offsets,
+                                          p.tokens,
+                                          p.inverse,
+                                          p.experts,
+                                          p.grouped_weights,
+                                          p.active};
+                for (int i = 0; i < 9; ++i)
+                {
+                    const void *actual = nullptr;
+                    std::memcpy(&actual, k.kernelParams[i], sizeof(actual));
+                    if (actual != pointers[i])
+                        throw std::runtime_error("Grouping captured pointer differs");
+                }
+                const int scalars[] = {p.slots, p.num_experts, p.top_k, p.max_active};
+                for (int i = 0; i < 4; ++i)
+                {
+                    int actual = 0;
+                    std::memcpy(&actual, k.kernelParams[9 + i], sizeof(actual));
+                    if (actual != scalars[i])
+                        throw std::runtime_error("Grouping captured scalar differs");
+                }
+                hipFuncAttributes resource{};
+                check(hipFuncGetAttributes(&resource, k.func));
+                if (resource.localSizeBytes || resource.numRegs <= 0)
+                    throw std::runtime_error(
+                        "Grouping native private storage/resource proof missing");
+                const char *symbol = hipKernelNameRefByPtr(k.func, stream);
+                const std::string expected =
+                    "40rocm_moe_group_tokens_small_float_kernelIL27SmallFloatGroupPrefixPolicy" +
+                    std::to_string(p.num_experts > 32 ? 1 : 0) + "EE";
+                if (!symbol || std::string(symbol).find(expected) == std::string::npos)
+                    throw std::runtime_error(
+                        "Grouping production native family/prefix policy differs");
+                if (emit && node == nodes.front())
+                    std::cout << "SMALL_FLOAT_GROUP_PRODUCTION_CAPTURE E=" << p.num_experts
+                              << " M=" << p.slots / p.top_k << " K=" << p.top_k
+                              << " A=" << p.max_active << " repetitions=" << repetitions
+                              << " grid=1x1x1 block=" << block
+                              << " policy=" << (p.num_experts > 32 ? 1 : 0)
+                              << " function=" << k.func << " native_symbol=" << symbol
+                              << " registers=" << resource.numRegs
+                              << " shared=" << resource.sharedSizeBytes
+                              << " private=" << resource.localSizeBytes << "\n";
+            }
+            if (roots != 1 || edges != nodes.size() - 1)
+                throw std::runtime_error("Grouping capture is not one complete linear DAG");
+        }
+        /** @brief Time one retained 32-kernel graph; allocation/byte checks are excluded.
+         * @param graph Fully authenticated original production graph.
+         * @param stream Exact captured stream.
+         * @return Native event elapsed microseconds for the complete graph.
+         * @throws std::runtime_error For native event or replay errors.
+         */
+        static double sample(Graph &graph, Stream stream)
+        {
+            hipEvent_t first = nullptr, last = nullptr;
+            try
+            {
+                check(hipEventCreate(&first));
+                check(hipEventCreate(&last));
+                check(hipEventRecord(first, stream));
+                if (!graph.launch())
+                    throw std::runtime_error("Grouping timed replay failed");
+                check(hipEventRecord(last, stream));
+                check(hipEventSynchronize(last));
+                float ms = 0;
+                check(hipEventElapsedTime(&ms, first, last));
+                check(hipEventDestroy(last));
+                last = nullptr;
+                check(hipEventDestroy(first));
+                first = nullptr;
+                return double(ms) * 1000;
+            }
+            catch (...)
+            {
+                if (!syncNoThrow(stream))
+                    std::terminate();
+                if (last && hipEventDestroy(last) != hipSuccess)
+                    std::terminate();
+                if (first && hipEventDestroy(first) != hipSuccess)
+                    std::terminate();
+                throw;
+            }
+        }
+    };
+    /** @test Real captured production grouping publishes exact metadata/weight bytes for
+     * every backend-admitted row/top-k at expert boundaries, every expert count,
+     * truncated active lists and full/empty/high-half dirty replay, with poisoned tails. */
+    TEST(Test__ROCmMoEKernel, SmallFloatGroupingCapturedPublicationBoundaryTotality)
+    {
+        SKIP_IF_NO_ROCM();
+        llaminar2::test::runSharedSmallFloatGroupingProductionMatrix<
+            SharedSmallFloatGroupingRocmBackend>(64, 32);
+    }
+    /** @test Disabled one-cell complete production grouping native events, with
+     * the same original arguments and exact byte/guard proof before and after timing. */
+    TEST(Test__ROCmMoEKernel, DISABLED_SmallFloatGroupingProductionGeometryEvents)
+    {
+        SKIP_IF_NO_ROCM();
+        const auto geometry = llaminar2::test::sharedSmallFloatGroupingEventGeometry(
+            std::getenv("LLAMINAR_TEST_SMALL_FLOAT_GROUP_GEOMETRY"));
+        llaminar2::test::runSharedSmallFloatGroupingProductionEvents<
+            SharedSmallFloatGroupingRocmBackend>(64, 32, geometry);
+    }
+
+} // namespace
+#endif

@@ -332,6 +332,8 @@ namespace llaminar2
         uint32_t destination_previous_layer = kDeviceMoEInvalidSlot;
         uint32_t destination_previous_expert = kDeviceMoEInvalidSlot;
         uint32_t destination_generation = 0;
+        /** Must publish zero: explicit authority for the former four-byte ABI gap. */
+        uint32_t reserved = 0;
         /** Demand sealed by the planner before histogram scratch is reused. */
         uint64_t activation_count = 0;
     };
@@ -816,6 +818,13 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceGraphControllerState>);
     static_assert(sizeof(DeviceMoERebalanceGraphControllerState) == moe_rebalance_abi::kGraphControllerBytes);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
+    static_assert(std::is_standard_layout_v<DeviceMoERebalancePlanEntry>);
+    static_assert(std::has_unique_object_representations_v<DeviceMoERebalancePlanEntry>,
+                  "every command byte must have one typed field authority");
+    static_assert(offsetof(DeviceMoERebalancePlanEntry, reserved) ==
+                  moe_rebalance_abi::kPlanEntryReservedOffset);
+    static_assert(offsetof(DeviceMoERebalancePlanEntry, activation_count) ==
+                  moe_rebalance_abi::kPlanEntryActivationCountOffset);
     static_assert(
         sizeof(DeviceMoERebalancePlanEntry) ==
             moe_rebalance_abi::kPlanEntryBytes,
@@ -1949,6 +1958,8 @@ namespace llaminar2
             return false;
         }
         plan_entries[*plan_count] = entry;
+        // Reserved transport bytes are canonical, never inherited allocator contents.
+        plan_entries[*plan_count].reserved = 0u;
         ++(*plan_count);
         if (status)
             ++status->planned_arrivals;
