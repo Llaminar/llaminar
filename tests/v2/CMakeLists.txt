@@ -22997,6 +22997,13 @@ if(HAVE_ROCM)
     )
 endif()
 
+# Retained leaf-elimination algebra and lifecycle checks remain device-free.
+# Native trials have an explicit standalone build, outside serving and image gates.
+add_v2_test(V2_Unit_GDNLeafEliminationReference
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/research/gdn_leaf_elimination/test_harness.py
+    LABELS "V2;Unit;GDN;Research;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
 # Test: GDN Kernels — Phase C: GDNProjectionStage, ShortConv1dStage,
 # GDNRecurrenceStage (recurrent step + chunk-parallel prefill)
 add_executable(v2_test_gdn_kernels unit/execution/Test__GDNKernels.cpp)
