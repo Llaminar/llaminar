@@ -27,19 +27,19 @@ struct alignas(16) SparseHalfVector
 static_assert(sizeof(SparseHalfVector) == 16);
 
 /**
- * @brief Thread-private V-panel vectors reused across second-panel QK and first PV.
+ * @brief Thread-private raw KV panel reused across the QK and PV overlap windows.
  * @details G6 uses 384 cooperative threads for 1024 vectors. The first 256
  * threads own three vectors and the remaining 128 own two. Unused slots are
- * initialized but never published. V0 dies at LDS publication before the same
- * bank is reused for V1. This is intended to scalarize into registers;
+ * initialized but never published. K1, V0 and V1 each die at their LDS
+ * publication before the same bank is reused by the next panel. This is intended to scalarize into registers;
  * compiler spill/resource and ISA gates must prove that physical realization.
  * It adds no workspace, allocation or native memory transfer.
  */
-struct SparseHalfValuePrefetch
+struct SparseHalfPanelPrefetch
 {
     SparseHalfVector first, second, third;
 };
-static_assert(sizeof(SparseHalfValuePrefetch) == 48);
+static_assert(sizeof(SparseHalfPanelPrefetch) == 48);
 
 /** @brief Two packed-half pairs; both split-half inputs use exact8-byte transfers. */
 struct alignas(8) SparseHalfDuo
@@ -85,6 +85,73 @@ __device__ __forceinline__ float2 rotateSparseHalfSplitPair(
         detail::roundRepresentation(high * c, representation) +
         detail::roundRepresentation(low * s, representation), representation);
     return make_float2(first, second);
+}
+
+/**
+ * @brief One guarded native KV-vector source, prepared before the value is loaded.
+ * @details An inactive source owns no native read. Only the key/value preparation helpers
+ * create live sources, after the original count, selected-ID and ring logic.
+ * This thread-private descriptor is neither model state nor workspace.
+ */
+struct SparseHalfVectorSource
+{
+    const SparseHalfVector* data = nullptr;
+    bool live = false;
+};
+
+/**
+ * @brief Read one prepared native vector or construct the original neutral bits.
+ * @param source Thread-private source from the original count/address proof.
+ * @return The exact raw16-byte value or four original positive-zero half pairs.
+ * @details This shared K1/V payload-load authority serves their ordinary copies and
+ * fixed prefetch field. It adds no arithmetic, conversion or padded native read.
+ */
+__device__ __forceinline__ SparseHalfVector readSparseHalfVector(
+    const SparseHalfVectorSource& source)
+{
+    SparseHalfVector value;
+#pragma unroll
+    for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
+    if (source.live) value = *source.data;
+    return value;
+}
+
+/**
+ * @brief Resolve one raw second-key-panel vector without reading its payload.
+ * @tparam FullPanel True only when all64 selected key tokens are live.
+ * @tparam IdentityAddressing Use the original validated identity membership.
+ * @param p Original immutable native FP16 key bank.
+ * @param selected Sorted selected IDs at this logical tile's first token.
+ * @param count Original live key tokens, from one through64.
+ * @param logicalBegin Original selected ordinal at the tile's first token.
+ * @param kvHead Original local KV owner.
+ * @param origin Original physical ring origin.
+ * @param capacity Original ring capacity, or zero for contiguous keys.
+ * @param vector Admitted vector in [0,1024), mapped as64 tokens by16 vectors.
+ * @return A guarded native source for coordinates128..255, with no payload read.
+ * @details This is the single raw K1 address authority for both copy schedules.
+ * The existing transform applies only to Coordinate0; Coordinate128 remains
+ * raw in both admitted key encodings. No value-bank binding is substituted.
+ */
+template<bool FullPanel, bool IdentityAddressing>
+__device__ __forceinline__ SparseHalfVectorSource prepareSparseHalfKeySecondPanelVector(
+    const QwenSparseAttention& p, const std::int32_t* selected, int count,
+    int logicalBegin, int kvHead, int origin, int capacity, int vector)
+{
+    const int token = vector / 16, pair = (vector % 16) * 4;
+    SparseHalfVectorSource source{};
+    if (FullPanel || token < count)
+    {
+        const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
+        const int physical = detail::physicalRow(logical, origin, capacity);
+        const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
+            std::size_t(physical) * p.kv.keys.token_stride_bytes +
+            std::size_t(kvHead) * p.kv.keys.head_stride_bytes +
+            std::size_t(128 + pair * 2) * sizeof(half);
+        source.data = reinterpret_cast<const SparseHalfVector*>(bytes);
+        source.live = true;
+    }
+    return source;
 }
 
 /**
@@ -166,17 +233,26 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
         }
         const int pair = columnVector * 4;
         SparseHalfVector value;
-#pragma unroll
-        for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
-        if (FullPanel || token < count)
+        if constexpr (Coordinate == 128)
         {
-            const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
-            const int physical = detail::physicalRow(logical, origin, capacity);
-            const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
-                std::size_t(physical) * p.kv.keys.token_stride_bytes +
-                std::size_t(kvHead) * p.kv.keys.head_stride_bytes +
-                std::size_t(Coordinate + pair * 2) * sizeof(half);
-            value = *reinterpret_cast<const SparseHalfVector*>(bytes);
+            const auto source = prepareSparseHalfKeySecondPanelVector<FullPanel, IdentityAddressing>(
+                p,selected,count,logicalBegin,kvHead,origin,capacity,vector);
+            value = readSparseHalfVector(source);
+        }
+        else
+        {
+#pragma unroll
+            for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
+            if (FullPanel || token < count)
+            {
+                const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
+                const int physical = detail::physicalRow(logical, origin, capacity);
+                const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
+                    std::size_t(physical) * p.kv.keys.token_stride_bytes +
+                    std::size_t(kvHead) * p.kv.keys.head_stride_bytes +
+                    std::size_t(Coordinate + pair * 2) * sizeof(half);
+                value = *reinterpret_cast<const SparseHalfVector*>(bytes);
+            }
         }
         *reinterpret_cast<SparseHalfVector*>(tile + token * 68 + pair) = value;
     }
@@ -236,16 +312,98 @@ __device__ __forceinline__ void loadSparseHalfKeys(
 }
 
 /**
- * @brief One guarded native V-vector source, prepared before the value is loaded.
- * @details An inactive source owns no native read. Only the preparation helper
- * creates live sources, after the original count, selected-ID and ring logic.
- * This thread-private descriptor is neither model state nor workspace.
+ * @brief Prepare all guarded K1 addresses, then read three fixed register fields.
+ * @tparam FullPanel Original full64 permission; partial tiles retain every guard.
+ * @tparam IdentityAddressing Original row-uniform identity membership proof.
+ * @tparam Threads Exact384-thread G6 cooperative ownership.
+ * @param p Original immutable attention bindings.
+ * @param selected Original sorted IDs at the logical tile's first token.
+ * @param count Original live tile count.
+ * @param logicalBegin Original selected ordinal at the tile's first token.
+ * @param kvHead Original native key head.
+ * @param origin Original ring origin.
+ * @param capacity Original ring capacity, or zero for contiguous keys.
+ * @return One48-byte bank; last128 threads have a neutral unused third field.
+ * @details No LDS is written. The caller keeps both original publication and
+ * retirement barriers; actual ISA must prove native loads overlap QK0.
  */
-struct SparseHalfValueVectorSource
+template<bool FullPanel, bool IdentityAddressing, int Threads>
+__device__ __forceinline__ SparseHalfPanelPrefetch prefetchSparseHalfKeySecondPanelBody(
+    const QwenSparseAttention& p, const std::int32_t* selected, int count,
+    int logicalBegin, int kvHead, int origin, int capacity)
 {
-    const SparseHalfVector* data = nullptr;
-    bool live = false;
-};
+    static_assert(Threads==384,"K1 prefetch requires G6 ownership");
+    const int vector = int(threadIdx.x);
+    const auto first = prepareSparseHalfKeySecondPanelVector<FullPanel, IdentityAddressing>(
+        p,selected,count,logicalBegin,kvHead,origin,capacity,vector);
+    const auto second = prepareSparseHalfKeySecondPanelVector<FullPanel, IdentityAddressing>(
+        p,selected,count,logicalBegin,kvHead,origin,capacity,vector + Threads);
+    SparseHalfVectorSource third{};
+    if (vector + 2 * Threads < 64 * 16)
+        third = prepareSparseHalfKeySecondPanelVector<FullPanel, IdentityAddressing>(
+            p,selected,count,logicalBegin,kvHead,origin,capacity,vector + 2 * Threads);
+    return SparseHalfPanelPrefetch{
+        readSparseHalfVector(first), readSparseHalfVector(second), readSparseHalfVector(third)};
+}
+
+/**
+ * @brief Select original full/partial and identity/sparse K1 copy permissions.
+ * @tparam Threads Exact G6 cooperative copy size.
+ * @param p Original immutable attention bindings.
+ * @param selected Original sorted IDs at the logical tile's first token.
+ * @param count Original live tile count, from one through64.
+ * @param logicalBegin Original selected ordinal at the tile's first token.
+ * @param allVisible Original validated row-uniform identity proof.
+ * @param kvHead Original native key head.
+ * @param origin Original ring origin.
+ * @param capacity Original ring capacity, or zero for contiguous keys.
+ * @return One typed K1 bank, without publishing or changing membership.
+ */
+template<int Threads>
+__device__ __forceinline__ SparseHalfPanelPrefetch prefetchSparseHalfKeySecondPanel(
+    const QwenSparseAttention& p, const std::int32_t* selected, int count,
+    int logicalBegin, bool allVisible, int kvHead, int origin, int capacity)
+{
+    if (allVisible)
+    {
+        if (count == 64)
+            return prefetchSparseHalfKeySecondPanelBody<true, true, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity);
+        return prefetchSparseHalfKeySecondPanelBody<false, true, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity);
+    }
+    if (count == 64)
+        return prefetchSparseHalfKeySecondPanelBody<true, false, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity);
+    return prefetchSparseHalfKeySecondPanelBody<false, false, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity);
+}
+
+/**
+ * @brief Publish one admitted K1 vector using its original stride68 LDS layout.
+ * @param value Exact raw16-byte register field for coordinates128..255.
+ * @param vector Original admitted cooperative vector in [0,1024).
+ * @param tile Original key panel after every K0 reader has retired.
+ */
+__device__ __forceinline__ void publishSparseHalfKeySecondPanelVector(
+    const SparseHalfVector& value, int vector, half2* tile)
+{
+    const int token = vector / 16, pair = (vector % 16) * 4;
+    *reinterpret_cast<SparseHalfVector*>(tile + token * 68 + pair) = value;
+}
+
+/**
+ * @brief Publish the fixed K1 fields after the original K0 retirement barrier.
+ * @param prefetched One typed raw panel, reused later for V0 and V1.
+ * @param tile Original stride68 key LDS; no V-panel mapping is substituted.
+ * @details Every useful/padded vector retains its original owner. The caller
+ * retains the original K1 publication barrier before any second-QK reader.
+ */
+__device__ __forceinline__ void publishSparseHalfKeySecondPanel(
+    const SparseHalfPanelPrefetch& prefetched, half2* tile)
+{
+    const int vector = int(threadIdx.x);
+    publishSparseHalfKeySecondPanelVector(prefetched.first, vector, tile);
+    publishSparseHalfKeySecondPanelVector(prefetched.second, vector + 384, tile);
+    if (vector + 2 * 384 < 64 * 16)
+        publishSparseHalfKeySecondPanelVector(prefetched.third, vector + 2 * 384, tile);
+}
 
 /**
  * @brief Resolve the original native V-vector address without reading its payload.
@@ -265,12 +423,12 @@ struct SparseHalfValueVectorSource
  * compiler a chance to finish selected-ID waits before issuing native loads.
  */
 template<bool FullPanel, bool IdentityAddressing>
-__device__ __forceinline__ SparseHalfValueVectorSource prepareSparseHalfValueVector(
+__device__ __forceinline__ SparseHalfVectorSource prepareSparseHalfValueVector(
     const QwenSparseAttention& p, const std::int32_t* selected, int count,
     int logicalBegin, int kvHead, int origin, int capacity, int vector)
 {
     const int token = vector / 32, pair = (vector % 32) * 4;
-    SparseHalfValueVectorSource source{};
+    SparseHalfVectorSource source{};
     if (FullPanel || token < count)
     {
         const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
@@ -282,23 +440,6 @@ __device__ __forceinline__ SparseHalfValueVectorSource prepareSparseHalfValueVec
         source.live = true;
     }
     return source;
-}
-
-/**
- * @brief Read one prepared native vector or construct the original neutral bits.
- * @param source Thread-private source from the original count/address proof.
- * @return The exact raw16-byte value or four original positive-zero half pairs.
- * @details This single payload-load authority serves ordinary copies and each
- * fixed prefetch field. It adds no arithmetic, conversion or padded native read.
- */
-__device__ __forceinline__ SparseHalfVector readSparseHalfValueVector(
-    const SparseHalfValueVectorSource& source)
-{
-    SparseHalfVector value;
-#pragma unroll
-    for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
-    if (source.live) value = *source.data;
-    return value;
 }
 
 /**
@@ -337,17 +478,17 @@ __device__ __forceinline__ auto copySparseHalfValuesPanel(
             p,selected,count,logicalBegin,kvHead,origin,capacity,vector);
         const auto second = prepareSparseHalfValueVector<FullPanel, IdentityAddressing>(
             p,selected,count,logicalBegin,kvHead,origin,capacity,vector + Threads);
-        SparseHalfValueVectorSource third{};
+        SparseHalfVectorSource third{};
         if (vector + 2 * Threads < 32 * 32)
             third = prepareSparseHalfValueVector<FullPanel, IdentityAddressing>(
                 p,selected,count,logicalBegin,kvHead,origin,capacity,vector + 2 * Threads);
         // Distinct aggregate fields expose independent SSA results, without a
         // dynamic slot or reused payload temporary. Actual ISA must prove
         // that the compiler keeps their native loads outstanding across QK.
-        return SparseHalfValuePrefetch{
-            readSparseHalfValueVector(first),
-            readSparseHalfValueVector(second),
-            readSparseHalfValueVector(third)};
+        return SparseHalfPanelPrefetch{
+            readSparseHalfVector(first),
+            readSparseHalfVector(second),
+            readSparseHalfVector(third)};
     }
     else
     {
@@ -357,7 +498,7 @@ __device__ __forceinline__ auto copySparseHalfValuesPanel(
             const int token = vector / 32, pair = (vector % 32) * 4;
             const auto source = prepareSparseHalfValueVector<FullPanel, IdentityAddressing>(
                 p,selected,count,logicalBegin,kvHead,origin,capacity,vector);
-            const auto value = readSparseHalfValueVector(source);
+            const auto value = readSparseHalfVector(source);
             *reinterpret_cast<SparseHalfVector*>(tile + token * 128 + pair) = value;
         }
     }
@@ -435,7 +576,7 @@ __device__ __forceinline__ void publishSparseHalfValueVector(
  * The original publication barrier remains the consumer edge before PV.
  */
 __device__ __forceinline__ void publishSparseHalfValuePrefetch(
-    const SparseHalfValuePrefetch& prefetched, half2* tile)
+    const SparseHalfPanelPrefetch& prefetched, half2* tile)
 {
     const int vector = int(threadIdx.x);
     publishSparseHalfValueVector(prefetched.first, vector, tile);
@@ -543,7 +684,8 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
     constexpr int Threads = 64 * GroupHeads;
     static_assert(12 % GroupHeads == 0, "Attention groups must not cross a KV head");
     constexpr int LoadUnroll=Parts==33?4:1;
-    constexpr int QKUnroll = Parts == 33 ? 64 : 16;
+    constexpr int QKFirstUnroll = Parts == 33 ? 64 : 16;
+    constexpr int QKSecondUnroll = Parts == 33 ? 32 : 16;
     static_assert(Parts != 33 || QwenSparseSelected <= Parts * 64,
                   "The single-pass 33 schedule requires at most 33 selected tiles");
     const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
@@ -621,6 +763,12 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
         float score = 0.0f;
         loadSparseHalfKeys<Transform, 0, LoadUnroll, (Parts == 33), Threads>(p, r, indices + begin, count, begin, allVisible, kvHead, origin, capacity, tile);
         __syncthreads();
+        SparseHalfPanelPrefetch prefetchedPanel;
+        if constexpr (Parts == 33)
+            // K0 and query publication also completes the original validation.
+            // Retain raw K1 in registers while QK0 reads only the live LDS panel.
+            prefetchedPanel = prefetchSparseHalfKeySecondPanel<Threads>(
+                p, indices + begin, count, begin, allVisible, kvHead, origin, capacity);
         using NativePair = _Float16 __attribute__((ext_vector_type(2)));
         if (owned)
         {
@@ -628,26 +776,28 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
             // before the dependent dot chain completes. Dot coordinates and
             // their FP32 accumulation order remain unchanged. The scheduling
             // width is sealed by Parts; production8 retains its original16.
-#pragma unroll(QKUnroll)
+#pragma unroll(QKFirstUnroll)
             for (int pair = 0; pair < 64; ++pair)
                 score = __builtin_amdgcn_fdot2(__builtin_bit_cast(NativePair, queries[wave][pair]),
                     __builtin_bit_cast(NativePair, tile[lane * 68 + pair]), score, false);
         }
         __syncthreads(); // Every QK reader retires before the second panel replaces K.
-        loadSparseHalfKeys<Transform, 128, LoadUnroll, (Parts == 33), Threads>(p, r, indices + begin, count, begin, allVisible, kvHead, origin, capacity, tile);
+        if constexpr (Parts == 33)
+            publishSparseHalfKeySecondPanel(prefetchedPanel, tile);
+        else
+            loadSparseHalfKeys<Transform, 128, LoadUnroll, (Parts == 33), Threads>(p, r, indices + begin, count, begin, allVisible, kvHead, origin, capacity, tile);
         __syncthreads();
-        SparseHalfValuePrefetch prefetchedValues;
         if constexpr (Parts == 33)
             // All original membership/ring validation and both K publications
             // have completed. Read V0 now without touching the live K LDS bank;
             // its registers span the unchanged second QK/softmax arithmetic.
-            prefetchedValues = loadSparseHalfValues<LoadUnroll, true, Threads, true>(
+            prefetchedPanel = loadSparseHalfValues<LoadUnroll, true, Threads, true>(
                 p, indices + begin, min(32, count), begin,
                 allVisible, kvHead, origin, capacity, tile);
         float tileMaximum = 0.0f, tileDenominator = 0.0f;
         if (owned)
         {
-#pragma unroll(QKUnroll)
+#pragma unroll(QKSecondUnroll)
             for (int pair = 0; pair < 64; ++pair)
                 score = __builtin_amdgcn_fdot2(__builtin_bit_cast(NativePair, queries[wave][pair + 64]),
                     __builtin_bit_cast(NativePair, tile[lane * 68 + pair]), score, false);
@@ -677,7 +827,7 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
         for (int chunk = 0; chunk < 2; ++chunk)
         {
             if constexpr (Parts == 33)
-                publishSparseHalfValuePrefetch(prefetchedValues, tile);
+                publishSparseHalfValuePrefetch(prefetchedPanel, tile);
             if constexpr (Parts != 33)
                 loadSparseHalfValues<LoadUnroll, (Parts == 33), Threads>(p, indices + begin + min(chunk * 32, count),
                 max(0, min(32, count - chunk * 32)), begin + min(chunk * 32, count),
@@ -688,7 +838,7 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
                     // V0 fields died at publication above. Reuse that bank for
                     // V1 while unchanged PV0 consumes only the published LDS.
                     // V1 reaches LDS only after the original V0 retirement edge.
-                    prefetchedValues = loadSparseHalfValues<LoadUnroll, true, Threads, true>(
+                    prefetchedPanel = loadSparseHalfValues<LoadUnroll, true, Threads, true>(
                         p, indices + begin + min(32, count), max(0, min(32, count - 32)),
                         begin + min(32, count), allVisible, kvHead, origin, capacity, tile);
             if (owned)

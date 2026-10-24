@@ -335,6 +335,109 @@ TEST(ROCmQwenSparseAttention,FP16Virtual33EmptyTailPreservesSignedZero)
 }
 
 /**
+ * @test Nonzero raw K1 scores have an independent analytic oracle in both key encodings.
+ * @details Q is one only in coordinates128..255, and each authored logical
+ * token has those key coordinates all +1/8 or -1/8, so its score is exactly
+ * +1 or -1 after the original1/16 query scaling. K0 is zero, including its
+ * transformed64-coordinate prefix. Values are the corresponding +1 or -1.
+ * Class counts alone determine maxima, FP32 denominators and ideal softmax;
+ * no host QK/PV implementation reproduces the native loop or reduction tree.
+ *
+ * Native probability rounding and each32-term half-PV chain contribute at
+ * most gamma33=33u/(1-33u), u=2^-11, relative to the positive denominator.
+ * This alternating-class construction keeps nonzero half intermediates normal.
+ * The0.02 absolute numerator/denominator bound exceeds gamma33 plus FP32
+ * exp/fold/division error; it still separates an omitted K1 score from the
+ * expected signed logistic response. Maxima remain exact and denominators
+ * use a separate tight FP32 bound. Full partial/output bytes must additionally
+ * match serial capture; dirty inactive/empty records and guards stay unchanged.
+ * Original row0 uses identity selection, later rows use causal sparse subsets;
+ * wrapped physical placement is authored independently of the kernel mapper.
+ * Setup uploads join before capture/replay; terminal downloads retire work
+ * before borrowed host storage or retained graph owners leave scope.
+ */
+TEST(ROCmQwenSparseAttention,FP16Phase33NonzeroSecondKeyPanelOracle)
+{
+    using namespace fp16_attention;
+    constexpr int rows=3,capacity=4096,origin=capacity-1;
+    const double low=std::exp(-2.0);
+    for(bool transform:{false,true}){
+        SCOPED_TRACE(transform?"pre_rotary":"post_rotary");
+        Fixture f(rows,2050,capacity,QwenSparseScalar::FP16);Inputs input(f,0,6,0,1);
+        std::fill(input.host_query.begin(),input.host_query.end(),0.0f);
+        for(int row=0;row<rows;++row)for(int head=0;head<6;++head)for(int d=128;d<256;++d)
+            input.host_query[(std::size_t(row)*6+head)*256+d]=1.0f;
+        std::fill(input.host_keys.begin(),input.host_keys.end(),detail::encodeHalf(0.0f));
+        for(int logical=0;logical<capacity;++logical){
+            const int physical=logical==0?capacity-1:logical-1;
+            const bool positive=logical%4<2;
+            for(int d=128;d<256;++d)input.host_keys[std::size_t(physical)*256+d]=detail::encodeHalf(positive?0.125f:-0.125f);
+            for(int d=0;d<256;++d)input.host_values[std::size_t(physical)*256+d]=detail::encodeHalf(positive?1.0f:-1.0f);
+        }
+        input.query.upload(input.host_query.data(),f.stream);input.keys.upload(input.host_keys.data(),f.stream);input.values.upload(input.host_values.data(),f.stream);
+        check(hipStreamSynchronize(f.stream));
+        auto args=input.base();args.kv.addressing=QwenSparseKVAddressing::FixedLogicalView;
+        args.kv.logical_view={.logical_row_origin=origin,.physical_row_capacity=capacity};args.kv.row_parameters=nullptr;
+        if(transform)args=selectedKeyTransform(args,10000000.0f,origin,capacity);
+        FP16Run33 grouped(args,f.stream);grouped.record();
+        auto prior=grouped.initial_partials;auto previousOutput=grouped.poison;
+        for(const auto [selectedCount,live]:{std::pair{2051,rows},std::pair{31,rows},std::pair{32,rows},std::pair{33,rows},
+            std::pair{63,rows},std::pair{64,rows},std::pair{65,rows},std::pair{1,1},std::pair{3,0},std::pair{1,rows},std::pair{3,rows},std::pair{2051,rows}}){
+            SCOPED_TRACE(::testing::Message()<<"selected="<<selectedCount<<" live="<<live);
+            std::vector<std::int32_t> selected(f.selected.size,-77),counts(rows,selectedCount);
+            for(int row=0;row<rows;++row)for(int token=0;token<selectedCount;++token)
+                selected[std::size_t(row)*QwenSparseSelected+token]=row+token;
+            f.replay={selectedCount-1,live,65536};f.state.upload(&f.replay,f.stream);
+            f.selected.upload(selected.data(),f.stream);f.count.upload(counts.data(),f.stream);check(hipStreamSynchronize(f.stream));
+            grouped.capture.launch();const auto result=grouped.output.download(f.stream);
+            const auto parts=grouped.partials.download(f.stream);const auto observations=grouped.observations.download(f.stream);
+            for(int row=0;row<rows;++row){
+                const auto first=std::size_t(row)*6*33;
+                if(row>=live){
+                    ASSERT_EQ(std::memcmp(parts.data()+first,prior.data()+first,6*33*sizeof(QwenSparseAttentionPartial)),0);
+                    ASSERT_EQ(std::memcmp(result.data()+std::size_t(row)*1536,previousOutput.data()+std::size_t(row)*1536,1536*sizeof(float)),0);
+                    for(int head=0;head<6;++head){const auto& o=observations[row*6+head];ASSERT_EQ(o.key_elements,0u);ASSERT_EQ(o.value_elements,0u);ASSERT_EQ(o.selected_tokens,0u);}
+                    continue;
+                }
+                int totalPositive=0;
+                for(int token=0;token<selectedCount;++token)totalPositive+=(row+token)%4<2;
+                const int totalNegative=selectedCount-totalPositive;
+                const double expected=totalPositive==0?-1.0:(totalPositive-totalNegative*low)/(totalPositive+totalNegative*low);
+                for(int head=0;head<6;++head){
+                    for(int d=0;d<256;++d)ASSERT_NEAR(result[(std::size_t(row)*6+head)*256+d],expected,0.02);
+                    for(int part=0;part<33;++part){
+                        const auto i=(std::size_t(row)*6+head)*33+part;const auto& p=parts[i];
+                        const int begin=part*64,end=std::min(selectedCount,begin+64);
+                        if(begin>=selectedCount){
+                            ASSERT_EQ(p.maximum,-INFINITY);ASSERT_EQ(p.denominator,0.0f);ASSERT_EQ(p.key_elements,0u);ASSERT_EQ(p.value_elements,0u);
+                            ASSERT_EQ(std::memcmp(p.weighted,prior[i].weighted,sizeof(p.weighted)),0);continue;
+                        }
+                        int positive=0;for(int token=begin;token<end;++token)positive+=(row+token)%4<2;
+                        const int negative=end-begin-positive;
+                        const double denominator=(positive?positive+negative*low:double(negative))/128.0;
+                        const double numerator=(positive?positive-negative*low:-double(negative))/128.0;
+                        ASSERT_EQ(p.maximum,positive?1.0f:-1.0f);
+                        ASSERT_NEAR(p.denominator,denominator,2.0e-6*denominator+1.0e-9);
+                        for(float value:p.weighted)ASSERT_NEAR(value,numerator,0.02*denominator);
+                    }
+                }
+                auto serialArgs=args;serialArgs.row_capacity=1;serialArgs.query=input.query.data+std::size_t(row)*1536;
+                serialArgs.selected=f.selected.data+std::size_t(row)*QwenSparseSelected;serialArgs.selected_count=f.count.data+row;
+                FP16Run33 serial(serialArgs,f.stream);serial.record();
+                std::copy_n(prior.data()+first,6*33,serial.initial_partials.data());serial.partials.upload(serial.initial_partials.data(),f.stream);
+                f.replay={selectedCount-1+row,1,65536};f.state.upload(&f.replay,f.stream);serial.capture.launch();
+                const auto one=serial.output.download(f.stream);const auto oneParts=serial.partials.download(f.stream);
+                ASSERT_EQ(std::memcmp(one.data(),result.data()+std::size_t(row)*1536,1536*sizeof(float)),0);
+                ASSERT_EQ(std::memcmp(oneParts.data(),parts.data()+first,6*33*sizeof(QwenSparseAttentionPartial)),0);
+                ASSERT_EQ(std::memcmp(one.data()+1536,serial.poison.data()+1536,16*sizeof(float)),0);
+            }
+            ASSERT_EQ(std::memcmp(result.data()+std::size_t(rows)*1536,grouped.poison.data()+std::size_t(rows)*1536,16*sizeof(float)),0);
+            prior=parts;previousOutput=result;
+        }
+    }
+}
+
+/**
  * @test Disabled native-event comparison of explicit8/33 arithmetic on identical inputs.
  * @details Uses existing bounded selectors and source-owned native captures only;
  * this component does not claim cross-program equality or full-model qualification.

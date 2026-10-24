@@ -868,11 +868,9 @@ checkpoint; full preflight remains G60 and production defaults are unchanged.
 The pinned Castagna512
 pair remains14.424µs, so the short-context component target is still open.
 
-The next held design is K1 load overlap across QK0, reusing the same register
-bank after each original publication/retirement edge. It has no implementation
-in this checkpoint. Its different64-by16 vector layout and key strides must
-remain explicit, and its register pressure, grouped economics and model
-accuracy require the same native/profile/model gates.
+K1 load overlap was held at checkpoint160. The following164 qualification
+retains its distinct64-by16 layout and key strides, and measures the register,
+grouped-performance and model-accuracy consequences.
 
 The per-GPU normalization above is a **work comparison**, not a request-latency
 identity. The fork rounds attention tensor slices to whole 12-query-head GQA
@@ -880,6 +878,34 @@ groups and rotates ownership by attention-layer ordinal. Each attention layer
 therefore has two active GPUs, whereas Llaminar has four six-head participants.
 All-device interval unions and authenticated per-layer spans must remain
 separate from per-GPU sums/medians when assessing the actual stage latency.
+
+## K1 overlap and split QK scheduling164
+
+The selected change overlaps raw K1 loads with QK0, then reuses the same48-byte thread-private bank for V0 and V1. K1 retains its64-token, stride68 layout and raw coordinates128..255 in both key encodings; the existing64-coordinate paired RoPE formula is unchanged. Original count, selected-ID, ring, ownership, publication and retirement rules remain. There is no extra barrier, global workspace, allocation, transfer or graph argument.
+
+The compiler schedule matters for grouped economics. All four probes pass19 native tests and eight independent frozen160 output/numerical-partial comparisons:
+
+| Candidate | QK0/QK1 unroll | Used/allocated VGPR | M1/512, µs | M1/64K, µs | M16/64K, µs |
+|---|---|---|---|---|---|
+|160 retained V overlap |64/64 |64/64 |15.446 |20.179 |88.597 |
+|161 K1 overlap |64/64 |65/68 |14.995 |19.351 |108.755 |
+|162 |32/32 |64/64 |15.181 |19.523 |84.861 |
+|163 |32/64 |65/68 |15.005 |19.362 |109.015 |
+|**164 retained** |**64/32** |**63/64** |**15.086** |**19.444** |**84.354** |
+
+161 and163 are rejected for grouped slowdown.164 also improves the640/768/2048 post-RoPE cells to15.856/15.884/18.455µs and the pre-RoPE512/64K cells to16.724/21.203µs. The64K cache contains at most2051 selected attention rows; these are attention-pair timings, excluding indexer work. Castagna's pinned native H12/512 pair remains14.424µs, versus Llaminar's local H6 shape. That target and the whole-model42.959tok/s target remain open.
+
+The exact source/core-bound ISA proves all four full/partial × identity/sparse exits retain K1/V0/V1 loads across QK0/QK1/PV0. Symbolic coordinate/carry checks prove128 ascending dynamic dot2 operations:64 in QK0, then two32-operation iterations in QK1. Source unroll32 does not imply half as many live LDS operands; the emitted loop and resource counts are the evidence. Final resources are63 used/64 allocated VGPR,58 used/112 allocated SGPR,21248B LDS and zero scratch/spills. Native HIP's unchanged two-block resource limit is theoretical; no achieved-occupancy or unique regression-cause claim is made.
+
+Isolated rocprof shows zero LDS bank conflicts. At512/64K, the producer launches198 waves and executes193.081/710.576 vector instructions per wave. At M16/64K it launches3168 waves, with723.437 vector instructions per wave,30.145% memory-unit busy and6369.563KiB fetched. VALUUtilization97.301% is active-lane utilization, not achieved occupancy. The pre-RoPE64K specialization is also independently profiled:198 waves,942.980 vector instructions per wave,2062.563KiB fetched,62 used/64 allocated VGPRs,21248B LDS and zero private bytes. Its exact join requires the canonical-engine rotary source,64 rotary coordinates and model theta. Profiles and timing runs are separate. Evidence is under `parity-results/qwen-flash-next/attention164-qk-reverse-{events-r1.json,joined-profile-r1.json,m16-profile-r1.json,isa-r1}`; the complete scheduling comparison retains rejected probes too.
+
+The added `FP16Phase33NonzeroSecondKeyPanelOracle` makes raw K1 errors observable independently of the production arithmetic loop. Constructed scores are exactly±1; authored class counts determine exact maxima, tightly bounded FP32 denominators and a double-precision logistic expectation. An explicit half-rounding bound covers PV output. Both key encodings, full/partial tiles, wrapped rows, sparse/identity selections, inactive rows and dirty grouped/serial replay are covered. The test is explicitly named in the canonical ROCm FP16 production-preflight registration. Expanded Release native coverage passes20 tests; the updated registration passes separately after the complete832 Unit/affected gate. This test-only addition leaves the profiled/model core's stat identity unchanged.
+
+The canonical Release model panel passes all required groups, authenticates actual Prefill8/Decode33 on all four GPUs, and retains all26 files/185 final-logit rows byte-for-byte. Mean KL and top-1/top-5 stay at the qualified151 values. Source/build/runtime/driver and normal-retirement evidence is retained. Release and Integration builds keep the normal spill guard and configured CUDA80/86/89/90 plus HIPgfx906 target set; this production edit is ROCm-only.
+
+The clean unprofiled A/B/A measures **819.682 prefill /40.265 decode tok/s**, versus frozen151 controls' **819.102 /40.186**. The +0.071% /+0.196% differences have overlapping ranges: whole-model throughput is effectively unchanged. Decode ranges are40.070–40.262 for controls and40.130–40.361 for164. All nine natural256-token sequences are identical. Settings remain fullTP4 on fourMI50s, sharded vocabulary,28 physical NUMA1 workers, RAM ngrams, native post-RoPE FP16 KV, explicit Prefill8/Decode33, prompt512/decode256/context4096, MTP/prefix off, one warmup plus three measured requests per arm. This uses the same Qwen3.8-Flash-Next UD-Q4_K_XL GGUF. Profile timings are excluded. Every arm passes source/runtime/model/driver/resource and normal-retirement checks; `attention164-qk-reverse-model-throughput-comparison-r1.json` retains the matched result.
+
+This is a focused checkpoint of the explicit FP16 phase8/33 program. Production defaults and complete preflightG60 are unchanged. The next private candidate retains key-row address calculations across the K0/K1 boundary; its native resource, numerical and economic gates remain open.
 
 ## Primary source map
 
@@ -894,5 +920,6 @@ Llaminar ownership remains in
 `src/v2/kernels/rocm/attention/ROCmQwenSparseFP16Attention.cuh`,
 `ROCmQwenSparseAttention.hip`, and the reducer in
 `src/v2/kernels/qwen4exp/QwenSparseGPU.cuh`. Native key-encoding and arithmetic
-regressions live in `QwenSparseFP16ROCmTest.h`; their explicit preflight entry
+regressions live in `QwenSparseFP16ROCmTest.h` and
+`QwenSparseFP16Parts33ROCmTest.h`; their explicit preflight entry
 is `V2_Integration_ROCm_QwenSparseFP16TileArithmetic`.
