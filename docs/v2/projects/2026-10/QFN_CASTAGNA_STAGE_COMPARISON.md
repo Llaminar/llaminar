@@ -269,6 +269,27 @@ with overlapping ranges and identical natural outputs. See the
 [complete qualification and evidence](QFN_ATTENTION_STRUCTURE_COMPARISON.md#retained-key-rows165-and-refreshed-paired-profiles).
 Broader wrapper attribution and the other candidates below remain open.
 
+### Qualified169 merge component
+
+HIP33 now folds the same ordered denominator beside each output numerator,
+removing the register-broadcast banks. All eight unprofiled component cells
+improve0.95–3.58% versus165; Post-RoPE M1 pairs are14.745µs at512 and18.521µs
+at64K, with M16/64K81.506µs. All21 native tests, including the retained actual-
+merge uint64 carry regression, and eight independent numerical exports pass.
+Canonical model groups/counters pass and all185 logit rows remain byte-identical
+to151. All832 Unit/affected registrations pass. Matched unprofiled A/B/A measures
+**819.319 prefill /40.175 decode tok/s**, versus frozen165's **818.872 /40.112**.
+The +0.055% /+0.159% differences have overlapping ranges, with all nine natural
+sequences identical: whole-model throughput is effectively unchanged.
+
+Exact isolated merge evidence is124/124 VGPRs,708B LDS, zero scratch/spills and
+preserved FP32 chains/division. Lower-register168/170/171/172 alternatives are
+rejected for economy; no achieved-occupancy claim follows from VALU utilization.
+See [the169 qualification and benchmark settings](QFN_ATTENTION_STRUCTURE_COMPARISON.md#ordered-per-output-normalization169).
+The full-model/core comparison above remains165: component timing is not a new
+whole-stage result or request-latency ratio. Defaults/full preflight are unchanged;
+the approximately43tok/s goal and broader attribution remain open.
+
 1. Preserve the HC injection FP32 reduction order while reducing barriers;
    validate the real optimized CPU/CUDA/ROCm paths as applicable.
 2. Avoid unused short-context indexer Q work with explicit row liveness and

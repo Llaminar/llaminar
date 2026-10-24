@@ -438,6 +438,87 @@ TEST(ROCmQwenSparseAttention,FP16Phase33NonzeroSecondKeyPanelOracle)
 }
 
 /**
+ * @brief Exercise real merge counter carries without executing its producer.
+ * @test Prove uint64 observation carries, all-zero nonowner observations, null
+ * publication and inactive-row reset using the actual captured FP16 merge.
+ * @details Clone only the already authenticated production merge node. Authored
+ * uint32 records cross32-bit boundaries; independent uint64 sums are the oracle.
+ * The original capture and all argument storage outlive the clone's terminal join.
+ */
+TEST(ROCmQwenSparseAttention,FP16Phase33MergeWideCounters)
+{
+    using namespace fp16_attention;
+    /** @brief Test-owned merge-only graph borrowing one authenticated pair's args. */
+    struct MergeOnly final {
+        hipStream_t stream;hipGraph_t graph=nullptr;hipGraphExec_t exec=nullptr;
+        /** @brief Borrow the non-default stream until terminal graph retirement. */
+        explicit MergeOnly(hipStream_t s):stream(s){require(stream!=nullptr,"Wide-counter merge requires an exact non-default stream");}
+        /** @brief Join before graph and borrowed parameter storage can retire. */
+        ~MergeOnly(){if(hipStreamSynchronize(stream)!=hipSuccess)std::terminate();
+            if(exec && hipGraphExecDestroy(exec)!=hipSuccess)std::terminate();
+            if(graph && hipGraphDestroy(graph)!=hipSuccess)std::terminate();}
+        /**
+         * @brief Copy exactly one native production merge kernel and its bindings.
+         * @param run Retained complete production pair, recorded but never launched.
+         * @details Native graph creation copies kernel arguments; the original run
+         * still outlives this clone. No new production launcher or arithmetic exists.
+         */
+        void record(FP16Run33& run){
+            std::size_t n=0;check(hipGraphGetNodes(run.capture.graph,nullptr,&n));require(n==2,"Wide-counter source must retain one complete pair");
+            std::vector<hipGraphNode_t> nodes(n);check(hipGraphGetNodes(run.capture.graph,nodes.data(),&n));
+            hipKernelNodeParams params{};int found=0;
+            for(auto node:nodes){const auto metadata=inspectObservationKernel(node,stream);
+                if(metadata.name.find("reduceAttentionPartitionsILNS_10TensorTypeE2ELi33EE")!=std::string::npos){
+                    check(hipGraphKernelNodeGetParams(node,&params));++found;}}
+            require(found==1 && params.gridDim.x==2 && params.gridDim.y==1 && params.gridDim.z==1 &&
+                params.blockDim.x==256 && params.blockDim.y==1 && params.blockDim.z==1,"Wide-counter merge geometry differs");
+            check(hipGraphCreate(&graph,0));hipGraphNode_t merge=nullptr;
+            check(hipGraphAddKernelNode(&merge,graph,nullptr,0,&params));
+            check(hipGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+        }
+        /** @brief Replay only the cloned merge after ordered fixture uploads. */
+        void launch(){check(hipGraphLaunch(exec,stream));}
+    };
+    Fixture f(2,2050,4096,QwenSparseScalar::FP16);Inputs inputs(f,0,1,0,1);
+    auto args=inputs.base();
+    for(bool observed:{true,false}){
+        SCOPED_TRACE(observed);FP16Run33 run(args,f.stream);
+        if(!observed)run.args.observations=nullptr;
+        run.record();MergeOnly merge(f.stream);merge.record(run);
+        for(int fold:{33,8,16,32,33})for(bool zeroCounters:{false,true}){
+            SCOPED_TRACE(::testing::Message()<<"fold="<<fold<<" zero_counters="<<zeroCounters);
+            const int selected=(fold-1)*64+1;
+            std::vector<std::int32_t> counts(2,selected);f.count.upload(counts.data(),f.stream);
+            f.replay={2050,1,0};f.state.upload(&f.replay,f.stream);
+            auto authored=run.initial_partials;std::uint64_t keys=0,values=0;
+            for(std::size_t i=0;i<authored.size();++i){auto& part=authored[i];
+                part.maximum=0.0f;part.denominator=1.0f;
+                std::fill(std::begin(part.weighted),std::end(part.weighted),0.0f);
+                part.key_elements=(i%3==0)?UINT32_MAX:std::uint32_t(0x80000000u+i);
+                part.value_elements=(i%2==0)?UINT32_MAX:std::uint32_t(i+17);
+                if(zeroCounters)part.key_elements=part.value_elements=0;
+                if(i<std::size_t(fold)){keys+=std::uint64_t(part.key_elements);values+=std::uint64_t(part.value_elements);}}
+            if(zeroCounters){ASSERT_EQ(keys,0u);ASSERT_EQ(values,0u);}
+            else{ASSERT_GT(keys,std::uint64_t(UINT32_MAX));ASSERT_GT(values,std::uint64_t(UINT32_MAX));}
+            std::vector<QwenSparseAttentionObservation> dirty(2);
+            for(auto& o:dirty){o.key_elements=0x123456789abcdef0ull;o.value_elements=0xfedcba9876543210ull;o.selected_tokens=999;}
+            run.partials.upload(authored.data(),f.stream);run.output.upload(run.poison.data(),f.stream);
+            run.observations.upload(dirty.data(),f.stream);merge.launch();
+            const auto actual=run.observations.download(f.stream);const auto output=run.output.download(f.stream);
+            const auto after=run.partials.download(f.stream);
+            ASSERT_EQ(std::memcmp(after.data(),authored.data(),authored.size()*sizeof(authored[0])),0);
+            for(int d=0;d<256;++d)ASSERT_EQ(output[d],0.0f);
+            ASSERT_EQ(std::memcmp(output.data()+256,run.poison.data()+256,(output.size()-256)*sizeof(float)),0);
+            if(observed){ASSERT_EQ(actual[0].key_elements,keys);ASSERT_EQ(actual[0].value_elements,values);
+                ASSERT_EQ(actual[0].selected_tokens,std::uint32_t(selected));
+                ASSERT_EQ(actual[1].key_elements,0u);ASSERT_EQ(actual[1].value_elements,0u);ASSERT_EQ(actual[1].selected_tokens,0u);}
+            else for(int row=0;row<2;++row){ASSERT_EQ(actual[row].key_elements,dirty[row].key_elements);
+                ASSERT_EQ(actual[row].value_elements,dirty[row].value_elements);ASSERT_EQ(actual[row].selected_tokens,dirty[row].selected_tokens);}
+        }
+    }
+}
+
+/**
  * @test Disabled native-event comparison of explicit8/33 arithmetic on identical inputs.
  * @details Uses existing bounded selectors and source-owned native captures only;
  * this component does not claim cross-program equality or full-model qualification.

@@ -887,23 +887,61 @@ struct QwenSparsePartialMetadataView
     std::uint32_t (&keys)[33]; ///< Original counters, authored only when observed.
     std::uint32_t (&values)[33]; ///< Original counters, authored only when observed.
 };
+/** @brief Ordered attention numerator and its exact normalization denominator. */
+struct QwenSparseAttentionFoldResult
+{
+    float numerator; ///< Original ascending weighted-FMA result, including neutral tails.
+    float denominator; ///< Positive finite original ascending normalization fold.
+};
+/**
+ * @brief Publish actual producer-authored counters from one ordered fixed prefix.
+ * @tparam FoldParts Original selected structural prefix.
+ * @tparam StorageParts Original8 or phase33 partial storage program.
+ * @param p Original observation/selected-count bindings; null observations do no work.
+ * @param parts Original row/head partial base for direct8 reads.
+ * @param metadata Already published33 metadata, unused by Storage8.
+ * @param row Original request-local output row.
+ * @param head Original participant-local output head.
+ * @pre Only output owner zero calls, after the same denominator validity check.
+ * @details The exact integer additions and single original output publication
+ * are retained. Counters come from actual partial records, never expected work.
+ */
+template<int FoldParts,int StorageParts>
+__device__ __forceinline__ void publishAttentionFoldObservation(
+    const QwenSparseAttention& p,const QwenSparseAttentionPartial* parts,
+    QwenSparsePartialMetadataView metadata,int row,int head)
+{
+    if (p.observations)
+    {
+        QwenSparseAttentionObservation observation;
+        for (int part = 0; part < FoldParts; ++part)
+        {
+            observation.key_elements += StorageParts == 33 ? metadata.keys[part] : parts[part].key_elements;
+            observation.value_elements += StorageParts == 33 ? metadata.values[part] : parts[part].value_elements;
+        }
+        observation.selected_tokens = p.selected_count[row];
+        p.observations[row * p.query_heads + head] = observation;
+    }
+}
 /**
  * @brief Fold a fixed structural prefix of its admitted partial storage in order.
  * @tparam FoldParts Closed compile-time prefix bound: 8, 16, 32 or 33 records.
- * @tparam StorageParts Original arithmetic/storage program: production 8 or test 33.
+ * @tparam StorageParts Original arithmetic/storage program:8 or admitted phase33.
  * @param p Original read-only replay/selection and output-observation bindings.
  * @param parts Original row/head partial base with the StorageParts record stride.
  * @param scales Exclusive CTA shared storage for the selected prefix scales.
- * @param denominator Exclusive CTA shared scalar published by output owner zero.
+ * @param denominator Original shared normalizer, used by8 and the CUDA33 fold.
  * @param row Original request-local row, used only for observation ownership.
  * @param head Original participant-local query head.
  * @param d Original output-coordinate owner in this 256-thread CTA.
  * @param metadata Borrowed kernel-owned shared banks, used only by StorageParts33.
- * @return Numerator after the ordered prefix and exact finite empty-tail effect.
+ * @return Ordered numerator and validated denominator; the caller divides once.
  * @details Every CTA thread invokes the same specialization. Storage8 retains
  * its original owner-zero metadata fold. Storage33 distributes exponentials
- * across one logical subgroup while every member retains the ordered maximum
- * and denominator-FMA sequence; only owner zero publishes observations. The
+ * across one logical subgroup. CUDA retains the original broadcast denominator;
+ * HIP33 folds the same denominator beside each output lane's numerator after
+ * scale publication, removing the broadcast banks without a new reduction tree.
+ * Only owner zero publishes observations, after denominator validation. The
  * existing publication barrier precedes all weighted loads. The caller
  * derives this bound from the immutable-in-flight device selected count, so
  * omitted records are producer-authored empty virtual tiles. Production 8
@@ -911,7 +949,7 @@ struct QwenSparsePartialMetadataView
  * FMAs preserve their finite RN fixed point even with output-only FP32 flush.
  */
 template<int FoldParts,int StorageParts>
-__device__ __forceinline__ float foldAttentionPrefix(
+__device__ __forceinline__ QwenSparseAttentionFoldResult foldAttentionPrefix(
     const QwenSparseAttention& p,const QwenSparseAttentionPartial* parts,
     float* scales,float& denominator,int row,int head,int d,
     QwenSparsePartialMetadataView metadata)
@@ -919,6 +957,11 @@ __device__ __forceinline__ float foldAttentionPrefix(
     static_assert((StorageParts==8 && FoldParts==8) ||
                   (StorageParts==33 && (FoldParts==8 || FoldParts==16 || FoldParts==32 || FoldParts==33)),
                   "Closed attention fold/storage geometry");
+#if defined(__HIPCC__)
+    constexpr bool PerOutputDenominator = StorageParts == 33;
+#else
+    constexpr bool PerOutputDenominator = false;
+#endif
     if constexpr (StorageParts == 33)
     {
         if (d < FoldParts)
@@ -938,7 +981,8 @@ __device__ __forceinline__ float foldAttentionPrefix(
     if constexpr (StorageParts == 33)
     {
         // The first logical subgroup is complete on CUDA warp32 and the lower
-        // half of HIP wave64. All32 lanes reach every register broadcast below.
+        // half of HIP wave64. CUDA retains its complete broadcast participants;
+        // HIP33 publishes the same scales without a register-broadcast bank.
         if (d < 32)
         {
             float maximum = -INFINITY;
@@ -952,27 +996,32 @@ __device__ __forceinline__ float foldAttentionPrefix(
                 scales[d] = localScale;
             }
             float sum = 0.0f;
-            constexpr int SubgroupParts = FoldParts < 32 ? FoldParts : 32;
-            for (int part = 0; part < SubgroupParts; ++part)
+            if constexpr (!PerOutputDenominator)
             {
-                const float partDenominator = broadcastAttentionLane32(localDenominator,part);
-                const float partScale = broadcastAttentionLane32(localScale,part);
-                sum = fmaf(partDenominator,partScale,sum);
+                constexpr int SubgroupParts = FoldParts < 32 ? FoldParts : 32;
+                for (int part = 0; part < SubgroupParts; ++part)
+                {
+                    const float partDenominator = broadcastAttentionLane32(localDenominator,part);
+                    const float partScale = broadcastAttentionLane32(localScale,part);
+                    sum = fmaf(partDenominator,partScale,sum);
+                }
             }
             if constexpr (FoldParts == 33)
             {
-                // Replicated last-part evaluation appends the same33rd FMA in
-                // every lane; only owner0 publishes its shared scale slot.
+                // Retain the exact replicated part32 exponential in both
+                // schedules; only owner0 publishes its shared scale slot.
                 const float partDenominator = metadata.denominator[32];
                 const float partScale = partDenominator == 0.0f ? 0.0f : expf(metadata.maximum[32] - maximum);
-                sum = fmaf(partDenominator,partScale,sum);
+                if constexpr (!PerOutputDenominator)
+                    sum = fmaf(partDenominator,partScale,sum);
                 if (d == 0) scales[32] = partScale;
             }
-            if (d == 0)
-            {
-                require(isfinite(sum) && sum > 0.0f);
-                denominator = sum;
-            }
+            if constexpr (!PerOutputDenominator)
+                if (d == 0)
+                {
+                    require(isfinite(sum) && sum > 0.0f);
+                    denominator = sum;
+                }
         }
     }
     if (d == 0)
@@ -993,34 +1042,39 @@ __device__ __forceinline__ float foldAttentionPrefix(
             require(isfinite(sum) && sum > 0.0f);
             denominator = sum;
         }
-        if (p.observations)
-        {
-            QwenSparseAttentionObservation observation;
-            for (int part = 0; part < FoldParts; ++part)
-            {
-                observation.key_elements += StorageParts == 33 ? metadata.keys[part] : parts[part].key_elements;
-                observation.value_elements += StorageParts == 33 ? metadata.values[part] : parts[part].value_elements;
-            }
-            observation.selected_tokens = p.selected_count[row];
-            p.observations[row * p.query_heads + head] = observation;
-        }
+        if constexpr (!PerOutputDenominator)
+            publishAttentionFoldObservation<FoldParts,StorageParts>(p,parts,metadata,row,head);
     }
     __syncthreads();
-    float result = 0.0f;
+    float result = 0.0f, localDenominator = 0.0f;
     for (int part = 0; part < FoldParts; ++part)
     {
         const float part_denominator = StorageParts == 33 ? metadata.denominator[part] : parts[part].denominator;
         const float weighted = part_denominator == 0.0f ? 0.0f : parts[part].weighted[d];
-        result = fmaf(weighted, scales[part], result);
+        const float part_scale = scales[part];
+        result = fmaf(weighted, part_scale, result);
+        if constexpr (PerOutputDenominator)
+            localDenominator = fmaf(part_denominator, part_scale, localDenominator);
     }
     if constexpr (FoldParts < StorageParts) result = fmaf(0.0f, 0.0f, result);
     if constexpr (FoldParts + 1 < StorageParts) result = fmaf(0.0f, 0.0f, result);
-    return result;
+    if constexpr (PerOutputDenominator)
+    {
+        // Every output lane receives the same published operands and keeps the
+        // original ascending denominator chain. Guarded admitted weighted reads
+        // may precede this check; no observation or output publication does.
+        require(isfinite(localDenominator) && localDenominator > 0.0f);
+        if (d == 0)
+            publishAttentionFoldObservation<FoldParts,StorageParts>(p,parts,metadata,row,head);
+        return {result,localDenominator};
+    }
+    else
+        return {result,denominator};
 }
 /**
  * @brief Merge the same fixed arithmetic partitions for serial and grouped execution.
  * @tparam ValueCodec Original native value codec and optional output rotation.
- * @tparam Parts Production8 or the explicit FP16 test-native33 arithmetic program.
+ * @tparam Parts Original8 or the admitted FP16 phase33 arithmetic program.
  * @param p Original row/head bindings and partial storage for that exact program.
  * @details Production 8 keeps its original fold. The explicit 33-part program selects
  * a fixed structural prefix and retains the finite RN effect of its omitted
@@ -1047,7 +1101,7 @@ __global__ __launch_bounds__(256, 2) void reduceAttentionPartitions(QwenSparseAt
     __shared__ std::uint32_t cached_keys[33], cached_values[33];
     const QwenSparsePartialMetadataView metadata{
         cached_maximum,cached_denominator,cached_keys,cached_values};
-    float result;
+    QwenSparseAttentionFoldResult folded;
     if constexpr (Parts == 33)
     {
         const int selected = p.selected_count[row];
@@ -1055,17 +1109,17 @@ __global__ __launch_bounds__(256, 2) void reduceAttentionPartitions(QwenSparseAt
         // One immutable device count selects a CTA-uniform structural tile bound.
         // The row/head storage stride remains 33 in every specialization.
         if (selected <= 8 * 64)
-            result = foldAttentionPrefix<8,33>(p, parts, scales, denominator, row, head, d, metadata);
+            folded = foldAttentionPrefix<8,33>(p, parts, scales, denominator, row, head, d, metadata);
         else if (selected <= 16 * 64)
-            result = foldAttentionPrefix<16,33>(p, parts, scales, denominator, row, head, d, metadata);
+            folded = foldAttentionPrefix<16,33>(p, parts, scales, denominator, row, head, d, metadata);
         else if (selected <= 32 * 64)
-            result = foldAttentionPrefix<32,33>(p, parts, scales, denominator, row, head, d, metadata);
+            folded = foldAttentionPrefix<32,33>(p, parts, scales, denominator, row, head, d, metadata);
         else
-            result = foldAttentionPrefix<33,33>(p, parts, scales, denominator, row, head, d, metadata);
+            folded = foldAttentionPrefix<33,33>(p, parts, scales, denominator, row, head, d, metadata);
     }
     else
-        result = foldAttentionPrefix<8,8>(p, parts, scales, denominator, row, head, d, metadata);
-    result /= denominator;
+        folded = foldAttentionPrefix<8,8>(p, parts, scales, denominator, row, head, d, metadata);
+    float result = folded.numerator / folded.denominator;
     if constexpr (ValueCodec == TensorType::TQ4 || ValueCodec == TensorType::TQ8)
     {
         rotated_values[d] = result;

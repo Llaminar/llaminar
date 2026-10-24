@@ -2,8 +2,9 @@
 
 This comparison uses Castagna revision
 `3483d462715d61f21ed5877836be35a724446359`. The opening comparison records
-candidate124; the latest qualified candidate165 and refreshed four-MI50 traces
-are recorded below. It distinguishes source
+candidate124; qualified candidate169 and the latest four-MI50 traces from165
+are recorded below. Candidate169 passes native/model accuracy, complete Unit,
+affected device gates and matched model benchmarking. It distinguishes source
 structure from measured causation. The source findings inform subsequent
 arithmetic-preserving candidates; they do not establish a new production
 default or an end-to-end speedup by themselves.
@@ -1018,6 +1019,103 @@ Evidence under the ignored QFN results root includes
 production defaults and full preflightG60 remain unchanged. Both the short
 attention-pair target and approximately43tok/s whole-model decode target remain
 open.
+
+## Ordered per-output normalization169
+
+**169 is a qualified component improvement; whole-model throughput is unchanged.**
+It replaces HIP33's32-lane denominator broadcast banks with the same ascending
+denominator FMAs beside each output lane's numerator. Shared max/exp scales,
+weighted guards, both neutral-tail FMAs and observation ownership remain; a
+typed numerator/denominator result receives one outer division. Observations
+publish only after denominator validation. The8/CUDA arithmetic paths remain,
+and default8 native instruction bodies match frozen165 exactly.
+
+| Captured producer-plus-merge median, µs |165 |169 |
+|---|---:|---:|
+| Post-RoPE M1 /512 |15.05355 |14.74500 |
+| Post-RoPE M1 /640 |15.81605 |15.57500 |
+| Post-RoPE M1 /768 |15.85720 |15.60500 |
+| Post-RoPE M1 /2048 |18.45470 |17.79375 |
+| Post-RoPE M1 /65536 |19.12725 |18.52125 |
+| Post-RoPE M16 /65536 |82.28515 |81.50635 |
+| Pre-RoPE M1 /512 |16.79850 |16.48375 |
+| Pre-RoPE M1 /65536 |20.76470 |20.40625 |
+
+All eight event cells improve0.95–3.58%. These are unprofiled component pairs,
+not full-model throughput. Pre-RoPE denotes a key-encoding diagnostic, not
+prefill; this matched model run uses Post-RoPE FP16 KV. All21 native tests
+pass, and eight independent frozen165 output/numerical-partial exports are exact.
+The retained `FP16Phase33MergeWideCounters` test replays the authenticated actual
+production merge without its producer, checking arbitrary uint32 counter fields
+with independent uint64 sums, zero/carry cases, null observations and inactive
+rows. It is explicitly included in the existing
+`V2_Integration_ROCm_QwenSparseFP16TileArithmetic` preflight registration; this
+focused result does not certify complete production preflight.
+
+Thirteen isolated M1 profiles plus one M16 profile authenticate the restored169
+merge:124 used/124 allocated VGPRs,708B LDS and zero private scratch/spills.
+The ordered FP32 chains/division are preserved and the denominator
+`ds_swizzle` banks are absent. Restoring169 reproduces the original source-bound
+1,636,888-byte ELF slice exactly. Lower register count is not the selection rule:
+
+| Isolated Post-RoPE M1 merge metric |Context512 |Context65536 |
+|---|---:|---:|
+| Wavefronts |24 |24 |
+| VALU instructions/wave |100.75 |374.25 |
+| Active-lane VALU utilization, % |85.56047 |90.099385 |
+| Memory-unit busy, % |5.160391 |11.495053 |
+| Reported fetch, KiB |51.6875 |200.5625 |
+| LDS bank conflicts |0 |0 |
+
+The M16 profile launches384 merge waves. The native resource query admits at
+most two256-thread CTAs per compute unit; this is a theoretical resource limit.
+`VALUUtilization` measures active lanes, not achieved occupancy. These
+instrumented counters explain work, not request latency.
+
+The rejected weighted-unroll168 keeps70 VGPRs but slows the pair. Applying the
+hint over169 in170 drops to40 VGPRs yet loses long/grouped economy. Cooperative
+uint64 counter trees171/172 reach104 VGPRs/424B LDS; their short cells lose and
+long gains remain below1%, so their production complexity is retired. The
+wide-counter regression remains.169 retains the exact serial counter sum.
+
+| Broader169 qualification |Status |
+|---|---|
+| Canonical model accuracy and actual Prefill8/Decode33 counters on all four GPUs |PASS |
+| Independent final-logit comparison to151 |PASS:26 files /185 rows byte-identical |
+| Complete Unit and affected Integration registrations |PASS:776 Unit plus56 affected entries;832 total, no CTest failures or skips |
+| Matched unprofiled165/169 A/B/A |PASS:all nine natural256-token sequences are identical; overlapping performance ranges |
+
+| Unprofiled full-model throughput, tok/s |Frozen165 control |169 |
+|---|---:|---:|
+| Prefill median |818.872 |819.319 |
+| Prefill range |817.288–819.872 |818.183–819.331 |
+| Decode median |40.112 |40.175 |
+| Decode range |40.067–40.280 |40.128–40.230 |
+
+The +0.055% prefill /+0.159% decode differences are within the overlapping
+ranges; they do not establish a whole-model speedup. The A/B/A schedule uses
+one warmup and three measured requests per arm, with six control samples and
+three candidate samples. All nine natural256-token sequences are identical.
+Settings remain fullTP4 on fourMI50s, sharded vocabulary,28 physical NUMA1
+workers, RAM ngrams, native Post-RoPE FP16 KV, explicit Prefill8/Decode33,
+prompt512/decode256/context4096, MTP/prefix off and greedyseed42 on the same
+Qwen3.8-Flash-Next UD-Q4_K_XL GGUF. Profile timings are excluded. Every arm
+passes source/runtime/model/driver/resource and normal-retirement checks.
+The [matched benchmark receipt](../../../../parity-results/qwen-flash-next/attention169-local-denominator-model-throughput-comparison-r1.json)
+retains the samples, settings and source-bound evidence.
+
+The [model panel](../../../../parity-results/qwen-flash-next/attention169-local-denominator-model-fp16-r1/)
+passes required groups; its
+[byte comparison](../../../../parity-results/qwen-flash-next/attention169-local-denominator-model-fp16-r1/comparison151-logit-bytes.json)
+retains the independent result. The complete832-entry focused qualification is
+recorded in `attention169-local-denominator-unit-native-r1/result.json`;
+`attention169-local-denominator-joined-profile-r2.json` and
+`attention169-local-denominator-joined-m16-wavefronts-r2.json` authenticate
+the isolated profiles. `attention169-restored-code-object-r2.json` proves the
+bounded ELF comparison. No refreshed full-model core trace is claimed: that
+comparison remains165. Source basis is checkpoint165
+`6cb7e9132`; production defaults and complete preflightG60 remain unchanged.
+The approximately43tok/s decode goal is still open.
 
 ## Primary source map
 

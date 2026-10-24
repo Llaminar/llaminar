@@ -1,5 +1,23 @@
 # QFN tuning dashboard
 
+**Attention checkpoint169 is green:** **819.319 prefill /40.175 decode tok/s**,
+versus frozen165 controls'818.872 /40.112. The +0.055% /+0.159% differences
+have overlapping ranges: whole-model throughput is effectively unchanged.
+All nine natural256-token sequences are identical.
+The ordered per-output denominator removes HIP33 broadcast banks without changing
+FP32 chains/division. All eight component cells beat165: **14.745µs at M1/512,
+18.521µs at M1/64K and81.506µs at M16/64K**. All21 native tests, the retained
+wide-counter regression and eight independent numerical exports pass. Canonical
+model groups/phase counters pass;26 final-logit files/185 rows are byte-identical
+to151. **All832 Unit/affected entries and matched165 A/B/A pass.**
+
+The [169 qualification and benchmark settings](QFN_ATTENTION_STRUCTURE_COMPARISON.md#ordered-per-output-normalization169)
+record124/124 VGPRs,708B LDS, zero scratch/spills and exact default8 bodies.
+Lower-register168/170 and counter-tree171/172 lose economy and are rejected.
+VALU utilization is active-lane utilization, not achieved occupancy. No169
+whole-model throughput gain is claimed.165 remains the preceding qualified
+checkpoint below; defaults/full preflight are unchanged and43tok/s remains open.
+
 **Attention checkpoint165 is green:** **818.073 prefill /40.190 decode tok/s**,
 versus frozen151 controls'818.437 /40.151. The −0.045% /+0.095% differences
 have overlapping ranges: whole-model throughput is effectively unchanged.
