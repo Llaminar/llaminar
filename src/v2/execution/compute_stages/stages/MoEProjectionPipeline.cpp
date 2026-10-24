@@ -13,6 +13,8 @@
  * producer boundary; they never add a full-route bank or another collective.
  * Bounded Automatic owner execution reads the existing startup observation at
  * declaration and resolves the actual mode before graph identity or admission.
+ * Fixed scalar output rows publish directly from the existing native allgather;
+ * wider and device-counted rows retain their original receive/assembly banks.
  */
 #include "MoEProjectionPipeline.h"
 #include "MoEOverlayPinnedRouteEvidenceViews.h"
@@ -670,6 +672,61 @@ namespace
         DeviceWorkspaceManager *workspace_ = nullptr;
     };
 
+    /**
+     * @brief Publish a fixed scalar row directly from the existing native gather.
+     *
+     * For M=1, [participant,row,column] and [row,participant,column] have the
+     * identical address: (participant * 1 + 0) * columns + column. The native
+     * receive therefore owns the original final output bank directly. No copy,
+     * alias, arena remap or additional publication stage is required. Counted
+     * rows retain their original assembly because an empty receive must leave
+     * its bank untouched; redirecting that bank would alter inactive bytes.
+     * The retained binding keeps original route-epoch snapshot leases alive.
+     */
+    class ProjectionColumnGatherStage final : public NativeAllGatherStage
+    {
+    public:
+        /**
+         * @brief Retain native transport and the exact row-major output owner.
+         * @param params Complete existing native gather declaration.
+         * @param binding Original prepared projection transaction and leases.
+         * @param output Original routed or explicitly combined output bank.
+         * @throws std::invalid_argument For nonidentity geometry or a foreign bank.
+         */
+        ProjectionColumnGatherStage(NativeAllGatherStage::Params params,
+            std::shared_ptr<Binding> binding, MoEProjectionTensorBinding output)
+            : NativeAllGatherStage(std::move(params)), binding_(std::move(binding)), output_(output)
+        {
+            if (!binding_ || binding_->params.rows != 1 || binding_->params.live_rows ||
+                this->params().live_rows || this->params().arena_rows ||
+                this->params().rank_major_output != output_.tensor ||
+                this->params().output_buffer_id != output_.id)
+                throw std::invalid_argument("Direct projection gather requires one fixed row and its exact output bank");
+        }
+        /** @return Original prepared transaction; no runtime state is copied. */
+        const std::shared_ptr<Binding> &binding() const noexcept { return binding_; }
+        /** @return Whether the shared-column finalizer already installed its output. */
+        bool publishesCombinedColumns() const noexcept
+        { return this->params().local_input == binding_->params.local_route_columns.tensor; }
+        /**
+         * @return Original complete-row snapshot and route-epoch evidence.
+         * @details The diagnostic name stays projection_assemble although its
+         * actual stage is the explicit native allgather that now owns the bytes.
+         */
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            StageDumpInfo info;
+            info.addScalarInt("projection_phase", static_cast<int>(Phase::Assemble));
+            info.addOutput(publishesCombinedColumns() ? "combined_output" : "output", output_.tensor,
+                1, binding_->params.fixed_down->ownership().geometry().model_columns);
+            if (binding_->route_evidence) binding_->route_evidence->appendOutputs(info);
+            return info;
+        }
+    private:
+        const std::shared_ptr<Binding> binding_; ///< Existing transaction/descriptor lease, retained through graph retirement.
+        const MoEProjectionTensorBinding output_; ///< Sole native receive and snapshot authority.
+    };
+
     /** @brief Explicit counted collective; all model arithmetic remains in local phases. */
     class CompactExchangeStage final : public CapturedAllGatherStage
     {
@@ -830,6 +887,7 @@ std::string appendMoEProjectionPipeline(ComputeGraph &graph, MoEProjectionPipeli
     auto binding = std::make_shared<Binding>(std::move(params));
     const auto &p = binding->params;
     const auto &ownership = p.fixed_down->ownership();
+    const bool direct_row = p.rows == 1 && !p.live_rows;
     const auto column_bytes = std::size_t(p.rows) * ownership.projection(WeightRole::MoEExpertDown).rows * sizeof(float);
     const std::array names{p.prefix + "gate_up_pack", p.prefix + "intermediate_allgather",
         p.prefix + "import_down", p.prefix + "fold_routes", p.prefix + "column_allgather", p.prefix + "assemble"};
@@ -849,22 +907,27 @@ std::string appendMoEProjectionPipeline(ComputeGraph &graph, MoEProjectionPipeli
         if (input.id == p.local_columns.id && p.live_rows)
             params.live_rows = NativeCollectiveRows(*p.live_rows,
                 ownership.projection(WeightRole::MoEExpertDown).rows * sizeof(float));
-        return std::make_unique<NativeAllGatherStage>(std::move(params));
+        return params;
     };
     // Native membership and every tensor contract must validate before adding
     // any graph node. Neither constructor performs backend work or allocates VRAM.
     std::array<std::unique_ptr<IComputeStage>, 6> stages{
         std::make_unique<ProjectionStage>(binding, Phase::GateUpPack, names[0]),
         p.counted_exchange ? std::unique_ptr<IComputeStage>(std::make_unique<CompactExchangeStage>(binding))
-            : gather(p.local_packet, p.gathered_packets, binding->layout.packetBytes(), names[1]),
+            : std::make_unique<NativeAllGatherStage>(gather(p.local_packet, p.gathered_packets, binding->layout.packetBytes(), names[1])),
         std::make_unique<ProjectionStage>(binding, Phase::ImportDown, names[2]),
         std::make_unique<ProjectionStage>(binding, Phase::FoldRoutes, names[3]),
-        gather(p.local_columns, p.gathered_columns, column_bytes, names[4]),
-        std::make_unique<ProjectionStage>(binding, Phase::Assemble, names[5])};
+        direct_row ? nullptr : std::make_unique<NativeAllGatherStage>(gather(p.local_columns, p.gathered_columns, column_bytes, names[4])),
+        direct_row ? std::unique_ptr<IComputeStage>(std::make_unique<ProjectionColumnGatherStage>(
+            gather(p.local_columns, p.output, column_bytes, names[5]), binding, p.output))
+            : std::make_unique<ProjectionStage>(binding, Phase::Assemble, names[5])};
+    auto predecessor = p.router_node;
     for (std::size_t i = 0; i < stages.size(); ++i)
     {
+        if (!stages[i]) continue;
         graph.addNode(names[i], std::move(stages[i]), binding->device());
-        graph.addDependency(names[i], i ? names[i - 1] : p.router_node);
+        graph.addDependency(names[i], predecessor);
+        predecessor = names[i];
     }
     return names.back();
 }
@@ -897,13 +960,15 @@ std::string finalizeMoEProjectionSharedColumns(ComputeGraph &graph,
 {
     auto *assembly_node = graph.getNode(prefix + "assemble");
     const auto *assembly = assembly_node ? dynamic_cast<const ProjectionStage *>(assembly_node->stage.get()) : nullptr;
-    auto *gather_node = graph.getNode(prefix + "column_allgather");
+    const auto *direct = assembly_node ? dynamic_cast<const ProjectionColumnGatherStage *>(assembly_node->stage.get()) : nullptr;
+    auto *gather_node = direct ? assembly_node : graph.getNode(prefix + "column_allgather");
     const auto *gather = gather_node ? dynamic_cast<const NativeAllGatherStage *>(gather_node->stage.get()) : nullptr;
     const auto *producer = graph.getNode(shared.producer);
-    if (!assembly || assembly->phase() != Phase::Assemble || assembly->publishesCombinedColumns() ||
-        !gather || !producer || !producer->stage || !shared.gate || !shared.combined_output.tensor)
+    const bool original_terminal = (assembly && assembly->phase() == Phase::Assemble && !assembly->publishesCombinedColumns()) ||
+        (direct && !direct->publishesCombinedColumns());
+    if (!original_terminal || !gather || !producer || !producer->stage || !shared.gate || !shared.combined_output.tensor)
         throw std::invalid_argument("Shared-column finalization requires an unmodified projection DAG and complete shared producer");
-    const auto binding = assembly->binding();
+    const auto binding = direct ? direct->binding() : assembly->binding();
     const auto &p = binding->params;
     const auto &owner = p.fixed_down->ownership();
     const auto &sum = shared.reduction;
@@ -918,9 +983,9 @@ std::string finalizeMoEProjectionSharedColumns(ComputeGraph &graph,
         shared.combined_output.tensor->native_type() != TensorType::FP32 ||
         shared.combined_output.tensor->size_bytes() < full_bytes ||
         gather->params().local_input != p.local_columns.tensor ||
-        gather->params().rank_major_output != p.gathered_columns.tensor ||
+        gather->params().rank_major_output != (direct ? p.output.tensor : p.gathered_columns.tensor) ||
         gather_node->dependencies != std::vector<std::string>{prefix + "fold_routes"} ||
-        assembly_node->dependencies != std::vector<std::string>{prefix + "column_allgather"})
+        (!direct && assembly_node->dependencies != std::vector<std::string>{prefix + "column_allgather"}))
         throw std::invalid_argument("Shared-column finalization disagrees with native policy, bank geometry or graph ownership");
     for (const auto &b : {p.hidden, p.local_columns, p.local_route_columns, p.gathered_columns,
                           p.local_packet, p.gathered_packets, p.routing_indices, p.routing_weights})
@@ -948,8 +1013,15 @@ std::string finalizeMoEProjectionSharedColumns(ComputeGraph &graph,
     // now the compact combined-column send bank; no third allocation is needed.
     combined_gather.local_input = p.local_route_columns.tensor;
     combined_gather.input_buffer_id = p.local_route_columns.id;
-    auto combined_gather_stage = std::make_unique<NativeAllGatherStage>(combined_gather);
-    auto combined_assembly = std::make_unique<ProjectionStage>(binding, Phase::Assemble,
+    if (direct)
+    {
+        combined_gather.rank_major_output = shared.combined_output.tensor;
+        combined_gather.output_buffer_id = shared.combined_output.id;
+    }
+    std::unique_ptr<IComputeStage> combined_gather_stage = direct
+        ? std::unique_ptr<IComputeStage>(std::make_unique<ProjectionColumnGatherStage>(combined_gather, binding, shared.combined_output))
+        : std::make_unique<NativeAllGatherStage>(combined_gather);
+    auto combined_assembly = direct ? nullptr : std::make_unique<ProjectionStage>(binding, Phase::Assemble,
         prefix + "assemble", shared.combined_output);
     auto gate_stage = std::make_unique<SharedColumnGateStage>(binding, shared);
 
@@ -965,8 +1037,8 @@ std::string finalizeMoEProjectionSharedColumns(ComputeGraph &graph,
     // All participants submit intermediate gather -> shared scatter -> column
     // gather. Only local down compute occupies the scatter's event window.
     gather_node->stage = std::move(combined_gather_stage);
-    graph.addDependency(prefix + "column_allgather", gate_name);
-    assembly_node->stage = std::move(combined_assembly);
+    graph.addDependency(prefix + (direct ? "assemble" : "column_allgather"), gate_name);
+    if (!direct) assembly_node->stage = std::move(combined_assembly);
     return prefix + "assemble";
 }
 } // namespace llaminar2

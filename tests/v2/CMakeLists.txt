@@ -31135,6 +31135,14 @@ if(NOT V2_PERF_TESTS_ONLY)
                 if(TEST V2_Integration_MoEProjectionPhaseScheduling_${_phase_backend})
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionPhaseScheduling_${_phase_backend})
                 endif()
+                add_v2_test(V2_Integration_MoEProjectionScalarPublication_${_phase_backend}
+                    COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
+                        --gtest_filter=MoEProjectionScalarPublication.${_phase_backend}
+                    LABELS "V2;Integration;ProductionTestPreflight;LocalTP;MoE;GraphCapture;ByteExact;${_phase_backend_label};Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+                if(TEST V2_Integration_MoEProjectionScalarPublication_${_phase_backend})
+                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionScalarPublication_${_phase_backend})
+                endif()
             endif()
         endforeach()
     endif()

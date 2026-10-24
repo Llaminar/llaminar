@@ -1,5 +1,21 @@
 # QFN tuning dashboard
 
+**Checkpoint180 passes scoped qualification:** **819.594 prefill / 41.030
+decode tok/s**, versus frozen179 controls at 819.241 / 40.797. The extended
+A/B/A/B/A comparison retains all 15 measured requests: **+0.572% decode**,
+with prefill effectively unchanged. Both brackets favor the candidate; the
+first has overlapping decode ranges and the second has non-overlapping ranges.
+All 15 natural token sequences and all 185 canonical final-logit rows match.
+The complete **823-entry Unit/affected gate** and seven focused native tests
+pass. Fixed M1 MoE column allgathers now publish directly to the final bank;
+wider and counted rows retain their existing behavior. The real-model captured
+inventory has zero final identity-copy observations on all four GPUs, verified
+by a separate offline reconciliation that preserves the original postprocessing
+failure. See the [settings and qualification record](QFN_SCALAR_COLUMN_PUBLICATION_TUNING.md).
+The **42.959 tok/s Castagna target remains open**. Complete preflight remains
+G60, and the explicit FP16 attention policy is unchanged. The archived GDN
+component experiment below remains separate from production.
+
 **Checkpoint179 passes scoped qualification:** **819.648 prefill / 40.656
 decode tok/s**, versus bracketed frozen177 controls at 819.665 / 40.295.
 Decode improves **0.897%** with non-overlapping sample ranges; prefill is flat.
@@ -10,8 +26,16 @@ ROCm profiles pass. The short model trace proves 48 scan calls in every
 model graph. See the [settings and qualification record](QFN_SMALL_GROUP_PREFIX_TUNING.md).
 The **42.959 tok/s Castagna target remains open**. This uses explicit FP16
 attention Prefill8/Decode33; default promotion and complete preflight remain
-separate work. Next is a bounded existing-quantizer comparison through the
-unchanged complete HC-down projection.
+separate work. The [existing-quantizer screen](QFN_ACTIVATION_PREPARATION_TUNING.md)
+finds a 1.72% complete HC-down projection gain for V2 with exact bytes and
+18.9% fewer vector instruction issues. It is a synthetic one-shape result;
+defaults and model scores remain unchanged. The same record now includes a
+private GDN normalization/SingleQ8 fusion: **15.325→13.2925 µs (13.26%)** for
+the complete synthetic native19/M1 projection boundary, exact bytes, no spills
+and **38.8% fewer vector instruction issues** in preparation. Its expanded
+122-case row/sums matrix and12 recorded-value cases pass; the prototype is
+archived separately. Fixed-M1 MoE column publication is qualified by180 above;
+the component results do not replace that measured model score.
 
 **Previous checkpoint177 passes the focused production-integration slice:** **819.876
 prefill / 40.328 decode tok/s**, versus frozen175 controls at 820.235 / 40.151.

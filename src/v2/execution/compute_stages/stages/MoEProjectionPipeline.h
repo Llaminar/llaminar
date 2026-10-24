@@ -91,7 +91,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Append a complete six-node projection transaction without device work.
+     * @brief Append a complete projection transaction without device work.
      * @param graph Participant-local model graph with the declared router already present.
      * @param params Prepared ownership plus exact arena bindings and native membership.
      * @return The row-major output publication node, for downstream graph dependencies.
@@ -100,6 +100,10 @@ namespace llaminar2
      *
      * The sequence is gate/up+pack → explicit exchange → regroup/import/down dots →
      * ordered local route fold → native column gather → row-major assembly.
+     * A fixed M=1 row has identical rank-major and row-major layouts: its gather
+     * writes the original final bank and owns the original assembly identity.
+     * Device-counted rows keep their original receive/assembly banks, including
+     * empty-row stale-byte semantics. No-live scalar prefill and decode agree.
      * Independent down dots can run concurrently; only their short top-k fold
      * is serial. Consumer regrouping reads the
      * original router weights, never locally filtered runtime weights. Native
@@ -136,7 +140,7 @@ namespace llaminar2
 
     /**
      * @brief Complete a projection DAG by summing shared output only to its column owners.
-     * @param graph Existing six-node projection pipeline and shared-FFN producer.
+     * @param graph Existing projection pipeline and shared-FFN producer.
      * @param projection_prefix Exact prefix previously passed to appendMoEProjectionPipeline.
      * @param shared Original shared reduction/gate policy and final output bank.
      * @return Final full-row assembly identity for downstream consumers.

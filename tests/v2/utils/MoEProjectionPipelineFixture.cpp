@@ -31,6 +31,9 @@
  * Decode's full-row cohort preserves the separate native shared allreduce and
  * verifies its bytes while routed down and the following native gather execute
  * in the production fork/join order. It never substitutes a column reduction.
+ * Fixed scalar rows additionally prove actual native gather output ownership,
+ * complete-row diagnostic leases and absence of the old identity-copy kernel.
+ * Counted rows retain their original two-bank declarations even at capacity one.
  */
 #include "MoEProjectionPipelineFixture.h"
 #include "integration/transfer/CapturedChannelGraphProof.h"
@@ -47,6 +50,8 @@
 #include "planning/PlanningObservedResource.h"
 #include "utils/MPIContext.h"
 #include "execution/compute_stages/stages/MoEProjectionPipeline.h"
+#include "execution/compute_stages/stages/NativeAllGatherStage.h"
+#include "kernels/common/ColumnShardAssemblyKernels.h"
 #include "execution/compute_stages/stages/TPLocalReduceOverlap.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/moe/MoEGroupedVerifierHistogramBoundarySet.h"
@@ -79,6 +84,7 @@
 #include <map>
 #include <thread>
 #include <vector>
+#include <string_view>
 
 namespace llaminar2::test
 {
@@ -300,7 +306,7 @@ std::vector<GraphCaptureDependencyLedger::StagePlan> capturePlan(
     return plans;
 }
 
-/** @brief Exercise full/empty/sparse rows and changed owners on a retained six-node transaction. */
+/** @brief Exercise full/empty/sparse rows and changed owners on the retained production transaction. */
 void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::barrier<> &rendezvous,
     const Format &format, const ProjectionPipelineFixtureConfig &config,
     const std::vector<OriginalExpertSources> &originals,
@@ -592,7 +598,48 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
             params.bindArena(arena);
             require(params.hidden.tensor == hidden.get(), "production normalized activation binding");
             const auto terminal = appendMoEProjectionPipeline(graph, params);
-            require(graph.size() == 7 && terminal == "layer0_projection_assemble", "projection graph structure");
+            const auto expected_nodes = rows == 1 ? 6u : 7u;
+            require(graph.size() == expected_nodes && terminal == "layer0_projection_assemble", "projection graph structure");
+            const auto *direct_gather = dynamic_cast<const NativeAllGatherStage *>(graph.getNode(terminal)->stage.get());
+            require((direct_gather != nullptr) == (rows == 1), "only a fixed scalar row may publish directly from allgather");
+            if (direct_gather)
+            {
+                require(!graph.getNode(params.prefix + "column_allgather") &&
+                    direct_gather->params().rank_major_output == output.get() &&
+                    direct_gather->params().output_buffer_id == params.output.id &&
+                    direct_gather->params().local_input == columns.get() &&
+                    direct_gather->params().bytes_per_participant == std::size_t(width / participants) * sizeof(float),
+                    "scalar gather changed its original banks or exact communication extent");
+                // Independently reduce the actual layout coordinates. The
+                // scalar row cancels the only rank/row transpose; wider rows
+                // remain covered by the old native assembly below.
+                for (int column = 0; column < width; ++column)
+                {
+                    const int peer = column / (width / participants);
+                    const int local = column % (width / participants);
+                    require((peer * rows + 0) * (width / participants) + local == column,
+                        "scalar rank-major/row-major addresses differ");
+                }
+            }
+            // A mutable live count is a different byte-lifetime contract even
+            // when its capacity is one. Construction must retain the original
+            // receive bank/assembly and the exact native count authority.
+            {
+                ComputeGraph counted_graph;
+                counted_graph.addNode("fixture_router", std::make_unique<FixtureRouterBoundary>(device), device);
+                auto counted_params = params;
+                counted_params.live_rows = DeviceRowRange::deviceCounted(rows,
+                    static_cast<const int *>(active_rows->gpu_data_ptr()));
+                const auto counted_terminal = appendMoEProjectionPipeline(counted_graph, counted_params);
+                const auto *counted_gather = dynamic_cast<const NativeAllGatherStage *>(
+                    counted_graph.getNode(params.prefix + "column_allgather")->stage.get());
+                require(counted_graph.size() == 7 && counted_terminal == terminal && counted_gather &&
+                    counted_gather->params().rank_major_output == gathered.get() &&
+                    counted_gather->params().live_rows &&
+                    counted_gather->params().live_rows->rows().countOwner() == active_rows->gpu_data_ptr() &&
+                    counted_graph.getNode(counted_terminal)->stage->type() == ComputeStageType::MOE_PROJECTION_PHASE,
+                    "device-counted assembly changed its empty-row bank or native count authority");
+            }
             if (params.counted_exchange)
             {
                 auto unresolved = params;
@@ -602,7 +649,7 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
             }
             auto invalid = params; invalid.prefix = "invalid_"; invalid.local_packet = invalid.output;
             EXPECT_THROW(appendMoEProjectionPipeline(graph, invalid), std::invalid_argument);
-            EXPECT_EQ(graph.size(), 7u);
+            EXPECT_EQ(graph.size(), expected_nodes);
             if (has_shared)
             {
                 graph.addNode("fixture_shared", std::make_unique<FixtureRouterBoundary>(device), device);
@@ -622,7 +669,7 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     overlapMoEProjectionSharedAllreduce(graph, params.prefix, sum.stage_name);
                     EXPECT_THROW(overlapMoEProjectionSharedAllreduce(graph, params.prefix, sum.stage_name),
                                  std::invalid_argument);
-                    require(graph.size() == 11, "projection full-row overlap duplicated a node");
+                    require(graph.size() == expected_nodes + 4, "projection full-row overlap duplicated a node");
                     // Pin the exact native submission order, not merely final
                     // equality: a peer may otherwise capture a different order.
                     const auto order = graph.getExecutionOrder();
@@ -634,7 +681,7 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     require(position(params.prefix + "intermediate_allgather") < position(sum.stage_name + "_submit") &&
                             position(sum.stage_name + "_submit") < position(params.prefix + "import_down") &&
                             position(params.prefix + "import_down") < position(sum.stage_name) &&
-                            position(sum.stage_name) < position(params.prefix + "column_allgather"),
+                            position(sum.stage_name) < position(rows == 1 ? terminal : params.prefix + "column_allgather"),
                             "projection full-row sum is outside its independent down window");
                 }
                 else
@@ -645,9 +692,24 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                 require(finalizeMoEProjectionSharedColumns(graph, params.prefix, completion) == terminal,
                     "projection shared completion changed terminal identity");
                 EXPECT_THROW(finalizeMoEProjectionSharedColumns(graph, params.prefix, completion), std::invalid_argument);
-                require(graph.size() == 12, "projection shared completion duplicated a node");
+                require(graph.size() == (rows == 1 ? 11u : 12u), "projection shared completion duplicated a node");
                 }
             }
+            // Both original and scalar terminal nodes expose the same
+            // complete-value snapshot semantics, including after finalization.
+            require(graph.getNode(terminal)->stage->type() == (rows == 1
+                    ? ComputeStageType::NATIVE_ALLGATHER : ComputeStageType::MOE_PROJECTION_PHASE),
+                "projection snapshot metadata disguised the actual native stage type");
+            const auto terminal_dump = graph.getNode(terminal)->stage->getDumpInfoSnapshot();
+            const auto terminal_name = shared_columns ? "combined_output" : "output";
+            const auto final_output = std::find_if(terminal_dump.outputs.begin(), terminal_dump.outputs.end(),
+                [&](const auto &entry) { return entry.name && std::string_view(entry.name) == terminal_name; });
+            require(final_output != terminal_dump.outputs.end() && final_output->tensor == output.get() &&
+                final_output->rows == static_cast<std::size_t>(rows) && final_output->cols == static_cast<std::size_t>(width),
+                "projection final native/assembled publication lost its original snapshot owner");
+            const auto final_keys = SnapshotCapture::possibleKeysForStage(terminal, terminal_dump);
+            require(std::find(final_keys.begin(), final_keys.end(), (shared_columns ? "layer0_MOE_COMBINED_OUTPUT" : "layer0_MOE_EXPERT_OUTPUT")) != final_keys.end(),
+                "projection terminal lost the complete-row snapshot key");
             std::map<BufferId, TensorBase *> buffers;
             for (const auto binding : {params.hidden, params.routing_indices, params.routing_weights, params.local_packet,
                     params.gathered_packets, params.local_route_columns,
@@ -735,6 +797,31 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     scope.complete();
                 }
                 recording.finish();
+                // Bind the expected assembly function to one real captured
+                // production launch. Function identity authenticates removal
+                // even if a backend cannot resolve a symbolic kernel name.
+                auto assembly_probe = gpu.createGraphCapture(stream);
+                {
+                    ScopedBackendGraphCapture probe_recording(gpu, *assembly_probe, "projection_assembly_identity_oracle");
+                    require(probe_recording.begin() && assembleColumnShardsFP32(device,
+                        static_cast<const float *>(gathered->gpu_data_ptr()),
+                        static_cast<float *>(output->gpu_data_ptr()), rows, participants, width / participants, stream),
+                        "projection assembly identity oracle capture");
+                    probe_recording.finish();
+                }
+                std::vector<GPUGraphKernelNodeInfo> probe_nodes, native_nodes;
+                std::string inspection_error;
+                require(assembly_probe->inspectKernelNodes(probe_nodes, &inspection_error) && probe_nodes.size() == 1 &&
+                    probe_nodes.front().valid(), "projection assembly oracle kernel identity");
+                require(capture->inspectKernelNodes(native_nodes, &inspection_error), "projection native kernel inventory");
+                const auto copies = std::count_if(native_nodes.begin(), native_nodes.end(), [&](const auto &node) {
+                    return node.function_identity == probe_nodes.front().function_identity;
+                });
+                // Shared-column packing legitimately uses the same existing
+                // transpose kernel before reduce-scatter. Only the final scalar
+                // copy disappears; M>1 keeps its original final assembly.
+                require(copies == (rows == 1 ? 0 : 1) + (shared_columns ? 1 : 0),
+                    "captured projection did not remove exactly the scalar identity copy");
                 if (params.counted_exchange)
                 {
                     // Inspect the actual retained graph at the same geometry
@@ -989,6 +1076,19 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                             "projection published route columns do not fold to the captured output");
                     }
                 }
+                auto observed_terminal = terminal_dump;
+                for (auto &entry : observed_terminal.outputs)
+                    if (entry.name && std::string_view(entry.name) == terminal_name)
+                        entry.data = actual.data();
+                SnapshotCapture terminal_snapshots;
+                terminal_snapshots.captureStage(terminal, observed_terminal);
+                const auto terminal_snapshot = terminal_snapshots.getShared(
+                    shared_columns ? "layer0_MOE_COMBINED_OUTPUT" : "layer0_MOE_EXPERT_OUTPUT");
+                require(terminal_snapshot && terminal_snapshot->publication == SnapshotPublication::CompleteValue &&
+                    terminal_snapshot->rows == static_cast<std::size_t>(rows) &&
+                    terminal_snapshot->cols == static_cast<std::size_t>(width) &&
+                    terminal_snapshot->data == std::vector<float>(actual.begin(), actual.begin() + std::size_t(rows) * width),
+                    "projection native/assembled terminal snapshot changed complete-row semantics");
                 for (std::size_t i = 0; i < actual.size(); ++i)
                     if (!std::isfinite(actual[i]) || std::bit_cast<uint32_t>(actual[i]) != std::bit_cast<uint32_t>(reference[i]))
                         throw std::runtime_error(format.name + " projection byte mismatch rows=" + std::to_string(rows) +

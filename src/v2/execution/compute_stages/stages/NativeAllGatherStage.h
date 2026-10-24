@@ -5,7 +5,9 @@
  * Projection-partitioned MoE exchanges already encoded intermediate rows and
  * finished output columns. Neither exchange is a floating-point reduction or a
  * strided MPI gather. This stage exposes the native collective explicitly in the
- * graph, borrowing arena storage and the existing communicator. It owns no
+ * graph, borrowing arena storage and the existing communicator. A typed terminal
+ * may specialize diagnostic projection semantics while inheriting this exact
+ * transport, validation and capture/publication implementation. It owns no
  * allocation, placement state, host rendezvous, precision policy or transport
  * alternative. Consumers interpret the rank-major bytes in a separate stage.
  */
@@ -37,7 +39,7 @@ namespace llaminar2
      * device-counted row declarations clip useful payloads on every replay.
      * A participant is a communicator coordinate, not a physical GPU ordinal.
      */
-    class NativeAllGatherStage final : public CapturedAllGatherStage
+    class NativeAllGatherStage : public CapturedAllGatherStage
     {
     public:
         /**
