@@ -62,6 +62,13 @@ namespace llaminar2
             result->appears_zero = 1;
             result->sample_min = FLT_MAX;
             result->sample_max = -FLT_MAX;
+            if(extent.usesProjectionWork()) {
+                std::uint64_t rows=0;
+                for(int request=extent.projectionWork.requestForRow(0);request<=extent.projectionWork.requestForRow(extent.projectionWork.physicalRows()-1);++request)
+                    rows+=static_cast<unsigned>(extent.projectionWork.resolveDevice(request).size());
+                result->total_checked=static_cast<unsigned>(rows*extent.columns);
+                return;
+            }
             auto geometry = extent.geometry;
             std::int32_t prior = 0, live = 0;
             if (geometry.kind == SnapshotContiguousRowKind::StatePrefixRows)
@@ -118,10 +125,11 @@ namespace llaminar2
     __global__ void validateFP32KernelCUDA(
         const float *__restrict__ data,
         size_t num_elements,
-        DeviceValidationResult *__restrict__ result)
+        DeviceValidationResult *__restrict__ result, TensorValidationExtent extent)
     {
         // Initialization on this stream has already authenticated the frontier.
-        num_elements = result->total_checked;
+        num_elements = extent.usesProjectionWork() ? num_elements : result->total_checked;
+        if(result->invalid_extent)return;
 
         __shared__ unsigned int s_nan_count;
         __shared__ unsigned int s_inf_count;
@@ -153,6 +161,7 @@ namespace llaminar2
 
         for (size_t i = idx; i < num_elements; i += stride)
         {
+            if(extent.usesProjectionWork()&&!extent.projectionWork.rowIsActive(static_cast<int>(i/extent.columns)))continue;
             float val = data[i];
 
             if (isnan(val))
@@ -223,10 +232,11 @@ namespace llaminar2
     __global__ void validateBF16KernelCUDA(
         const uint16_t *__restrict__ data,
         size_t num_elements,
-        DeviceValidationResult *__restrict__ result)
+        DeviceValidationResult *__restrict__ result, TensorValidationExtent extent)
     {
         // Initialization on this stream has already authenticated the frontier.
-        num_elements = result->total_checked;
+        num_elements = extent.usesProjectionWork() ? num_elements : result->total_checked;
+        if(result->invalid_extent)return;
 
         __shared__ unsigned int s_nan_count;
         __shared__ unsigned int s_inf_count;
@@ -252,6 +262,7 @@ namespace llaminar2
 
         for (size_t i = idx; i < num_elements; i += stride)
         {
+            if(extent.usesProjectionWork()&&!extent.projectionWork.rowIsActive(static_cast<int>(i/extent.columns)))continue;
             uint16_t bf16 = data[i];
             uint16_t exp = (bf16 >> 7) & 0xFF;
             uint16_t mant = bf16 & 0x7F;
@@ -305,10 +316,11 @@ namespace llaminar2
     __global__ void validateFP16KernelCUDA(
         const uint16_t *__restrict__ data,
         size_t num_elements,
-        DeviceValidationResult *__restrict__ result)
+        DeviceValidationResult *__restrict__ result, TensorValidationExtent extent)
     {
         // Initialization on this stream has already authenticated the frontier.
-        num_elements = result->total_checked;
+        num_elements = extent.usesProjectionWork() ? num_elements : result->total_checked;
+        if(result->invalid_extent)return;
 
         __shared__ unsigned int s_nan_count;
         __shared__ unsigned int s_inf_count;
@@ -334,6 +346,7 @@ namespace llaminar2
 
         for (size_t i = idx; i < num_elements; i += stride)
         {
+            if(extent.usesProjectionWork()&&!extent.projectionWork.rowIsActive(static_cast<int>(i/extent.columns)))continue;
             uint16_t fp16 = data[i];
             uint16_t exp = (fp16 >> 10) & 0x1F;
             uint16_t mant = fp16 & 0x3FF;
@@ -466,15 +479,15 @@ namespace llaminar2
             {
             case TensorValidationDataType::FP32:
                 validateFP32KernelCUDA<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const float *>(device_ptr), num_elements, d_result_);
+                    static_cast<const float *>(device_ptr), num_elements, d_result_, extent);
                 break;
             case TensorValidationDataType::BF16:
                 validateBF16KernelCUDA<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const uint16_t *>(device_ptr), num_elements, d_result_);
+                    static_cast<const uint16_t *>(device_ptr), num_elements, d_result_, extent);
                 break;
             case TensorValidationDataType::FP16:
                 validateFP16KernelCUDA<<<num_blocks, block_size, 0, stream>>>(
-                    static_cast<const uint16_t *>(device_ptr), num_elements, d_result_);
+                    static_cast<const uint16_t *>(device_ptr), num_elements, d_result_, extent);
                 break;
             }
             requireSuccess(cudaGetLastError(), "tensor validation kernel launch");

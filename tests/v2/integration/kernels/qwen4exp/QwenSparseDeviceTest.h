@@ -13,6 +13,7 @@
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseMath.h"
 #include "kernels/qwen4exp/QwenSparseReplay.h"
+#include "kernels/qwen4exp/QwenSparseQueryRowWork.h"
 #include "kernels/qwen4exp/Qwen4ExpStateIO.h"
 #include "QwenSparseNativeCodecFixture.h"
 #include "QwenSparseRotaryReference.h"
@@ -1117,5 +1118,206 @@ TEST(QSA_SUITE, BoundedCandidateFullIndexerAndAttentionBytes)
                 ASSERT_FALSE(::testing::Test::HasFailure());
             }
         }
+}
+} // namespace llaminar2::qwen4exp::QSA_SUITE
+
+namespace llaminar2::qwen4exp::QSA_SUITE
+{
+/**
+ * @test Retained per-row query preparation preserves native indexer/attention bytes.
+ *
+ * Both policies record the real pipeline once per representation and M.
+ * Query demand is chosen independently per original row by the pool equation;
+ * skipped prefixes and inactive suffixes retain their exact changing poison. Native
+ * replay changes only original publications and fixture input bytes. Poisoned
+ * skipped Q and untouched prepared-Q prefixes/inactive suffixes prove the gate cannot read stale
+ * query capacity, while the AllLive graph supplies the exact same-backend oracle.
+ * The existing CPU native-cache consumer independently checks active attention
+ * values using the captured original selected IDs and original query/KV bytes.
+ */
+TEST(QSA_SUITE, CapturedRankingOnlyQueryPreparationPreservesNativeResults)
+{
+    constexpr int tokens=2080,headWidth=256;
+    for(const auto selection:{QwenSparsePoolSelection::Installed,QwenSparsePoolSelection::Bounded1024_1024})
+    for(const auto representation:{QwenSparseScalar::FP32,QwenSparseScalar::FP16,QwenSparseScalar::BF16})
+    for(const int rows:{1,3,16})
+    {
+        SCOPED_TRACE(::testing::Message()<<"representation="<<int(representation)<<" M="<<rows);
+        Fixture ordinary(rows,2052-rows,tokens,representation);
+        BoundedPipelineRetirement ordinaryRetirement{ordinary.stream};
+        Fixture gated(rows,2052-rows,tokens,representation);
+        BoundedPipelineRetirement gatedRetirement{gated.stream};
+        ordinary.indexer.query_demand=QwenSparseQueryDemand::AllLive;
+        gated.indexer.query_demand=QwenSparseQueryDemand::RankingOnly;
+        // One original global query head exercises the unchanged selected-KV
+        // consumer without expanding this focused gate case into a head sweep.
+        // The fixture's complete two-head native KV encoding remains intact.
+        ordinary.attention.query_heads=gated.attention.query_heads=1;
+        Fixture serial(1,2050,tokens,representation);
+        BoundedPipelineRetirement serialRetirement{serial.stream};
+        serial.attention.query_heads=1;
+        ordinary.indexer.pool_selection=gated.indexer.pool_selection=serial.indexer.pool_selection=selection;
+        ordinary.capture();gated.capture();
+        // Inspect runtime-owned captured arguments without reading any device
+        // publication. The two demand specializations must be distinct native
+        // functions and carry their exact original replay/row-work identity.
+        const auto queryFunction=[&](Fixture &f) {
+            std::size_t count=0;check(QSA_RT(GraphGetNodes)(f.graph,nullptr,&count));
+            std::vector<QSA_RT(GraphNode_t)> nodes(count);
+            check(QSA_RT(GraphGetNodes)(f.graph,nodes.data(),&count));
+            void *function=nullptr;
+            for(auto node:nodes) {
+                QSA_RT(GraphNodeType) type;check(QSA_RT(GraphNodeGetType)(node,&type));
+                if(type!=QSA_RT(GraphNodeTypeKernel))throw std::runtime_error("Query fixture contains a non-kernel node");
+                QSA_RT(KernelNodeParams) native{};check(QSA_RT(GraphKernelNodeGetParams)(node,&native));
+                if(native.gridDim.x!=unsigned(rows*4)||native.gridDim.y!=1||native.gridDim.z!=1||native.blockDim.x!=128)continue;
+                if(function||native.blockDim.y!=1||native.blockDim.z!=1||native.sharedMemBytes||!native.kernelParams)
+                    throw std::runtime_error("Query preparation has ambiguous geometry/arguments");
+                const auto &params=*static_cast<const QwenSparseIndexer *>(native.kernelParams[0]);
+                const auto &work=*static_cast<const ProjectionRowWork *>(native.kernelParams[1]);
+                if(params.replay!=f.indexer.replay||params.row_capacity!=rows||params.token_capacity!=tokens||
+                   params.query_demand!=f.indexer.query_demand||params.query!=f.indexer.query||
+                   params.prepared_query!=f.indexer.prepared_query||
+                   work.captureIdentity()!=qwenSparseIndexerQueryWork(f.indexer).repeatEachRow(4).captureIdentity())
+                    throw std::runtime_error("Query preparation lost its original replay/work binding");
+                function=native.func;
+            }
+            if(!function)throw std::runtime_error("Query preparation native function is missing");
+            return function;
+        };
+        EXPECT_NE(queryFunction(ordinary),queryFunction(gated));
+        // Capture the original single-row indexer plus accepted-tail commit
+        // once. This serial replay is a diagnostic oracle only, and does not
+        // add unrelated core-attention arithmetic to the row reference.
+        check(QSA_RT(StreamBeginCapture)(serial.stream,QSA_RT(StreamCaptureModeThreadLocal)));
+        try {
+            QSA_INDEXER(serial.indexer,serial.stream);
+            QSA_COMMIT((QwenSparsePartialCommit{.replay=serial.state.data,.prior_partial=serial.partial.data,
+                .raw_keys=serial.raw.data,.acceptance=AcceptedRequestPrefixes::fixed(
+                    DeviceRequestRowRanges::deviceCounted(1,1,&serial.state.data->live_rows),1),
+                .partial_keys=serial.partial.data}),serial.stream);
+        } catch(...) {
+            QSA_GRAPH abandoned=nullptr;
+            (void)QSA_RT(StreamEndCapture)(serial.stream,&abandoned);
+            if(abandoned)(void)QSA_RT(GraphDestroy)(abandoned);
+            throw;
+        }
+        check(QSA_RT(StreamEndCapture)(serial.stream,&serial.graph));
+        std::size_t serialNodes=0;
+        check(QSA_RT(GraphGetNodes)(serial.graph,nullptr,&serialNodes));EXPECT_EQ(serialNodes,5u);
+        check(QSA_RT(GraphInstantiate)(&serial.executable,serial.graph,nullptr,nullptr,0));
+        const auto ordinaryExecutable=ordinary.executable,gatedExecutable=gated.executable;
+        const int partial=std::min(rows,2);
+        int iteration=0;
+        for(const auto replay:std::array{QwenSparseReplay{2060,rows,17},
+                QwenSparseReplay{2051-rows,rows,17},QwenSparseReplay{2060-rows,rows,17},
+                QwenSparseReplay{3,std::min(rows,3),17},QwenSparseReplay{2060,0,17},
+                QwenSparseReplay{2050,rows,17},QwenSparseReplay{2051,1,17},QwenSparseReplay{0,0,17},
+                QwenSparseReplay{2051-partial,partial,17},QwenSparseReplay{2052-partial,partial,17},
+                QwenSparseReplay{2060,rows,17}})
+        {
+            SCOPED_TRACE(::testing::Message()<<"prefix="<<replay.prefix_tokens<<" live="<<replay.live_rows);
+            const auto needed=[&](int row){return row<replay.live_rows&&(replay.prefix_tokens+row+1)/4>512;};
+            const size_t liveWords=size_t(replay.live_rows)*512;
+            const std::uint32_t preparedBits=0x7fc12000u+static_cast<unsigned>(iteration++);
+            float preparedSentinel;std::memcpy(&preparedSentinel,&preparedBits,sizeof(preparedSentinel));
+            const float outputSentinel=-8123.25f;
+            std::vector<float> ordinaryQuery(ordinary.query.size,NAN),gatedQuery(gated.query.size,NAN);
+            std::copy_n(ordinary.host_query.begin(),liveWords,ordinaryQuery.begin());
+            for(int row=0;row<replay.live_rows;++row)if(needed(row))
+                std::copy_n(gated.host_query.begin()+std::size_t(row)*512,512,gatedQuery.begin()+std::size_t(row)*512);
+            const auto priorPools=gated.pools.download(gated.stream);
+            std::vector<float> preparedPoison(ordinary.prepared.size,preparedSentinel);
+            std::vector<float> scorePoison(ordinary.scores.size,-1357.f),outputPoison(ordinary.output.size,outputSentinel);
+            std::vector<std::int32_t> selectedPoison(ordinary.selected.size,-77),countPoison(ordinary.count.size,-77);
+            // Last-declared joins keep every host upload buffer alive even when
+            // an assertion or backend failure exits this replay early.
+            BoundedPipelineRetirement ordinaryUploads{ordinary.stream},gatedUploads{gated.stream},serialUploads{serial.stream};
+            ordinary.replay=gated.replay=replay;
+            ordinary.query.upload(ordinaryQuery.data(),ordinary.stream);
+            gated.query.upload(gatedQuery.data(),gated.stream);
+            for(auto *f:{&ordinary,&gated}) {
+                f->state.upload(&f->replay,f->stream);
+                f->prepared.upload(preparedPoison.data(),f->stream);
+                f->scores.upload(scorePoison.data(),f->stream);
+                f->selected.upload(selectedPoison.data(),f->stream);
+                f->count.upload(countPoison.data(),f->stream);
+                f->output.upload(outputPoison.data(),f->stream);
+                f->launch();
+            }
+            const auto ordinaryPrepared=ordinary.prepared.download(ordinary.stream);
+            const auto gatedPrepared=gated.prepared.download(gated.stream);
+            EXPECT_TRUE(std::all_of(ordinaryPrepared.begin(),ordinaryPrepared.begin()+liveWords,
+                [](float value){return std::isfinite(value);}));
+            for(int row=0;row<rows;++row) {
+                const auto offset=std::size_t(row)*512;
+                const auto *expected=needed(row)?ordinaryPrepared.data()+offset:preparedPoison.data()+offset;
+                EXPECT_EQ(std::memcmp(gatedPrepared.data()+offset,expected,512*sizeof(float)),0)<<"original row="<<row;
+            }
+            const auto ordinaryPools=ordinary.pools.download(ordinary.stream),gatedPools=gated.pools.download(gated.stream);
+            const auto ordinaryScores=ordinary.scores.download(ordinary.stream),gatedScores=gated.scores.download(gated.stream);
+            const auto ordinarySelected=ordinary.selected.download(ordinary.stream),gatedSelected=gated.selected.download(gated.stream);
+            const auto ordinaryCount=ordinary.count.download(ordinary.stream),gatedCount=gated.count.download(gated.stream);
+            EXPECT_EQ(std::memcmp(ordinaryPools.data(),gatedPools.data(),ordinaryPools.size()*sizeof(float)),0);
+            for(int block=0;block<gated.blocks;++block)
+                if(block<replay.prefix_tokens/4||block>=(replay.prefix_tokens+replay.live_rows)/4)
+                    EXPECT_EQ(std::memcmp(gatedPools.data()+std::size_t(block)*128,
+                        priorPools.data()+std::size_t(block)*128,128*sizeof(float)),0)<<"untouched pool="<<block;
+            const auto originalRaw=gated.raw.download(gated.stream),originalPartial=gated.partial.download(gated.stream);
+            const auto originalQueries=gated.query.download(gated.stream);
+            EXPECT_EQ(std::memcmp(originalRaw.data(),gated.host_raw.data(),originalRaw.size()*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(originalPartial.data(),gated.host_partial.data(),originalPartial.size()*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(originalQueries.data(),gatedQuery.data(),gatedQuery.size()*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(ordinaryScores.data(),gatedScores.data(),ordinaryScores.size()*sizeof(float)),0);
+            EXPECT_EQ(ordinarySelected,gatedSelected);EXPECT_EQ(ordinaryCount,gatedCount);
+            for(int row=0;row<rows;++row) {
+                const int visible=replay.prefix_tokens+row+1;
+                EXPECT_EQ(gatedCount[row],row<replay.live_rows ? std::min(visible/4,512)*4+visible%4 : 0);
+            }
+            const auto ordinaryOutput=ordinary.output.download(ordinary.stream),gatedOutput=gated.output.download(gated.stream);
+            EXPECT_EQ(std::memcmp(ordinaryOutput.data(),gatedOutput.data(),ordinaryOutput.size()*sizeof(float)),0);
+            EXPECT_TRUE(std::all_of(gatedOutput.begin()+size_t(replay.live_rows)*headWidth,gatedOutput.end(),
+                [&](float value){return value==outputSentinel;}));
+            auto oracle=ordinary.attention;
+            std::vector<float> expected(ordinary.output.size,outputSentinel);
+            oracle.replay=&ordinary.replay;oracle.query=ordinary.host_core_query.data();oracle.gate=ordinary.host_gate.data();
+            oracle.kv.keys.data=representation==QwenSparseScalar::FP32 ?
+                static_cast<const void *>(ordinary.host_key.data()) : ordinary.key16.data();
+            oracle.kv.values.data=representation==QwenSparseScalar::FP32 ?
+                static_cast<const void *>(ordinary.host_value.data()) : ordinary.value16.data();
+            oracle.selected=ordinarySelected.data();oracle.selected_count=ordinaryCount.data();oracle.output=expected.data();
+            oracle.gpu_partials=nullptr;oracle.observations=nullptr;
+            ASSERT_NO_THROW(cpuQwenSparseAttention(oracle));
+            for(size_t word=0;word<size_t(replay.live_rows)*headWidth;++word)
+                ASSERT_NEAR(gatedOutput[word],expected[word],3e-6f)<<"word="<<word;
+            const auto originalState=gated.state.download(gated.stream);
+            ASSERT_EQ(originalState.size(),1u);
+            EXPECT_EQ(std::memcmp(originalState.data(),&replay,sizeof(replay)),0);
+            // Diagnostic row replay uses the original AllLive native producer,
+            // not a copied arithmetic oracle or a production serial path.
+            serial.pools.upload(priorPools.data(),serial.stream);
+            serial.partial.upload(ordinary.host_partial.data(),serial.stream);
+            for(int row=0;row<replay.live_rows;++row) {
+                serial.replay={replay.prefix_tokens+row,1,replay.position_origin};
+                serial.state.upload(&serial.replay,serial.stream);
+                serial.query.upload(ordinary.host_query.data()+std::size_t(row)*512,serial.stream);
+                serial.selected.upload(selectedPoison.data(),serial.stream);
+                serial.count.upload(countPoison.data(),serial.stream);
+                serial.raw.upload(ordinary.host_raw.data()+std::size_t(row)*128,serial.stream);
+                serial.launch();
+                const auto onePrepared=serial.prepared.download(serial.stream);
+                const auto oneSelected=serial.selected.download(serial.stream);
+                const auto oneCount=serial.count.download(serial.stream);
+                if(needed(row))EXPECT_EQ(std::memcmp(gatedPrepared.data()+std::size_t(row)*512,onePrepared.data(),512*sizeof(float)),0);
+                EXPECT_EQ(gatedCount[row],oneCount[0]);
+                EXPECT_EQ(std::memcmp(gatedSelected.data()+std::size_t(row)*QwenSparseSelected,
+                    oneSelected.data(),QwenSparseSelected*sizeof(std::int32_t)),0);
+            }
+            const auto serialPools=serial.pools.download(serial.stream);
+            EXPECT_EQ(std::memcmp(gatedPools.data(),serialPools.data(),gatedPools.size()*sizeof(float)),0);
+            EXPECT_EQ(ordinary.executable,ordinaryExecutable);EXPECT_EQ(gated.executable,gatedExecutable);
+            ASSERT_FALSE(::testing::Test::HasFailure());
+        }
+    }
 }
 } // namespace llaminar2::qwen4exp::QSA_SUITE

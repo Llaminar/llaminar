@@ -1498,6 +1498,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/ComputeStageBase.cpp
     execution/compute_stages/ComputeStageFactory.cpp
     # Individual stages in compute_stages/stages/
+    execution/compute_stages/ProjectionRowWorkBinding.cpp
     execution/compute_stages/stages/GEMMStage.cpp
     execution/compute_stages/stages/FusedQKVGEMMStage.cpp
     execution/compute_stages/stages/FusedGateUpGEMMStage.cpp

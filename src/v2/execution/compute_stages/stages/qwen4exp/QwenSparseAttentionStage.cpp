@@ -7,6 +7,7 @@
  * the exact canonical per-row mapping produced earlier on the executor DAG.
  */
 #include "QwenSparseAttentionStage.h"
+#include "kernels/qwen4exp/QwenSparseQueryRowWork.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "../../../../kernels/KernelFactory.h"
 #include "../../../../tensors/Tensors.h"
@@ -117,6 +118,8 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             add(a.traffic,sizeof(qwen4exp::QwenSparsePriorTraffic),Access::Output,"prior_traffic");
         },
         [&](const Indexer &a) {
+            if(a.queryDemand!=qwen4exp::QwenSparseQueryDemand::AllLive&&a.queryDemand!=qwen4exp::QwenSparseQueryDemand::RankingOnly)
+                throw std::invalid_argument("QSA indexer has an unknown original-query demand policy");
             qwen4exp::validateQwenSparsePoolSelection(a.poolSelection, params_.rowCapacity);
             // The arena/cache contract owns one exact native bank per layer.
             // A larger containing allocation uses an exact byte subview; it
@@ -345,7 +348,7 @@ bool QwenSparseAttentionStage::execute(IDeviceContext *context)
                 .row_capacity=params_.rowCapacity,.token_capacity=params_.tokenCapacity,.block_capacity=a.blockCapacity,
                 .position_capacity=a.positionCapacity,.rotary_dim=a.rotaryDim,.norm_epsilon=a.epsilon,.representation=a.representation,.rotary_source=a.rotarySource,.rope_theta=a.ropeTheta,.inverse_frequencies=indexerFrequencies_,
                 .transaction_prior=a.transactionPrior ? transactionPrior(*a.transactionPrior) : nullptr,
-                .pool_selection=a.poolSelection},stream);
+                .pool_selection=a.poolSelection,.query_demand=a.queryDemand},stream);
         },
         [&](const SelectedAttention &a) {
             auto kv = a.native.cache.acquireSparseAttentionNativeView(a.native.layer,a.native.sequence,
@@ -498,7 +501,7 @@ uint64_t QwenSparseAttentionStage::graphCaptureVariantSignature() const
     for(const auto& input:nativeInputs_) {mix(reinterpret_cast<std::uintptr_t>(input.data));mix(input.capacity);}
     if(indexer) {
         mix(static_cast<uint64_t>(device().type));mix(device().ordinal);
-        mix(static_cast<uint64_t>(indexer->poolSelection));mix(indexer->transactionPrior.has_value());
+        mix(static_cast<uint64_t>(indexer->poolSelection));mix(static_cast<uint64_t>(indexer->queryDemand));mix(indexer->transactionPrior.has_value());
         mix(indexer->blockCapacity);mix(indexer->positionCapacity);mix(indexer->rotaryDim);
         mix(std::bit_cast<uint32_t>(indexer->epsilon));mix(std::bit_cast<uint32_t>(indexer->ropeTheta));
         mix(static_cast<uint64_t>(indexer->representation));mix(static_cast<uint64_t>(indexer->rotarySource));
@@ -626,6 +629,20 @@ StageDumpInfo QwenSparseAttentionStage::buildDumpInfoImpl() const
     }
     if(const auto *indexer=std::get_if<Indexer>(&params_.operation)) {
         const SnapshotInt32Binding live{params_.replay.tensor,params_.replay.byteOffset+sizeof(std::int32_t)};
+        std::optional<SnapshotAuthoredTokenRows> queryRows;
+        if(indexer->queryDemand==qwen4exp::QwenSparseQueryDemand::RankingOnly) {
+            const auto *original=pointer<const qwen4exp::QwenSparseReplay>(params_.replay,Access::Input);
+            qwen4exp::QwenSparseIndexer invocation;
+            invocation.replay=original;invocation.row_capacity=params_.rowCapacity;
+            invocation.token_capacity=params_.tokenCapacity;invocation.query_demand=indexer->queryDemand;
+            queryRows.emplace(SnapshotAuthoredTokenRows{qwen4exp::qwenSparseIndexerQueryWork(invocation),
+                {{{params_.replay.tensor,params_.replay.byteOffset},live,{}}},{}});
+        }
+        for(auto &input:result.inputs) {
+            const std::string_view name(input.name);
+            if(name=="query"&&queryRows)input.semantic_extent=*queryRows;
+            else if(name=="query"||name=="raw_key")input.semantic_extent=SnapshotTokenRows{live};
+        }
         for(auto &output:result.outputs) {
             const std::string_view name(output.name);
             const auto role = name=="prepared_query" ? Qwen4ExpSnapshotOutput::PreparedQuery :
@@ -634,7 +651,8 @@ StageDumpInfo QwenSparseAttentionStage::buildDumpInfoImpl() const
             const auto shape = qwen4ExpSparseSnapshotShape(role, params_.rowCapacity,
                 params_.tokenCapacity, qwen4exp::QwenSparseSelected);
             requireQwen4ExpSnapshotShape(shape, output.rows, output.cols, output.element_size);
-            if(name=="prepared_query" || name=="selected_count") output.semantic_extent=SnapshotTokenRows{live};
+            if(name=="prepared_query"&&queryRows)output.semantic_extent=*queryRows;
+            else if(name=="prepared_query" || name=="selected_count") output.semantic_extent=SnapshotTokenRows{live};
             else if(name=="pooled_keys") output.semantic_extent=SnapshotStatePrefixRows{
                 {params_.replay.tensor,params_.replay.byteOffset},params_.tokenCapacity,4};
             else if(name=="selected") output.semantic_extent=SnapshotCountedSelectionRows{live,

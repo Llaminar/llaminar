@@ -331,3 +331,33 @@ TEST(QwenSparseSnapshotState, ActualLocalMoEDescriptorCannotSelectCompletedRoute
     EXPECT_EQ(layout.required_alignment,alignof(float));
 }
 #endif
+
+
+/** @test Flattened raw and per-request prepared descriptors price exact distinct metadata envelopes. */
+TEST(QwenSparseSnapshotState, AuthoredQueryMetadataUsesActualDescriptorCounts)
+{
+    const auto model=sparseModel();
+    for(const int requests:{1,2,8})for(const int rows:{1,16,512})for(const std::size_t owners:{1u,3u}) {
+        SCOPED_TRACE(::testing::Message()<<"R="<<requests<<" M="<<rows<<" owners="<<owners);
+        const std::array raw{GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseRawQuery)};
+        const std::array prepared{GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseQuery)};
+        const auto rawBytes=qwenSparseSnapshotMemory(model,48,0,47,8192,requests,rows,owners,raw);
+        const auto preparedBytes=qwenSparseSnapshotMemory(model,48,0,47,8192,requests,rows,owners,prepared);
+        EXPECT_EQ(rawBytes.native_state_payload_bytes,0u);EXPECT_EQ(preparedBytes.native_state_payload_bytes,0u);
+        // Each slot has 8-byte authored alignment. FP32[*,512] needs no internal
+        // padding; the existing layout contributor explicitly bounds at most7
+        // bytes of preceding-slot alignment. No query payload is charged twice.
+        EXPECT_EQ(rawBytes.authored_metadata_bytes,owners*(16u+48u*requests+7u));
+        EXPECT_EQ(preparedBytes.authored_metadata_bytes,owners*requests*(16u+48u+7u));
+        std::size_t end=4,payload=4;
+        const DiagnosticSnapshotCopyGeometry flat{DiagnosticSnapshotCopyKind::AuthoredTokenRows,requests*rows,512,4,0,1,requests};
+        const auto layout=snapshotStorageLayout({std::size_t(requests)*rows*512*4,flat});
+        const auto slot=placeSnapshotStorageSlot(end,layout);end=slot.end_bytes;payload+=layout.payload_storage_bytes;
+        EXPECT_LE(end-payload,rawBytes.authored_metadata_bytes/owners);
+        // Prefill source geometry remains its original authored token prefix.
+        EXPECT_EQ(qwen4ExpSparseSnapshotShape(Qwen4ExpSnapshotOutput::PreparedQuery,rows,8192,2051).geometry.kind,
+            DiagnosticSnapshotCopyKind::TokenRows);
+    }
+    const std::array raw{GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseRawQuery)};
+    EXPECT_THROW((void)qwenSparseSnapshotMemory(model,48,0,47,8192,2,std::numeric_limits<int>::max(),1,raw),std::overflow_error);
+}

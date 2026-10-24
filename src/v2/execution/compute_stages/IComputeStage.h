@@ -162,6 +162,7 @@ namespace llaminar2
             size_t byte_size = 0;      ///< Total byte size for native format (0 = use rows*cols*element_size)
             ITensor *tensor = nullptr; ///< Optional tensor pointer for coherence management
             size_t tensor_byte_offset = 0; ///< Exact admitted byte subview within tensor storage.
+            SnapshotSemanticExtent semantic_extent; ///< Exact authored input intervals; capacity is not read extent.
         };
 
         // Output buffers (written during execute)
@@ -180,6 +181,7 @@ namespace llaminar2
             SnapshotSemanticExtent semantic_extent; ///< Explicit authored axis; never infer cache geometry from token-shaped capacity.
             const SnapshotObservedHeader *observed_header=nullptr; ///< Acquired diagnostic metadata, never a live device pointer.
             std::span<const std::uint64_t> observed_row_offsets; ///< Acquired native selection counts encoded as exclusive offsets.
+            std::span<const SnapshotAuthoredTokenRowRecord> observed_authored_rows; ///< Acquired original request intervals, never live pointers.
         };
 
         // Weight/parameter buffers (read-only during execute)
@@ -673,6 +675,7 @@ namespace llaminar2
         None,
         CaptureOnly,
         CaptureAndReplay,
+        HostEntry, ///< CPU-only idempotent metadata preparation before input validation/execution.
     };
 
     /**

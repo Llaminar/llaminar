@@ -79,7 +79,7 @@ public:
     StageShardingConfig getStageShardingConfig() const override
     {
         auto policy=Qwen35MoESchemaFactory::getStageShardingConfig();
-        for(const char *name:{"GR_NORM","GR_READ","GR_WRITE","QSA_INDEXER_QUERY","QSA_INDEXER_POOLED_KEYS",
+        for(const char *name:{"GR_NORM","GR_READ","GR_WRITE","QSA_INDEXER_RAW_QUERY","QSA_INDEXER_QUERY","QSA_INDEXER_POOLED_KEYS",
             "QSA_SELECTED_INDICES","PLE_HASH_INDICES","PLE_GATHER","PLE_GATE","PLE_CONVOLUTION"})
             policy[name]=SnapshotShardingMode::REPLICATED;
         return policy;

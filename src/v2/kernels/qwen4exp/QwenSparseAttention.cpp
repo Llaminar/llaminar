@@ -156,6 +156,11 @@ void validateQwenSparseSelection(const QwenSparseIndexer &p)
 }
 void validateQwenSparseIndexer(const QwenSparseIndexer &p)
 {
+    switch(p.query_demand){
+    case QwenSparseQueryDemand::AllLive:
+    case QwenSparseQueryDemand::RankingOnly:break;
+    default:throw std::invalid_argument("Qwen sparse indexer: unknown query demand policy");
+    }
     validateQwenSparseSelection(p);
     if(p.transaction_prior && (p.replay!=&p.transaction_prior->replay || p.partial_keys!=p.transaction_prior->partial))
         throw std::invalid_argument("QSA indexer immutable prior codec does not own its replay and raw tail");

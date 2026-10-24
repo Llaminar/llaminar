@@ -1719,6 +1719,8 @@ namespace
         CountingForeignGemm foreign;
         FP32Tensor input({static_cast<size_t>(M), static_cast<size_t>(K)});
         FP32Tensor output({static_cast<size_t>(M), static_cast<size_t>(N)});
+        std::fill_n(output.mutable_data(),output.numel(),-917.25f);
+        const std::vector<float> unchanged(output.data(),output.data()+output.numel());
 
         std::vector<ITensorGemm::TensorProjectionDesc> mixed = {
             {&foreign, &output, N, nullptr, "foreign"}};
@@ -1729,11 +1731,19 @@ namespace
         EXPECT_EQ(foreign.calls, 0)
             << "A rejected fused contract must not replay the foreign kernel";
 
+        EXPECT_EQ(std::memcmp(output.data(),unchanged.data(),output.size_bytes()),0);
+
+        // Planning/execution share this code-owned capacity. Seventeen members
+        // are now valid after routed-expert bundles grew, so that historical
+        // literal incorrectly reached the legitimate workspace admission gate.
+        constexpr size_t oversized_count=static_cast<size_t>(NativeVNNIFusedRowsPlan::capacity)+1;
         std::vector<ITensorGemm::TensorProjectionDesc> oversized;
-        oversized.reserve(17);
-        for (int i = 0; i < 17; ++i)
+        oversized.reserve(oversized_count);
+        for (size_t i = 0; i < oversized_count; ++i)
             oversized.emplace_back(&anchor, &output, N, nullptr, "oversized");
         EXPECT_FALSE(anchor.multiply_fused_tensor(&input, oversized, M, K));
+        EXPECT_EQ(std::memcmp(output.data(),unchanged.data(),output.size_bytes()),0);
+        EXPECT_EQ(foreign.calls,0);
     }
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_FusedProjection_AllFormats)

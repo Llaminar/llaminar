@@ -158,13 +158,13 @@ struct Plan final
     }
     /** @return Exact native block size for one source-confirmed indexer role. */
     dim3 block(int role) const { return dim3(role<2 ? 128 : 256,1,1); }
-    /** @return Exact qualified native function name, excluding the one argument type. */
+    /** @return Exact qualified native function name, excluding argument types. */
     std::string function(int role) const
     {
-        const std::array<const char*,3> names{"preparePools","prepareQueries","scorePools"};
+        const std::array<const char*,3> names{"preparePools","prepareQueries<false>","scorePools"};
         require(role>=0 && role<4,"Unknown source-owned indexer role");
         // Itanium demangling includes the return type for this kernel function template.
-        const std::string returned=role==3 && policy.block>0?"void ":"";
+        const std::string returned=role==1 || (role==3 && policy.block>0)?"void ":"";
         return returned+"llaminar2::qwen4exp::rocm_sparse_detail::"+(role==3?selector():names[std::size_t(role)]);
     }
 };
@@ -246,9 +246,23 @@ struct Capture final
             const std::string actual(demangled.get());
             int role=-1;
             for (int candidate=0; candidate<4; ++candidate)
-                if (actual==plan.function(candidate)+"(llaminar2::qwen4exp::QwenSparseIndexer)")
+                if (actual==plan.function(candidate)+(candidate==1 ?
+                    "(llaminar2::qwen4exp::QwenSparseIndexer, llaminar2::ProjectionRowWork)" :
+                    "(llaminar2::qwen4exp::QwenSparseIndexer)"))
                 { require(role==-1,"Ambiguous native indexer role"); role=candidate; }
             require(role>=0,"Captured native function is outside the exact four-kernel indexer inventory");
+            if(role==1) {
+                require(native.kernelParams && native.kernelParams[0] && native.kernelParams[1],
+                    "AllLive query capture lacks original native arguments");
+                const auto &query=*static_cast<const QwenSparseIndexer *>(native.kernelParams[0]);
+                const auto &work=*static_cast<const ProjectionRowWork *>(native.kernelParams[1]);
+                require(params.query_demand==QwenSparseQueryDemand::AllLive &&
+                    query.query_demand==QwenSparseQueryDemand::AllLive && query.replay==params.replay &&
+                    query.row_capacity==params.row_capacity && query.token_capacity==params.token_capacity &&
+                    query.query==params.query && query.prepared_query==params.prepared_query &&
+                    work.captureIdentity()==qwenSparseIndexerQueryWork(params).repeatEachRow(4).captureIdentity(),
+                    "AllLive query capture changed its original replay/prefix work identity");
+            }
             const auto expectedGrid=plan.grid(role), expectedBlock=plan.block(role);
             require(native.gridDim.x==expectedGrid.x && native.gridDim.y==expectedGrid.y && native.gridDim.z==expectedGrid.z &&
                 native.blockDim.x==expectedBlock.x && native.blockDim.y==expectedBlock.y && native.blockDim.z==expectedBlock.z &&

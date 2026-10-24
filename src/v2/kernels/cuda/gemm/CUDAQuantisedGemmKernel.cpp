@@ -33,8 +33,13 @@
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include "CUDAQuantisedActivationProducers.h"
 #include "kernels/common/NativeEmbeddingIQTables.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -2264,6 +2269,10 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             // Use passed workspace if provided, otherwise fall back to bound workspace
             DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
             if (effective_ws != workspace_)
@@ -2285,6 +2294,10 @@ namespace llaminar2
             const TensorBase *bias,
             int activation_row_offset)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             if (!A || !C)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor] Null input or output tensor");
@@ -2295,6 +2308,8 @@ namespace llaminar2
 
             // Ensure weights are converted
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
 
             /*
              * Tensor-level calls may need a final device-to-device copy when
@@ -2506,6 +2521,10 @@ namespace llaminar2
             const IMPIContext * /*mpi_ctx*/,
             DeviceWorkspaceManager *workspace)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             for (const auto &projection : projections)
             {
                 projection.requireOriginalOutputSlice(k);
@@ -2548,6 +2567,10 @@ namespace llaminar2
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             if (!input || projections.empty())
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Null input or empty projections");
@@ -3111,6 +3134,8 @@ namespace llaminar2
             // blockwise eligibility. canUseNativeVNNIBlockwise() reads impl_->
             // d_weights_native_vnni which is only populated after ensureWeightsConverted().
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
 
             bool needs_block_sums = (m > 1) && nativeVNNIUsesAsymmetricCorrection(impl_->native_codebook_id);
             if (m > 1)
@@ -3785,6 +3810,10 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] m=" << m << " n=" << n << " k=" << k);
 
             validateWorkspace();
@@ -3792,6 +3821,8 @@ namespace llaminar2
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
 
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
             void *execution_stream = gpu_stream_;
             if (!execution_stream)
             {
@@ -3982,6 +4013,10 @@ namespace llaminar2
             float beta,
             DeviceWorkspaceManager *workspace)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
             if (effective_ws != workspace_)
             {
@@ -4061,6 +4096,10 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             if (!d_A || !d_C)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Null input or output");
@@ -4077,6 +4116,8 @@ namespace llaminar2
 
             validateWorkspace();
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
 
             /*
              * Capture the stream once before quantizing rows.  This helper is
@@ -4139,6 +4180,10 @@ namespace llaminar2
             bool use_specialized_small_m_kernel,
             void *execution_stream)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             if (!d_A_int8 || !d_scales_A_blockwise || !d_C)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Null input, scale, or output");
@@ -4159,6 +4204,8 @@ namespace llaminar2
             }
 
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
             const uint8_t arithmetic_policy_codebook_id =
                 impl_->native_source_identity.present
                     ? canonicalDeviceVnniCodebookId(
@@ -4390,6 +4437,10 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] m=" << m << " n=" << n << " k=" << k
                                                                             << " alpha=" << alpha << " beta=" << beta
                                                                             << " d_A=" << static_cast<const void *>(d_A)
@@ -4404,6 +4455,8 @@ namespace llaminar2
 
             // Ensure weights converted
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
 
             /*
              * All launches in this public GEMM transaction must use the same
@@ -4524,6 +4577,10 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             // Validate workspace is bound (REQUIRED - kernels don't do internal allocation)
             validateWorkspace();
 
@@ -4533,6 +4590,8 @@ namespace llaminar2
 
             // Ensure weights converted
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
 
             /*
              * Bias and non-bias FP32 paths share the same stream lifetime

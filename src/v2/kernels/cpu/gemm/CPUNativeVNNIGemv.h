@@ -37,6 +37,9 @@
  *
  * Uses NativeVNNITileConfig (from CPUNativeVNNITileConfig.h) to select
  * N-block size based on detected L1/L2/L3 and shape category.
+ * Query work borrows original request intervals before OpenMP; inactive rows
+ * never enter activation conversion, packed products, ordered reductions or
+ * epilogues. Physical M and each original row address remain unchanged.
  * The scalar Q6 diagnostic also retains the production paths' explicit rounding
  * boundaries so it can check original source factors without introducing FMA drift.
  */
@@ -56,6 +59,7 @@
 #include <string>
 
 #include "CPUNativeVNNIDecode.h"
+#include "kernels/common/ProjectionRowWork.h"
 #include "CPUNativeVNNIContributionContract.h"
 #include "CPUNativeVNNIFP16.h"
 #include "CPUNativeVNNIWeightPacker.h"
@@ -4987,6 +4991,96 @@ namespace llaminar2::cpu::native_vnni
     // Shared activation quantization (for multiply_fused quantize-once)
     // =========================================================================
 
+    /**
+     * @brief Request-aligned CPU work grid over one borrowed original publication.
+     *
+     * Construct before entering OpenMP. Workers borrow this immutable value;
+     * they never fetch recorder TLS or compact row IDs. Fixed physical tiles
+     * share packed-weight decoding while every row retains serial K arithmetic.
+     */
+    class CPUProjectionRowGrid final
+    {
+    public:
+        /** @brief Validate all original request publications before any destination write.
+         * @param physical Original matrix/partial row capacity.
+         * @param work Optional invocation-owned immutable row admission.
+         * @throws std::invalid_argument For bad geometry or publication values.
+         */
+        CPUProjectionRowGrid(int physical,const ProjectionRowWork *work)
+            :physical_(physical),work_(work)
+        {
+            if(physical<=0||(work&&work->physicalRows()!=physical))
+                throw std::invalid_argument("CPU projection work requires exact physical matrix rows");
+            if(work_)for(int request=0;request<work_->requests();++request)(void)work_->resolveHost(request);
+        }
+        /** @return Whether any original request owns useful rows in this physical slice. */
+        [[nodiscard]] bool hasAny() const
+        {
+            if(!work_)return true;
+            for(int request=0;request<work_->requests();++request)
+                if(work_->resolveHost(request).size()>0)return true;
+            return false;
+        }
+        /** @brief Test an original physical row before any activation or partial read.
+         * @param row Original matrix-relative row, never a compacted useful index.
+         * @return Whether that exact row is authored.
+         */
+        [[nodiscard]] bool active(int row) const
+        {
+            if(row<0||row>=physical_)return false;
+            if(!work_)return true;
+            return work_->resolveHost(work_->requestForRow(row)).contains(row);
+        }
+        /** @brief Resolve immutable request-aligned task geometry.
+         * @param width Positive physical microkernel reuse width.
+         * @return Fixed tile count, independent of live word values.
+         * @throws std::invalid_argument For a nonpositive width.
+         */
+        [[nodiscard]] int tiles(int width) const
+        {
+            if(width<=0)throw std::invalid_argument("CPU projection row tile width must be positive");
+            return work_ ? work_->requests()*((work_->rowsPerRequest()-1)/width+1) : (physical_-1)/width+1;
+        }
+        /** @brief Resolve both endpoints of one original request-aligned work tile.
+         * @param tile Immutable task-grid row tile index.
+         * @param width Positive physical microkernel reuse width.
+         * @return Original matrix-relative useful span, including midtile suffixes.
+         * @throws std::out_of_range For an invalid immutable tile coordinate.
+         */
+        [[nodiscard]] ProjectionRowSpan tileSpan(int tile,int width) const
+        {
+            if(tile<0||tile>=tiles(width))throw std::out_of_range("CPU projection work tile exceeds geometry");
+            if(!work_) {
+                const int first=tile*width;
+                return {first,first+std::min(width,physical_-first)};
+            }
+            const int per=(work_->rowsPerRequest()-1)/width+1,request=tile/per;
+            const auto authored=work_->resolveHost(request);
+            const auto identity=work_->captureIdentity();
+            const auto base=static_cast<std::int64_t>(request)*work_->rowsPerRequest();
+            const auto originalFirst=base+static_cast<std::int64_t>(tile%per)*width;
+            const auto originalEnd=std::min(originalFirst+width,base+work_->rowsPerRequest());
+            const int first=static_cast<int>(std::clamp<std::int64_t>(originalFirst-identity.first_physical_row,0,physical_));
+            const int end=static_cast<int>(std::clamp<std::int64_t>(originalEnd-identity.first_physical_row,0,physical_));
+            const int selectedEnd=std::min(end,authored.end);
+            return {std::min(selectedEnd,std::max(first,authored.first)),selectedEnd};
+        }
+    private:
+        int physical_; ///< Original tensor/partial capacity; never useful row count.
+        const ProjectionRowWork *work_; ///< Invocation-owned immutable metadata, live through the workshare.
+    };
+
+    /**
+     * @brief Quantize only authored original activation rows into admitted Q8 storage.
+     * @param A_fp32 Original immutable matrix with physical M-by-K coordinates.
+     * @param A_q8 Invocation-owned physical-M Q8 bank; unused rows stay dirty.
+     * @param M Original physical row capacity, never useful row count.
+     * @param K Original logical input width.
+     * @param K_blocks Original ceil(K/32) blocks per physical row.
+     * @param policy Existing per-block quantization arithmetic, unchanged.
+     * @param work Optional explicit original-row selection borrowed before OpenMP.
+     * @throws std::invalid_argument For inconsistent work/publication geometry.
+     */
     inline void quantize_activations_to_q8_1(
         const float *A_fp32,
         Q8_1Block *A_q8,
@@ -4994,8 +5088,11 @@ namespace llaminar2::cpu::native_vnni
         int K,
         int K_blocks,
         CPUProjectionNumericalPolicy policy =
-            CPUProjectionNumericalPolicy::BackendNative)
+            CPUProjectionNumericalPolicy::BackendNative,
+        const ProjectionRowWork *work = nullptr)
     {
+        const CPUProjectionRowGrid row_grid(M,work);
+        if(!row_grid.hasAny())return;
         const bool k_aligned = (K % 32 == 0);
 
         auto do_quantize = [&]()
@@ -5003,6 +5100,7 @@ namespace llaminar2::cpu::native_vnni
 #pragma omp for schedule(static)
             for (int m = 0; m < M; ++m)
             {
+                if(!row_grid.active(m))continue;
                 const float *row_a = A_fp32 + m * K;
                 Q8_1Block *row_q8 = A_q8 + static_cast<size_t>(m) * K_blocks;
                 int kb = 0;
@@ -5185,7 +5283,8 @@ namespace llaminar2::cpu::native_vnni
         ISAPath isa_path,
         VerifierRowsPolicy verifier_policy_override,
         bool publish_verifier_route,
-        int full_k_n_block_chunks_override = 0);
+        int full_k_n_block_chunks_override = 0,
+        const ProjectionRowWork *work = nullptr);
 
     /**
      * @brief Execute ordinary prefill with serial-row-exact K arithmetic.
@@ -5199,6 +5298,7 @@ namespace llaminar2::cpu::native_vnni
      * @param verifier_policy_override Diagnostic schedule for serial K-part work.
      * @param schedule_override Diagnostic full-K output-task schedule.
      * @param n_block_chunks_override Zero for automatic or exact positive N tile.
+     * @param work Optional original-row admission inherited from explicit grouped decode.
      * @throws std::invalid_argument For unsupported forced schedules or geometry.
      *
      * Output ownership and row reuse are economy choices only. K partitions
@@ -5215,8 +5315,11 @@ namespace llaminar2::cpu::native_vnni
         ISAPath isa_path = ISAPath::AUTO,
         VerifierRowsPolicy verifier_policy_override = VerifierRowsPolicy::Auto,
         PrefillSchedulePolicy schedule_override = PrefillSchedulePolicy::Auto,
-        int n_block_chunks_override = 0)
+        int n_block_chunks_override = 0,
+        const ProjectionRowWork *work = nullptr)
     {
+        const CPUProjectionRowGrid row_grid(M,work);
+        if(!row_grid.hasAny())return;
         const int N = packed.N;
         const int K_blocks = packed.blocks_per_row;
         const int N_chunks = (N + 63) / 64;
@@ -5408,7 +5511,8 @@ namespace llaminar2::cpu::native_vnni
                 ldc,
                 isa_path,
                 selected_kpart_policy,
-                /*publish_verifier_route=*/false);
+                /*publish_verifier_route=*/false,
+                0,work);
             return;
         }
 
@@ -5432,7 +5536,7 @@ namespace llaminar2::cpu::native_vnni
                 use_four_row_grid ? VerifierRowsPolicy::WideRows
                                   : VerifierRowsPolicy::Pairwise,
                 /*publish_verifier_route=*/false,
-                n_block_chunks);
+                n_block_chunks,work);
             return;
         }
 
@@ -5460,6 +5564,7 @@ namespace llaminar2::cpu::native_vnni
                 {
                     int chunk = task / M;
                     int m = task % M;
+                    if(!row_grid.active(m))continue;
                     const Q8_1Block *aq = A_q8_all + static_cast<size_t>(m) * K_blocks;
                     float *c_out = C + m * ldc + chunk * 64;
 
@@ -5525,154 +5630,159 @@ namespace llaminar2::cpu::native_vnni
                     int kb_end = std::min(kb_start + k_tile_blocks, K_blocks);
                     bool accum = (kt > 0);
 
-                    int m = 0;
-                    for (; m + 1 < M; m += 2)
+                    for(int row_tile=0;row_tile<row_grid.tiles(2);++row_tile)
                     {
-                        const Q8_1Block *aq0 = A_q8_all + static_cast<size_t>(m) * K_blocks;
-                        const Q8_1Block *aq1 = A_q8_all + static_cast<size_t>(m + 1) * K_blocks;
-
-                        for (int ci = 0; ci < chunk_count; ++ci)
+                        const auto span=row_grid.tileSpan(row_tile,2);
+                        if(span.size()==0)continue;
+                        const int m=span.first;
+                        if(span.size()==2)
                         {
-                            int chunk = chunk_start + ci;
-                            int n_start = chunk * 64;
-                            float *c0 = C + m * ldc + n_start;
-                            float *c1 = C + (m + 1) * ldc + n_start;
+                            const Q8_1Block *aq0 = A_q8_all + static_cast<size_t>(m) * K_blocks;
+                            const Q8_1Block *aq1 = A_q8_all + static_cast<size_t>(m + 1) * K_blocks;
 
-                            /*
-                             * The physical microkernel always publishes one
-                             * complete 64-column chunk. A logical tensor row,
-                             * however, is allowed to end partway through that
-                             * chunk. Publishing the last chunk directly would
-                             * overwrite the beginning of the following row and
-                             * would run past the allocation for the final row.
-                             *
-                             * Keep the weight-sharing two-row microkernel for
-                             * the tail, but point it at stack-owned full chunks
-                             * and copy only the logical columns back. For a
-                             * K-tiled call, seed the valid prefix with the
-                             * previously accumulated output; zero padding is
-                             * private scratch and never becomes tensor state.
-                             */
-                            const int n_cols_actual =
-                                std::min(64, N - n_start);
-                            const auto compute_two_rows =
-                                [&](float *output0, float *output1)
+                            for (int ci = 0; ci < chunk_count; ++ci)
                             {
-                                if (use_avx512)
-                                {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                                    if (packed.usesNibbleLUT())
-                                        gemm_2row_native_chunk(
-                                            packed, aq0, aq1, output0, output1,
-                                            chunk, kb_start, kb_end,
-                                            decode_lut_512, accum);
-                                    else
-                                        gemm_2row_non_nibble_chunk(
-                                            packed, aq0, aq1, output0, output1,
-                                            chunk, kb_start, kb_end, accum);
-#endif
-                                }
-                                else
-                                {
-                                    if (packed.usesNibbleLUT())
-                                        gemm_2row_native_chunk_avx2(
-                                            packed, aq0, aq1, output0, output1,
-                                            chunk, kb_start, kb_end,
-                                            decode_lut_256, accum);
-                                    else
-                                        gemm_2row_non_nibble_chunk_avx2(
-                                            packed, aq0, aq1, output0, output1,
-                                            chunk, kb_start, kb_end,
-                                            accum);
-                                }
-                            };
+                                int chunk = chunk_start + ci;
+                                int n_start = chunk * 64;
+                                float *c0 = C + m * ldc + n_start;
+                                float *c1 = C + (m + 1) * ldc + n_start;
 
-                            if (n_cols_actual == 64)
-                            {
-                                compute_two_rows(c0, c1);
-                            }
-                            else
-                            {
                                 /*
-                                 * Keep scratch construction out of the common
-                                 * full-chunk path. This route is selected for
-                                 * throughput, so complete chunks must not pay
-                                 * for 128 unnecessary stores per K tile.
+                                 * The physical microkernel always publishes one
+                                 * complete 64-column chunk. A logical tensor row,
+                                 * however, is allowed to end partway through that
+                                 * chunk. Publishing the last chunk directly would
+                                 * overwrite the beginning of the following row and
+                                 * would run past the allocation for the final row.
+                                 *
+                                 * Keep the weight-sharing two-row microkernel for
+                                 * the tail, but point it at stack-owned full chunks
+                                 * and copy only the logical columns back. For a
+                                 * K-tiled call, seed the valid prefix with the
+                                 * previously accumulated output; zero padding is
+                                 * private scratch and never becomes tensor state.
                                  */
-                                alignas(64) float tail0[64] = {};
-                                alignas(64) float tail1[64] = {};
-                                if (accum)
+                                const int n_cols_actual =
+                                    std::min(64, N - n_start);
+                                const auto compute_two_rows =
+                                    [&](float *output0, float *output1)
                                 {
-                                    std::copy_n(c0, n_cols_actual, tail0);
-                                    std::copy_n(c1, n_cols_actual, tail1);
-                                }
-                                compute_two_rows(tail0, tail1);
-                                std::copy_n(tail0, n_cols_actual, c0);
-                                std::copy_n(tail1, n_cols_actual, c1);
-                            }
-                        }
-                    }
-
-                    // Odd M tail: single row
-                    if (m < M)
-                    {
-                        const Q8_1Block *aq = A_q8_all + static_cast<size_t>(m) * K_blocks;
-                        for (int ci = 0; ci < chunk_count; ++ci)
-                        {
-                            int chunk = chunk_start + ci;
-                            int n_start = chunk * 64;
-                            float *c_row = C + m * ldc + n_start;
-
-                            /*
-                             * An odd final M row uses the serial-shaped chunk
-                             * kernel, which also writes 64 columns. Give a
-                             * partial N tail the same bounded publication
-                             * contract as the paired-row path above.
-                             */
-                            const int n_cols_actual =
-                                std::min(64, N - n_start);
-                            const auto compute_one_row = [&](float *output)
-                            {
-                                if (use_avx512)
-                                {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                                    if (packed.usesNibbleLUT())
-                                        gemv_native_vnni_avx512_chunk_native(
-                                            packed, aq, output, chunk,
-                                            kb_start, kb_end, decode_lut_512,
-                                            accum);
+                                    if (use_avx512)
+                                    {
+    #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                                        if (packed.usesNibbleLUT())
+                                            gemm_2row_native_chunk(
+                                                packed, aq0, aq1, output0, output1,
+                                                chunk, kb_start, kb_end,
+                                                decode_lut_512, accum);
+                                        else
+                                            gemm_2row_non_nibble_chunk(
+                                                packed, aq0, aq1, output0, output1,
+                                                chunk, kb_start, kb_end, accum);
+    #endif
+                                    }
                                     else
-                                        gemv_native_vnni_avx512_chunk_non_nibble(
-                                            packed, aq, output, chunk,
-                                            kb_start, kb_end, accum);
-#endif
+                                    {
+                                        if (packed.usesNibbleLUT())
+                                            gemm_2row_native_chunk_avx2(
+                                                packed, aq0, aq1, output0, output1,
+                                                chunk, kb_start, kb_end,
+                                                decode_lut_256, accum);
+                                        else
+                                            gemm_2row_non_nibble_chunk_avx2(
+                                                packed, aq0, aq1, output0, output1,
+                                                chunk, kb_start, kb_end,
+                                                accum);
+                                    }
+                                };
+
+                                if (n_cols_actual == 64)
+                                {
+                                    compute_two_rows(c0, c1);
                                 }
                                 else
                                 {
-                                    if (packed.usesNibbleLUT())
-                                        gemv_avx2_chunk_native(
-                                            packed, aq, output, chunk,
-                                            kb_start, kb_end, decode_lut_256,
-                                            accum);
-                                    else
-                                        gemv_avx2_chunk_non_nibble(
-                                            packed, aq, output, chunk,
-                                            kb_start, kb_end, accum);
+                                    /*
+                                     * Keep scratch construction out of the common
+                                     * full-chunk path. This route is selected for
+                                     * throughput, so complete chunks must not pay
+                                     * for 128 unnecessary stores per K tile.
+                                     */
+                                    alignas(64) float tail0[64] = {};
+                                    alignas(64) float tail1[64] = {};
+                                    if (accum)
+                                    {
+                                        std::copy_n(c0, n_cols_actual, tail0);
+                                        std::copy_n(c1, n_cols_actual, tail1);
+                                    }
+                                    compute_two_rows(tail0, tail1);
+                                    std::copy_n(tail0, n_cols_actual, c0);
+                                    std::copy_n(tail1, n_cols_actual, c1);
                                 }
-                            };
+                            }
 
-                            if (n_cols_actual == 64)
+                        }
+                        else
+                        {
+                            const Q8_1Block *aq = A_q8_all + static_cast<size_t>(m) * K_blocks;
+                            for (int ci = 0; ci < chunk_count; ++ci)
                             {
-                                compute_one_row(c_row);
+                                int chunk = chunk_start + ci;
+                                int n_start = chunk * 64;
+                                float *c_row = C + m * ldc + n_start;
+
+                                /*
+                                 * An odd final M row uses the serial-shaped chunk
+                                 * kernel, which also writes 64 columns. Give a
+                                 * partial N tail the same bounded publication
+                                 * contract as the paired-row path above.
+                                 */
+                                const int n_cols_actual =
+                                    std::min(64, N - n_start);
+                                const auto compute_one_row = [&](float *output)
+                                {
+                                    if (use_avx512)
+                                    {
+    #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                                        if (packed.usesNibbleLUT())
+                                            gemv_native_vnni_avx512_chunk_native(
+                                                packed, aq, output, chunk,
+                                                kb_start, kb_end, decode_lut_512,
+                                                accum);
+                                        else
+                                            gemv_native_vnni_avx512_chunk_non_nibble(
+                                                packed, aq, output, chunk,
+                                                kb_start, kb_end, accum);
+    #endif
+                                    }
+                                    else
+                                    {
+                                        if (packed.usesNibbleLUT())
+                                            gemv_avx2_chunk_native(
+                                                packed, aq, output, chunk,
+                                                kb_start, kb_end, decode_lut_256,
+                                                accum);
+                                        else
+                                            gemv_avx2_chunk_non_nibble(
+                                                packed, aq, output, chunk,
+                                                kb_start, kb_end, accum);
+                                    }
+                                };
+
+                                if (n_cols_actual == 64)
+                                {
+                                    compute_one_row(c_row);
+                                }
+                                else
+                                {
+                                    alignas(64) float tail[64] = {};
+                                    if (accum)
+                                        std::copy_n(c_row, n_cols_actual, tail);
+                                    compute_one_row(tail);
+                                    std::copy_n(tail, n_cols_actual, c_row);
+                                }
                             }
-                            else
-                            {
-                                alignas(64) float tail[64] = {};
-                                if (accum)
-                                    std::copy_n(c_row, n_cols_actual, tail);
-                                compute_one_row(tail);
-                                std::copy_n(tail, n_cols_actual, c_row);
-                            }
+
                         }
                     }
                 }
@@ -5706,6 +5816,7 @@ namespace llaminar2::cpu::native_vnni
      *        explicitly selected full-K pair-grid prefill candidate. Zero
      *        retains the serial-decode-derived verifier geometry. A nonzero
      *        value is invalid for K-partitioned decode-equivalent execution.
+     * @param work Optional request-major authored intervals; physical M remains unchanged.
      */
     inline void gemm_native_vnni_preq_decode_equivalent_rows(
         const CPUNativeVNNIPackedWeights &packed,
@@ -5717,8 +5828,11 @@ namespace llaminar2::cpu::native_vnni
         ISAPath isa_path = ISAPath::AUTO,
         VerifierRowsPolicy verifier_policy_override = VerifierRowsPolicy::Auto,
         bool publish_verifier_route = true,
-        int full_k_n_block_chunks_override)
+        int full_k_n_block_chunks_override,
+        const ProjectionRowWork *work)
     {
+        const CPUProjectionRowGrid row_grid(M,work);
+        if(!row_grid.hasAny())return;
         const int N = packed.N;
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
@@ -5883,7 +5997,7 @@ namespace llaminar2::cpu::native_vnni
                         VerifierRowsExecutionRoute::GroupedFullKRowChunkGrid
                     ? PrefillSchedulePolicy::RowChunkGrid
                     : PrefillSchedulePolicy::TwoRowNMajor,
-                schedule.n_block_chunks);
+                schedule.n_block_chunks,work);
             return;
         }
 
@@ -5918,7 +6032,7 @@ namespace llaminar2::cpu::native_vnni
                  */
                 const int row_tile_width = schedule.physical_row_tile;
                 const int row_tile_count =
-                    (M + row_tile_width - 1) / row_tile_width;
+                    row_grid.tiles(row_tile_width);
                 const int total_shared_tile_tasks =
                     row_tile_count * N_chunks * k_tiles;
 #pragma omp for schedule(static)
@@ -5928,8 +6042,9 @@ namespace llaminar2::cpu::native_vnni
                     const int chunk_and_row_tile = task / k_tiles;
                     const int chunk = chunk_and_row_tile % N_chunks;
                     const int row_tile = chunk_and_row_tile / N_chunks;
-                    const int row0 = row_tile * row_tile_width;
-                    const int tile_rows = std::min(row_tile_width, M - row0);
+                    const auto span=row_grid.tileSpan(row_tile,row_tile_width);
+                    if(span.size()==0)continue;
+                    const int row0=span.first,tile_rows=span.size();
                     const int kb_start = kt * k_blocks_per_tile;
                     const int kb_end =
                         std::min(kb_start + k_blocks_per_tile, K_blocks);
@@ -6045,6 +6160,7 @@ namespace llaminar2::cpu::native_vnni
                 {
                     const int chunk = task % N_chunks;
                     const int row = task / N_chunks;
+                    if(!row_grid.active(row))continue;
                     const int n_start = chunk * 64;
                     const int n_cols = std::min(64, N - n_start);
                     const float *base =
@@ -6071,7 +6187,7 @@ namespace llaminar2::cpu::native_vnni
              * AVX512 has native three/four-row kernels. Every tail still owns
              * disjoint output rows and increasing-K arithmetic.
              */
-            const int row_tile_count = (M + 3) / 4;
+            const int row_tile_count = row_grid.tiles(4);
             const int total_four_row_tasks = row_tile_count * total_blocks;
             auto do_four_rows = [&]()
             {
@@ -6080,8 +6196,9 @@ namespace llaminar2::cpu::native_vnni
                 {
                     const int block_idx = task / row_tile_count;
                     const int row_tile = task % row_tile_count;
-                    const int first_row = row_tile * 4;
-                    const int tile_rows = std::min(4, M - first_row);
+                    const auto span=row_grid.tileSpan(row_tile,4);
+                    if(span.size()==0)continue;
+                    const int first_row=span.first,tile_rows=span.size();
                     const int chunk_start = block_idx * n_block_chunks;
                     const int chunk_count =
                         std::min(n_block_chunks, N_chunks - chunk_start);
@@ -6207,7 +6324,7 @@ namespace llaminar2::cpu::native_vnni
          * Tail chunks use temporary 64-float rows so the microkernel never
          * writes past a compact verifier output buffer.
          */
-        const int row_pairs = (M + 1) / 2;
+        const int row_pairs = row_grid.tiles(2);
         const int total_tasks = row_pairs * total_blocks;
 
         auto process_pair_task = [&](int task)
@@ -6221,12 +6338,14 @@ namespace llaminar2::cpu::native_vnni
              */
             const int block_idx = task / row_pairs;
             const int pair = task % row_pairs;
-            const int row0 = pair * 2;
+            const auto span=row_grid.tileSpan(pair,2);
+            if(span.size()==0)return;
+            const int row0=span.first;
             const int row1 = row0 + 1;
             const int chunk_start = block_idx * n_block_chunks;
             const int chunk_count = std::min(n_block_chunks, N_chunks - chunk_start);
 
-            if (row1 < M)
+            if (row1 < span.end)
             {
                 const Q8_1Block *row0_q8 =
                     A_q8_all + static_cast<size_t>(row0) * K_blocks;
@@ -9077,6 +9196,7 @@ namespace llaminar2::cpu::native_vnni
      * @param activation_storage Invocation-owned Q8 bank shared by this one projection.
      * @param product_storage Independent FP32 product bank; unused when beta is zero.
      * @param partial_storage Invocation-owned shared bank for ordered K reductions.
+     * @param work Optional original M1 admission, independent of decode arithmetic policy.
      */
     inline void multiply_native_vnni_with_epilogue(
         const CPUNativeVNNIPackedWeights &packed,
@@ -9088,8 +9208,12 @@ namespace llaminar2::cpu::native_vnni
         float beta,
         std::span<Q8_1Block> activation_storage,
         std::span<float> product_storage,
-        std::span<float> partial_storage)
+        std::span<float> partial_storage,
+        const ProjectionRowWork *work = nullptr)
     {
+        if(work&&M!=1)throw std::invalid_argument("CPU ordinary work-selected projection requires its original M1 route");
+        const CPUProjectionRowGrid row_grid(M,work);
+        if(!row_grid.hasAny())return;
         auto multiply_into = [&](float *destination)
         {
             if (M == 1)
@@ -9146,10 +9270,23 @@ namespace llaminar2::cpu::native_vnni
     // Bias epilogue: C[m, j] += bias[j] for all M rows
     // =========================================================================
 
-    inline void apply_bias_epilogue(float *C, const float *bias, int M, int N, int ldc)
+    /**
+     * @brief Add unchanged bias only to authored original output rows.
+     * @param C Physical-M destination matrix, including dirty unused rows.
+     * @param bias Original immutable output-column bias values.
+     * @param M Original physical row capacity.
+     * @param N Logical authored columns per row.
+     * @param ldc Original physical destination row stride.
+     * @param work Optional invocation-owned original-row admission.
+     * @throws std::invalid_argument For inconsistent work/publication geometry.
+     */
+    inline void apply_bias_epilogue(float *C, const float *bias, int M, int N, int ldc,
+        const ProjectionRowWork *work = nullptr)
     {
+        const CPUProjectionRowGrid row_grid(M,work);
         for (int m = 0; m < M; ++m)
         {
+            if(!row_grid.active(m))continue;
             float *row = C + m * ldc;
             int j = 0;
 #if defined(__AVX512F__)

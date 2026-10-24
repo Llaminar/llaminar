@@ -595,3 +595,136 @@ TEST(QwenSparseAttention, BoundedCandidateFullIndexerKeepsScoreBytes)
         }
 }
 } // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp
+{
+/**
+ * @test Per-row query admission preserves actual CPU indexer and attention results.
+ *
+ * Every replay retains its original frontier and physical row capacity. The
+ * ungated producer receives every live input row; the gated producer receives
+ * NaN query poison whenever ranking is unnecessary. Its prepared-query poison
+ * must survive byte-for-byte, while keys, selections and native attention agree
+ * with the ordinary producer. Reusing both fixtures catches stale large/empty
+ * state without changing the invocation's arithmetic or observation policy.
+ * This substantial native CPU sweep is opt-in through its explicit Integration
+ * preflight registration and does not execute in the ordinary Unit suite.
+ */
+TEST(QwenSparseAttention, DISABLED_RankingOnlyQueryPreparationPreservesNativeResults)
+{
+    ThreadPolicy workers;omp_set_num_threads(3);
+    constexpr int tokens=2080,width=256;
+    for(const auto selection:{QwenSparsePoolSelection::Installed,QwenSparsePoolSelection::Bounded1024_1024})
+    for(const auto representation:{QwenSparseScalar::FP32,QwenSparseScalar::FP16,QwenSparseScalar::BF16})
+    {
+        const auto codec=representation==QwenSparseScalar::FP32 ? TensorType::FP32 :
+            representation==QwenSparseScalar::FP16 ? TensorType::FP16 : TensorType::BF16;
+        test::NativeCodecFixture keys(codec,tokens),values(codec,tokens);
+        for(const int rows:{1,3,16})
+        {
+            SCOPED_TRACE(::testing::Message()<<"representation="<<int(representation)<<" M="<<rows);
+            SparseFixture ordinary(2052-rows,rows,tokens,17),gated(2052-rows,rows,tokens,17),serial(2050,1,tokens,17);
+            ordinary.p.pool_selection=gated.p.pool_selection=serial.p.pool_selection=selection;
+            serial.p.representation=representation;
+            ordinary.p.representation=gated.p.representation=representation;
+            ordinary.p.query_demand=QwenSparseQueryDemand::AllLive;
+            gated.p.query_demand=QwenSparseQueryDemand::RankingOnly;
+            const auto originalQuery=ordinary.query;
+            std::vector<float> coreQuery(size_t(rows)*width),coreGate(coreQuery.size());
+            std::vector<float> expected(coreQuery.size()),actual(coreQuery.size());
+            for(size_t i=0;i<coreQuery.size();++i) {
+                coreQuery[i]=float(int(i%29)-14)/32.f;coreGate[i]=float(int(i%17)-8)/16.f;
+            }
+            auto attentionFor=[&](SparseFixture &f,std::vector<float> &output) {
+                return QwenSparseAttention{.replay=&f.replay,.query=coreQuery.data(),
+                    .kv={.keys=keys.bank(),.values=values.bank()},.selected=f.selected.data(),
+                    .selected_count=f.count.data(),.gate=coreGate.data(),.output=output.data(),
+                    .row_capacity=rows,.token_capacity=tokens,.query_heads=1};
+            };
+            const int partial=std::min(rows,2);
+            int iteration=0;
+            for(const auto replay:std::array{QwenSparseReplay{2060,rows,17},
+                    QwenSparseReplay{2051-rows,rows,17},QwenSparseReplay{2060-rows,rows,17},
+                    QwenSparseReplay{3,std::min(rows,3),17},QwenSparseReplay{2060,0,17},
+                    QwenSparseReplay{2050,rows,17},QwenSparseReplay{2051,1,17},QwenSparseReplay{0,0,17},
+                    QwenSparseReplay{2051-partial,partial,17},QwenSparseReplay{2052-partial,partial,17},
+                    QwenSparseReplay{2060,rows,17}})
+            {
+                SCOPED_TRACE(::testing::Message()<<"prefix="<<replay.prefix_tokens<<" live="<<replay.live_rows);
+                const auto needed=[&](int row){return row<replay.live_rows&&(replay.prefix_tokens+row+1)/4>512;};
+                const size_t liveWords=size_t(replay.live_rows)*512;
+                const std::uint32_t preparedBits=0x7fc12000u+static_cast<unsigned>(iteration++);
+                float preparedPoison;std::memcpy(&preparedPoison,&preparedBits,sizeof(preparedPoison));
+                const float outputPoison=-8123.25f;
+                const auto priorPools=gated.pools;
+                const auto readonlyRaw=gated.raw,readonlyPartial=gated.partial;
+                ordinary.replay=gated.replay=replay;
+                std::fill(ordinary.query.begin(),ordinary.query.end(),NAN);
+                std::copy_n(originalQuery.begin(),liveWords,ordinary.query.begin());
+                std::fill(gated.query.begin(),gated.query.end(),NAN);
+                for(int row=0;row<replay.live_rows;++row)if(needed(row))
+                    std::copy_n(originalQuery.begin()+std::size_t(row)*512,512,gated.query.begin()+std::size_t(row)*512);
+                const auto readonlyQuery=gated.query;
+                for(auto *f:{&ordinary,&gated}) {
+                    std::fill(f->prepared.begin(),f->prepared.end(),preparedPoison);
+                    std::fill(f->scores.begin(),f->scores.end(),-1357.f);
+                    std::fill(f->selected.begin(),f->selected.end(),-77);
+                    std::fill(f->count.begin(),f->count.end(),-77);
+                }
+                ASSERT_NO_THROW(cpuQwenSparseIndexer(ordinary.p));
+                ASSERT_NO_THROW(cpuQwenSparseIndexer(gated.p));
+                EXPECT_EQ(ordinary.replay.prefix_tokens,replay.prefix_tokens);
+                EXPECT_EQ(gated.replay.prefix_tokens,replay.prefix_tokens);
+                EXPECT_EQ(ordinary.replay.live_rows,replay.live_rows);EXPECT_EQ(gated.replay.live_rows,replay.live_rows);
+                EXPECT_TRUE(std::all_of(ordinary.prepared.begin(),ordinary.prepared.begin()+liveWords,
+                    [](float value){return std::isfinite(value);}));
+                for(int row=0;row<rows;++row) {
+                    const auto offset=std::size_t(row)*512;
+                    if(needed(row))EXPECT_EQ(std::memcmp(ordinary.prepared.data()+offset,gated.prepared.data()+offset,512*sizeof(float)),0);
+                    else for(int d=0;d<512;++d)EXPECT_EQ(detail::floatBits(gated.prepared[offset+d]),preparedBits);
+                }
+                EXPECT_EQ(std::memcmp(ordinary.pools.data(),gated.pools.data(),ordinary.pools.size()*sizeof(float)),0);
+                for(int block=0;block<gated.p.block_capacity;++block)
+                    if(block<replay.prefix_tokens/4||block>=(replay.prefix_tokens+replay.live_rows)/4)
+                        EXPECT_EQ(std::memcmp(gated.pools.data()+std::size_t(block)*128,
+                            priorPools.data()+std::size_t(block)*128,128*sizeof(float)),0);
+                EXPECT_EQ(std::memcmp(gated.query.data(),readonlyQuery.data(),readonlyQuery.size()*sizeof(float)),0);
+                EXPECT_EQ(std::memcmp(gated.raw.data(),readonlyRaw.data(),readonlyRaw.size()*sizeof(float)),0);
+                EXPECT_EQ(std::memcmp(gated.partial.data(),readonlyPartial.data(),readonlyPartial.size()*sizeof(float)),0);
+                EXPECT_EQ(std::memcmp(ordinary.scores.data(),gated.scores.data(),ordinary.scores.size()*sizeof(float)),0);
+                EXPECT_EQ(ordinary.selected,gated.selected);EXPECT_EQ(ordinary.count,gated.count);
+                for(int row=0;row<rows;++row) {
+                    const int visible=replay.prefix_tokens+row+1;
+                    EXPECT_EQ(gated.count[row],row<replay.live_rows ? std::min(visible/4,512)*4+visible%4 : 0);
+                }
+                std::fill(expected.begin(),expected.end(),outputPoison);std::fill(actual.begin(),actual.end(),outputPoison);
+                ASSERT_NO_THROW(cpuQwenSparseAttention(attentionFor(ordinary,expected)));
+                ASSERT_NO_THROW(cpuQwenSparseAttention(attentionFor(gated,actual)));
+                EXPECT_EQ(std::memcmp(expected.data(),actual.data(),expected.size()*sizeof(float)),0);
+                EXPECT_TRUE(std::all_of(actual.begin()+size_t(replay.live_rows)*width,actual.end(),
+                    [&](float value){return value==outputPoison;}));
+                std::copy(priorPools.begin(),priorPools.end(),serial.pools.begin());
+                std::copy(readonlyPartial.begin(),readonlyPartial.end(),serial.partial.begin());
+                for(int row=0;row<replay.live_rows;++row) {
+                    serial.replay={replay.prefix_tokens+row,1,replay.position_origin};
+                    std::copy_n(originalQuery.begin()+std::size_t(row)*512,512,serial.query.begin());
+                    std::copy_n(ordinary.raw.begin()+std::size_t(row)*128,128,serial.raw.begin());
+                    std::fill(serial.selected.begin(),serial.selected.end(),-77);
+                    std::fill(serial.count.begin(),serial.count.end(),-77);
+                    ASSERT_NO_THROW(cpuQwenSparseIndexer(serial.p));
+                    if(needed(row))EXPECT_EQ(std::memcmp(gated.prepared.data()+std::size_t(row)*512,serial.prepared.data(),512*sizeof(float)),0);
+                    EXPECT_EQ(gated.count[row],serial.count[0]);
+                    EXPECT_EQ(std::memcmp(gated.selected.data()+std::size_t(row)*QwenSparseSelected,
+                        serial.selected.data(),QwenSparseSelected*sizeof(std::int32_t)),0);
+                    ASSERT_NO_THROW(cpuQwenSparseCommitPartial({.replay=&serial.replay,.prior_partial=serial.partial.data(),
+                        .raw_keys=serial.raw.data(),.acceptance=AcceptedRequestPrefixes::fixed(
+                            DeviceRequestRowRanges::deviceCounted(1,1,&serial.replay.live_rows),1),
+                        .partial_keys=serial.partial.data()}));
+                }
+                EXPECT_EQ(std::memcmp(gated.pools.data(),serial.pools.data(),gated.pools.size()*sizeof(float)),0);
+                ASSERT_FALSE(::testing::Test::HasFailure());
+            }
+        }
+    }
+}
+} // namespace llaminar2::qwen4exp

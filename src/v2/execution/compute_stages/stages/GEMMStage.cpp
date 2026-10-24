@@ -2,6 +2,8 @@
  * @file GEMMStage.cpp
  * @brief Prepared participant-local projections with ordered output publication.
  *
+ * Causal query work borrows original frontier/live publications and remains
+ * independent of arithmetic. Only cold setup may publish an address-only table.
  * Verifier scopes borrow device counts; adapters retain physical scratch and
  * exact stream ordering. Fused SwiGLU consumes two [M,K] operands before the
  * projection produces [M,N]. Diagnostic descriptors preserve those distinct
@@ -54,6 +56,7 @@ namespace llaminar2
             if (auto *consumer = const_cast<GEMMStage *>(this)->getKernelAsWorkspaceConsumer())
                 consumer->appendOutputAccumulationWorkspaceRequirements(
                     requirements, rows, params_.n > 0 ? params_.n : n);
+        if(projection_row_work_)projection_row_work_->appendWorkspaceRequirements(requirements);
         return requirements;
     }
 
@@ -274,7 +277,18 @@ namespace llaminar2
             throw std::invalid_argument("GEMM activation operand precision is invalid");
         (void)typedProjectionBias(params_,params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size()));
         initializeHCUpSubmissionIdentities();
-        if(params_.request_rows) {
+        if(params_.projection_row_work) {
+            params_.validate();
+            if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8||
+               params_.gate_input||params_.do_swiglu||params_.hc_residual_down||params_.bias||params_.bias_tensor||
+               params_.alpha!=1.f||params_.beta!=0.f||
+               (params_.m>1&&!params_.force_decode_equivalent_verifier_prefill)||
+               params_.A->native_type()!=TensorType::FP32||params_.C->native_type()!=TensorType::FP32)
+                throw std::invalid_argument("Causal query work requires a plain native decode projection and explicit grouped arithmetic for M>1");
+            projection_row_work_=std::make_unique<ProjectionRowWorkBinding>(*params_.projection_row_work,
+                params_.device_id,params_.m,params_.verifier_row_range,params_.request_rows);
+        }
+        if(params_.request_rows&&!projection_row_work_) {
             params_.validate();
             if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8)
                 throw std::invalid_argument("Counted floating request rows do not support TwoTermQ8 activation arithmetic");
@@ -404,6 +418,17 @@ namespace llaminar2
 
     bool GEMMStage::prepareGraphLaunch(IDeviceContext* ctx,void* stream)
     {
+        if(projection_row_work_&&params_.device_id.is_cpu()) {
+            if(!ctx||ctx->deviceId()!=params_.device_id||stream||isGraphCaptureActive())
+                throw std::logic_error("CPU projection work requires its exact host preparation boundary");
+            projection_row_work_->prepare(getWorkspace(),nullptr);
+        }
+        if(projection_row_work_&&params_.device_id.is_gpu()) {
+            (void)ExplicitGPUStream(stream);
+            if(!ctx||ctx->deviceId()!=params_.device_id||requireGPUStream()!=stream||isGraphCaptureActive())
+                throw std::logic_error("Projection row work requires its exact context and stream before capture");
+            projection_row_work_->prepare(getWorkspace(),stream);
+        }
         if(!params_.hc_residual_down||!params_.device_id.is_gpu())return true;
         (void)ExplicitGPUStream(stream);
         if(!ctx||ctx->deviceId()!=params_.device_id||requireGPUStream()!=stream||isGraphCaptureActive())
@@ -436,7 +461,7 @@ namespace llaminar2
     uint64_t GEMMStage::graphCaptureVariantSignature() const
     {
         if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::SingleQ8 &&
-           !params_.verifier_row_range && !params_.request_rows)return 0;
+           !params_.verifier_row_range && !params_.request_rows && !projection_row_work_)return 0;
         if(params_.hc_residual_down&&params_.device_id.is_gpu()&&hc_native_binding_)
             requireHCNativePublicationBinding();
         // Preserve the qualified HC quantizer/scalars, then identify one sealed
@@ -450,6 +475,11 @@ namespace llaminar2
         mix(static_cast<uint64_t>(params_.quantized_operand_precision));
         mix(static_cast<uint64_t>(quantizer));mix(static_cast<uint64_t>(backend));mix(params_.device_id.ordinal);
         mix(params_.m);mix(params_.n);mix(params_.k);mix(params_.output_range.start);mix(params_.output_range.end);
+        if(projection_row_work_) {
+            mix(projection_row_work_->signature());
+            if(projection_row_work_->prepared())projection_row_work_->requirePrepared(getWorkspace(),
+                hasGPUStream()?requireGPUStream():projection_row_work_->recordingStream());
+        }
         mix(reinterpret_cast<std::uintptr_t>(params_.A));mix(reinterpret_cast<std::uintptr_t>(params_.B));
         mix(reinterpret_cast<std::uintptr_t>(params_.C));mix(params_.force_decode_equivalent_verifier_prefill);
         if(params_.hc_residual_down) {
@@ -514,7 +544,7 @@ namespace llaminar2
             if (error) *error = "GEMMStage PreparedWeightRef is not present in PreparedWeightStore";
             return false;
         }
-        if(params_.request_rows) {
+        if(params_.request_rows&&!projection_row_work_) {
             try {
                 auto *engine=resolvePreparedGemmForStage("counted floating validation",params_,!params_.output_range.empty());
                 if(!engine)throw std::invalid_argument("Counted floating projection has no prepared engine");
@@ -645,6 +675,14 @@ namespace llaminar2
             LOG_ERROR("[GEMMStage] Invalid dimensions: m=" << params_.m
                                                            << " n=" << params_.n << " k=" << params_.k);
             return false;
+        }
+
+        std::optional<ProjectionRowWorkScope> original_row_work;
+        if(projection_row_work_) {
+            if(params_.device_id.is_gpu())projection_row_work_->requirePrepared(getWorkspace(),requireGPUStream());
+            else projection_row_work_->requirePrepared(getWorkspace(),nullptr);
+            projection_row_work_->requirePublishedInputs();
+            original_row_work.emplace(projection_row_work_->work());
         }
 
         // === Stage Tracing (Task 3) ===
@@ -856,8 +894,9 @@ namespace llaminar2
 
         // Nested tensor adapters inherit this geometry while retaining their
         // backend-specific serial arithmetic policy. No device count is read here.
-        auto verifier_rows = params_.request_rows
-            ? gemm->beginFloatingRequestRowsScope(*params_.request_rows)
+        auto verifier_rows = projection_row_work_
+            ? gemm->beginVerifierDecodeEquivalentScope(std::nullopt)
+            : params_.request_rows ? gemm->beginFloatingRequestRowsScope(*params_.request_rows)
             : gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
         bool success = false;
         if (params_.gate_input)
@@ -978,6 +1017,27 @@ namespace llaminar2
             info.addOutput("C", params_.C, params_.m, params_.n);
         }
 
+        if(projection_row_work_) {
+            // Diagnostic consumers borrow the exact prepared work. They cannot
+            // prepare storage, repair stale ownership or observe unused rows.
+            projection_row_work_->requirePrepared(getWorkspace(),hasGPUStream()?requireGPUStream():projection_row_work_->recordingStream());
+            SnapshotAuthoredTokenRows authored{projection_row_work_->work(),{},projection_row_work_->table()};
+            const auto identity=authored.work.captureIdentity();
+            const auto &sources=projection_row_work_->declaration().sources;
+            for(std::size_t request=0;request<sources.size();++request) {
+                const auto &source=sources[request];
+                SnapshotProjectionPublicationBinding publication{
+                    {source.tensor,source.frontierByteOffset},{source.tensor,source.liveByteOffset},{}};
+                if(identity.inherited_counts)
+                    publication.inheritedLive=SnapshotNativeInt32Borrow{params_.device_id,identity.inherited_counts,
+                        (sources.size()-1)*std::size_t(identity.inherited_count_stride)+1,
+                        request*std::size_t(identity.inherited_count_stride)};
+                authored.publications.push_back(publication);
+            }
+            info.inputs.front().semantic_extent=authored;
+            info.outputs.front().semantic_extent=std::move(authored);
+        }
+
         // Bias is immutable model state, not a per-execution activation. Prefer
         // the typed tensor so device-only prepared ownership remains visible.
         if (params_.bias_tensor)
@@ -1060,6 +1120,13 @@ namespace llaminar2
     // IWorkspaceConsumerStage Implementation
     // =============================================================================
 
+    void GEMMStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        IWorkspaceConsumerStage::bindWorkspace(workspace);
+        if(projection_row_work_&&params_.device_id.is_cpu())
+            projection_row_work_->prepare(workspace,nullptr);
+    }
+
     IWorkspaceConsumer *GEMMStage::getKernelAsWorkspaceConsumer()
     {
         if (!params_.B)
@@ -1097,6 +1164,8 @@ namespace llaminar2
         if (params_.gate_input && params_.gate_buffer_id)
             contract.addInput(*params_.gate_buffer_id);
         contract.addOutput(*params_.c_buffer_id);
+        if(projection_row_work_)for(const auto &source:projection_row_work_->declaration().sources)
+            contract.addInput(source.buffer);
         // GEMM consumes the PreparedWeightStore-owned representation, never the
         // source tensor's raw device pointer.
         if (params_.B)

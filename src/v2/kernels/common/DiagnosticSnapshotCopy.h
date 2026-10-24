@@ -16,13 +16,14 @@
 namespace llaminar2
 {
 /** @brief Mathematical source layout, chosen before capture. */
-enum class DiagnosticSnapshotCopyKind : std::uint8_t { TokenRows,StatePrefixRows,CountedSelectionRows };
+enum class DiagnosticSnapshotCopyKind : std::uint8_t { TokenRows,StatePrefixRows,CountedSelectionRows,AuthoredTokenRows };
 /** @brief Immutable maximum geometry with exact native element and grouping units. */
 struct DiagnosticSnapshotCopyGeometry
 {
     DiagnosticSnapshotCopyKind kind=DiagnosticSnapshotCopyKind::TokenRows;
     int rows=0,columns=0,elementBytes=4;
     int sourceCapacity=0,sourceRowsPerStateRow=1;
+    int requests=0; ///< Original requests intersecting the source slice.
 };
 /** @brief Complete borrowed source/destination/count bindings embedded in a capture. */
 struct DiagnosticSnapshotCopyArgs
@@ -30,10 +31,11 @@ struct DiagnosticSnapshotCopyArgs
     DiagnosticSnapshotCopyGeometry geometry;
     const void *source=nullptr;
     void *destination=nullptr; ///< Disjoint retained payload capacity; selection data is packed here.
-    SnapshotObservedHeader *metadata=nullptr; ///< Header, followed by uint64 offsets only for counted rows.
+    SnapshotObservedHeader *metadata=nullptr; ///< Header, followed by counted uint64 offsets or fixed original-request records.
     const std::int32_t *frontier=nullptr; ///< State prefix's two adjacent native words, prior then produced.
     const std::int32_t *liveRows=nullptr; ///< Token/selection rows; null is explicitly all active.
     const std::int32_t *counts=nullptr; ///< One authored selected-column count per live token row.
+    ProjectionRowWork work=ProjectionRowWork::fromPrefix(DeviceRowRange::fullyActive(1)); ///< Borrowed original work only for authored intervals.
 };
 /** @brief Exact retained metadata capacity, not a terminal communication extent.
  * @param geometry Frozen admitted dimensions and mathematical source layout.

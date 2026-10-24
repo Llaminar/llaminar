@@ -87,6 +87,7 @@ class PipelineStage(Enum):
     PLE_GATHER = auto()
     PLE_GATE = auto()                 # Four gated shared values, flattened to the 4H trunk width
     PLE_CONVOLUTION = auto()          # Fused residual + gated value + SiLU(depthwise convolution)
+    QSA_INDEXER_RAW_QUERY = auto()    # Existing indexer projection before per-head norm and RoPE
 
 
 # Mapping for string conversion (matches C++ stage_to_string)
@@ -135,6 +136,7 @@ _STAGE_TO_STRING: Dict[PipelineStage, str] = {
     PipelineStage.GR_NORM: "GR_NORM",
     PipelineStage.GR_READ: "GR_READ",
     PipelineStage.GR_WRITE: "GR_WRITE",
+    PipelineStage.QSA_INDEXER_RAW_QUERY: "QSA_INDEXER_RAW_QUERY",
     PipelineStage.QSA_INDEXER_QUERY: "QSA_INDEXER_QUERY",
     PipelineStage.QSA_INDEXER_POOLED_KEYS: "QSA_INDEXER_POOLED_KEYS",
     PipelineStage.QSA_SELECTED_INDICES: "QSA_SELECTED_INDICES",

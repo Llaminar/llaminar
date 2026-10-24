@@ -27,8 +27,13 @@
  * @see ROCmDenseProductionPrefillOverlay.h
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include "ROCmQuantisedActivationProducers.h"
 #include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
@@ -2615,6 +2620,10 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             if (llaminar2::rocm::currentNativeQ8SerialGeometry())
             {
                 // A geometry experiment must reach the actual native-Q8 M1
@@ -2771,6 +2780,8 @@ namespace llaminar2
                 (m > 1 || countedVerifierRows(m)))
             {
                 ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
 
                 int8_t *d_weights_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
                 float *d_scales_B = nullptr;
@@ -3063,6 +3074,8 @@ namespace llaminar2
             {
                 // Ensure weights are on device
                 ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
 
                 // Option B: weights are stored as VNNI on device
                 int8_t *d_weights_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
@@ -3296,6 +3309,8 @@ namespace llaminar2
             if (phase_timing)
                 phase_start = std::chrono::high_resolution_clock::now();
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
             if (phase_timing)
             {
                 phase_end = std::chrono::high_resolution_clock::now();
@@ -3568,6 +3583,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             for (const auto &projection : projections)
             {
                 projection.requireOriginalOutputSlice(k);
@@ -5561,6 +5580,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             // Activation-activation GEMM is not supported by quantized kernel
             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_activations] Not supported - use dedicated attention kernel");
             return false;
@@ -5575,6 +5598,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             // Strided activation GEMM is not supported
             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_activations_strided] Not supported");
             return false;
@@ -6432,6 +6459,10 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             // TODO: Implement in Phase 5
             return false;
         }
@@ -6440,6 +6471,10 @@ namespace llaminar2
             const Q8_1Block *d_A_q8, Q8_1Block *d_C_q8,
             int m, int n, int k)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             // TODO: Implement in Phase 5
             return false;
         }
@@ -6463,6 +6498,10 @@ namespace llaminar2
             float alpha, float beta,
             DeviceWorkspaceManager *workspace)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             (void)requireGPUStream();
 
             DeviceWorkspaceManager *ws = workspace ? workspace : workspace_;
@@ -6520,6 +6559,8 @@ namespace llaminar2
             }
 
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
             validateWorkspace();
 
             if (!impl_)
@@ -6749,6 +6790,10 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             return multiply_fp32_to_fp32_with_bias(d_A, d_C, nullptr, m, n, k, alpha, beta);
         }
 
@@ -6757,6 +6802,10 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             (void)requireGPUStream();
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] m=" << m << " n=" << n << " k=" << k
@@ -6769,6 +6818,8 @@ namespace llaminar2
             if (m == 1 && !countedVerifierRows(m))
             {
                 ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
                 // Option B: weights are VNNI and/or ratio-VNNI on device
                 int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
                 float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
@@ -6941,6 +6992,8 @@ namespace llaminar2
 
             // Ensure weights converted and validate workspace
             ensureWeightsConverted();
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
             validateWorkspace();
 
             // Step 1: Quantize FP32 activations to INT8 (blockwise)
@@ -7020,6 +7073,10 @@ namespace llaminar2
             const float *d_A, Q8_1Block *d_C_q8,
             int m, int n, int k)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             // TODO: Implement in Phase 5
             return false;
         }

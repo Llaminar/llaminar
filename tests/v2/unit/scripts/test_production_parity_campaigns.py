@@ -568,9 +568,13 @@ class ProductionParityCampaignTest(unittest.TestCase):
         for filename, header in campaigns.REQUIRED_CSV_HEADERS.items():
             payload = header + "\n"
             if filename in campaigns.CSV_ARTIFACTS_REQUIRING_DATA:
-                payload += ",".join(
-                    "value" for _ in next(campaigns.csv.reader([header]))
-                ) + "\n"
+                columns = next(campaigns.csv.reader([header]))
+                row = dict.fromkeys(columns, "value")
+                if filename in ("prefill_stages.csv", "decode_stages.csv"):
+                    proof_start = columns.index("checkpoint_evidence_kind")
+                    row.update({column: "" for column in columns[proof_start:]})
+                    row["checkpoint_evidence_kind"] = "compared_values"
+                payload += ",".join(row[column] for column in columns) + "\n"
             (directory / filename).write_text(payload, encoding="utf-8")
 
     @staticmethod
@@ -596,7 +600,12 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "route_conditioned_passed,route_conditioned_cosine,"
             "route_conditioned_rel_l2,route_conditioned_max_abs,"
             "route_weights_max_error,hf_reconstruction_rel_l2,scalar_type,"
-            "integer_mismatch_count,passed"
+            "integer_mismatch_count,passed,checkpoint_evidence_kind,structural_valid,query_empty_reason,history_prompt_rows,"
+            "history_decode_rows_before,history_live_rows,history_source_capacity,observed_request_count,observed_prefix_rows,"
+            "observed_live_rows,observed_row_capacity,observed_source_capacity,observed_first_required_logical_row,"
+            "observed_row_offset,observed_first_row,observed_end_row,observed_payload_row_offset,observed_physical_rows,"
+            "observed_repeats_per_row,observed_slice_first_row,observed_payload_rows,observed_payload_columns,"
+            "observed_payload_elements,reference_rows,reference_first_row"
         ).split(",")
         rows = [columns]
         for scalar_type, stage, mismatches, authority, passed in (
@@ -605,6 +614,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ("FP32", "MOE_EXPERT_OUT", "", "route_conditioned_hf", "0"),
         ):
             row = dict.fromkeys(columns, "")
+            row["checkpoint_evidence_kind"] = "compared_values"
             row.update(backend="CPU0", layer="1", stage=stage,
                        scalar_type=scalar_type, integer_mismatch_count=mismatches,
                        proof_authority=authority, canonical_passed=passed,

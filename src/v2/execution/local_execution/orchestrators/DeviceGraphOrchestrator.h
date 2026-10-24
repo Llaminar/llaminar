@@ -4337,25 +4337,8 @@ namespace llaminar2
 
         SnapshotInfo getSnapshotWithShape(const std::string &key) const override
         {
-            const StoredSnapshotHandle snap = snapshot_capture_.getShared(key);
-            if (!snap)
-                return {};
-            return SnapshotInfo{
-                .data = snap->data.isInteger() ? nullptr : snap->data.data(),
-                .size = snap->data.size(),
-                .rows = snap->rows,
-                .cols = snap->cols,
-                /*
-                 * Keep the immutable publication alive after this lookup
-                 * returns. Rank/global parity routers intentionally copy the
-                 * FP32 payload outside SnapshotCapture's map lock, while a
-                 * later graph callback may replace or clear that map entry.
-                 */
-                .lifetime_owner = snap,
-                .publication = snap->publication,
-                .row_ownership = snap->row_ownership,
-                .typed_values = snap->data.view(),
-            };
+            // Preserve acquired original coordinates and owned empty publications.
+            return retainedSnapshotInfo(snapshot_capture_.getShared(key));
         }
 
         std::vector<std::string> getSnapshotKeys() const override

@@ -1,6 +1,8 @@
 /** @file GEMMStage.h
  * @brief GEMM stage: C = alpha * A * B + beta * C
  * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
+ * Original causal query work is a separate retained descriptor; it never selects
+ * verifier arithmetic or invents a second live-count owner.
  * Typed bias retains its original tensor/view through ordinary and verifier dispatch.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
@@ -19,6 +21,7 @@
 #include "kernels/common/Q8ResidualCorrection.h"
 
 #include "../IComputeStage.h"
+#include "../ProjectionRowWorkBinding.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../utils/GemmContext.h"
@@ -156,6 +159,8 @@ namespace llaminar2
             std::optional<DeviceRowRange> verifier_row_range;
             /// Independent floating request prefixes; requires explicit decode-equivalent arithmetic and excludes verifier_row_range.
             std::optional<DeviceRequestRowRanges> request_rows;
+            /// Explicit decode-only causal work; plain projections keep their original arithmetic.
+            std::optional<ProjectionRowWorkDeclaration> projection_row_work;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
@@ -207,9 +212,10 @@ namespace llaminar2
          * @throws std::logic_error On any postbind operand/workspace replacement.
          */
         bool prepareGraphLaunch(IDeviceContext* ctx,void* stream) override;
-        /** @brief HC metadata binds only for capture; ordinary GEMMs retain no preparation. */
+        /** @brief GPU metadata binds before capture; CPU query metadata binds before input observation. */
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override {
-            return params_.hc_residual_down&&params_.device_id.is_gpu()
+            if(params_.projection_row_work&&params_.device_id.is_cpu())return GraphLaunchPreparationPolicy::HostEntry;
+            return (params_.projection_row_work||params_.hc_residual_down)&&params_.device_id.is_gpu()
                 ? GraphLaunchPreparationPolicy::CaptureOnly : GraphLaunchPreparationPolicy::None;
         }
         void resetSessionState() override;
@@ -233,12 +239,15 @@ namespace llaminar2
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
          */
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+        /** @brief Bind the admitted arena and prepare CPU address metadata before validation. */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
 
         /** @brief Declare projection scratch and the explicitly selected input transform. */
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
     private:
         Params params_;
+        std::unique_ptr<ProjectionRowWorkBinding> projection_row_work_; ///< Cold original-owner binding, retained across request reset.
         /** @brief Exact address/geometry identity; contains no live GPU values. */
         struct HCNativePublicationIdentity {
             std::array<const void*,7> pointers{}; ///< Raw A, activated, C, then the four consumed banks.

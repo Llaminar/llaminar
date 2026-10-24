@@ -8,6 +8,7 @@
  * The heap stores only 512 block indices; attention reads at most 2051 native
  * cache rows rather than scanning a dense bank and testing a sparse mask.
  */
+#include "kernels/qwen4exp/QwenSparseQueryRowWork.h"
 #include "../../qwen4exp/QwenSparseReplay.h"
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseMath.h"
@@ -287,6 +288,11 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
     if (p.rotary_source==QwenSparseRotarySource::TablePlanes &&
         static_cast<std::int64_t>(replay.position_origin) + replay.prefix_tokens + replay.live_rows > p.position_capacity)
         throw std::invalid_argument("CPU Qwen sparse indexer: RoPE position capacity exceeded");
+    // CPU owns these words. Resolve once before the OpenMP region; no query
+    // operand outside this original row/head span is an authored value.
+    const auto queryHeads=p.query_demand==QwenSparseQueryDemand::RankingOnly
+        ? qwenSparseIndexerQueryWork(p).repeatEachRow(4).resolveHost()
+        : ProjectionRowSpan{0,replay.live_rows*4};
     const int first_block = replay.prefix_tokens / 4;
     const int complete_blocks = (replay.prefix_tokens + replay.live_rows) / 4;
     auto preparation = [&]()
@@ -306,7 +312,7 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
                     p.pooled_keys + std::size_t(block) * 128);
         }
 #pragma omp for schedule(static)
-        for (int row_head = 0; row_head < replay.live_rows * 4; ++row_head)
+        for (int row_head = queryHeads.first; row_head < queryHeads.end; ++row_head)
             prepare(p.query + std::size_t(row_head) * 128, p.query_norm,
                     replay.position_origin + replay.prefix_tokens + row_head / 4, p,
                     p.prepared_query + std::size_t(row_head) * 128);

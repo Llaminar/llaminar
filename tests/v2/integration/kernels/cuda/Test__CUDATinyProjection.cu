@@ -7,7 +7,11 @@
  * Functional registration covers all floating weights, K/N tails, MTP rows and
  * prefill. Shared-operand candidates additionally prove complete output bytes
  * after each poisoned replay, including exhaustive finite FP16/BF16 weights.
- * The separate performance test never enters production preflight.
+ * Full interval work additionally retains device-authored request publications
+ * across empty, threshold-crossing and dirty replays. Useful output bytes match
+ * the independent original serial tree; unauthored inputs/outputs stay poisoned.
+ * Separate performance cells select one exact format, geometry and row policy
+ * per process and never enter production preflight.
  */
 #include <gtest/gtest.h>
 #include "kernels/common/FloatingPointVerifierLaunch.h"
@@ -19,6 +23,8 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -101,6 +107,59 @@ __global__ void legacyProjection(const float *a, const void *b, float *c,
     }
     if (threadIdx.x == 0)
         c[(static_cast<size_t>(blockIdx.z)*gridDim.y+blockIdx.y)*n+blockIdx.x] = parts[0];
+}
+
+/** @brief Synthetic original replay words; this fixture owns their device storage. */
+struct ProjectionReplayPublication {
+    int32_t frontier,live,reserved;
+};
+/** @brief Typed adversarial replay states, independent of production admission code. */
+enum class ProjectionReplayShape { Full,Unequal,Empty,Crossing,Unranked };
+constexpr int projectionRequestRows=3; ///< Ragged request stride crosses the fixed eight-row CTA.
+constexpr int projectionRequests=173; ///< Physical M519 enters the actual shared production dispatch.
+constexpr int projectionFirstRequired=2051; ///< Synthetic boundary: visible row2052 first requires query work.
+constexpr int projectionTimingCopies=256; ///< Fixed serial kernel nodes per timing graph, eliminating host supply gaps.
+constexpr int projectionTimingWarmGraphs=5; ///< Matching warmup occurrences precede the one measured graph.
+/** @brief Define original test publications without calling the production resolver. */
+__host__ __device__ ProjectionReplayPublication projectionPublicationFor(
+    int request,ProjectionReplayShape shape)
+{
+    switch(shape) {
+    case ProjectionReplayShape::Full:return {4096,3,0x13579};
+    case ProjectionReplayShape::Empty:return {4096,0,0x13579};
+    case ProjectionReplayShape::Unranked:return {2048,3,0x13579};
+    case ProjectionReplayShape::Crossing:return {2051-request%3,3,0x13579};
+    case ProjectionReplayShape::Unequal:
+        switch(request%5) {
+        case 0:return {0,3,0x13579};
+        case 1:return {2049,3,0x13579};
+        case 2:return {2050,2,0x13579};
+        case 3:return {4096,1,0x13579};
+        default:return {4096,0,0x13579};
+        }
+    }
+    return {-1,-1,-1};
+}
+/** @brief Independent original-coordinate contract for poison placement and expected writes. */
+__host__ __device__ bool projectionRowExpected(int row,ProjectionReplayShape shape)
+{
+    const auto publication=projectionPublicationFor(row/projectionRequestRows,shape);
+    const int local=row%projectionRequestRows;
+    return local<publication.live && publication.frontier+local>=projectionFirstRequired;
+}
+/** @brief Author original replay words on device before the captured consumer edge. */
+__global__ void publishProjectionReplay(
+    ProjectionReplayPublication* publications,ProjectionReplayShape shape)
+{
+    const int request=blockIdx.x*blockDim.x+threadIdx.x;
+    if(request<projectionRequests)publications[request]=projectionPublicationFor(request,shape);
+}
+/** @brief Restore useful activations and poison unauthored original rows without host reads. */
+__global__ void prepareProjectionReplayInputs(
+    float* destination,const float* original,int elements,int k,ProjectionReplayShape shape)
+{
+    const int index=blockIdx.x*blockDim.x+threadIdx.x;
+    if(index<elements)destination[index]=projectionRowExpected(index/k,shape)?original[index]:__int_as_float(0x7fc01234);
 }
 
 /** @brief Own one model-free projection bundle and all its replay resources. */
@@ -236,6 +295,89 @@ public:
         else if (type == 1) verifySharedAs<__half, RowsPerCTA>();
         else verifySharedAs<__nv_bfloat16, RowsPerCTA>();
     }
+    /**
+     * @brief Capture the real shared work bridge and stress its CTA metadata boundary.
+     * @details Device-authored replay words retain their original addresses. Every
+     * replay restores finite useful A, poisons inactive A and C, and compares all
+     * original output bytes with the independent serial reduction oracle. M519
+     * and request stride3 force unequal request intervals inside eight-row CTAs.
+     */
+    void verifySharedWork()
+    {
+        ASSERT_EQ(m,projectionRequests*projectionRequestRows);
+        ASSERT_GE(n,32); ASSERT_GE(k,256);
+        const auto work=prepareSharedWork();
+        original_input=std::make_unique<Storage<float>>(size_t(m)*k);
+        checked(cudaMemcpyAsync(original_input->data,a.data,size_t(m)*k*sizeof(float),cudaMemcpyDeviceToDevice,stream));
+        legacyProjection<<<dim3(n,m,2),256,0,stream>>>(a.data,b.data,oracle.data,n,k,type);
+        checked(cudaGetLastError());
+        std::vector<float> serial(size_t(m)*n*2),actual(serial.size());
+        std::vector<unsigned char> expected(serial.size()*sizeof(float));
+        checked(cudaMemcpyAsync(serial.data(),oracle.data,expected.size(),cudaMemcpyDeviceToHost,stream));
+        checked(cudaStreamSynchronize(stream));
+        {
+            llaminar2::ProjectionRowWorkScope scope(work);
+            capture();
+        }
+        expectSharedWorkResources(true);
+        const std::array modes{ProjectionReplayShape::Full,ProjectionReplayShape::Unequal,
+            ProjectionReplayShape::Empty,ProjectionReplayShape::Crossing,
+            ProjectionReplayShape::Unranked,ProjectionReplayShape::Full};
+        for(int replay=0;replay<20;++replay) {
+            const auto shape=modes[replay%modes.size()];
+            publishSharedWork(shape);
+            const int elements=m*k;
+            prepareProjectionReplayInputs<<<(elements+255)/256,256,0,stream>>>(
+                a.data,original_input->data,elements,k,shape);
+            checked(cudaGetLastError());
+            checked(cudaMemsetAsync(output.data,0x7e,expected.size(),stream));
+            checked(cudaGraphLaunch(exec,stream));
+            checked(cudaMemcpyAsync(actual.data(),output.data,expected.size(),cudaMemcpyDeviceToHost,stream));
+            checked(cudaStreamSynchronize(stream));
+            std::fill(expected.begin(),expected.end(),0x7e);
+            for(int batch=0;batch<2;++batch)for(int row=0;row<m;++row)if(projectionRowExpected(row,shape)) {
+                const size_t first=(size_t(batch)*m+row)*n;
+                std::memcpy(expected.data()+first*sizeof(float),serial.data()+first,size_t(n)*sizeof(float));
+            }
+            ASSERT_EQ(std::memcmp(expected.data(),actual.data(),expected.size()),0)
+                << "M="<<m<<" N="<<n<<" K="<<k<<" dtype="<<type<<" replay="<<replay
+                <<" shape="<<static_cast<int>(shape);
+        }
+    }
+    /**
+     * @brief Time one exact policy/format/shape with existing retained graph events.
+     * @param interval True for the full-work CTA-mask candidate, false for compact prefix control.
+     * @details Each parameterized test runs one kernel family only. Setup producers
+     * complete before warmup/timing; profiling can filter that exact projection
+     * symbol. Separate test processes measure interval and compact-prefix cases.
+     */
+    void measureSharedWork(bool interval)
+    {
+        ASSERT_EQ(m,projectionRequests*projectionRequestRows);
+        const auto work=prepareSharedWork();
+        {
+            std::optional<llaminar2::ProjectionRowWorkScope> scope;
+            if(interval)scope.emplace(work);
+            // One native graph contains the complete fixed sequence. A single
+            // host submission supplies all measured nodes, so short kernels
+            // cannot turn host launch gaps into a false barrier timing result.
+            checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+            for(int copy=0;copy<projectionTimingCopies;++copy)launch();
+            checked(cudaStreamEndCapture(stream,&graph));
+            checked(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+        }
+        ASSERT_NO_FATAL_FAILURE(expectSharedWorkTimingResources(interval));
+        for(int warm=0;warm<projectionTimingWarmGraphs;++warm)checked(cudaGraphLaunch(exec,stream));
+        checked(cudaEventRecord(start,stream));
+        checked(cudaGraphLaunch(exec,stream));
+        checked(cudaEventRecord(stop,stream));
+        checked(cudaEventSynchronize(stop));
+        float ms=0;checked(cudaEventElapsedTime(&ms,start,stop));
+        std::cout<<"projection_work_us,dtype="<<type<<",m="<<m<<",n="<<n<<",k="<<k
+                 <<",policy="<<(interval?"interval":"compact_prefix")
+                 <<",copies="<<projectionTimingCopies<<",warm_graphs="<<projectionTimingWarmGraphs
+                 <<",event_graphs=1,us="<<ms*1000/projectionTimingCopies<<'\n';
+    }
     /** @brief Report unprofiled native-event latency; no economy assertion in preflight. */
     void measure()
     {
@@ -266,6 +408,79 @@ public:
         checked(cudaGraphDestroy(legacy_graph));
     }
 private:
+    /** @brief Publish original words on the exact consumer stream without host count inspection. */
+    void publishSharedWork(ProjectionReplayShape shape)
+    {
+        publishProjectionReplay<<<(projectionRequests+255)/256,256,0,stream>>>(work_publications->data,shape);
+        checked(cudaGetLastError());
+    }
+    /** @brief Retain original replay storage for the entire captured graph lifetime. */
+    llaminar2::ProjectionRowWork prepareSharedWork()
+    {
+        static_assert(sizeof(ProjectionReplayPublication)==3*sizeof(int32_t));
+        work_publications=std::make_unique<Storage<ProjectionReplayPublication>>(projectionRequests);
+        publishSharedWork(ProjectionReplayShape::Full);
+        return llaminar2::ProjectionRowWork::causalStrided(projectionRequests,projectionRequestRows,
+            &work_publications->data[0].frontier,&work_publications->data[0].live,
+            sizeof(ProjectionReplayPublication)/sizeof(int32_t),8192,projectionFirstRequired);
+    }
+    /**
+     * @brief Authenticate every timed native node, its resources and one serial dependency chain.
+     * @param interval True only for the original-work mask/barrier specialization.
+     * @details The functional graph remains one node and keeps its existing
+     * checker. This timing-only inventory rejects staging, mixed functions,
+     * geometry changes, branches and disconnected copies before recording time.
+     */
+    void expectSharedWorkTimingResources(bool interval)
+    {
+        size_t count=0;checked(cudaGraphGetNodes(graph,nullptr,&count));
+        ASSERT_EQ(count,size_t(projectionTimingCopies));
+        std::vector<cudaGraphNode_t> nodes(count);checked(cudaGraphGetNodes(graph,nodes.data(),&count));
+        size_t heads=0,tails=0,edges=0;void* function=nullptr;
+        const int rows=type==1?4:8;
+        cudaFuncAttributes resources{};
+        for(const auto node:nodes) {
+            cudaGraphNodeType kind{};checked(cudaGraphNodeGetType(node,&kind));
+            ASSERT_EQ(kind,cudaGraphNodeTypeKernel);
+            cudaKernelNodeParams params{};checked(cudaGraphKernelNodeGetParams(node,&params));
+            if(!function)function=params.func;else ASSERT_EQ(params.func,function);
+            ASSERT_EQ(params.gridDim.x,static_cast<unsigned>((n+7)/8));
+            ASSERT_EQ(params.gridDim.y,static_cast<unsigned>((m+rows-1)/rows));ASSERT_EQ(params.gridDim.z,2u);
+            ASSERT_EQ(params.blockDim.x,256u);ASSERT_EQ(params.blockDim.y,1u);ASSERT_EQ(params.blockDim.z,1u);
+            ASSERT_EQ(params.sharedMemBytes,0u);
+            checked(cudaFuncGetAttributes(&resources,params.func));
+            ASSERT_EQ(resources.localSizeBytes,0u);
+            ASSERT_EQ(resources.sharedSizeBytes,size_t((8+rows)*256)*sizeof(float)+(interval?sizeof(unsigned int):0));
+            size_t predecessors=0,successors=0;
+            checked(cudaGraphNodeGetDependencies(node,nullptr,nullptr,&predecessors));
+            checked(cudaGraphNodeGetDependentNodes(node,nullptr,nullptr,&successors));
+            ASSERT_LE(predecessors,1u);ASSERT_LE(successors,1u);
+            heads+=predecessors==0;tails+=successors==0;edges+=predecessors;
+        }
+        ASSERT_EQ(heads,1u);ASSERT_EQ(tails,1u);ASSERT_EQ(edges,size_t(projectionTimingCopies-1));
+        int resident=0;checked(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident,function,256,0));
+        ASSERT_GT(resident,0);
+        std::cout<<"projection_work_launch,dtype="<<type<<",m="<<m<<",n="<<n<<",k="<<k
+                 <<",policy="<<(interval?"interval":"compact_prefix")<<",copies="<<count
+                 <<",grid_x="<<(n+7)/8<<",grid_y="<<(m+rows-1)/rows<<",grid_z=2,block_x=256,block_y=1,block_z=1"
+                 <<",dynamic_shared=0,static_shared="<<resources.sharedSizeBytes<<",local="<<resources.localSizeBytes
+                 <<",registers="<<resources.numRegs<<",max_threads="<<resources.maxThreadsPerBlock
+                 <<",active_blocks_per_sm="<<resident<<'\n';
+    }
+    /** @brief Authenticate the real recorded shared kernel and its exact local resource footprint. */
+    void expectSharedWorkResources(bool interval)
+    {
+        size_t count=0;checked(cudaGraphGetNodes(graph,nullptr,&count));ASSERT_EQ(count,1u);
+        cudaGraphNode_t node=nullptr;checked(cudaGraphGetNodes(graph,&node,&count));
+        cudaKernelNodeParams params{};checked(cudaGraphKernelNodeGetParams(node,&params));
+        const int rows=type==1?4:8;
+        EXPECT_EQ(params.gridDim.x,static_cast<unsigned>((n+7)/8));
+        EXPECT_EQ(params.gridDim.y,static_cast<unsigned>((m+rows-1)/rows));
+        EXPECT_EQ(params.gridDim.z,2u);EXPECT_EQ(params.blockDim.x,256u);
+        cudaFuncAttributes resources{};checked(cudaFuncGetAttributes(&resources,params.func));
+        EXPECT_EQ(resources.localSizeBytes,0u);
+        EXPECT_EQ(resources.sharedSizeBytes,size_t((8+rows)*256)*sizeof(float)+(interval?sizeof(unsigned int):0));
+    }
     /**
      * @brief Admit and capture the exact native format/row specialization.
      * @tparam Weight Unchanged native weight type selected by the fixture.
@@ -287,7 +502,7 @@ private:
         checked(cudaGetLastError());
         checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
         kernel<<<dim3((n+7)/8,(m+RowsPerCTA-1)/RowsPerCTA,2),256,0,stream>>>(
-            aa.data,bb.data,cc.data,m,n,k, llaminar2::FloatingProjectionRows::bind(m,nullptr,nullptr));
+            aa.data,bb.data,cc.data,m,n,k, llaminar2::FloatingProjectionPrefixRows(llaminar2::DeviceRowRange::fullyActive(m)));
         const auto launch_status = cudaGetLastError();
         checked(cudaStreamEndCapture(stream,&graph));
         checked(launch_status);
@@ -316,6 +531,10 @@ private:
     cudaEvent_t start=nullptr,stop=nullptr;
     cudaGraph_t graph=nullptr;
     cudaGraphExec_t exec=nullptr;
+    // Destructor body retires the graph before these original publication/input
+    // owners are released, including early ASSERT failures inside verification.
+    std::unique_ptr<Storage<ProjectionReplayPublication>> work_publications;
+    std::unique_ptr<Storage<float>> original_input;
 };
 }
 
@@ -380,6 +599,36 @@ TEST(CUDATinyProjection, SharedOperandCandidatesMatchLegacyTree)
             }
     }
 }
+
+/** @brief Prove full-work shared CTAs survive empty, crossing and dirty request replay. */
+TEST(CUDATinyProjection, CapturedSharedWorkMatchesSerialBytesAcrossDirtyRequests)
+{
+    checked(cudaSetDevice(0));
+    for(int type=0;type<3;++type)
+        ProjectionCase(projectionRequests*projectionRequestRows,33,257,type).verifySharedWork();
+}
+
+/** @brief One exact native type/shape/policy per optional profiler process. */
+class CUDATinyProjectionWorkEconomy : public testing::TestWithParam<std::tuple<int,int,int,bool>> {};
+/** @brief Report event latency without turning hardware timing into a functional gate. */
+TEST_P(CUDATinyProjectionWorkEconomy, CapturedLatency)
+{
+    checked(cudaSetDevice(0));
+    const auto [type,n,k,interval]=GetParam();
+    ProjectionCase(projectionRequests*projectionRequestRows,n,k,type).measureSharedWork(interval);
+}
+/** @brief Give isolated timing/profile cells complete native policy and geometry names. */
+std::string workEconomyCaseName(const testing::TestParamInfo<std::tuple<int,int,int,bool>>& info)
+{
+    const auto [type,n,k,interval]=info.param;
+    return std::string(std::array{"FP32","FP16","BF16"}[type])+"_N"+std::to_string(n)+
+        "_K"+std::to_string(k)+(interval?"_Interval":"_CompactPrefix");
+}
+INSTANTIATE_TEST_SUITE_P(AllSharedWorkPolicies,CUDATinyProjectionWorkEconomy,
+    testing::Values(std::tuple{0,33,257,false},std::tuple{0,33,257,true},
+        std::tuple{2,33,257,false},std::tuple{2,33,257,true},
+        std::tuple{0,48,5120,false},std::tuple{0,48,5120,true},
+        std::tuple{2,48,5120,false},std::tuple{2,48,5120,true}),workEconomyCaseName);
 
 /** @brief Select one exact format/row candidate per profiler process. */
 class CUDATinyProjectionEconomy : public testing::TestWithParam<std::tuple<int,int>> {};

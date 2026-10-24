@@ -44,8 +44,13 @@
  * Split from ROCmGemvKernel.hip.
  *
  * @see ROCmGemvKernel_INT8_VNNI.hip for INT8 VNNI kernels
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>
@@ -1496,7 +1501,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
 //
 // Output is FP32 with scale_A applied inline — no epilogue kernel needed.
 // ============================================================================
-template <int TILE_N, int CPT, NativeVNNIFormat FMT>
+template <int TILE_N, int CPT, NativeVNNIFormat FMT, bool HasWork = false>
 __global__ void gemv_native_vnni_kernel_t(
     const int8_t*    __restrict__ d_A_int8,       // [K] quantized activations (INT8)
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × payload_bytes] payload
@@ -1507,8 +1512,11 @@ __global__ void gemv_native_vnni_kernel_t(
     float*           __restrict__ d_partial_fp32,  // [KB × N] partials, used when kblocks>1
     const float*     __restrict__ d_scale_A,       // [1] per-row activation scale (CK fallback, used when d_scale_A_blockwise==nullptr)
     const float*     __restrict__ d_scale_A_blockwise, // [blocks_per_row] per-block activation scales
-    int N, int K, int kblocks)
+    int N, int K, int kblocks, llaminar2::ProjectionRowWork work)
 {
+    if constexpr(HasWork)
+    if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return; // Same ordinary M1 route; no unauthored reads/writes.
+
     using Traits = NVNNITraits<FMT>;
     static_assert(CPT == 1 || CPT == 2, "native-VNNI supports CPT in {1,2}");
 
@@ -4318,20 +4326,25 @@ __device__ __forceinline__ void nativeM1FoldColumns(const float *d_partial_fp32,
     }
 }
 
-template <int TILE_N, int CPT>
+template <int TILE_N, int CPT, bool HasWork = false>
 __global__ void gemv_native_vnni_reduce_kernel_t(const float *__restrict__ partials,
-    float *__restrict__ output,int N,int partitions)
+    float *__restrict__ output,int N,int partitions, llaminar2::ProjectionRowWork work)
 {
+    if constexpr(HasWork)
+    if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return; // Same ordinary M1 route; no unauthored reads/writes.
+
     nativeM1FoldColumns<TILE_N,CPT>(partials,output,N,partitions,blockIdx.x,threadIdx.x);
 }
 
 /** @brief Concatenate original live reducer tiles without extending any projection. */
-template <int TILE_N,int CPT>
+template <int TILE_N,int CPT, bool HasWork = false>
 __global__ void nativeM1GroupedReduce(llaminar2::rocm::NativeM1ReductionGrid group)
 {
     int p=0;
     #pragma unroll
     for(int i=1;i<4;++i)if(i<group.count && int(blockIdx.x)>=group.offsets[i])p=i;
+    if constexpr(HasWork)
+    if(!llaminar2::projectionWorkRowIsActiveUniform(group.work[p],0))return;
     nativeM1FoldColumns<TILE_N,CPT>(group.partials[p],group.outputs[p],group.columns[p],
         group.partitions[p],blockIdx.x-group.offsets[p],threadIdx.x);
 }
@@ -4349,29 +4362,30 @@ struct NativeM1ReductionIssuer
     }
     /** @brief Publish a ticket only after the exact original producer launch succeeded. */
     static void issue(NativeM1ReductionTicket &ticket,const float *partials,float *output,
-        int n,int kb,int tile,int cpt,int device,void *stream)
+        int n,int kb,int tile,int cpt,int device,void *stream,llaminar2::ProjectionRowWork work,bool has_work)
     {
         requireEmpty(ticket);
         ticket.shape_={n,kb,tile,cpt};ticket.partials_=partials;ticket.output_=output;
-        ticket.device_=device;ticket.stream_=stream;
+        ticket.device_=device;ticket.stream_=stream;ticket.work_=work;
+        ticket.has_work_=has_work;
         ticket.state_=kb>1?NativeM1ReductionTicket::State::Pending:NativeM1ReductionTicket::State::Direct;
     }
 };
 }
 
 /** @brief Retain ordinary submission or issue its exact successful producer ticket. */
-template <int TN,int CPT>
+template <int TN,int CPT,bool HasWork>
 void finishNativeM1Producer(float *partials,float *output,int n,int kb,int device,void *stream,
-    llaminar2::rocm::NativeM1ReductionTicket *deferred)
+    llaminar2::rocm::NativeM1ReductionTicket *deferred,llaminar2::ProjectionRowWork work)
 {
     if(deferred)
     {
         if(hipPeekAtLastError()!=hipSuccess)throw std::runtime_error("M1 deferred producer submission failed");
-        llaminar2::rocm::NativeM1ReductionIssuer::issue(*deferred,partials,output,n,kb,TN,CPT,device,stream);
+        llaminar2::rocm::NativeM1ReductionIssuer::issue(*deferred,partials,output,n,kb,TN,CPT,device,stream,work,HasWork);
     }
     else if(kb>1)
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<TN,CPT>),
-            dim3(1+(n-1)/TN),dim3(TN/CPT),0,static_cast<hipStream_t>(stream),partials,output,n,kb);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<TN,CPT,HasWork>),
+            dim3(1+(n-1)/TN),dim3(TN/CPT),0,static_cast<hipStream_t>(stream),partials,output,n,kb,work);
 }
 
 
@@ -4393,12 +4407,12 @@ struct NativeQ8SerialSymbols
  * @tparam CPT Independent output columns per lane.
  * @return Loaded HIP symbols and stable readable specialization spellings.
  */
-template <int TN, int CPT>
+template <int TN, int CPT, bool HasWork = false>
 NativeQ8SerialSymbols nativeQ8SerialSymbols()
 {
 #define NQ8_SYMBOL_NAMES(N, C) \
-    "gemv_native_vnni_kernel_t<" #N "," #C ",NVNNI_Q8_0>", \
-    "gemv_native_vnni_reduce_kernel_t<" #N "," #C ">"
+    HasWork ? "gemv_native_vnni_kernel_t<" #N "," #C ",NVNNI_Q8_0,true>" : "gemv_native_vnni_kernel_t<" #N "," #C ",NVNNI_Q8_0,false>", \
+    HasWork ? "gemv_native_vnni_reduce_kernel_t<" #N "," #C ",true>" : "gemv_native_vnni_reduce_kernel_t<" #N "," #C ",false>"
     const char *producer_name = nullptr;
     const char *reducer_name = nullptr;
 #define NQ8_NAME_CASE(N, C) \
@@ -4414,8 +4428,8 @@ NativeQ8SerialSymbols nativeQ8SerialSymbols()
 #undef NQ8_SYMBOL_NAMES
     static_assert((TN == 64 && CPT == 1) || (TN == 128 && (CPT == 1 || CPT == 2)) ||
                   (TN == 256 && (CPT == 1 || CPT == 2)));
-    return {reinterpret_cast<const void *>(gemv_native_vnni_kernel_t<TN, CPT, NVNNI_Q8_0>),
-            reinterpret_cast<const void *>(gemv_native_vnni_reduce_kernel_t<TN, CPT>),
+    return {reinterpret_cast<const void *>(gemv_native_vnni_kernel_t<TN, CPT, NVNNI_Q8_0, HasWork>),
+            reinterpret_cast<const void *>(gemv_native_vnni_reduce_kernel_t<TN, CPT, HasWork>),
             producer_name, reducer_name};
 }
 
@@ -4426,16 +4440,18 @@ NativeQ8SerialSymbols nativeQ8SerialSymbols()
  */
 NativeQ8SerialSymbols nativeQ8SerialSymbols(llaminar2::rocm::NativeQ8SerialGeometry geometry)
 {
+    return llaminar2::dispatchProjectionWorkMode(1,[&]<bool HasWork>() {
     using G = llaminar2::rocm::NativeQ8SerialGeometry;
     switch (geometry)
     {
-    case G::TN64CPT1: return nativeQ8SerialSymbols<64, 1>();
-    case G::TN128CPT1: return nativeQ8SerialSymbols<128, 1>();
-    case G::TN256CPT1: return nativeQ8SerialSymbols<256, 1>();
-    case G::TN128CPT2: return nativeQ8SerialSymbols<128, 2>();
-    case G::TN256CPT2: return nativeQ8SerialSymbols<256, 2>();
+    case G::TN64CPT1: return nativeQ8SerialSymbols<64, 1, HasWork>();
+    case G::TN128CPT1: return nativeQ8SerialSymbols<128, 1, HasWork>();
+    case G::TN256CPT1: return nativeQ8SerialSymbols<256, 1, HasWork>();
+    case G::TN128CPT2: return nativeQ8SerialSymbols<128, 2, HasWork>();
+    case G::TN256CPT2: return nativeQ8SerialSymbols<256, 2, HasWork>();
     }
     throw std::invalid_argument("unknown ROCm native-Q8 serial geometry");
+    });
 }
 
 /**
@@ -4502,15 +4518,17 @@ void launchNativeVNNISerialGeometry(
     static_assert(TN % CPT == 0);
     const int grid_n = 1 + (N - 1) / TN;
     const dim3 block(TN / CPT, 1, 1);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT>),
-        dim3(grid_n, kb, 1), block, 0, static_cast<hipStream_t>(stream),
-        A, payload, scales, mins, emins, output, partials, scale_a, block_scales, N, K, kb);
+    const auto work=llaminar2::projectionWorkForLaunch(1);
+    return llaminar2::dispatchProjectionWorkMode(1,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN,CPT,FMT,HasWork>),
+        dim3(grid_n,kb,1),block,0,static_cast<hipStream_t>(stream),
+        A,payload,scales,mins,emins,output,partials,scale_a,block_scales,N,K,kb,work);
     if (g_native_q8_serial_scope && hipPeekAtLastError() != hipSuccess)
     {
         g_native_q8_serial_launch.reset();
         throw std::runtime_error("native-VNNI serial producer submission failed");
     }
-    finishNativeM1Producer<TN,CPT>(partials,output,N,kb,device,stream,deferred);
+    finishNativeM1Producer<TN,CPT,HasWork>(partials,output,N,kb,device,stream,deferred,work);
     if (g_native_q8_serial_scope && hipPeekAtLastError() != hipSuccess)
     {
         g_native_q8_serial_launch.reset();
@@ -4518,7 +4536,7 @@ void launchNativeVNNISerialGeometry(
     }
     if constexpr (FMT == NVNNI_Q8_0)
     {
-        const auto symbols = nativeQ8SerialSymbols<TN, CPT>();
+        const auto symbols = nativeQ8SerialSymbols<TN,CPT,HasWork>();
         const int b_per = 1 + (K / 32 - 1) / kb;
         const int nonempty = 1 + (K / 32 - 1) / b_per;
         const auto launch = [&](const void *function, const char *name, int grid_y)
@@ -4540,6 +4558,7 @@ void launchNativeVNNISerialGeometry(
             .reducer = kb > 1 && !deferred ? launch(symbols.reducer, symbols.reducer_name, 1)
                 : llaminar2::rocm::NativeQ8SerialKernelLaunch{}};
     }
+    });
 }
 } // namespace
 
@@ -4567,18 +4586,18 @@ llaminar2::rocm::admitNativeQ8SerialGeometry(NativeQ8SerialGeometry geometry, in
  * and ascending-KB addition order do not depend on speculative capacity; this
  * is serial M=1's reduction applied to each row's `[KB][M][N]` partial slice.
  */
-template <int TILE_N, int CPT>
+template <int TILE_N, int CPT, bool HasWork = false>
 __global__ void gemv_native_vnni_reduce_small_m_kernel_t(
     const float* __restrict__ d_partial_fp32,    // [KB x M x N] partial buffer
     float* __restrict__ d_C_fp32,                // [M x N] output
-    int M, int N, int kblocks, llaminar2::DeviceRowRange rows)
+    int M, int N, int kblocks, llaminar2::DeviceRowRange rows, llaminar2::ProjectionRowWork work)
 {
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
     // The count is borrowed once. Physical M remains the split-K plane stride
     // after a large-to-small replay; no inactive partial is read or published.
-    const int active_m = rows.activeRows();
-    for (int row = static_cast<int>(blockIdx.y); row < active_m;
-         row += static_cast<int>(gridDim.y))
+    auto rowWork=llaminar2::projectionCursorFor<HasWork>(work,rows,int(blockIdx.y),int(gridDim.y),1);
+    int row,active_m;
+    while(rowWork.next(row,active_m))
     {
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
@@ -4652,7 +4671,8 @@ struct NativeVNNISmallMBatchedArgs
     uint8_t codebook[NVNNI_SMALL_M_MAX_BATCH] = {};
     // Preserve the aligned projection planes at the front of the launch ABI.
     // Row admission dies before decoder dispatch, unlike those live operands.
-    llaminar2::DeviceRowRange rows; ///< Required physical/live row contract.
+    llaminar2::DeviceRowRange rows; ///< Original prefix/grid geometry.
+    llaminar2::ProjectionRowWork work; ///< Independent original-row arithmetic admission.
 };
 
 /**
@@ -5090,7 +5110,7 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
     const int8_t* __restrict__ d_A_int8,
     const float* __restrict__ d_scale_A_blockwise,
     const int32_t* __restrict__ d_sum_A_blockwise,
-    NativeVNNISmallMProjection projection, unsigned K, unsigned partition_blocks, unsigned active_m)
+    NativeVNNISmallMProjection projection, unsigned K, unsigned partition_blocks, unsigned active_m,unsigned row_first)
 {
     float resolved_bias[CPT] = {};
     if constexpr (Publication == NativeVNNIVerifierPublication::DirectOutput)
@@ -5105,9 +5125,7 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
     }
     projection.bias = nullptr;
     // A runtime traversal must not speculate extra register-resident row tiles.
-    #pragma unroll 1
-    for (unsigned row_base = blockIdx.z * ROWS_PER_TILE;
-         row_base < active_m; row_base += gridDim.z * ROWS_PER_TILE)
+    const unsigned row_base = row_first;
     {
         gemv_native_vnni_small_m_batched_shared_tile<TILE_N, CPT, ROWS_PER_TILE, FMT, Publication>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
@@ -5116,7 +5134,7 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
 }
 
 template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT,
-          NativeVNNIVerifierPublication Publication>
+          NativeVNNIVerifierPublication Publication, bool HasWork = false>
 __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched_shared_kernel_t(
     const int8_t* __restrict__ d_A_int8,                // [M x K]
     const float* __restrict__ d_scale_A_blockwise,      // [M x blocks_per_row]
@@ -5129,17 +5147,19 @@ __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched
     const int M = args.rows.physicalRows();
     // Resolve admission before format dispatch. The count's pointer/bounds
     // are dead before the decoder's long scalar-register live ranges begin.
-    const int active_m = args.rows.activeRows();
-    if (static_cast<int>(blockIdx.z) * ROWS_PER_TILE >= active_m)
-        return;
+    auto rowWork=llaminar2::projectionCursorFor<HasWork>(args.work,args.rows,int(blockIdx.z),int(gridDim.z),ROWS_PER_TILE);
+    int row_first,active_m;
+    while(rowWork.next(row_first,active_m))
+    {
     const int proj = native_vnni_batched_projection_for_tile(args, blockIdx.x);
     const auto projection = native_vnni_resolve_small_m_projection<TILE_N, CPT, Publication>(
         args, proj, M);
     gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, FMT, Publication>(
-        d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
+        d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+    } // Only authored request tiles enter format dispatch.
 }
 
-template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIVerifierPublication Publication>
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIVerifierPublication Publication, bool HasWork = false>
 __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched_shared_mixed_kernel_t(
     const int8_t* __restrict__ d_A_int8,                // [M x K]
     const float* __restrict__ d_scale_A_blockwise,      // [M x blocks_per_row]
@@ -5152,9 +5172,10 @@ __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched
     const int M = args.rows.physicalRows();
     // Resolve admission before format dispatch. The count's pointer/bounds
     // are dead before the decoder's long scalar-register live ranges begin.
-    const int active_m = args.rows.activeRows();
-    if (static_cast<int>(blockIdx.z) * ROWS_PER_TILE >= active_m)
-        return;
+    auto rowWork=llaminar2::projectionCursorFor<HasWork>(args.work,args.rows,int(blockIdx.z),int(gridDim.z),ROWS_PER_TILE);
+    int row_first,active_m;
+    while(rowWork.next(row_first,active_m))
+    {
     const int proj = native_vnni_batched_projection_for_tile(args, blockIdx.x);
     const auto projection = native_vnni_resolve_small_m_projection<TILE_N, CPT, Publication>(
         args, proj, M);
@@ -5164,79 +5185,80 @@ __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched
     {
     case NVNNI_Q4_0:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q4_0, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ4_NL:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ4_NL, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ4_XS_SOURCE:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ4_XS_SOURCE, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_Q4_1:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q4_1, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_Q5_0:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q5_0, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_Q5_1:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q5_1, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_Q6_K:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q6_K, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_Q3_K:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q3_K, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_Q2_K:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q2_K, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ3_S:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ3_S, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ3_XXS:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ3_XXS, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ2_S:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_S, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ2_XS:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_XS, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ2_XXS:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_XXS, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ1_S:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ1_S, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_IQ1_M:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ1_M, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_Q8_0:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q8_0, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_EXPANDED_INT8_MIN:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_EXPANDED_INT8_MIN, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
-        return;
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     default:
-        return;
+        break;
     }
+    } // Only authored request tiles enter format dispatch.
 }
 
 /**
@@ -5246,7 +5268,7 @@ __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched
  * rows are live. The fixed-width register state and ascending-KB fold preserve
  * serial-M1 arithmetic for every depth without launching idle physical rows.
  */
-template <int TILE_N, int CPT>
+template <int TILE_N, int CPT, bool HasWork = false>
 __global__ void gemv_native_vnni_reduce_small_m_batched_kernel_t(
     NativeVNNISmallMBatchedArgs args,
     int kblocks)
@@ -5263,10 +5285,9 @@ __global__ void gemv_native_vnni_reduce_small_m_batched_kernel_t(
     const float* bias_base = args.bias[proj];
     float* out_base = args.output[proj];
     // Physical M remains the scratch stride even when fewer rows are live.
-    const int active_m = args.rows.activeRows();
-    #pragma unroll 1
-    for (int row = static_cast<int>(blockIdx.y); row < active_m;
-         row += static_cast<int>(gridDim.y))
+    auto rowWork=llaminar2::projectionCursorFor<HasWork>(args.work,args.rows,int(blockIdx.y),int(gridDim.y),1);
+    int row,active_m;
+    while(rowWork.next(row,active_m))
     {
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
@@ -5301,7 +5322,7 @@ __global__ void gemv_native_vnni_reduce_small_m_batched_kernel_t(
  * block order. Split-K uses the fixed physical workspace stride so the reducer
  * can publish partitions in serial-M1 order on every replay.
  */
-template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT>
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT, bool HasWork = false>
 __global__ void gemv_native_vnni_small_m_kernel_t(
     const int8_t*    __restrict__ d_A_int8,       // [M x K] quantized activations
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row x N x payload_bytes]
@@ -5312,7 +5333,7 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
     float*           __restrict__ d_partial_fp32, // [KB x M x N] partials
     const float*     __restrict__ d_scale_A_blockwise, // [M x blocks_per_row]
     const int32_t*   __restrict__ d_sum_A_blockwise,   // [M x blocks_per_row], nullable
-    int M, int N, int K, int kblocks, llaminar2::DeviceRowRange rows)
+    int M, int N, int K, int kblocks, llaminar2::DeviceRowRange rows, llaminar2::ProjectionRowWork work)
 {
     static_assert(CPT == 1 || CPT == 2, "native-VNNI small-M supports CPT in {1,2}");
     static_assert(
@@ -5326,17 +5347,43 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
     const int kb = blockIdx.y;
     // Geometry supplies enough column/K parallelism before admitting extra
     // row workers. The whole CTA borrows one count; padding owns no dot product.
-    const int active_m = rows.activeRows();
+    int active_m;
+    std::uint32_t authored_rows=0;
+    if constexpr(HasWork)
+    {
+        // The existing launcher slices the persistent workspace at this exact
+        // bound; this is not a semantic M limit. Observe original publications
+        // once before decoder lifetimes, then retain only derived row bits.
+        static_assert(llaminar2::kDefaultNativeVNNIVerifierRowCapacity<=32);
+        __shared__ std::uint32_t published_rows;
+        if(threadIdx.x==0)
+        {
+            if(M<=0 || M>llaminar2::kDefaultNativeVNNIVerifierRowCapacity)
+                __builtin_trap();
+            std::uint32_t mask=0;
+            for(int row=0;row<M;++row)
+                if(work.rowIsActive(row))mask|=std::uint32_t(1)<<row;
+            published_rows=mask;
+        }
+        // All threads consume the same derived mask before any packed weight,
+        // activation or partial access. It is republished on every graph replay.
+        __syncthreads();
+        authored_rows=__builtin_amdgcn_readfirstlane(published_rows);
+        if(!authored_rows)return;
+        active_m=M;
+    }
+    else active_m=rows.activeRows();
 
     const int blocks_per_row = K / 32;
     const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
     const int b_start = kb * b_per;
     const int b_end = min(b_start + b_per, blocks_per_row);
 
-    for (int row_base = static_cast<int>(blockIdx.z) * ROWS_PER_TILE;
-         row_base < active_m;
-         row_base += static_cast<int>(gridDim.z) * ROWS_PER_TILE)
+    for(int row_base=int(blockIdx.z)*ROWS_PER_TILE;row_base<active_m;
+        row_base+=int(gridDim.z)*ROWS_PER_TILE)
     {
+        if constexpr(HasWork)
+            if(!((authored_rows>>row_base)&((std::uint32_t(1)<<ROWS_PER_TILE)-1)))continue;
         float acc[ROWS_PER_TILE][CPT];
 #pragma unroll
         for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
@@ -5367,6 +5414,8 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
                     const int row = row_base + tile_row;
                     if (row >= active_m)
                         continue;
+                    if constexpr(HasWork)
+                        if(!(authored_rows&(std::uint32_t(1)<<row)))continue;
                     native_vnni_small_m_accumulate_row<FMT>(
                         acc[tile_row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, row, K,
                         blocks_per_row, b, packed_groups, payload, d_block_scales, d_block_mins,
@@ -5388,6 +5437,8 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
                 const int row = row_base + tile_row;
                 if (row >= active_m)
                     continue;
+                if constexpr(HasWork)
+                    if(!(authored_rows&(std::uint32_t(1)<<row)))continue;
                 const size_t out_idx =
                     static_cast<size_t>(row) * static_cast<size_t>(N) + static_cast<size_t>(n);
                 if (kblocks == 1)
@@ -5427,7 +5478,7 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
 // Otherwise identical to the main kernel: sdot4 accumulation, FP16 scales,
 // dual-scale, asymmetric min correction, scatter+reduce K-partitioning.
 // ============================================================================
-template <int IQ_TN, NativeVNNIFormat FMT>
+template <int IQ_TN, NativeVNNIFormat FMT, bool HasWork = false>
 __global__ void gemv_iq_lds_kernel_t(
     const int8_t*    __restrict__ d_A_int8,
     const uint8_t*   __restrict__ d_payload,
@@ -5438,8 +5489,11 @@ __global__ void gemv_iq_lds_kernel_t(
     float*           __restrict__ d_partial_fp32,
     const float*     __restrict__ d_scale_A,
     const float*     __restrict__ d_scale_A_blockwise,
-    int N, int K, int kblocks)
+    int N, int K, int kblocks, llaminar2::ProjectionRowWork work)
 {
+    if constexpr(HasWork)
+    if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return; // Same ordinary M1 route; no unauthored reads/writes.
+
     using Traits = NVNNITraits<FMT>;
     static_assert(Traits::is_iq_grid || Traits::is_iq1_grid,
                   "LDS kernel only for IQ grid formats");
@@ -6483,25 +6537,29 @@ bool rocmLaunch_native_vnni_small_m_fp32(
 
         if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
         {
-            hipLaunchKernelGGL(
+            llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<
-                    TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, FMT>),
+                    TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, FMT, HasWork>),
                 dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
                 static_cast<hipStream_t>(stream),
                 tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 tile_c, d_partial_fp32, tile_scales, tile_sums,
-                tile_m, N, K, kb, tile_rows);
+                tile_m, N, K, kb, tile_rows,llaminar2::projectionWorkForLaunch(M,row_range).slice(row_base,tile_m));
+        });
         }
         else
         {
-            hipLaunchKernelGGL(
+            llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<
-                    TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, FMT>),
+                    TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, FMT, HasWork>),
                 dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
                 static_cast<hipStream_t>(stream),
                 tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 tile_c, d_partial_fp32, tile_scales, tile_sums,
-                tile_m, N, K, kb, tile_rows);
+                tile_m, N, K, kb, tile_rows,llaminar2::projectionWorkForLaunch(M,row_range).slice(row_base,tile_m));
+        });
         }
 
         hipError_t err = hipGetLastError();
@@ -6515,11 +6573,13 @@ bool rocmLaunch_native_vnni_small_m_fp32(
 
         if (kb > 1)
         {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_kernel_t<TN, CPT>),
+            llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_kernel_t<TN, CPT, HasWork>),
                 dim3(grid_n, reducer_row_groups), dim3(THREADS, 1, 1), 0,
                 static_cast<hipStream_t>(stream),
-                d_partial_fp32, tile_c, tile_m, N, kb, tile_rows);
+                d_partial_fp32, tile_c, tile_m, N, kb, tile_rows,llaminar2::projectionWorkForLaunch(M,row_range).slice(row_base,tile_m));
+        });
         }
 
         err = hipGetLastError();
@@ -6570,7 +6630,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         llaminar2::DeviceRowRange::fullyActive(M);
     if (!stream || rows.physicalRows() != M)
         return false;
-    NativeVNNISmallMBatchedArgs args{.rows = rows};
+    NativeVNNISmallMBatchedArgs args{.rows = rows,.work=llaminar2::projectionWorkForLaunch(M,row_range)};
     args.num_projections = num_projections;
     for (int p = 0; p < num_projections; ++p)
     {
@@ -6707,6 +6767,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
         NativeVNNISmallMBatchedArgs tile_args = args;
         tile_args.rows = rows.slice(row_base, tile_m);
+        tile_args.work = args.work.slice(row_base,tile_m);
         const int tile_row_groups = llaminar2::deviceRowWorkerGroups(
             tile_args.rows, tile_rows_per_group,
             static_cast<int64_t>(args.total_grid_n) * kb, target_total_waves);
@@ -6735,25 +6796,29 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         {
             if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
             {
-                hipLaunchKernelGGL(
+                llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_kernel_t<
-                        TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, FMT, Publication>),
+                        TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, FMT, Publication, HasWork>),
                     dim3(tile_args.total_grid_n, kb, tile_row_groups),
                     dim3(THREADS, 1, 1), 0,
                     static_cast<hipStream_t>(stream),
                     tile_a, tile_scales, tile_sums, tile_args, K,
                     (blocks_per_row + kb - 1) / kb);
+        });
             }
             else
             {
-                hipLaunchKernelGGL(
+                llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_kernel_t<
-                        TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, FMT, Publication>),
+                        TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, FMT, Publication, HasWork>),
                     dim3(tile_args.total_grid_n, kb, tile_row_groups),
                     dim3(THREADS, 1, 1), 0,
                     static_cast<hipStream_t>(stream),
                     tile_a, tile_scales, tile_sums, tile_args, K,
                     (blocks_per_row + kb - 1) / kb);
+        });
             }
         };
         if (kb == 1)
@@ -6773,11 +6838,13 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
 
         if (kb > 1)
         {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT>),
+            llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT, HasWork>),
                 dim3(tile_args.total_grid_n, reducer_row_groups),
                 dim3(THREADS, 1, 1), 0,
                 static_cast<hipStream_t>(stream), tile_args, kb);
+        });
         }
 
         err = hipGetLastError();
@@ -6884,7 +6951,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
         llaminar2::DeviceRowRange::fullyActive(M);
     if (!stream || rows.physicalRows() != M)
         return false;
-    NativeVNNISmallMBatchedArgs args{.rows = rows};
+    NativeVNNISmallMBatchedArgs args{.rows = rows,.work=llaminar2::projectionWorkForLaunch(M,row_range)};
     args.num_projections = num_projections;
     for (int p = 0; p < num_projections; ++p)
     {
@@ -7021,6 +7088,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
         const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
         NativeVNNISmallMBatchedArgs tile_args = args;
         tile_args.rows = rows.slice(row_base, tile_m);
+        tile_args.work = args.work.slice(row_base,tile_m);
         const int tile_row_groups = llaminar2::deviceRowWorkerGroups(
             tile_args.rows, tile_rows_per_group,
             static_cast<int64_t>(args.total_grid_n) * kb, target_total_waves);
@@ -7049,25 +7117,29 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
         {
             if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
             {
-                hipLaunchKernelGGL(
+                llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_mixed_kernel_t<
-                        TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, Publication>),
+                        TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, Publication, HasWork>),
                     dim3(tile_args.total_grid_n, kb, tile_row_groups),
                     dim3(THREADS, 1, 1), 0,
                     static_cast<hipStream_t>(stream),
                     tile_a, tile_scales, tile_sums, tile_args, K,
                     (blocks_per_row + kb - 1) / kb);
+        });
             }
             else
             {
-                hipLaunchKernelGGL(
+                llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
                     HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_mixed_kernel_t<
-                        TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, Publication>),
+                        TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, Publication, HasWork>),
                     dim3(tile_args.total_grid_n, kb, tile_row_groups),
                     dim3(THREADS, 1, 1), 0,
                     static_cast<hipStream_t>(stream),
                     tile_a, tile_scales, tile_sums, tile_args, K,
                     (blocks_per_row + kb - 1) / kb);
+        });
             }
         };
         if (kb == 1)
@@ -7087,11 +7159,13 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
 
         if (kb > 1)
         {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT>),
+            llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
+        hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT, HasWork>),
                 dim3(tile_args.total_grid_n, reducer_row_groups),
                 dim3(THREADS, 1, 1), 0,
                 static_cast<hipStream_t>(stream), tile_args, kb);
+        });
         }
 
         err = hipGetLastError();
@@ -7892,13 +7966,13 @@ static bool nativeM1WithReduction(
         dim3 block(IQ_THREADS, 1, 1);
 
         #define LAUNCH_IQ_LDS(FMT_TAG) \
-            do { \
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN,FMT_TAG>), \
+            do { llaminar2::dispatchProjectionWorkMode(1,[&]<bool HasWork>() { \
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN,FMT_TAG,HasWork>), \
                     dim3(grid_n,kb),block,0,static_cast<hipStream_t>(stream), \
                     d_A_int8,d_payload,d_scales_u16,d_mins_u16,d_emins_u32, \
-                    d_C_fp32,d_partial_fp32,d_scale_A,d_scale_A_blockwise,N,K,kb); \
-                finishNativeM1Producer<IQ_TN,1>(d_partial_fp32,d_C_fp32,N,kb,device_id,stream,deferred); \
-            } while(false)
+                    d_C_fp32,d_partial_fp32,d_scale_A,d_scale_A_blockwise,N,K,kb,llaminar2::projectionWorkForLaunch(1)); \
+                finishNativeM1Producer<IQ_TN,1,HasWork>(d_partial_fp32,d_C_fp32,N,kb,device_id,stream,deferred,llaminar2::projectionWorkForLaunch(1)); \
+            }); } while(false)
 
         switch (static_cast<NativeVNNIFormat>(codebook_id))
         {
@@ -8230,9 +8304,13 @@ bool submitNativeM1Reductions(std::span<NativeM1ReductionTicket> tickets,int dev
                 tickets[i].shape_.columns_per_thread==leader.shape_.columns_per_thread)
             {selected[i]=true;indices[count]=i;shapes[count++]=tickets[i].shape_;}
         auto grid=nativeM1ReductionGrid(std::span(shapes.data(),count));
-        for(std::size_t i=0;i<count;++i){grid.partials[i]=tickets[indices[i]].partials_;grid.outputs[i]=tickets[indices[i]].output_;}
+        for(std::size_t i=0;i<count;++i){grid.partials[i]=tickets[indices[i]].partials_;grid.outputs[i]=tickets[indices[i]].output_;grid.work[i]=tickets[indices[i]].work_;grid.has_work=grid.has_work || tickets[indices[i]].has_work_;}
 #define LAUNCH_M1_REDUCTION(TN,CPT) \
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(nativeM1GroupedReduce<TN,CPT>),dim3(grid.tiles),dim3(TN/CPT),0,static_cast<hipStream_t>(stream),grid)
+        do { if(grid.has_work) { \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(nativeM1GroupedReduce<TN,CPT,true>),dim3(grid.tiles),dim3(TN/CPT),0,static_cast<hipStream_t>(stream),grid); \
+        } else { \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(nativeM1GroupedReduce<TN,CPT,false>),dim3(grid.tiles),dim3(TN/CPT),0,static_cast<hipStream_t>(stream),grid); \
+        } } while(false)
         switch(leader.shape_.tile_columns*10+leader.shape_.columns_per_thread)
         {
         case 641: LAUNCH_M1_REDUCTION(64,1);break;

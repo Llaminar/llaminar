@@ -230,7 +230,8 @@ namespace llaminar2
             if (!stage.runner)
                 continue;
             auto info = stage.runner->getSnapshotWithShape(key);
-            if (info.data)
+            // Presence belongs to the retained typed owner, including empty observations.
+            if (info)
                 return info;
         }
         return {};

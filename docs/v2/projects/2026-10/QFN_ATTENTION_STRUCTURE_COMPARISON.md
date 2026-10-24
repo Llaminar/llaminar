@@ -1174,6 +1174,153 @@ identical to qualified169 across its complete1,636,888-byte slice. Receipts are
 rerun is claimed for this test-only follow-up;169's accuracy/throughput evidence
 still applies to the unchanged production code. Full preflight remains G60.
 
+## Demand-limited indexer queries175
+
+**Scoped regressions and the selected Release accuracy panel are green;
+matched whole-model decode throughput is unchanged.** Explicit Decode projects and prepares indexer queries only
+when their original causal row needs ranking. Visible lengths through2051 can
+retain every eligible pool without a query;2052 is the first required row.
+Prefill remains AllLive. Raw keys, incremental pools, accepted history and
+selection state remain maintained on every live row. The work descriptor
+changes authorship, not physical row layout or reduction order. Query snapshots
+describe unauthored rows explicitly instead of comparing invented zeros.
+
+The final focused evidence contains778 Unit registrations,153 Integration
+registrations and the model fixture. The [repair run](../../../../parity-results/qwen-flash-next/indexer175-unit-cuda-repair-r2/result.json)
+passes785 registrations in453.537s; the [composition receipt](../../../../parity-results/qwen-flash-next/indexer175-repair-composite-r1.json)
+individually retains147 unchanged Integration passes from the earlier931-entry
+run. It checks unchanged production source, native binaries and recorded loader
+dependencies, allowing only the CUDA test translation unit and its exact added
+capture regression registration to differ. This is932 registrations across two
+sources, not a same-source932 run or complete ProductionTestPreflight. Original
+failed receipts remain retained. The35-case starter gate also passes.
+
+The broad run exposed one CPU empty-tile origin defect and stale test fixtures.
+An empty work intersection now retains its original tile origin. CUDA fixtures
+now bind declared CPU/cuBLAS workspace, derive real GDN shards from canonical
+head ownership, use scoped graph capture and validate retained prepared weight
+storage. Concurrent M1 route checks observe the actual stream-pool transaction
+while retaining grouped/serial byte comparisons. The tiny real model's LM head
+is tested in its stored Q8_0 format with a CPU/CUDA numerical comparison;
+the model's Q4_0 filename no longer causes that check to skip. Nine affected
+fixtures passed an isolated diagnostic before the final canonical rerun.
+The Integration build passes with CUDA80/86/89/90 and HIPgfx906; its source and
+native lifetime receipts are under `indexer175-integration-build-r8`.
+
+The Release build passes with CUDA80/86/89/90 and HIPgfx906. Its immutable runtime
+passes the unchanged25-history selected-topology final-logit panel in103.506s.
+All26 files /185 rows, including reset, are byte-identical to151. The retained
+`qsa-pools-2047` history includes nine decode observations and crosses the first
+required query row. Mean KL and top-1/top-5 agreement are unchanged:
+
+| Group / phase | Mean final-logit KL | Top-1 agreement | Mean top-5 overlap |
+|---|---:|---:|---:|
+| Short / prefill |0.02561369 |93.750% |92.500% |
+| Short / decode |0.02827640 |95.833% |92.292% |
+| Held-out / prefill |0.01491055 |100% |95.000% |
+| Held-out / decode |0.00455288 |100% |91.667% |
+| Ranking threshold / prefill |0.00016808 |100% |100% |
+| Ranking threshold / decode |0.00020987 |100% |93.333% |
+
+This retains the existing local fixed-history pilot scope. It is not full-corpus
+or image certification. The accuracy and exact-byte receipts are under
+`indexer175-model-fp16-r1`; full-stage reference packs still need the new raw-query
+checkpoint before detailed stage diagnosis.
+
+Fifteen isolated native event cells exercise the production BF16 N512/K2560
+query projection and four-head128-wide query preparation. Events repeat one
+synthetic matrix in a captured graph; these are not twelve-layer model cache
+measurements. Every authored output matches its independent control exactly;
+skipped rows retain poison bytes. Projection compares frozen169 with175;
+preparation compares current175 AllLive and RankingOnly because the old QSA
+argument ABI is different.
+
+| Native median, µs | Context512 | Context2052 | Context65536 |
+|---|---:|---:|---:|
+|169 projection |46.00635 |45.99850 |46.03970 |
+|175 projection, no demand descriptor |45.99190 |46.04755 |46.03500 |
+|175 projection, ranking demand |6.19126 |46.00370 |46.04160 |
+|175 preparation, AllLive |4.41657 |4.40813 |4.40969 |
+|175 preparation, ranking demand |3.22751 |5.98626 |5.99032 |
+
+Twenty-one separate rocprof collections bind exactly one counter to the sixth
+captured occurrence of one function. At512, skipped projection reduces fetched
+data from2570.313KiB to0.188KiB; active2052 remains2570.375KiB. Its2048 launched
+waves and10 used /12 allocated VGPRs are unchanged. Preparation launches eight
+waves with20 used/allocated VGPRs. AllLive, skipped and active-ranking preparation
+measure104,69 and167 vector instructions per wave respectively. The additional
+active-row admission work costs approximately1.58µs in these events and remains
+an explicit tuning concern. Fetched bytes are hardware traffic, not an inferred
+source-level load count.
+
+Bounded extraction of the actual profiler-selected code objects proves zero
+SGPR/VGPR spills and private scratch for all five selected symbols. Projection
+uses1024B LDS and preparation512B; resource limits are theoretical, not achieved
+occupancy. Evidence is `indexer175-query-component-summary-r1.json` and
+`indexer175-query-code-objects-r1`.
+
+The matched169/175 Release A/B/A passes all lifecycle, source, runtime and
+trajectory checks; all nine natural256-token sequences are identical:
+
+| Unprofiled full-model throughput, tok/s | Frozen169 control |175 |
+|---|---:|---:|
+| Prefill median |818.657 |820.229 |
+| Decode median |40.221 |40.170 |
+| Decode range |40.105–40.333 |40.101–40.173 |
+
+The +0.192% prefill and−0.125% decode differences do not establish a decode gain.
+Settings remain fullTP4 on fourMI50s, the same UD-Q4_K_XL GGUF, sharded vocabulary,
+RAM ngrams,28 physical NUMA1 workers, FP16 KV, explicit Prefill8/Decode33,
+512-token prompt/256 emitted tokens/context4096, MTP/prefix off, and one warmup
+plus three measured requests per arm. Evidence:
+`indexer175-model-throughput-comparison-r1.json`.
+
+The fresh175 complete-model trace passes exact native phase, geometry, source,
+runtime, trajectory and driver checks. Its4108 graph launches and6,632,680
+dispatches join successfully; measured decode has255 forwards per GPU. Source
+classification reuses165's already-corrected reduction rule; the initial stale
+rule rejection remains retained. Measured query-family counts stay3060/GPU,
+with the actual interval projection and `prepareQueries<true>` specializations.
+Median per-GPU mean query-projection time falls from165's54.453µs to10.386µs;
+preparation falls9.024→6.704µs. Key projection remains8.477→8.560µs. These are
+instrumented kernel service times; they prove the intended work reduction but
+do not establish critical-path savings. The unchanged model result above is
+authoritative. Evidence: `indexer175-model-{trace,join}-r1`,
+`indexer175-model-intervals-r2`, and `indexer175-query-model-geometry-r1.json`.
+
+A separate host-only entry/return uprobe observation rejects the hypothesis
+that ordinary HIP graph submission accounts for the flat throughput. Each of
+four model handles has1020 launches and its paired scheduler1024, with exact
+request ordering; after excluding warmup,765 launches per participant have
+medians202.712,205.403,212.345 and240.889µs. These concurrent participant
+durations must not be summed. The three measured token sequences match175;
+native retirement, source/runtime identity and driver checks pass. The roughly
+95ms host-call durations under rocprof are therefore not ordinary submission
+cost. The uprobe includes observer overhead and measures CPU entry-to-return,
+not GPU completion or canonical throughput. Evidence remains at
+`/tmp/qfn-indexer175-hip-launch-r1/{analysis.json,trace.jsonl,native/}`.
+
+CUDA shared-projection full-work economics also complete48 unprofiled runs
+across eight cells. At M519 with173 three-row requests, interval admission costs
+approximately43–44% over compact prefixes for N33/K257, and4.7–4.9% for
+N48/K5120, in FP32 and BF16. This measures the full validation/masking path,
+including request boundaries, not just a barrier. Ordinary compact-prefix
+dispatch remains separate. These large multi-request cells are not the QFN
+single-request model benchmark and do not imply a matching model regression.
+
+The first exact NCU attachment exits0 but triggers repeated NVIDIA
+`pSmIssueThrottleCtrl != NULL` driver assertions. The driver gate rejects its
+profile; subsequent CUPTI/NCU/NSYS attachment stops under the CUDA tuning
+workflow. The48 earlier clean event runs remain separate evidence. No hardware
+counter result from the rejected profile is qualified. Receipts are under
+`indexer175-cuda-economy-r1`; the complete local collection remains at
+`/tmp/qfn-indexer175-cuda-economy-r1`.
+
+No default promotion or throughput win is claimed, and the42.959tok/s decode
+target remains open. The larger GDN preprocessing/recurrence boundary is the
+next bounded candidate; its retained paired trace comparison is diagnostic,
+not a promise of removable request latency.
+
 ## Primary source map
 
 All Castagna references below are pinned to the compared revision:
@@ -1190,3 +1337,22 @@ Llaminar ownership remains in
 regressions live in `QwenSparseFP16ROCmTest.h` and
 `QwenSparseFP16Parts33ROCmTest.h`; their explicit preflight entry
 is `V2_Integration_ROCm_QwenSparseFP16TileArithmetic`.
+
+
+## Direct merged-input GDN177 qualification
+
+The next measured decode boundary after query175 is now integrated on CUDA
+and ROCm: nonidentity M1 recurrence consumes original merged QKV directly,
+removing deinterleave while preserving FP32 arithmetic and state ownership.
+Final native-event timings are 14.479→12.098 µs on MI50, 5.104→3.568 µs for
+RTX3090 H12 and 5.776→4.271 µs for H24. Exact resource/ISA evidence, retained
+verifier-envelope regression and profiler interpretation are in the
+[GDN qualification record](QFN_GDN_RECURRENCE_TUNING.md#scope-and-current-disposition).
+
+The same-source focused gate passes 804 entries including every Unit registration.
+All 185 selected model logits remain byte-identical to151; all nine benchmark
+sequences match. Matched frozen175/177 A/B/A measures 819.876 prefill /40.328
+decode tok/s versus 820.235 /40.151. The +0.439% decode difference has narrowly
+overlapping ranges; the 42.959 tok/s model target remains open. The GDN record
+owns the exact settings and samples. No complete-preflight or whole-corpus
+certificate is inferred from these focused results.

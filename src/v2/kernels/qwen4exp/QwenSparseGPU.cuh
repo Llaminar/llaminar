@@ -9,6 +9,7 @@
  * selected rows and has the same reduction topology for M=1 and grouped M.
  */
 #pragma once
+#include "kernels/common/ProjectionRowWork.h"
 #if defined(__HIPCC__)
 #include <hip/hip_fp16.h>
 #else
@@ -115,13 +116,25 @@ __device__ __forceinline__ void prepareHead(float value, const float *weight, in
 #else
 #define QSA_GRID_CONSTANT const
 #endif
-/** @brief Prepare all active indexer Q heads without writing inactive scratch. */
-__global__ __launch_bounds__(128, 2) void prepareQueries(QSA_GRID_CONSTANT QwenSparseIndexer p)
+/**
+ * @brief Prepare exactly the authored original indexer query heads.
+ * @tparam RankingOnly Immutable construction policy; false retains original AllLive arithmetic/admission.
+ * @param p Original captured indexer operands and replay authority.
+ * @param queryWork Same original-row demand as query projection, expanded by four heads.
+ * @details Admission precedes every query, norm and rotary read. The original
+ * row/head address, RMS tree, RoPE position and representation rounding remain
+ * unchanged; skipped query capacity is unauthored and is never zero-filled.
+ */
+template<bool RankingOnly>
+__global__ __launch_bounds__(128, 2) void prepareQueries(QSA_GRID_CONSTANT QwenSparseIndexer p,
+    ProjectionRowWork queryWork)
 {
     const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
     require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
     const int row_head = int(blockIdx.x);
     if (row_head >= r.live_rows * 4) return;
+    if constexpr (RankingOnly)
+        if (!queryWork.rowIsActive(row_head)) return;
     const int position = r.position_origin + r.prefix_tokens + row_head / 4;
     require(position >= 0 && (p.rotary_source!=QwenSparseRotarySource::TablePlanes || position<p.position_capacity));
     __shared__ float shared[128];

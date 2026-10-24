@@ -105,6 +105,9 @@ TEST(CapturedComputeIsolation, PlainGemmRejectsHiddenReadsAndCommunication)
 {
     GEMMStage::Params params;
     EXPECT_TRUE(plainGemmIsolationFormSupported(params));
+    params.projection_row_work=ProjectionRowWorkDeclaration{};
+    EXPECT_FALSE(plainGemmIsolationFormSupported(params));
+    params.projection_row_work.reset();
     params.beta=1; EXPECT_FALSE(plainGemmIsolationFormSupported(params));params.beta=0;
     params.alpha=.5f;EXPECT_FALSE(plainGemmIsolationFormSupported(params));params.alpha=1;
     params.needs_allreduce=true;EXPECT_FALSE(plainGemmIsolationFormSupported(params));params.needs_allreduce=false;

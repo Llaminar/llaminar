@@ -173,10 +173,10 @@ TEST(ParitySnapshotMemoryCapacity, RejectsUnauthenticatedOrMalformedNativeStateP
     saveCheckpoint(truncated_path,{1,2,128});
     std::filesystem::resize_file(truncated_path,std::filesystem::file_size(truncated_path)-4);
     EXPECT_THROW((void)deriveParitySnapshotMemoryCapacity(truncated.path(),9,9,{},selected),std::invalid_argument);
-    for(const auto role:{GraphSnapshotSourceRole::QwenSparseQuery,GraphSnapshotSourceRole::QwenSparseSelectedIndices})
+    for(const auto role:{GraphSnapshotSourceRole::QwenSparseRawQuery,GraphSnapshotSourceRole::QwenSparseQuery,GraphSnapshotSourceRole::QwenSparseSelectedIndices})
     {
         const auto item=GraphSnapshotSourceOutput::qwenSparse(3,role);
-        const auto columns=role==GraphSnapshotSourceRole::QwenSparseQuery ? 512u : 2051u;
+        const auto columns=role==GraphSnapshotSourceRole::QwenSparseSelectedIndices ? 2051u : 512u;
         for(const auto shape:std::vector<std::vector<std::size_t>>{{1,9,columns-1},{1,8,columns},{1,0,columns},{2,9,columns}})
         {
             TemporarySnapshotDirectory malformed;
@@ -301,4 +301,25 @@ TEST(ParitySnapshotMemoryCapacity, RetainedServingPhasesIncludeOriginalPrefillBu
     EXPECT_EQ(evidence.capacity.main_phase_payload->bytesFor(
         llaminar2::ServingSnapshotArenaInventory::ordinary(true, false, 0, 0)),
         (512u + 2u) * 2u * sizeof(float));
+}
+
+/** @test Raw query has a distinct exact source key and retains its existing FP32 payload envelope. */
+TEST(ParitySnapshotMemoryCapacity, RawIndexerQueryHasIndependentAuthenticatedSourceIdentity)
+{
+    const auto raw=GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseRawQuery);
+    EXPECT_EQ(raw.semanticKey(),"layer3_QSA_INDEXER_RAW_QUERY");
+    EXPECT_EQ(GraphSnapshotSourceOutput::fromQwenSparseSemanticKey(raw.semanticKey()),raw);
+    EXPECT_FALSE(raw.replacesReferencePayload());
+    EXPECT_NE(raw,GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseQuery));
+    EXPECT_FALSE(GraphSnapshotSourceOutput::fromQwenSparseSemanticKey("layer03_QSA_INDEXER_RAW_QUERY"));
+    EXPECT_FALSE(GraphSnapshotSourceOutput::fromQwenSparseSemanticKey("predictor_layer3_QSA_INDEXER_RAW_QUERY"));
+    TemporarySnapshotDirectory snapshots;
+    saveCheckpoint(snapshots.path()/"layer3_QSA_INDEXER_RAW_QUERY.npy",{1,9,512});
+    saveCheckpoint(snapshots.path()/"decode_step0_layer3_QSA_INDEXER_RAW_QUERY.npy",{1,1,512});
+    const auto ordinary=deriveParitySnapshotMemoryCapacity(snapshots.path(),9,9,{});
+    const auto selected=deriveParitySnapshotMemoryCapacity(snapshots.path(),9,9,{}, {raw});
+    ASSERT_TRUE(selected.valid());EXPECT_EQ(selected.capacity.per_accelerator_bytes,ordinary.capacity.per_accelerator_bytes);
+    EXPECT_EQ(selected.replaced_state_payload_bytes,0u);
+    ASSERT_EQ(selected.capacity.authored_source_outputs.size(),1u);
+    EXPECT_EQ(selected.capacity.authored_source_outputs.front(),raw);
 }

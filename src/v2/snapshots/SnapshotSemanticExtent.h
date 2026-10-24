@@ -9,6 +9,11 @@
  */
 #pragma once
 #include "SnapshotContiguousRows.h"
+#include "SnapshotAuthoredTokenRowsObservation.h"
+#include "../kernels/common/ProjectionRowWork.h"
+#include "../backends/DeviceId.h"
+#include <vector>
+#include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -19,10 +24,11 @@
 namespace llaminar2
 {
 class ITensor;
+class ProjectionRowPublicationTable;
 /** @brief Borrowed INT32 authority; its exact tensor, subview and lifetime are capture identity. */
 struct SnapshotInt32Binding
 {
-    ITensor *tensor=nullptr;
+    const ITensor *tensor=nullptr;
     std::size_t byteOffset=0;
     bool operator==(const SnapshotInt32Binding &) const=default;
 };
@@ -47,9 +53,64 @@ struct SnapshotCountedSelectionRows
     SnapshotInt32Binding counts; ///< One native authored-column count per physical token row.
     bool operator==(const SnapshotCountedSelectionRows &) const=default;
 };
-/** @brief Legacy inference, explicit tokens, latest state or counted index rows. */
+/**
+ * @brief Borrow an existing canonical native count owner without inventing a tensor.
+ *
+ * The original controller/input owns the pointer and publication lifetime. The
+ * diagnostic freezes device, entire native owner capacity and scalar subview;
+ * it never dereferences this borrow separately from ProjectionRowWork::observe*.
+ */
+struct SnapshotNativeInt32Borrow
+{
+    DeviceId device=DeviceId::invalid();
+    const std::int32_t *data=nullptr;
+    std::size_t capacity=0,wordOffset=0;
+    bool operator==(const SnapshotNativeInt32Borrow &) const=default;
+};
+/** @brief Optional inherited agreement authority: original tensor or canonical native borrow. */
+using SnapshotInheritedInt32Binding=std::variant<std::monostate,SnapshotInt32Binding,SnapshotNativeInt32Borrow>;
+/** @brief Original tensor/subview authorities for one request publication. */
+struct SnapshotProjectionPublicationBinding
+{
+    SnapshotInt32Binding frontier,live;
+    SnapshotInheritedInt32Binding inheritedLive;
+    bool operator==(const SnapshotProjectionPublicationBinding &) const=default;
+};
+/**
+ * @brief Borrow the exact prepared projection work and its original scalar owners.
+ *
+ * The stage retains and seals any immutable indirect table through its existing
+ * SerialGraphFamily workspace publication. The work's table address/generation
+ * belongs to capture identity; this descriptor is not another table or live ledger.
+ * Primary frontier/live words name original tensor/subviews; inherited agreement
+ * may borrow the existing controller/input native owner. These borrows remain
+ * valid until the captured diagnostic transaction and terminal observer retire.
+ */
+struct SnapshotAuthoredTokenRows
+{
+    ProjectionRowWork work;
+    std::vector<SnapshotProjectionPublicationBinding> publications; ///< Only original requests intersecting this source slice, in order.
+    std::shared_ptr<const ProjectionRowPublicationTable> publicationTable; ///< Original immutable workspace publication; absent for strided work.
+    /** @brief Compare complete immutable owner/publication/geometry identity, excluding live contents. */
+    bool operator==(const SnapshotAuthoredTokenRows &other) const {
+        return work.captureIdentity()==other.work.captureIdentity()&&publications==other.publications&&publicationTable==other.publicationTable;
+    }
+};
+/** @return First original request intersecting the immutable source slice. */
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__
+#endif
+inline int snapshotProjectionFirstRequest(ProjectionRowWork work) noexcept {return work.requestForRow(0);}
+/** @return Required original-request records; unrelated requests do not communicate metadata. */
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__
+#endif
+inline int snapshotProjectionRequestCount(ProjectionRowWork work) noexcept {
+    return work.requestForRow(work.physicalRows()-1)-work.requestForRow(0)+1;
+}
+/** @brief Legacy inference, tokens, state, counted indices or authored request intervals. */
 using SnapshotSemanticExtent=std::variant<std::monostate,SnapshotTokenRows,
-    SnapshotStatePrefixRows,SnapshotCountedSelectionRows>;
+    SnapshotStatePrefixRows,SnapshotCountedSelectionRows,SnapshotAuthoredTokenRows>;
 
 /** @brief Required point-in-time metadata written by the diagnostic copy kernel. */
 struct alignas(8) SnapshotObservedHeader
@@ -65,7 +126,7 @@ struct SnapshotObservedShape
 {
     std::size_t rows=0;
     std::size_t payloadBytes=0;
-    std::size_t offsetBytes=0; ///< Required packed-row offsets, zero for ordinary/state prefixes.
+    std::size_t offsetBytes=0; ///< Required offsets/request records, zero for ordinary/state prefixes.
 };
 
 /** @brief Validate an observed header without touching a live execution pointer.
@@ -98,7 +159,14 @@ inline SnapshotObservedShape validateSnapshotObservedHeader(const SnapshotSemant
     {
         if(header.priorRows||std::holds_alternative<std::monostate>(extent))
             throw std::logic_error("Diagnostic token/count header does not match its frozen mathematical axis");
-        if(std::holds_alternative<SnapshotCountedSelectionRows>(extent))
+        if(const auto *authored=std::get_if<SnapshotAuthoredTokenRows>(&extent))
+        {
+            if(capacity>static_cast<std::size_t>(INT32_MAX)||authored->work.physicalRows()!=static_cast<int>(capacity)||
+               static_cast<std::size_t>(snapshotProjectionRequestCount(authored->work))>(std::numeric_limits<std::size_t>::max()-sizeof(SnapshotObservedHeader))/sizeof(SnapshotAuthoredTokenRowRecord))
+                throw std::logic_error("Diagnostic authored work disagrees with its admitted source slice");
+            offsetBytes=static_cast<std::size_t>(snapshotProjectionRequestCount(authored->work))*sizeof(SnapshotAuthoredTokenRowRecord);
+        }
+        else if(std::holds_alternative<SnapshotCountedSelectionRows>(extent))
         {
             if(rows==std::numeric_limits<std::size_t>::max()||rows+1>std::numeric_limits<std::size_t>::max()/8)
                 throw std::overflow_error("Diagnostic counted-row metadata overflows observation storage");
@@ -106,9 +174,47 @@ inline SnapshotObservedShape validateSnapshotObservedHeader(const SnapshotSemant
         }
     }
     if(rows>capacity||header.payloadBytes>rows*rowBytes||
-       (!offsetBytes&&header.payloadBytes!=rows*rowBytes)||header.payloadBytes%elementBytes)
+       (!std::holds_alternative<SnapshotCountedSelectionRows>(extent)&&header.payloadBytes!=rows*rowBytes)||header.payloadBytes%elementBytes)
         throw std::logic_error("Diagnostic payload bytes disagree with their exact native live extent");
     return {rows,static_cast<std::size_t>(header.payloadBytes),offsetBytes};
+}
+
+/**
+ * @brief Authenticate every acquired request interval without rereading live words.
+ * @param extent Frozen original work, independent of mutable publication contents.
+ * @param records Complete point-in-time native records, including empty requests.
+ * @param shape Already checked total payload shape.
+ * @return Immutable provenance retained beside the exact packed payload.
+ * @throws std::logic_error For missing records, wrong coordinates/reasons or invented bytes.
+ * @details Canonical numerical comparison separately checks original model history;
+ * this structural check cannot certify the producer's own threshold as model truth.
+ */
+inline SnapshotAuthoredTokenRowsObservation validateSnapshotAuthoredTokenRows(
+    const SnapshotAuthoredTokenRows &extent,std::span<const SnapshotAuthoredTokenRowRecord> records,
+    SnapshotObservedShape shape)
+{
+    const auto id=extent.work.captureIdentity();
+    if(records.size()!=static_cast<std::size_t>(snapshotProjectionRequestCount(extent.work))||id.source_capacity<=0)
+        throw std::logic_error("Authored query observation lacks complete original request records");
+    std::uint64_t rows=0;
+    for(std::size_t record=0;record<records.size();++record)
+    {
+        const int request=snapshotProjectionFirstRequest(extent.work)+static_cast<int>(record);
+        const auto &r=records[record];
+        const auto span=extent.work.resolveFor(request,r.liveRows,r.prefixRows);
+        const auto noRanking=r.liveRows==0||static_cast<std::int64_t>(r.prefixRows)+r.liveRows<=id.first_required_logical_row;
+        if(!span.valid()||r.rowOffset!=request*id.logical_rows*id.repeats_per_row-id.first_physical_row||
+           r.rowCapacity!=id.logical_rows||r.sourceCapacity!=id.source_capacity||
+           r.firstRequiredLogicalRow!=id.first_required_logical_row||r.firstRow!=span.first||r.endRow!=span.end||
+           r.payloadRowOffset!=rows||r.reserved||
+           r.emptyReason!=(noRanking?SnapshotEmptyReason::RankingNotRequired:SnapshotEmptyReason::None))
+            throw std::logic_error("Authored query metadata contradicts original request coordinates");
+        rows+=static_cast<unsigned>(span.size());
+    }
+    if(rows!=shape.rows)
+        throw std::logic_error("Authored query payload invents or omits required interval rows");
+    return {{records.begin(),records.end()},static_cast<std::size_t>(id.physical_rows),
+        id.repeats_per_row,id.first_physical_row};
 }
 
 /** @brief Authenticate captured packed offsets and every native row count before reading payload.

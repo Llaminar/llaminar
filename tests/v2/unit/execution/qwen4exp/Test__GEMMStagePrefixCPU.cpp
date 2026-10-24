@@ -123,3 +123,70 @@ TEST(GEMMStagePrefixCPU, TypedBiasRejectsNonFP32UndersizedAndMissingRequiredMeta
     params.bias_tensor=&halfBias;EXPECT_THROW({GEMMStage stage(params);},std::invalid_argument);
     params.bias_tensor=nullptr;params.bias_required=true;EXPECT_THROW({GEMMStage stage(params);},std::invalid_argument);
 }
+
+/**
+ * @brief A query suffix preserves each original row and ordinary serial arithmetic.
+ * Independent original requests include an empty first request and a suffix that
+ * begins inside a four-row SIMD tile. A one-hot input gives an exact reference
+ * without mirroring the implementation's reduction or interval helper.
+ */
+TEST(GEMMStagePrefixCPU, QueryDemandKeepsOriginalRowsAndAllFloatingSourceArithmetic)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    CPUDeviceContext context(DeviceId::cpu(),1);
+    constexpr int n=5,k=17,column=7;
+    constexpr std::uint32_t poison=0x7fc06241u;
+    for(TensorType type:{TensorType::FP32,TensorType::FP16,TensorType::BF16}) {
+        FP32Tensor floatWeight({n,k});FP16Tensor halfWeight({n,k});BF16Tensor bfloatWeight({n,k});
+        TensorBase *weight=type==TensorType::FP32?static_cast<TensorBase *>(&floatWeight):
+            type==TensorType::FP16?static_cast<TensorBase *>(&halfWeight):static_cast<TensorBase *>(&bfloatWeight);
+        for(int row=0;row<n;++row)for(int col=0;col<k;++col) {
+            const float value=float((row+col)%13-6)/16.f;
+            if(type==TensorType::FP32)static_cast<float *>(weight->raw_mutable_data())[row*k+col]=value;
+            else static_cast<std::uint16_t *>(weight->raw_mutable_data())[row*k+col]=type==TensorType::FP16?
+                qwen4exp::detail::encodeHalf(value):std::uint16_t(qwen4exp::detail::floatBits(value)>>16);
+        }
+        auto prepared=test::makePreparedGemmFixture(weight,DeviceId::cpu(),"qsa.query.demand.cpu",
+            ModelContextId{99800+static_cast<unsigned>(type)});
+        for(int requests:{1,2})for(int capacity:{1,3,8}) {
+            const int m=requests*capacity;
+            FP32Tensor input({std::size_t(m),k}),output({std::size_t(m),n});
+            INT32Tensor replay({std::size_t(requests),3});
+            ProjectionRowWorkDeclaration work{capacity,8192,2051,{}};
+            for(int request=0;request<requests;++request)work.sources.push_back({&replay,BufferId::QFN_QSA_REPLAY,
+                std::size_t(request)*3*sizeof(int),std::size_t(request*3+1)*sizeof(int)});
+            GEMMStage stage({.device_id=DeviceId::cpu(),.A=&input,.B=weight,.C=&output,.m=m,.n=n,.k=k,
+                .force_decode_equivalent_verifier_prefill=m>1,
+                .request_rows=m>1?std::optional{DeviceRequestRowRanges::fullyActiveRequests(requests,capacity)}:std::nullopt,
+                .projection_row_work=work,.prepared_ref=prepared.ref,.prepared_store=prepared.store.get()});
+            const auto identity=stage.graphCaptureVariantSignature();
+            EXPECT_THROW(stage.execute(&context),std::logic_error);
+            ASSERT_TRUE(stage.prepareGraphLaunch(&context,nullptr));
+            for(int step=0;step<5;++step) {
+                auto *header=static_cast<int *>(replay.raw_mutable_data());
+                for(int request=0;request<requests;++request) {
+                    header[request*3]=step==0||step==4?4096:step==1?512:2048;
+                    header[request*3+1]=step==2?0:request==0&&requests>1&&step==3?0:capacity;
+                    header[request*3+2]=0;
+                }
+                std::fill_n(input.mutable_data(),m*k,std::numeric_limits<float>::quiet_NaN());
+                std::fill_n(output.mutable_data(),m*n,std::bit_cast<float>(poison));
+                for(int row=0;row<m;++row) {
+                    const int request=row/capacity,local=row%capacity;
+                    if(local<header[3*request+1]&&header[3*request]+local>=2051) {
+                        std::fill_n(input.mutable_data()+row*k,k,0.f);input.mutable_data()[row*k+column]=1.f;
+                    }
+                }
+                ASSERT_TRUE(stage.execute(&context));
+                EXPECT_EQ(stage.graphCaptureVariantSignature(),identity);
+                for(int row=0;row<m;++row)for(int col=0;col<n;++col) {
+                    const int request=row/capacity,local=row%capacity;
+                    const bool authored=local<header[3*request+1]&&header[3*request]+local>=2051;
+                    const auto expected=authored?std::bit_cast<std::uint32_t>(float((col+column)%13-6)/16.f):poison;
+                    EXPECT_EQ(std::bit_cast<std::uint32_t>(output.data()[row*n+col]),expected)
+                        <<"type="<<int(type)<<" requests="<<requests<<" capacity="<<capacity<<" step="<<step<<" row="<<row;
+                }
+            }
+        }
+    }
+}

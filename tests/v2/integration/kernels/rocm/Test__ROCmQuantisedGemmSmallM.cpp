@@ -23,6 +23,8 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
+#include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
 #include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include <bit>
@@ -481,9 +483,14 @@ namespace
      * @brief CPU reference for ROCm Q8 blockwise activation quantization.
      *
      * The ROCm small-M NativeVNNI path uses per-32-value activation scales and
-     * quantized activation sums. This reference mirrors the GPU rounding and
-     * clamp rules so integration tests can catch workgroup/wavefront indexing
-     * errors before they become verifier-row numerical drift.
+     * quantized activation sums. This bounded normal-scale fixture independently
+     * rounds the published scale through the existing tensor binary16 converter;
+     * it does not call the device quantizer/scale implementation. Keeping an
+     * unrounded FP32 sidecar here would test a different activation format.
+     * @param input Original finite row-major fixture activations.
+     * @param M Original physical fixture rows. @param K Original source row width.
+     * @param quantized Exact signed output bytes. @param scales Widened half scales.
+     * @param sums Exact sums of the expected output bytes.
      */
     void cpuBlockwiseQuantizeWithSums(
         const std::vector<float> &input,
@@ -509,7 +516,12 @@ namespace
                 for (int k = k_start; k < k_end; ++k)
                     max_abs = std::max(max_abs, std::fabs(input[static_cast<size_t>(row) * K + k]));
 
-                const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+                // The format publishes RN16(RN32(amax * RN32(1/127))).
+                // This fixture's scales are normal binary16 values; the tensor
+                // converter supplies an independent host RNE implementation.
+                const float unpublished_scale = (max_abs > 0.0f) ? (max_abs * 0x1.020408p-7f) : 1.0f;
+                ASSERT_TRUE(std::isfinite(unpublished_scale) && unpublished_scale>=0x1p-14f && unpublished_scale<=65504.f);
+                const float scale = fp16_to_fp32(fp32_to_fp16(unpublished_scale));
                 const float inv_scale = 1.0f / scale;
                 int32_t sum = 0;
                 for (int k = k_start; k < k_end; ++k)
@@ -2269,6 +2281,11 @@ namespace
         std::unique_ptr<HIPGraphCapture> captured_graph;
         if (graph_capture)
         {
+            // Uploads are graph-external producers even on the same stream.
+            // Join both exact original events before capture, matching the
+            // production executor and this fixture's GEMM-stage boundary.
+            ASSERT_NO_THROW(TransferEngine::requireDeviceInput(gate.get(),DeviceId::rocm(0),stream));
+            ASSERT_NO_THROW(TransferEngine::requireDeviceInput(up.get(),DeviceId::rocm(0),stream));
             captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
             ScopedBackendGraphCapture capture_transaction(
                 *captured_graph,
@@ -2453,7 +2470,11 @@ namespace
         v_kernel.setGPUStream(stream);
 #endif
 
-        auto q_workspace = bindWorkspace(q_kernel, M, Nq, K);
+        // This operation launches three projections concurrently. Declare the
+        // exact fused partial bank through the same typed production contract
+        // used by the strict serial-row companion, rather than scalar scratch.
+        const std::array<int,3> fused_columns{Nq,Nk,Nv};
+        auto q_workspace = bindWorkspace(q_kernel, M, Nq, K, fused_columns);
         auto k_workspace = bindWorkspace(k_kernel, M, Nk, K);
         auto v_workspace = bindWorkspace(v_kernel, M, Nv, K);
         ASSERT_NE(q_workspace, nullptr);
@@ -4149,20 +4170,28 @@ TEST(Test__ROCmQuantisedGemmSmallM,
 }
 
 /**
- * @test The serial-partition scope overrides a genuinely distinct policy key.
+ * @test Mirrored public queries retain canonical partitions despite distinct generated requests.
  *
- * This companion uses the Qwen3.6 dense hidden width, where the generated
- * table currently distinguishes full- and half-vocabulary geometry.  It proves
- * that the scope changes selector lookup rather than merely restoring a
- * thread-local integer after an otherwise identical production selection.
+ * Use a raw generated N-boundary witness, then require the public serial
+ * selector to retain the code-owned ordered K tree for both widths. The
+ * learned requested KB may differ, but it cannot replace that arithmetic
+ * identity. The scope still publishes/restores the exact serial lookup width.
  */
 TEST(Test__ROCmQuantisedGemmSmallM,
-     MirroredLMHeadSerialPartitionOverridesDistinctGeneratedPolicy)
+     MirroredLMHeadRetainsCanonicalPartitionsForDistinctGeneratedPolicies)
 {
     constexpr uint8_t IQ3_S_CODEBOOK = 11;
     constexpr int FULL_N = 248320;
     constexpr int SERIAL_PARTITION_N = 124160;
-    constexpr int K = 5120;
+    constexpr int K = 10240;
+    llaminar2::rocm::generated::ROCmNativeVNNIDecodeDispatchConfig raw_serial{},raw_full{};
+    ASSERT_TRUE(llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(IQ3_S_CODEBOOK,1,SERIAL_PARTITION_N,K,raw_serial));
+    ASSERT_TRUE(llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(IQ3_S_CODEBOOK,1,FULL_N,K,raw_full));
+    ASSERT_TRUE(raw_serial.kb!=raw_full.kb || raw_serial.target_waves_per_cu!=raw_full.target_waves_per_cu)
+        << "The raw generated-policy witness must remain distinct before canonical arithmetic admission";
+    ASSERT_TRUE(MoEProjectionNumericalContract::ownsOrderedKPartitionTree(IQ3_S_CODEBOOK));
+    constexpr int canonical_kb=MoEProjectionNumericalContract::orderedKPartitionsForWidth(K);
+    static_assert(canonical_kb>0);
 
     int serial_kb = 0;
     int serial_waves = 0;
@@ -4181,17 +4210,17 @@ TEST(Test__ROCmQuantisedGemmSmallM,
         K,
         &unconstrained_kb,
         &unconstrained_waves));
-    ASSERT_TRUE(
-        unconstrained_kb != serial_kb ||
-        unconstrained_waves != serial_waves)
-        << "The distinct-policy sentinel must be updated when generated "
-           "dispatch converges for this geometry";
+    EXPECT_EQ(serial_kb,canonical_kb);
+    EXPECT_EQ(unconstrained_kb,canonical_kb);
+    EXPECT_EQ(serial_waves,raw_serial.target_waves_per_cu);
+    EXPECT_EQ(unconstrained_waves,raw_full.target_waves_per_cu);
 
     int mirrored_kb = 0;
     int mirrored_waves = 0;
     {
         ScopedROCmSerialPartitionPolicy serial_partition_scope(
             SERIAL_PARTITION_N);
+        EXPECT_EQ(rocmGemv_native_vnni_get_serial_partition_n(),SERIAL_PARTITION_N);
         ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
             IQ3_S_CODEBOOK,
             FULL_N,
@@ -4200,6 +4229,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
             &mirrored_waves));
     }
 
+    EXPECT_EQ(mirrored_kb,canonical_kb);
     EXPECT_EQ(mirrored_kb, serial_kb);
     EXPECT_EQ(mirrored_waves, serial_waves);
     EXPECT_EQ(rocmGemv_native_vnni_get_serial_partition_n(), 0);
@@ -5505,9 +5535,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, BlockwiseQuantizeWithSumsUsesWaveLocalShuffl
     const size_t block_count = static_cast<size_t>(M) * static_cast<size_t>(blocks_per_row);
 
     /*
-     * This fixture fills all eight logical 32-thread groups in one v2
-     * quantizer workgroup. The last six groups live in later wave64 wavefronts,
-     * which used to expose the block-global shuffle-source bug.
+     * Distinct signed inputs cover eight 32-value blocks through the actual
+     * sums-producing entrypoint. Its current small-M V4 schedule owns one block
+     * per 32-thread CTA; the original V2 fixture used eight groups in one CTA.
+     * Exact bytes/scales/sums remain the public contract across those schedules.
      */
     std::vector<float> input(value_count);
     for (int row = 0; row < M; ++row)
@@ -5529,6 +5560,11 @@ TEST(Test__ROCmQuantisedGemmSmallM, BlockwiseQuantizeWithSumsUsesWaveLocalShuffl
     std::vector<float> expected_scales;
     std::vector<int32_t> expected_sums;
     cpuBlockwiseQuantizeWithSums(input, M, K, expected_q, expected_scales, expected_sums);
+    // Independent authored witness: amax 2.125 publishes half 0x2449, so -2 maps
+    // to -119. The old unrounded FP32 scale incorrectly predicted -120.
+    ASSERT_EQ(std::bit_cast<std::uint32_t>(expected_scales.front()),UINT32_C(0x3c892000));
+    ASSERT_EQ(expected_q.at(15),-119);
+    ASSERT_EQ(expected_sums.front(),8);
 
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
@@ -5587,6 +5623,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, BlockwiseQuantizeWithSumsUsesWaveLocalShuffl
               hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
+    ASSERT_EQ(std::bit_cast<std::uint32_t>(actual_scales.front()),UINT32_C(0x3c892000));
     for (size_t i = 0; i < value_count; ++i)
         ASSERT_EQ(actual_q[i], expected_q[i]) << "quantized byte mismatch at element " << i;
     for (size_t i = 0; i < block_count; ++i)

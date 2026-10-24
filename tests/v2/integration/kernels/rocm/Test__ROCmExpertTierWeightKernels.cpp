@@ -557,6 +557,9 @@ namespace llaminar2
          * Real packed producers retain their source policy and immutable inputs.
          * The independent oracle captures ordinary immediate producer/reducer pairs;
          * dirty reset nodes poison all live outputs/partials on every replay.
+         * A mixed pair additionally retires an inactive original-work scope before
+         * submitting its ticket beside an ordinary no-work producer. The retained
+         * native reducer must preserve both modes after the host scope is gone.
          */
         TEST_F(ROCmExpertTierWeightKernelsTest,CapturedOrdinaryM1DeferredReductionsAllFormats)
         {
@@ -570,7 +573,7 @@ namespace llaminar2
             };
             for(const auto &format:test::quantizedVerifierFormats())
             {
-                std::vector<Case> cases={{256,{192,320},{}},{256,{7680,7936},{}},{256,{192,7680},{}}};
+                std::vector<Case> cases={{256,{192,320},{}},{256,{7680,7936},{}},{256,{192,7680},{}},{2560,{192,320},{}}};
                 if(std::strcmp(format.label,"Q8_0")==0)
                     for(const auto geometry:kNativeQ8SerialGeometries)
                     {
@@ -619,8 +622,16 @@ namespace llaminar2
                 ASSERT_EQ(activation.upload(input),hipSuccess);
                 ASSERT_EQ(activation_scales.upload(scale),hipSuccess);
                 std::array<std::vector<float>,2> original_partials;
-                const auto observe=[&](bool grouped,bool witness=false)
+                // This original publication remains alive through every captured
+                // replay. It is never copied into an informal host count shadow.
+                TestHIPBuffer<std::int32_t> inactive_count(1);
+                ASSERT_EQ(inactive_count.upload(std::vector<std::int32_t>{0}),hipSuccess);
+                const auto inactive_work=ProjectionRowWork::fromPrefix(
+                    DeviceRowRange::deviceCounted(1,inactive_count.data()));
+                const auto observe=[&](bool grouped,bool witness=false,bool mixed_work=false,bool active_work=false)
                 {
+                    if(inactive_count.upload(std::vector<std::int32_t>{active_work?1:0})!=hipSuccess)
+                        throw std::runtime_error("Deferred M1 work publication failed");
                     HIPGraphCapture graph(stream.native(),0);
                     struct Join
                     {
@@ -643,6 +654,8 @@ namespace llaminar2
                            hipMemsetAsync(w.partials.data(),0xa5,w.partials.bytes(),stream.native())!=hipSuccess ||
                            hipMemsetAsync(w.frozen.data(),0xff,w.frozen.bytes(),stream.native())!=hipSuccess)
                             throw std::runtime_error("Deferred M1 fixture dirty history failed");
+                        std::optional<ProjectionRowWorkScope> work_scope;
+                        if(mixed_work && p==0)work_scope.emplace(inactive_work);
                         const bool ok=grouped?enqueueNativeM1Producer(tickets[p],activation.data(),w.payload.data(),
                             w.scales.data(),w.mins.data(),w.emins.data(),w.output.data(),nullptr,w.partials.data(),
                             widths[p],K,w.packed.codebook_id,canonicalDeviceVnniCodebookId(w.packed.source_codebook_id),0,stream.opaque(),activation_scales.data()):
@@ -650,6 +663,9 @@ namespace llaminar2
                             w.mins.data(),w.emins.data(),w.output.data(),nullptr,w.partials.data(),widths[p],K,
                             w.packed.codebook_id,canonicalDeviceVnniCodebookId(w.packed.source_codebook_id),0,stream.opaque(),activation_scales.data());
                         if(!ok)throw std::runtime_error("Deferred M1 fixture original producer failed");
+                        // The ticket, not this retired TLS scope, owns reduction
+                        // admission. Projection one is issued with no work scope.
+                        work_scope.reset();
                         if(admission)
                         {
                             const auto actual=lastNativeQ8SerialLaunch();
@@ -679,6 +695,7 @@ namespace llaminar2
                         for(std::size_t p=0;p<2;++p)
                         {
                             const auto &shape=tickets[p].producerShape();
+                            if(mixed_work && !active_work && p==0)continue; // Frozen dirty output is the independent no-write oracle.
                             if(shape.partitions>1)
                             {
                                 if(witness && !testInjectNativeM1RNPartials(prepared[p]->partials.data(),widths[p],shape.partitions,stream.opaque()))
@@ -710,8 +727,8 @@ namespace llaminar2
                             ++grouped_nodes;
                             std::string compact=node.name;
                             compact.erase(std::remove_if(compact.begin(),compact.end(),[](unsigned char c){return std::isspace(c);}),compact.end());
-                            const auto mangled="nativeM1GroupedReduceILi"+std::to_string(spec.tile_columns)+"ELi"+std::to_string(spec.columns_per_thread)+"EE";
-                            const auto demangled="nativeM1GroupedReduce<"+std::to_string(spec.tile_columns)+","+std::to_string(spec.columns_per_thread)+">";
+                            const auto mangled="nativeM1GroupedReduceILi"+std::to_string(spec.tile_columns)+"ELi"+std::to_string(spec.columns_per_thread)+"ELb0EE";
+                            const auto demangled="nativeM1GroupedReduce<"+std::to_string(spec.tile_columns)+","+std::to_string(spec.columns_per_thread)+",false>";
                             EXPECT_TRUE(compact.find(mangled)!=std::string::npos || compact.find(demangled)!=std::string::npos);
                             EXPECT_EQ(node.grid_x,unsigned(1+(widths[0]-1)/spec.tile_columns+1+(widths[1]-1)/spec.tile_columns));
                             EXPECT_EQ(node.grid_y,1u);
@@ -722,6 +739,22 @@ namespace llaminar2
                             EXPECT_EQ(node.local_memory_bytes_per_thread,0u);
                         }
                         EXPECT_EQ(grouped_nodes,grouped && receipts[0].k_partitions>1?1u:0u);
+                    }
+                    if(mixed_work)
+                    {
+                        EXPECT_EQ(currentProjectionRowWork(1),nullptr);
+                        std::vector<GPUGraphKernelNodeInfo> nodes;std::string error;
+                        if(!graph.inspectKernelNodes(nodes,&error))throw std::runtime_error("Mixed-work M1 native inventory failed: "+error);
+                        unsigned work_reducers=0;
+                        for(const auto &node:nodes)
+                        {
+                            if(node.name.find("nativeM1GroupedReduce")==std::string::npos)continue;
+                            auto name=node.name;
+                            name.erase(std::remove_if(name.begin(),name.end(),[](unsigned char c){return std::isspace(c);}),name.end());
+                            EXPECT_TRUE(name.find("ELb1EE")!=std::string::npos || name.find(",true>")!=std::string::npos);
+                            ++work_reducers;
+                        }
+                        EXPECT_GT(work_reducers,0u);
                     }
                     if(!graph.instantiate())throw std::runtime_error("Deferred M1 fixture graph instantiate failed");
                     std::array<std::vector<float>,2> first;
@@ -738,6 +771,13 @@ namespace llaminar2
                                 std::vector<float> frozen;
                                 if(prepared[p]->frozen.download(frozen)!=hipSuccess)throw std::runtime_error("M1 frozen original terminal observation failed");
                                 EXPECT_EQ(std::memcmp(frozen.data(),actual.data(),actual.size()*sizeof(float)),0);
+                            }
+                            if(mixed_work && !active_work && p==0)
+                            {
+                                for(const auto value:actual)EXPECT_EQ(std::bit_cast<std::uint32_t>(value),0xffffffffu);
+                                std::vector<float> partials;
+                                if(prepared[p]->partials.download(partials)!=hipSuccess)throw std::runtime_error("Inactive ticket partial observation failed");
+                                for(const auto value:partials)EXPECT_EQ(std::bit_cast<std::uint32_t>(value),0xa5a5a5a5u);
                             }
                             if(admission)
                             {
@@ -769,6 +809,14 @@ namespace llaminar2
                 {
                     ASSERT_EQ(original[p].size(),grouped[p].size());
                     EXPECT_EQ(std::memcmp(original[p].data(),grouped[p].data(),original[p].size()*sizeof(float)),0);
+                }
+                if(!admission && K==2560 && widths[0]==192 && widths[1]==320)
+                {
+                    const auto mixed=observe(true,false,true);
+                    EXPECT_EQ(std::memcmp(original[1].data(),mixed[1].data(),original[1].size()*sizeof(float)),0);
+                    const auto active=observe(true,false,true,true);
+                    for(std::size_t p=0;p<2;++p)
+                        EXPECT_EQ(std::memcmp(original[p].data(),active[p].data(),original[p].size()*sizeof(float)),0);
                 }
                 if((std::strcmp(format.label,"Q4_0")==0 && widths[0]==192 && widths[1]==320) ||
                     (admission && K==640))(void)observe(true,true);

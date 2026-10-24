@@ -2160,7 +2160,8 @@ namespace llaminar2
                     copy.semantic_extent == output.semantic_extent &&
                     copy.semantic_copy.frontier == nativeCopy.frontier &&
                     copy.semantic_copy.liveRows == nativeCopy.liveRows &&
-                    copy.semantic_copy.counts == nativeCopy.counts;
+                    copy.semantic_copy.counts == nativeCopy.counts &&
+                    copy.semantic_copy.work.captureIdentity() == nativeCopy.work.captureIdentity();
                 if (!descriptor_matches)
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
@@ -2365,6 +2366,13 @@ namespace llaminar2
             bool selections=false;
             for(const auto &[name,stage]:snapshot_manifest.stage_copies)for(const auto &copy:stage.outputs)
             {
+                if(const auto *authored=std::get_if<SnapshotAuthoredTokenRows>(&copy.semantic_extent)) {
+                    selections=true;
+                    const auto *header=reinterpret_cast<const SnapshotObservedHeader *>(host+copy.storage_offset_bytes+copy.metadata_offset_bytes);
+                    const auto shape=validateSnapshotObservedHeader(copy.semantic_extent,*header,copy.rows,copy.cols,copy.element_size);
+                    validateSnapshotAuthoredTokenRows(*authored,{reinterpret_cast<const SnapshotAuthoredTokenRowRecord *>(header+1),static_cast<std::size_t>(snapshotProjectionRequestCount(authored->work))},shape);
+                    acquire(copy.storage_offset_bytes,shape.payloadBytes);continue;
+                }
                 if(!std::holds_alternative<SnapshotCountedSelectionRows>(copy.semantic_extent)) continue;
                 selections=true;
                 const auto *header=reinterpret_cast<const SnapshotObservedHeader *>(host+copy.storage_offset_bytes+copy.metadata_offset_bytes);
@@ -2509,7 +2517,9 @@ namespace llaminar2
             if(!std::holds_alternative<std::monostate>(copy.semantic_extent)) {
                 output.observed_header=reinterpret_cast<const SnapshotObservedHeader *>(arena_host_bytes+copy.storage_offset_bytes+copy.metadata_offset_bytes);
                 const auto shape=validateSnapshotObservedHeader(copy.semantic_extent,*output.observed_header,copy.rows,copy.cols,copy.element_size);
-                if(shape.offsetBytes) output.observed_row_offsets={reinterpret_cast<const std::uint64_t *>(output.observed_header+1),shape.rows+1};
+                if(const auto *authored=std::get_if<SnapshotAuthoredTokenRows>(&copy.semantic_extent))
+                    output.observed_authored_rows={reinterpret_cast<const SnapshotAuthoredTokenRowRecord *>(output.observed_header+1),static_cast<std::size_t>(snapshotProjectionRequestCount(authored->work))};
+                else if(shape.offsetBytes) output.observed_row_offsets={reinterpret_cast<const std::uint64_t *>(output.observed_header+1),shape.rows+1};
             }
             // A compact producer's physical rows acquire logical coordinates
             // only at terminal observation. Restore the exact frozen ownership
@@ -3329,6 +3339,17 @@ namespace llaminar2
         if (isGraphCaptureActive() && annotation_observer && stage_device.is_gpu())
             annotation.emplace(annotation_observer, stage_device, node.stage->gpuStream(),
                 node.name.c_str(), computeStageTypeName(node.stage->type()));
+        // HostEntry is independent of run policy: prepare before input
+        // diagnostics and before collective intercepts can bypass the checked
+        // runner. Preparation only retains immutable addresses, never live words.
+        if (stage_device.is_cpu() &&
+            node.stage->graphLaunchPreparationPolicy() == GraphLaunchPreparationPolicy::HostEntry)
+        {
+            if (!ctx || ctx->deviceId() != stage_device)
+                throw std::logic_error("CPU metadata preparation requires its exact context: " + node.name);
+            if (!node.stage->prepareGraphLaunch(ctx, nullptr))
+                throw std::runtime_error("CPU stage metadata preparation failed before input diagnostics: " + node.name);
+        }
         const bool success = runStageImpl(
             node, ctx, policy, is_collective, snapshot_manifest);
         if (success)
@@ -4493,6 +4514,13 @@ namespace llaminar2
                 if (isGraphCaptureActive() && observer && stage_device.is_gpu())
                     annotation.emplace(observer, stage_device, node->stage->gpuStream(),
                         node->name.c_str(), computeStageTypeName(node->stage->type()));
+                // This retained direct branch bypasses runStage(), so it owns
+                // the same CPU preparation boundary. The diagnostic branch above
+                // delegates to runStage() and must not prepare twice.
+                if (stage_device.is_cpu() &&
+                    node->stage->graphLaunchPreparationPolicy() == GraphLaunchPreparationPolicy::HostEntry &&
+                    !node->stage->prepareGraphLaunch(ctx, nullptr))
+                    throw std::runtime_error("CPU stage metadata preparation failed before retained execution: " + node->name);
                 stage_ok = node->stage->execute(ctx);
                 if (stage_ok && annotation) annotation->complete();
             }

@@ -18,8 +18,13 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include "CUDAFloatingPointGemmKernel.h"
 #include "CUDAFloatingPointGemmWorkspaceContract.h"
 #include "kernels/common/FloatingPointVerifierLaunch.h"
@@ -319,6 +324,13 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
         {
+            if (m > 0 && currentProjectionRowWork(m) && C && C->isMapped())
+                throw std::invalid_argument("Decode projection work requires native unmapped output storage");
+
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!A || !C)
             {
@@ -439,7 +451,7 @@ namespace llaminar2
                 const void *operand = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE
                     ? prepareFP16Operand(d_A, m, k, effective_workspace) : d_A;
                 bool success = ((operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && m == 1) ||
-                    VerifierKernelModeScope::active() || fixed_columns || VerifierKernelModeScope::rowsFor(m))
+                    VerifierKernelModeScope::active() || currentProjectionRowWork(m) || fixed_columns || VerifierKernelModeScope::rowsFor(m))
                     ? submitFixedOperandProjection(operand, d_C, m, n, k, effective_workspace)
                     : submitOperandProjection(operand, d_C, m, n, k, effective_workspace);
                 if (success && d_mapped_output)
@@ -697,9 +709,14 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-                for (const auto &projection : projections)
-                    if (projection.original_output_slice)
-                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+            for (const auto &projection : projections)
+                if (projection.original_output_slice)
+                    throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
+            // Declarations are validated before work/arithmetic path selection.
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
 
             // Validate immutable operand identity before seed-based dispatch:
             // a Native seed must not silently admit a half-A consumer either.
@@ -733,7 +750,7 @@ namespace llaminar2
                         throw std::invalid_argument("Explicit fused CUDA operand descriptor is incompatible");
                 }
                 const bool fixed = (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && m == 1) ||
-                    VerifierKernelModeScope::active() || VerifierKernelModeScope::rowsFor(m) ||
+                    VerifierKernelModeScope::active() || currentProjectionRowWork(m) || VerifierKernelModeScope::rowsFor(m) ||
                     std::any_of(projections.begin(), projections.end(), [](const auto &p) {
                         return FloatingOutputPartitionScope::requiresFixedColumns(*p.kernel, p.n);
                     });
@@ -1453,6 +1470,10 @@ namespace llaminar2
             float beta,
             DeviceWorkspaceManager *workspace)
         {
+            // Decode work admission never changes the selected arithmetic program.
+            if (m > 1 && currentProjectionRowWork(m) && !VerifierKernelModeScope::active())
+                throw std::invalid_argument("Projection row intervals require explicit grouped Decode arithmetic for M>1");
+
             return run_fixed_order_swiglu_down(
                 gate,
                 up,

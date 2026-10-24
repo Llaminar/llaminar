@@ -27,12 +27,16 @@ inline constexpr int QwenSparseIndexHeads = 4; ///< Indexer query heads.
 inline constexpr int QwenSparseIndexDim = 128; ///< Indexer coordinates per head.
 inline constexpr int QwenSparsePool = 4; ///< Visible tokens per complete pool.
 inline constexpr int QwenSparseBlocks = 512; ///< Maximum selected complete pools.
+inline constexpr int QwenSparseFirstRankingLogicalRow = QwenSparsePool*(QwenSparseBlocks+1)-1; ///< First zero-based row that needs pool ranking.
 inline constexpr int QwenSparseSelected = 2051; ///< 2048 complete tokens plus tail.
 inline constexpr int QwenSparseQueryHeads = 24; ///< Core attention query heads.
 inline constexpr int QwenSparseKVHeads = 2; ///< Core attention key/value heads.
 inline constexpr int QwenSparseHeadDim = 256; ///< Core attention coordinates.
 inline constexpr int QwenSparsePartitions = 8; ///< Fixed selected-index arithmetic partitions.
 inline constexpr int QwenSparsePartitionTokens = 257; ///< Covers 2051 indices in eight partitions.
+
+/** @brief Explicit query authorship; keys and accepted history always remain live. */
+enum class QwenSparseQueryDemand : std::uint8_t { AllLive, RankingOnly };
 
 /** @brief Explicit representation; unsupported codecs cannot enter a native reader. */
 enum class QwenSparseScalar : std::uint8_t { FP32, FP16, BF16 };
@@ -124,6 +128,7 @@ struct QwenSparseIndexer
     const QwenSparseTransactionPrior* transaction_prior=nullptr; ///< Optional typed immutable original replay/tail codec.
     QwenSparsePoolSelection pool_selection = QwenSparsePoolSelection::Installed; ///< Explicit selector candidate; scores/arithmetic are unchanged.
     QwenSparseSelectionObservation *selection_observations = nullptr; ///< Optional original [row_capacity] diagnostics; no host mirror.
+    QwenSparseQueryDemand query_demand = QwenSparseQueryDemand::AllLive; ///< Explicit decode query work; ordinary prefill retains complete query authorship.
 };
 
 /**

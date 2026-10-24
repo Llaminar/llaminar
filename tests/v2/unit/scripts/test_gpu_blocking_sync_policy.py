@@ -319,6 +319,44 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
                 with temporary:
                     self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
 
+    def test_workspace_metadata_setup_event_cannot_escape_into_execution(self) -> None:
+        """One exact setup event retires immutable host metadata outside capture."""
+        allowance, = (entry for entry in ALLOWANCES
+                      if entry.caller == "TransferEngine::initializeWorkspaceMetadata")
+        self.assertEqual((allowance.category, allowance.kind, allowance.count),
+                         ("setup_certification", "backend_event", 1))
+        fixture = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (
+            ("initializeWorkspaceMetadata", 1, True),
+            ("initializeWorkspaceMetadata", 2, False),
+            ("prepareGraphLaunch", 1, False),
+            ("execute", 1, False),
+            ("publishDeviceWrite", 1, False),
+        ):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(
+                    f"void TransferEngine::{caller}() {{"
+                    + "backend->waitForEvent(event, ordinal);" * count + "}")
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture,)), accepted)
+        root = pathlib.Path(__file__).resolve().parents[4]
+        source = strip_comments_and_literals((root / allowance.path).read_text(encoding="utf-8"))
+        bodies = [source[first + 1:last] for first, last, name in function_intervals(source)
+                  if name == allowance.caller]
+        self.assertEqual(len(bodies), 1)
+        body = "".join(bodies[0].split())
+        self.assertIn("if(isGraphCaptureActive()", body)
+        self.assertIn("!destination.contains(0,source.size())", body)
+        self.assertIn("reinterpret_cast<std::uintptr_t>(stream)<=2", body)
+        self.assertLess(body.index("isGraphCaptureActive()"), body.index("std::memcpy("))
+        self.assertLess(body.index("isGraphCaptureActive()"), body.index("backend->createEvent("))
+        self.assertLess(body.index("backend!=destination.backend()"), body.index("backend->createEvent("))
+        self.assertLess(body.index("backend->hostToDeviceOnStream("), body.index("backend->recordEvent("))
+        self.assertLess(body.index("backend->recordEvent("), body.index("backend->waitForEvent("))
+        self.assertLess(body.index("backend->waitForEvent("), body.rindex("backend->destroyEvent("))
+        self.assertIn("std::terminate()", body)
+        self.assertEqual(body.count("backend->waitForEvent("), 1)
+
     def test_asynchronous_backend_wrapper_is_not_rejected(self) -> None:
         temporary, root = self.make_repo(
             """

@@ -96,6 +96,7 @@ namespace llaminar2
             if (auto keys = one("_hc_attn_branch_norm", "output", {"_GR_NORM"})) return keys;
             if (auto keys = one("_hc_attn_write", "output", {"_GR_WRITE", "_ATTENTION_RESIDUAL"})) return keys;
             if (auto keys = one("_hc_ffn_write", "output", {"_FFN_RESIDUAL"})) return keys;
+            if (auto keys = one("_qsa_query_proj", "C", {"_QSA_INDEXER_RAW_QUERY"})) return keys;
             constexpr std::string_view indexer = "_qsa_indexer";
             if (!name.ends_with(indexer)) return std::nullopt;
             const auto prefix = name.substr(0, name.size() - indexer.size());
@@ -474,7 +475,7 @@ namespace llaminar2
             {
                 const auto keys = flashNextSnapshotOutputKeys(name, output.name ? output.name : "");
                 for (const auto &key : *keys)
-                    if (output.data) storeOutput(key, output);
+                    if (output.data || output.observed_header) storeOutput(key, output);
             }
             return;
         }
@@ -1904,7 +1905,8 @@ namespace llaminar2
         size_t cols,
         SnapshotPublication publication,
         SnapshotOwnedRows row_ownership,
-        SnapshotSemanticAxis semantic_axis)
+        SnapshotSemanticAxis semantic_axis,
+        std::optional<SnapshotAuthoredTokenRowsObservation> authored_token_rows)
     {
         snapshots_[key] = std::make_shared<const StoredSnapshot>(
             StoredSnapshot{
@@ -1914,6 +1916,7 @@ namespace llaminar2
                 .publication = publication,
                 .row_ownership = std::move(row_ownership),
                 .semantic_axis = semantic_axis,
+                .authored_token_rows = std::move(authored_token_rows),
             });
     }
 
@@ -1950,9 +1953,9 @@ namespace llaminar2
                 if (publication != SnapshotPublication::SchemaPartition)
                     throw std::logic_error("Conflicting explicit snapshot publication policies");
                 validateSnapshotOwnedRows(*owned, out.rows);
-                storeSnapshot(key, std::move(data), out.rows, out.cols, SnapshotPublication::RowPartition, *owned, axis);
+                storeSnapshot(key, std::move(data), out.rows, out.cols, SnapshotPublication::RowPartition, *owned, axis, observation.authoredTokenRows());
             }
-            else storeSnapshot(key, std::move(data), out.rows, out.cols, publication, {}, axis);
+            else storeSnapshot(key, std::move(data), out.rows, out.cols, publication, {}, axis, observation.authoredTokenRows());
         }
     }
 

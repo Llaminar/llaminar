@@ -26,6 +26,7 @@
 #include "../ops/CUDAHelpers.cuh"
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
+#include "kernels/gdn/GDNMergedRecurrence.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -200,33 +201,43 @@ namespace
         asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     }
 
+    /** @brief Physical operand coordinates; CUDA arithmetic is layout-independent. */
+    enum class CUDAGDNInputLayout { ExpandedPlanar, MergedPostConvolution };
+
     /**
-     * @brief Advance request-local GDN rows with one fixed, batch-invariant tree.
-     *
-     * Temporal rows remain causal and execute in increasing order inside one
-     * resident block. Within a row, eight lanes own contiguous, disjoint K
-     * partitions for each value column. Both M=1 decode and runtime-sized MTP
-     * verification launch this exact specialization, so the partial-sum order
-     * is independent of M and grouped outputs remain byte-identical to serial
-     * calls of the same production kernel.
-     *
-     * A lane keeps its state partition in registers across every row. For the
-     * Qwen GDN geometry (`D_K=128`) this is sixteen floats per lane: state is
-     * loaded once and committed once, while optional post-row snapshots are
-     * still published for every verifier row. This removes the old second
-     * global state read and exposes eight times as many warps without atomics,
-     * launch-level row replay, or a host-owned recurrence.
-     *
-     * Q/K normalization deliberately retains the former one-warp arithmetic
-     * tree. Preserving that preprocessing order limits numerical change to the
-     * newly explicit K-part reduction itself and keeps capture identity stable.
-     *
-     * @tparam D_K Compile-time key width. Supported graph geometries select a
-     *              specialization before capture; no runtime fallback exists.
+     * @brief Single CUDA numeric body for planar and direct merged recurrence.
+     * @tparam D_K Native64/128 key width.
+     * @tparam OutOfPlaceState Preserve original live versus speculative state access.
+     * @tparam Layout Explicit immutable physical input coordinates.
+     * @param q Planar Q or the original merged post-convolution row.
+     * @param k Planar K; unused for merged coordinates.
+     * @param v Planar V; unused for merged coordinates.
+     * @param alpha Per-row/head projected alpha.
+     * @param beta_raw Per-row/head original beta projection.
+     * @param A_log Local-head learned gate scale.
+     * @param dt_bias Local-head learned time-step bias.
+     * @param output Exclusive original physical output plane.
+     * @param initial_state Borrowed canonical live state.
+     * @param updated_state Bound live or speculative terminal destination.
+     * @param request_count Independent state-bank count.
+     * @param request_seq_len Original physical rows per request.
+     * @param n_heads Participant-local value-head count.
+     * @param d_v Positive native value width, including partial32-column tiles.
+     * @param use_qk_l2norm Original immutable normalization policy.
+     * @param effective_seq_len_ptr Borrowed device lengths, or fully active.
+     * @param effective_row_idx Existing serial-slice row coordinate.
+     * @param state_snapshots Optional bound original post-row state matrix.
+     * @param snapshot_stride_floats Original snapshot row stride.
+     * @param max_snapshot_rows Original admitted snapshot row envelope.
+     * @param merged_key_heads Merged source Q/K heads; unused for planar input.
+     * @param global_value_offset Signed modular Q/K head coordinate.
+     * @details Only input address calculation changes with Layout. CUDA's
+     * one-warp norm tree, eight-part ascending reductions, query-scale constants,
+     * rounded state arithmetic and all publication barriers remain literal.
      */
-    template <int D_K, bool OutOfPlaceState>
-    __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
-    void cuda_gdn_recurrent_step_kernel(
+    template <int D_K, bool OutOfPlaceState, CUDAGDNInputLayout Layout>
+    __device__ __forceinline__
+    void cuda_gdn_recurrent_step_body(
         const float *__restrict__ q,        // [n_heads * d_k]
         const float *__restrict__ k,        // [n_heads * d_k]
         const float *__restrict__ v,        // [n_heads * d_v]
@@ -244,7 +255,8 @@ namespace
         int effective_row_idx,
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
-        int max_snapshot_rows)
+        int max_snapshot_rows,
+        int merged_key_heads = 0, int global_value_offset = 0)
     {
         const int request_head = blockIdx.x;
         const int request = request_head / n_heads;
@@ -313,18 +325,46 @@ namespace
                 state_rows[local_row] = 0.0f;
         }
 
+        // Source ownership is invariant across causal rows. Preserve the full
+        // signed addition before modulo, then correct a negative remainder.
+        int merged_source_head = 0;
+        size_t merged_key_span = 0, merged_row_stride = 0;
+        if constexpr (Layout == CUDAGDNInputLayout::MergedPostConvolution)
+        {
+            merged_source_head = static_cast<int>(
+                (std::int64_t{h} + global_value_offset) % merged_key_heads);
+            if (merged_source_head < 0)
+                merged_source_head += merged_key_heads;
+            merged_key_span = static_cast<size_t>(merged_key_heads) * D_K;
+            merged_row_stride = 2 * merged_key_span + request_v_stride;
+        }
+
         for (int request_row = 0; request_row < request_seq_len; ++request_row)
         {
             const int flat_row = request * request_seq_len + request_row;
-            const float *q_head =
+            const float *q_head, *k_head, *v_head;
+            if constexpr (Layout == CUDAGDNInputLayout::MergedPostConvolution)
+            {
+                const float *source =
+                    q + static_cast<size_t>(flat_row) * merged_row_stride;
+                q_head = source + static_cast<size_t>(merged_source_head) * D_K;
+                k_head = source + merged_key_span +
+                    static_cast<size_t>(merged_source_head) * D_K;
+                v_head = source + 2 * merged_key_span +
+                    static_cast<size_t>(h) * d_v;
+            }
+            else
+            {
+            q_head =
                 q + static_cast<size_t>(flat_row) * request_qk_stride +
                 static_cast<size_t>(h) * D_K;
-            const float *k_head =
+            k_head =
                 k + static_cast<size_t>(flat_row) * request_qk_stride +
                 static_cast<size_t>(h) * D_K;
-            const float *v_head =
+            v_head =
                 v + static_cast<size_t>(flat_row) * request_v_stride +
                 static_cast<size_t>(h) * d_v;
+            }
             float *o_head =
                 output + static_cast<size_t>(flat_row) * request_v_stride +
                 static_cast<size_t>(h) * d_v;
@@ -503,6 +543,84 @@ namespace
                 S_updated[state_row * d_v + vi] = state_rows[local_row];
             }
         }
+    }
+
+    /**
+     * @brief Retain the original planar kernel symbol and launch geometry.
+     * @tparam D_K Native key width64/128.
+     * @tparam OutOfPlaceState Original alias-sensitive live/speculative state mode.
+     * @details Arguments retain the numeric body's documented geometry,
+     * ownership and exact-stream lifetime. All original callers remain literal.
+     */
+    template <int D_K, bool OutOfPlaceState>
+    __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+    void cuda_gdn_recurrent_step_kernel(
+        const float *__restrict__ q,        // [n_heads * d_k]
+        const float *__restrict__ k,        // [n_heads * d_k]
+        const float *__restrict__ v,        // [n_heads * d_v]
+        const float *__restrict__ alpha,    // [n_heads]
+        const float *__restrict__ beta_raw, // [n_heads]
+        const float *__restrict__ A_log,    // [n_heads]
+        const float *__restrict__ dt_bias,  // [n_heads]
+        float *__restrict__ output,         // [n_heads * d_v]
+        const float *initial_state,
+        float *updated_state,
+        int request_count, int request_seq_len,
+        int n_heads, int d_v,
+        bool use_qk_l2norm,
+        const int *__restrict__ effective_seq_len_ptr,
+        int effective_row_idx,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        cuda_gdn_recurrent_step_body<
+            D_K, OutOfPlaceState, CUDAGDNInputLayout::ExpandedPlanar>(
+            q, k, v, alpha, beta_raw, A_log, dt_bias, output,
+            initial_state, updated_state, request_count, request_seq_len,
+            n_heads, d_v, use_qk_l2norm, effective_seq_len_ptr,
+            effective_row_idx, state_snapshots, snapshot_stride_floats,
+            max_snapshot_rows);
+    }
+
+    /**
+     * @brief Capture one direct merged-input CUDA recurrence transaction.
+     * @tparam D_K Native key width64/128.
+     * @tparam OutOfPlaceState Original alias-sensitive live/speculative state mode.
+     * @details Original numeric-body arguments retain their ownership and
+     * publication semantics. Final scalars bind source Q/K heads and signed
+     * modular offset; the first pointer names the original merged source.
+     */
+    template <int D_K, bool OutOfPlaceState>
+    __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+    void cuda_gdn_merged_recurrent_step_kernel(
+        const float *__restrict__ q,        // [n_heads * d_k]
+        const float *__restrict__ k,        // [n_heads * d_k]
+        const float *__restrict__ v,        // [n_heads * d_v]
+        const float *__restrict__ alpha,    // [n_heads]
+        const float *__restrict__ beta_raw, // [n_heads]
+        const float *__restrict__ A_log,    // [n_heads]
+        const float *__restrict__ dt_bias,  // [n_heads]
+        float *__restrict__ output,         // [n_heads * d_v]
+        const float *initial_state,
+        float *updated_state,
+        int request_count, int request_seq_len,
+        int n_heads, int d_v,
+        bool use_qk_l2norm,
+        const int *__restrict__ effective_seq_len_ptr,
+        int effective_row_idx,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int merged_key_heads, int global_value_offset)
+    {
+        cuda_gdn_recurrent_step_body<
+            D_K, OutOfPlaceState, CUDAGDNInputLayout::MergedPostConvolution>(
+            q, k, v, alpha, beta_raw, A_log, dt_bias, output,
+            initial_state, updated_state, request_count, request_seq_len,
+            n_heads, d_v, use_qk_l2norm, effective_seq_len_ptr,
+            effective_row_idx, state_snapshots, snapshot_stride_floats,
+            max_snapshot_rows, merged_key_heads, global_value_offset);
     }
 
     /**
@@ -2864,3 +2982,72 @@ extern "C"
     }
 
 } // extern "C"
+
+namespace llaminar2::gdn
+{
+    /**
+     * @brief Enqueue ordinary M1 recurrence directly over borrowed merged QKV.
+     * @param p Bound physical input, live/speculative state and snapshot envelope.
+     * @param stream Exact caller-owned non-default CUDA stream.
+     * @return False on invalid immutable admission or native enqueue failure.
+     * @details Caller has already selected the CUDA device and resolved native
+     * state authority. This slice admits one ordinary row only; prefill and
+     * grouped/request-batched entrypoints retain their existing implementations.
+     * No allocation, transfer, synchronization or implicit alternate is used.
+     */
+    bool launchCUDAMergedRecurrence(const MergedRecurrenceInput& p, void* stream)
+    {
+        constexpr auto maximum = std::numeric_limits<int>::max();
+        if (reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            !p.merged || !p.alpha || !p.beta_raw || !p.A_log || !p.dt_bias ||
+            !p.output || !p.initial_state || !p.updated_state ||
+            p.rows.requests() != 1 || p.rows.rowsPerRequest() != 1 ||
+            (p.key_width != 64 && p.key_width != 128) ||
+            !p.sourceOutputDisjoint())
+            return false;
+        const std::int64_t state_floats =
+            std::int64_t{p.value_heads} * p.key_width * p.value_width;
+        if (state_floats > maximum ||
+            (p.snapshots && (p.snapshot_stride_floats < state_floats ||
+                             p.max_snapshot_rows < 1)))
+            return false;
+        const dim3 grid(p.value_heads,
+            1 + (p.value_width - 1) / kGdnRecurrentColumnsPerBlock);
+        const size_t shared_bytes =
+            static_cast<size_t>(2 * p.key_width + 2 * kGdnRecurrentThreads) *
+            sizeof(float);
+        const auto native_stream = static_cast<cudaStream_t>(stream);
+#define LLAMINAR_LAUNCH_CUDA_GDN_MERGED(DK, OUT_OF_PLACE)                    \
+        cuda_gdn_merged_recurrent_step_kernel<DK, OUT_OF_PLACE>              \
+            <<<grid, kGdnRecurrentThreads, shared_bytes, native_stream>>>(     \
+                p.merged, nullptr, nullptr, p.alpha, p.beta_raw, p.A_log,      \
+                p.dt_bias, p.output, p.initial_state, p.updated_state,         \
+                1, 1, p.value_heads, p.value_width, p.use_qk_l2norm,           \
+                p.rows.lengthOwner(), 0, p.snapshots,                        \
+                p.snapshot_stride_floats, p.max_snapshot_rows,               \
+                p.key_heads, p.global_value_offset)
+        if (p.key_width == 64)
+        {
+            if (p.initial_state == p.updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_MERGED(64, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_MERGED(64, true);
+        }
+        else
+        {
+            if (p.initial_state == p.updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_MERGED(128, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_MERGED(128, true);
+        }
+#undef LLAMINAR_LAUNCH_CUDA_GDN_MERGED
+        const auto error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            fprintf(stderr, "[launchCUDAMergedRecurrence] %s\n",
+                cudaGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+}

@@ -61,6 +61,7 @@ public:
         float ropeTheta = 10000.0f;
         std::optional<QwenSparseTransactionPriorBinding> transactionPrior; ///< Original typed replay/tail source in verifier mode.
         qwen4exp::QwenSparsePoolSelection poolSelection = qwen4exp::QwenSparsePoolSelection::Installed; ///< Immutable native selection implementation, sealed into capture identity.
+        qwen4exp::QwenSparseQueryDemand queryDemand = qwen4exp::QwenSparseQueryDemand::AllLive; ///< Original-query authorship, independent of selection arithmetic.
     };
     /** @brief Immutable selected-read cache identity and explicit publication encoding. */
     struct NativeCache

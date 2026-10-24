@@ -9,9 +9,12 @@
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/StageVerifier.h"
 #include "tensors/TensorVerification.h"
+#include "tensors/Tensors.h"
+#include <limits>
 #include "utils/DebugEnv.h"
 
 #include <cstdlib>
+#include <array>
 #include <memory>
 #include <string>
 #include <utility>
@@ -116,6 +119,65 @@ TEST(Test__StageVerifier, TrulyAllZeroOutputStillFailsValidation)
         DeviceId::cpu());
 
     EXPECT_THROW(verifyStageExit(node, 0), verification::VerificationFailure);
+}
+
+/** @brief Host-owned stage exposes the same original work on input and output declarations. */
+class AuthoredQueryStage final : public IComputeStage
+{
+public:
+    /** @brief Retain original publications and numerical storage for all diagnostic borrows. */
+    AuthoredQueryStage():IComputeStage(DeviceId::cpu()),payload_({8,2}),controls_({4}) {
+        auto *c=static_cast<std::int32_t *>(controls_.raw_mutable_data());
+        c[0]=2049;c[1]=4;c[2]=2051;c[3]=2;
+        std::fill_n(payload_.mutable_data(),16,std::numeric_limits<float>::quiet_NaN());
+        for(const int row:{2,3,4,5})for(int col=0;col<2;++col)payload_.mutable_data()[row*2+col]=float(row+col+1);
+    }
+    /** @brief Publish new host-owned original replay coordinates, without altering graph geometry. */
+    void setControls(std::array<std::int32_t,4> values) {
+        std::copy(values.begin(),values.end(),static_cast<std::int32_t *>(controls_.raw_mutable_data()));
+    }
+    /** @brief Corrupt one originally useful value to prove it cannot be skipped. */
+    void poisonUseful() {payload_.mutable_data()[4]=std::numeric_limits<float>::quiet_NaN();}
+    bool execute(IDeviceContext *) override{return true;}
+    ComputeStageType type() const override{return ComputeStageType::MOE_ROUTER;}
+    bool supportsBackend(ComputeBackendType b) const override{return b==ComputeBackendType::CPU;}
+protected:
+    /** @brief Declare original physical shape and per-request borrowed tensor subviews. */
+    StageDumpInfo buildDumpInfoImpl() const override {
+        auto *controls=const_cast<INT32Tensor *>(&controls_);
+        auto *payload=const_cast<FP32Tensor *>(&payload_);
+        const auto *c=static_cast<const std::int32_t *>(controls_.raw_data());
+        const SnapshotAuthoredTokenRows extent{
+            ProjectionRowWork::causalStrided(2,4,c,c+1,2,8192,2051),
+            {{{controls,0},{controls,4},{}},{{controls,8},{controls,12},{}}}};
+        StageDumpInfo dump;
+        dump.inputs.push_back({.name="raw_query",.data=payload_.raw_data(),.rows=8,.cols=2,
+            .dtype="FP32",.element_size=4,.byte_size=64,.tensor=payload,.semantic_extent=extent});
+        dump.outputs.push_back({.name="prepared_query",.data=payload_.raw_data(),.rows=8,.cols=2,
+            .dtype="FP32",.element_size=4,.byte_size=64,.tensor=payload,.semantic_extent=extent});
+        return dump;
+    }
+private:
+    FP32Tensor payload_;
+    INT32Tensor controls_;
+};
+
+/** @test Both entry and exit skip only unauthored poison and reject required or malformed rows. */
+TEST(Test__StageVerifier, AuthoredInputAndOutputUseOriginalRequestIntervals)
+{
+    ScopedValidationEnv env;env.enableStrictOutputValidation();
+    auto stage=std::make_unique<AuthoredQueryStage>();auto *owned=stage.get();
+    ComputeNode node("qsa_query",std::move(stage),DeviceId::cpu());
+    EXPECT_NO_THROW(verifyStageEntry(node,1));
+    EXPECT_NO_THROW(verifyStageExit(node,1));
+    owned->setControls({0,4,2048,3});
+    EXPECT_NO_THROW(verifyStageEntry(node,1));
+    EXPECT_NO_THROW(verifyStageExit(node,1));
+    owned->setControls({2049,4,2051,2});owned->poisonUseful();
+    EXPECT_THROW(verifyStageEntry(node,1),verification::VerificationFailure);
+    EXPECT_THROW(verifyStageExit(node,1),verification::VerificationFailure);
+    owned->setControls({2049,4,8192,1});
+    EXPECT_THROW(verifyStageEntry(node,1),verification::VerificationFailure);
 }
 
 #endif // LLAMINAR_ASSERTIONS_ACTIVE

@@ -4,6 +4,10 @@
  * @author David Sanftenberg
  * @date December 2025
  *
+ * Original input/output declarations retain tensor/subview and publication
+ * ownership. Authored request intervals validate only numerical rows produced by
+ * the current transaction; corrupt native metadata never becomes a valid empty
+ * diagnostic. GPU counts stay native until the existing compact result retires.
  * Extracted from DeviceGraphExecutor.cpp.
  */
 
@@ -94,8 +98,8 @@ namespace llaminar2
         }
 
         /**
-         * @brief Bind an output's authored contiguous axis to its original count owner.
-         * @param buffer Original dump declaration; input buffers retain physical geometry.
+         * @brief Bind an input or output's exact authored axis to its original publication.
+         * @param buffer Original dump declaration, including input query elision intervals.
          * @param gpu Whether the payload's authoritative storage is native GPU memory.
          * @param device Exact stage/metadata device, never inferred from a count value.
          * @return Call-only borrow, valid until this validation transaction retires.
@@ -109,6 +113,10 @@ namespace llaminar2
                 {SnapshotContiguousRowKind::Physical, buffer.rows}, buffer.cols, nullptr};
             if constexpr (requires { buffer.semantic_extent; })
             {
+                if(const auto *authored=std::get_if<SnapshotAuthoredTokenRows>(&buffer.semantic_extent)) {
+                    result.projectionWork=snapshotProjectionWork(*authored,gpu,device);
+                    result.rowSelection=TensorValidationRowSelection::ProjectionWork;return result;
+                }
                 SnapshotInt32Binding binding;
                 std::size_t words = 1;
                 if (const auto *tokens = std::get_if<SnapshotTokenRows>(&buffer.semantic_extent))
@@ -201,7 +209,7 @@ namespace llaminar2
                     return {gpuResultToVerification(buffer.name, result, config), true};
                 }
                 const auto extent = validationExtent(buffer, false, stage.device());
-                const bool authored = extent.geometry.kind != SnapshotContiguousRowKind::Physical;
+                const bool authored = extent.usesProjectionWork() || extent.geometry.kind != SnapshotContiguousRowKind::Physical;
                 const void *data = buffer.data;
                 if (authored)
                 {
@@ -214,6 +222,27 @@ namespace llaminar2
                 }
                 if (!data)
                     throw std::logic_error("Stage buffer exposes a null payload pointer");
+                if(extent.usesProjectionWork()) {
+                    auto total=verification::VerificationResult::ok();
+                    total.tensor_name=bufferName(buffer.name);
+                    auto perRequest=config;perRequest.check_all_zero=false;
+                    for(int request=extent.projectionWork.requestForRow(0);request<=extent.projectionWork.requestForRow(extent.projectionWork.physicalRows()-1);++request) {
+                        const auto span=extent.projectionWork.resolveHost(request);
+                        if(!span.size())continue;
+                        // Retain original physical coordinates; never scan poison
+                        // in a short request's prefix or inactive bucket suffix.
+                        const auto result=verification::verifyRawBuffer(
+                            static_cast<const std::byte *>(data)+static_cast<std::size_t>(span.first)*buffer.cols*buffer.element_size,
+                            static_cast<std::size_t>(span.size()),buffer.cols,bufferName(buffer.name),buffer.dtype,perRequest);
+                        if(!result.passed) return {result,false};
+                        total.nan_count+=result.nan_count;total.inf_count+=result.inf_count;
+                        total.zero_count+=result.zero_count;total.total_sampled+=result.total_sampled;
+                    }
+                    if(config.check_all_zero&&total.total_sampled&&total.zero_count==total.total_sampled)
+                        return {verification::VerificationResult::withDiagnostics(false,bufferName(buffer.name),
+                            "All authored sampled elements are zero",total.nan_count,total.inf_count,total.zero_count,total.total_sampled),false};
+                    return {total,false};
+                }
                 std::int32_t prior = 0, live = 0;
                 auto geometry = extent.geometry;
                 if (geometry.kind == SnapshotContiguousRowKind::StatePrefixRows)

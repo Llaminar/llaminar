@@ -17,6 +17,10 @@
  * serial CUDA decode, independently of numerical CPU reference tolerances.
  * Q6_K source-scale regressions additionally inspect actual packed words and
  * captured source-equation results, including the explicit ROWPAR engines.
+ * Scratchless CPU references create no empty physical-memory resource. Native
+ * quantizer observations use one explicit stream, and retained tensor captures
+ * publish their software capture owner before any producer-event validation.
+ * Exact tile checks authenticate the installed common-generated policy.
  * Explicit floating GDN operand fixtures exercise real half-A/half-B GemmEx
  * with FP32 C/accumulation, pedantic full-FP32 controls, immutable fused-mode
  * rejection and exact complete-M extents on retained changing-input graphs.
@@ -56,6 +60,7 @@
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "config/TensorParallelConfig.h"
+#include "config/GDNHeadAssignment.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
 #include "loaders/ModelContextConfig.h"
@@ -94,6 +99,7 @@
 #include <cstdlib>
 #include <functional>
 #include <initializer_list>
+#include <optional>
 #include <random>
 #include <numeric>
 #include <filesystem>
@@ -129,6 +135,10 @@ extern "C"
     bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
     void cudaNativeVNNIPrefill_setForceTile(int tile_id);
     void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
+    /** @return Whether the exact common-generated production overlay policy is enabled. */
+    bool cudaNativeVNNIPrefill_getExactOverlayEnabled();
+    /** @return Whether the last actual launch consumed its certified exact overlay. */
+    int cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay();
     void cudaNativeVNNIPrefill_getLastLaunchSelection(
         int *tile_id,
         int *k_partitions,
@@ -902,9 +912,13 @@ namespace
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
         if (beta != 0.0f)
             std::memcpy(C_tensor->mutable_data(), C_data, (size_t)M * N * sizeof(float));
-        CPUProjectionTestWorkspace workspace(cpuProjectionTestRequirements(M, {kernel}));
+        const auto requirements=cpuProjectionTestRequirements(M,{kernel});
+        std::optional<CPUProjectionTestWorkspace> workspace;
+        // An empty declaration owns no physical bytes. Construct the admitted
+        // arena only for actual scratch; a zero-byte resource is not a BOM.
+        if(requirements.total_bytes_with_alignment()!=0)workspace.emplace(requirements);
         bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K,
-            transpose_B, alpha, beta, nullptr, nullptr, -1, workspace.get());
+            transpose_B, alpha, beta, nullptr, nullptr, -1, workspace?workspace->get():nullptr);
         if (ok)
             std::memcpy(C_data, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
@@ -1464,8 +1478,8 @@ namespace
      * @brief Configure a loaded Qwen3.6 MoE context for two-way LocalTP slicing.
      *
      * The sharder needs both the schema's weight-sharding annotations and GDN
-     * dimensions.  Fused GDN QKV is asymmetric: Q and K are replicated, while V
-     * is sharded.  Missing any one of these hints changes the physical weight
+     * dimensions. Fused GDN QKV packs each participant's owned key-head
+     * interval with its modulo-linked value heads. Missing any hint changes the physical weight
      * presented to `GDNProjectionStage`, so this helper mirrors the production
      * LocalTP setup before a regression requests per-device weights.
      */
@@ -1513,8 +1527,8 @@ namespace
     /**
      * @brief Configure the dense Qwen3.6 production two-way LocalTP sharder.
      *
-     * Qwen3.6 GDN QKV is not a uniform column slice: Q/K channels are mirrored
-     * while V channels are apportioned.  A synthetic tensor with the resulting
+     * Qwen3.6 GDN QKV packs each participant's key-head interval and all
+     * modulo-linked value heads. A synthetic tensor with the resulting
      * dimensions cannot prove the production slice wrapper, native GGUF block
      * boundaries, or GPU repack.  This helper installs the real dense schema and
      * model dimensions before a regression asks WeightManager for each device's
@@ -1560,6 +1574,19 @@ namespace
         return tp_config;
     }
 
+    /**
+     * @brief Execute the CPU fused reference using its declared participant arena.
+     * @param kernel Prepared CPU down-projection engine.
+     * @param gate_host Original gate matrix with M rows and K columns.
+     * @param up_host Original up matrix with the same row/column layout.
+     * @param C_host Terminal output, also the initial beta addend when requested.
+     * @param M Live reference rows.
+     * @param N Down-projection output columns.
+     * @param K Fused activation input columns.
+     * @param alpha Product multiplier.
+     * @param beta Existing output multiplier.
+     * @return Whether the original fused reference invocation succeeded.
+     */
     bool cpuFusedSwiGLUDownToVector(ITensorGemm *kernel,
                                     const float *gate_host,
                                     const float *up_host,
@@ -1575,9 +1602,16 @@ namespace
         if (beta != 0.0f)
             std::memcpy(C_tensor->mutable_data(), C_host, (size_t)M * N * sizeof(float));
 
+        auto requirements = cpuProjectionTestRequirements(M, {kernel});
+        // The fused input is owned by this invocation's arena; a prepared
+        // weight engine owns no mutable activation scratch between calls.
+        requirements.merge(cpuSwiGLUWorkspaceRequirements(M, K));
+        if (beta != 0.0f)
+            dynamic_cast<IWorkspaceConsumer &>(*kernel).appendOutputAccumulationWorkspaceRequirements(requirements, M, N);
+        CPUProjectionTestWorkspace workspace(requirements);
         bool ok = kernel->multiply_tensor_with_fused_swiglu(
             gate_tensor.get(), up_tensor.get(), C_tensor.get(),
-            M, N, K, alpha, beta);
+            M, N, K, alpha, beta, workspace.get());
         if (ok)
             std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
@@ -2329,6 +2363,9 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
     auto *cuda_kernel = getPreparedKernel(
         weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
+    // Direct tests must admit the same declared cuBLAS/fixed-order arena
+    // that a production stage binds before submitting this prepared engine.
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel,M,N,K));
 
     // Execute CUDA GEMM via tensor coherence
     std::vector<float> C_cuda(M * N, 0.0f);
@@ -2344,6 +2381,7 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
     EXPECT_LE(result.relative_l2_error, 0.01)
         << "Relative L2 error too high: " << (result.relative_l2_error * 100) << "%";
 
+    cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
@@ -2370,11 +2408,15 @@ TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
     auto *cuda_kernel = getPreparedKernel(
         weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
+    // Direct tests must admit the same declared cuBLAS/fixed-order arena
+    // that a production stage binds before submitting this prepared engine.
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel,M,N,K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
     ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 
+    cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
@@ -2401,11 +2443,15 @@ TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
     auto *cuda_kernel = getPreparedKernel(
         weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
+    // Direct tests must admit the same declared cuBLAS/fixed-order arena
+    // that a production stage binds before submitting this prepared engine.
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel,M,N,K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
     ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 
+    cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
@@ -2419,11 +2465,15 @@ TEST_F(Test__CUDAGemmParity, BlockwiseActivationQuantizationProducesExpectedBloc
     int8_t *d_A_int8 = nullptr;
     float *d_scales = nullptr;
 
+    ScopedGPUStream stream_owner(gpu_device_);
+    auto stream=static_cast<cudaStream_t>(stream_owner.get());
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_A, A_data.size() * sizeof(float)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_A_int8, A_data.size() * sizeof(int8_t)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_scales, static_cast<size_t>(M) * (K / 32) * sizeof(float)), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(d_A, A_data.data(), A_data.size() * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_A,A_data.data(),A_data.size()*sizeof(float),cudaMemcpyHostToDevice,stream),cudaSuccess);
+    // The public producer rejects a missing stream before any native enqueue.
+    EXPECT_THROW(cudaQuantGemm_quantizeActivationsBlockwise(d_A,d_A_int8,d_scales,M,K,gpu_device_.ordinal,nullptr),std::invalid_argument);
 
     ASSERT_TRUE(cudaQuantGemm_quantizeActivationsBlockwise(
         d_A,
@@ -2432,13 +2482,14 @@ TEST_F(Test__CUDAGemmParity, BlockwiseActivationQuantizationProducesExpectedBloc
         M,
         K,
         gpu_device_.ordinal,
-        nullptr));
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        stream_owner.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     std::vector<int8_t> quantized(A_data.size(), 0);
     std::vector<float> scales(static_cast<size_t>(M) * (K / 32), 0.0f);
-    ASSERT_EQ(cudaMemcpy(quantized.data(), d_A_int8, quantized.size() * sizeof(int8_t), cudaMemcpyDeviceToHost), cudaSuccess);
-    ASSERT_EQ(cudaMemcpy(scales.data(), d_scales, scales.size() * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(quantized.data(),d_A_int8,quantized.size()*sizeof(int8_t),cudaMemcpyDeviceToHost,stream),cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(scales.data(),d_scales,scales.size()*sizeof(float),cudaMemcpyDeviceToHost,stream),cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream),cudaSuccess);
 
     for (int row = 0; row < M; ++row)
     {
@@ -2468,6 +2519,27 @@ TEST_F(Test__CUDAGemmParity, BlockwiseActivationQuantizationProducesExpectedBloc
             EXPECT_TRUE(saw_nonzero) << "row=" << row << " block=" << block;
         }
     }
+
+    // Independent fixed-word witness, deliberately distinct from ROCm's
+    // half-rounded scale contract. FP32(2.125/127) is 0x3c891224, so -2 maps
+    // to -120. Rounding that scale to half 0x2449 would incorrectly yield -119.
+    // The zero block also pins scale 1 and all-zero quantized bytes.
+    std::vector<float> witness(A_data.size(),0.0f);
+    witness[0]=2.125f;witness[1]=-2.0f;
+    witness[K]=-2.125f;witness[K+1]=2.0f;
+    std::fill_n(witness.begin()+K+32,32,2.125f);
+    std::vector<std::int8_t> expected(quantized.size(),0);
+    expected[0]=127;expected[1]=-120;expected[K]=-127;expected[K+1]=120;
+    std::fill_n(expected.begin()+K+32,32,std::int8_t{127});
+    ASSERT_EQ(cudaMemcpyAsync(d_A,witness.data(),witness.size()*sizeof(float),cudaMemcpyHostToDevice,stream),cudaSuccess);
+    ASSERT_TRUE(cudaQuantGemm_quantizeActivationsBlockwise(d_A,d_A_int8,d_scales,M,K,gpu_device_.ordinal,stream_owner.get()));
+    ASSERT_EQ(cudaMemcpyAsync(quantized.data(),d_A_int8,quantized.size()*sizeof(std::int8_t),cudaMemcpyDeviceToHost,stream),cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(scales.data(),d_scales,scales.size()*sizeof(float),cudaMemcpyDeviceToHost,stream),cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream),cudaSuccess);
+    EXPECT_EQ(quantized,expected);
+    constexpr std::array<std::uint32_t,4> expected_scale_words{0x3c891224u,0x3f800000u,0x3c891224u,0x3c891224u};
+    for(std::size_t i=0;i<expected_scale_words.size();++i)
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(scales[i]),expected_scale_words[i])<<"known block="<<i;
 
     cudaFree(d_scales);
     cudaFree(d_A_int8);
@@ -3116,13 +3188,16 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
         int expected_tile;
     };
     constexpr std::array<OverlayCase, 3> cases = {{
-        {"Q4_1", 3},  // T64x128_w2x4
-        {"Q5_1", 3},  // T64x128_w2x4
-        {"IQ1_S", 2}, // T64x128_w4x2
+        // The immutable common-generated exact overlay supersedes the older
+        // generic-policy witness and selects these certified shape-specific tiles.
+        {"Q4_1", 2},  // Certified T64x128_w4x2.
+        {"Q5_1", 2},  // Certified T64x128_w4x2.
+        {"IQ1_S", 5}, // Certified T128x128_w4x4.
     }};
 
     ScopedCudaPrefillModes modes;
     cudaNativeVNNIPrefill_setBK256Mode(0);
+    ASSERT_TRUE(cudaNativeVNNIPrefill_getExactOverlayEnabled());
 
     const std::vector<float> input =
         randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
@@ -3174,6 +3249,7 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
             &used_bk256,
             &used_canonical_kpart);
         ASSERT_EQ(tile_id, conservative_tile);
+        ASSERT_EQ(cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay(),0);
         ASSERT_EQ(k_partitions, 1);
         ASSERT_EQ(used_bk256, 0);
         ASSERT_EQ(used_canonical_kpart, 0);
@@ -3196,6 +3272,8 @@ TEST_F(Test__CUDAGemmParity, AsymmetricQwen36GDNProjectionUsesProfiledByteExactT
             &k_partitions,
             &used_bk256,
             &used_canonical_kpart);
+        EXPECT_EQ(cudaNativeVNNIPrefill_getLastLaunchUsedExactOverlay(),1)
+            << "Production must consume its certified exact overlay, not a matching generic tile";
         EXPECT_EQ(tile_id, overlay.expected_tile)
             << overlay.format_name << " did not use its profiled production tile";
         EXPECT_EQ(k_partitions, 1);
@@ -3716,8 +3794,8 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
     FP32Tensor C_tensor({static_cast<size_t>(M), static_cast<size_t>(N)});
 
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
-    cudaStream_t stream = nullptr;
-    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    ScopedGPUStream stream_owner(gpu_device_);
+    auto stream=static_cast<cudaStream_t>(stream_owner.get());
 
     ASSERT_TRUE(A_tensor.ensureOnDevice(gpu_device_, stream));
     ASSERT_TRUE(C_tensor.ensureOnDevice(gpu_device_, stream));
@@ -3764,26 +3842,37 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
         << "Regression must exercise persistent canonical K-partition scratch";
     ASSERT_EQ(k_partitions, canonical_k_partitions);
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graph_exec = nullptr;
-
-    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), cudaSuccess);
-    ASSERT_TRUE(cuda_kernel->multiply_tensor(
-        &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
-        gpu_device_.ordinal, workspace_.get()));
-    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
-    ASSERT_NE(graph, nullptr);
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_NE(graph_exec, nullptr);
-
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    // Join the exact external producer before recording. A software capture
+    // owner prevents importing that uncaptured event from inside native capture.
+    TransferEngine::requireDeviceInput(&A_tensor,gpu_device_,stream);
+    TransferEngine::requireDeviceOutput(&C_tensor,gpu_device_,stream);
+    {
+    CUDAGraphCapture graph(stream,gpu_device_.ordinal);
+    {
+        ScopedBackendGraphCapture recording(graph,"canonical K-partition reset fixture");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_TRUE(cuda_kernel->multiply_tensor(
+            &A_tensor,&C_tensor,M,N,K,true,1.0f,0.0f,nullptr,nullptr,
+            gpu_device_.ordinal,workspace_.get()));
+        recording.finish();
+    }
+    // Captured execution must retain the same explicit arithmetic schedule.
+    cudaNativeVNNIPrefill_getLastLaunchSelection(&tile_id,&k_partitions,&used_bk256,&used_canonical_kpart);
+    EXPECT_EQ(tile_id,1);EXPECT_EQ(used_bk256,0);EXPECT_EQ(used_canonical_kpart,1);
+    EXPECT_EQ(k_partitions,canonical_k_partitions);
+    EXPECT_FALSE(isGraphCaptureActive());
+    cudaStreamCaptureStatus status=cudaStreamCaptureStatusActive;
+    ASSERT_EQ(cudaStreamIsCapturing(stream,&status),cudaSuccess);
+    EXPECT_EQ(status,cudaStreamCaptureStatusNone);
+    ASSERT_TRUE(graph.instantiate());
+    ASSERT_TRUE(graph.launch());
+    ASSERT_EQ(cudaStreamSynchronize(stream),cudaSuccess);
 
     cuda_kernel->resetDynamicState();
     EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
         << "resetDynamicState should clear request-scoped stream binding";
 
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess)
+    ASSERT_TRUE(graph.launch())
         << "Captured graph must survive request reset without dangling context scratch";
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
@@ -3809,11 +3898,7 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
     EXPECT_GE(result.cosine_similarity, 0.99)
         << "Cosine similarity too low after graph replay: " << result.cosine_similarity;
 
-    if (graph_exec)
-        cudaGraphExecDestroy(graph_exec);
-    if (graph)
-        cudaGraphDestroy(graph);
-    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    } // Retire executable before workspace and original tensor/stream owners.
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
@@ -4931,9 +5016,9 @@ TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSi
 /**
  * @brief Guard the asymmetric Qwen3.6 dense LocalTP GDN QKV shard at M=2.
  *
- * Two-way LocalTP replicates the GDN Q/K channels and shards the wider V
- * channels.  The resulting rank-local fused QKV tensor has 7168 output rows,
- * a geometry absent from the earlier full-weight `N=10240` regressions.  The
+ * This synthetic regression retains the historical replicated-Q/K 7168-row
+ * geometry as additional numerical coverage. The real-weight regression below
+ * authenticates current linked-head LocalTP ownership instead.  The
  * device-resident request-batch condition graph uses exactly M=2, and its first
  * observed byte drift occurred at this projection.  Exercise the public
  * grouped projection API and independently quantized ordinary M=1 API so the
@@ -5026,6 +5111,15 @@ TEST_F(Test__CUDAGemmParity, RealQwen36DenseLocalTPGDNQKVShardM2MatchesSerialDec
     ASSERT_TRUE(tp_config->validate()) << tp_config->validationError();
 
     constexpr int M = 2;
+    const auto& loader=model_ctx->concreteLoader();
+    const int key_heads=loader.getInt("ssm.group_count",0);
+    const int value_heads=loader.getInt("ssm.time_step_rank",0);
+    const int state_width=loader.getInt("ssm.state_size",0);
+    ASSERT_GT(key_heads,0);ASSERT_GT(value_heads,0);ASSERT_GT(state_width,0);
+    const auto source_shape=loader.getTensorShape("blk.0.attn_qkv.weight");
+    ASSERT_TRUE(source_shape.has_value());ASSERT_EQ(source_shape->size(),2u);
+    ASSERT_EQ((*source_shape)[0],std::size_t(2*key_heads+value_heads)*state_width);
+    ASSERT_EQ((*source_shape)[1],5120u);
     const ModelContextId model_id{36364};
     for (int rank = 0; rank < 2; ++rank)
     {
@@ -5038,8 +5132,19 @@ TEST_F(Test__CUDAGemmParity, RealQwen36DenseLocalTPGDNQKVShardM2MatchesSerialDec
 
         const int N = static_cast<int>(weight->rows());
         const int K = static_cast<int>(weight->cols());
-        ASSERT_EQ(N, 7168) << "rank=" << rank;
-        ASSERT_EQ(K, 5120) << "rank=" << rank;
+        // Use the production geometry authority, not the retired layout
+        // that replicated every Q/K row on each participant. Linked V heads
+        // are packed with their owned Q/K heads before native GPU repacking.
+        const auto& participant=tp_config->forDevice(logical_tp_devices[std::size_t(rank)]);
+        const auto assignment=GDNHeadAssignment::fromPartition(key_heads,value_heads,
+            participant.head_start,participant.head_count,tp_config->totalHeads());
+        ASSERT_EQ(std::size_t(N),assignment.localFusedRows(state_width))<<"rank="<<rank;
+        ASSERT_EQ(K,5120)<<"rank="<<rank;
+        const auto* slice=dynamic_cast<const TensorSlice*>(weight.get());
+        ASSERT_NE(slice,nullptr);EXPECT_TRUE(slice->metadata().inner_is_presliced);
+        EXPECT_EQ(slice->metadata().rank,rank);EXPECT_EQ(slice->metadata().world_size,2);
+        EXPECT_EQ(slice->original_rows(),(*source_shape)[0]);
+        EXPECT_EQ(slice->metadata().original_cols,(*source_shape)[1]);
 
         auto prepared = llaminar2::test::makeGpuPreparedGemm(
             gpuPreparationTensor(weight.get()),
@@ -5285,6 +5390,22 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
     stage.setGPUStream(static_cast<void *>(stream));
     CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+    /** @brief Retire submitted work and borrowed stage/kernel streams on every exit. */
+    struct GdnInvocationRetirement
+    {
+        cudaStream_t stream; ///< Original nonblocking execution/capture stream.
+        GDNProjectionStage &stage; ///< Stage outlives its workspace/stream borrow.
+        std::array<ITensorGemm *, 4> kernels; ///< Prepared engines outlive this guard.
+        /** @brief Drain before prepared sources, staging and tensor operands can destruct. */
+        ~GdnInvocationRetirement()
+        {
+            (void)cudaStreamSynchronize(stream);
+            stage.unbindWorkspace();
+            for (auto *kernel : kernels)
+                kernel->resetDynamicState();
+            (void)cudaStreamDestroy(stream);
+        }
+    } retirement{stream, stage, {kernel_qkv, kernel_z, kernel_alpha, kernel_beta}};
 
     const bool ok = with_gpu_coherence(
         gpu_device_,
@@ -5316,31 +5437,70 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
               cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
-    ASSERT_TRUE(stage.execute(&ctx))
-        << "CUDA GDN projection stage should be graph-capturable with fused qkv+z and alpha+beta subgroups";
-    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
-    ASSERT_NE(graph, nullptr);
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    // Join original external publications before native recording. The
+    // software capture owner validates these exact event/stream generations
+    // rather than importing uncaptured upload events from a capture body.
+    // Prepared floating engines consume immutable RAW_FP pool payloads, not
+    // the original host-only source tensors. Their load pipeline has drained
+    // repack/H2D before returning; authenticate the actual retained resource
+    // without manufacturing a tensor publication or uploading another copy.
+    for (const auto *prepared : {&alpha_prepared, &beta_prepared})
+    {
+        ASSERT_NE(prepared->orchestrator, nullptr);
+        ASSERT_NE(prepared->store, nullptr);
+        ASSERT_EQ(prepared->store->gemmKernel(prepared->ref), prepared->kernel);
+        ASSERT_TRUE(prepared->binding.immutable);
+        ASSERT_NE(prepared->binding.tensor, nullptr);
+        const auto *pool = prepared->orchestrator->getPool(gpu_device_.ordinal);
+        ASSERT_NE(pool, nullptr);
+        ASSERT_TRUE(pool->isAllocated());
+        ASSERT_EQ(pool->deviceId(), gpu_device_.ordinal);
+        const auto slot = pool->getSlot(prepared->binding.identity.canonical_name);
+        ASSERT_TRUE(slot.has_value());
+        ContiguousFloatingPointWeightDescriptor actual;
+        ASSERT_TRUE(prepared->kernel->exportContiguousFloatingPointWeights(actual));
+        ASSERT_TRUE(actual.valid());
+        ASSERT_EQ(actual.data, static_cast<const void *>(slot->d_native_vnni_payload));
+        ASSERT_LE(actual.bytes, slot->payload_bytes);
+        ASSERT_EQ(actual.type, prepared->binding.tensor->native_type());
+        ASSERT_EQ(actual.n, static_cast<int>(prepared->binding.tensor->rows()));
+        ASSERT_EQ(actual.k, static_cast<int>(prepared->binding.tensor->cols()));
+    }
+    TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+    for (auto *output : {output_qkv.get(), output_z.get(), output_alpha.get(), output_beta.get()})
+        TransferEngine::requireDeviceOutput(output, gpu_device_, stream);
+    // Route counters below must be authored by this capture, not its warmup.
+    PerfStatsCollector::reset();
+    CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+    /** @brief Join submitted replay before the retained graph object retires. */
+    struct GdnReplayRetirement
+    {
+        cudaStream_t stream; ///< Exact retained graph submission stream.
+        /** @brief Also retire replay/DMA when a terminal assertion fails. */
+        ~GdnReplayRetirement() { (void)cudaStreamSynchronize(stream); }
+    } replay_retirement{stream};
+    {
+        ScopedBackendGraphCapture recording(graph, "CUDA GDN quantized verifier fused projections");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_TRUE(stage.execute(&ctx))
+            << "CUDA GDN projections must remain graph-native with their original fused subgroups";
+        recording.finish();
+    }
+    ASSERT_GT(graph.nodeCount(), 0u);
+    ASSERT_FALSE(isGraphCaptureActive());
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusActive;
+    ASSERT_EQ(cudaStreamIsCapturing(stream, &status), cudaSuccess);
+    ASSERT_EQ(status, cudaStreamCaptureStatusNone);
+    ASSERT_TRUE(graph.instantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 
     TransferEngine::publishCurrentDeviceWrite(output_qkv, stream);
     TransferEngine::publishCurrentDeviceWrite(output_z, stream);
     TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
     TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
-    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
-
-    stage.unbindWorkspace();
-    workspace_.reset();
-    kernel_qkv->resetDynamicState();
-    kernel_z->resetDynamicState();
-    kernel_alpha->resetDynamicState();
-    kernel_beta->resetDynamicState();
+    // Scoped replay/graph/invocation owners retire in that order, before
+    // prepared weights; the fixture retains its original workspace until then.
 
     const auto route_records = PerfStatsCollector::snapshot({"kernel.gdn_projection_route"});
     const auto qkv_z_route = std::find_if(
@@ -5525,6 +5685,22 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysi
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
     stage.setGPUStream(static_cast<void *>(stream));
     CUDADeviceContext context(gpu_device_, gpu_device_.ordinal);
+    /** @brief Retire submitted work and borrowed stage/kernel streams on every exit. */
+    struct GdnInvocationRetirement
+    {
+        cudaStream_t stream; ///< Original nonblocking execution/capture stream.
+        GDNProjectionStage &stage; ///< Stage outlives its workspace/stream borrow.
+        std::array<ITensorGemm *, 4> kernels; ///< Prepared engines outlive this guard.
+        /** @brief Drain before prepared sources, staging and tensor operands can destruct. */
+        ~GdnInvocationRetirement()
+        {
+            (void)cudaStreamSynchronize(stream);
+            stage.unbindWorkspace();
+            for (auto *kernel : kernels)
+                kernel->resetDynamicState();
+            (void)cudaStreamDestroy(stream);
+        }
+    } retirement{stream, stage, {prepared_qkv.kernel, prepared_z.kernel, prepared_alpha.kernel, prepared_beta.kernel}};
 
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device_,
@@ -5534,14 +5710,62 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysi
         [&] { return stage.execute(&context); }));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
-    ASSERT_TRUE(stage.execute(&context));
-    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
-    ASSERT_NE(graph, nullptr);
-    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    // Join original external publications before native recording. The
+    // software capture owner validates these exact event/stream generations
+    // rather than importing uncaptured upload events from a capture body.
+    // Prepared floating engines consume immutable RAW_FP pool payloads, not
+    // the original host-only source tensors. Their load pipeline has drained
+    // repack/H2D before returning; authenticate the actual retained resource
+    // without manufacturing a tensor publication or uploading another copy.
+    for (const auto *prepared : {&prepared_qkv, &prepared_z, &prepared_alpha, &prepared_beta})
+    {
+        ASSERT_NE(prepared->orchestrator, nullptr);
+        ASSERT_NE(prepared->store, nullptr);
+        ASSERT_EQ(prepared->store->gemmKernel(prepared->ref), prepared->kernel);
+        ASSERT_TRUE(prepared->binding.immutable);
+        ASSERT_NE(prepared->binding.tensor, nullptr);
+        const auto *pool = prepared->orchestrator->getPool(gpu_device_.ordinal);
+        ASSERT_NE(pool, nullptr);
+        ASSERT_TRUE(pool->isAllocated());
+        ASSERT_EQ(pool->deviceId(), gpu_device_.ordinal);
+        const auto slot = pool->getSlot(prepared->binding.identity.canonical_name);
+        ASSERT_TRUE(slot.has_value());
+        ContiguousFloatingPointWeightDescriptor actual;
+        ASSERT_TRUE(prepared->kernel->exportContiguousFloatingPointWeights(actual));
+        ASSERT_TRUE(actual.valid());
+        ASSERT_EQ(actual.data, static_cast<const void *>(slot->d_native_vnni_payload));
+        ASSERT_LE(actual.bytes, slot->payload_bytes);
+        ASSERT_EQ(actual.type, prepared->binding.tensor->native_type());
+        ASSERT_EQ(actual.n, static_cast<int>(prepared->binding.tensor->rows()));
+        ASSERT_EQ(actual.k, static_cast<int>(prepared->binding.tensor->cols()));
+    }
+    TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+    for (auto *output : {output_qkv.get(), output_z.get(), output_alpha.get(), output_beta.get()})
+        TransferEngine::requireDeviceOutput(output, gpu_device_, stream);
+    // Route counters below must be authored by this capture, not its warmup.
+    PerfStatsCollector::reset();
+    CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+    /** @brief Join submitted replay before the retained graph object retires. */
+    struct GdnReplayRetirement
+    {
+        cudaStream_t stream; ///< Exact retained graph submission stream.
+        /** @brief Also retire replay/DMA when a terminal assertion fails. */
+        ~GdnReplayRetirement() { (void)cudaStreamSynchronize(stream); }
+    } replay_retirement{stream};
+    {
+        ScopedBackendGraphCapture recording(graph, "CUDA GDN mixed BF16/FP32 physical subgroups");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_TRUE(stage.execute(&context))
+            << "CUDA GDN projections must remain graph-native with their original fused subgroups";
+        recording.finish();
+    }
+    ASSERT_GT(graph.nodeCount(), 0u);
+    ASSERT_FALSE(isGraphCaptureActive());
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusActive;
+    ASSERT_EQ(cudaStreamIsCapturing(stream, &status), cudaSuccess);
+    ASSERT_EQ(status, cudaStreamCaptureStatusNone);
+    ASSERT_TRUE(graph.instantiate());
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     TransferEngine::publishCurrentDeviceWrite(output_qkv, stream);
@@ -5594,11 +5818,8 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysi
     EXPECT_TRUE(has_pair("qkv+z"));
     EXPECT_TRUE(has_pair("alpha+beta"));
 
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
-    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
-    stage.unbindWorkspace();
-    workspace_.reset();
+    // Scoped replay/graph/invocation owners retire in that order, before
+    // prepared weights; the fixture retains its original workspace until then.
     PerfStatsCollector::reset();
 }
 
@@ -5941,11 +6162,10 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_RuntimeMMatchesSeri
 /**
  * @brief Prove the sharded LocalTP Qwen3.6 MoE GDN projection verifier shape.
  *
- * The LocalTP graph keeps Q/K replicated but shards the GDN value heads, so the
- * production projection dimensions differ from the full single-device MoE
- * shape: QKV is `[6144, 2048]`, Z is `[2048, 2048]`, and alpha/beta are
- * `[16, 2048]`. This regression prevents the grouped verifier implementation
- * from being correct only for the unsharded GDN tensor geometry.
+ * This synthetic historical replicated-Q/K layout retains QKV `[6144,2048]`,
+ * Z `[2048,2048]` and alpha/beta `[16,2048]` as extra numerical coverage.
+ * The real-weight test below derives current linked-head ownership from the
+ * original model metadata and canonical participant assignment.
  */
 TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_RuntimeMMatchesSerialStageRows)
 {
@@ -6130,8 +6350,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_Runtime
  * Qwen3.6 MoE layer-0 GDN projection weights through the LocalTP two-device
  * sharding path:
  *
- * - `attn_qkv.weight`: fused asymmetric Q/K/V, with Q and K replicated and V
- *   sharded.
+ * - `attn_qkv.weight`: owned Q/K heads packed with modulo-linked V heads.
  * - `attn_gate.weight`: Q6_K column-parallel gate/Z projection.
  * - `ssm_alpha.weight` and `ssm_beta.weight`: FP32 column-parallel per-value
  *   head projections.
@@ -6161,10 +6380,18 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
     ASSERT_TRUE(tp_config->validate()) << tp_config->validationError();
 
     constexpr int kK = 2048;
-    constexpr int kNQKV = 6144;
     constexpr int kNZ = 2048;
     constexpr int kNAlpha = 16;
     constexpr int kNBeta = 16;
+    const auto& loader=model_ctx->concreteLoader();
+    const int key_heads=loader.getInt("ssm.group_count",0);
+    const int value_heads=loader.getInt("ssm.time_step_rank",0);
+    const int state_width=loader.getInt("ssm.state_size",0);
+    ASSERT_GT(key_heads,0);ASSERT_GT(value_heads,0);ASSERT_GT(state_width,0);
+    const auto source_shape=loader.getTensorShape("blk.0.attn_qkv.weight");
+    ASSERT_TRUE(source_shape.has_value());ASSERT_EQ(source_shape->size(),2u);
+    ASSERT_EQ((*source_shape)[0],std::size_t(2*key_heads+value_heads)*state_width);
+    ASSERT_EQ((*source_shape)[1],std::size_t(kK));
     const ModelContextId model_id{36363};
 
     struct StageOutputs
@@ -6175,11 +6402,11 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
         std::unique_ptr<FP32Tensor> beta;
     };
 
-    auto make_outputs = [](int rows) -> StageOutputs
+    auto make_outputs = [](int rows,int qkv_width) -> StageOutputs
     {
         return {
             std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNQKV)}),
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(qkv_width)}),
             std::make_unique<FP32Tensor>(
                 std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNZ)}),
             std::make_unique<FP32Tensor>(
@@ -6210,6 +6437,14 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
     for (int rank = 0; rank < 2; ++rank)
     {
         const DeviceId shard_device = logical_tp_devices[static_cast<size_t>(rank)];
+        const auto& participant=tp_config->forDevice(shard_device);
+        const auto assignment=GDNHeadAssignment::fromPartition(key_heads,value_heads,
+            participant.head_start,participant.head_count,tp_config->totalHeads());
+        const int kNQKV=static_cast<int>(assignment.localFusedRows(state_width));
+        ASSERT_GT(kNQKV,0);
+        ASSERT_EQ(std::size_t(kNZ),std::size_t(assignment.localValueHeads())*state_width);
+        ASSERT_EQ(kNAlpha,assignment.localValueHeads());
+        ASSERT_EQ(kNBeta,assignment.localValueHeads());
 
         auto weights_qkv = model_ctx->getWeightForDevice("blk.0.attn_qkv.weight", shard_device);
         auto weights_z = model_ctx->getWeightForDevice("blk.0.attn_gate.weight", shard_device);
@@ -6226,6 +6461,11 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
         ASSERT_EQ(weights_beta->native_type(), TensorType::FP32);
         ASSERT_EQ(weights_qkv->rows(), static_cast<size_t>(kNQKV));
         ASSERT_EQ(weights_qkv->cols(), static_cast<size_t>(kK));
+        const auto* qkv_slice=dynamic_cast<const TensorSlice*>(weights_qkv.get());
+        ASSERT_NE(qkv_slice,nullptr);EXPECT_TRUE(qkv_slice->metadata().inner_is_presliced);
+        EXPECT_EQ(qkv_slice->metadata().rank,rank);EXPECT_EQ(qkv_slice->metadata().world_size,2);
+        EXPECT_EQ(qkv_slice->original_rows(),(*source_shape)[0]);
+        EXPECT_EQ(qkv_slice->metadata().original_cols,(*source_shape)[1]);
         ASSERT_EQ(weights_z->rows(), static_cast<size_t>(kNZ));
         ASSERT_EQ(weights_z->cols(), static_cast<size_t>(kK));
         ASSERT_EQ(weights_alpha->rows(), static_cast<size_t>(kNAlpha));
@@ -6319,12 +6559,12 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
         for (const int M : kGroupedVerifierBoundaryRows)
         {
             const auto input_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(kK));
-            StageOutputs grouped = make_outputs(M);
+            StageOutputs grouped = make_outputs(M,kNQKV);
             run_stage(M, input_data.data(), &grouped);
 
             for (int row = 0; row < M; ++row)
             {
-                StageOutputs serial = make_outputs(1);
+                StageOutputs serial = make_outputs(1,kNQKV);
                 run_stage(
                     1,
                     input_data.data() + static_cast<size_t>(row) * static_cast<size_t>(kK),
@@ -9408,6 +9648,8 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
     const int K = 5120;
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv concurrent_decode("LLAMINAR_CUDA_CONCURRENT_DECODE","1");
+    ASSERT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
     PerfStatsCollector::reset();
 
     auto weights_gate = TestTensorFactory::createQ4_KRandom(
@@ -9612,23 +9854,22 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_ProductionM1UsesCanonicalDecod
         up_m1->data(),
         static_cast<size_t>(N));
 
-    const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_decode_calls"});
-    uint64_t canonical_m1 = 0;
-    for (const auto &record : route_records)
-    {
-        if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_m1_canonical_decode_calls" &&
-            record.kind == PerfStatRecord::Kind::Counter &&
-            record.tags.at("codebook") == "5" &&
-            record.tags.at("n") == std::to_string(N) &&
-            record.tags.at("k") == std::to_string(K))
+    // Production M1 uses the persistent side-stream transaction. Its raw
+    // native M1 launcher keeps canonical math, but bypasses the sequential
+    // adapter's per-projection counter. Authenticate the actual production
+    // route, while the byte checks above prove its arithmetic matches grouped.
+    const auto route_records=PerfStatsCollector::snapshot({"kernel.cuda_fused_projection_stream_pool_calls"});
+    std::uint64_t concurrent_m1=0;
+    for(const auto& record:route_records)
+        if(record.domain=="kernel" && record.name=="cuda_fused_projection_stream_pool_calls" &&
+            record.kind==PerfStatRecord::Kind::Counter && record.device=="cuda:"+std::to_string(gpu_device_.ordinal))
         {
-            canonical_m1 += record.count;
+            EXPECT_EQ(record.tags.at("mode"),"decode");EXPECT_EQ(record.tags.at("m"),"1");
+            EXPECT_EQ(record.tags.at("k"),std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"),"2");EXPECT_EQ(record.tags.at("streams"),"2");
+            concurrent_m1+=record.count;
         }
-    }
-    EXPECT_EQ(canonical_m1, 2u)
-        << "Production M=1 gate/up must route through canonical decode GEMV";
+    EXPECT_EQ(concurrent_m1,1u)<<"Production M1 must execute exactly one two-stream native transaction";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
     cuda_gate->clearGPUStreamBinding();
@@ -9647,6 +9888,8 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_ProductionM1UsesCanonicalDecod
     const int K = 5120;
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv concurrent_decode("LLAMINAR_CUDA_CONCURRENT_DECODE","1");
+    ASSERT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
     PerfStatsCollector::reset();
 
     auto weights_gate = TestTensorFactory::createQ5_KRandom(
@@ -9723,23 +9966,22 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_ProductionM1UsesCanonicalDecod
         up_m1->data(),
         static_cast<size_t>(N));
 
-    const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_decode_calls"});
-    uint64_t canonical_m1 = 0;
-    for (const auto &record : route_records)
-    {
-        if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_m1_canonical_decode_calls" &&
-            record.kind == PerfStatRecord::Kind::Counter &&
-            record.tags.at("codebook") == "7" &&
-            record.tags.at("n") == std::to_string(N) &&
-            record.tags.at("k") == std::to_string(K))
+    // Production M1 uses the persistent side-stream transaction. Its raw
+    // native M1 launcher keeps canonical math, but bypasses the sequential
+    // adapter's per-projection counter. Authenticate the actual production
+    // route, while the byte checks above prove its arithmetic matches grouped.
+    const auto route_records=PerfStatsCollector::snapshot({"kernel.cuda_fused_projection_stream_pool_calls"});
+    std::uint64_t concurrent_m1=0;
+    for(const auto& record:route_records)
+        if(record.domain=="kernel" && record.name=="cuda_fused_projection_stream_pool_calls" &&
+            record.kind==PerfStatRecord::Kind::Counter && record.device=="cuda:"+std::to_string(gpu_device_.ordinal))
         {
-            canonical_m1 += record.count;
+            EXPECT_EQ(record.tags.at("mode"),"decode");EXPECT_EQ(record.tags.at("m"),"1");
+            EXPECT_EQ(record.tags.at("k"),std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"),"2");EXPECT_EQ(record.tags.at("streams"),"2");
+            concurrent_m1+=record.count;
         }
-    }
-    EXPECT_EQ(canonical_m1, 2u)
-        << "Production M=1 Q5_K gate/up must route through canonical decode GEMV";
+    EXPECT_EQ(concurrent_m1,1u)<<"Production M1 must execute exactly one two-stream native transaction";
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
     cuda_gate->clearGPUStreamBinding();
@@ -10414,61 +10656,48 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
  * Tests vocabulary projection (LM head) which is the final layer.
  * Shape: [vocab_size, hidden_dim] = [151936, 896] for Qwen2.5
  */
-TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
+/**
+ * @test Compare the model's actual native LM-head format on CPU and CUDA.
+ * @details A model's headline quantization does not constrain output.weight.
+ * Preserve its stored format and compare the original full vocabulary output;
+ * a different native format is coverage, never a reason to skip this test.
+ */
+TEST_F(Test__CUDAGemmParity, RealModel_NativeLMHead)
 {
-    if (!std::filesystem::exists(REAL_MODEL_PATH))
-    {
-        GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
-    }
-
+    ASSERT_TRUE(std::filesystem::exists(REAL_MODEL_PATH))
+        << "The model fixture must provide " << REAL_MODEL_PATH;
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
     ModelLoader loader(&factory);
-
-    if (!loader.loadModel(REAL_MODEL_PATH))
-    {
-        GTEST_SKIP() << "Failed to load model: " << REAL_MODEL_PATH;
-    }
-
+    ASSERT_TRUE(loader.loadModel(REAL_MODEL_PATH));
     auto weights = loader.loadTensor("output.weight", DeviceId::cpu());
-    ASSERT_NE(weights, nullptr) << "Failed to load output.weight (LM head)";
-
-    auto *q4_tensor = dynamic_cast<Q4_0Tensor *>(weights.get());
-    if (!q4_tensor)
-    {
-        // LM head might be in a different format (e.g., FP32/FP16)
-        std::cout << "LM head is not Q4_0, tensor type: "
-                  << static_cast<int>(weights->native_type()) << "\n";
-        GTEST_SKIP() << "LM head is not Q4_0 format";
-    }
-
-    const int M = 2;                                       // Smaller batch for large vocab
-    const int N = static_cast<int>(q4_tensor->shape()[0]); // vocab_size
-    const int K = static_cast<int>(q4_tensor->shape()[1]); // hidden_dim
-
-    std::cout << "Real model LM head weight: " << N << "x" << K << " (Q4_0)\n";
-
-    auto A_data = randomFP32(M * K);
-
-    // CPU
-    std::vector<float> C_cpu(M * N, 0.0f);
+    ASSERT_NE(weights, nullptr);
+    ASSERT_EQ(weights->shape().size(), 2u);
+    const auto original_type = weights->native_type();
+    const int M = 2;
+    const int N = static_cast<int>(weights->shape()[0]);
+    const int K = static_cast<int>(weights->shape()[1]);
+    ASSERT_EQ(static_cast<size_t>(N), loader.vocabSize());
+    ASSERT_EQ(static_cast<size_t>(K), loader.embeddingLength());
+    const auto input = randomFP32(static_cast<size_t>(M) * K);
+    std::vector<float> cpu_output(static_cast<size_t>(M) * N, 0.0f);
+    std::vector<float> cuda_output(cpu_output.size(), 0.0f);
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CPU);
-    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
-
-    // CUDA
-    ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto *cuda_kernel = getPreparedKernel(
-        q4_tensor, gpu_device_);
-
-    // Set up workspace for quantized kernel
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), input.data(), cpu_output.data(), M, N, K));
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
-
-    float *d_A, *d_C;
-    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
-
-    // Clean up cache entry while tensor is still alive
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, input.data(), cuda_output.data(), M, N, K, gpu_device_));
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive());
+    EXPECT_EQ(weights->native_type(), original_type);
+    const auto parity = checkParity(cuda_output.data(), cpu_output.data(), cpu_output.size(), 0.99, 0.15);
+    parity.print("Real model native LM head");
+    EXPECT_FALSE(parity.has_nan_inf);
+    EXPECT_GE(parity.cosine_similarity, 0.99);
+    EXPECT_LE(parity.relative_l2_error, 0.15);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
@@ -10523,9 +10752,10 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
         q4_tensor, KernelDeviceType::CPU);
     ASSERT_NE(cpu_kernel, nullptr);
+    CPUProjectionTestWorkspace cpu_workspace(cpuProjectionTestRequirements(M, {cpu_kernel.get()}));
     ASSERT_TRUE(cpu_kernel->multiply_tensor(
         input_tensor.get(), output_cpu.get(),
-        M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1));
+        M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1, cpu_workspace.get()));
 
     // ===== CUDA: multiply_tensor() =====
     // First ensure weights are on GPU

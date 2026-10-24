@@ -3821,7 +3821,29 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             "VerifierRowsExecutionRoute::GroupedFullKWideRows",
             source,
         )
-        self.assertIn("const int row_tile_count = (M + 3) / 4", source)
+        # The generated policy still consumes physical M. Ordinary work keeps
+        # ceil(M/4), now expressed without M+3 overflow by the shared row grid.
+        # Explicit request work adds only request-aligned holes/suffixes; it must
+        # retain four-row reuse in one workshare rather than serialize requests.
+        grid_begin = source.index("class CPUProjectionRowGrid final")
+        grid_end = source.index("int physical_;", grid_begin)
+        grid = re.sub(r"\s+", "", source[grid_begin:grid_end])
+        self.assertIn(
+            "returnwork_?work_->requests()*((work_->rowsPerRequest()-1)/width+1):"
+            "(physical_-1)/width+1;",
+            grid,
+        )
+        self.assertIn("const CPUProjectionRowGrid row_grid(M,work);", source)
+        self.assertRegex(
+            source,
+            r"(?s)if \(schedule\.route ==\s*"
+            r"VerifierRowsExecutionRoute::GroupedFullKWideRows\)\s*\{"
+            r".{0,1024}?const int row_tile_count = row_grid\.tiles\(4\);",
+        )
+        self.assertIn("const int total_four_row_tasks = row_tile_count * total_blocks;", source)
+        self.assertIn("const auto span=row_grid.tileSpan(row_tile,4);", source)
+        self.assertIn("if(span.size()==0)continue;", source)
+        self.assertIn("const int first_row=span.first,tile_rows=span.size();", source)
         self.assertNotIn("policy_tile_rows", source)
         self.assertNotIn("M > 4 && resolve_generated_policy", source)
         self.assertIn(

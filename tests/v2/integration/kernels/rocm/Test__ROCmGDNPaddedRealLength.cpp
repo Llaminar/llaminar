@@ -4320,5 +4320,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceAdditiveEpsilonNearZeroCaptured)
 
 #include "ROCmGDNPairedNormalizationTest.h"
 #include "ROCmGDNPairedNormalizationPerf.h"
+#include "ROCmGDNMergedTrial.h"
+#include "ROCmGDNMergedExtendedTrial.h"
 
 #endif

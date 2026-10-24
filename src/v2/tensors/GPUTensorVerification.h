@@ -15,6 +15,7 @@
 #pragma once
 
 #include "../snapshots/SnapshotContiguousRows.h"
+#include "../kernels/common/ProjectionRowWork.h"
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -63,6 +64,9 @@ namespace llaminar2
         FP16,
     };
 
+    /** @brief Closed native validation row-authority selection, fixed before launch. */
+    enum class TensorValidationRowSelection : std::uint8_t {Contiguous,ProjectionWork};
+
     /**
      * @brief Borrow of the original native frontier for one validation transaction.
      *
@@ -77,6 +81,13 @@ namespace llaminar2
         SnapshotContiguousRowGeometry geometry;
         std::size_t columns = 1;
         const std::int32_t *frontier = nullptr;
+        TensorValidationRowSelection rowSelection=TensorValidationRowSelection::Contiguous;
+        /** @brief Test only immutable row-authority selection, never a count value. */
+#if defined(__CUDACC__) || defined(__HIPCC__)
+        __host__ __device__
+#endif
+        bool usesProjectionWork() const noexcept {return rowSelection==TensorValidationRowSelection::ProjectionWork;}
+        ProjectionRowWork projectionWork=ProjectionRowWork::fromPrefix(DeviceRowRange::fullyActive(1));
     };
 
     /**
@@ -94,6 +105,12 @@ namespace llaminar2
         TensorValidationExtent extent, TensorValidationDataType data_type)
     {
         const auto &geometry = extent.geometry;
+        if(extent.rowSelection!=TensorValidationRowSelection::Contiguous&&
+           extent.rowSelection!=TensorValidationRowSelection::ProjectionWork)
+            throw std::invalid_argument("Tensor validation has an unknown row authority");
+        if(extent.usesProjectionWork()&&(extent.frontier||geometry.kind!=SnapshotContiguousRowKind::Physical||
+           geometry.capacity>static_cast<std::size_t>(INT32_MAX)||extent.projectionWork.physicalRows()!=static_cast<int>(geometry.capacity)))
+            throw std::invalid_argument("Tensor validation projection work disagrees with source coordinates");
         if (!geometry.capacity || !extent.columns ||
             geometry.capacity > UINT32_MAX / extent.columns)
             throw std::invalid_argument("Tensor validation diagnostic extent exceeds positive UINT32 counters");
@@ -147,7 +164,7 @@ namespace llaminar2
             ExplicitGPUStream producer_stream) = 0;
 
         /**
-         * @brief Validate only authored contiguous rows, acquiring counts natively.
+         * @brief Validate only authored rows, acquiring original request counts natively.
          * @param device_ptr Original non-null, bounded output subview.
          * @param extent Frozen physical geometry and authenticated native frontier.
          * @param data_type Exact native floating-point representation.

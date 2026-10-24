@@ -48,6 +48,27 @@ __device__ __forceinline__ void invalid()
 __global__ __launch_bounds__(256,2) void captureMetadata(DiagnosticSnapshotCopyArgs a)
 {
     const auto &g=a.geometry;
+    if(g.kind==DiagnosticSnapshotCopyKind::AuthoredTokenRows)
+    {
+        if(threadIdx.x==0) {
+            auto *records=reinterpret_cast<SnapshotAuthoredTokenRowRecord *>(a.metadata+1);
+            const auto id=a.work.captureIdentity();
+            std::uint64_t rows=0;
+            for(int record=0;record<g.requests;++record) {
+                const int request=snapshotProjectionFirstRequest(a.work)+record;
+                const auto observed=a.work.observeDevice(request);
+                const auto span=observed.span;
+                records[record]={observed.frontier,observed.live,
+                    request*id.logical_rows*id.repeats_per_row-id.first_physical_row,
+                    id.logical_rows,id.source_capacity,id.first_required_logical_row,span.first,span.end,
+                    observed.live==0||static_cast<std::int64_t>(observed.frontier)+observed.live<=id.first_required_logical_row
+                        ?SnapshotEmptyReason::RankingNotRequired:SnapshotEmptyReason::None,0,rows};
+                rows+=static_cast<unsigned>(span.size());
+            }
+            *a.metadata={0,static_cast<std::int32_t>(rows),rows*static_cast<unsigned>(g.columns)*g.elementBytes};
+        }
+        return;
+    }
     if(g.kind!=DiagnosticSnapshotCopyKind::CountedSelectionRows)
     {
         if(threadIdx.x==0)
@@ -111,6 +132,22 @@ __global__ __launch_bounds__(256,2) void copyAuthoredPayload(DiagnosticSnapshotC
     const auto stride=static_cast<std::uint64_t>(gridDim.x)*256;
     const auto *source=static_cast<const std::uint32_t *>(a.source);
     auto *destination=static_cast<std::uint32_t *>(a.destination);
+    if(g.kind==DiagnosticSnapshotCopyKind::AuthoredTokenRows)
+    {
+        const auto *records=reinterpret_cast<const SnapshotAuthoredTokenRowRecord *>(a.metadata+1);
+        const auto rowWords=static_cast<std::uint64_t>(g.columns)*(g.elementBytes/4);
+        const auto capacityWords=static_cast<std::uint64_t>(g.rows)*rowWords;
+        for(auto word=first;word<capacityWords;word+=stride) {
+            const int row=static_cast<int>(word/rowWords);
+            const int request=a.work.requestForRow(row);
+            const auto &r=records[request-snapshotProjectionFirstRequest(a.work)];
+            // Inactive cells are skipped before source access; packed rows
+            // retain their original coordinate only in acquired provenance.
+            if(row>=r.firstRow&&row<r.endRow)
+                destination[(r.payloadRowOffset+row-r.firstRow)*rowWords+word%rowWords]=source[word];
+        }
+        return;
+    }
     if(g.kind!=DiagnosticSnapshotCopyKind::CountedSelectionRows)
     {
         const auto words=a.metadata->payloadBytes/4;

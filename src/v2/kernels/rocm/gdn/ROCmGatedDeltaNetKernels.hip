@@ -35,8 +35,11 @@
 #include <stdexcept>
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
+#include "kernels/gdn/GDNMergedRecurrence.h"
 
 namespace {
+
+
 
 const char *memory_type_name(hipMemoryType type)
 {
@@ -129,11 +132,34 @@ enum class GdnPrefillSnapshots
  *             specialization before capture so register extent and occupancy
  *             are fixed properties of the captured launch.
  */
-template <int D_K>
-// HIP's second bound is waves per execution unit, not CUDA blocks per SM.
-// Preserve the original two-wave register constraint when shrinking the CTA.
-__global__ __launch_bounds__(kGdnRecurrentThreads, 2)
-void rocm_gdn_recurrent_step_kernel(
+/** @brief Compile-time physical input coordinates; arithmetic policy is independent. */
+enum class GDNRecurrentInputLayout { ExpandedPlanar, MergedPostConvolution };
+/**
+ * @brief One original raw recurrence body over explicit planar or merged coordinates.
+ * @tparam D_K Original64/128 key width.
+ * @tparam Layout Explicit physical planar or merged input coordinates.
+ * @param q,k,v Original planar inputs, or merged QKV in q for explicit merged layout.
+ * @param alpha,beta_raw Original projected gates without preparation or changed rounding.
+ * @param A_log,dt_bias Original local-head gate parameters.
+ * @param output Original physical row-major output plane.
+ * @param initial_state,updated_state Borrowed initial and exclusive terminal state banks.
+ * @param request_count,request_seq_len Original request-major physical row geometry.
+ * @param n_heads,d_v Original local head and value width dimensions.
+ * @param use_qk_l2norm Original raw normalization policy.
+ * @param effective_seq_len_ptr Borrowed per-request device live lengths, or fully active.
+ * @param effective_row_idx Original row offset for a serial diagnostic slice.
+ * @param state_snapshots Optional exclusive physical snapshot bank.
+ * @param snapshot_stride_floats Original per-row snapshot stride.
+ * @param max_snapshot_rows Admitted physical snapshot row capacity.
+ * @param merged_key_heads Merged source head count; unused for planar layout.
+ * @param global_value_offset Signed modular head coordinate; unused for planar layout.
+ * @details Both physical layouts retain literal original raw gate/normalization,
+ * state arithmetic and snapshot/publication ordering.
+ */
+template <int D_K,
+          GDNRecurrentInputLayout Layout = GDNRecurrentInputLayout::ExpandedPlanar>
+__device__ __forceinline__
+void rocm_gdn_recurrent_step_body(
     const float *__restrict__ q,
     const float *__restrict__ k,
     const float *__restrict__ v,
@@ -151,7 +177,8 @@ void rocm_gdn_recurrent_step_kernel(
     int effective_row_idx,
     float *__restrict__ state_snapshots,
     int snapshot_stride_floats,
-    int max_snapshot_rows)
+    int max_snapshot_rows,
+    int merged_key_heads = 0, int global_value_offset = 0)
 {
     const int request_head = blockIdx.x;
     const int request = request_head / n_heads;
@@ -168,6 +195,9 @@ void rocm_gdn_recurrent_step_kernel(
         kRowsPerSplit - kRegisterRowsPerSplit;
 
     const int tid = threadIdx.x;
+    // Original128-thread column/split mapping is identical for both layouts.
+    static_assert(kGdnRecurrentRowSplit == 4);
+    static_assert(64 % kGdnRecurrentRowSplit == 0);
     const int split_id = tid / kGdnRecurrentColumnsPerBlock;
     const int col_in_block = tid % kGdnRecurrentColumnsPerBlock;
     const int vi =
@@ -244,18 +274,46 @@ void rocm_gdn_recurrent_step_kernel(
     }
     __syncthreads();
 
+    // Merged coordinates are invariant across this request's live rows.
+    int merged_source_head = 0;
+    std::size_t merged_key_span = 0, merged_row_stride = 0;
+    if constexpr (Layout == GDNRecurrentInputLayout::MergedPostConvolution)
+    {
+        merged_source_head = static_cast<int>((std::int64_t{h} + global_value_offset) % merged_key_heads);
+        if (merged_source_head < 0) merged_source_head += merged_key_heads;
+        merged_key_span = std::size_t(merged_key_heads) * D_K;
+        merged_row_stride = 2 * merged_key_span + row_v_stride;
+    }
     for (int request_row = 0; request_row < request_seq_len; ++request_row)
     {
         const int flat_row = request * request_seq_len + request_row;
-        const float *q_head =
+        const float *q_head, *k_head, *v_head;
+        if constexpr (Layout == GDNRecurrentInputLayout::MergedPostConvolution)
+        {
+
+            // Match gdnDeinterleaveLiveRows positive modulo using64-bit addition.
+            // Admission reuses its exact INT32 physical extent proof. Values
+            // retain original request/row/head coordinates, including holes.
+            const auto source_head = merged_source_head;
+            const auto key_span = merged_key_span;
+            const auto merged_stride = merged_row_stride;
+            const float *source = q + std::size_t(flat_row) * merged_stride;
+            q_head = source + std::size_t(source_head) * D_K;
+            k_head = source + key_span + std::size_t(source_head) * D_K;
+            v_head = source + 2 * key_span + std::size_t(h) * d_v;
+        }
+        else
+        {
+        q_head =
             q + static_cast<size_t>(flat_row) * row_qk_stride +
             static_cast<size_t>(h) * D_K;
-        const float *k_head =
+        k_head =
             k + static_cast<size_t>(flat_row) * row_qk_stride +
             static_cast<size_t>(h) * D_K;
-        const float *v_head =
+        v_head =
             v + static_cast<size_t>(flat_row) * row_v_stride +
             static_cast<size_t>(h) * d_v;
+        }
         float *o_head =
             output + static_cast<size_t>(flat_row) * row_v_stride +
             static_cast<size_t>(h) * d_v;
@@ -270,6 +328,7 @@ void rocm_gdn_recurrent_step_kernel(
             continue;
         }
 
+
         // Original norm lanes0..127 retain their input and physical wave64 rank.
         // The two absent historical waves are published as exact +0 below.
         for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
@@ -277,7 +336,9 @@ void rocm_gdn_recurrent_step_kernel(
             q_local[i] = q_head[i];
             k_local[i] = k_head[i];
         }
+
         __syncthreads();
+
 
         if (use_qk_l2norm)
         {
@@ -343,17 +404,21 @@ void rocm_gdn_recurrent_step_kernel(
             __syncthreads();
         }
 
+
+
         if (tid == 0)
         {
             const size_t gate_index =
                 static_cast<size_t>(flat_row) *
                     static_cast<size_t>(n_heads) +
                 h;
+
             const float x = alpha[gate_index] + dt_bias[h];
             const float sp = (x > 20.0f) ? x : log1pf(expf(x));
             wave_sums[0] = expf(A_log[h] * sp);
             wave_sums[1] =
                 1.0f / (1.0f + expf(-beta_raw[gate_index]));
+
         }
         __syncthreads();
         const float decay = wave_sums[0];
@@ -375,8 +440,9 @@ void rocm_gdn_recurrent_step_kernel(
                  ++local_row)
             {
                 const int state_row = row_begin + local_row;
+                const int qk_row = state_row;
                 state_rows[local_row] *= decay;
-                partial_kv += state_rows[local_row] * k_local[state_row];
+                partial_kv += state_rows[local_row] * k_local[qk_row];
             }
 #pragma clang loop unroll(disable)
             for (int tail_row = 0;
@@ -387,25 +453,30 @@ void rocm_gdn_recurrent_step_kernel(
                     row_begin + kRegisterRowsPerSplit + tail_row;
                 const int lds_index =
                     tail_row * kGdnRecurrentThreads + tid;
+                const int qk_row = state_row;
                 const float s_decayed = state_tail[lds_index] * decay;
                 state_tail[lds_index] = s_decayed;
-                partial_kv += s_decayed * k_local[state_row];
+                partial_kv += s_decayed * k_local[qk_row];
             }
         }
+
         reduce_kv[tid] = partial_kv;
         __syncthreads();
+
 
         // The split reduction order is fixed and shared with M=1 decode.
         float delta = 0.0f;
         if (vi < d_v)
         {
             float kv = 0.0f;
+
             for (int split = 0; split < kGdnRecurrentRowSplit; ++split)
             {
                 kv += reduce_kv[
                     col_in_block +
                     split * kGdnRecurrentColumnsPerBlock];
             }
+
             delta = (v_head[vi] - kv) * beta_h;
         }
 
@@ -426,13 +497,14 @@ void rocm_gdn_recurrent_step_kernel(
                  ++local_row)
             {
                 const int state_row = row_begin + local_row;
+                const int qk_row = state_row;
                 const float s_new =
                     state_rows[local_row] +
-                    k_local[state_row] * delta;
+                    k_local[qk_row] * delta;
                 state_rows[local_row] = s_new;
                 if (snapshot)
                     snapshot[state_row * d_v + vi] = s_new;
-                partial_out += s_new * q_local[state_row];
+                partial_out += s_new * q_local[qk_row];
             }
 #pragma clang loop unroll(disable)
             for (int tail_row = 0;
@@ -443,15 +515,17 @@ void rocm_gdn_recurrent_step_kernel(
                     row_begin + kRegisterRowsPerSplit + tail_row;
                 const int lds_index =
                     tail_row * kGdnRecurrentThreads + tid;
+                const int qk_row = state_row;
                 const float s_new =
                     state_tail[lds_index] +
-                    k_local[state_row] * delta;
+                    k_local[qk_row] * delta;
                 state_tail[lds_index] = s_new;
                 if (snapshot)
                     snapshot[state_row * d_v + vi] = s_new;
-                partial_out += s_new * q_local[state_row];
+                partial_out += s_new * q_local[qk_row];
             }
         }
+
         reduce_out[tid] = partial_out;
         __syncthreads();
 
@@ -467,7 +541,11 @@ void rocm_gdn_recurrent_step_kernel(
             o_head[vi] = out_vi;
         }
 
+
         // Shared rows and reduction slots belong to exactly one causal row.
+        // Prepared waves may finish at different times: retain this CTA edge
+        // before the next row overwrites Q/K and gate words still being read.
+        // State-tail words remain exclusively lane-owned for the entire CTA.
         __syncthreads();
     }
 
@@ -494,6 +572,77 @@ void rocm_gdn_recurrent_step_kernel(
         }
     }
 }
+/** @brief Enqueue-equivalent kernel boundary over the single literal recurrence body.
+ * @tparam D_K Admitted64/128 key width. The original raw symbol remains unchanged.
+ * @details All pointer/geometry arguments retain the body's documented lifetime;
+ * merged entry changes only physical input addresses, never arithmetic.
+ */
+template <int D_K>
+__global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+void rocm_gdn_recurrent_step_kernel(
+    const float *__restrict__ q,
+    const float *__restrict__ k,
+    const float *__restrict__ v,
+    const float *__restrict__ alpha,
+    const float *__restrict__ beta_raw,
+    const float *__restrict__ A_log,
+    const float *__restrict__ dt_bias,
+    float *__restrict__ output,
+    const float *initial_state,
+    float *updated_state,
+    int request_count, int request_seq_len,
+    int n_heads, int d_v,
+    bool use_qk_l2norm,
+    const int *__restrict__ effective_seq_len_ptr,
+    int effective_row_idx,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows)
+{
+    rocm_gdn_recurrent_step_body<D_K>(q, k, v, alpha, beta_raw, A_log, dt_bias, output,
+        initial_state, updated_state, request_count, request_seq_len,
+        n_heads, d_v, use_qk_l2norm, effective_seq_len_ptr, effective_row_idx,
+        state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+}
+
+/**
+ * @brief Explicit merged-post-convolution entry, with original raw arithmetic.
+ * @tparam D_K Admitted key width64/128.
+ * @details First pointer names merged rows; unused K/V slots are null. Remaining
+ * original arguments retain raw recurrence order, lifetime and state semantics.
+ * Final scalars name source key-head count and signed global modular offset.
+ */
+template <int D_K>
+__global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+void rocm_gdn_merged_recurrent_step_kernel(
+    const float *__restrict__ q,
+    const float *__restrict__ k,
+    const float *__restrict__ v,
+    const float *__restrict__ alpha,
+    const float *__restrict__ beta_raw,
+    const float *__restrict__ A_log,
+    const float *__restrict__ dt_bias,
+    float *__restrict__ output,
+    const float *initial_state,
+    float *updated_state,
+    int request_count, int request_seq_len,
+    int n_heads, int d_v,
+    bool use_qk_l2norm,
+    const int *__restrict__ effective_seq_len_ptr,
+    int effective_row_idx,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int merged_key_heads, int global_value_offset)
+{
+    rocm_gdn_recurrent_step_body<D_K, GDNRecurrentInputLayout::MergedPostConvolution>(q, k, v, alpha, beta_raw, A_log, dt_bias, output,
+        initial_state, updated_state, request_count, request_seq_len,
+        n_heads, d_v, use_qk_l2norm, effective_seq_len_ptr, effective_row_idx,
+        state_snapshots, snapshot_stride_floats, max_snapshot_rows, merged_key_heads, global_value_offset);
+}
+
+
+
 
 /**
  * @brief Launch one fixed HIP recurrence specialization for graph capture.
@@ -581,6 +730,8 @@ bool launch_rocm_gdn_recurrent_step(
     }
     return true;
 }
+
+
 
 // =========================================================================
 // Prefill Recurrence Kernel (seq_len>1, register-cached state)
@@ -3462,3 +3613,48 @@ bool rocmGDN_q_gate_split(
 }
 
 } // extern "C"
+
+
+
+
+namespace llaminar2::gdn
+{
+/**
+ * @brief Submit original raw recurrence directly over admitted merged QKV rows.
+ * @param p Frozen original row/shape/offset and borrowed immutable native inputs.
+ * @param stream Exact caller-owned stream retained through graph retirement.
+ * @return False on invalid admission or failed native enqueue; no layout copy.
+ * @details Existing deinterleave extent validation proves original physical
+ * indexing. No plane, gate, workspace, transfer, or graph topology is allocated.
+ */
+bool launchROCmMergedRecurrence(const MergedRecurrenceInput& p, void* stream)
+{
+    // Match the original raw route: storage may retain a larger verifier
+    // envelope or padded snapshot stride than this M1 invocation consumes.
+    // Physical rows select stores; admitted capacity is never the work extent.
+    if (reinterpret_cast<std::uintptr_t>(stream) <= 2 || !p.sourceOutputDisjoint() || !p.merged || !p.alpha || !p.beta_raw ||
+        !p.A_log || !p.dt_bias || !p.output || !p.initial_state || !p.updated_state ||
+        (p.key_width != 64 && p.key_width != 128) ||
+        p.value_width <= 0 || p.rows.rowsPerRequest() > 16 ||
+        gdnDeinterleaveElementsPerRequest(p.rows,p.key_heads,p.value_heads,p.key_width,p.value_width) <= 0 ||
+        (p.rows.rowsPerRequest() > 1 && !p.snapshots) ||
+        (p.snapshots && (std::int64_t(p.snapshot_stride_floats) < std::int64_t(p.value_heads) * p.key_width * p.value_width ||
+                        p.max_snapshot_rows < p.rows.physicalRows()))) return false;
+    // The original recurrent grid multiplies request_count and local heads.
+    // Guard its INT32 coordinate before forming either the grid or state stride.
+    if (std::int64_t(p.rows.requests()) * p.value_heads > INT_MAX ||
+        std::int64_t(p.value_heads) * p.key_width * p.value_width > INT_MAX) return false;
+    const auto hs=static_cast<hipStream_t>(stream);
+    const dim3 grid(p.rows.requests()*p.value_heads,
+                    1+(p.value_width-1)/kGdnRecurrentColumnsPerBlock);
+    const int tail=std::max(0,p.key_width/kGdnRecurrentRowSplit-22);
+    const std::size_t shared=std::size_t(2*p.key_width+4+2*kGdnRecurrentThreads+tail*kGdnRecurrentThreads)*sizeof(float);
+#define MERGED(DK) hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_gdn_merged_recurrent_step_kernel<DK>), \
+    grid,dim3(kGdnRecurrentThreads),shared,hs,p.merged,nullptr,nullptr,p.alpha,p.beta_raw,p.A_log,p.dt_bias, \
+    p.output,p.initial_state,p.updated_state,p.rows.requests(),p.rows.rowsPerRequest(),p.value_heads,p.value_width, \
+    p.use_qk_l2norm,p.rows.lengthOwner(),0,p.snapshots,p.snapshot_stride_floats,p.max_snapshot_rows,p.key_heads,p.global_value_offset)
+    if(p.key_width==64){MERGED(64);}else{MERGED(128);}
+#undef MERGED
+    return hipGetLastError()==hipSuccess;
+}
+}

@@ -24,6 +24,7 @@
 #include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
 #include "../kernels/common/DeviceRowRange.h"
 #include "../kernels/common/DeviceRequestRowRanges.h"
+#include "../kernels/common/ProjectionRowWork.h"
 #include "NativeVnniFormatInfo.h"
 #include "TensorType.h"
 #include "BlockStructures.h"
@@ -417,6 +418,17 @@ namespace llaminar2
         {
             return FloatingActivationOperandPrecision::Native;
         }
+
+        /**
+         * @brief Independent recorder-local projection work selection.
+         *
+         * This alias shares the lightweight native-wrapper registry. Entering
+         * work selection never enables decode-equivalent verifier arithmetic;
+         * the caller preserves its original ordinary/grouped arithmetic scope.
+         * Every backend must consume the same by-value descriptor before this
+         * scope may be selected by a production graph.
+         */
+        using ProjectionWorkScope = ProjectionRowWorkScope;
 
         /**
          * @brief RAII token for verifier-only kernel dispatch modes.
@@ -4514,6 +4526,10 @@ namespace llaminar2
          * launch their graph-captured device transform before recurrence. The
          * caller must never materialize a host-side Q/K/V copy as an alternate
          * path.
+         * Merged source and output byte ranges must be disjoint, including partial
+         * views. GPU direct-input entrypoints reject overlap before enqueue. The
+         * existing live-state owner may update its own bank in place; that state
+         * alias is independent of the source/output contract.
          *
          * This operation is mandatory for every backend. It covers ordinary
          * live-state execution; verifier snapshots, request-batched state banks,

@@ -19,10 +19,12 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
+#include "kernels/gdn/GDNMergedRecurrence.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -415,11 +417,13 @@ namespace llaminar2
         }
 
         /**
-         * @brief Execute merged-QKV recurrence through the bound CUDA workspace.
+         * @brief Execute ordinary merged-QKV input on its native CUDA layout path.
          *
-         * Both launches remain on the exact stage stream and are captured as
-         * one ordered graph sequence. No host materialization, allocation, or
-         * synchronization participates in this mandatory layout operation.
+         * Nonidentity M1 reads merged coordinates in one recurrence kernel.
+         * Existing identity and multi-row paths retain their original transform
+         * and recurrence implementation. State and optional verifier snapshots
+         * stay bound to their original native authorities on the stage stream.
+         * No host materialization, allocation or synchronization participates.
          */
         bool chunkForwardMergedQKV(
             const float *merged_qkv, int qkv_stride,
@@ -430,13 +434,57 @@ namespace llaminar2
             int global_v_head_offset, int chunk_size,
             bool use_qk_l2norm) override
         {
+            if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
+                n_heads <= 0 || d_k <= 0 || d_v <= 0)
+                return false;
+            const auto rows = DeviceRequestRowRanges::fullyActive(seq_len);
+            if (gdnDeinterleaveElementsPerRequest(
+                    rows, n_k_heads, n_heads, d_k, d_v) <= 0)
+                return false;
+            // Coordinate admission above proves these products and their sum.
             const int compact_stride =
                 2 * n_k_heads * d_k + n_heads * d_v;
-            if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
-                n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-                qkv_stride != compact_stride)
-            {
+            if (qkv_stride != compact_stride)
                 return false;
+
+            if (seq_len == 1 &&
+                (n_k_heads != n_heads || global_v_head_offset != 0))
+            {
+                cudaGDN_gpu_set_device(device_ordinal_);
+                const std::int64_t state_floats =
+                    std::int64_t{n_heads} * d_k * d_v;
+                if (state_floats > std::numeric_limits<int>::max())
+                    return false;
+                const int required_state_size = static_cast<int>(state_floats);
+                float *live_state = requireState(required_state_size,
+                    "CUDAGatedDeltaNet::chunkForwardMergedQKV");
+                if (!live_state)
+                    return false;
+                float *effective_state = resolveVerifierStateDestination(
+                    required_state_size, stream_);
+                if (!effective_state)
+                    return false;
+                return gdn::launchCUDAMergedRecurrence(
+                    gdn::MergedRecurrenceInput{
+                        .rows = rows,
+                        .key_heads = n_k_heads,
+                        .value_heads = n_heads,
+                        .key_width = d_k,
+                        .value_width = d_v,
+                        .global_value_offset = global_v_head_offset,
+                        .use_qk_l2norm = use_qk_l2norm,
+                        .merged = merged_qkv,
+                        .alpha = alpha,
+                        .beta_raw = beta_raw,
+                        .A_log = A_log,
+                        .dt_bias = dt_bias,
+                        .output = output,
+                        .initial_state = live_state,
+                        .updated_state = effective_state,
+                        .snapshots = verifier_state_capture_,
+                        .snapshot_stride_floats = verifier_state_capture_size_,
+                        .max_snapshot_rows = verifier_state_capture_rows_,
+                    }, stream_);
             }
 
             float *q = nullptr;

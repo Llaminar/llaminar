@@ -16,8 +16,11 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
+#include "kernels/gdn/GDNMergedRecurrence.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 
 extern "C"
 {
@@ -389,10 +392,10 @@ namespace llaminar2
         }
 
         /**
-         * @brief Execute merged-QKV recurrence through the bound HIP workspace.
+         * @brief Execute explicit merged M1 directly; retain optimized prefill layout preparation.
          *
-         * Device deinterleave and recurrence are enqueued on the exact stage
-         * stream and remain one graph-captured producer/consumer sequence. The
+         * Nonidentity M1 has one captured raw recurrence; ordinary prefill retains
+         * its original transform and optimized recurrence on the exact stream. The
          * implementation performs no host materialization or synchronization.
          */
         bool chunkForwardMergedQKV(
@@ -404,13 +407,30 @@ namespace llaminar2
             int global_v_head_offset, int chunk_size,
             bool use_qk_l2norm) override
         {
-            const int compact_stride =
-                2 * n_k_heads * d_k + n_heads * d_v;
-            if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
-                n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-                qkv_stride != compact_stride)
-            {
+            if (!merged_qkv || seq_len<=0 || n_k_heads<=0 || n_heads<=0 || d_k<=0 || d_v<=0)
                 return false;
+            const auto rows=DeviceRequestRowRanges::fullyActive(seq_len);
+            if(gdnDeinterleaveElementsPerRequest(rows,n_k_heads,n_heads,d_k,d_v)<=0)
+                return false;
+            const auto compact_stride=2*std::int64_t(n_k_heads)*d_k+std::int64_t(n_heads)*d_v;
+            if(qkv_stride!=compact_stride)return false;
+
+            if (seq_len == 1 && (n_k_heads != n_heads || global_v_head_offset != 0))
+            {
+                // Resolve exactly the live/speculative banks used by recurrent_step.
+                // The merged address specialization introduces no state authority.
+                rocmGDN_gpu_set_device(device_ordinal_);
+                const auto state_floats=std::int64_t(n_heads)*d_k*d_v;
+                if(state_floats<=0 || state_floats>std::numeric_limits<int>::max()) return false;
+                const int required_state_size=static_cast<int>(state_floats);
+                float* live_state=requireState(required_state_size,"ROCmGatedDeltaNet::chunkForwardMergedQKV");
+                if(!live_state)return false;
+                float* destination=resolveVerifierStateDestination(required_state_size,stream_);
+                if(!destination)return false;
+                return gdn::launchROCmMergedRecurrence({
+                    DeviceRequestRowRanges::fullyActive(1),n_k_heads,n_heads,d_k,d_v,global_v_head_offset,
+                    use_qk_l2norm,merged_qkv,alpha,beta_raw,A_log,dt_bias,output,live_state,destination,
+                    verifier_state_capture_,verifier_state_capture_size_,verifier_state_capture_rows_},stream_);
             }
 
             float *q = nullptr;

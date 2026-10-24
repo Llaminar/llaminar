@@ -46,6 +46,8 @@ inline std::size_t qwenSparseSnapshotMultiply(std::size_t a, std::size_t b)
  * @return Native pooled payload plus source-authored metadata/slot padding exactly once.
  *
  * Token query/selection payload remains in the caller's reference envelope.
+ * The metadata envelope retains Decode's 16+48R flat raw-query record or R
+ * separate 16+48 prepared-query records, while Prefill still submits TokenRows.
  * Each selected pool's live NPY payload was excluded there and is replaced
  * here by its native context-capacity bank. A semantic alias is one selected
  * output; different producer occurrences/owners remain distinct. Dense0 has no
@@ -75,10 +77,30 @@ inline QwenSparseSnapshotMemory qwenSparseSnapshotMemory(
                 static_cast<unsigned>(source.layer())) == model.sparse_decoder_layers.end())
             throw std::invalid_argument("QSA snapshot source is absent from the admitted sparse-main manifest");
         if (source.layer() < first || source.layer() > last) continue;
-        const auto role = source.role() == GraphSnapshotSourceRole::QwenSparseQuery ? Qwen4ExpSnapshotOutput::PreparedQuery :
+        // Raw and prepared indexer queries share exact M-by-512 storage,
+        // while retaining distinct producer identities in the selected BOM.
+        const auto role = (source.role() == GraphSnapshotSourceRole::QwenSparseQuery ||
+            source.role() == GraphSnapshotSourceRole::QwenSparseRawQuery) ? Qwen4ExpSnapshotOutput::PreparedQuery :
             source.role() == GraphSnapshotSourceRole::QwenSparsePooledKeys ? Qwen4ExpSnapshotOutput::PooledKeys :
             Qwen4ExpSnapshotOutput::SelectedIndices;
-        const auto shape = qwen4ExpSparseSnapshotShape(role, tokenRows, context, model.maximum_selected_tokens);
+        auto shape = qwen4ExpSparseSnapshotShape(role, tokenRows, context, model.maximum_selected_tokens);
+        auto metadataInstances=instances;
+        // A retained owner admits both unchanged Prefill TokenRows and Decode
+        // authored intervals. Price their explicit maximum metadata envelope.
+        // Raw GEMM has one flattened R*M producer; prepared Q has R independent
+        // M-row producers. Only PMA materializes these declared bytes.
+        if(source.role()==GraphSnapshotSourceRole::QwenSparseRawQuery) {
+            const auto flattened=qwenSparseSnapshotMultiply(static_cast<std::size_t>(requests),static_cast<std::size_t>(tokenRows));
+            if(flattened>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+                throw std::overflow_error("Raw query snapshot physical rows exceed native geometry");
+            shape.geometry.rows=static_cast<int>(flattened);
+            shape.geometry.kind=DiagnosticSnapshotCopyKind::AuthoredTokenRows;
+            shape.geometry.requests=requests;
+            metadataInstances=owners;
+        } else if(source.role()==GraphSnapshotSourceRole::QwenSparseQuery) {
+            shape.geometry.kind=DiagnosticSnapshotCopyKind::AuthoredTokenRows;
+            shape.geometry.requests=1;
+        }
         const auto layout = snapshotStorageLayout(shape.storageShape());
         if (source.replacesReferencePayload())
             result.native_state_payload_bytes = snapshot_storage_detail::add(result.native_state_payload_bytes,
@@ -87,7 +109,7 @@ inline QwenSparseSnapshotMemory qwenSparseSnapshotMemory(
         // both physical bytes. The bound is per actual selected descriptor;
         // it does not spend unrelated payload slack on missing headers.
         result.authored_metadata_bytes = snapshot_storage_detail::add(result.authored_metadata_bytes,
-            qwenSparseSnapshotMultiply(qwen4ExpSnapshotMetadataBytes(shape), instances));
+            qwenSparseSnapshotMultiply(qwen4ExpSnapshotMetadataBytes(shape), metadataInstances));
     }
     (void)result.totalBytes();
     return result;

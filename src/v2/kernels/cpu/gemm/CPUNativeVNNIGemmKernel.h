@@ -7,6 +7,8 @@
  * their explicit numerical policy and reduction order. A shared prepared
  * engine never retains another participant's workspace binding: the owning
  * stage supplies admitted activation scratch with each invocation.
+ * Query projection work is borrowed before OpenMP and retains original request
+ * coordinates through rotation, quantization and fixed-order products.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
@@ -305,6 +307,21 @@ namespace llaminar2::cpu::native_vnni
         /**
          * @brief C[m×n] = A[m×k] @ B_packed[n×k]^T
          *
+         * @param A Immutable FP32 input with original physical row coordinates.
+         * @param C Physical-M output; unused query rows remain unwritten.
+         * @param m Original physical matrix row capacity.
+         * @param n Original prepared output width.
+         * @param k Original prepared input width.
+         * @param transpose_B Existing native prepared orientation.
+         * @param alpha Original product multiplier.
+         * @param beta Original destination multiplier.
+         * @param bias Optional immutable bias; typed query construction admits none.
+         * @param mpi_ctx Existing CPU/MPI execution context.
+         * @param device_idx CPU execution selector, required to be -1.
+         * @param workspace Participant-admitted stable scratch.
+         * @param activation_row_offset Original input row offset.
+         * @return Whether the original prepared operation completed successfully.
+         * @throws std::invalid_argument For work-bearing non-M1 ordinary calls.
          * Primary tensor-aware GEMM entry point.
          * For M=1: dispatches to optimized GEMV path.
          * For M>1: dispatches to tiled GEMM path.
@@ -335,6 +352,10 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
+            const auto projection_work=projectionWorkFor(m);
+            const auto *work=projection_work?&*projection_work:nullptr;
+            if(work&&m!=1)throw std::invalid_argument("CPU ordinary query work requires explicit M1 arithmetic");
+            if(work&&!CPUProjectionRowGrid(m,work).hasAny())return true;
             const float *A_data = A->data() + static_cast<size_t>(activation_row_offset) * k;
             float *C_data = C->mutable_data();
 
@@ -342,17 +363,17 @@ namespace llaminar2::cpu::native_vnni
             const auto activation_storage = q8Workspace(workspace, m, k);
             const auto product_storage = productWorkspace(workspace, m, n, beta);
             const auto partial_storage = partialWorkspace(workspace, m);
-            A_data = maybe_rotate_activation(A_data, m, k, workspace);
+            A_data = maybe_rotate_activation(A_data, m, k, workspace,work);
 
             multiply_native_vnni_with_epilogue(
                 packed_, A_data, C_data, m, n, alpha, beta,
-                activation_storage, product_storage, partial_storage);
+                activation_storage, product_storage, partial_storage,work);
 
             // Apply bias epilogue: C[m, j] += bias[j]
             if (bias)
             {
                 const float *bias_data = bias->data();
-                apply_bias_epilogue(C_data, bias_data, m, n, n);
+                apply_bias_epilogue(C_data, bias_data, m, n, n,work);
             }
 
             return true;
@@ -914,6 +935,12 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
+            const auto projection_work=projectionWorkFor(m);
+            const auto *work=projection_work?&*projection_work:nullptr;
+            // Query work is one prepared projection. Fused bundles retain their
+            // existing no-work contract; do not advertise an unwired work mode.
+            if(work&&projections.size()!=1)
+                throw std::invalid_argument("CPU query row work requires one prepared projection, without fused bundle");
             const float *input_data = input->data();
             if (!input_data || input->numel() < static_cast<size_t>(m) * k)
             {
@@ -985,7 +1012,7 @@ namespace llaminar2::cpu::native_vnni
                     ? proj.original_output_slice->policyColumns() : 0;
             }
 
-            const int live_rows = verifierLiveRows(m);
+            const int live_rows = work ? m : verifierLiveRows(m);
             auto shared_q8 = q8Workspace(workspace, m, k);
             if (projections.size() == 1)
             {
@@ -1015,13 +1042,13 @@ namespace llaminar2::cpu::native_vnni
             if (activation_rotation_)
                 (void)CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation,
                     static_cast<size_t>(m) * k);
-            if (live_rows == 0) return true;
+            if(live_rows==0||(work&&!CPUProjectionRowGrid(m,work).hasAny()))return true;
 
             const bool perf_enabled =
                 PerfStatsCollector::isDomainEnabled("kernel");
             auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                            : PerfStatsCollector::Clock::time_point{};
-            input_data = maybe_rotate_activation(input_data, live_rows, k, workspace);
+            input_data = maybe_rotate_activation(input_data, live_rows, k, workspace,work);
 
             const int K_blocks = (k + 31) / 32;
             quantize_activations_to_q8_1(
@@ -1030,7 +1057,7 @@ namespace llaminar2::cpu::native_vnni
                 live_rows,
                 k,
                 K_blocks,
-                numerical_policy_);
+                numerical_policy_,work);
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_projection_activation_quantize",
                 perf_start,
@@ -1116,7 +1143,8 @@ namespace llaminar2::cpu::native_vnni
                 else
                     gemm_native_vnni_preq_decode_equivalent_rows(
                         vnni->packed_, shared_q8.data(), out_data,
-                        vnni->partialWorkspace(workspace, m), live_rows, proj.n);
+                        vnni->partialWorkspace(workspace, m), live_rows, proj.n,
+                        ISAPath::AUTO,VerifierRowsPolicy::Auto,true,0,work);
                 recordVerifierTiming(
                     "cpu_native_vnni_verifier_projection_per_gemv",
                     perf_start,
@@ -1127,7 +1155,7 @@ namespace llaminar2::cpu::native_vnni
 
                 if (proj.bias)
                 {
-                    apply_bias_epilogue(out_data, biases[i], live_rows, proj.n, proj.n);
+                    apply_bias_epilogue(out_data, biases[i], live_rows, proj.n, proj.n,work);
                 }
             }
 
@@ -1715,6 +1743,26 @@ namespace llaminar2::cpu::native_vnni
 
     private:
         /**
+         * @brief Borrow and authenticate query row work before any OpenMP team starts.
+         * @param physicalRows Original matrix/scratch row capacity.
+         * @return Invocation-local immutable metadata, absent for unchanged operations.
+         * @throws std::invalid_argument For inconsistent inherited publication geometry.
+         * @details TLS is read on the invoking recorder only. Workers receive
+         * explicit metadata pointers; work never enables verifier arithmetic.
+         */
+        static std::optional<ProjectionRowWork> projectionWorkFor(int physicalRows)
+        {
+            const auto *scoped=currentProjectionRowWork(physicalRows);
+            if(!scoped)return std::nullopt;
+            auto work=*scoped;
+            if(const auto *requests=ITensorGemm::VerifierKernelModeScope::requestsFor(physicalRows))
+                work=work.withInheritedRequests(*requests);
+            else if(const auto *prefix=ITensorGemm::VerifierKernelModeScope::prefixForFloating(physicalRows))
+                work=work.withInheritedPrefix(*prefix);
+            (void)CPUProjectionRowGrid(physicalRows,&work);
+            return work;
+        }
+        /**
          * @brief Resolve only the canonical host-owned CPU live prefix.
          * @param physical_rows Immutable matrix capacity used by tensor/workspace admission.
          * @return Valid active rows; absent count means every physical row.
@@ -1783,20 +1831,25 @@ namespace llaminar2::cpu::native_vnni
          * @param m Simultaneously live rows.
          * @param k Logical row width paired with the prepared rotation.
          * @param workspace Participant-owned storage declared by this engine.
+         * @param work Optional original-row admission borrowed before the workshare.
          * @return Original input for an unrotated engine, otherwise the rotated bank.
          *
          * Copy and rotation share one row owner. Existing OpenMP teams enter
          * the same workshare and its completion barrier publishes the full bank
          * before quantization. A standalone single row needs no extra team.
          */
-        const float *maybe_rotate_activation(const float *input, int m, int k, DeviceWorkspaceManager *workspace) const
+        const float *maybe_rotate_activation(const float *input, int m, int k, DeviceWorkspaceManager *workspace,
+            const ProjectionRowWork *work = nullptr) const
         {
             if (!activation_rotation_)
                 return input;
 
+            const CPUProjectionRowGrid row_grid(m,work);
+            if(!row_grid.hasAny())return input;
             const size_t len = static_cast<size_t>(m) * k;
             auto rotated = CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation, len);
             auto rotate_row = [&](int row) {
+                if(!row_grid.active(row))return;
                 float *destination = rotated.data() + static_cast<size_t>(row) * k;
                 std::memcpy(destination, input + static_cast<size_t>(row) * k, static_cast<size_t>(k) * sizeof(float));
                 activation_rotation_->rotate_inplace(destination, k);

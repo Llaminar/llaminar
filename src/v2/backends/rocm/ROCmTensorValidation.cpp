@@ -61,6 +61,13 @@ namespace llaminar2
             result->appears_zero = 1;
             result->sample_min = std::numeric_limits<float>::max();
             result->sample_max = std::numeric_limits<float>::lowest();
+            if(extent.usesProjectionWork()) {
+                std::uint64_t rows=0;
+                for(int request=extent.projectionWork.requestForRow(0);request<=extent.projectionWork.requestForRow(extent.projectionWork.physicalRows()-1);++request)
+                    rows+=static_cast<unsigned>(extent.projectionWork.resolveDevice(request).size());
+                result->total_checked=static_cast<unsigned>(rows*extent.columns);
+                return;
+            }
             auto geometry = extent.geometry;
             std::int32_t prior = 0, live = 0;
             if (geometry.kind == SnapshotContiguousRowKind::StatePrefixRows)
@@ -120,10 +127,11 @@ namespace llaminar2
     __global__ void validateFP32Kernel(
         const float *__restrict__ data,
         size_t num_elements,
-        DeviceValidationResult *__restrict__ result)
+        DeviceValidationResult *__restrict__ result, TensorValidationExtent extent)
     {
         // Initialization on this stream has already authenticated the frontier.
-        num_elements = result->total_checked;
+        num_elements = extent.usesProjectionWork() ? num_elements : result->total_checked;
+        if(result->invalid_extent)return;
 
         // Shared memory for block-level reduction
         __shared__ unsigned int s_nan_count;
@@ -159,6 +167,7 @@ namespace llaminar2
 
         for (size_t i = idx; i < num_elements; i += stride)
         {
+            if(extent.usesProjectionWork()&&!extent.projectionWork.rowIsActive(static_cast<int>(i/extent.columns)))continue;
             float val = data[i];
 
             if (isnan(val))
@@ -235,10 +244,11 @@ namespace llaminar2
     __global__ void validateBF16Kernel(
         const uint16_t *__restrict__ data,
         size_t num_elements,
-        DeviceValidationResult *__restrict__ result)
+        DeviceValidationResult *__restrict__ result, TensorValidationExtent extent)
     {
         // Initialization on this stream has already authenticated the frontier.
-        num_elements = result->total_checked;
+        num_elements = extent.usesProjectionWork() ? num_elements : result->total_checked;
+        if(result->invalid_extent)return;
 
         __shared__ unsigned int s_nan_count;
         __shared__ unsigned int s_inf_count;
@@ -264,6 +274,7 @@ namespace llaminar2
 
         for (size_t i = idx; i < num_elements; i += stride)
         {
+            if(extent.usesProjectionWork()&&!extent.projectionWork.rowIsActive(static_cast<int>(i/extent.columns)))continue;
             uint16_t bf16 = data[i];
 
             // BF16 format: 1 sign, 8 exponent, 7 mantissa
@@ -321,10 +332,11 @@ namespace llaminar2
     __global__ void validateFP16Kernel(
         const uint16_t *__restrict__ data,
         size_t num_elements,
-        DeviceValidationResult *__restrict__ result)
+        DeviceValidationResult *__restrict__ result, TensorValidationExtent extent)
     {
         // Initialization on this stream has already authenticated the frontier.
-        num_elements = result->total_checked;
+        num_elements = extent.usesProjectionWork() ? num_elements : result->total_checked;
+        if(result->invalid_extent)return;
 
         __shared__ unsigned int s_nan_count;
         __shared__ unsigned int s_inf_count;
@@ -350,6 +362,7 @@ namespace llaminar2
 
         for (size_t i = idx; i < num_elements; i += stride)
         {
+            if(extent.usesProjectionWork()&&!extent.projectionWork.rowIsActive(static_cast<int>(i/extent.columns)))continue;
             uint16_t fp16 = data[i];
 
             // FP16 format: 1 sign, 5 exponent, 10 mantissa
@@ -500,7 +513,7 @@ namespace llaminar2
                     stream,
                     static_cast<const float *>(device_ptr),
                     num_elements,
-                    d_result_);
+                    d_result_, extent);
                 break;
             case TensorValidationDataType::BF16:
                 hipLaunchKernelGGL(
@@ -511,7 +524,7 @@ namespace llaminar2
                     stream,
                     static_cast<const uint16_t *>(device_ptr),
                     num_elements,
-                    d_result_);
+                    d_result_, extent);
                 break;
             case TensorValidationDataType::FP16:
                 hipLaunchKernelGGL(
@@ -522,7 +535,7 @@ namespace llaminar2
                     stream,
                     static_cast<const uint16_t *>(device_ptr),
                     num_elements,
-                    d_result_);
+                    d_result_, extent);
                 break;
             }
             requireSuccess(hipGetLastError(), "tensor validation kernel launch");

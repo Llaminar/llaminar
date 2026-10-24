@@ -275,8 +275,13 @@ std::array<std::uintptr_t,4> inspectSelectorForwarding(const IGPUGraphCapture& g
         policy==QwenSparsePoolSelection::Bounded1024_1024;
     const bool rowCTA=policy!=QwenSparsePoolSelection::Installed || rows<=attention::kMaxGroupedVerifierAttentionRows;
     const std::string space=device.is_cuda()?"llaminar2::qwen4exp::cuda_sparse_detail::":"llaminar2::qwen4exp::rocm_sparse_detail::";
-    std::array<std::string,4> names{space+"preparePools",space+"prepareQueries",space+"scorePools",(templated?"void ":"")+space+selector};
-    for(auto& name:names)name+="(llaminar2::qwen4exp::QwenSparseIndexer)";
+    // This selector-only fixture seals AllLive query preparation. Its native
+    // template has a return prefix and an explicit original row-work argument;
+    // RankingOnly is covered separately and cannot match this inventory.
+    std::array<std::string,4> names{space+"preparePools","void "+space+"prepareQueries<false>",space+"scorePools",(templated?"void ":"")+space+selector};
+    for(std::size_t role=0;role<names.size();++role)
+        names[role]+=role==1?"(llaminar2::qwen4exp::QwenSparseIndexer, llaminar2::ProjectionRowWork)":
+            "(llaminar2::qwen4exp::QwenSparseIndexer)";
     const std::array<unsigned,4> gridX{unsigned((rows+6)/4),unsigned(rows*4),unsigned((blocks+7)/8),
         unsigned(rowCTA?rows:(rows+7)/8)};
     std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;
@@ -287,7 +292,7 @@ std::array<std::uintptr_t,4> inspectSelectorForwarding(const IGPUGraphCapture& g
         int status=0;std::unique_ptr<char,decltype(&std::free)> name(abi::__cxa_demangle(node.name.c_str(),nullptr,nullptr,&status),&std::free);
         require(status==0 && name,"Cannot demangle actual Indexer stage native function");
         const auto found=std::find(names.begin(),names.end(),std::string(name.get()));
-        require(found!=names.end(),"Stage forwarded a foreign selector/function specialization");const auto role=std::size_t(found-names.begin());
+        require(found!=names.end(),("Stage forwarded a foreign selector/function specialization: actual="+std::string(name.get())).c_str());const auto role=std::size_t(found-names.begin());
         require(!functions[role],"Stage captured a duplicate native role");functions[role]=node.function_identity;
         // The two existing rotary producers can contain libdevice's deliberate
         // range-reduction stack storage. The canonical compiler spill gate owns
@@ -311,8 +316,9 @@ std::array<std::uintptr_t,4> inspectSelectorForwarding(const IGPUGraphCapture& g
  * @details BufferArena owns every mutable native byte. TransferEngine prepares
  * bindings before capture. Terminal test-only transfers inspect complete dirty
  * output capacity and live produced scores; no mirror drives captured execution.
- * Contextual M1/M16 cross8195/8196, mixed rows and long/empty/short/reset
- * under the same retained native function; M33 admits only original policies.
+ * All four explicit selectors retain AllLive query preparation at M1/M16/M33.
+ * Replays cross8195/8196 and mixed/empty/short/reset contexts under the same
+ * retained native functions; no semantic Decode phase is inferred from M.
  */
 void proveStageSelectorForwarding(DeviceId device)
 {
@@ -362,7 +368,8 @@ void proveStageSelectorForwarding(DeviceId device)
                 Stage::Indexer input{Float(query,BufferId::QFN_QSA_QUERY),Float(raw,BufferId::QFN_QSA_RAW_KEY),Float(prior,BufferId::QFN_QSA_PARTIAL_KEYS),
                     Float(pools,BufferId::QFN_QSA_POOLED_KEYS),Weight(gain),Weight(gain),Weight(cosine),Weight(sine),
                     Float(prepared,BufferId::QFN_QSA_PREPARED_QUERY),Float(scores,BufferId::QFN_QSA_SCORES),
-                    Int(selected,BufferId::QFN_QSA_SELECTED),Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),blocks,positions};input.poolSelection=policy;
+                    Int(selected,BufferId::QFN_QSA_SELECTED),Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),blocks,positions};
+                input.poolSelection=policy;input.queryDemand=QwenSparseQueryDemand::AllLive;
                 Stage stage({.device_id=device,.rowCapacity=rows,.tokenCapacity=tokens,.replay=Int(replay,BufferId::QFN_QSA_REPLAY),.operation=input});
                 stage.setGPUStream(storage.stream);const auto signature=stage.graphCaptureVariantSignature();ASSERT_NE(signature,0u);EXPECT_TRUE(signatures.insert(signature).second);
                 storage.graph=worker.createGraphCapture(storage.stream);

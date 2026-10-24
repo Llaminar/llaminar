@@ -357,7 +357,9 @@ class Qwen4ExpReferenceModel(AbstractReferenceModel):
         """Score pooled blocks, select live token IDs and run sparse grouped-query attention."""
         batch, length, _ = value.shape
         positions = torch.arange(start, start + length).expand(batch, -1)
-        iq = self._linear(value, prefix, 'indexer.q_proj').reshape(batch, length, 4, 128)
+        # Retain the existing projection as its own checkpoint; compute it once.
+        raw_iq = self._linear(value, prefix, 'indexer.q_proj')
+        iq = raw_iq.reshape(batch, length, 4, 128)
         iq = self._rope(self._norm(iq, prefix + 'indexer.q_norm.weight'), positions)
         raw = self._linear(value, prefix, 'indexer.k_proj')
         raw = torch.cat((cache['index_keys'], raw), 1) if 'index_keys' in cache else raw
@@ -398,7 +400,8 @@ class Qwen4ExpReferenceModel(AbstractReferenceModel):
             contexts.append(torch.einsum('bhn,bnhd->bhd', probability, vals))
         context = torch.stack(contexts, 1)
         gated = context * gate.sigmoid()
-        for stage, tensor in ((S.QSA_INDEXER_QUERY, iq), (S.QSA_INDEXER_POOLED_KEYS, pooled),
+        for stage, tensor in ((S.QSA_INDEXER_RAW_QUERY, raw_iq),
+                              (S.QSA_INDEXER_QUERY, iq), (S.QSA_INDEXER_POOLED_KEYS, pooled),
                               (S.QSA_SELECTED_INDICES, selected.float()), (S.Q_PROJECTION, qgate.flatten(-2)),
                               (S.Q_ROPE, q), (S.K_ROPE, k[:, -length:]),
                               (S.ATTENTION_CONTEXT, context.flatten(-2)),

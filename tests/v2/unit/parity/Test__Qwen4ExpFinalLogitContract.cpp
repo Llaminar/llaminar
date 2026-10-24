@@ -12,6 +12,9 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <vector>
 
 namespace llaminar2::test::parity
 {
@@ -24,6 +27,7 @@ public:
     using ParityTestBase::acceptsFinalLogitDecodeEvidence;
     using ParityTestBase::acceptsFinalLogitRawEvidence;
     using ParityTestBase::finalizeDecodeSummaryNumerics;
+    using ParityTestBase::finalizeDecodeLayerNumerics;
     using ParityTestBase::finalizePrefillLayerNumerics;
     using ParityTestBase::finalizePrefillSummaryNumerics;
     using ParityTestBase::retainMissingRequiredParityStage;
@@ -49,17 +53,59 @@ StageComparisonResult observation(const std::string &name, bool red = false)
     const auto actual = red ? std::array{-1.0f, -2.0f} : expected;
     return compareParityTensorData(actual.data(), expected.data(), actual.size(), name, .99f);
 }
-/** @return Complete source-declared layer roles using tiny actual comparisons, not copied stage inventories. */
-std::vector<LayerStats> layers(const ParityConfig &contract)
+/**
+ * @brief A finite red query comparison with independently supplied original Decode history.
+ * @param name Original raw/prepared checkpoint identity from the canonical declaration.
+ * @param step Original single-row Decode step in this synthetic aggregation fixture.
+ * @return Owned authored512-coordinate evidence, with no model/native shape claim.
+ * @details Synthetic original prompt2051 makes the first visible horizon2052.
+ * The acquired record independently states prefix2051+step and one useful row;
+ * the canonical history validator must authenticate their agreement. Numerical
+ * red cosine is retained, just like the other raw aggregation witnesses.
+ */
+StageComparisonResult decodeQueryObservation(const std::string &name, int step)
+{
+    std::array<float,512> reference;
+    std::vector<float> actual(reference.size());
+    for(std::size_t i=0;i<reference.size();++i) {
+        reference[i]=1.f+float(i%2);actual[i]=-reference[i];
+    }
+    auto owner=std::make_shared<const std::vector<float>>(std::move(actual));
+    SnapshotInfo snapshot{.data=owner->data(),.size=owner->size(),.rows=1,.cols=512,
+        .lifetime_owner=owner,.typed_values=std::span<const float>(*owner),
+        .semantic_axis=SnapshotSemanticAxis::AuthoredTokenRows,
+        .authored_token_rows=SnapshotAuthoredTokenRowsObservation{
+            .requests={{.prefixRows=2051+step,.liveRows=1,.rowOffset=0,.rowCapacity=1,.sourceCapacity=4096,
+                .firstRequiredLogicalRow=2051,.firstRow=0,.endRow=1,.emptyReason=SnapshotEmptyReason::None}},
+            .physicalRows=1,.repeatsPerRow=1}};
+    auto result=compareParityTensorData(snapshot.data,reference.data(),reference.size(),name,.99f);
+    result.checkpoint_evidence_kind=ParityCheckpointEvidenceKind::AuthoredQuery;
+    result.query_work_evidence=inspectQwenSparseQueryEvidence(snapshot,
+        {.promptRows=2051,.decodeRowsBefore=std::size_t(step),.liveRows=1,.sourceCapacity=4096},reference.size());
+    return result;
+}
+/**
+ * @brief Build every source-declared role using actual finite fixture comparisons.
+ * @param contract Original phase-specific checkpoint declaration and thresholds.
+ * @param decodeStep Original synthetic Decode step; absent retains Prefill evidence.
+ * @return Complete source-indexed layer records, never a copied model inventory.
+ */
+std::vector<LayerStats> layers(const ParityConfig &contract, std::optional<int> decodeStep=std::nullopt)
 {
     std::vector<LayerStats> result;
     for (int index = 0; index < contract.early_layers_count; ++index)
     {
         LayerStats layer; layer.layer_idx = index;
         const auto prefix = "layer" + std::to_string(index) + "_";
-        for (const auto &key : contract.graph_snapshot_policy.required_prefill_snapshot_keys)
-            if (key.starts_with(prefix)) layer.stage_results.push_back(observation(key.substr(prefix.size()), true));
-        FinalLogitProbe::finalizePrefillLayerNumerics(layer, contract);
+        const auto phase=decodeStep?ParityForwardPhase::Decode:ParityForwardPhase::Prefill;
+        for (const auto &key : contract.graph_snapshot_policy.requiredSnapshotKeys(phase))
+            if (key.starts_with(prefix)) {
+                const auto name=key.substr(prefix.size());
+                layer.stage_results.push_back(decodeStep && isQwenSparseQueryCheckpoint(name)
+                    ?decodeQueryObservation(name,*decodeStep):observation(name,true));
+            }
+        if(decodeStep)FinalLogitProbe::finalizeDecodeLayerNumerics(layer,contract,true);
+        else FinalLogitProbe::finalizePrefillLayerNumerics(layer, contract);
         result.push_back(std::move(layer));
     }
     return result;
@@ -72,7 +118,7 @@ DecodeStepStats step(int index, const ParityConfig &contract)
     result.step_idx = index; result.has_logit_data = true;
     result.logit_evidence_valid = !finalParityLogitRow(values.data(), values.size(), values.size()).empty();
     result.kl_divergence = computeKLDivergence(values.data(), values.data(), values.size(), values.size());
-    result.cosine_similarity = 1.f; result.layer_stats = layers(contract);
+    result.cosine_similarity = 1.f; result.layer_stats = layers(contract,index);
     return result;
 }
 /** @return Two actual final-row metric observations under the exact main trajectory declaration. */
@@ -166,6 +212,43 @@ TEST(Qwen4ExpFinalLogits, EveryStepAndStrictBudgetBoundaryAreRequired)
     auto prompt = prefill(cfg); prompt.lm_head_kl = .05f;
     FinalLogitProbe::finalizePrefillSummaryNumerics(prompt, cfg, true, true);
     EXPECT_FALSE(prompt.overall_passed);
+}
+
+/** @test Valid final logits cannot waive raw/prepared Q provenance or authenticate a false empty guard. */
+TEST(Qwen4ExpFinalLogits, DecodeQueryHistoryCannotBeWaivedByValidFinalRows)
+{
+    const auto cfg=config();auto good=decode(cfg);
+    FinalLogitProbe::finalizeDecodeSummaryNumerics(good,cfg,true);
+    ASSERT_TRUE(good.overall_passed);
+    for(const auto *name:{"QSA_INDEXER_RAW_QUERY","QSA_INDEXER_QUERY"})for(int mutation=0;mutation<3;++mutation)
+    {
+        SCOPED_TRACE(::testing::Message()<<name<<" mutation="<<mutation);
+        auto changed=good;
+        auto &records=changed.step_stats.front().layer_stats.at(3).stage_results;
+        const auto found=std::find_if(records.begin(),records.end(),[&](const auto &stage){return stage.stage_name==name;});
+        ASSERT_NE(found,records.end());
+        ASSERT_TRUE(validParityCheckpointEvidence(*found,true));
+        EXPECT_FALSE(found->passed); // The original deliberately red comparison is still visible.
+        if(mutation==0)found->query_work_evidence.reset();
+        else if(mutation==1)++found->query_work_evidence->history.decodeRowsBefore;
+        else {
+            // Internally consistent empty metadata from a claimed shorter
+            // prefix cannot override the independently supplied original2051.
+            auto proof=*found->query_work_evidence;
+            proof.observation.data=nullptr;proof.observation.size=proof.observation.rows=0;
+            proof.observation.typed_values=std::span<const float>{};
+            auto &record=proof.observation.authored_token_rows->requests.front();
+            record.prefixRows=2050;record.firstRow=record.endRow=1;
+            record.emptyReason=SnapshotEmptyReason::RankingNotRequired;
+            ASSERT_TRUE(validSnapshotAuthoredTokenRows(proof.observation));
+            proof.unauthored=true;proof.referenceFirstRow=1;
+            *found=StageComparisonResult{};found->stage_name=name;
+            found->checkpoint_evidence_kind=ParityCheckpointEvidenceKind::UnauthoredQuery;
+            found->query_work_evidence=std::move(proof);
+        }
+        FinalLogitProbe::finalizeDecodeSummaryNumerics(changed,cfg,true);
+        EXPECT_FALSE(changed.overall_passed);
+    }
 }
 
 /** @test Missing/duplicate/truncated final rows reject, including default-invalid evidence at low KL. */

@@ -13,8 +13,9 @@
  *
  * GPU path: The executor and TransferEngine prepare arena bindings on the
  * stage's explicit stream; this stage consumes device pointers only. Merged
- * QKV deinterleave is done on-device via deinterleave_qkv_device(). No H2D/D2H
- * copies occur in the hot path.
+ * Nonidentity merged M1 decode reads its original row directly. Multi-row
+ * execution retains device deinterleave in its admitted prefill workspace.
+ * No H2D/D2H copies occur in the hot path.
  *
  * CPU execution never materializes temporary Q/K/V matrices in the stage.
  *
@@ -24,6 +25,7 @@
 
 #include "GDNRecurrenceStage.h"
 #include "kernels/common/CPURequestStateBankView.h"
+#include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "GDNSpeculativeWorkspaceContract.h"
 #include "../../../kernels/IKVCache.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -899,8 +901,12 @@ namespace llaminar2
             // Check if merged: when Q, K, V all point to the same tensor
             const bool merged_qkv = (params_.Q == params_.K && params_.K == params_.V);
             const int nkh = (params_.n_k_heads > 0) ? params_.n_k_heads : params_.n_heads;
+            // This is immutable input geometry, not a recovery/capability branch.
+            const bool direct_merged_m1 =
+                merged_qkv && params_.seq_len == 1 &&
+                (nkh != params_.n_heads || params_.global_v_head_offset != 0);
 
-            if (merged_qkv)
+            if (merged_qkv && !direct_merged_m1)
             {
                 // Merged QKV buffer on device
                 const float *d_merged = static_cast<const float *>(q_base->gpu_data_ptr());
@@ -957,7 +963,7 @@ namespace llaminar2
                           << " offset=" << params_.global_v_head_offset
                           << (params_.seq_len == 1 ? " (decode offset)" : " (kernel deinterleave)"));
             }
-            else
+            else if (!direct_merged_m1)
             {
                 // Separate Q, K, V tensors — already on device via executor coherence
                 d_q = static_cast<const float *>(q_base->gpu_data_ptr());
@@ -966,7 +972,30 @@ namespace llaminar2
             }
 
             bool ok;
-            if (params_.seq_len == 1)
+            if (direct_merged_m1)
+            {
+                if (gdnDeinterleaveElementsPerRequest(
+                        DeviceRequestRowRanges::fullyActive(1),
+                        nkh, params_.n_heads, params_.d_k, params_.d_v) <= 0)
+                {
+                    LOG_ERROR("[GDNRecurrenceStage] Invalid merged decode geometry");
+                    return false;
+                }
+                const auto stride = 2 * std::int64_t(nkh) * params_.d_k +
+                    std::int64_t(params_.n_heads) * params_.d_v;
+                if (stride <= 0 || stride > std::numeric_limits<int>::max())
+                {
+                    LOG_ERROR("[GDNRecurrenceStage] Merged decode row stride exceeds native indexing");
+                    return false;
+                }
+                ok = params_.kernel->chunkForwardMergedQKV(
+                    static_cast<const float *>(q_base->gpu_data_ptr()),
+                    static_cast<int>(stride), d_alpha, d_beta, d_alog, d_dtbias,
+                    d_output, params_.recurrence_state, 1, nkh, params_.n_heads,
+                    params_.d_k, params_.d_v, params_.global_v_head_offset,
+                    params_.chunk_size, params_.use_qk_l2norm);
+            }
+            else if (params_.seq_len == 1)
             {
                 LOG_TRACE("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
                                                                             << " Q=" << static_cast<const void *>(d_q)
@@ -1091,6 +1120,24 @@ namespace llaminar2
             {
                 LOG_ERROR("[GDNRecurrenceStage] GPU kernel failed");
                 return false;
+            }
+
+            if (PerfStatsCollector::isDomainEnabled("gdn_recurrence"))
+            {
+                // This observes successful recording/submission, not replayed
+                // tokens. No device read or extra native operation is needed.
+                const char *layout = direct_merged_m1 ? "direct_merged_m1" :
+                    !merged_qkv ? "planar" :
+                    params_.seq_len == 1 ? "identity_row_alias" : "deinterleaved";
+                PerfStatsCollector::addCounter(
+                    "gdn_recurrence", "input_layout_submission", 1.0,
+                    isGraphCaptureActive() ? "capture" : "execute",
+                    device().toString(),
+                    {{"layout", layout},
+                     {"layer", std::to_string(params_.layer_idx)},
+                     {"rows", std::to_string(params_.seq_len)},
+                     {"key_heads", std::to_string(nkh)},
+                     {"value_heads", std::to_string(params_.n_heads)}});
             }
 
             // A pipeline slice can contain no attention append at all. Its

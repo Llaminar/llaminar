@@ -32,8 +32,13 @@
  * Counted producers retain immutable DeviceRowRange metadata by value. Their
  * compile-time specialization rejects inactive rows before source/scratch access;
  * ordinary kernels compile out every live-count read and predicate.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/gemm/ROCmQuantisedActivationProducers.h"
 #include "kernels/rocm/gemm/ROCmQuantisedEpilogues.h"
@@ -138,12 +143,12 @@ __global__ void applyScaling_full_kernel(
  * @param alpha Original multiplier, evaluated before optional bias.
  * @param rows Immutable launch descriptor borrowing the count on this stream.
  */
-template<bool CountedRows>
+template<bool CountedRows, class Rows>
 __global__ void applyFp32Epilogue_kernel(
     float* __restrict__ d_output,
     const float* __restrict__ d_bias,
     int M, int N,
-    float alpha, llaminar2::DeviceRowRange rows)
+    float alpha, Rows rows)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = M * N;
@@ -153,7 +158,7 @@ __global__ void applyFp32Epilogue_kernel(
     {
         // No barriers follow this per-element guard. A wave can cover several
         // physical rows; all lanes borrow the same device count authority.
-        if (idx / N >= rows.activeRows()) return;
+        if (!llaminar2::projectionRowIsActive(rows,idx / N)) return;
     }
     const int col = idx % N;
     float result = alpha * d_output[idx];
@@ -164,17 +169,20 @@ __global__ void applyFp32Epilogue_kernel(
     d_output[idx] = result;
 }
 
+template<class Rows>
 __global__ void applyFp32CombineEpilogue_kernel(
     const float* d_computed,
     float* d_output,
     const float* d_existing,
     const float* __restrict__ d_bias,
     int M, int N,
-    float alpha, float beta)
+    float alpha, float beta,Rows work)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = M * N;
     if (idx >= total) return;
+    if constexpr (std::is_same_v<Rows,llaminar2::ProjectionRowWork>)
+        if (!llaminar2::projectionRowIsActive(work,idx/N)) return;
 
     const int col = idx % N;
     float result = alpha * d_computed[idx];
@@ -335,12 +343,12 @@ __global__ void fillConstantFloat_kernel(float* __restrict__ dst, int count, flo
  * @param blocks_per_row Original producer operand or immutable physical geometry.
  * @param activeRows Immutable physical/live descriptor copied into this launch.
 */
-template <int BLOCK_SIZE, bool Counted>
+template <int BLOCK_SIZE, bool Counted, class Rows>
 __global__ void quantizeActivationsQ8_blockwise_kernel(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
-    int M, int K, int blocks_per_row, llaminar2::DeviceRowRange activeRows)
+    int M, int K, int blocks_per_row, Rows activeRows)
 {
     const int linear_block = blockIdx.x;
     const int row = linear_block / blocks_per_row;
@@ -349,10 +357,10 @@ __global__ void quantizeActivationsQ8_blockwise_kernel(
     if (row >= M)
         return;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -436,13 +444,13 @@ __global__ void quantizeActivationsQ8_blockwise_kernel(
  * @param total_blocks Original producer operand or immutable physical geometry.
  * @param activeRows Immutable physical/live descriptor copied into this launch.
 */
-template <int BLOCKS_PER_WG, bool Counted>
+template <int BLOCKS_PER_WG, bool Counted, class Rows>
 __global__ __launch_bounds__(256, 4)
 void quantizeActivationsQ8_blockwise_v2_kernel(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
-    int M, int K, int blocks_per_row, int total_blocks, llaminar2::DeviceRowRange activeRows)
+    int M, int K, int blocks_per_row, int total_blocks, Rows activeRows)
 {
     constexpr int QUANT_BLOCK = 32;  // elements per quantization block
     constexpr int WG_SIZE = 256;
@@ -461,10 +469,10 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     if (row >= M)
         return;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -518,14 +526,14 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     }
 }
 
-template <int BLOCKS_PER_WG, bool Counted>
+template <int BLOCKS_PER_WG, bool Counted, class Rows>
 __global__ __launch_bounds__(256, 4)
 void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
     int32_t *__restrict__ d_sums,
-    int M, int K, int blocks_per_row, int total_blocks, llaminar2::DeviceRowRange activeRows)
+    int M, int K, int blocks_per_row, int total_blocks, Rows activeRows)
 {
     constexpr int QUANT_BLOCK = 32;
     const int tid = threadIdx.x;
@@ -541,10 +549,10 @@ void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
     if (row >= M)
         return;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -624,13 +632,13 @@ void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
  * @param blocks_per_row Original producer operand or immutable physical geometry.
  * @param activeRows Immutable physical/live descriptor copied into this launch.
 */
-template<bool Counted>
+template<bool Counted, class Rows>
 __global__ __launch_bounds__(256, 4)
 void quantizeActivationsQ8_blockwise_v3_kernel(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
-    int M, int K, int blocks_per_row, llaminar2::DeviceRowRange activeRows)
+    int M, int K, int blocks_per_row, Rows activeRows)
 {
     constexpr int QUANT_BLOCK = 32;
     constexpr int WG_SIZE = 256;
@@ -639,10 +647,10 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
     if (row >= M)
         return;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -739,13 +747,13 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
  * @param blocks_per_row Original producer operand or immutable physical geometry.
  * @param activeRows Immutable physical/live descriptor copied into this launch.
 */
-template<bool Counted>
+template<bool Counted, class Rows>
 __global__ __launch_bounds__(32, 8)
 void quantizeActivationsQ8_blockwise_v4_kernel(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
-    int M, int K, int blocks_per_row, llaminar2::DeviceRowRange activeRows)
+    int M, int K, int blocks_per_row, Rows activeRows)
 {
     constexpr int QUANT_BLOCK = 32;
     const int global_block = blockIdx.x;
@@ -755,10 +763,10 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
     if (row >= M)
         return;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -825,14 +833,14 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
  * @param blocks_per_row Original producer operand or immutable physical geometry.
  * @param activeRows Immutable physical/live descriptor copied into this launch.
 */
-template<bool Counted>
+template<bool Counted, class Rows>
 __global__ __launch_bounds__(32, 8)
 void quantizeActivationsQ8_blockwise_v4_with_sums_kernel(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
     int32_t *__restrict__ d_sums,
-    int M, int K, int blocks_per_row, llaminar2::DeviceRowRange activeRows)
+    int M, int K, int blocks_per_row, Rows activeRows)
 {
     constexpr int QUANT_BLOCK = 32;
     const int global_block = blockIdx.x;
@@ -842,10 +850,10 @@ void quantizeActivationsQ8_blockwise_v4_with_sums_kernel(
     if (row >= M)
         return;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -922,13 +930,13 @@ void quantizeActivationsQ8_blockwise_v4_with_sums_kernel(
  * @param blocks_per_row Original producer operand or immutable physical geometry.
  * @param activeRows Immutable physical/live descriptor copied into this launch.
 */
-template <int BLOCK_SIZE, bool Counted>
+template <int BLOCK_SIZE, bool Counted, class Rows>
 __global__ __launch_bounds__(64, 8)
 void quantizeActivationsQ8_blockwise_generic_kernel(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
-    int M, int K, int blocks_per_row, llaminar2::DeviceRowRange activeRows)
+    int M, int K, int blocks_per_row, Rows activeRows)
 {
     constexpr int ELEMS_PER_THREAD = (BLOCK_SIZE + 63) / 64;
 
@@ -937,10 +945,10 @@ void quantizeActivationsQ8_blockwise_generic_kernel(
     const int block_idx = global_block % blocks_per_row;
     if (row >= M) return;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -1021,13 +1029,13 @@ void quantizeActivationsQ8_blockwise_generic_kernel(
  * @param blocks_per_row Original producer operand or immutable physical geometry.
  * @param activeRows Immutable physical/live descriptor copied into this launch.
 */
-template<bool Counted>
+template<bool Counted, class Rows>
 __global__ __launch_bounds__(256, 4)
 void quantizeActivationsQ8_blockwise_v5_kernel(
     const float *__restrict__ d_A_fp32,
     int8_t *__restrict__ d_A_int8,
     float *__restrict__ d_scales,
-    int M, int K, int blocks_per_row, llaminar2::DeviceRowRange activeRows)
+    int M, int K, int blocks_per_row, Rows activeRows)
 {
     constexpr int QUANT_BLOCK = 32;
     constexpr int WG_SIZE = 256;
@@ -1038,10 +1046,10 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
     if (row >= M)
         return;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -1172,12 +1180,12 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
   * @tparam Counted Read the device row authority only in the counted specialization.
  * @param activeRows Immutable physical/live descriptor copied into this launch.
 */
-template<bool Aligned, bool WithSums, bool Counted>
+template<bool Aligned, bool WithSums, bool Counted, class Rows>
 __global__ __launch_bounds__(128, 4)
 void quantizeActivationsQ8_register_blocks_kernel(
     const float *__restrict__ input, int8_t *__restrict__ output,
     float *__restrict__ scales, int32_t *__restrict__ sums,
-    int rows, int width, int blocks_per_row, llaminar2::DeviceRowRange activeRows)
+    int rows, int width, int blocks_per_row, Rows activeRows)
 {
     constexpr int lanes_per_block = 8;
     const int group = (static_cast<int>(blockIdx.x) * 128 + threadIdx.x) / lanes_per_block;
@@ -1185,10 +1193,10 @@ void quantizeActivationsQ8_register_blocks_kernel(
     const int lane = threadIdx.x % lanes_per_block;
     const int row = group / blocks_per_row;
     // Whole row/quantization subgroup agrees before any load, store or barrier.
-    // Counted invalid publications trap in DeviceRowRange::activeRows().
+    // Invalid interval publications trap before authored native row accesses.
     if constexpr (Counted)
     {
-        if (row >= activeRows.activeRows())
+        if (!llaminar2::projectionRowIsActive(activeRows,row))
             return;
     }
 
@@ -1261,8 +1269,9 @@ static void launchRegisterBlockQuantization(
     const float *input, int8_t *output, float *scales, int32_t *sums,
     int rows, int width, hipStream_t stream, const llaminar2::DeviceRowRange* rowRange)
 {
-    const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(rows);
-    const bool countedRows = rowRange && rowRange->countOwner();
+    return llaminar2::dispatchProjectionRows(rows,rowRange,[&](auto rowAuthority) {
+
+    const bool countedRows = (rowRange && rowRange->countOwner()) || llaminar2::currentProjectionRowWork(rowAuthority.physicalRows());
 
     const int blocks_per_row = (width + 31) / 32;
     const dim3 grid((rows * blocks_per_row + 15) / 16);
@@ -1274,23 +1283,24 @@ static void launchRegisterBlockQuantization(
     if (aligned)
     {
         if (countedRows) {
-            hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<true, WithSums, true>),
+            hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<true, WithSums, true, decltype(rowAuthority)>),
                 grid, dim3(128), 0, stream, input, output, scales, sums, rows, width, blocks_per_row, rowAuthority);
         } else {
-            hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<true, WithSums, false>),
+            hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<true, WithSums, false, decltype(rowAuthority)>),
                 grid, dim3(128), 0, stream, input, output, scales, sums, rows, width, blocks_per_row, rowAuthority);
         }
     }
     else
     {
         if (countedRows) {
-            hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<false, WithSums, true>),
+            hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<false, WithSums, true, decltype(rowAuthority)>),
                 grid, dim3(128), 0, stream, input, output, scales, sums, rows, width, blocks_per_row, rowAuthority);
         } else {
-            hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<false, WithSums, false>),
+            hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<false, WithSums, false, decltype(rowAuthority)>),
                 grid, dim3(128), 0, stream, input, output, scales, sums, rows, width, blocks_per_row, rowAuthority);
         }
     }
+});
 }
 
 // ============================================================================
@@ -1327,14 +1337,14 @@ static void validateHIPActivationProducer(int m,int k,void* stream,const llamina
  * @param rows Validated immutable descriptor copied into native launch args.
  * @return Whether this exact launch succeeded; failures remain visible.
  */
-template<bool CountedRows>
+template<bool CountedRows, class Rows>
 static bool launchFp32Epilogue(float* output,const float* bias,int m,int n,float alpha,
-    hipStream_t stream,llaminar2::DeviceRowRange rows)
+    hipStream_t stream,Rows rows)
 {
     constexpr int block_size = 256;
     const int total = m * n;
     const int grid_size = 1 + (total - 1) / block_size;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(applyFp32Epilogue_kernel<CountedRows>),
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(applyFp32Epilogue_kernel<CountedRows, Rows>),
         dim3(grid_size),dim3(block_size),0,stream,output,bias,m,n,alpha,rows);
     const auto error = hipGetLastError();
     if (error != hipSuccess)
@@ -1402,8 +1412,9 @@ extern "C"
         int block_size, const llaminar2::DeviceRowRange* rowRange)
     {
         validateHIPActivationProducer(M, K, stream, rowRange);
-        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
-        const bool countedRows = rowRange && rowRange->countOwner();
+        return llaminar2::dispatchProjectionRows(M,rowRange,[&](auto rowAuthority) {
+
+        const bool countedRows = (rowRange && rowRange->countOwner()) || llaminar2::currentProjectionRowWork(rowAuthority.physicalRows());
 
         if (!rocmQuantGemm_setDevice(rocm_device_id))
             return false;
@@ -1429,12 +1440,12 @@ extern "C"
             {
                 if (countedRows) {
                     hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<64, true>),
+                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<64, true, decltype(rowAuthority)>),
                         grid, blk, 0, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 } else {
                     hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<64, false>),
+                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<64, false, decltype(rowAuthority)>),
                         grid, blk, 0, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 }
@@ -1443,12 +1454,12 @@ extern "C"
             {
                 if (countedRows) {
                     hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<128, true>),
+                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<128, true, decltype(rowAuthority)>),
                         grid, blk, 0, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 } else {
                     hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<128, false>),
+                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_generic_kernel<128, false, decltype(rowAuthority)>),
                         grid, blk, 0, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 }
@@ -1515,12 +1526,12 @@ extern "C"
                 size_t shared_bytes = static_cast<size_t>(blocks_per_row) * sizeof(float);
                 if (countedRows) {
                     hipLaunchKernelGGL(
-                        quantizeActivationsQ8_blockwise_v3_kernel<true>,
+                        (quantizeActivationsQ8_blockwise_v3_kernel<true, decltype(rowAuthority)>),
                         grid, block, shared_bytes, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 } else {
                     hipLaunchKernelGGL(
-                        quantizeActivationsQ8_blockwise_v3_kernel<false>,
+                        (quantizeActivationsQ8_blockwise_v3_kernel<false, decltype(rowAuthority)>),
                         grid, block, shared_bytes, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 }
@@ -1533,12 +1544,12 @@ extern "C"
                 dim3 block(32, 1, 1);
                 if (countedRows) {
                     hipLaunchKernelGGL(
-                        quantizeActivationsQ8_blockwise_v4_kernel<true>,
+                        (quantizeActivationsQ8_blockwise_v4_kernel<true, decltype(rowAuthority)>),
                         grid, block, 0, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 } else {
                     hipLaunchKernelGGL(
-                        quantizeActivationsQ8_blockwise_v4_kernel<false>,
+                        (quantizeActivationsQ8_blockwise_v4_kernel<false, decltype(rowAuthority)>),
                         grid, block, 0, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 }
@@ -1552,12 +1563,12 @@ extern "C"
                 size_t shared_bytes = static_cast<size_t>(blocks_per_row) * sizeof(float);
                 if (countedRows) {
                     hipLaunchKernelGGL(
-                        quantizeActivationsQ8_blockwise_v5_kernel<true>,
+                        (quantizeActivationsQ8_blockwise_v5_kernel<true, decltype(rowAuthority)>),
                         grid, block, shared_bytes, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 } else {
                     hipLaunchKernelGGL(
-                        quantizeActivationsQ8_blockwise_v5_kernel<false>,
+                        (quantizeActivationsQ8_blockwise_v5_kernel<false, decltype(rowAuthority)>),
                         grid, block, shared_bytes, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 }
@@ -1570,12 +1581,12 @@ extern "C"
                 dim3 block(64, 1, 1);
                 if (countedRows) {
                     hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_kernel<QUANT_BLOCK, true>),
+                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_kernel<QUANT_BLOCK, true, decltype(rowAuthority)>),
                         grid, block, 0, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 } else {
                     hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_kernel<QUANT_BLOCK, false>),
+                        HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_kernel<QUANT_BLOCK, false, decltype(rowAuthority)>),
                         grid, block, 0, s,
                         d_A_fp32, d_A_int8, d_scales_blockwise, M, K, blocks_per_row, rowAuthority);
                 }
@@ -1592,7 +1603,8 @@ extern "C"
         }
 
         return true;
-    }
+    });
+}
 
     /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
     bool rocmQuantGemm_quantizeActivationsBlockwise(
@@ -1622,8 +1634,9 @@ extern "C"
                 M, K, rocm_device_id, stream, block_size, rowRange);
         }
         validateHIPActivationProducer(M, K, stream, rowRange);
-        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
-        const bool countedRows = rowRange && rowRange->countOwner();
+        return llaminar2::dispatchProjectionRows(M,rowRange,[&](auto rowAuthority) {
+
+        const bool countedRows = (rowRange && rowRange->countOwner()) || llaminar2::currentProjectionRowWork(rowAuthority.physicalRows());
 
         if (!rocmQuantGemm_setDevice(rocm_device_id))
             return false;
@@ -1653,13 +1666,13 @@ extern "C"
         else
             if (countedRows) {
                 hipLaunchKernelGGL(
-                    quantizeActivationsQ8_blockwise_v4_with_sums_kernel<true>,
+                    (quantizeActivationsQ8_blockwise_v4_with_sums_kernel<true, decltype(rowAuthority)>),
                     dim3(total_blocks, 1, 1), dim3(32, 1, 1), 0, static_cast<hipStream_t>(stream),
                     d_A_fp32, d_A_int8, d_scales_blockwise, d_sums_blockwise,
                     M, K, blocks_per_row, rowAuthority);
         } else {
             hipLaunchKernelGGL(
-                quantizeActivationsQ8_blockwise_v4_with_sums_kernel<false>,
+                (quantizeActivationsQ8_blockwise_v4_with_sums_kernel<false, decltype(rowAuthority)>),
                 dim3(total_blocks, 1, 1), dim3(32, 1, 1), 0, static_cast<hipStream_t>(stream),
                 d_A_fp32, d_A_int8, d_scales_blockwise, d_sums_blockwise,
                 M, K, blocks_per_row, rowAuthority);
@@ -1674,7 +1687,8 @@ extern "C"
         }
 
         return true;
-    }
+    });
+}
 
     /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
     bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
@@ -1962,10 +1976,11 @@ extern "C"
         if (!d_output) return false;
         if (!rocmQuantGemm_setDevice(rocm_device_id)) return false;
         if (alpha == 1.0f && d_bias == nullptr) return true;
-        const auto authority = rows ? *rows : llaminar2::DeviceRowRange::fullyActive(M);
-        if (rows && rows->countOwner())
+        return llaminar2::dispatchProjectionRows(M,rows,[&](auto authority) {
+        if ((rows && rows->countOwner()) || llaminar2::currentProjectionRowWork(M))
             return launchFp32Epilogue<true>(d_output,d_bias,M,N,alpha,native,authority);
         return launchFp32Epilogue<false>(d_output,d_bias,M,N,alpha,native,authority);
+        });
     }
 
     bool rocmQuantGemm_applyFp32CombineEpilogue(
@@ -2003,10 +2018,12 @@ extern "C"
         const int block_size = 256;
         const int total = M * N;
         const int grid_size = (total + block_size - 1) / block_size;
+        llaminar2::dispatchProjectionRows(M,nullptr,[&](auto authority) {
         hipLaunchKernelGGL(
-            applyFp32CombineEpilogue_kernel,
+            (applyFp32CombineEpilogue_kernel<decltype(authority)>),
             dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
-            d_computed, d_output, d_existing, d_bias, M, N, alpha, beta);
+            d_computed, d_output, d_existing, d_bias, M, N, alpha, beta,authority);
+        });
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)

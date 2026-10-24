@@ -45,6 +45,36 @@ __device__ __forceinline__ float tinyProjectionWeight(Weight value)
 }
 
 /**
+ * @brief Complete generic interval observation before the shared numeric body.
+ * @tparam Width Unchanged compiled physical row tile.
+ * @tparam Rows Immutable compact prefix/request or original interval argument.
+ * @param rows Borrowed original publication and geometry descriptor.
+ * @param first Original physical tile origin. @param physical Original matrix M.
+ * @return One compact tile bound/mask; tensor and scratch strides are unchanged.
+ * @details Compact legacy arguments retain their existing direct resolver. For
+ * full interval work, thread zero alone validates the original publications and
+ * derives one CTA-local mask. Its publication barrier completes that metadata
+ * phase before any operand or accumulator lifetime. The mask is a temporary
+ * projection of original state, never another live-count owner or GPU transfer.
+ * Empty CTAs return together after this boundary without tensor/scratch writes.
+ */
+template<int Width,class Rows>
+__device__ __forceinline__ auto resolveTinyProjectionRows(
+    const Rows& rows,int first,int physical)
+{
+    if constexpr (std::is_same_v<Rows,FloatingProjectionRows>)
+    {
+        __shared__ unsigned int interval_mask;
+        if (threadIdx.x == 0)
+            interval_mask = rows.template nativeTile<Width>(first,physical).mask;
+        __syncthreads();
+        return FloatingProjectionMaskTile{interval_mask};
+    }
+    else
+        return rows.template nativeTile<Width>(first,physical);
+}
+
+/**
  * @brief Project a row/column tile while preserving every serial FP32 operation.
  *
  * Lane L owns eight independent partials, corresponding to the original block
@@ -62,6 +92,7 @@ __device__ __forceinline__ float tinyProjectionWeight(Weight value)
  * @tparam Weight Native persistent weight element type, not activation precision.
  * @tparam RowsPerCTA Compiled physical row tile: 2, 4 or 8.
  * @tparam Activation Physical FP32 or FP16 activation element, widened before arithmetic.
+ * @tparam Rows Compact prefix/request or original interval argument selected at recording.
  * @param activations Device pointer array of FP32 activation matrices [M,K].
  * @param weights Device pointer array using the existing floating-projection ABI;
  *                each address owns a native Weight matrix [N,K].
@@ -73,10 +104,11 @@ __device__ __forceinline__ float tinyProjectionWeight(Weight value)
  *      (ceil(N/8),ceil(M/RowsPerCTA),batch_count). Pointer arrays and matrices
  *      must be prepared, admitted, and alive for the complete captured replay.
  */
-template<class Weight, int RowsPerCTA, class Activation = float>
+template<class Weight, int RowsPerCTA, class Activation = float,
+         class Rows = FloatingProjectionPrefixRows>
 __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     const float *const *activations, const float *const *weights,
-    float *const *outputs, int m, int n, int k, FloatingProjectionRows row_range)
+    float *const *outputs, int m, int n, int k, const __grid_constant__ Rows row_range)
 {
     static_assert(RowsPerCTA == 2 || RowsPerCTA == 4 || RowsPerCTA == 8);
     constexpr int warp_width = 32;
@@ -91,11 +123,11 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     const int first_row = static_cast<int>(blockIdx.y) * RowsPerCTA;
     // Whole inactive CTAs retire before operand loads or barriers. Partial
     // tiles retain neutral lanes and the exact established reduction tree.
-    unsigned int active_mask=0u;
-    #pragma unroll
-    for(int row=0;row<RowsPerCTA;++row)
-        if(row<m-first_row && row_range.rowIsActive(first_row+row))active_mask|=1u<<row;
-    if(active_mask==0u)return;
+    // Only this compact bound/mask survives into arithmetic. Legacy prefixes
+    // retain their original unconditional neutral-tail multiply/reduction body;
+    // explicit request/interval holes are retired with their original offsets.
+    const auto authored = resolveTinyProjectionRows<RowsPerCTA>(row_range, first_row, m);
+    if (authored.empty()) return;
     const int first_column = static_cast<int>(blockIdx.x) * columns_per_cta;
     const Activation *a = reinterpret_cast<const Activation *>(activations[blockIdx.z]);
     const Weight *b = reinterpret_cast<const Weight *>(weights[blockIdx.z]);
@@ -112,7 +144,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
         // still stage neutral storage so every warp can obey the same barriers.
         #pragma unroll
         for (int row = 0; row < RowsPerCTA; ++row)
-            activation_tile[row][threadIdx.x] = (active_mask & (1u<<row)) && load_k < static_cast<unsigned int>(k)
+            activation_tile[row][threadIdx.x] = authored.contains(row) && load_k < static_cast<unsigned int>(k)
                 ? tinyProjectionWeight(a[static_cast<size_t>(first_row + row) * k + load_k]) : 0.0f;
         #pragma unroll
         for (int col = 0; col < columns_per_cta; ++col)
@@ -130,7 +162,15 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
                 const float weight = weight_tile[column][tile_k];
                 #pragma unroll
                 for (int row = 0; row < RowsPerCTA; ++row)
-                    if(active_mask & (1u<<row))partials[row][part] += activation_tile[row][tile_k] * weight;
+                {
+                    if constexpr (Rows::masksTileArithmetic)
+                    {
+                        if (authored.contains(row))
+                            partials[row][part] += activation_tile[row][tile_k] * weight;
+                    }
+                    else
+                        partials[row][part] += activation_tile[row][tile_k] * weight;
+                }
             }
         }
         __syncthreads();
@@ -139,7 +179,8 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     #pragma unroll
     for (int row = 0; row < RowsPerCTA; ++row)
     {
-        if(!(active_mask & (1u<<row)))continue;
+        if constexpr (Rows::masksTileArithmetic)
+            if (!authored.contains(row)) continue;
         // Keep the same partial pairings as the legacy block reduction. Do not
         // collapse the eight accumulators or use an order-dependent atomic sum.
         #pragma unroll
@@ -153,7 +194,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
         #pragma unroll
         for (int stride = warp_width / 2; stride > 0; stride >>= 1)
             result += __shfl_down_sync(0xffffffffu, result, stride);
-        if (lane == 0 && (active_mask & (1u<<row)) && first_column + column < n)
+        if (lane == 0 && authored.contains(row) && first_column + column < n)
             c[static_cast<size_t>(first_row + row) * n + first_column + column] = result;
     }
 }

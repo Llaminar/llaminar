@@ -43,6 +43,8 @@ float sample(std::size_t i,unsigned seed) {
  unsigned x=unsigned(i)+seed;x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;
  return std::bit_cast<float>((x&0x807fffffu)|((123u+(x>>24)%9u)<<23));
 }
+/** @brief Exact compact row argument recorded by this legacy fixture. */
+enum class RecordedProjectionRows { Prefix,Requests };
 /**
  * @brief Authenticate exact custom/original node names and compact live geometry.
  * @param graph Retained graph under inspection.
@@ -53,9 +55,11 @@ float sample(std::size_t i,unsigned seed) {
  * @param type Original FP32/native16 consumer family.
  * @param copyTarget Optional exact mapped output destination.
  * @param copySource Optional exact original HBM redirect source.
+ * @param recordedRows Exact compact prefix/request argument selected at recording.
  */
 void inspect(Captured &graph,std::vector<unsigned> expectedZ,int expectedPublications,int n,int m,int k,
- bool original,int type,void *copyTarget=nullptr,void *copySource=nullptr) {
+ bool original,int type,void *copyTarget=nullptr,void *copySource=nullptr,
+ RecordedProjectionRows recordedRows=RecordedProjectionRows::Prefix) {
  std::size_t count=0;checked(hipGraphGetNodes(graph.graph,nullptr,&count));
  std::vector<hipGraphNode_t> nodes(count);checked(hipGraphGetNodes(graph.graph,nodes.data(),&count));
  int publications=0,copies=0;std::vector<unsigned> actualZ;
@@ -80,7 +84,7 @@ void inspect(Captured &graph,std::vector<unsigned> expectedZ,int expectedPublica
   } else {
    ASSERT_NE(name.find(type==0?"fp32_small_n_batched_projection_kernel":"fp32x16_batched_projection_kernel"),std::string::npos)<<name;
    EXPECT_EQ(params.blockDim.x,256u);EXPECT_EQ(params.gridDim.x,unsigned(n));EXPECT_EQ(params.gridDim.y,unsigned(m));
-   if(!original && type==0) {
+   if(!original) {
     // Graph topology is proof: validate the actual mode of this native chunk,
     // including partial final chunks, without inspecting mutable live counts.
     std::string readable=name;
@@ -90,9 +94,18 @@ void inspect(Captured &graph,std::vector<unsigned> expectedZ,int expectedPublica
       abi::__cxa_demangle(name.c_str(),nullptr,nullptr,&status),&std::free);
      ASSERT_EQ(status,0)<<name;ASSERT_NE(decoded.get(),nullptr);readable=decoded.get();
     }
-    const int mode=static_cast<int>(rocm::selectFP32ProjectionLoadPairs(m,n,int(params.gridDim.z),k));
-    const std::string expected="fp32_small_n_batched_projection_kernel<"+std::to_string(mode)+">";
-    ASSERT_NE(readable.find(expected),std::string::npos)<<readable<<" expected "<<expected;
+    const std::string rowType=recordedRows==RecordedProjectionRows::Requests?
+     "llaminar2::FloatingProjectionRequestRows":"llaminar2::FloatingProjectionPrefixRows";
+    // Authenticate the complete final row argument, not merely a family name.
+    // A full interval descriptor or opposite compact policy cannot pass these
+    // unchanged ordinary prefix/request fixtures after the template ABI grows.
+    const std::string rowSuffix=", "+rowType+">";
+    ASSERT_NE(readable.find(rowSuffix),std::string::npos)<<readable<<" expected "<<rowSuffix;
+    if(type==0) {
+     const int mode=static_cast<int>(rocm::selectFP32ProjectionLoadPairs(m,n,int(params.gridDim.z),k));
+     const std::string expected="fp32_small_n_batched_projection_kernel<"+std::to_string(mode)+rowSuffix;
+     ASSERT_NE(readable.find(expected),std::string::npos)<<readable<<" expected "<<expected;
+    }
    }
    actualZ.push_back(params.gridDim.z);
   }
@@ -287,7 +300,8 @@ void run(int type,int m,int n,int k,int count,Options options={}) {
   const auto originalZ=chunks((independent&&!direct)||mapped);
   const auto candidateZ=(direct&&QFN_POINTER102_VALUE_ABI)?std::vector<unsigned>{unsigned(count)}:chunks(independent||mapped);
   inspect(candidate,candidateZ,QFN_POINTER102_VALUE_ABI?0:int(candidateZ.size()),n,m,k,false,type,mapped?c[0]:nullptr,
-   mapped?workspace.getBuffer(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT):nullptr);
+   mapped?workspace.getBuffer(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT):nullptr,
+   holes&&!direct?RecordedProjectionRows::Requests:RecordedProjectionRows::Prefix);
   inspect(oracle,originalZ,int(originalZ.size()),n,m,k,true,type);
  }
  for(int replay=0;replay<(timing?1:20);++replay) {

@@ -30,6 +30,7 @@
  */
 
 #include "RankOrchestrator.h"
+#include "snapshots/SnapshotAuthoredTokenRows.h"
 #include "PipelineResidualWidth.h"
 #include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
 #include "models/qwen4exp/Qwen4ExpReplicatedPLEPrefixOrigin.h"
@@ -18354,6 +18355,14 @@ namespace llaminar2
         return std::vector<std::string>(all_keys.begin(), all_keys.end());
     }
 
+    /**
+     * @brief Retain typed diagnostic bytes and authenticate every authored-row participant.
+     * @param key Exact canonical checkpoint identity.
+     * @return Immutable owned publication, including a valid empty observation, or absence.
+     * @throws std::logic_error When authored interval provenance is missing or disagrees.
+     * @details This diagnostic lookup reads no live execution metadata. CompleteValue
+     * can supersede a partition only after every declared interval participant agrees.
+     */
     SnapshotInfo RankOrchestrator::getSnapshotWithShape(const std::string &key) const
     {
         // PP mode: search across all PP stage runners
@@ -18374,18 +18383,24 @@ namespace llaminar2
         // A completed publication is authoritative even when its owner is not
         // participant zero. Keep an ordinary shard only when no finalizer has
         // published this semantic value; getTPSnapshot owns shard assembly.
-        SnapshotInfo first_partition;
-        for (size_t i = 0; i < device_runners_.size(); ++i)
+        SnapshotInfo first_partition,complete_value;
+        std::vector<SnapshotInfo> replicas;
+        replicas.reserve(device_runners_.size());
+        bool authored=false;
+        for (const auto &runner:device_runners_)
         {
-            if (!device_runners_[i])
-                continue;
-            auto participant = device_runners_[i]->getSnapshotWithShape(key);
-            if (participant && participant.publication ==
-                                   SnapshotPublication::CompleteValue)
-                return participant;
-            if (participant && !first_partition)
-                first_partition = std::move(participant);
+            replicas.push_back(runner?runner->getSnapshotWithShape(key):SnapshotInfo{});
+            const auto &participant=replicas.back();
+            authored|=participant.semantic_axis==SnapshotSemanticAxis::AuthoredTokenRows ||
+                participant.authored_token_rows.has_value();
+            if(participant && participant.publication==SnapshotPublication::CompleteValue && !complete_value)
+                complete_value=participant;
+            if(participant && !first_partition)first_partition=participant;
         }
+        // Every declared participant must authenticate the same original row
+        // provenance before a complete publication can supersede partitions.
+        if(authored)validateSnapshotAuthoredTokenRowReplicas(replicas);
+        if(complete_value)return complete_value;
         if (first_partition && first_partition.isInteger())
         {
             // Integer identities are replicated declarations, never numerical

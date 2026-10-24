@@ -10,6 +10,9 @@
 #include "SnapshotValues.h"
 #include "SnapshotPublication.h"
 #include "SnapshotRowPartition.h"
+#include "SnapshotSemanticAxis.h"
+#include "SnapshotAuthoredTokenRowsObservation.h"
+#include <optional>
 #include <memory>
 
 namespace llaminar2
@@ -47,6 +50,9 @@ namespace llaminar2
         SnapshotOwnedRows row_ownership; ///< Immutable observed row ownership; no inference authority.
 
         SnapshotValueView typed_values; ///< Exact integer view or floating diagnostic view, sharing the same owner.
+
+        SnapshotSemanticAxis semantic_axis=SnapshotSemanticAxis::Legacy; ///< Immutable acquired mathematical axis.
+        std::optional<SnapshotAuthoredTokenRowsObservation> authored_token_rows; ///< Acquired original coordinates; no live authority.
 
         /** @return Whether this publication contains exact signed integer identities. */
         [[nodiscard]] bool isInteger() const noexcept

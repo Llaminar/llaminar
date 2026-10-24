@@ -1,5 +1,56 @@
 # QFN tuning dashboard
 
+**Candidate177 passes the focused production-integration slice:** **819.876
+prefill / 40.328 decode tok/s**, versus frozen175 controls at 820.235 / 40.151.
+The measured +0.439% decode gain is small and the ranges narrowly overlap;
+the **42.959 tok/s Castagna target remains open**. All nine natural token
+sequences and all 185 canonical final-logit rows match the accepted control.
+The 804-entry gate passes the complete 778 Unit registrations and affected GDN
+regressions. This is focused qualification, not complete ProductionTestPreflight.
+
+Direct merged-input GDN decode now removes its rearrangement launch on CUDA
+and ROCm while retaining exact recurrence arithmetic and state ownership.
+The final complete-boundary gains are 16.45% on MI50 and 26.05–30.09% on RTX3090;
+compiler/resource checks report zero spills. See the
+[qualification and benchmark settings](QFN_GDN_RECURRENCE_TUNING.md#scope-and-current-disposition).
+The next bounded experiment fuses NativeQ8 partial production with its exact
+ordered reduction; it has no measured result yet.
+
+**Previous candidate175 passes scoped regressions and the selected Release accuracy
+panel, but model decode throughput is unchanged.** The matched169/175 A/B/A
+measures **820.229 prefill /40.170 decode tok/s** versus818.657 /40.221.
+All nine natural256-token sequences match. All185 final-logit rows across
+26 files remain byte-identical to151, including the ranking threshold and reset.
+Explicit Decode now omits unused indexer query projection
+and preparation below visible context2052 while retaining keys, pools and
+history. The final repair run passes778 Unit registrations and six CUDA
+registrations plus the model fixture;147 unchanged Integration results are
+retained with source/binary/runtime checks. The resulting932-entry evidence is
+a bounded two-source composition, not complete ProductionTestPreflight.
+See [the qualification record](QFN_ATTENTION_STRUCTURE_COMPARISON.md#demand-limited-indexer-queries175).
+Isolated query projection falls46.006→6.191µs at context512; rocprof confirms
+2570.313→0.188KiB fetched with zero scratch/spills. Active projection remains
+approximately46µs; active preparation adds approximately1.58µs. These synthetic
+component results do not establish a model gain. The fresh complete-model trace
+confirms the intended interval kernels execute: measured query projection
+falls54.453→10.386µs/call versus165, with unchanged key projection. The model
+result remains flat; GDN preprocessing/recurrence is the next bounded target.
+A separate host uprobe observation measures only202–241µs median per model
+`hipGraphLaunch`, compared with approximately25ms per unprofiled decode step.
+All four participants and three measured token sequences validate. The long
+host calls in rocprof are instrumentation effects, not ordinary submission cost.
+The [GDN follow-up](QFN_GDN_RECURRENCE_TUNING.md#scope-and-current-disposition)
+rejects the176 preparation variants for single-token decode. Direct merged-input
+candidate177 removes deinterleave. Frozen175 A/B/A confirms a complete M1
+component reduction from14.529075 to12.10125µs (16.71%). All261 extended
+geometry cells and12 cells of repeated in-place state updates pass exact-byte
+checks. Profiles show zero spills and LDS bank conflicts. The final production
+integration and matched model results are recorded above and in the GDN report.
+The approximately43tok/s decode target remains open. CUDA full-work interval
+overhead has now been measured separately; NCU counter collection is rejected
+after driver assertions, with further attachment stopped. See the linked record
+for the accepted unprofiled measurements and diagnostic limits.
+
 **Attention checkpoint169 is green:** **819.319 prefill /40.175 decode tok/s**,
 versus frozen165 controls'818.872 /40.112. The +0.055% /+0.159% differences
 have overlapping ranges: whole-model throughput is effectively unchanged.

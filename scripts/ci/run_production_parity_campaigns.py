@@ -140,7 +140,12 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_p95,pytorch_p99,pytorch_outlier_frac,pytorch_dynamic_range,"
         "pytorch_sparsity,pytorch_zero_frac,pytorch_nan_count,"
         "pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER
-        + ",scalar_type,integer_mismatch_count,passed"
+        + ",scalar_type,integer_mismatch_count,passed,checkpoint_evidence_kind,structural_valid,query_empty_reason,"
+          "history_prompt_rows,history_decode_rows_before,history_live_rows,history_source_capacity,observed_request_count,"
+          "observed_prefix_rows,observed_live_rows,observed_row_capacity,observed_source_capacity,"
+          "observed_first_required_logical_row,observed_row_offset,observed_first_row,observed_end_row,"
+          "observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,observed_slice_first_row,"
+          "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row"
     ),
     "decode_steps.csv": (
         "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,"
@@ -162,7 +167,12 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_skewness,pytorch_p95,pytorch_p99,pytorch_outlier_frac,"
         "pytorch_dynamic_range,pytorch_sparsity,pytorch_zero_frac,"
         "pytorch_nan_count,pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER
-        + ",scalar_type,integer_mismatch_count,passed"
+        + ",scalar_type,integer_mismatch_count,passed,checkpoint_evidence_kind,structural_valid,query_empty_reason,"
+          "history_prompt_rows,history_decode_rows_before,history_live_rows,history_source_capacity,observed_request_count,"
+          "observed_prefix_rows,observed_live_rows,observed_row_capacity,observed_source_capacity,"
+          "observed_first_required_logical_row,observed_row_offset,observed_first_row,observed_end_row,"
+          "observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,observed_slice_first_row,"
+          "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row"
     ),
     "prefix_restore.csv": (
         "backend,phase,cache_config_enabled,cache_ready,cache_bypassed,"
@@ -2287,6 +2297,121 @@ def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
     return headers
 
 
+def expected_query_snapshot_interval(prompt, decode_rows_before, live, capacity):
+    """Derive original query coordinates from independent request history."""
+    if (any(type(value) is not int for value in (prompt, decode_rows_before, live, capacity)) or
+            prompt <= 0 or decode_rows_before < 0 or live < 0 or
+            not 0 < capacity <= 2147483647 or prompt + decode_rows_before + live > capacity):
+        raise ValueError("invalid original query history")
+    prefix = prompt + decode_rows_before
+    # Independent complete-pool demand: floor((prefix+row+1)/4)>512.
+    first = min(live, max(0, 4 * (512 + 1) - 1 - prefix))
+    return prefix, first, live
+
+
+def validate_stage_checkpoint_evidence(rows, *, decode):
+    """Authenticate query intervals while preserving numerical comparison authority.
+
+    The existing canonical detailed route submits one request and one live row.
+    It supplies prompt/submitted-row history independently of native acquisition.
+    Structural records keep required identity with no invented numerical metrics.
+    Every other stage retains its prior comparison policy and blank query proof.
+    """
+    query_stages = {"QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY"}
+    proof_fields = (
+        "structural_valid", "query_empty_reason", "history_prompt_rows",
+        "history_decode_rows_before", "history_live_rows", "history_source_capacity",
+        "observed_request_count", "observed_prefix_rows", "observed_live_rows",
+        "observed_row_capacity", "observed_source_capacity", "observed_first_required_logical_row",
+        "observed_row_offset", "observed_first_row", "observed_end_row", "observed_payload_row_offset",
+        "observed_physical_rows", "observed_repeats_per_row", "observed_slice_first_row",
+        "observed_payload_rows", "observed_payload_columns", "observed_payload_elements",
+        "reference_rows", "reference_first_row",
+    )
+    metrics = ("cosine", "cosine_drop", "rel_l2", "max_abs_diff", "snr_db", "rmse",
+               "error_entropy", "routing_overlap", "routing_top1_match", "routing_weight_l1")
+    seen = set()
+    cohorts = {}
+    try:
+        for values in rows[1:]:
+            row = dict(zip(rows[0], values, strict=True))
+            query = row["stage"] in query_stages
+            identity = tuple(row[key] for key in (("backend", "step", "layer", "stage") if decode
+                                                 else ("backend", "layer", "stage")))
+            if query:
+                if identity in seen:
+                    return "duplicate original query checkpoint"
+                seen.add(identity)
+                cohorts.setdefault(identity[:-1], set()).add(row["stage"])
+            kind = row["checkpoint_evidence_kind"]
+            if kind == "compared_values":
+                if any(row[field] for field in proof_fields) or (decode and query):
+                    return "query evidence missing from numerical Decode checkpoint"
+                continue
+            if not decode or not query or kind not in ("authored_query", "unauthored_query"):
+                return "unsupported query evidence kind or phase"
+            if (row["structural_valid"] != "1" or row["scalar_type"] != "FP32" or
+                    row["integer_mismatch_count"] or row["is_routing"] != "0" or
+                    row["route_conditioned_evaluated"] != "0"):
+                return "invalid typed query checkpoint evidence"
+            prompt = int(row["history_prompt_rows"])
+            before = int(row["history_decode_rows_before"])
+            live = int(row["history_live_rows"])
+            capacity = int(row["history_source_capacity"])
+            prefix, first, end = expected_query_snapshot_interval(prompt, before, live, capacity)
+            # This is the actual detailed canonical M1 route. Grouped metadata
+            # requires its own immutable transaction history, never M1 extrapolation.
+            if live != 1 or before != int(row["step"]):
+                return "query checkpoint has no canonical submitted-row history"
+            integers = {field: int(row[field]) for field in proof_fields
+                        if field not in ("structural_valid", "query_empty_reason")}
+            row_capacity = integers["observed_row_capacity"]
+            expected = {
+                "observed_request_count": 1, "observed_prefix_rows": prefix,
+                "observed_live_rows": live, "observed_source_capacity": capacity,
+                "observed_first_required_logical_row": 2051, "observed_row_offset": 0,
+                "observed_first_row": first, "observed_end_row": end,
+                "observed_payload_row_offset": 0, "observed_physical_rows": row_capacity,
+                "observed_repeats_per_row": 1, "observed_slice_first_row": 0,
+                "observed_payload_rows": end-first, "observed_payload_columns": 512,
+                "observed_payload_elements": (end-first)*512,
+            }
+            if not live <= row_capacity <= capacity or any(integers[key] != value for key, value in expected.items()):
+                return "query snapshot disagrees with independent original history or coordinates"
+            reference_rows = integers["reference_rows"]
+            if reference_rows not in (live, prefix+live):
+                return "query reference extent is not original live/history rows"
+            reference_first = first if reference_rows == live else prefix+first
+            if integers["reference_first_row"] != reference_first:
+                return "query reference crop lost original row coordinates"
+            empty = first == end
+            if ((row["query_empty_reason"] != ("ranking_not_required" if empty else "none")) or
+                    (kind == "unauthored_query") != empty):
+                return "wrong query empty reason or authored suffix"
+            if empty:
+                if (row["passed"] != "0" or row["canonical_passed"] != "0" or
+                        row["proof_authority"] != "structural_query_interval"):
+                    return "uncomputed query masquerades as numerical equality"
+                if any(row[field] for field in metrics) or any(
+                        value for key, value in row.items() if key.startswith(("llaminar_", "pytorch_")) or
+                        (key.startswith("route_conditioned_") and key != "route_conditioned_evaluated") or
+                        key in ("route_weights_max_error", "hf_reconstruction_rel_l2")):
+                    return "uncomputed query contains fabricated numerical values"
+            else:
+                if (row["proof_authority"] != "canonical_hf" or
+                        int(row["llaminar_elements"]) != (end-first)*512 or
+                        int(row["pytorch_elements"]) != (end-first)*512 or
+                        any(int(row[field]) != 0 for field in ("llaminar_nan_count", "llaminar_inf_count",
+                                                             "pytorch_nan_count", "pytorch_inf_count")) or
+                        any(not math.isfinite(float(row[field])) for field in ("cosine", "rel_l2", "max_abs_diff"))):
+                    return "authored useful query lost its original finite numerical comparison"
+        if any(stages != query_stages for stages in cohorts.values()):
+            return "missing required raw or prepared query checkpoint"
+    except (ValueError, KeyError, TypeError, OverflowError) as error:
+        return f"malformed query checkpoint evidence: {error}"
+    return None
+
+
 def validate_native_verifier_rows(rows: list[list[str]]) -> str | None:
     """Require finite-byte success and one coherent mandatory checkpoint bank.
 
@@ -2516,6 +2641,11 @@ def validate_campaign_artifacts(
             if requires_data and len(rows) < 2:
                 errors.append(f"{gtest_case}: {filename} has no evidence row")
                 continue
+            if filename in ("prefill_stages.csv", "decode_stages.csv"):
+                stage_error = validate_stage_checkpoint_evidence(rows, decode=filename == "decode_stages.csv")
+                if stage_error:
+                    errors.append(f"{gtest_case}: {filename}: {stage_error}")
+                    continue
             if filename == "mtp_native_verifier_rows.csv":
                 native_error = validate_native_verifier_rows(rows)
                 if native_error:

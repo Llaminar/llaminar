@@ -1168,6 +1168,21 @@ namespace llaminar2
             const TensorBase& tensor, DeviceId device, size_t bytes) const;
         TransferEngine() = default;
 
+        /**
+         * @brief Initialize exact immutable metadata in an already admitted workspace region.
+         * @param destination Lease on the original PMA-owned physical region.
+         * @param source Complete immutable payload; allocation padding is excluded.
+         * @param stream Exact GPU setup stream; CPU setup uses nullptr.
+         * @details Setup only, before capture. The copy's own event is drained
+         * before returning so temporary host address metadata may retire. This
+         * does not allocate device storage or publish mutable execution state.
+         * The caller's retained immutable publication registry prevents rewrites.
+         * @throws std::invalid_argument For capture, geometry or stream violations.
+         * @throws std::runtime_error For backend or event failures.
+         */
+        void initializeWorkspaceMetadata(const WorkspaceBufferLease &destination,
+            std::span<const std::byte> source, void *stream) const;
+
         /// Construct a TransferEngine with an injected backend resolver
         /// (for testing with MockBackend).
         using BackendResolver = IBackend *(*)(DeviceId);

@@ -27,8 +27,13 @@
  * IQ4_XS physical format 24 preserves the original half base and raw six-bit
  * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/cuda/gemm/CUDACanonicalKpartFold.h"
@@ -1182,7 +1187,7 @@ namespace
      * @param d_C_existing Optional existing output used when beta is nonzero.
      * @param d_bias Optional final per-column bias.
      */
-    template <int TILE_N, int CPT, uint8_t CB>
+    template <int TILE_N, int CPT, uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     __global__ void nativeVnniGemv_wide(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -1194,8 +1199,11 @@ namespace
         int N, int K,
         float alpha, float beta,
         const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias)
+        const float *__restrict__ d_bias, Rows work)
     {
+        if constexpr (std::is_same_v<Rows,llaminar2::ProjectionRowWork>)
+        if (!llaminar2::projectionWorkRowIsActiveUniform(work,0)) return; // Original M1 arithmetic; skip before any operand or partial access.
+
         const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
 
         const int blocks_per_row = K / BLOCK_K;
@@ -1276,7 +1284,7 @@ namespace
     // Every partition writes its disjoint persistent partial row. The ordered
     // reducer below is the sole owner of final output publication.
     // =====================================================================
-    template <int TILE_N, int CPT, uint8_t CB>
+    template <int TILE_N, int CPT, uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     __global__ void nativeVnniGemv_kpar(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -1286,8 +1294,11 @@ namespace
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
         int N, int K, int kb,
-        float alpha)
+        float alpha, Rows work)
     {
+        if constexpr (std::is_same_v<Rows,llaminar2::ProjectionRowWork>)
+        if (!llaminar2::projectionWorkRowIsActiveUniform(work,0)) return; // Original M1 arithmetic; skip before any operand or partial access.
+
         const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
         const int split_idx = blockIdx.y;
         if (n_base >= N)
@@ -1409,13 +1420,16 @@ namespace
      * @param existing Previous output, required when beta is nonzero.
      * @param bias Optional per-column bias applied last.
      */
-    template <uint8_t CB, int Columns>
+    template <uint8_t CB, int Columns, class Rows = llaminar2::DeviceRowRange>
     __global__ void nativeVnniGemv_fusedKpar(
         const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
         const uint16_t *secondary, const uint32_t *extended_minima, float *output,
         const float *activation_scales, int n, int k, int kb, float alpha,
-        float beta, const float *existing, const float *bias)
+        float beta, const float *existing, const float *bias, Rows work)
     {
+        if constexpr (std::is_same_v<Rows,llaminar2::ProjectionRowWork>)
+        if (!llaminar2::projectionWorkRowIsActiveUniform(work,0)) return; // Original M1 arithmetic; skip before any operand or partial access.
+
         extern __shared__ float partials[];
         const int lane = threadIdx.x;
         const int partition = threadIdx.y;
@@ -1465,14 +1479,17 @@ namespace
     {
         cudaFuncAttributes attributes{};
         int active_blocks = 0;
-        if (cudaFuncGetAttributes(&attributes, nativeVnniGemv_fusedKpar<CB, Columns>) != cudaSuccess ||
+        return llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
+        using Rows=decltype(work);
+        if (cudaFuncGetAttributes(&attributes, nativeVnniGemv_fusedKpar<CB, Columns, Rows>) != cudaSuccess ||
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &active_blocks, nativeVnniGemv_fusedKpar<CB, Columns>,
+                &active_blocks, nativeVnniGemv_fusedKpar<CB, Columns, Rows>,
                 plan.threads(), plan.sharedBytes()) != cudaSuccess)
             return false;
         resources = {attributes.numRegs, attributes.localSizeBytes, attributes.sharedSizeBytes,
                      attributes.maxThreadsPerBlock, active_blocks};
         return true;
+        });
     }
 
     /** @brief Submit one admitted candidate; never alter its arithmetic partition tree. */
@@ -1491,12 +1508,14 @@ namespace
             if (!extended_minima) return false;
         const auto launch = [&]<int Columns>() {
             // Division without n+Columns-1 avoids overflow near the ABI limit.
+            llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeVnniGemv_fusedKpar<CB, Columns><<<
                 1 + (n - 1) / Columns, dim3(Columns, plan.partitions()),
                 plan.sharedBytes(), stream>>>(
                 activations, payload, scales, secondary, extended_minima, output,
                 activation_scales, n, plan.reductionElements(), plan.partitions(),
-                alpha, beta, existing, bias);
+                alpha, beta, existing, bias, work);
+            });
             return cudaGetLastError() == cudaSuccess;
         };
         switch (plan.columns())
@@ -1544,7 +1563,7 @@ namespace
      * @param d_C_existing Optional existing output consumed when beta is nonzero.
      * @param d_bias Optional output-column bias.
      */
-    template <int NWARPS, uint8_t CB>
+    template <int NWARPS, uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     __global__ void nativeVnniGemv_rowpar(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload_rm,
@@ -1556,8 +1575,11 @@ namespace
         int N, int K,
         float alpha, float beta,
         const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias)
+        const float *__restrict__ d_bias, Rows work)
     {
+        if constexpr (std::is_same_v<Rows,llaminar2::ProjectionRowWork>)
+        if (!llaminar2::projectionWorkRowIsActiveUniform(work,0)) return; // Original M1 arithmetic; skip before any operand or partial access.
+
         constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
         const int n = blockIdx.x;
         if (n >= N)
@@ -1719,7 +1741,7 @@ namespace
      * @param M Physical activation-row stride.
      * @param rows Device-resident active-row extent within the physical stride.
      */
-    template <int ROWS_PER_TILE, int NWARPS, uint8_t CB>
+    template <int ROWS_PER_TILE, int NWARPS, uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     __global__ void nativeVnniGemv_rowpar_small_m(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload_rm,
@@ -1731,16 +1753,18 @@ namespace
         int M, int N, int K,
         float alpha, float beta,
         const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias, llaminar2::DeviceRowRange rows)
+        const float *__restrict__ d_bias, Rows rows)
     {
         static_assert(ROWS_PER_TILE > 0, "Verifier row tiles must contain at least one row");
         constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
         const int n = blockIdx.x;
-        const int row_base = blockIdx.y * ROWS_PER_TILE;
         // The controller count is uniform across the CTA; exit before any
         // weight load or block barrier, keeping physical row strides intact.
-        const int active_m = rows.activeRows();
-        if (row_base >= active_m || n >= N)
+        llaminar2::ProjectionWorkCursor rowWork(rows,int(blockIdx.y),int(gridDim.y),ROWS_PER_TILE);
+        int row_base,active_m;
+        while(rowWork.next(row_base,active_m))
+        {
+        if (n >= N)
             return;
 
         const int k_blocks = K / BLOCK_K;
@@ -1913,7 +1937,8 @@ namespace
                 d_C[out_idx] = out;
             }
         }
-    }
+            } // Original-row interval tiles.
+}
 
     // =====================================================================
     // Reduce kernel: sum kb partials per column + apply beta/bias
@@ -1924,13 +1949,17 @@ namespace
     // Layout: d_partials[k * N + n] for k=0..kb-1
     // Adjacent threads read adjacent n values → coalesced for each k.
     // =====================================================================
+    template<class Rows = llaminar2::DeviceRowRange>
     __global__ void nativeVnniGemv_reduce(
         const float *__restrict__ d_partials,
         float *__restrict__ d_C,
         const float *__restrict__ d_C_existing,
         const float *__restrict__ d_bias,
-        int N, int kb, float beta)
+        int N, int kb, float beta, Rows work)
     {
+        if constexpr (std::is_same_v<Rows,llaminar2::ProjectionRowWork>)
+        if (!llaminar2::projectionWorkRowIsActiveUniform(work,0)) return; // Original M1 arithmetic; skip before any operand or partial access.
+
         const int n = blockIdx.x * blockDim.x + threadIdx.x;
         if (n >= N)
             return;
@@ -2044,7 +2073,7 @@ namespace
      * by serial DP4A decode. Runtime M only changes the independent Y-grid tile
      * count; it cannot alter an accepted row's arithmetic.
      */
-    template <uint8_t CB>
+    template <uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     __global__ __launch_bounds__(128, 8) void nativeVnniGemvTensorCoreSmallM(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -2057,7 +2086,7 @@ namespace
         int N,
         int K,
         int kb,
-        float alpha, llaminar2::DeviceRowRange rows)
+        float alpha, Rows rows)
     {
 #if __CUDA_ARCH__ >= 800
         constexpr int kRows = 16;
@@ -2066,12 +2095,14 @@ namespace
         constexpr int kWordsPerBlock = BLOCK_K / sizeof(int32_t);
         const int warp = threadIdx.x / warpSize;
         const int lane = threadIdx.x % warpSize;
-        const int row_base = blockIdx.y * kRows;
         const int column_base =
             (blockIdx.x * kWarpsPerBlock + warp) * kColumns;
-        const int active_m = rows.activeRows();
+        llaminar2::ProjectionWorkCursor rowWork(rows,int(blockIdx.y),int(gridDim.y),kRows);
+        int row_base,active_m;
+        while(rowWork.next(row_base,active_m))
+        {
         // Whole inactive MMA tiles leave before warp-cooperative work.
-        if (row_base >= active_m || column_base >= N)
+        if (column_base >= N)
             return;
         const int split_index = blockIdx.z;
         const int blocks_per_row = K / BLOCK_K;
@@ -2225,6 +2256,7 @@ namespace
                     column] = __fmul_rn(alpha, accumulator[element]);
             }
         }
+        } // Original-row interval tiles.
 #else
         (void)d_A_int8;
         (void)d_payload;
@@ -2258,7 +2290,7 @@ namespace
         int TILE_N,
         int CPT,
         uint8_t CB,
-        bool PUBLISH_SINGLE_PARTITION = false>
+        bool PUBLISH_SINGLE_PARTITION = false, class Rows = llaminar2::DeviceRowRange>
     // The geometry bounds live row accumulators directly. Do not tighten ptxas's
     // maximum-CTA hint to the actual launch width: for these memory-bound tiles
     // that lets it inflate registers even at shallow depths, reducing occupancy.
@@ -2275,7 +2307,7 @@ namespace
         float alpha,
         float beta,
         const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias, llaminar2::DeviceRowRange rows)
+        const float *__restrict__ d_bias, Rows rows)
     {
         static_assert(ROWS_PER_TILE > 0, "Verifier row tiles must contain at least one row");
         static_assert(
@@ -2285,10 +2317,14 @@ namespace
         constexpr int ROWS_PER_LANE = Geometry::rows_per_lane;
         const int n_base = Geometry::columnBase(blockIdx.x, threadIdx.x);
         const int split_idx = blockIdx.y;
-        const int row_base = Geometry::rowBase(blockIdx.z, threadIdx.x);
-        const int active_m = rows.activeRows();
+        llaminar2::ProjectionWorkCursor rowWork(rows,int(blockIdx.z),int(gridDim.z),ROWS_PER_TILE);
+        int tile_first,active_m;
+        while(rowWork.next(tile_first,active_m))
+        {
+        const int row_base=tile_first+Geometry::rowBase(0,threadIdx.x);
+        if(row_base>=active_m)continue;
         // Admission is logical; partial indexing below must keep physical M.
-        if (row_base >= active_m || n_base >= N)
+        if (n_base >= N)
             return;
 
         const int blocks_per_row = K / BLOCK_K;
@@ -2435,7 +2471,8 @@ namespace
                 }
             }
         }
-    }
+            } // Original-row interval tiles.
+}
 
     /**
      * @brief Publish one runtime verifier row from ordered K-partition partials.
@@ -2444,17 +2481,21 @@ namespace
      * of the total verifier depth. This is the same ascending-partition loop as
      * serial M=1 publication, applied to the row's disjoint partial slice.
      */
+    template<class Rows = llaminar2::DeviceRowRange>
     __global__ void nativeVnniGemv_reduce_small_m(
         const float *__restrict__ d_partials,
         float *__restrict__ d_C,
         const float *__restrict__ d_C_existing,
         const float *__restrict__ d_bias,
-        int M, int N, int kb, float beta, llaminar2::DeviceRowRange rows)
+        int M, int N, int kb, float beta, Rows rows)
     {
-        const int row = blockIdx.y;
+        llaminar2::ProjectionWorkCursor rowWork(rows,int(blockIdx.y),int(gridDim.y),1);
+        int row,active_m;
+        while(rowWork.next(row,active_m))
+        {
         const int n = blockIdx.x * blockDim.x + threadIdx.x;
         // Do not consume scratch left by a previous, wider transaction.
-        if (row >= rows.activeRows() || n >= N)
+        if (n >= N)
             return;
 
         float sum = 0.0f;
@@ -2469,7 +2510,8 @@ namespace
         if (d_bias)
             sum += d_bias[n];
         d_C[out_idx] = sum;
-    }
+            } // Original-row partials only.
+}
 
     // =====================================================================
     // KPAR tile profiles — different TILE_N × CPT × K-split combinations
@@ -2493,7 +2535,7 @@ namespace
         int CPT,
         uint8_t CB,
         int ROWS_PER_TILE = 2,
-        bool MATCH_WIDE_SERIAL = false>
+        bool MATCH_WIDE_SERIAL = false, class Rows = llaminar2::DeviceRowRange>
     bool launchKparSmallMImpl(
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
@@ -2505,7 +2547,7 @@ namespace
         int exact_kb,
         int force_two_phase,
         int device_id, cudaStream_t stream,
-        CUDAGemvContext_ *gemv_ctx, llaminar2::DeviceRowRange rows)
+        CUDAGemvContext_ *gemv_ctx, Rows rows)
     {
         static_assert(
             ROWS_PER_TILE == 2 || ROWS_PER_TILE == 4 ||
@@ -2651,7 +2693,7 @@ namespace
         return true;
     }
 
-    template <uint8_t CB>
+    template <uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     bool launchTensorCoreSmallMGenerated(
         NativeGemvShape serial_shape,
         const GeneratedDispatchTuning &serial_tuning,
@@ -2670,7 +2712,7 @@ namespace
         const float *d_C_existing,
         const float *d_bias,
         CUDAGemvContext_ *gemv_ctx,
-        cudaStream_t stream, llaminar2::DeviceRowRange rows)
+        cudaStream_t stream, Rows rows)
     {
         int kb = 1;
         if (usesOrderedKpartTree(serial_shape))
@@ -2784,31 +2826,39 @@ namespace
         switch (nwarps)
         {
         case 2:
+            llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeVnniGemv_rowpar<2, CB><<<N, 64, 0, stream>>>(
                 d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+            });
             break;
         case 4:
+            llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeVnniGemv_rowpar<4, CB><<<N, 128, 0, stream>>>(
                 d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+            });
             break;
         case 8:
+            llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeVnniGemv_rowpar<8, CB><<<N, 256, 0, stream>>>(
                 d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+            });
             break;
         default:
+            llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeVnniGemv_rowpar<4, CB><<<N, 128, 0, stream>>>(
                 d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+            });
             break;
         }
 
         return cudaGetLastError() == cudaSuccess;
     }
 
-    template <uint8_t CB>
+    template <uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     bool launchRowParSmallM(
         const int8_t *d_A_int8,
         const uint8_t *d_payload_rm,
@@ -2820,7 +2870,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int nwarps,
-        cudaStream_t stream, llaminar2::DeviceRowRange rows)
+        cudaStream_t stream, Rows rows)
     {
         constexpr int ROWS_PER_TILE = 2;
         const dim3 grid(N, (M + ROWS_PER_TILE - 1) / ROWS_PER_TILE);
@@ -2894,65 +2944,81 @@ namespace
             case 32 * 100 + 1:
             {
                 const int grid_n = (N + 32 - 1) / 32;
+                llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeVnniGemv_wide<32, 1, CB><<<grid_n, 32, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                });
                 return cudaGetLastError() == cudaSuccess;
             }
             case 64 * 100 + 1:
             {
                 const int grid_n = (N + 64 - 1) / 64;
+                llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeVnniGemv_wide<64, 1, CB><<<grid_n, 64, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                });
                 return cudaGetLastError() == cudaSuccess;
             }
             case 64 * 100 + 2:
             {
                 const int grid_n = (N + 64 - 1) / 64;
+                llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeVnniGemv_wide<64, 2, CB><<<grid_n, 32, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                });
                 return cudaGetLastError() == cudaSuccess;
             }
             case 128 * 100 + 1:
             {
                 const int grid_n = (N + 128 - 1) / 128;
+                llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeVnniGemv_wide<128, 1, CB><<<grid_n, 128, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                });
                 return cudaGetLastError() == cudaSuccess;
             }
             case 128 * 100 + 2:
             {
                 const int grid_n = (N + 128 - 1) / 128;
+                llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeVnniGemv_wide<128, 2, CB><<<grid_n, 64, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                });
                 return cudaGetLastError() == cudaSuccess;
             }
             case 256 * 100 + 2:
             {
                 const int grid_n = (N + 256 - 1) / 256;
+                llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeVnniGemv_wide<256, 2, CB><<<grid_n, 128, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                });
                 return cudaGetLastError() == cudaSuccess;
             }
             case 256 * 100 + 4:
             {
                 const int grid_n = (N + 256 - 1) / 256;
+                llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeVnniGemv_wide<256, 4, CB><<<grid_n, 64, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                });
                 return cudaGetLastError() == cudaSuccess;
             }
             case 512 * 100 + 4:
             {
                 const int grid_n = (N + 512 - 1) / 512;
+                llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeVnniGemv_wide<512, 4, CB><<<grid_n, 128, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                    d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                });
                 return cudaGetLastError() == cudaSuccess;
             }
             default:
@@ -3048,7 +3114,7 @@ namespace
         CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream);
 
-    template <int ROWS_PER_TILE, uint8_t CB, bool MATCH_WIDE_SERIAL = false>
+    template <int ROWS_PER_TILE, uint8_t CB, bool MATCH_WIDE_SERIAL = false, class Rows = llaminar2::DeviceRowRange>
     bool dispatchKparSmallMGeneratedRows(
         const GeneratedDispatchTuning &tuning,
         const int8_t *d_A_int8, const uint8_t *d_payload,
@@ -3058,7 +3124,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         CUDAGemvContext_ *gemv_ctx,
-        int cuda_device_id, cudaStream_t stream, llaminar2::DeviceRowRange rows)
+        int cuda_device_id, cudaStream_t stream, Rows rows)
     {
         switch (tuning.tile_n * 100 + tuning.cpt)
         {
@@ -3138,7 +3204,7 @@ namespace
      * tile and exact K-partition schedule, so this parameter cannot alter that
      * row's reduction tree or publication bytes.
      */
-    template <uint8_t CB, bool MATCH_WIDE_SERIAL = false>
+    template <uint8_t CB, bool MATCH_WIDE_SERIAL = false, class Rows = llaminar2::DeviceRowRange>
     bool dispatchKparSmallMGenerated(
         const GeneratedDispatchTuning &tuning,
         int grouped_rows,
@@ -3149,7 +3215,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         CUDAGemvContext_ *gemv_ctx,
-        int cuda_device_id, cudaStream_t stream, llaminar2::DeviceRowRange rows)
+        int cuda_device_id, cudaStream_t stream, Rows rows)
     {
         switch (grouped_rows)
         {
@@ -3314,7 +3380,7 @@ namespace
             cuda_device_id, stream);
     }
 
-    template <uint8_t CB>
+    template <uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     bool dispatchCodebookSmallMRowPar(
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
@@ -3325,7 +3391,7 @@ namespace
         CUDAGemvContext_ *gemv_ctx,
         CUDARowMajorWeights_ **rm_slot,
         uint8_t arithmetic_policy_codebook_id,
-        int cuda_device_id, cudaStream_t stream, llaminar2::DeviceRowRange rows)
+        int cuda_device_id, cudaStream_t stream, Rows rows)
     {
         bool graph_captured = false;
         if (!queryGraphCapturedExecution(stream, graph_captured))
@@ -3602,6 +3668,7 @@ namespace
         return nullptr;
     }
 
+    template<class Rows = llaminar2::DeviceRowRange>
     bool dispatchSmallMByCodebook(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
@@ -3619,7 +3686,7 @@ namespace
         int cuda_device_id,
         cudaStream_t cuda_stream,
         CUDAGemvContext_ *gemv_ctx,
-        CUDARowMajorWeights_ **rm_slot, llaminar2::DeviceRowRange rows)
+        CUDARowMajorWeights_ **rm_slot, Rows rows)
     {
         switch (codebook_id)
         {
@@ -3680,9 +3747,11 @@ namespace
         if (!d_partials)
             return false;
 
+        llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
         nativeVnniGemv_kpar<TILE_N, CPT, CB><<<grid, THREADS, 0, stream>>>(
             d_A_int8, d_payload, d_scales, d_mins, d_emins,
-            d_partials, d_scales_A, N, K, kb_capped, alpha);
+            d_partials, d_scales_A, N, K, kb_capped, alpha, work);
+        });
         {
             const cudaError_t launch_error = cudaGetLastError();
             if (launch_error != cudaSuccess)
@@ -3690,8 +3759,10 @@ namespace
         }
 
         const int reduction_blocks = (N + 255) / 256;
+        llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
         nativeVnniGemv_reduce<<<reduction_blocks, 256, 0, stream>>>(
-            d_partials, d_C, d_C_existing, d_bias, N, kb_capped, beta);
+            d_partials, d_C, d_C_existing, d_bias, N, kb_capped, beta, work);
+        });
 
         return cudaGetLastError() == cudaSuccess;
     }
@@ -4268,14 +4339,14 @@ extern "C"
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
-        const auto rows = row_range ? *row_range :
-            llaminar2::DeviceRowRange::fullyActive(M);
+        return llaminar2::dispatchProjectionRows(M,row_range,[&](auto rows) {
         return dispatchSmallMByCodebook(
             d_A_int8, d_payload, d_scales, d_mins, d_emins,
             d_C_fp32, d_scales_A_block, M, N, K, alpha, beta,
             d_C_existing, d_bias, codebook_id,
             arithmetic_policy_codebook_id, cuda_device_id,
             cuda_stream, gemv_ctx, rm_slot, rows);
+        });
     }
 
     bool cudaNativeVNNIInitIQGridTables_tuned()

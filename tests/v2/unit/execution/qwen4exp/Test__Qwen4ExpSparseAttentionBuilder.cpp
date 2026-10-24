@@ -519,3 +519,90 @@ TEST(Qwen4ExpSparseAttentionBuilder, Phase33ColdRejectionLeavesGraphUnchanged)
         EXPECT_EQ(g.size(),1u);
     }
 }
+
+
+/**
+ * @test Only explicit Decode elides queries; Prefill and absent phase retain AllLive.
+ * @details Both builder entrypoints use the same fixed geometry and original
+ * grouped arithmetic. Exact key GEMM/capture identity remains unchanged, so a
+ * query gate cannot silently suppress key history needed by later ranking.
+ */
+TEST(Qwen4ExpSparseAttentionBuilder, QueryDemandUsesOnlyExplicitDecodeAndLeavesKeysUnchanged)
+{
+    using Phase=ForwardExecutionPhase;
+    using Demand=qwen4exp::QwenSparseQueryDemand;
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture f;
+    const std::array<std::optional<Phase>,3> phases{std::nullopt,Phase::Prefill,Phase::Decode};
+    std::array<std::uint64_t,3> queryIdentities{},indexerIdentities{};
+    std::uint64_t keyIdentity=0;
+    for(std::size_t phase=0;phase<phases.size();++phase)for(const bool requestsEntry:{false,true})
+    {
+        SCOPED_TRACE(::testing::Message()<<"phase="<<phase<<" requestsEntry="<<requestsEntry);
+        ComputeGraph graph;f.seed(graph);
+        auto policy=f.policy();policy.executionPhase=phases[phase];
+        // Hold arithmetic fixed to isolate the declared query-work policy.
+        policy.projectionArithmetic=Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
+        if(requestsEntry)
+            (void)Builder::appendRequests(graph,f.consumer(),policy,f.weights(),
+                DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}});
+        else
+            (void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers());
+        ASSERT_EQ(graph.size(),6u);
+        const auto *query=dynamic_cast<const GEMMStage *>(graph.getNode("qsa.qsa_query_proj")->stage.get());
+        const auto *key=dynamic_cast<const GEMMStage *>(graph.getNode("qsa.qsa_key_proj")->stage.get());
+        const auto *indexer=dynamic_cast<const QwenSparseAttentionStage *>(graph.getNode("qsa.qsa_indexer")->stage.get());
+        ASSERT_NE(query,nullptr);
+        ASSERT_NE(key,nullptr);
+        ASSERT_NE(indexer,nullptr);
+        const auto &q=query->getParams();const auto &k=key->getParams();
+        const auto &i=std::get<QwenSparseAttentionStage::Indexer>(indexer->getParams().operation);
+        const bool ranking=phases[phase]==Phase::Decode;
+        EXPECT_EQ(i.queryDemand,ranking?Demand::RankingOnly:Demand::AllLive);
+        EXPECT_EQ(q.projection_row_work.has_value(),ranking);
+        if(ranking) {
+            const auto &work=*q.projection_row_work;
+            EXPECT_EQ(work.rowsPerRequest,Fixture::rows);
+            EXPECT_EQ(work.sourceCapacity,Fixture::tokens);
+            EXPECT_EQ(work.firstRequiredLogicalRow,2051);
+            ASSERT_EQ(work.sources.size(),1u);
+            EXPECT_EQ(work.sources[0].tensor,&f.replay);
+            EXPECT_EQ(work.sources[0].frontierByteOffset,0u);
+            EXPECT_EQ(work.sources[0].liveByteOffset,sizeof(std::int32_t));
+        }
+        EXPECT_FALSE(k.projection_row_work);
+        EXPECT_EQ(k.A,&f.input);EXPECT_EQ(k.C,&f.raw);
+        EXPECT_EQ(k.m,Fixture::rows);EXPECT_EQ(k.n,128);EXPECT_EQ(k.k,Fixture::hidden);
+        EXPECT_TRUE(k.force_decode_equivalent_verifier_prefill);
+        EXPECT_EQ(i.rawKey.tensor,&f.raw);EXPECT_EQ(i.pooledKeys.tensor,&f.pools);
+        EXPECT_EQ(i.selected.tensor,&f.selected);EXPECT_EQ(i.selectedCount.tensor,&f.count);
+        EXPECT_FALSE(i.transactionPrior);
+        const auto keyNow=key->graphCaptureVariantSignature();
+        if(!keyIdentity)keyIdentity=keyNow;
+        EXPECT_EQ(keyNow,keyIdentity);
+        if(requestsEntry) {
+            EXPECT_EQ(query->graphCaptureVariantSignature(),queryIdentities[phase]);
+            EXPECT_EQ(indexer->graphCaptureVariantSignature(),indexerIdentities[phase]);
+        } else {
+            queryIdentities[phase]=query->graphCaptureVariantSignature();
+            indexerIdentities[phase]=indexer->graphCaptureVariantSignature();
+        }
+    }
+    EXPECT_EQ(queryIdentities[0],queryIdentities[1]);
+    EXPECT_NE(queryIdentities[1],queryIdentities[2]);
+    EXPECT_EQ(indexerIdentities[0],indexerIdentities[1]);
+    EXPECT_NE(indexerIdentities[1],indexerIdentities[2]);
+}
+
+/** @test Invalid typed phase never chooses AllLive or mutates a partially published graph. */
+TEST(Qwen4ExpSparseAttentionBuilder, QueryDemandRejectsUnknownPhaseBeforeGraphMutation)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture f;ComputeGraph graph;f.seed(graph);
+    auto policy=f.policy();policy.executionPhase=static_cast<ForwardExecutionPhase>(255);
+    EXPECT_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()),std::invalid_argument);
+    EXPECT_EQ(graph.size(),1u);
+    EXPECT_THROW((void)Builder::appendRequests(graph,f.consumer(),policy,f.weights(),
+        DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}}),std::invalid_argument);
+    EXPECT_EQ(graph.size(),1u);
+}

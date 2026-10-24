@@ -163,17 +163,18 @@ namespace
      * @param N Number of output columns.
      * @param K Reduction width; each original thread visits stride-256 positions.
      */
-    template <int WeightDtype, bool HalfActivation = false>
+    template <int WeightDtype, bool HalfActivation = false, class Rows = llaminar2::FloatingProjectionPrefixRows>
     __global__ __launch_bounds__(TINY_FP32_BLOCK)
     void floating_tiny_block_projection_kernel(
         const float *const *d_A_array, const float *const *d_B_array,
         float *const *d_C_array, int M, int N, int K,
-        llaminar2::FloatingProjectionRows row_range)
+        const __grid_constant__ Rows row_range)
     {
         const int n = blockIdx.x, m = blockIdx.y, batch = blockIdx.z;
+        if (!row_range.rowIsActiveUniform(m) || n >= N) return;
         const float *a = d_A_array[batch], *b = d_B_array[batch];
         float *c = d_C_array[batch];
-        if (!a || !b || !c || !row_range.rowIsActive(m) || n >= N) return;
+        if (!a || !b || !c) return;
         float sum = 0.0f;
         for (int k = threadIdx.x; k < K; k += TINY_FP32_BLOCK)
             sum += projection_activation<HalfActivation>(a, static_cast<size_t>(m) * K + k) *
@@ -273,7 +274,7 @@ namespace
      * @param N Number of output columns per projection.
      * @param K Reduction width; positive unaligned tails are supported.
      */
-    template <int WeightDtype, bool HalfActivation = false>
+    template <int WeightDtype, bool HalfActivation = false, class Rows = llaminar2::FloatingProjectionPrefixRows>
     __global__ __launch_bounds__(TINY_FP32_BLOCK)
         void floating_tiny_warp_projection_kernel(
             const float *const *__restrict__ d_A_array,
@@ -282,7 +283,7 @@ namespace
             int M,
             int N,
             int K,
-            llaminar2::FloatingProjectionRows row_range)
+            const __grid_constant__ Rows row_range)
     {
         constexpr int warp_size = TINY_PROJECTION_WARP_SIZE;
         constexpr int partials_per_lane = TINY_FP32_BLOCK / warp_size;
@@ -291,7 +292,7 @@ namespace
                       static_cast<int>(threadIdx.x) / warp_size;
         const int m = static_cast<int>(blockIdx.y);
         const int batch = static_cast<int>(blockIdx.z);
-        if (!row_range.rowIsActive(m) || n >= N)
+        if (!row_range.rowIsActiveUniform(m) || n >= N)
             return;
 
         const float *A = d_A_array[batch];
@@ -351,14 +352,14 @@ namespace
      * @param batches Number of independent projections.
      * @param stream Exact non-null stream validated by the public launch bridge.
      */
-    template <int WeightDtype, bool HalfActivation = false>
+    template <int WeightDtype, bool HalfActivation = false, class Rows = llaminar2::FloatingProjectionPrefixRows>
     void launch_tiny_projection(const float *const *a, const float *const *b,
                                 float *const *c, int m, int n, int k,
                                 int batches, cudaStream_t stream,
-                                llaminar2::FloatingProjectionRows row_range)
+                                Rows row_range)
     {
         if (m < TINY_PROJECTION_PREFILL_MIN_ROWS)
-            floating_tiny_block_projection_kernel<WeightDtype, HalfActivation>
+            floating_tiny_block_projection_kernel<WeightDtype, HalfActivation, Rows>
                 <<<dim3(n, m, batches), TINY_FP32_BLOCK, 0, stream>>>(a, b, c, m, n, k, row_range);
         else if (m >= TINY_PROJECTION_SHARED_MIN_ROWS &&
                  n >= TINY_PROJECTION_SHARED_MIN_COLUMNS &&
@@ -368,12 +369,12 @@ namespace
                 float, std::conditional_t<WeightDtype == TINY_PROJECTION_WEIGHT_FP16,
                                          __half, __nv_bfloat16>>;
             constexpr int rows = WeightDtype == TINY_PROJECTION_WEIGHT_FP16 ? 4 : 8;
-            llaminar2::cuda::detail::sharedTinyProjectionKernel<Weight, rows, std::conditional_t<HalfActivation, __half, float>>
+            llaminar2::cuda::detail::sharedTinyProjectionKernel<Weight, rows, std::conditional_t<HalfActivation, __half, float>, Rows>
                 <<<dim3((n-1)/TINY_PROJECTION_WARPS+1, (m-1)/rows+1, batches),
                    TINY_FP32_BLOCK, 0, stream>>>(a, b, c, m, n, k, row_range);
         }
         else
-            floating_tiny_warp_projection_kernel<WeightDtype, HalfActivation>
+            floating_tiny_warp_projection_kernel<WeightDtype, HalfActivation, Rows>
                 <<<dim3((n + TINY_PROJECTION_WARPS - 1) / TINY_PROJECTION_WARPS, m, batches),
                    TINY_FP32_BLOCK, 0, stream>>>(a, b, c, m, n, k, row_range);
     }
@@ -389,15 +390,15 @@ namespace
      * @param g Validated borrowed input/weight/output owners and column ends.
      * @param runtime_k Positive reduction width. @param rows Device-live row authority.
      */
-    template<int FixedK = 0, bool Single = false>
+    template<int FixedK = 0, bool Single = false, class Rows = llaminar2::FloatingProjectionPrefixRows>
     __global__ __launch_bounds__(256)
     void short_half_projection_group_kernel(
         const __grid_constant__ llaminar2::FixedHalfProjectionGroup g,
-        int runtime_k, llaminar2::FloatingProjectionRows rows)
+        int runtime_k, const __grid_constant__ Rows rows)
     {
         const int k = FixedK ? FixedK : runtime_k;
         const int row = blockIdx.y, flat = blockIdx.x, lane = threadIdx.x;
-        if (!rows.rowIsActive(row)) return;
+        if (!rows.rowIsActiveUniform(row)) return;
         int p = 0;
         if constexpr (!Single)
             while (flat >= g.columnEnd(p)) ++p;
@@ -444,6 +445,7 @@ namespace
      * @param K Fixed-order reduction width.
      * @param weight_dtype Validated SwiGLU bridge encoding.
      */
+    template<class Rows>
     __global__ __launch_bounds__(TINY_FP32_BLOCK)
         void floating_swiglu_down_projection_kernel(
             const float *__restrict__ gate,
@@ -454,11 +456,11 @@ namespace
             int N,
             int K,
             int weight_dtype,
-            llaminar2::FloatingProjectionRows row_range)
+            const __grid_constant__ Rows row_range)
     {
         const int n = static_cast<int>(blockIdx.x);
         const int m = static_cast<int>(blockIdx.y);
-        if (!row_range.rowIsActive(m) || n >= N)
+        if (!row_range.rowIsActiveUniform(m) || n >= N)
             return;
 
         float sum = 0.0f;
@@ -604,48 +606,50 @@ extern "C" bool cudaFp32_tiny_batched_projection(
     if (M<=0 || (row_range && request_rows) ||
         (row_range && row_range->physicalRows()!=M) ||
         (request_rows && request_rows->physicalRows()!=M))return false;
-    const auto rows=llaminar2::FloatingProjectionRows::bind(M,row_range,request_rows);
-    if (!d_A_array || !d_B_array || !d_C_array ||
-        M <= 0 ||
-        N <= 0 ||
-        K <= 0 ||
-        batch_count <= 0 || batch_count > TINY_FP32_MAX_BATCH ||
-        !stream)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFp32_tiny_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d stream=%p\n",
-            M,
-            N,
-            K,
-            batch_count,
-            stream);
-        return false;
-    }
+    return llaminar2::FloatingProjectionRows::dispatchNative(M,row_range,request_rows, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (!d_A_array || !d_B_array || !d_C_array ||
+            M <= 0 ||
+            N <= 0 ||
+            K <= 0 ||
+            batch_count <= 0 || batch_count > TINY_FP32_MAX_BATCH ||
+            !stream)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFp32_tiny_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d stream=%p\n",
+                M,
+                N,
+                K,
+                batch_count,
+                stream);
+            return false;
+        }
 
-    cudaError_t err = cudaSetDevice(device_id);
-    if (err != cudaSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFp32_tiny_batched_projection] cudaSetDevice failed: %s\n",
-            cudaGetErrorString(err));
-        return false;
-    }
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFp32_tiny_batched_projection] cudaSetDevice failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
 
-    launch_tiny_projection<TINY_PROJECTION_WEIGHT_FP32>(
-        d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
+        launch_tiny_projection<TINY_PROJECTION_WEIGHT_FP32, false, Rows>(
+            d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFp32_tiny_batched_projection] launch failed: %s\n",
-            cudaGetErrorString(err));
-        return false;
-    }
-    return true;
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFp32_tiny_batched_projection] launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    });
 }
 
 /**
@@ -679,55 +683,57 @@ extern "C" bool cudaFp32x16_tiny_batched_projection(
     if (M<=0 || (row_range && request_rows) ||
         (row_range && row_range->physicalRows()!=M) ||
         (request_rows && request_rows->physicalRows()!=M))return false;
-    const auto rows=llaminar2::FloatingProjectionRows::bind(M,row_range,request_rows);
-    if (!d_A_array || !d_B_array || !d_C_array ||
-        M <= 0 ||
-        N <= 0 ||
-        K <= 0 ||
-        batch_count <= 0 || batch_count > TINY_FP32_MAX_BATCH ||
-        (weight_dtype != TINY_PROJECTION_WEIGHT_FP16 &&
-         weight_dtype != TINY_PROJECTION_WEIGHT_BF16) ||
-        !stream)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFp32x16_tiny_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d dtype=%d stream=%p\n",
-            M,
-            N,
-            K,
-            batch_count,
-            weight_dtype,
-            stream);
-        return false;
-    }
+    return llaminar2::FloatingProjectionRows::dispatchNative(M,row_range,request_rows, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (!d_A_array || !d_B_array || !d_C_array ||
+            M <= 0 ||
+            N <= 0 ||
+            K <= 0 ||
+            batch_count <= 0 || batch_count > TINY_FP32_MAX_BATCH ||
+            (weight_dtype != TINY_PROJECTION_WEIGHT_FP16 &&
+             weight_dtype != TINY_PROJECTION_WEIGHT_BF16) ||
+            !stream)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFp32x16_tiny_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d dtype=%d stream=%p\n",
+                M,
+                N,
+                K,
+                batch_count,
+                weight_dtype,
+                stream);
+            return false;
+        }
 
-    cudaError_t err = cudaSetDevice(device_id);
-    if (err != cudaSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFp32x16_tiny_batched_projection] cudaSetDevice failed: %s\n",
-            cudaGetErrorString(err));
-        return false;
-    }
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFp32x16_tiny_batched_projection] cudaSetDevice failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
 
-    if (weight_dtype == TINY_PROJECTION_WEIGHT_BF16)
-        launch_tiny_projection<TINY_PROJECTION_WEIGHT_BF16>(
-            d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
-    else
-        launch_tiny_projection<TINY_PROJECTION_WEIGHT_FP16>(
-            d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
+        if (weight_dtype == TINY_PROJECTION_WEIGHT_BF16)
+            launch_tiny_projection<TINY_PROJECTION_WEIGHT_BF16, false, Rows>(
+                d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
+        else
+            launch_tiny_projection<TINY_PROJECTION_WEIGHT_FP16, false, Rows>(
+                d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFp32x16_tiny_batched_projection] launch failed: %s\n",
-            cudaGetErrorString(err));
-        return false;
-    }
-    return true;
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFp32x16_tiny_batched_projection] launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    });
 }
 
 /**
@@ -749,11 +755,13 @@ extern "C" bool cudaFp16_tiny_batched_projection(
     if (!stream || !d_A_array || !d_B_array || !d_C_array || M <= 0 || N <= 0 || K <= 0 ||
         batch_count <= 0 || batch_count > TINY_FP32_MAX_BATCH ||
         (row_range && row_range->physicalRows() != M)) return false;
-    const auto rows = llaminar2::FloatingProjectionRows::bind(M,row_range,nullptr);
-    if (cudaSetDevice(device_id) != cudaSuccess) return false;
-    launch_tiny_projection<TINY_PROJECTION_WEIGHT_FP16, true>(
-        d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
-    return cudaGetLastError() == cudaSuccess;
+    return llaminar2::FloatingProjectionRows::dispatchNative(M,row_range,nullptr, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (cudaSetDevice(device_id) != cudaSuccess) return false;
+        launch_tiny_projection<TINY_PROJECTION_WEIGHT_FP16, true, Rows>(
+            d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
+        return cudaGetLastError() == cudaSuccess;
+    });
 }
 
 /**
@@ -785,64 +793,66 @@ extern "C" bool cudaFloating_swiglu_down_projection(
 {
     if (row_range && row_range->physicalRows() != M)
         return false;
-    const auto rows = llaminar2::FloatingProjectionRows::bind(M,row_range,nullptr);
-    if (!d_gate || !d_up || !d_weights || !d_output ||
-        M <= 0 ||
-        N <= 0 ||
-        K <= 0 ||
-        (weight_dtype != TINY_SWIGLU_DOWN_WEIGHT_FP32 &&
-         weight_dtype != TINY_SWIGLU_DOWN_WEIGHT_FP16 &&
-         weight_dtype != TINY_SWIGLU_DOWN_WEIGHT_BF16) ||
-        !stream)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFloating_swiglu_down_projection] invalid arguments: gate=%p up=%p weights=%p output=%p M=%d N=%d K=%d dtype=%d stream=%p\n",
-            static_cast<const void *>(d_gate),
-            static_cast<const void *>(d_up),
+    return llaminar2::FloatingProjectionRows::dispatchNative(M,row_range,nullptr, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (!d_gate || !d_up || !d_weights || !d_output ||
+            M <= 0 ||
+            N <= 0 ||
+            K <= 0 ||
+            (weight_dtype != TINY_SWIGLU_DOWN_WEIGHT_FP32 &&
+             weight_dtype != TINY_SWIGLU_DOWN_WEIGHT_FP16 &&
+             weight_dtype != TINY_SWIGLU_DOWN_WEIGHT_BF16) ||
+            !stream)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFloating_swiglu_down_projection] invalid arguments: gate=%p up=%p weights=%p output=%p M=%d N=%d K=%d dtype=%d stream=%p\n",
+                static_cast<const void *>(d_gate),
+                static_cast<const void *>(d_up),
+                d_weights,
+                static_cast<void *>(d_output),
+                M,
+                N,
+                K,
+                weight_dtype,
+                stream);
+            return false;
+        }
+
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFloating_swiglu_down_projection] cudaSetDevice failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+
+        dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), 1);
+        dim3 block(TINY_FP32_BLOCK);
+        floating_swiglu_down_projection_kernel<Rows><<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+            d_gate,
+            d_up,
             d_weights,
-            static_cast<void *>(d_output),
+            d_output,
             M,
             N,
             K,
             weight_dtype,
-            stream);
-        return false;
-    }
+            rows);
 
-    cudaError_t err = cudaSetDevice(device_id);
-    if (err != cudaSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFloating_swiglu_down_projection] cudaSetDevice failed: %s\n",
-            cudaGetErrorString(err));
-        return false;
-    }
-
-    dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), 1);
-    dim3 block(TINY_FP32_BLOCK);
-    floating_swiglu_down_projection_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
-        d_gate,
-        d_up,
-        d_weights,
-        d_output,
-        M,
-        N,
-        K,
-        weight_dtype,
-        rows);
-
-    err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[cudaFloating_swiglu_down_projection] launch failed: %s\n",
-            cudaGetErrorString(err));
-        return false;
-    }
-    return true;
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaFloating_swiglu_down_projection] launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    });
 }
 
 /** @brief Submit validated short-row bindings; see the shared launch ABI contract. */
@@ -852,18 +862,20 @@ extern "C" bool cudaFp16_short_projection_group(
 {
     if (!stream || m <= 0 || m > llaminar2::kShortHalfProjectionMaxRows || k <= 0 ||
         (row_range && row_range->physicalRows() != m)) return false;
-    const auto rows = llaminar2::FloatingProjectionRows::bind(m,row_range,nullptr);
-    if (cudaSetDevice(device_id) != cudaSuccess) return false;
-    const auto native = static_cast<cudaStream_t>(stream);
-    const auto launch = [&]<int K, bool Single>() {
-        short_half_projection_group_kernel<K, Single><<<dim3(group.totalColumns(), m), 256, 0, native>>>(group, k, rows);
-    };
-    const auto width = [&]<bool Single>() {
-        if (k == 2048) launch.template operator()<2048, Single>();
-        else if (k == 4096) launch.template operator()<4096, Single>();
-        else launch.template operator()<0, Single>();
-    };
-    if (group.size() == 1) width.template operator()<true>();
-    else width.template operator()<false>();
-    return cudaGetLastError() == cudaSuccess;
+    return llaminar2::FloatingProjectionRows::dispatchNative(m,row_range,nullptr, [&](auto rows) {
+        using Rows = decltype(rows);
+        if (cudaSetDevice(device_id) != cudaSuccess) return false;
+        const auto native = static_cast<cudaStream_t>(stream);
+        const auto launch = [&]<int K, bool Single>() {
+            short_half_projection_group_kernel<K, Single, Rows><<<dim3(group.totalColumns(), m), 256, 0, native>>>(group, k, rows);
+        };
+        const auto width = [&]<bool Single>() {
+            if (k == 2048) launch.template operator()<2048, Single>();
+            else if (k == 4096) launch.template operator()<4096, Single>();
+            else launch.template operator()<0, Single>();
+        };
+        if (group.size() == 1) width.template operator()<true>();
+        else width.template operator()<false>();
+        return cudaGetLastError() == cudaSuccess;
+    });
 }

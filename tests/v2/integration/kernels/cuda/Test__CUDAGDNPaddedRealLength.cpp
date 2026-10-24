@@ -5100,3 +5100,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceAdditiveEpsilonNearZeroCaptured)
 }
 
 #endif
+
+#include "CUDAGDNMergedDecodeRegression.h"
+
+#include "CUDAGDNMergedDecodeTiming.h"

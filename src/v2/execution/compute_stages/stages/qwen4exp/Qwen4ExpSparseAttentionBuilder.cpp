@@ -31,7 +31,8 @@ struct Pending
 };
 /** @brief Preserve exact source/store identity and canonical verifier arithmetic. */
 std::unique_ptr<IComputeStage> projection(const AttentionConsumerBinding &c,const Qwen4ExpSparseAttentionPolicy &p,
-    const Qwen4ExpPreparedProjection &weight,Qwen4ExpFloatBinding output,int width,DeviceRequestRowRanges rows)
+    const Qwen4ExpPreparedProjection &weight,Qwen4ExpFloatBinding output,int width,DeviceRequestRowRanges rows,
+    std::optional<ProjectionRowWorkDeclaration> work=std::nullopt)
 {
     require(output.byteOffset==0,"QSA prepared projection requires a native zero-offset output tensor view");
     require(weight.ref().device==c.device,"QSA indexer projection belongs to a different participant");
@@ -42,7 +43,8 @@ std::unique_ptr<IComputeStage> projection(const AttentionConsumerBinding &c,cons
         .a_buffer_id=c.projectionInput.buffer,.c_buffer_id=output.buffer,
         .force_decode_equivalent_verifier_prefill=p.projectionArithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
         .request_rows=p.projectionArithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier ?
-            std::optional<DeviceRequestRowRanges>{rows} : std::nullopt,.prepared_ref=weight.ref(),.prepared_store=&weight.store()});
+            std::optional<DeviceRequestRowRanges>{rows} : std::nullopt,
+        .projection_row_work=std::move(work),.prepared_ref=weight.ref(),.prepared_store=&weight.store()});
 }
 /** @brief One admitted request-local byte interval, including borrowed producer metadata. */
 struct RequestLease
@@ -246,7 +248,22 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
     std::vector<Pending> nodes;
     std::vector<std::string> projectionDependencies{c.projectionInputReady};
     for(const auto &request:requests)projectionDependencies.push_back(request.buffers.replayReady);
-    nodes.push_back({queryName,projection(c,p,w.query,Qwen4ExpFloatBinding(*first.query.tensor,first.query.buffer),512,rows),projectionDependencies});
+    std::optional<ProjectionRowWorkDeclaration> queryWork;
+    const auto queryDemand=p.executionPhase==ForwardExecutionPhase::Decode ?
+        qwen4exp::QwenSparseQueryDemand::RankingOnly : qwen4exp::QwenSparseQueryDemand::AllLive;
+    if(queryDemand==qwen4exp::QwenSparseQueryDemand::RankingOnly) {
+        require(c.queryRows==1||p.projectionArithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
+            "Selected decode query rows require original explicit grouped decode arithmetic for M>1");
+        queryWork.emplace(ProjectionRowWorkDeclaration{rows.rowsPerRequest(),p.tokenCapacity,
+            qwen4exp::QwenSparseFirstRankingLogicalRow,{}});
+        for(const auto &request:requests) {
+            const auto &replay=request.buffers.replay;
+            queryWork->sources.push_back({replay.tensor,replay.buffer,
+                replay.byteOffset+offsetof(qwen4exp::QwenSparseReplay,prefix_tokens),
+                replay.byteOffset+offsetof(qwen4exp::QwenSparseReplay,live_rows)});
+        }
+    }
+    nodes.push_back({queryName,projection(c,p,w.query,Qwen4ExpFloatBinding(*first.query.tensor,first.query.buffer),512,rows,std::move(queryWork)),projectionDependencies});
     nodes.push_back({keyName,projection(c,p,w.rawKey,Qwen4ExpFloatBinding(*first.rawKey.tensor,first.rawKey.buffer),128,rows),projectionDependencies});
     std::vector<std::string> terminals;
     using Stage=QwenSparseAttentionStage;
@@ -283,7 +300,7 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
             .operation=Stage::Indexer{b.query,b.rawKey,b.priorPartial,b.pooledKeys,w.queryNorm,w.keyNorm,w.cosine,w.sine,
                 b.preparedQuery,b.scores,b.selected,b.selectedCount,p.blockCapacity,p.positionCapacity,p.rotaryDimension,
                 p.epsilon,p.representation,p.rotarySource,p.ropeTheta,b.retained ? std::optional{b.retained->transactionPrior} : std::nullopt,
-                p.poolSelection}}),{queryName,keyName,b.replayReady}});
+                p.poolSelection,queryDemand}}),{queryName,keyName,b.replayReady}});
         const auto coreOffset=firstRow*c.queryHeads*256*sizeof(float);
         Stage::SelectedAttention attention{{*c.cache,c.cacheLayer,request.sequence,c.keyPolicy},
             Qwen4ExpFloatBinding(c.preparedQuery.tensor,c.preparedQuery.buffer,coreOffset),b.selected,b.selectedCount,

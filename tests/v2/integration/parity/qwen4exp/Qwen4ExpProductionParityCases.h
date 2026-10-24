@@ -115,7 +115,7 @@ inline ModelParityDefinition qwen4ExpProductionDefinition(Qwen4ExpParityTopology
         for (const auto *stage : {"GR_NORM", "GR_READ", "GR_WRITE", "FFN_NORM", "FFN_RESIDUAL"})
             required.push_back(prefix + stage);
         if ((layer + 1) % 4 == 0)
-            for (const auto *stage : {"QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES"})
+            for (const auto *stage : {"QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES"})
                 required.push_back(prefix + stage);
     }
     for (const auto *stage : {"PLE_HASH_INDICES", "PLE_GATHER", "PLE_GATE", "PLE_CONVOLUTION"})

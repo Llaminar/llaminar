@@ -17,7 +17,7 @@
 namespace llaminar2
 {
 /** @brief Closed main-QSA producer roles with authored native extent metadata. */
-enum class GraphSnapshotSourceRole { QwenSparseQuery, QwenSparsePooledKeys, QwenSparseSelectedIndices };
+enum class GraphSnapshotSourceRole { QwenSparseQuery, QwenSparsePooledKeys, QwenSparseSelectedIndices, QwenSparseRawQuery };
 /** @brief Sealed source role/layer identity; the planner authenticates residency and exact model geometry. */
 class GraphSnapshotSourceOutput final
 {
@@ -27,6 +27,7 @@ public:
     {
         if (layer < 0) throw std::invalid_argument("QSA snapshot source requires a nonnegative main layer");
         switch (role) {
+        case GraphSnapshotSourceRole::QwenSparseRawQuery:
         case GraphSnapshotSourceRole::QwenSparseQuery:
         case GraphSnapshotSourceRole::QwenSparsePooledKeys:
         case GraphSnapshotSourceRole::QwenSparseSelectedIndices: return {layer, role};
@@ -42,7 +43,8 @@ public:
     /** @return Canonical semantic key emitted by the real source producer. */
     std::string semanticKey() const
     {
-        const char *suffix = role_ == GraphSnapshotSourceRole::QwenSparseQuery ? "_QSA_INDEXER_QUERY" :
+        const char *suffix = role_ == GraphSnapshotSourceRole::QwenSparseRawQuery ? "_QSA_INDEXER_RAW_QUERY" :
+            role_ == GraphSnapshotSourceRole::QwenSparseQuery ? "_QSA_INDEXER_QUERY" :
             role_ == GraphSnapshotSourceRole::QwenSparsePooledKeys ? "_QSA_INDEXER_POOLED_KEYS" : "_QSA_SELECTED_INDICES";
         return "layer" + std::to_string(layer_) + suffix;
     }
@@ -65,6 +67,7 @@ public:
         const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), layer);
         if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size() || layer < 0) return std::nullopt;
         const auto suffix = key.substr(separator);
+        if (suffix == "_QSA_INDEXER_RAW_QUERY") return qwenSparse(layer, GraphSnapshotSourceRole::QwenSparseRawQuery);
         if (suffix == "_QSA_INDEXER_QUERY") return qwenSparse(layer, GraphSnapshotSourceRole::QwenSparseQuery);
         if (suffix == "_QSA_INDEXER_POOLED_KEYS") return qwenSparse(layer, GraphSnapshotSourceRole::QwenSparsePooledKeys);
         if (suffix == "_QSA_SELECTED_INDICES") return qwenSparse(layer, GraphSnapshotSourceRole::QwenSparseSelectedIndices);

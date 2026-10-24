@@ -5,6 +5,7 @@
  * This boundary rejects default streams and surfaces native launch failures.
  * Dynamic shape/state diagnostics remain device-owned inside captured kernels.
  */
+#include "kernels/qwen4exp/QwenSparseQueryRowWork.h"
 #include "../../qwen4exp/QwenSparseReplay.h"
 #include "ROCmQwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseGPU.cuh"
@@ -33,9 +34,13 @@ void rocmQwenSparseIndexer(const QwenSparseIndexer &p, hipStream_t stream)
 {
     requireStream(stream);
     validateQwenSparseIndexer(p);
+    const auto queryWork=qwenSparseIndexerQueryWork(p).repeatEachRow(4);
     rocm_sparse_detail::preparePools<<<(p.row_capacity + 6) / 4, 128, 0, stream>>>(p);
     checkLaunch();
-    rocm_sparse_detail::prepareQueries<<<p.row_capacity * 4, 128, 0, stream>>>(p);
+    if(p.query_demand==QwenSparseQueryDemand::RankingOnly)
+        rocm_sparse_detail::prepareQueries<true><<<p.row_capacity * 4, 128, 0, stream>>>(p,queryWork);
+    else
+        rocm_sparse_detail::prepareQueries<false><<<p.row_capacity * 4, 128, 0, stream>>>(p,queryWork);
     checkLaunch();
     rocm_sparse_detail::scorePools<<<dim3((p.block_capacity + 7) / 8, p.row_capacity), 256, 0, stream>>>(p);
     checkLaunch();

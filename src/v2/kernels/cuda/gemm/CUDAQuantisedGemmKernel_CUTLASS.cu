@@ -17,8 +17,13 @@
  * Counted producers retain immutable DeviceRowRange metadata by value. Their
  * compile-time specialization rejects inactive rows before source/scratch access;
  * ordinary kernels compile out every live-count read and predicate.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include <cuda_runtime.h>
 #include "kernels/cuda/gemm/CUDAQuantisedActivationProducers.h"
 #include <stdexcept>
@@ -114,22 +119,22 @@ namespace
           * @tparam Counted Read the device row authority only in the counted specialization.
      * @param activeRows Immutable physical/live descriptor copied into this launch.
     */
-    template<bool Counted>
+    template<bool Counted, class Rows>
     __global__ void quantize_activations_blockwise_kernel(
         const float *__restrict__ A_fp32,       // [M × K]
         int8_t *__restrict__ A_int8,            // [M × K] output
         float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
         int32_t *__restrict__ sums_A_blockwise, // [num_blocks × M] optional quantized activation sums
-        int M, int K, llaminar2::DeviceRowRange activeRows)
+        int M, int K, Rows activeRows)
     {
         const int row = blockIdx.y;
         if (row >= M)
             return;
         // Whole row/quantization subgroup agrees before any load, store or barrier.
-        // Counted invalid publications trap in DeviceRowRange::activeRows().
+        // Invalid interval publications trap before authored native row accesses.
         if constexpr (Counted)
         {
-            if (row >= activeRows.activeRows())
+            if (!llaminar2::projectionRowIsActive(activeRows,row))
                 return;
         }
 
@@ -242,8 +247,9 @@ extern "C"
         void *stream, const llaminar2::DeviceRowRange* rowRange)
     {
         validateCUDAActivationProducer(M, K, stream, rowRange);
-        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
-        const bool countedRows = rowRange && rowRange->countOwner();
+        return llaminar2::dispatchProjectionRows(M,rowRange,[&](auto rowAuthority) {
+
+        const bool countedRows = (rowRange && rowRange->countOwner()) || llaminar2::currentProjectionRowWork(rowAuthority.physicalRows());
 
         if (!d_A_fp32 || !d_A_int8 || !d_scales_A_blockwise)
         {
@@ -271,10 +277,10 @@ extern "C"
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         if (countedRows) {
-            quantize_activations_blockwise_kernel<true><<<grid, block, 0, cuda_stream>>>(
+            quantize_activations_blockwise_kernel<true, decltype(rowAuthority)><<<grid, block, 0, cuda_stream>>>(
                 d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K, rowAuthority);
         } else {
-            quantize_activations_blockwise_kernel<false><<<grid, block, 0, cuda_stream>>>(
+            quantize_activations_blockwise_kernel<false, decltype(rowAuthority)><<<grid, block, 0, cuda_stream>>>(
                 d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K, rowAuthority);
         }
 
@@ -289,7 +295,8 @@ extern "C"
         }
 
         return true;
-    }
+    });
+}
 
     /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
     bool cudaQuantGemm_quantizeActivationsBlockwise(
@@ -332,8 +339,9 @@ extern "C"
                 M, K, cuda_device_id, stream, rowRange);
         }
         validateCUDAActivationProducer(M, K, stream, rowRange);
-        const auto rowAuthority = rowRange ? *rowRange : llaminar2::DeviceRowRange::fullyActive(M);
-        const bool countedRows = rowRange && rowRange->countOwner();
+        return llaminar2::dispatchProjectionRows(M,rowRange,[&](auto rowAuthority) {
+
+        const bool countedRows = (rowRange && rowRange->countOwner()) || llaminar2::currentProjectionRowWork(rowAuthority.physicalRows());
 
         if (!d_A_fp32 || !d_A_int8 || !d_scales_A_blockwise)
         {
@@ -366,10 +374,10 @@ extern "C"
         dim3 block(BLOCK_SIZE);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         if (countedRows) {
-            quantize_activations_blockwise_kernel<true><<<grid, block, 0, cuda_stream>>>(
+            quantize_activations_blockwise_kernel<true, decltype(rowAuthority)><<<grid, block, 0, cuda_stream>>>(
                 d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, rowAuthority);
         } else {
-            quantize_activations_blockwise_kernel<false><<<grid, block, 0, cuda_stream>>>(
+            quantize_activations_blockwise_kernel<false, decltype(rowAuthority)><<<grid, block, 0, cuda_stream>>>(
                 d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, rowAuthority);
         }
 
@@ -384,7 +392,8 @@ extern "C"
         }
 
         return true;
-    }
+    });
+}
 
     /** @brief Preserve the ordinary producer ABI; no live-count predicate is selected. */
     bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(

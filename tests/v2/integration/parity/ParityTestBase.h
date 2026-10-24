@@ -57,6 +57,7 @@
 #include "snapshots/SnapshotSelectedIds.h"
 #include "snapshots/SnapshotEmptyObservation.h"
 #include "../../utils/TypedNpySnapshot.h"
+#include "../../utils/QwenSparseQueryParityEvidence.h"
 
 #include "ParityReferenceCache.h"
 #include "ParityPredictorSource.h"
@@ -727,6 +728,8 @@ namespace llaminar2::test::parity
         float routing_top1_match = std::numeric_limits<float>::quiet_NaN(); ///< Fraction of tokens where top-1 expert matches (indices only)
         float routing_weight_l1 = std::numeric_limits<float>::quiet_NaN();  ///< Mean L1 distance of sparse weight vectors (weights only)
         std::optional<MoERouteConditionedProof> route_conditioned_proof; ///< Explicit additional HF-input equation; original metrics stay intact.
+        ParityCheckpointEvidenceKind checkpoint_evidence_kind=ParityCheckpointEvidenceKind::ComparedValues;
+        std::optional<QwenSparseQueryEvidence> query_work_evidence; ///< Original row provenance; empty structural evidence never grants numerical equality.
     };
 
     /**
@@ -1801,6 +1804,15 @@ namespace llaminar2::test::parity
                 << stats.element_count;
         }
 
+        /**
+         * @brief Publish original stage verdicts and typed query provenance without inventing values.
+         * @param path Owned canonical CSV destination. @param backend Actual compared participant label.
+         * @param layers Retained original stage bank. @param decode_step Original Decode ordinal, or Prefill.
+         * @param append Append later Decode rows beneath the existing exact schema.
+         * @return Whether the complete CSV write succeeded.
+         * @details Structural query evidence leaves metrics and distributions blank
+         * and numerical pass false. Authored useful queries retain normal metrics.
+         */
         static bool writeStages(
             const std::filesystem::path &path,
             const std::string &backend,
@@ -1827,37 +1839,68 @@ namespace llaminar2::test::parity
                 writeDistributionHeader(out, "pytorch_");
                 out << ',';
                 writeMoERouteProofCSVHeader(out);
-                out << ",scalar_type,integer_mismatch_count,passed";
+                out << ",scalar_type,integer_mismatch_count,passed,checkpoint_evidence_kind,structural_valid,query_empty_reason,"
+                       "history_prompt_rows,history_decode_rows_before,history_live_rows,history_source_capacity,observed_request_count,"
+                       "observed_prefix_rows,observed_live_rows,observed_row_capacity,observed_source_capacity,"
+                       "observed_first_required_logical_row,observed_row_offset,observed_first_row,observed_end_row,"
+                       "observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,observed_slice_first_row,"
+                       "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row";
                 out << '\n';
             }
             for (const auto &layer : layers)
             {
                 for (const auto &stage : layer.stage_results)
                 {
+                    const bool structural=stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery;
                     out << csvEscape(backend) << ',';
                     if (decode_step)
                         out << *decode_step << ',';
                     out << layer.layer_idx << ','
                         << csvEscape(stage.stage_name) << ','
-                        << ((stage.is_routing_stage || stage.integer_mismatch_count) ? "" : std::to_string(stage.cosine_similarity)) << ','
-                        << ((stage.is_routing_stage || stage.integer_mismatch_count) ? "" : std::to_string(stage.cosine_drop)) << ','
-                        << ((stage.is_routing_stage || stage.integer_mismatch_count) ? "" : std::to_string(stage.rel_l2_norm)) << ','
-                        << (stage.integer_mismatch_count ? "" : std::to_string(stage.max_abs_diff)) << ','
-                        << ((stage.is_routing_stage || stage.integer_mismatch_count) ? "" : std::to_string(stage.snr_db)) << ','
-                        << ((stage.is_routing_stage || stage.integer_mismatch_count) ? "" : std::to_string(stage.rmse)) << ','
-                        << ((stage.is_routing_stage || stage.integer_mismatch_count) ? "" : std::to_string(stage.error_entropy)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.cosine_similarity)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.cosine_drop)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.rel_l2_norm)) << ','
+                        << ((stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.max_abs_diff)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.snr_db)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.rmse)) << ','
+                        << ((stage.is_routing_stage || stage.integer_mismatch_count || structural) ? "" : std::to_string(stage.error_entropy)) << ','
                         << (stage.is_routing_stage ? "1" : "0") << ','
                         << (stage.is_routing_stage ? std::to_string(stage.routing_overlap) : "") << ','
                         << (std::isnan(stage.routing_top1_match) ? "" : std::to_string(stage.routing_top1_match)) << ','
                         << (std::isnan(stage.routing_weight_l1) ? "" : std::to_string(stage.routing_weight_l1)) << ',';
-                    writeDistribution(out, stage.llaminar_stats, !stage.integer_mismatch_count);
+                    writeDistribution(out, stage.llaminar_stats, !stage.integer_mismatch_count && !structural);
                     out << ',';
-                    writeDistribution(out, stage.pytorch_stats, !stage.integer_mismatch_count);
+                    writeDistribution(out, stage.pytorch_stats, !stage.integer_mismatch_count && !structural);
                     out << ',';
-                    writeMoERouteProofCSV(out, stage.route_conditioned_proof, stage.passed);
+                    if(structural)out << "structural_query_interval,0,0,,,,,,";
+                    else writeMoERouteProofCSV(out, stage.route_conditioned_proof, stage.passed);
                     out << ',' << stage.scalar_type << ',';
                     if (stage.integer_mismatch_count) out << *stage.integer_mismatch_count;
                     out << ',' << (stage.passed ? 1 : 0);
+                    const bool authored_query=stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::AuthoredQuery;
+                    out << ',' << (structural?"unauthored_query":authored_query?"authored_query":"compared_values");
+                    if(stage.query_work_evidence && (structural || authored_query) &&
+                       stage.query_work_evidence->observation.authored_token_rows &&
+                       stage.query_work_evidence->observation.authored_token_rows->requests.size()==1)
+                    {
+                        const auto &proof=*stage.query_work_evidence;
+                        const auto &actual=proof.observation;
+                        const auto &observation=*actual.authored_token_rows;
+                        const auto &record=observation.requests.front();
+                        out << ',' << (validParityCheckpointEvidence(stage,decode_step.has_value())?1:0)
+                            << ',' << (record.emptyReason==SnapshotEmptyReason::RankingNotRequired?"ranking_not_required":
+                                record.emptyReason==SnapshotEmptyReason::None?"none":"invalid")
+                            << ',' << proof.history.promptRows << ',' << proof.history.decodeRowsBefore
+                            << ',' << proof.history.liveRows << ',' << proof.history.sourceCapacity
+                            << ',' << observation.requests.size() << ',' << record.prefixRows << ',' << record.liveRows
+                            << ',' << record.rowCapacity << ',' << record.sourceCapacity << ',' << record.firstRequiredLogicalRow
+                            << ',' << record.rowOffset << ',' << record.firstRow << ',' << record.endRow
+                            << ',' << record.payloadRowOffset << ',' << observation.physicalRows
+                            << ',' << observation.repeatsPerRow << ',' << observation.sliceFirstRow
+                            << ',' << actual.rows << ',' << actual.cols << ',' << actual.size
+                            << ',' << proof.referenceElements/512 << ',' << proof.referenceFirstRow;
+                    }
+                    else out << std::string(24,',');
                     out << '\n';
                 }
             }
@@ -6464,12 +6507,99 @@ namespace llaminar2::test::parity
             return {};
         }
 
-        /** @brief Compare an integer NumPy checkpoint through the canonical stage-result path. */
+        /**
+         * @brief Resolve independent admitted query context from immutable setup authorities.
+         * @return Original context capacity, or zero for an unsupported/unbound legacy composite.
+         *
+         * Resident graph buckets size activation storage separately. The admitted
+         * plan's full context must agree with the original runner configuration;
+         * native query metadata cannot select either expected value.
+         */
+        int canonicalQuerySourceCapacity() const
+        {
+            if(orch_runner_) {
+                const int admitted=orch_runner_->executionPlan().runtime.max_seq_len;
+                return admitted>0 && admitted==orch_runner_->config().max_seq_len ? admitted : 0;
+            }
+            if(const auto *device=dynamic_cast<const DeviceGraphOrchestrator *>(activeLegacyRunner()))
+                return device->max_seq_len();
+            if(const auto *rank=dynamic_cast<const RankOrchestrator *>(activeLegacyRunner()))
+            {
+                int admitted=0;
+                if(rank->device_count()<=0)return 0;
+                // Direct legacy TP borrows each existing immutable graph
+                // configuration. No live cache/count observation selects it.
+                for(int participant=0;participant<rank->device_count();++participant)
+                {
+                    const auto *device=dynamic_cast<const DeviceGraphOrchestrator *>(rank->deviceRunner(participant));
+                    const int capacity=device?device->max_seq_len():0;
+                    if(capacity<=0 || (admitted && admitted!=capacity))return 0;
+                    admitted=capacity;
+                }
+                return admitted;
+            }
+            return 0;
+        }
+
+        /**
+         * @brief Compare typed identities, exact empty state, or original-coordinate query evidence.
+         * @param reference_key Exact authenticated NumPy reference checkpoint.
+         * @param production_key Canonical acquired native checkpoint identity.
+         * @param stage Original semantic stage, never an optional derived diagnostic.
+         * @param query_decode_step Original single-row Decode trajectory ordinal; absent for Prefill.
+         * @return An actual typed result, or absence for the unchanged ordinary floating route.
+         * @details Query history is canonical input history, independent of the
+         * acquired metadata. Only useful original reference rows enter numerical
+         * comparison; an owned empty query never acquires a numerical verdict.
+         */
         std::optional<StageComparisonResult> compareIntegerReference(
-            const std::string &reference_key, const std::string &production_key, const std::string &stage)
+            const std::string &reference_key, const std::string &production_key, const std::string &stage,
+            std::optional<std::size_t> query_decode_step=std::nullopt)
         {
             const auto path = config_.snapshot_dir + "/" + reference_key + ".npy";
             if (!std::filesystem::exists(path)) return std::nullopt;
+            if(query_decode_step && isQwenSparseQueryCheckpoint(stage))
+            {
+                const auto descriptor=inspectNpySnapshot(path);
+                const auto actual=activeTypedSnapshot(production_key);
+                auto proof=inspectQwenSparseQueryEvidence(actual,
+                    {.promptRows=config_.token_ids.size(),.decodeRowsBefore=*query_decode_step,
+                     .liveRows=1,.sourceCapacity=canonicalQuerySourceCapacity()},descriptor.count);
+                const auto &shape=descriptor.shape;
+                const bool reference_shape=(shape.size()==3 && shape[0]==1 && shape[2]==512) ||
+                    (stage=="QSA_INDEXER_QUERY" && shape.size()==4 && shape[0]==1 && shape[2]==4 && shape[3]==128);
+                proof.valid=proof.valid && descriptor.scalar==NpySnapshotScalar::FP32 && reference_shape &&
+                    reference_key.starts_with("decode_step"+std::to_string(*query_decode_step)+"_");
+                EXPECT_TRUE(proof.valid)<<"Query snapshot disagrees with independent original history: "<<production_key;
+                StageComparisonResult result;result.stage_name=stage;
+                const auto expected=expectedQwenSparseQueryInterval(proof.history);
+                const bool empty=expected && expected->firstRow==expected->endRow;
+                result.checkpoint_evidence_kind=empty?ParityCheckpointEvidenceKind::UnauthoredQuery:
+                    ParityCheckpointEvidenceKind::AuthoredQuery;
+                if(proof.valid && !empty)
+                {
+                    const auto reference=loadPyTorchSnapshot(reference_key);
+                    const auto first=proof.referenceFirstRow*512;
+                    if(reference.size()!=descriptor.count || first>reference.size() || actual.size>reference.size()-first)
+                        proof.valid=false;
+                    else
+                    {
+                        // Original history chooses this interval. Native payload
+                        // length never selects a final-position reference crop.
+                        const std::vector<float> useful(reference.begin()+static_cast<std::ptrdiff_t>(first),
+                            reference.begin()+static_cast<std::ptrdiff_t>(first+actual.size));
+                        result=compareTensors(actual.data,useful,actual.size,stage);
+                        result.checkpoint_evidence_kind=ParityCheckpointEvidenceKind::AuthoredQuery;
+                    }
+                }
+                if(empty)
+                    result.cosine_similarity=result.rel_l2_norm=result.max_abs_diff=result.snr_db=result.rmse=
+                        result.error_entropy=std::numeric_limits<float>::quiet_NaN();
+                result.query_work_evidence=std::move(proof);
+                // Empty required Q retains identity and structural evidence;
+                // numerical passed/evidence_valid remain false with zero samples.
+                return result;
+            }
             if(reference_key.ends_with("_QSA_INDEXER_POOLED_KEYS"))
             {
                 const auto descriptor=inspectNpySnapshot(path);
@@ -11241,7 +11371,8 @@ namespace llaminar2::test::parity
          * decode, but retain true for the raw MOE_EXPERT_OUTPUT: prefill still
          * compares that complete semantic sum strictly even if routes differ.
          * Integer and exact empty observations have no cosine; their existing
-         * pass/fail witnesses remain authoritative. A layer needs at least one
+         * pass/fail witnesses remain authoritative. Authenticated unauthored Q
+         * adds structural evidence while its numerical verdict stays unset. A layer needs at least one
          * finite comparable numerical stage, so routing-only or empty evidence
          * cannot pass by inheriting the minimum's initial value of one.
          *
@@ -11267,7 +11398,14 @@ namespace llaminar2::test::parity
             std::optional<float> previous_comparable;
             for (const auto &stage : stats.stage_results)
             {
-                actual_evidence_valid = actual_evidence_valid && stage.evidence_valid;
+                actual_evidence_valid = actual_evidence_valid && validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode);
+                if(stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery)
+                {
+                    // A structural witness contributes no numerical sample or
+                    // tolerance verdict and cannot establish layer coverage.
+                    witnesses_passed=witnesses_passed && phase==ParityForwardPhase::Decode && validParityCheckpointEvidence(stage,true);
+                    continue;
+                }
                 if (stage.integer_mismatch_count)
                 {
                     // Exact identities never acquire a floating cosine. Both
@@ -11387,14 +11525,16 @@ namespace llaminar2::test::parity
          * @brief Require every original declared raw layer checkpoint, independently of diagnostic verdicts.
          * @tparam Layers Ordinary or TP source-indexed records.
          * @param layers Actual comparison banks. @param required Existing phase-specific graph declaration.
-         * @return Success only when each declared layer key has exactly one actual valid comparison.
+         * @param phase Actual main phase; Decode requires independently authenticated query provenance.
+         * @return Success only when each declared layer key has one valid typed evidence record.
          *
          * EMBEDDING and LM_HEAD have separate default-invalid witnesses. Optional
          * derived alignment is never added to this original publication authority.
          */
         template <typename Layers>
         static ::testing::AssertionResult acceptsRequiredRawParityStages(
-            const Layers &layers, const std::vector<std::string> &required)
+            const Layers &layers, const std::vector<std::string> &required,
+            ParityForwardPhase phase=ParityForwardPhase::Prefill)
         {
             if (required.empty()) return ::testing::AssertionFailure() << "Final-logit contract has no original required snapshot declaration";
             for (const auto &key : required)
@@ -11414,12 +11554,12 @@ namespace llaminar2::test::parity
                             if constexpr (requires { record.combined_result; }) return record.combined_result;
                             else return record;
                         }();
-                        if (!stage.evidence_valid)
+                        if (!validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode))
                             return ::testing::AssertionFailure() << "Missing or invalid declared raw checkpoint " << key;
                     }
                 }
                 if (matches != 1)
-                    return ::testing::AssertionFailure() << "Required raw checkpoint " << key << " needs exactly one original comparison, observed " << matches;
+                    return ::testing::AssertionFailure() << "Required raw checkpoint " << key << " needs exactly one original evidence record, observed " << matches;
             }
             return ::testing::AssertionSuccess();
         }
@@ -11452,11 +11592,13 @@ namespace llaminar2::test::parity
                         if constexpr (requires { record.combined_result; }) return record.combined_result;
                         else return record;
                     }();
-                    if (!stage.evidence_valid || (stage.integer_mismatch_count && *stage.integer_mismatch_count != 0))
+                    if (!validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode) ||
+                        (phase!=ParityForwardPhase::Decode && stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery) ||
+                        (stage.integer_mismatch_count && *stage.integer_mismatch_count != 0))
                         return ::testing::AssertionFailure() << "Invalid raw checkpoint " << stage.stage_name << " in decoder " << layer.layer_idx;
                 }
             }
-            return acceptsRequiredRawParityStages(layers, config.graph_snapshot_policy.requiredSnapshotKeys(phase));
+            return acceptsRequiredRawParityStages(layers, config.graph_snapshot_policy.requiredSnapshotKeys(phase),phase);
         }
 
         /** @return Additional original decoder evidence; legacy families retain their policy. */
@@ -11632,7 +11774,7 @@ namespace llaminar2::test::parity
             // Stages to compare per layer
             std::vector<std::string> per_layer_stages = {
                 "GR_NORM", "GR_READ", "GR_WRITE",
-                "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
+                "QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
                 "PLE_HASH_INDICES", "PLE_GATHER", "PLE_GATE", "PLE_CONVOLUTION",
                 "ATTENTION_NORM",
                 // GDN sub-stages (skipped for FA layers where they don't exist)
@@ -11974,7 +12116,9 @@ namespace llaminar2::test::parity
                         bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
                         bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
                         if (curr_routing || prev_routing || stats.stage_results[s].integer_mismatch_count ||
-                            stats.stage_results[s - 1].integer_mismatch_count)
+                            stats.stage_results[s - 1].integer_mismatch_count ||
+                            stats.stage_results[s].checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery ||
+                            stats.stage_results[s - 1].checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery)
                             continue; // Skip drops involving routing stages
 
                         float drop = stats.stage_results[s - 1].cosine_similarity -
@@ -12180,7 +12324,7 @@ namespace llaminar2::test::parity
             // truncating their comparison.
             std::vector<std::string> per_layer_stages = {
                 "GR_NORM", "GR_READ", "GR_WRITE",
-                "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
+                "QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
                 "PLE_HASH_INDICES", "PLE_GATHER", "PLE_GATE", "PLE_CONVOLUTION",
                 "ATTENTION_NORM",
                 "Q_PROJECTION", // DIAGNOSTIC: check QKV GEMM output
@@ -13104,7 +13248,7 @@ namespace llaminar2::test::parity
             // Stages to compare per layer during decode (same as prefill)
             const std::vector<std::string> decode_per_layer_stages = {
                 "GR_NORM", "GR_READ", "GR_WRITE",
-                "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
+                "QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY", "QSA_INDEXER_POOLED_KEYS", "QSA_SELECTED_INDICES",
                 "PLE_HASH_INDICES", "PLE_GATHER", "PLE_GATE", "PLE_CONVOLUTION",
                 "ATTENTION_NORM",
                 "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_CONV1D_OUTPUT", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
@@ -13395,7 +13539,7 @@ namespace llaminar2::test::parity
 
                             // PyTorch snapshot key: decode_step{N}_layer{L}_{STAGE}
                             std::string pytorch_key = step_prefix + "_layer" + std::to_string(layer_idx) + "_" + stage;
-                            if (auto integer_result = compareIntegerReference(pytorch_key, semantic_key, stage))
+                            if (auto integer_result = compareIntegerReference(pytorch_key, semantic_key, stage, step))
                             {
                                 stats.stage_results.push_back(*integer_result);
                                 continue;
@@ -13580,7 +13724,9 @@ namespace llaminar2::test::parity
                                 bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
                                 bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
                                 if (curr_routing || prev_routing || stats.stage_results[s].integer_mismatch_count ||
-                            stats.stage_results[s - 1].integer_mismatch_count)
+                            stats.stage_results[s - 1].integer_mismatch_count ||
+                            stats.stage_results[s].checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery ||
+                            stats.stage_results[s - 1].checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery)
                                     continue;
 
                                 float drop = stats.stage_results[s - 1].cosine_similarity -

@@ -5,8 +5,13 @@
  * Producers retain their original decoder, launch geometry and source arithmetic
  * policy. A successful producer issues a noncopyable ticket on its exact stream.
  * Submission consumes tickets explicitly; destruction never submits GPU work.
+ *
+ * Projection work admission is copied independently of arithmetic dispatch.
+ * Borrowed original request intervals guard native operand/partial/output
+ * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 #pragma once
+#include "kernels/common/ProjectionWorkLaunch.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -31,7 +36,9 @@ struct NativeM1ReductionGrid
     std::array<const float *,4> partials{};
     std::array<float *,4> outputs{};
     std::array<int,4> columns{},partitions{},offsets{};
+    std::array<ProjectionRowWork,4> work{ProjectionRowWork::fromPrefix(DeviceRowRange::fullyActive(1)),ProjectionRowWork::fromPrefix(DeviceRowRange::fullyActive(1)),ProjectionRowWork::fromPrefix(DeviceRowRange::fullyActive(1)),ProjectionRowWork::fromPrefix(DeviceRowRange::fullyActive(1))}; ///< Copied exact producer row-work authority.
     int count=0,tiles=0;
+    bool has_work=false; ///< Copied immutable mode: false kernels never resolve generic descriptors.
 };
 /**
  * @brief Validate exact reducer geometry and concatenate live tile intervals.
@@ -94,6 +101,8 @@ private:
     enum class State : std::uint8_t { Empty,Direct,Pending,Consumed,Aborted };
     State state_=State::Empty;
     NativeM1ReductionShape shape_;
+    bool has_work_=false; ///< Exact successful producer mode retained through deferred submission.
+    ProjectionRowWork work_=ProjectionRowWork::fromPrefix(DeviceRowRange::fullyActive(1)); ///< Replaced only by successful producer issuance.
     const float *partials_=nullptr;
     float *output_=nullptr;
     int device_=-1;

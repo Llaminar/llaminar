@@ -45,7 +45,7 @@ struct IsolationWorkspaceBaseline
 {
     return params.alpha==1.f && params.beta==0.f && !params.mpi_ctx && !params.needs_allreduce &&
         !params.bias && !params.bias_tensor && !params.bias_required && !params.gate_input && !params.do_swiglu &&
-        !params.verifier_row_range && !params.request_rows && params.output_range.empty();
+        !params.verifier_row_range && !params.request_rows && !params.projection_row_work && params.output_range.empty();
 }
 
 /**

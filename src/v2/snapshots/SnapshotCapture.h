@@ -23,6 +23,7 @@
 #include "SnapshotPublication.h"
 #include "SnapshotValues.h"
 #include "SnapshotSemanticObservation.h"
+#include "SnapshotInfo.h"
 
 namespace llaminar2
 {
@@ -38,6 +39,7 @@ namespace llaminar2
         SnapshotPublication publication = SnapshotPublication::SchemaPartition;
         SnapshotOwnedRows row_ownership; ///< Meaningful only for RowPartition publications.
         SnapshotSemanticAxis semantic_axis=SnapshotSemanticAxis::Legacy; ///< Explicit mathematical axis, independent of physical token geometry.
+        std::optional<SnapshotAuthoredTokenRowsObservation> authored_token_rows; ///< Original acquired coordinates retained with these exact bytes.
     };
 
     /**
@@ -51,6 +53,22 @@ namespace llaminar2
      * invalidating a reader that already acquired a handle.
      */
     using StoredSnapshotHandle = std::shared_ptr<const StoredSnapshot>;
+
+    /**
+     * @brief Retain all immutable acquired provenance through the public diagnostic view.
+     * @param snapshot Already captured owner, or absence.
+     * @return Typed payload, coordinates and lifetime; an owned empty remains present.
+     * @details This projection reads no live execution state and declares no parity verdict.
+     */
+    inline SnapshotInfo retainedSnapshotInfo(const StoredSnapshotHandle &snapshot)
+    {
+        if(!snapshot)return {};
+        return SnapshotInfo{.data=snapshot->data.isInteger()?nullptr:snapshot->data.data(),
+            .size=snapshot->data.size(),.rows=snapshot->rows,.cols=snapshot->cols,
+            .lifetime_owner=snapshot,.publication=snapshot->publication,
+            .row_ownership=snapshot->row_ownership,.typed_values=snapshot->data.view(),
+            .semantic_axis=snapshot->semantic_axis,.authored_token_rows=snapshot->authored_token_rows};
+    }
 
     /**
      * @brief Describe one ordered, logical prefill chunk retained for diagnostics.
@@ -300,6 +318,8 @@ namespace llaminar2
          * @param cols Logical column count reported by the producing stage.
          * @param publication Whether the producer already assembled the value.
          * @param row_ownership Exact observed intervals for a row-partitioned publication.
+         * @param semantic_axis Immutable mathematical axis of the acquired values.
+         * @param authored_token_rows Original acquired row coordinates and packed offsets, when declared.
          */
         void storeSnapshot(
             const std::string &key,
@@ -308,7 +328,8 @@ namespace llaminar2
             size_t cols,
             SnapshotPublication publication = SnapshotPublication::SchemaPartition,
             SnapshotOwnedRows row_ownership = {},
-            SnapshotSemanticAxis semantic_axis = SnapshotSemanticAxis::Legacy);
+            SnapshotSemanticAxis semantic_axis = SnapshotSemanticAxis::Legacy,
+            std::optional<SnapshotAuthoredTokenRowsObservation> authored_token_rows = std::nullopt);
 
         /**
          * @brief Extract and publish one stage output while the capture lock is held.

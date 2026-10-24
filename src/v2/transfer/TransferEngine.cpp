@@ -33,6 +33,7 @@
 #include "collective/BackendRouter.h"
 #include "collective/ICollectiveBackend.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/local_execution/device/WorkspaceBufferLease.h"
 #include "tensors/TensorClasses.h"
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
@@ -46,6 +47,37 @@
 
 namespace llaminar2
 {
+    void TransferEngine::initializeWorkspaceMetadata(const WorkspaceBufferLease &destination,
+        std::span<const std::byte> source, void *stream) const
+    {
+        const auto device=destination.device();
+        if(isGraphCaptureActive()||source.empty()||!source.data()||
+           !destination.contains(0,source.size())||
+           (device.is_gpu()?reinterpret_cast<std::uintptr_t>(stream)<=2:stream!=nullptr))
+            throw std::invalid_argument("Immutable workspace metadata requires bounded original storage and a setup stream outside capture");
+        if(device.is_cpu()) {
+            std::memcpy(destination.data(),source.data(),source.size());
+            return;
+        }
+        auto *backend=resolveBackend(device);
+        if(!backend||backend!=destination.backend())
+            throw std::runtime_error("Immutable workspace metadata lost its original backend owner");
+        const auto ordinal=device.gpu_ordinal();
+        void *event=backend->createEvent(ordinal);
+        if(!event)throw std::runtime_error("Immutable workspace metadata could not create its setup completion event");
+        if(!backend->hostToDeviceOnStream(destination.data(),source.data(),source.size(),ordinal,stream)) {
+            backend->destroyEvent(event,ordinal);
+            throw std::runtime_error("Immutable workspace metadata upload failed");
+        }
+        // Once a copy is accepted, its source cannot retire without proven
+        // completion. A failed event publication is fatal, not a retryable upload.
+        if(!backend->recordEvent(event,ordinal,stream)||!backend->waitForEvent(event,ordinal)) {
+            LOG_ERROR("Immutable workspace metadata could not authenticate completion of its accepted setup copy");
+            std::terminate();
+        }
+        backend->destroyEvent(event,ordinal);
+    }
+
     namespace
     {
         /**

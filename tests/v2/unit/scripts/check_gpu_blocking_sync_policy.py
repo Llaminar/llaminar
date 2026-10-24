@@ -174,8 +174,8 @@ CATEGORY_REASONS = {
         "release boundary outside steady-state graph execution."
     ),
     "setup_certification": (
-        "One setup-only exact event makes a retained graph's immutable "
-        "terminal record observable before inference admission."
+        "One setup-only exact event completes retained immutable graph metadata "
+        "or terminal certification before inference admission."
     ),
 }
 
@@ -439,6 +439,9 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # rejects an uncaptured setup-event dependency inside a retained graph.
         ("src/v2/transfer/MappedTransferProgressEpoch.cpp", "MappedTransferProgressEpoch::materialize", "worker_event", 1),
         ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "validateAllStaticTerminals", "worker_event", 1),
+        # A capture-rejecting exact setup copy must retire its temporary host
+        # address vector before publishing the retained immutable table owner.
+        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::initializeWorkspaceMetadata", "backend_event", 1),
     ),
 )
 

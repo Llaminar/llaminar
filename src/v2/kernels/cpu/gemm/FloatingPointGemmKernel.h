@@ -11,6 +11,8 @@
  * Explicit FP16RNE engines consume half-rounded A and prepared half B through
  * SIMD register conversions and a fixed256-lane FP32 tree for every runtime M.
  * They allocate no activation mirror and retain immutable policy in service views.
+ * Decode work selection preserves original request/row coordinates through
+ * each SIMD tile. Unauthored query rows never enter casts, products or epilogues.
  * Service-measurement execution handles may alias an existing prepared
  * engine's immutable tensor. Each invocation receives participant-owned
  * SwiGLU scratch; shared prepared engines retain no mutable arena binding.
@@ -59,6 +61,25 @@ namespace llaminar2
 {
     namespace gemm
     {
+        /**
+         * @brief Capture original CPU row selection before entering an OpenMP team.
+         * @param rows Physical matrix capacity, unchanged by mutable publications.
+         * @return Borrowed selection or no selection for an ordinary complete matrix.
+         * @throws std::invalid_argument For corrupt or disagreeing host publications.
+         * @details Thread-local launch scopes belong to the submitting thread;
+         * workers receive this immutable value through their enclosing workshare.
+         */
+        inline std::optional<FloatingProjectionRows> cpuFloatingProjectionRows(int rows)
+        {
+            if(rows<=0||!currentProjectionRowWork(rows))return std::nullopt;
+            const auto *prefix=ITensorGemm::VerifierKernelModeScope::prefixForFloating(rows);
+            const auto *requests=ITensorGemm::VerifierKernelModeScope::requestsFor(rows);
+            if(!prefix&&!requests&&!currentProjectionRowWork(rows))return std::nullopt;
+            auto selection=FloatingProjectionRows::bind(rows,prefix,requests);
+            selection.validateHostPublications();
+            return selection;
+        }
+
         // ========== OneDNN Engine/Stream Singletons ==========
 
         /**
@@ -159,6 +180,9 @@ namespace llaminar2
                 return false;
             }
 
+            const auto scoped_selection=cpuFloatingProjectionRows(M);
+            if(!selection&&scoped_selection)selection=&*scoped_selection;
+
             if(selection) {
                 if(selection->physicalRows()!=M)throw std::invalid_argument("Floating projection selection exceeds matrix rows");
                 selection->validateHostPublications();
@@ -193,9 +217,10 @@ namespace llaminar2
                     {
                         for (int col = 0; col < N; ++col)
                         {
-                            const int first_row = selection ? selection->hostTileFirst(row_tile,kVerifierRowTile) : row_tile * kVerifierRowTile;
-                            const int tile_rows =
-                                selection ? selection->hostTileRows(row_tile,kVerifierRowTile) : std::min(kVerifierRowTile, M - first_row);
+                            const auto span=selection ? selection->hostTileSpan(row_tile,kVerifierRowTile) :
+                                ProjectionRowSpan{row_tile*kVerifierRowTile,std::min(M,(row_tile+1)*kVerifierRowTile)};
+                            const int first_row=span.first;
+                            const int tile_rows=span.size();
                             if(tile_rows==0)continue;
                             const float *b_row =
                                 B + static_cast<size_t>(col) * K;
@@ -357,9 +382,9 @@ namespace llaminar2
              * the per-row accumulators. Every accumulator still visits K in
              * increasing order, exactly as the one-row decode primitive does.
              */
+            const auto selection=cpuFloatingProjectionRows(M);
             constexpr int kVerifierRowTile = 4;
-            const int row_tiles =
-                (M + kVerifierRowTile - 1) / kVerifierRowTile;
+            const int row_tiles = selection ? selection->hostTiles(kVerifierRowTile) : (M + kVerifierRowTile - 1) / kVerifierRowTile;
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
@@ -367,9 +392,11 @@ namespace llaminar2
                 {
                     for (int col = 0; col < N; ++col)
                     {
-                        const int first_row = row_tile * kVerifierRowTile;
-                        const int tile_rows =
-                            std::min(kVerifierRowTile, M - first_row);
+                        const auto span=selection ? selection->hostTileSpan(row_tile,kVerifierRowTile) :
+                            ProjectionRowSpan{row_tile*kVerifierRowTile,std::min(M,(row_tile+1)*kVerifierRowTile)};
+                        const int first_row=span.first;
+                        const int tile_rows=span.size();
+                        if(tile_rows==0)continue;
                         float accumulators[kVerifierRowTile] = {};
                         for (int kk = 0; kk < K; ++kk)
                         {
@@ -471,6 +498,9 @@ namespace llaminar2
                 return false;
             }
 
+            const auto scoped_selection=cpuFloatingProjectionRows(M);
+            if(!selection&&scoped_selection)selection=&*scoped_selection;
+
             if(selection) {
                 if(selection->physicalRows()!=M)throw std::invalid_argument("Floating projection selection exceeds matrix rows");
                 selection->validateHostPublications();
@@ -491,9 +521,10 @@ namespace llaminar2
                 {
                     for (int col = 0; col < N; ++col)
                     {
-                        const int first_row = selection ? selection->hostTileFirst(row_tile,kVerifierRowTile) : row_tile * kVerifierRowTile;
-                        const int tile_rows =
-                            selection ? selection->hostTileRows(row_tile,kVerifierRowTile) : std::min(kVerifierRowTile, M - first_row);
+                        const auto span=selection ? selection->hostTileSpan(row_tile,kVerifierRowTile) :
+                                ProjectionRowSpan{row_tile*kVerifierRowTile,std::min(M,(row_tile+1)*kVerifierRowTile)};
+                            const int first_row=span.first;
+                            const int tile_rows=span.size();
                             if(tile_rows==0)continue;
                         float accumulators[kVerifierRowTile] = {};
                         for (int kk = 0; kk < K; ++kk)
@@ -1151,12 +1182,13 @@ namespace llaminar2
                 return false;
             }
 
+            const auto selection=cpuFloatingProjectionRows(M);
             constexpr int kRowTile = 4;
             constexpr int kLanes =
                 floating_expert_numerical_contract::kReductionLanes;
             static_assert(kLanes == 256,
                           "CPU SIMD schedules implement the 256-lane device tree");
-            const int row_tiles = (M + kRowTile - 1) / kRowTile;
+            const int row_tiles = selection ? selection->hostTiles(kRowTile) : (M + kRowTile - 1) / kRowTile;
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
@@ -1164,9 +1196,11 @@ namespace llaminar2
                 {
                     for (int column = 0; column < N; ++column)
                     {
-                        const int first_row = row_tile * kRowTile;
-                        const int tile_rows =
-                            std::min(kRowTile, M - first_row);
+                        const auto span=selection ? selection->hostTileSpan(row_tile,kRowTile) :
+                            ProjectionRowSpan{row_tile*kRowTile,std::min(M,(row_tile+1)*kRowTile)};
+                        const int first_row=span.first;
+                        const int tile_rows=span.size();
+                        if(tile_rows==0)continue;
                         std::array<float, kRowTile> reduced{};
 #if defined(__AVX512F__) && defined(__AVX512BW__)
                         if constexpr (ISA == ISALevel::AVX512)
@@ -2572,6 +2606,12 @@ namespace llaminar2
                     return false;
                 }
 
+                if(const auto *work=currentProjectionRowWork(m)) {
+                    if(m!=1)
+                        throw std::invalid_argument("Selected floating decode rows require explicit grouped decode arithmetic");
+                    if(!work->resolveHost().contains(0))return true;
+                }
+
                 // Extract bias pointer (FP32 fused bias only for now)
                 const float *bias_ptr = bias ? bias->data() : nullptr;
 
@@ -2802,6 +2842,12 @@ namespace llaminar2
                               << static_cast<int>(act_type)
                               << " weight=" << static_cast<int>(weight_type_));
                     return false;
+                }
+
+                if(const auto *work=currentProjectionRowWork(m)) {
+                    if(m!=1)
+                        throw std::invalid_argument("Selected floating decode rows require explicit grouped decode arithmetic");
+                    if(!work->resolveHost().contains(0))return true;
                 }
 
                 // Extract bias pointer (FP32 fused bias only for now)
