@@ -1,8 +1,9 @@
 # QFN attention: actual Castagna and Llaminar execution structures
 
 This comparison uses Castagna revision
-`3483d462715d61f21ed5877836be35a724446359`, the kernels authenticated by the
-current four-MI50 traces, and Llaminar candidate124. It distinguishes source
+`3483d462715d61f21ed5877836be35a724446359`. The opening comparison records
+candidate124; the latest qualified candidate165 and refreshed four-MI50 traces
+are recorded below. It distinguishes source
 structure from measured causation. The source findings inform subsequent
 arithmetic-preserving candidates; they do not establish a new production
 default or an end-to-end speedup by themselves.
@@ -905,7 +906,118 @@ The canonical Release model panel passes all required groups, authenticates actu
 
 The clean unprofiled A/B/A measures **819.682 prefill /40.265 decode tok/s**, versus frozen151 controls' **819.102 /40.186**. The +0.071% /+0.196% differences have overlapping ranges: whole-model throughput is effectively unchanged. Decode ranges are40.070–40.262 for controls and40.130–40.361 for164. All nine natural256-token sequences are identical. Settings remain fullTP4 on fourMI50s, sharded vocabulary,28 physical NUMA1 workers, RAM ngrams, native post-RoPE FP16 KV, explicit Prefill8/Decode33, prompt512/decode256/context4096, MTP/prefix off, one warmup plus three measured requests per arm. This uses the same Qwen3.8-Flash-Next UD-Q4_K_XL GGUF. Profile timings are excluded. Every arm passes source/runtime/model/driver/resource and normal-retirement checks; `attention164-qk-reverse-model-throughput-comparison-r1.json` retains the matched result.
 
-This is a focused checkpoint of the explicit FP16 phase8/33 program. Production defaults and complete preflightG60 are unchanged. The next private candidate retains key-row address calculations across the K0/K1 boundary; its native resource, numerical and economic gates remain open.
+This is a focused checkpoint of the explicit FP16 phase8/33 program. Production defaults and complete preflightG60 are unchanged. The following165 qualification retains key-row address calculations across the K0/K1 boundary.
+
+## Retained key rows165 and refreshed paired profiles
+
+Candidate165 resolves each thread's original selected logical ID and physical
+ring row once before K0. K0 retains the original logical position for pre-RoPE
+arithmetic; K1 reuses the physical row. Three named records cover the G6 copy
+slots, with only two consumed by the last128 threads. Parts8 keeps its direct
+row source. Native arguments, strides, payload reads, barriers, workspace and
+floating arithmetic are unchanged. The records are invocation-local registers,
+not another KV-state authority.
+
+| Captured producer-plus-merge pair |164, µs |165, µs |
+|---|---:|---:|
+| Post-RoPE M1 /512 |15.08615 |15.05355 |
+| Post-RoPE M1 /640 |15.85615 |15.81605 |
+| Post-RoPE M1 /768 |15.88365 |15.85720 |
+| Post-RoPE M1 /2048 |18.45490 |18.45470 |
+| Post-RoPE M1 /65536 |19.44365 |19.12725 |
+| Post-RoPE M16 /65536 |84.35355 |82.28515 |
+| Pre-RoPE M1 /512 |16.72365 |16.79850 |
+| Pre-RoPE M1 /65536 |21.20250 |20.76470 |
+
+All20 native tests and eight comparisons against independent frozen164 output
+and numerical-partial exports pass. The source-bound ISA removes K1's repeated
+selected-ID loads and ring rematerialization on every original full/partial
+and identity/sparse route. The128 ascending dot2 operations and all three
+prefetch overlap windows remain. Post-RoPE uses63/64 used/allocated VGPRs;
+pre-RoPE uses62/64. Static LDS remains21248B, with zero scratch/spills. No
+achieved-occupancy claim follows from those resource bounds.
+
+Isolated producer profiles retain zero LDS bank conflicts. At512/64K they
+report190.576/697.000 vector instructions per wave and528.813/2062.438KiB
+fetch; M16/64K reports710.024 vector instructions per wave and6370.188KiB
+fetch. Source, native graph/dispatch identity, physical GPU and exact counter
+association remain authenticated. The complete Unit/affected gate passes
+**832/832 registrations in193.872 seconds**, without CTest failures or skips.
+Release and Integration retain CUDA80/86/89/90 plus HIPgfx906 and the normal
+spill guard. The canonical model panel passes, with all26 files /185 final-logit
+rows byte-identical to151; mean KL and top-1/top-5 are unchanged.
+
+The wider second-QK scheduling probe166 is rejected. Although it reaches
+14.992µs at512 and19.011µs at64K, M16/64K regresses to105.749µs from165's
+82.285µs. Registers rise to65 used /68 allocated. Its20 native tests and eight
+byte comparisons pass, but that does not satisfy grouped economy. The exact165
+code object was restored and compared byte-for-byte with its originally
+profiled bounded ELF before final qualification; no whole-library/model hash
+was used.
+
+The final unprofiled A/B/A measures **818.073 prefill /40.190 decode tok/s**,
+versus frozen151 controls' **818.437 /40.151**. Differences are
+**−0.045% /+0.095%**, with overlapping ranges: whole-model throughput remains
+effectively unchanged. All nine256-token sequences match. Settings remain the
+same Qwen3.8-Flash-Next UD-Q4_K_XL GGUF, fullTP4 on fourMI50s, sharded vocabulary,
+RAM ngrams,28 physical NUMA1 workers, native post-RoPE FP16 KV, explicit
+Prefill8/Decode33, prompt512/decode256/context4096, MTP/prefix off, and one warmup
+plus three measured requests per arm. The receipt is
+`attention165-retained-rows-model-throughput-comparison-r1.json`.
+
+Fresh complete-model rocprof traces now compare165 with the unchanged pinned
+fork on the same512-token prompt and256 emitted IDs /255 decode forwards.
+Both collectors pass source/runtime/driver, trajectory and retirement checks;
+the four shared GGUF shard identities match explicitly. Complete graph joins,
+exact phase/core counts and all intersecting kernels are retained. The cold
+Llaminar trace includes one prefill preparation replay before warmup/measured
+requests: three M512 replays per participant,36 producer/merge calls each,
+and6120 decode producer/merge calls each over warmup plus measurement. An initial
+private validator assumed two prefill executions and rejected the trace; the
+corrected validator binds the actual canonical replay probes and rejects extra
+replays/buckets. Its fresh collection passes. The old rejection remains retained.
+The classifier also now names the existing grouped split-K reducer, preserving
+every other kernel in overlap accounting.
+
+| Complete attention core, median per GPU | Llaminar165 | Castagna |
+|---|---:|---:|
+| Prefill inclusive work, µs/prompt row |11.6270 |4.0577 |
+| Prefill core-active union, µs/prompt row |11.6270 |4.0284 |
+| Prefill exclusive core time, µs/prompt row |11.6270 |4.0247 |
+| Decode inclusive work, µs/step |386.3394 |163.2296 |
+| Decode core-active union, µs/step |386.3394 |163.2296 |
+| Decode exclusive core time, µs/step |386.3394 |163.2228 |
+
+Llaminar's earlier124 decode-core work was581.918µs/GPU/step. The fresh result
+shows substantial component progress, while the matched whole-model result
+above remains flat. These are instrumented GPU-work/interval measures, not
+request latency, removable delay or an equal-arithmetic speed ratio. The local
+ownership remains H6×12 layers versus H12×6: both72 head-layer instances/GPU,
+but four versus two active participants per attention layer. The core excludes
+external projections, RoPE/cache publication, indexer and output gating.
+
+The source-geometry-bound decode breakdown identifies the next target:
+
+| Role, median of per-GPU mean call durations | Llaminar165, µs | Castagna, µs |
+|---|---:|---:|
+| Producer |22.6351 |21.6248 |
+| Ordered merge |9.5598 |5.5732 |
+
+Each Llaminar role has3060 measured calls/GPU; the fork has1530. Per-role
+medians must not be added to manufacture a total. The merge's synchronization,
+operand sharing and ordered fold now take priority over further producer load
+tuning. The unimplemented identity-only validation proposal167 remains separate;
+general one-wave sparse validation is unsafe before selected-dependent loads.
+
+Evidence under the ignored QFN results root includes
+`attention165-retained-rows-{events-r1.json,joined-profile-r1.json,m16-profile-r1.json,pre-profile-r1.json,isa-r1,model-fp16-r1,unit-native-r1}`,
+`attention165-stage-trace-r2`, `attention165-castagna-trace-r1`,
+`attention165-paired-model-postcollection-r1.json`,
+`attention165-complete-core-comparison-r1/attention-core.json` and
+`attention165-core-role-breakdown-r1.json`. This is a focused green checkpoint;
+production defaults and full preflightG60 remain unchanged. Both the short
+attention-pair target and approximately43tok/s whole-model decode target remain
+open.
 
 ## Primary source map
 

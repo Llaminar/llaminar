@@ -1,6 +1,28 @@
 # QFN tuning dashboard
 
-**Attention checkpoint164 is green:** **819.682 prefill /40.265 decode tok/s**,
+**Attention checkpoint165 is green:** **818.073 prefill /40.190 decode tok/s**,
+versus frozen151 controls'818.437 /40.151. The −0.045% /+0.095% differences
+have overlapping ranges: whole-model throughput is effectively unchanged.
+All nine timed sequences,185 final-logit rows,20 native tests, eight independent
+numerical exports and832 Unit/affected registrations pass.
+
+Retaining original key-row addresses reduces the native pair from19.444 to
+**19.127µs at64K** and84.354 to**82.285µs for M16/64K**. The512 pair is
+15.054µs. Registers remain63 used/64 allocated with zero spills; the wider
+QK probe166 is rejected for grouped slowdown. The
+[qualification and fresh profiles](QFN_ATTENTION_STRUCTURE_COMPARISON.md#retained-key-rows165-and-refreshed-paired-profiles)
+retain all settings, timings, numeric comparisons and source/ISA evidence.
+
+Fresh full-model rocprof traces pass for both engines. Recorded attention-core
+work is **0.386ms/GPU/decode step versus Castagna's0.163ms**, down from the
+earlier0.582ms Llaminar trace. This is instrumented work, not request latency;
+H6×12 versus H12×6 ownership remains explicit. Per-call producer means are
+22.64 versus21.62µs, but merge means are **9.56 versus5.57µs**. The next tuning
+target is the ordered merge. The fork's14.424µs short-context native pair and
+approximately43tok/s whole-model target remain open. Defaults and complete
+preflightG60 are unchanged; this remains the explicit FP16 phase8/33 experiment.
+
+**Previous attention checkpoint164:** **819.682 prefill /40.265 decode tok/s**,
 versus frozen151's819.102 /40.186. The +0.071% /+0.196% differences have
 overlapping ranges: whole-model throughput is effectively unchanged.
 All nine timed sequences and185 final-logit rows match. The expanded20 native
@@ -18,8 +40,7 @@ retains every probe, isolated rocprof counters, independent byte comparisons,
 new oracle, model metrics and matched benchmark settings. The fork's14.424µs
 short-context pair and42.959tok/s model target remain open. This is an explicit
 FP16 phase8/33 experiment; defaults and complete preflightG60 are unchanged.
-The next private candidate retains key-row address work; it has no native
-qualification and is not installed in this checkpoint.
+The subsequent165 qualification above retains key-row address work.
 
 **Earlier phase-schedule checkpoint151 is qualified** with separate prefill/decode
 programs: **818.579 prefill / 40.110 decode tok/s**, versus the matched uniform8
@@ -616,6 +637,7 @@ its actual prepared route must be represented explicitly in coverage.
 | A1.E151 | Same A1 topology; explicit FP16 attention with `prefill8_decode33`, native FP16 KV; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 832 Unit/affected registrations; boundary panel diagnostic | 818.579 E151† | 467.821 F62§ | — | 40.110 E151† | 42.959 F62§ | — | +0.566% decode versus same-binary uniform8. Tune decode head grouping; retain prefill. Experimental arithmetic; no new complete preflight or default promotion. |
 | A1.E160 | Same A1 topology; explicit FP16 `prefill8_decode33`, V0/V1 overlap and PV unroll2; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 832 Unit/affected registrations | 818.413 E160† | 467.821 F62§ | — | 40.111 E160† | 42.959 F62§ | — | Matched model throughput is flat versus frozen151. Native M1/512 pair15.446µs and M16/64K88.597µs. Experimental arithmetic; full preflight/default promotion remain open. |
 | A1.E164 | Same A1 topology; explicit FP16 `prefill8_decode33`, K1/V0/V1 overlap and QK64/32; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 832 Unit/affected plus new K1 oracle registration | 819.682 E164† | 467.821 F62§ | — | 40.265 E164† | 42.959 F62§ | — | Matched model ranges overlap frozen151. Native M1/512 pair15.086µs and M16/64K84.354µs. Experimental arithmetic; full preflight/default promotion remain open. |
+| A1.E165 | Same A1 topology; explicit FP16 `prefill8_decode33`, retained K0/K1 row addresses; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 20 native tests and 832 Unit/affected | 818.073 E165† | 467.821 F62§ | — | 40.190 E165† | 42.959 F62§ | — | Matched model ranges overlap frozen151. Native M1/51215.054µs, M1/64K19.127µs, M16/64K82.285µs. Fresh paired profiles identify merge as next target; default/full-preflight status unchanged. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |

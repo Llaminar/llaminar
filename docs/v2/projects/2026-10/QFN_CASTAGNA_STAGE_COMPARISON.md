@@ -252,6 +252,23 @@ projection/expert work.
 
 ## Next measured candidates
 
+The subsequent attention165 checkpoint refreshes the bounded numerical-core
+comparison. Both complete-model collectors, shared four-shard model identities,
+graph joins and measured phase/count checks pass. Llaminar's median per-GPU
+decode-core work is386.339µs/step versus Castagna's163.230µs; core-active unions
+are identical to those sums, with exclusive times386.339/163.223µs. Earlier124
+Llaminar core work was581.918µs. These instrumented measures retain H6×12 versus
+H12×6 local ownership and are not critical-path or removable-latency estimates.
+
+The per-GPU mean call-duration breakdown, taking the median across four GPUs,
+is22.635/21.625µs for Llaminar/Castagna producers and9.560/5.573µs for their
+merges. There are3060 versus1530 measured calls per role/GPU. This makes the
+ordered merge the next attention target. The matched unprofiled165 A/B/A is
+818.073/40.190 prefill/decode tok/s versus818.437/40.151 for frozen151 controls,
+with overlapping ranges and identical natural outputs. See the
+[complete qualification and evidence](QFN_ATTENTION_STRUCTURE_COMPARISON.md#retained-key-rows165-and-refreshed-paired-profiles).
+Broader wrapper attribution and the other candidates below remain open.
+
 1. Preserve the HC injection FP32 reduction order while reducing barriers;
    validate the real optimized CPU/CUDA/ROCm paths as applicable.
 2. Avoid unused short-context indexer Q work with explicit row liveness and

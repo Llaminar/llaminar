@@ -117,9 +117,173 @@ __device__ __forceinline__ SparseHalfVector readSparseHalfVector(
 }
 
 /**
+ * @brief Original selected logical ID and its derived physical key row.
+ * @details Inactive records have no selected/native read. Logical IDs retain
+ * the original pre-RoPE position while K0 runs; only physical rows are consumed
+ * by K1 after K0 publication, so logical values have no later live consumer.
+ */
+struct SparseHalfKeyRow
+{
+    int logical = -1;
+    int physical = -1;
+};
+
+/** @brief Typed direct row source for the unchanged interleaved8 schedule. */
+struct SparseHalfDirectKeyRows
+{
+    static constexpr bool retainsRows = false;
+};
+
+/**
+ * @brief Three thread-owned derived key rows for one immutable33 logical tile.
+ * @details This is ephemeral register state for a single invocation, not a
+ * request/model authority or workspace. The third row is inactive for the last
+ * 128 G6 threads. K1 consumes only physical fields before its payloads are born.
+ */
+struct SparseHalfRetainedKeyRows
+{
+    static constexpr bool retainsRows = true;
+    SparseHalfKeyRow first, second, third;
+};
+
+/**
+ * @brief Resolve the original selected ID and ring row once for a key token.
+ * @tparam FullPanel Original full64 permission.
+ * @tparam IdentityAddressing Original validated identity membership.
+ * @param selected Original selected list at this logical tile's first token.
+ * @param count Original live key count.
+ * @param logicalBegin Original selected ordinal at this tile's first token.
+ * @param origin Original ring origin.
+ * @param capacity Original ring capacity, or zero for contiguous keys.
+ * @param token Original key token in [0,64).
+ * @return Original logical/physical pair, or an inactive record with no read.
+ * @details This is the single key selected/ring authority for both direct and
+ * retained-row copies. No inverse-ring reconstruction or ordinal substitution
+ * is used for sparse lists or pre-RoPE positions.
+ */
+template<bool FullPanel, bool IdentityAddressing>
+__device__ __forceinline__ SparseHalfKeyRow prepareSparseHalfKeyRow(
+    const std::int32_t* selected, int count, int logicalBegin,
+    int origin, int capacity, int token)
+{
+    SparseHalfKeyRow row{};
+    if (FullPanel || token < count)
+    {
+        row.logical = IdentityAddressing ? logicalBegin + token : selected[token];
+        row.physical = detail::physicalRow(row.logical, origin, capacity);
+    }
+    return row;
+}
+
+/**
+ * @brief Evaluate the original direct key-row lookup at the original vector.
+ * @tparam FullPanel Original full64 permission.
+ * @tparam IdentityAddressing Original membership permission.
+ * @param rows Empty typed source; it retains no invocation values.
+ * @param selected Original selected list.
+ * @param count Original live key count.
+ * @param logicalBegin Original selected ordinal at the tile start.
+ * @param origin Original ring origin.
+ * @param capacity Original ring capacity or zero.
+ * @param vector Original admitted64-by16 key vector.
+ * @param slot Unused for direct lookup; optimized away with the empty source.
+ * @return Original logical/physical row for this vector's token.
+ */
+template<bool FullPanel, bool IdentityAddressing>
+__device__ __forceinline__ SparseHalfKeyRow sparseHalfKeyRowForVector(
+    [[maybe_unused]] const SparseHalfDirectKeyRows& rows, const std::int32_t* selected,
+    int count, int logicalBegin, int origin, int capacity, int vector, [[maybe_unused]] int slot)
+{
+    return prepareSparseHalfKeyRow<FullPanel, IdentityAddressing>(
+        selected,count,logicalBegin,origin,capacity,vector / 16);
+}
+
+/**
+ * @brief Borrow an already resolved thread-owned row without a selected read.
+ * @tparam FullPanel Original permission, already honored during preparation.
+ * @tparam IdentityAddressing Original permission, already honored during preparation.
+ * @param rows Original three row records prepared before K0.
+ * @param selected Unused original selected binding; no native/selected read occurs.
+ * @param count Original count, already guarded by the caller and preparation.
+ * @param logicalBegin Original ordinal, already included in the retained records.
+ * @param origin Original ring origin, already resolved by the same authority.
+ * @param capacity Original ring capacity, already resolved by the same authority.
+ * @param vector Original cooperative vector; its slot has unchanged ownership.
+ * @param slot Compile-unrolled original vector ordinal0,1,2 within this thread.
+ * @return The original retained logical/physical row for that slot.
+ */
+template<bool FullPanel, bool IdentityAddressing>
+__device__ __forceinline__ SparseHalfKeyRow sparseHalfKeyRowForVector(
+    const SparseHalfRetainedKeyRows& rows, [[maybe_unused]] const std::int32_t* selected,
+    [[maybe_unused]] int count, [[maybe_unused]] int logicalBegin, [[maybe_unused]] int origin,
+    [[maybe_unused]] int capacity, [[maybe_unused]] int vector, int slot)
+{
+    if (slot == 0) return rows.first;
+    if (slot == 1) return rows.second;
+    return rows.third;
+}
+
+/**
+ * @brief Resolve the three original G6 row slots before any K0 payload read.
+ * @tparam FullPanel Original full64 permission.
+ * @tparam IdentityAddressing Original membership permission.
+ * @tparam Threads Exact384-thread G6 ownership.
+ * @param selected Original selected list at this tile's first token.
+ * @param count Original live count.
+ * @param logicalBegin Original tile start ordinal.
+ * @param origin Original ring origin.
+ * @param capacity Original ring capacity or zero.
+ * @return Three named rows, with an inactive unused third field where required.
+ */
+template<bool FullPanel, bool IdentityAddressing, int Threads>
+__device__ __forceinline__ SparseHalfRetainedKeyRows prepareSparseHalfKeyRowsBody(
+    const std::int32_t* selected, int count, int logicalBegin, int origin, int capacity)
+{
+    static_assert(Threads==384,"Retained key rows require G6 ownership");
+    const int vector = int(threadIdx.x);
+    SparseHalfRetainedKeyRows rows{};
+    rows.first = prepareSparseHalfKeyRow<FullPanel, IdentityAddressing>(
+        selected,count,logicalBegin,origin,capacity,vector / 16);
+    rows.second = prepareSparseHalfKeyRow<FullPanel, IdentityAddressing>(
+        selected,count,logicalBegin,origin,capacity,(vector + Threads) / 16);
+    if (vector + 2 * Threads < 64 * 16)
+        rows.third = prepareSparseHalfKeyRow<FullPanel, IdentityAddressing>(
+            selected,count,logicalBegin,origin,capacity,(vector + 2 * Threads) / 16);
+    return rows;
+}
+
+/**
+ * @brief Seal original identity/full permissions for the retained key rows.
+ * @tparam Threads Exact G6 cooperative size.
+ * @param selected Original selected list at this logical tile.
+ * @param count Original live key count.
+ * @param logicalBegin Original selected start ordinal.
+ * @param allVisible Original validated identity proof.
+ * @param origin Original ring origin.
+ * @param capacity Original ring capacity or zero.
+ * @return Register candidates for the original physical rows and K0 positions.
+ */
+template<int Threads>
+__device__ __forceinline__ SparseHalfRetainedKeyRows prepareSparseHalfKeyRows(
+    const std::int32_t* selected, int count, int logicalBegin, bool allVisible,
+    int origin, int capacity)
+{
+    if (allVisible)
+    {
+        if (count == 64)
+            return prepareSparseHalfKeyRowsBody<true,true,Threads>(selected,count,logicalBegin,origin,capacity);
+        return prepareSparseHalfKeyRowsBody<false,true,Threads>(selected,count,logicalBegin,origin,capacity);
+    }
+    if (count == 64)
+        return prepareSparseHalfKeyRowsBody<true,false,Threads>(selected,count,logicalBegin,origin,capacity);
+    return prepareSparseHalfKeyRowsBody<false,false,Threads>(selected,count,logicalBegin,origin,capacity);
+}
+
+/**
  * @brief Resolve one raw second-key-panel vector without reading its payload.
  * @tparam FullPanel True only when all64 selected key tokens are live.
  * @tparam IdentityAddressing Use the original validated identity membership.
+ * @tparam KeyRows Typed direct or original retained key-row source.
  * @param p Original immutable native FP16 key bank.
  * @param selected Sorted selected IDs at this logical tile's first token.
  * @param count Original live key tokens, from one through64.
@@ -128,22 +292,25 @@ __device__ __forceinline__ SparseHalfVector readSparseHalfVector(
  * @param origin Original physical ring origin.
  * @param capacity Original ring capacity, or zero for contiguous keys.
  * @param vector Admitted vector in [0,1024), mapped as64 tokens by16 vectors.
+ * @param rows Typed direct source or original thread-owned rows; no host mirror.
+ * @param slot Original unrolled vector ordinal within this thread.
  * @return A guarded native source for coordinates128..255, with no payload read.
  * @details This is the single raw K1 address authority for both copy schedules.
  * The existing transform applies only to Coordinate0; Coordinate128 remains
  * raw in both admitted key encodings. No value-bank binding is substituted.
  */
-template<bool FullPanel, bool IdentityAddressing>
+template<bool FullPanel, bool IdentityAddressing, typename KeyRows=SparseHalfDirectKeyRows>
 __device__ __forceinline__ SparseHalfVectorSource prepareSparseHalfKeySecondPanelVector(
     const QwenSparseAttention& p, const std::int32_t* selected, int count,
-    int logicalBegin, int kvHead, int origin, int capacity, int vector)
+    int logicalBegin, int kvHead, int origin, int capacity, int vector, int slot, const KeyRows& rows = {})
 {
     const int token = vector / 16, pair = (vector % 16) * 4;
     SparseHalfVectorSource source{};
     if (FullPanel || token < count)
     {
-        const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
-        const int physical = detail::physicalRow(logical, origin, capacity);
+        const auto row = sparseHalfKeyRowForVector<FullPanel, IdentityAddressing>(
+            rows,selected,count,logicalBegin,origin,capacity,vector,slot);
+        const int physical = row.physical;
         const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
             std::size_t(physical) * p.kv.keys.token_stride_bytes +
             std::size_t(kvHead) * p.kv.keys.head_stride_bytes +
@@ -162,6 +329,7 @@ __device__ __forceinline__ SparseHalfVectorSource prepareSparseHalfKeySecondPane
  * @tparam FullPanel True only when the wrapper proves all64 key tokens live.
  * @tparam Threads Immutable cooperative copy stride: 256 for G4 or 384 for G6.
  * @tparam IdentityAddressing Use validated original ordinals instead of selected IDs.
+ * @tparam KeyRows Typed direct or original retained key-row source.
  * @param p Original immutable attention bindings and native cache policy.
  * @param r Authenticated original replay, including absolute position origin.
  * @param selected Sorted selected indices at this tile's first logical token.
@@ -171,6 +339,7 @@ __device__ __forceinline__ SparseHalfVectorSource prepareSparseHalfKeySecondPane
  * @param origin Canonical physical ring origin for the current query row.
  * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
  * @param tile Exclusive panel storage with68 packed pairs per token.
+ * @param rows Typed direct source or original thread-owned rows; no host mirror.
  * @details Each selected native element is read once per group. The original
  * readKeyAs rounding boundaries are retained before FP16 tile publication.
  * The caller publishes the entire panel with a CTA barrier before consuming it.
@@ -178,16 +347,17 @@ __device__ __forceinline__ SparseHalfVectorSource prepareSparseHalfKeySecondPane
  * Sparse lists retain selected-ID loads; physical ring mapping and absolute
  * RoPE positions are unchanged. Production8 always passes constant false.
  */
-template<bool Transform, int Coordinate, int LoadUnroll, bool FullPanel, int Threads, bool IdentityAddressing=false>
+template<bool Transform, int Coordinate, int LoadUnroll, bool FullPanel, int Threads, bool IdentityAddressing=false, typename KeyRows=SparseHalfDirectKeyRows>
 __device__ __forceinline__ void copySparseHalfKeysPanel(
     const QwenSparseAttention& p, const QwenSparseReplay& r,
     const std::int32_t* selected, int count, int logicalBegin,
-    int kvHead, int origin, int capacity, half2* tile)
+    int kvHead, int origin, int capacity, half2* tile, const KeyRows& rows = {})
 {
     static_assert(LoadUnroll==1 || LoadUnroll==4,"Closed native tile-load schedule");
     static_assert(Threads==256 || Threads==384,"Closed cooperative tile-copy geometry");
+    static_assert(!KeyRows::retainsRows || Threads==384,"Retained key rows require G6 ownership");
 #pragma unroll(LoadUnroll)
-    for (int vector = int(threadIdx.x); vector < 64 * 16; vector += Threads)
+    for (int vector = int(threadIdx.x), slot = 0; vector < 64 * 16; vector += Threads, ++slot)
     {
         const int token = vector / 16, columnVector = vector % 16;
         if constexpr (Transform && Coordinate == 0)
@@ -208,8 +378,10 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
                 }
                 if (FullPanel || token < count)
                 {
-                    const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
-                    const int physical = detail::physicalRow(logical, origin, capacity);
+                    const auto row = sparseHalfKeyRowForVector<FullPanel, IdentityAddressing>(
+                        rows,selected,count,logicalBegin,origin,capacity,vector,slot);
+                    const int logical = row.logical;
+                    const int physical = row.physical;
                     const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
                         std::size_t(physical) * p.kv.keys.token_stride_bytes +
                         std::size_t(kvHead) * p.kv.keys.head_stride_bytes;
@@ -236,7 +408,7 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
         if constexpr (Coordinate == 128)
         {
             const auto source = prepareSparseHalfKeySecondPanelVector<FullPanel, IdentityAddressing>(
-                p,selected,count,logicalBegin,kvHead,origin,capacity,vector);
+                p,selected,count,logicalBegin,kvHead,origin,capacity,vector,slot,rows);
             value = readSparseHalfVector(source);
         }
         else
@@ -245,8 +417,9 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
             for (auto& pairValue : value.pairs) pairValue = __float2half2_rn(0.0f);
             if (FullPanel || token < count)
             {
-                const int logical = IdentityAddressing ? logicalBegin + token : selected[token];
-                const int physical = detail::physicalRow(logical, origin, capacity);
+                const auto row = sparseHalfKeyRowForVector<FullPanel, IdentityAddressing>(
+                    rows,selected,count,logicalBegin,origin,capacity,vector,slot);
+                const int physical = row.physical;
                 const auto* bytes = static_cast<const unsigned char*>(p.kv.keys.data) +
                     std::size_t(physical) * p.kv.keys.token_stride_bytes +
                     std::size_t(kvHead) * p.kv.keys.head_stride_bytes +
@@ -265,6 +438,7 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
  * @tparam LoadUnroll Existing vector scheduling factor, independent of permission.
  * @tparam AllowFullPanel True only for the explicit Parts33 producer.
  * @tparam Threads Exact CTA size shared by copy wrappers and their panel body.
+ * @tparam KeyRows Typed direct or original retained key-row source.
  * @param p Original immutable attention bindings and native cache policy.
  * @param r Authenticated original replay, including absolute position origin.
  * @param selected Sorted selected indices at this tile's first logical token.
@@ -275,6 +449,7 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
  * @param origin Canonical physical ring origin for the current query row.
  * @param capacity Canonical physical ring capacity, or zero for contiguous KV.
  * @param tile Exclusive panel storage with68 packed pairs per token.
+ * @param rows Typed direct source or original thread-owned rows; no host mirror.
  * @details Each selected native element is read once per group. The original
  * readKeyAs rounding boundaries are retained before FP16 tile publication.
  * The caller publishes the entire panel with a CTA barrier before consuming it.
@@ -284,11 +459,11 @@ __device__ __forceinline__ void copySparseHalfKeysPanel(
  * Sparse lists retain selected-ID loads; physical ring mapping and absolute
  * RoPE positions are unchanged. Production8 always passes constant false.
  */
-template<bool Transform, int Coordinate, int LoadUnroll=1, bool AllowFullPanel=false, int Threads=256>
+template<bool Transform, int Coordinate, int LoadUnroll=1, bool AllowFullPanel=false, int Threads=256, typename KeyRows=SparseHalfDirectKeyRows>
 __device__ __forceinline__ void loadSparseHalfKeys(
     const QwenSparseAttention& p, const QwenSparseReplay& r,
     const std::int32_t* selected, int count, int logicalBegin, bool allVisible,
-    int kvHead, int origin, int capacity, half2* tile)
+    int kvHead, int origin, int capacity, half2* tile, const KeyRows& rows = {})
 {
     if constexpr (AllowFullPanel)
     {
@@ -297,18 +472,18 @@ __device__ __forceinline__ void loadSparseHalfKeys(
         if (allVisible)
         {
             if (count == 64)
-                copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, true, Threads, true>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+                copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, true, Threads, true>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile,rows);
             else
-                copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, false, Threads, true>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+                copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, false, Threads, true>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile,rows);
             return;
         }
         if (count == 64)
         {
-            copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, true, Threads>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+            copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, true, Threads>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile,rows);
             return;
         }
     }
-    copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, false, Threads>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile);
+    copySparseHalfKeysPanel<Transform, Coordinate, LoadUnroll, false, Threads>(p,r,selected,count,logicalBegin,kvHead,origin,capacity,tile,rows);
 }
 
 /**
@@ -316,6 +491,7 @@ __device__ __forceinline__ void loadSparseHalfKeys(
  * @tparam FullPanel Original full64 permission; partial tiles retain every guard.
  * @tparam IdentityAddressing Original row-uniform identity membership proof.
  * @tparam Threads Exact384-thread G6 cooperative ownership.
+ * @tparam KeyRows Typed direct or original retained key-row source.
  * @param p Original immutable attention bindings.
  * @param selected Original sorted IDs at the logical tile's first token.
  * @param count Original live tile count.
@@ -323,25 +499,26 @@ __device__ __forceinline__ void loadSparseHalfKeys(
  * @param kvHead Original native key head.
  * @param origin Original ring origin.
  * @param capacity Original ring capacity, or zero for contiguous keys.
+ * @param rows Typed direct source or original thread-owned rows; no host mirror.
  * @return One48-byte bank; last128 threads have a neutral unused third field.
  * @details No LDS is written. The caller keeps both original publication and
  * retirement barriers; actual ISA must prove native loads overlap QK0.
  */
-template<bool FullPanel, bool IdentityAddressing, int Threads>
+template<bool FullPanel, bool IdentityAddressing, int Threads, typename KeyRows=SparseHalfDirectKeyRows>
 __device__ __forceinline__ SparseHalfPanelPrefetch prefetchSparseHalfKeySecondPanelBody(
     const QwenSparseAttention& p, const std::int32_t* selected, int count,
-    int logicalBegin, int kvHead, int origin, int capacity)
+    int logicalBegin, int kvHead, int origin, int capacity, const KeyRows& rows = {})
 {
     static_assert(Threads==384,"K1 prefetch requires G6 ownership");
     const int vector = int(threadIdx.x);
     const auto first = prepareSparseHalfKeySecondPanelVector<FullPanel, IdentityAddressing>(
-        p,selected,count,logicalBegin,kvHead,origin,capacity,vector);
+        p,selected,count,logicalBegin,kvHead,origin,capacity,vector,0,rows);
     const auto second = prepareSparseHalfKeySecondPanelVector<FullPanel, IdentityAddressing>(
-        p,selected,count,logicalBegin,kvHead,origin,capacity,vector + Threads);
+        p,selected,count,logicalBegin,kvHead,origin,capacity,vector + Threads,1,rows);
     SparseHalfVectorSource third{};
     if (vector + 2 * Threads < 64 * 16)
         third = prepareSparseHalfKeySecondPanelVector<FullPanel, IdentityAddressing>(
-            p,selected,count,logicalBegin,kvHead,origin,capacity,vector + 2 * Threads);
+            p,selected,count,logicalBegin,kvHead,origin,capacity,vector + 2 * Threads,2,rows);
     return SparseHalfPanelPrefetch{
         readSparseHalfVector(first), readSparseHalfVector(second), readSparseHalfVector(third)};
 }
@@ -349,6 +526,7 @@ __device__ __forceinline__ SparseHalfPanelPrefetch prefetchSparseHalfKeySecondPa
 /**
  * @brief Select original full/partial and identity/sparse K1 copy permissions.
  * @tparam Threads Exact G6 cooperative copy size.
+ * @tparam KeyRows Typed direct or original retained key-row source.
  * @param p Original immutable attention bindings.
  * @param selected Original sorted IDs at the logical tile's first token.
  * @param count Original live tile count, from one through64.
@@ -357,22 +535,23 @@ __device__ __forceinline__ SparseHalfPanelPrefetch prefetchSparseHalfKeySecondPa
  * @param kvHead Original native key head.
  * @param origin Original ring origin.
  * @param capacity Original ring capacity, or zero for contiguous keys.
+ * @param rows Typed direct source or original thread-owned rows; no host mirror.
  * @return One typed K1 bank, without publishing or changing membership.
  */
-template<int Threads>
+template<int Threads, typename KeyRows=SparseHalfDirectKeyRows>
 __device__ __forceinline__ SparseHalfPanelPrefetch prefetchSparseHalfKeySecondPanel(
     const QwenSparseAttention& p, const std::int32_t* selected, int count,
-    int logicalBegin, bool allVisible, int kvHead, int origin, int capacity)
+    int logicalBegin, bool allVisible, int kvHead, int origin, int capacity, const KeyRows& rows = {})
 {
     if (allVisible)
     {
         if (count == 64)
-            return prefetchSparseHalfKeySecondPanelBody<true, true, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity);
-        return prefetchSparseHalfKeySecondPanelBody<false, true, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity);
+            return prefetchSparseHalfKeySecondPanelBody<true, true, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity,rows);
+        return prefetchSparseHalfKeySecondPanelBody<false, true, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity,rows);
     }
     if (count == 64)
-        return prefetchSparseHalfKeySecondPanelBody<true, false, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity);
-    return prefetchSparseHalfKeySecondPanelBody<false, false, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity);
+        return prefetchSparseHalfKeySecondPanelBody<true, false, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity,rows);
+    return prefetchSparseHalfKeySecondPanelBody<false, false, Threads>(p,selected,count,logicalBegin,kvHead,origin,capacity,rows);
 }
 
 /**
@@ -761,14 +940,25 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
                     (begin + lane == 0 || logical > indices[begin + lane - 1]));
         }
         float score = 0.0f;
-        loadSparseHalfKeys<Transform, 0, LoadUnroll, (Parts == 33), Threads>(p, r, indices + begin, count, begin, allVisible, kvHead, origin, capacity, tile);
+        SparseHalfRetainedKeyRows retainedKeyRows;
+        if constexpr (Parts == 33)
+        {
+            // Derive rows only after original membership validation. Logical
+            // positions serve K0 RoPE; only physical rows survive its publication.
+            retainedKeyRows = prepareSparseHalfKeyRows<Threads>(
+                indices + begin,count,begin,allVisible,origin,capacity);
+            loadSparseHalfKeys<Transform, 0, LoadUnroll, true, Threads>(
+                p,r,indices + begin,count,begin,allVisible,kvHead,origin,capacity,tile,retainedKeyRows);
+        }
+        else
+            loadSparseHalfKeys<Transform, 0, LoadUnroll, (Parts == 33), Threads>(p, r, indices + begin, count, begin, allVisible, kvHead, origin, capacity, tile);
         __syncthreads();
         SparseHalfPanelPrefetch prefetchedPanel;
         if constexpr (Parts == 33)
             // K0 and query publication also completes the original validation.
             // Retain raw K1 in registers while QK0 reads only the live LDS panel.
             prefetchedPanel = prefetchSparseHalfKeySecondPanel<Threads>(
-                p, indices + begin, count, begin, allVisible, kvHead, origin, capacity);
+                p, indices + begin, count, begin, allVisible, kvHead, origin, capacity, retainedKeyRows);
         using NativePair = _Float16 __attribute__((ext_vector_type(2)));
         if (owned)
         {
