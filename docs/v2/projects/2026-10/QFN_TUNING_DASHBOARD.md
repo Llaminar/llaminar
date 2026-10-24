@@ -18,6 +18,13 @@ VALU utilization is active-lane utilization, not achieved occupancy. No169
 whole-model throughput gain is claimed.165 remains the preceding qualified
 checkpoint below; defaults/full preflight are unchanged and43tok/s remains open.
 
+Follow-up probes173/174 are rejected: distributing merge coordinates across
+more CTAs and shortening counter register lifetimes preserve bytes but do not
+deliver consistent timing gains. The useful gate-coordinate regression remains;
+the restored169 kernel passes all21 native tests and a fresh832-entry Unit/
+affected gate. Its captured attention ELF matches the qualified bytes exactly.
+See [the rejected probes and retained regression](QFN_ATTENTION_STRUCTURE_COMPARISON.md#rejected-merge-scheduling-probes-173174).
+
 **Attention checkpoint165 is green:** **818.073 prefill /40.190 decode tok/s**,
 versus frozen151 controls'818.437 /40.151. The −0.045% /+0.095% differences
 have overlapping ranges: whole-model throughput is effectively unchanged.

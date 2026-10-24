@@ -440,10 +440,14 @@ TEST(ROCmQwenSparseAttention,FP16Phase33NonzeroSecondKeyPanelOracle)
 /**
  * @brief Exercise real merge counter carries without executing its producer.
  * @test Prove uint64 observation carries, all-zero nonowner observations, null
- * publication and inactive-row reset using the actual captured FP16 merge.
+ * publication, global-coordinate gates and inactive-row reset using the actual
+ * captured FP16 merge.
  * @details Clone only the already authenticated production merge node. Authored
  * uint32 records cross32-bit boundaries; independent uint64 sums are the oracle.
- * The original capture and all argument storage outlive the clone's terminal join.
+ * Each weighted coordinate is4 with unit denominator/max0, giving an exact4
+ * quotient. Coordinate gates+1000/-1000/0 yield exact4/0/2 without a host exp
+ * oracle. Fixture-owned gate storage and host backing precede every capture;
+ * all original argument storage outlives the clone's terminal join.
  */
 TEST(ROCmQwenSparseAttention,FP16Phase33MergeWideCounters)
 {
@@ -481,8 +485,15 @@ TEST(ROCmQwenSparseAttention,FP16Phase33MergeWideCounters)
     };
     Fixture f(2,2050,4096,QwenSparseScalar::FP16);Inputs inputs(f,0,1,0,1);
     auto args=inputs.base();
-    for(bool observed:{true,false}){
-        SCOPED_TRACE(observed);FP16Run33 run(args,f.stream);
+    // Use existing fixture-owned storage: it and its host backing outlive all
+    // captures. Every head's original global coordinate has the same pattern.
+    for(std::size_t i=0;i<f.host_gate.size();++i){const int coordinate=int(i%256);
+        f.host_gate[i]=coordinate%3==0?1000.0f:(coordinate%3==1?-1000.0f:0.0f);}
+    f.gate.upload(f.host_gate.data(),f.stream);check(hipStreamSynchronize(f.stream));
+    for(bool gated:{false,true})for(bool observed:{true,false}){
+        SCOPED_TRACE(::testing::Message()<<"gated="<<gated<<" observed="<<observed);
+        auto caseArgs=args;caseArgs.gate=gated?f.gate.data:nullptr;
+        FP16Run33 run(caseArgs,f.stream);
         if(!observed)run.args.observations=nullptr;
         run.record();MergeOnly merge(f.stream);merge.record(run);
         for(int fold:{33,8,16,32,33})for(bool zeroCounters:{false,true}){
@@ -493,7 +504,7 @@ TEST(ROCmQwenSparseAttention,FP16Phase33MergeWideCounters)
             auto authored=run.initial_partials;std::uint64_t keys=0,values=0;
             for(std::size_t i=0;i<authored.size();++i){auto& part=authored[i];
                 part.maximum=0.0f;part.denominator=1.0f;
-                std::fill(std::begin(part.weighted),std::end(part.weighted),0.0f);
+                std::fill(std::begin(part.weighted),std::end(part.weighted),4.0f);
                 part.key_elements=(i%3==0)?UINT32_MAX:std::uint32_t(0x80000000u+i);
                 part.value_elements=(i%2==0)?UINT32_MAX:std::uint32_t(i+17);
                 if(zeroCounters)part.key_elements=part.value_elements=0;
@@ -507,7 +518,12 @@ TEST(ROCmQwenSparseAttention,FP16Phase33MergeWideCounters)
             const auto actual=run.observations.download(f.stream);const auto output=run.output.download(f.stream);
             const auto after=run.partials.download(f.stream);
             ASSERT_EQ(std::memcmp(after.data(),authored.data(),authored.size()*sizeof(authored[0])),0);
-            for(int d=0;d<256;++d)ASSERT_EQ(output[d],0.0f);
+            for(int d=0;d<256;++d){
+                // Expected values use the original global coordinate, never a
+                // production helper or a slice-local coordinate.
+                const float expected=!gated?4.0f:(d%3==0?4.0f:(d%3==1?0.0f:2.0f));
+                ASSERT_EQ(detail::floatBits(output[d]),detail::floatBits(expected));
+            }
             ASSERT_EQ(std::memcmp(output.data()+256,run.poison.data()+256,(output.size()-256)*sizeof(float)),0);
             if(observed){ASSERT_EQ(actual[0].key_elements,keys);ASSERT_EQ(actual[0].value_elements,values);
                 ASSERT_EQ(actual[0].selected_tokens,std::uint32_t(selected));
@@ -516,6 +532,8 @@ TEST(ROCmQwenSparseAttention,FP16Phase33MergeWideCounters)
                 ASSERT_EQ(actual[row].value_elements,dirty[row].value_elements);ASSERT_EQ(actual[row].selected_tokens,dirty[row].selected_tokens);}
         }
     }
+    const auto afterGate=f.gate.download(f.stream);
+    ASSERT_EQ(std::memcmp(afterGate.data(),f.host_gate.data(),f.host_gate.size()*sizeof(float)),0);
 }
 
 /**

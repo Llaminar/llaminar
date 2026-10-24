@@ -1117,6 +1117,63 @@ comparison remains165. Source basis is checkpoint165
 `6cb7e9132`; production defaults and complete preflightG60 remain unchanged.
 The approximately43tok/s decode goal is still open.
 
+## Rejected merge scheduling probes 173/174
+
+Both probes retain 169's arithmetic. They pass 21 native tests and all eight
+independent frozen 169 output/numerical-partial comparisons, but neither earns
+installation. The table reports unprofiled complete producer-plus-merge events;
+the profiler runs are separate.
+
+| Component median, µs |169 |173 coordinate slices |174 counter scheduling |
+|---|---:|---:|---:|
+| Post-RoPE M1 /512 |14.74500 |14.80125 |14.78125 |
+| Post-RoPE M1 /640 |15.57500 |15.61875 |15.46250 |
+| Post-RoPE M1 /768 |15.60500 |15.65000 |15.48125 |
+| Post-RoPE M1 /65536 |18.52125 |18.63250 |18.51125 |
+| Post-RoPE M16 /65536 |81.50635 |82.07750 |81.53245 |
+| Pre-RoPE M1 /512 |16.48375 |16.51500 |16.60125 |
+
+173 assigns four disjoint 64-coordinate CTAs per row/head, increasing the M1/Q6
+grid from six to 24 CTAs while retaining 24 waves and one reader per weighted
+coordinate. Only coordinate tile 0 owns observations. The compiler removes the
+single-wave CTA barriers but repeats metadata/max/scale work: 512/64K vector
+instructions per wave rise from 100.75/374.25 to 137/388. Actual resources are
+127 used / 128 allocated VGPRs,708 B LDS and zero scratch/spills. Default 8 producer
+and merge instruction bodies remain exact. This wider distribution does not
+improve measured latency.
+
+174 uses an empty compiler-asm input dependency to finish the owner-zero
+numerator before loading its serial observation counters. Bound ISA confirms
+the intended shorter overlap and103 used / 104 allocated VGPRs, with 708 B LDS and
+zero scratch/spills. It adds no hardware barrier and preserves the default 8
+instruction bodies, but changes compiler scheduling: fewer static waits/vector
+moves and more scalar moves do not establish a speedup. Mixed event changes
+below 1% do not justify the hint. Its first build rejected the AMD constraint in
+NVCC's discarded branch; the corrected HIP preprocessor guard passes the full
+configured architecture build. Both production probes are removed, with no
+model benchmark or new model-speed claim.
+
+Evidence is retained under `attention173-coordinate64-rejected-r1` and
+`attention174-counter-lifetime-rejected-r1`, their eight-cell `events-r1.json`
+and isolated `joined-profile-r1.json` receipts. Source/core-bound ELF reviews
+retain actual resources and unchanged default 8 comparisons.
+
+The useful test extension remains in `FP16Phase33MergeWideCounters`: authored
+weighted values 4 and unit denominators give an exact 4 quotient; coordinate-
+varying gates +1000/−1000/0 require exact 4/0/2 outputs. The independent oracle
+detects slice-local indexing mistakes without relying on host/device exp
+agreement. Gated/ungated and observed/null cases retain wide uint64 carries,
+zero counters, inactive output guards and read-only gate/partial checks. It
+uses the existing explicit production-preflight registration. The restored169
+kernel passes all21 native tests, including this extension, and all832 Unit/
+affected registrations (776 Unit plus56 affected), with no CTest failures or
+skips and a clean driver window. The actual captured attention ELF is byte-
+identical to qualified169 across its complete1,636,888-byte slice. Receipts are
+`attention169-gate-oracle-{functional-r1,unit-native-r1}/result.json` and
+`attention169-gate-oracle-restored-code-object-r1.json`. No model or benchmark
+rerun is claimed for this test-only follow-up;169's accuracy/throughput evidence
+still applies to the unchanged production code. Full preflight remains G60.
+
 ## Primary source map
 
 All Castagna references below are pinned to the compared revision:
