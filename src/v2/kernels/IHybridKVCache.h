@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "kernels/common/GDNRecurrenceStateLayout.h"
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -27,6 +28,7 @@ namespace llaminar2
     class ITensorGatedDeltaNet;
     struct HybridGDNLayerState;
 
+    /** @brief Immutable cache-owned physical section identity, independent of payload contents. */
     struct HybridPrefixStateMetadata
     {
         int total_layers = 0;
@@ -34,8 +36,13 @@ namespace llaminar2
         size_t host_bytes = 0;
         size_t device_bytes = 0;
         bool has_device_kernel_state = false;
+        GDNRecurrenceStateLayout host_recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Host section physical format.
+        GDNRecurrenceStateLayout device_recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Device section physical format.
     };
 
+    /** @brief Authenticated source/destination formats and ordered prefix operation extent. */
     struct HybridPrefixStateDescriptor
     {
         int seq_idx = 0;
@@ -46,7 +53,35 @@ namespace llaminar2
         bool synchronize = true;
         bool include_host_state = true;
         bool include_device_state = true;
+        GDNRecurrenceStateLayout host_recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Authenticated source/target host
+                                                               ///< format.
+        GDNRecurrenceStateLayout device_recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Authenticated source/target
+                                                               ///< device format.
     };
+
+    /**
+     * @brief Authenticate selected physical sections before any prefix payload access.
+     * @param metadata Original cache-owned geometry/layout metadata.
+     * @param request Immutable declared source/target prefix operation.
+     * @return False for unknown or incompatible formats even when byte counts match.
+     * @details Export names the requested destination format; import names the
+     * authenticated payload format. No conversion or live state is inferred.
+     */
+    [[nodiscard]] inline bool
+    hybridPrefixStateLayoutsMatch(const HybridPrefixStateMetadata &metadata,
+                                  const HybridPrefixStateDescriptor &request) noexcept
+    {
+        return validGDNRecurrenceStateLayout(metadata.host_recurrence_layout) &&
+               validGDNRecurrenceStateLayout(metadata.device_recurrence_layout) &&
+               validGDNRecurrenceStateLayout(request.host_recurrence_layout) &&
+               validGDNRecurrenceStateLayout(request.device_recurrence_layout) &&
+               (!request.include_host_state || !metadata.host_bytes ||
+                request.host_recurrence_layout == metadata.host_recurrence_layout) &&
+               (!request.include_device_state || !metadata.device_bytes ||
+                request.device_recurrence_layout == metadata.device_recurrence_layout);
+    }
 
     /**
      * @brief Extended KV cache interface with GDN state management

@@ -38,6 +38,14 @@
 #include "collective/ICollectiveBackend.h"
 #include "collective/LocalTPContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
+#include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
+#include "kernels/rocm/gdn/ROCmShortConvolution.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include <stdexcept>
+#include <utility>
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "kernels/common/TPRankOrderedReductionKernels.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
@@ -4913,6 +4921,296 @@ TEST(Test__LocalTPRCCLGraphCapture,
         residency_pressure[participant].clear();
     }
 }
+
+namespace
+{
+    /**
+     * @brief Count original state imports without replacing native implementation.
+     * @tparam Native Existing production short-convolution or recurrence owner.
+     * @details Inheritance is fixture-only instrumentation: the override delegates
+     * all admission, ownership and transfer work to the exact production method.
+     */
+    template <class Native> class GDNHandoffImportCensus final : public Native
+    {
+    public:
+        using Native::Native;
+        int imports = 0; ///< C++ recording imports; retained native replay must not reenter.
+        /** @brief Delegate one complete original import and retain its census. */
+        bool importStateForSize(int size, const void* host, const void* device, void* stream) override
+        {
+            ++imports;
+            return Native::importStateForSize(size, host, device, stream);
+        }
+    };
+
+    /** @brief Own one real participant until its captured work is fully retired. */
+    struct GDNHandoffParticipant final
+    {
+        static constexpr int Guard = 16;
+        static constexpr float Poison = -193.25f;
+        int ordinal;
+        hipStream_t stream = nullptr;
+        std::unique_ptr<ROCmDeviceContext> context;
+        std::shared_ptr<PhysicalMemoryAuthority> memory;
+        std::unique_ptr<DeviceWorkspaceManager> states, workspace;
+        GDNHandoffImportCensus<ROCmShortConvolution> conv;
+        GDNHandoffImportCensus<ROCmGatedDeltaNet> recurrence;
+        std::unique_ptr<GDNLiveStateAllGatherStage> stage;
+        CaptureResult capture;
+        int preparations = 0, capture_attempts = 0;
+        bool prepared = false;
+        std::string error;
+        GDNLinkedLiveStateShape conv_shape, recurrence_shape;
+
+        /** @brief Construct only cold, typed owner/context metadata. */
+        explicit GDNHandoffParticipant(int device)
+            : ordinal(device), context(std::make_unique<ROCmDeviceContext>(DeviceId::rocm(device), device)),
+              conv(device), recurrence(device) {}
+
+        /** @brief Retire graphs before every embedded buffer/owner/stream. */
+        ~GDNHandoffParticipant()
+        {
+            (void)hipSetDevice(ordinal);
+            if (stream) (void)hipStreamSynchronize(stream);
+            if (capture.exec) (void)hipGraphExecDestroy(capture.exec);
+            if (capture.graph) (void)hipGraphDestroy(capture.graph);
+            if (stage) stage->unbindWorkspace();
+            stage.reset(); workspace.reset(); states.reset(); memory.reset();
+            context.reset();
+            if (stream) (void)hipStreamDestroy(stream);
+        }
+
+        /** @brief Fail a fixture operation precisely without escaping a worker. */
+        static void require(bool okay, const char* where)
+        {
+            if (!okay) throw std::runtime_error(where);
+        }
+        /** @brief Check a native status with its original diagnostic. */
+        static void native(hipError_t status, const char* where)
+        {
+            if (status != hipSuccess)
+                throw std::runtime_error(std::string(where)+": "+hipGetErrorString(status));
+        }
+        /** @brief Return the original test-owned state bank, never a mirror. */
+        float* bank(const char* name) const { return static_cast<float*>(states->getBuffer(name)); }
+
+        /**
+         * @brief Allocate and bind original local/full/request banks before capture.
+         * @param clique Exact two-device native collective context.
+         * @param layout This participant's immutable declared recurrence format.
+         */
+        void initialize(ILocalTPContext& clique, GDNRecurrenceStateLayout layout)
+        {
+            native(hipSetDevice(ordinal), "select GDN handoff participant");
+            native(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking), "create GDN handoff stream");
+            GDNLinkedLiveStateGeometry geometry{
+                .global_key_heads=2,.global_value_heads=4,.key_width=64,.value_width=65,
+                .conv_history_length=3,.recurrence_layout=layout};
+            conv_shape=*geometry.resolve(GDNLinkedLiveStateKind::ConvHistory,2);
+            recurrence_shape=*geometry.resolve(GDNLinkedLiveStateKind::Recurrence,2);
+            GDNLiveStateAllGatherStage::Params params;
+            params.device_id=DeviceId::rocm(ordinal);params.tp_ctx=&clique;
+            params.conv_kernel=&conv;params.recurrence_kernel=&recurrence;
+            params.layer_idx=7;params.tp_device_idx=ordinal;params.geometry=geometry;
+            // Collective names remain participant-invariant, as in production.
+            params.stage_name="gdn_value_major_handoff_fixture";
+            stage=std::make_unique<GDNLiveStateAllGatherStage>(params);
+            WorkspaceRequirements state_requirements;
+            const auto add=[&](const char* name,int floats){
+                state_requirements.buffers.push_back({name,(std::size_t(floats)+Guard)*sizeof(float),256,false});
+            };
+            add("conv_local",conv_shape.local_state_floats);add("conv_full",conv_shape.full_state_floats);add("conv_requests",conv_shape.full_state_floats);
+            add("recurrence_local",recurrence_shape.local_state_floats);add("recurrence_full",recurrence_shape.full_state_floats);add("recurrence_requests",recurrence_shape.full_state_floats);
+            const auto work_requirements=stage->getWorkspaceRequirements(1);
+            const auto state_bytes=state_requirements.total_bytes_with_alignment();
+            const auto work_bytes=work_requirements.total_bytes_with_alignment();
+            const PhysicalMemoryResource resource{.world_rank=0,.device=params.device_id,
+                .total_bytes=state_bytes+work_bytes,.admission_available_bytes=state_bytes+work_bytes};
+            PhysicalMemoryPlanBuilder plan;
+            plan.add(resource,PhysicalMemoryOwner::RecurrentLiveState,state_bytes);
+            plan.add(resource,PhysicalMemoryOwner::ExecutionWorkspace,work_bytes);
+            memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+            states=std::make_unique<DeviceWorkspaceManager>(params.device_id,state_bytes,memory,PhysicalMemoryOwner::RecurrentLiveState);
+            workspace=std::make_unique<DeviceWorkspaceManager>(params.device_id,work_bytes,memory);
+            require(states->allocate(state_requirements)&&workspace->allocate(work_requirements),"allocate original GDN handoff banks");
+            const auto binding=[&](const char* local,const char* full,const char* requests,const GDNLinkedLiveStateShape& shape,GDNRecurrenceStateLayout format){
+                return GDNDeviceStateBinding{.primary_state=bank(local),.primary_state_floats=shape.local_state_floats,
+                    .secondary_state=bank(full),.secondary_state_floats=shape.full_state_floats,
+                    .request_state_bank=bank(requests),.request_state_bank_floats=std::size_t(shape.full_state_floats),
+                    .request_capacity=1,.recurrence_layout=format};
+            };
+            require(conv.bindDeviceState(binding("conv_local","conv_full","conv_requests",conv_shape,GDNRecurrenceStateLayout::KeyMajorValueContiguous)),"bind original convolution state");
+            require(recurrence.bindDeviceState(binding("recurrence_local","recurrence_full","recurrence_requests",recurrence_shape,layout)),"bind typed recurrence state");
+            require(recurrence.recurrenceStateLayout()==layout,"native owner lost recurrence format");
+            stage->bindWorkspace(workspace.get());
+            require(stage->isGraphCapturable(),"real GDN handoff lacks native raw allgather capture");
+        }
+
+        /**
+         * @brief Author global opaque head blocks and this rank's original local order.
+         * @param shape Exact original conv/recurrence geometry.
+         * @param version Dirty replay tag, independent of all device state.
+         * @return Global full state and participant-local source coordinates.
+         */
+        std::pair<std::vector<float>,std::vector<float>> values(const GDNLinkedLiveStateShape& shape,int version) const
+        {
+            std::vector<float> full(shape.full_state_floats),local(shape.local_state_floats);
+            for(std::size_t i=0;i<full.size();++i)full[i]=float(i+version*262144)+0.25f;
+            full[0]=-0.0f;full[1]=0.0f;
+            // Independent host oracle: semantic groups are contiguous; original
+            // key heads are modulo-sharded. Inner head coordinates stay opaque.
+            const int keys=shape.global_key_heads,local_keys=shape.local_key_heads;
+            for(int group=0;group<shape.prefix_group_count;++group)
+                for(int key=ordinal;key<keys;key+=2)
+                    std::copy_n(full.data()+(group*keys+key)*shape.key_elements_per_head,
+                        shape.key_elements_per_head,local.data()+(group*local_keys+key/2)*shape.key_elements_per_head);
+            const int full_prefix=shape.prefix_group_count*keys*shape.key_elements_per_head;
+            const int local_prefix=shape.prefix_group_count*local_keys*shape.key_elements_per_head;
+            for(int repeat=0;repeat<shape.repeat_factor;++repeat)
+                for(int key=ordinal;key<keys;key+=2)
+                    std::copy_n(full.data()+full_prefix+(repeat*keys+key)*shape.value_elements_per_head,
+                        shape.value_elements_per_head,local.data()+local_prefix+(repeat*local_keys+key/2)*shape.value_elements_per_head);
+            return {std::move(full),std::move(local)};
+        }
+
+        /** @brief Publish fixture-only dirty data and guards outside captured work. */
+        void dirty(int version)
+        {
+            native(hipSetDevice(ordinal),"select dirty handoff owner");
+            const auto upload=[&](const char* name,int count,const std::vector<float>* source){
+                std::vector<float> host(std::size_t(count)+Guard,Poison);
+                if(source)std::copy(source->begin(),source->end(),host.begin());
+                native(hipMemcpyAsync(bank(name),host.data(),host.size()*sizeof(float),hipMemcpyHostToDevice,stream),"publish dirty original bank");
+                native(hipStreamSynchronize(stream),"retire cold fixture publication");
+            };
+            for(const bool rec:{false,true})
+            {
+                const auto& shape=rec?recurrence_shape:conv_shape;
+                const auto authored=values(shape,version+(rec?4:0));
+                upload(rec?"recurrence_local":"conv_local",shape.local_state_floats,&authored.second);
+                upload(rec?"recurrence_full":"conv_full",shape.full_state_floats,nullptr);
+                upload(rec?"recurrence_requests":"conv_requests",shape.full_state_floats,nullptr);
+            }
+        }
+
+        /** @brief Observe complete test-owned bank bytes only after native retirement. */
+        std::vector<float> download(const char* name,int count)
+        {
+            std::vector<float> host(std::size_t(count)+Guard);
+            native(hipSetDevice(ordinal),"select observed handoff owner");
+            native(hipMemcpyAsync(host.data(),bank(name),host.size()*sizeof(float),hipMemcpyDeviceToHost,stream),"observe handoff bank");
+            native(hipStreamSynchronize(stream),"retire handoff observation");
+            return host;
+        }
+
+        /** @brief Apply the exact executor lifecycle predicate, counting real hook entries. */
+        bool prepare(GraphLaunchPreparationPhase phase)
+        {
+            if(!requiresGraphLaunchPreparation(stage->graphLaunchPreparationPolicy(),phase))return true;
+            ++preparations;
+            return stage->prepareGraphLaunch(context.get(),stream);
+        }
+    };
+}
+
+/**
+ * @brief Real two-device stage cold preparation precedes native capture and imports.
+ *
+ * Reuses this fixture's real context, Barrier, CaptureResult and per-participant
+ * thread/capture pattern. Matching typed ValueMajor owners execute original
+ * export/allgather/reassembly/import work. Same-sized foreign formats reject on
+ * both workers before either begins capture, leaving every bank/guard unchanged.
+ */
+TEST(Test__LocalTPRCCLGraphCapture, GDNValueMajorColdPrepareCapturesReplaysAndRejectsForeignLayout)
+{
+    auto* backend=getROCmBackend();ASSERT_NE(backend,nullptr);
+    if(backend->deviceCount()<2)GTEST_SKIP()<<"Requires two ROCm devices";
+    using Participant=GDNHandoffParticipant;using Layout=GDNRecurrenceStateLayout;
+    for(const bool mismatch:{false,true})
+    {
+        SCOPED_TRACE(::testing::Message()<<"foreign_layout="<<mismatch);
+        auto clique=createLocalTPContext({GlobalDeviceAddress::rocm(0),GlobalDeviceAddress::rocm(1)}, {},CollectiveBackendType::RCCL);
+        ASSERT_NE(clique,nullptr);
+        std::array<std::unique_ptr<Participant>,2> participants;
+        for(int rank=0;rank<2;++rank)
+        {
+            participants[rank]=std::make_unique<Participant>(rank);
+            participants[rank]->initialize(*clique,mismatch&&rank==1?Layout::KeyMajorValueContiguous:Layout::ValueMajorKeyContiguous);
+            participants[rank]->dirty(0);
+        }
+        Barrier prepared(2),begun(2),recorded(2);
+        const auto worker=[&](int rank){
+            auto& p=*participants[rank];
+            try{Participant::native(hipSetDevice(rank),"select cold worker");p.prepared=p.prepare(GraphLaunchPreparationPhase::Capture);}
+            catch(const std::exception& e){p.error=e.what();clique->requestAbort();}
+            prepared.arriveAndWait();
+            if(!participants[0]->prepared||!participants[1]->prepared)return;
+            ++p.capture_attempts;
+            p.capture.begin_status=hipStreamBeginCapture(p.stream,hipStreamCaptureModeRelaxed);
+            if(p.capture.begin_status!=hipSuccess)clique->requestAbort();
+            begun.arriveAndWait();
+            try{
+                if(p.capture.begin_status==hipSuccess){GraphCaptureGuard guard;p.capture.collective_ok=p.stage->execute(p.context.get());}
+                if(!p.capture.collective_ok)clique->requestAbort();
+            }catch(const std::exception& e){p.error=e.what();clique->requestAbort();}
+            recorded.arriveAndWait();
+            if(p.capture.begin_status==hipSuccess)p.capture.end_status=hipStreamEndCapture(p.stream,&p.capture.graph);
+            if(p.capture.end_status==hipSuccess&&p.capture.graph)
+                p.capture.instantiate_status=hipGraphInstantiate(&p.capture.exec,p.capture.graph,nullptr,nullptr,0);
+        };
+        std::thread left(worker,0),right(worker,1);left.join();right.join();
+        for(int rank=0;rank<2;++rank)
+        {
+            auto& p=*participants[rank];ASSERT_TRUE(p.error.empty())<<p.error;
+            Participant::native(hipSetDevice(rank),"inspect owning graph device");
+            EXPECT_EQ(p.preparations,1);
+            if(mismatch){EXPECT_FALSE(p.prepared);EXPECT_EQ(p.capture_attempts,0);EXPECT_EQ(p.capture.graph,nullptr);EXPECT_EQ(p.capture.exec,nullptr);EXPECT_EQ(p.conv.imports,0);EXPECT_EQ(p.recurrence.imports,0);}
+            else{
+                ASSERT_TRUE(p.prepared);ASSERT_EQ(p.capture_attempts,1);
+                ASSERT_EQ(p.capture.begin_status,hipSuccess);ASSERT_TRUE(p.capture.collective_ok);
+                ASSERT_EQ(p.capture.end_status,hipSuccess);ASSERT_NE(p.capture.graph,nullptr);
+                ASSERT_EQ(p.capture.instantiate_status,hipSuccess);ASSERT_NE(p.capture.exec,nullptr);
+                std::size_t nodes=0;Participant::native(hipGraphGetNodes(p.capture.graph,nullptr,&nodes),"inspect actual stage graph");ASSERT_GT(nodes,0u);
+                EXPECT_EQ(p.conv.imports,1);EXPECT_EQ(p.recurrence.imports,1);
+            }
+        }
+        for(int replay=0;replay<(mismatch?1:2);++replay)
+        {
+            const int version=mismatch?0:replay+1;
+            if(!mismatch)
+            {
+                for(auto& p:participants)p->dirty(version);
+                const auto launch=[&](int rank){auto& p=*participants[rank];
+                    try{Participant::native(hipSetDevice(rank),"select retained worker");Participant::require(p.prepare(GraphLaunchPreparationPhase::Replay),"unexpected replay preparation failure");
+                        Participant::native(hipGraphLaunch(p.capture.exec,p.stream),"replay original handoff graph");
+                        Participant::native(hipStreamSynchronize(p.stream),"retire retained handoff graph");}
+                    catch(const std::exception& e){p.error=e.what();clique->requestAbort();}};
+                std::thread a(launch,0),b(launch,1);a.join();b.join();
+            }
+            for(auto& owned:participants)
+            {
+                auto& p=*owned;ASSERT_TRUE(p.error.empty())<<p.error;EXPECT_EQ(p.preparations,1);
+                EXPECT_EQ(p.conv.imports,mismatch?0:1);EXPECT_EQ(p.recurrence.imports,mismatch?0:1);
+                for(const bool rec:{false,true})
+                {
+                    const auto& shape=rec?p.recurrence_shape:p.conv_shape;
+                    auto authored=p.values(shape,version+(rec?4:0));
+                    authored.second.resize(shape.local_state_floats+Participant::Guard,Participant::Poison);
+                    const auto local=p.download(rec?"recurrence_local":"conv_local",shape.local_state_floats);
+                    EXPECT_EQ(std::memcmp(local.data(),authored.second.data(),local.size()*sizeof(float)),0)<<"original local bank/guards changed";
+                    for(const char* name:rec?std::array{"recurrence_full","recurrence_requests"}:std::array{"conv_full","conv_requests"})
+                    {
+                        auto expected=mismatch?std::vector<float>(shape.full_state_floats,Participant::Poison):authored.first;
+                        expected.resize(shape.full_state_floats+Participant::Guard,Participant::Poison);
+                        const auto actual=p.download(name,shape.full_state_floats);
+                        EXPECT_EQ(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float)),0)<<name<<" full physical state/guards";
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 #else
 

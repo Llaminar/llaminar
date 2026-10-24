@@ -157,6 +157,26 @@ namespace llaminar2
         return hash;
     }
 
+    void
+    appendGDNStateLayoutFingerprintFields(std::vector<PrefixFingerprintField> &fields,
+                                          std::optional<GDNRecurrenceStateLayout> host_layout,
+                                          std::optional<GDNRecurrenceStateLayout> device_layout)
+    {
+        if ((host_layout && !validGDNRecurrenceStateLayout(*host_layout)) ||
+            (device_layout && !validGDNRecurrenceStateLayout(*device_layout)))
+            throw std::invalid_argument("Unknown GDN prefix recurrence layout");
+        for (const auto &field : fields)
+            if (field.name == "gdn_host_recurrence_layout" ||
+                field.name == "gdn_device_recurrence_layout")
+                throw std::invalid_argument("Duplicate GDN prefix recurrence layout authority");
+        if (host_layout)
+            fields.push_back({"gdn_host_recurrence_layout",
+                              std::string(gdnRecurrenceStateLayoutName(*host_layout))});
+        if (device_layout)
+            fields.push_back({"gdn_device_recurrence_layout",
+                              std::string(gdnRecurrenceStateLayoutName(*device_layout))});
+    }
+
     PrefixFingerprintParts buildPrefixFingerprintParts(
         const PrefixFingerprintMaterial &material)
     {

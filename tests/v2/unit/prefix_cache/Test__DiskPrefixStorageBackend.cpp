@@ -1939,3 +1939,42 @@ TEST(Test__DiskPrefixStorageBackend, FlashNextCompactAuxiliarySectionsPersistAnd
     }
     std::filesystem::remove_all(directory);
 }
+
+/** @brief Restart preserves the authenticated format and refuses same-size foreign hydration. */
+TEST(Test__DiskPrefixStorageBackend,
+     HybridRecurrenceLayoutSurvivesRestartAndRejectsForeignHydration)
+{
+    using L = GDNRecurrenceStateLayout;
+    const auto dir = tempDir();
+    auto layout = makeLayout();
+    layout.includes_hybrid_state = true;
+    layout.hybrid_device_state_bytes = 6 * sizeof(float);
+    layout.hybrid_state_bytes = layout.hybrid_device_state_bytes;
+    layout.hybrid_device_recurrence_layout = L::ValueMajorKeyContiguous;
+    RamPrefixStorageBackend ram(1024);
+    auto source = ram.allocate(testKey(), layout);
+    ASSERT_TRUE(source.valid());
+    ASSERT_NE(source.hybrid_storage, nullptr);
+    std::fill(source.hybrid_storage->begin(), source.hybrid_storage->end(), 0x5a);
+    source.has_hybrid_state = true;
+    std::string error;
+    {
+        DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelArtifactIdentity);
+        ASSERT_TRUE(disk.ready()) << disk.initializationError();
+        PrefixBlockHandle stored;
+        ASSERT_TRUE(disk.writeBlock(source, &stored, nullptr, &error)) << error;
+    }
+    {
+        DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelArtifactIdentity);
+        ASSERT_TRUE(disk.ready()) << disk.initializationError();
+        PrefixBlockHandle restored;
+        auto foreign = layout;
+        foreign.hybrid_device_recurrence_layout = L::KeyMajorValueContiguous;
+        EXPECT_FALSE(disk.readBlock(testKey(), foreign, &restored, &error));
+        ASSERT_TRUE(disk.readBlock(testKey(), layout, &restored, &error)) << error;
+        EXPECT_EQ(restored.layout.hybrid_device_recurrence_layout, L::ValueMajorKeyContiguous);
+        ASSERT_NE(restored.hybrid_storage, nullptr);
+        EXPECT_EQ(*source.hybrid_storage, *restored.hybrid_storage);
+    }
+    std::filesystem::remove_all(dir);
+}

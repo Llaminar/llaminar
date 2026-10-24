@@ -5566,7 +5566,7 @@ add_v2_test(V2_Integration_DeviceRequestRowRanges
     MPI_PROCS 1 NO_MODELS)
 add_v2_test(V2_Integration_GDNMergedInputMetadata
     COMMAND $<TARGET_FILE:v2_test_device_request_row_ranges>
-        --gtest_filter=DeviceRequestRowRanges.MergedSourceOutputIntervalsPreserveOnlyStateAlias:DeviceRequestRowRanges.MergedSourceOutputRejectsUnrepresentableRanges
+        --gtest_filter=DeviceRequestRowRanges.MergedSourceOutputIntervalsPreserveOnlyStateAlias:DeviceRequestRowRanges.MergedSourceOutputRejectsUnrepresentableRanges:DeviceRequestRowRanges.PlanarRecurrenceLayoutsProtectEveryNativeSpan:DeviceRequestRowRanges.MergedRecurrenceLayoutsProtectCompactSourcesAndState:DeviceRequestRowRanges.RecurrenceStateExtentsUseWideRequestOffsets
     LABELS "V2;Integration;ProductionTestPreflight;GDN;GraphCapture;Ownership;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS)
 target_include_directories(v2_test_moe_grouped_source_rows PRIVATE ${CMAKE_SOURCE_DIR})
@@ -7209,6 +7209,12 @@ add_v2_test(V2_Integration_Qwen4ExpHCUpPolicy
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Policy;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
+add_v2_test(V2_Integration_GDNRecurrenceStatePolicy
+    COMMAND $<TARGET_FILE:v2_test_deterministic_mode>
+            --gtest_filter=Test__DeterministicMode.GDNStateLayout*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GDN;Policy;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
 # Test: BenchmarkRunnerCPU (CPU device handling in benchmark runner)
 add_executable(v2_test_benchmark_runner_cpu unit/utils/Test__BenchmarkRunnerCPU.cpp)
 target_include_directories(v2_test_benchmark_runner_cpu PRIVATE
@@ -7747,6 +7753,8 @@ add_v2_test(V2_Unit_HybridKVCache
     MPI_PROCS 1
     NO_MODELS
 )
+
+
 
 # Test: Q16SafeBlockAccess (Phase 2 - Safe Q16 block accessors and dispatch helpers)
 add_executable(v2_test_q16_safe_block_access unit/tensors/Test__Q16SafeBlockAccess.cpp)
@@ -10375,6 +10383,21 @@ add_v2_test(V2_Integration_GDNInputTileLifecycle_CUDA
     MPI_PROCS 1
     NO_MODELS
 )
+# Both immutable persistent formats use the existing production CUDA fixture.
+add_v2_test(V2_Integration_CUDAGDNValueMajorAllRows
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
+        --gtest_filter=Test__CUDAGDNPaddedRealLength.CapturedValueMajorStateAllRowsByteExact
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;GatedDeltaNet;StateLayout;GraphCapture;ByteExact;RequestBatch;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK cuda_gpu_0
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+add_v2_test(V2_Integration_CUDAGDNValueMajorMergedRestore
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
+        --gtest_filter=Test__CUDAGDNPaddedRealLength.CapturedValueMajorMergedRestoreAndBindingsByteExact
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;GatedDeltaNet;StateLayout;GraphCapture;ByteExact;StatePublication;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK cuda_gpu_0
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
             --gtest_filter=Test__CUDAGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__CUDAGDNPaddedRealLength.RecurrenceM2VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.RecurrenceM4VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedVerifierAndDecodeRecurrencePublicationRuntimeM
@@ -12966,6 +12989,8 @@ add_v2_test(V2_Unit_PrefixCacheFingerprint
     LABELS "V2;Unit;PrefixCache;Fingerprint;MoE;MTP"
     MPI_PROCS 1
 )
+
+
 
 add_v2_test(V2_Integration_Qwen4ExpHCUpPrefixIdentity
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
@@ -19157,6 +19182,34 @@ if(HAVE_ROCM)
         MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
 
+    add_v2_test(V2_Integration_ROCmGDNValueMajorBindings
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.CapturedValueMajorMergedRestoreAndBindingsByteExact
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+
+    add_v2_test(V2_Integration_ROCmGDNValueMajorCompleteBoundary
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.ValueMajorProductionCompleteBoundaryBytes
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;StateLayout;ShortConv;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    add_v2_test(V2_Integration_ROCmGDNValueMajorGrouped
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.ValueMajorProductionGroupedAndAlignmentBytes
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;StateLayout;GraphCapture;ByteExact;RequestBatch;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    add_v2_test(V2_Integration_ROCmGDNValueMajorLongPrefill
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.ValueMajorProductionLongRouteBoundariesBytes
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;StateLayout;GraphCapture;ByteExact;Prefill;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
     add_v2_test(V2_Integration_ROCmGDNPaddedRealLength
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
         LABELS "V2;Integration;ROCm;GatedDeltaNet;ShortConv;Padding;Phase6;RealLength;FP32;gfx906"
@@ -20955,6 +21008,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
         endif()
     endforeach()
+    set(V2_GDN_LIVE_STATE_LAYOUT_NATIVE_PREFLIGHT_TESTS)
     add_executable(v2_integration_local_tp_backend_behavior
         integration/collective/Test__LocalTPBackendBehavior.cpp
         integration/collective/Test__LocalTPNCCLGraphCapture.cpp
@@ -20987,6 +21041,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
             TIMEOUT 60
             NO_MODELS
         )
+        add_v2_test(V2_Integration_CUDA_GDNLiveStateColdLayout
+            COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
+                --gtest_filter=Test__LocalTPNCCLGraphCapture.GDNValueMajorColdPrepareCapturesReplaysAndRejectsForeignLayout
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;LocalTP;NCCL;GatedDeltaNet;StateLayout;GraphCapture;ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK "cuda_gpu_0;cuda_gpu_1"
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+        list(APPEND V2_GDN_LIVE_STATE_LAYOUT_NATIVE_PREFLIGHT_TESTS V2_Integration_CUDA_GDNLiveStateColdLayout)
         add_v2_test(V2_Integration_CUDA_TPCanonicalRankOrderGraphCapture
             COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
                 --gtest_filter=Test__LocalTPNCCLGraphCapture.NCCLCanonicalRankOrderReduction_GraphCapturedRowZeroIsBatchInvariant
@@ -21013,6 +21074,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
     endif()
     if(HAVE_ROCM)
+        add_v2_test(V2_Integration_ROCm_GDNLiveStateColdLayout
+            COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
+                --gtest_filter=Test__LocalTPRCCLGraphCapture.GDNValueMajorColdPrepareCapturesReplaysAndRejectsForeignLayout
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;LocalTP;RCCL;GatedDeltaNet;StateLayout;GraphCapture;ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK "rocm_gpu_0;rocm_gpu_1"
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+        list(APPEND V2_GDN_LIVE_STATE_LAYOUT_NATIVE_PREFLIGHT_TESTS V2_Integration_ROCm_GDNLiveStateColdLayout)
         add_v2_test(V2_Integration_ROCm_TPCanonicalRankOrderGraphCapture
             COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
                 --gtest_filter=Test__LocalTPRCCLGraphCapture.RCCLCanonicalRankOrderReduction_GraphCapturedRowZeroIsBatchInvariant
@@ -21997,6 +22065,21 @@ foreach(_backend CPU CUDA ROCm)
         LABELS "V2;Integration;ProductionTestPreflight;${_backend};PipelineParallel;PrefixCache;MTP;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 endforeach()
+
+# One actual CUDA/ROCm PP pair retains different persistent recurrence formats.
+set(V2_PIPELINE_MIXED_GDN_LAYOUT_PREFLIGHT_TESTS "")
+if(HAVE_CUDA AND HAVE_ROCM)
+    add_v2_test(V2_Integration_PipelinePrefixMixedGDNLayouts
+        COMMAND $<TARGET_FILE:v2_integration_pipeline_prefix_state>
+            --gtest_filter=PipelinePrefixMixedLayouts.OwnChildRamAndDiskRestartRestoreBytes
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;PipelineParallel;PrefixCache;GDN;StateLayout;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+        RESOURCE_LOCK "cuda_gpu_0;rocm_gpu_0"
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    list(APPEND V2_PIPELINE_MIXED_GDN_LAYOUT_PREFLIGHT_TESTS
+        V2_Integration_PipelinePrefixMixedGDNLayouts)
+endif()
 
 # Test: Scenario 7 Multi-Domain Pipeline Parallel
 # Validates end-to-end integration for multi-domain PP with heterogeneous devices.
@@ -24957,6 +25040,11 @@ add_v2_test(V2_Unit_PrefillGraphCapturability
     LABELS "V2;Unit;MoE;GDN;Stages;GraphCapture"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_GDNRecurrenceCaptureOwnerIdentity
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_capturability>
+        --gtest_filter=GDNPrefillGraphCapture.CaptureIdentityRejectsMissingOrUnknownRecurrenceOwner
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;GraphCapture;StateLayout;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MTPPublicationCommitAuthority
     COMMAND $<TARGET_FILE:v2_test_prefill_graph_capturability>
         --gtest_filter=MTPSpeculativeStatePublicationGraphCapture.BoundedGenerationRejectsHostCommitLimits:MTPSpeculativeStatePublicationGraphCapture.CompactOutcomeCommitLimitsRemainCaptureIdentity
@@ -25507,8 +25595,68 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # invariant. The Python campaign driver discovers this label; it must not copy
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
+add_v2_test(V2_Integration_GDNStateLayoutOwnerAndImportIdentity
+    COMMAND $<TARGET_FILE:v2_test_hybrid_kvcache>
+        --gtest_filter=Test__HybridGDNStateGeometry.RecurrenceLayoutPreservesOwnerFootprintAndRejectsUnknown:Test__HybridGDNStateGeometry.SnapshotBindingsRejectForeignLayoutBeforeMutation:Test__HybridGDNStateGeometry.DiagnosticCoordinatesPreserveRectangularStateBytes:Test__CPUHybridKVCache.HybridPrefixStateRejectsSameSizeForeignLayoutBeforeImport
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;PrefixCache;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNStateLayoutPrefixIdentity
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.GDNRecurrenceLayoutSeparatesSameSizeStateAndRejectsDuplicateAuthority:Test__PrefixCacheFingerprint.AbsentRecurrenceSectionsPreserveExistingIdentity
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;PrefixCache;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNStateLayoutArchiveIdentity
+    COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
+        --gtest_filter=Test__DiskPrefixStorageBackend.HybridRecurrenceLayoutSurvivesRestartAndRejectsForeignHydration
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;PrefixCache;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNStateLayoutOpaqueCollective
+    COMMAND $<TARGET_FILE:v2_test_gdn_linked_tp_regression>
+        --gtest_filter=Test__GDNLinkedTPRegression.RecurrenceLayoutPreservesRectangularOpaqueHeadBlocks
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;LocalTP;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNStateLayoutDiagnosticIdentity
+    COMMAND $<TARGET_FILE:v2_test_mtp_state_transaction>
+        --gtest_filter=Test__MTPStateTransaction.RuntimeSnapshotComparesDifferentGDNLayoutsUsingCanonicalBytes
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;MTP;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNStateLayoutSnapshotIdentity
+    COMMAND $<TARGET_FILE:v2_test_prefix_state_snapshot>
+        --gtest_filter=Test__PrefixStateSnapshot.RecurrenceFormatSurvivesSnapshotCopyAndMove
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;PrefixCache;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNStateLayoutPayloadIdentity
+    COMMAND $<TARGET_FILE:v2_test_ram_prefix_storage_backend>
+        --gtest_filter=Test__RamPrefixStorageBackend.HybridRecurrenceLayoutRejectsEqualSizeForeignPayload:Test__RamPrefixStorageBackend.AbsentRecurrenceSectionsIgnoreUnusedFormatWords
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;PrefixCache;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNStateLayoutCliqueIdentity
+    COMMAND $<TARGET_FILE:v2_test_local_tp_context>
+        --gtest_filter=Test__LocalTPContext.GDNLayoutIdentityRejectsSameSizeForeignParticipantBeforeCapture
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;LocalTP;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    ${V2_PIPELINE_MIXED_GDN_LAYOUT_PREFLIGHT_TESTS}
+    ${V2_GDN_LIVE_STATE_LAYOUT_NATIVE_PREFLIGHT_TESTS}
+    V2_Integration_GDNStateLayoutOwnerAndImportIdentity
+    V2_Integration_GDNStateLayoutPrefixIdentity
+    V2_Integration_GDNStateLayoutArchiveIdentity
+    V2_Integration_GDNStateLayoutOpaqueCollective
+    V2_Integration_GDNStateLayoutDiagnosticIdentity
+    V2_Integration_GDNStateLayoutSnapshotIdentity
+    V2_Integration_GDNStateLayoutPayloadIdentity
+    V2_Integration_GDNStateLayoutCliqueIdentity
     V2_Integration_GDNMergedInputMetadata
+    V2_Integration_GDNRecurrenceStatePolicy
     ${V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS}
     ${V2_GDN_ADDITIVE_EPSILON_CPU_PREFLIGHT_TESTS}
     V2_Integration_EmbeddingUploadStagingContract
@@ -25518,6 +25666,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUResidualAddTailExtents
     V2_Integration_CUDAResidualAddTailExtents
     V2_Integration_FP16PrefillWorkspaceGeometryAdmission
+    V2_Integration_GDNRecurrenceCaptureOwnerIdentity
     V2_Integration_FP16PrefillSchemaCodecAdmission
     V2_Integration_MTPBoundedPrefixLifecycleEvidence
     V2_Integration_MTPBoundedSamplingPositionEvidence
@@ -25760,6 +25909,8 @@ if(HAVE_CUDA)
     V2_Integration_CUDAGDNMergedDecode
     V2_Integration_GDNAdditiveEpsilon_CUDA
     V2_Integration_GDNInputTileLifecycle_CUDA
+    V2_Integration_CUDAGDNValueMajorAllRows
+    V2_Integration_CUDAGDNValueMajorMergedRestore
     V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
     V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
     V2_Integration_GPUDeviceContext_CUDA
@@ -25867,6 +26018,10 @@ if(HAVE_ROCM)
     V2_Integration_ROCmGDNMergedSourceOutputDisjoint
     V2_Integration_ROCmGDNMergedVerifierEnvelope
     V2_Integration_ROCmGDNMergedInPlaceHistory
+    V2_Integration_ROCmGDNValueMajorBindings
+    V2_Integration_ROCmGDNValueMajorCompleteBoundary
+    V2_Integration_ROCmGDNValueMajorGrouped
+    V2_Integration_ROCmGDNValueMajorLongPrefill
     V2_Integration_GDNAdditiveEpsilon_ROCm
     V2_Integration_GPUDeviceContext_ROCm
     V2_Integration_RCCLRuntimeGenerationRetirement
@@ -32629,3 +32784,5 @@ foreach(V2_HC103_CPU_ISA Default AVX2)
         endforeach()
     endforeach()
 endforeach()
+
+# Immutable GDN state formats are validated before archive hydration or native publication.

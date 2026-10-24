@@ -14,6 +14,7 @@
 
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/GDNRecurrenceStatePolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include "kernels/qwen4exp/QwenSparseAttentionArithmetic.h"
@@ -1116,6 +1117,10 @@ namespace llaminar2
      */
     struct ExecutionConfig
     {
+        /** @brief Cold LLAMINAR_CUDA_GDN_STATE_LAYOUT physical-format override; copied into the cache owner. */
+        GDNRecurrenceStateLayout cuda_gdn_state_layout = kDefaultCUDAGDNStateLayout;
+        /** @brief Cold LLAMINAR_ROCM_GDN_STATE_LAYOUT override of the ValueMajor default; never changes a live bank. */
+        GDNRecurrenceStateLayout rocm_gdn_state_layout = kDefaultROCmGDNStateLayout;
         bool use_layer_executor = true;                                        ///< Master switch for LayerExecutor (default: ON)
         std::string execution_mode = "sequential";                             ///< Execution mode
         bool executor_profiling = false;                                       ///< Enable stage profiling
@@ -1229,6 +1234,12 @@ namespace llaminar2
         /** @brief Reload execution controls without performing device work. */
         void reload()
         {
+            const char *cuda_gdn_layout = std::getenv("LLAMINAR_CUDA_GDN_STATE_LAYOUT");
+            const char *rocm_gdn_layout = std::getenv("LLAMINAR_ROCM_GDN_STATE_LAYOUT");
+            cuda_gdn_state_layout = cuda_gdn_layout
+                ? parseGDNRecurrenceStateLayout(cuda_gdn_layout) : kDefaultCUDAGDNStateLayout;
+            rocm_gdn_state_layout = rocm_gdn_layout
+                ? parseGDNRecurrenceStateLayout(rocm_gdn_layout) : kDefaultROCmGDNStateLayout;
             fast_decode = true;
             executor_profiling = false;
             gpu_graphs = true;

@@ -152,6 +152,12 @@ namespace llaminar2
 
     size_t PrefixPayloadLayout::totalBytes() const
     {
+        if (includes_hybrid_state &&
+            ((hybrid_host_state_bytes > 0 &&
+              !validGDNRecurrenceStateLayout(hybrid_host_recurrence_layout)) ||
+             (hybrid_device_state_bytes > 0 &&
+              !validGDNRecurrenceStateLayout(hybrid_device_recurrence_layout))))
+            throw std::invalid_argument("Unknown prefix payload recurrence layout");
         size_t total = faKVBytes();
         if (includes_hybrid_state)
         {
@@ -175,31 +181,28 @@ namespace llaminar2
     bool PrefixPayloadLayout::compatiblePayloadShape(const PrefixPayloadLayout &other) const
     {
         return main_auxiliary.kind == other.main_auxiliary.kind &&
-               mtp_auxiliary.kind == other.mtp_auxiliary.kind &&
-               block_size == other.block_size &&
-               first_layer_index == other.first_layer_index &&
-               total_layers == other.total_layers &&
-               fa_layers == other.fa_layers &&
-               gdn_layers == other.gdn_layers &&
-               local_kv_heads == other.local_kv_heads &&
-               kv_head_start == other.kv_head_start &&
-               head_dim == other.head_dim &&
-               k_precision == other.k_precision &&
-               v_precision == other.v_precision &&
-               kv_layout == other.kv_layout &&
+               mtp_auxiliary.kind == other.mtp_auxiliary.kind && block_size == other.block_size &&
+               first_layer_index == other.first_layer_index && total_layers == other.total_layers &&
+               fa_layers == other.fa_layers && gdn_layers == other.gdn_layers &&
+               local_kv_heads == other.local_kv_heads && kv_head_start == other.kv_head_start &&
+               head_dim == other.head_dim && k_precision == other.k_precision &&
+               v_precision == other.v_precision && kv_layout == other.kv_layout &&
                bytes_per_fa_layer_k == other.bytes_per_fa_layer_k &&
                bytes_per_fa_layer_v == other.bytes_per_fa_layer_v &&
                hybrid_host_state_bytes == other.hybrid_host_state_bytes &&
                hybrid_device_state_bytes == other.hybrid_device_state_bytes &&
                hybrid_state_bytes == other.hybrid_state_bytes &&
-               mtp_origin == other.mtp_origin &&
-               mtp_layers == other.mtp_layers &&
+               (!(includes_hybrid_state && other.includes_hybrid_state &&
+                  hybrid_host_state_bytes > 0) ||
+                hybrid_host_recurrence_layout == other.hybrid_host_recurrence_layout) &&
+               (!(includes_hybrid_state && other.includes_hybrid_state &&
+                  hybrid_device_state_bytes > 0) ||
+                hybrid_device_recurrence_layout == other.hybrid_device_recurrence_layout) &&
+               mtp_origin == other.mtp_origin && mtp_layers == other.mtp_layers &&
                mtp_local_kv_heads == other.mtp_local_kv_heads &&
-               mtp_kv_head_start == other.mtp_kv_head_start &&
-               mtp_head_dim == other.mtp_head_dim &&
+               mtp_kv_head_start == other.mtp_kv_head_start && mtp_head_dim == other.mtp_head_dim &&
                mtp_k_precision == other.mtp_k_precision &&
-               mtp_v_precision == other.mtp_v_precision &&
-               mtp_kv_layout == other.mtp_kv_layout &&
+               mtp_v_precision == other.mtp_v_precision && mtp_kv_layout == other.mtp_kv_layout &&
                bytes_per_mtp_layer_k == other.bytes_per_mtp_layer_k &&
                bytes_per_mtp_layer_v == other.bytes_per_mtp_layer_v &&
                mtp_kv_bytes == other.mtp_kv_bytes &&
@@ -227,6 +230,8 @@ namespace llaminar2
         if (hybrid)
         {
             const HybridPrefixStateMetadata metadata = hybrid->hybridPrefixStateMetadata();
+            layout.hybrid_host_recurrence_layout = metadata.host_recurrence_layout;
+            layout.hybrid_device_recurrence_layout = metadata.device_recurrence_layout;
             layout.hybrid_host_state_bytes = metadata.host_bytes;
             layout.hybrid_device_state_bytes = metadata.device_bytes;
             layout.hybrid_state_bytes = metadata.host_bytes + metadata.device_bytes;

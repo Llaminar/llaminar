@@ -800,6 +800,8 @@ namespace llaminar2
                 return false;
 
             const HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if (!hybridPrefixStateLayoutsMatch(metadata, desc))
+                return false;
             if (!desc.include_device_state || metadata.device_bytes == 0)
                 return true;
             if (!dst_host && !dst_device)
@@ -838,6 +840,8 @@ namespace llaminar2
                 return false;
 
             const HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if (!hybridPrefixStateLayoutsMatch(metadata, desc))
+                return false;
             if (!desc.include_device_state || metadata.device_bytes == 0)
                 return true;
             if (!src_host && !src_device)
@@ -922,6 +926,12 @@ namespace llaminar2
             metadata.total_layers = total_layers_;
             metadata.gdn_layers = layer_map_.gdnLayerCount();
             metadata.host_bytes = 0;
+            metadata.device_recurrence_layout = gdn_state_geometry_.recurrence_layout;
+            for (const auto &state : gdn_states_)
+                if (state.recurrence_layout != metadata.device_recurrence_layout ||
+                    (state.rec_kernel && state.rec_kernel->recurrenceStateLayout() !=
+                                             metadata.device_recurrence_layout))
+                    throw std::logic_error("Hybrid GDN cache state/layout authority changed");
             metadata.device_bytes =
                 gdn_state_geometry_.deviceSerializedPayloadBytes(
                     metadata.gdn_layers);
@@ -1136,6 +1146,7 @@ namespace llaminar2
             {
                 state.n_v_heads = geometry.local_value_heads;
                 state.n_k_heads = geometry.local_key_heads;
+                state.recurrence_layout = geometry.recurrence_layout;
                 state.d_k = geometry.d_k;
                 state.d_v = geometry.d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;

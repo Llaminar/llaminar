@@ -201,7 +201,8 @@ namespace
             Kernel &kernel,
             int primary_state_floats,
             int secondary_state_floats = 0,
-            int request_capacity = 2)
+            int request_capacity = 2,
+            GDNRecurrenceStateLayout recurrence_layout = GDNRecurrenceStateLayout::KeyMajorValueContiguous)
             : primary_(
                   secondary_state_floats > 0 &&
                           secondary_state_floats != primary_state_floats
@@ -234,6 +235,7 @@ namespace
                 .request_state_bank = requests_->ptr,
                 .request_state_bank_floats = requests_->count,
                 .request_capacity = request_capacity,
+                .recurrence_layout = recurrence_layout,
             };
             if (!kernel.bindDeviceState(binding))
                 throw std::runtime_error(
@@ -273,13 +275,31 @@ namespace
             checkCuda(cudaMemcpy(ptr, &value, sizeof(int), cudaMemcpyHostToDevice), "cudaMemcpy host-to-device(int)");
         }
 
-        explicit CudaIntBuffer(std::initializer_list<int> values)
+        /**
+         * @brief Publish an explicitly sized request-count array during fixture setup.
+         * @param values Authored count words; storage remains owned until captured work retires.
+         */
+        explicit CudaIntBuffer(const std::vector<int>& values)
         {
-            std::vector<int> host(values);
-            checkCuda(cudaMalloc(reinterpret_cast<void **>(&ptr), host.size() * sizeof(int)), "cudaMalloc(int[])");
-            checkCuda(cudaMemcpy(ptr, host.data(), host.size() * sizeof(int), cudaMemcpyHostToDevice),
-                      "cudaMemcpy host-to-device(int[])");
+            if (values.empty())
+                throw std::invalid_argument("CUDA request-count fixture requires a nonempty array");
+            checkCuda(cudaMalloc(reinterpret_cast<void **>(&ptr), values.size() * sizeof(int)), "cudaMalloc(int[])");
+            try
+            {
+                checkCuda(cudaMemcpy(ptr, values.data(), values.size() * sizeof(int), cudaMemcpyHostToDevice),
+                          "cudaMemcpy host-to-device(int[])");
+            }
+            catch (...)
+            {
+                (void)cudaFree(ptr);
+                ptr = nullptr;
+                throw;
+            }
         }
+
+        /** @brief Preserve explicitly authored initializer-list count arrays. */
+        explicit CudaIntBuffer(std::initializer_list<int> values)
+            : CudaIntBuffer(std::vector<int>(values)) {}
 
         ~CudaIntBuffer()
         {
@@ -5104,3 +5124,291 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceAdditiveEpsilonNearZeroCaptured)
 #include "CUDAGDNMergedDecodeRegression.h"
 
 #include "CUDAGDNMergedDecodeTiming.h"
+
+#ifdef HAVE_CUDA
+/**
+ * @brief Prove CUDA ValueMajor endpoints preserve scalar/grouped/long arithmetic.
+ *
+ * The native candidate uses the typed production planar API and one retained
+ * graph per geometry. Only cold host fixture setup maps physical state; neither
+ * captured program contains a transpose or preparation node. KeyMajor controls
+ * and diagnostic serial rows keep CUDA's original eight-part arithmetic. Full,
+ * partial and absent snapshots, odd strides, empty/partial/overlarge counts,
+ * tails, aligned/float-only bases and dirty reuse cover all publication paths.
+ */
+TEST_F(Test__CUDAGDNPaddedRealLength, CapturedValueMajorStateAllRowsByteExact)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice(value-major)");
+    using Layout = GDNRecurrenceStateLayout;
+    constexpr float poison = -97.25f;
+    constexpr int guards = 17;
+    for (int capacity : {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,33,129,512})
+        for (int dk : {64,128})
+            for (bool normalize : {false,true})
+                for (bool in_place : {false,true})
+                {
+                    const int requests = capacity == 512 ? 1 : 3;
+                    const int heads = capacity % 4 == 0 ? 3 : 1;
+                    const int dv = std::array{1,17,65,128,129}[capacity % 5];
+                    const int rows = requests * capacity, state_size = heads * dk * dv;
+                    const int qk_stride = heads * dk, value_stride = heads * dv;
+                    const int state_count = requests * state_size;
+                    const int shift = capacity % 2; // Native FP32 pointers need not be float4 aligned.
+                    const int snapshot_rows = capacity % 3 == 0 ? rows : capacity % 3 == 1 ? rows - 1 : 0;
+                    const int snapshot_stride = state_size + 13; // Deliberately unaligned later rows.
+                    const size_t snapshot_count = static_cast<size_t>(std::max(1,snapshot_rows)) * snapshot_stride + guards;
+                    const size_t output_count = static_cast<size_t>(rows) * value_stride;
+                    SCOPED_TRACE(::testing::Message()<<"M="<<capacity<<" R="<<requests<<" DK="<<dk
+                        <<" DV="<<dv<<" H="<<heads<<" norm="<<normalize<<" alias="<<in_place
+                        <<" snapshots="<<snapshot_rows<<" shift="<<shift);
+                    // This is a fixture-only physical packing oracle. It does not
+                    // call production indexing helpers or run in either graph.
+                    const auto physical = [&](const std::vector<float>& source, int matrices, int stride, int prefix) {
+                        auto result = source;
+                        for (int matrix=0;matrix<matrices;++matrix)
+                            for (int head=0;head<heads;++head)
+                                for (int key=0;key<dk;++key)
+                                    for (int value=0;value<dv;++value)
+                                    {
+                                        const size_t base=prefix+static_cast<size_t>(matrix)*stride+head*dk*dv;
+                                        result[base+value*dk+key]=source[base+key*dv+value];
+                                    }
+                        return result;
+                    };
+                    const auto initial_core = makeInitialState(state_count,0.0017f);
+                    std::vector<float> initial(state_count+shift+guards,poison);
+                    std::copy(initial_core.begin(),initial_core.end(),initial.begin()+shift);
+                    const auto value_initial=physical(initial,requests,state_size,shift);
+                    const auto host_q=makeSequenceRows(rows,qk_stride,rows,rows,0.0037f,0.0f,0.0f);
+                    const auto host_k=makeSequenceRows(rows,qk_stride,rows,rows,-0.0029f,0.0f,0.0f);
+                    const auto host_alpha=makeSequenceRows(rows,heads,rows,rows,0.037f,0.0f,0.0f);
+                    const auto host_beta=makeSequenceRows(rows,heads,rows,rows,-0.031f,0.0f,0.0f);
+                    CudaStreamHandle stream;
+                    CudaFloatBuffer q(host_q),k(host_k),alpha(host_alpha),beta(host_beta);
+                    CudaFloatBuffer cq(host_q),ck(host_k),ca(host_alpha),cb(host_beta);
+                    CudaFloatBuffer sq(host_q),sk(host_k),sa(host_alpha),sb(host_beta);
+                    CudaFloatBuffer v(makeSequenceRows(rows,value_stride,rows,rows,0.0043f,0.0f,0.0f));
+                    CudaFloatBuffer a_log(heads,-0.5f),bias(heads,0.1f);
+                    CudaFloatBuffer control_state(initial),value_state(value_initial),serial_state(initial_core);
+                    CudaFloatBuffer control_terminal(initial.size(),poison),value_terminal(initial.size(),poison);
+                    CudaFloatBuffer control_output(output_count+guards,poison),value_output(output_count+guards,poison);
+                    CudaFloatBuffer serial_output(output_count,0.0f);
+                    CudaFloatBuffer control_snapshots(snapshot_count,poison),value_snapshots(snapshot_count,poison);
+                    CudaFloatBuffer serial_snapshots(snapshot_count,poison);
+                    std::vector<int> lengths(requests,capacity);
+                    CudaIntBuffer counts(lengths);
+                    float* control_final=in_place?control_state.ptr+shift:control_terminal.ptr+shift;
+                    float* value_final=in_place?value_state.ptr+shift:value_terminal.ptr+shift;
+                    gdn::PlanarRecurrenceInput control{
+                        .rows=DeviceRequestRowRanges::deviceCounted(requests,capacity,counts.ptr),
+                        .heads=heads,.key_width=dk,.value_width=dv,.normalize_qk=normalize,
+                        .query=cq.ptr,.key=ck.ptr,.value=v.ptr,.alpha=ca.ptr,.beta_raw=cb.ptr,
+                        .A_log=a_log.ptr,.dt_bias=bias.ptr,.output=control_output.ptr,
+                        .initial_state=control_state.ptr+shift,.updated_state=control_final,
+                        .snapshots=snapshot_rows?control_snapshots.ptr:nullptr,
+                        .snapshot_stride_floats=snapshot_stride,.max_snapshot_rows=snapshot_rows,
+                        .recurrence_layout=Layout::KeyMajorValueContiguous};
+                    auto candidate=control;
+                    candidate.query=q.ptr;candidate.key=k.ptr;candidate.alpha=alpha.ptr;candidate.beta_raw=beta.ptr;
+                    candidate.output=value_output.ptr;candidate.initial_state=value_state.ptr+shift;
+                    candidate.updated_state=value_final;candidate.snapshots=snapshot_rows?value_snapshots.ptr:nullptr;
+                    candidate.recurrence_layout=Layout::ValueMajorKeyContiguous;
+                    auto invalid=candidate;invalid.recurrence_layout=static_cast<Layout>(255);
+                    ASSERT_FALSE(gdn::launchCUDAPlanarRecurrence(invalid,stream.stream));
+                    ASSERT_FALSE(gdn::launchCUDAPlanarRecurrence(candidate,nullptr));
+                    if (capacity>8 && snapshot_rows<rows)
+                    {
+                        auto alias=candidate;alias.key=alias.query;
+                        ASSERT_FALSE(gdn::launchCUDAPlanarRecurrence(alias,stream.stream));
+                        alias=candidate;alias.A_log=alias.alpha;
+                        ASSERT_FALSE(gdn::launchCUDAPlanarRecurrence(alias,stream.stream));
+                    }
+                    CudaCapturedGraph control_graph(stream.stream,[&]{return gdn::launchCUDAPlanarRecurrence(control,stream.stream);});
+                    CudaCapturedGraph value_graph(stream.stream,[&]{return gdn::launchCUDAPlanarRecurrence(candidate,stream.stream);});
+                    const bool long_path=capacity>8 && snapshot_rows<rows;
+                    void* functions[2]{};
+                    for (int which=0;which<2;++which)
+                    {
+                        const auto& graph=which?value_graph:control_graph;
+                        size_t count=0;checkCuda(cudaGraphGetNodes(graph.graph,nullptr,&count),"value-major graph count");
+                        ASSERT_EQ(count,long_path?2u:1u);
+                        std::vector<cudaGraphNode_t> nodes(count);
+                        checkCuda(cudaGraphGetNodes(graph.graph,nodes.data(),&count),"value-major graph nodes");
+                        for (auto node:nodes)
+                        {
+                            cudaGraphNodeType type;checkCuda(cudaGraphNodeGetType(node,&type),"value-major node type");
+                            ASSERT_EQ(type,cudaGraphNodeTypeKernel);
+                            cudaKernelNodeParams p{};checkCuda(cudaGraphKernelNodeGetParams(node,&p),"value-major native ABI");
+                            if (p.blockDim.x==64) {ASSERT_TRUE(long_path);continue;}
+                            ASSERT_EQ(p.blockDim.x,long_path?128u:256u);
+                            ASSERT_EQ(p.gridDim.x,static_cast<unsigned>(long_path?heads:requests*heads));
+                            ASSERT_EQ(p.gridDim.y,static_cast<unsigned>((dv+(long_path?16:32)-1)/(long_path?16:32)));
+                            ASSERT_EQ(p.gridDim.z,static_cast<unsigned>(long_path?requests:1));
+                            ASSERT_EQ(p.sharedMemBytes,static_cast<unsigned>(long_path?2*8*(2*dk+16+2)*sizeof(float):(2*dk+2*256)*sizeof(float)));
+                            ASSERT_NE(p.kernelParams,nullptr);functions[which]=p.func;
+                            const int first=long_path?6:8;
+                            ASSERT_EQ(*static_cast<const float*const*>(p.kernelParams[first]),which?candidate.initial_state:control.initial_state);
+                            ASSERT_EQ(*static_cast<float*const*>(p.kernelParams[first+1]),which?candidate.updated_state:control.updated_state);
+                            cudaFuncAttributes attributes{};checkCuda(cudaFuncGetAttributes(&attributes,p.func),"value-major native resources");
+                            ASSERT_EQ(attributes.localSizeBytes,0u);
+                        }
+                        ASSERT_NE(functions[which],nullptr);
+                    }
+                    ASSERT_NE(functions[0],functions[1]);
+                    // One large/partial/empty/large sequence reuses both captures.
+                    for (int replay=0;replay<4;++replay)
+                    {
+                        for(int request=0;request<requests;++request)
+                            lengths[request]=replay==0||replay==3?capacity:replay==1?std::max(0,capacity-request-1):request==0?-1:request==1?0:capacity+1;
+                        q.copyFrom(host_q);k.copyFrom(host_k);alpha.copyFrom(host_alpha);beta.copyFrom(host_beta);
+                        cq.copyFrom(host_q);ck.copyFrom(host_k);ca.copyFrom(host_alpha);cb.copyFrom(host_beta);
+                        value_state.copyFrom(value_initial);control_state.copyFrom(initial);serial_state.copyFrom(initial_core);
+                        value_terminal.fill(poison);control_terminal.fill(poison);
+                        value_output.fill(poison);control_output.fill(poison);serial_output.fill(0.0f);
+                        value_snapshots.fill(poison);control_snapshots.fill(poison);serial_snapshots.fill(poison);
+                        checkCuda(cudaMemcpyAsync(counts.ptr,lengths.data(),requests*sizeof(int),cudaMemcpyHostToDevice,stream.stream),"publish value-major live rows");
+                        control_graph.launch(stream.stream);value_graph.launch(stream.stream);
+                        for(int request=0;request<requests;++request)
+                            for(int local=0;local<std::clamp(lengths[request],0,capacity);++local)
+                            {
+                                const int row=request*capacity+local;
+                                float* state=serial_state.ptr+request*state_size;
+                                ASSERT_TRUE(cudaGDN_recurrent_step(
+                                    sq.ptr+static_cast<size_t>(row)*qk_stride,sk.ptr+static_cast<size_t>(row)*qk_stride,
+                                    v.ptr+static_cast<size_t>(row)*value_stride,sa.ptr+row*heads,sb.ptr+row*heads,
+                                    a_log.ptr,bias.ptr,serial_output.ptr+static_cast<size_t>(row)*value_stride,
+                                    state,state,heads,dk,dv,normalize,cuda_ordinal_,stream.stream));
+                                if(row<snapshot_rows)checkCuda(cudaMemcpyAsync(serial_snapshots.ptr+static_cast<size_t>(row)*snapshot_stride,
+                                    state,state_size*sizeof(float),cudaMemcpyDeviceToDevice,stream.stream),"retain value-major serial snapshot");
+                            }
+                        checkCuda(cudaStreamSynchronize(stream.stream),"join value-major replay bytes");
+                        const auto expected_output=control_output.toHost();const auto actual_output=value_output.toHost();
+                        expectByteExactEquivalent("value-major outputs and guards",actual_output,expected_output,0,actual_output.size());
+                        expectByteExactEquivalent("CUDA serial output",expected_output,serial_output.toHost(),0,output_count);
+                        const auto control_bank=in_place?control_state.toHost():control_terminal.toHost();
+                        const auto value_bank=in_place?value_state.toHost():value_terminal.toHost();
+                        expectByteExactEquivalent("value-major terminal and guards",value_bank,
+                            physical(control_bank,requests,state_size,shift),0,value_bank.size());
+                        if (!in_place)
+                        {
+                            expectByteExactEquivalent("value-major original state read-only",value_state.toHost(),value_initial,0,value_initial.size());
+                            expectByteExactEquivalent("KeyMajor original state read-only",control_state.toHost(),initial,0,initial.size());
+                        }
+                        const auto control_shots=control_snapshots.toHost();const auto value_shots=value_snapshots.toHost();
+                        expectByteExactEquivalent("value-major snapshots and odd guards",value_shots,
+                            physical(control_shots,snapshot_rows,snapshot_stride,0),0,value_shots.size());
+                        expectByteExactEquivalent("CUDA serial snapshots",control_shots,serial_snapshots.toHost(),0,snapshot_count);
+                        if(snapshot_rows<rows)
+                        {
+                            const auto serial_bank=serial_state.toHost();
+                            expectByteExactEquivalent("CUDA serial terminal",
+                                std::vector<float>(control_bank.begin()+shift,control_bank.begin()+shift+state_count),
+                                serial_bank,0,state_count);
+                        }
+                    }
+                }
+}
+
+/**
+ * @brief Prove merged native ValueMajor capture, typed snapshots and continuation.
+ *
+ * A layout is adopted by the production CUDA owner exactly once. Wrong-format
+ * workspace bindings must reject before changing a binding. Original merged
+ * coordinates, including signed source offsets, are compared to an independently
+ * authored planar scalar oracle. Snapshot restore then feeds a retained ordinary
+ * decode graph; only host fixture setup/download maps matrix coordinates.
+ */
+TEST_F(Test__CUDAGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsByteExact)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_),"cudaSetDevice(value-major merged)");
+    using Layout=GDNRecurrenceStateLayout;
+    constexpr int heads=3,key_heads=4,dv=17;
+    constexpr float poison=-93.25f;
+    for(int dk:{64,128})for(int offset:{0,5,-5})for(bool normalize:{false,true})
+    {
+        SCOPED_TRACE(::testing::Message()<<"DK="<<dk<<" offset="<<offset<<" norm="<<normalize);
+        const int state_size=heads*dk*dv,merged_stride=2*key_heads*dk+heads*dv;
+        const auto merged=makeSequenceRows(1,merged_stride,1,1,0.0037f,0.0f,0.0f);
+        std::vector<float> q(heads*dk),k(heads*dk),v(heads*dv);
+        for(int head=0;head<heads;++head)
+        {
+            int source=(head+offset)%key_heads;if(source<0)source+=key_heads;
+            std::copy_n(merged.data()+source*dk,dk,q.data()+head*dk);
+            std::copy_n(merged.data()+key_heads*dk+source*dk,dk,k.data()+head*dk);
+        }
+        std::copy_n(merged.data()+2*key_heads*dk,heads*dv,v.data());
+        const auto initial=makeInitialState(state_size,0.0017f);
+        const auto physical=[&](const std::vector<float>& logical){
+            auto result=logical;
+            for(int head=0;head<heads;++head)for(int key=0;key<dk;++key)for(int value=0;value<dv;++value)
+                result[head*dk*dv+value*dk+key]=logical[head*dk*dv+key*dv+value];
+            return result;
+        };
+        const auto value_initial=physical(initial);
+        CudaStreamHandle stream;
+        CudaFloatBuffer d_merged(merged),d_q(q),d_k(k),d_v(v);
+        CudaFloatBuffer alpha(heads,0.037f),beta(heads,-0.031f),a_log(heads,-0.5f),bias(heads,0.1f);
+        CudaFloatBuffer source(value_initial),serial(initial),output(heads*dv,poison),oracle(heads*dv,poison);
+        CudaFloatBuffer snapshots(state_size+13,poison),work(state_size,poison),observed_state(state_size,poison);
+        CUDAGatedDeltaNet api(cuda_ordinal_);
+        CudaGDNStateOwner owner(api,state_size,0,2,Layout::ValueMajorKeyContiguous);
+        ASSERT_EQ(api.recurrenceStateLayout(),Layout::ValueMajorKeyContiguous);
+        api.setGPUStream(stream.stream);
+        EXPECT_THROW(api.bindRecurrenceStateCaptureWorkspace(snapshots.ptr,1,state_size,Layout::KeyMajorValueContiguous),std::invalid_argument);
+        EXPECT_THROW(api.bindRecurrenceSpeculativeWorkspace(work.ptr,state_size,Layout::KeyMajorValueContiguous),std::invalid_argument);
+        EXPECT_THROW(api.bindRecurrenceStateCaptureWorkspace(snapshots.ptr,1,state_size,static_cast<Layout>(255)),std::invalid_argument);
+        api.bindRecurrenceStateCaptureWorkspace(snapshots.ptr,1,state_size,Layout::ValueMajorKeyContiguous);
+        api.bindRecurrenceSpeculativeWorkspace(work.ptr,state_size,Layout::ValueMajorKeyContiguous);
+        CudaCapturedGraph verifier(stream.stream,[&]{
+            return api.chunkForwardMergedQKV(d_merged.ptr,merged_stride,alpha.ptr,beta.ptr,a_log.ptr,bias.ptr,
+                output.ptr,nullptr,1,key_heads,heads,dk,dv,offset,64,normalize);
+        });
+        api.bindRecurrenceStateCaptureWorkspace(nullptr,0,state_size,Layout::ValueMajorKeyContiguous);
+        api.bindRecurrenceSpeculativeWorkspace(nullptr,0,Layout::ValueMajorKeyContiguous);
+        CudaCapturedGraph ordinary(stream.stream,[&]{
+            return api.chunkForwardMergedQKV(d_merged.ptr,merged_stride,alpha.ptr,beta.ptr,a_log.ptr,bias.ptr,
+                output.ptr,nullptr,1,key_heads,heads,dk,dv,offset,64,normalize);
+        });
+        api.bindRecurrenceStateCaptureWorkspace(snapshots.ptr,1,state_size,Layout::ValueMajorKeyContiguous);
+        api.bindRecurrenceSpeculativeWorkspace(work.ptr,state_size,Layout::ValueMajorKeyContiguous);
+        for(const auto* graph:{&verifier,&ordinary})
+        {
+            size_t count=0;checkCuda(cudaGraphGetNodes(graph->graph,nullptr,&count),"merged ValueMajor node count");ASSERT_EQ(count,1u);
+            cudaGraphNode_t node;checkCuda(cudaGraphGetNodes(graph->graph,&node,&count),"merged ValueMajor node");
+            cudaGraphNodeType type;checkCuda(cudaGraphNodeGetType(node,&type),"merged ValueMajor node type");ASSERT_EQ(type,cudaGraphNodeTypeKernel);
+            cudaKernelNodeParams p{};checkCuda(cudaGraphKernelNodeGetParams(node,&p),"merged ValueMajor native arguments");
+            ASSERT_EQ(p.blockDim.x,256u);ASSERT_EQ(p.gridDim.x,static_cast<unsigned>(heads));ASSERT_EQ(p.gridDim.y,1u);
+            ASSERT_NE(p.kernelParams,nullptr);ASSERT_EQ(*static_cast<const float*const*>(p.kernelParams[0]),d_merged.ptr);
+            ASSERT_EQ(*static_cast<const float*const*>(p.kernelParams[1]),nullptr);ASSERT_EQ(*static_cast<const float*const*>(p.kernelParams[2]),nullptr);
+            ASSERT_EQ(*static_cast<const int*>(p.kernelParams[20]),key_heads);ASSERT_EQ(*static_cast<const int*>(p.kernelParams[21]),offset);
+            cudaFuncAttributes attributes{};checkCuda(cudaFuncGetAttributes(&attributes,p.func),"merged ValueMajor resources");ASSERT_EQ(attributes.localSizeBytes,0u);
+        }
+        for(int replay=0;replay<3;++replay)
+        {
+            ASSERT_TRUE(api.importState(nullptr,source.ptr,stream.stream));
+            serial.copyFrom(initial);snapshots.fill(poison);work.fill(poison);output.fill(poison);
+            verifier.launch(stream.stream);
+            ASSERT_TRUE(cudaGDN_recurrent_step(d_q.ptr,d_k.ptr,d_v.ptr,alpha.ptr,beta.ptr,a_log.ptr,bias.ptr,
+                oracle.ptr,serial.ptr,serial.ptr,heads,dk,dv,normalize,cuda_ordinal_,stream.stream));
+            ASSERT_TRUE(api.exportState(nullptr,observed_state.ptr,stream.stream));
+            checkCuda(cudaStreamSynchronize(stream.stream),"join merged ValueMajor verifier");
+            expectByteExactEquivalent("merged ValueMajor output",output.toHost(),oracle.toHost(),0,heads*dv);
+            expectByteExactEquivalent("merged ValueMajor live preserved",observed_state.toHost(),value_initial,0,state_size);
+            const auto first=serial.toHost();auto expected=physical(first);expected.resize(state_size+13,poison);
+            expectByteExactEquivalent("merged ValueMajor snapshot guard",snapshots.toHost(),expected,0,expected.size());
+            expectByteExactEquivalent("complete snapshot leaves terminal work",work.toHost(),std::vector<float>(state_size,poison),0,state_size);
+            ASSERT_TRUE(api.restoreVerifierStateCaptureRow(nullptr,0,stream.stream));
+            ordinary.launch(stream.stream);
+            ASSERT_TRUE(cudaGDN_recurrent_step(d_q.ptr,d_k.ptr,d_v.ptr,alpha.ptr,beta.ptr,a_log.ptr,bias.ptr,
+                oracle.ptr,serial.ptr,serial.ptr,heads,dk,dv,normalize,cuda_ordinal_,stream.stream));
+            ASSERT_TRUE(api.exportState(nullptr,observed_state.ptr,stream.stream));
+            checkCuda(cudaStreamSynchronize(stream.stream),"join merged ValueMajor restored decode");
+            expectByteExactEquivalent("merged ValueMajor continuation",output.toHost(),oracle.toHost(),0,heads*dv);
+            expectByteExactEquivalent("merged ValueMajor restored terminal",observed_state.toHost(),physical(serial.toHost()),0,state_size);
+        }
+    }
+}
+
+#endif

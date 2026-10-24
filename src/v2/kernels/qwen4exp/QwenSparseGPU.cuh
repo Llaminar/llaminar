@@ -938,7 +938,7 @@ __device__ __forceinline__ void publishAttentionFoldObservation(
 }
 /**
  * @brief Fold a fixed structural prefix of its admitted partial storage in order.
- * @tparam FoldParts Closed compile-time prefix bound: 8, 16, 32 or 33 records.
+ * @tparam FoldParts Closed compile-time prefix bound: 8, 12, 16, 32 or 33 records.
  * @tparam StorageParts Original arithmetic/storage program:8 or admitted phase33.
  * @param p Original read-only replay/selection and output-observation bindings.
  * @param parts Original row/head partial base with the StorageParts record stride.
@@ -968,7 +968,7 @@ __device__ __forceinline__ QwenSparseAttentionFoldResult foldAttentionPrefix(
     QwenSparsePartialMetadataView metadata)
 {
     static_assert((StorageParts==8 && FoldParts==8) ||
-                  (StorageParts==33 && (FoldParts==8 || FoldParts==16 || FoldParts==32 || FoldParts==33)),
+                  (StorageParts==33 && (FoldParts==8 || FoldParts==12 || FoldParts==16 || FoldParts==32 || FoldParts==33)),
                   "Closed attention fold/storage geometry");
 #if defined(__HIPCC__)
     constexpr bool PerOutputDenominator = StorageParts == 33;
@@ -1124,7 +1124,15 @@ __global__ __launch_bounds__(256, 2) void reduceAttentionPartitions(QwenSparseAt
         if (selected <= 8 * 64)
             folded = foldAttentionPrefix<8,33>(p, parts, scales, denominator, row, head, d, metadata);
         else if (selected <= 16 * 64)
-            folded = foldAttentionPrefix<16,33>(p, parts, scales, denominator, row, head, d, metadata);
+        {
+            // Keep the long-context selector depth unchanged. Only this short
+            // interval needs the extra boundary. Omitted records are authored
+            // empty tiles; the exact prefix retains both neutral numerator FMAs.
+            if (selected <= 12 * 64)
+                folded = foldAttentionPrefix<12,33>(p, parts, scales, denominator, row, head, d, metadata);
+            else
+                folded = foldAttentionPrefix<16,33>(p, parts, scales, denominator, row, head, d, metadata);
+        }
         else if (selected <= 32 * 64)
             folded = foldAttentionPrefix<32,33>(p, parts, scales, denominator, row, head, d, metadata);
         else

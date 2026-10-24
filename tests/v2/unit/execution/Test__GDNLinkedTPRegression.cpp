@@ -201,4 +201,37 @@ namespace llaminar2
             GDNLinkedLiveStateKind::Recurrence,
             /*degree=*/3));
     }
+    /** @brief Allgather moves opaque rectangular head blocks without changing inner axes. */
+    TEST(Test__GDNLinkedTPRegression, RecurrenceLayoutPreservesRectangularOpaqueHeadBlocks)
+    {
+        using L = GDNRecurrenceStateLayout;
+        for (const int degree : std::array{2, 4, 8})
+        {
+            GDNLinkedLiveStateGeometry geometry{
+                .global_key_heads = 8,
+                .global_value_heads = 24,
+                .key_width = 64,
+                .value_width = 65,
+                .conv_history_length = 3,
+                .recurrence_layout = L::ValueMajorKeyContiguous,
+            };
+            const auto shape = geometry.resolve(GDNLinkedLiveStateKind::Recurrence, degree);
+            ASSERT_TRUE(shape.has_value());
+            EXPECT_EQ(shape->recurrence_layout, L::ValueMajorKeyContiguous);
+            std::vector<float> full(shape->full_state_floats);
+            for (size_t i = 0; i < full.size(); ++i)
+                full[i] = static_cast<float>(i);
+            const auto gathered = makeRankMajorGathered(full, *shape);
+            for (int i = 0; i < shape->full_state_floats; ++i)
+            {
+                const auto source = geometry.gatheredOffsetForFullOffset(
+                    GDNLinkedLiveStateKind::Recurrence, degree, static_cast<size_t>(i));
+                ASSERT_TRUE(source.has_value());
+                EXPECT_EQ(gathered[*source], full[static_cast<size_t>(i)]);
+            }
+            geometry.recurrence_layout = static_cast<L>(255);
+            EXPECT_FALSE(geometry.resolve(GDNLinkedLiveStateKind::Recurrence, degree).has_value());
+        }
+    }
+
 } // namespace llaminar2

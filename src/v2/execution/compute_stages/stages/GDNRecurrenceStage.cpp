@@ -41,9 +41,22 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 
 namespace llaminar2
 {
+
+    uint64_t GDNRecurrenceStage::graphCaptureVariantSignature() const
+    {
+        if (!params_.kernel)
+            throw std::logic_error(
+                "GDN recurrence capture identity requires its bound kernel state owner");
+        const auto layout = params_.kernel->recurrenceStateLayout();
+        if (!validGDNRecurrenceStateLayout(layout))
+            throw std::invalid_argument(
+                "GDN recurrence capture identity has an unknown persistent state layout");
+        return 0x47444e4c00000000ULL | static_cast<uint64_t>(layout);
+    }
 
     void GDNRecurrenceStage::updateDynamicParams(int pos_offset, int seq_len)
     {
@@ -211,10 +224,8 @@ namespace llaminar2
         verifier_capture_workspace_bound_ =
             capture != nullptr && capture_rows > 0 && capture_state_size > 0;
         verifier_capture_rows_bound_ = capture_rows;
-        params_.kernel->bindVerifierStateCaptureWorkspace(
-            capture,
-            capture_rows,
-            capture_state_size);
+        params_.kernel->bindRecurrenceStateCaptureWorkspace(
+            capture, capture_rows, capture_state_size, params_.kernel->recurrenceStateLayout());
 
         float *speculative_work = nullptr;
         int speculative_work_size = capture_state_size;
@@ -238,9 +249,8 @@ namespace llaminar2
         }
         speculative_state_work_bound_ =
             speculative_work != nullptr || !params_.device_id.is_gpu();
-        params_.kernel->bindSpeculativeStateWorkspace(
-            speculative_work,
-            speculative_work_size);
+        params_.kernel->bindRecurrenceSpeculativeWorkspace(
+            speculative_work, speculative_work_size, params_.kernel->recurrenceStateLayout());
     }
 
     void GDNRecurrenceStage::clearKernelVerifierStateWorkspace()
@@ -253,13 +263,13 @@ namespace llaminar2
         if (!params_.kernel)
             return;
 
-        params_.kernel->bindVerifierStateCaptureWorkspace(
+        params_.kernel->bindRecurrenceStateCaptureWorkspace(
             nullptr,
             0,
-            verifier_capture_state_size_bound_);
-        params_.kernel->bindSpeculativeStateWorkspace(
-            nullptr,
-            verifier_capture_state_size_bound_);
+            verifier_capture_state_size_bound_,
+            params_.kernel->recurrenceStateLayout());
+        params_.kernel->bindRecurrenceSpeculativeWorkspace(
+            nullptr, verifier_capture_state_size_bound_, params_.kernel->recurrenceStateLayout());
     }
 
     int GDNRecurrenceStage::effectivePrefillSeqLen() const
@@ -1134,6 +1144,8 @@ namespace llaminar2
                     isGraphCaptureActive() ? "capture" : "execute",
                     device().toString(),
                     {{"layout", layout},
+                     {"state_layout", std::string(gdnRecurrenceStateLayoutName(
+                         params_.kernel->recurrenceStateLayout()))},
                      {"layer", std::to_string(params_.layer_idx)},
                      {"rows", std::to_string(params_.seq_len)},
                      {"key_heads", std::to_string(nkh)},

@@ -491,6 +491,8 @@ namespace llaminar2
                 return false;
 
             HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if (!hybridPrefixStateLayoutsMatch(metadata, desc))
+                return false;
             const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
             const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
             if ((needs_host && !dst_host) ||
@@ -518,6 +520,8 @@ namespace llaminar2
                 return false;
 
             HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if (!hybridPrefixStateLayoutsMatch(metadata, desc))
+                return false;
             const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
             const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
             if ((needs_host && !src_host) ||
@@ -614,6 +618,8 @@ namespace llaminar2
                 if (gdn_idx < 0)
                     continue;
                 const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
+                if (state.recurrence_layout != metadata.host_recurrence_layout)
+                    throw std::logic_error("CPU hybrid GDN state/layout authority changed");
                 if (state.conv_kernel)
                     metadata.device_bytes += state.conv_kernel->stateBytes();
                 if (state.rec_kernel)
@@ -780,11 +786,15 @@ namespace llaminar2
             const HybridGDNStateGeometry geometry =
                 config.gdnStateGeometry();
 
+            if (geometry.recurrence_layout != GDNRecurrenceStateLayout::KeyMajorValueContiguous)
+                throw std::invalid_argument(
+                    "CPU hybrid cache requires its implemented key-major recurrence layout");
             gdn_states_.resize(n_gdn);
             for (auto &state : gdn_states_)
             {
                 state.n_v_heads = geometry.local_value_heads;
                 state.n_k_heads = geometry.local_key_heads;
+                state.recurrence_layout = geometry.recurrence_layout;
                 state.d_k = geometry.d_k;
                 state.d_v = geometry.d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;

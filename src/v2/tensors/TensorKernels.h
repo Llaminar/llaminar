@@ -4188,6 +4188,48 @@ namespace llaminar2
     public:
         virtual ~ITensorGatedDeltaNet() = default;
 
+        /** @return Immutable physical orientation of every owned recurrence bank. */
+        virtual GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept
+        {
+            return GDNRecurrenceStateLayout::KeyMajorValueContiguous;
+        }
+
+        /**
+         * @brief Bind row snapshots only in the live owner's physical orientation.
+         * @param workspace Borrowed arena storage, retained through graph retirement.
+         * @param rows Admitted snapshot row count; zero clears the binding.
+         * @param state_size FP32 elements per snapshot, not allocation capacity.
+         * @param layout Immutable format sealed by the graph's state owner.
+         * @throws std::invalid_argument Before changing a binding on a format mismatch.
+         */
+        void bindRecurrenceStateCaptureWorkspace(float *workspace,
+                                                 int rows,
+                                                 int state_size,
+                                                 GDNRecurrenceStateLayout layout)
+        {
+            if (!validGDNRecurrenceStateLayout(layout) || layout != recurrenceStateLayout())
+                throw std::invalid_argument(
+                    "GDN snapshot layout differs from its live state owner");
+            bindVerifierStateCaptureWorkspace(workspace, rows, state_size);
+        }
+
+        /**
+         * @brief Bind a borrowed speculative bank in the immutable live-bank format.
+         * @param workspace Arena-owned storage, or null to clear the binding.
+         * @param state_size Admitted FP32 element extent.
+         * @param layout Physical format authenticated by the state owner.
+         * @throws std::invalid_argument Before changing a binding on a format mismatch.
+         */
+        void bindRecurrenceSpeculativeWorkspace(float *workspace,
+                                                int state_size,
+                                                GDNRecurrenceStateLayout layout)
+        {
+            if (!validGDNRecurrenceStateLayout(layout) || layout != recurrenceStateLayout())
+                throw std::invalid_argument(
+                    "GDN speculative layout differs from its live state owner");
+            bindSpeculativeStateWorkspace(workspace, state_size);
+        }
+
         /// Validate a raw CUDA/HIP stream before forwarding it to the implementation.
         void setGPUStream(void *stream)
         {
@@ -4277,7 +4319,8 @@ namespace llaminar2
          *
          * When enabled for an all-position MTP verifier graph, implementations may
          * write the recurrence state after each candidate verifier row into this
-         * buffer. Layout is [rows, n_heads, d_k, d_v] in FP32.
+         * buffer. Layout is [rows, heads, native head matrix] in FP32; the immutable owner names
+         * its inner axes.
          */
         virtual void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
         {

@@ -1,20 +1,47 @@
 # QFN tuning dashboard
 
-**Checkpoint180 passes scoped qualification:** **819.594 prefill / 41.030
-decode tok/s**, versus frozen179 controls at 819.241 / 40.797. The extended
-A/B/A/B/A comparison retains all 15 measured requests: **+0.572% decode**,
-with prefill effectively unchanged. Both brackets favor the candidate; the
-first has overlapping decode ranges and the second has non-overlapping ranges.
-All 15 natural token sequences and all 185 canonical final-logit rows match.
-The complete **823-entry Unit/affected gate** and seven focused native tests
-pass. Fixed M1 MoE column allgathers now publish directly to the final bank;
-wider and counted rows retain their existing behavior. The real-model captured
-inventory has zero final identity-copy observations on all four GPUs, verified
-by a separate offline reconciliation that preserves the original postprocessing
-failure. See the [settings and qualification record](QFN_SCALAR_COLUMN_PUBLICATION_TUNING.md).
-The **42.959 tok/s Castagna target remains open**. Complete preflight remains
-G60, and the explicit FP16 attention policy is unchanged. The archived GDN
-component experiment below remains separate from production.
+**Checkpoint190 installs the qualified ROCm ValueMajor default:** the final
+override-free repeat measures **820.777 prefill / 41.562 decode tok/s**. Its
+matched explicit-policy A/B/A measured **820.871 / 41.537**, versus
+bracketed frozen 180 controls at **818.918 / 40.906**. Decode improves **1.542%**
+in that A/B/A with non-overlapping measured ranges; prefill is preserved.
+All nine A/B/A natural 256-token trajectories and all three default repeat
+trajectories match. All 185 canonical final-logit rows remain byte-identical.
+The fresh **873-entry Unit/affected gate** passes, including mixed CUDA/ROCm
+RAM/disk prefix restart. Actual owner telemetry proves default selection on all
+four MI50s with both layout overrides absent. **Castagna's 42.959 decode tok/s
+target remains open.** This is focused
+qualification, not complete preflight, whole-corpus or image certification.
+
+The [GDN qualification record](QFN_GDN_RECURRENCE_TUNING.md) retains the exact
+settings, per-arm scores, current source/build evidence and archived experiments.
+The complete production convolution/recurrence boundary improves **15.3450 to
+11.0900 µs (27.73% less time)**. The transposed persistent state supports prefill,
+serial/grouped decode, snapshots, linked state and prefix archives without a live
+transpose or host mirror. The native ROCm sweep covers all 22 new variants,
+354 cases and 2,832 captured replays, with zero private storage/spills. CPU and
+CUDA defaults remain key-major. Prepared Q/K publication is a separate later
+candidate; the retired private kernels are removed from production source.
+
+The [short-context attention comparison](QFN_SHORT_CONTEXT_ATTENTION_ATTRIBUTION.md)
+finds that the large apparent per-head deficit was mainly local Q6 versus Q12
+batching. With matched Q12 inputs and the new nested Fold12 merge, the residual
+is **1.334% at 512 and 0.424% at 768**. Both use compact KV rows, shared KV panels and
+two kernel launches. Extra empty-header/control work is present, but its latency
+share is unproven; the 768 residual is comparable to measured run variation.
+Fold12 reduces the matched complete boundary by 2.067% at 768 and preserves exact
+bytes. Long-context checks retain the measured +0.411% pre-rotary 64K cost; no
+whole-model gain is attributed to attention alone.
+
+The prior [checkpoint180 qualification](QFN_SCALAR_COLUMN_PUBLICATION_TUNING.md)
+remains retained at 819.594 / 41.030 tok/s, with its 823-entry Unit/affected gate.
+Its [fresh stage attribution](QFN_CASTAGNA_STAGE_COMPARISON.md#fresh-checkpoint180-attribution-2026-10-24)
+ranked GDN as the largest comparable deficit; it precedes 190 and must not be
+presented as current stage timing. The [GDN structure map](QFN_GDN_STRUCTURE_COMPARISON.md)
+explains which Castagna layout lessons preserve Llaminar's reduction order.
+The routed SwiGLU181 and HC publication182 component screens remain archived
+separately; neither changes the qualified model score. Complete preflight
+remains G60 and the explicit FP16 attention policy is unchanged.
 
 **Checkpoint179 passes scoped qualification:** **819.648 prefill / 40.656
 decode tok/s**, versus bracketed frozen177 controls at 819.665 / 40.295.

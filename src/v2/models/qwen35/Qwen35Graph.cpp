@@ -1241,6 +1241,7 @@ namespace llaminar2
             .key_width = d_k,
             .value_width = d_v,
             .conv_history_length = conv_history_len,
+            .recurrence_layout = gdn_state->recurrence_layout,
         };
         const int live_state_degree =
             config_.tp_ctx && config_.tp_ctx->isLocal()

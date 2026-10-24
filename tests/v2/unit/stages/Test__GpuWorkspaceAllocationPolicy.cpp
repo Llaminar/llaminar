@@ -3956,7 +3956,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPVerifierGDNStateSnapshotsUseDecodeEq
         "bool cudaGDN_chunk_forward("));
     const auto cuda_batched_route = stripCommentsAndStringLiterals(sliceBetween(
         cuda_source,
-        "bool cudaGDN_chunk_forward_batched_kernel_route(",
+        "static bool cuda_gdn_chunk_forward_batched_route(",
         "bool cudaGDN_chunk_forward_kernel_route("));
     EXPECT_NE(cuda_route.find("state_snapshots"), std::string::npos)
         << "CUDA grouped verifier GDN must publish post-row state snapshots.";
@@ -3971,6 +3971,58 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPVerifierGDNStateSnapshotsUseDecodeEq
         << "CUDA grouped verifier GDN must launch on the explicit capture stream.";
     EXPECT_EQ(cuda_route.find("cudaDeviceSynchronize"), std::string::npos)
         << "CUDA grouped verifier GDN must stay graph-capturable.";
+
+    // The typed production bridge owns stream/layout admission. Its grouped
+    // route must preserve complete snapshot publication for every verifier M,
+    // rather than entering the long-prefill preprocessing arithmetic schedule.
+    const auto cuda_batched_compact = removeAsciiWhitespace(cuda_batched_route);
+    EXPECT_NE(cuda_batched_compact.find(
+                  "state_snapshots!=nullptr&&"
+                  "snapshot_stride_floats>=required_snapshot_stride&&"
+                  "max_snapshot_rows>=seq_len"),
+              std::string::npos);
+    EXPECT_NE(cuda_batched_compact.find(
+                  "if(request_seq_len<=8||complete_verifier_capture)"),
+              std::string::npos);
+    EXPECT_NE(cuda_batched_compact.find(
+                  "device_effective_seq_len,0,state_snapshots,"
+                  "snapshot_stride_floats,max_snapshot_rows,"
+                  "static_cast<cudaStream_t>(stream),state_layout)"),
+              std::string::npos)
+        << "Grouped verifier launch must retain device row lengths, the complete "
+           "snapshot envelope, exact stream and immutable recurrence layout.";
+    expectNeedleBefore(cuda_batched_compact,
+                       "returnlaunch_cuda_gdn_recurrent_step(",
+                       "cuda_gdn_prefill_preprocess_kernel<<<",
+                       "Complete verifier snapshots must select the scalar-order grouped "
+                       "kernel before long-prefill preprocessing.");
+    EXPECT_EQ(cuda_batched_compact.find("for("), std::string::npos)
+        << "Grouped verifier submission must not become a host serial-row replay.";
+    EXPECT_EQ(cuda_batched_compact.find("while("), std::string::npos);
+    EXPECT_EQ(cuda_batched_route.find("cudaDeviceSynchronize"), std::string::npos);
+    EXPECT_EQ(cuda_batched_route.find("cudaStreamSynchronize"), std::string::npos);
+
+    const auto typed_begin = cuda_source.find("bool launchCUDAPlanarRecurrence(");
+    ASSERT_NE(typed_begin, std::string::npos);
+    const auto cuda_planar = removeAsciiWhitespace(stripCommentsAndStringLiterals(
+        cuda_source.substr(typed_begin)));
+    EXPECT_NE(cuda_planar.find(
+                  "if(reinterpret_cast<std::uintptr_t>(stream)<=2||"
+                  "!validPlanarRecurrenceStorage(p)||"
+                  "!validCUDAPlanarPreprocessStorage(p))returnfalse;"),
+              std::string::npos)
+        << "The typed CUDA bridge must reject null, legacy and per-thread default "
+           "streams and invalid immutable input/layout/storage before enqueue.";
+    EXPECT_NE(cuda_planar.find("returncuda_gdn_chunk_forward_batched_route("),
+              std::string::npos);
+    EXPECT_NE(cuda_planar.find(
+                  "p.snapshots,p.snapshot_stride_floats,p.max_snapshot_rows,"
+                  "p.rows.lengthOwner(),stream,p.recurrence_layout)"),
+              std::string::npos)
+        << "The actual typed production route must forward the source-owned live "
+           "rows and snapshot/layout authority without a host shadow.";
+    EXPECT_EQ(cuda_planar.find("cudaDeviceSynchronize"), std::string::npos);
+    EXPECT_EQ(cuda_planar.find("cudaStreamSynchronize"), std::string::npos);
 
     const auto cuda_body = stripCommentsAndStringLiterals(sliceBetween(
         cuda_source,

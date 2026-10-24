@@ -337,7 +337,7 @@ namespace llaminar2
 
         json layoutToJson(const PrefixPayloadLayout &layout)
         {
-            return {
+            json result{
                 {"device_type", static_cast<int>(layout.device.type)},
                 {"device_ordinal", layout.device.ordinal},
                 {"block_size", layout.block_size},
@@ -376,6 +376,16 @@ namespace llaminar2
                 {"includes_terminal_hidden", layout.includes_terminal_hidden},
                 {"includes_terminal_logits", layout.includes_terminal_logits},
             };
+            if (layout.includes_hybrid_state)
+            {
+                if (layout.hybrid_host_state_bytes > 0)
+                    result["hybrid_host_recurrence_layout"] =
+                        static_cast<uint8_t>(layout.hybrid_host_recurrence_layout);
+                if (layout.hybrid_device_state_bytes > 0)
+                    result["hybrid_device_recurrence_layout"] =
+                        static_cast<uint8_t>(layout.hybrid_device_recurrence_layout);
+            }
+            return result;
         }
 
         bool layoutFromJson(const json &value, PrefixPayloadLayout *layout)
@@ -411,6 +421,27 @@ namespace llaminar2
                     value.at("hybrid_device_state_bytes").get<size_t>();
                 layout->hybrid_state_bytes =
                     value.at("hybrid_state_bytes").get<size_t>();
+                // Pure-attention and omitted state sections preserve their legacy archive identity.
+                // A real recurrent payload must authenticate its format before any hydration.
+                if (value.at("includes_hybrid_state").get<bool>())
+                {
+                    const auto read_layout = [&](const char *name)
+                    {
+                        if (!value.at(name).is_number_integer())
+                            throw std::invalid_argument(
+                                "GDN recurrence layout must be an integer word");
+                        const auto word = value.at(name).get<uint64_t>();
+                        if (word > 1)
+                            throw std::invalid_argument("Unknown archived GDN recurrence layout");
+                        return static_cast<GDNRecurrenceStateLayout>(word);
+                    };
+                    if (layout->hybrid_host_state_bytes > 0)
+                        layout->hybrid_host_recurrence_layout =
+                            read_layout("hybrid_host_recurrence_layout");
+                    if (layout->hybrid_device_state_bytes > 0)
+                        layout->hybrid_device_recurrence_layout =
+                            read_layout("hybrid_device_recurrence_layout");
+                }
                 layout->mtp_origin=static_cast<MTPShiftedCacheOrigin>(value.at("mtp_origin").get<uint8_t>());
                 if(!validMTPShiftedCacheOrigin(layout->mtp_origin))throw std::invalid_argument("Unknown archived predictor cache origin");
                 layout->mtp_layers = value.at("mtp_layers").get<int>();

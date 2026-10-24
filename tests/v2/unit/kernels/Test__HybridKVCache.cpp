@@ -12,16 +12,20 @@
 
 #include <gtest/gtest.h>
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
+#include "execution/prefix_cache/PrefixCacheStateProbe.h"
 #include "kernels/HybridKVCacheConfig.h"
 #include "kernels/HybridGDNStateGeometry.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
+#include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
 #include "utils/MPIContext.h"
 #include "backends/DeviceId.h"
 #include "../../utils/TestTensorFactory.h"
 
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -1114,6 +1118,128 @@ namespace llaminar2::test
         HybridKVCacheConfig config;
         EXPECT_FALSE(config.isHybrid());
         EXPECT_EQ(config.countKVLayers(), 0);
+    }
+
+    /** @brief Format changes preserve byte ownership and reject unknown metadata. */
+    TEST(Test__HybridGDNStateGeometry, RecurrenceLayoutPreservesOwnerFootprintAndRejectsUnknown)
+    {
+        using L = GDNRecurrenceStateLayout;
+        const auto original = HybridGDNStateGeometry::resolve(4, 0, 0, 2, 4, 2, 8, 3);
+        const auto transposed =
+            HybridGDNStateGeometry::resolve(4, 0, 0, 2, 4, 2, 8, 3, L::ValueMajorKeyContiguous);
+        auto config = makeQwen35_08B_Config();
+        EXPECT_EQ(config.gdnStateGeometry().recurrence_layout, L::KeyMajorValueContiguous);
+        config.recurrence_layout = L::ValueMajorKeyContiguous;
+        EXPECT_EQ(config.gdnStateGeometry().recurrence_layout, L::ValueMajorKeyContiguous);
+        EXPECT_EQ(original.recurrence_layout, L::KeyMajorValueContiguous);
+        EXPECT_EQ(transposed.recurrence_layout, L::ValueMajorKeyContiguous);
+        EXPECT_EQ(original.local_recurrence_state_floats, transposed.local_recurrence_state_floats);
+        EXPECT_EQ(original.full_recurrence_state_floats, transposed.full_recurrence_state_floats);
+        EXPECT_EQ(original.deviceSerializedPayloadBytes(3),
+                  transposed.deviceSerializedPayloadBytes(3));
+        std::array<float, 16> storage{};
+        GDNDeviceStateBinding binding;
+        binding.primary_state = storage.data();
+        binding.primary_state_floats = 16;
+        binding.request_state_bank = storage.data();
+        binding.request_state_bank_floats = storage.size();
+        binding.request_capacity = 1;
+        ASSERT_TRUE(binding.valid());
+        EXPECT_EQ(binding.recurrence_layout, L::KeyMajorValueContiguous);
+        binding.recurrence_layout = L::ValueMajorKeyContiguous;
+        EXPECT_TRUE(binding.valid()); // Metadata represents both implemented native orientations.
+        binding.recurrence_layout = static_cast<L>(255);
+        EXPECT_FALSE(binding.valid());
+        EXPECT_THROW(HybridGDNStateGeometry::resolve(4, 0, 0, 2, 4, 2, 8, 3, static_cast<L>(255)),
+                     std::invalid_argument);
+    }
+
+    /** @brief Same-sized foreign physical state must fail before any payload read/write. */
+    TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRejectsSameSizeForeignLayoutBeforeImport)
+    {
+        using L = GDNRecurrenceStateLayout;
+        auto cache = createCache();
+        auto *state = cache->getGDNState(0);
+        ASSERT_NE(state, nullptr);
+        ASSERT_FALSE(state->recurrence_state.empty());
+        state->recurrence_state[0] = 0.125f;
+        const auto original = state->recurrence_state;
+        const auto metadata = cache->hybridPrefixStateMetadata();
+        ASSERT_GT(metadata.host_bytes, 0u);
+        HybridPrefixStateDescriptor request;
+        request.seq_idx = 0;
+        request.include_device_state = false;
+        request.host_recurrence_layout = L::ValueMajorKeyContiguous;
+        EXPECT_FALSE(hybridPrefixStateLayoutsMatch(metadata, request));
+        // This non-null deliberately unreadable address proves admission runs
+        // before copying a payload whose capacity alone would look compatible.
+        const auto *unreadable = reinterpret_cast<const void *>(std::uintptr_t{1});
+        EXPECT_FALSE(cache->importHybridPrefixState(request, unreadable, nullptr));
+        EXPECT_FALSE(
+            cache->exportHybridPrefixState(request, const_cast<void *>(unreadable), nullptr));
+        EXPECT_EQ(state->recurrence_state, original);
+        request.host_recurrence_layout = L::KeyMajorValueContiguous;
+        EXPECT_TRUE(hybridPrefixStateLayoutsMatch(metadata, request));
+        request.host_recurrence_layout = static_cast<L>(255);
+        EXPECT_FALSE(hybridPrefixStateLayoutsMatch(metadata, request));
+        HybridPrefixStateMetadata device_metadata;
+        device_metadata.device_bytes = metadata.host_bytes; // Identical physical capacity.
+        device_metadata.device_recurrence_layout = L::ValueMajorKeyContiguous;
+        request = {};
+        request.include_host_state = false;
+        EXPECT_FALSE(hybridPrefixStateLayoutsMatch(device_metadata, request));
+        request.device_recurrence_layout = L::ValueMajorKeyContiguous;
+        EXPECT_TRUE(hybridPrefixStateLayoutsMatch(device_metadata, request));
+    }
+
+    /** @brief Same-capacity speculative banks cannot be rebound using foreign inner axes. */
+    TEST(Test__HybridGDNStateGeometry, SnapshotBindingsRejectForeignLayoutBeforeMutation)
+    {
+        CPUGatedDeltaNet kernel;
+        using L = GDNRecurrenceStateLayout;
+        float storage[6]{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+        EXPECT_EQ(kernel.recurrenceStateLayout(), L::KeyMajorValueContiguous);
+        EXPECT_NO_THROW(
+            kernel.bindRecurrenceStateCaptureWorkspace(storage, 1, 6, L::KeyMajorValueContiguous));
+        EXPECT_NO_THROW(
+            kernel.bindRecurrenceSpeculativeWorkspace(storage, 6, L::KeyMajorValueContiguous));
+        EXPECT_THROW(
+            kernel.bindRecurrenceStateCaptureWorkspace(storage, 1, 6, L::ValueMajorKeyContiguous),
+            std::invalid_argument);
+        EXPECT_THROW(kernel.bindRecurrenceSpeculativeWorkspace(storage, 6, static_cast<L>(255)),
+                     std::invalid_argument);
+        float restored[6]{};
+        ASSERT_TRUE(kernel.restoreVerifierStateCaptureRow(restored, 0, nullptr));
+        for (int i = 0; i < 6; ++i)
+            EXPECT_EQ(restored[i], storage[i]);
+        EXPECT_NO_THROW(
+            kernel.bindRecurrenceStateCaptureWorkspace(nullptr, 0, 6, L::KeyMajorValueContiguous));
+        EXPECT_NO_THROW(
+            kernel.bindRecurrenceSpeculativeWorkspace(nullptr, 6, L::KeyMajorValueContiguous));
+    }
+
+    /** @brief Rectangular diagnostic values preserve every logical coordinate and signed-zero bit.
+     */
+    TEST(Test__HybridGDNStateGeometry, DiagnosticCoordinatesPreserveRectangularStateBytes)
+    {
+        using L = GDNRecurrenceStateLayout;
+        std::vector<float> physical{
+            0.0f, 3.0f, 1.0f, 4.0f, 2.0f, 5.0f, -0.0f, 9.0f, 7.0f, 10.0f, 8.0f, 11.0f};
+        const std::vector<float> expected{
+            0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, -0.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f};
+        canonicalizeRecurrenceValuesForPrefixProbe(physical, 2, 3, L::ValueMajorKeyContiguous);
+        ASSERT_EQ(physical.size(), expected.size());
+        EXPECT_EQ(std::memcmp(physical.data(), expected.data(), physical.size() * sizeof(float)),
+                  0);
+        canonicalizeRecurrenceValuesForPrefixProbe(physical, 2, 3, L::KeyMajorValueContiguous);
+        EXPECT_EQ(std::memcmp(physical.data(), expected.data(), physical.size() * sizeof(float)),
+                  0);
+        EXPECT_THROW(
+            canonicalizeRecurrenceValuesForPrefixProbe(physical, 2, 5, L::ValueMajorKeyContiguous),
+            std::invalid_argument);
+        EXPECT_THROW(
+            canonicalizeRecurrenceValuesForPrefixProbe(physical, 2, 3, static_cast<L>(255)),
+            std::invalid_argument);
     }
 
 } // namespace llaminar2::test

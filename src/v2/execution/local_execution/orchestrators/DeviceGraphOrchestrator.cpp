@@ -3805,6 +3805,8 @@ namespace llaminar2
             desc.logical_token_count = logical_token_count;
             desc.stream = stream;
             desc.synchronize = synchronize;
+            desc.host_recurrence_layout = handle->layout.hybrid_host_recurrence_layout;
+            desc.device_recurrence_layout = handle->layout.hybrid_device_recurrence_layout;
             desc.include_host_state = handle->layout.hybrid_host_state_bytes > 0;
             desc.include_device_state = handle->layout.hybrid_device_state_bytes > 0;
             if (!hybrid->exportHybridPrefixState(
@@ -3853,6 +3855,8 @@ namespace llaminar2
             desc.logical_token_count = handle.key.token_start + handle.key.token_count;
             desc.stream = stream;
             desc.synchronize = synchronize;
+            desc.host_recurrence_layout = handle.layout.hybrid_host_recurrence_layout;
+            desc.device_recurrence_layout = handle.layout.hybrid_device_recurrence_layout;
             desc.include_host_state = handle.layout.hybrid_host_state_bytes > 0;
             desc.include_device_state = handle.layout.hybrid_device_state_bytes > 0;
             if (restore_for_suffix_prefill &&
@@ -16484,6 +16488,12 @@ namespace llaminar2
             if (config.hasGDN() && !config.layer_types.empty())
             {
                 hybrid_config_storage = std::make_unique<HybridKVCacheConfig>();
+                // Freeze the physical recurrence format before bank allocation.
+                // Every graph, snapshot and prefix payload consumes that owner;
+                // execution never rereads this diagnostic environment policy.
+                hybrid_config_storage->recurrence_layout = gdnRecurrenceStateLayoutForDevice(
+                    device, debugEnv().execution.cuda_gdn_state_layout,
+                    debugEnv().execution.rocm_gdn_state_layout);
                 hybrid_config_storage->first_layer_index = kv_config.first_layer_index;
                 const int first_layer = std::max(0, kv_config.first_layer_index);
                 const int layer_count = std::max(0, kv_config.num_layers);
@@ -46129,6 +46139,19 @@ namespace llaminar2
                                     {"hybrid_state_bytes", std::to_string(prefix_layout_.hybrid_state_bytes)},
                                 }
                               : std::vector<PrefixFingerprintField>{{"enabled", "false"}};
+        if (prefix_layout_.includes_hybrid_state)
+        {
+            const auto *hybrid = dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get());
+            if (!hybrid)
+                throw std::logic_error("Hybrid prefix identity requires canonical cache metadata");
+            const auto metadata = hybrid->hybridPrefixStateMetadata();
+            appendGDNStateLayoutFingerprintFields(
+                material.hybrid,
+                metadata.host_bytes > 0 ? std::optional{metadata.host_recurrence_layout}
+                                        : std::nullopt,
+                metadata.device_bytes > 0 ? std::optional{metadata.device_recurrence_layout}
+                                          : std::nullopt);
+        }
         material.mtp = config.mtp.enabled
                            ? std::vector<PrefixFingerprintField>{
                                  {"enabled", "true"},
@@ -47744,24 +47767,37 @@ namespace llaminar2
                         ? const_cast<void *>(
                               terminal_handle.deviceHybridData())
                         : prefix_archive_device_staging_->hybrid.devicePtr();
-                if (!hybrid || !terminal_handle.has_hybrid_state ||
+                // Authenticate the source before queuing even the archive staging copy.
+                HybridPrefixStateDescriptor source_format;
+                source_format.include_host_state = false;
+                source_format.include_device_state = true;
+                source_format.host_recurrence_layout =
+                    terminal_handle.layout.hybrid_host_recurrence_layout;
+                source_format.device_recurrence_layout =
+                    terminal_handle.layout.hybrid_device_recurrence_layout;
+                if (!hybrid ||
+                    !hybridPrefixStateLayoutsMatch(hybrid->hybridPrefixStateMetadata(),
+                                                   source_format) ||
+                    !terminal_handle.has_hybrid_state ||
                     terminal_handle.layout.hybrid_host_state_bytes != 0 ||
-                    terminal_handle.layout.hybrid_device_state_bytes == 0 ||
-                    !hybrid_staging ||
-                    (!terminal_device_hot &&
-                     (!terminal_handle.hybrid_payload ||
-                      !prefix_backend->hostToDeviceOnStream(
-                          hybrid_staging,
-                          terminal_handle.hybrid_payload,
-                          terminal_handle.layout.hybrid_device_state_bytes,
-                          state_.device_id.gpu_ordinal(),
-                          stream))))
+                    terminal_handle.layout.hybrid_device_state_bytes == 0 || !hybrid_staging ||
+                    (!terminal_device_hot && (!terminal_handle.hybrid_payload ||
+                                              !prefix_backend->hostToDeviceOnStream(
+                                                  hybrid_staging,
+                                                  terminal_handle.hybrid_payload,
+                                                  terminal_handle.layout.hybrid_device_state_bytes,
+                                                  state_.device_id.gpu_ordinal(),
+                                                  stream))))
                 {
                     hybrid_imported = false;
                 }
                 else
                 {
                     HybridPrefixStateDescriptor desc;
+                    desc.host_recurrence_layout =
+                        terminal_handle.layout.hybrid_host_recurrence_layout;
+                    desc.device_recurrence_layout =
+                        terminal_handle.layout.hybrid_device_recurrence_layout;
                     desc.seq_idx = seq_idx;
                     desc.logical_token_count =
                         terminal_handle.key.token_start +
@@ -48797,6 +48833,9 @@ namespace llaminar2
                     else
                     {
                         HybridPrefixStateDescriptor desc;
+                        desc.host_recurrence_layout = block_layout.hybrid_host_recurrence_layout;
+                        desc.device_recurrence_layout =
+                            block_layout.hybrid_device_recurrence_layout;
                         desc.seq_idx = 0;
                         desc.logical_token_count =
                             key.token_start + key.token_count;

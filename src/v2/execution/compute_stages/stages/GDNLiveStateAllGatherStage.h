@@ -70,6 +70,23 @@ namespace llaminar2
         /** @brief Enqueue both state gathers and device-side reassemblies. */
         bool execute(IDeviceContext *ctx) override;
 
+        /** @return Immutable head-block orientation included in native graph identity. */
+        uint64_t graphCaptureVariantSignature() const override;
+
+        /** @return Layout agreement runs only at graph materialization, never retained replay. */
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return GraphLaunchPreparationPolicy::CaptureOnly;
+        }
+
+        /**
+         * @brief Authenticate identical opaque recurrence head blocks across the existing clique.
+         * @param ctx Exact participant context.
+         * @param stream Explicit graph capture stream.
+         * @return False before capture on a peer format mismatch or the standard lifecycle timeout.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+
         /** @brief Return the stable stage type used by graph diagnostics. */
         ComputeStageType type() const override
         {

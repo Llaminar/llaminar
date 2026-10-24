@@ -8162,6 +8162,29 @@ namespace llaminar2::test
             }
         }
 
+        // Persistent format is owned by the bound kernel, independently of
+        // planar/merged input coordinates. This source contract protects the
+        // real producer; native/model tests assert the resulting record values.
+        const std::string recurrence = readFile(
+            source_root / "execution/compute_stages/stages/GDNRecurrenceStage.cpp");
+        const size_t accepted = recurrence.find("if (!ok)");
+        const size_t domain_gate = recurrence.find(
+            "PerfStatsCollector::isDomainEnabled(\"gdn_recurrence\")", accepted);
+        const size_t submission = recurrence.find(
+            "\"gdn_recurrence\", \"input_layout_submission\"", domain_gate);
+        ASSERT_NE(accepted, std::string::npos);
+        ASSERT_NE(domain_gate, std::string::npos);
+        ASSERT_NE(submission, std::string::npos);
+        const size_t end = recurrence.find("});", submission);
+        ASSERT_NE(end, std::string::npos);
+        const std::string dimensions = withoutWhitespace(
+            recurrence.substr(submission, end + 3 - submission));
+        EXPECT_NE(dimensions.find(
+            "{\"state_layout\",std::string(gdnRecurrenceStateLayoutName("
+            "params_.kernel->recurrenceStateLayout()))}"), std::string::npos)
+            << "Successful recurrence submission must report the actual bound "
+               "state owner, never an environment guess or a default layout";
+
         EXPECT_TRUE(violations.empty())
             << "Production instrumentation must use an exact PerfStats domain; "
                "broad enablement changes unrelated execution scheduling. First "

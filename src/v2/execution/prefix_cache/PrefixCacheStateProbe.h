@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "kernels/common/GDNRecurrenceStateLayout.h"
 
 #include "backends/DeviceId.h"
 #include "execution/config/RuntimeConfig.h"
@@ -268,6 +269,10 @@ namespace llaminar2
     struct PrefixGDNLayerProbe
     {
         int global_layer = 0;
+        GDNRecurrenceStateLayout recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Physical source format;
+                                                               ///< diagnostic values are canonical
+                                                               ///< key-major.
         size_t recurrence_values = 0;
         size_t conv_values = 0;
         uint64_t recurrence_hash = 0;
@@ -521,6 +526,19 @@ namespace llaminar2
         const IKVCache &cache,
         void *stream,
         const PrefixProbeCapturePolicy &capture_policy);
+
+    /**
+     * @brief Canonicalize an explicit diagnostic copy to [head, key, value] coordinates.
+     * @param values Complete observed matrices; never live cache storage.
+     * @param key_width Positive key width.
+     * @param value_width Positive value width, independently validated for rectangular heads.
+     * @param layout Authenticated physical source format.
+     * @throws std::invalid_argument For unknown format or incomplete/overflowing matrix geometry.
+     */
+    void canonicalizeRecurrenceValuesForPrefixProbe(std::vector<float> &values,
+                                                    int key_width,
+                                                    int value_width,
+                                                    GDNRecurrenceStateLayout layout);
 
     uint64_t hashFloatBufferForPrefixProbe(const float *values, size_t count);
     uint64_t hashByteBufferForPrefixProbe(const void *values, size_t bytes);

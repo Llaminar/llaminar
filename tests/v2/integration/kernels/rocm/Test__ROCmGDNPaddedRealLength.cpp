@@ -130,12 +130,23 @@ namespace
      */
     struct HipGDNStateOwner
     {
+        /**
+         * @brief Bind the sole test-owned persistent banks before capture.
+         * @param kernel Concrete backend owner receiving one immutable binding.
+         * @param primary_state_floats Primary recurrence geometry.
+         * @param secondary_state_floats Optional independent local-TP geometry.
+         * @param request_capacity Admitted independent request-bank slots.
+         * @param recurrence_layout Canonical format fixed for all recurrence banks.
+         * @details Default KeyMajor preserves every existing fixture; history
+         * buffers use the same binding type but never enter recurrence math.
+         */
         template <typename Kernel>
         HipGDNStateOwner(
             Kernel &kernel,
             int primary_state_floats,
             int secondary_state_floats = 0,
-            int request_capacity = 2)
+            int request_capacity = 2,
+            GDNRecurrenceStateLayout recurrence_layout = GDNRecurrenceStateLayout::KeyMajorValueContiguous)
             : primary_(
                   secondary_state_floats > 0 &&
                           secondary_state_floats != primary_state_floats
@@ -168,6 +179,7 @@ namespace
                 .request_state_bank = requests_->ptr,
                 .request_state_bank_floats = requests_->count,
                 .request_capacity = request_capacity,
+                .recurrence_layout = recurrence_layout,
             };
             if (!kernel.bindDeviceState(binding))
                 throw std::runtime_error(
@@ -213,6 +225,22 @@ namespace
             checkHip(hipMalloc(reinterpret_cast<void **>(&ptr), host.size() * sizeof(int)), "hipMalloc(int[])");
             checkHip(hipMemcpy(ptr, host.data(), host.size() * sizeof(int), hipMemcpyHostToDevice),
                      "hipMemcpy host-to-device(int[])");
+        }
+
+        /**
+         * @brief Own exactly the authored integer array, distinct from scalar initialization.
+         * @param values Nonempty initial device metadata, copied before capture.
+         * @details The integer constructor initializes one value; it is not a
+         * capacity argument. Array callers pass their actual authored extent.
+         */
+        explicit HipIntBuffer(const std::vector<int>& values)
+        {
+            if(values.empty())
+                throw std::invalid_argument("HIP integer metadata requires a nonempty array");
+            checkHip(hipMalloc(reinterpret_cast<void **>(&ptr), values.size() * sizeof(int)),
+                     "hipMalloc(authored int[])");
+            checkHip(hipMemcpy(ptr, values.data(), values.size() * sizeof(int), hipMemcpyHostToDevice),
+                     "hipMemcpy authored host-to-device(int[])");
         }
 
         ~HipIntBuffer()
@@ -4322,5 +4350,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceAdditiveEpsilonNearZeroCaptured)
 #include "ROCmGDNPairedNormalizationPerf.h"
 #include "ROCmGDNMergedTrial.h"
 #include "ROCmGDNMergedExtendedTrial.h"
+#include "ROCmGDNValueMajorProductionTest.h"
+#include "ROCmGDNValueMajorCompletePerf.h"
 
 #endif

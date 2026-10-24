@@ -76,6 +76,92 @@ namespace
     };
 }
 
+/** @brief State format names are exact and do not introduce implicit mode aliases. */
+TEST(Test__DeterministicMode, GDNStateLayoutNamesAreClosed)
+{
+    for (const auto layout : {GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+                              GDNRecurrenceStateLayout::ValueMajorKeyContiguous})
+        EXPECT_EQ(parseGDNRecurrenceStateLayout(gdnRecurrenceStateLayoutName(layout)), layout);
+    for (const auto invalid : {"", "auto", "native", "key_major", "value_major",
+                              "value_major_key_contiguous ", "KEY_MAJOR_VALUE_CONTIGUOUS"})
+        EXPECT_THROW((void)parseGDNRecurrenceStateLayout(invalid), std::invalid_argument);
+}
+
+/** @brief Every device ordinal consumes only its own backend's immutable policy. */
+TEST(Test__DeterministicMode, GDNStateLayoutBackendPoliciesAreIndependent)
+{
+    using Layout = GDNRecurrenceStateLayout;
+    for (const auto cuda_layout : {Layout::KeyMajorValueContiguous, Layout::ValueMajorKeyContiguous})
+        for (const auto rocm_layout : {Layout::KeyMajorValueContiguous, Layout::ValueMajorKeyContiguous})
+            for (int ordinal = 0; ordinal != 8; ++ordinal)
+            {
+                EXPECT_EQ(gdnRecurrenceStateLayoutForDevice(DeviceId::cuda(ordinal), cuda_layout, rocm_layout), cuda_layout);
+                EXPECT_EQ(gdnRecurrenceStateLayoutForDevice(DeviceId::rocm(ordinal), cuda_layout, rocm_layout), rocm_layout);
+                EXPECT_EQ(gdnRecurrenceStateLayoutForDevice(DeviceId(DeviceType::CPU, ordinal), cuda_layout, rocm_layout),
+                          Layout::KeyMajorValueContiguous);
+            }
+    EXPECT_THROW((void)gdnRecurrenceStateLayoutForDevice(DeviceId::invalid(),
+        Layout::KeyMajorValueContiguous, Layout::KeyMajorValueContiguous), std::invalid_argument);
+    EXPECT_THROW((void)gdnRecurrenceStateLayoutForDevice(DeviceId(static_cast<DeviceType>(255), 0),
+        Layout::KeyMajorValueContiguous, Layout::KeyMajorValueContiguous), std::invalid_argument);
+    EXPECT_THROW((void)gdnRecurrenceStateLayoutForDevice(DeviceId::cpu(),
+        static_cast<Layout>(255), Layout::KeyMajorValueContiguous), std::invalid_argument);
+    EXPECT_THROW((void)gdnRecurrenceStateLayoutForDevice(DeviceId::rocm(0),
+        Layout::KeyMajorValueContiguous, static_cast<Layout>(255)), std::invalid_argument);
+}
+
+/** @brief Reload restores defaults and cannot mutate a previously copied bank policy. */
+TEST(Test__DeterministicMode, GDNStateLayoutReloadRetainsOnlyExplicitOverrides)
+{
+    using Layout = GDNRecurrenceStateLayout;
+    ScopedEnv defaults({{"LLAMINAR_CUDA_GDN_STATE_LAYOUT", nullptr},
+                        {"LLAMINAR_ROCM_GDN_STATE_LAYOUT", nullptr}});
+    ExecutionConfig policy;
+    EXPECT_EQ(kDefaultCUDAGDNStateLayout, Layout::KeyMajorValueContiguous);
+    EXPECT_EQ(kDefaultROCmGDNStateLayout, Layout::ValueMajorKeyContiguous);
+    EXPECT_EQ(policy.cuda_gdn_state_layout, kDefaultCUDAGDNStateLayout);
+    EXPECT_EQ(policy.rocm_gdn_state_layout, kDefaultROCmGDNStateLayout);
+    const auto original = gdnRecurrenceStateLayoutForDevice(DeviceId::rocm(3),
+        policy.cuda_gdn_state_layout, policy.rocm_gdn_state_layout);
+    for (const auto selected : {Layout::KeyMajorValueContiguous, Layout::ValueMajorKeyContiguous})
+    {
+        // KeyMajor now differs from ROCm's default. Both explicit programs must
+        // remain selectable, and neither may change the copied bank policy.
+        ScopedEnv rocm({{"LLAMINAR_ROCM_GDN_STATE_LAYOUT", gdnRecurrenceStateLayoutName(selected).data()}});
+        policy.reload();
+        EXPECT_EQ(policy.cuda_gdn_state_layout, kDefaultCUDAGDNStateLayout);
+        EXPECT_EQ(policy.rocm_gdn_state_layout, selected);
+        EXPECT_EQ(original, Layout::ValueMajorKeyContiguous);
+    }
+    policy.reload();
+    EXPECT_EQ(policy.rocm_gdn_state_layout, kDefaultROCmGDNStateLayout);
+    for (const auto selected : {Layout::KeyMajorValueContiguous, Layout::ValueMajorKeyContiguous})
+    {
+        ScopedEnv cuda({{"LLAMINAR_CUDA_GDN_STATE_LAYOUT", gdnRecurrenceStateLayoutName(selected).data()}});
+        policy.reload();
+        EXPECT_EQ(policy.cuda_gdn_state_layout, selected);
+        EXPECT_EQ(policy.rocm_gdn_state_layout, kDefaultROCmGDNStateLayout);
+        EXPECT_EQ(gdnRecurrenceStateLayoutForDevice(DeviceId::cpu(),
+            policy.cuda_gdn_state_layout, policy.rocm_gdn_state_layout), Layout::KeyMajorValueContiguous);
+    }
+    policy.reload();
+    EXPECT_EQ(policy.cuda_gdn_state_layout, kDefaultCUDAGDNStateLayout);
+    EXPECT_EQ(policy.rocm_gdn_state_layout, kDefaultROCmGDNStateLayout);
+}
+
+/** @brief An explicit malformed environment setting fails cold admission. */
+TEST(Test__DeterministicMode, GDNStateLayoutMalformedEnvironmentIsRejected)
+{
+    ScopedEnv defaults({{"LLAMINAR_CUDA_GDN_STATE_LAYOUT", nullptr},
+                        {"LLAMINAR_ROCM_GDN_STATE_LAYOUT", nullptr}});
+    for (const auto name : {"LLAMINAR_CUDA_GDN_STATE_LAYOUT", "LLAMINAR_ROCM_GDN_STATE_LAYOUT"})
+    {
+        ASSERT_EQ(setenv(name, "auto", 1), 0);
+        EXPECT_THROW((void)ExecutionConfig{}, std::invalid_argument);
+        EXPECT_EQ(unsetenv(name), 0);
+    }
+}
+
 /** @brief HC-up correction is explicit, strict, and independent of other arithmetic. */
 TEST(Test__DeterministicMode, FlashNextHCUpActivationPolicyIsExplicit)
 {

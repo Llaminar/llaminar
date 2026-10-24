@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "execution/mtp/MTPShiftedCacheOrigin.h"
+#include "kernels/common/GDNRecurrenceStateLayout.h"
 #include "kernels/qwen4exp/Qwen4ExpArchiveGeometry.h"
 
 #include "backends/DeviceId.h"
@@ -64,6 +65,12 @@ namespace llaminar2
         size_t hybrid_host_state_bytes = 0;
         size_t hybrid_device_state_bytes = 0;
         size_t hybrid_state_bytes = 0;
+        GDNRecurrenceStateLayout hybrid_host_recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Authenticated serialized host
+                                                               ///< orientation.
+        GDNRecurrenceStateLayout hybrid_device_recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Authenticated serialized device
+                                                               ///< orientation.
         MTPShiftedCacheOrigin mtp_origin=MTPShiftedCacheOrigin::SuccessorPairsOnly; ///< Source-authenticated cache block coordinates.
         int mtp_layers = 0;
         int mtp_local_kv_heads = 0;

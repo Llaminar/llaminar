@@ -12,7 +12,9 @@
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
+#include "kernels/common/GDNRecurrenceStateLayout.h"
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,6 +52,19 @@ namespace llaminar2
         std::vector<PrefixFingerprintField> moe;
         std::vector<PrefixFingerprintField> mtp;
     };
+
+    /**
+     * @brief Seal host/device recurrence formats before persisted prefix lookup.
+     * @param fields Canonical hybrid compatibility category.
+     * @param host_layout Authenticated host representation, absent without a host payload section.
+     * @param device_layout Authenticated device representation, absent without a device payload
+     * section.
+     * @throws std::invalid_argument For unknown layout or duplicate authority.
+     */
+    void
+    appendGDNStateLayoutFingerprintFields(std::vector<PrefixFingerprintField> &fields,
+                                          std::optional<GDNRecurrenceStateLayout> host_layout,
+                                          std::optional<GDNRecurrenceStateLayout> device_layout);
 
     /**
      * @brief Bind persisted state to the immutable projection arithmetic choices.

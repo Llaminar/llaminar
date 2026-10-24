@@ -20,6 +20,8 @@
  * order. Long prefill double-buffers bounded input tiles in shared memory;
  * prefetch changes memory scheduling, never the causal recurrence or its
  * arithmetic. Persistent state is loaded/committed once per captured launch.
+ * The cache binding fixes KeyMajor or ValueMajor state for its entire lifetime;
+ * state/snapshot endpoints implement that physical format without conversion.
  */
 
 #include "../../common/GatedNormActivation.h"
@@ -27,6 +29,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNPlanarRecurrence.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -201,6 +204,115 @@ namespace
         asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     }
 
+    using llaminar2::GDNRecurrenceStateLayout;
+
+    /**
+     * @brief Address one logical state coordinate in its immutable physical format.
+     * @tparam StateLayout Cache-owned matrix format; never inferred from shape.
+     * @tparam D_K Exact native key width.
+     * @param key Logical key row.
+     * @param value Logical value column.
+     * @param d_v Native value width, including odd tails.
+     * @return Head-local FP32 element offset, with no conversion or mirror.
+     */
+    template <GDNRecurrenceStateLayout StateLayout, int D_K>
+    __device__ __forceinline__ int cuda_gdn_state_offset(int key, int value, int d_v)
+    {
+        if constexpr (StateLayout == GDNRecurrenceStateLayout::ValueMajorKeyContiguous)
+            return value * D_K + key;
+        else
+            return key * d_v + value;
+    }
+
+    /**
+     * @brief Load a complete register-owned partition from canonical state.
+     * @tparam StateLayout Immutable matrix coordinate authority.
+     * @tparam D_K Native key width.
+     * @tparam Rows Compile-time partition length, eight or sixteen.
+     * @param head Original request/head state base.
+     * @param state Exclusive scalarized register partition.
+     * @param first_key Original ascending key-partition origin.
+     * @param value Valid value column owned by this lane.
+     * @param d_v Original value width.
+     * @details Value-major rows are contiguous per lane. Aligned production banks
+     * use float4 endpoints; raw FP32-only pointers retain exact scalar endpoints.
+     * The one base-alignment branch is outside every causal recurrence loop and
+     * changes no partition, arithmetic, allocation or supported pointer contract.
+     */
+    template <GDNRecurrenceStateLayout StateLayout, int D_K, int Rows>
+    __device__ __forceinline__ void cuda_gdn_load_state_partition(
+        const float* head, float (&state)[Rows], int first_key, int value, int d_v)
+    {
+        if constexpr (StateLayout == GDNRecurrenceStateLayout::ValueMajorKeyContiguous)
+        {
+            static_assert(Rows % 4 == 0);
+            const float* source = head + value * D_K + first_key;
+            if ((reinterpret_cast<std::uintptr_t>(source) & 15u) == 0)
+            {
+#pragma unroll
+                for (int row = 0; row < Rows; row += 4)
+                {
+                    const float4 packed = *reinterpret_cast<const float4*>(source + row);
+                    state[row] = packed.x; state[row + 1] = packed.y;
+                    state[row + 2] = packed.z; state[row + 3] = packed.w;
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (int row = 0; row < Rows; ++row) state[row] = source[row];
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int row = 0; row < Rows; ++row)
+                state[row] = head[(first_key + row) * d_v + value];
+        }
+    }
+
+    /**
+     * @brief Commit one complete resident partition without changing arithmetic.
+     * @tparam StateLayout Immutable matrix coordinate authority.
+     * @tparam D_K Native key width.
+     * @tparam Rows Exact compile-time register partition length.
+     * @param head Original request/head terminal destination.
+     * @param state Register-owned final FP32 values.
+     * @param first_key Original ascending key-partition origin.
+     * @param value Valid value column owned by this lane.
+     * @param d_v Original value width.
+     * @details Odd snapshot strides remain separate scalar coordinate stores.
+     * This endpoint runs once per launch, including empty-live state preservation.
+     */
+    template <GDNRecurrenceStateLayout StateLayout, int D_K, int Rows>
+    __device__ __forceinline__ void cuda_gdn_store_state_partition(
+        float* head, const float (&state)[Rows], int first_key, int value, int d_v)
+    {
+        if constexpr (StateLayout == GDNRecurrenceStateLayout::ValueMajorKeyContiguous)
+        {
+            static_assert(Rows % 4 == 0);
+            float* destination = head + value * D_K + first_key;
+            if ((reinterpret_cast<std::uintptr_t>(destination) & 15u) == 0)
+            {
+#pragma unroll
+                for (int row = 0; row < Rows; row += 4)
+                    *reinterpret_cast<float4*>(destination + row) =
+                        float4{state[row], state[row + 1], state[row + 2], state[row + 3]};
+            }
+            else
+            {
+#pragma unroll
+                for (int row = 0; row < Rows; ++row) destination[row] = state[row];
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int row = 0; row < Rows; ++row)
+                head[(first_key + row) * d_v + value] = state[row];
+        }
+    }
+
     /** @brief Physical operand coordinates; CUDA arithmetic is layout-independent. */
     enum class CUDAGDNInputLayout { ExpandedPlanar, MergedPostConvolution };
 
@@ -209,6 +321,7 @@ namespace
      * @tparam D_K Native64/128 key width.
      * @tparam OutOfPlaceState Preserve original live versus speculative state access.
      * @tparam Layout Explicit immutable physical input coordinates.
+     * @tparam StateLayout Canonical immutable persistent/snapshot matrix format.
      * @param q Planar Q or the original merged post-convolution row.
      * @param k Planar K; unused for merged coordinates.
      * @param v Planar V; unused for merged coordinates.
@@ -235,7 +348,8 @@ namespace
      * one-warp norm tree, eight-part ascending reductions, query-scale constants,
      * rounded state arithmetic and all publication barriers remain literal.
      */
-    template <int D_K, bool OutOfPlaceState, CUDAGDNInputLayout Layout>
+    template <int D_K, bool OutOfPlaceState, CUDAGDNInputLayout Layout,
+        GDNRecurrenceStateLayout StateLayout = GDNRecurrenceStateLayout::KeyMajorValueContiguous>
     __device__ __forceinline__
     void cuda_gdn_recurrent_step_body(
         const float *__restrict__ q,        // [n_heads * d_k]
@@ -311,12 +425,8 @@ namespace
         const int row_begin = split_id * kRowsPerSplit;
         if (vi < d_v)
         {
-#pragma unroll
-            for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
-            {
-                const int state_row = row_begin + local_row;
-                state_rows[local_row] = S_initial[state_row * d_v + vi];
-            }
+            cuda_gdn_load_state_partition<StateLayout, D_K>(
+                S_initial, state_rows, row_begin, vi, d_v);
         }
         else
         {
@@ -505,7 +615,7 @@ namespace
                         k_local[state_row] * delta;
                     state_rows[local_row] = s_new;
                     if (snapshot)
-                        snapshot[state_row * d_v + vi] = s_new;
+                        snapshot[cuda_gdn_state_offset<StateLayout, D_K>(state_row, vi, d_v)] = s_new;
                     partial_out += s_new * q_local[state_row];
                 }
             }
@@ -536,12 +646,8 @@ namespace
             max_snapshot_rows >= request_count * request_seq_len;
         if (vi < d_v && !terminal_state_is_snapshotted)
         {
-#pragma unroll
-            for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
-            {
-                const int state_row = row_begin + local_row;
-                S_updated[state_row * d_v + vi] = state_rows[local_row];
-            }
+            cuda_gdn_store_state_partition<StateLayout, D_K>(
+                S_updated, state_rows, row_begin, vi, d_v);
         }
     }
 
@@ -576,6 +682,45 @@ namespace
     {
         cuda_gdn_recurrent_step_body<
             D_K, OutOfPlaceState, CUDAGDNInputLayout::ExpandedPlanar>(
+            q, k, v, alpha, beta_raw, A_log, dt_bias, output,
+            initial_state, updated_state, request_count, request_seq_len,
+            n_heads, d_v, use_qk_l2norm, effective_seq_len_ptr,
+            effective_row_idx, state_snapshots, snapshot_stride_floats,
+            max_snapshot_rows);
+    }
+
+    /**
+     * @brief Bind the canonical ValueMajor state program to the original CUDA ABI.
+     * @tparam D_K Supported key width64/128.
+     * @tparam OutOfPlaceState Existing exact live/speculative state alias policy.
+     * @details Only state endpoints differ; input coordinates, CUDA norm/order,
+     * output ownership, snapshot guards and launch geometry remain unchanged.
+     */
+    template <int D_K, bool OutOfPlaceState>
+    __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+    void cuda_gdn_value_major_recurrent_step_kernel(
+        const float *__restrict__ q,        // [n_heads * d_k]
+        const float *__restrict__ k,        // [n_heads * d_k]
+        const float *__restrict__ v,        // [n_heads * d_v]
+        const float *__restrict__ alpha,    // [n_heads]
+        const float *__restrict__ beta_raw, // [n_heads]
+        const float *__restrict__ A_log,    // [n_heads]
+        const float *__restrict__ dt_bias,  // [n_heads]
+        float *__restrict__ output,         // [n_heads * d_v]
+        const float *initial_state,
+        float *updated_state,
+        int request_count, int request_seq_len,
+        int n_heads, int d_v,
+        bool use_qk_l2norm,
+        const int *__restrict__ effective_seq_len_ptr,
+        int effective_row_idx,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        cuda_gdn_recurrent_step_body<
+            D_K, OutOfPlaceState, CUDAGDNInputLayout::ExpandedPlanar,
+            GDNRecurrenceStateLayout::ValueMajorKeyContiguous>(
             q, k, v, alpha, beta_raw, A_log, dt_bias, output,
             initial_state, updated_state, request_count, request_seq_len,
             n_heads, d_v, use_qk_l2norm, effective_seq_len_ptr,
@@ -624,6 +769,46 @@ namespace
     }
 
     /**
+     * @brief Bind the canonical ValueMajor state program to the original CUDA ABI.
+     * @tparam D_K Supported key width64/128.
+     * @tparam OutOfPlaceState Existing exact live/speculative state alias policy.
+     * @details Only state endpoints differ; input coordinates, CUDA norm/order,
+     * output ownership, snapshot guards and launch geometry remain unchanged.
+     */
+    template <int D_K, bool OutOfPlaceState>
+    __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+    void cuda_gdn_value_major_merged_recurrent_step_kernel(
+        const float *__restrict__ q,        // [n_heads * d_k]
+        const float *__restrict__ k,        // [n_heads * d_k]
+        const float *__restrict__ v,        // [n_heads * d_v]
+        const float *__restrict__ alpha,    // [n_heads]
+        const float *__restrict__ beta_raw, // [n_heads]
+        const float *__restrict__ A_log,    // [n_heads]
+        const float *__restrict__ dt_bias,  // [n_heads]
+        float *__restrict__ output,         // [n_heads * d_v]
+        const float *initial_state,
+        float *updated_state,
+        int request_count, int request_seq_len,
+        int n_heads, int d_v,
+        bool use_qk_l2norm,
+        const int *__restrict__ effective_seq_len_ptr,
+        int effective_row_idx,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int merged_key_heads, int global_value_offset)
+    {
+        cuda_gdn_recurrent_step_body<
+            D_K, OutOfPlaceState, CUDAGDNInputLayout::MergedPostConvolution,
+            GDNRecurrenceStateLayout::ValueMajorKeyContiguous>(
+            q, k, v, alpha, beta_raw, A_log, dt_bias, output,
+            initial_state, updated_state, request_count, request_seq_len,
+            n_heads, d_v, use_qk_l2norm, effective_seq_len_ptr,
+            effective_row_idx, state_snapshots, snapshot_stride_floats,
+            max_snapshot_rows, merged_key_heads, global_value_offset);
+    }
+
+    /**
      * @brief Launch the fixed CUDA GDN recurrence specialization for a graph.
      *
      * GDN key width is model topology, not a hot-path tuning input. Selecting
@@ -654,8 +839,10 @@ namespace
         float *state_snapshots,
         int snapshot_stride_floats,
         int max_snapshot_rows,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        GDNRecurrenceStateLayout state_layout = GDNRecurrenceStateLayout::KeyMajorValueContiguous)
     {
+        if (!llaminar2::validGDNRecurrenceStateLayout(state_layout)) return false;
         const dim3 grid(
             request_count * n_heads,
             (d_v + kGdnRecurrentColumnsPerBlock - 1) /
@@ -672,7 +859,17 @@ namespace
             request_count, request_seq_len, n_heads, d_v, use_qk_l2norm,       \
             effective_seq_len_ptr, effective_row_idx, state_snapshots,          \
             snapshot_stride_floats, max_snapshot_rows)
+#define LLAMINAR_LAUNCH_CUDA_GDN_VALUE_RECURRENT(D_K, OUT_OF_PLACE)                  \
+    cuda_gdn_value_major_recurrent_step_kernel<D_K, OUT_OF_PLACE>                          \
+        <<<grid, kGdnRecurrentThreads, shared_bytes, stream>>>(                 \
+            q, k, v, alpha, beta_raw, A_log, dt_bias, output,                  \
+            initial_state, updated_state,                                      \
+            request_count, request_seq_len, n_heads, d_v, use_qk_l2norm,       \
+            effective_seq_len_ptr, effective_row_idx, state_snapshots,          \
+            snapshot_stride_floats, max_snapshot_rows)
 
+        if (state_layout == GDNRecurrenceStateLayout::KeyMajorValueContiguous)
+        {
         switch (d_k)
         {
         case 64:
@@ -697,6 +894,35 @@ namespace
             return false;
         }
 
+        }
+        else
+        {
+        switch (d_k)
+        {
+        case 64:
+            if (initial_state == updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_VALUE_RECURRENT(64, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_VALUE_RECURRENT(64, true);
+            break;
+        case 128:
+            if (initial_state == updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_VALUE_RECURRENT(128, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_VALUE_RECURRENT(128, true);
+            break;
+        default:
+            fprintf(
+                stderr,
+                "[%s] unsupported CUDA GDN d_k=%d; capture supports d_k in "
+                "{64,128}\n",
+                caller,
+                d_k);
+            return false;
+        }
+
+        }
+#undef LLAMINAR_LAUNCH_CUDA_GDN_VALUE_RECURRENT
 #undef LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT
 
         const cudaError_t err = cudaGetLastError();
@@ -733,6 +959,7 @@ namespace
      * Padded rows publish zero without updating state or touching input memory.
      *
      * @tparam D_K Supported key width, 64 or 128.
+     * @tparam StateLayout Canonical immutable persistent/snapshot matrix format.
      * @param Q Canonically preprocessed query rows.
      * @param K Canonically preprocessed key rows.
      * @param V Value rows.
@@ -750,8 +977,8 @@ namespace
      * @param n_heads Participant-local head count.
      * @param d_v Value columns per head.
      */
-    template <int D_K>
-    __global__ __launch_bounds__(kGdnPrefillThreads, 4) void cuda_gdn_chunk_forward_kernel(
+    template <int D_K, GDNRecurrenceStateLayout StateLayout>
+    __device__ __forceinline__ void cuda_gdn_chunk_forward_body(
         const float *__restrict__ Q,        // [seq_len, n_heads * d_k]
         const float *__restrict__ K,        // [seq_len, n_heads * d_k]
         const float *__restrict__ V,        // [seq_len, n_heads * d_v]
@@ -833,9 +1060,8 @@ namespace
 
         if (vi < d_v)
         {
-#pragma unroll
-            for (int j = 0; j < ROWS_PER_SPLIT; ++j)
-                sc[j] = S_initial[(j_start + j) * d_v + vi];
+            cuda_gdn_load_state_partition<StateLayout, D_K>(
+                S_initial, sc, j_start, vi, d_v);
         }
         else
         {
@@ -966,7 +1192,7 @@ namespace
                     static_cast<size_t>(h) * static_cast<size_t>(D_K) * static_cast<size_t>(d_v);
 #pragma unroll
                 for (int j = 0; j < ROWS_PER_SPLIT; ++j)
-                    snapshot[(j_start + j) * d_v + vi] = sc[j];
+                    snapshot[cuda_gdn_state_offset<StateLayout, D_K>(j_start + j, vi, d_v)] = sc[j];
             }
             if (has_next_row && tile_row == tile_rows - 1)
             {
@@ -980,10 +1206,67 @@ namespace
 
         if (vi < d_v)
         {
-#pragma unroll
-            for (int j = 0; j < ROWS_PER_SPLIT; ++j)
-                S_updated[(j_start + j) * d_v + vi] = sc[j];
+            cuda_gdn_store_state_partition<StateLayout, D_K>(
+                S_updated, sc, j_start, vi, d_v);
         }
+    }
+
+    /**
+     * @brief Bind one immutable persistent-state format to tiled CUDA prefill.
+     * @tparam D_K Supported key width64/128.
+     * @details Retains the original argument ABI, tiled inputs, eight-part fold,
+     * live-row guards and exact request/snapshot publication. No conversion.
+     */
+    template <int D_K>
+    __global__ __launch_bounds__(kGdnPrefillThreads, 4) void cuda_gdn_chunk_forward_kernel(
+        const float *__restrict__ Q,        // [seq_len, n_heads * d_k]
+        const float *__restrict__ K,        // [seq_len, n_heads * d_k]
+        const float *__restrict__ V,        // [seq_len, n_heads * d_v]
+        const float *__restrict__ decay,    // preprocessed [seq_len, n_heads]
+        const float *__restrict__ beta,     // preprocessed [seq_len, n_heads]
+        float *__restrict__ output,         // [seq_len, n_heads * d_v]
+        const float *initial_state,
+        float *updated_state,
+        const int *__restrict__ effective_seq_len_ptr,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int request_count, int request_seq_len,
+        int n_heads, int d_v)
+    {
+        cuda_gdn_chunk_forward_body<D_K, GDNRecurrenceStateLayout::KeyMajorValueContiguous> (
+            Q, K, V, decay, beta, output, initial_state, updated_state,
+            effective_seq_len_ptr, state_snapshots, snapshot_stride_floats,
+            max_snapshot_rows, request_count, request_seq_len, n_heads, d_v);
+    }
+
+    /**
+     * @brief Bind one immutable persistent-state format to tiled CUDA prefill.
+     * @tparam D_K Supported key width64/128.
+     * @details Retains the original argument ABI, tiled inputs, eight-part fold,
+     * live-row guards and exact request/snapshot publication. No conversion.
+     */
+    template <int D_K>
+    __global__ __launch_bounds__(kGdnPrefillThreads, 4) void cuda_gdn_value_major_chunk_forward_kernel(
+        const float *__restrict__ Q,        // [seq_len, n_heads * d_k]
+        const float *__restrict__ K,        // [seq_len, n_heads * d_k]
+        const float *__restrict__ V,        // [seq_len, n_heads * d_v]
+        const float *__restrict__ decay,    // preprocessed [seq_len, n_heads]
+        const float *__restrict__ beta,     // preprocessed [seq_len, n_heads]
+        float *__restrict__ output,         // [seq_len, n_heads * d_v]
+        const float *initial_state,
+        float *updated_state,
+        const int *__restrict__ effective_seq_len_ptr,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int request_count, int request_seq_len,
+        int n_heads, int d_v)
+    {
+        cuda_gdn_chunk_forward_body<D_K, GDNRecurrenceStateLayout::ValueMajorKeyContiguous> (
+            Q, K, V, decay, beta, output, initial_state, updated_state,
+            effective_seq_len_ptr, state_snapshots, snapshot_stride_floats,
+            max_snapshot_rows, request_count, request_seq_len, n_heads, d_v);
     }
 
     __global__ void cuda_gdn_prefill_preprocess_kernel(
@@ -2338,7 +2621,7 @@ extern "C"
             static_cast<cudaStream_t>(stream));
     }
 
-    bool cudaGDN_chunk_forward_batched_kernel_route(
+    static bool cuda_gdn_chunk_forward_batched_route(
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
@@ -2350,9 +2633,10 @@ extern "C"
         int snapshot_stride_floats,
         int max_snapshot_rows,
         const int *device_effective_seq_len,
-        int device_idx, void *stream)
+        void *stream,
+        GDNRecurrenceStateLayout state_layout = GDNRecurrenceStateLayout::KeyMajorValueContiguous)
     {
-        cudaSetDevice(device_idx);
+        if (!llaminar2::validGDNRecurrenceStateLayout(state_layout)) return false;
         if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
             !output || !initial_state || !updated_state || !stream ||
             seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
@@ -2404,7 +2688,7 @@ extern "C"
                 state_snapshots,
                 snapshot_stride_floats,
                 max_snapshot_rows,
-                static_cast<cudaStream_t>(stream));
+                static_cast<cudaStream_t>(stream), state_layout);
         }
 
         // Eight threads retain one deterministic key-row partition per output
@@ -2438,6 +2722,8 @@ extern "C"
         }
 
         const dim3 grid(n_heads, num_col_blocks, request_count);
+        if (state_layout == GDNRecurrenceStateLayout::KeyMajorValueContiguous)
+        {
         switch (d_k)
         {
         case 64:
@@ -2471,6 +2757,43 @@ extern "C"
                 d_k);
             return false;
         }
+        }
+        else
+        {
+        switch (d_k)
+        {
+        case 64:
+            cuda_gdn_value_major_chunk_forward_kernel<64>
+                <<<grid, col_threads, smem_size, static_cast<cudaStream_t>(stream)>>>(
+                    Q, K, V, alpha, beta_raw,
+                    output, initial_state, updated_state,
+                    device_effective_seq_len,
+                    state_snapshots,
+                    snapshot_stride_floats,
+                    max_snapshot_rows,
+                    request_count, request_seq_len,
+                    n_heads, d_v);
+            break;
+        case 128:
+            cuda_gdn_value_major_chunk_forward_kernel<128>
+                <<<grid, col_threads, smem_size, static_cast<cudaStream_t>(stream)>>>(
+                    Q, K, V, alpha, beta_raw,
+                    output, initial_state, updated_state,
+                    device_effective_seq_len,
+                    state_snapshots,
+                    snapshot_stride_floats,
+                    max_snapshot_rows,
+                    request_count, request_seq_len,
+                    n_heads, d_v);
+            break;
+        default:
+            fprintf(
+                stderr,
+                "[cudaGDN_chunk_forward] unsupported d_k=%d; expected 64 or 128\n",
+                d_k);
+            return false;
+        }
+        }
 
         err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -2494,7 +2817,8 @@ extern "C"
         const int *device_effective_seq_len,
         int device_idx, void *stream)
     {
-        return cudaGDN_chunk_forward_batched_kernel_route(
+        cudaSetDevice(device_idx);
+        return cuda_gdn_chunk_forward_batched_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, initial_state, updated_state,
             seq_len, /*request_count=*/1, /*request_seq_len=*/seq_len,
@@ -2503,7 +2827,7 @@ extern "C"
             snapshot_stride_floats,
             max_snapshot_rows,
             device_effective_seq_len,
-            device_idx, stream);
+            stream);
     }
 
     bool cudaGDN_chunk_forward(
@@ -2586,9 +2910,10 @@ extern "C"
         int max_snapshot_rows,
         int device_idx, void *stream)
     {
+        cudaSetDevice(device_idx);
         if (!device_effective_seq_lens)
             return false;
-        return cudaGDN_chunk_forward_batched_kernel_route(
+        return cuda_gdn_chunk_forward_batched_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, initial_state, updated_state,
             seq_len, request_count, request_seq_len,
@@ -2597,7 +2922,7 @@ extern "C"
             snapshot_stride_floats,
             max_snapshot_rows,
             device_effective_seq_lens,
-            device_idx, stream);
+            stream);
     }
 
     bool cudaGDN_short_conv1d(
@@ -2998,12 +3323,13 @@ namespace llaminar2::gdn
     bool launchCUDAMergedRecurrence(const MergedRecurrenceInput& p, void* stream)
     {
         constexpr auto maximum = std::numeric_limits<int>::max();
-        if (reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+        if (!validGDNRecurrenceStateLayout(p.recurrence_layout) ||
+            reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
             !p.merged || !p.alpha || !p.beta_raw || !p.A_log || !p.dt_bias ||
             !p.output || !p.initial_state || !p.updated_state ||
             p.rows.requests() != 1 || p.rows.rowsPerRequest() != 1 ||
             (p.key_width != 64 && p.key_width != 128) ||
-            !p.sourceOutputDisjoint())
+            !validMergedRecurrenceStorage(p))
             return false;
         const std::int64_t state_floats =
             std::int64_t{p.value_heads} * p.key_width * p.value_width;
@@ -3026,6 +3352,18 @@ namespace llaminar2::gdn
                 p.rows.lengthOwner(), 0, p.snapshots,                        \
                 p.snapshot_stride_floats, p.max_snapshot_rows,               \
                 p.key_heads, p.global_value_offset)
+#define LLAMINAR_LAUNCH_CUDA_GDN_VALUE_MERGED(DK, OUT_OF_PLACE)                    \
+        cuda_gdn_value_major_merged_recurrent_step_kernel<DK, OUT_OF_PLACE>              \
+            <<<grid, kGdnRecurrentThreads, shared_bytes, native_stream>>>(     \
+                p.merged, nullptr, nullptr, p.alpha, p.beta_raw, p.A_log,      \
+                p.dt_bias, p.output, p.initial_state, p.updated_state,         \
+                1, 1, p.value_heads, p.value_width, p.use_qk_l2norm,           \
+                p.rows.lengthOwner(), 0, p.snapshots,                        \
+                p.snapshot_stride_floats, p.max_snapshot_rows,               \
+                p.key_heads, p.global_value_offset)
+        if (p.recurrence_layout == GDNRecurrenceStateLayout::KeyMajorValueContiguous)
+        {
+
         if (p.key_width == 64)
         {
             if (p.initial_state == p.updated_state)
@@ -3040,6 +3378,26 @@ namespace llaminar2::gdn
             else
                 LLAMINAR_LAUNCH_CUDA_GDN_MERGED(128, true);
         }
+        }
+        else
+        {
+
+        if (p.key_width == 64)
+        {
+            if (p.initial_state == p.updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_VALUE_MERGED(64, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_VALUE_MERGED(64, true);
+        }
+        else
+        {
+            if (p.initial_state == p.updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_VALUE_MERGED(128, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_VALUE_MERGED(128, true);
+        }
+        }
+#undef LLAMINAR_LAUNCH_CUDA_GDN_VALUE_MERGED
 #undef LLAMINAR_LAUNCH_CUDA_GDN_MERGED
         const auto error = cudaGetLastError();
         if (error != cudaSuccess)
@@ -3050,4 +3408,63 @@ namespace llaminar2::gdn
         }
         return true;
     }
+    /**
+     * @brief Protect CUDA long-prefill preprocessing writes before any enqueue.
+     * @param p Tuple already admitted by validPlanarRecurrenceStorage.
+     * @return Whether mutable Q/K/alpha/beta planes are pairwise disjoint and
+     * disjoint from original values, learned gates, state and device counts.
+     * @details Small and complete-snapshot programs read their source planes
+     * without mutation and keep legitimate read/read aliases. This is immutable
+     * byte-range admission, not a live-state mirror or allocation ledger.
+     */
+    static bool validCUDAPlanarPreprocessStorage(const PlanarRecurrenceInput& p)
+    {
+        const std::size_t state = std::size_t(p.heads) * p.key_width * p.value_width;
+        const bool complete = p.snapshots && p.snapshot_stride_floats >= state &&
+            p.max_snapshot_rows >= p.rows.physicalRows();
+        if (p.rows.rowsPerRequest() <= 8 || complete) return true;
+        using namespace planar_recurrence_detail;
+        const std::size_t rows = p.rows.physicalRows(), heads = p.heads;
+        Range writes[4]{}, reads[5]{};
+        const void* scratch[]{p.query,p.key,p.alpha,p.beta_raw};
+        const std::size_t qk = rows * heads * p.key_width * sizeof(float);
+        const std::size_t gates = rows * heads * sizeof(float);
+        const std::size_t sizes[]{qk,qk,gates,gates};
+        for (int i=0;i<4;++i) if (!range(scratch[i],sizes[i],writes[i])) return false;
+        const void* immutable[]{p.value,p.A_log,p.dt_bias,p.initial_state,p.rows.lengthOwner()};
+        const std::size_t protected_sizes[]{rows*heads*p.value_width*sizeof(float),
+            heads*sizeof(float),heads*sizeof(float),std::size_t(p.rows.requests())*state*sizeof(float),
+            std::size_t(p.rows.requests())*sizeof(std::int32_t)};
+        for (int i=0;i<5;++i)
+            if (immutable[i] && !range(immutable[i],protected_sizes[i],reads[i])) return false;
+        for (int i=0;i<4;++i)
+        {
+            for (int j=0;j<i;++j) if (overlaps(writes[i],writes[j])) return false;
+            for (auto read:reads) if (overlaps(writes[i],read)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Enqueue native planar CUDA recurrence in its bound persistent format.
+     * @param p Original borrowed operands, device live rows and state authority.
+     * @param stream Exact non-default caller stream; caller selected its device.
+     * @return False before enqueue for invalid geometry/alias/layout/stream.
+     * @details Both layouts share the same preprocessor, scalar/grouped numeric
+     * body and resident-state long-prefill loop. No tensor transpose, mirror,
+     * allocation, transfer or graph node is introduced by state layout.
+     */
+    bool launchCUDAPlanarRecurrence(const PlanarRecurrenceInput& p, void* stream)
+    {
+        if (reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            !validPlanarRecurrenceStorage(p) || !validCUDAPlanarPreprocessStorage(p)) return false;
+        return cuda_gdn_chunk_forward_batched_route(
+            p.query, p.key, p.value, p.alpha, p.beta_raw, p.A_log, p.dt_bias,
+            p.output, p.initial_state, p.updated_state,
+            p.rows.physicalRows(), p.rows.requests(), p.rows.rowsPerRequest(),
+            p.heads, p.key_width, p.value_width, p.normalize_qk,
+            p.snapshots, p.snapshot_stride_floats, p.max_snapshot_rows,
+            p.rows.lengthOwner(), stream, p.recurrence_layout);
+    }
+
 }

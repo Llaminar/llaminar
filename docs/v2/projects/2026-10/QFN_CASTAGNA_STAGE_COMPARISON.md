@@ -1,6 +1,89 @@
 # QFN: Castagna and Llaminar stage comparison
 
-## Attention124: current matched core comparison
+## Fresh checkpoint180 attribution, 2026-10-24
+
+The fresh four-MI50 capture of qualified checkpoint180 passes native exit,
+driver, runtime/source identity, exact work and cleanup checks. The measured
+request has 512 prompt tokens, 256 emitted tokens and 255 after-prefill forwards;
+all emitted IDs match both the qualified180 control and retained Castagna165.
+All 6,461,320 dispatches join successfully, including 6,348,052 captured
+dispatches across 4,108 graph launches. No measured kernel name is unclassified
+at the operation-family level. Complete semantic model-stage attribution is
+still unavailable for some fused and generic kernels.
+
+The table reports the median across four physical GPU pairs of each engine's
+recorded kernel-union time per decode step. It is **instrumented diagnostic
+time**, not request latency or predicted removable time. The output retains
+per-card sums, unions, exclusive intervals and the full overlap partition.
+
+| Source-identified decode portion | Llaminar ms/step | Castagna ms/step |
+|---|---:|---:|
+| GDN convolution, recurrence and output norm | 1.154 | 0.690 |
+| Short-context indexer query projection/preparation nodes | 0.271 | No corresponding work |
+| Main attention core, producer and merge | 0.356 | 0.163 |
+| Vocabulary projection and reducer | 0.290 | 0.260 |
+| HC injection projection | 0.653 | 0.759 |
+
+**GDN is the largest remaining directly comparable gap.** Its paired-card
+median difference is 0.459 ms/step, followed by the guarded indexer nodes at
+0.271 ms and attention at 0.193 ms. Paired medians need not equal the difference
+between separately rounded engine medians. These gaps must not be added into
+an expected throughput gain.
+
+Checkpoint175 skips short-context query arithmetic and weight reads, but
+retains its captured projection and preparation nodes. The fresh trace proves
+12 guarded projection and 12 preparation calls per decode step/GPU. This is
+remaining guarded-dispatch cost; it does not mean the unused query matrix
+product was reintroduced. Prefill still uses its original AllLive query policy.
+The existing measured-work boundary requires ranking first at visible length
+2052; this workload remains below that boundary.
+
+The GDN comparison includes the selected three physical operations, rather
+than every projection or gate in a full GDN layer. Castagna moves some
+normalization into convolution and also quantizes in its output norm. Its
+persistent HC extensions remain indivisible in the full family report.
+The attention layouts retain Q6 across 12 layers per Llaminar GPU versus Q12
+across 6 active Castagna layers per GPU. Arithmetic and grouping differ.
+HC injection is now ahead on all four cards; the separate HC-down/up fusion
+screen182 concerns a different operation.
+
+The [three-way GDN structure map](QFN_GDN_STRUCTURE_COMPARISON.md) compares
+Llaminar ROCm/CUDA with the fork's observed HIP program. Independent component
+service sums locate the main deficit in recurrence: 682.274 versus 221.521
+µs/step/GPU. These are sums of kernel durations, not the union values above.
+The fork uses FP32 recurrence with a different state layout, more lanes per
+column, fewer registers and no recurrence LDS/barriers. It also computes Q/K
+normalization at convolution once per key head; our current recurrence repeats
+it 12 times. The map records arithmetic differences and required tests before
+transferring these structures.
+
+The complete 512-row prefill is retained separately, including Castagna's
+320+188+4 physical chunks. Attention-core time is 11.670 versus 4.028 µs per
+prompt row/GPU. Prefill tuning remains secondary to the decode target.
+The four-device report also retains active-kernel unions and concurrent-GPU
+intervals. Kernel-free intervals are not identified as host idle. Large
+instrumented collective waits are not unprofiled communication costs.
+
+Unprofiled production evidence remains checkpoint180's 819.594 prefill /
+41.030 decode tok/s; this capture supplies no new throughput score. The
+42.959 Castagna decode target remains open. The source-only next-step reviews
+focus on the GDN components and a proven short-context graph variant that
+could omit the guarded query launches entirely, without host live-state mirrors
+or hot-path recapture.
+
+[Fresh trace](../../../../parity-results/qwen-flash-next/direct180-stage-trace-r1/result.json),
+[complete graph join](../../../../parity-results/qwen-flash-next/direct180-stage-join-r1/joined-dispatches.json),
+[native-family intervals](../../../../parity-results/qwen-flash-next/direct180-stage-intervals-r1/intervals.json),
+[paired core admission](../../../../parity-results/qwen-flash-next/direct180-attention-core-comparison-r1/attention-core.json)
+and [full comparison](../../../../parity-results/qwen-flash-next/direct180-stage-comparison-r1/stages.json)
+retain the exact evidence. The Castagna side is the admitted retained165 trace,
+not a new run; its shared GGUF identities, source/runtime receipts, complete
+trajectory and four physical PCI pairings were reauthenticated. The source
+view proves committed 819496597 code equals qualified180's 1309a0fe plus its
+original source patch. Private experiments181/182 were archived and removed
+before the production capture.
+
+## Historical attention124 matched core comparison
 
 The same four-MI50 workload now measures **817.871 prefill /39.754 decode
 tok/s** for Llaminar's explicit FP16 tile policy, versus **816.092 /39.390**
@@ -303,3 +386,13 @@ the approximately43tok/s goal and broader attribution remain open.
 Every candidate needs focused regressions, numerical acceptance, isolated
 profiler evidence and a matched unprofiled model decision. Current source
 inspection is not acceptance of an unimplemented optimization.
+
+
+### Short-context attention attribution, 2026-10-24
+
+The [quantified follow-up](QFN_SHORT_CONTEXT_ATTENTION_ATTRIBUTION.md) separates
+local Q6/Q12 geometry and card duty cycle from kernel work. The measured
+per-card service gap is 66.44% producer and 33.56% merge. The actual model
+merge uses16 records versus the fork's12, not all33 allocated records; an
+intermediate12-record fold is the next bounded candidate. No register-only
+attention or request-latency saving is inferred from per-card sums.

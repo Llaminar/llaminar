@@ -798,3 +798,40 @@ TEST(Test__PrefixCacheFingerprint, QFNAttentionBaseIdentityIsStableAndRejectsInv
         EXPECT_EQ(duplicate.size(),fp16.size());
     }
 }
+
+/** @brief Equal byte geometry cannot alias persisted prefixes across recurrence formats. */
+TEST(Test__PrefixCacheFingerprint,
+     GDNRecurrenceLayoutSeparatesSameSizeStateAndRejectsDuplicateAuthority)
+{
+    using L = GDNRecurrenceStateLayout;
+    PrefixFingerprintMaterial original, transposed;
+    original.hybrid = {{"enabled", "true"}, {"hybrid_state_bytes", "4096"}};
+    transposed.hybrid = original.hybrid;
+    appendGDNStateLayoutFingerprintFields(
+        original.hybrid, L::KeyMajorValueContiguous, L::KeyMajorValueContiguous);
+    appendGDNStateLayoutFingerprintFields(
+        transposed.hybrid, L::KeyMajorValueContiguous, L::ValueMajorKeyContiguous);
+    EXPECT_NE(buildPrefixFingerprintParts(original).hybrid,
+              buildPrefixFingerprintParts(transposed).hybrid);
+    const auto retained = original.hybrid;
+    EXPECT_THROW(appendGDNStateLayoutFingerprintFields(
+                     original.hybrid, L::KeyMajorValueContiguous, L::KeyMajorValueContiguous),
+                 std::invalid_argument);
+    ASSERT_EQ(original.hybrid.size(), retained.size());
+    std::vector<PrefixFingerprintField> invalid;
+    EXPECT_THROW(appendGDNStateLayoutFingerprintFields(
+                     invalid, static_cast<L>(255), L::KeyMajorValueContiguous),
+                 std::invalid_argument);
+    EXPECT_TRUE(invalid.empty());
+}
+
+/** @brief Pure attention and omitted sections contribute no unrelated recurrence identity. */
+TEST(Test__PrefixCacheFingerprint, AbsentRecurrenceSectionsPreserveExistingIdentity)
+{
+    std::vector<PrefixFingerprintField> fields{{"enabled", "false"}};
+    const auto original = fields;
+    appendGDNStateLayoutFingerprintFields(fields, std::nullopt, std::nullopt);
+    ASSERT_EQ(fields.size(), original.size());
+    EXPECT_EQ(fields[0].name, original[0].name);
+    EXPECT_EQ(fields[0].value, original[0].value);
+}

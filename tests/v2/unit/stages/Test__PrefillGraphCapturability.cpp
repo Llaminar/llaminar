@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 using namespace llaminar2;
@@ -3287,6 +3288,27 @@ protected:
         return p;
     }
 };
+
+/** @brief Missing/unknown state owners cannot manufacture a retained capture orientation. */
+TEST_F(GDNPrefillGraphCapture, CaptureIdentityRejectsMissingOrUnknownRecurrenceOwner)
+{
+    GDNRecurrenceStage missing(makeValidPrefillParams(nullptr));
+    EXPECT_THROW(missing.graphCaptureVariantSignature(), std::logic_error);
+    StubGDNKernel valid(true, N_HEADS * D_K * D_V);
+    GDNRecurrenceStage admitted(makeValidPrefillParams(&valid));
+    EXPECT_EQ(admitted.graphCaptureVariantSignature(), 0x47444e4c00000000ULL);
+    /** @brief Corrupt metadata only; this unit stub never invokes a device. */
+    struct UnknownLayout final : StubGDNKernel
+    {
+        using StubGDNKernel::StubGDNKernel;
+        GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override
+        {
+            return static_cast<GDNRecurrenceStateLayout>(255);
+        }
+    } unknown(true, N_HEADS * D_K * D_V);
+    GDNRecurrenceStage malformed(makeValidPrefillParams(&unknown));
+    EXPECT_THROW(malformed.graphCaptureVariantSignature(), std::invalid_argument);
+}
 
 TEST_F(GDNPrefillGraphCapture, PrefillCapturableWhenGPUStateReady)
 {

@@ -11,10 +11,13 @@
 
 #pragma once
 
+#include "kernels/common/GDNRecurrenceStateLayout.h"
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -44,6 +47,8 @@ namespace llaminar2
         int value_elements_per_head = 0;   ///< Elements in one V head group.
         int local_state_floats = 0;        ///< Participant-local bank size.
         int full_state_floats = 0;         ///< Global group-major bank size.
+        GDNRecurrenceStateLayout recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Opaque head-block inner axes.
 
         /** @brief Return the local width of one Q or K semantic group. */
         constexpr int localKeyGroupFloats() const noexcept
@@ -84,6 +89,26 @@ namespace llaminar2
         int key_width = 0;              ///< Elements in one query/key vector.
         int value_width = 0;            ///< Elements in one value vector.
         int conv_history_length = 0;    ///< Persistent short-conv history rows.
+        GDNRecurrenceStateLayout recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Immutable clique format.
+
+        /**
+         * @brief Participant-invariant cold clique identity, without rank-local names or pointers.
+         * @param global_layer Common model layer owning this handoff.
+         * @return Geometry and physical format used by the existing lifecycle rendezvous.
+         * @throws std::invalid_argument For an invalid layer or unknown layout.
+         */
+        [[nodiscard]] std::string captureLayoutIdentity(int global_layer) const
+        {
+            if (global_layer < 0 || !validGDNRecurrenceStateLayout(recurrence_layout))
+                throw std::invalid_argument("Invalid GDN clique layout identity");
+            return "gdn_live_state_layer=" + std::to_string(global_layer) +
+                   ":key_heads=" + std::to_string(global_key_heads) +
+                   ":value_heads=" + std::to_string(global_value_heads) +
+                   ":DK=" + std::to_string(key_width) + ":DV=" + std::to_string(value_width) +
+                   ":history=" + std::to_string(conv_history_length) + ":recurrence_layout=" +
+                   std::string(gdnRecurrenceStateLayoutName(recurrence_layout));
+        }
 
         /**
          * @brief Resolve exact equal-participant sizes for one state kind.
@@ -97,10 +122,9 @@ namespace llaminar2
             GDNLinkedLiveStateKind kind,
             int degree) const noexcept
         {
-            if (degree <= 0 || global_key_heads <= 0 ||
-                global_value_heads <= 0 || key_width <= 0 ||
-                value_width <= 0 ||
-                global_value_heads % global_key_heads != 0 ||
+            if (!validGDNRecurrenceStateLayout(recurrence_layout) || degree <= 0 ||
+                global_key_heads <= 0 || global_value_heads <= 0 || key_width <= 0 ||
+                value_width <= 0 || global_value_heads % global_key_heads != 0 ||
                 global_key_heads % degree != 0)
             {
                 return std::nullopt;
@@ -151,12 +175,11 @@ namespace llaminar2
                 .local_key_heads = local_key_heads,
                 .repeat_factor = repeat_factor,
                 .prefix_group_count = prefix_group_count,
-                .key_elements_per_head =
-                    static_cast<int>(key_elements_per_head),
-                .value_elements_per_head =
-                    static_cast<int>(value_elements_per_head),
+                .key_elements_per_head = static_cast<int>(key_elements_per_head),
+                .value_elements_per_head = static_cast<int>(value_elements_per_head),
                 .local_state_floats = static_cast<int>(local_state_floats),
                 .full_state_floats = static_cast<int>(full_state_floats),
+                .recurrence_layout = recurrence_layout,
             };
         }
 

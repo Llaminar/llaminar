@@ -1388,6 +1388,9 @@ namespace llaminar2
                 return mismatch("GDN recurrence value count mismatch");
             if (lhs.conv_values != rhs.conv_values)
                 return mismatch("GDN short-conv value count mismatch");
+            if (!validGDNRecurrenceStateLayout(lhs.recurrence_layout) ||
+                !validGDNRecurrenceStateLayout(rhs.recurrence_layout))
+                return mismatch("Unknown GDN diagnostic recurrence layout");
             if (options.gdn_state_policy ==
                 MTPGDNStateComparisonPolicy::LogicalMetadataOnly)
             {
@@ -1426,8 +1429,26 @@ namespace llaminar2
                 compare_device_gdn_hashes
                     ? rhs.conv_device_hash
                     : rhs.conv_hash;
-            const bool recurrence_hash_changed =
-                lhs_recurrence_hash != rhs_recurrence_hash;
+            const bool recurrence_layout_changed = lhs.recurrence_layout != rhs.recurrence_layout;
+            if (!validGDNRecurrenceStateLayout(lhs.recurrence_layout) ||
+                !validGDNRecurrenceStateLayout(rhs.recurrence_layout))
+                return mismatch("Unknown GDN diagnostic recurrence layout");
+            bool canonical_recurrence_equal = false;
+            if (recurrence_layout_changed)
+            {
+                if (lhs.recurrence_sample_values.size() != recurrence_expected_values ||
+                    rhs.recurrence_sample_values.size() != recurrence_expected_values)
+                    return mismatch(
+                        "GDN layout comparison requires complete canonical recurrence observations");
+                canonical_recurrence_equal =
+                    recurrence_expected_values == 0 ||
+                    std::memcmp(lhs.recurrence_sample_values.data(),
+                                rhs.recurrence_sample_values.data(),
+                                recurrence_expected_values * sizeof(float)) == 0;
+            }
+            const bool recurrence_hash_changed = recurrence_layout_changed
+                                                     ? !canonical_recurrence_equal
+                                                     : lhs_recurrence_hash != rhs_recurrence_hash;
             const bool conv_hash_changed = lhs_conv_hash != rhs_conv_hash;
             const bool compare_recurrence_numerically =
                 always_numerical_gdn ||

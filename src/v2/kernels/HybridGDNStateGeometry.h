@@ -13,6 +13,7 @@
 #pragma once
 
 #include "config/GDNHeadAssignment.h"
+#include "kernels/common/GDNRecurrenceStateLayout.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -44,6 +45,8 @@ namespace llaminar2
         int local_conv_state_floats = 0; ///< Local short-convolution bank.
         int full_recurrence_state_floats = 0; ///< Full recurrent matrix bank.
         int local_recurrence_state_floats = 0; ///< Local recurrent matrix bank.
+        GDNRecurrenceStateLayout recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Fixed persistent bank format.
 
         /** Stable byte alignment used by HybridGDNDeviceStateArena. */
         static constexpr std::size_t kDeviceBankAlignment = 256u;
@@ -61,19 +64,24 @@ namespace llaminar2
          * @param inner_size Global value projection width; zero derives
          *        `value_heads * state_size`.
          * @param conv_kernel_size Causal convolution kernel width.
+         * @param recurrence_layout Immutable persistent matrix format; no conversion is performed.
          * @throws std::invalid_argument for incomplete or non-integral geometry.
          * @throws std::overflow_error when the kernel ABI cannot represent it.
          */
-        [[nodiscard]] static HybridGDNStateGeometry resolve(
-            int attention_heads,
-            int local_head_start,
-            int local_attention_heads,
-            int group_count,
-            int time_step_rank,
-            int state_size,
-            int inner_size,
-            int conv_kernel_size)
+        [[nodiscard]] static HybridGDNStateGeometry
+        resolve(int attention_heads,
+                int local_head_start,
+                int local_attention_heads,
+                int group_count,
+                int time_step_rank,
+                int state_size,
+                int inner_size,
+                int conv_kernel_size,
+                GDNRecurrenceStateLayout recurrence_layout =
+                    GDNRecurrenceStateLayout::KeyMajorValueContiguous)
         {
+            if (!validGDNRecurrenceStateLayout(recurrence_layout))
+                throw std::invalid_argument("Unknown persistent GDN recurrence layout");
             if (attention_heads <= 0 || state_size <= 0 ||
                 conv_kernel_size <= 0)
             {
@@ -87,6 +95,7 @@ namespace llaminar2
             }
 
             HybridGDNStateGeometry result;
+            result.recurrence_layout = recurrence_layout;
             result.full_key_heads =
                 group_count > 0 ? group_count : attention_heads;
             result.full_value_heads =

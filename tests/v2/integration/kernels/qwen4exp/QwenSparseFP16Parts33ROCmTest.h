@@ -273,11 +273,15 @@ TEST(ROCmQwenSparseAttention,FP16Virtual33UniformExtremeFiniteAndSignedZero)
  * on the actual native math path; no mirrored device kernel supplies an oracle.
  * M16 repeats the same explicitly authored causal selection for each row, then
  * compares every row's output/partials to its independently captured serial call.
+ * Contexts 512/513 and 768/769 straddle the short prefix bounds. In particular,
+ * Context 768 ends on the last live Fold12 record: its neutral tail must still turn the
+ * underflowed negative numerator into the original positive zero. The producer
+ * must author empty metadata and leave every omitted weighted payload untouched.
  */
 TEST(ROCmQwenSparseAttention,FP16Virtual33EmptyTailPreservesSignedZero)
 {
     using namespace fp16_attention;
-    for(int rows:{1,16})for(int context:{512,1024,2048,2051}){
+    for(int rows:{1,16})for(int context:{512,513,768,769,1024,2048,2051}){
         SCOPED_TRACE(::testing::Message()<<"M="<<rows<<" selected="<<context);
         Fixture f(rows,context-1,context+rows-1,QwenSparseScalar::FP16);Inputs input(f,0,6,0,1);
         std::fill(input.host_query.begin(),input.host_query.end(),1.0f);
@@ -316,6 +320,15 @@ TEST(ROCmQwenSparseAttention,FP16Virtual33EmptyTailPreservesSignedZero)
                         if(part==lastPart)ASSERT_EQ(x,-float(lastCount)*0x1p-7f);
                         else ASSERT_EQ(detail::floatBits(x),0u);
                     }
+                }
+                // This is a real producer, not authored merge metadata: every
+                // omitted virtual tile must prove the exact empty-tail contract.
+                for(int part=lastPart+1;part<33;++part){
+                    const auto index=(std::size_t(row)*6+head)*33+part;
+                    const auto& empty=partials[index];
+                    ASSERT_EQ(empty.maximum,-INFINITY);ASSERT_EQ(empty.denominator,0.0f);
+                    ASSERT_EQ(empty.key_elements,0u);ASSERT_EQ(empty.value_elements,0u);
+                    ASSERT_EQ(std::memcmp(empty.weighted,grouped.initial_partials[index].weighted,sizeof(empty.weighted)),0);
                 }
             }
             if(rows==16){
@@ -496,9 +509,14 @@ TEST(ROCmQwenSparseAttention,FP16Phase33MergeWideCounters)
         FP16Run33 run(caseArgs,f.stream);
         if(!observed)run.args.observations=nullptr;
         run.record();MergeOnly merge(f.stream);merge.record(run);
-        for(int fold:{33,8,16,32,33})for(bool zeroCounters:{false,true}){
-            SCOPED_TRACE(::testing::Message()<<"fold="<<fold<<" zero_counters="<<zeroCounters);
-            const int selected=(fold-1)*64+1;
+        // Keep every original authored case. Additional 513/705/768/769 cases
+        // authenticate the new 12-record prefix and its upper transition. These
+        // deliberately nonzero banks test structural prefix/counter behavior;
+        // valid producer emptiness is proved by the signed-zero test above.
+        for(const auto [fold,selected]:{std::pair{33,2049},std::pair{8,449},
+            std::pair{12,513},std::pair{12,705},std::pair{12,768},std::pair{16,769},
+            std::pair{16,961},std::pair{32,1985},std::pair{33,2049}})for(bool zeroCounters:{false,true}){
+            SCOPED_TRACE(::testing::Message()<<"fold="<<fold<<" selected="<<selected<<" zero_counters="<<zeroCounters);
             std::vector<std::int32_t> counts(2,selected);f.count.upload(counts.data(),f.stream);
             f.replay={2050,1,0};f.state.upload(&f.replay,f.stream);
             auto authored=run.initial_partials;std::uint64_t keys=0,values=0;
@@ -543,6 +561,9 @@ TEST(ROCmQwenSparseAttention,FP16Phase33MergeWideCounters)
  * Optional QFN_FP16_PROFILE_SIDE=control|candidate isolates one complete pair
  * with repeats1, five warmups and exact sixth occurrence. Paired-only exports
  * retain candidate33 numerical coordinates and explicit mapping/policy metadata.
+ * The optional fixture-only QFN_FP16_QUERY_HEADS selector admits six or twelve
+ * compact query heads over the same original KV head; native kernels, arithmetic,
+ * graph topology and selected membership are unchanged. All extents follow it.
  */
 TEST(ROCmQwenSparseAttention,DISABLED_FP16Virtual33AttentionEvents)
 {
@@ -551,6 +572,10 @@ TEST(ROCmQwenSparseAttention,DISABLED_FP16Virtual33AttentionEvents)
     const char* modeText=std::getenv("QFN_FP16_KEY_ENCODING");require(modeText&&*modeText,"Explicit33 key encoding required");const std::string mode=modeText;
     require(mode=="post_rotary"||mode=="pre_rotary","Unknown33 key encoding");
     const int rows=integer("QFN_FP16_M"),context=integer("QFN_FP16_CONTEXT"),repeats=integer("QFN_FP16_REPEATS");
+    // Fixture geometry only: both widths use the unchanged production kernels.
+    // Preserve six heads for existing callers that do not request a width cell.
+    const int heads=std::getenv("QFN_FP16_QUERY_HEADS")?integer("QFN_FP16_QUERY_HEADS"):6;
+    require(heads==6 || heads==12,"Width audit requires six or twelve query heads");
     const int position=integer("QFN_FP16_POSITION_ORIGIN"),ring=integer("QFN_FP16_RING_ORIGIN");
     const char* text=std::getenv("QFN_FP16_ROPE_THETA");require(text&&*text,"Explicit33 theta required");std::size_t used=0;const float theta=std::stof(text,&used);
     const char* sideText=std::getenv("QFN_FP16_PROFILE_SIDE");const std::string side=sideText?sideText:"paired";
@@ -558,7 +583,7 @@ TEST(ROCmQwenSparseAttention,DISABLED_FP16Virtual33AttentionEvents)
     require(paired||!std::getenv("QFN_FP16_EXPORT_DIR"),"33 numerical export requires paired mode");
     require(used==std::strlen(text)&&std::isfinite(theta)&&theta>0&&rows>0&&rows<=16&&context>=rows&&context<=65536&&position>=0&&ring>=0&&ring<context&&
         (paired?(repeats>=2&&repeats<=256):repeats==1),"Invalid33 event/profile geometry/policy");
-    Fixture f(rows,context-rows,context,QwenSparseScalar::FP16);Inputs input(f,0,6,0,1);auto a=input.base();
+    Fixture f(rows,context-rows,context,QwenSparseScalar::FP16);Inputs input(f,0,heads,0,1);auto a=input.base();
     a.kv.addressing=QwenSparseKVAddressing::FixedLogicalView;a.kv.logical_view={.logical_row_origin=ring,.physical_row_capacity=f.capacity};a.kv.row_parameters=nullptr;
     if(mode=="pre_rotary")a=selectedKeyTransform(a,theta,ring,f.capacity);
     FP16Run baseline(a,f.stream,repeats);FP16Run33 candidate(a,f.stream,repeats);baseline.record();candidate.record();publishReplayPosition(f,context-rows,rows,position);Events events(f.stream);
@@ -568,40 +593,40 @@ TEST(ROCmQwenSparseAttention,DISABLED_FP16Virtual33AttentionEvents)
         auto& chosen=side=="control"?baseline.capture:candidate.capture;
         for(int warm=0;warm<5;++warm)(void)events.sample(chosen);
         const float us=events.sample(chosen);const int parts=side=="control"?8:33;
-        std::cout<<"QFN_FP16_PARTS33_SINGLE,"<<side<<",M="<<rows<<",context="<<context<<",Q=6,KV=1,parts="<<parts<<",virtual_parts="<<parts<<",physical_slots="<<parts<<",group_heads="<<(side=="control"?4:6)<<",producer_threads="<<(side=="control"?256:384)<<",merge_threads=256,key_encoding="<<mode
+        std::cout<<"QFN_FP16_PARTS33_SINGLE,"<<side<<",M="<<rows<<",context="<<context<<",Q="<<heads<<",KV=1,parts="<<parts<<",virtual_parts="<<parts<<",physical_slots="<<parts<<",group_heads="<<(side=="control"?4:6)<<",producer_threads="<<(side=="control"?256:384)<<",merge_threads=256,key_encoding="<<mode
             <<",key_rotary_source="<<(mode=="pre_rotary"?"canonical_engine":"cached_post_rotary")<<",key_rotary_dim="<<(mode=="pre_rotary"?64:0)
             <<",addressing=fixed_logical_view,ring_origin="<<ring<<",ring_capacity="<<context<<",position_origin="<<position<<",theta_bits="<<(mode=="pre_rotary"?detail::floatBits(theta):0u)
             <<",repeats=1,warmups=5,occurrence=6,us="<<us<<",profiled_timings_used_as_score=false\n";
         const auto actual=side=="control"?baseline.output.download(f.stream):candidate.output.download(f.stream);
         const auto& poison=side=="control"?baseline.poison:candidate.poison;
-        for(std::size_t i=0;i<std::size_t(rows)*1536;++i)ASSERT_TRUE(std::isfinite(actual[i]));
-        ASSERT_EQ(std::memcmp(actual.data()+std::size_t(rows)*1536,poison.data()+std::size_t(rows)*1536,16*sizeof(float)),0);
+        for(std::size_t i=0;i<std::size_t(rows)*heads*256;++i)ASSERT_TRUE(std::isfinite(actual[i]));
+        ASSERT_EQ(std::memcmp(actual.data()+std::size_t(rows)*heads*256,poison.data()+std::size_t(rows)*heads*256,16*sizeof(float)),0);
         return;
     }
     for(int warm=0;warm<5;++warm){(void)events.sample(baseline.capture);(void)events.sample(candidate.capture);}
     for(int pair=0;pair<12;++pair){float old=0,newer=0;if(pair&1){newer=events.sample(candidate.capture);old=events.sample(baseline.capture);}else{old=events.sample(baseline.capture);newer=events.sample(candidate.capture);}
-        std::cout<<"QFN_FP16_PARTS33_PAIR,"<<pair<<",M="<<rows<<",context="<<context<<",Q=6,KV=1,virtual_parts=33,physical_slots=33,candidate_group_heads=6,candidate_producer_threads=384,control_group_heads=4,control_producer_threads=256,merge_threads=256,key_encoding="<<mode
+        std::cout<<"QFN_FP16_PARTS33_PAIR,"<<pair<<",M="<<rows<<",context="<<context<<",Q="<<heads<<",KV=1,virtual_parts=33,physical_slots=33,candidate_group_heads=6,candidate_producer_threads=384,control_group_heads=4,control_producer_threads=256,merge_threads=256,key_encoding="<<mode
             <<",addressing=fixed_logical_view,ring_origin="<<ring<<",ring_capacity="<<context<<",position_origin="<<position<<",theta_bits="<<(mode=="pre_rotary"?detail::floatBits(theta):0u)
             <<",repeats="<<repeats<<",baseline8_us="<<old<<",candidate33_us="<<newer<<'\n';
     }
     const auto old=baseline.output.download(f.stream),actual=candidate.output.download(f.stream);
-    for(std::size_t i=0;i<std::size_t(rows)*1536;++i){ASSERT_TRUE(std::isfinite(old[i]));ASSERT_TRUE(std::isfinite(actual[i]));}
+    for(std::size_t i=0;i<std::size_t(rows)*heads*256;++i){ASSERT_TRUE(std::isfinite(old[i]));ASSERT_TRUE(std::isfinite(actual[i]));}
     // Focused ordinary-input witness only: <=512 uses one tile per old stream.
     // It does not promise universal signed-zero equivalence between programs.
-    if(context<=512)ASSERT_EQ(std::memcmp(old.data(),actual.data(),std::size_t(rows)*1536*sizeof(float)),0);
-    ASSERT_EQ(std::memcmp(old.data()+std::size_t(rows)*1536,baseline.poison.data()+std::size_t(rows)*1536,16*sizeof(float)),0);
-    ASSERT_EQ(std::memcmp(actual.data()+std::size_t(rows)*1536,candidate.poison.data()+std::size_t(rows)*1536,16*sizeof(float)),0);
+    if(context<=512)ASSERT_EQ(std::memcmp(old.data(),actual.data(),std::size_t(rows)*heads*256*sizeof(float)),0);
+    ASSERT_EQ(std::memcmp(old.data()+std::size_t(rows)*heads*256,baseline.poison.data()+std::size_t(rows)*heads*256,16*sizeof(float)),0);
+    ASSERT_EQ(std::memcmp(actual.data()+std::size_t(rows)*heads*256,candidate.poison.data()+std::size_t(rows)*heads*256,16*sizeof(float)),0);
     if(const char* destination=std::getenv("QFN_FP16_EXPORT_DIR")){
         const auto partials=candidate.partials.download(f.stream);std::vector<float> numerical;numerical.reserve(partials.size()*258);
         for(const auto& part:partials){numerical.push_back(part.maximum);numerical.push_back(part.denominator);numerical.insert(numerical.end(),std::begin(part.weighted),std::end(part.weighted));}
-        const auto outputCount=std::size_t(rows)*6*256;
+        const auto outputCount=std::size_t(rows)*heads*256;
         require((outputCount+numerical.size())*sizeof(float)<=128ULL*1024*1024,"FP16 parts33 export exceeds128 MiB");
         const std::filesystem::path directory(destination);require(*destination&&!std::filesystem::exists(directory),"FP16 parts33 export requires a fresh directory");
         require(std::filesystem::create_directories(directory),"FP16 parts33 export directory creation failed");
         const auto write=[&](const char* name,const float* values,std::size_t count){std::ofstream stream(directory/name,std::ios::binary);stream.exceptions(std::ios::failbit|std::ios::badbit);stream.write(reinterpret_cast<const char*>(values),static_cast<std::streamsize>(count*sizeof(float)));stream.close();};
         write("output-fp32.bin",actual.data(),outputCount);write("partials-fp32.bin",numerical.data(),numerical.size());
         std::ofstream shape(directory/"shape.json");shape.exceptions(std::ios::failbit|std::ios::badbit);
-        shape<<"{\"M\":"<<rows<<",\"context\":"<<context<<",\"Q\":6,\"KV\":1,\"partitions\":33,\"virtual_parts\":33,\"physical_slots\":33,\"group_heads\":6,\"partial_coordinates\":258,\"selection\":\"causal-spread-512groups\",\"key_encoding\":\""<<mode<<"\",\"key_rotary_source\":\""<<(mode=="pre_rotary"?"canonical_engine":"cached_post_rotary")<<"\",\"key_rotary_dim\":"<<(mode=="pre_rotary"?64:0)<<",\"theta_bits\":"<<(mode=="pre_rotary"?detail::floatBits(theta):0u)<<",\"position_origin\":"<<position<<",\"addressing\":\""<<"fixed_logical_view"<<"\",\"ring_origin\":"<<ring<<",\"ring_capacity\":"<<context<<"}\n";shape.close();
+        shape<<"{\"M\":"<<rows<<",\"context\":"<<context<<",\"Q\":"<<heads<<",\"KV\":1,\"partitions\":33,\"virtual_parts\":33,\"physical_slots\":33,\"group_heads\":6,\"partial_coordinates\":258,\"selection\":\"causal-spread-512groups\",\"key_encoding\":\""<<mode<<"\",\"key_rotary_source\":\""<<(mode=="pre_rotary"?"canonical_engine":"cached_post_rotary")<<"\",\"key_rotary_dim\":"<<(mode=="pre_rotary"?64:0)<<",\"theta_bits\":"<<(mode=="pre_rotary"?detail::floatBits(theta):0u)<<",\"position_origin\":"<<position<<",\"addressing\":\""<<"fixed_logical_view"<<"\",\"ring_origin\":"<<ring<<",\"ring_capacity\":"<<context<<"}\n";shape.close();
     }
 }
 

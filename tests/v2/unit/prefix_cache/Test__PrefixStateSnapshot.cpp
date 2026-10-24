@@ -479,4 +479,24 @@ TEST(Test__PrefixStateSnapshot, MoveLeavesSourceEmptyForNestedPayloadHandles)
     EXPECT_EQ(assigned.blocks.back().hybrid_payload, source_block_payload);
 }
 
+/** @brief Snapshot copy/move preserves physical recurrence provenance beside every payload. */
+TEST(Test__PrefixStateSnapshot, RecurrenceFormatSurvivesSnapshotCopyAndMove)
+{
+    PrefixStateSnapshot snapshot;
+    snapshot.valid = true;
+    PrefixBlockHandle block;
+    block.layout.includes_hybrid_state = true;
+    block.layout.hybrid_device_state_bytes = 64 * 65 * sizeof(float);
+    block.layout.hybrid_state_bytes = block.layout.hybrid_device_state_bytes;
+    block.layout.hybrid_device_recurrence_layout =
+        GDNRecurrenceStateLayout::ValueMajorKeyContiguous;
+    snapshot.blocks.push_back(block);
+    auto copy = snapshot;
+    PrefixStateSnapshot moved = std::move(copy);
+    ASSERT_EQ(moved.blocks.size(), 1u);
+    EXPECT_EQ(moved.blocks.front().layout, snapshot.blocks.front().layout);
+    EXPECT_EQ(moved.blocks.front().layout.hybrid_device_recurrence_layout,
+              GDNRecurrenceStateLayout::ValueMajorKeyContiguous);
+}
+
 } // namespace llaminar2

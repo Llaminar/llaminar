@@ -1374,4 +1374,20 @@ TEST(Test__MTPStateTransaction, VisibleCommitPlanRejectsAmbiguousLifecycleInputs
     EXPECT_FALSE(planMTPVisibleStateCommit(2, 0, -1));
 }
 
+/** @brief Foreign physical hashes require complete canonical values and retain byte-exact
+ * acceptance. */
+TEST(Test__MTPStateTransaction, RuntimeSnapshotComparesDifferentGDNLayoutsUsingCanonicalBytes)
+{
+    auto oracle = makeRuntimeSnapshot(7);
+    auto candidate = oracle;
+    auto &gdn = candidate.gdn_layers.front();
+    gdn.recurrence_layout = GDNRecurrenceStateLayout::ValueMajorKeyContiguous;
+    gdn.recurrence_hash ^= 1;
+    EXPECT_TRUE(compareMTPRuntimeStateSnapshots(oracle, candidate));
+    gdn.recurrence_sample_values[0] += 1e-7f;
+    EXPECT_FALSE(compareMTPRuntimeStateSnapshots(oracle, candidate));
+    gdn.recurrence_sample_values.clear();
+    EXPECT_FALSE(compareMTPRuntimeStateSnapshots(oracle, candidate));
+}
+
 } // namespace llaminar2

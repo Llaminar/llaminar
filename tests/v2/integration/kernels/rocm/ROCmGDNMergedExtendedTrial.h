@@ -159,11 +159,21 @@ struct Cell final
     {
         control->launch(stream.stream);candidate->launch(stream.stream);historical->launch(stream.stream);serial->launch(stream.stream);
         checkHip(hipStreamSynchronize(stream.stream),"GDN trial parity terminal join");
-        for(auto pair:{std::pair{&co,&po},std::pair{&cs,&ps},std::pair{&cshots,&pshots},std::pair{&po,&ho},std::pair{&po,&so},std::pair{&ps,&hs},std::pair{&pshots,&hshots}}){
-            const auto a=pair.first->toHost(),b=pair.second->toHost();
+        // All four graphs have retired above. No device work or publication occurs
+        // until check() returns, so each terminal image can serve every assertion.
+        // Cache only the three reused candidate images; download each independent
+        // partner once and release it after comparison to bound host staging.
+        const auto output=po.toHost(),state_image=ps.toHost(),snapshots=pshots.toHost();
+        for(const auto pair:{
+            std::pair{&co,&output},std::pair{&cs,&state_image},
+            std::pair{&cshots,&snapshots},std::pair{&ho,&output},
+            std::pair{&so,&output},std::pair{&hs,&state_image},
+            std::pair{&hshots,&snapshots}}){
+            const auto a=pair.first->toHost();
+            const auto& b=*pair.second;
             require(a.size()==b.size()&&std::memcmp(a.data(),b.data(),a.size()*sizeof(float))==0,"GDN complete-pair bytes differ");
         }
-        const auto snapshots=pshots.toHost(),serial_state=ss.toHost();
+        const auto serial_state=ss.toHost();
         for(int request=0;request<requests;++request){
             const auto base=std::size_t(request)*state;
             const float* terminal=lengths[request]>0 ? snapshots.data()+std::size_t(request*per_request+lengths[request]-1)*state : initial.data()+base;

@@ -697,3 +697,34 @@ TEST(Test__RamPrefixStorageBackend, FlashNextAuxiliaryAllowsZeroPoolStrideAndChe
     layout.main_auxiliary.bytes_per_attention_layer = std::numeric_limits<size_t>::max();
     EXPECT_FALSE(backend.allocate(keyFor(2), layout).valid());
 }
+
+/** @brief Equal-size physical recurrence formats remain incompatible through copied handles. */
+TEST(Test__RamPrefixStorageBackend, HybridRecurrenceLayoutRejectsEqualSizeForeignPayload)
+{
+    using L = GDNRecurrenceStateLayout;
+    auto key_major = makeLayout();
+    key_major.includes_hybrid_state = true;
+    key_major.hybrid_device_state_bytes = 6 * sizeof(float);
+    key_major.hybrid_state_bytes = key_major.hybrid_device_state_bytes;
+    auto value_major = key_major;
+    value_major.hybrid_device_recurrence_layout = L::ValueMajorKeyContiguous;
+    EXPECT_EQ(key_major.totalBytes(), value_major.totalBytes());
+    EXPECT_FALSE(key_major.compatiblePayloadShape(value_major));
+    EXPECT_FALSE(value_major.compatiblePayloadShape(key_major));
+    PrefixBlockHandle handle;
+    handle.layout = value_major;
+    const auto copy = handle;
+    EXPECT_EQ(copy.layout.hybrid_device_recurrence_layout, L::ValueMajorKeyContiguous);
+    EXPECT_EQ(copy.layout, value_major);
+}
+
+/** @brief Omitted recurrence sections never fence an otherwise identical attention archive. */
+TEST(Test__RamPrefixStorageBackend, AbsentRecurrenceSectionsIgnoreUnusedFormatWords)
+{
+    auto attention = makeLayout();
+    auto unused_format = attention;
+    unused_format.hybrid_device_recurrence_layout =
+        GDNRecurrenceStateLayout::ValueMajorKeyContiguous;
+    EXPECT_TRUE(attention.compatiblePayloadShape(unused_format));
+    EXPECT_EQ(attention.totalBytes(), unused_format.totalBytes());
+}

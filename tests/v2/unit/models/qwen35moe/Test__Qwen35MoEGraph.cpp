@@ -8,6 +8,8 @@
  * then broadcast; a participant-local partial sum cannot replace that contract.
  * Remote expert dispatch overlaps local compute, and local host payloads are
  * consumed through their original stable storage instead of a redundant copy.
+ * Independent CPU/CUDA/ROCm GDN formats retain participant-local graph state
+ * when their collective cannot perform a homogeneous live-state handoff.
  */
 
 #include <gtest/gtest.h>
@@ -16,6 +18,7 @@
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "collective/IGlobalTPContext.h"
+#include "config/GDNRecurrenceStatePolicy.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoERankBatchSparseStages.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
@@ -2611,111 +2614,174 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedPrefillKeepsShardedAttentionStat
         << "Decode uses the full replicated dense set";
 }
 
+/** @test Backend-local formats do not create a cross-backend live-state handoff. */
 TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedKeepsStatefulGDNDecodeTPLocal)
 {
-    auto tp_ctx = std::make_unique<MockLocalTPContext>();
-    tp_ctx->setDevices({GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
-    tp_ctx->setBackend(CollectiveBackendType::HOST);
-
-    GraphConfig config = makeGDNTPConfig(tp_ctx.get());
-    config.dense_tp_enabled = true;
-    config.dense_tp_decode_replicated = true;
-
-    TensorArena arena;
-    LayerWeights base_layer = makeGDNTPLayerWeights(
-        arena, config, /*value_heads=*/1, /*row_parallel_out=*/true);
-    LayerWeights decode_layer = makeGDNTPLayerWeights(
-        arena, config, /*value_heads=*/2, /*row_parallel_out=*/false);
-
-    WeightBinding base_attn_norm = makeTestBinding(base_layer.attn_norm);
-    WeightBinding base_qkv = makeTestBinding(base_layer.attn_qkv);
-    WeightBinding base_gate = makeTestBinding(base_layer.attn_gate);
-    WeightBinding base_alpha = makeTestBinding(base_layer.ssm_alpha);
-    WeightBinding base_beta = makeTestBinding(base_layer.ssm_beta);
-    WeightBinding base_conv = makeTestBinding(base_layer.ssm_conv1d);
-    WeightBinding base_dt = makeTestBinding(base_layer.ssm_dt_bias);
-    WeightBinding base_a = makeTestBinding(base_layer.ssm_a);
-    WeightBinding base_norm = makeTestBinding(base_layer.ssm_norm);
-    WeightBinding base_out = makeTestBinding(base_layer.ssm_out);
-
-    WeightBinding decode_attn_norm = makeTestBinding(decode_layer.attn_norm);
-    WeightBinding decode_qkv = makeTestBinding(decode_layer.attn_qkv);
-    WeightBinding decode_gate = makeTestBinding(decode_layer.attn_gate);
-    WeightBinding decode_alpha = makeTestBinding(decode_layer.ssm_alpha);
-    WeightBinding decode_beta = makeTestBinding(decode_layer.ssm_beta);
-    WeightBinding decode_conv = makeTestBinding(decode_layer.ssm_conv1d);
-    WeightBinding decode_dt = makeTestBinding(decode_layer.ssm_dt_bias);
-    WeightBinding decode_a = makeTestBinding(decode_layer.ssm_a);
-    WeightBinding decode_norm = makeTestBinding(decode_layer.ssm_norm);
-    WeightBinding decode_out = makeTestBinding(decode_layer.ssm_out);
-
-    ModelWeightBindings base_bindings;
-    base_bindings.get_layer_weights = [&](int)
+    using Layout = GDNRecurrenceStateLayout;
+    /**
+     * @brief Graph metadata only; deliberately advertises no executable GPU state.
+     * @details The CPU-backed cache is the existing declarative fixture. Only
+     * its recurrence identity is replaced; no state bytes are read or executed.
+     */
+    struct MetadataOwner final : ITensorGatedDeltaNet
     {
-        LayerWeightBindings layer;
-        layer.attn_norm = &base_attn_norm;
-        layer.attn_qkv = &base_qkv;
-        layer.attn_gate = &base_gate;
-        layer.ssm_alpha = &base_alpha;
-        layer.ssm_beta = &base_beta;
-        layer.ssm_conv1d = &base_conv;
-        layer.ssm_dt_bias = &base_dt;
-        layer.ssm_a = &base_a;
-        layer.ssm_norm = &base_norm;
-        layer.ssm_out = &base_out;
-        return layer;
+        const Layout format;
+        /** @param selected Immutable participant policy being wired into the graph. */
+        explicit MetadataOwner(Layout selected) : format(selected) {}
+        /** @return The exact inert owner format used by capture identity. */
+        Layout recurrenceStateLayout() const noexcept override { return format; }
+        /** @return False: this fixture never implements or captures native execution. */
+        bool isGPUStateReady(int) const override { return false; }
+        /** @brief Any accidental arithmetic execution is a fixture error. */
+        bool chunk_forward(const float *, const float *, const float *, const float *,
+            const float *, const float *, const float *, float *, float *,
+            int, int, int, int, int, bool) override
+        { throw std::logic_error("Metadata-only GDN graph owner cannot execute"); }
+        /** @brief Any accidental merged arithmetic execution is a fixture error. */
+        bool chunkForwardMergedQKV(const float *, int, const float *, const float *,
+            const float *, const float *, float *, float *,
+            int, int, int, int, int, int, int, bool) override
+        { throw std::logic_error("Metadata-only GDN graph owner cannot execute"); }
+        /** @brief Any accidental scalar arithmetic execution is a fixture error. */
+        bool recurrent_step(const float *, const float *, const float *, const float *,
+            const float *, const float *, const float *, float *, float *,
+            int, int, int, bool) override
+        { throw std::logic_error("Metadata-only GDN graph owner cannot execute"); }
     };
-
-    ModelWeightBindings decode_bindings;
-    decode_bindings.get_layer_weights = [&](int)
+    /** @brief One inert declared collective and its actual participant backends. */
+    struct Topology
     {
-        LayerWeightBindings layer;
-        layer.attn_norm = &decode_attn_norm;
-        layer.attn_qkv = &decode_qkv;
-        layer.attn_gate = &decode_gate;
-        layer.ssm_alpha = &decode_alpha;
-        layer.ssm_beta = &decode_beta;
-        layer.ssm_conv1d = &decode_conv;
-        layer.ssm_dt_bias = &decode_dt;
-        layer.ssm_a = &decode_a;
-        layer.ssm_norm = &decode_norm;
-        layer.ssm_out = &decode_out;
-        return layer;
+        std::vector<GlobalDeviceAddress> devices;
+        CollectiveBackendType backend;
     };
+    const std::array topologies{
+        Topology{{GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)}, CollectiveBackendType::HOST},
+        Topology{{GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::rocm(0)}, CollectiveBackendType::HOST},
+        Topology{{GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)}, CollectiveBackendType::HOST},
+        Topology{{GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)}, CollectiveBackendType::HETEROGENEOUS},
+    };
+    for (const auto &topology : topologies)
+        for (int participant = 0; participant != 2; ++participant)
+        {
+            const auto device = topology.devices[participant].toLocalDeviceId();
+            SCOPED_TRACE(::testing::Message() << "backend=" << static_cast<int>(topology.backend)
+                << " device=" << device.toString());
+            auto tp_ctx = std::make_unique<MockLocalTPContext>();
+            tp_ctx->setDevices(topology.devices);
+            tp_ctx->setBackend(topology.backend);
+            GraphConfig config = makeGDNTPConfig(tp_ctx.get());
+            config.default_device = device;
+            config.tp_device_idx = config.local_rank = participant;
+            config.head_start = participant;
+            config.dense_tp_enabled = true;
+            config.dense_tp_decode_replicated = true;
 
-    TestableQwen35MoEGraph graph_builder(config, nullptr);
-    graph_builder.setWeightBindings(base_bindings);
-    graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+            TensorArena arena;
+            LayerWeights base_layer = makeGDNTPLayerWeights(
+                arena, config, /*value_heads=*/1, /*row_parallel_out=*/true);
+            LayerWeights decode_layer = makeGDNTPLayerWeights(
+                arena, config, /*value_heads=*/2, /*row_parallel_out=*/false);
 
-    auto mpi = std::make_shared<MockMPIContext>(0, 1);
-    CPUHybridRingKVCacheFP32 cache(
-        makeGDNTPHybridConfig(config),
-        *mpi,
-        config.n_layers,
-        /*batch_size=*/1,
-        config.max_seq_len,
-        config.n_kv_heads,
-        config.head_dim,
-        DeviceId::cpu());
+            WeightBinding base_attn_norm = makeTestBinding(base_layer.attn_norm);
+            WeightBinding base_qkv = makeTestBinding(base_layer.attn_qkv);
+            WeightBinding base_gate = makeTestBinding(base_layer.attn_gate);
+            WeightBinding base_alpha = makeTestBinding(base_layer.ssm_alpha);
+            WeightBinding base_beta = makeTestBinding(base_layer.ssm_beta);
+            WeightBinding base_conv = makeTestBinding(base_layer.ssm_conv1d);
+            WeightBinding base_dt = makeTestBinding(base_layer.ssm_dt_bias);
+            WeightBinding base_a = makeTestBinding(base_layer.ssm_a);
+            WeightBinding base_norm = makeTestBinding(base_layer.ssm_norm);
+            WeightBinding base_out = makeTestBinding(base_layer.ssm_out);
 
-    ActivationBuffers buffers = makeGDNTPActivationBuffers(
-        arena, /*tokens=*/1, config, /*value_heads=*/1);
-    int position_id = 0;
+            WeightBinding decode_attn_norm = makeTestBinding(decode_layer.attn_norm);
+            WeightBinding decode_qkv = makeTestBinding(decode_layer.attn_qkv);
+            WeightBinding decode_gate = makeTestBinding(decode_layer.attn_gate);
+            WeightBinding decode_alpha = makeTestBinding(decode_layer.ssm_alpha);
+            WeightBinding decode_beta = makeTestBinding(decode_layer.ssm_beta);
+            WeightBinding decode_conv = makeTestBinding(decode_layer.ssm_conv1d);
+            WeightBinding decode_dt = makeTestBinding(decode_layer.ssm_dt_bias);
+            WeightBinding decode_a = makeTestBinding(decode_layer.ssm_a);
+            WeightBinding decode_norm = makeTestBinding(decode_layer.ssm_norm);
+            WeightBinding decode_out = makeTestBinding(decode_layer.ssm_out);
 
-    ComputeGraph graph = graph_builder.buildAttentionGraphForTokenCount(
-        decode_layer,
-        buffers,
-        /*layer_idx=*/0,
-        /*seq_len=*/1,
-        /*batch_size=*/1,
-        &cache,
-        &position_id,
-        DeviceId::cpu());
+            ModelWeightBindings base_bindings;
+            base_bindings.get_layer_weights = [&](int)
+            {
+                LayerWeightBindings layer;
+                layer.attn_norm = &base_attn_norm;
+                layer.attn_qkv = &base_qkv;
+                layer.attn_gate = &base_gate;
+                layer.ssm_alpha = &base_alpha;
+                layer.ssm_beta = &base_beta;
+                layer.ssm_conv1d = &base_conv;
+                layer.ssm_dt_bias = &base_dt;
+                layer.ssm_a = &base_a;
+                layer.ssm_norm = &base_norm;
+                layer.ssm_out = &base_out;
+                return layer;
+            };
 
-    EXPECT_NE(graph.getNode("layer0_gdn_wo_allreduce"), nullptr)
-        << "Dense-replicated decode cannot switch GDN to full mirrored state until "
-           "TP-prefill GDN conv/recurrent state is allgathered into every participant.";
-    EXPECT_TRUE(hasDependency(graph, "layer0_gdn_wo_allreduce", "layer0_gdn_out_proj"));
+            ModelWeightBindings decode_bindings;
+            decode_bindings.get_layer_weights = [&](int)
+            {
+                LayerWeightBindings layer;
+                layer.attn_norm = &decode_attn_norm;
+                layer.attn_qkv = &decode_qkv;
+                layer.attn_gate = &decode_gate;
+                layer.ssm_alpha = &decode_alpha;
+                layer.ssm_beta = &decode_beta;
+                layer.ssm_conv1d = &decode_conv;
+                layer.ssm_dt_bias = &decode_dt;
+                layer.ssm_a = &decode_a;
+                layer.ssm_norm = &decode_norm;
+                layer.ssm_out = &decode_out;
+                return layer;
+            };
+
+            TestableQwen35MoEGraph graph_builder(config, nullptr);
+            graph_builder.setWeightBindings(base_bindings);
+            graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+
+            auto mpi = std::make_shared<MockMPIContext>(0, 1);
+            auto hybrid_config = makeGDNTPHybridConfig(config);
+            hybrid_config.local_head_start = participant;
+            CPUHybridRingKVCacheFP32 cache(
+                hybrid_config,
+                *mpi,
+                config.n_layers,
+                /*batch_size=*/1,
+                config.max_seq_len,
+                config.n_kv_heads,
+                config.head_dim,
+                DeviceId::cpu());
+            const auto selected = gdnRecurrenceStateLayoutForDevice(device,
+                kDefaultCUDAGDNStateLayout, kDefaultROCmGDNStateLayout);
+            auto *state = cache.getGDNState(0);
+            ASSERT_NE(state, nullptr);
+            state->recurrence_layout = selected;
+            state->rec_kernel = std::make_shared<MetadataOwner>(selected);
+            for (int rows : {1, 2})
+            {
+                SCOPED_TRACE(rows);
+                ActivationBuffers buffers = makeGDNTPActivationBuffers(arena, rows, config, 1);
+                int positions[2] = {0, 1};
+                ComputeGraph graph = graph_builder.buildAttentionGraphForTokenCount(
+                    rows == 1 ? decode_layer : base_layer, buffers, 0, rows, 1,
+                    &cache, positions, device);
+                EXPECT_NE(graph.getNode("layer0_gdn_wo_allreduce"), nullptr);
+                EXPECT_TRUE(hasDependency(graph, "layer0_gdn_wo_allreduce", "layer0_gdn_out_proj"));
+                EXPECT_EQ(graph.getNode("layer0_gdn_live_state_allgather"), nullptr);
+                const auto *node = graph.getNode("layer0_gdn_recurrence");
+                ASSERT_NE(node, nullptr);
+                const auto *recurrence = dynamic_cast<const GDNRecurrenceStage *>(node->stage.get());
+                ASSERT_NE(recurrence, nullptr);
+                EXPECT_EQ(recurrence->getParams().n_heads, 1);
+                EXPECT_EQ(recurrence->getParams().n_k_heads, 1);
+                EXPECT_EQ(recurrence->getParams().kernel, state->rec_kernel.get());
+                EXPECT_EQ(recurrence->graphCaptureVariantSignature(),
+                    0x47444e4c00000000ULL | static_cast<uint64_t>(selected));
+            }
+        }
 }
 
 TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherWhenAvailable)

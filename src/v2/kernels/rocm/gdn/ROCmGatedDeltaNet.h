@@ -2,7 +2,10 @@
  * @file ROCmGatedDeltaNet.h
  * @brief ROCm/HIP implementation of ITensorGatedDeltaNet
  *
- * Consumes cache-owned, persistently bound GPU recurrence state.
+ * Consumes cache-owned, persistently bound GPU recurrence state. The sole
+ * successful device-state binding freezes its canonical physical layout;
+ * planar/merged launchers carry that same value through decode, grouped rows,
+ * long prefill and snapshots without conversion or a second state bank.
  *
  * Device-pointer design: All input/output pointers passed to chunk_forward()
  * and recurrent_step() are expected to be DEVICE pointers (already on GPU).
@@ -17,6 +20,7 @@
 #include "../../../utils/Logger.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNPlanarRecurrence.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -135,6 +139,7 @@ namespace llaminar2
             if (device_state_bound_ || !binding.valid())
                 return false;
 
+            recurrence_layout_ = binding.recurrence_layout;
             gpu_state_ = binding.primary_state;
             state_size_ = binding.primary_state_floats;
             secondary_gpu_state_ = binding.secondary_state;
@@ -145,6 +150,9 @@ namespace llaminar2
             device_state_bound_ = true;
             return true;
         }
+
+        /** @brief Return the layout frozen by the sole successful device-state binding. */
+        GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override { return recurrence_layout_; }
 
         bool resetGPUState(void *stream) override { return resetState(stream); }
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
@@ -380,7 +388,7 @@ namespace llaminar2
                 return false;
 
             // All pointers are device pointers — pass directly to HIP kernel.
-            const bool ok = rocmGDN_chunk_forward(
+            const bool ok = launchBoundPlanar(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
@@ -430,7 +438,7 @@ namespace llaminar2
                 return gdn::launchROCmMergedRecurrence({
                     DeviceRequestRowRanges::fullyActive(1),n_k_heads,n_heads,d_k,d_v,global_v_head_offset,
                     use_qk_l2norm,merged_qkv,alpha,beta_raw,A_log,dt_bias,output,live_state,destination,
-                    verifier_state_capture_,verifier_state_capture_size_,verifier_state_capture_rows_},stream_);
+                    verifier_state_capture_,verifier_state_capture_size_,verifier_state_capture_rows_,recurrence_layout_},stream_);
             }
 
             float *q = nullptr;
@@ -485,7 +493,7 @@ namespace llaminar2
             if (!effective_state)
                 return false;
 
-            const bool ok = rocmGDN_chunk_forward_effective(
+            const bool ok = launchBoundPlanarEffective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
@@ -572,7 +580,7 @@ namespace llaminar2
                         std::min(request_seq_len, verifier_state_capture_rows_ - snapshot_base);
                 }
 
-                if (!rocmGDN_chunk_forward(
+                if (!launchBoundPlanar(
                         Q + qk_offset,
                         K + qk_offset,
                         V + v_offset,
@@ -651,7 +659,7 @@ namespace llaminar2
                 effective_states = speculative_state_work_;
             }
 
-            return rocmGDN_chunk_forward_batched_effective(
+            return launchBoundPlanarRequests(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, request_state_bank_, effective_states,
                 seq_len, request_count, request_seq_len,
@@ -697,7 +705,7 @@ namespace llaminar2
              * true replay-equivalent handoff rather than a backend-specific
              * approximation.
              */
-            const bool ok = rocmGDN_chunk_forward(
+            const bool ok = launchBoundPlanar(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
                 /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
@@ -952,7 +960,90 @@ namespace llaminar2
         }
 
     private:
+        // Written once by bindDeviceState before any snapshot binding/capture.
+        GDNRecurrenceStateLayout recurrence_layout_=GDNRecurrenceStateLayout::KeyMajorValueContiguous;
         int device_ordinal_;
+
+        /**
+         * @brief Bind the immutable admitted state layout to a fully-active planar launch.
+         * @param Q,K,V Original expanded planar inputs.
+         * @param alpha,beta_raw Original projected gates.
+         * @param A_log,dt_bias Original learned head gates.
+         * @param output Exclusive activation destination.
+         * @param initial_state,updated_state Same-layout state owners; exact alias is legal.
+         * @param seq_len Physical rows in this request.
+         * @param heads,dk,dv Original recurrence geometry.
+         * @param normalize Original raw-input normalization policy.
+         * @param snapshots Optional same-layout snapshot owner.
+         * @param stride,maximum Full admitted snapshot envelope.
+         * @param device Exact owner ordinal retained by this backend.
+         * @param stream Exact caller-owned non-default stream.
+         * @return Typed native admission/enqueue status.
+         */
+        bool launchBoundPlanar(const float* Q,const float* K,const float* V,
+            const float* alpha,const float* beta_raw,const float* A_log,const float* dt_bias,
+            float* output,const float* initial_state,float* updated_state,int seq_len,int heads,int dk,int dv,
+            bool normalize,float* snapshots,int stride,int maximum,int device,void* stream)
+        {
+            if(seq_len<=0||device!=device_ordinal_||reinterpret_cast<std::uintptr_t>(stream)<=2)return false;
+            return gdn::launchROCmPlanarRecurrence({DeviceRequestRowRanges::fullyActive(seq_len),heads,dk,dv,normalize,
+                Q,K,V,alpha,beta_raw,A_log,dt_bias,output,initial_state,updated_state,snapshots,stride,maximum,recurrence_layout_},stream);
+        }
+        /**
+         * @brief Bind one device-owned live prefix without reading it on the host.
+         * @param Q,K,V Original expanded planar input planes.
+         * @param alpha,beta_raw Original projected gates.
+         * @param A_log,dt_bias Original learned gates.
+         * @param output Original activation destination.
+         * @param initial_state,updated_state Original same-layout state owners.
+         * @param seq_len Physical request capacity.
+         * @param heads,dk,dv Original head/key/value geometry.
+         * @param normalize Original raw normalization flag.
+         * @param count Original replay-owned live-prefix pointer.
+         * @param snapshots Optional same-layout snapshots.
+         * @param stride,maximum Full snapshot envelope.
+         * @param device Exact owner ordinal.
+         * @param stream Exact caller-owned stream.
+         * @return Typed native admission/enqueue status.
+         */
+        bool launchBoundPlanarEffective(const float* Q,const float* K,const float* V,
+            const float* alpha,const float* beta_raw,const float* A_log,const float* dt_bias,
+            float* output,const float* initial_state,float* updated_state,int seq_len,int heads,int dk,int dv,
+            bool normalize,const int* count,float* snapshots,int stride,int maximum,int device,void* stream)
+        {
+            if(seq_len<=0||!count||device!=device_ordinal_||reinterpret_cast<std::uintptr_t>(stream)<=2)return false;
+            return gdn::launchROCmPlanarRecurrence({DeviceRequestRowRanges::deviceCounted(1,seq_len,count),heads,dk,dv,normalize,
+                Q,K,V,alpha,beta_raw,A_log,dt_bias,output,initial_state,updated_state,snapshots,stride,maximum,recurrence_layout_},stream);
+        }
+        /**
+         * @brief Bind independent original request counts to one native grid.
+         * @param Q,K,V Original request-major expanded planes.
+         * @param alpha,beta_raw Original projected gates.
+         * @param A_log,dt_bias Original learned gates.
+         * @param output Original activation destination.
+         * @param initial_state,updated_state Original per-request same-layout state banks.
+         * @param seq_len,requests,per_request Exact original physical row topology.
+         * @param heads,dk,dv Original recurrence dimensions.
+         * @param normalize Original raw normalization policy.
+         * @param counts Original independent device prefix array.
+         * @param snapshots Optional same-layout snapshots in flattened original row order.
+         * @param stride,maximum Original snapshot envelope.
+         * @param device Exact owner ordinal.
+         * @param stream Exact non-default caller stream.
+         * @return Typed native admission/enqueue status.
+         */
+        bool launchBoundPlanarRequests(const float* Q,const float* K,const float* V,
+            const float* alpha,const float* beta_raw,const float* A_log,const float* dt_bias,
+            float* output,const float* initial_state,float* updated_state,int seq_len,int requests,int per_request,
+            int heads,int dk,int dv,bool normalize,const int* counts,float* snapshots,int stride,int maximum,int device,void* stream)
+        {
+            if(seq_len<=0||requests<=0||per_request<=0||std::int64_t(requests)*per_request!=seq_len||!counts||
+                device!=device_ordinal_||reinterpret_cast<std::uintptr_t>(stream)<=2)return false;
+            return gdn::launchROCmPlanarRecurrence({DeviceRequestRowRanges::deviceCounted(requests,per_request,counts),heads,dk,dv,
+                normalize,Q,K,V,alpha,beta_raw,A_log,dt_bias,output,initial_state,updated_state,snapshots,stride,maximum,recurrence_layout_},stream);
+        }
+
+
         void *stream_ = nullptr;
         float *gpu_state_ = nullptr;
         int state_size_ = 0;

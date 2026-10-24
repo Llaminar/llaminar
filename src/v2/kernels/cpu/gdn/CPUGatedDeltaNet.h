@@ -27,6 +27,12 @@ namespace llaminar2
     class CPUGatedDeltaNet : public ITensorGatedDeltaNet, public ICPURequestStateBankView
     {
     public:
+        /** @return CPU recurrence matrices always use key-major storage. */
+        GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override
+        {
+            return GDNRecurrenceStateLayout::KeyMajorValueContiguous;
+        }
+
         /** @brief Borrow the kernel's sole native CPU request-bank allocation for publication planning. */
         CPURequestStateBankView cpuRequestStateBankView()noexcept override
         {return {request_state_bank_,request_state_capacity_,request_state_size_};}

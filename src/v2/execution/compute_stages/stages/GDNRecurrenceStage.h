@@ -160,6 +160,9 @@ namespace llaminar2
         static_assert(StageParamsRequired<Params>);
 
         explicit GDNRecurrenceStage(Params params);
+        /** @return Immutable recurrence orientation included in retained graph identity. */
+        uint64_t graphCaptureVariantSignature() const override;
+
         ~GDNRecurrenceStage() override = default;
 
         bool execute(IDeviceContext *ctx) override;

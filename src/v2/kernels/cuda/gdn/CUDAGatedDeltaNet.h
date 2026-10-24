@@ -20,6 +20,7 @@
 #include "../../../utils/Logger.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNPlanarRecurrence.h"
 
 #include <algorithm>
 #include <cmath>
@@ -146,7 +147,8 @@ namespace llaminar2
          */
         bool bindDeviceState(const GDNDeviceStateBinding &binding) override
         {
-            if (device_state_bound_ || !binding.valid())
+            if (device_state_bound_ || !binding.valid() ||
+                !validGDNRecurrenceStateLayout(binding.recurrence_layout))
                 return false;
 
             gpu_state_ = binding.primary_state;
@@ -156,8 +158,16 @@ namespace llaminar2
             request_state_bank_ = binding.request_state_bank;
             request_state_bank_floats_ = binding.request_state_bank_floats;
             request_state_bank_capacity_ = binding.request_capacity;
+            recurrence_layout_ = binding.recurrence_layout;
             device_state_bound_ = true;
             return true;
+        }
+
+        /** @brief Return the immutable cache-owned physical recurrence format.
+         * @return Format adopted by the one successful state binding. */
+        GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override
+        {
+            return recurrence_layout_;
         }
 
         bool resetGPUState(void *stream) override { return resetState(stream); }
@@ -405,14 +415,13 @@ namespace llaminar2
             // All pointers are device pointers — pass directly to CUDA kernel.
             // No H2D/D2H copies, no scratch buffer, no stream synchronization.
             // The stage handles coherence (ensureOnDevice/allocateOnDevice).
-            const bool ok = cudaGDN_chunk_forward(
+            const bool ok = launchPlanarRecurrence(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
-                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-                verifier_state_capture_,
-                verifier_state_capture_size_,
-                verifier_state_capture_rows_,
-                device_ordinal_, stream_);
+                DeviceRequestRowRanges::fullyActive(seq_len),
+                n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_, verifier_state_capture_size_,
+                verifier_state_capture_rows_);
             return ok;
         }
 
@@ -484,6 +493,7 @@ namespace llaminar2
                         .snapshots = verifier_state_capture_,
                         .snapshot_stride_floats = verifier_state_capture_size_,
                         .max_snapshot_rows = verifier_state_capture_rows_,
+                        .recurrence_layout = recurrence_layout_,
                     }, stream_);
             }
 
@@ -538,15 +548,14 @@ namespace llaminar2
             if (!effective_state)
                 return false;
 
-            const bool ok = cudaGDN_chunk_forward_effective(
+            if (!device_effective_seq_len) return false;
+            const bool ok = launchPlanarRecurrence(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
-                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-                device_effective_seq_len,
-                verifier_state_capture_,
-                verifier_state_capture_size_,
-                verifier_state_capture_rows_,
-                device_ordinal_, stream_);
+                DeviceRequestRowRanges::deviceCounted(1, seq_len, device_effective_seq_len),
+                n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_, verifier_state_capture_size_,
+                verifier_state_capture_rows_);
             return ok;
         }
 
@@ -626,7 +635,7 @@ namespace llaminar2
                         std::min(request_seq_len, verifier_state_capture_rows_ - snapshot_base);
                 }
 
-                if (!cudaGDN_chunk_forward(
+                if (!launchPlanarRecurrence(
                         Q + qk_offset,
                         K + qk_offset,
                         V + v_offset,
@@ -641,12 +650,9 @@ namespace llaminar2
                         output + v_offset,
                         request_state,
                         updated_request_state,
-                        request_seq_len, n_heads, head_dim_k, head_dim_v,
-                        use_qk_l2norm,
-                        snapshots,
-                        required_state_size,
-                        snapshot_rows,
-                        device_ordinal_, stream_))
+                        DeviceRequestRowRanges::fullyActive(request_seq_len),
+                        n_heads, head_dim_k, head_dim_v, use_qk_l2norm,
+                        snapshots, required_state_size, snapshot_rows))
                 {
                     return false;
                 }
@@ -705,17 +711,15 @@ namespace llaminar2
                 effective_states = speculative_state_work_;
             }
 
-            return cudaGDN_chunk_forward_batched_effective(
+            return launchPlanarRecurrence(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, request_state_bank_, effective_states,
-                seq_len, request_count, request_seq_len,
-                n_heads, head_dim_k, head_dim_v,
-                use_qk_l2norm,
-                device_request_seq_lens,
+                DeviceRequestRowRanges::deviceCounted(
+                    request_count, request_seq_len, device_request_seq_lens),
+                n_heads, head_dim_k, head_dim_v, use_qk_l2norm,
                 capture_active ? verifier_state_capture_ : nullptr,
                 required_state_size,
-                capture_active ? verifier_state_capture_rows_ : 0,
-                device_ordinal_, stream_);
+                capture_active ? verifier_state_capture_rows_ : 0);
         }
 
         bool recurrent_step(
@@ -745,14 +749,13 @@ namespace llaminar2
             // slightly different GDN state over long generations, which can
             // flip near-tie Qwen3.6 tokens while the chunk-style verifier path
             // remains aligned with PyTorch.
-            const bool ok = cudaGDN_chunk_forward(
+            const bool ok = launchPlanarRecurrence(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, live_state, effective_state,
-                /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
-                verifier_state_capture_,
-                verifier_state_capture_size_,
-                verifier_state_capture_rows_,
-                device_ordinal_, stream_);
+                DeviceRequestRowRanges::fullyActive(1),
+                n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_, verifier_state_capture_size_,
+                verifier_state_capture_rows_);
             return ok;
         }
 
@@ -1020,6 +1023,46 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
     private:
+        /**
+         * @brief Publish original planar operands with the immutable state layout.
+         * @param Q Original raw planar queries; retained prefill scratch where applicable.
+         * @param K Original raw planar keys with the same lifecycle.
+         * @param V Original value rows.
+         * @param alpha Original projected gate scratch.
+         * @param beta_raw Original projected update-gate scratch.
+         * @param A_log Read-only per-head learned decay scale.
+         * @param dt_bias Read-only per-head learned time-step bias.
+         * @param output Exclusive output rows.
+         * @param initial_state Bound live request/head state.
+         * @param updated_state Bound live or speculative terminal state.
+         * @param rows Original request geometry and optional device length authority.
+         * @param heads Participant-local value heads.
+         * @param key_width Supported native64/128 key width.
+         * @param value_width Positive value width, including tail columns.
+         * @param normalize Original raw Q/K normalization policy.
+         * @param snapshots Optional same-format physical post-row state bank.
+         * @param snapshot_stride Exact admitted row stride, including odd padding.
+         * @param snapshot_rows Physical snapshot capacity.
+         * @return Exact typed native admission/enqueue result; no conversion.
+         */
+        bool launchPlanarRecurrence(
+            const float* Q, const float* K, const float* V,
+            const float* alpha, const float* beta_raw,
+            const float* A_log, const float* dt_bias,
+            float* output, const float* initial_state, float* updated_state,
+            DeviceRequestRowRanges rows, int heads, int key_width, int value_width,
+            bool normalize, float* snapshots, int snapshot_stride, int snapshot_rows) const
+        {
+            return gdn::launchCUDAPlanarRecurrence(gdn::PlanarRecurrenceInput{
+                .rows=rows, .heads=heads, .key_width=key_width, .value_width=value_width,
+                .normalize_qk=normalize, .query=Q, .key=K, .value=V,
+                .alpha=alpha, .beta_raw=beta_raw, .A_log=A_log, .dt_bias=dt_bias,
+                .output=output, .initial_state=initial_state, .updated_state=updated_state,
+                .snapshots=snapshots, .snapshot_stride_floats=snapshot_stride,
+                .max_snapshot_rows=snapshot_rows, .recurrence_layout=recurrence_layout_,
+            }, stream_);
+        }
+
         int device_ordinal_;
         void *stream_ = nullptr;
         float *gpu_state_ = nullptr;
@@ -1039,6 +1082,9 @@ namespace llaminar2
         int speculative_state_work_size_ = 0;
         DeviceWorkspaceManager *workspace_ = nullptr;
         bool device_state_bound_ = false;
+        GDNRecurrenceStateLayout recurrence_layout_ =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Fixed by the one cache binding.
+
 
         bool hasState(int required_state_size) const
         {

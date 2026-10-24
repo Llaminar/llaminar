@@ -775,6 +775,7 @@ namespace llaminar2
             for (const PrefixGDNLayerProbe &layer : probe.gdn_layers)
             {
                 fold_u64(gdn_digest, static_cast<uint64_t>(layer.global_layer));
+                fold_u64(gdn_digest, static_cast<uint64_t>(layer.recurrence_layout));
                 fold_u64(gdn_digest, layer.recurrence_hash);
                 fold_u64(gdn_digest, layer.conv_hash);
                 if (layer.device_state_hash_available)
@@ -833,8 +834,8 @@ namespace llaminar2
             {
                 const auto &layer = probe.gdn_layers[i];
                 oss << " L" << layer.global_layer
-                    << "/rh=" << layer.recurrence_hash
-                    << "/ch=" << layer.conv_hash;
+                    << "/layout=" << gdnRecurrenceStateLayoutName(layer.recurrence_layout)
+                    << "/rh=" << layer.recurrence_hash << "/ch=" << layer.conv_hash;
                 if (layer.device_state_hash_available)
                     oss << "/rdh=" << layer.recurrence_device_hash
                         << "/cdh=" << layer.conv_device_hash;
@@ -11831,6 +11832,7 @@ namespace llaminar2
                         b.device_state_hash_available;
                     const bool mismatch =
                         a.global_layer != b.global_layer ||
+                        a.recurrence_layout != b.recurrence_layout ||
                         (both_have_device_state
                              ? (a.recurrence_device_bytes != b.recurrence_device_bytes ||
                                 a.conv_device_bytes != b.conv_device_bytes ||
@@ -11844,31 +11846,23 @@ namespace llaminar2
                     if (mismatch)
                     {
                         std::ostringstream oss;
-                        oss << "layer=" << a.global_layer
-                            << " " << lhs_name << "_rec="
-                            << a.recurrence_hash
-                            << " " << rhs_name << "_rec="
-                            << b.recurrence_hash
-                            << " " << lhs_name << "_conv="
-                            << a.conv_hash
-                            << " " << rhs_name << "_conv="
-                            << b.conv_hash
-                            << " " << lhs_name << "_dev_rec="
-                            << a.recurrence_device_hash
-                            << " " << rhs_name << "_dev_rec="
-                            << b.recurrence_device_hash
-                            << " " << lhs_name << "_dev_conv="
-                            << a.conv_device_hash
-                            << " " << rhs_name << "_dev_conv="
-                            << b.conv_device_hash
-                            << " " << lhs_name << "_rec_zero="
-                            << (a.recurrence_all_zero ? "true" : "false")
-                            << " " << rhs_name << "_rec_zero="
-                            << (b.recurrence_all_zero ? "true" : "false")
-                            << " " << lhs_name << "_conv_zero="
-                            << (a.conv_all_zero ? "true" : "false")
-                            << " " << rhs_name << "_conv_zero="
-                            << (b.conv_all_zero ? "true" : "false");
+                        oss << "layer=" << a.global_layer << " " << lhs_name
+                            << "_layout=" << gdnRecurrenceStateLayoutName(a.recurrence_layout)
+                            << " " << rhs_name
+                            << "_layout=" << gdnRecurrenceStateLayoutName(b.recurrence_layout)
+                            << " " << lhs_name << "_rec=" << a.recurrence_hash << " " << rhs_name
+                            << "_rec=" << b.recurrence_hash << " " << lhs_name
+                            << "_conv=" << a.conv_hash << " " << rhs_name << "_conv=" << b.conv_hash
+                            << " " << lhs_name << "_dev_rec=" << a.recurrence_device_hash << " "
+                            << rhs_name << "_dev_rec=" << b.recurrence_device_hash << " "
+                            << lhs_name << "_dev_conv=" << a.conv_device_hash << " " << rhs_name
+                            << "_dev_conv=" << b.conv_device_hash << " " << lhs_name
+                            << "_rec_zero=" << (a.recurrence_all_zero ? "true" : "false") << " "
+                            << rhs_name
+                            << "_rec_zero=" << (b.recurrence_all_zero ? "true" : "false") << " "
+                            << lhs_name << "_conv_zero=" << (a.conv_all_zero ? "true" : "false")
+                            << " " << rhs_name
+                            << "_conv_zero=" << (b.conv_all_zero ? "true" : "false");
                         return oss.str();
                     }
                 }

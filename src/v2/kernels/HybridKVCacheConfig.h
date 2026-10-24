@@ -110,12 +110,15 @@ namespace llaminar2
          * @brief Cache-owned device slices bound into the recurrence kernel.
          */
         GDNDeviceStateBinding recurrence_device_state;
+        GDNRecurrenceStateLayout recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Authoritative recurrence bank
+                                                               ///< orientation.
 
         /**
          * @brief Initialize the CPU-owned live state vectors.
          *
-         * GPU caches must call @ref initializeShape instead and let their
-         * backend kernels allocate the live device banks.
+         * GPU caches call @ref initializeShape instead; their cache-owned arena
+         * materializes the live device banks under the existing authority.
          */
         void initializeCPUState(int qkv_dim)
         {
@@ -204,6 +207,9 @@ namespace llaminar2
         /// Device for GDN kernel instances (convolution + recurrence)
         int device_type = 0;    ///< KernelFactory device type enum
         int device_ordinal = 0; ///< Device index within the type
+        GDNRecurrenceStateLayout recurrence_layout =
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Internal immutable cache format,
+                                                               ///< not a CLI mode.
 
         /// Returns true if this config represents a hybrid model
         bool isHybrid() const { return !layer_types.empty(); }
@@ -219,15 +225,15 @@ namespace llaminar2
          */
         [[nodiscard]] HybridGDNStateGeometry gdnStateGeometry() const
         {
-            return HybridGDNStateGeometry::resolve(
-                n_heads,
-                local_head_start,
-                local_n_heads,
-                gdn_group_count,
-                gdn_time_step_rank,
-                gdn_state_size,
-                gdn_inner_size,
-                gdn_conv_kernel_size);
+            return HybridGDNStateGeometry::resolve(n_heads,
+                                                   local_head_start,
+                                                   local_n_heads,
+                                                   gdn_group_count,
+                                                   gdn_time_step_rank,
+                                                   gdn_state_size,
+                                                   gdn_inner_size,
+                                                   gdn_conv_kernel_size,
+                                                   recurrence_layout);
         }
 
         /// Count the number of full-attention layers

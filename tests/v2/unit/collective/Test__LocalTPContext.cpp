@@ -36,6 +36,7 @@
 #include <sstream>
 
 #include "collective/LocalTPContext.h"
+#include "execution/compute_stages/stages/GDNLinkedLiveStateGeometry.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "collective/ICollectiveBackend.h"
 #include "collective/DeviceGroup.h"
@@ -3135,4 +3136,46 @@ TEST_F(Test__LocalTPContext, GatherFromDevicesOutputTooSmallFails)
 
     std::vector<const TensorBase *> shards = {shard0.get(), shard1.get()};
     EXPECT_FALSE(ctx->gatherFromDevices(shards, output.get()));
+}
+
+/** @brief Cold clique admission rejects same-size foreign recurrence formats before capture. */
+TEST_F(Test__LocalTPContext, GDNLayoutIdentityRejectsSameSizeForeignParticipantBeforeCapture)
+{
+    using L = GDNRecurrenceStateLayout;
+    for (const bool mismatch : {false, true})
+    {
+        auto ctx = createLocalTPContext(
+            {cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
+        ASSERT_NE(ctx, nullptr);
+        GDNLinkedLiveStateGeometry first{
+            .global_key_heads = 8,
+            .global_value_heads = 24,
+            .key_width = 64,
+            .value_width = 65,
+            .conv_history_length = 3,
+            .recurrence_layout = L::ValueMajorKeyContiguous,
+        };
+        auto second = first;
+        if (mismatch)
+            second.recurrence_layout = L::KeyMajorValueContiguous;
+        bool first_ok = false;
+        bool second_ok = false;
+        std::thread left(
+            [&] {
+                first_ok =
+                    ctx->graphCaptureBoundaryRendezvous(first.captureLayoutIdentity(7), 0, 30000);
+            });
+        std::thread right(
+            [&] {
+                second_ok =
+                    ctx->graphCaptureBoundaryRendezvous(second.captureLayoutIdentity(7), 1, 30000);
+            });
+        left.join();
+        right.join();
+        EXPECT_EQ(first_ok, !mismatch);
+        EXPECT_EQ(second_ok, !mismatch);
+        if (mismatch)
+            EXPECT_FALSE(
+                ctx->graphCaptureBoundaryRendezvous(first.captureLayoutIdentity(7), 0, 30000));
+    }
 }
