@@ -13,6 +13,17 @@ four MI50s with both layout overrides absent. **Castagna's 42.959 decode tok/s
 target remains open.** This is focused
 qualification, not complete preflight, whole-corpus or image certification.
 
+The [QSA certificate study](QFN_QSA_CERTIFIED_PRUNING_STUDY.md) now covers
+4K, 16K, 64K and 128K learned histories on the same TP4 binary. Neither the
+stronger temporal bound nor contiguous-page ball bounds provides net scoring
+savings in the tested configurations. At 128K, tiny two-block pages have an
+optimistic 14.87% pruning potential against a 50% head-dot break-even point;
+larger pages save almost nothing. All native captures and driver/retirement
+checks pass. One of 1,920 selections differs from the float64 oracle; source-order
+FP32 reproduction explains the exact tie and matches native. This is an operand
+feasibility study, not a new model-accuracy or throughput gate. No pruning policy
+is installed, and the qualified production score above remains unchanged.
+
 The [GDN qualification record](QFN_GDN_RECURRENCE_TUNING.md) retains the exact
 settings, per-arm scores, current source/build evidence and archived experiments.
 The complete production convolution/recurrence boundary improves **15.3450 to
