@@ -27690,6 +27690,38 @@ if(TARGET v2_test_rocm_qwen_sparse_attention)
         V2_Integration_ROCm_QwenSparseFP16TileArithmetic)
 endif()
 
+# The evaluator witness belongs only to native callers, with the same canonical
+# HIP configuration and global spill guard; serving core has no diagnostic API.
+if(HAVE_ROCM)
+    set_source_files_properties(integration/kernels/rocm/QwenSparseFP16OnlineRescaleProbe.hip
+        PROPERTIES LANGUAGE HIP)
+    foreach(QSA_RESCALE_TARGET IN ITEMS v2_test_rocm_qwen_sparse_attention v2_perf_rocm_qwen_sparse_attention)
+        if(TARGET ${QSA_RESCALE_TARGET})
+            target_sources(${QSA_RESCALE_TARGET} PRIVATE
+                integration/kernels/rocm/QwenSparseFP16OnlineRescaleProbe.hip)
+            target_link_libraries(${QSA_RESCALE_TARGET} PRIVATE hip::host)
+            set_target_properties(${QSA_RESCALE_TARGET} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        endif()
+    endforeach()
+endif()
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_rocm_qwen_sparse_attention)
+    add_v2_test(V2_Integration_ROCm_QwenSparseOnlineRescaleEvaluator
+        COMMAND $<TARGET_FILE:v2_test_rocm_qwen_sparse_attention>
+            --gtest_filter=ROCmQwenSparseAttention.FP16OnlineRescaleCompiledEvaluatorAndNonfiniteBytes
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;Attention;Capture;ByteExact;Regression"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    add_v2_test(V2_Integration_ROCm_QwenSparseOnlineRescaleReplay
+        COMMAND $<TARGET_FILE:v2_test_rocm_qwen_sparse_attention>
+            --gtest_filter=ROCmQwenSparseAttention.FP16OnlineRescaleAdversarialGroupedSerialRetainedBytes
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;Attention;Capture;ByteExact;Regression"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCm_QwenSparseOnlineRescaleEvaluator
+        V2_Integration_ROCm_QwenSparseOnlineRescaleReplay)
+endif()
+
 # Cold output ownership and immutable publication authority regressions.
 target_sources(v2_test_qwen4exp_primitives PRIVATE
     unit/execution/qwen4exp/Test__VerifierPublicationExecution.cpp)

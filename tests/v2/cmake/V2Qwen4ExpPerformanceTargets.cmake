@@ -21,8 +21,14 @@ endif()
 
 if(HAVE_ROCM)
     # Reuse the native QSA fixture in Release; disabled filters alone run events.
+    set_source_files_properties(
+        "${_qfn_test_sources}/integration/kernels/rocm/QwenSparseFP16OnlineRescaleProbe.hip"
+        PROPERTIES LANGUAGE HIP)
     add_executable(v2_perf_rocm_qwen_sparse_observations EXCLUDE_FROM_ALL
-        "${_qfn_test_sources}/integration/kernels/rocm/Test__ROCmQwenSparseAttention.cpp")
+        "${_qfn_test_sources}/integration/kernels/rocm/Test__ROCmQwenSparseAttention.cpp"
+        "${_qfn_test_sources}/integration/kernels/rocm/QwenSparseFP16OnlineRescaleProbe.hip")
+    set_target_properties(v2_perf_rocm_qwen_sparse_observations PROPERTIES
+        HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
     target_link_libraries(v2_perf_rocm_qwen_sparse_observations PRIVATE
         llaminar2_core GTest::gtest_main hip::host)
     set_source_files_properties(

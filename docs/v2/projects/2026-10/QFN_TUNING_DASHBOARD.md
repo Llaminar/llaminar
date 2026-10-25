@@ -15,8 +15,8 @@ sequences and 185 final-logit rows match. The complete 796-registration
 Unit/affected selection passed; full production preflight remains pending.
 [Checkpoint settings and evidence][checkpoint196].
 
-**Coherent candidate slice:** prepared GDN Q/K, grouped QSA preparation,
-admitted attention defaults and norm/SingleQ8 fusion. Current source passes
+**Committed slice `f52896b8`:** prepared GDN Q/K, grouped QSA preparation,
+admitted attention defaults and norm/SingleQ8 fusion. That checkpoint passes
 **828/828 Unit/affected registrations**, with the same 95 explicit historical
 Unit omissions. All 185 model-logit rows match five references; actual policies
 are verified on all four MI50s. This is scoped qualification, not full preflight.
@@ -28,7 +28,7 @@ norm increment; no new speed promotion. [Evidence and limitations][qsa].
 
 | Next action | State / decision |
 |---|---|
-| Elide online rescale exponentials | Next user-requested experiment: first/equal/winning-scale cases only; exact parity, nonfinite handling and ISA proof required. |
+| Elide online rescale exponentials | Native/accuracy green; ≈0.75% prefill and ≈0.6% short-decode component savings. Model 820.812 P / 42.211 D vs 820.343 / 42.416: no overall gain. [Evidence][online-rescale]. |
 | Fuse GDN output normalization with SingleQ8 preparation | Focused gates, model panel, profiles and matched run green; 185 exact rows. Component 6.9% faster; cumulative model timing neutral. |
 | Fuse branch normalization with HC-down SingleQ8 preparation | Private component prototype ready; retain the FP32 output used by ResidualRead. No measured win yet. |
 | Complete CUDA QSA component timings | First M1/512 cell saves 22.685%; remaining shapes pending. No CUDA model-speed claim. |
@@ -49,7 +49,7 @@ speed or an image. G60 is the last complete topology gate; later A1 gates are sc
 
 | ID | Topology and ngrams | Accuracy | Llaminar P | Reference P | Strata P | Llaminar D | Reference D | Strata D | Next / limitation |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 196 + current exact panel | 821.541 | 467.821 C | — | 42.229 | 42.959 C | — | Close decode gap; screen exact online-rescale elision. |
+| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 196 + current exact panel | 821.541 | 467.821 C | — | 42.229 | 42.959 C | — | Close decode gap; next branch norm/HC-down fusion. |
 | A2 | ROCm1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a2] | 156.707 | 159.177 C | 45.270≈ | 15.164 | 11.600 C | 24.024≈ | Prefill trails Castagna; decode trails Strata. |
 | A3 | CUDA1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a3] | 180.920 | 129.020 U⚠ | 74.301≈ | 18.231 | 13.059 U⚠ | 31.253≈ | Resolve upstream variance; decode trails Strata. |
 | A4 | CPU1, 28 physical workers; SSD mmap ngrams | [🟢 G60][a4] | 98.466 | 48.408 C | n/a | 5.797 | 4.611 C | n/a | Both recorded phases lead Castagna. |
@@ -196,6 +196,7 @@ owns full geometry, ownership and live-communication coverage.
 [ngrams]: QFN_NGRAM_TIERED_STORAGE_PLAN.md
 [stages]: QFN_CASTAGNA_STAGE_COMPARISON.md
 [attention]: QFN_PACKED_ATTENTION_TUNING.md
+[online-rescale]: QFN_ATTENTION_ONLINE_RESCALE.md
 [scaling]: QFN_TP_COMPUTE_SCALING.md
 [cases]: ../../../../tests/v2/integration/parity/qwen4exp/Qwen4ExpLocalPairedCases.h
 [a2]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/rocm-cpu-static8-adaptive-hc-up-two-term/report.json

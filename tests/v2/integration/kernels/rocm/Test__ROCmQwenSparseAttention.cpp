@@ -31,3 +31,7 @@ extern "C" bool hipOps_rope_fp32_decode(float *,float *,const float *,int,int,in
 #include "../qwen4exp/QwenSparseFP16ROCmTest.h"
 
 #include "../qwen4exp/QwenSparseFP16Parts33ROCmTest.h"
+
+#ifdef HAVE_ROCM
+#include "../qwen4exp/QwenSparseFP16OnlineRescaleROCmTest.h"
+#endif

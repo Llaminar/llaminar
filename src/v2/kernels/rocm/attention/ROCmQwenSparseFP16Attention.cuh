@@ -16,6 +16,7 @@
  * Llaminar contracts; no dense gather or host-owned execution state is added.
  */
 #pragma once
+#include "ROCmQwenSparseOnlineRescale.cuh"
 
 namespace llaminar2::qwen4exp::rocm_sparse_detail
 {
@@ -1044,8 +1045,9 @@ __global__ __launch_bounds__(64 * (Parts == 33 ? 6 : 4), 2) void selectedAttenti
         if (owned)
         {
             const float nextMaximum = fmaxf(maximum, tileMaximum);
-            const float previousScale = denominator == 0.0f ? 0.0f : expf(maximum - nextMaximum);
-            const float tileScale = expf(tileMaximum - nextMaximum);
+            const auto scales = sparseHalfOnlineScales(maximum, tileMaximum, denominator, nextMaximum);
+            const float previousScale = scales.previous;
+            const float tileScale = scales.tile;
 #pragma unroll
             for (int coordinate = 0; coordinate < 4; ++coordinate)
             {
