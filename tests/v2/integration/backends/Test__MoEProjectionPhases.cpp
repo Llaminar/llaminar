@@ -14,6 +14,7 @@
  * round trip. Full/empty/sparse replay also checks exact byte extents and guards.
  */
 #include "backends/BackendManager.h"
+#include "backends/IGPUGraphCapture.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -21,6 +22,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
+#include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
 #include "kernels/KernelFactory.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/QuantizedVerifierFormats.h"
@@ -32,6 +34,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -99,21 +102,46 @@ namespace
     };
 
     /**
+     * @brief Bounded authored source/slice geometry for a focused native-weight proof.
+     *
+     * This changes fixture admission only. The existing complete, split and
+     * canonical production transactions, source views, guards and20 dirty
+     * replays remain identical. Ordinary broad callers retain their inventories.
+     */
+    struct ProjectionGeometry
+    {
+        int model_columns;
+        int intermediate_columns;
+        int capacity;
+        std::vector<int> rows;
+        std::vector<std::pair<int, int>> intervals;
+    };
+
+    /**
      * @brief Verify all grouped row widths and TP degrees on one prepared format.
      * @param device Actual endpoint; all launches use its context's exact stream.
      * @param format Native source format, never substituted or dequantized.
      * @param tails Exercise non-block-aligned floating N/K and uneven intervals.
      * @param proof Compact cases additionally reconstruct destroyed intermediates from an exact live packet.
+     * @param geometry Optional small source/row/slice inventory; absent preserves the full original sweep.
      */
     void prove(DeviceId device, const Format &format, bool tails = false,
-        IntermediateProof proof = IntermediateProof::DirectWorkspace)
+        IntermediateProof proof = IntermediateProof::DirectWorkspace,
+        std::optional<ProjectionGeometry> geometry = std::nullopt)
     {
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&]
         {
-            constexpr int capacity = 65, experts = 3, top_k = 2, guard = 16;
-            const int d_model = tails ? 271 : 256;
-            const int intermediate = tails ? 259 : 256;
+            constexpr int experts = 3, top_k = 2, guard = 16;
+            const int capacity = geometry ? geometry->capacity : 65;
+            const int d_model = geometry ? geometry->model_columns : (tails ? 271 : 256);
+            const int intermediate = geometry ? geometry->intermediate_columns : (tails ? 259 : 256);
+            require(!geometry || (!tails && proof == IntermediateProof::DirectWorkspace),
+                "focused projection geometry must retain its direct production phases");
+            const auto row_inventory = geometry ? geometry->rows : std::vector<int>{1, 2, 3, 15, 16, 17, 33, 65};
+            require(capacity > 0 && capacity <= 65 && d_model > 0 && intermediate > 0 &&
+                !row_inventory.empty() && std::all_of(row_inventory.begin(), row_inventory.end(),
+                    [&](int rows) { return rows > 0 && rows <= capacity; }), "projection geometry admission");
             const bool floating = deviceMoEWeightFormatIsFloating(format.family);
             const bool compact = proof == IntermediateProof::CompactPacket;
             auto *backend = getBackendFor(device);
@@ -175,7 +203,23 @@ namespace
                         exported_family == format.family, "floating projection descriptor export");
                 }
                 else
+                {
                     require(prepared.back().kernel->exportNativeVNNIMatrixDesc(native), "projection descriptor export");
+                    if (geometry)
+                    {
+                        const auto &registry = quantizedMoEVerifierFormats();
+                        const auto entry = std::find_if(registry.begin(), registry.end(), [&](const auto &candidate) {
+                            return format.name == candidate.label;
+                        });
+                        require(entry != registry.end() && entry->device_execution_codebook_id == 7 &&
+                            entry->source_codebook_id == 7 && sources.back()->native_type() == entry->tensor_type &&
+                            native.valid() && native.k == static_cast<int>(sources.back()->cols()) &&
+                            native.n == static_cast<int>(sources.back()->rows()) && native.codebook_id == entry->device_execution_codebook_id &&
+                            native.source_identity_present && native.source_codebook_id == entry->source_codebook_id &&
+                            bool(native.source_is_superblock) == entry->source_is_superblock,
+                            "focused projection lost its actual native source/physical format identity");
+                    }
+                }
             };
             std::vector<std::shared_ptr<TensorBase>> down_sources;
             for (int expert = 0; expert < experts; ++expert)
@@ -251,7 +295,15 @@ namespace
             }
             std::vector<Slice> slices;
             std::vector<std::pair<int, int>> intervals;
-            if (compact)
+            if (geometry)
+            {
+                intervals = geometry->intervals;
+                require(!intervals.empty() && std::all_of(intervals.begin(), intervals.end(), [&](const auto &interval) {
+                    return interval.first >= 0 && interval.first < d_model && interval.second > 0 &&
+                        interval.second <= d_model - interval.first;
+                }), "projection source-slice admission");
+            }
+            else if (compact)
                 intervals = {{0, d_model}};
             else if (tails)
                 intervals = {{0, 1}, {1, 17}, {18, 117}, {135, 136}};
@@ -286,7 +338,7 @@ namespace
 
             // The complete and all sliced graphs reuse one admitted workspace,
             // strictly sequentially. They never own concurrent writes to it.
-            for (const int rows : {1, 2, 3, 15, 16, 17, 33, capacity})
+            for (const int rows : row_inventory)
             {
                 SCOPED_TRACE(::testing::Message() << "format=" << format.name << " rows=" << rows);
                 auto layout = packet_capacity;
@@ -391,6 +443,32 @@ namespace
                     require(graph->endCapture(), "projection end capture");
                 }
                 require(graph->instantiate(), "projection instantiate");
+                if (geometry && device.is_rocm())
+                {
+                    std::vector<GPUGraphKernelNodeInfo> nodes;
+                    std::string error;
+                    require(graph->inspectKernelNodes(nodes, &error), "focused projection native graph inspection");
+                    for (const auto &slice : slices)
+                    {
+                        // Authored one-column M17 retains four workers and
+                        // reuses slots 0 and 32; its wider siblings require serial.
+                        const bool workers = slice.width == 1 || rows <= 3;
+                        const std::string expected_symbol = workers
+                            ? "moe_grouped_down_publish_canonical_routes_prefill_kernelILi7ELi4EE"
+                            : "moe_grouped_down_publish_canonical_routes_prefill_kernelILi7ELi1EE";
+                        require(std::any_of(nodes.begin(), nodes.end(), [&](const auto &node) {
+                            return node.name_resolved && node.function_identity &&
+                                node.name.find(expected_symbol) != std::string::npos &&
+                                node.block_x == (workers ? 256u : 64u) && node.block_y == 1 && node.block_z == 1 &&
+                                node.static_shared_memory_bytes == (workers ?
+                                    size_t(NativeVNNIGroupedDecodePolicy::maximum_k_partitions) * 64 * sizeof(float) : 0u) &&
+                                node.dynamic_shared_memory_bytes == 0 && node.local_memory_bytes_per_thread == 0 &&
+                                node.grid_x == static_cast<unsigned>((slice.width + 63) / 64) &&
+                                node.grid_y == static_cast<unsigned>(std::min(rows * top_k, 32)) && node.grid_z == 1;
+                        }), "focused Q5 source slice did not capture canonical format7 down");
+                    }
+                }
+                bool checked_slot_stride_pair = false;
                 for (int replay = 0; replay < 20; ++replay)
                 {
                     SCOPED_TRACE(::testing::Message() << "replay=" << replay);
@@ -403,11 +481,24 @@ namespace
                             const int slot = row * top_k + route;
                             // Full -> empty -> sparse -> full, with high physical
                             // row indices and changing expert/route identities.
-                            const bool active = replay % 5 != 1 && (replay % 5 != 2 || row % 3 == 2);
+                            // Two live original slots separated by the retained
+                            // gridY32 force a single CTA to reuse its partial bank.
+                            // Their compact live count still admits route-owned
+                            // work, unlike a fully populated M17 tiled replay.
+                            const bool stride_pair = geometry && rows * top_k > 32 && replay % 5 == 3;
+                            const bool active = stride_pair ? (slot == 0 || slot == 32)
+                                : replay % 5 != 1 && (replay % 5 != 2 || row % 3 == 2);
                             ids[slot] = active ? float((row + route + replay) % experts) : -1.0f;
                             probabilities[slot] = active ? (route == 0 ? 0.625f : 0.375f) : 0.0f;
                             live_routes += active;
                         }
+                    if (geometry && rows * top_k > 32 && replay % 5 == 3)
+                    {
+                        ASSERT_EQ(live_routes, 2u);
+                        ASSERT_GE(ids[0], 0.0f);
+                        ASSERT_GE(ids[32], 0.0f);
+                        checked_slot_stride_pair = true;
+                    }
                     publish(hidden.get(), h); publish(indices.get(), ids); publish(weights.get(), probabilities);
                     const auto poison_tensor = [&](ITensor *target)
                     {
@@ -477,6 +568,8 @@ namespace
                             ASSERT_EQ(routes[i], -1234.5f) << "route projection wrote unused capacity at " << i;
                     }
                 }
+                if (geometry && rows * top_k > 32)
+                    ASSERT_TRUE(checked_slot_stride_pair);
             }
         });
     }
@@ -486,6 +579,33 @@ namespace
     {
         const DeviceId device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
         for (const auto &format : formats()) prove(device, format);
+    }
+
+    /**
+     * @test Actual sourceN2560 down views keep canonical bytes across physical640/tail strides.
+     *
+     * These independently prepared source views keep the original model-column
+     * arithmetic key in the existing phase calls. The complete unchanged
+     * transaction is the control; canonical contributions and guards are checked
+     * across the same 20 full/empty/sparse/restored dirty replays as broad cases.
+     * M17/topK2 crosses the slot grid stride for the physical tail CTAs too.
+     */
+    TEST_P(MoEProjectionPhases, CanonicalQ5PartitionSlices)
+    {
+        auto selected = formats();
+        std::erase_if(selected, [](const Format &format) { return format.name != "Q5_1" && format.name != "Q5_K"; });
+        ASSERT_EQ(selected.size(), 2u) << "Focused source-format filter must contain exactly Q5_1 and Q5_K";
+        const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        for (const auto &format : selected)
+        {
+            ASSERT_TRUE(format.name == "Q5_1" || format.name == "Q5_K");
+            ASSERT_EQ(format.family, DeviceMoEWeightFormat::NativeVNNI);
+            SCOPED_TRACE(format.name);
+            const ProjectionGeometry geometry{2560, format.name == "Q5_1" ? 640 : 768, 17,
+                format.name == "Q5_1" ? std::vector<int>{1, 3, 17} : std::vector<int>{1},
+                {{0, 640}, {639, 641}, {2559, 1}}};
+            ASSERT_NO_FATAL_FAILURE(prove(device, format, false, IntermediateProof::DirectWorkspace, geometry));
+        }
     }
 
     /** @brief Floating intervals are not restricted to quantized block geometry. */

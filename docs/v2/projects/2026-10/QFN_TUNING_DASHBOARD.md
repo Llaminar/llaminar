@@ -1,5 +1,20 @@
 # QFN tuning dashboard
 
+**Checkpoint196 qualifies shape-selected ROCm Q5 down publication:**
+**821.541 prefill / 42.229 decode tok/s**, versus freshly bracketed frozen190
+controls at **820.931 / 41.702**. Decode improves **1.264%** with non-overlapping
+sample ranges; prefill is preserved. All nine 256-token trajectories and all
+185 canonical final-logit rows match. The complete **796-entry Unit/affected
+gate** passes, with no required skips and 95 unchanged legacy Unit omissions
+retained explicitly. Four cooperative workers preserve the original partition
+and reduction order; a checked shape rule keeps the serial program for small-K
+and wider grids where cooperation loses. The selected-program economy check
+passes eight cells and 24 A/B/A arms. See the
+[settings, profiling and qualification record](QFN_ROUTE_OWNED_MOE_TUNING.md#canonical-q5-partition-workers196--qualified-checkpoint-2026-10-25).
+**Castagna's 42.959 decode tok/s target remains open.** This is focused
+qualification, not complete preflight or image certification. The explicit
+FP16 attention Prefill8/Decode33 policy is unchanged.
+
 **Checkpoint190 installs the qualified ROCm ValueMajor default:** the final
 override-free repeat measures **820.777 prefill / 41.562 decode tok/s**. Its
 matched explicit-policy A/B/A measured **820.871 / 41.537**, versus
@@ -798,7 +813,7 @@ its actual prepared route must be represented explicitly in coverage.
 
 | ID | Topology / actual work placement | Ngrams | Reference engine | Accuracy | Llaminar prefill | Reference prefill | Strata prefill | Llaminar decode | Reference decode | Strata decode | Next action |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 L106† Release required groups; L95 prefix restore; latest complete topology gate [G60][a1] | 815.992 L106† | 467.821 F62§ | — | 39.274 L106† | 42.959 F62§ | — | L106 schedules FP32 loads by captured geometry: +4.676% matched decode with unchanged prefill and exact logits. Next qualify packed FP16 attention/KV sharing. Full preflight remains pending. |
+| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 Checkpoint196 Release required groups; 185 exact rows; 796 Unit/affected registrations; latest complete topology gate [G60][a1] | 821.541 checkpoint196† | 467.821 F62§ | — | 42.229 checkpoint196† | 42.959 F62§ | — | Shape-selected Q5 down publication adds 1.264% matched decode; prefill preserved and all nine sequences match. Explicit FP16 Prefill8/Decode33 attention; MTP/prefix off. Close the remaining decode gap. Full preflight and attention default promotion remain pending. |
 | A1.E151 | Same A1 topology; explicit FP16 attention with `prefill8_decode33`, native FP16 KV; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 832 Unit/affected registrations; boundary panel diagnostic | 818.579 E151† | 467.821 F62§ | — | 40.110 E151† | 42.959 F62§ | — | +0.566% decode versus same-binary uniform8. Tune decode head grouping; retain prefill. Experimental arithmetic; no new complete preflight or default promotion. |
 | A1.E160 | Same A1 topology; explicit FP16 `prefill8_decode33`, V0/V1 overlap and PV unroll2; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 832 Unit/affected registrations | 818.413 E160† | 467.821 F62§ | — | 40.111 E160† | 42.959 F62§ | — | Matched model throughput is flat versus frozen151. Native M1/512 pair15.446µs and M16/64K88.597µs. Experimental arithmetic; full preflight/default promotion remain open. |
 | A1.E164 | Same A1 topology; explicit FP16 `prefill8_decode33`, K1/V0/V1 overlap and QK64/32; MTP/prefix off | RAM | Castagna | 🟢 Required Release groups; 185 exact rows; 832 Unit/affected plus new K1 oracle registration | 819.682 E164† | 467.821 F62§ | — | 40.265 E164† | 42.959 F62§ | — | Matched model ranges overlap frozen151. Native M1/512 pair15.086µs and M16/64K84.354µs. Experimental arithmetic; full preflight/default promotion remain open. |
@@ -815,7 +830,7 @@ Use the exact policy names in subsequent four-GPU records. The dense-compute pol
 
 | ID | Dense-compute policy | Expert policy | QFN accuracy | Llaminar prefill | Castagna prefill | Llaminar decode | Castagna decode | Status |
 |---|---|---|---|---:|---:|---:|---:|---|
-| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L106† Release required groups; L95 prefix restore | 815.992 | 467.821 | 39.274 | 42.959 | Explicit `VocabularySharded` head, Automatic-resolved Four-worker owner gate/up, compact K/V, HC activation/publication fusion and geometry-selected FP32 load schedules; 185 identical logit rows and all twelve matching sequences. |
+| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 Checkpoint196 Release required groups; 185 exact rows; 796 Unit/affected registrations | 821.541 | 467.821 | 42.229 | 42.959 | Explicit `VocabularySharded` head, Automatic-resolved Four-worker owner gate/up, shape-selected Q5 down publication, ValueMajor GDN and explicit FP16 Prefill8/Decode33 attention; all nine matched sequences identical. Complete topology gate remains G60. |
 | A1.1 | `TensorParallel` | `Apportioned` | 🟢 L64† Release required groups | 561.867 | 467.821 | 30.515 | 42.959 | Accuracy, corrected SnapshotAdmission and timing passed; slower than current A1 in both phases. |
 | A1.2 | `PrefillTensorParallelDecodeReplicated` | `GateUpOwnedDownColumns` | 🔴 L65† Release short decode row KL | — | 467.821 | — | 42.959 | Admission and native execution passed; one forced decode row KL 1.119 exceeds the unchanged 1.0 ceiling. Diagnose before promotion. Timing pending. |
 | A1.3 | `PrefillTensorParallelDecodeReplicated` | `Apportioned` | 🟢 L65† Release required groups | 382.757 | 467.821 | 30.761 | 42.959 | Retained **Ornith** arrangement; admission, accuracy and timing passed, but both phases are slower than the current A1 control and Castagna. |
@@ -987,7 +1002,7 @@ This host has four MI50s and two RTX 3090s. Six mixed-vendor GPUs do not satisfy
 | D6 | 8 homogeneous GPUs: TP2 × PP4 | RAM initially | Bind backend first | ⚪ PENDING | — | — | — | — | — | — | Eight same-backend devices unavailable. |
 | D7 | 8 homogeneous GPUs: TP4 × PP2 | RAM initially | Bind backend first | ⚪ PENDING | — | — | — | — | — | — | Eight same-backend devices unavailable. |
 
-## Accuracy detail for the current green observations
+## Accuracy detail for checkpoint60 broad-panel observations
 
 Checkpoint60 broad-panel prompt-balanced final-logit metrics: 16 frozen histories, prefill plus six forced decode steps. Eight separate heldout histories also passed on every row. Values below are **prefill / decode**. KL is in nats; top-1 is exact agreement; top-5 is mean set intersection divided by five. N2047/D9 remains diagnostic, not long-context certification.
 

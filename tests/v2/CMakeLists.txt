@@ -23181,6 +23181,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 MPI_PROCS 1
                 NO_MODELS
                 TIMEOUT 120)
+            add_v2_test(V2_Integration_MoECanonicalQ5Partitions_${_live_rows_backend}
+                COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                    --gtest_filter=Backends/MoELiveRows.CanonicalQ5PartitionGeometry/${_live_rows_backend}:Backends/MoEProjectionPhases.CanonicalQ5PartitionSlices/${_live_rows_backend}
+                    --gtest_brief=1
+                LABELS "V2;Integration;ProductionTestPreflight;${_live_rows_backend};MoE;NativeVNNI;PreparedWeights;GraphCapture;ByteExact;Regression"
+                MPI_PROCS 1
+                NO_MODELS
+                TIMEOUT 120)
             add_v2_test(V2_Integration_MoEOriginalSourceRows_${_live_rows_backend}
                 COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                     --gtest_filter=Backends/MoELiveRows.OriginalRowsAllFormatsAndPrefillBoundaries/${_live_rows_backend}
@@ -25884,6 +25892,7 @@ if(HAVE_CUDA)
     V2_Integration_MoECompactProductionPackets_CUDA
     V2_Integration_MoEGroupingInitialization_CUDA
     V2_Integration_MoELiveRows_CUDA
+    V2_Integration_MoECanonicalQ5Partitions_CUDA
     V2_Integration_MoEOriginalSourceRows_CUDA
     V2_Integration_MoEProjectionPhases_CUDA
     V2_Integration_MoERouterHiddenQ8_CUDA
@@ -25975,6 +25984,7 @@ if(HAVE_ROCM)
     V2_Integration_MoECompactProductionPackets_ROCm
     V2_Integration_MoEGroupingInitialization_ROCm
     V2_Integration_MoELiveRows_ROCm
+    V2_Integration_MoECanonicalQ5Partitions_ROCm
     V2_Integration_MoEOriginalSourceRows_ROCm
     V2_Integration_MoEProjectionPhases_ROCm
     V2_Integration_MoERouterHiddenQ8_ROCm

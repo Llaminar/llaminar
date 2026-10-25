@@ -584,18 +584,61 @@ private:
 
 };
 
+/** @brief Immutable complete launch geometry; route slots are capacity, never a live host count. */
+struct MoECanonicalDownShape
+{
+    std::int64_t columns;
+    std::int64_t k;
+    std::int64_t route_slots;
+};
+
+/** @brief Closed execution choice; both alternatives preserve canonical route-axis arithmetic. */
+enum class MoECanonicalDownExecution : std::uint8_t
+{
+    Serial,
+    FourWorkers,
+};
+
 /**
- * @brief Inspect the unchanged fixed-down64 control on the exact device.
+ * @brief Validate launch extents and select partition execution without runtime probes.
+ * @param shape Immutable physical N/K/route capacity embedded in the captured transaction.
+ * @return One-wave serial or four-wave partition execution, never another output layout.
+ * @throws std::invalid_argument For nonpositive, unaligned or unrepresentable launch geometry.
+ * @note The gfx906 economy boundary is fixed from matched component measurements;
+ * it selects execution geometry only, never a different arithmetic program.
+ * Source-owned partition counts and their arithmetic are not changed by this geometry choice.
+ */
+[[nodiscard]] inline MoECanonicalDownExecution selectMoECanonicalDownExecution(MoECanonicalDownShape shape)
+{
+    constexpr std::int64_t minimum_parallel_k = 128;
+    constexpr std::uint64_t maximum_parallel_ctas = 240;
+    constexpr std::int64_t maximum_extent = 2147483647;
+    if (shape.columns <= 0 || shape.k <= 0 || shape.route_slots <= 0 ||
+        shape.columns > maximum_extent || shape.k > maximum_extent ||
+        shape.route_slots > maximum_extent || shape.k % 32 != 0)
+        throw std::invalid_argument("canonical down requires checked positive N/K/slots and K32 alignment");
+    const auto tiles = (static_cast<std::uint64_t>(shape.columns) + 63u) / 64u;
+    const auto slot_lanes = static_cast<std::uint64_t>(std::min<std::int64_t>(shape.route_slots, 32));
+    const auto ctas = tiles * slot_lanes;
+    const auto work_limited_ctas = std::min(maximum_parallel_ctas, static_cast<std::uint64_t>(shape.k));
+    return shape.k >= minimum_parallel_k && ctas <= work_limited_ctas
+        ? MoECanonicalDownExecution::FourWorkers : MoECanonicalDownExecution::Serial;
+}
+
+/**
+ * @brief Inspect the exact shape-selected down leaf before graph capture.
  * @param execution_codebook Physical native decoder; mixed tables are not this diagnostic.
  * @param layout Canonical route publication or original token-row publication.
+ * @param shape Complete immutable physical launch geometry.
  * @param device_ordinal Exact native owner.
- * @return Actual fixed-down leaf resources, including its original64-thread width.
- * @throws std::invalid_argument For unknown decoder/layout/device.
+ * @return Selected symbol and its actual block/resource allocation.
+ * @throws std::invalid_argument For unknown decoder/layout/device or invalid shape.
  * @throws std::logic_error During graph capture.
  * @throws std::runtime_error For incomplete/nonresident/private-memory resources.
  */
-[[nodiscard]] MoERouteOwnedKernelResources inspectMoERouteOwnedDown64(
-    std::uint8_t execution_codebook, MoEPrefillOutputLayout layout, int device_ordinal);
+[[nodiscard]] MoERouteOwnedKernelResources inspectMoERouteOwnedDown(
+    std::uint8_t execution_codebook, MoEPrefillOutputLayout layout,
+    MoECanonicalDownShape shape, int device_ordinal);
 
 /** @brief One accepted host producer submission; device counts are not observed. */
 struct MoERouteOwnedGateUpLaunch

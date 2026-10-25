@@ -3,7 +3,8 @@
  * @brief Native resource admission and empty-capture rejection for route-owned tuning.
  *
  * Cold inspection authenticates every canonical physical decoder at each exact
- * K_LANES1 width, plus the unchanged fixed64 down controls. Public invalid calls
+ * K_LANES1 width and shape-selected canonical down controls. Independent explicit
+ * shape expectations guard both serial and partition-worker execution. Public invalid calls
  * are observed in a real native capture and must leave zero nodes of any kind.
  * Admission/empty-capture cases guard scope and exact resource ownership.
  * The captured cases compare real production leaf transactions against an
@@ -117,13 +118,26 @@ TEST(ROCmMoERouteOwnedGeometryNative, ExactLeafAdmissionAndScopeRetirement)
         }
         for (const auto codebook : compiledPhysicalCodebooks())
         for (const auto layout : {MoEPrefillOutputLayout::OriginalRouteRows, MoEPrefillOutputLayout::TokenRows})
-            expectResources(inspectMoERouteOwnedDown64(codebook, layout, 0), 64);
+        {
+            struct Case { MoECanonicalDownShape shape; bool parallel; };
+            for (const auto &cell : {Case{{640, 640, 10}, true}, Case{{648, 640, 10}, true},
+                     Case{{2560, 640, 10}, false}, Case{{16, 32, 10}, false},
+                     Case{{640, 640, 33}, false}})
+            {
+                const bool workers = codebook == 7 &&
+                    layout == MoEPrefillOutputLayout::OriginalRouteRows && cell.parallel;
+                const auto resources = inspectMoERouteOwnedDown(codebook, layout, cell.shape, 0);
+                expectResources(resources, workers ? 256 : 64);
+                EXPECT_EQ(resources.static_shared_memory_bytes, workers ? 64u * 64u * sizeof(float) : 0u);
+                EXPECT_EQ(resources.dynamic_shared_memory_bytes, 0u);
+            }
+        }
         EXPECT_THROW((void)admitMoERouteOwnedGateUpGeometry(
             MoERouteOwnedGateUpGeometry::TN64, 255, 0), std::invalid_argument);
         EXPECT_THROW((void)admitMoERouteOwnedGateUpGeometry(
             MoERouteOwnedGateUpGeometry::TN64, 19, -1), std::invalid_argument);
-        EXPECT_THROW((void)inspectMoERouteOwnedDown64(
-            19, static_cast<MoEPrefillOutputLayout>(255), 0), std::invalid_argument);
+        EXPECT_THROW((void)inspectMoERouteOwnedDown(
+            19, static_cast<MoEPrefillOutputLayout>(255), {640, 640, 10}, 0), std::invalid_argument);
     });
 }
 

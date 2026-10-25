@@ -14,12 +14,14 @@
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
+#include "backends/IGPUGraphCapture.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
+#include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
 #include "kernels/KernelFactory.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/QuantizedVerifierFormats.h"
@@ -148,6 +150,27 @@ namespace
                         prepared[expert * 3].kernel, prepared[expert * 3 + 1].kernel,
                         prepared[expert * 3 + 2].kernel, hidden_size, width, descriptors[expert]));
                     ASSERT_EQ(descriptors[expert].weight_format, format.format);
+                    // Q5_K and Q5_1 share physical7, but original block
+                    // provenance must survive the real load/prepare/export path.
+                    if (std::string(format.label) == "Q5_1" || std::string(format.label) == "Q5_K")
+                    {
+                        const auto &registry = quantizedMoEVerifierFormats();
+                        const auto source = std::find_if(registry.begin(), registry.end(), [&](const auto &entry) {
+                            return std::string(entry.label) == format.label;
+                        });
+                        ASSERT_NE(source, registry.end());
+                        ASSERT_EQ(source->device_execution_codebook_id, uint8_t{7});
+                        ASSERT_EQ(source->source_codebook_id, uint8_t{7});
+                        ASSERT_EQ(source_weights[expert * 3 + 2]->native_type(), source->tensor_type);
+                        const auto &down = descriptors[expert].down;
+                        ASSERT_EQ(down.n, hidden_size);
+                        ASSERT_EQ(down.k, width);
+                        ASSERT_EQ(down.blocks_per_row, static_cast<uint32_t>(width / 32));
+                        ASSERT_EQ(down.codebook_id, source->device_execution_codebook_id);
+                        ASSERT_TRUE(down.source_identity_present);
+                        ASSERT_EQ(down.source_codebook_id, source->source_codebook_id);
+                        ASSERT_EQ(bool(down.source_is_superblock), source->source_is_superblock);
+                    }
                 }
 
                 for (const bool shared : {false, true})
@@ -344,6 +367,39 @@ namespace
                         ASSERT_TRUE(capture->endCapture());
                     }
                     ASSERT_TRUE(capture->instantiate());
+                    if (device.is_rocm() && (std::string(format.label) == "Q5_1" ||
+                                              std::string(format.label) == "Q5_K"))
+                    {
+                        // Runtime HIP symbols are raw mangled names. Inspect
+                        // the actual retained graph, never infer its family
+                        // from a label or from the scalar oracle's success.
+                        std::vector<GPUGraphKernelNodeInfo> nodes;
+                        std::string error;
+                        ASSERT_TRUE(capture->inspectKernelNodes(nodes, &error)) << error;
+                        // Explicit authored cells independently require both native families.
+                        ASSERT_TRUE((hidden_size == 256 && width == 256) || hidden_size == 2560);
+                        const bool workers = hidden_size == 256 ||
+                            (width != 32 && (rows == 1 || (shared && rows == 3)));
+                        const std::string expected_symbol = workers
+                            ? "moe_grouped_down_publish_canonical_routes_prefill_kernelILi7ELi4EE"
+                            : "moe_grouped_down_publish_canonical_routes_prefill_kernelILi7ELi1EE";
+                        const auto canonical = std::find_if(nodes.begin(), nodes.end(), [&](const auto &node) {
+                            return node.name_resolved && node.name.find(
+                                expected_symbol) != std::string::npos;
+                        });
+                        ASSERT_NE(canonical, nodes.end());
+                        ASSERT_NE(canonical->function_identity, 0u);
+                        ASSERT_EQ(canonical->block_x, workers ? 256u : 64u);
+                        ASSERT_EQ(canonical->static_shared_memory_bytes,
+                            workers ? size_t(NativeVNNIGroupedDecodePolicy::maximum_k_partitions) * 64 * sizeof(float) : 0u);
+                        ASSERT_EQ(canonical->dynamic_shared_memory_bytes, 0u);
+                        ASSERT_EQ(canonical->local_memory_bytes_per_thread, 0u);
+                        ASSERT_EQ(canonical->block_y, 1u);
+                        ASSERT_EQ(canonical->block_z, 1u);
+                        ASSERT_EQ(canonical->grid_x, static_cast<unsigned>((hidden_size + 63) / 64));
+                        ASSERT_EQ(canonical->grid_y, static_cast<unsigned>(std::min(rows * top_k, 32)));
+                        ASSERT_EQ(canonical->grid_z, 1u);
+                    }
                     std::vector<float> actual(serial.size());
                     std::vector<float> reduced(serial.size());
                     const std::vector<float> poison(serial.size(), std::numeric_limits<float>::quiet_NaN());
@@ -477,6 +533,41 @@ namespace
                 SCOPED_TRACE(::testing::Message() << "rows=" << rows << " source=" << int(source));
                 proveLiveRows(device, context, formats, 256, 256, rows, source);
             }
+    }
+
+    /**
+     * @test Cooperative Q5 canonical publication retains the original ordered partition bytes.
+     *
+     * K256 has only singleton partitions. These source-authentic cells include
+     * the production 20-block geometry, singleton final ranges, kparts1 and a
+     * whole-superblock Q5_K source. M9/topK4 crosses the 32-slot grid stride,
+     * so serial publication covers successive original slots; the narrow
+     * projection fixture separately proves four-worker shared-bank reuse.
+     * Existing capture/poison/live-prefix cycles
+     * and the independent ordinary M1 oracle remain the only execution owners.
+     */
+    TEST_P(MoELiveRows, CanonicalQ5PartitionGeometry)
+    {
+        auto formats = liveRowsFormats();
+        std::erase_if(formats, [](const WeightCase &format) {
+            return std::string(format.label) != "Q5_1" && std::string(format.label) != "Q5_K";
+        });
+        ASSERT_EQ(formats.size(), 2u) << "Focused Q5 selection must not silently disappear or broaden";
+        struct Geometry { const char *source; int width; int rows; };
+        const std::array<Geometry, 7> cells = {{{"Q5_1", 640, 1}, {"Q5_1", 640, 3}, {"Q5_1", 640, 9},
+            {"Q5_1", 608, 1}, {"Q5_1", 672, 1}, {"Q5_1", 32, 1}, {"Q5_K", 768, 1}}};
+        const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        for (const auto &cell : cells)
+        {
+            SCOPED_TRACE(::testing::Message() << "source=" << cell.source << " K=" << cell.width << " M=" << cell.rows);
+            auto selected = formats;
+            std::erase_if(selected, [&](const WeightCase &format) { return std::string(format.label) != cell.source; });
+            ASSERT_EQ(selected.size(), 1u);
+            ASSERT_EQ(std::string(selected.front().label), cell.source);
+            ASSERT_NO_FATAL_FAILURE(proveLiveRows(device, context, selected,
+                /*hidden_size=*/2560, cell.width, cell.rows));
+        }
     }
 
     /** @test Fused floating intermediates retain serial bytes for every live M. */

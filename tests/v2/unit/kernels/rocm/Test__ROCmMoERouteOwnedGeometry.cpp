@@ -379,3 +379,36 @@ TEST(ROCmMoERouteOwnedGeometry, AutomaticOwnerPolicyPreservesExplicitModes)
     EXPECT_EQ(facts.select(MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes), MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes);
     EXPECT_THROW((void)facts.select(static_cast<MoERouteOwnedModelPartitionPolicy>(255)), std::invalid_argument);
 }
+
+/** @brief Checked immutable geometry selects both sides without devices or live-count shadows. */
+TEST(ROCmMoERouteOwnedGeometry, CanonicalDownShapeSelectionIsCheckedAndTotal)
+{
+    using E = MoECanonicalDownExecution;
+    EXPECT_EQ(selectMoECanonicalDownExecution({640, 640, 10}), E::FourWorkers);
+    EXPECT_EQ(selectMoECanonicalDownExecution({648, 640, 10}), E::FourWorkers);
+    EXPECT_EQ(selectMoECanonicalDownExecution({1536, 640, 10}), E::FourWorkers);
+    EXPECT_EQ(selectMoECanonicalDownExecution({1537, 640, 10}), E::Serial);
+    EXPECT_EQ(selectMoECanonicalDownExecution({768, 128, 10}), E::FourWorkers);
+    EXPECT_EQ(selectMoECanonicalDownExecution({832, 128, 10}), E::Serial);
+    EXPECT_EQ(selectMoECanonicalDownExecution({1280, 128, 10}), E::Serial);
+    EXPECT_EQ(selectMoECanonicalDownExecution({1536, 128, 10}), E::Serial);
+    EXPECT_EQ(selectMoECanonicalDownExecution({1536, 256, 10}), E::FourWorkers);
+    EXPECT_EQ(selectMoECanonicalDownExecution({640, 640, 16}), E::FourWorkers);
+    EXPECT_EQ(selectMoECanonicalDownExecution({1280, 640, 16}), E::Serial);
+    EXPECT_EQ(selectMoECanonicalDownExecution({16, 64, 10}), E::Serial);
+    EXPECT_EQ(selectMoECanonicalDownExecution({16, 128, 10}), E::FourWorkers);
+    EXPECT_EQ(selectMoECanonicalDownExecution({2560, 640, 10}), E::Serial);
+    EXPECT_EQ(selectMoECanonicalDownExecution({640, 640, 33}), E::Serial);
+    for (const auto shape : {MoECanonicalDownShape{0, 128, 10}, {64, 0, 10},
+             {64, 33, 10}, {64, 128, 0}, {-1, 128, 10},
+             {std::numeric_limits<std::int64_t>::max(), 128, 10},
+             {64, 128, std::numeric_limits<std::int64_t>::max()}})
+        EXPECT_THROW((void)selectMoECanonicalDownExecution(shape), std::invalid_argument);
+    for (int n = 1; n <= 4096; ++n)
+        for (const int k : {32, 64, 128, 640, 2560})
+            for (const int slots : {1, 10, 31, 32, 33, 512})
+            {
+                const auto execution = selectMoECanonicalDownExecution({n, k, slots});
+                EXPECT_TRUE(execution == E::Serial || execution == E::FourWorkers);
+            }
+}

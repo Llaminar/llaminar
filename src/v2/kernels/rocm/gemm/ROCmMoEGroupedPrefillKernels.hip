@@ -2976,6 +2976,21 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
 }
 
 /**
+ * @brief Compile-time geometry shared by canonical route publication and inspection.
+ *
+ * Output columns stay wave-sized for every format. Only the physical Q5_1
+ * specialization assigns four workers to the original ordered K partitions.
+ */
+template <int FORMAT_TAG, int WORKERS>
+struct MoECanonicalRouteDownGeometry
+{
+    static constexpr int columns = 64;
+    static_assert(WORKERS == 1 || (WORKERS == 4 && FORMAT_TAG == static_cast<int>(NVNNI_PF_Q5_1)));
+    static constexpr int workers = WORKERS;
+    static constexpr int threads = columns * workers;
+};
+
+/**
  * @brief Publish one weighted grouped down row per original router slot.
  *
  * Invalid or participant-remote slots explicitly write zero. The route axis is
@@ -2983,10 +2998,16 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
  * the canonical router-order epilogue. A bounded slot grid avoids scheduling
  * the entire physical matrix when device admission chooses the other family.
  *
+ * @details The Q5_1 physical specialization uses four wave-uniform workers
+ * over the original serial-M1 K partitions. A full-capacity partition-major
+ * shared bank and two slot-loop barriers preserve ascending RN publication
+ * for every M. Other formats and mixed-table execution retain the original
+ * single-wave implementation.
  * @tparam FORMAT_TAG NativeVNNI format value, or the mixed-table sentinel.
+ * @tparam WORKERS One serial wave or four original-partition worker waves.
  */
-template <int FORMAT_TAG>
-__global__ __launch_bounds__(64)
+template <int FORMAT_TAG, int WORKERS = (FORMAT_TAG == static_cast<int>(NVNNI_PF_Q5_1) ? 4 : 1)>
+__global__ __launch_bounds__((MoECanonicalRouteDownGeometry<FORMAT_TAG, WORKERS>::threads))
 void moe_grouped_down_publish_canonical_routes_prefill_kernel(
     const int8_t* __restrict__ swiglu_int8,
     const float* __restrict__ swiglu_scales,
@@ -3004,7 +3025,81 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
 {
     if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned))
         return;
-    constexpr int TILE_N = 64;
+    if constexpr (WORKERS == 4)
+    {
+        constexpr int columns = MoECanonicalRouteDownGeometry<FORMAT_TAG, WORKERS>::columns;
+        constexpr int workers = MoECanonicalRouteDownGeometry<FORMAT_TAG, WORKERS>::workers;
+        constexpr int maximum_partitions = llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
+        __shared__ float partials[maximum_partitions][columns];
+        const int output_lane = static_cast<int>(threadIdx.x) % columns;
+        const int worker = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x) / columns);
+        const int n = static_cast<int>(blockIdx.x) * columns + output_lane;
+        const int blocks_per_row = K / 32;
+
+        for (int original_slot = static_cast<int>(blockIdx.y); original_slot < total_slots;
+             original_slot += static_cast<int>(gridDim.y))
+        {
+            const size_t output_index = static_cast<size_t>(original_slot) * N + n;
+            const int grouped_slot = __builtin_amdgcn_readfirstlane(original_to_grouped[original_slot]);
+            const int expert_id = original_expert_ids
+                ? __builtin_amdgcn_readfirstlane(original_expert_ids[original_slot])
+                : (num_experts == 1 ? 0 : -1);
+            if (grouped_slot < 0 || expert_id < 0 || expert_id >= num_experts)
+            {
+                // The original publisher authors positive zero for every invalid
+                // route column. Exactly one wave writes it; no duplicate writers.
+                if (worker == 0 && n < N)
+                    route_output[output_index] = 0.0f;
+                continue;
+            }
+            if (grouped_slot >= total_slots)
+                moe_prefill_fail_fast_invalid_grouped_index();
+            const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
+            if (!prefill_native_vnni_desc_shape_ok<NVNNI_PF_Q5_1>(desc, N, K))
+                moe_prefill_fail_fast_invalid_grouped_index();
+            const int partitions = k_partition_policy.forDescriptor(desc);
+            if (partitions <= 0 || partitions > blocks_per_row || partitions > maximum_partitions)
+                moe_prefill_fail_fast_invalid_grouped_index();
+            const int blocks_per_partition = (blocks_per_row + partitions - 1) / partitions;
+            const int8_t* slot_A = swiglu_int8 + static_cast<size_t>(grouped_slot) * K;
+            const float* slot_scales = swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
+            if (n < N)
+            {
+#pragma unroll 1
+                for (int partition = worker; partition < partitions; partition += workers)
+                {
+                    const int begin = partition * blocks_per_partition;
+                    const int end = min(begin + blocks_per_partition, blocks_per_row);
+                    partials[partition][output_lane] = begin < end
+                        ? moe_prefill_dot_desc_range<NVNNI_PF_Q5_1>(
+                              desc, n, slot_A, slot_scales, N, begin, end)
+                        : 0.0f;
+                }
+            }
+            // Tail lanes remain participants: every live partial is published
+            // before wave 0 reads it. No thread exits early on a column tail.
+            __syncthreads();
+            if (worker == 0 && n < N)
+            {
+                float value = partials[0][output_lane];
+                if (partitions != 1)
+                {
+                    float total = 0.0f;
+#pragma unroll 1
+                    for (int partition = 0; partition < partitions; ++partition)
+                        total = rocm_native_vnni_accumulate_rn(total, partials[partition][output_lane]);
+                    value = total;
+                }
+                route_output[output_index] = rocm_native_vnni_weight_route_rn(grouped_weights[grouped_slot], value);
+            }
+            // Every slot iteration retires wave 0's bank reads before any other
+            // wave can overwrite them for the next slot. Keep this second barrier
+            // explicit for all-M publication, including tail-column participants.
+            __syncthreads();
+        }
+        return;
+    }
+    constexpr int TILE_N = MoECanonicalRouteDownGeometry<FORMAT_TAG, WORKERS>::columns;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     if (n >= N)
         return;
@@ -3661,15 +3756,23 @@ MoERouteLeafSymbol routeGateUpSymbolForGeometry(llaminar2::rocm::MoERouteOwnedGa
     throw std::invalid_argument("unknown route-owned producer geometry");
 }
 
-/** @brief Inspect the original fixed64 publication leaf, never an expert-tiled proxy. */
+/** @brief Inspect the exact format-owned 64-column publication leaf, never an expert-tiled proxy. */
 template <NativeVNNIFormatPrefill FMT>
-MoERouteLeafSymbol routeDownSymbol(llaminar2::MoEPrefillOutputLayout layout)
+MoERouteLeafSymbol routeDownSymbol(llaminar2::MoEPrefillOutputLayout layout,
+    llaminar2::rocm::MoECanonicalDownExecution execution)
 {
     switch (layout)
     {
     case llaminar2::MoEPrefillOutputLayout::OriginalRouteRows:
+        if constexpr (FMT == NVNNI_PF_Q5_1)
+        {
+            if (execution == llaminar2::rocm::MoECanonicalDownExecution::FourWorkers)
+                return {reinterpret_cast<const void *>(HIP_KERNEL_NAME(
+                    moe_grouped_down_publish_canonical_routes_prefill_kernel<static_cast<int>(FMT), 4>)),
+                    __PRETTY_FUNCTION__, 256, 0};
+        }
         return {reinterpret_cast<const void *>(HIP_KERNEL_NAME(
-            moe_grouped_down_publish_canonical_routes_prefill_kernel<static_cast<int>(FMT)>)),
+            moe_grouped_down_publish_canonical_routes_prefill_kernel<static_cast<int>(FMT), 1>)),
             __PRETTY_FUNCTION__, 64, 0};
     case llaminar2::MoEPrefillOutputLayout::TokenRows:
         return {reinterpret_cast<const void *>(HIP_KERNEL_NAME(
@@ -3789,11 +3892,12 @@ llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(
 }
 
 llaminar2::rocm::MoERouteOwnedKernelResources
-llaminar2::rocm::inspectMoERouteOwnedDown64(uint8_t codebook,
-    MoEPrefillOutputLayout layout, int device)
+llaminar2::rocm::inspectMoERouteOwnedDown(uint8_t codebook,
+    MoEPrefillOutputLayout layout, MoECanonicalDownShape shape, int device)
 {
+    const auto execution = selectMoECanonicalDownExecution(shape);
     const auto symbol = selectMoERouteOwnedFormat(codebook,
-        [=]<NativeVNNIFormatPrefill FMT>() { return routeDownSymbol<FMT>(layout); });
+        [=]<NativeVNNIFormatPrefill FMT>() { return routeDownSymbol<FMT>(layout, execution); });
     requireMoERouteOwnedColdInspection(device);
     return inspectMoERouteLeaf(symbol);
 }
@@ -4633,18 +4737,36 @@ bool rocmMoE_grouped_prefill_pipeline(
              * the mixed-table specialization. Both routes execute the same
              * ordered publication kernels and differ solely in decoder dispatch.
              */
+            #define LAUNCH_CANONICAL_DOWN_WORKERS(FORMAT_TAG, WORKERS) \
+                do { \
+                    using CanonicalGeometry = MoECanonicalRouteDownGeometry<FORMAT_TAG, WORKERS>; \
+                    dim3 grid((down_columns + CanonicalGeometry::columns - 1) / CanonicalGeometry::columns, \
+                              std::min(total_slots, kCanonicalPublicationSlotLanes)); \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_down_publish_canonical_routes_prefill_kernel<FORMAT_TAG, WORKERS>), \
+                        grid, dim3(CanonicalGeometry::threads), 0, hip_stream, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                        d_original_to_grouped, d_original_expert_ids, d_group_weights, \
+                        d_canonical_route_contributions, total_slots, down_columns, \
+                        intermediate, num_experts, down_k_partition_policy, admission); \
+                } while (0)
+
             #define LAUNCH_ROUTE_OWNED_DOWN(FORMAT_TAG) \
                 do { \
                     if (canonical_publication) { \
-                        dim3 grid((down_columns + TILE_N - 1) / TILE_N, \
-                                  std::min(total_slots, kCanonicalPublicationSlotLanes)); \
-                        hipLaunchKernelGGL( \
-                            HIP_KERNEL_NAME(moe_grouped_down_publish_canonical_routes_prefill_kernel<FORMAT_TAG>), \
-                            grid, block, 0, hip_stream, \
-                            d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                            d_original_to_grouped, d_original_expert_ids, d_group_weights, \
-                            d_canonical_route_contributions, total_slots, down_columns, \
-                            intermediate, num_experts, down_k_partition_policy, admission); \
+                        const auto execution = llaminar2::rocm::selectMoECanonicalDownExecution( \
+                            {down_columns, intermediate, total_slots}); \
+                        [&]<int SelectedFormat>() { \
+                            if constexpr (SelectedFormat == static_cast<int>(NVNNI_PF_Q5_1)) { \
+                                if (execution == llaminar2::rocm::MoECanonicalDownExecution::FourWorkers) { \
+                                    LAUNCH_CANONICAL_DOWN_WORKERS(SelectedFormat, 4); \
+                                } else { \
+                                    LAUNCH_CANONICAL_DOWN_WORKERS(SelectedFormat, 1); \
+                                } \
+                            } else { \
+                                LAUNCH_CANONICAL_DOWN_WORKERS(SelectedFormat, 1); \
+                            } \
+                        }.template operator()<FORMAT_TAG>(); \
                     } else { \
                         dim3 grid((down_columns + TILE_N - 1) / TILE_N, seq_len); \
                         hipLaunchKernelGGL( \
@@ -4697,6 +4819,7 @@ bool rocmMoE_grouped_prefill_pipeline(
 
             #undef LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT
             #undef LAUNCH_ROUTE_OWNED_DOWN
+            #undef LAUNCH_CANONICAL_DOWN_WORKERS
         }
         if (use_expert_row_tiles)
         {

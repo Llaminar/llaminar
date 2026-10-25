@@ -1330,10 +1330,11 @@ inline void run(const Diagnostic &spec)
                     require(admissions.front().leafResources(codebook).function != admissions.back().leafResources(codebook).function,
                         "route89 worker contender aliases the serial physical leaf");
         }
-        const auto fixed_down_resources = rocm::inspectMoERouteOwnedDown64(
-            down_format.device_execution_codebook_id, MoEPrefillOutputLayout::OriginalRouteRows, device);
-        evidence["fixed_down64_resources"] = resources(fixed_down_resources);
         const auto physical_down = spec.ownership().projection(WeightRole::MoEExpertDown);
+        const auto fixed_down_resources = rocm::inspectMoERouteOwnedDown(
+            down_format.device_execution_codebook_id, MoEPrefillOutputLayout::OriginalRouteRows,
+            {physical_down.rows, spec.source.routed_expert_width, spec.source.experts_per_token}, device);
+        evidence["fixed_down64_resources"] = resources(fixed_down_resources);
         evidence["operation_geometry"] = {{"original_h", spec.source.hidden_size}, {"full_f", spec.source.routed_expert_width},
             {"logical_experts", spec.source.expert_count}, {"top_k", spec.source.experts_per_token},
             {"down_first_column", physical_down.first_row}, {"down_physical_n", physical_down.rows},
@@ -1431,7 +1432,12 @@ inline void run(const Diagnostic &spec)
         for (const auto &node : fixed_nodes)
             if (node.function_identity == reinterpret_cast<std::uintptr_t>(fixed_down_resources.function))
             {
-                require(node.block_x == 64 && node.block_y == 1 && node.block_z == 1 &&
+                require(fixed_down_resources.block_threads > 0 &&
+                    node.block_x == static_cast<unsigned>(fixed_down_resources.block_threads) &&
+                    node.block_y == 1 && node.block_z == 1 &&
+                    node.static_shared_memory_bytes == fixed_down_resources.static_shared_memory_bytes &&
+                    node.local_memory_bytes_per_thread == fixed_down_resources.local_memory_bytes_per_thread &&
+                    node.registers_per_thread == static_cast<unsigned>(fixed_down_resources.registers_per_thread) &&
                     node.grid_x == static_cast<unsigned>((physical_down.rows + 63) / 64) &&
                     node.grid_y == static_cast<unsigned>(spec.source.experts_per_token) && node.grid_z == 1 &&
                     node.dynamic_shared_memory_bytes == fixed_down_resources.dynamic_shared_memory_bytes,
@@ -1463,6 +1469,10 @@ inline void run(const Diagnostic &spec)
             writeRawEvidence(raw.get(), spec, control);
             throw;
         }
+        // Observe the final timed output before any further replay can replace
+        // it. The existing oracle also checks complete route/output guards.
+        proveDownOutput(state);
+        evidence["fixed_down_final_timed_bytes_verified"] = true;
         writeRawEvidence(raw.get(), spec, control);
         writeEvidence(aggregate.get(), spec, control);
         evidence["serial_byte_equal"] = true; evidence["compact_record_bits_equal"] = true;

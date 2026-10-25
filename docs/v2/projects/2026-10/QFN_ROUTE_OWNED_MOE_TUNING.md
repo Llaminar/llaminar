@@ -731,3 +731,146 @@ capacity, one warmup/three measured requests and the same six arithmetic
 selectors. Compilation proves authored mode independently from the actual
 model Four records. Complete current-source production preflight remains
 pending; this focused default qualification does not replace it.
+
+### Q5 partition lookahead screen194 — parked, 2026-10-25
+
+This experiment starts from qualified checkpoint190. It pipelines one raw Q5
+block ahead inside each existing serial-M1 partition of the canonical down
+publisher. It preserves the integer-dot order, FP scale/min arithmetic,
+ascending rounded partial fold, empty-partition zeros and route weighting.
+Only the physical Q5_1 specialization changes; Q5_K sources that use that
+prepared format inherit the same implementation. For QFN's K640 source, the
+sixteen canonical partitions contain ten two-block ranges and six empty ranges.
+The actual TP4 down publisher consumes all imported routes; owner-local gate/up
+route counts are not its work extent.
+
+The [focused gate](../../../../parity-results/qwen-flash-next/expert-down194-focused-gate-r2/result.json)
+passes all four existing captured MoE registrations. The first attempt retains
+a 120-second ProjectionPhases timeout during overlapping external compilation;
+the rerun passes with the same timeout and numerical checks. This is a focused
+screen, not complete production preflight.
+The [canonical model panel](../../../../parity-results/qwen-flash-next/expert-down194-model-fp16-r1/runtime-observation.json)
+passes, with all 26 final-logit files / 185 rows byte-identical to checkpoint190.
+
+The compiled gfx906 target has zero private storage and memory spills. Used
+VGPRs change from 52 to 45 and allocated VGPRs from 52 to 48, but the function grows
+from 3,884 to 4,276 bytes. ISA review proves next-block loads overlap current-block
+arithmetic; it also finds extra moves/control and loss of the original first
+block's activation-sum overlap. These are static observations, not proof of
+lower latency. All 555 unrelated functions preserve their arithmetic/resource
+identity; 100 need explicit PC-relative constant-address normalization before
+their bytes match. The raw comparison failure is retained alongside that proof.
+
+All three Release A/B/A processes complete normally and all nine measured
+256-token sequences match. However, the
+[passive host-window guard](../../../../parity-results/qwen-flash-next/expert-down194-benchmark-host-window-r1/result.json)
+detects external-worktree tests during the batch. **This timing is disqualified
+and establishes no performance gain or regression.** Its raw decode medians
+are 41.629 / 41.641 / 41.648 tok/s for control/candidate/control, consistent with
+the decision not to spend another qualification cycle on this candidate.
+The [disposition](../../../../parity-results/qwen-flash-next/expert-down194-disposition-r1/result.json)
+parks the patch and restores the exact production source. Checkpoint190 remains
+the qualified default at 820.777 prefill / 41.562 decode tok/s; the Castagna target
+of 42.959 decode tok/s remains open.
+
+### Canonical Q5 partition workers196 — qualified checkpoint, 2026-10-25
+
+Four wave64 workers compute separate original K partitions, then wave0 folds
+their FP32 values in the original ascending rounded order. The physical Q5_1
+implementation also covers Q5_K weights prepared into that format. Original
+source partition selection, scale/min arithmetic, empty-partition positive
+zeros and final route weighting are unchanged. The 64-column block uses a
+16 KiB shared partition bank; two barriers protect publication and reuse across
+successive original route slots. Tail columns participate in both barriers.
+No global workspace, transfer, precision mode or new allocation is introduced.
+
+The initial unconditional variant passes the canonical model panel: all 26
+final-logit files / 185 rows are byte-identical to checkpoints190,180 and151.
+Its clean matched Release A/B/A records these medians:
+
+| Role | Prefill tok/s | Decode tok/s | Decode sample range |
+|---|---:|---:|---:|
+| Bracketed checkpoint190 controls, six samples | 820.577 | 41.537 | 41.457–41.638 |
+| Four-worker candidate, three samples | 820.667 | 42.191 | 42.171–42.368 |
+
+This is **+1.575% decode**, with effectively unchanged prefill and all nine
+256-token trajectories identical. The passive host guard records 502 samples
+without competing inference, tests, compilation or profiling. Settings remain
+the matched four-MI50 TP4 workload: GateUpOwnedDownColumns, sharded vocabulary,
+RAM ngrams, context4096/M512, prompt512/output256, one warmup/three measurements,
+28 physical NUMA1 workers, greedy seed42, MTP/prefix cache off and the same
+explicit FP16 Prefill8/Decode33 attention policy and arithmetic selectors.
+The [candidate arm](../../../../parity-results/qwen-flash-next/expert-down196-model-throughput-b1-r1/result.json)
+and [quiet-window evidence](../../../../parity-results/qwen-flash-next/expert-down196-model-host-window-r1/result.json)
+retain the exact runtime closure and unchanged model metadata.
+
+Production profiling confirms the actual changed kernel on all four physical
+cards, 10,965 calls per card across 43 layers and 255 decode steps. Median
+instrumented service time falls from 47.589 to 18.120 microseconds per call.
+This comparison uses the retained190 trace, not newly interleaved profiled
+controls, and is not removable request latency. The compiled four-worker kernel
+uses 52 allocated VGPRs, 16 KiB LDS, 256 threads and zero private storage/spills.
+No achieved-occupancy or hardware-counter claim follows from those allocations.
+
+Broader economy testing rejects unconditional four-worker selection. The
+[32-cell study](../../../../parity-results/qwen-flash-next/expert-down196-shape-selection-study-r1.json)
+contains 96 clean A/B/A arms with 31 native-event samples per arm and exact output
+checks after the final timed replay. Examples of complete down-plus-fold time:
+
+| Physical N / K / route slots | Serial µs | Four-worker µs |
+|---|---:|---:|
+| 640 / 640 / 10 | 20.547 | 16.260 |
+| 648 / 640 / 10 | 21.117 | 16.255 |
+| 640 / 2560 / 10 | 63.517 | 39.630 |
+| 2560 / 640 / 10 | 27.322 | 36.325 |
+| 16 / 32 / 10 | 6.255 | 7.120 |
+
+The selected dispatch uses four workers only when `K >= 128` and
+`ceil(N/64) * min(route_slots,32) <= min(240,K)`; other shapes use the original
+canonical serial program. These are immutable captured extents, not host
+observations of live routes. Launch and cold resource inspection share one
+typed selector. The empirical rule stays within 4.333% of the faster measured
+variant across the 32 cells, including independently collected boundary cases.
+This is not a universal optimum or timing of the newly dispatched binary.
+The synthetic fixture executes a gate/up tournament before its separately
+captured down-plus-fold interval; only the latter interval is compared.
+
+The first expanded gate records 795/796 passes, including all 778 Unit entries.
+Its sole failure is an old admission assertion requiring 64 threads for every
+format; the intended four-worker leaf reports 256. That failed result is retained.
+The final shape dispatch also changes production selection, so it receives
+fresh qualification. Release and Integration builds pass, followed by the
+[complete 796-entry Unit/affected gate](../../../../parity-results/qwen-flash-next/expert-down196-shape-gate-r1/result.json).
+No required case is skipped; the receipt separately retains 95 unchanged legacy
+Unit omissions under their existing exact source/reason policy.
+All 557 compiled resource records match their baselines. Both selected Q5
+bodies are byte-identical to the measured variants; other changed instruction
+literals address identical IQ constant tables at identical table offsets.
+The final [canonical model panel](../../../../parity-results/qwen-flash-next/expert-down196-shape-model-fp16-r1/report.json)
+passes every required group. All 26 final-logit files / 185 rows remain
+byte-identical to the unconditional196 trial and checkpoints190,180 and151,
+including reset replays. The selected binary's eight-cell economy check passes
+all 24 A/B/A arms with exact final timed outputs. At N640/K640, complete
+down-plus-fold time improves from 20.555 to 16.260 microseconds; the wide
+N2560/K640 and tiny N16/K32 shapes now select Serial and remain within 0.3% of
+the control. The largest observed cost in this bounded selected-program check
+is 1.20% at N1536/K256. These are synthetic component measurements, not model
+throughput or multi-GPU communication measurements.
+
+Fresh matched Release A/B/A on the final shape-selected binary records:
+
+| Role | Prefill tok/s | Decode tok/s | Decode sample range |
+|---|---:|---:|---:|
+| Bracketed checkpoint190 controls, six samples | 820.931 | 41.702 | 41.609–41.745 |
+| Shape-selected196, three samples | 821.541 | 42.229 | 42.207–42.254 |
+
+This final result is **+1.264% decode**, with non-overlapping sample ranges,
+and **+0.074% prefill**, whose ranges overlap. All nine 256-token trajectories
+match. The [candidate arm](../../../../parity-results/qwen-flash-next/expert-down196-shape-model-throughput-b1-r1/result.json)
+and [quiet-window receipt](../../../../parity-results/qwen-flash-next/expert-down196-shape-model-host-window-r1/result.json)
+retain the unchanged workload above, authenticated runtime/driver lifecycle,
+normal retirement and 502 observations with no competing work. Both GDN layout
+overrides are absent; the qualified ValueMajor default runs on all four cards.
+The final result supersedes the initial unconditional trial's timing rather
+than borrowing its larger percentage improvement. The **42.959 decode target**
+and complete production-preflight/image certification remain open.
