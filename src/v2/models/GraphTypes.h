@@ -120,8 +120,50 @@ namespace llaminar2
         /// Exact Flash Next metadata contract. Null denotes the ordinary single residual stream.
         std::shared_ptr<const Qwen4ExpConfig> flash_next;
 
-        /// Exact runtime/admission schedule; model/schema construction must not re-read DebugEnv.
+        /// Exact admitted attention program; graph construction must not re-read DebugEnv.
+        qwen4exp::QwenSparseAttentionArithmetic attention_arithmetic =
+            qwen4exp::QwenSparseAttentionArithmetic::FixedFP32; ///< Same admitted arithmetic
+                                                                ///< consumed by execution.
         qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+        /**
+         * @brief Copy this actual device's already-admitted QSA pair, without resolving defaults.
+         * @param participants Immutable projection derived from the successful device_inputs.
+         * @throws std::invalid_argument For a foreign model, missing or conflicting participant.
+         * @details Both assignments occur only after lookup validates the complete source policy.
+         */
+        void bindAdmittedQwenSparseAttentionProgram(
+            const std::shared_ptr<
+                const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>> &participants)
+        {
+            if (!flash_next)
+                throw std::invalid_argument(
+                    "QSA admission binding requires registered Flash Next metadata");
+            if (pp_layer_offset < 0 || n_layers <= 0 ||
+                static_cast<size_t>(pp_layer_offset) > layer_types.size() ||
+                static_cast<size_t>(n_layers) >
+                    layer_types.size() - static_cast<size_t>(pp_layer_offset))
+                throw std::invalid_argument("QSA factory has an invalid declared layer interval");
+            const auto first = layer_types.begin() + pp_layer_offset;
+            if (std::none_of(first,
+                             first + n_layers,
+                             [](const auto &kind) { return kind == "full_attention"; }))
+                return; // No QSA consumer exists in this stage; no policy lookup or native work
+                        // occurs.
+            const auto program = qwen4exp::admittedQwenSparseAttentionPolicy(
+                participants, default_device, pp_layer_offset, pp_layer_offset + n_layers - 1);
+            if (program.arithmetic != qwen4exp::QwenSparseAttentionArithmetic::FixedFP32 &&
+                (resolveKVCacheStoragePrecision(kv_cache_precision, default_device.is_cpu()) !=
+                     ActivationPrecision::FP16 ||
+                 head_dim != 256 || partial_rotary_factor != 0.25f))
+                throw std::invalid_argument(
+                    "QSA graph geometry disagrees with its admitted FP16 program");
+            if (program.schedule == qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33 &&
+                max_request_count != 1)
+                throw std::invalid_argument(
+                    "QSA graph requests disagree with its admitted split program");
+            attention_arithmetic = program.arithmetic;
+            attention_phase_schedule = program.schedule;
+        }
 
         /// Frozen HC-up activation arithmetic; ordinary models never consume it.
         QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;

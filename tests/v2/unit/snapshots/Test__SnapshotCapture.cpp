@@ -2021,3 +2021,27 @@ TEST_F(Test__SnapshotCapture_Routing, LMHeadAllgatherRetainsCompleteScopedPublic
             EXPECT_EQ(capture.getShared(key), complete);
     }
 }
+
+/** @test The actual composite outputs retain both old semantic keys and exact filtered/scoped publication. */
+TEST(Test__SnapshotCapture_KeyConversion,GDNCompositeNamedOutputsPreserveNormAndProjection)
+{
+    const std::vector<float> normalized{1.f,-0.f,3.f,4.f},projection{5.f,6.f};
+    StageDumpInfo composite;
+    composite.outputs.push_back(makeFP32Output("C",projection.data(),1,2));
+    composite.outputs.push_back(makeFP32Output("normalized",normalized.data(),1,4));
+    const auto keys=SnapshotCapture::possibleKeysForStage("layer0_gdn_out_proj",composite);
+    EXPECT_EQ(keys,(std::vector<std::string>{"layer0_ATTENTION_OUTPUT","layer0_GDN_NORM_GATE_OUTPUT"}));
+    SnapshotCapture capture;capture.captureStage("layer0_gdn_out_proj",composite);
+    ASSERT_NE(capture.get("layer0_GDN_NORM_GATE_OUTPUT"),nullptr);
+    ASSERT_NE(capture.get("layer0_ATTENTION_OUTPUT"),nullptr);
+    EXPECT_EQ(capture.get("layer0_GDN_NORM_GATE_OUTPUT")->data.size(),normalized.size());
+    EXPECT_EQ(std::memcmp(capture.get("layer0_GDN_NORM_GATE_OUTPUT")->data.data(),normalized.data(),normalized.size()*sizeof(float)),0);
+    EXPECT_EQ(capture.get("layer0_ATTENTION_OUTPUT")->data,projection);
+    StageDumpInfo ordinary;ordinary.outputs.push_back(makeFP32Output("C",projection.data(),1,2));
+    EXPECT_EQ(SnapshotCapture::possibleKeysForStage("layer0_gdn_out_proj",ordinary),
+        (std::vector<std::string>{"layer0_ATTENTION_OUTPUT"}));
+    SnapshotCapture scoped;scoped.captureStage("decode::layer0_gdn_out_proj",composite);
+    EXPECT_EQ(SnapshotCapture::possibleKeysForStage("decode::layer0_gdn_out_proj",composite),
+        (std::vector<std::string>{"DECODE_layer0_ATTENTION_OUTPUT","DECODE_layer0_GDN_NORM_GATE_OUTPUT"}));
+    ASSERT_NE(scoped.get("DECODE_layer0_GDN_NORM_GATE_OUTPUT"),nullptr);
+}

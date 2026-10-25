@@ -26,6 +26,8 @@
  */
 
 #include "../../common/GatedNormActivation.h"
+#include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
+#include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>
@@ -36,6 +38,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNPreparedQK.h"
 #include "kernels/gdn/GDNPlanarRecurrence.h"
 
 namespace {
@@ -143,7 +146,7 @@ enum class GdnPrefillSnapshots
  *             are fixed properties of the captured launch.
  */
 /** @brief Compile-time physical input coordinates; arithmetic policy is independent. */
-enum class GDNRecurrentInputLayout { ExpandedPlanar, MergedPostConvolution };
+enum class GDNRecurrentInputLayout { ExpandedPlanar, MergedPostConvolution, PreparedCompactQK };
 /**
  * @brief Compile-time canonical physical address; no arithmetic/reduction policy.
  * @tparam Layout One immutable state-bank format.
@@ -1609,6 +1612,131 @@ void rocm_gdn_chunk_forward_kernel(
 // Short Conv1d Kernels
 // =========================================================================
 
+/**
+ * @brief Publish original four-tap convolution and exact compact normalized Q/K.
+ * @tparam D_K Original key width64/128; every block retains128 normalization lanes.
+ * @details One channel tile owns its original state and raw output. Normalization
+ * uses the old two wave64 trees and four ascending leaves, including explicit
+ * zeros. The scalar production caller admits exactly one row; retaining the
+ * historical terminal/snapshot stores preserves accepted state publication.
+ * The compact arena root is disjoint from every original raw/state owner.
+ */
+template <int D_K>
+__global__ __launch_bounds__(128, 2)
+void rocm_gdn_scalar_prepared_qk_conv_kernel(
+    const float* input, const float* weight, const float* bias,
+    const float* initial_state, float* raw, float* updated_state,
+    float* snapshots, float* prepared_q, float* prepared_k,
+    int rows, int key_heads, int value_heads, int value_width,
+    const int* live_rows, int snapshot_stride, int max_snapshot_rows,
+    bool normalize_qk)
+{
+    const int tid = threadIdx.x;
+    const int channel = blockIdx.x * D_K + tid;
+    const int key_span = key_heads * D_K;
+    const int channels = 2 * key_span + value_heads * value_width;
+    const bool valid = tid < D_K && channel < channels;
+    const bool is_q = blockIdx.x < key_heads;
+    const bool is_k = blockIdx.x >= key_heads && blockIdx.x < 2 * key_heads;
+    const bool normalized_tile = is_q || is_k;
+    const int original_head = is_q ? blockIdx.x : blockIdx.x - key_heads;
+    __shared__ float partial[4];
+    int effective_rows = rows;
+    if (live_rows)
+    {
+        const int count = *live_rows;
+        // Match the original scalar/small-M convolution contract, including
+        // its minimum-one row. Recurrence independently owns its true live count.
+        effective_rows = count < 1 ? 1 : (count > rows ? rows : count);
+    }
+    const bool terminal_is_snapshot = snapshots && max_snapshot_rows >= rows;
+    const float scale = rsqrtf(static_cast<float>(D_K));
+    for (int row = 0; row < rows; ++row)
+    {
+        float sum = 0.0f;
+        if (valid && row < effective_rows)
+        {
+            // Preserve the old ascending four products from positive zero;
+            // neither a reassociated four-term expression nor a fused tree.
+            for (int tap = 0; tap < 4; ++tap)
+            {
+                const int source_row = row - 3 + tap;
+                const float value = source_row >= 0
+                    ? input[std::size_t(source_row) * channels + channel]
+                    : initial_state[std::size_t(channel) * 3 + 3 + source_row];
+                sum += value * weight[std::size_t(channel) * 4 + tap];
+            }
+            if (bias) sum += bias[channel];
+            sum = sum / (1.0f + expf(-sum));
+        }
+        if (valid)
+        {
+            raw[std::size_t(row) * channels + channel] = sum;
+            if (snapshots && row < effective_rows && row < max_snapshot_rows)
+            {
+                for (int index = 0; index < 3; ++index)
+                {
+                    const int source_row = row - 2 + index;
+                    snapshots[std::size_t(row) * snapshot_stride + std::size_t(channel) * 3 + index] =
+                        source_row >= 0
+                            ? input[std::size_t(source_row) * channels + channel]
+                            : initial_state[std::size_t(channel) * 3 + 3 + source_row];
+                }
+            }
+        }
+        // The branch is block-uniform; inactive tail lanes contribute +0 to
+        // the historical norm tree and participate in every required barrier.
+        if (normalized_tile)
+        {
+            float prepared = sum;
+            if (normalize_qk)
+            {
+#pragma clang fp contract(off)
+                float squared_sum = 0.0f;
+                if (tid < D_K) squared_sum += sum * sum;
+                for (int offset = 32; offset > 0; offset >>= 1)
+                    squared_sum += __shfl_xor(squared_sum, offset);
+                if (tid % 64 == 0)
+                {
+                    partial[tid / 64] = squared_sum;
+                    partial[tid / 64 + 2] = 0.0f;
+                }
+                __syncthreads();
+                if (tid == 0)
+                {
+                    float total = 0.0f;
+                    for (int leaf = 0; leaf < 4; ++leaf) total += partial[leaf];
+                    partial[0] = total;
+                }
+                __syncthreads();
+                const float inverse = is_q
+                    ? scale / sqrtf(partial[0] + 1e-6f)
+                    : 1.0f / sqrtf(partial[0] + 1e-6f);
+                prepared *= inverse;
+            }
+            else if (is_q)
+                prepared *= scale;
+            if (tid < D_K)
+            {
+                float* destination = is_q ? prepared_q : prepared_k;
+                destination[std::size_t(row) * key_span + original_head * D_K + tid] = prepared;
+            }
+            // Retire all readers before the next row reuses norm partials.
+            __syncthreads();
+        }
+    }
+    if (valid && !terminal_is_snapshot)
+    {
+        for (int index = 0; index < 3; ++index)
+        {
+            const int source_row = effective_rows - 3 + index;
+            updated_state[std::size_t(channel) * 3 + index] = source_row >= 0
+                ? input[std::size_t(source_row) * channels + channel]
+                : initial_state[std::size_t(channel) * 3 + 3 + source_row];
+        }
+    }
+}
+
 __global__ void rocm_short_conv1d_decode_kernel(
     const float *__restrict__ input,
     const float *__restrict__ weight,
@@ -2180,6 +2308,159 @@ __global__ void rocm_gated_rmsnorm_kernel(
             gate_act = gate_val;
         output[offset + j] = normalized * gamma_eff * gate_act;
     }
+}
+
+/** @brief Internal borrowed destination; the prepared invocation retains its owner. */
+struct GatedNormSingleQ8Destination { std::int8_t* bytes;float* scales; };
+/**
+ * @brief Retain the green aligned128 norm/Q8 numeric program without reassociation.
+ * @details The function body is the retained rows/sums prototype verbatim apart
+ * from its private ABI names. Only<true,false,false> is instantiated here:
+ * ordinaryM1 owns full FP32/Q8/scales; sums remain untouched as in the original
+ * scalar quantizer/consumer. Other row programs keep their existing kernels.
+ */
+template <bool Fixed128, bool Masked, bool WithSums>
+__device__ __forceinline__ void
+rocm_gated_norm_single_q8_production_body(const float *input,
+                               const float *__restrict__ gate,
+                               const float *__restrict__ gamma,
+                               float *output,
+                               int total_work,
+                               int n_groups,
+                               int runtime_norm_dim,
+                               int d_model,
+                               int runtime_gamma_period,
+                               float eps,
+                               bool subtract_one,
+                               llaminar2::GatedNormActivation gate_activation,
+                               GatedNormSingleQ8Destination destination,
+                               bool quantize_row,
+                               std::int32_t *sums)
+{
+    // One block per (seq_position, group) pair
+    const int work_idx = blockIdx.x;
+    if (work_idx >= total_work)
+        return;
+
+    const int norm_dim = Fixed128 ? 128 : runtime_norm_dim;
+    const int gamma_period = Fixed128 ? 128 : runtime_gamma_period;
+    int offset;
+    if constexpr (Fixed128)
+    {
+        // For divisible rows, flattened group ownership equals the original
+        // row/group mapping at every M. No query/context threshold is involved.
+        offset = work_idx * 128;
+    }
+    else
+    {
+        const int t = work_idx / n_groups;
+        const int g = work_idx % n_groups;
+        offset = t * d_model + g * norm_dim;
+    }
+    const int tid = threadIdx.x;
+    const int block_size = Fixed128 ? 128 : blockDim.x;
+
+    // Pass 1: Each thread handles its slice of norm_dim, accumulate sum_sq
+    float first_value = 0.0f;
+
+    float sum_sq = 0.0f;
+    for (int j = tid; j < norm_dim; j += block_size)
+    {
+        float v = input[offset + j];
+        if (j == tid)
+            first_value = v;
+        sum_sq += v * v;
+    }
+
+    // Warp shuffle reduction (64-wide wavefronts on GCN/CDNA)
+    for (int offset_s = 32; offset_s > 0; offset_s >>= 1)
+        sum_sq += __shfl_xor(sum_sq, offset_s);
+
+    // Cross-wavefront reduction via shared memory
+    const int lane = tid & 63;
+    const int warp_id = tid >> 6;
+    const int num_warps = (block_size + 63) >> 6;
+
+    __shared__ float warp_sums[4]; // max 256 threads = 4 wavefronts
+    if (lane == 0)
+        warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (tid == 0)
+    {
+        float total = 0.0f;
+        for (int w = 0; w < num_warps; w++)
+            total += warp_sums[w];
+        warp_sums[0] = total;
+    }
+    __syncthreads();
+
+    float inv_rms = rsqrtf(warp_sums[0] / (float)runtime_norm_dim + eps);
+
+    // Pass 2: Normalize with register-cached values
+    for (int j = tid; j < norm_dim; j += block_size)
+    {
+        float normalized = (j == tid ? first_value : input[offset + j]) * inv_rms;
+        int gamma_idx = j % gamma_period;
+        float gamma_eff = subtract_one ? (1.0f + gamma[gamma_idx]) : gamma[gamma_idx];
+        float gate_val = gate[offset + j];
+        float gate_act;
+        if (gate_activation == llaminar2::GatedNormActivation::SiLU)
+            gate_act = gate_val / (1.0f + expf(-gate_val));
+        else if (gate_activation == llaminar2::GatedNormActivation::Sigmoid)
+            gate_act = 1.0f / (1.0f + expf(-gate_val));
+        else
+            gate_act = gate_val;
+        // The original final FP32 value remains an observable full tensor store.
+        // FP32 register arithmetic has the same final rounding point; byte gates
+        // certify its use here rather than assuming expression reuse is proof.
+        const float value = normalized * gamma_eff * gate_act;
+        output[offset + j] = value;
+        if constexpr (Masked)
+        {
+            // This predicate cannot skip physical normalization or its store.
+            // Original request holes own only quantized publication extents.
+            if (!quantize_row)
+                continue;
+        }
+        float maximum = fabsf(value);
+// Four independent32-value blocks per128-thread norm CTA. Width32
+// prevents adjacent logical blocks sharing a physical wave64 maximum.
+#pragma unroll
+        for (int shift = 16; shift > 0; shift >>= 1)
+            maximum = fmaxf(maximum, __shfl_down(maximum, shift, 32));
+        maximum = __shfl(maximum, 0, 32);
+        const float scale = llaminar2::rocm::decode_equivalent::q8Scale(maximum);
+        const float inverse = 1.0f / scale;
+        const int element = offset + j;
+        if ((tid & 31) == 0)
+            destination.scales[element / 32] = scale;
+        if constexpr (WithSums)
+        {
+            const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(value, inverse);
+            destination.bytes[element] = static_cast<int8_t>(q);
+            int sum = q;
+#pragma unroll
+            for (int shift = 16; shift > 0; shift >>= 1)
+                sum += __shfl_down(sum, shift, 32);
+            if ((tid & 31) == 0)
+                sums[element / 32] = sum;
+        }
+        else
+        {
+            destination.bytes[element] =
+                static_cast<int8_t>(llaminar2::rocm::decode_equivalent::quantizeQ8(value, inverse));
+        }
+    }
+}
+/** @brief One original head per CTA; persistent scratch belongs to the caller. */
+__global__ void rocm_gdn_gated_norm_single_q8_kernel(llaminar2::rocm::GatedNormSingleQ8Input input)
+{
+    const auto& p=input.parameters;
+    rocm_gated_norm_single_q8_production_body<true,false,false>(input.input,input.gate,
+        input.gamma,input.output,input.columns/128,input.columns/128,p.norm_dim,
+        input.columns,p.gamma_period,p.eps,p.subtract_one,p.activation,
+        {input.quant,input.scales},true,nullptr);
 }
 
 // =========================================================================
@@ -3791,7 +4072,8 @@ void rocm_gdn_value_major_scalar_kernel(
     int merged_key_heads,int global_value_offset)
 {
     static_assert(D_K==64 || D_K==128);
-    static_assert(InputLayout==GDNRecurrentInputLayout::ExpandedPlanar||InputLayout==GDNRecurrentInputLayout::MergedPostConvolution);
+    static_assert(InputLayout==GDNRecurrentInputLayout::ExpandedPlanar||
+        InputLayout==GDNRecurrentInputLayout::MergedPostConvolution||InputLayout==GDNRecurrentInputLayout::PreparedCompactQK);
     constexpr int kOwnedKeys=D_K/16;
     const int tid=threadIdx.x,lane=tid%64,group_lane=tid%16;
     const int quarter=group_lane/4,segment=group_lane%4;
@@ -3831,7 +4113,7 @@ void rocm_gdn_value_major_scalar_kernel(
         return;
     }
     int source_head=h;
-    if constexpr(InputLayout==GDNRecurrentInputLayout::MergedPostConvolution)
+    if constexpr(InputLayout==GDNRecurrentInputLayout::MergedPostConvolution||InputLayout==GDNRecurrentInputLayout::PreparedCompactQK)
     {
         source_head=static_cast<int>((std::int64_t{h}+global_value_offset)%merged_key_heads);
         if(source_head<0)source_head+=merged_key_heads;
@@ -3839,14 +4121,19 @@ void rocm_gdn_value_major_scalar_kernel(
     const auto key_span=std::size_t(merged_key_heads)*D_K;
     const auto raw_stride=2*key_span+values;
     const float* raw=nullptr;
-    if constexpr(InputLayout==GDNRecurrentInputLayout::MergedPostConvolution)raw=q+std::size_t(request)*raw_stride;
+    if constexpr(InputLayout==GDNRecurrentInputLayout::MergedPostConvolution||InputLayout==GDNRecurrentInputLayout::PreparedCompactQK)raw=q+std::size_t(request)*raw_stride;
     const float* q_head=nullptr;const float* k_head=nullptr;
-    if constexpr(InputLayout==GDNRecurrentInputLayout::MergedPostConvolution)
+    if constexpr(InputLayout==GDNRecurrentInputLayout::PreparedCompactQK)
+    {q_head=k+std::size_t(source_head)*D_K;k_head=v+std::size_t(source_head)*D_K;}
+    else if constexpr(InputLayout==GDNRecurrentInputLayout::MergedPostConvolution)
     {q_head=raw+std::size_t(source_head)*D_K;k_head=raw+key_span+std::size_t(source_head)*D_K;}
     else
     {q_head=q+(std::size_t(request)*n_heads+h)*D_K;k_head=k+(std::size_t(request)*n_heads+h)*D_K;}
+    float q_inv=1.0f,k_inv=1.0f;
+    if constexpr(InputLayout!=GDNRecurrentInputLayout::PreparedCompactQK)
+    {
     const float scale=rsqrtf(float(D_K));
-    float q_inv=scale,k_inv=1.0f;
+    q_inv=scale;
     if(use_qk_l2norm)
     {
 #pragma clang fp contract(off)
@@ -3873,6 +4160,7 @@ void rocm_gdn_value_major_scalar_kernel(
         }
         q_inv=__shfl(q_inv,0,64);k_inv=__shfl(k_inv,0,64);
     }
+    }
     float decay=0.0f,beta_h=0.0f;
     if(lane==0)
     {
@@ -3894,12 +4182,24 @@ void rocm_gdn_value_major_scalar_kernel(
         const auto kr=gdnRecurrenceLoadFour<Access>(k_head+offset);
         state[pack*4+0]=sr.x;state[pack*4+1]=sr.y;
         state[pack*4+2]=sr.z;state[pack*4+3]=sr.w;
+        if constexpr(InputLayout==GDNRecurrentInputLayout::PreparedCompactQK)
+        {
+            // These bits already include original normalization and query scale;
+            // even a multiply by one would violate the explicit prepared contract.
+            query[pack*4+0]=qr.x;query[pack*4+1]=qr.y;
+            query[pack*4+2]=qr.z;query[pack*4+3]=qr.w;
+            key[pack*4+0]=kr.x;key[pack*4+1]=kr.y;
+            key[pack*4+2]=kr.z;key[pack*4+3]=kr.w;
+        }
+        else
+        {
         query[pack*4+0]=qr.x*q_inv;query[pack*4+1]=qr.y*q_inv;
         query[pack*4+2]=qr.z*q_inv;query[pack*4+3]=qr.w*q_inv;
         key[pack*4+0]=use_qk_l2norm?kr.x*k_inv:kr.x;
         key[pack*4+1]=use_qk_l2norm?kr.y*k_inv:kr.y;
         key[pack*4+2]=use_qk_l2norm?kr.z*k_inv:kr.z;
         key[pack*4+3]=use_qk_l2norm?kr.w*k_inv:kr.w;
+        }
     }
 #pragma unroll
     for(int i=0;i<kOwnedKeys;++i)state[i]*=decay;
@@ -3908,7 +4208,7 @@ void rocm_gdn_value_major_scalar_kernel(
     float value=0.0f;
     if(group_lane==0)
     {
-        if constexpr(InputLayout==GDNRecurrentInputLayout::MergedPostConvolution)value=raw[2*key_span+std::size_t(h)*d_v+vi];
+        if constexpr(InputLayout==GDNRecurrentInputLayout::MergedPostConvolution||InputLayout==GDNRecurrentInputLayout::PreparedCompactQK)value=raw[2*key_span+std::size_t(h)*d_v+vi];
         else value=v[std::size_t(request)*values+std::size_t(h)*d_v+vi];
     }
     value=__shfl(value,0,16);
@@ -4913,3 +5213,72 @@ bool enqueueGdnValueMajorMerged(const llaminar2::gdn::MergedRecurrenceInput& p,v
     return hipGetLastError()==hipSuccess;
 }
 } // anonymous namespace
+
+
+namespace llaminar2::gdn
+{
+bool launchROCmScalarPreparedQKConvolution(const ScalarPreparedQKConvolutionInput& p,void* stream)
+{
+    if(reinterpret_cast<std::uintptr_t>(stream)<=2||!validScalarPreparedQKConvolutionStorage(p))return false;
+    const auto& a=p.operands;
+    const auto layout=ScalarPreparedQKLayout::fromHeads(a.key_heads,a.value_heads,a.key_width,a.value_width);
+    const int channels=static_cast<int>(layout.elements+std::size_t(a.value_heads)*a.value_width);
+    const dim3 grid((channels-1)/a.key_width+1);
+    const auto hs=reinterpret_cast<hipStream_t>(stream);
+#define SCALAR_PREPARED_CONV(DK) hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_gdn_scalar_prepared_qk_conv_kernel<DK>), \
+    grid,dim3(128),0,hs,a.input,a.weight,a.bias,p.initial_state,a.raw_output,p.updated_state,p.snapshots, \
+    a.prepared,a.prepared+layout.plane_elements,1,a.key_heads,a.value_heads,a.value_width,nullptr, \
+    p.snapshot_stride_floats,p.max_snapshot_rows,a.normalize_qk)
+    if(a.key_width==64){SCALAR_PREPARED_CONV(64);}
+    else{SCALAR_PREPARED_CONV(128);}
+#undef SCALAR_PREPARED_CONV
+    return hipGetLastError()==hipSuccess;
+}
+
+bool launchROCmScalarPreparedQKRecurrence(const ScalarPreparedQKRecurrenceInput& inputs,void* stream)
+{
+    if(reinterpret_cast<std::uintptr_t>(stream)<=2||!validScalarPreparedQKRecurrenceStorage(inputs))return false;
+    const auto& p=inputs.original;
+    const auto layout=ScalarPreparedQKLayout::fromHeads(p.key_heads,p.value_heads,p.key_width,p.value_width);
+    const auto hs=reinterpret_cast<hipStream_t>(stream);
+    const dim3 grid(p.value_heads,(p.value_width-1)/32+1);
+    // One immutable alignment specialization also accepts float-aligned native
+    // test endpoints. Odd snapshot strides remain scalar stores in the kernel.
+    const auto alignment=reinterpret_cast<std::uintptr_t>(p.initial_state)|
+        reinterpret_cast<std::uintptr_t>(p.updated_state)|reinterpret_cast<std::uintptr_t>(inputs.prepared);
+    const bool vector_endpoints=alignment%16==0;
+#define SCALAR_PREPARED_REC(DK,ACCESS) hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_gdn_value_major_scalar_kernel<DK, \
+    GDNRecurrentInputLayout::PreparedCompactQK,ACCESS>),grid,dim3(512),0,hs,p.merged,inputs.prepared, \
+    inputs.prepared+layout.plane_elements,p.alpha,p.beta_raw,p.A_log,p.dt_bias,p.output,p.initial_state,p.updated_state, \
+    1,1,p.value_heads,p.value_width,p.use_qk_l2norm,p.rows.lengthOwner(),0,p.snapshots, \
+    p.snapshot_stride_floats,p.max_snapshot_rows,p.key_heads,p.global_value_offset)
+    if(p.key_width==64)
+    {
+        if(vector_endpoints){SCALAR_PREPARED_REC(64,GdnRecurrenceEndpointAccess::VectorAligned);}
+        else{SCALAR_PREPARED_REC(64,GdnRecurrenceEndpointAccess::ScalarAligned);}
+    }
+    else
+    {
+        if(vector_endpoints){SCALAR_PREPARED_REC(128,GdnRecurrenceEndpointAccess::VectorAligned);}
+        else{SCALAR_PREPARED_REC(128,GdnRecurrenceEndpointAccess::ScalarAligned);}
+    }
+#undef SCALAR_PREPARED_REC
+    return hipGetLastError()==hipSuccess;
+}
+} // namespace llaminar2::gdn
+
+namespace llaminar2::rocm
+{
+/** @copydoc launchGatedNormSingleQ8 */
+bool launchGatedNormSingleQ8(const GatedNormSingleQ8Input& input,int device,void* stream)
+{
+    if(device<0||reinterpret_cast<std::uintptr_t>(stream)<=2||!input.input||!input.gate||!input.gamma||
+       !input.output||!input.quant||!input.scales||
+       !gatedNormSingleQ8Geometry(1,input.columns,input.parameters))
+        throw std::invalid_argument("Gated-norm SingleQ8 requires exact stream, owned pointers and aligned128 scalar geometry");
+    if(HipDeviceGuard::setDevice(device)!=static_cast<int>(hipSuccess))return false;
+    hipLaunchKernelGGL(rocm_gdn_gated_norm_single_q8_kernel,dim3(input.columns/128),dim3(128),
+        0,static_cast<hipStream_t>(stream),input);
+    return hipGetLastError()==hipSuccess;
+}
+} // namespace llaminar2::rocm

@@ -93,6 +93,17 @@ namespace llaminar2
                 }
                 return keys;
             };
+            // A prepared GDN composite retains two mathematical outputs.
+            // Ordinary separate projections expose only C, so actual-output
+            // filtering never invents a normalized payload on that program.
+            constexpr std::string_view gdn_projection="_gdn_out_proj";
+            if(name.ends_with(gdn_projection)) {
+                const auto prefix=name.substr(0,name.size()-gdn_projection.size());
+                std::vector<std::string> keys;
+                if(output.empty()||output=="C")keys.push_back(prefix+"_ATTENTION_OUTPUT");
+                if(output.empty()||output=="normalized")keys.push_back(prefix+"_GDN_NORM_GATE_OUTPUT");
+                return keys;
+            }
             if (auto keys = one("_hc_attn_branch_norm", "output", {"_GR_NORM"})) return keys;
             if (auto keys = one("_hc_attn_write", "output", {"_GR_WRITE", "_ATTENTION_RESIDUAL"})) return keys;
             if (auto keys = one("_hc_ffn_write", "output", {"_FFN_RESIDUAL"})) return keys;

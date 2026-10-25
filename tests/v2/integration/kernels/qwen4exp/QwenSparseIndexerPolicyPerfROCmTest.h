@@ -5,7 +5,8 @@
  * This private include follows QwenSparseDeviceTest.h in the ROCm QSA test TU.
  * Fixture storage owns setup, synthetic inputs, copies and terminal collection.
  * The timed graph contains only repeated complete production indexer calls:
- * preparePools -> prepareQueries -> scorePools -> explicitly selected policy. Capture
+ * Grouped1..16: fused preparation -> scorePools -> explicitly selected policy.
+ * Prefill: separate pool/query preparation -> scorePools -> selected policy. Capture
  * validation authenticates every native function, launch shape and dependency.
  * Independent score sorting checks actual membership outside timing; it is not
  * a broad indexer arithmetic, stage, model, memory-admission or 64K-prefill proof.
@@ -26,6 +27,7 @@
 #include <vector>
 #include <cxxabi.h>
 #include <fstream>
+#include <filesystem>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -99,6 +101,15 @@ inline std::string markerFunction(const std::string& name)
     return encoded;
 }
 
+/** @return Explicit fixture demand; an omitted selector retains historical AllLive. */
+inline QwenSparseQueryDemand readDemand()
+{
+    const char* value = std::getenv("QFN_INDEXER108_DEMAND");
+    if (!value || std::string(value) == "AllLive") return QwenSparseQueryDemand::AllLive;
+    if (std::string(value) == "RankingOnly") return QwenSparseQueryDemand::RankingOnly;
+    throw std::invalid_argument("Unknown explicit indexer query demand");
+}
+
 /** @brief Immutable source-owned workload/capture bounds, not a physical memory ledger. */
 struct Plan final
 {
@@ -111,6 +122,8 @@ struct Plan final
     int rows, context, prefix, capacity, blocks, repeats;
     std::uint64_t causal_pools = 0, scored_pools = 0, selected_tokens = 0;
     SelectionPolicy policy;
+    QwenSparseQueryDemand demand = readDemand();
+    const char* demandName() const { return demand == QwenSparseQueryDemand::AllLive ? "AllLive" : "RankingOnly"; }
     bool wide;
     /** @brief Validate exact geometry and bound graph repeats by row and score work. */
     Plan(int m, int c,SelectionPolicy selected) : rows(m), context(c), prefix(0), capacity(c), blocks(0), repeats(1),
@@ -144,29 +157,44 @@ struct Plan final
         if(policy.value==QwenSparsePoolSelection::Installed)return wide?"selectPoolsWide":"selectPools";
         return "selectPoolsBounded<"+std::to_string(policy.block)+", "+std::to_string(policy.slack)+">";
     }
+    /** @return Exact immutable preparation schedule and complete-role inventory. */
+    bool fusedPreparation() const { return wide; }
+    /** @return Exact total native kernels per captured indexer transaction. */
+    int roleCount() const { return fusedPreparation() ? 3 : 4; }
+    /** @return Role carrying the original replay-backed query row-work argument. */
+    int queryRole() const { return fusedPreparation() ? 0 : 1; }
+    /** @return Original score role, immediately before the selector. */
+    int scoreRole() const { return roleCount()-2; }
+    /** @return Stable marker spelling for the immutable geometry-selected program. */
+    const char* preparationName() const { return fusedPreparation() ? "fused_grouped" : "separate_prefill"; }
     /** @return Exact native grid for one source-confirmed indexer role. */
     dim3 grid(int role) const
     {
-        switch(role)
+        require(role>=0 && role<roleCount(),"Unknown geometry-selected indexer role");
+        if (role < scoreRole())
         {
-        case 0:return dim3((rows+6)/4,1,1);
-        case 1:return dim3(rows*4,1,1);
-        case 2:return dim3((blocks+7)/8,rows,1);
-        case 3:return policy.value!=QwenSparsePoolSelection::Installed || wide ? dim3(rows,1,1) : dim3((rows+7)/8,1,1);
+            if (fusedPreparation()) return dim3((rows+6)/4+rows*4,1,1);
+            return dim3(role==0 ? (rows+6)/4 : rows*4,1,1);
         }
-        throw std::invalid_argument("Unknown source-owned indexer role");
+        if (role==scoreRole()) return dim3((blocks+7)/8,rows,1);
+        return policy.value!=QwenSparsePoolSelection::Installed || wide ? dim3(rows,1,1) : dim3((rows+7)/8,1,1);
     }
-    /** @return Exact native block size for one source-confirmed indexer role. */
-    dim3 block(int role) const { return dim3(role<2 ? 128 : 256,1,1); }
-    /** @return Exact qualified native function name, excluding argument types. */
+    /** @return Exact original preparation/scoring thread geometry. */
+    dim3 block(int role) const { return dim3(role<scoreRole() ? 128 : 256,1,1); }
+    /** @return Exact demangled native name without its original parameter list. */
     std::string function(int role) const
     {
-        const std::array<const char*,3> names{"preparePools","prepareQueries<false>","scorePools"};
-        require(role>=0 && role<4,"Unknown source-owned indexer role");
-        // Itanium demangling includes the return type for this kernel function template.
-        const std::string returned=role==1 || (role==3 && policy.block>0)?"void ":"";
-        return returned+"llaminar2::qwen4exp::rocm_sparse_detail::"+(role==3?selector():names[std::size_t(role)]);
+        require(role>=0 && role<roleCount(),"Unknown geometry-selected indexer role");
+        const std::string ranked=demand==QwenSparseQueryDemand::AllLive ? "false" : "true";
+        std::string name;
+        if (role==roleCount()-1) name=selector();
+        else if (role==scoreRole()) name="scorePools";
+        else if (fusedPreparation()) name="preparePoolsAndQueries<"+ranked+">";
+        else name=role==0 ? "preparePools" : "prepareQueries<"+ranked+">";
+        const std::string returned=role==queryRole() || (role==roleCount()-1 && policy.block>0) ? "void " : "";
+        return returned+"llaminar2::qwen4exp::rocm_sparse_detail::"+name;
     }
+
 };
 
 /** @brief One persistent complete-indexer graph with exact ordered native inventory. */
@@ -186,6 +214,7 @@ struct Capture final
         a.inverse_frequencies=makeQwenSparsePowerFrequencies(a.rope_theta,64);
         a.cosine=nullptr; a.sine=nullptr;
         a.pool_selection=plan.policy.value;
+        a.query_demand=plan.demand;
         a.selection_observations=nullptr;
         return a;
     }())
@@ -222,14 +251,14 @@ struct Capture final
         check(hipStreamEndCapture(stream,&graph));
         std::size_t count=0;
         check(hipGraphGetNodes(graph,nullptr,&count));
-        require(count==std::size_t(plan.repeats)*4,"Indexer graph must contain exactly four kernels per repeat");
+        require(count==std::size_t(plan.repeats)*plan.roleCount(),"Indexer graph must contain the exact geometry-selected kernels per repeat");
         std::vector<hipGraphNode_t> nodes(count);
         check(hipGraphGetNodes(graph,nodes.data(),&count));
         std::vector<int> roles(count,-1), next(count,-1);
-        std::array<void*,4> functions{};
-        std::array<std::string,4> actualNames;
-        std::array<dim3,4> actualGrids, actualBlocks;
-        std::array<int,4> roleCounts{};
+        std::vector<void*> functions(std::size_t(plan.roleCount()));
+        std::vector<std::string> actualNames(std::size_t(plan.roleCount()));
+        std::vector<dim3> actualGrids(std::size_t(plan.roleCount())), actualBlocks(std::size_t(plan.roleCount()));
+        std::vector<int> roleCounts(std::size_t(plan.roleCount()));
         std::size_t first=count;
         for (std::size_t index=0; index<count; ++index)
         {
@@ -245,19 +274,19 @@ struct Capture final
             require(status==0 && demangled,"Cannot demangle the pinned HIP indexer kernel identity");
             const std::string actual(demangled.get());
             int role=-1;
-            for (int candidate=0; candidate<4; ++candidate)
-                if (actual==plan.function(candidate)+(candidate==1 ?
+            for (int candidate=0; candidate<plan.roleCount(); ++candidate)
+                if (actual==plan.function(candidate)+(candidate==plan.queryRole() ?
                     "(llaminar2::qwen4exp::QwenSparseIndexer, llaminar2::ProjectionRowWork)" :
                     "(llaminar2::qwen4exp::QwenSparseIndexer)"))
                 { require(role==-1,"Ambiguous native indexer role"); role=candidate; }
-            require(role>=0,"Captured native function is outside the exact four-kernel indexer inventory");
-            if(role==1) {
+            require(role>=0,"Captured native function is outside the exact geometry-selected indexer inventory");
+            if(role==plan.queryRole()) {
                 require(native.kernelParams && native.kernelParams[0] && native.kernelParams[1],
                     "AllLive query capture lacks original native arguments");
                 const auto &query=*static_cast<const QwenSparseIndexer *>(native.kernelParams[0]);
                 const auto &work=*static_cast<const ProjectionRowWork *>(native.kernelParams[1]);
-                require(params.query_demand==QwenSparseQueryDemand::AllLive &&
-                    query.query_demand==QwenSparseQueryDemand::AllLive && query.replay==params.replay &&
+                require(params.query_demand==plan.demand &&
+                    query.query_demand==plan.demand && query.replay==params.replay &&
                     query.row_capacity==params.row_capacity && query.token_capacity==params.token_capacity &&
                     query.query==params.query && query.prepared_query==params.prepared_query &&
                     work.captureIdentity()==qwenSparseIndexerQueryWork(params).repeatEachRow(4).captureIdentity(),
@@ -292,7 +321,7 @@ struct Capture final
                 next[previous]=int(index);
             }
         }
-        for (int role=0; role<4; ++role)
+        for (int role=0; role<plan.roleCount(); ++role)
         {
             require(roleCounts[std::size_t(role)]==plan.repeats,"Captured indexer role count differs");
             for (int other=0; other<role; ++other)
@@ -306,27 +335,27 @@ struct Capture final
             require(cursor>=0 && !visited[std::size_t(cursor)],"Captured indexer chain is incomplete/cyclic");
             const auto index=std::size_t(cursor);
             visited[index]=true;
-            require(roles[index]==int(step%4),"Captured native indexer operations are out of order");
+            require(roles[index]==int(step%std::size_t(plan.roleCount())),"Captured native indexer operations are out of order");
             cursor=next[index];
         }
         require(cursor==-1,"Captured indexer chain has excess operations");
         check(hipGraphInstantiate(&executable,graph,nullptr,nullptr,0));
-        for (int role=0; role<4; ++role)
+        for (int role=0; role<plan.roleCount(); ++role)
         {
             const auto grid=actualGrids[std::size_t(role)], block=actualBlocks[std::size_t(role)];
             hipFuncAttributes attributes{};check(hipFuncGetAttributes(&attributes,functions[std::size_t(role)]));
             require(attributes.localSizeBytes==0,"Captured indexer kernel exposes forbidden private storage");
-            if(role==3)require(attributes.sharedSizeBytes>=plan.policy.sourceStorageBytes(),
+            if(role==plan.roleCount()-1)require(attributes.sharedSizeBytes>=plan.policy.sourceStorageBytes(),
                 "Captured bounded selector lacks its actual lexical shared bank");
-            std::cout<<"INDEXER108_CAPTURE,version=3,policy="<<plan.policy.name<<",policy_code="<<int(plan.policy.value)
+            std::cout<<"INDEXER108_CAPTURE,version=5,policy="<<plan.policy.name<<",policy_code="<<int(plan.policy.value)
                 <<",bounded_block="<<plan.policy.block<<",bounded_slack="<<plan.policy.slack
-                <<",selection_observations=off"
+                <<",selection_observations=off,preparation_policy="<<plan.preparationName()
                 <<",role="<<role<<",function_encoding=percent-comma,function="<<markerFunction(actualNames[std::size_t(role)])
                 <<",native_function="<<functions[std::size_t(role)]<<",grid="<<grid.x<<':'<<grid.y<<':'<<grid.z
                 <<",block="<<block.x<<':'<<block.y<<':'<<block.z<<",occurrences="<<roleCounts[std::size_t(role)]
                 <<",ordered_chain_nodes="<<count<<",native_attribute_num_regs="<<attributes.numRegs
                 <<",native_attribute_shared_bytes="<<attributes.sharedSizeBytes<<",native_attribute_local_bytes="<<attributes.localSizeBytes
-                <<",source_selector_storage_bytes="<<(role==3?plan.policy.sourceStorageBytes():0)<<'\n';
+                <<",source_selector_storage_bytes="<<(role==plan.roleCount()-1?plan.policy.sourceStorageBytes():0)<<'\n';
         }
     }
     /** @brief Replay exactly the retained graph on its original non-default stream. */
@@ -443,6 +472,56 @@ inline Membership verifyMembership(Fixture& f, const Plan& plan)
     return metadata;
 }
 
+/** @brief Export bounded actual terminal banks only after final native join and checks.
+ * @details Existing owners/staging survive each download join. No replay is submitted.
+ * The directory must already exist; each file must be absent. This is component
+ * evidence, not a public runtime dump interface or a model-accuracy receipt.
+ */
+inline void exportTerminal(Fixture& f, const Plan& plan)
+{
+    const char* raw = std::getenv("QFN_INDEXER108_EXPORT_DIR");
+    if (!raw) return;
+    const std::filesystem::path directory(raw);
+    require(directory.is_absolute() && std::filesystem::is_directory(directory),
+        "Indexer export requires an existing absolute directory");
+    const std::uint64_t bytes = (f.pools.size + f.prepared.size + f.scores.size) * sizeof(float)
+        + (f.selected.size + f.count.size) * sizeof(std::int32_t);
+    require(bytes <= (std::uint64_t{64} << 20), "Indexer terminal export exceeds 64 MiB bound");
+    const auto save = [&](const char* name, const auto& values) {
+        const auto path = directory / name;
+        require(!std::filesystem::exists(path), "Indexer export refuses to overwrite evidence");
+        std::ofstream out(path,std::ios::binary | std::ios::out);
+        out.write(reinterpret_cast<const char*>(values.data()),
+            std::streamsize(values.size()*sizeof(values[0])));
+        out.close();
+        require(bool(out), "Indexer terminal export write failed");
+    };
+    save("pools.f32",f.pools.download(f.stream));
+    const auto prepared = f.prepared.download(f.stream);
+    // RankingOnly must retain the exact initial poison below its device threshold.
+    for (int row=0; row<plan.rows; ++row) {
+        if (plan.demand != QwenSparseQueryDemand::RankingOnly || plan.prefix+row+1 >= 2052) continue;
+        for (int col=0; col<512; ++col)
+            require(detail::floatBits(prepared[std::size_t(row)*512+col]) == 0xa5a5a5a5u,
+                "RankingOnly skipped query changed its diagnostic poison");
+    }
+    save("prepared.f32",prepared);
+    save("scores.f32",f.scores.download(f.stream));
+    save("selected.i32",f.selected.download(f.stream));
+    save("counts.i32",f.count.download(f.stream));
+    const auto metadata = directory / "geometry.txt";
+    require(!std::filesystem::exists(metadata), "Indexer export metadata already exists");
+    std::ofstream out(metadata);
+    out << "schema=1\nM=" << plan.rows << "\ncontext=" << plan.context
+        << "\nprefix=" << plan.prefix << "\ncapacity=" << plan.capacity
+        << "\nblocks=" << plan.blocks << "\nquery_demand=" << plan.demandName()
+        << "\npolicy=" << plan.policy.name << "\nrepresentation=FP32\npoison_bits=a5a5a5a5\n";
+    out.close();
+    require(bool(out), "Indexer export metadata failed");
+    std::cout << "INDEXER108_EXPORT,version=1,M=" << plan.rows << ",context=" << plan.context
+        << ",query_demand=" << plan.demandName() << ",bytes=" << bytes << ",passed=1\n";
+}
+
 /** @brief Fixture-only native events around one graph, normalized once by complete transactions. */
 struct Events final
 {
@@ -481,12 +560,17 @@ TEST(ROCmQwenSparseAttention,DISABLED_Indexer108PoliciesCapturedRepeatEvents)
     using namespace indexer_policy_perf108;
     const Plan plan(positiveSelector("QFN_INDEXER108_M"),positiveSelector("QFN_INDEXER108_CONTEXT"),SelectionPolicy::read());
     Fixture fixture(plan.rows,plan.prefix,plan.capacity,QwenSparseScalar::FP32);
+    // Diagnostic initialization is outside capture and every event interval.
+    check(hipMemsetAsync(fixture.prepared.data,0xa5,fixture.prepared.size*sizeof(float),fixture.stream));
+    check(hipMemsetAsync(fixture.scores.data,0xa5,fixture.scores.size*sizeof(float),fixture.stream));
+    check(hipMemsetAsync(fixture.selected.data,0xa5,fixture.selected.size*sizeof(std::int32_t),fixture.stream));
+    check(hipMemsetAsync(fixture.count.data,0xa5,fixture.count.size*sizeof(std::int32_t),fixture.stream));
     Capture capture(fixture,plan);
     capture.record();
     capture.launch();
     const auto initial=verifyMembership(fixture,plan);
     const auto publishMembership=[&](const char* phase,const Membership& membership,const char* retained){
-        std::cout<<"INDEXER108_MEMBERSHIP,version=2,phase="<<phase<<",policy="<<plan.policy.name
+        std::cout<<"INDEXER108_MEMBERSHIP,version=2,phase="<<phase<<",query_demand="<<plan.demandName()<<",policy="<<plan.policy.name
             <<",M="<<plan.rows<<",prefix="<<plan.prefix<<",context="<<plan.context<<",rows="<<plan.rows
             <<",selected_tokens="<<membership.selected_tokens<<",largest_selected="<<membership.largest_selected
             <<",oracle=numeric-sort-produced-scores,tie_order=lower-original-pool-id,retained_equal="<<retained<<'\n';};
@@ -497,12 +581,12 @@ TEST(ROCmQwenSparseAttention,DISABLED_Indexer108PoliciesCapturedRepeatEvents)
     {
         const float graphUs=events.sample(capture);
         require(std::isfinite(graphUs) && graphUs>0.0f,"Native indexer event interval is invalid");
-        std::cout<<"INDEXER108_EVENT,version=3,sample="<<sample
+        std::cout<<"INDEXER108_EVENT,version=5,sample="<<sample
             <<",M="<<plan.rows<<",prefix="<<plan.prefix<<",context="<<plan.context<<",capacity="<<plan.capacity
-            <<",blocks="<<plan.blocks<<",position_origin=17,repeats="<<plan.repeats<<",nodes="<<plan.repeats*4
-            <<",policy="<<plan.policy.name<<",policy_code="<<int(plan.policy.value)
+            <<",blocks="<<plan.blocks<<",position_origin=17,repeats="<<plan.repeats<<",nodes="<<plan.repeats*plan.roleCount()
+            <<",query_demand="<<plan.demandName()<<",policy="<<plan.policy.name<<",policy_code="<<int(plan.policy.value)
             <<",bounded_block="<<plan.policy.block<<",bounded_slack="<<plan.policy.slack
-                <<",selection_observations=off"
+                <<",selection_observations=off,preparation_policy="<<plan.preparationName()
             <<",representation=FP32,rotary=AnalyticTheta,theta=10000000,selector="<<markerFunction(plan.selector())
             <<",source_causal_complete_pools="<<plan.causal_pools<<",source_scored_pools="<<plan.scored_pools
             <<",source_score_fmas="<<plan.scored_pools*512<<",selected_tokens="<<initial.selected_tokens
@@ -517,5 +601,7 @@ TEST(ROCmQwenSparseAttention,DISABLED_Indexer108PoliciesCapturedRepeatEvents)
     const bool retainedEqual=final.selected_tokens==initial.selected_tokens && final.largest_selected==initial.largest_selected &&
         final.live_ids==initial.live_ids;
     publishMembership("final",final,retainedEqual?"true":"false");
+    require(retainedEqual,"Indexer terminal membership changed before export");
+    exportTerminal(fixture,plan);
 }
 } // namespace llaminar2::qwen4exp::ROCmQwenSparseAttention

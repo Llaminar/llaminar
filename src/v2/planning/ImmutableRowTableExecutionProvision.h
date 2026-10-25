@@ -54,11 +54,28 @@ private:
     /** @return All immutable activation geometry; never a count value or allocation address. */
     static bool sameActivation(const ActivationGraphMemoryGeometry &a,const ActivationGraphMemoryGeometry &b) noexcept
     {
-        const auto key=[](const ActivationGraphMemoryGeometry &g) {
-            return std::tuple{g.ngram_lookup,g.batch_size,g.resident_graph_rows,g.context_tokens,g.local_d_ff,
-                g.local_n_heads,g.local_n_kv_heads,g.local_vocab,g.replicated_dense_decode,g.first_layer,g.last_layer,
-                g.total_shards,g.routed_compute_policy,g.mtp_target_query_rows,g.retained_mtp_candidate_rows,
-                g.mtp_terminal_logits_layout,g.generation_request_capacity,g.ngram_fixed_head_participants,g.attention_phase_schedule};
+        const auto key = [](const ActivationGraphMemoryGeometry &g)
+        {
+            return std::tuple{g.ngram_lookup,
+                              g.batch_size,
+                              g.resident_graph_rows,
+                              g.context_tokens,
+                              g.local_d_ff,
+                              g.local_n_heads,
+                              g.local_n_kv_heads,
+                              g.local_vocab,
+                              g.replicated_dense_decode,
+                              g.first_layer,
+                              g.last_layer,
+                              g.total_shards,
+                              g.routed_compute_policy,
+                              g.mtp_target_query_rows,
+                              g.retained_mtp_candidate_rows,
+                              g.mtp_terminal_logits_layout,
+                              g.generation_request_capacity,
+                              g.ngram_fixed_head_participants,
+                              g.attention_arithmetic,
+                              g.attention_phase_schedule};
         };
         return key(a)==key(b);
     }

@@ -710,23 +710,120 @@ TEST(RankMemoryPlanInputs, QueryConsumerSourceMatchesCanonicalAssignmentEveryDeg
  */
 TEST(RankMemoryPlanInputs, AttentionPhaseScheduleSnapshotSurvivesDebugReloadAndAdapterCopies)
 {
-    using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
+    using A = qwen4exp::QwenSparseAttentionArithmetic;
+    using S = qwen4exp::QwenSparseAttentionPhaseSchedule;
     struct RestoreAttention final {
         AttentionConfig original;
-        /** @brief Restore the exact incoming test setup after all assertions/unwinding. */
+        /** @brief Restore incoming setup on every assertion/unwind path. */
         ~RestoreAttention(){mutableDebugEnv().attention=std::move(original);}
     } restore{mutableDebugEnv().attention};
-    mutableDebugEnv().attention.qfn_sparse_attention_phase_schedule=Schedule::Prefill8Decode33;
-    const auto frozen=RuntimeConfig::fromOrchestrationConfig(4096,1,"fp32","fp16");
-    EXPECT_EQ(frozen.attention_phase_schedule,Schedule::Prefill8Decode33);
-    mutableDebugEnv().attention.reload();
-    mutableDebugEnv().attention.qfn_sparse_attention_phase_schedule=Schedule::Uniform;
-    Fixture fixture(DeviceType::ROCm,4);fixture.plan.runtime=frozen;
+    mutableDebugEnv().attention.qfn_sparse_attention.reset();
+    mutableDebugEnv().attention.qfn_sparse_attention_phase_schedule.reset();
+    auto frozen = RuntimeConfig::fromOrchestrationConfig(4096, 1, "fp32", "fp16");
+    EXPECT_FALSE(frozen.attention_setup_request.arithmetic);
+    EXPECT_FALSE(frozen.attention_setup_request.schedule);
+    mutableDebugEnv().attention.qfn_sparse_attention = A::FixedFP32;
+    mutableDebugEnv().attention.qfn_sparse_attention_phase_schedule = S::Uniform;
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    Fixture fixture(DeviceType::ROCm, 4);
+    fixture.model = source.metadata().memoryProfile();
+    fixture.plan.last_layer = 47;
+    fixture.plan.runtime = frozen;
+    fixture.plan.runtime.ngram_table_policy.storage = ImmutableRowStoragePreference::RAM;
     const auto inputs=buildRankMemoryPlanInputs(fixture.request());ASSERT_EQ(inputs.size(),4u);
-    for(const auto& input:inputs)EXPECT_EQ(input.attention_phase_schedule,Schedule::Prefill8Decode33);
+    for (const auto &input : inputs)
+    {
+        EXPECT_EQ(input.attention_arithmetic, A::TileFP16WithFP32Totals);
+        EXPECT_EQ(input.attention_phase_schedule, S::Prefill8Decode33);
+    }
+    frozen.attention_participants =
+        projectAdmittedQwenSparseAttentionPrograms(fixture.model, inputs, 0);
     const auto rank=RankOrchestrator::Config::fromRuntime(frozen);
     const auto runner=InferenceRunnerConfig::fromRuntime(frozen);
-    EXPECT_EQ(rank.attention_phase_schedule,Schedule::Prefill8Decode33);
-    EXPECT_EQ(runner.attention_phase_schedule,Schedule::Prefill8Decode33);
-    EXPECT_EQ(frozen.attention_phase_schedule,Schedule::Prefill8Decode33);
+    EXPECT_EQ(rank.attention_participants, frozen.attention_participants);
+    EXPECT_EQ(runner.attention_participants, frozen.attention_participants);
+    EXPECT_EQ(qwen4exp::admittedQwenSparseAttentionPolicy(
+                  runner.attention_participants, DeviceId::rocm(0), 0, 47)
+                  .schedule,
+              S::Prefill8Decode33);
+    EXPECT_FALSE(frozen.attention_setup_request.arithmetic);
+    EXPECT_FALSE(frozen.attention_setup_request.schedule);
+}
+
+/** @test Mixed PP copies the same resolved per-device policies into execution, never a rank-global
+ * default. */
+TEST(RankMemoryPlanInputs, AdmittedAttentionDefaultsKeepMixedParticipantsAndColdControls)
+{
+    using A = qwen4exp::QwenSparseAttentionArithmetic;
+    using S = qwen4exp::QwenSparseAttentionPhaseSchedule;
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    std::vector<DevicePlanConfig> inputs;
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.world_rank = 0;
+        cfg.batch_size = 1;
+        cfg.generation_request_capacity = 1;
+        cfg.kv_precision = "fp16"; // Already resolved by the canonical device-input adapter.
+        RuntimeConfig snapshot;
+        snapshot.kv_cache_precision = KVCachePrecision::FP16;
+        resolveQwenSparseAttentionDeviceProgram(source.metadata().memoryProfile(), cfg, snapshot);
+        inputs.push_back(cfg);
+    }
+    const auto projection =
+        projectAdmittedQwenSparseAttentionPrograms(source.metadata().memoryProfile(), inputs, 0);
+    for (const auto &input : inputs)
+    {
+        const auto copied = qwen4exp::admittedQwenSparseAttentionPolicy(
+            projection,
+            input.device,
+            input.first_layer,
+            input.last_layer < 0 ? source.metadata().memoryProfile().mainLayerCount() - 1
+                                 : input.last_layer);
+        EXPECT_EQ(copied.arithmetic, input.attention_arithmetic);
+        EXPECT_EQ(copied.schedule, input.attention_phase_schedule);
+        EXPECT_EQ(copied.arithmetic,
+                  input.device.is_rocm() ? A::TileFP16WithFP32Totals : A::FixedFP32);
+    }
+    auto duplicate = inputs;
+    duplicate.push_back(inputs.back());
+    EXPECT_THROW(
+        projectAdmittedQwenSparseAttentionPrograms(source.metadata().memoryProfile(), duplicate, 0),
+        std::invalid_argument);
+    RuntimeConfig control;
+    control.kv_cache_precision = KVCachePrecision::FP16;
+    control.attention_setup_request.arithmetic = A::FixedFP32;
+    auto cfg = inputs.back();
+    resolveQwenSparseAttentionDeviceProgram(source.metadata().memoryProfile(), cfg, control);
+    EXPECT_EQ(cfg.attention_arithmetic, A::FixedFP32);
+    EXPECT_EQ(cfg.attention_phase_schedule, S::Uniform);
+    auto no_attention = inputs.front();
+    no_attention.first_layer = 0;
+    no_attention.last_layer = 2; // Published layers0..2 are GDN; first QSA is3.
+    RuntimeConfig half;
+    half.kv_cache_precision = KVCachePrecision::FP16;
+    half.attention_setup_request = {A::TileFP16WithFP32Totals, S::Prefill8Decode33};
+    EXPECT_NO_THROW(resolveQwenSparseAttentionDeviceProgram(
+        source.metadata().memoryProfile(), no_attention, half));
+    EXPECT_FALSE(projectAdmittedQwenSparseAttentionPrograms(
+        source.metadata().memoryProfile(), {no_attention}, 0));
+    no_attention.last_layer = 3;
+    EXPECT_THROW(resolveQwenSparseAttentionDeviceProgram(
+                     source.metadata().memoryProfile(), no_attention, half),
+                 std::invalid_argument);
+    for (const auto *storage : {"fp32", "q16_1", "tq4", "tq8"})
+    {
+        auto declared_storage = inputs.back();
+        declared_storage.kv_precision = storage;
+        RuntimeConfig omitted; // The helper must consume the admitted input, not reinterpret AUTO.
+        resolveQwenSparseAttentionDeviceProgram(source.metadata().memoryProfile(), declared_storage, omitted);
+        EXPECT_EQ(declared_storage.attention_arithmetic, A::FixedFP32) << storage;
+        EXPECT_EQ(declared_storage.attention_phase_schedule, S::Uniform) << storage;
+        omitted.attention_setup_request.arithmetic = A::TileFP16WithFP32Totals;
+        EXPECT_THROW(resolveQwenSparseAttentionDeviceProgram(source.metadata().memoryProfile(), declared_storage, omitted), std::invalid_argument);
+    }
+
 }

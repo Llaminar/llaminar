@@ -35,13 +35,27 @@ void rocmQwenSparseIndexer(const QwenSparseIndexer &p, hipStream_t stream)
     requireStream(stream);
     validateQwenSparseIndexer(p);
     const auto queryWork=qwenSparseIndexerQueryWork(p).repeatEachRow(4);
-    rocm_sparse_detail::preparePools<<<(p.row_capacity + 6) / 4, 128, 0, stream>>>(p);
-    checkLaunch();
-    if(p.query_demand==QwenSparseQueryDemand::RankingOnly)
-        rocm_sparse_detail::prepareQueries<true><<<p.row_capacity * 4, 128, 0, stream>>>(p,queryWork);
+    const auto preparation = qwenSparsePreparationGrid(p.row_capacity);
+    // Geometry is immutable before capture: grouped decode retains one fused
+    // dispatch; prefill retains its independently scheduled original programs.
+    if (preparation.program == QwenSparsePreparationProgram::FusedGrouped)
+    {
+        if(p.query_demand==QwenSparseQueryDemand::RankingOnly)
+            rocm_sparse_detail::preparePoolsAndQueries<true><<<preparation.total_blocks, 128, 0, stream>>>(p,queryWork);
+        else
+            rocm_sparse_detail::preparePoolsAndQueries<false><<<preparation.total_blocks, 128, 0, stream>>>(p,queryWork);
+        checkLaunch();
+    }
     else
-        rocm_sparse_detail::prepareQueries<false><<<p.row_capacity * 4, 128, 0, stream>>>(p,queryWork);
-    checkLaunch();
+    {
+        rocm_sparse_detail::preparePools<<<preparation.pool_blocks, 128, 0, stream>>>(p);
+        checkLaunch();
+        if (p.query_demand == QwenSparseQueryDemand::RankingOnly)
+            rocm_sparse_detail::prepareQueries<true><<<preparation.query_blocks, 128, 0, stream>>>(p,queryWork);
+        else
+            rocm_sparse_detail::prepareQueries<false><<<preparation.query_blocks, 128, 0, stream>>>(p,queryWork);
+        checkLaunch();
+    }
     rocm_sparse_detail::scorePools<<<dim3((p.block_capacity + 7) / 8, p.row_capacity), 256, 0, stream>>>(p);
     checkLaunch();
     rocmQwenSparseSelectPools(p, stream);

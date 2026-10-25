@@ -3782,3 +3782,7 @@ namespace
     }
 
 } // anonymous namespace
+
+#ifdef HAVE_ROCM
+#include "ROCmGatedNormSingleQ8ProductionTest.h"
+#endif

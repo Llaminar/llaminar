@@ -181,7 +181,8 @@ struct Fixture
         check(QSA_RT(StreamEndCapture)(stream, &graph));
         std::size_t nodes = 0;
         check(QSA_RT(GraphGetNodes)(graph, nullptr, &nodes));
-        EXPECT_EQ(nodes, detail::isRotated(attention.kv.keys) ? 7u : 6u);
+        const std::size_t indexerNodes = rows <= llaminar2::attention::kMaxGroupedVerifierAttentionRows ? 3u : 4u;
+        EXPECT_EQ(nodes, indexerNodes + (detail::isRotated(attention.kv.keys) ? 3u : 2u));
         check(QSA_RT(GraphInstantiate)(&executable, graph, nullptr, nullptr, 0));
     }
     /** @brief Replay the retained production graph without allocation or host state reads. */
@@ -1170,7 +1171,12 @@ TEST(QSA_SUITE, CapturedRankingOnlyQueryPreparationPreservesNativeResults)
                 QSA_RT(GraphNodeType) type;check(QSA_RT(GraphNodeGetType)(node,&type));
                 if(type!=QSA_RT(GraphNodeTypeKernel))throw std::runtime_error("Query fixture contains a non-kernel node");
                 QSA_RT(KernelNodeParams) native{};check(QSA_RT(GraphKernelNodeGetParams)(node,&native));
-                if(native.gridDim.x!=unsigned(rows*4)||native.gridDim.y!=1||native.gridDim.z!=1||native.blockDim.x!=128)continue;
+                // Grouped rows retain one fused pool/query launch; prefill uses
+                // the independent original query program. Both carry the exact
+                // original queryWork tuple inspected below.
+                const unsigned queryGrid = rows <= attention::kMaxGroupedVerifierAttentionRows
+                    ? unsigned((rows+6)/4+rows*4) : unsigned(rows*4);
+                if(native.gridDim.x!=queryGrid||native.gridDim.y!=1||native.gridDim.z!=1||native.blockDim.x!=128)continue;
                 if(function||native.blockDim.y!=1||native.blockDim.z!=1||native.sharedMemBytes||!native.kernelParams)
                     throw std::runtime_error("Query preparation has ambiguous geometry/arguments");
                 const auto &params=*static_cast<const QwenSparseIndexer *>(native.kernelParams[0]);
@@ -1204,7 +1210,8 @@ TEST(QSA_SUITE, CapturedRankingOnlyQueryPreparationPreservesNativeResults)
         }
         check(QSA_RT(StreamEndCapture)(serial.stream,&serial.graph));
         std::size_t serialNodes=0;
-        check(QSA_RT(GraphGetNodes)(serial.graph,nullptr,&serialNodes));EXPECT_EQ(serialNodes,5u);
+        check(QSA_RT(GraphGetNodes)(serial.graph,nullptr,&serialNodes));
+        EXPECT_EQ(serialNodes,4u); // Grouped M1 indexer3 plus accepted-tail commit1.
         check(QSA_RT(GraphInstantiate)(&serial.executable,serial.graph,nullptr,nullptr,0));
         const auto ordinaryExecutable=ordinary.executable,gatedExecutable=gated.executable;
         const int partial=std::min(rows,2);

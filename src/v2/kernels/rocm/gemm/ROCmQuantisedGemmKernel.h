@@ -98,6 +98,7 @@
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
+#include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
@@ -485,6 +486,13 @@ namespace llaminar2
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
+
+            /** @copydoc ITensorGemm::validate_gated_rmsnorm_single_q8 */
+            void validate_gated_rmsnorm_single_q8(GatedRMSNormProjectionInput input,
+                TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace) const override;
+            /** @copydoc ITensorGemm::multiply_gated_rmsnorm_single_q8 */
+            bool multiply_gated_rmsnorm_single_q8(GatedRMSNormProjectionInput input,
+                TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace) override;
 
             /**
              * @brief Tensor-aware fused multi-projection GEMM
@@ -916,6 +924,24 @@ namespace llaminar2
             // under stable names so graph rebuilds do not force workspace
             // reallocations solely because new kernel instances were created.
             uint32_t slice_id_ = 0;
+
+            /** @brief Stack-only validated launch operands, never an allocation or registry. */
+            struct GatedNormExecutionBinding {
+                GatedNormSingleQ8Input input;
+                DeviceNativeVNNIMatrixDesc weights;
+                float* row_scales;
+                float* partials;
+            };
+            /** @brief Share one exact cold/capture admission with no numeric or native side effects.
+             * @param input Original retained FP32 values and immutable gate/gamma.
+             * @param output Original distinct output tensor.
+             * @param n Exact output width.
+             * @param k Exact reduction width.
+             * @param workspace Original PMA-owned quantization/projection scratch.
+             * @return Borrowed stack-only launch tuple after complete span validation.
+             */
+            GatedNormExecutionBinding gatedNormExecutionBinding(GatedRMSNormProjectionInput input,
+                TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace) const;
 
             std::string scatterPartialBufferName() const
             {

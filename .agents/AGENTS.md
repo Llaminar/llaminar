@@ -212,6 +212,13 @@ replays; correct output alone does not prove economical communication.
     commands, gates, and architecture; dashboards/project plans record current
     progress, measurements, failures, and next steps. Do not turn `SKILL.md` or
     `AGENTS.md` into a task diary.
+    **Tuning/status dashboards are always size bounded and never exhaustive
+    audit logs.** Each dashboard must declare and stay within a byte-size limit;
+    use 15,000 UTF-8 bytes unless another limit is explicitly agreed. Keep only
+    current status, comparison matrices, blockers, next actions, and evidence
+    links. Replace superseded entries rather than appending a chronology. Put
+    detailed experiments, commands, samples, traces, and failure investigations
+    in linked tuning notes or dated records.
 38. **Keep names and docs synchronized.** When modes or CLI options change,
     update code, tests, help, `README.md`, `AGENTS.md`, project docs, and source
     sanitizers together. Fully disambiguate execution modes rather than carrying

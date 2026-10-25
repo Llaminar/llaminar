@@ -126,3 +126,34 @@ TEST(Qwen4ExpGDNOutputStage, CPURejectsNoncompactHostAuthorityBeforeStage6)
     EXPECT_EQ(graph.getNode("layer0_gdn_out_proj"),nullptr);
     EXPECT_TRUE(source.sourceUnchanged());
 }
+
+/** @test Closed geometry admits only the complete128 scalar producer, without a model-name policy. */
+TEST(Qwen4ExpGDNOutputStage,GatedNormSingleQ8GeometryAndExplicitUnsupportedAdmission)
+{
+    GatedRMSNormProjectionParameters norm{128,128,1e-6f,false,GatedNormActivation::Sigmoid};
+    for(const int heads:{1,3,6,12,24,48})EXPECT_TRUE(gatedNormSingleQ8Geometry(1,heads*128,norm));
+    for(const int rows:{0,2,3,16,31,512})EXPECT_FALSE(gatedNormSingleQ8Geometry(rows,1536,norm));
+    for(const int width:{-128,0,32,64,127,129,1535})EXPECT_FALSE(gatedNormSingleQ8Geometry(1,width,norm));
+    auto bad=norm;bad.gamma_period=64;EXPECT_FALSE(gatedNormSingleQ8Geometry(1,1536,bad));
+    bad=norm;bad.norm_dim=64;EXPECT_FALSE(gatedNormSingleQ8Geometry(1,1536,bad));
+    bad=norm;bad.activation=static_cast<GatedNormActivation>(255);EXPECT_FALSE(gatedNormSingleQ8Geometry(1,1536,bad));
+    Qwen4ExpGDNOutputStageFixture source(DeviceId::cpu());
+    Qwen4ExpGDNOutputActivationFixture activation(1);
+    ForwardInput input;input.execution_phase=ForwardExecutionPhase::Decode;
+    input.batch_size=1;input.seq_len=1;input.real_seq_len=1;input.device=DeviceId::cpu();
+    auto config=source.config;config.qfn_gdn_output_activation=QuantizedActivationOperandPrecision::SingleQ8;
+    auto builder=source.builder(config);ComputeGraph graph;
+    activation.addProducer(graph,1,DeviceId::cpu());
+    builder->append(graph,input,activation.buffers,source.prepared.binding);
+    const auto* stage=dynamic_cast<const GEMMStage*>(graph.getNode("layer0_gdn_out_proj")->stage.get());
+    ASSERT_NE(stage,nullptr);EXPECT_FALSE(stage->getParams().gated_norm);
+    auto params=stage->getParams();
+    FP32Tensor gate({1u,6144u}),gamma({128u});
+    params.gated_norm=GEMMStage::GatedNormPublication{&gate,&gamma,BufferId::GDN_Z,norm};
+    // A selected unsupported backend is fatal; ordinary CPU remains complete.
+    EXPECT_THROW(static_cast<void>(GEMMStage{params}),std::invalid_argument);
+    params.prepared_store=nullptr;params.prepared_ref.reset();
+    params.device_id=DeviceId::rocm(0);
+    EXPECT_THROW(static_cast<void>(GEMMStage{params}),std::invalid_argument);
+    EXPECT_TRUE(source.sourceUnchanged());
+}

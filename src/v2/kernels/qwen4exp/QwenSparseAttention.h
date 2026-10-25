@@ -234,6 +234,26 @@ struct QwenSparseAttention
     QwenSparseAttentionArithmetic arithmetic = kDefaultQwenSparseAttentionArithmetic; ///< Sealed arithmetic, independent of row/context geometry.
 };
 
+/** @brief Immutable captured preparation programs, selected only by admitted row capacity. */
+enum class QwenSparsePreparationProgram : std::uint8_t
+{
+    FusedGrouped,
+    SeparatePrefill
+};
+/** @brief Checked original CTA counts and immutable launch program; no CTA is omitted. */
+struct QwenSparsePreparationGrid
+{
+    int pool_blocks, query_blocks, total_blocks;
+    QwenSparsePreparationProgram program;
+};
+/**
+ * @brief Derive representable CTA extents and the retained row-regime program without live-state reads.
+ * @param rows Immutable physical row capacity, independent of current live rows.
+ * @return Original pool/query CTA counts, their exact sum, and the grouped/prefill launch program.
+ * @throws std::invalid_argument For nonpositive rows or native signed-index overflow.
+ */
+[[nodiscard]] QwenSparsePreparationGrid qwenSparsePreparationGrid(int rows);
+
 /** @brief Validate static pointer/geometry bindings without reading device state.
  * @param params Complete arena/cache indexer bindings.
  * @throws std::invalid_argument For an incomplete binding or unsupported immutable policy.

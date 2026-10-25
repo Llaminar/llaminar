@@ -859,14 +859,16 @@ namespace llaminar2
          * @brief Setup-only LLAMINAR_QFN_SPARSE_ATTENTION=fp32|fp16_tile.
          * QFN graph construction freezes this explicit arithmetic before capture.
          * The FP16 tile experiment admits ROCm attention with native FP16 KV;
-         * CPU/CUDA reject it. Unset selects the unchanged fixed FP32 program.
+         * CPU/CUDA reject it. Unset remains absent until actual participant admission resolves the
+         * installed default.
          */
-        qwen4exp::QwenSparseAttentionArithmetic qfn_sparse_attention = qwen4exp::kDefaultQwenSparseAttentionArithmetic;
+        std::optional<qwen4exp::QwenSparseAttentionArithmetic> qfn_sparse_attention;
         /** @brief Explicit setup schedule, snapshotted into RuntimeConfig before planning.
          * LLAMINAR_QFN_SPARSE_ATTENTION_PHASE_SCHEDULE=uniform|prefill8_decode33.
-         * Split schedule requires explicit fp16_tile and ROCm/native FP16; its
+         * Split schedule requires a resolved FP16 program and ROCm/native FP16; its
          * immutable copy, never a later environment read, owns arena geometry. */
-        qwen4exp::QwenSparseAttentionPhaseSchedule qfn_sparse_attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+        std::optional<qwen4exp::QwenSparseAttentionPhaseSchedule>
+            qfn_sparse_attention_phase_schedule;
         bool fp32_scores = false; ///< Use FP32 for Q·K score computation (default: integer)
 
         bool debug_effective_kv_snapshot = false;             ///< Capture effective K/V tensors when LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT is non-zero.
@@ -917,11 +919,14 @@ namespace llaminar2
         void reload()
         {
             const char *qfn_sparse = std::getenv("LLAMINAR_QFN_SPARSE_ATTENTION");
-            qfn_sparse_attention = qfn_sparse ? qwen4exp::parseQwenSparseAttentionArithmetic(qfn_sparse) :
-                qwen4exp::kDefaultQwenSparseAttentionArithmetic;
+            qfn_sparse_attention =
+                qfn_sparse ? std::optional{qwen4exp::parseQwenSparseAttentionArithmetic(qfn_sparse)}
+                           : std::nullopt;
             const char *qfn_schedule=std::getenv("LLAMINAR_QFN_SPARSE_ATTENTION_PHASE_SCHEDULE");
-            qfn_sparse_attention_phase_schedule=qfn_schedule ? qwen4exp::parseQwenSparseAttentionPhaseSchedule(qfn_schedule) :
-                qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+            qfn_sparse_attention_phase_schedule =
+                qfn_schedule
+                    ? std::optional{qwen4exp::parseQwenSparseAttentionPhaseSchedule(qfn_schedule)}
+                    : std::nullopt;
             const char *fp32_scores_env = std::getenv("LLAMINAR_Q8_ATTENTION_FP32_SCORES");
             if (fp32_scores_env)
             {

@@ -1697,7 +1697,8 @@ namespace llaminar2
                                                  InferenceRunnerConfig runner_config;
                                                  runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
                                                  runner_config.activation_seq_len = config_.resident_graph_rows;
-                                                 runner_config.attention_phase_schedule = config_.attention_phase_schedule;
+                                                 runner_config.attention_participants =
+                                                     config_.attention_participants;
                                                  runner_config.batch_size = config_.batch_size;
                                                  runner_config.ordinary_terminal_projection = config_.ordinary_terminal_projection;
                                                  runner_config.activation_precision = config_.activation_precision;
@@ -2056,7 +2057,7 @@ namespace llaminar2
             InferenceRunnerConfig runner_config;
             runner_config.max_seq_len = static_cast<int>(child_config.max_seq_len);
             runner_config.activation_seq_len = child_config.resident_graph_rows;
-            runner_config.attention_phase_schedule = child_config.attention_phase_schedule;
+            runner_config.attention_participants = child_config.attention_participants;
             runner_config.batch_size = child_config.batch_size;
             runner_config.ordinary_terminal_projection = child_config.ordinary_terminal_projection;
             runner_config.activation_precision = child_config.activation_precision;

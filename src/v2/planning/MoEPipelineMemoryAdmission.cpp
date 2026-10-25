@@ -22,6 +22,7 @@ namespace llaminar2
         runtime.resident_graph_rows = rank_plan_.runtime.resident_graph_rows;
         runtime.moe_routed_prefill.overlay_segment_rows = rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows;
         runtime.ngram_table_placement = rank_plan_.runtime.ngram_table_placement;
+        runtime.attention_participants = rank_plan_.runtime.attention_participants;
     }
 
     AdmittedMoEPipelineMemory AdmittedMoEPipelineMemory::admit(
@@ -156,6 +157,19 @@ namespace llaminar2
                 }
                 result.rank_plan_.runtime.resident_graph_rows = selected_fixed.front().resident_graph_rows;
                 result.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = selected_segments.front();
+                std::vector<DevicePlanConfig> admitted_attention_inputs;
+                for (auto &stage : result.stages_)
+                {
+                    stage.rank_plan_.runtime.attention_participants =
+                        projectAdmittedQwenSparseAttentionPrograms(
+                            profile, stage.devices_, stage.rank_plan_.rank);
+                    admitted_attention_inputs.insert(admitted_attention_inputs.end(),
+                                                     stage.devices_.begin(),
+                                                     stage.devices_.end());
+                }
+                result.rank_plan_.runtime.attention_participants =
+                    projectAdmittedQwenSparseAttentionPrograms(
+                        profile, admitted_attention_inputs, result.rank_plan_.rank);
                 return result;
     }
 }

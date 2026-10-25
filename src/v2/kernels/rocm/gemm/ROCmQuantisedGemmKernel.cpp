@@ -35,6 +35,7 @@
 
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "ROCmQuantisedActivationProducers.h"
+#include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
 #include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
@@ -1629,6 +1630,117 @@ namespace llaminar2
                 stream, impl_->residual_iq_tables);
             publishROCmTensorWrite(*activated, rocm_device_id_, stream);
             publishROCmTensorWrite(*output, rocm_device_id_, stream);
+        }
+
+        /**
+         * @brief Consume fused norm publication within the original prepared GEMM owner.
+         * @details Only the preparation launch changes. The same M1 native
+         * producer/reducer and source arithmetic policy immediately consume the
+         * original named workspace. No prepared activation escapes this call.
+         */
+        ROCmQuantisedGemmKernel::GatedNormExecutionBinding ROCmQuantisedGemmKernel::gatedNormExecutionBinding(
+            GatedRMSNormProjectionInput input,TensorBase* output,int n,int k,
+            DeviceWorkspaceManager* workspace) const
+        {
+            const auto target=DeviceId::rocm(rocm_device_id_);
+            if(!gatedNormSingleQ8Geometry(1,k,input.parameters)||!output||
+               output==&input.values||output==&input.gate||output==&input.gamma||
+               &input.values==&input.gate||&input.values==&input.gamma||
+               input.values.native_type()!=TensorType::FP32||input.gate.native_type()!=TensorType::FP32||
+               input.gamma.native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
+               input.values.current_device()!=std::optional{target}||input.gate.current_device()!=std::optional{target}||
+               input.gamma.current_device()!=std::optional{target}||output->current_device()!=std::optional{target}||
+               input.values.isMapped()||output->isMapped()||n!=static_cast<int>(N_)||k!=static_cast<int>(K_)||
+               input.values.numel()<static_cast<size_t>(k)||input.gate.numel()<static_cast<size_t>(k)||
+               input.gamma.numel()<128||output->numel()<static_cast<size_t>(n)||
+               !workspace||workspace!=workspace_||workspace->device()!=target||!workspace->isAllocated()||
+               !weights_converted()||currentProjectionRowWork(1)||countedVerifierRows(1))
+                throw std::invalid_argument("Gated-norm SingleQ8 requires its ordinary scalar FP32 tensors, exact prepared source and original bound workspace");
+            DeviceNativeVNNIMatrixDesc weights;
+            if(!inspectPreparedNativeVNNIMatrixDesc(weights))
+                throw std::logic_error("Gated-norm SingleQ8 requires already-prepared native source planes");
+            const auto physical=requireQ8ResidualNativeMatrix(weights,1,n,k);
+            const auto requirements=getWorkspaceRequirements(1,n,k);
+            const auto requireBank=[&](const std::string& name,size_t minimum)->void* {
+                const auto* needed=requirements.find(name);
+                if(!needed)throw std::logic_error("Gated-norm SingleQ8 bank is absent from the original BOM");
+                minimum=std::max(minimum,needed->size_bytes);
+                auto* pointer=workspace->getBuffer(name);
+                if(!pointer||workspace->getBufferSize(name)<minimum)
+                    throw std::logic_error("Gated-norm SingleQ8 lacks an original admitted quantization/projection bank");
+                return pointer;
+            };
+            auto* quant=static_cast<std::int8_t*>(requireBank(GemmWorkspaceBuffers::QUANT_A,k));
+            auto* scales=static_cast<float*>(requireBank(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
+                static_cast<size_t>(k/32)*sizeof(float)));
+            auto* partials=static_cast<float*>(requireBank(scatterPartialBufferName(),sizeof(float)));
+            auto* row_scales=static_cast<float*>(requireBank(GemmWorkspaceBuffers::SCALES_A,sizeof(float)));
+            (void)requireBank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,static_cast<size_t>(k/32)*sizeof(std::int32_t));
+            const auto blocks=static_cast<size_t>(n)*weights.blocks_per_row;
+            // Protect complete original capacities, including unused immutable
+            // allocation planes and the scalar consumer's untouched sums bank.
+            const std::array writes{
+                Q8ResidualStorageSpan{input.values.gpu_data_ptr(),std::max(input.values.size_bytes(),static_cast<size_t>(k)*sizeof(float)),alignof(float)},
+                Q8ResidualStorageSpan{output->gpu_data_ptr(),std::max(output->size_bytes(),static_cast<size_t>(n)*sizeof(float)),alignof(float)},
+                Q8ResidualStorageSpan{quant,workspace->getBufferSize(GemmWorkspaceBuffers::QUANT_A),16},
+                Q8ResidualStorageSpan{scales,workspace->getBufferSize(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE),alignof(float)},
+                Q8ResidualStorageSpan{partials,workspace->getBufferSize(scatterPartialBufferName()),alignof(float)}};
+            const std::array reads{
+                Q8ResidualStorageSpan{input.gate.gpu_data_ptr(),std::max(input.gate.size_bytes(),static_cast<size_t>(k)*sizeof(float)),alignof(float)},
+                Q8ResidualStorageSpan{input.gamma.gpu_data_ptr(),std::max(input.gamma.size_bytes(),size_t{128}*sizeof(float)),alignof(float)},
+                Q8ResidualStorageSpan{weights.payload,blocks*(weights.allocation_payload_bytes_per_block?
+                    weights.allocation_payload_bytes_per_block:physical.payload_bytes_per_block),16},
+                Q8ResidualStorageSpan{weights.scales,blocks*sizeof(std::uint16_t),alignof(std::uint16_t)},
+                Q8ResidualStorageSpan{weights.mins,weights.mins?blocks*sizeof(std::uint16_t):0,alignof(std::uint16_t)},
+                Q8ResidualStorageSpan{weights.emins,weights.emins?blocks*sizeof(std::uint32_t):0,alignof(std::uint32_t)},
+                Q8ResidualStorageSpan{workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),
+                    workspace->getBufferSize(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),alignof(std::int32_t)},
+                Q8ResidualStorageSpan{row_scales,workspace->getBufferSize(GemmWorkspaceBuffers::SCALES_A),alignof(float)}};
+            validateQ8ResidualStorage(writes,reads);
+            const rocm::GatedNormSingleQ8Input native{
+                static_cast<const float*>(input.values.gpu_data_ptr()),
+                static_cast<const float*>(input.gate.gpu_data_ptr()),
+                static_cast<const float*>(input.gamma.gpu_data_ptr()),
+                static_cast<float*>(input.values.gpu_data_ptr()),k,input.parameters,quant,scales};
+            return {native,weights,row_scales,partials};
+        }
+
+        /** @copydoc validate_gated_rmsnorm_single_q8 */
+        void ROCmQuantisedGemmKernel::validate_gated_rmsnorm_single_q8(
+            GatedRMSNormProjectionInput input,TensorBase* output,int n,int k,
+            DeviceWorkspaceManager* workspace) const
+        { (void)gatedNormExecutionBinding(input,output,n,k,workspace); }
+
+        /** @copydoc multiply_gated_rmsnorm_single_q8 */
+        bool ROCmQuantisedGemmKernel::multiply_gated_rmsnorm_single_q8(
+            GatedRMSNormProjectionInput input,TensorBase* output,int n,int k,
+            DeviceWorkspaceManager* workspace)
+        {
+            (void)ExplicitGPUStream(gpu_stream_);
+            const auto native=gatedNormExecutionBinding(input,output,n,k,workspace);
+            const auto target=DeviceId::rocm(rocm_device_id_);
+            TransferEngine::requireDeviceInput(&input.values,target,gpu_stream_);
+            TransferEngine::requireDeviceInput(const_cast<TensorBase*>(&input.gate),target,gpu_stream_);
+            TransferEngine::requireDeviceInput(const_cast<TensorBase*>(&input.gamma),target,gpu_stream_);
+            TransferEngine::requireDeviceOutput(output,target,gpu_stream_);
+            if(!rocm::launchGatedNormSingleQ8(native.input,rocm_device_id_,gpu_stream_))return false;
+            const auto& weights=native.weights;
+            if(!rocmGemv_native_vnni_fp32_with_policy(native.input.quant,weights.payload,weights.scales,weights.mins,
+                weights.emins,static_cast<float*>(output->gpu_data_ptr()),native.row_scales,native.partials,n,k,
+                weights.codebook_id,requireNativeVNNIArithmeticPolicyCodebook(
+                    impl_->native_vnni_codebook_id,impl_->native_source_identity),
+                rocm_device_id_,gpu_stream_,native.input.scales))return false;
+            publishROCmTensorWrite(input.values,rocm_device_id_,gpu_stream_);
+            publishROCmTensorWrite(*output,rocm_device_id_,gpu_stream_);
+            if(PerfStatsCollector::isDomainEnabled("gdn_output"))
+                PerfStatsCollector::addCounter("gdn_output","normalization_submission",1.,"gemm",
+                    "rocm:"+std::to_string(rocm_device_id_),PerfStatsCollector::Tags{
+                        {"preparation","fused_single_q8"},{"m","1"},{"n",std::to_string(n)},
+                        {"k",std::to_string(k)},{"norm_dim","128"},{"normalized_fp32","retained"},
+                        {"codebook",std::to_string(weights.codebook_id)},
+                        {"source_codebook",std::to_string(weights.source_codebook_id)},
+                        {"activation",std::to_string(static_cast<unsigned>(input.parameters.activation))}});
+            return true;
         }
 
         bool ROCmQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)

@@ -154,6 +154,17 @@ void validateQwenSparseSelection(const QwenSparseIndexer &p)
                 banks[j].begin < banks[i].begin + banks[i].bytes)
                 throw std::invalid_argument("QSA selection immutable inputs and exclusive outputs overlap");
 }
+QwenSparsePreparationGrid qwenSparsePreparationGrid(int rows)
+{
+    if(rows<=0)throw std::invalid_argument("QSA preparation requires positive row capacity");
+    const std::int64_t pools=(std::int64_t(rows)+6)/4,queries=std::int64_t(rows)*4;
+    if(pools+queries>std::numeric_limits<int>::max())
+        throw std::invalid_argument("QSA preparation grid exceeds native index capacity");
+    return {static_cast<int>(pools),static_cast<int>(queries),static_cast<int>(pools+queries),
+        rows <= attention::kMaxGroupedVerifierAttentionRows
+            ? QwenSparsePreparationProgram::FusedGrouped
+            : QwenSparsePreparationProgram::SeparatePrefill};
+}
 void validateQwenSparseIndexer(const QwenSparseIndexer &p)
 {
     switch(p.query_demand){
@@ -174,6 +185,7 @@ void validateQwenSparseIndexer(const QwenSparseIndexer &p)
         p.rotary_dim % 2 != 0 || !(p.norm_epsilon > 0.0f) ||
         !(p.norm_epsilon < std::numeric_limits<float>::infinity()))
         throw std::invalid_argument("Qwen sparse indexer: invalid admitted geometry or normalization policy");
+    (void)qwenSparsePreparationGrid(p.row_capacity);
     validateRepresentation(p.representation);
     if(p.rotary_source==QwenSparseRotarySource::TablePlanes) {
         if(!p.cosine || !p.sine)throw std::invalid_argument("QSA table rotary source requires both immutable planes");
@@ -183,6 +195,45 @@ void validateQwenSparseIndexer(const QwenSparseIndexer &p)
         for(float frequency:p.inverse_frequencies)if(!std::isfinite(frequency) || frequency<=0)
             throw std::invalid_argument("QSA analytic frequency invariant is invalid");
     } else throw std::invalid_argument("QSA indexer has invalid rotary source");
+    // Only newly concurrent cross-role hazards are rejected. Shared immutable
+    // weights/tables and the original prior-tail codec remain legal aliases.
+    struct Span { std::uintptr_t begin,end; };
+    const auto span=[](const void* pointer,std::size_t count,std::size_t width)
+    {
+        const auto begin=reinterpret_cast<std::uintptr_t>(pointer);
+        if(!pointer||count>SIZE_MAX/width||begin%alignof(float)||begin>UINTPTR_MAX-count*width)
+            throw std::invalid_argument("QSA preparation span overflows or is unaligned");
+        return Span{begin,begin+count*width};
+    };
+    const auto overlaps=[](Span a,Span b){return a.begin<b.end&&b.begin<a.end;};
+    const auto rows=std::size_t(p.row_capacity);
+    if(rows>SIZE_MAX/512||std::size_t(p.block_capacity)>SIZE_MAX/128||
+        std::size_t(p.position_capacity)>SIZE_MAX/std::size_t(p.rotary_dim/2))
+        throw std::invalid_argument("QSA preparation element-count product overflows");
+    const auto queries=span(p.prepared_query,rows*512,sizeof(float));
+    const auto pools=span(p.pooled_keys,std::size_t(p.block_capacity)*128,sizeof(float));
+    if(overlaps(queries,pools))throw std::invalid_argument("QSA concurrent preparation outputs overlap");
+    const Span query_reads[]{span(p.query,rows*512,sizeof(float)),span(p.query_norm,128,sizeof(float))};
+    const Span pool_reads[]{span(p.raw_keys,rows*128,sizeof(float)),
+        span(p.partial_keys,(p.transaction_prior?3u:4u)*128,sizeof(float)),span(p.key_norm,128,sizeof(float))};
+    for(const auto& input:query_reads)if(overlaps(pools,input))
+        throw std::invalid_argument("QSA pooled-key output overlaps concurrent query preparation input");
+    for(const auto& input:pool_reads)if(overlaps(queries,input))
+        throw std::invalid_argument("QSA prepared-query output overlaps concurrent pool preparation input");
+    const auto protect_shared=[&](Span input)
+    {
+        if(overlaps(pools,input)||overlaps(queries,input))
+            throw std::invalid_argument("QSA preparation output overlaps shared immutable input");
+    };
+    protect_shared(span(p.replay,1,sizeof(*p.replay)));
+    if(p.transaction_prior)protect_shared(span(p.transaction_prior,1,sizeof(*p.transaction_prior)));
+    if(p.rotary_source==QwenSparseRotarySource::TablePlanes)
+    {
+        const auto coordinates=std::size_t(p.position_capacity)*std::size_t(p.rotary_dim/2);
+        protect_shared(span(p.cosine,coordinates,sizeof(float)));
+        protect_shared(span(p.sine,coordinates,sizeof(float)));
+    }
+
 }
 void validateQwenSparseAttention(const QwenSparseAttention &p)
 {

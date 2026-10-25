@@ -19,8 +19,9 @@
  *
  * CPU execution never materializes temporary Q/K/V matrices in the stage.
  *
- * All preprocessing (L2 normalization, query scaling, gate computation)
- * is handled by the kernel, keeping this stage device-agnostic.
+ * Raw programs retain their kernel normalization/scaling. The explicit scalar
+ * prepared contract instead consumes the original convolution producer's exact
+ * compact Q/K activation; gates and every state/snapshot owner stay unchanged.
  */
 
 #include "GDNRecurrenceStage.h"
@@ -55,12 +56,15 @@ namespace llaminar2
         if (!validGDNRecurrenceStateLayout(layout))
             throw std::invalid_argument(
                 "GDN recurrence capture identity has an unknown persistent state layout");
-        return 0x47444e4c00000000ULL | static_cast<uint64_t>(layout);
+        return (0x47444e4c00000000ULL | static_cast<uint64_t>(layout)) ^
+            gdnQKCaptureIdentity(params_.qk_contract);
     }
 
     void GDNRecurrenceStage::updateDynamicParams(int pos_offset, int seq_len)
     {
         (void)pos_offset;
+        if(std::holds_alternative<GDNPreparedQKBinding>(params_.qk_contract)&&seq_len!=1)
+            throw std::invalid_argument("Scalar prepared GDN recurrence cannot change captured row geometry");
 
         /*
          * The execution engine supplies a per-request sequence width, whereas
@@ -97,6 +101,23 @@ namespace llaminar2
           params_(std::move(params)),
           workspace_slice_id_(g_gdn_recurrence_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
+        if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+        {
+            const auto layout=p->layout();
+            const auto *bank=dynamic_cast<const TensorBase*>(p->storage);
+            const int keys=params_.n_k_heads>0?params_.n_k_heads:params_.n_heads;
+            if(!device().is_rocm()||!params_.kernel||
+                params_.kernel->recurrenceStateLayout()!=GDNRecurrenceStateLayout::ValueMajorKeyContiguous||
+                params_.seq_len!=1||params_.request_count!=1||
+                (params_.request_seq_len!=0&&params_.request_seq_len!=1)||!params_.Q||
+                params_.Q!=params_.K||params_.K!=params_.V||
+                p->key_heads!=keys||p->value_heads!=params_.n_heads||
+                p->key_width!=params_.d_k||p->value_width!=params_.d_v||
+                p->normalize_qk!=params_.use_qk_l2norm||
+                !bank||bank->native_type()!=TensorType::FP32||bank->size_bytes()<layout.bytes||
+                bank->home_device()!=device())
+                throw std::invalid_argument("Scalar prepared GDN recurrence has an incomplete consumer binding");
+        }
     }
 
     WorkspaceRequirements GDNRecurrenceStage::getWorkspaceRequirements(int m, int n, int k) const
@@ -143,6 +164,9 @@ namespace llaminar2
         if (!params_.device_id.is_gpu())
             return reqs;
 
+        // This immutable scalar input program never deinterleaves. Existing
+        // speculative state banks above remain priced and owned exactly once.
+        if(std::holds_alternative<GDNPreparedQKBinding>(params_.qk_contract))return reqs;
         const bool merged_qkv = params_.Q == params_.K && params_.K == params_.V;
         if (!merged_qkv)
             return reqs;
@@ -891,6 +915,11 @@ namespace llaminar2
         // =====================================================================
         if (device().is_gpu())
         {
+            if(std::holds_alternative<GDNPreparedQKBinding>(params_.qk_contract)&&
+                (params_.seq_len!=1||params_.request_count!=1||
+                (params_.request_seq_len!=0&&params_.request_seq_len!=1)||
+                 params_.kernel->recurrenceStateLayout()!=GDNRecurrenceStateLayout::ValueMajorKeyContiguous))
+                throw std::invalid_argument("Prepared GDN consumer no longer matches its immutable scalar program");
             // Coherence is handled by the executor via bufferContract():
             //   - Arena inputs (QKV, alpha, beta) via prepareForRead
             //   - Model weights (A_log, dt_bias) via contract.weight_tensors
@@ -912,9 +941,10 @@ namespace llaminar2
             const bool merged_qkv = (params_.Q == params_.K && params_.K == params_.V);
             const int nkh = (params_.n_k_heads > 0) ? params_.n_k_heads : params_.n_heads;
             // This is immutable input geometry, not a recovery/capability branch.
+            const bool prepared_qk=std::holds_alternative<GDNPreparedQKBinding>(params_.qk_contract);
             const bool direct_merged_m1 =
                 merged_qkv && params_.seq_len == 1 &&
-                (nkh != params_.n_heads || params_.global_v_head_offset != 0);
+                (prepared_qk || nkh != params_.n_heads || params_.global_v_head_offset != 0);
 
             if (merged_qkv && !direct_merged_m1)
             {
@@ -998,7 +1028,16 @@ namespace llaminar2
                     LOG_ERROR("[GDNRecurrenceStage] Merged decode row stride exceeds native indexing");
                     return false;
                 }
-                ok = params_.kernel->chunkForwardMergedQKV(
+                if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+                {
+                    auto execution=gpuExecution();execution.requirePreparedInput(p->storage);
+                    const auto *bank=dynamic_cast<const TensorBase*>(p->storage);
+                    ok=params_.kernel->chunkForwardPreparedQK({nkh,params_.n_heads,params_.d_k,params_.d_v,
+                        params_.global_v_head_offset,params_.use_qk_l2norm,
+                        static_cast<const float*>(q_base->gpu_data_ptr()),static_cast<const float*>(bank->gpu_data_ptr()),
+                        d_alpha,d_beta,d_alog,d_dtbias,d_output});
+                }
+                else ok = params_.kernel->chunkForwardMergedQKV(
                     static_cast<const float *>(q_base->gpu_data_ptr()),
                     static_cast<int>(stride), d_alpha, d_beta, d_alog, d_dtbias,
                     d_output, params_.recurrence_state, 1, nkh, params_.n_heads,
@@ -1144,6 +1183,7 @@ namespace llaminar2
                     isGraphCaptureActive() ? "capture" : "execute",
                     device().toString(),
                     {{"layout", layout},
+                     {"qk_preparation",prepared_qk?"producer_prepared":"raw"},
                      {"state_layout", std::string(gdnRecurrenceStateLayoutName(
                          params_.kernel->recurrenceStateLayout()))},
                      {"layer", std::to_string(params_.layer_idx)},
@@ -1612,6 +1652,8 @@ namespace llaminar2
         // Arena-managed output
         if (params_.output_buffer_id)
             contract.addOutput(*params_.output_buffer_id);
+        if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+            contract.addInput(p->buffer_id);
         // Model weights (not arena-managed)
         if (params_.A_log)
             contract.addWeight(const_cast<ITensor *>(params_.A_log));

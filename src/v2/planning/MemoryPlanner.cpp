@@ -506,10 +506,15 @@ NgramModeMemory ngramModeMemory(const ModelMemoryProfile &profile, const DeviceP
             .total_shards = cfg.total_shards, .mtp_target_query_rows = cfg.mtp_target_query_rows,
             .retained_mtp_candidate_rows = cfg.mtp_enabled ? cfg.mtp_target_query_rows : 0,
             .generation_request_capacity = cfg.generation_request_capacity,
-            .ngram_fixed_head_participants = storage==ImmutableRowLookupExecution::FixedHeadShardGPU
-                ? (cfg.ngram_table_placement ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
-                   : fixedHeadParticipants(profile,cfg)) : 0,
-            .attention_phase_schedule = cfg.attention_phase_schedule}, cfg.device);
+            .ngram_fixed_head_participants =
+                storage == ImmutableRowLookupExecution::FixedHeadShardGPU
+                    ? (cfg.ngram_table_placement
+                           ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
+                           : fixedHeadParticipants(profile, cfg))
+                    : 0,
+            .attention_arithmetic = cfg.attention_arithmetic,
+            .attention_phase_schedule = cfg.attention_phase_schedule},
+        cfg.device);
     if(storage==ImmutableRowLookupExecution::AdaptiveGPUCache)
         return {arena,0u,GPUGraphMemoryContract::reservationBytesPerExecutable(cfg.device)};
     if (immutableRowLookupUsesNativeDeviceStorage(storage) || !cfg.device.is_gpu()) return {arena, 0u, 0u};
@@ -543,20 +548,36 @@ ActivationGraphMemoryGeometry continuationActivationGeometry(const ModelMemoryPr
     if(replicated){heads=profile.n_heads;dff=profile.d_ff;kv=profile.n_kv_heads;}
     if(cfg.total_shards>1 && cfg.local_kv_heads<=0 && !cfg.tensor_parallel_assignment)
         kv=std::max(1,profile.n_kv_heads/cfg.total_shards);
-    return {.ngram_lookup=storage,.batch_size=cfg.batch_size,.resident_graph_rows=ngramActivationRows(profile,cfg),
-        .context_tokens=cfg.max_seq_len>0?cfg.max_seq_len:profile.max_seq_len,.local_d_ff=dff,.local_n_heads=heads,
-        .local_n_kv_heads=kv,.local_vocab=replicated?profile.vocab_size:
-            (cfg.tensor_parallel_assignment?cfg.tensor_parallel_assignment->vocab_count:0),
-        .replicated_dense_decode=replicated,.first_layer=cfg.first_layer,
-        .last_layer=cfg.last_layer>=0?cfg.last_layer:profile.n_layers-1,.total_shards=cfg.total_shards,
-        .routed_compute_policy=cfg.routed_compute_policy,.mtp_target_query_rows=cfg.mtp_target_query_rows,
-        .retained_mtp_candidate_rows=cfg.mtp_enabled?cfg.mtp_target_query_rows:0,
-        .mtp_terminal_logits_layout=replicated?MTPTerminalLogitsLayout::FullVocabularyPerParticipant:cfg.mtp_terminal_logits_layout,
-        .generation_request_capacity=cfg.generation_request_capacity,
-        .ngram_fixed_head_participants=storage==ImmutableRowLookupExecution::FixedHeadShardGPU
-            ? (cfg.ngram_table_placement ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
-               : fixedHeadParticipants(profile,cfg)) : 0,
-        .attention_phase_schedule = cfg.attention_phase_schedule};
+    return {.ngram_lookup = storage,
+            .batch_size = cfg.batch_size,
+            .resident_graph_rows = ngramActivationRows(profile, cfg),
+            .context_tokens = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len,
+            .local_d_ff = dff,
+            .local_n_heads = heads,
+            .local_n_kv_heads = kv,
+            .local_vocab = replicated ? profile.vocab_size
+                                      : (cfg.tensor_parallel_assignment
+                                             ? cfg.tensor_parallel_assignment->vocab_count
+                                             : 0),
+            .replicated_dense_decode = replicated,
+            .first_layer = cfg.first_layer,
+            .last_layer = cfg.last_layer >= 0 ? cfg.last_layer : profile.n_layers - 1,
+            .total_shards = cfg.total_shards,
+            .routed_compute_policy = cfg.routed_compute_policy,
+            .mtp_target_query_rows = cfg.mtp_target_query_rows,
+            .retained_mtp_candidate_rows = cfg.mtp_enabled ? cfg.mtp_target_query_rows : 0,
+            .mtp_terminal_logits_layout =
+                replicated ? MTPTerminalLogitsLayout::FullVocabularyPerParticipant
+                           : cfg.mtp_terminal_logits_layout,
+            .generation_request_capacity = cfg.generation_request_capacity,
+            .ngram_fixed_head_participants =
+                storage == ImmutableRowLookupExecution::FixedHeadShardGPU
+                    ? (cfg.ngram_table_placement
+                           ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
+                           : fixedHeadParticipants(profile, cfg))
+                    : 0,
+            .attention_arithmetic = cfg.attention_arithmetic,
+            .attention_phase_schedule = cfg.attention_phase_schedule};
 }
 /**
  * @brief Project one source-owned mandatory execution alternative.
@@ -2414,6 +2435,15 @@ std::shared_ptr<const ImmutableRowTableExecutionProvision> MemoryPlanner::restor
                 return c.sameAllocator(identity.resource); }))
             throw std::invalid_argument("Remote ngram provision has invalid or foreign graph geometry");
         const auto &a=identity.activation;
+        qwen4exp::validateQwenSparseAttentionArithmetic(a.attention_arithmetic,
+                                                        identity.resource.device.type);
+        if (a.attention_arithmetic ==
+                qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33 ||
+            (a.attention_phase_schedule ==
+                 qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33 &&
+             a.attention_arithmetic !=
+                 qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals))
+            throw std::invalid_argument("Remote QSA setup policy is unresolved or conflicting");
         if(a.attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform &&
            a.attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33)
             throw std::invalid_argument("Remote ngram attention phase schedule is invalid");

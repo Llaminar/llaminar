@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -34,6 +35,8 @@ namespace llaminar2
     void ShortConv1dStage::updateDynamicParams(int pos_offset, int seq_len)
     {
         (void)pos_offset;
+        if(std::holds_alternative<GDNPreparedQKBinding>(params_.qk_contract)&&seq_len!=1)
+            throw std::invalid_argument("Scalar prepared GDN convolution cannot change captured row geometry");
 
         /*
          * ForwardInput::seq_len is the width of one request.  The short-conv
@@ -70,6 +73,16 @@ namespace llaminar2
           params_(std::move(params)),
           workspace_slice_id_(g_shortconv_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
+        if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+        {
+            const auto layout=p->layout();
+            const auto *bank=dynamic_cast<const TensorBase*>(p->storage);
+            if(!device().is_rocm()||!params_.kernel||params_.seq_len!=1||params_.request_count!=1||
+                (params_.request_seq_len!=0&&params_.request_seq_len!=1)||
+                params_.kernel_size!=4||!bank||bank->native_type()!=TensorType::FP32||bank->size_bytes()<layout.bytes||bank->home_device()!=device()||
+                std::size_t(params_.channels)!=layout.elements+std::size_t(p->value_heads)*p->value_width)
+                throw std::invalid_argument("Scalar prepared GDN convolution has an incomplete producer binding");
+        }
     }
 
     WorkspaceRequirements ShortConv1dStage::getWorkspaceRequirements(int m, int n, int k) const
@@ -779,7 +792,16 @@ namespace llaminar2
             }
 
             bool ok = false;
-            if (request_batched)
+            if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+            {
+                if(params_.seq_len!=1||params_.request_count!=1)
+                    throw std::invalid_argument("Scalar prepared GDN convolution cannot change captured row geometry");
+                auto execution=gpuExecution();execution.requirePreparedOutput(p->storage);
+                auto *bank=dynamic_cast<TensorBase*>(p->storage);
+                ok=params_.kernel->forwardPreparedQK({p->key_heads,p->value_heads,p->key_width,p->value_width,
+                    p->normalize_qk,d_input,d_weight,d_bias,d_output,static_cast<float*>(bank->gpu_data_ptr())});
+            }
+            else if (request_batched)
             {
                 const int state_size = params_.channels * std::max(0, params_.kernel_size - 1);
                 if (!params_.request_seq_lens_device)
@@ -1004,6 +1026,8 @@ namespace llaminar2
             contract.addInput(*params_.input_buffer_id);
         if (params_.output_buffer_id)
             contract.addOutput(*params_.output_buffer_id);
+        if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
+            contract.addOutput(p->buffer_id);
         // Conv weights are model parameters, not arena-managed
         if (params_.weight)
             contract.addWeight(const_cast<ITensor *>(params_.weight));

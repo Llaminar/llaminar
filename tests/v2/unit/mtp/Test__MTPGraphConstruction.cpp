@@ -42,6 +42,9 @@
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
+#include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
+#include "kernels/cpu/gdn/CPUShortConvolution.h"
+#include <unordered_set>
 #include "kernels/cpu/CPURingKVCache.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/PreparedWeightStore.h"
@@ -878,7 +881,8 @@ namespace
         explicit TinyQwen35GDNLayerFixture(const GraphConfig &config)
         {
             const size_t d = static_cast<size_t>(config.d_model);
-            const size_t qkv_dim = 48;
+            const size_t qkv_dim = 2*static_cast<size_t>(config.gdn.group_count)*
+                config.gdn.state_size+static_cast<size_t>(config.gdn.inner_size);
             const size_t value_dim =
                 static_cast<size_t>(config.gdn.inner_size);
             const size_t value_heads =
@@ -941,7 +945,8 @@ namespace
         {
             const size_t rows = static_cast<size_t>(total_tokens);
             const size_t d = static_cast<size_t>(config.d_model);
-            const size_t qkv_dim = 48;
+            const size_t qkv_dim = 2*static_cast<size_t>(config.gdn.group_count)*
+                config.gdn.state_size+static_cast<size_t>(config.gdn.inner_size);
             const size_t value_dim =
                 static_cast<size_t>(config.gdn.inner_size);
             const size_t value_heads =
@@ -8221,4 +8226,169 @@ TEST(Test__MTPGraphConstruction, OrdinaryNativeVocabularyPublishesFullLogitsWith
         EXPECT_FALSE(orchestrator.getLogitsLocalInfo());
         EXPECT_FALSE(orchestrator.consumeLogitsLocalInfoForSampling());
     }
+}
+
+
+namespace
+{
+/** @brief Inert convolution owner for declarative prepared-binding tests. */
+class PreparedGraphConvolutionOwner final : public CPUShortConvolution
+{
+public:
+    /** @brief Reject any accidental raw arithmetic execution in this metadata fixture. */
+    bool forward(const float *, const float *, const float *, float *, float *,
+        int, int, int, bool) override
+    { throw std::logic_error("Metadata convolution owner cannot execute"); }
+    /** @brief Reject any accidental producer execution in this metadata fixture. */
+    bool forwardPreparedQK(const gdn::ScalarPreparedQKConvolution &) override
+    { throw std::logic_error("Metadata convolution owner cannot execute"); }
+};
+
+/**
+ * @brief Nonexecuting metadata stub for this graph-policy test only.
+ * @details CPU construction allocates no device resources. Reporting an authored
+ * physical format permits testing cold graph policy without native discovery;
+ * actual owner execution is covered by the distinct ROCm integration fixture.
+ */
+class PreparedGraphPolicyOwner final:public CPUGatedDeltaNet
+{
+public:
+    /** @return The explicitly authored metadata layout, never a format inference. */
+    GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override
+    {return GDNRecurrenceStateLayout::ValueMajorKeyContiguous;}
+    /** @brief Reject accidental execution of this metadata-only contract. */
+    bool chunkForwardPreparedQK(const gdn::ScalarPreparedQKRecurrence&) override
+    {throw std::logic_error("Prepared graph-policy stub cannot execute");}
+};
+/** @brief CPU-owned shape/type metadata that cannot be mistaken for executable device bytes. */
+class PreparedGraphPolicyBank final:public FP32Tensor
+{
+public:
+    /** @brief Own ordinary CPU storage for one graph-only compact shape. */
+    explicit PreparedGraphPolicyBank(std::size_t words):FP32Tensor({1,words},DeviceId::cpu()){}
+    /** @return Authored placement metadata for the device-free constructor proof. */
+    DeviceId home_device() const override{return DeviceId::rocm(0);}
+    /** @brief Reject accidental use as native device storage. */
+    void* gpu_data_ptr() override{throw std::logic_error("Graph-policy activation has no device allocation");}
+    /** @brief Reject accidental use as native read-only device storage. */
+    const void* gpu_data_ptr() const override{throw std::logic_error("Graph-policy activation has no device allocation");}
+};
+}
+
+/** @test Real graph construction binds both stage contracts and rejects missing/mismatched owners cold. */
+TEST(Test__MTPGraphConstruction, GDNPreparedQKGraphBindingIsExplicitAndCaptureStable)
+{
+    auto mpi=std::make_shared<MockMPIContext>(0,1);
+    auto config=tinyQwen35GDNConfig(DeviceId::rocm(0));
+    config.gdn.state_size=64;config.gdn.inner_size=128;
+    config.mtp.enabled=false;config.mtp.draft_tokens=0;
+    config.grouped_mtp_verifier=false;config.compute_all_position_logits=false;
+    auto hybrid=tinyGDNHybridConfig();hybrid.gdn_state_size=64;hybrid.gdn_inner_size=128;
+    CPUHybridRingKVCacheFP32 cache(hybrid,*mpi,config.n_layers,1,config.max_seq_len,
+        config.n_kv_heads,config.head_dim,DeviceId::cpu());
+    auto* state=cache.getGDNState(0);ASSERT_NE(state,nullptr);
+    state->conv_kernel = std::make_shared<PreparedGraphConvolutionOwner>();
+    auto retained_owner=std::make_shared<PreparedGraphPolicyOwner>();
+    state->rec_kernel=retained_owner;
+    state->recurrence_layout=GDNRecurrenceStateLayout::ValueMajorKeyContiguous;
+    TinyQwen35GDNLayerFixture weights(config);
+    TinyQwen35GDNActivationFixture activations(config,2);
+    const auto layout=gdn::ScalarPreparedQKLayout::fromHeads(2,2,64,64);
+    PreparedGraphPolicyBank bank(layout.elements),other(layout.elements),small(layout.elements-1);
+    activations.buffers.extensions[BufferId::GDN_PREPARED_QK]=&bank;
+    Qwen35Graph builder(config,mpi);
+    auto graph=builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,&cache,nullptr,DeviceId::rocm(0),nullptr);
+    const auto* conv_node=graph.getNode("layer0_short_conv");const auto* rec_node=graph.getNode("layer0_gdn_recurrence");
+    ASSERT_NE(conv_node,nullptr);ASSERT_NE(rec_node,nullptr);
+    const auto* conv=dynamic_cast<const ShortConv1dStage*>(conv_node->stage.get());
+    const auto* rec=dynamic_cast<const GDNRecurrenceStage*>(rec_node->stage.get());
+    ASSERT_NE(conv,nullptr);ASSERT_NE(rec,nullptr);
+    const auto* producer=std::get_if<GDNPreparedQKBinding>(&conv->getParams().qk_contract);
+    const auto* consumer=std::get_if<GDNPreparedQKBinding>(&rec->getParams().qk_contract);
+    ASSERT_NE(producer,nullptr);ASSERT_NE(consumer,nullptr);
+    EXPECT_EQ(producer->storage,&bank);EXPECT_EQ(consumer->storage,&bank);
+    auto pending=rec_node->dependencies;
+    std::unordered_set<std::string> visited;
+    bool ordered=false;
+    while(!pending.empty())
+    {
+        const auto name=pending.back();pending.pop_back();if(!visited.insert(name).second)continue;
+        if(name=="layer0_short_conv"){ordered=true;break;}
+        const auto* parent=graph.getNode(name);ASSERT_NE(parent,nullptr);
+        pending.insert(pending.end(),parent->dependencies.begin(),parent->dependencies.end());
+    }
+    EXPECT_TRUE(ordered)<<"Prepared consumer must depend on its actual producer, including diagnostic edges";
+    EXPECT_EQ(producer->layout().bytes,layout.bytes);EXPECT_EQ(consumer->normalize_qk,rec->getParams().use_qk_l2norm);
+    const auto has=[](const auto& bindings,BufferId id)
+    {return std::any_of(bindings.begin(),bindings.end(),[&](const auto& b){return b.id==id;});};
+    EXPECT_TRUE(has(conv->bufferContract().outputs,BufferId::GDN_PREPARED_QK));
+    EXPECT_TRUE(has(rec->bufferContract().inputs,BufferId::GDN_PREPARED_QK));
+    EXPECT_EQ(rec->getWorkspaceRequirements(1).find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH),nullptr);
+    EXPECT_EQ(conv->graphCaptureVariantSignature(),rec->graphCaptureVariantSignature()^
+        (0x47444e4c00000000ULL|static_cast<uint64_t>(GDNRecurrenceStateLayout::ValueMajorKeyContiguous)));
+    const auto identity=gdnQKCaptureIdentity(conv->getParams().qk_contract);
+    for(int field=0;field<5;++field)
+    {
+        auto changed=conv->getParams().qk_contract;auto& binding=std::get<GDNPreparedQKBinding>(changed);
+        if(field==0)--binding.key_heads;
+        else if(field==1)--binding.value_heads;
+        else if(field==2)binding.key_width=128;
+        else if(field==3)++binding.value_width;
+        else binding.normalize_qk=!binding.normalize_qk;
+        EXPECT_NE(gdnQKCaptureIdentity(changed),identity);
+    }
+    auto conv_params=conv->getParams();auto rec_params=rec->getParams();
+    std::get<GDNPreparedQKBinding>(conv_params.qk_contract).storage=&other;
+    EXPECT_NE(ShortConv1dStage(conv_params).graphCaptureVariantSignature(),conv->graphCaptureVariantSignature());
+    std::get<GDNPreparedQKBinding>(rec_params.qk_contract).normalize_qk=false;
+    EXPECT_THROW((void)GDNRecurrenceStage(rec_params),std::invalid_argument);
+    conv_params=conv->getParams();std::get<GDNPreparedQKBinding>(conv_params.qk_contract).storage=&small;
+    EXPECT_THROW((void)ShortConv1dStage(conv_params),std::invalid_argument);
+    auto changed=conv->getParams();ShortConv1dStage scalar(changed);
+    EXPECT_THROW(scalar.updateDynamicParams(0,2),std::invalid_argument);
+    GDNRecurrenceStage recurrence(rec->getParams());EXPECT_THROW(recurrence.updateDynamicParams(0,2),std::invalid_argument);
+    auto grouped=builder.buildAttentionGraph(weights.layer,activations.buffers,0,2,1,&cache,nullptr,DeviceId::rocm(0),nullptr);
+    const auto* grouped_rec=dynamic_cast<const GDNRecurrenceStage*>(grouped.getNode("layer0_gdn_recurrence")->stage.get());
+    ASSERT_NE(grouped_rec,nullptr);EXPECT_TRUE(std::holds_alternative<GDNRawQKInput>(grouped_rec->getParams().qk_contract));
+    auto batched=builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,2,&cache,nullptr,DeviceId::rocm(0),nullptr);
+    const auto* batch_rec=dynamic_cast<const GDNRecurrenceStage*>(batched.getNode("layer0_gdn_recurrence")->stage.get());
+    ASSERT_NE(batch_rec,nullptr);EXPECT_TRUE(std::holds_alternative<GDNRawQKInput>(batch_rec->getParams().qk_contract));
+    auto verifier_config=config;verifier_config.grouped_mtp_verifier=true;
+    verifier_config.mtp.enabled=true;verifier_config.mtp.draft_tokens=2;
+    verifier_config.compute_all_position_logits=true;
+    Qwen35Graph verifier_builder(verifier_config,mpi);
+    auto verifier_graph=verifier_builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,&cache,nullptr,DeviceId::rocm(0),nullptr);
+    const auto* verifier_rec=dynamic_cast<const GDNRecurrenceStage*>(verifier_graph.getNode("layer0_gdn_recurrence")->stage.get());
+    ASSERT_NE(verifier_rec,nullptr);EXPECT_TRUE(std::holds_alternative<GDNRawQKInput>(verifier_rec->getParams().qk_contract));
+    auto raw_owner=std::make_shared<CPUGatedDeltaNet>();state->rec_kernel=raw_owner;
+    state->recurrence_layout=GDNRecurrenceStateLayout::KeyMajorValueContiguous;
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        auto raw_config=config;raw_config.default_device=device;Qwen35Graph raw_builder(raw_config,mpi);
+        auto raw_graph=raw_builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,&cache,nullptr,device,nullptr);
+        const auto* raw_rec=dynamic_cast<const GDNRecurrenceStage*>(raw_graph.getNode("layer0_gdn_recurrence")->stage.get());
+        ASSERT_NE(raw_rec,nullptr);EXPECT_TRUE(std::holds_alternative<GDNRawQKInput>(raw_rec->getParams().qk_contract));
+        const auto schema=raw_builder.getSchema();
+        EXPECT_EQ(std::any_of(schema.layer_buffers.begin(),schema.layer_buffers.end(),
+            [](const auto& b){return b.name=="gdn_prepared_qk";}),device.is_rocm());
+    }
+    state->rec_kernel=retained_owner;state->recurrence_layout=GDNRecurrenceStateLayout::ValueMajorKeyContiguous;
+    auto cuda_value_major_config=config;cuda_value_major_config.default_device=DeviceId::cuda(0);
+    Qwen35Graph cuda_value_major_builder(cuda_value_major_config,mpi);
+    auto cuda_value_major_graph=cuda_value_major_builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,
+        &cache,nullptr,DeviceId::cuda(0),nullptr);
+    const auto* cuda_value_major_rec=dynamic_cast<const GDNRecurrenceStage*>(
+        cuda_value_major_graph.getNode("layer0_gdn_recurrence")->stage.get());
+    ASSERT_NE(cuda_value_major_rec,nullptr);
+    EXPECT_TRUE(std::holds_alternative<GDNRawQKInput>(cuda_value_major_rec->getParams().qk_contract));
+    activations.buffers.extensions.erase(BufferId::GDN_PREPARED_QK);
+    EXPECT_THROW((void)builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,&cache,nullptr,DeviceId::rocm(0),nullptr),std::invalid_argument);
+    state->rec_kernel.reset();
+    try
+    {
+        (void)builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,&cache,nullptr,DeviceId::rocm(0),nullptr);
+        FAIL()<<"Missing recurrence owner was accepted";
+    }
+    catch(const std::invalid_argument& e)
+    {EXPECT_NE(std::string(e.what()).find("retained recurrence owner"),std::string::npos);}
 }

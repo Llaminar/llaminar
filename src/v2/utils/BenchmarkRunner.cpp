@@ -542,6 +542,9 @@ namespace llaminar2
             return observation;
 
         static const std::vector<PerfStatsCollector::RecordFamily> families{
+            // A retained composite submits only at capture/setup; measured
+            // graph replays perform no host callback to republish this family.
+            {"gdn_output", "normalization_submission"},
             {"kernel", "gdn_projection_route"},
             {"kernel", "hc_up_projection_submissions"},
             {"weight_loading", "gdn_projection_arithmetic_prepared_weight"},

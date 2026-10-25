@@ -6,6 +6,8 @@
 #include <gtest/gtest.h>
 #include "planning/ActivationMemoryEstimator.h"
 #include "backends/DeviceId.h"
+#include "config/TensorParallelAssignmentDeclaration.h"
+#include "kernels/gdn/GDNPreparedQK.h"
 
 #include <algorithm>
 #include <string>
@@ -124,6 +126,11 @@ TEST(Test__ActivationMemoryEstimator,
     profile.head_dim = 256;
     profile.vocab_size = 248320;
     profile.max_seq_len = 4096;
+    profile.gdn_conv_kernel_size = 4;
+    profile.gdn_state_size = 128;
+    profile.gdn_inner_size = 8192;
+    profile.gdn_group_count = 16;
+    profile.gdn_time_step_rank = 64;
     profile.expert_count = 256;
     profile.expert_used_count = 8;
     profile.expert_feed_forward_length = 1024;
@@ -142,7 +149,7 @@ TEST(Test__ActivationMemoryEstimator,
     };
     add_projection("blk.0.attn_q.weight", 16384, 3072);
     add_projection("blk.0.attn_gate.weight", 8192, 3072);
-    add_projection("blk.0.attn_qkv.weight", 16384, 3072);
+    add_projection("blk.0.attn_qkv.weight", 12288, 3072);
     add_projection("blk.0.ssm_out.weight", 3072, 8192);
     add_projection("blk.0.ssm_alpha.weight", 64, 3072);
     add_projection("blk.0.ssm_beta.weight", 64, 3072);
@@ -164,15 +171,28 @@ TEST(Test__ActivationMemoryEstimator,
         profile, geometry, DeviceId::cuda(0));
 
     /*
-     * This constant is the independent sum of all 49 layer/model BufferSpecs
-     * resolved by Qwen35MoESchema for the real 122B local-TP geometry.  It is
-     * also the byte sum printed by BufferArena's address map in the production
-     * model probe. In particular it includes the 503,316,480-byte canonical
-     * route tensor that exposed the original capacity-admission defect.
+     * The historical independent owner sum was 2,253,085,700 bytes before
+     * the separately admitted UINT64 seed. Its synthetic merged width was
+     * 16,384, while the source tensor is [12,288, 3,072]. At TP2 this corrects
+     * each of the two distinct FP32 raw-QKV banks from 8,192 to 6,144 columns:
+     * 2 * 4,096 rows * 2,048 columns * 4 bytes = 67,108,864 bytes removed.
+     * All other owner terms are unchanged, including the 503,316,480-byte
+     * canonical route tensor. This is an explicit schema-width correction,
+     * not a claim that a new production BufferArena probe was executed.
      */
-    // The production arena additionally retains one admitted UINT64 seed.
-    constexpr size_t kExpectedDeclarativeArenaBytes = 2253085700ULL + sizeof(uint64_t);
+    constexpr size_t kExpectedDeclarativeArenaBytes = 2185976836ULL + sizeof(uint64_t);
     EXPECT_EQ(actual, kExpectedDeclarativeArenaBytes);
+
+    // Actual TP2 ownership has eight key heads of width128, hence2,048
+    // FP32 Q/K words (8,192 bytes), independent of the retained row capacity.
+    // CPU/CUDA have no prepared activation role.
+    for(const int resident_rows:{1,4096})
+    {
+        auto scalar_geometry=geometry;
+        scalar_geometry.resident_graph_rows=resident_rows;
+        const auto raw=ActivationMemoryEstimator::estimate(profile,scalar_geometry,DeviceId::cuda(0));
+        EXPECT_EQ(ActivationMemoryEstimator::estimate(profile,scalar_geometry,DeviceId::rocm(0)),raw+8192u);
+    }
 
     // A sharded projection replaces the full local bank with its vocabulary
     // slice AND needs the complete gathered bank. Previously admission only
@@ -215,4 +235,88 @@ TEST(Test__ActivationMemoryEstimator, GPUSeedBankUsesExactRequestCapacity)
     geometry.generation_request_capacity = 0;
     EXPECT_THROW(ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cuda(0)),
         std::invalid_argument);
+}
+
+/** @test Prepared capacity uses exact whole heads for TP1..8, including uneven TP5. */
+TEST(Test__ActivationMemoryEstimator, PreparedQKCapacityMatchesCanonicalUnevenHeadOwnership)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35moe";
+    profile.n_layers = 1;
+    profile.d_model = 2560;
+    profile.d_ff = 1024;
+    profile.n_heads = 24;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.vocab_size = 320;
+    profile.max_seq_len = 128;
+    profile.gdn_group_count = 16;
+    profile.gdn_time_step_rank = 48;
+    profile.gdn_state_size = 128;
+    profile.gdn_inner_size = 6144;
+    profile.gdn_conv_kernel_size = 4;
+    const auto add = [&](std::string name, std::size_t n, std::size_t k)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = std::move(name);
+        tensor.K = k;
+        tensor.elements = n * k;
+        tensor.layer_index = 0;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    add("blk.0.attn_q.weight", 12288, 2560);
+    add("blk.0.attn_gate.weight", 6144, 2560);
+    add("blk.0.attn_qkv.weight", 10240, 2560);
+    add("blk.0.ssm_out.weight", 2560, 6144);
+    add("blk.0.ssm_alpha.weight", 48, 2560);
+    add("blk.0.ssm_beta.weight", 48, 2560);
+    const auto declaration = TensorParallelAssignmentDeclaration::fromOriginal(
+        {24, 2}, KVHeadCoveragePolicy::QueryInterval,
+        QueryHeadPartitionDeclaration::fromOriginalConsumers(24, {{16, 48}}));
+    bool saw_uneven_five = false;
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        std::vector<DeviceId> devices;
+        for (int rank = 0; rank < degree; ++rank) devices.push_back(DeviceId::rocm(rank));
+        const auto assignment = declaration.partition(devices, {}, profile.d_ff, profile.vocab_size);
+        for (const auto &local : assignment.assignments())
+        {
+            SCOPED_TRACE(::testing::Message() << "degree=" << degree
+                << " head_start=" << local.head_start << " head_count=" << local.head_count);
+            const auto actual = GDNHeadAssignment::fromPartition(16, 48,
+                local.head_start, local.head_count, 24);
+            const auto expected = gdn::ScalarPreparedQKLayout::fromHeads(
+                actual.localKeyHeads(), actual.localValueHeads(), 128, 128);
+            const auto capacity = gdn::ScalarPreparedQKLayout::fromHeadPartition(
+                16, 48, 128, local.head_count, 24);
+            EXPECT_EQ(capacity.bytes, expected.bytes);
+            ActivationGraphMemoryGeometry geometry;
+            geometry.resident_graph_rows = 32;
+            geometry.context_tokens = 128;
+            geometry.local_d_ff = local.d_ff_count;
+            geometry.local_n_heads = local.head_count;
+            geometry.local_n_kv_heads = local.kv_head_count;
+            geometry.local_vocab = local.vocab_count;
+            geometry.first_layer = geometry.last_layer = 0;
+            geometry.total_shards = degree;
+            for (bool replicated : {false, true})
+            {
+                geometry.replicated_dense_decode = replicated;
+                const auto prepared = replicated
+                    ? gdn::ScalarPreparedQKLayout::fromHeads(16, 48, 128, 128) : expected;
+                EXPECT_EQ(ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::rocm(0)),
+                    ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cuda(0)) +
+                        prepared.bytes);
+            }
+            if (degree == 5 && local.head_count != 24 / degree) saw_uneven_five = true;
+        }
+    }
+    EXPECT_TRUE(saw_uneven_five);
+    for (int dk : {64, 128})
+        EXPECT_TRUE(gdn::ScalarPreparedQKLayout::supportsNativeGeometry(dk, 4));
+    for (int dk : {2, 8, 32, 96, 256})
+        EXPECT_FALSE(gdn::ScalarPreparedQKLayout::supportsNativeGeometry(dk, 4));
+    EXPECT_FALSE(gdn::ScalarPreparedQKLayout::supportsNativeGeometry(128, 3));
+    EXPECT_THROW((void)gdn::ScalarPreparedQKLayout::fromHeadPartition(
+        16, 48, 128, 1, 24), std::invalid_argument);
 }

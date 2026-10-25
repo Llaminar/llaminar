@@ -18189,6 +18189,9 @@ namespace llaminar2
                     auto admitted=selected_capacity_draft->admit(complete_requests);
                     if(admitted.size()!=1u)throw std::logic_error("Standalone overlay finalization lost its exact stage");
                     selected_capacity=std::move(admitted.front());
+                    plan_.runtime.attention_participants =
+                        projectAdmittedQwenSparseAttentionPrograms(
+                            profile, selected_local_capacity->device_inputs, plan_.rank);
                     for(const auto &placement:selected_capacity->ngram_table_placements)
                         if(placement->worldRank()==plan_.rank)plan_.runtime.ngram_table_placement=placement;
                     return true;
@@ -21691,6 +21694,8 @@ namespace llaminar2
             if (!publishPhysicalMemoryAuthority())
                 return false;
 
+            plan_.runtime.attention_participants =
+                projectAdmittedQwenSparseAttentionPrograms(profile, device_configs, plan_.rank);
             LOG_DEBUG(
                 "[MemoryPlanner] Retained physical-memory authority accepts "
                 "the current runner footprint:\n"
@@ -21707,6 +21712,8 @@ namespace llaminar2
             const PhysicalMemoryPlanAdmissionCertificate>(final_plan);
         if (!publishPhysicalMemoryAuthority())
             return false;
+        plan_.runtime.attention_participants =
+            projectAdmittedQwenSparseAttentionPrograms(profile, device_configs, plan_.rank);
 
         LOG_DEBUG("[MemoryPlanner] Memory validation passed:\n"
                   << plan.renderTable());

@@ -225,6 +225,7 @@ namespace llaminar2
         QFN_QSA_TRANSACTION_PRIOR_TRAFFIC, ///< Native required metadata bytes and actual live original-tail payload bytes.
         QFN_NGRAM_ADAPTIVE_CACHE, ///< Original model-owned optional native slots and directory/policy metadata.
         QFN_NGRAM_ADAPTIVE_FRAME, ///< Original mandatory single-inflight native work frame, including zero-slot mode.
+        GDN_PREPARED_QK, ///< Scalar producer-normalized Q/K; transient activation, not recurrent state.
         _COUNT ///< Sentinel – must be last
     };
 
@@ -539,6 +540,7 @@ namespace llaminar2
         case BufferId::QFN_PLE_TRANSACTION_COPY_BYTES: return "QFN_PLE_TRANSACTION_COPY_BYTES";
         case BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY: return "QFN_PLE_PRIOR_TOKEN_HISTORY";
         case BufferId::QFN_PLE_PRIOR_CONV_HISTORY: return "QFN_PLE_PRIOR_CONV_HISTORY";
+        case BufferId::GDN_PREPARED_QK: return "GDN_PREPARED_QK";
         case BufferId::_COUNT:
             return "_COUNT";
         }

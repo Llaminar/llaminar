@@ -147,27 +147,34 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
     const auto &cohort=cfg.ngram_replicated_ple_cohort;
     const auto &loop=mtp_device_generation_loop_graph_;
     const auto &reference=canonical.mtp_device_generation_loop_graph_;
-    if(!cohort || cohort!=other.ngram_replicated_ple_cohort ||
-        cohort->modelOwner()!=injected_model_ctx_.get() || injected_model_ctx_!=canonical.injected_model_ctx_ ||
-        cfg.tp_ctx!=&cohort->context() || other.tp_ctx!=cfg.tp_ctx ||
-        state_.device_id.type!=canonical.state_.device_id.type || !state_.device_id.is_gpu() ||
-        !loop.valid || !loop.capture || !loop.stream || loop.launched ||
-        loop.workspace_generation!=workspaceGeneration(state_.device_id) ||
-        !reference.valid || !reference.capture || reference.launched ||
-        loop.request_count!=1 || loop.request_count!=reference.request_count ||
-        loop.execution_kind!=reference.execution_kind || loop.sampling_mode!=reference.sampling_mode ||
-        loop.draft_depth!=reference.draft_depth || loop.verifier_rows_per_request!=reference.verifier_rows_per_request ||
-        loop.minimum_draft_depth!=reference.minimum_draft_depth || loop.maximum_draft_depth!=reference.maximum_draft_depth ||
-        loop.depth_policy_mode!=reference.depth_policy_mode ||
-        cfg.activation_precision!=other.activation_precision || cfg.kv_cache_precision!=other.kv_cache_precision ||
-        cfg.attention_phase_schedule!=other.attention_phase_schedule ||
-        cfg.qfn_hc_up_activation!=other.qfn_hc_up_activation || cfg.qfn_gdn_output_activation!=other.qfn_gdn_output_activation ||
-        cfg.qfn_fa_output_activation!=other.qfn_fa_output_activation ||
-        cfg.qfn_gdn_qkv_activation!=other.qfn_gdn_qkv_activation ||
-        cfg.getAllreducePrecision()!=other.getAllreducePrecision() ||
-        mtp_request_penalty_policy_!=canonical.mtp_request_penalty_policy_ ||
-        mtp_request_stop_token_count_!=canonical.mtp_request_stop_token_count_ ||
-        mtp_request_stop_tokens_!=canonical.mtp_request_stop_tokens_)fail();
+    if (!cohort || cohort != other.ngram_replicated_ple_cohort ||
+        cohort->modelOwner() != injected_model_ctx_.get() ||
+        injected_model_ctx_ != canonical.injected_model_ctx_ || cfg.tp_ctx != &cohort->context() ||
+        other.tp_ctx != cfg.tp_ctx || state_.device_id.type != canonical.state_.device_id.type ||
+        !state_.device_id.is_gpu() || !loop.valid || !loop.capture || !loop.stream ||
+        loop.launched || loop.workspace_generation != workspaceGeneration(state_.device_id) ||
+        !reference.valid || !reference.capture || reference.launched || loop.request_count != 1 ||
+        loop.request_count != reference.request_count ||
+        loop.execution_kind != reference.execution_kind ||
+        loop.sampling_mode != reference.sampling_mode ||
+        loop.draft_depth != reference.draft_depth ||
+        loop.verifier_rows_per_request != reference.verifier_rows_per_request ||
+        loop.minimum_draft_depth != reference.minimum_draft_depth ||
+        loop.maximum_draft_depth != reference.maximum_draft_depth ||
+        loop.depth_policy_mode != reference.depth_policy_mode ||
+        cfg.activation_precision != other.activation_precision ||
+        cfg.kv_cache_precision != other.kv_cache_precision ||
+        cfg.attention_arithmetic != other.attention_arithmetic ||
+        cfg.attention_phase_schedule != other.attention_phase_schedule ||
+        cfg.qfn_hc_up_activation != other.qfn_hc_up_activation ||
+        cfg.qfn_gdn_output_activation != other.qfn_gdn_output_activation ||
+        cfg.qfn_fa_output_activation != other.qfn_fa_output_activation ||
+        cfg.qfn_gdn_qkv_activation != other.qfn_gdn_qkv_activation ||
+        cfg.getAllreducePrecision() != other.getAllreducePrecision() ||
+        mtp_request_penalty_policy_ != canonical.mtp_request_penalty_policy_ ||
+        mtp_request_stop_token_count_ != canonical.mtp_request_stop_token_count_ ||
+        mtp_request_stop_tokens_ != canonical.mtp_request_stop_tokens_)
+        fail();
     (void)cohort->requireParticipant(state_.device_id,cfg.tp_device_idx);
     const auto &a=*active_device_generation_admission_;const auto &b=*canonical.active_device_generation_admission_;
     Qwen4ExpReplicatedPLECohort::requireSameGenerationAdmission(b,a);

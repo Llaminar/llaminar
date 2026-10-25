@@ -121,32 +121,38 @@ __device__ __forceinline__ void prepareHead(float value, const float *weight, in
  * @tparam RankingOnly Immutable construction policy; false retains original AllLive arithmetic/admission.
  * @param p Original captured indexer operands and replay authority.
  * @param queryWork Same original-row demand as query projection, expanded by four heads.
+ * @param row_head Original expanded logical head index, independent of physical fused CTA index.
+ * @param shared This CTA's exclusive 128-coordinate normalization scratch.
  * @details Admission precedes every query, norm and rotary read. The original
  * row/head address, RMS tree, RoPE position and representation rounding remain
  * unchanged; skipped query capacity is unauthored and is never zero-filled.
  */
 template<bool RankingOnly>
-__global__ __launch_bounds__(128, 2) void prepareQueries(QSA_GRID_CONSTANT QwenSparseIndexer p,
-    ProjectionRowWork queryWork)
+__device__ __forceinline__ void prepareQueryHead(const QwenSparseIndexer &p,
+    const ProjectionRowWork &queryWork, int row_head, float *shared)
 {
     const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
     require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
-    const int row_head = int(blockIdx.x);
     if (row_head >= r.live_rows * 4) return;
     if constexpr (RankingOnly)
         if (!queryWork.rowIsActive(row_head)) return;
     const int position = r.position_origin + r.prefix_tokens + row_head / 4;
     require(position >= 0 && (p.rotary_source!=QwenSparseRotarySource::TablePlanes || position<p.position_capacity));
-    __shared__ float shared[128];
     prepareHead(p.query[std::size_t(row_head) * 128 + threadIdx.x], p.query_norm, position,
                 p, p.prepared_query + std::size_t(row_head) * 128, shared);
 }
-/** @brief Prepare only pools completed by this transaction, reading the prior raw tail. */
-__global__ __launch_bounds__(128, 2) void preparePools(QSA_GRID_CONSTANT QwenSparseIndexer p)
+/**
+ * @brief Prepare only pools completed by this transaction, reading the prior raw tail.
+ * @param p Original captured immutable inputs and exclusive pooled output.
+ * @param logical_block Original pool-grid index, independent of physical fused CTA index.
+ * @param shared This CTA's exclusive 128-coordinate normalization scratch.
+ */
+__device__ __forceinline__ void preparePoolBlock(const QwenSparseIndexer &p,
+    int logical_block, float *shared)
 {
     const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
     require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
-    const int block = r.prefix_tokens / 4 + int(blockIdx.x);
+    const int block = r.prefix_tokens / 4 + logical_block;
     if (block >= (r.prefix_tokens + r.live_rows) / 4) return;
     const int position = r.position_origin + block * 4;
     require(position >= 0 && (p.rotary_source!=QwenSparseRotarySource::TablePlanes || position<p.position_capacity) && block < p.block_capacity);
@@ -161,9 +167,51 @@ __global__ __launch_bounds__(128, 2) void preparePools(QSA_GRID_CONSTANT QwenSpa
         const float value = detail::roundRepresentation(raw, p.representation);
         pooled = member == 0 ? value : pooled + value;
     }
-    __shared__ float shared[128];
     prepareHead(detail::roundRepresentation(pooled * 0.25f, p.representation), p.key_norm,
                 position, p, p.pooled_keys + std::size_t(block) * 128, shared);
+}
+/**
+ * @brief Prepare independent pool and query heads in one 128-thread dispatch.
+ * @tparam RankingOnly Same original query-demand program as the query projection.
+ * @param p Original captured operands; cross-role writes/reads are disjoint.
+ * @param queryWork Original replay-backed row work expanded by four index heads.
+ * @details The first pool-grid CTAs and the remaining query-grid CTAs own
+ * independent shared banks. Explicit logical indices preserve every original
+ * address/tree/rounding step; no cross-CTA dependency or barrier is introduced.
+ */
+template<bool RankingOnly>
+__global__ __launch_bounds__(128, 2) void preparePoolsAndQueries(
+    QSA_GRID_CONSTANT QwenSparseIndexer p, ProjectionRowWork queryWork)
+{
+    const int pool_blocks = (p.row_capacity + 6) / 4;
+    const int physical_block = int(blockIdx.x);
+    __shared__ float shared[128];
+    if (physical_block < pool_blocks)
+        preparePoolBlock(p, physical_block, shared);
+    else
+        prepareQueryHead<RankingOnly>(p, queryWork, physical_block - pool_blocks, shared);
+}
+/**
+ * @brief Preserve the independently scheduled prefill pool program and original logical CTA.
+ * @param p Original captured pool operands, with the same physical and replay extents.
+ */
+__global__ __launch_bounds__(128, 2) void preparePools(QSA_GRID_CONSTANT QwenSparseIndexer p)
+{
+    __shared__ float shared[128];
+    preparePoolBlock(p, int(blockIdx.x), shared);
+}
+/**
+ * @brief Preserve the independently scheduled prefill query program.
+ * @tparam RankingOnly Original replay-backed demand; no physical row is inferred live.
+ * @param p Immutable original preparation operands.
+ * @param queryWork Original query projection row authority expanded by four heads.
+ */
+template<bool RankingOnly>
+__global__ __launch_bounds__(128, 2) void prepareQueries(
+    QSA_GRID_CONSTANT QwenSparseIndexer p, ProjectionRowWork queryWork)
+{
+    __shared__ float shared[128];
+    prepareQueryHead<RankingOnly>(p, queryWork, int(blockIdx.x), shared);
 }
 /** @brief Score eight complete pools with fixed 32-lane index-head reductions. */
 __global__ __launch_bounds__(256, 2) void scorePools(QwenSparseIndexer p)

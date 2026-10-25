@@ -18,6 +18,7 @@
 #include "planning/PipelineTransferMemory.h"
 #include "backends/PeerAccessCoverage.h"
 #include "planning/WeightMemoryEstimator.h"
+#include "planning/KVCacheMemoryEstimator.h"
 #include "backends/DeviceId.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include "config/CollectiveBackendType.h"
@@ -32,6 +33,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -259,7 +261,10 @@ struct DevicePlanConfig
      */
     bool runtime_device_policy_available = false;
 
-    /// Exact admitted attention phase schedule; source is the owning rank runtime snapshot.
+    /// Resolved setup pair authored once by the actual attention device-input builder.
+    qwen4exp::QwenSparseAttentionArithmetic attention_arithmetic =
+        qwen4exp::QwenSparseAttentionArithmetic::FixedFP32; ///< Same admitted arithmetic consumed
+                                                            ///< by execution.
     qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
 
     /// Setup-frozen arithmetic that changes named HC-up activation scratch only.
@@ -485,6 +490,84 @@ struct DevicePlanConfig
         DeviceExecutionMemoryRole::ContinuationGraph;
 
 };
+
+/**
+ * @brief Identify real sparse-attention consumers within the admitted PP layer interval.
+ * @param profile Authenticated model metadata with original global sparse-layer IDs.
+ * @param config Existing participant input, including its final layer range and role.
+ * @return False for expert-only and GDN-only continuation stages.
+ */
+inline bool ownsQwenSparseAttentionProgram(const ModelMemoryProfile &profile,
+                                           const DevicePlanConfig &config)
+{
+    if (!profile.flash_next ||
+        config.execution_role != DeviceExecutionMemoryRole::ContinuationGraph)
+        return false;
+    const int last = config.last_layer < 0 ? profile.mainLayerCount() - 1 : config.last_layer;
+    return std::any_of(profile.flash_next->sparse_decoder_layers.begin(),
+                       profile.flash_next->sparse_decoder_layers.end(),
+                       [&](auto layer) {
+                           return static_cast<int>(layer) >= config.first_layer &&
+                                  static_cast<int>(layer) <= last;
+                       });
+}
+/**
+ * @brief Resolve the program once while authoring an actual attention participant BOM.
+ * @param profile Authenticated source metadata; non-QFN and expert-only inputs do not own QSA.
+ * @param config Existing complete device input; no capacity is computed here.
+ * @param runtime Value-owned startup snapshot with absence preserved.
+ * @throws std::invalid_argument For an unsupported explicit program or malformed geometry.
+ */
+inline void resolveQwenSparseAttentionDeviceProgram(const ModelMemoryProfile &profile,
+                                                    DevicePlanConfig &config,
+                                                    const RuntimeConfig &runtime)
+{
+    if (!ownsQwenSparseAttentionProgram(profile, config))
+        return;
+    // The device input already holds canonical backend-resolved storage. Reuse
+    // its existing strict execution-format conversion; do not reinterpret AUTO.
+    const auto operands = KVCacheMemoryEstimator::attentionExecutionFormat(config.kv_precision);
+    // Qwen4ExpConfig authenticates the published64-coordinate rotary geometry.
+    // Both graph batch and retained request capacity must admit the split program.
+    const auto policy = qwen4exp::resolveQwenSparseAttentionSetup(
+        runtime.attention_setup_request,
+        {config.device.type,
+         operands,
+         operands,
+         std::max(config.batch_size, config.generation_request_capacity),
+         profile.head_dim,
+         64});
+    config.attention_arithmetic = policy.arithmetic;
+    config.attention_phase_schedule = policy.schedule;
+}
+/**
+ * @brief Copy the admitted owner's policies into factory setup, without re-resolution.
+ * @param profile Original source metadata; other model families need no QSA projection.
+ * @param inputs Exact device_inputs retained by the successful admission.
+ * @param rank Physical rank receiving the immutable factory view.
+ * @return Only existing attention participants; expert-only ranks carry an empty pointer.
+ * @throws std::invalid_argument For duplicate/conflicting devices or invalid policies.
+ */
+inline std::shared_ptr<const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>>
+projectAdmittedQwenSparseAttentionPrograms(const ModelMemoryProfile &profile,
+                                           const std::vector<DevicePlanConfig> &inputs,
+                                           int rank)
+{
+    if (!profile.flash_next)
+        return {};
+    std::vector<qwen4exp::QwenSparseAttentionParticipantProgram> participants;
+    for (const auto &input : inputs)
+        if (input.world_rank == rank && ownsQwenSparseAttentionProgram(profile, input))
+            participants.emplace_back(
+                input.device,
+                qwen4exp::QwenSparseAttentionResolvedPolicy{input.attention_arithmetic,
+                                                            input.attention_phase_schedule},
+                input.first_layer,
+                input.last_layer < 0 ? profile.mainLayerCount() - 1 : input.last_layer);
+    if (participants.empty())
+        return {}; // This rank owns no attention graph; factories reject a foreign lookup.
+    return qwen4exp::sealQwenSparseAttentionParticipants(std::move(participants));
+}
 
 /**
  * @brief Result of selecting one common resident graph-row capacity.

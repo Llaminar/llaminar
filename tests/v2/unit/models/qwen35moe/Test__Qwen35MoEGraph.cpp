@@ -38,6 +38,7 @@
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
+#include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/ModelContext.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
@@ -2648,6 +2649,33 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedKeepsStatefulGDNDecodeTPLocal)
             int, int, int, bool) override
         { throw std::logic_error("Metadata-only GDN graph owner cannot execute"); }
     };
+    /** @brief CPU storage with authored placement only; never executable GPU bytes. */
+    struct MetadataBank final : FP32Tensor
+    {
+        DeviceId declared_device;
+        /** @brief Own the exact small bank without initializing a device backend. */
+        MetadataBank(std::size_t words, DeviceId device)
+            : FP32Tensor({1, words}, DeviceId::cpu()), declared_device(device) {}
+        /** @return The explicit declarative participant metadata. */
+        DeviceId home_device() const override { return declared_device; }
+        /** @brief Reject accidental native operand access. */
+        void *gpu_data_ptr() override
+        { throw std::logic_error("Metadata bank has no native storage"); }
+        /** @brief Reject accidental native read-only operand access. */
+        const void *gpu_data_ptr() const override
+        { throw std::logic_error("Metadata bank has no native storage"); }
+    };
+    /** @brief Inert convolution owner paired with the inert recurrence owner. */
+    struct MetadataConvolution final : CPUShortConvolution
+    {
+        /** @brief Reject accidental raw arithmetic execution. */
+        bool forward(const float *, const float *, const float *, float *, float *,
+            int, int, int, bool) override
+        { throw std::logic_error("Metadata convolution cannot execute"); }
+        /** @brief Reject accidental producer execution. */
+        bool forwardPreparedQK(const gdn::ScalarPreparedQKConvolution &) override
+        { throw std::logic_error("Metadata convolution cannot execute"); }
+    };
     /** @brief One inert declared collective and its actual participant backends. */
     struct Topology
     {
@@ -2670,6 +2698,10 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedKeepsStatefulGDNDecodeTPLocal)
             tp_ctx->setDevices(topology.devices);
             tp_ctx->setBackend(topology.backend);
             GraphConfig config = makeGDNTPConfig(tp_ctx.get());
+            // Preserve two global/one local value heads with an actual native
+            // width; this fixture validates ownership, never executes arithmetic.
+            config.gdn.state_size = 64;
+            config.gdn.inner_size = 128;
             config.default_device = device;
             config.tp_device_idx = config.local_rank = participant;
             config.head_start = participant;
@@ -2760,10 +2792,18 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedKeepsStatefulGDNDecodeTPLocal)
             ASSERT_NE(state, nullptr);
             state->recurrence_layout = selected;
             state->rec_kernel = std::make_shared<MetadataOwner>(selected);
+            state->conv_kernel = std::make_shared<MetadataConvolution>();
             for (int rows : {1, 2})
             {
                 SCOPED_TRACE(rows);
                 ActivationBuffers buffers = makeGDNTPActivationBuffers(arena, rows, config, 1);
+                std::unique_ptr<MetadataBank> prepared;
+                if (device.is_rocm() && rows == 1)
+                {
+                    const auto layout = gdn::ScalarPreparedQKLayout::fromHeads(1, 1, 64, 64);
+                    prepared = std::make_unique<MetadataBank>(layout.elements, device);
+                    buffers.extensions[BufferId::GDN_PREPARED_QK] = prepared.get();
+                }
                 int positions[2] = {0, 1};
                 ComputeGraph graph = graph_builder.buildAttentionGraphForTokenCount(
                     rows == 1 ? decode_layer : base_layer, buffers, 0, rows, 1,
@@ -2779,7 +2819,18 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedKeepsStatefulGDNDecodeTPLocal)
                 EXPECT_EQ(recurrence->getParams().n_k_heads, 1);
                 EXPECT_EQ(recurrence->getParams().kernel, state->rec_kernel.get());
                 EXPECT_EQ(recurrence->graphCaptureVariantSignature(),
-                    0x47444e4c00000000ULL | static_cast<uint64_t>(selected));
+                    (0x47444e4c00000000ULL | static_cast<uint64_t>(selected)) ^
+                        gdnQKCaptureIdentity(recurrence->getParams().qk_contract));
+                if (prepared)
+                {
+                    const auto *binding = std::get_if<GDNPreparedQKBinding>(
+                        &recurrence->getParams().qk_contract);
+                    ASSERT_NE(binding, nullptr);
+                    EXPECT_EQ(binding->storage, prepared.get());
+                }
+                else
+                    EXPECT_TRUE(std::holds_alternative<GDNRawQKInput>(
+                        recurrence->getParams().qk_contract));
             }
         }
 }

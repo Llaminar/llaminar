@@ -14,6 +14,8 @@
 #include <array>
 #include "kernels/gdn/GDNPlanarRecurrence.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNPreparedQK.h"
+#include "kernels/rocm/gdn/ROCmShortConvolution.h"
 #include <cxxabi.h>
 
 namespace
@@ -381,13 +383,13 @@ TEST(Test__ROCmGDNPaddedRealLength, ValueMajorProductionLongRouteBoundariesBytes
 }
 
 /**
- * @test Real value-major owner rejects foreign workspace formats and restores captured state.
- * @details Captures real merged verifier and ordinary graphs once. An independent
- * frozen planar oracle advances the same two rows; no reference state is used as
- * a candidate input. Rejected same-sized workspace binds must leave good bindings
- * intact, and the same restored live bank must drive ordinary continuation.
+ * @brief Reuse the real owner restore transaction for raw and producer-prepared inputs.
+ * @param prepared Select the explicit producer/consumer binding, never a serving mode.
+ * @details Each retained graph survives all dirty state resets. The prepared
+ * branch adds original convolution to the independent oracle and uses the real
+ * convolution/recurrence owners with their original speculative banks.
  */
-TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsByteExact)
+inline void proveValueMajorOwnerRestore(bool prepared)
 {
     using Layout=llaminar2::GDNRecurrenceStateLayout;
     constexpr int Heads=3,Keys=4,DV=17,Guard=128;
@@ -396,15 +398,29 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsBy
     for(int dk:{64,128})for(int offset:{0,5,-5})for(bool norm:{false,true})
     {
         SCOPED_TRACE(::testing::Message()<<"DK="<<dk<<" offset="<<offset<<" normalize="<<norm);
-        const int state=Heads*dk*DV,width=2*Keys*dk+Heads*DV;
+        const int state=Heads*dk*DV,width=2*Keys*dk+Heads*DV,conv_state=3*width;
         HipStreamHandle stream;
         HipFloatBuffer raw(2*width),alpha(2*Heads),beta(2*Heads),log(std::vector<float>(Heads,-.375f)),dt(std::vector<float>(Heads,.125f));
         HipFloatBuffer q(2*Heads*dk),k(q.count),v(2*Heads*DV),reference_state(state),reference_output(2*Heads*DV+Guard),output(reference_output.count);
         HipFloatBuffer snapshots(2*state+Guard),work(state+Guard),wrong_snapshots(snapshots.count),wrong_work(work.count);
+        HipFloatBuffer postconv(prepared?2*width+Guard:0),reference_raw(postconv.count),
+            weights(prepared?4*width:0),bias(prepared?width:0),reference_conv(prepared?conv_state:0),
+            conv_snapshots(prepared?2*conv_state+Guard:0),conv_work(prepared?conv_state+Guard:0),
+            compact(prepared?gdn::ScalarPreparedQKLayout::fromHeads(Keys,Heads,dk,DV).elements+Guard:0);
         ROCmGatedDeltaNet kernel(0);
         HipGDNStateOwner owner(kernel,state,0,3,Layout::ValueMajorKeyContiguous);
         kernel.setGPUStream(stream.stream);
-        std::unique_ptr<HipCapturedGraph> verifier,ordinary,reference_first,reference_next;
+        ROCmShortConvolution convolution(0);
+        std::unique_ptr<HipGDNStateOwner> conv_owner;
+        if(prepared)
+        {
+            conv_owner=std::make_unique<HipGDNStateOwner>(convolution,conv_state);
+            convolution.setGPUStream(stream.stream);
+            convolution.bindVerifierStateCaptureWorkspace(conv_snapshots.ptr,2,conv_state);
+            convolution.bindSpeculativeStateWorkspace(conv_work.ptr,conv_state);
+        }
+        HipIntBuffer accepted_row(0);
+        std::unique_ptr<HipCapturedGraph> verifier,ordinary,reference_first,reference_next,restore;
         gdn_merged_extended::Cell::Retirement retirement{stream.stream};
         ASSERT_EQ(kernel.recurrenceStateLayout(),Layout::ValueMajorKeyContiguous);
         kernel.bindRecurrenceStateCaptureWorkspace(snapshots.ptr,2,state,Layout::ValueMajorKeyContiguous);
@@ -414,18 +430,44 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsBy
         EXPECT_THROW(kernel.bindRecurrenceSpeculativeWorkspace(wrong_work.ptr,state,Layout::KeyMajorValueContiguous),std::invalid_argument);
         const auto merged=[&](int row)
         {
+            if(prepared)
+            {
+                if(!convolution.forwardPreparedQK({Keys,Heads,dk,DV,norm,raw.ptr+row*width,
+                    weights.ptr,bias.ptr,postconv.ptr+row*width,compact.ptr}))return false;
+                return kernel.chunkForwardPreparedQK({Keys,Heads,dk,DV,offset,norm,
+                    postconv.ptr+row*width,compact.ptr,alpha.ptr+row*Heads,beta.ptr+row*Heads,
+                    log.ptr,dt.ptr,output.ptr+row*Heads*DV});
+            }
             return kernel.chunkForwardMergedQKV(raw.ptr+row*width,width,alpha.ptr+row*Heads,beta.ptr+row*Heads,
                 log.ptr,dt.ptr,output.ptr+row*Heads*DV,nullptr,1,Keys,Heads,dk,DV,offset,64,norm);
         };
         verifier=std::make_unique<HipCapturedGraph>(stream.stream,[&]{return merged(0);});
         kernel.bindRecurrenceStateCaptureWorkspace(nullptr,0,state,Layout::ValueMajorKeyContiguous);
         kernel.bindRecurrenceSpeculativeWorkspace(nullptr,0,Layout::ValueMajorKeyContiguous);
+        if(prepared)
+        {
+            convolution.bindVerifierStateCaptureWorkspace(nullptr,0,conv_state);
+            convolution.bindSpeculativeStateWorkspace(nullptr,conv_state);
+        }
         ordinary=std::make_unique<HipCapturedGraph>(stream.stream,[&]{return merged(1);});
         kernel.bindRecurrenceStateCaptureWorkspace(snapshots.ptr,2,state,Layout::ValueMajorKeyContiguous);
         kernel.bindRecurrenceSpeculativeWorkspace(work.ptr,state,Layout::ValueMajorKeyContiguous);
+        if(prepared)
+        {
+            convolution.bindVerifierStateCaptureWorkspace(conv_snapshots.ptr,2,conv_state);
+            convolution.bindSpeculativeStateWorkspace(conv_work.ptr,conv_state);
+            restore=std::make_unique<HipCapturedGraph>(stream.stream,[&]
+            {
+                return convolution.restoreVerifierStateCaptureRowFromDeviceIndex(nullptr,accepted_row.ptr,stream.stream)&&
+                    kernel.restoreVerifierStateCaptureRowFromDeviceIndex(nullptr,accepted_row.ptr,stream.stream);
+            });
+        }
         const auto reference=[&](int row)
         {
-            if(!rocmGDN_deinterleave_qkv(raw.ptr+row*width,q.ptr+row*Heads*dk,k.ptr+row*Heads*dk,v.ptr+row*Heads*DV,
+            if(prepared&&!rocmGDN_short_conv1d_effective(raw.ptr+row*width,weights.ptr,bias.ptr,
+                reference_raw.ptr+row*width,reference_conv.ptr,reference_conv.ptr,1,width,4,true,
+                nullptr,nullptr,conv_state,0,0,stream.stream))return false;
+            if(!rocmGDN_deinterleave_qkv(prepared?reference_raw.ptr+row*width:raw.ptr+row*width,q.ptr+row*Heads*dk,k.ptr+row*Heads*dk,v.ptr+row*Heads*DV,
                 DeviceRequestRowRanges::fullyActive(1),Keys,Heads,dk,DV,offset,0,stream.stream))return false;
             return gdn_historical_native::launch({q.ptr+row*Heads*dk,k.ptr+row*Heads*dk,v.ptr+row*Heads*DV,
                 alpha.ptr+row*Heads,beta.ptr+row*Heads,log.ptr,dt.ptr,reference_output.ptr+row*Heads*DV,
@@ -434,22 +476,62 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsBy
         reference_first=std::make_unique<HipCapturedGraph>(stream.stream,[&]{return reference(0);});
         reference_next=std::make_unique<HipCapturedGraph>(stream.stream,[&]{return reference(1);});
         // Authenticate the real owner-selected workspace/live-bank bindings.
+        const void* conv_live_bank=nullptr;
         const auto inspect=[&](const HipCapturedGraph& graph,bool capture,const void* live_bank)
         {
-            std::size_t count=0;checkHip(hipGraphGetNodes(graph.graph,nullptr,&count),"Owner production node count");gdn_merged_extended::require(count==1u,"Owner graph must contain one native kernel");
-            hipGraphNode_t handle{};checkHip(hipGraphGetNodes(graph.graph,&handle,&count),"Owner production node");
-            hipGraphNodeType type{};checkHip(hipGraphNodeGetType(handle,&type),"Owner production node type");gdn_merged_extended::require(type==hipGraphNodeTypeKernel,"Owner graph contains foreign work");
-            count=0;checkHip(hipGraphNodeGetDependencies(handle,nullptr,&count),"Owner production parent count");gdn_merged_extended::require(count==0u,"Owner graph has unexpected parent");
+            std::size_t count=0;checkHip(hipGraphGetNodes(graph.graph,nullptr,&count),"Owner production node count");
+            gdn_merged_extended::require(count==std::size_t(prepared?2:1),"Owner graph has hidden or missing work");
+            std::vector<hipGraphNode_t> nodes(count);checkHip(hipGraphGetNodes(graph.graph,nodes.data(),&count),"Owner production nodes");
+            hipGraphNode_t handle{},conv_node{};
+            for(const auto node:nodes)
+            {
+                hipGraphNodeType type{};checkHip(hipGraphNodeGetType(node,&type),"Owner production node type");
+                gdn_merged_extended::require(type==hipGraphNodeTypeKernel,"Owner graph contains foreign work");
+                std::size_t parents=0;checkHip(hipGraphNodeGetDependencies(node,nullptr,&parents),"Owner parent count");
+                if(prepared&&!parents)conv_node=node;else handle=node;
+            }
+            gdn_merged_extended::require(handle!=nullptr,"Owner recurrence node is missing");
+            count=0;checkHip(hipGraphNodeGetDependencies(handle,nullptr,&count),"Owner production parent count");
+            gdn_merged_extended::require(count==std::size_t(prepared?1:0),"Owner recurrence parent differs");
+            if(prepared)
+            {
+                hipGraphNode_t parent{};checkHip(hipGraphNodeGetDependencies(handle,&parent,&count),"Owner convolution edge");
+                gdn_merged_extended::require(parent==conv_node,"Owner producer/consumer edge differs");
+                hipKernelNodeParams conv{};checkHip(hipGraphKernelNodeGetParams(conv_node,&conv),"Owner convolution tuple");
+                const char* raw_name=hipKernelNameRefByPtr(conv.func,stream.stream);
+                gdn_merged_extended::require(raw_name!=nullptr,"Owner convolution function unresolved");
+                int status=-1;std::unique_ptr<char,decltype(&std::free)> name(abi::__cxa_demangle(raw_name,nullptr,nullptr,&status),&std::free);
+                gdn_merged_extended::require(status==0&&bool(name)&&std::string(name.get()).find(
+                    "rocm_gdn_scalar_prepared_qk_conv_kernel<"+std::to_string(dk)+">(")!=std::string::npos,"Owner convolution is not the production prepared program");
+                gdn_merged_extended::require(conv.kernelParams&&!conv.extra,"Owner convolution tuple missing");
+                const auto pointer=[&](int i,const void* expected){const void* got=nullptr;std::memcpy(&got,conv.kernelParams[i],sizeof(got));gdn_merged_extended::require(got==expected,"Owner convolution pointer differs");};
+                const auto integer=[&](int i,int expected){int got=0;std::memcpy(&got,conv.kernelParams[i],sizeof(got));gdn_merged_extended::require(got==expected,"Owner convolution scalar differs");};
+                const void* initial=nullptr;std::memcpy(&initial,conv.kernelParams[3],sizeof(initial));
+                gdn_merged_extended::require(initial!=nullptr,"Owner convolution live bank missing");
+                if(!conv_live_bank)conv_live_bank=initial;
+                pointer(0,raw.ptr+(capture?0:1)*width);pointer(1,weights.ptr);pointer(2,bias.ptr);pointer(3,conv_live_bank);
+                pointer(4,postconv.ptr+(capture?0:1)*width);pointer(5,capture?conv_work.ptr:conv_live_bank);
+                pointer(6,capture?conv_snapshots.ptr:nullptr);pointer(7,compact.ptr);pointer(8,compact.ptr+Keys*dk);
+                integer(9,1);integer(10,Keys);integer(11,Heads);integer(12,DV);pointer(13,nullptr);integer(14,conv_state);integer(15,capture?2:0);
+                bool normalization=false;std::memcpy(&normalization,conv.kernelParams[16],sizeof(normalization));
+                gdn_merged_extended::require(normalization==norm,"Owner convolution normalization differs");
+                gdn_merged_extended::require(conv.blockDim.x==128&&conv.blockDim.y==1&&conv.blockDim.z==1&&
+                    conv.gridDim.x==unsigned((width-1)/dk+1)&&conv.gridDim.y==1&&conv.gridDim.z==1&&conv.sharedMemBytes==0,"Owner convolution geometry differs");
+                hipFuncAttributes attr{};checkHip(hipFuncGetAttributes(&attr,conv.func),"Owner convolution resources");
+                gdn_merged_extended::require(attr.localSizeBytes==0&&attr.sharedSizeBytes==16,"Owner convolution has unexpected private/LDS storage");
+            }
             hipKernelNodeParams node{};checkHip(hipGraphKernelNodeGetParams(handle,&node),"Owner production arguments");
             gdn_merged_extended::require(node.kernelParams&&!node.extra,"Owner native tuple missing");
             const char* name=hipKernelNameRefByPtr(node.func,stream.stream);gdn_merged_extended::require(name!=nullptr,"Owner native function unresolved");
             gdn_merged_extended::require(std::string(name).find("rocm_gdn_value_major_scalar_kernelILi"+std::to_string(dk))!=std::string::npos,"Owner native family/policy differs");
-            gdn_merged_extended::require(std::string(name).find("GDNRecurrentInputLayoutE1E")!=std::string::npos,"Owner native family/policy differs");
-            gdn_merged_extended::require(std::string(name).find(std::string("GdnRecurrenceEndpointAccessE")+(capture?"0E":"1E"))!=std::string::npos,"Owner native family/policy differs");
+            gdn_merged_extended::require(std::string(name).find(std::string("GDNRecurrentInputLayoutE")+(prepared?"2E":"1E"))!=std::string::npos,"Owner native family/policy differs");
+            gdn_merged_extended::require(std::string(name).find(std::string("GdnRecurrenceEndpointAccessE")+(prepared||capture?"0E":"1E"))!=std::string::npos,"Owner native family/policy differs");
             const auto pointer=[&](int i,const void* expected){const void* got=nullptr;std::memcpy(&got,node.kernelParams[i],sizeof(got));gdn_merged_extended::require(got==expected,"Owner native captured argument differs");};
             const auto integer=[&](int i,int expected){int got=0;std::memcpy(&got,node.kernelParams[i],sizeof(got));gdn_merged_extended::require(got==expected,"Owner native captured argument differs");};
             const int row=capture?0:1;
-            pointer(0,raw.ptr+row*width);pointer(1,nullptr);pointer(2,nullptr);pointer(3,alpha.ptr+row*Heads);pointer(4,beta.ptr+row*Heads);
+            pointer(0,prepared?postconv.ptr+row*width:raw.ptr+row*width);
+            pointer(1,prepared?compact.ptr:nullptr);pointer(2,prepared?compact.ptr+Keys*dk:nullptr);
+            pointer(3,alpha.ptr+row*Heads);pointer(4,beta.ptr+row*Heads);
             pointer(5,log.ptr);pointer(6,dt.ptr);pointer(7,output.ptr+row*Heads*DV);
             if(live_bank)pointer(8,live_bank);
             pointer(9,capture?static_cast<const void*>(work.ptr):live_bank);
@@ -462,8 +544,15 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsBy
             hipFuncAttributes resources{};checkHip(hipFuncGetAttributes(&resources,node.func),"Owner production resources");gdn_merged_extended::require(resources.localSizeBytes==0u,"Owner native geometry/resource differs");
         };
         inspect(*verifier,true,nullptr); // Authenticate known22arg family before borrowing its live-bank address.
-        std::size_t n=0;checkHip(hipGraphGetNodes(verifier->graph,nullptr,&n),"Owner live-bank count");ASSERT_EQ(n,1u);
-        hipGraphNode_t node{};checkHip(hipGraphGetNodes(verifier->graph,&node,&n),"Owner live-bank node");
+        std::size_t n=0;checkHip(hipGraphGetNodes(verifier->graph,nullptr,&n),"Owner live-bank count");ASSERT_EQ(n,std::size_t(prepared?2:1));
+        std::vector<hipGraphNode_t> native_nodes(n);checkHip(hipGraphGetNodes(verifier->graph,native_nodes.data(),&n),"Owner live-bank nodes");
+        hipGraphNode_t node{};
+        for(auto possible:native_nodes)
+        {
+            std::size_t parents=0;checkHip(hipGraphNodeGetDependencies(possible,nullptr,&parents),"Owner live-bank dependency");
+            if(parents==std::size_t(prepared?1:0))node=possible;
+        }
+        ASSERT_NE(node,nullptr);
         hipGraphNodeType kind{};checkHip(hipGraphNodeGetType(node,&kind),"Owner live-bank node type");ASSERT_EQ(kind,hipGraphNodeTypeKernel);
         hipKernelNodeParams params{};checkHip(hipGraphKernelNodeGetParams(node,&params),"Owner live-bank binding");
         ASSERT_TRUE(params.kernelParams);
@@ -484,6 +573,16 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsBy
                 std::memcpy(&native[(h*DV+value)*dk+key],&initial[(h*dk+key)*DV+value],sizeof(float));
             raw.copyFrom(source);alpha.copyFrom(a);beta.copyFrom(b);reference_state.copyFrom(initial);
             ASSERT_TRUE(kernel.importState(native.data(),nullptr,stream.stream));
+            std::vector<float> initial_history(prepared?conv_state:0),host_weights(weights.count),host_bias(bias.count);
+            if(prepared)
+            {
+                for(int i=0;i<conv_state;++i)initial_history[i]=float((i+seed)%17-8)*.03125f;
+                for(std::size_t i=0;i<host_weights.size();++i)host_weights[i]=float(int((i*3+seed)%13)-6)*.0625f;
+                for(std::size_t i=0;i<host_bias.size();++i)host_bias[i]=float(int((i+seed)%5)-2)*.015625f;
+                reference_conv.copyFrom(initial_history);weights.copyFrom(host_weights);bias.copyFrom(host_bias);
+                ASSERT_TRUE(convolution.importState(initial_history.data(),nullptr,stream.stream));
+                for(auto* bank:{&postconv,&reference_raw,&conv_snapshots,&conv_work,&compact})bank->fill(Poison);
+            }
             for(auto* bank:{&snapshots,&work,&wrong_snapshots,&wrong_work,&output,&reference_output})bank->fill(Poison);
             reference_first->launch(stream.stream);verifier->launch(stream.stream);
             checkHip(hipStreamSynchronize(stream.stream),"Owner verifier terminal observation");
@@ -493,7 +592,17 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsBy
             std::vector<float> live_state(state);ASSERT_TRUE(kernel.exportState(live_state.data(),nullptr,stream.stream));
             checkHip(hipStreamSynchronize(stream.stream),"Owner live state observation");ASSERT_EQ(std::memcmp(live_state.data(),native.data(),state*sizeof(float)),0);
             for(float x:work.toHost())EXPECT_EQ(x,Poison);
-            ASSERT_TRUE(kernel.restoreVerifierStateCaptureRow(nullptr,0,stream.stream));
+            if(prepared)
+            {
+                const auto golden_history=reference_conv.toHost(),actual_history=conv_snapshots.toHost();
+                ASSERT_EQ(std::memcmp(actual_history.data(),golden_history.data(),conv_state*sizeof(float)),0);
+                std::vector<float> live_history(conv_state);ASSERT_TRUE(convolution.exportState(live_history.data(),nullptr,stream.stream));
+                checkHip(hipStreamSynchronize(stream.stream),"Prepared owner speculative history observation");
+                ASSERT_EQ(std::memcmp(live_history.data(),initial_history.data(),conv_state*sizeof(float)),0);
+                for(float x:conv_work.toHost())EXPECT_EQ(x,Poison);
+                restore->launch(stream.stream);
+            }
+            else ASSERT_TRUE(kernel.restoreVerifierStateCaptureRow(nullptr,0,stream.stream));
             reference_next->launch(stream.stream);ordinary->launch(stream.stream);
             checkHip(hipStreamSynchronize(stream.stream),"Owner restored continuation observation");
             const auto final_expected=reference_output.toHost(),final_output=output.toHost(),final_state=reference_state.toHost();
@@ -507,7 +616,42 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsBy
             EXPECT_EQ(std::memcmp(beta_after.data(),b.data(),b.size()*sizeof(float)),0);
             for(auto pair:{std::pair{&log,-.375f},std::pair{&dt,.125f}})
                 for(float x:pair.first->toHost())EXPECT_EQ(std::memcmp(&x,&pair.second,sizeof(float)),0);
+            if(prepared)
+            {
+                const auto want_raw=reference_raw.toHost(),got_raw=postconv.toHost();
+                ASSERT_EQ(std::memcmp(want_raw.data(),got_raw.data(),want_raw.size()*sizeof(float)),0);
+                const auto want_history=reference_conv.toHost();std::vector<float> got_history(conv_state);
+                ASSERT_TRUE(convolution.exportState(got_history.data(),nullptr,stream.stream));
+                checkHip(hipStreamSynchronize(stream.stream),"Prepared owner continued history observation");
+                ASSERT_EQ(std::memcmp(want_history.data(),got_history.data(),conv_state*sizeof(float)),0);
+                const auto cs=conv_snapshots.toHost(),cw=conv_work.toHost(),cq=compact.toHost();
+                for(std::size_t i=conv_state;i<cs.size();++i)EXPECT_EQ(cs[i],Poison);
+                for(float x:cw)EXPECT_EQ(x,Poison);
+                for(std::size_t i=2*Keys*dk;i<cq.size();++i)EXPECT_EQ(cq[i],Poison);
+                const auto actual_weights=weights.toHost(),actual_bias=bias.toHost();
+                EXPECT_EQ(std::memcmp(actual_weights.data(),host_weights.data(),actual_weights.size()*sizeof(float)),0);
+                EXPECT_EQ(std::memcmp(actual_bias.data(),host_bias.data(),actual_bias.size()*sizeof(float)),0);
+            }
             ASSERT_EQ(kernel.recurrenceStateLayout(),Layout::ValueMajorKeyContiguous);
         }
     }
+}
+
+
+/**
+ * @test Real value-major owner rejects foreign workspace formats and restores captured state.
+ * @details Captures real merged verifier and ordinary graphs once. An independent
+ * frozen planar oracle advances the same two rows; no reference state is used as
+ * a candidate input. Rejected same-sized workspace binds must leave good bindings
+ * intact, and the same restored live bank must drive ordinary continuation.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindingsByteExact)
+{
+    proveValueMajorOwnerRestore(false);
+}
+
+/** @test Real producer/consumer owners capture, restore and reset without recapture or a host shadow. */
+TEST(Test__ROCmGDNPaddedRealLength, CapturedPreparedQKOwnersRestoreAndResetByteExact)
+{
+    proveValueMajorOwnerRestore(true);
 }

@@ -12,6 +12,7 @@
 #include "kernels/common/DeviceRequestRowRanges.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNPreparedQK.h"
 #include <array>
 #include <limits>
 
@@ -219,4 +220,94 @@ TEST(DeviceRequestRowRanges, RecurrenceStateExtentsUseWideRequestOffsets)
     merged.updated_state=planar.updated_state;
     EXPECT_FALSE(gdn::validPlanarRecurrenceStorage(planar));
     EXPECT_FALSE(gdn::validMergedRecurrenceStorage(merged));
+}
+
+
+/** @test One scalar activation formula agrees across original projection/head geometry. */
+TEST(DeviceRequestRowRanges, ScalarPreparedQKCapacityUsesOriginalProjectionWidths)
+{
+    for(const int dk:{64,128})
+        for(const int keys:{1,4,16})
+            for(const int heads:{1,3,12})
+                for(const int dv:{1,65,128,129})
+                {
+                    const auto from_heads=gdn::ScalarPreparedQKLayout::fromHeads(keys,heads,dk,dv);
+                    const auto from_weights=gdn::ScalarPreparedQKLayout::fromProjectionWidths(
+                        2*std::size_t(keys)*dk+std::size_t(heads)*dv,std::size_t(heads)*dv);
+                    EXPECT_EQ(from_heads.plane_elements,from_weights.plane_elements);
+                    EXPECT_EQ(from_heads.elements,from_weights.elements);
+                    EXPECT_EQ(from_heads.bytes,from_weights.bytes);
+                }
+    EXPECT_EQ(gdn::ScalarPreparedQKLayout::fromHeads(4,12,128,128).bytes,4096u);
+    EXPECT_THROW((void)gdn::ScalarPreparedQKLayout::fromProjectionWidths(128,128),std::invalid_argument);
+    EXPECT_THROW((void)gdn::ScalarPreparedQKLayout::fromProjectionWidths(130,129),std::invalid_argument);
+    EXPECT_THROW((void)gdn::ScalarPreparedQKLayout::fromHeads(1,1,32,128),std::invalid_argument);
+    EXPECT_THROW((void)gdn::ScalarPreparedQKLayout::fromHeads(std::numeric_limits<int>::max(),1,128,128),std::invalid_argument);
+    EXPECT_THROW((void)gdn::ScalarPreparedQKLayout::fromProjectionWidths(
+        std::numeric_limits<std::size_t>::max(),1),std::invalid_argument);
+}
+
+/** @test Compact producer/consumer admission preserves all original owners and exact state alias only. */
+TEST(DeviceRequestRowRanges, ScalarPreparedQKStorageProtectsRawStateAndSnapshots)
+{
+    const auto read=[](std::uintptr_t p){return reinterpret_cast<const float*>(p);};
+    const auto write=[](std::uintptr_t p){return reinterpret_cast<float*>(p);};
+    // Deliberately non-dereferenceable authored ranges prove device data stays opaque.
+    gdn::ScalarPreparedQKConvolutionInput producer{
+        {4,12,128,128,true,read(0x100000000),read(0x110000000),read(0x120000000),
+         write(0x130000000),write(0x140000000)},
+        read(0x150000000),write(0x160000000),write(0x170000000),3*2560+13,2};
+    ASSERT_TRUE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    const auto original=producer;
+    producer.updated_state=const_cast<float*>(producer.initial_state);
+    EXPECT_TRUE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    producer=original;
+    producer.updated_state=write(reinterpret_cast<std::uintptr_t>(producer.initial_state)+4);
+    EXPECT_FALSE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    producer=original;producer.operands.raw_output=const_cast<float*>(producer.operands.input);
+    EXPECT_FALSE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    producer=original;producer.operands.prepared=producer.operands.raw_output;
+    EXPECT_FALSE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    producer=original;producer.operands.prepared=write(reinterpret_cast<std::uintptr_t>(producer.operands.weight)+4);
+    EXPECT_FALSE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    producer=original;producer.snapshots=const_cast<float*>(producer.initial_state);
+    EXPECT_FALSE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    producer=original;producer.operands.prepared=write(std::numeric_limits<std::uintptr_t>::max()-3);
+    EXPECT_FALSE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    producer=original;producer.operands.value_heads=std::numeric_limits<int>::max();
+    EXPECT_FALSE(gdn::validScalarPreparedQKConvolutionStorage(producer));
+    producer=original;producer.operands.prepared=write(0x140000004);
+    EXPECT_TRUE(gdn::validScalarPreparedQKConvolutionStorage(producer)); // Scalar-aligned native endpoint.
+
+    gdn::ScalarPreparedQKRecurrenceInput consumer{{
+        DeviceRequestRowRanges::deviceCounted(1,1,reinterpret_cast<const std::int32_t*>(std::uintptr_t{0x210000000})),
+        4,12,128,128,-5,true,read(0x100000000),read(0x110000000),read(0x120000000),
+        read(0x130000000),read(0x140000000),write(0x150000000),read(0x160000000),
+        write(0x170000000),write(0x180000000),12*128*128+13,2,
+        GDNRecurrenceStateLayout::ValueMajorKeyContiguous},read(0x190000000)};
+    ASSERT_TRUE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    const auto sealed=consumer;
+    consumer.original.updated_state=const_cast<float*>(consumer.original.initial_state);
+    EXPECT_TRUE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.prepared=consumer.original.merged;
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.prepared=consumer.original.alpha;
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.prepared=consumer.original.output;
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.prepared=consumer.original.initial_state;
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.prepared=read(reinterpret_cast<std::uintptr_t>(consumer.original.snapshots)+
+        std::size_t(consumer.original.snapshot_stride_floats)*sizeof(float));
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer)); // Protect full retained envelope.
+    consumer=sealed;consumer.prepared=reinterpret_cast<const float*>(consumer.original.rows.lengthOwner());
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.original.recurrence_layout=GDNRecurrenceStateLayout::KeyMajorValueContiguous;
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.original.rows=DeviceRequestRowRanges::fullyActive(2);
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.original.rows=DeviceRequestRowRanges::fullyActiveRequests(2,1);
+    EXPECT_FALSE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
+    consumer=sealed;consumer.prepared=read(0x190000004);
+    EXPECT_TRUE(gdn::validScalarPreparedQKRecurrenceStorage(consumer));
 }

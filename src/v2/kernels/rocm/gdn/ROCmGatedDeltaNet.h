@@ -400,6 +400,34 @@ namespace llaminar2
         }
 
         /**
+         * @brief Consume the explicitly paired scalar convolution's compact Q/K activation.
+         * @param input Original raw merged V/gates and exact immutable head mapping.
+         * @return Native enqueue success; no alternate raw-input program is retried.
+         * @throws std::invalid_argument For invalid original scalar head geometry.
+         * @details The original cache binding remains the sole live, speculative
+         * and snapshot state authority. Its physical layout must be ValueMajor.
+         */
+        bool chunkForwardPreparedQK(const gdn::ScalarPreparedQKRecurrence& input) override
+        {
+            if(recurrence_layout_!=GDNRecurrenceStateLayout::ValueMajorKeyContiguous)return false;
+            (void)gdn::ScalarPreparedQKLayout::fromHeads(
+                input.key_heads,input.value_heads,input.key_width,input.value_width);
+            const auto state=std::int64_t(input.value_heads)*input.key_width*input.value_width;
+            if(state<=0||state>std::numeric_limits<int>::max())return false;
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const int size=static_cast<int>(state);
+            const float* initial=requireState(size,"ROCmGatedDeltaNet::chunkForwardPreparedQK");
+            float* destination=resolveVerifierStateDestination(size,stream_);
+            if(!initial||!destination)return false;
+            return gdn::launchROCmScalarPreparedQKRecurrence({{
+                DeviceRequestRowRanges::fullyActive(1),input.key_heads,input.value_heads,
+                input.key_width,input.value_width,input.global_value_offset,input.normalize_qk,
+                input.merged,input.alpha,input.beta_raw,input.A_log,input.dt_bias,input.output,
+                initial,destination,verifier_state_capture_,verifier_state_capture_size_,
+                verifier_state_capture_rows_,recurrence_layout_},input.prepared},stream_);
+        }
+
+        /**
          * @brief Execute explicit merged M1 directly; retain optimized prefill layout preparation.
          *
          * Nonidentity M1 has one captured raw recurrence; ordinary prefill retains

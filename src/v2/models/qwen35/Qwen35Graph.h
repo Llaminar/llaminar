@@ -21,8 +21,9 @@
  *   - Fused QKV + Z + A + B projections (4 separate GEMMs)
  *   - Short causal conv1d + SiLU on QKV
  *   - Delta rule recurrence (chunk-parallel prefill, single-step decode)
- *   - Gated RMSNorm: RMSNorm(output) * SiLU(Z)
- *   - Output projection (Wo GEMM)
+ *   - Gated RMSNorm with the model-declared SiLU or sigmoid gate
+ *   - Prepared output projection; eligible ROCm scalar SingleQ8 composes norm
+ *     publication while retaining the complete normalized FP32 tensor
  *
  * FA layers use:
  *   - Standard Q/K/V projections (separate weights)
@@ -35,6 +36,7 @@
 #pragma once
 
 #include "../qwen/QwenGraphBase.h"
+#include "execution/compute_stages/stages/GEMMStage.h"
 #include <memory>
 
 namespace llaminar2
@@ -150,6 +152,16 @@ namespace llaminar2
         }
 
     protected:
+        /**
+         * @brief Complete every dense/MoE-derived hybrid arena schema once.
+         * @param schema The actual factory schema retained by this graph family.
+         * @details Registers the canonical participant-local prepared activation
+         * and exact global PP layer-template interval. No storage is allocated here;
+         * the resolver and PMA retain their existing geometry/ownership roles.
+         * @throws std::invalid_argument For an incomplete global PP interval.
+         */
+        void completeHybridSchema(GraphSchema &schema) const;
+
         /**
          * @brief Return whether a recursive MTP sidecar is being assembled.
          *
@@ -357,14 +369,16 @@ namespace llaminar2
          * @param batch_size Number of independent request prefixes.
          * @param device Exact projection/prepared-weight/count owner.
          * @param lengths Original grouped verifier count; never an ordinary query substitute.
-         * @param dependency Gated norm producer of the existing GDN output tensor.
+         * @param dependency Original producer/checkpoint of the retained GDN input.
+         * @param gated_norm Explicit supported composite; absent preserves the original separate normalization program.
          * @return The actual GEMMStage node name, retaining original source and query pointers.
          * @throws std::exception Before node insertion for unsupported explicit TwoTerm source or query ownership.
          */
         std::string addGDNOutputProjection(ComputeGraph &graph, const std::string &prefix,
             ActivationBuffers &buffers, TensorBase *weight, const WeightBinding *binding,
             int seq_len, int batch_size, DeviceId device, const int32_t *lengths,
-            const std::string &dependency);
+            const std::string &dependency,
+            std::optional<GEMMStage::GatedNormPublication> gated_norm=std::nullopt);
 
         /**
          * @brief Compose actual main FA Stage5 from frozen original source/query authority.

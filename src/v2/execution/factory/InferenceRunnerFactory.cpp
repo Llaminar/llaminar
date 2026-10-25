@@ -3143,7 +3143,7 @@ namespace llaminar2
         graph_config.ngram_table_placement = config.ngram_table_placement;
         graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
-        graph_config.attention_phase_schedule = config.attention_phase_schedule;
+
         LOG_DEBUG("[InferenceRunner] KV cache scale: K=" << graph_config.kv_cache_scale_k
                                                          << ", V=" << graph_config.kv_cache_scale_v);
         LOG_DEBUG("[InferenceRunner] KV cache precision mode: "
@@ -3351,6 +3351,8 @@ namespace llaminar2
             ScopedWeightLoadDetailTimer timer("graph.build.create_orchestrator");
             DeviceGraphOrchestrator::Dependencies deps;
             deps.model_ctx = model_ctx;
+            if (graph_config.flash_next)
+                graph_config.bindAdmittedQwenSparseAttentionProgram(config.attention_participants);
             deps.graph_builder =
                 GraphBuilderRegistry::create(architecture, graph_config, mpi_ctx);
             deps.graph_builder->setModelContext(model_ctx);
@@ -4261,7 +4263,6 @@ namespace llaminar2
         graph_config.ngram_table_placement = config.ngram_table_placement;
         graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
-        graph_config.attention_phase_schedule = config.attention_phase_schedule;
 
         // TurboQuant context for TQ4/TQ KV cache
         std::shared_ptr<TurboQuantContext> turboquant_ctx;
@@ -4368,6 +4369,8 @@ namespace llaminar2
         // Create Dependencies struct
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
+        if (graph_config.flash_next)
+            graph_config.bindAdmittedQwenSparseAttentionProgram(config.attention_participants);
         deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
         deps.graph_builder->setModelContext(model_ctx);
         deps.turboquant_ctx = std::move(turboquant_ctx);

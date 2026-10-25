@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <limits>
 #include <omp.h>
 
 namespace llaminar2::qwen4exp
@@ -58,6 +59,44 @@ struct SparseFixture
              .position_capacity = capacity + origin};
     }
 };
+
+/** @test Combined CTA capacity is checked independently of live replay counts. */
+TEST(QwenSparseAttention, FusedPreparationGridAndCrossRoleAliases)
+{
+    for(const int rows:{1,16,33,2048})
+    {
+        const auto grid=qwenSparsePreparationGrid(rows);
+        EXPECT_EQ(grid.pool_blocks,(rows+6)/4);EXPECT_EQ(grid.query_blocks,rows*4);
+        EXPECT_EQ(grid.total_blocks,grid.pool_blocks+grid.query_blocks);
+    }
+    EXPECT_THROW((void)qwenSparsePreparationGrid(0),std::invalid_argument);
+    EXPECT_THROW((void)qwenSparsePreparationGrid(std::numeric_limits<int>::max()),std::invalid_argument);
+    for (int rows : {1,16})
+        EXPECT_EQ(qwenSparsePreparationGrid(rows).program,QwenSparsePreparationProgram::FusedGrouped);
+    for (int rows : {17,33,512,65536})
+        EXPECT_EQ(qwenSparsePreparationGrid(rows).program,QwenSparsePreparationProgram::SeparatePrefill);
+    EXPECT_NO_THROW((void)qwenSparsePreparationGrid(505290269));
+    EXPECT_THROW((void)qwenSparsePreparationGrid(505290270),std::invalid_argument);
+    SparseFixture f(3,16,4096);
+    const auto original=f.p;
+    EXPECT_NO_THROW(validateQwenSparseIndexer(f.p)); // Shared immutable norm is legal.
+    const auto reject=[&](QwenSparseIndexer p){EXPECT_THROW(validateQwenSparseIndexer(p),std::invalid_argument);};
+    f.p.pooled_keys=const_cast<float*>(f.p.query)+1;reject(f.p);
+    f.p=original;f.p.pooled_keys=const_cast<float*>(f.p.query_norm);reject(f.p);
+    f.p=original;f.p.prepared_query=const_cast<float*>(f.p.raw_keys)+1;reject(f.p);
+    f.p=original;f.p.prepared_query=const_cast<float*>(f.p.partial_keys);reject(f.p);
+    f.p=original;f.p.prepared_query=const_cast<float*>(f.p.key_norm);reject(f.p);
+    f.p=original;f.p.prepared_query=f.p.pooled_keys+1;reject(f.p);
+    f.p=original;f.p.prepared_query=const_cast<float*>(f.p.cosine);reject(f.p);
+    f.p=original;f.p.pooled_keys=reinterpret_cast<float*>(const_cast<QwenSparseReplay*>(f.p.replay));reject(f.p);
+    f.p=original;f.p.raw_keys=f.p.query;EXPECT_NO_THROW(validateQwenSparseIndexer(f.p)); // Read/read alias.
+    f.p=original;f.p.prepared_query=const_cast<float*>(f.p.query);EXPECT_NO_THROW(validateQwenSparseIndexer(f.p)); // Same-head in-place query preparation.
+    QwenSparseTransactionPrior codec{};codec.row_capacity=16;
+    f.p=original;f.p.transaction_prior=&codec;f.p.replay=&codec.replay;f.p.partial_keys=codec.partial;
+    EXPECT_NO_THROW(validateQwenSparseIndexer(f.p)); // Canonical prior-header/tail owner.
+    f.p=original;f.p.prepared_query=reinterpret_cast<float*>(UINTPTR_MAX-3);reject(f.p);
+    f.p=original;EXPECT_NO_THROW(validateQwenSparseIndexer(f.p));
+}
 
 TEST(QwenSparseAttention, ExplicitRepresentationAndStaticBindingValidation)
 {

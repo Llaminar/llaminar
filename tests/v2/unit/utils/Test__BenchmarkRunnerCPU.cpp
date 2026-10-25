@@ -3032,6 +3032,10 @@ namespace
                 {{"route", "homogeneous_full"}, {"m", "512"}, {"k", "2560"},
                  {"projections", "4"}, {"names", "qkv+z+alpha+beta"},
                  {"n", "10240+6144+48+48"}, {"codebooks", "none+none+none+none"}}),
+            counter("gdn_output", "normalization_submission", "gemm", "rocm:1",
+                {{"preparation","fused_single_q8"},{"m","1"},{"n","2560"},{"k","1536"},
+                 {"norm_dim","128"},{"normalized_fp32","retained"},{"codebook","19"},
+                 {"source_codebook","19"},{"activation","2"}}),
             counter("weight_loading", "gdn_projection_arithmetic_prepared_weight", "materialize", "rocm:1",
                 {{"canonical_name", "blk.0.attn_qkv.weight"}, {"weight_role", "FusedQKV"},
                  {"policy", "fp16"}, {"source_format", "Q8_0"}, {"prepared_format", "FP16"},
@@ -3095,6 +3099,7 @@ TEST(Test__BenchmarkRunnerCPU, RetainsSetupArithmeticObservationSeparatelyFromMe
     benchmark.setPostWarmupCallback([&]()
     {
         emitArithmeticSetupFixture(expected);
+        PerfStatsCollector::addCounter("gdn_output", "normalization_submission.unrelated", 97.0);
         PerfStatsCollector::addCounter("kernel", "gdn_projection_route.unrelated", 99.0);
         PerfStatsCollector::addCounter("kernel", "hc_up_projection_submissions.unrelated", 103.0);
         PerfStatsCollector::addCounter("kernel", "unrelated_setup_counter", 101.0);

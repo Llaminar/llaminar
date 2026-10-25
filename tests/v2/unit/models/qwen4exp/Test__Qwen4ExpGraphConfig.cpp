@@ -27,8 +27,10 @@ TEST(Qwen4ExpGraphConfig, AttentionBasePrefixIdentitySurvivesSetupReload)
     GraphConfig config;config.default_device=DeviceId::rocm(0);
     Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false),config);
     config.attention_phase_schedule=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
-    setup.qfn_sparse_attention=A::FixedFP32;Qwen4ExpGraph ordinary(config);
-    setup.qfn_sparse_attention=A::TileFP16WithFP32Totals;Qwen4ExpGraph candidate(config);
+    config.attention_arithmetic = A::FixedFP32;
+    Qwen4ExpGraph ordinary(config);
+    config.attention_arithmetic = A::TileFP16WithFP32Totals;
+    Qwen4ExpGraph candidate(config);
     PrefixFingerprintMaterial before;candidate.appendPrefixCacheFingerprintMaterial(before);
     setup.reload();setup.qfn_sparse_attention=A::FixedFP32;
     PrefixFingerprintMaterial after,control,parent;
@@ -285,4 +287,43 @@ TEST(Qwen4ExpGraphConfig, GDNQKVActivationPolicyIsFrozenAndIndependent)
     EXPECT_EQ(GraphConfig{}.qfn_gdn_qkv_activation, QuantizedActivationOperandPrecision::SingleQ8);
 }
 
+/** @test The actual factory binding copies admission before the graph freezes its arithmetic
+ * identity. */
+TEST(Qwen4ExpGraphConfig, AttentionDefaultGraphBindsOnlyItsAdmittedParticipant)
+{
+    using namespace qwen4exp;
+    using A = QwenSparseAttentionArithmetic;
+    using S = QwenSparseAttentionPhaseSchedule;
+    const auto admitted = sealQwenSparseAttentionParticipants(
+        {{DeviceId::cpu(), {}, 0, 47},
+         {DeviceId::rocm(0), {A::TileFP16WithFP32Totals, S::Prefill8Decode33}, 0, 47}});
+    GraphConfig config;
+    config.default_device = DeviceId::rocm(0);
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), config);
+    config.max_request_count = 1;
+    config.kv_cache_precision = KVCachePrecision::FP16;
+    config.bindAdmittedQwenSparseAttentionProgram(admitted);
+    EXPECT_EQ(config.attention_arithmetic, A::TileFP16WithFP32Totals);
+    EXPECT_EQ(config.attention_phase_schedule, S::Prefill8Decode33);
+    Qwen4ExpGraph graph(config);
+    PrefixFingerprintMaterial material;
+    graph.appendPrefixCacheFingerprintMaterial(material);
+    config.default_device = DeviceId::rocm(1);
+    EXPECT_THROW(config.bindAdmittedQwenSparseAttentionProgram(admitted), std::invalid_argument);
+    EXPECT_EQ(config.attention_arithmetic, A::TileFP16WithFP32Totals);
+    EXPECT_EQ(config.attention_phase_schedule, S::Prefill8Decode33);
+    config.default_device = DeviceId::cpu();
+    config.bindAdmittedQwenSparseAttentionProgram(admitted);
+    EXPECT_EQ(config.attention_arithmetic, A::FixedFP32);
+    EXPECT_EQ(config.attention_phase_schedule, S::Uniform);
+    GraphConfig gdn_only;
+    gdn_only.default_device = DeviceId::cpu();
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), gdn_only);
+    gdn_only.n_layers = 3;
+    EXPECT_NO_THROW(gdn_only.bindAdmittedQwenSparseAttentionProgram({}));
+    EXPECT_EQ(gdn_only.attention_arithmetic, A::FixedFP32);
+    gdn_only.n_layers = 4;
+    EXPECT_THROW(gdn_only.bindAdmittedQwenSparseAttentionProgram({}), std::invalid_argument);
 }
+
+} // namespace llaminar2::test

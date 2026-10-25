@@ -28,18 +28,30 @@
 
 namespace llaminar2
 {
-Qwen4ExpGraph::Qwen4ExpGraph(const GraphConfig &config,std::shared_ptr<IMPIContext> mpi)
-    :Qwen35MoEGraph(config,std::move(mpi)),
-     sparse_attention_arithmetic_(debugEnv().attention.qfn_sparse_attention),
-     sparse_attention_phase_schedule_(config_.attention_phase_schedule)
-{
-    if(!config_.flash_next)
-        throw std::invalid_argument("Flash Next graph requires an authenticated exact GGUF configuration");
-    qwen4exp::validateQwenSparseAttentionPhaseSchedule(sparse_attention_phase_schedule_,config_.default_device.type);
-    if(sparse_attention_phase_schedule_==qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33 &&
-       (sparse_attention_arithmetic_!=qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals || config_.max_request_count!=1))
-        throw std::invalid_argument("QSA prefill8_decode33 requires explicit fp16_tile and the canonical single-request graph family");
-}
+    Qwen4ExpGraph::Qwen4ExpGraph(const GraphConfig &config, std::shared_ptr<IMPIContext> mpi)
+        : Qwen35MoEGraph(config, std::move(mpi)),
+          sparse_attention_arithmetic_(config_.attention_arithmetic),
+          sparse_attention_phase_schedule_(config_.attention_phase_schedule)
+    {
+        if (!config_.flash_next)
+            throw std::invalid_argument(
+                "Flash Next graph requires an authenticated exact GGUF configuration");
+        qwen4exp::validateQwenSparseAttentionArithmetic(sparse_attention_arithmetic_,
+                                                        config_.default_device.type);
+        if (sparse_attention_arithmetic_ ==
+            qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
+            throw std::invalid_argument(
+                "QSA graph requires a base setup program, not a resolved native Decode33 program");
+        qwen4exp::validateQwenSparseAttentionPhaseSchedule(sparse_attention_phase_schedule_,
+                                                           config_.default_device.type);
+        if (sparse_attention_phase_schedule_ ==
+                qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33 &&
+            (sparse_attention_arithmetic_ !=
+                 qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals ||
+             config_.max_request_count != 1))
+            throw std::invalid_argument(
+                "QSA prefill8_decode33 requires explicit fp16_tile and the canonical single-request graph family");
+    }
 void Qwen4ExpGraph::appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
 {
     Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(material);
@@ -48,8 +60,6 @@ void Qwen4ExpGraph::appendPrefixCacheFingerprintMaterial(PrefixFingerprintMateri
 GraphSchema Qwen4ExpGraph::getSchema() const
 {
     auto schema=Qwen35MoEGraph::getSchema();schema.name=architectureName();
-    for(int local=0;local<config_.n_layers;++local)
-        schema.layer_template_names[local]=config_.layer_types.at(config_.pp_layer_offset+local);
     applyQwen4ExpBufferLayout(schema,config_);return schema;
 }
 GraphResolverConfig Qwen4ExpGraph::getResolverConfig(int seq_len) const

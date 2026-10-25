@@ -230,6 +230,9 @@ namespace llaminar2
             }
             auto certificate=std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(final_plan);
             publishCandidateTables(placements,ranks,memory.device_inputs);
+            for (auto &rank : ranks)
+                rank.runtime.attention_participants = projectAdmittedQwenSparseAttentionPrograms(
+                    profile, memory.device_inputs, rank.rank);
             if (memory.resident_graph_rows <= 0)
                 throw std::logic_error("Candidate admission returned no executable graph rows");
             for (auto &rank : ranks) rank.runtime.resident_graph_rows = memory.resident_graph_rows;
@@ -316,6 +319,9 @@ namespace llaminar2
             throw std::logic_error("Candidate overlay final admission lost its exact stage");
         auto capacity=std::move(capacities.front());
         publishCandidateTables(capacity.ngram_table_placements,ranks,devices);
+        for (auto &rank : ranks)
+            rank.runtime.attention_participants =
+                projectAdmittedQwenSparseAttentionPrograms(profile, devices, rank.rank);
         /*
          * Auto's capacity result proves and ranks this topology at
          * discovery time; it is not a user-authored fixed quota.

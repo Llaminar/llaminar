@@ -4535,15 +4535,7 @@ namespace llaminar2
         GraphSchema schema = factory.createSchema();
         if (const auto *projection = projectionArena()) projection->replaceWholeExpertSchema(schema);
 
-        // Populate layer_template_names from config_.layer_types
-        if (!config_.layer_types.empty())
-        {
-            schema.layer_template_names.resize(config_.n_layers);
-            for (int i = 0; i < config_.n_layers; ++i)
-            {
-                schema.layer_template_names[i] = config_.layer_types[i];
-            }
-        }
+        completeHybridSchema(schema);
 
         return schema;
     }

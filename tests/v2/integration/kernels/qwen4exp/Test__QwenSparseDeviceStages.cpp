@@ -168,7 +168,7 @@ void prove(DeviceId device)
                 require(commit.execute(context.get()),"QSA commit stage capture failed");
                 capture.finish();
             }
-            EXPECT_EQ(storage.graph->nodeCount(),7u); // Four indexer, two core, one acceptance kernel; zero gathers/copies.
+            EXPECT_EQ(storage.graph->nodeCount(),6u); // Three indexer, two core, one acceptance kernel; zero gathers/copies.
             require(storage.graph->instantiate(),"QSA stage retained executable creation failed");
             // Ordinary CommitPartial has no immutable transaction prior:
             // acceptance zero preserves its destination rather than restoring
@@ -261,8 +261,9 @@ namespace
  * @param policy Explicit implementation admitted for this captured row capacity.
  * @return Function identities in semantic role order, never native enumeration order.
  */
-std::array<std::uintptr_t,4> inspectSelectorForwarding(const IGPUGraphCapture& graph,DeviceId device,
-    int rows,int blocks,QwenSparsePoolSelection policy)
+std::vector<std::uintptr_t> inspectSelectorForwarding(const IGPUGraphCapture& graph,DeviceId device,
+    int rows,int blocks,QwenSparsePoolSelection policy,
+    QwenSparseQueryDemand demand=QwenSparseQueryDemand::AllLive)
 {
     std::string selector;
     switch(policy){
@@ -275,18 +276,31 @@ std::array<std::uintptr_t,4> inspectSelectorForwarding(const IGPUGraphCapture& g
         policy==QwenSparsePoolSelection::Bounded1024_1024;
     const bool rowCTA=policy!=QwenSparsePoolSelection::Installed || rows<=attention::kMaxGroupedVerifierAttentionRows;
     const std::string space=device.is_cuda()?"llaminar2::qwen4exp::cuda_sparse_detail::":"llaminar2::qwen4exp::rocm_sparse_detail::";
-    // This selector-only fixture seals AllLive query preparation. Its native
-    // template has a return prefix and an explicit original row-work argument;
-    // RankingOnly is covered separately and cannot match this inventory.
-    std::array<std::string,4> names{space+"preparePools","void "+space+"prepareQueries<false>",space+"scorePools",(templated?"void ":"")+space+selector};
-    for(std::size_t role=0;role<names.size();++role)
-        names[role]+=role==1?"(llaminar2::qwen4exp::QwenSparseIndexer, llaminar2::ProjectionRowWork)":
-            "(llaminar2::qwen4exp::QwenSparseIndexer)";
-    const std::array<unsigned,4> gridX{unsigned((rows+6)/4),unsigned(rows*4),unsigned((blocks+7)/8),
-        unsigned(rowCTA?rows:(rows+7)/8)};
+    const bool fused = rows <= attention::kMaxGroupedVerifierAttentionRows;
+    const std::string ranked = demand == QwenSparseQueryDemand::RankingOnly ? "true" : "false";
+    const std::string indexer = "(llaminar2::qwen4exp::QwenSparseIndexer)";
+    const std::string query = "(llaminar2::qwen4exp::QwenSparseIndexer, llaminar2::ProjectionRowWork)";
+    std::vector<std::string> names;
+    std::vector<unsigned> gridX;
+    if (fused)
+    {
+        names = {"void " + space + "preparePoolsAndQueries<" + ranked + ">" + query};
+        gridX = {unsigned((rows+6)/4+rows*4)};
+    }
+    else
+    {
+        names = {space + "preparePools" + indexer, "void " + space + "prepareQueries<" + ranked + ">" + query};
+        gridX = {unsigned((rows+6)/4), unsigned(rows*4)};
+    }
+    const auto scoreRole = names.size();
+    names.push_back(space + "scorePools" + indexer);
+    names.push_back((templated ? "void " : "") + space + selector + indexer);
+    gridX.push_back(unsigned((blocks+7)/8));
+    gridX.push_back(unsigned(rowCTA?rows:(rows+7)/8));
     std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;
-    require(graph.nodeCount()==4 && graph.inspectKernelNodes(nodes,&detail) && nodes.size()==4,"Actual Indexer stage must capture exactly four inspectable native kernels");
-    std::array<std::uintptr_t,4> functions{};
+    require(graph.nodeCount()==names.size() && graph.inspectKernelNodes(nodes,&detail) && nodes.size()==names.size(),
+        "Actual Indexer stage has the wrong geometry-selected preparation inventory");
+    std::vector<std::uintptr_t> functions(names.size());
     for(const auto& node:nodes){
         require(node.valid() && node.name_resolved && node.nesting_depth==0,"Indexer native node lacks exact flat function identity");
         int status=0;std::unique_ptr<char,decltype(&std::free)> name(abi::__cxa_demangle(node.name.c_str(),nullptr,nullptr,&status),&std::free);
@@ -294,20 +308,20 @@ std::array<std::uintptr_t,4> inspectSelectorForwarding(const IGPUGraphCapture& g
         const auto found=std::find(names.begin(),names.end(),std::string(name.get()));
         require(found!=names.end(),("Stage forwarded a foreign selector/function specialization: actual="+std::string(name.get())).c_str());const auto role=std::size_t(found-names.begin());
         require(!functions[role],"Stage captured a duplicate native role");functions[role]=node.function_identity;
-        // The two existing rotary producers can contain libdevice's deliberate
+        // The combined rotary producer can contain libdevice's deliberate
         // range-reduction stack storage. The canonical compiler spill gate owns
         // that distinction; this test also fixes their function identities across
         // policies. Scoring and the selector must have no private storage.
-        require(node.grid_x==gridX[role] && node.grid_y==unsigned(role==2?rows:1) && node.grid_z==1 &&
-            node.block_x==unsigned(role<2?128:256) && node.block_y==1 && node.block_z==1 &&
-            node.dynamic_shared_memory_bytes==0 && (role<2 || node.local_memory_bytes_per_thread==0),
+        require(node.grid_x==gridX[role] && node.grid_y==unsigned(role==scoreRole?rows:1) && node.grid_z==1 &&
+            node.block_x==unsigned(role<scoreRole?128:256) && node.block_y==1 && node.block_z==1 &&
+            node.dynamic_shared_memory_bytes==0 && (role<scoreRole || node.local_memory_bytes_per_thread==0),
             ("Stage selector forwarding changed actual native launch/resource geometry: role="+std::to_string(role)+
             " function="+name.get()+" grid="+std::to_string(node.grid_x)+":"+std::to_string(node.grid_y)+":"+std::to_string(node.grid_z)+
             " block="+std::to_string(node.block_x)+":"+std::to_string(node.block_y)+":"+std::to_string(node.block_z)+
             " dynamic_shared="+std::to_string(node.dynamic_shared_memory_bytes)+
             " local="+std::to_string(node.local_memory_bytes_per_thread)).c_str());
     }
-    require(std::set<std::uintptr_t>(functions.begin(),functions.end()).size()==4,"Indexer native roles alias one function");return functions;
+    require(std::set<std::uintptr_t>(functions.begin(),functions.end()).size()==names.size(),"Indexer native roles alias one function");return functions;
 }
 
 /**
@@ -320,7 +334,9 @@ std::array<std::uintptr_t,4> inspectSelectorForwarding(const IGPUGraphCapture& g
  * Replays cross8195/8196 and mixed/empty/short/reset contexts under the same
  * retained native functions; no semantic Decode phase is inferred from M.
  */
-void proveStageSelectorForwarding(DeviceId device)
+void proveStageSelectorForwarding(DeviceId device,
+    QwenSparseQueryDemand demand=QwenSparseQueryDemand::AllLive,
+    QwenSparseScalar representation=QwenSparseScalar::FP32)
 {
     auto* backend=getBackendFor(device);if(!backend || backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested backend unavailable";
     if(!hasCPUBackend())initCPUBackend(-1);
@@ -330,7 +346,7 @@ void proveStageSelectorForwarding(DeviceId device)
         constexpr int tokens=8320,blocks=tokens/4,positions=tokens+17;
         constexpr std::array policies{QwenSparsePoolSelection::Installed,QwenSparsePoolSelection::Bounded256_512,
             QwenSparsePoolSelection::Bounded512_512,QwenSparsePoolSelection::Bounded1024_1024};
-        for(int rows:{1,16,33}){
+        for(int rows:{1,16,17,33}){
             SCOPED_TRACE(rows);
             llaminar2::test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(ArenaConfig{.factory=&factory});
             const auto declare=[&](BufferId id,int n,int width,const char* type){require(arena.registerBuffer(id,n,width,type,device),"Selector arena role admission failed");};
@@ -356,12 +372,12 @@ void proveStageSelectorForwarding(DeviceId device)
             for(TensorBase* value:std::vector<TensorBase*>{&query,&raw,&prior,&pools,&prepared,&scores,&selected,&counts,&replay,&gain,&cosine,&sine}){
                 TransferEngine::prepareDeviceInput(value,device,storage.stream);TransferEngine::requireDeviceInput(value,device,storage.stream);}
             struct Result{std::vector<float> pools,prepared,scores;std::vector<int> selected,counts;};
-            std::vector<Result> reference;std::set<std::uint64_t> signatures;std::set<std::uintptr_t> selectors;std::array<std::uintptr_t,3> producers{};
+            std::vector<Result> reference;std::set<std::uint64_t> signatures;std::set<std::uintptr_t> selectors;std::vector<std::uintptr_t> producers(rows<=16?2:3);
             // Replay every retained selector across pool boundaries, mixed live
             // rows and empty requests without rebuilding the graph.
             const std::array cases{std::pair{4096,rows},std::pair{4096,std::min(rows,2)},std::pair{2047,rows},
                 std::pair{8194,1},std::pair{8195,1},std::pair{8187,rows},std::pair{8195,std::min(rows,2)},
-                std::pair{0,0},std::pair{0,1},std::pair{8195,rows}};
+                std::pair{0,0},std::pair{0,1},std::pair{2050,rows},std::pair{2051,rows},std::pair{2052,rows},std::pair{8195,rows}};
             const auto expectedPolicies=policies.size();
             for(const auto policy:policies){
                 SCOPED_TRACE(static_cast<int>(policy));
@@ -369,14 +385,14 @@ void proveStageSelectorForwarding(DeviceId device)
                     Float(pools,BufferId::QFN_QSA_POOLED_KEYS),Weight(gain),Weight(gain),Weight(cosine),Weight(sine),
                     Float(prepared,BufferId::QFN_QSA_PREPARED_QUERY),Float(scores,BufferId::QFN_QSA_SCORES),
                     Int(selected,BufferId::QFN_QSA_SELECTED),Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),blocks,positions};
-                input.poolSelection=policy;input.queryDemand=QwenSparseQueryDemand::AllLive;
+                input.poolSelection=policy;input.queryDemand=demand;input.representation=representation;
                 Stage stage({.device_id=device,.rowCapacity=rows,.tokenCapacity=tokens,.replay=Int(replay,BufferId::QFN_QSA_REPLAY),.operation=input});
                 stage.setGPUStream(storage.stream);const auto signature=stage.graphCaptureVariantSignature();ASSERT_NE(signature,0u);EXPECT_TRUE(signatures.insert(signature).second);
                 storage.graph=worker.createGraphCapture(storage.stream);
                 {ScopedBackendGraphCapture capture(worker,*storage.graph,"QSA explicit selector stage forwarding");require(capture.begin(),"Selector Stage capture begin failed");
                     require(stage.execute(execution.get()),"Actual Indexer stage capture failed");capture.finish();}
-                const auto native=inspectSelectorForwarding(*storage.graph,device,rows,blocks,policy);EXPECT_TRUE(selectors.insert(native[3]).second);
-                if(policy==QwenSparsePoolSelection::Installed)std::copy_n(native.begin(),3,producers.begin());else EXPECT_TRUE(std::equal(producers.begin(),producers.end(),native.begin()));
+                const auto native=inspectSelectorForwarding(*storage.graph,device,rows,blocks,policy,demand);EXPECT_TRUE(selectors.insert(native.back()).second);
+                if(policy==QwenSparsePoolSelection::Installed)std::copy_n(native.begin(),producers.size(),producers.begin());else EXPECT_TRUE(std::equal(producers.begin(),producers.end(),native.begin()));
                 require(storage.graph->instantiate(),"Selector stage instantiate failed");
                 for(std::size_t iteration=0;iteration<cases.size();++iteration){const auto [prefix,live]=cases[iteration];SCOPED_TRACE(iteration);
                     const std::array<int,3> words{prefix,live,0};storage.upload(replay.gpu_data_ptr(),words.data(),sizeof(words));
@@ -392,14 +408,14 @@ void proveStageSelectorForwarding(DeviceId device)
                         ASSERT_EQ(result.counts[row],int(expected.size()));
                         for(int i=0;i<2051;++i)EXPECT_EQ(result.selected[row*2051+i],i<int(expected.size())?expected[std::size_t(i)]:-77);
                         for(int b=0;b<blocks;++b)if(row>=live||complete<=512||b>=complete)EXPECT_EQ(result.scores[row*blocks+b],scorePoison[row*blocks+b]);
-                        if(row>=live)for(int d=0;d<512;++d)EXPECT_EQ(result.prepared[row*512+d],preparedPoison[row*512+d]);}
+                        if(row>=live||(demand==QwenSparseQueryDemand::RankingOnly&&visible<QwenSparseFirstRankingLogicalRow+1))for(int d=0;d<512;++d)EXPECT_EQ(result.prepared[row*512+d],preparedPoison[row*512+d]);}
                     if(policy==QwenSparsePoolSelection::Installed)reference.push_back(result);else{const auto& expected=reference[iteration];
                         EXPECT_EQ(result.selected,expected.selected);EXPECT_EQ(result.counts,expected.counts);
                         EXPECT_EQ(std::memcmp(result.pools.data(),expected.pools.data(),pools.size_bytes()),0);
                         EXPECT_EQ(std::memcmp(result.prepared.data(),expected.prepared.data(),prepared.size_bytes()),0);
                         EXPECT_EQ(std::memcmp(result.scores.data(),expected.scores.data(),scores.size_bytes()),0);}
                     EXPECT_EQ(stage.graphCaptureVariantSignature(),signature);ASSERT_FALSE(::testing::Test::HasFailure());}
-                EXPECT_EQ(inspectSelectorForwarding(*storage.graph,device,rows,blocks,policy),native);storage.graph.reset();
+                EXPECT_EQ(inspectSelectorForwarding(*storage.graph,device,rows,blocks,policy,demand),native);storage.graph.reset();
             }
             EXPECT_EQ(signatures.size(),expectedPolicies);EXPECT_EQ(selectors.size(),expectedPolicies);
         }
@@ -494,7 +510,7 @@ void proveObservedIndexer(DeviceId device)
             require(node.stage->execute(context.get()),"Observed Indexer capture failed");
             capture.finish();
         }
-        ASSERT_EQ(storage.graph->nodeCount(),4u);
+        ASSERT_EQ(storage.graph->nodeCount(),3u);
         require(storage.graph->instantiate(),"Observed Indexer instantiate failed");
         std::vector<float> poolValues(pools.numel()),preparedValues(prepared.numel());
         // Twenty retained replays repeatedly cross full->short->empty without
@@ -566,4 +582,71 @@ TEST(QwenSparseDeviceStages, ROCmObservedIndexerValidation)
     proveObservedIndexer(DeviceId::rocm(0));
 }
 #endif
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Fused CUDA preparation retains dirty grouped/query-threshold replay without recapture. */
+TEST(QwenSparseDeviceStages, CUDAFusedPreparationReplay)
+{
+    for(const auto representation:{QwenSparseScalar::FP32,QwenSparseScalar::FP16,QwenSparseScalar::BF16})
+        for(const auto demand:{QwenSparseQueryDemand::AllLive,QwenSparseQueryDemand::RankingOnly})
+            proveStageSelectorForwarding(DeviceId::cuda(0),demand,representation);
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Fused HIP preparation retains dirty grouped/query-threshold replay without recapture. */
+TEST(QwenSparseDeviceStages, ROCmFusedPreparationReplay)
+{
+    for(const auto representation:{QwenSparseScalar::FP32,QwenSparseScalar::FP16,QwenSparseScalar::BF16})
+        for(const auto demand:{QwenSparseQueryDemand::AllLive,QwenSparseQueryDemand::RankingOnly})
+            proveStageSelectorForwarding(DeviceId::rocm(0),demand,representation);
+}
+#endif
+
+namespace
+{
+/** @brief Reject all newly concurrent alias classes before either backend records native work. */
+void proveFusedPreparationAliasAdmission(DeviceId device)
+{
+    auto* backend=getBackendFor(device);
+    if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested backend unavailable";
+    auto kernels=llaminar::v2::kernels::KernelFactory::createQwenSparseAttention(device);
+    require(bool(kernels),"Sparse native bundle unavailable");
+    auto& worker=GPUDeviceContextPool::instance().getContext(device);
+    worker.submitAndWait([&]{
+        const auto ptr=[](std::uintptr_t x){return reinterpret_cast<float*>(x);};
+        QwenSparseIndexer p{.replay=reinterpret_cast<const QwenSparseReplay*>(0x100000),
+            .query=ptr(0x200000),.raw_keys=ptr(0x300000),.partial_keys=ptr(0x400000),
+            .pooled_keys=ptr(0x500000),.query_norm=ptr(0x600000),.key_norm=ptr(0x600000),
+            .cosine=ptr(0x700000),.sine=ptr(0x800000),.prepared_query=ptr(0x900000),
+            .scores=ptr(0xa00000),.selected=reinterpret_cast<int*>(0xb00000),
+            .selected_count=reinterpret_cast<int*>(0xc00000),.row_capacity=16,.token_capacity=4096,
+            .block_capacity=1024,.position_capacity=4096};
+        for(int hazard=0;hazard<5;++hazard)
+        {
+            auto bad=p;
+            if(hazard==0)bad.pooled_keys=const_cast<float*>(p.query)+1;
+            if(hazard==1)bad.prepared_query=const_cast<float*>(p.raw_keys)+1;
+            if(hazard==2)bad.prepared_query=p.pooled_keys;
+            if(hazard==3)bad.pooled_keys=const_cast<float*>(p.query_norm);
+            if(hazard==4)bad.prepared_query=const_cast<float*>(p.key_norm);
+            auto graph=worker.createGraphCapture(worker.defaultStream());
+            {ScopedBackendGraphCapture capture(worker,*graph,"Fused QSA alias admission");
+                require(capture.begin(),"Alias capture begin failed");
+                EXPECT_THROW(kernels->indexer(bad,worker.defaultStream()),std::invalid_argument);
+                capture.finish();}
+            EXPECT_EQ(graph->nodeCount(),0u);
+        }
+    });
+}
+}
+#ifdef HAVE_CUDA
+/** @test Invalid CUDA cross-role spans must leave capture empty. */
+TEST(QwenSparseDeviceStages, CUDAFusedPreparationAliasAdmission)
+{ proveFusedPreparationAliasAdmission(DeviceId::cuda(0)); }
+#endif
+#ifdef HAVE_ROCM
+/** @test Invalid HIP cross-role spans must leave capture empty. */
+TEST(QwenSparseDeviceStages, ROCmFusedPreparationAliasAdmission)
+{ proveFusedPreparationAliasAdmission(DeviceId::rocm(0)); }
 #endif

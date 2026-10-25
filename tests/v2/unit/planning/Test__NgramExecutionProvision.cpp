@@ -601,14 +601,19 @@ TEST(NgramExecutionProvision, AttentionPhaseScheduleWireRoundTripRejectsUnknownA
     using Schedule=qwen4exp::QwenSparseAttentionPhaseSchedule;
     test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());const auto& profile=source.metadata().memoryProfile();
     for(const auto schedule:{Schedule::Uniform,Schedule::Prefill8Decode33}){
-        auto c=consumer(DeviceType::ROCm,ImmutableRowStoragePreference::MemoryMapped);c.attention_phase_schedule=schedule;
+        auto c = consumer(DeviceType::ROCm, ImmutableRowStoragePreference::MemoryMapped);
+        c.attention_phase_schedule = schedule;
+        c.attention_arithmetic = qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals;
         const auto q=request(profile,{c});const std::array requests{q};const auto wire=serializeImmutableRowTableAdmissionRequests(requests);
         const auto decoded=parseImmutableRowTableAdmissionRequests(wire,0,&profile);
         ASSERT_EQ(decoded.size(),1u);ASSERT_TRUE(decoded.front().execution_provision);
         EXPECT_EQ(decoded.front().execution_provision->consumers(),q.execution_provision->consumers());
         const auto& consumers=q.execution_provision->consumers();ASSERT_EQ(consumers.size(),1u);
         const auto& a=consumers.front().activation;EXPECT_EQ(a.attention_phase_schedule,schedule);
-        auto prior=wire;prior.at(4)=6;EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(prior,0,&profile),std::invalid_argument);
+        auto prior = wire;
+        prior.at(4) = 7;
+        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(prior, 0, &profile),
+                     std::invalid_argument);
         std::vector<std::uint8_t> words;
         for(const auto value:{std::uint32_t(a.local_d_ff),std::uint32_t(a.local_n_heads),std::uint32_t(a.local_n_kv_heads),std::uint32_t(a.local_vocab),
             std::uint32_t(a.replicated_dense_decode),std::uint32_t(a.routed_compute_policy),std::uint32_t(a.mtp_terminal_logits_layout),std::uint32_t(schedule)})
@@ -635,4 +640,63 @@ TEST(NgramExecutionProvision, AttentionPhaseScheduleIsPartOfConsumerAndRestoreId
     changed.front().activation.attention_phase_schedule=static_cast<Schedule>(255);
     EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,changed,
         q.execution_provision->executionPlan(),q.execution_provision->requiredBase()),std::invalid_argument);
+}
+
+/** @test Base arithmetic is a strict wire/cohort identity scalar, including values that would
+ * narrow to valid enums. */
+TEST(NgramExecutionProvision,
+     AttentionBaseArithmeticWireAndRestoreRejectUnknownAndConflictingPrograms)
+{
+    using A = qwen4exp::QwenSparseAttentionArithmetic;
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &profile = source.metadata().memoryProfile();
+    auto c = consumer(DeviceType::ROCm, ImmutableRowStoragePreference::MemoryMapped);
+    c.attention_arithmetic = A::TileFP16WithFP32Totals;
+    const auto q = request(profile, {c});
+    const std::array requests{q};
+    const auto wire = serializeImmutableRowTableAdmissionRequests(requests);
+    const auto decoded = parseImmutableRowTableAdmissionRequests(wire, 0, &profile);
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(
+        decoded.front().execution_provision->consumers().front().activation.attention_arithmetic,
+        A::TileFP16WithFP32Totals);
+    const auto &a = q.execution_provision->consumers().front().activation;
+    std::vector<std::uint8_t> words;
+    for (const auto value : {std::uint32_t(a.local_d_ff),
+                             std::uint32_t(a.local_n_heads),
+                             std::uint32_t(a.local_n_kv_heads),
+                             std::uint32_t(a.local_vocab),
+                             std::uint32_t(a.replicated_dense_decode),
+                             std::uint32_t(a.routed_compute_policy),
+                             std::uint32_t(a.mtp_terminal_logits_layout),
+                             std::uint32_t(a.attention_phase_schedule),
+                             std::uint32_t(a.attention_arithmetic)})
+        for (int shift = 0; shift < 32; shift += 8)
+            words.push_back(std::uint8_t(value >> shift));
+    const auto found = std::search(wire.begin(), wire.end(), words.begin(), words.end());
+    ASSERT_NE(found, wire.end());
+    ASSERT_EQ(std::search(found + 1, wire.end(), words.begin(), words.end()), wire.end());
+    const auto offset = std::size_t(found - wire.begin()) + words.size() - 4;
+    for (const std::uint32_t invalid : {2u, 255u, 256u, 257u, 0x7fffffffu})
+    {
+        auto bad = wire;
+        for (int byte = 0; byte < 4; ++byte)
+            bad.at(offset + byte) = std::uint8_t(invalid >> (byte * 8));
+        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(bad, 0, &profile),
+                     std::invalid_argument);
+    }
+    auto changed = q.execution_provision->consumers();
+    const auto original = changed.front();
+    changed.front().activation.attention_arithmetic = A::FixedFP32;
+    EXPECT_FALSE(changed.front() == original);
+    changed.front().activation.attention_arithmetic = static_cast<A>(255);
+    EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(
+                     profile,
+                     q.requested,
+                     q.input,
+                     changed,
+                     q.execution_provision->executionPlan(),
+                     q.execution_provision->requiredBase()),
+                 std::invalid_argument);
 }

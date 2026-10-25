@@ -9,6 +9,7 @@
  */
 
 #include "planning/ActivationMemoryEstimator.h"
+#include "kernels/gdn/GDNPreparedQK.h"
 #include "execution/mtp/GenerationRequestSeeds.h"
 #include "execution/mtp/MTPTerminalGatherGeometry.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
@@ -388,6 +389,24 @@ size_t ActivationMemoryEstimator::estimate(
                 attention_output - local_q,
                 "hybrid attention-output width delta"),
             "hybrid attention-output width delta");
+    }
+
+    // The scalar prepared program adds one arena activation, not a row-capacity
+    // multiple or per-layer state bank. Schema and BOM share this exact layout.
+    if (device.is_rocm() && gdn::ScalarPreparedQKLayout::supportsNativeGeometry(
+            profile.gdn_state_size, profile.gdn_conv_kernel_size))
+    {
+        const int key_heads = profile.gdn_group_count > 0
+            ? profile.gdn_group_count : profile.n_heads;
+        const int value_heads = profile.gdn_time_step_rank > 0
+            ? profile.gdn_time_step_rank : key_heads;
+        // The replicated-decode schema union owns full-width buffers, even
+        // when its prefill graph retains a smaller actual TP interval.
+        const int query_heads = geometry.replicated_dense_decode
+            ? profile.n_heads : geometry.local_n_heads;
+        bytes = checkedAdd(bytes, gdn::ScalarPreparedQKLayout::fromHeadPartition(
+            key_heads, value_heads, profile.gdn_state_size,
+            query_heads, profile.n_heads).bytes, "scalar GDN prepared Q/K activation");
     }
 
     /* gdn_qkv and gdn_recurrence_in are distinct simultaneous owners. */

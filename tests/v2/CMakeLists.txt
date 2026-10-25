@@ -971,6 +971,13 @@ foreach(V2_QFN_BACKEND IN ITEMS CUDA ROCm)
             integration/kernels/${V2_QFN_BACKEND_DIR}/Test__${V2_QFN_BACKEND}QwenSparseAttention.cpp)
         target_link_libraries(v2_test_${V2_QFN_BACKEND_DIR}_qwen_sparse_attention
             PRIVATE llaminar2_core GTest::gtest_main)
+        # The same captured production fixture owns opt-in Release measurements;
+        # rebuilding its core and caller together preserves native argument ABI.
+        add_executable(v2_perf_${V2_QFN_BACKEND_DIR}_qwen_sparse_attention
+            integration/kernels/${V2_QFN_BACKEND_DIR}/Test__${V2_QFN_BACKEND}QwenSparseAttention.cpp)
+        target_link_libraries(v2_perf_${V2_QFN_BACKEND_DIR}_qwen_sparse_attention
+            PRIVATE llaminar2_core GTest::gtest_main ${CMAKE_DL_LIBS})
+        v2_test_device_scope(v2_perf_${V2_QFN_BACKEND_DIR}_qwen_sparse_attention DeclaredBackends)
         add_v2_test(V2_Integration_${V2_QFN_BACKEND}_QwenSparseAttention
             COMMAND $<TARGET_FILE:v2_test_${V2_QFN_BACKEND_DIR}_qwen_sparse_attention>
                 --gtest_filter=${V2_QFN_BACKEND}QwenSparseAttention.*
@@ -5566,7 +5573,7 @@ add_v2_test(V2_Integration_DeviceRequestRowRanges
     MPI_PROCS 1 NO_MODELS)
 add_v2_test(V2_Integration_GDNMergedInputMetadata
     COMMAND $<TARGET_FILE:v2_test_device_request_row_ranges>
-        --gtest_filter=DeviceRequestRowRanges.MergedSourceOutputIntervalsPreserveOnlyStateAlias:DeviceRequestRowRanges.MergedSourceOutputRejectsUnrepresentableRanges:DeviceRequestRowRanges.PlanarRecurrenceLayoutsProtectEveryNativeSpan:DeviceRequestRowRanges.MergedRecurrenceLayoutsProtectCompactSourcesAndState:DeviceRequestRowRanges.RecurrenceStateExtentsUseWideRequestOffsets
+        --gtest_filter=DeviceRequestRowRanges.MergedSourceOutputIntervalsPreserveOnlyStateAlias:DeviceRequestRowRanges.MergedSourceOutputRejectsUnrepresentableRanges:DeviceRequestRowRanges.PlanarRecurrenceLayoutsProtectEveryNativeSpan:DeviceRequestRowRanges.MergedRecurrenceLayoutsProtectCompactSourcesAndState:DeviceRequestRowRanges.RecurrenceStateExtentsUseWideRequestOffsets:DeviceRequestRowRanges.ScalarPreparedQKCapacityUsesOriginalProjectionWidths:DeviceRequestRowRanges.ScalarPreparedQKStorageProtectsRawStateAndSnapshots
     LABELS "V2;Integration;ProductionTestPreflight;GDN;GraphCapture;Ownership;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS)
 target_include_directories(v2_test_moe_grouped_source_rows PRIVATE ${CMAKE_SOURCE_DIR})
@@ -13748,6 +13755,11 @@ add_v2_test(V2_Unit_MTPGraphConstruction
     LABELS "V2;Unit;MTP;Graph;PrefixCache"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_GDNPreparedQKGraphBinding
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+        --gtest_filter=Test__MTPGraphConstruction.GDNPreparedQKGraphBindingIsExplicitAndCaptureStable
+    LABELS "V2;Integration;ProductionTestPreflight;GDN;GraphCapture;DeviceFree;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MTPNativeVocabularyGraphPublication
     COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
         --gtest_filter=Test__MTPGraphConstruction.NativeLocalShardedHeadPublishesCompleteVerifierLogits
@@ -19194,6 +19206,20 @@ if(HAVE_ROCM)
             --gtest_filter=Test__ROCmGDNPaddedRealLength.ValueMajorProductionCompleteBoundaryBytes
             --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;StateLayout;ShortConv;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    add_v2_test(V2_Integration_ROCmGDNPreparedQKCompleteBoundary
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.PreparedQKProductionCompleteBoundaryBytes:Test__ROCmGDNPaddedRealLength.PreparedQKInvalidBindingsRecordNoNativeWork
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;ShortConv;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    add_v2_test(V2_Integration_ROCmGDNPreparedQKOwners
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.CapturedPreparedQKOwnersRestoreAndResetByteExact
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;ShortConv;GraphCapture;ByteExact;Ownership;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
     add_v2_test(V2_Integration_ROCmGDNValueMajorGrouped
@@ -25664,6 +25690,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_GDNStateLayoutPayloadIdentity
     V2_Integration_GDNStateLayoutCliqueIdentity
     V2_Integration_GDNMergedInputMetadata
+    V2_Integration_GDNPreparedQKGraphBinding
     V2_Integration_GDNRecurrenceStatePolicy
     ${V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS}
     ${V2_GDN_ADDITIVE_EPSILON_CPU_PREFLIGHT_TESTS}
@@ -26030,6 +26057,8 @@ if(HAVE_ROCM)
     V2_Integration_ROCmGDNMergedInPlaceHistory
     V2_Integration_ROCmGDNValueMajorBindings
     V2_Integration_ROCmGDNValueMajorCompleteBoundary
+    V2_Integration_ROCmGDNPreparedQKCompleteBoundary
+    V2_Integration_ROCmGDNPreparedQKOwners
     V2_Integration_ROCmGDNValueMajorGrouped
     V2_Integration_ROCmGDNValueMajorLongPrefill
     V2_Integration_GDNAdditiveEpsilon_ROCm
@@ -30255,6 +30284,36 @@ add_v2_test(V2_Integration_QwenSparseSelectorPolicyCaptureIdentity
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseSelectorPolicyCaptureIdentity)
 
+# Installed attention defaults resolve before BOM; these interfaces never initialize devices.
+add_v2_test(V2_Integration_QwenSparseDefaultSetupPolicy
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseAttentionStage.InstalledDefaultSetupResolvesBackendAndExplicitChoices:QwenSparseAttentionStage.AdmittedDefaultProjectionRejectsMissingDuplicateAndConflictingOwners
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseDefaultSetupPolicy)
+add_v2_test(V2_Integration_QwenSparseDefaultSetupAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=RankMemoryPlanInputs.AttentionPhaseScheduleSnapshotSurvivesDebugReloadAndAdapterCopies:RankMemoryPlanInputs.AdmittedAttentionDefaultsKeepMixedParticipantsAndColdControls
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseDefaultSetupAdmission)
+add_v2_test(V2_Integration_QwenSparseDefaultSetupGraph
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+        --gtest_filter=Qwen4ExpGraphConfig.AttentionBasePrefixIdentitySurvivesSetupReload:Qwen4ExpGraphConfig.AttentionDefaultGraphBindsOnlyItsAdmittedParticipant
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseDefaultSetupGraph)
+add_v2_test(V2_Integration_QwenSparseDefaultSetupWire
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=NgramExecutionProvision.AttentionBaseArithmeticWireAndRestoreRejectUnknownAndConflictingPrograms:NgramExecutionProvision.AttentionPhaseScheduleWireRoundTripRejectsUnknownAndOldVersion:NgramExecutionProvision.AttentionPhaseScheduleIsPartOfConsumerAndRestoreIdentity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseDefaultSetupWire)
+
 # Typed selected-attention arithmetic and capture identity require no device startup.
 add_v2_test(V2_Integration_QwenSparseAttentionArithmeticPolicy
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
@@ -32464,6 +32523,83 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;DeviceResident;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_MoERebalanceCommandBytes)
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY)
+    # Focused fused QSA preparation span/grid/replay regressions, no new native owner.
+    add_v2_test(V2_Integration_QwenSparseFusedPreparationContract
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=QwenSparseAttention.FusedPreparationGridAndCrossRoleAliases
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;QSA;Ownership;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseFusedPreparationContract)
+    if(HAVE_CUDA)
+        add_v2_test(V2_Integration_CUDA_QwenSparseFusedPreparation
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=QwenSparseDeviceStages.CUDAFusedPreparationReplay:QwenSparseDeviceStages.CUDAFusedPreparationAliasAdmission
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;Qwen4Exp;QSA;GraphCapture;Ownership;Regression"
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120 RESOURCE_LOCK cuda_gpu_0)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_QwenSparseFusedPreparation)
+    endif()
+    if(HAVE_ROCM)
+        add_v2_test(V2_Integration_ROCm_QwenSparseFusedPreparation
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=QwenSparseDeviceStages.ROCmFusedPreparationReplay:QwenSparseDeviceStages.ROCmFusedPreparationAliasAdmission
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;QSA;GraphCapture;Ownership;Regression"
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_QwenSparseFusedPreparation)
+    endif()
+
+endif()
+
+
+if(NOT V2_PERF_TESTS_ONLY)
+    # Device-free proof of the prepared activation's canonical unequal-TP BOM.
+    add_v2_test(V2_Integration_GDNPreparedQKUnevenCapacity
+        COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
+            --gtest_filter=Test__ActivationMemoryEstimator.PreparedQKCapacityMatchesCanonicalUnevenHeadOwnership
+        LABELS "V2;Integration;ProductionTestPreflight;GDN;Memory;LocalTP;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GDNPreparedQKUnevenCapacity)
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_GDNPreparedQKInheritedSchema
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+            --gtest_filter=Qwen4ExpBufferLayout.PreparedQKDenseSchemaMatchesArenaAndBOM:Qwen4ExpBufferLayout.PreparedQKMoESchemaMatchesArenaAndBOM:Qwen4ExpBufferLayout.PreparedQKFlashNextSchemaMatchesArenaAndBOM:Qwen4ExpBufferLayout.PreparedQKSchemaKeepsGlobalPPInterval:Qwen4ExpBufferLayout.PublishedFlashNextRejectsForeignPreparedWidths
+        LABELS "V2;Integration;ProductionTestPreflight;GDN;GraphSchema;Memory;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GDNPreparedQKInheritedSchema)
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY)
+    # Actual gated-normalization publication remains inside the prepared GEMM owner.
+    # These narrow aliases complement the original all-format/grouped/backend suites.
+    add_v2_test(V2_Integration_GDNNormSingleQ8Metadata
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+            --gtest_filter=Qwen4ExpGDNOutputStage.GatedNormSingleQ8GeometryAndExplicitUnsupportedAdmission
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GDN;GEMM;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Integration_GDNNormSingleQ8Snapshots
+        COMMAND $<TARGET_FILE:v2_test_snapshot_capture>
+            --gtest_filter=Test__SnapshotCapture_KeyConversion.GDNCompositeNamedOutputsPreserveNormAndProjection
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Snapshots;GDN;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_GDNNormSingleQ8Metadata V2_Integration_GDNNormSingleQ8Snapshots)
+    if(HAVE_ROCM)
+        add_v2_test(V2_Integration_ROCm_GDNNormSingleQ8Production
+            COMMAND $<TARGET_FILE:v2_perf_native_vnni_throughput>
+                --gtest_filter=NativeVNNIPerfTest.GatedNormSingleQ8ProductionOwnerAndAllFormatBytes
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;GEMM;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_PERF_STATS_TABLE=1;LLAMINAR_PERF_STATS_FILTER=gdn_output.normalization_submission")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_GDNNormSingleQ8Production)
+    endif()
 endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)

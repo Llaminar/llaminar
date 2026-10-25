@@ -563,7 +563,7 @@ compiled difference is `LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS=serial` versus
 terminal output, MTP off with zero reserved draft capacity, the original QFN
 four-shard UD-Q4_K_XL weights, all six frozen arithmetic selectors, 512 copies
 of token 1228, 256 natural output tokens, C4096/M512, prefix caching off, and
-28 physical NUMA1 workers. The [dashboard settings](QFN_TUNING_DASHBOARD.md#measured-performance-checkpoints)
+28 physical NUMA1 workers. The [historical checkpoint settings](QFN_TUNING_HISTORY_2026-10-25.md#measured-performance-checkpoints)
 record the shared workload and previous accepted checkpoints.
 
 This qualifies the explicit build for this measured model/configuration. It
@@ -874,3 +874,102 @@ overrides are absent; the qualified ValueMajor default runs on all four cards.
 The final result supersedes the initial unconditional trial's timing rather
 than borrowing its larger percentage improvement. The **42.959 decode target**
 and complete production-preflight/image certification remain open.
+
+### Eight-worker publication198 — model-neutral, not promoted, 2026-10-25
+
+The next candidate adds eight wave64 workers for narrow grids with sufficient
+K work. With `C = ceil(N/64) * min(route_slots,32)`, eight workers are selected
+when `K >= 256` and `C <= min(120,K/2)`; the qualified four-worker and serial
+rules otherwise remain unchanged. These are captured physical extents, not
+host observations of active routes. The original source-owned K partitions,
+their FP32 arithmetic and the ascending rounded fold are unchanged. The
+512-thread leaf uses the same 16 KiB partition bank and thirteen arguments.
+
+A separate change retains the second barrier only when another original slot
+can reuse that bank. The first publication barrier remains mandatory; the
+final iteration needs no reuse barrier. An unsigned slot counter also keeps
+the final invalid-route increment representable for every admitted extent.
+Source and disassembly show the same uniform remaining-slot condition in both
+parallel programs. Serial and every other format retain their original code.
+
+The original eight-worker trial197 passes eight synthetic M1 A/B/A cells,
+24 arms and all final timed byte checks. Complete down-plus-fold measurements:
+
+| Physical N / K / route slots | Four-worker196 µs | Eight-worker197 µs |
+|---|---:|---:|
+| 640 / 640 / 10 | 16.240 | 14.615 |
+| 648 / 640 / 10 | 16.215 | 14.665 |
+| 640 / 2560 / 10 | 39.648 | 32.495 |
+| 768 / 640 / 10 | 17.200 | 15.370 |
+
+The actual model shape improves **10.006%** and the larger-K case **18.040%**.
+The unchanged Four/Serial regions remain within 0.27% of their controls.
+The following independently bracketed198 screen isolates terminal-barrier
+elision: N640/K640 improves **14.615 to 14.445 µs (1.163%)**, while N648/K640
+improves **14.670 to 14.495 µs**. All 24 arms pass. These two comparisons are
+separate measurements; their percentages are not a measured model speedup.
+
+A six-cell, 18-arm extension covers K224/K256, the 120/130-CTA boundary,
+tiny N and a synthetic sixteen-route region. All outputs and lifecycle checks
+pass. N16/K256 improves **8.520 to 7.725 µs**; the largest measured cost is
+**1.684%** at N640/K256. The simple selector is retained without fitting that
+small difference. Each of the three screens has a complete quiet-window pass;
+all 66 arms retain their raw samples. The fixture's gate/up tournament executes
+before the separately timed down-plus-fold interval and is excluded from these
+comparisons. These are component economics, not grouped or model throughput.
+
+The final eight-worker leaf uses 43 VGPRs (44 allocated), 83 SGPRs, 16 KiB LDS
+and no private storage or spills. All 556 other programs remain byte-identical
+to197; only the two parallel targets change for the conditional barrier.
+Final source cleanup retains all 558 compiled bodies and resources exactly.
+These compiler allocations do not establish achieved occupancy.
+
+The first full Unit/affected gate records 795/796 passes. Its sole failure is
+an independently authored test expectation: shared M33/M65 at N256/K256 has
+128 CTAs and correctly selects Four, while the test expected Eight for every
+shared batch. The repaired test records geometry inside the device worker and
+checks the 30/31-slot boundary explicitly. Production code is unchanged by that
+repair. The fresh [796-entry gate](../../../../parity-results/qwen-flash-next/expert-down198-final-r2-gate-r1/result.json)
+passes all Unit and affected CUDA/ROCm registrations. No required case is
+skipped; the same 95 source-bound legacy Unit omissions remain explicit.
+The canonical model panel passes every required group and all 26 final-logit
+files / 185 rows are byte-identical to shape-selected196 and the accepted
+earlier controls, including reset replay. The isolated profiling and fresh
+matched model throughput evidence follows below.
+
+Three isolated rocprof launches select occurrence273, the first timed down
+dispatch. Each trace authenticates all 1,264 target dispatches: 80 eager checks
+and 37 retained complete graphs containing 32 down and 32 fold nodes each.
+The actual loaded 3,200-byte target body matches the final compiler output.
+The [Wavefronts join](../../../../parity-results/qwen-flash-next/expert-down198-final-profile-wavefronts-join-r3.json)
+reports exactly **800 wavefronts**, matching 100 blocks of 512 threads.
+Separate [VALUInsts](../../../../parity-results/qwen-flash-next/expert-down198-final-profile-valuinsts-join-r3.json)
+and [FetchSize](../../../../parity-results/qwen-flash-next/expert-down198-final-profile-fetchsize-join-r3.json)
+observations report **394.375** and **3,008.125 KB**, respectively, under their
+recorded SDK definitions. Achieved occupancy is unavailable; these observations
+do not establish a wall-time bandwidth or latency attribution. Profiled event
+times are excluded from every canonical timing comparison.
+
+The fresh matched Release A/B/A completes with the same 512-token prompt,
+256-token trajectory, warmup and three measured repetitions per arm as196.
+Its [leading control](../../../../parity-results/qwen-flash-next/expert-down198-final-r2-model-throughput-a1-r1/result.json),
+[candidate](../../../../parity-results/qwen-flash-next/expert-down198-final-r2-model-throughput-b1-r1/result.json)
+and [trailing control](../../../../parity-results/qwen-flash-next/expert-down198-final-r2-model-throughput-a2-r1/result.json)
+retain every sample:
+
+| Policy | Prefill median tok/s | Decode median tok/s | Decode sample range |
+|---|---:|---:|---:|
+| Frozen196, six bracketed samples | 820.344 | 42.122 | 42.030–42.393 |
+| Candidate198, three samples | 820.302 | 42.138 | 42.079–42.148 |
+
+All nine natural token sequences match. The
+[quiet-window receipt](../../../../parity-results/qwen-flash-next/expert-down198-final-r2-model-host-window-r1/result.json)
+passes 497 observations over 507.241 seconds, including clean process retirement.
+The **0.039% decode gain is inside measured variation**; prefill changes by
+−0.005%. Faster synthetic down-plus-fold events do not establish a useful
+full-model gain. The candidate source and tests are archived outside tracked
+production and the six changed implementation/test files are restored to196.
+Checkpoint196 remains the installed, qualified policy and its recorded 42.229
+decode tok/s remains the dashboard checkpoint. Both this repeat and that
+checkpoint still use explicit FP16 attention Prefill8/Decode33; default policy
+promotion and the 42.959 decode target remain open.

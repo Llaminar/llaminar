@@ -884,3 +884,108 @@ TEST(QwenSparseAttentionStage, Phase33CaptureExtentAndColdAdmission)
     cache.values=ActivationPrecision::BF16;EXPECT_THROW((Stage(p)),std::invalid_argument);
 }
 #endif
+
+/** @test Omitted intent resolves by actual backend/geometry, with explicit choices preserved. */
+TEST(QwenSparseAttentionStage, InstalledDefaultSetupResolvesBackendAndExplicitChoices)
+{
+    using namespace qwen4exp;
+    using A = QwenSparseAttentionArithmetic;
+    using S = QwenSparseAttentionPhaseSchedule;
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto storage :
+             {TensorType::FP16, TensorType::FP32, TensorType::Q16_1, TensorType::TQ4})
+            for (const int requests : {1, 2})
+            {
+                const QwenSparseAttentionSetupGeometry geometry{
+                    backend, storage, storage, requests, 256, 64};
+                const bool eligible =
+                    backend == DeviceType::ROCm && storage == TensorType::FP16 && requests == 1;
+                const auto actual = resolveQwenSparseAttentionSetup({}, geometry);
+                EXPECT_EQ(actual.arithmetic, eligible ? A::TileFP16WithFP32Totals : A::FixedFP32);
+                EXPECT_EQ(actual.schedule, eligible ? S::Prefill8Decode33 : S::Uniform);
+                const auto control =
+                    resolveQwenSparseAttentionSetup({A::FixedFP32, std::nullopt}, geometry);
+                EXPECT_EQ(control.arithmetic, A::FixedFP32);
+                EXPECT_EQ(control.schedule, S::Uniform);
+            }
+    const QwenSparseAttentionSetupGeometry native{
+        DeviceType::ROCm, TensorType::FP16, TensorType::FP16, 1, 256, 64};
+    EXPECT_EQ(
+        resolveQwenSparseAttentionSetup({A::TileFP16WithFP32Totals, std::nullopt}, native).schedule,
+        S::Prefill8Decode33);
+    EXPECT_EQ(resolveQwenSparseAttentionSetup({std::nullopt, S::Uniform}, native).schedule,
+              S::Uniform);
+    EXPECT_EQ(resolveQwenSparseAttentionSetup({std::nullopt, S::Uniform}, native).arithmetic,
+              A::TileFP16WithFP32Totals);
+    EXPECT_EQ(
+        resolveQwenSparseAttentionSetup({std::nullopt, S::Prefill8Decode33}, native).arithmetic,
+        A::TileFP16WithFP32Totals);
+    auto multi = native;
+    multi.request_capacity = 2;
+    EXPECT_EQ(
+        resolveQwenSparseAttentionSetup({A::TileFP16WithFP32Totals, S::Uniform}, multi).schedule,
+        S::Uniform);
+    EXPECT_THROW(resolveQwenSparseAttentionSetup({A::FixedFP32, S::Prefill8Decode33}, native),
+                 std::invalid_argument);
+    EXPECT_THROW(resolveQwenSparseAttentionSetup({std::nullopt, S::Prefill8Decode33}, multi),
+                 std::invalid_argument);
+    for (const auto invalid : {A::TileFP16WithFP32Totals33, static_cast<A>(255)})
+        EXPECT_THROW(resolveQwenSparseAttentionSetup({invalid, std::nullopt}, native),
+                     std::invalid_argument);
+    EXPECT_THROW(resolveQwenSparseAttentionSetup({std::nullopt, static_cast<S>(255)}, native),
+                 std::invalid_argument);
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA})
+    {
+        auto other = native;
+        other.backend = backend;
+        EXPECT_THROW(
+            resolveQwenSparseAttentionSetup({A::TileFP16WithFP32Totals, std::nullopt}, other),
+            std::invalid_argument);
+    }
+    for (const int bad : {0, -1})
+    {
+        auto malformed = native;
+        malformed.request_capacity = bad;
+        EXPECT_THROW(resolveQwenSparseAttentionSetup({}, malformed), std::invalid_argument);
+    }
+    auto other = native;
+    other.rotary_dimension = 128;
+    EXPECT_EQ(resolveQwenSparseAttentionSetup({}, other).arithmetic, A::FixedFP32);
+    EXPECT_THROW(resolveQwenSparseAttentionSetup({A::TileFP16WithFP32Totals, std::nullopt}, other),
+                 std::invalid_argument);
+}
+/** @test Factories can only borrow a unique actual admitted participant, without default
+ * resolution. */
+TEST(QwenSparseAttentionStage, AdmittedDefaultProjectionRejectsMissingDuplicateAndConflictingOwners)
+{
+    using namespace qwen4exp;
+    using A = QwenSparseAttentionArithmetic;
+    using S = QwenSparseAttentionPhaseSchedule;
+    const QwenSparseAttentionResolvedPolicy half{A::TileFP16WithFP32Totals, S::Prefill8Decode33};
+    const auto projection = sealQwenSparseAttentionParticipants(
+        {{DeviceId::cpu(), {}, 0, 0}, {DeviceId::rocm(3), half, 0, 0}});
+    EXPECT_EQ(admittedQwenSparseAttentionPolicy(projection, DeviceId::rocm(3), 0, 0), half);
+    EXPECT_EQ(admittedQwenSparseAttentionPolicy(projection, DeviceId::cpu(), 0, 0).arithmetic,
+              A::FixedFP32);
+    EXPECT_THROW(admittedQwenSparseAttentionPolicy({}, DeviceId::rocm(3), 0, 0),
+                 std::invalid_argument);
+    EXPECT_THROW(admittedQwenSparseAttentionPolicy(projection, DeviceId::rocm(0), 0, 0),
+                 std::invalid_argument);
+    EXPECT_THROW(sealQwenSparseAttentionParticipants({}), std::invalid_argument);
+    EXPECT_THROW(sealQwenSparseAttentionParticipants(
+                     {{DeviceId::rocm(3), half, 0, 0}, {DeviceId::rocm(3), half, 0, 0}}),
+                 std::invalid_argument);
+    EXPECT_THROW(sealQwenSparseAttentionParticipants({{DeviceId::cuda(0), half, 0, 0}}),
+                 std::invalid_argument);
+    EXPECT_THROW(sealQwenSparseAttentionParticipants(
+                     {{DeviceId::rocm(0), {A::FixedFP32, S::Prefill8Decode33}, 0, 0}}),
+                 std::invalid_argument);
+    const auto disjoint = sealQwenSparseAttentionParticipants(
+        {{DeviceId::rocm(3), half, 0, 3}, {DeviceId::rocm(3), half, 4, 7}});
+    EXPECT_EQ(admittedQwenSparseAttentionPolicy(disjoint, DeviceId::rocm(3), 4, 7), half);
+    EXPECT_THROW(admittedQwenSparseAttentionPolicy(disjoint, DeviceId::rocm(3), 0, 7),
+                 std::invalid_argument);
+    EXPECT_THROW(sealQwenSparseAttentionParticipants(
+                     {{DeviceId::rocm(3), half, 0, 3}, {DeviceId::rocm(3), half, 3, 7}}),
+                 std::invalid_argument);
+}

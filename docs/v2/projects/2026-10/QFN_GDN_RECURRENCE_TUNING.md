@@ -1,5 +1,209 @@
 # QFN GDN recurrence tuning
 
+## Output normalization and SingleQ8 preparation, 2026-10-25
+
+The next candidate combines the original gated normalization and scalar Q8
+activation preparation inside the prepared output-projection owner. It retains
+the complete normalized FP32 output, original weight planes, workspace banks,
+projection producer/reducer, reduction order and diagnostic observations.
+Selection is limited to ordinary ROCm M1 with complete 128-wide heads and
+SingleQ8 operands. Other complete programs retain their existing implementations.
+
+The coherent Release and Integration builds pass. The four registered focused
+regressions pass in **19.688 seconds**: metadata admission, named snapshots,
+benchmark arithmetic observations and actual retained production capture.
+The native sweep proves **193 cases / 1,546 replays**, including every admitted
+quantized consumer format, dirty storage, guards, immutable sources, reset,
+alias rejection and failed-device recovery. All observed bytes match the
+original complete operation; capture contains exactly one fewer preparation
+kernel. The setup submission counter advances during recording, not replay.
+Evidence: `gdn-norm-single-q8-{release,integration}-build-r3` and
+`gdn-norm-single-q8-focused-gate-r2` under the local QFN result directory.
+
+The gfx906 linked-object audit proves all **51 existing GDN kernel bodies and
+resource records unchanged**, plus one new kernel using **16 VGPRs, 26 SGPRs,
+16 bytes LDS and zero private storage or spills**. These are static resources,
+not achieved occupancy. The linked GDN code object is 487,944 bytes.
+
+The first fixture run correctly failed before arithmetic because setup producer
+events had not been joined before capture. Explicit TransferEngine joins in
+test setup repair that omission; production coherence checks remain intact.
+Earlier failed build/test receipts are preserved. **Real-model accuracy,
+unprofiled economics and separate profiling** are separate qualification steps.
+
+The real TP4 model panel now passes in **96.902 seconds** with the fused
+normalization submission proved on every participant. All **185 final-logit
+rows / 26 files are byte-identical** to each of the five accepted references.
+Short-panel mean KL remains **0.025614 prefill / 0.028276 decode**; heldout-short
+means remain **0.014911 / 0.004553**. Histories, scoring and thresholds are
+unchanged. Evidence: `gdn-norm-single-q8-model-fp16-r1`, including its five
+exact-row comparison reports. These submission counters are not replay counts.
+
+Release complete-operation events pass at M1/N2560/K1536, Q8_0, with five
+warmup pairs and twelve alternating measured pairs. Each arm restores its input
+before one retained graph replay and includes the same terminal publications.
+Median time falls from **39.44 to 36.72 µs (6.897%)**; every paired sample is
+faster. Actual final timed banks, guards and immutable sources remain exact.
+This measures the full public operation, not isolated kernel service time or
+model throughput. Evidence: `gdn-norm-single-q8-production-events-r1`; the
+collector's earlier Markdown source-pin admission rejection launched no native
+work and is retained separately.
+
+Nine separate singleton profiler launches now pass their strict graph, dispatch,
+counter, resource, loader and retirement joins. Each profiles the seventh
+execution of exactly one role in the unchanged complete-operation fixture:
+
+| Preparation role | Wavefronts | VALUInsts per wave | FetchSize (SDK kilobytes) |
+|---|---:|---:|---:|
+| Original normalization | 24 | 139.00 | 14.5625 |
+| Original Q8 preparation | 48 | 94.25 | 6.0625 |
+| Fused normalization/Q8 | 24 | 200.75 | 15.1250 |
+
+The SDK defines `VALUInsts` as summed vector instructions divided by waves, so
+the two original averages cannot simply be added. Weighting by the observed
+waves gives 7,860 versus 4,818 wave instructions, **38.70% less preparation
+work**. Preparation uses 24 rather than 72 waves; reported fetched traffic is
+15.125 versus 20.625 SDK kilobytes. The shared projection is unchanged. These
+are exact-shape diagnostic observations, not achieved occupancy or model
+throughput. Every join authenticates all 38 retained graph submissions and 133
+graph kernel dispatches, including both byte-check pairs and timed alternation.
+The successor join corrects its assumption about C++ equality-operand evaluation
+order to match the frozen binary; the earlier failed join is retained.
+Evidence: `gdn-norm-single-q8-profile-{norm,quantizer,fused}-{wavefronts,valu,fetch}-r1`
+and their adjudications; the first fused Wavefronts adjudication resides in
+`/tmp/qfn-gdn-norm-single-q8-profile-join-r2-private/`.
+
+The matched Release A/B/A now passes in **507.089 seconds**, with no external
+work overlap in 493 passive observations. Every arm retains the original MPI
+self-bootstrap, exact runtime closure, 28 physical NUMA1 workers, RAM ngrams,
+vocabulary sharding, context 4,096, M512, 512 prompt tokens and 256 natural
+outputs (255 after prefill), MTP/prefix off, greedy seed42 and warm1/measure3.
+All nine generated sequences match exactly. Six control samples have median
+**821.056620 prefill / 42.280710 decode tok/s**; three candidate samples have
+median **820.172503 / 42.335471**. Changes are **-0.1077% / +0.1295%** and the
+decode sample ranges overlap. This is **neutral model performance** despite the
+complete-operation improvement. Candidate prefill samples are 820.848877,
+809.536850 and 820.172503; retain that variation rather than reporting only
+the median. This comparison includes prepared-QK/QSA/default changes as well
+as normalization fusion; it does not isolate the fusion's model contribution.
+Evidence: `gdn-norm-single-q8-model-throughput-{a1,b1,a2}-r1`,
+`gdn-norm-single-q8-model-host-window-r1` and
+`/tmp/qfn-gdn-norm-single-q8-model-benchmark-r1/summary.json`.
+
+The benchmark observer now authenticates the controlled bootstrap PID, its
+same-epoch exec into the pinned MPI launcher, and one actual rank0/world1
+compute worker. Sixteen pure regressions cover that lifecycle; the transient
+pre-exec application observation is optional. All real arms pass the worker,
+selector, retirement and driver checks. The old direct-PID failure remains
+preserved. The fresh coherent current-source gate now passes **828/828
+Unit/affected registrations** in **311.138 seconds**, rc0. Its native norm
+proof retains 193 cases / 1,546 replays; all 95 historical Unit omissions remain
+visible and no new omission is admitted. Evidence:
+`gdn-norm-single-q8-unit-affected-{integration-build,gate}-r1`.
+This slice does not certify full production preflight or promote a throughput score.
+
+The retained earlier prepared-QK/QSA/default bundle also completes its corrected
+MPI-observer A/B/A. Candidate medians are **820.973634 prefill / 42.464423 decode**
+versus frozen196 controls **820.637629 / 42.243967 tok/s**
+(**+0.04094% / +0.52186%**), with all nine trajectories identical. This is its own
+historical runtime comparison, not current-checkout certification. It does not
+make the separate norm-inclusive run a paired measurement of the norm increment;
+no subtraction or cross-trial speed conclusion is justified. Original controls
+and the failed first observer run remain preserved. See the
+[historical bundle record](QFN_QSA_PREPARATION_FUSION.md#historical-bundle-matched-throughput).
+
+The next user-requested experiment is **online rescale exponential elision** in
+attention, limited to first-tile and exact equal/winning-maximum scale cases.
+Retain genuine rescale exponentials and the original FP32 arithmetic/reduction
+order. Exact scalar/grouped/tail bytes, signed zero and nonfinite behavior must
+pass before economics; compiled ISA must prove the intended redundant exponentials
+are removed without spills. This is a pending candidate, not an installed policy
+or measured gain.
+
+## Prepared Q/K component screen, 2026-10-25
+
+The current candidate moves original Q/K normalization and query scaling into
+the existing four-tap convolution producer. Scalar ROCm ValueMajor recurrence
+then consumes those exact FP32 values without repeating normalization. Raw
+convolution output, live recurrent state, convolution history and accepted-state
+snapshots keep their existing owners and formats. A single typed arena bank
+adds 4 KiB for the TP4 shape; schema and admission use the same capacity helper.
+CPU/CUDA, grouped rows, multi-request and KeyMajor retain their original programs.
+This is an unpromoted candidate, not a new production checkpoint.
+
+The combined prepared-Q/K/QSA/default-policy model panel now passes with all
+185 final-logit rows byte-identical to the accepted references. Real schema
+inheritance and global PP indexing defects found during qualification are
+fixed, with original-code negative controls and explicit preflight regressions.
+See the [qualification record](QFN_QSA_PREPARATION_FUSION.md#selected-production-candidate)
+for the retained tooling timeouts, exact retry, process-observer correction and
+scope. Its retained historical runtime now passes the matched A/B/A documented
+[below](QFN_QSA_PREPARATION_FUSION.md#historical-bundle-matched-throughput);
+that result remains separate from the norm-inclusive trial above.
+
+The coherent Release perf-target build passes in 204.459 seconds. All 45 prior
+gfx906 GDN programs retain identical compiled bodies and resources. The six
+new programs have no private storage or register spills. At DK128 the producer
+uses 35 VGPRs (36 allocated), 16 bytes of LDS and 128 threads; the prepared
+consumer uses 42 VGPRs (44 allocated), no LDS and 512 threads, versus 54/56
+used/allocated VGPRs for the original consumer. These are compiler resources,
+not measured occupancy. The linked 481,416-byte GDN code object matches the
+compiled inventory exactly.
+
+The [native component gate](../../../../parity-results/qwen-flash-next/gdn-prepared-qk-component-r1/functional/result.json)
+passes three tests in 6.652 seconds: 84 geometries, 336 dirty-state comparisons,
+invalid bindings with zero recorded native work, and 36 actual owner
+restore/reset checks. Coverage includes DK64/128, scalar and grouped rows1–16,
+partial value columns, normalization on/off and signed head offsets. Grouped
+prepared scalar chains are diagnostic oracles only; serving retains the
+existing grouped kernel.
+
+The [matched complete-pair events](../../../../parity-results/qwen-flash-next/gdn-prepared-qk-component-r1/events/result.json)
+retain two kernels per operation, 64 operations per captured graph, five
+warmups, 12 alternating pairs and final timed-output byte checks. At TP4's
+key-head4/value-head12/DK128/DV128 shape, the original pair measures
+**10.9525 µs** (10.9225–10.9650), versus **10.5425 µs** (10.5350–10.5675)
+for prepared Q/K: **3.743% less time**. This is a synthetic component result;
+full executor/model qualification and a useful full-model gain remain unproven.
+No change to the installed checkpoint196 score is attributed to it.
+
+Sixteen separate profiler launches cover both original and prepared roles,
+with one counter per exact post-warm dispatch. All
+[joined records](../../../../parity-results/qwen-flash-next/gdn-prepared-qk-profile-summary-r2.json)
+pass the six complete-graph/twelve-dispatch census, actual loaded-code identity,
+native geometry and clean runtime/driver retirement checks:
+
+| Counter | Original convolution | Prepared convolution | Original recurrence | Prepared recurrence |
+|---|---:|---:|---:|---:|
+| Wavefronts | 40 | 40 | 384 | 384 |
+| VALU instructions per wave | 106 | 120.6 | 502 | 343 |
+| FetchSize, KiB | 90.875 | 90.875 | 778.5 | 778.5 |
+| WriteSize, KiB | 0 | 0 | 1.5 | 1.0 |
+
+The counter-derived vector instruction issues across both roles fall from
+197,008 to136,536, about30.7%; the producer's additional work is much smaller
+than the recurrence saving. Memory counters describe the observed cache/VRAM
+traffic during that dispatch, not logical tensor bytes: zero WriteSize does
+not mean the producer omitted its required stores. No achieved-occupancy or
+bandwidth measurement is inferred from these counts. Profiled durations are
+excluded from the paired-event medians above.
+
+The first offline join incorrectly compared gfx906's eight-register descriptor
+encoding granule with the SDK's sixteen-register physical SGPR allocation.
+The previously source-authenticated conversion fixes the join in a separate
+reader with eight positive/negative tests. Original collectors and native
+receipts are unchanged, and all sixteen joins use exact converted equality.
+
+A prepared-only 256-thread variant also passes the 84-geometry and dirty-owner
+checks with zero spills. Its complete pair measures **10.5401 µs**, effectively
+unchanged from the 512-thread candidate's 10.5425 µs. The smaller block doubles
+the CTA count while retaining the same wave count, so this screen supplies no
+reason to change the 512-thread layout. The first attempt exposed a fixture
+geometry expectation at DV17; correcting that expectation restored the full
+owner test, with no arithmetic change. Both attempts are retained under
+`gdn-prepared-qk-component-v3-r1` and `gdn-prepared-qk-component-v3-r2`.
+The 256-thread source is archived and the 512-thread candidate restored.
+
 ## Production layout integration190, 2026-10-24
 
 The current default-policy focused gate passes **873 registrations: all 778 Unit

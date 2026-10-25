@@ -528,7 +528,7 @@ namespace llaminar2
                 DevicePlanConfig config;
                 config.world_rank = rank_plan.rank;
                 config.device = device;
-                config.attention_phase_schedule = rank_plan.runtime.attention_phase_schedule;
+                // Concrete attention policy is resolved once after this input is fully authored.
                 config.qfn_hc_up_activation = profile.flash_next
                     ? debugEnv().gemm.qfn_hc_up_activation
                     : QuantizedActivationOperandPrecision::SingleQ8;
@@ -748,6 +748,7 @@ namespace llaminar2
                                   profile.expert_count, no_routed_experts)
                         : DeviceWeightResidency::selectedRoutedExpertsOnly(
                               profile.expert_count, no_routed_experts);
+                resolveQwenSparseAttentionDeviceProgram(profile, config, rank_plan.runtime);
                 return config;
             };
 

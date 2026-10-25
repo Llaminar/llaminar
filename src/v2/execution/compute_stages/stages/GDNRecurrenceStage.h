@@ -26,6 +26,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "GDNPreparedQKBinding.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -63,6 +64,7 @@ namespace llaminar2
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
+            GDNQKInputContract qk_contract=GDNRawQKInput{}; ///< Immutable raw or paired prepared program.
 
             // Input tensors (all FP32, already projected + conv'd + RoPE'd)
             const ITensor *Q = nullptr; ///< Query  [seq_len, n_heads * d_k]

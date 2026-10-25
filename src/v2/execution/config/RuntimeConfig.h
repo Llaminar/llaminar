@@ -2139,8 +2139,12 @@ namespace llaminar2
      */
     struct RuntimeConfig
     {
-        /// Setup snapshot copied into admission and graph allocation; never a live DebugEnv reference.
-        qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+        /// Optional startup intent resolved before participant BOMs; never a live DebugEnv
+        /// reference.
+        qwen4exp::QwenSparseAttentionSetupRequest attention_setup_request;
+        /// Immutable projection copied directly from admitted attention device inputs.
+        std::shared_ptr<const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>>
+            attention_participants;
         /// Maximum sequence length (buffer allocation sizing)
         int max_seq_len = 4096;
 
@@ -2237,8 +2241,8 @@ namespace llaminar2
          * @return Value-owned runtime policy passed unchanged to planning/graph adapters.
          * @throws std::exception For invalid authored precision, batch or table policy.
          * @details Setup is read here once; later reloads cannot mutate the copied
-         * schedule in a retained runtime/admission. Arithmetic remains independently
-         * selected and must be compatible when the actual graph is constructed.
+         * intent in a retained runtime. The actual participant resolves one concrete
+         * arithmetic/schedule pair before its BOM; factories only consume that admission.
          */
         static RuntimeConfig fromOrchestrationConfig(
             int max_seq_len,
@@ -2258,7 +2262,8 @@ namespace llaminar2
             RuntimeConfig rc;
             // Freeze once, before planning. Later DebugEnv::reload cannot change
             // the admitted value copied through participant and graph adapters.
-            rc.attention_phase_schedule = debugEnv().attention.qfn_sparse_attention_phase_schedule;
+            rc.attention_setup_request = {debugEnv().attention.qfn_sparse_attention,
+                                          debugEnv().attention.qfn_sparse_attention_phase_schedule};
             rc.max_seq_len = max_seq_len;
             rc.batch_size = resolveRuntimeBatchSizeForMTP(batch_size, mtp);
             rc.activation_precision = parseActivationPrecision(activation_precision_str);

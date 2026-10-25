@@ -14,12 +14,14 @@
 #include "kernels/FloatingActivationOperandPrecision.h"
 #include "kernels/common/Q8ResidualCorrection.h"
 #include "kernels/common/OriginalOutputSlice.h"
+#include "kernels/common/GatedRMSNormProjection.h"
 
 #include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../kernels/IPackedWeights.h"
 #include "../kernels/GDNDeviceStateBinding.h"
+#include "../kernels/gdn/GDNPreparedQK.h"
 #include "../kernels/attention/AttentionExecutionPolicy.h"
 #include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
 #include "../kernels/common/DeviceRowRange.h"
@@ -1819,6 +1821,39 @@ namespace llaminar2
          * @return Number of input features this kernel expects, or 0 if unknown
          */
         virtual int get_k() const { return 0; }
+        /**
+         * @brief Validate the exact selected composite binding without native work.
+         * @param input Original already-materialized tensors and immutable policy.
+         * @param output Original already-materialized projection destination.
+         * @param n Exact prepared local output width.
+         * @param k Exact prepared local reduction width.
+         * @param workspace Original allocated invocation workspace.
+         * @throws std::exception For unsupported or aliasing/incomplete storage.
+         * @note This cold observation never allocates, uploads, selects a device,
+         * reads a live value, initializes tables or issues a GPU operation.
+         */
+        virtual void validate_gated_rmsnorm_single_q8(GatedRMSNormProjectionInput input,
+            TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace) const
+        { (void)input;(void)output;(void)n;(void)k;(void)workspace;
+          throw std::logic_error("Selected prepared GEMM does not implement gated-norm SingleQ8 binding"); }
+
+        /**
+         * @brief Normalize/gate the retained FP32 source and consume its SingleQ8 immediately.
+         * @param input Exact original in-place FP32 values, immutable gate/gamma and policy.
+         * @param output Distinct original FP32 projection destination.
+         * @param n Exact participant-local prepared output width.
+         * @param k Exact participant-local prepared reduction width.
+         * @param workspace Original admitted GEMM scratch; no buffer ownership is transferred.
+         * @return Native successful submission on this engine's exact bound stream.
+         * @throws std::logic_error When explicitly selected on an unsupported engine.
+         * @note Only ordinary uncounted physicalM1 is admitted. Other complete
+         * programs are selected at graph construction, never after a failure.
+         */
+        virtual bool multiply_gated_rmsnorm_single_q8(GatedRMSNormProjectionInput input,
+            TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace)
+        { (void)input;(void)output;(void)n;(void)k;(void)workspace;
+          throw std::logic_error("Selected prepared GEMM does not implement gated-norm SingleQ8"); }
+
         /** @brief Declare two Q8 activation banks against the actual native quantized source.
          * @param m Physical maximum rows retained by the stage.
          * @param n Exact prepared output width.
@@ -3716,6 +3751,13 @@ namespace llaminar2
     {
     public:
         virtual ~ITensorShortConvolution() = default;
+        /**
+         * @brief Execute the explicitly bound scalar prepared-Q/K convolution.
+         * @param input Original raw operands and arena activation, with no state ownership.
+         * @return Enqueue success; unsupported selected implementations fail, never retry raw.
+         */
+        virtual bool forwardPreparedQK(const gdn::ScalarPreparedQKConvolution& input)
+        { (void)input; return false; }
 
         /// Validate a raw CUDA/HIP stream before forwarding it to the implementation.
         void setGPUStream(void *stream)
@@ -4554,6 +4596,14 @@ namespace llaminar2
             float *output, float *state,
             int seq_len, int n_heads, int d_k, int d_v,
             int chunk_size, bool use_qk_l2norm) = 0;
+
+        /**
+         * @brief Consume a sealed scalar prepared-Q/K producer on the original state owner.
+         * @param input Original merged V/gates and explicit compact prepared activation.
+         * @return Enqueue success; failure never selects a different input program.
+         */
+        virtual bool chunkForwardPreparedQK(const gdn::ScalarPreparedQKRecurrence& input)
+        { (void)input; return false; }
 
         /**
          * @brief Execute ordinary decode or prefill directly from merged QKV rows.

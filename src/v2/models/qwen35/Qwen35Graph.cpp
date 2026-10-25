@@ -14,6 +14,7 @@
  */
 
 #include "Qwen35Graph.h"
+#include "kernels/gdn/GDNPreparedQK.h"
 #include "../../config/GDNHeadAssignment.h"
 #include "Qwen35Schema.h"
 #include "../qwen4exp/Qwen4ExpProjectionWorkspace.h"
@@ -131,18 +132,32 @@ namespace llaminar2
     {
         Qwen35SchemaFactory factory;
         GraphSchema schema = factory.createSchema();
+        completeHybridSchema(schema);
+        return schema;
+    }
+
+    void Qwen35Graph::completeHybridSchema(GraphSchema &schema) const
+    {
+        if (config_.default_device.is_rocm() &&
+            gdn::ScalarPreparedQKLayout::supportsNativeGeometry(
+                config_.gdn.state_size, config_.gdn.conv_kernel_size))
+            schema.layer_buffers.push_back({"gdn_prepared_qk",{"1","gdn_prepared_qk_columns"},
+                "fp32",BufferSemantic::Scratch,"",0,"Scalar normalized/scaled Q/K activation"});
 
         // Populate layer_template_names from config_.layer_types
         if (!config_.layer_types.empty())
         {
+            if (config_.pp_layer_offset < 0 || config_.n_layers < 0 ||
+                std::size_t(config_.pp_layer_offset) > config_.layer_types.size() ||
+                std::size_t(config_.n_layers) >
+                    config_.layer_types.size() - std::size_t(config_.pp_layer_offset))
+                throw std::invalid_argument("Hybrid schema lacks its complete global layer interval");
             schema.layer_template_names.resize(config_.n_layers);
             for (int i = 0; i < config_.n_layers; ++i)
-            {
-                schema.layer_template_names[i] = config_.layer_types[i];
-            }
+                schema.layer_template_names[i] = config_.layer_types[
+                    std::size_t(config_.pp_layer_offset) + i];
         }
 
-        return schema;
     }
 
     // =========================================================================
@@ -261,6 +276,17 @@ namespace llaminar2
             static_cast<size_t>(gdn_inner);
         config.custom_formulas["gdn_qkv_dim"] =
             static_cast<size_t>(2 * key_dim + gdn_inner);
+        if (config_.default_device.is_rocm() &&
+            gdn::ScalarPreparedQKLayout::supportsNativeGeometry(
+                config_.gdn.state_size, config_.gdn.conv_kernel_size))
+        {
+            const int query_heads = config_.qkv_column_parallel &&
+                !config_.dense_tp_decode_replicated && resolver_local_n_heads > 0
+                    ? resolver_local_n_heads : config_.n_heads;
+            config.custom_formulas["gdn_prepared_qk_columns"] =
+                gdn::ScalarPreparedQKLayout::fromHeadPartition(n_k_heads_full,
+                    n_v_heads_full, d_k, query_heads, config_.n_heads).elements;
+        }
         config.custom_formulas["gdn_time_step_rank"] =
             static_cast<size_t>(n_v_heads_local);
 
@@ -295,6 +321,7 @@ namespace llaminar2
 
         // Add GDN buffer name → BufferId mappings
         config.buffer_name_to_id["gdn_qkv"] = BufferId::GDN_QKV;
+        config.buffer_name_to_id["gdn_prepared_qk"] = BufferId::GDN_PREPARED_QK;
         config.buffer_name_to_id["gdn_recurrence_in"] = BufferId::GDN_RECURRENCE_IN;
         config.buffer_name_to_id["gdn_z"] = BufferId::GDN_Z;
         config.buffer_name_to_id["gdn_alpha"] = BufferId::GDN_ALPHA;
@@ -994,7 +1021,8 @@ namespace llaminar2
     std::string Qwen35Graph::addGDNOutputProjection(ComputeGraph &graph,
         const std::string &prefix, ActivationBuffers &buffers, TensorBase *weight,
         const WeightBinding *binding, int seq_len, int batch_size, DeviceId device,
-        const int32_t *lengths, const std::string &dependency)
+        const int32_t *lengths, const std::string &dependency,
+        std::optional<GEMMStage::GatedNormPublication> gated_norm)
     {
         if(forward_input_construction_)applyForwardGraphConstructionIntent(graph,*forward_input_construction_);
         const auto rows = gdnOutputProjectionRows(weight, binding, seq_len, batch_size, device, lengths);
@@ -1002,6 +1030,21 @@ namespace llaminar2
             config_.qfn_gdn_output_activation, config_.flash_next != nullptr,
             binding ? binding->identity.role : WeightRole::Other,
             binding ? binding->identity.canonical_name : std::string_view{});
+        if(gated_norm) {
+            if(rows||precision!=QuantizedActivationOperandPrecision::SingleQ8||!weight)
+                throw std::invalid_argument("Gated-norm composite requires its explicit ordinary SingleQ8 projection");
+            const std::string node=prefix+"gdn_out_proj";
+            graph.addNode(node,ComputeStageFactory::createGEMM({
+                .device_id=device,.A=buffers.attn_output,.B=weight,.C=buffers.attn_proj,
+                .gated_norm=std::move(gated_norm),.m=seq_len*batch_size,
+                .n=static_cast<int>(weight->shape()[0]),.k=static_cast<int>(weight->shape()[1]),
+                .alpha=1.f,.beta=0.f,.transpose_B=false,.gemm_context=GemmContext::ATTN,
+                .a_buffer_id=buffers.idFor(BufferId::ATTN_OUTPUT),
+                .c_buffer_id=buffers.idFor(BufferId::ATTN_PROJ),
+                .prepared_ref=preparedRefForGraphWeight(binding,device),.prepared_store=prepared_weight_store_,
+                .quantized_operand_precision=precision}),device);
+            graph.addDependency(node,dependency);return node;
+        }
         return addWoProjection(graph, prefix, buffers, weight, binding,
             seq_len * batch_size, device, dependency, "gdn_out_proj", rows,
             Qwen4ExpProjectionArithmetic::Ordinary, precision);
@@ -1161,6 +1204,13 @@ namespace llaminar2
         auto *gdn_state = hybrid_cache->getGDNState(layer_idx);
         LLAMINAR_ASSERTF(gdn_state != nullptr,
                          "No GDN state found for layer " << layer_idx);
+
+        const bool scalar_rocm_qk_pair=device.is_rocm() && batch_size==1 && seq_len==1 &&
+            !config_.grouped_mtp_verifier &&
+            gdn::ScalarPreparedQKLayout::supportsNativeGeometry(
+                config_.gdn.state_size, config_.gdn.conv_kernel_size);
+        if(scalar_rocm_qk_pair&&!gdn_state->rec_kernel)
+            throw std::invalid_argument("Scalar GDN Q/K binding requires its retained recurrence owner");
 
         // Full (global) head counts from model config
         const int n_k_heads_full = config_.gdn.group_count > 0
@@ -1399,6 +1449,18 @@ namespace llaminar2
         // =====================================================================
         // Stage 3: Short Conv1d + SiLU on QKV
         // =====================================================================
+        // Scalar ValueMajor ROCm is one explicit native program. Grouped,
+        // multi-row prefill, CPU/CUDA and KeyMajor retain their raw contracts;
+        // a failed prepared producer/consumer never retries another program.
+        GDNQKInputContract qk_contract=GDNRawQKInput{};
+        if(scalar_rocm_qk_pair&&
+            gdn_state->rec_kernel->recurrenceStateLayout()==GDNRecurrenceStateLayout::ValueMajorKeyContiguous)
+        {
+            auto *bank=buffers.get(BufferId::GDN_PREPARED_QK);
+            if(!bank)throw std::invalid_argument("Prepared scalar GDN graph lacks its admitted arena activation");
+            qk_contract=GDNPreparedQKBinding{bank,
+                n_k_heads,n_v_heads,d_k,d_v,true};
+        }
         ShortConv1dStage::Params conv_params;
         conv_params.device_id = device;
         conv_params.input = buffers.get(BufferId::GDN_QKV);
@@ -1425,6 +1487,7 @@ namespace llaminar2
         // Use kernel instance from hybrid cache (lifetime tied to cache)
         conv_params.kernel = gdn_state->conv_kernel.get();
 
+        conv_params.qk_contract=qk_contract;
         conv_params.input_buffer_id = BufferId::GDN_QKV;
         conv_params.output_buffer_id = BufferId::GDN_RECURRENCE_IN;
 
@@ -1488,6 +1551,7 @@ namespace llaminar2
         rec_params.global_v_head_offset = 0;
 
         rec_params.output_buffer_id = BufferId::ATTN_OUTPUT;
+        rec_params.qk_contract=qk_contract;
         rec_params.qkv_buffer_id = BufferId::GDN_RECURRENCE_IN;
         rec_params.alpha_buffer_id = BufferId::GDN_ALPHA;
         rec_params.beta_buffer_id = BufferId::GDN_BETA;
@@ -1597,7 +1661,7 @@ namespace llaminar2
                 sequence_lengths_device);
 
         // =====================================================================
-        // Stage 5: Gated RMSNorm — RMSNorm(output) * SiLU(Z)
+        // Stage 5: Model-declared gated RMSNorm and prepared output projection
         // =====================================================================
         GatedRMSNormStage::Params gnorm_params;
         gnorm_params.device_id = device;
@@ -1617,36 +1681,53 @@ namespace llaminar2
         gnorm_params.gate_buffer_id = BufferId::GDN_Z;
         gnorm_params.output_buffer_id = BufferId::ATTN_OUTPUT;
 
-        graph.addNode(prefix + "gated_norm",
-                      ComputeStageFactory::createGatedRMSNorm(gnorm_params),
-                      device);
-        graph.addDependency(prefix + "gated_norm", gdn_state_ready_node);
-        const std::string gated_norm_ready =
-            maybeAddGDNDiagnosticCheckpoint(
-                graph,
-                "gdn_gated_norm",
-                buffers.attn_output,
-                BufferId::ATTN_OUTPUT,
-                prefix + "gated_norm",
-                layer_idx,
-                total_tokens,
-                value_dim,
-                device,
-                sequence_lengths_device);
-
-        // =====================================================================
-        // Stage 6: Local output projection, observation, then TP reconstruction
-        // =====================================================================
-        const std::string local_projection_node = addGDNOutputProjection(
-            graph, prefix, buffers, gdn_layer->ssm_out, layer_bindings.ssm_out,
-            seq_len, batch_size, device, sequence_lengths_device, gated_norm_ready);
+        // Select one complete program from immutable geometry/operand policy.
+        // Grouped/count-owned/floating/other backends retain their original
+        // separate producer and consumer; a selected composite never retries.
+        if(!gdn_layer->ssm_norm)throw std::invalid_argument("GDN normalization requires its original gain owner");
+        const GatedRMSNormProjectionParameters normalization{d_v,
+            static_cast<int>(std::min<size_t>(gdn_layer->ssm_norm->numel(),d_v)),
+            gnorm_params.eps,gnorm_params.subtract_one,gnorm_params.gate_activation};
+        const auto projection_rows=gdnOutputProjectionRows(gdn_layer->ssm_out,layer_bindings.ssm_out,
+            seq_len,batch_size,device,sequence_lengths_device);
+        const auto precision=Qwen4ExpProjectionWorkspace::gdnOutputPrecision(
+            config_.qfn_gdn_output_activation,config_.flash_next!=nullptr,
+            layer_bindings.ssm_out?layer_bindings.ssm_out->identity.role:WeightRole::Other,
+            layer_bindings.ssm_out?layer_bindings.ssm_out->identity.canonical_name:std::string_view{});
+        const bool fused_normalization=device.is_rocm()&&!projection_rows&&
+            !buffers.attn_output->isMapped()&&!buffers.attn_proj->isMapped()&&
+            gatedNormSingleQ8Geometry(total_tokens,value_dim,normalization)&&
+            precision==QuantizedActivationOperandPrecision::SingleQ8&&gdn_layer->ssm_out&&
+            gdn_layer->ssm_out->shape().size()==2&&gdn_layer->ssm_out->shape()[1]==static_cast<size_t>(value_dim)&&
+            native_vnni_formats::forQuantType(tensorTypeName(gdn_layer->ssm_out->native_type()));
+        std::optional<GEMMStage::GatedNormPublication> norm_publication;
+        std::string gated_norm_ready=gdn_state_ready_node;
+        if(fused_normalization)
+            norm_publication=GEMMStage::GatedNormPublication{gnorm_params.gate,gnorm_params.gamma,
+                buffers.idFor(BufferId::GDN_Z),normalization};
+        else {
+            graph.addNode(prefix+"gated_norm",ComputeStageFactory::createGatedRMSNorm(gnorm_params),device);
+            graph.addDependency(prefix+"gated_norm",gdn_state_ready_node);
+            gated_norm_ready=maybeAddGDNDiagnosticCheckpoint(graph,"gdn_gated_norm",buffers.attn_output,
+                BufferId::ATTN_OUTPUT,prefix+"gated_norm",layer_idx,total_tokens,value_dim,device,sequence_lengths_device);
+        }
+        const std::string local_projection_node=addGDNOutputProjection(graph,prefix,buffers,
+            gdn_layer->ssm_out,layer_bindings.ssm_out,seq_len,batch_size,device,sequence_lengths_device,
+            gated_norm_ready,std::move(norm_publication));
+        // Projection reads the retained normalized FP32 tensor without writing
+        // it. Observe the same norm bytes after the composite, before reuse;
+        // no internal pre-projection intervention or extra copy is introduced.
+        const std::string local_projection_observed=fused_normalization
+            ?maybeAddGDNDiagnosticCheckpoint(graph,"gdn_gated_norm",buffers.attn_output,BufferId::ATTN_OUTPUT,
+                local_projection_node,layer_idx,total_tokens,value_dim,device,sequence_lengths_device)
+            :local_projection_node;
         const std::string local_projection_ready =
             maybeAddGDNDiagnosticCheckpoint(
                 graph,
                 "gdn_local_output_projection",
                 buffers.attn_proj,
                 BufferId::ATTN_PROJ,
-                local_projection_node,
+                local_projection_observed,
                 layer_idx,
                 total_tokens,
                 config_.d_model,
@@ -1676,7 +1757,7 @@ namespace llaminar2
             terminal_node = addBranchBlockWrite(graph, std::move(*residual_read), buffers, terminal_node);
 
         // NOTE: GDN layers do NOT apply a sigmoid output gate after out_proj.
-        // The Z projection is consumed entirely by GatedRMSNorm (SiLU gating).
+        // The Z projection is consumed by the model-declared gated normalization.
         // Only FA layers use a sigmoid output gate (embedded in Q projection).
 
         // NOTE: No explicit ResidualAdd here. The FFN's FusedResidualNormStage

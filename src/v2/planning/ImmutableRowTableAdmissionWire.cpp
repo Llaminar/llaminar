@@ -2,9 +2,9 @@
  * @file ImmutableRowTableAdmissionWire.cpp
  * @brief Authenticate bounded setup-only table candidate metadata with no payload reads.
  *
- * Version7 retains the original source-authored attention schedule alongside
- * common activation geometry. Unknown values reject before narrowing; reloadable
- * debug state is never consulted when restoring an admitted remote provision.
+ * Version8 retains the resolved arithmetic and original source-authored attention schedule
+ * alongside common activation geometry. Unknown values reject before narrowing; reloadable debug
+ * state is never consulted when restoring an admitted remote provision.
  */
 #include "ImmutableRowTableAdmissionWire.h"
 #include "MemoryPlanner.h"
@@ -16,28 +16,28 @@ namespace llaminar2
 {
 namespace
 {
-constexpr std::uint32_t Magic=0x4e475231u, Version=7;
-/** @brief Exact typed QFN layout words carried by this schema, without native padding. */
-constexpr std::array QfnLayoutWords{
-    &Qwen4ExpMemoryGeometry::residual_width,
-    &Qwen4ExpMemoryGeometry::terminal_head_width,
-    &Qwen4ExpMemoryGeometry::residual_branches,
-    &Qwen4ExpMemoryGeometry::residual_gate_rank,
-    &Qwen4ExpMemoryGeometry::indexer_query_heads,
-    &Qwen4ExpMemoryGeometry::indexer_key_heads,
-    &Qwen4ExpMemoryGeometry::indexer_head_dimension,
-    &Qwen4ExpMemoryGeometry::compression_ratio,
-    &Qwen4ExpMemoryGeometry::selected_token_budget,
-    &Qwen4ExpMemoryGeometry::maximum_selected_tokens,
-    &Qwen4ExpMemoryGeometry::ple_decoder_layer,
-    &Qwen4ExpMemoryGeometry::ple_heads,
-    &Qwen4ExpMemoryGeometry::ple_row_elements,
-    &Qwen4ExpMemoryGeometry::ple_convolution_kernel,
-    &Qwen4ExpMemoryGeometry::ple_convolution_dilation,
-    &Qwen4ExpMemoryGeometry::ple_convolution_history,
-    &Qwen4ExpMemoryGeometry::ple_hash_history_tokens,
-    &Qwen4ExpMemoryGeometry::ple_table_gguf_type,
-};
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 8;
+    /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
+    constexpr std::array QfnLayoutWords{
+        &Qwen4ExpMemoryGeometry::residual_width,
+        &Qwen4ExpMemoryGeometry::terminal_head_width,
+        &Qwen4ExpMemoryGeometry::residual_branches,
+        &Qwen4ExpMemoryGeometry::residual_gate_rank,
+        &Qwen4ExpMemoryGeometry::indexer_query_heads,
+        &Qwen4ExpMemoryGeometry::indexer_key_heads,
+        &Qwen4ExpMemoryGeometry::indexer_head_dimension,
+        &Qwen4ExpMemoryGeometry::compression_ratio,
+        &Qwen4ExpMemoryGeometry::selected_token_budget,
+        &Qwen4ExpMemoryGeometry::maximum_selected_tokens,
+        &Qwen4ExpMemoryGeometry::ple_decoder_layer,
+        &Qwen4ExpMemoryGeometry::ple_heads,
+        &Qwen4ExpMemoryGeometry::ple_row_elements,
+        &Qwen4ExpMemoryGeometry::ple_convolution_kernel,
+        &Qwen4ExpMemoryGeometry::ple_convolution_dilation,
+        &Qwen4ExpMemoryGeometry::ple_convolution_history,
+        &Qwen4ExpMemoryGeometry::ple_hash_history_tokens,
+        &Qwen4ExpMemoryGeometry::ple_table_gguf_type,
+    };
 
 /** @brief Encode one unsigned scalar in explicit little-endian order. */
 template<class T> void append(std::vector<std::uint8_t> &out,T value)
@@ -198,12 +198,28 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
                 append(out,static_cast<std::uint32_t>(c.tp_coordinate+1));
                 append(out,static_cast<std::uint32_t>(c.tp_topology));
                 const auto &a=c.activation;
+                qwen4exp::validateQwenSparseAttentionArithmetic(a.attention_arithmetic,
+                                                                c.resource.device.type);
+                if (a.attention_arithmetic ==
+                        qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33 ||
+                    (a.attention_phase_schedule ==
+                         qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33 &&
+                     a.attention_arithmetic !=
+                         qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals))
+                    throw std::invalid_argument(
+                        "Ngram wire QSA policy is unresolved or conflicting");
                 if(a.attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform &&
                    a.attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33)
                     throw std::invalid_argument("Ngram wire attention phase schedule is invalid");
-                for(const int value:{a.local_d_ff,a.local_n_heads,a.local_n_kv_heads,a.local_vocab,
-                    static_cast<int>(a.replicated_dense_decode),static_cast<int>(a.routed_compute_policy),
-                    static_cast<int>(a.mtp_terminal_logits_layout),static_cast<int>(a.attention_phase_schedule)})
+                for (const int value : {a.local_d_ff,
+                                        a.local_n_heads,
+                                        a.local_n_kv_heads,
+                                        a.local_vocab,
+                                        static_cast<int>(a.replicated_dense_decode),
+                                        static_cast<int>(a.routed_compute_policy),
+                                        static_cast<int>(a.mtp_terminal_logits_layout),
+                                        static_cast<int>(a.attention_phase_schedule),
+                                        static_cast<int>(a.attention_arithmetic)})
                 {
                     if(value<0)throw std::invalid_argument("Ngram common activation geometry must be nonnegative");
                     append(out,static_cast<std::uint32_t>(value));
@@ -289,7 +305,7 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
             if(!canonical_source->flash_next || layout!=*canonical_source->flash_next)
                 throw std::invalid_argument("Ngram wire provision layout disagrees with independent receiver source metadata");
             const auto instances=in.read<std::uint32_t>();
-            if(instances==0 || instances>in.remaining()/108u)
+            if (instances == 0 || instances > in.remaining() / 112u)
                 throw std::invalid_argument("Ngram wire provision geometry count exceeds its exact frame");
             std::vector<ImmutableRowTableExecutionConsumer> geometry;
             for(std::uint32_t i=0;i<instances;++i)
@@ -305,7 +321,7 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
                 const auto coordinate=in.read<std::uint32_t>(),topology=in.read<std::uint32_t>();
                 if(coordinate>8 || topology>static_cast<std::uint32_t>(ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal))
                     throw std::invalid_argument("Ngram wire TP provenance is invalid");
-                int common[8];
+                int common[9];
                 for(int &field:common)
                 {
                     const auto value=in.read<std::uint32_t>();
@@ -319,13 +335,43 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
                 if(common[7]!=static_cast<int>(qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform) &&
                    common[7]!=static_cast<int>(qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33))
                     throw std::invalid_argument("Ngram wire attention phase schedule is invalid");
-                ActivationGraphMemoryGeometry activation{.batch_size=fields[1],.resident_graph_rows=fields[0],
-                    .context_tokens=fields[2],.local_d_ff=common[0],.local_n_heads=common[1],.local_n_kv_heads=common[2],
-                    .local_vocab=common[3],.replicated_dense_decode=bool(common[4]),.first_layer=fields[4],.last_layer=fields[5],
-                    .total_shards=fields[6],.routed_compute_policy=static_cast<RoutedExpertComputePolicy>(common[5]),
-                    .mtp_target_query_rows=fields[7],.retained_mtp_candidate_rows=fields[8],
-                    .mtp_terminal_logits_layout=static_cast<MTPTerminalLogitsLayout>(common[6]),.generation_request_capacity=fields[9],
-                    .attention_phase_schedule=static_cast<qwen4exp::QwenSparseAttentionPhaseSchedule>(common[7])};
+                if (common[8] !=
+                        static_cast<int>(qwen4exp::QwenSparseAttentionArithmetic::FixedFP32) &&
+                    common[8] !=
+                        static_cast<int>(
+                            qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals))
+                    throw std::invalid_argument("Ngram wire base arithmetic is invalid");
+                const auto arithmetic =
+                    static_cast<qwen4exp::QwenSparseAttentionArithmetic>(common[8]);
+                qwen4exp::validateQwenSparseAttentionArithmetic(arithmetic, r.device.type);
+                if (arithmetic ==
+                        qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33 ||
+                    (common[7] ==
+                         static_cast<int>(
+                             qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33) &&
+                     arithmetic != qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals))
+                    throw std::invalid_argument(
+                        "Ngram wire QSA policy is unresolved or conflicting");
+                ActivationGraphMemoryGeometry activation{
+                    .batch_size = fields[1],
+                    .resident_graph_rows = fields[0],
+                    .context_tokens = fields[2],
+                    .local_d_ff = common[0],
+                    .local_n_heads = common[1],
+                    .local_n_kv_heads = common[2],
+                    .local_vocab = common[3],
+                    .replicated_dense_decode = bool(common[4]),
+                    .first_layer = fields[4],
+                    .last_layer = fields[5],
+                    .total_shards = fields[6],
+                    .routed_compute_policy = static_cast<RoutedExpertComputePolicy>(common[5]),
+                    .mtp_target_query_rows = fields[7],
+                    .retained_mtp_candidate_rows = fields[8],
+                    .mtp_terminal_logits_layout = static_cast<MTPTerminalLogitsLayout>(common[6]),
+                    .generation_request_capacity = fields[9],
+                    .attention_arithmetic = arithmetic,
+                    .attention_phase_schedule =
+                        static_cast<qwen4exp::QwenSparseAttentionPhaseSchedule>(common[7])};
                 geometry.push_back({r,fields[0],fields[1],fields[2],fields[3],fields[4],fields[5],fields[6],fields[7],fields[8],fields[9],activation,
                     static_cast<int>(coordinate)-1,static_cast<ImmutableRowTableTPTopology>(topology)});
             }

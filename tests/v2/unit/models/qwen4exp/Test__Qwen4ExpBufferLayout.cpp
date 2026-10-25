@@ -5,10 +5,14 @@
  * Device-free tests resolve the production declaration inventory at different
  * row/request capacities. Unowned lexical/indexer state and GPU-only partials
  * must be absent, while residual width never changes compute/head dimensions.
+ * Dense/MoE/QFN inheritance resolves the actual prepared GDN role and global PP
+ * templates through the same public schema/resolver and canonical BOM inputs.
  */
 #include "Qwen4ExpMetadataFixture.h"
 #include "../../../utils/Qwen4ExpPlacementFixture.h"
 #include "models/qwen4exp/Qwen4ExpGraph.h"
+#include "models/qwen35/Qwen35Graph.h"
+#include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
 #include "models/qwen4exp/Qwen4ExpBufferLayout.h"
 #include "models/GraphTypes.h"
@@ -16,6 +20,10 @@
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
 #include "planning/ActivationMemoryEstimator.h"
+#include "config/TensorParallelAssignmentDeclaration.h"
+#include "kernels/gdn/GDNPreparedQK.h"
+#include "memory/BufferArena.h"
+#include <memory>
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include <gtest/gtest.h>
@@ -408,3 +416,228 @@ TEST(Qwen4ExpBufferLayout, Phase33EstimatorAndAllocatorAdaptersAgree)
     }
 }
 }
+
+namespace llaminar2::test
+{
+/**
+ * @test Real dense/MoE/QFN schema inheritance retains the prepared arena owner.
+ * @details Resolves complete actual buffer inventories without allocating them.
+ * The named prepared-role bytes are compared to the canonical BOM's ROCm/CUDA
+ * delta; this does not claim equality of unrelated historical raw-buffer terms.
+ * CPU/CUDA and unsupported dense/MoE widths retain no prepared declaration.
+ */
+namespace
+{
+enum class PreparedSchemaFamily { Dense, MoE, FlashNext };
+/** @brief Exercise one actual public schema family through allocation descriptors and BOM. */
+void checkPreparedSchemaFamily(PreparedSchemaFamily family)
+{
+    using Family = PreparedSchemaFamily;
+    const auto directory = qwen4MetadataFixture(false);
+    GraphConfig original;
+    original.max_seq_len = 4096;
+    original.max_activation_rows = 512;
+    original.max_request_count = 1;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(directory, original);
+    original.mtp.enabled = false;
+    original.mtp.draft_tokens = 0;
+    original.mtp.graph_capacity_draft_tokens = 0;
+    original.mtp.max_request_batch = 1;
+    const auto declaration = TensorParallelAssignmentDeclaration::fromOriginal(
+        {24, 2}, KVHeadCoveragePolicy::QueryInterval,
+        QueryHeadPartitionDeclaration::fromOriginalConsumers(24, {{16, 48}}));
+    bool uneven_five = false;
+    for (const int width : {32, 64, 128})
+    {
+        // Published QFN authenticates DK128 exactly. Dense/MoE additionally
+        // exercise the separately supported64 and unsupported32 schemas.
+        if (family == Family::FlashNext && width != 128) continue;
+        ModelMemoryProfile profile = ModelMemoryProfile::fromGGUF(directory);
+        if (family != Family::FlashNext)
+        {
+            profile.flash_next.reset();
+            profile.architecture = family == Family::Dense ? "qwen35" : "qwen35moe";
+            profile.gdn_state_size = width;
+            profile.gdn_inner_size = 48 * width;
+        }
+        const auto add = [&](std::string name, std::size_t n, std::size_t k)
+        {
+            TensorSizeInfo tensor;
+            tensor.name = std::move(name);
+            tensor.K = k;
+            tensor.elements = n * k;
+            tensor.layer_index = tensor.name.starts_with("blk.3.") ? 3 : 0;
+            profile.tensors.push_back(std::move(tensor));
+        };
+        add("blk.3.attn_q.weight", 12288, 2560);
+        add("blk.3.attn_gate.weight", 6144, 2560);
+        add("blk.0.attn_qkv.weight", 80 * width, 2560);
+        add("blk.0.ssm_out.weight", 2560, 48 * width);
+        add("blk.0.ssm_alpha.weight", 48, 2560);
+        add("blk.0.ssm_beta.weight", 48, 2560);
+        for (int degree = 1; degree <= 8; ++degree)
+        {
+            // Obtain actual supported GPU query-consumer intervals from the
+            // canonical distributor. CPU metadata is a bank-absence control
+            // over those same geometric intervals, not a new CPU TP mode.
+            std::vector<DeviceId> endpoints;
+            for (int rank = 0; rank < degree; ++rank)
+                endpoints.push_back(DeviceId::rocm(rank));
+            const auto partition = declaration.partition(endpoints, {}, original.d_ff, original.vocab_size);
+            for (const auto &local : partition.assignments())
+            for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+            for (const bool replicated : {false, true})
+            {
+                SCOPED_TRACE(::testing::Message() << "family=" << int(family)
+                    << " width=" << width << " degree=" << degree
+                    << " start=" << local.head_start << " count=" << local.head_count
+                    << " device=" << device.toString() << " replicated=" << replicated);
+                auto config = original;
+                config.default_device = device;
+                config.qkv_column_parallel = true;
+                config.dense_tp_enabled = true;
+                config.dense_tp_decode_replicated = replicated;
+                config.head_start = local.head_start;
+                config.local_n_heads = local.head_count;
+                config.local_n_kv_heads = local.kv_head_count;
+                config.d_ff_local = local.d_ff_count;
+                config.vocab_local = local.vocab_count;
+                config.gdn.state_size = width;
+                config.gdn.inner_size = 48 * width;
+                if (family != Family::FlashNext) config.flash_next.reset();
+                else admitQwen4ExpTestTable(config);
+                std::unique_ptr<Qwen35Graph> graph;
+                if (family == Family::Dense) graph = std::make_unique<Qwen35Graph>(config, nullptr);
+                else if (family == Family::MoE) graph = std::make_unique<Qwen35MoEGraph>(config, nullptr);
+                else graph = std::make_unique<Qwen4ExpGraph>(config, nullptr);
+                const auto schema = graph->getSchema();
+                ASSERT_EQ(schema.layer_template_names.size(), std::size_t(config.n_layers));
+                EXPECT_EQ(schema.layer_template_names.front(), config.layer_types.front());
+                const bool expected = device.is_rocm() && (width == 64 || width == 128);
+                for (const int rows : {1, 16, 512})
+                {
+                    const auto resolver = graph->getResolverConfig(rows);
+                    const auto inventory = BufferAllocator::resolveAll(schema, resolver);
+                    const auto count = std::count_if(inventory.begin(), inventory.end(),
+                        [](const auto &bank) { return bank.name == "gdn_prepared_qk"; });
+                    ASSERT_EQ(count, expected ? 1 : 0);
+                    const auto requirements = BufferAllocator::toBufferRequirements(inventory);
+                    const auto bank = std::find_if(requirements.buffers.begin(), requirements.buffers.end(),
+                        [](const auto &entry) { return entry.name == "gdn_prepared_qk"; });
+                    if (!expected)
+                    {
+                        EXPECT_EQ(bank, requirements.buffers.end());
+                        EXPECT_EQ(resolver.custom_formulas.count("gdn_prepared_qk_columns"), 0u);
+                        continue;
+                    }
+                    ASSERT_NE(bank, requirements.buffers.end());
+                    EXPECT_EQ(BufferArena::bufferNameToId(bank->name), BufferId::GDN_PREPARED_QK);
+                    EXPECT_EQ(bank->tensor_type, BufferTensorType::FP32);
+                    EXPECT_EQ(bank->device, device);
+                    EXPECT_EQ(bank->role, BufferRole::SCRATCH);
+                    const auto assigned = GDNHeadAssignment::fromPartition(16, 48,
+                        replicated ? 0 : local.head_start,
+                        replicated ? 24 : local.head_count, 24);
+                    const auto bytes = gdn::ScalarPreparedQKLayout::fromHeads(
+                        assigned.localKeyHeads(), assigned.localValueHeads(), width, width).bytes;
+                    EXPECT_EQ(bank->sizeBytes(), bytes);
+                    EXPECT_EQ(bank->shape, (std::vector<std::size_t>{1, bytes / sizeof(float)}));
+                    ActivationGraphMemoryGeometry geometry;
+                    geometry.resident_graph_rows = rows;
+                    geometry.context_tokens = config.max_seq_len;
+                    geometry.local_d_ff = local.d_ff_count;
+                    geometry.local_n_heads = local.head_count;
+                    geometry.local_n_kv_heads = local.kv_head_count;
+                    geometry.local_vocab = local.vocab_count;
+                    geometry.replicated_dense_decode = replicated;
+                    geometry.first_layer = 0;
+                    geometry.last_layer = config.n_layers - 1;
+                    geometry.total_shards = degree;
+                    geometry.mtp_target_query_rows = 1;
+                    geometry.ngram_lookup = ImmutableRowLookupExecution::HostProvider;
+                    EXPECT_EQ(ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::rocm(0)),
+                        ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cuda(0)) + bytes);
+                }
+                if (degree == 5 && local.head_count != 24 / degree) uneven_five = true;
+            }
+        }
+    }
+    EXPECT_TRUE(uneven_five);
+}
+} // namespace
+
+/** @test Dense public schemas retain the exact prepared role on eligible backends. */
+TEST(Qwen4ExpBufferLayout, PreparedQKDenseSchemaMatchesArenaAndBOM)
+{ checkPreparedSchemaFamily(PreparedSchemaFamily::Dense); }
+
+/** @test MoE factory schemas receive the common hybrid arena completion. */
+TEST(Qwen4ExpBufferLayout, PreparedQKMoESchemaMatchesArenaAndBOM)
+{ checkPreparedSchemaFamily(PreparedSchemaFamily::MoE); }
+
+/** @test Real QFN inheritance resolves its admitted prepared role without a manually injected bank. */
+TEST(Qwen4ExpBufferLayout, PreparedQKFlashNextSchemaMatchesArenaAndBOM)
+{ checkPreparedSchemaFamily(PreparedSchemaFamily::FlashNext); }
+
+/** @test Every inherited public schema uses the declared global PP interval. */
+TEST(Qwen4ExpBufferLayout, PreparedQKSchemaKeepsGlobalPPInterval)
+{
+    GraphConfig original;
+    original.max_seq_len = 4096;
+    original.max_activation_rows = 16;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), original);
+    original.mtp.enabled = false;
+    original.mtp.graph_capacity_draft_tokens = 0;
+    original.qkv_column_parallel = true;
+    original.local_n_heads = 6;
+    original.local_n_kv_heads = 1;
+    original.head_start = 6;
+    for (const auto family : {PreparedSchemaFamily::Dense, PreparedSchemaFamily::MoE,
+                              PreparedSchemaFamily::FlashNext})
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto span : {std::pair{3, 5}, std::pair{3, 1}})
+    for (const bool replicated : {false, true})
+    {
+        auto config = original;
+        config.default_device = device;
+        config.pp_layer_offset = span.first;
+        config.n_layers = span.second;
+        config.dense_tp_decode_replicated = replicated;
+        if (family == PreparedSchemaFamily::FlashNext) admitQwen4ExpTestTable(config);
+        else config.flash_next.reset();
+        std::unique_ptr<Qwen35Graph> graph;
+        if (family == PreparedSchemaFamily::Dense) graph = std::make_unique<Qwen35Graph>(config, nullptr);
+        else if (family == PreparedSchemaFamily::MoE) graph = std::make_unique<Qwen35MoEGraph>(config, nullptr);
+        else graph = std::make_unique<Qwen4ExpGraph>(config, nullptr);
+        const auto schema = graph->getSchema();
+        ASSERT_EQ(schema.layer_template_names.size(), std::size_t(span.second));
+        for (int i = 0; i < span.second; ++i)
+            EXPECT_EQ(schema.layer_template_names[i], config.layer_types[span.first + i]);
+        const auto resolver = graph->getResolverConfig(16);
+        const auto inventory = BufferAllocator::resolveAll(schema, resolver);
+        const auto bank = std::find_if(inventory.begin(), inventory.end(),
+            [](const auto &entry) { return entry.name == "gdn_prepared_qk"; });
+        if (device.is_rocm())
+        {
+            ASSERT_NE(bank, inventory.end());
+            const auto assigned = GDNHeadAssignment::fromPartition(16, 48,
+                replicated ? 0 : 6, replicated ? 24 : 6, 24);
+            EXPECT_EQ(bank->totalBytes(), gdn::ScalarPreparedQKLayout::fromHeads(
+                assigned.localKeyHeads(), assigned.localValueHeads(), 128, 128).bytes);
+        }
+        else EXPECT_EQ(bank, inventory.end());
+    }
+}
+
+/** @test Published QFN metadata never advertises foreign prepared key widths. */
+TEST(Qwen4ExpBufferLayout, PublishedFlashNextRejectsForeignPreparedWidths)
+{
+    for (const std::uint32_t width : {32u, 64u, 256u})
+    {
+        auto directory = qwen4MetadataFixture(false);
+        directory.metadata["qwen4exp.ssm.state_size"] = qwen4Scalar(GGUFValueType::UINT32, width);
+        GraphConfig config;
+        EXPECT_THROW(Qwen4ExpGraphConfigBuilder::populateFromDirectory(directory, config),
+            std::invalid_argument);
+    }
+}
+} // namespace llaminar2::test

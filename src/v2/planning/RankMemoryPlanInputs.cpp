@@ -169,7 +169,7 @@ namespace llaminar2
             DevicePlanConfig cfg;
             cfg.world_rank = current_rank;
             cfg.device = device;
-            cfg.attention_phase_schedule = request.plan.runtime.attention_phase_schedule;
+            // Attention resolves below after the exact native KV/request geometry is known.
             cfg.qfn_hc_up_activation = profile.flash_next
                 ? debugEnv().gemm.qfn_hc_up_activation
                 : QuantizedActivationOperandPrecision::SingleQ8;
@@ -502,6 +502,9 @@ namespace llaminar2
                     cfg.ngram_table_placement = request.plan.runtime.ngram_table_placement;
                 }
         }
+        // PP overrides final layer ranges after makeConfigForDevice; resolve only now.
+        for (auto &input : device_configs)
+            resolveQwenSparseAttentionDeviceProgram(profile, input, request.plan.runtime);
         return device_configs;
     }
 }

@@ -15,6 +15,7 @@
  */
 
 #include "GEMMStage.h"
+#include <bit>
 #include "kernels/common/FloatingProjectionRows.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -300,6 +301,30 @@ namespace llaminar2
                 !validateMatrixExtent(dynamic_cast<const TensorBase *>(params_.C),"counted output C",params_.m,params_.n))
                 throw std::invalid_argument("Counted floating projection exceeds admitted source/output matrix");
         }
+        if(params_.gated_norm) {
+            if(params_.bias_required)throw std::invalid_argument("Gated-norm composite does not admit a bias declaration");
+            params_.validate();
+            const auto& norm=*params_.gated_norm;
+            const auto binding=params_.prepared_store&&params_.prepared_ref
+                ?params_.prepared_store->binding(*params_.prepared_ref):std::nullopt;
+            if(!params_.device_id.is_rocm()||!gatedNormSingleQ8Geometry(params_.m,params_.k,norm.parameters)||
+               params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8||
+               !params_.A||!params_.B||!params_.C||!norm.gate||!norm.gamma||params_.A==params_.C||
+               params_.A==norm.gate||params_.A==norm.gamma||params_.C==norm.gate||params_.C==norm.gamma||
+               params_.A->native_type()!=TensorType::FP32||params_.C->native_type()!=TensorType::FP32||
+               norm.gate->native_type()!=TensorType::FP32||norm.gamma->native_type()!=TensorType::FP32||
+               !native_vnni_formats::forQuantType(tensorTypeName(params_.B->native_type()))||
+               !params_.a_buffer_id||!params_.c_buffer_id||*params_.a_buffer_id==*params_.c_buffer_id||
+               norm.gate_buffer==*params_.a_buffer_id||norm.gate_buffer==*params_.c_buffer_id||
+               params_.alpha!=1.f||params_.beta!=0.f||params_.transpose_B||!params_.output_range.empty()||
+               params_.hc_residual_down||params_.gate_input||params_.do_swiglu||params_.bias||params_.bias_tensor||
+               params_.projection_row_work||params_.verifier_row_range||params_.request_rows||
+               params_.force_decode_equivalent_verifier_prefill||!binding||!binding->immutable||
+               binding->tensor!=params_.B||params_.prepared_ref->device!=params_.device_id||
+               !validateMatrixExtent(dynamic_cast<const TensorBase*>(norm.gate),"gated norm gate",1,params_.k)||
+               norm.gamma->numel()<128)
+                throw std::invalid_argument("Gated-norm SingleQ8 requires exact prepared ordinary ROCm M1, disjoint gate/gain/output and retained in-place FP32 ownership");
+        }
         if(params_.hc_residual_down) {
             // HC's builder supplies the already-local source/ref. Resolving a
             // generic output slice could create a new prepared kernel during
@@ -416,8 +441,110 @@ namespace llaminar2
         }
     }
 
+    namespace {
+    /** @brief Original consumed scratch names; all sizes come from the engine's existing BOM. */
+    const std::array<const char*,5> gatedNormBanks{GemmWorkspaceBuffers::QUANT_A,
+        GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
+        GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::SCALES_A};
+    }
+
+    GEMMStage::GatedNormIdentity GEMMStage::currentGatedNormIdentity() const
+    {
+        if(!params_.gated_norm||!params_.device_id.is_rocm())
+            throw std::logic_error("Gated-norm binding requires its declared ROCm operation");
+        auto* workspace=getWorkspace();
+        if(!workspace||workspace->device()!=params_.device_id||!workspace->isAllocated())
+            throw std::logic_error("Gated-norm binding requires its original admitted workspace");
+        const auto source=params_.prepared_store&&params_.prepared_ref
+            ?params_.prepared_store->binding(*params_.prepared_ref):std::nullopt;
+        if(!source||!source->immutable||source->tensor!=params_.B||params_.prepared_ref->device!=params_.device_id)
+            throw std::logic_error("Gated-norm binding lost its original immutable prepared source");
+        GatedNormIdentity result;result.workspace_id=workspace->id();
+        result.engine=params_.prepared_store->gemmKernel(*params_.prepared_ref);
+        DeviceNativeVNNIMatrixDesc weights;
+        if(!result.engine||!result.engine->inspectPreparedNativeVNNIMatrixDesc(weights))
+            throw std::logic_error("Gated-norm binding requires original prepared native source planes");
+        (void)requireQ8ResidualNativeMatrix(weights,1,params_.n,params_.k);
+        result.weight_planes={weights.payload,weights.scales,weights.mins,weights.emins};
+        result.weight_geometry={static_cast<uint64_t>(weights.n),static_cast<uint64_t>(weights.k),
+            weights.blocks_per_row,weights.codebook_id,weights.allocation_payload_bytes_per_block,
+            weights.allocation_has_mins,weights.allocation_has_emins,weights.source_codebook_id,
+            weights.source_is_superblock,weights.source_identity_present,weights.reserved,weights.reserved_tail};
+        const std::array<const TensorBase*,4> tensors{dynamic_cast<const TensorBase*>(params_.A),
+            dynamic_cast<const TensorBase*>(params_.gated_norm->gate),
+            dynamic_cast<const TensorBase*>(params_.gated_norm->gamma),dynamic_cast<const TensorBase*>(params_.C)};
+        for(size_t i=0;i<tensors.size();++i) {
+            if(!tensors[i]||tensors[i]->current_device()!=std::optional{params_.device_id}||!tensors[i]->gpu_data_ptr())
+                throw std::logic_error("Gated-norm operands were not allocation-prebound");
+            result.pointers[i]=tensors[i]->gpu_data_ptr();
+            const auto needed=static_cast<size_t>(i==2?128:i==3?params_.n:params_.k)*sizeof(float);
+            result.bytes[i]=std::max(tensors[i]->size_bytes(),needed);result.types[i]=tensors[i]->native_type();
+        }
+        auto* consumer=dynamic_cast<IWorkspaceConsumer*>(result.engine);
+        if(!consumer||consumer->getWorkspace()!=workspace)
+            throw std::logic_error("Gated-norm binding requires the prepared engine's exact bound workspace");
+        const auto requirements=consumer->getWorkspaceRequirements(1,params_.n,params_.k);
+        for(size_t i=0;i<gatedNormBanks.size();++i) {
+            const auto* need=requirements.find(gatedNormBanks[i]);
+            result.pointers[i+4]=workspace->getBuffer(gatedNormBanks[i]);
+            result.bytes[i+4]=workspace->getBufferSize(gatedNormBanks[i]);
+            if(!need||!result.pointers[i+4]||result.bytes[i+4]<need->size_bytes)
+                throw std::logic_error("Gated-norm binding lacks an original admitted quantization/projection bank");
+        }
+        result.engine->validate_gated_rmsnorm_single_q8({*const_cast<TensorBase*>(tensors[0]),
+            *tensors[1],*tensors[2],params_.gated_norm->parameters},const_cast<TensorBase*>(tensors[3]),
+            params_.n,params_.k,workspace);
+        return result;
+    }
+
+    void GEMMStage::requireGatedNormBinding() const
+    {
+        if(!gated_norm_binding_||gated_norm_binding_->identity!=currentGatedNormIdentity())
+            throw std::logic_error("Gated-norm captured operands changed after launch preparation");
+        if(hasGPUStream()&&requireGPUStream()!=gated_norm_binding_->stream)
+            throw std::logic_error("Gated-norm captured recording stream changed");
+        const std::array<const TensorBase*,4> tensors{dynamic_cast<const TensorBase*>(params_.A),
+            dynamic_cast<const TensorBase*>(params_.gated_norm->gate),
+            dynamic_cast<const TensorBase*>(params_.gated_norm->gamma),dynamic_cast<const TensorBase*>(params_.C)};
+        for(size_t i=0;i<tensors.size();++i) {
+            if(tensors[i]->shape()!=gated_norm_binding_->shapes[i]||!gated_norm_binding_->operands[i])
+                throw std::logic_error("Gated-norm captured shape or storage owner changed");
+            TransferEngine{}.requireCapturedDeviceStorage(*gated_norm_binding_->operands[i],*tensors[i],
+                params_.device_id,gated_norm_binding_->identity.bytes[i]);
+        }
+        for(size_t i=0;i<gatedNormBanks.size();++i) {
+            const auto& lease=gated_norm_binding_->banks[i];
+            if(!lease||lease->device()!=params_.device_id||lease->data()!=gated_norm_binding_->identity.pointers[i+4]||
+               lease->sizeBytes()!=gated_norm_binding_->identity.bytes[i+4])
+                throw std::logic_error("Gated-norm captured workspace owner changed");
+        }
+    }
+
+    bool GEMMStage::prepareGatedNormBinding(IDeviceContext* ctx,void* stream)
+    {
+        (void)ExplicitGPUStream(stream);
+        if(!ctx||ctx->deviceId()!=params_.device_id||requireGPUStream()!=stream||isGraphCaptureActive())
+            throw std::logic_error("Gated-norm preparation requires its exact context/stream before capture");
+        auto* engine=params_.prepared_store->gemmKernel(*params_.prepared_ref);
+        if(!engine)throw std::logic_error("Gated-norm preparation lost its prepared engine");
+        bindStageStream(engine);
+        if(gated_norm_binding_) {requireGatedNormBinding();return true;}
+        GatedNormBinding binding;binding.identity=currentGatedNormIdentity();binding.stream=stream;
+        const std::array<const TensorBase*,4> tensors{dynamic_cast<const TensorBase*>(params_.A),
+            dynamic_cast<const TensorBase*>(params_.gated_norm->gate),
+            dynamic_cast<const TensorBase*>(params_.gated_norm->gamma),dynamic_cast<const TensorBase*>(params_.C)};
+        for(size_t i=0;i<tensors.size();++i) {
+            binding.shapes[i]=tensors[i]->shape();binding.operands[i]=TransferEngine{}.retainCapturedDeviceStorage(
+                *tensors[i],params_.device_id,binding.identity.bytes[i]);
+        }
+        for(size_t i=0;i<gatedNormBanks.size();++i)
+            binding.banks[i]=getWorkspace()->retainBuffer(gatedNormBanks[i],0,binding.identity.bytes[i+4]);
+        gated_norm_binding_.emplace(std::move(binding));requireGatedNormBinding();return true;
+    }
+
     bool GEMMStage::prepareGraphLaunch(IDeviceContext* ctx,void* stream)
     {
+        if(params_.gated_norm)return prepareGatedNormBinding(ctx,stream);
         if(projection_row_work_&&params_.device_id.is_cpu()) {
             if(!ctx||ctx->deviceId()!=params_.device_id||stream||isGraphCaptureActive())
                 throw std::logic_error("CPU projection work requires its exact host preparation boundary");
@@ -461,9 +588,10 @@ namespace llaminar2
     uint64_t GEMMStage::graphCaptureVariantSignature() const
     {
         if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::SingleQ8 &&
-           !params_.verifier_row_range && !params_.request_rows && !projection_row_work_)return 0;
+           !params_.verifier_row_range && !params_.request_rows && !projection_row_work_ && !params_.gated_norm)return 0;
         if(params_.hc_residual_down&&params_.device_id.is_gpu()&&hc_native_binding_)
             requireHCNativePublicationBinding();
+        if(params_.gated_norm&&gated_norm_binding_)requireGatedNormBinding();
         // Preserve the qualified HC quantizer/scalars, then identify one sealed
         // row alternative. Count pointer/geometry are immutable recording data;
         // execution-owned count values never enter graph identity.
@@ -490,6 +618,13 @@ namespace llaminar2
             // CaptureOnly preparation freezes exact native identity separately.
             // Its validation above throws on replacement, never mutates this
             // variant or asks the executor to recapture stale addresses.
+        }
+        if(params_.gated_norm) {
+            const auto& norm=*params_.gated_norm;mix(0x47444e4e4f524d01ULL);
+            mix(reinterpret_cast<std::uintptr_t>(norm.gate));mix(reinterpret_cast<std::uintptr_t>(norm.gamma));
+            mix(static_cast<uint64_t>(norm.gate_buffer));mix(norm.parameters.norm_dim);mix(norm.parameters.gamma_period);
+            mix(std::bit_cast<uint32_t>(norm.parameters.eps));mix(norm.parameters.subtract_one);
+            mix(static_cast<uint64_t>(norm.parameters.activation));
         }
         if(params_.request_rows) {
             mix(2);mix(FloatingProjectionRows::requestRecordingIdentity(*params_.request_rows));
@@ -767,6 +902,20 @@ namespace llaminar2
         {
             LOG_ERROR("[GEMMStage] Failed to get GEMM kernel for weight tensor");
             return false;
+        }
+
+        if(params_.gated_norm) {
+            requireGatedNormBinding();bindStageStream(gemm);
+            const auto& norm=*params_.gated_norm;
+            const bool success=gemm->multiply_gated_rmsnorm_single_q8(
+                {*const_cast<TensorBase*>(A_extent),*requireTensorBase(norm.gate,"gated norm gate"),
+                 *requireTensorBase(norm.gamma,"gated norm gamma"),norm.parameters},
+                C_extent,effective_n,params_.k,getWorkspace());
+            if(success) {
+                publishStageOutput(const_cast<TensorBase*>(A_extent));publishStageOutput(C_extent);
+                traceOutput("normalized",params_.A);traceOutput("C",params_.C);
+            }
+            return success;
         }
 
         if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::TwoTermQ8) {
@@ -1061,6 +1210,11 @@ namespace llaminar2
             info.addInput("gate_input", params_.gate_input, params_.m, params_.k);
         }
 
+        if(params_.gated_norm) {
+            info.addInput("gated_norm_gate",params_.gated_norm->gate,params_.m,params_.k);
+            info.addWeight("gated_norm_gamma",params_.gated_norm->gamma);
+            info.addOutput("normalized",params_.A,params_.m,params_.k);
+        }
         if(params_.hc_residual_down)
             info.addOutput("HC_activated",params_.hc_residual_down->activated,params_.m,params_.k);
         // Scalar params
@@ -1098,6 +1252,11 @@ namespace llaminar2
         // OUTPUT buffer
         reqs.addOutput("C", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, c_type);
 
+        if(params_.gated_norm) {
+            reqs.addInput("gated_norm_gate",{static_cast<size_t>(params_.m),static_cast<size_t>(params_.k)},BufferTensorType::FP32);
+            reqs.addWeight("gated_norm_gamma",{128u},BufferTensorType::FP32);
+            reqs.addOutput("normalized",{static_cast<size_t>(params_.m),static_cast<size_t>(params_.k)},BufferTensorType::FP32);
+        }
         if(params_.hc_residual_down)
             reqs.addOutput("HC_activated",{static_cast<size_t>(params_.m),static_cast<size_t>(params_.k)},BufferTensorType::FP32);
         // Metadata-only admission: do not fetch bias values while computing the BOM.
@@ -1122,6 +1281,10 @@ namespace llaminar2
 
     void GEMMStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        if(gated_norm_binding_&&workspace) {
+            if(workspace!=getWorkspace())throw std::logic_error("Gated-norm capture cannot replace its original workspace owner");
+            requireGatedNormBinding();
+        }
         IWorkspaceConsumerStage::bindWorkspace(workspace);
         if(projection_row_work_&&params_.device_id.is_cpu())
             projection_row_work_->prepare(workspace,nullptr);
@@ -1155,7 +1318,12 @@ namespace llaminar2
             return {};
 
         auto contract = StageBufferContract::build();
-        if(params_.hc_residual_down&&params_.hc_residual_down->buffer==*params_.a_buffer_id)
+        if(params_.gated_norm) {
+            contract.addPreallocatedInOut(*params_.a_buffer_id);
+            contract.addInput(params_.gated_norm->gate_buffer);
+            contract.addWeight(const_cast<ITensor*>(params_.gated_norm->gamma));
+        }
+        else if(params_.hc_residual_down&&params_.hc_residual_down->buffer==*params_.a_buffer_id)
             contract.addPreallocatedInOut(*params_.a_buffer_id);
         else {
             contract.addInput(*params_.a_buffer_id);

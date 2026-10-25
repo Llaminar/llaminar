@@ -18,6 +18,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "GDNPreparedQKBinding.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -50,6 +51,7 @@ namespace llaminar2
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
+            GDNQKInputContract qk_contract=GDNRawQKInput{}; ///< Immutable raw or paired prepared program.
 
             ITensor *input = nullptr;        ///< Input [seq_len, channels] (modified in-place for decode)
             ITensor *output = nullptr;       ///< Output [seq_len, channels]
@@ -107,6 +109,9 @@ namespace llaminar2
         ~ShortConv1dStage() override = default;
 
         bool execute(IDeviceContext *ctx) override;
+        /** @return Added immutable activation/program identity; raw retains its original zero. */
+        uint64_t graphCaptureVariantSignature() const override
+        { return gdnQKCaptureIdentity(params_.qk_contract); }
         ComputeStageType type() const override { return ComputeStageType::SHORT_CONV1D; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;

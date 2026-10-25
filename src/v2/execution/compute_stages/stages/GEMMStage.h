@@ -19,6 +19,7 @@
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/DeviceRequestRowRanges.h"
 #include "kernels/common/Q8ResidualCorrection.h"
+#include "kernels/common/GatedRMSNormProjection.h"
 
 #include "../IComputeStage.h"
 #include "../ProjectionRowWorkBinding.h"
@@ -66,6 +67,13 @@ namespace llaminar2
             TensorBase* activated; ///< Existing arena result, never a new allocation.
             BufferId buffer; ///< Exact output coherence authority.
         };
+        /** @brief Immutable gate/gain input for one retained FP32 normalization+projection. */
+        struct GatedNormPublication {
+            const ITensor* gate=nullptr; ///< Existing read-only arena gate output.
+            const ITensor* gamma=nullptr; ///< Original model gain tensor.
+            BufferId gate_buffer; ///< Exact gate coherence authority.
+            GatedRMSNormProjectionParameters parameters; ///< Original norm arithmetic.
+        };
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -75,6 +83,7 @@ namespace llaminar2
             const ITensor *B = nullptr; ///< Weight tensor [k, n] (may be quantized)
             ITensor *C = nullptr;       ///< Output tensor [m, n]
             std::optional<HCResidualDownPublication> hc_residual_down; ///< Typed raw-down input transform; valid only for TwoTermQ8.
+            std::optional<GatedNormPublication> gated_norm; ///< Explicit ordinary scalar SingleQ8 input program.
             int m = 0, n = 0, k = 0;    ///< Matrix dimensions
             float alpha = 1.0f;         ///< Scale factor for A*B
             float beta = 0.0f;          ///< Scale factor for existing C
@@ -215,7 +224,7 @@ namespace llaminar2
         /** @brief GPU metadata binds before capture; CPU query metadata binds before input observation. */
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override {
             if(params_.projection_row_work&&params_.device_id.is_cpu())return GraphLaunchPreparationPolicy::HostEntry;
-            return (params_.projection_row_work||params_.hc_residual_down)&&params_.device_id.is_gpu()
+            return (params_.projection_row_work||params_.hc_residual_down||params_.gated_norm)&&params_.device_id.is_gpu()
                 ? GraphLaunchPreparationPolicy::CaptureOnly : GraphLaunchPreparationPolicy::None;
         }
         void resetSessionState() override;
@@ -277,6 +286,35 @@ namespace llaminar2
          * @throws std::logic_error For any stale pointer, extent, source, shape, stream or generation.
          */
         void requireHCNativePublicationBinding() const;
+
+        /** @brief Exact prepared scalar producer/consumer address identity, never live data. */
+        struct GatedNormIdentity {
+            std::array<const void*,9> pointers{}; ///< A/gate/gamma/C, then original five workspace banks.
+            std::array<size_t,9> bytes{}; ///< Complete original retained capacities.
+            std::array<TensorType,4> types{}; ///< Actual tensor storage representations.
+            std::array<const void*,4> weight_planes{}; ///< Original native immutable planes.
+            std::array<uint64_t,12> weight_geometry{}; ///< Complete descriptor fields.
+            uint64_t workspace_id=0; ///< Original PMA-backed workspace instance.
+            ITensorGemm* engine=nullptr; ///< Exact prepared-store engine.
+            friend bool operator==(const GatedNormIdentity&,const GatedNormIdentity&)=default;
+        };
+        /** @brief Capture-held borrows of existing tensor and workspace authorities. */
+        struct GatedNormBinding {
+            GatedNormIdentity identity;
+            std::array<std::vector<size_t>,4> shapes;
+            std::array<std::shared_ptr<const CapturedDeviceStorageLease>,4> operands;
+            std::array<std::shared_ptr<const WorkspaceBufferLease>,5> banks;
+            void* stream=nullptr; ///< Exact recording stream, immutable after preparation.
+        };
+        std::optional<GatedNormBinding> gated_norm_binding_; ///< Survives data-only request resets.
+        /** @return Original allocation-prebound tensors, engine, native source and scratch identity.
+         * @throws std::logic_error For missing/foreign owner, source or native storage.
+         */
+        GatedNormIdentity currentGatedNormIdentity() const;
+        /** @brief Reject any post-preparation pointer/capacity/type/shape/source/stream replacement. */
+        void requireGatedNormBinding() const;
+        /** @brief Freeze the exact retained composite owners at the existing cold capture boundary. */
+        bool prepareGatedNormBinding(IDeviceContext* ctx,void* stream);
 
         // === Cached kernel pointers (avoid KernelFactory mutex per execute) ===
         // These are populated on first execute() and reused thereafter.
