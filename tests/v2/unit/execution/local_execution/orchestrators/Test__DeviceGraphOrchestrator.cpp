@@ -45,6 +45,7 @@
 #include "utils/Sha256.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
+#include "transfer/TransferEngine.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/HybridKVCacheConfig.h"
@@ -59,6 +60,43 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace llaminar2
+{
+    /** @brief Model-free access to the actual accepted CPU logits publication boundary. */
+    struct DeviceGraphOrchestratorLiveStateTestAccess
+    {
+        /** @brief Bind small CPU-owned producer/destination tensors and request identity. */
+        static void seed(DeviceGraphOrchestrator &runner,
+                         std::shared_ptr<TensorBase> producer,
+                         std::shared_ptr<TensorBase> canonical, uint64_t epoch)
+        {
+            runner.state_.device_id = DeviceId::cpu();
+            runner.state_.all_position_logits = std::move(producer);
+            runner.state_.logits = std::move(canonical);
+            runner.session_epoch_ = epoch;
+            runner.prefix_layout_.terminal_logits_bytes = 8 * sizeof(float);
+        }
+        /** @brief Invoke the production copy, coherence and scalar-publication operation. */
+        static bool publish(DeviceGraphOrchestrator &runner,
+                            const PrefixLogitsRowSelection &selection)
+        {
+            return runner.publishCPUAcceptedVerifierLogits(selection);
+        }
+        /** @brief Observe the real prefix/archive authority, not just canonical tensor bytes. */
+        static const TensorBase *current(DeviceGraphOrchestrator &runner)
+        {
+            const auto view = runner.currentPrefixArchiveLogits();
+            return view ? view->tensor : nullptr;
+        }
+        /** @brief Cross the production publication's request-epoch invalidation boundary. */
+        static void resetPublication(DeviceGraphOrchestrator &runner)
+        {
+            ++runner.session_epoch_;
+            runner.clearCurrentMainLogitsPublication("accepted_logits_unit_request_reset");
+        }
+    };
+}
 
 using namespace llaminar2;
 
@@ -5706,3 +5744,47 @@ TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPCallbackRejectingOut
     EXPECT_EQ(lw0.wq, nullptr);
 }
 // - DeviceWorkspaceManager allocation verification
+
+/** @brief Accepted row bytes, coherence and current scalar owner advance together. */
+TEST_F(Test__DeviceGraphOrchestrator, AcceptedVerifierTerminalLogitsPublishSelectedRowAndReset)
+{
+    auto config = config_;
+    config.vocab_size = 8;
+    auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator runner(builder);
+    auto producer = std::make_shared<FP32Tensor>(std::vector<size_t>{3, 8});
+    auto canonical = std::make_shared<FP32Tensor>(std::vector<size_t>{1, 8});
+    auto *values = static_cast<float *>(producer->raw_mutable_data());
+    ASSERT_NE(values, nullptr);
+    for (size_t row = 0; row < 3; ++row)
+        for (size_t column = 0; column < 8; ++column)
+            values[row * 8 + column] = static_cast<float>(100 * row + column);
+    TransferEngine::publishHostWrite(producer.get());
+    DeviceGraphOrchestratorLiveStateTestAccess::seed(runner, producer, canonical, 17);
+    const PrefixLogitsRowSelection accepted(1, 3, 17);
+    ASSERT_TRUE(DeviceGraphOrchestratorLiveStateTestAccess::publish(runner, accepted));
+    EXPECT_EQ(DeviceGraphOrchestratorLiveStateTestAccess::current(runner), canonical.get());
+    ASSERT_TRUE(canonical->hostValid());
+    const auto *published = canonical->fp32_data();
+    ASSERT_NE(published, nullptr);
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    // Producer reuse cannot alter the accepted scalar authority.
+    std::fill_n(values, 24, -777.0f);
+    TransferEngine::publishHostWrite(producer.get());
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    DeviceGraphOrchestratorLiveStateTestAccess::resetPublication(runner);
+    EXPECT_EQ(DeviceGraphOrchestratorLiveStateTestAccess::current(runner), nullptr);
+    EXPECT_THROW(DeviceGraphOrchestratorLiveStateTestAccess::publish(runner, accepted),
+                 std::invalid_argument);
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    // A capacity-shaped tensor cannot certify a narrower live producer view.
+    EXPECT_FALSE(DeviceGraphOrchestratorLiveStateTestAccess::publish(
+        runner, PrefixLogitsRowSelection(0, 2, 18)));
+    ASSERT_TRUE(DeviceGraphOrchestratorLiveStateTestAccess::publish(
+        runner, PrefixLogitsRowSelection(2, 3, 18)));
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], -777.0f);
+}

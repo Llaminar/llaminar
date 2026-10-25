@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "kernels/CPUSharedGDNSnapshots.h"
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -748,11 +750,13 @@ namespace llaminar2
     /**
      * @brief Immutable byte-copy plan for one CPU-owned verifier-state stage.
      *
-     * `source` points at the selected post-verifier snapshot and `destination`
-     * points at that stage's live CPU state. Both allocations remain owned by
-     * the stage/workspace that produced the plan and must stay valid until the
-     * enclosing publication transaction finishes. Publication copies these
-     * bytes verbatim; it never replays recurrence math.
+     * A contiguous plan names the complete selected snapshot through `source`.
+     * A shared-GDN plan instead names immutable compact slots and a typed accepted
+     * prefix; `bytes` remains the complete canonical live-bank extent. Both plans
+     * borrow stage/workspace allocations through the enclosing transaction.
+     * Planning changes no work or live bytes. After validating every plan and
+     * every source/live span, publication copies/zeros exactly the canonical
+     * bytes; it never stages another full bank or replays recurrence arithmetic.
      */
     struct CPUVerifierStateRestorePlan
     {
@@ -761,8 +765,9 @@ namespace llaminar2
         void *destination = nullptr;
         const void *source = nullptr;
         size_t bytes = 0;
+        std::optional<CPUSharedGDNAcceptedPrefix> shared_gdn_prefix;
 
-        /** @brief Return true when this plan describes a concrete byte copy. */
+        /** @brief Return true when this plan names a concrete canonical bank publication. */
         [[nodiscard]] bool ready() const noexcept
         {
             return status == CPUVerifierStateRestorePlanStatus::Ready &&

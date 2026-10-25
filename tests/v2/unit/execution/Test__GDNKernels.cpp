@@ -493,7 +493,7 @@ namespace
                      policy != record.tags.end() &&
                      policy->second == "fixed_epoch_shared_checkpoint" &&
                      materialization != record.tags.end() &&
-                     materialization->second == "complete_checkpoint_history");
+                     materialization->second == "shared_epoch_checkpoint_raw_log");
         }
         EXPECT_TRUE(found)
             << "CPU grouped verifier recurrence did not publish its production route counter\n"
@@ -1042,6 +1042,18 @@ public:
     int capture_rows = 11;
     int capture_state_size = 13;
     int capture_bind_calls = 0;
+    float *compact_slots = nullptr;
+    size_t compact_slot_floats = 0;
+    int compact_rows = 0;
+
+    /** @brief Record typed CPU compact storage separately from dense GPU metadata. */
+    void bindCPUSharedStateCapture(float *slots,size_t slot_floats,int rows) override
+    {
+        compact_slots = slots;
+        compact_slot_floats = slot_floats;
+        compact_rows = rows;
+    }
+
     float *speculative_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x6789));
     int speculative_state_size = 14;
     int speculative_bind_calls = 0;
@@ -1537,8 +1549,7 @@ TEST(Test__GDNKernels, RecurrencePublicationUsesStageBoundManagerCaptureAfterSha
     verifier_stage.bindWorkspace(&workspace);
     float *verifier_capture = kernel.capture_workspace;
     ASSERT_NE(verifier_capture, nullptr);
-    for (int i = 0; i < 2*CPUGDNStateLayout(2,4,4).floats(); ++i)
-        verifier_capture[i] = 2000.0f + static_cast<float>(i);
+    const auto expected_candidate = seedCPUGDNCompactTestTransaction(verifier_capture, 2, 4, 4, 2, 2000.0f);
 
     GDNRecurrenceStage::Params normal_p = verifier_p;
     normal_p.verifier_state_capture_rows = 0;
@@ -1552,7 +1563,7 @@ TEST(Test__GDNKernels, RecurrencePublicationUsesStageBoundManagerCaptureAfterSha
     for (int i = 0; i < CPUGDNStateLayout(2,4,4).floats(); ++i)
     {
         EXPECT_EQ(recurrence_state[static_cast<size_t>(i)],
-                  verifier_capture[CPUGDNStateLayout(2,4,4).floats() + i]);
+                  expected_candidate[static_cast<size_t>(i)]);
     }
 
     normal_stage.bindWorkspace(nullptr);
@@ -1672,15 +1683,13 @@ TEST(Test__GDNKernels, RecurrenceCPUPublicationRestoresParallelStagesFromTheirOw
     stage0->bindWorkspace(&workspace0);
     float *capture0 = shared_kernel.capture_workspace;
     ASSERT_NE(capture0, nullptr);
-    for (int i = 0; i < 2*CPUGDNStateLayout(2,4,4).floats(); ++i)
-        capture0[i] = 3000.0f + static_cast<float>(i);
+    const auto expected0 = seedCPUGDNCompactTestTransaction(capture0, 2, 4, 4, 2, 3000.0f);
 
     stage1->bindWorkspace(&workspace1);
     float *capture1 = shared_kernel.capture_workspace;
     ASSERT_NE(capture1, nullptr);
     ASSERT_NE(capture0, capture1);
-    for (int i = 0; i < 2*CPUGDNStateLayout(2,4,4).floats(); ++i)
-        capture1[i] = 4000.0f + static_cast<float>(i);
+    const auto expected1 = seedCPUGDNCompactTestTransaction(capture1, 2, 4, 4, 2, 4000.0f);
 
     /*
      * A normal decode graph can clear the shared kernel binding before the
@@ -1714,8 +1723,8 @@ TEST(Test__GDNKernels, RecurrenceCPUPublicationRestoresParallelStagesFromTheirOw
 
     for (int i = 0; i < CPUGDNStateLayout(2,4,4).floats(); ++i)
     {
-        EXPECT_EQ(state0[static_cast<size_t>(i)], capture0[CPUGDNStateLayout(2,4,4).floats() + i]);
-        EXPECT_EQ(state1[static_cast<size_t>(i)], capture1[CPUGDNStateLayout(2,4,4).floats() + i]);
+        EXPECT_EQ(state0[static_cast<size_t>(i)], expected0[static_cast<size_t>(i)]);
+        EXPECT_EQ(state1[static_cast<size_t>(i)], expected1[static_cast<size_t>(i)]);
     }
 }
 
@@ -1744,7 +1753,6 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
     std::vector<float> verifier_output(static_cast<size_t>(seq_len) * v_stride, 0.0f);
     std::vector<float> serial_output(verifier_output.size(), 0.0f);
     std::vector<float> capture(static_cast<size_t>(seq_len) * state_floats, 0.0f);
-    std::vector<float> work(state_floats, 0.0f);
 
     for (size_t i = 0; i < q.size(); ++i)
     {
@@ -1771,11 +1779,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
     clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     serial_state = initial_state;
 
-    verifier_kernel.bindVerifierStateCaptureWorkspace(
-        capture.data(),
-        seq_len,
-        state_floats);
-    verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+    CPUGDNCompactTestCapture compact_capture(verifier_kernel, n_heads, d_k, d_v, seq_len);
     ASSERT_TRUE(verifier_kernel.chunk_forward(
         q.data(),
         k.data(),
@@ -1795,6 +1799,8 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
 
     for (int t = 0; t < seq_len; ++t)
     {
+        ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+            capture.data() + static_cast<size_t>(t) * state_floats, t, nullptr));
         ASSERT_TRUE(serial_kernel.recurrent_step(
             q.data() + static_cast<size_t>(t) * qk_stride,
             k.data() + static_cast<size_t>(t) * qk_stride,
@@ -1810,6 +1816,8 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
             d_v,
             /*use_qk_l2norm=*/true));
 
+        expectByteExactFP32(capture.data() + static_cast<size_t>(t) * state_floats,
+            serial_state.data(), state_floats, "CPU compact candidate state");
         for (int i = 0; i < state_floats; ++i)
         {
             EXPECT_NEAR(
@@ -1825,6 +1833,8 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
         EXPECT_NEAR(verifier_output[i], serial_output[i], 1e-7f)
             << "output_idx=" << i;
     }
+    expectByteExactFP32(verifier_output.data(), serial_output.data(), serial_output.size(),
+        "CPU compact grouped outputs");
     EXPECT_EQ(verifier_state, initial_state)
         << "Verifier capture must not mutate the live state buffer";
 }
@@ -1854,7 +1864,6 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
     std::vector<float> verifier_output(static_cast<size_t>(seq_len) * v_stride, 0.0f);
     std::vector<float> serial_output(verifier_output.size(), 0.0f);
     std::vector<float> capture(static_cast<size_t>(seq_len) * state_floats, 0.0f);
-    std::vector<float> work(state_floats, 0.0f);
 
     for (size_t i = 0; i < q.size(); ++i)
     {
@@ -1881,11 +1890,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
     clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     serial_state = initial_state;
 
-    verifier_kernel.bindVerifierStateCaptureWorkspace(
-        capture.data(),
-        seq_len,
-        state_floats);
-    verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+    CPUGDNCompactTestCapture compact_capture(verifier_kernel, n_heads, d_k, d_v, seq_len);
     ASSERT_TRUE(verifier_kernel.chunk_forward(
         q.data(),
         k.data(),
@@ -1905,6 +1910,8 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
 
     for (int t = 0; t < seq_len; ++t)
     {
+        ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+            capture.data() + static_cast<size_t>(t) * state_floats, t, nullptr));
         ASSERT_TRUE(serial_kernel.recurrent_step(
             q.data() + static_cast<size_t>(t) * qk_stride,
             k.data() + static_cast<size_t>(t) * qk_stride,
@@ -1921,6 +1928,8 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
             /*use_qk_l2norm=*/true));
 
         double max_state_diff = 0.0;
+        expectByteExactFP32(capture.data() + static_cast<size_t>(t) * state_floats,
+            serial_state.data(), state_floats, "CPU compact candidate state");
         for (int i = 0; i < state_floats; ++i)
         {
             max_state_diff = std::max(
@@ -1941,6 +1950,8 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
             static_cast<double>(std::abs(verifier_output[i] - serial_output[i])));
     }
     EXPECT_LE(max_output_diff, 1e-7);
+    expectByteExactFP32(verifier_output.data(), serial_output.data(), serial_output.size(),
+        "CPU compact grouped outputs");
     EXPECT_EQ(verifier_state, initial_state)
         << "Verifier capture must not mutate the live state buffer";
 }
@@ -2003,13 +2014,8 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
         std::vector<float> verifier_output(static_cast<size_t>(rows) * v_stride, 0.0f);
         std::vector<float> serial_output(verifier_output.size(), 0.0f);
         std::vector<float> capture(static_cast<size_t>(rows) * state_floats, 0.0f);
-        std::vector<float> work(state_floats, 0.0f);
 
-        verifier_kernel.bindVerifierStateCaptureWorkspace(
-            capture.data(),
-            rows,
-            state_floats);
-        verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+        CPUGDNCompactTestCapture compact_capture(verifier_kernel, n_heads, d_k, d_v, rows);
         ASSERT_TRUE(verifier_kernel.chunk_forward(
             q.data(),
             k.data(),
@@ -2047,6 +2053,8 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
                 /*use_qk_l2norm=*/true))
                 << "rows=" << rows << " row=" << t;
 
+            ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+                capture.data() + static_cast<size_t>(t) * state_floats, t, nullptr));
             expectByteExactFP32(
                 capture.data() + static_cast<size_t>(t) * state_floats,
                 serial_state.data(),
@@ -6829,6 +6837,7 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
             /*use_qk_l2norm=*/true));
     };
 
+    std::vector<float> serial_candidates(static_cast<size_t>(request_count) * request_width * state_floats);
     for (int request = 0; request < request_count; ++request)
     {
         for (int row = 0; row < real_rows[request]; ++row)
@@ -6836,6 +6845,8 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
             run_serial_row(
                 request, row, merged.data(), request_width,
                 alpha.data(), beta.data(), expected.data());
+            std::copy(serial_state[request].begin(), serial_state[request].end(),
+                serial_candidates.begin() + static_cast<size_t>(request * request_width + row) * state_floats);
             if (row + 1 == accepted_rows[request])
                 serial_published_state[request] = serial_state[request];
         }
@@ -6846,16 +6857,7 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
     std::vector<float> verifier_capture(
         static_cast<size_t>(request_count) * request_width * state_floats,
         -777.0f);
-    std::vector<float> speculative_work(
-        static_cast<size_t>(request_count) * state_floats,
-        -888.0f);
-    grouped.bindVerifierStateCaptureWorkspace(
-        verifier_capture.data(),
-        request_count * request_width,
-        state_floats);
-    grouped.bindSpeculativeStateWorkspace(
-        speculative_work.data(),
-        static_cast<int>(speculative_work.size()));
+    CPUGDNCompactTestCapture compact_capture(grouped, n_heads, d_k, d_v, request_width, request_count);
     ASSERT_TRUE(grouped.chunkForwardBatchedMergedQKVWithHostSeqLens(
         merged.data(), qkv_stride,
         alpha.data(), beta.data(),
@@ -6878,6 +6880,20 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
         grouped_request_zero_state.data(), request_zero_state.data(),
         request_zero_state.size(),
         "CPU speculative GDN leaves live request-zero state unchanged");
+
+    for (int request = 0; request < request_count; ++request)
+        for (int row = 0; row < request_width; ++row)
+        {
+            const int flat = request * request_width + row;
+            float *observed = verifier_capture.data() + static_cast<size_t>(flat) * state_floats;
+            if (row < real_rows[request])
+            {
+                ASSERT_TRUE(grouped.restoreVerifierStateCaptureRow(observed, flat, nullptr));
+                expectByteExactFP32(observed, serial_candidates.data() + static_cast<size_t>(flat) * state_floats,
+                    state_floats, "CPU compact request candidate state");
+            }
+            else EXPECT_FALSE(grouped.restoreVerifierStateCaptureRow(observed, flat, nullptr));
+        }
 
     const std::array<int, request_count> restore_rows = {
         accepted_rows[0] - 1,
@@ -6913,7 +6929,7 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
         state_floats,
         "CPU request-zero GDN published state");
     grouped.bindVerifierStateCaptureWorkspace(nullptr, 0, 0);
-    grouped.bindSpeculativeStateWorkspace(nullptr, 0);
+    grouped.bindCPUSharedStateCapture(nullptr,0,0);
     serial_state = serial_published_state;
 
     std::array<int, request_count> continuation_rows = {1, 1};
@@ -6982,4 +6998,326 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
                                policy->second == "request_bank_snapshot_copy");
     }
     EXPECT_TRUE(publication_counter);
+}
+
+/**
+ * @brief Compact capture rejects incomplete admission before mutating live bytes.
+ */
+TEST(Test__GDNKernels, CPUCompactCaptureRejectsUndersizedSlotsAndInvalidBindingAtomically)
+{
+    constexpr int rows=2,heads=1,dk=3,dv=5;
+    const CPUGDNStateLayout layout(heads,dk,dv);
+    const std::vector<float> q(rows*dk,0.125f),k(rows*dk,0.25f),v(rows*dv,0.375f),
+        alpha(rows,0.1f),beta(rows,0.2f),a(heads,-0.3f),bias(heads,0.05f);
+    CPUGatedDeltaNet kernel;
+    CPUGDNCompactTestCapture capture(kernel,heads,dk,dv,rows);
+    std::vector<float> state(layout.floats(),0.0f),output(rows*dv,-1234.0f);
+    const auto initial=state,poison=output;
+    kernel.bindCPUSharedStateCapture(capture.slots.data(),capture.slots.size()-1,rows);
+    EXPECT_FALSE(kernel.chunk_forward(q.data(),k.data(),v.data(),alpha.data(),beta.data(),
+        a.data(),bias.data(),output.data(),state.data(),rows,heads,dk,dv,8,true));
+    expectByteExactFP32(state.data(),initial.data(),initial.size(),"undersized compact admission state");
+    expectByteExactFP32(output.data(),poison.data(),poison.size(),"undersized compact admission output");
+    EXPECT_FALSE(kernel.restoreVerifierStateCaptureRow(state.data(),0,nullptr));
+    EXPECT_THROW(kernel.bindCPUSharedStateCapture(capture.slots.data(),capture.slots.size(),0),std::invalid_argument);
+    EXPECT_THROW(kernel.bindCPUSharedStateCapture(nullptr,capture.slots.size(),rows),std::invalid_argument);
+}
+
+/**
+ * @brief Ragged transactions retain every live candidate and reject empty rows.
+ */
+TEST(Test__GDNKernels, CPUCompactCaptureEmptyAndRaggedRequestsMatchEverySerialCandidate)
+{
+    constexpr int requests = 3, width = 3, heads = 2, dk = 7, dv = 5;
+    const CPUGDNStateLayout layout(heads, dk, dv);
+    const std::array<int, requests> live = {0, 3, 1};
+    std::vector<float> q(requests * width * heads * dk), k(q.size()),
+        v(requests * width * heads * dv), alpha(requests * width * heads), beta(alpha.size()),
+        a(heads, -0.3f), bias(heads, 0.1f), output(v.size(), -1234.0f), expected(v.size(), 0.0f),
+        state(layout.floats(), 0.0f), observed(layout.floats(), -777.0f);
+    for (size_t i = 0; i < q.size(); ++i) { q[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 32.0f; k[i] = q[i] * 0.5f; }
+    for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<float>(static_cast<int>(i % 19) - 9) / 64.0f;
+    CPUGatedDeltaNet grouped;
+    CPUGDNCompactTestCapture capture(grouped, heads, dk, dv, width, requests);
+    ASSERT_TRUE(grouped.chunkForwardBatchedRequestsWithHostSeqLens(q.data(), k.data(), v.data(),
+        alpha.data(), beta.data(), a.data(), bias.data(), output.data(), state.data(),
+        requests * width, requests, width, heads, dk, dv, 8, true, live.data()));
+    for (int request = 0; request < requests; ++request)
+    {
+        CPUGatedDeltaNet serial;
+        std::vector<float> serial_state(layout.floats(), 0.0f);
+        for (int row = 0; row < width; ++row)
+        {
+            const int flat = request * width + row;
+            if (row >= live[request])
+            {
+                const auto poison = observed;
+                EXPECT_FALSE(grouped.restoreVerifierStateCaptureRow(observed.data(), flat, nullptr));
+                expectByteExactFP32(observed.data(), poison.data(), poison.size(), "inactive compact observation is atomic");
+                continue;
+            }
+            ASSERT_TRUE(serial.recurrent_step(q.data() + flat * heads * dk, k.data() + flat * heads * dk,
+                v.data() + flat * heads * dv, alpha.data() + flat * heads, beta.data() + flat * heads,
+                a.data(), bias.data(), expected.data() + flat * heads * dv, serial_state.data(), heads, dk, dv, true));
+            ASSERT_TRUE(grouped.restoreVerifierStateCaptureRow(observed.data(), flat, nullptr));
+            expectByteExactFP32(observed.data(), serial_state.data(), observed.size(), "ragged compact candidate");
+        }
+    }
+    expectByteExactFP32(output.data(), expected.data(), expected.size(), "empty/ragged compact outputs");
+    const auto initial = state;
+    const std::array<int, requests> invalid = {0, 5, 6};
+    EXPECT_FALSE(grouped.restoreVerifierStateCaptureRows(state.data(), invalid.data(), requests, nullptr));
+    expectByteExactFP32(state.data(), initial.data(), initial.size(), "empty request publication rejection is atomic");
+    const std::array<int, requests> accepted = {-1, 5, 6};
+    ASSERT_TRUE(grouped.restoreVerifierStateCaptureRows(state.data(), accepted.data(), requests, nullptr));
+    expectByteExactFP32(state.data(), initial.data(), initial.size(), "empty request preserves public request zero");
+}
+
+/** @brief Failed execution, rebind, and unbind retire every prior compact candidate. */
+TEST(Test__GDNKernels, CPUCompactStageRejectsStaleCandidatesAfterLifecycleChanges)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet kernel;
+    const CPUGDNStateLayout layout(2, 4, 4);
+    std::vector<float> state(layout.floats(), 0.0f);
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::cpu(); p.kernel = &kernel;
+    p.seq_len = 2; p.n_heads = 2; p.n_k_heads = 2; p.d_k = 4; p.d_v = 4;
+    p.verifier_state_capture_rows = 2; p.speculative_state_slot_rows = 2;
+    p.recurrence_state = state.data();
+    GDNRecurrenceStage stage(p);
+    const auto requirements = stage.getWorkspaceRequirements(2);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), requirements.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(requirements));
+    stage.bindWorkspace(&workspace);
+    float *slots = kernel.compact_slots;
+    ASSERT_NE(slots, nullptr);
+    seedCPUGDNCompactTestTransaction(slots, 2, 4, 4, 2, 1000.0f);
+    ASSERT_TRUE(stage.planCPUVerifierStateRestoreRow(1).ready());
+    const auto initial = state;
+    EXPECT_FALSE(stage.execute(nullptr));
+    EXPECT_FALSE(stage.planCPUVerifierStateRestoreRow(1).ready());
+    expectByteExactFP32(state.data(), initial.data(), state.size(), "failed execution preserves live state");
+    seedCPUGDNCompactTestTransaction(slots, 2, 4, 4, 2, 2000.0f);
+    ASSERT_TRUE(stage.planCPUVerifierStateRestoreRow(1).ready());
+    stage.bindWorkspace(&workspace);
+    EXPECT_FALSE(stage.planCPUVerifierStateRestoreRow(1).ready());
+    seedCPUGDNCompactTestTransaction(slots, 2, 4, 4, 2, 3000.0f);
+    ASSERT_TRUE(stage.planCPUVerifierStateRestoreRow(1).ready());
+    stage.unbindWorkspace();
+    EXPECT_FALSE(stage.planCPUVerifierStateRestoreRow(1).ready());
+    expectByteExactFP32(state.data(), initial.data(), state.size(), "binding changes preserve live state");
+}
+
+/**
+ * @brief Captured capacity fixes compact addressing across large-small-large replay.
+ *
+ * Nine rows cross an epoch boundary and make the second head's compact base differ
+ * from a two-row view. Every candidate is materialized and checked against serial
+ * decode; after the small replay, old high-row candidates must be invalid.
+ */
+TEST(Test__GDNKernels, CPUCompactStageLargeSmallLargeReplayUsesFixedAdmittedCapacity)
+{
+    ensureCPUBackendForWorkspace();
+    constexpr int capacity = 9, heads = 2, dk = 7, dv = 5;
+    const CPUGDNStateLayout layout(heads, dk, dv);
+    std::vector<float> q(capacity * heads * dk), k(q.size()), v(capacity * heads * dv),
+        alpha(capacity * heads), beta(alpha.size()), a(heads, -0.3f), bias(heads, 0.05f),
+        initial(layout.floats(), 0.0f), state = initial;
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        q[i] = static_cast<float>(static_cast<int>(i % 29) - 14) / 64.0f;
+        k[i] = static_cast<float>(static_cast<int>(i % 23) - 11) / 128.0f;
+    }
+    for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<float>(static_cast<int>(i % 31) - 15) / 64.0f;
+    auto qt = makeFP32({capacity, heads * dk}, q.data());
+    auto kt = makeFP32({capacity, heads * dk}, k.data());
+    auto vt = makeFP32({capacity, heads * dv}, v.data());
+    auto at = makeFP32({capacity, heads}, alpha.data());
+    auto bt = makeFP32({capacity, heads}, beta.data());
+    auto a_t = makeFP32({heads}, a.data());
+    auto bias_t = makeFP32({heads}, bias.data());
+    auto output = makeFP32({capacity, heads * dv});
+    auto context = makeCPUContext();
+    CPUGatedDeltaNet grouped;
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::cpu(); p.kernel = &grouped;
+    p.Q = qt.get(); p.K = kt.get(); p.V = vt.get();
+    p.alpha = at.get(); p.beta = bt.get(); p.A_log = a_t.get(); p.dt_bias = bias_t.get();
+    p.output = output.get(); p.recurrence_state = state.data();
+    p.seq_len = capacity; p.n_heads = heads; p.n_k_heads = heads; p.d_k = dk; p.d_v = dv;
+    p.verifier_state_capture_rows = capacity; p.speculative_state_slot_rows = capacity;
+    p.use_qk_l2norm = true;
+    GDNRecurrenceStage stage(p);
+    const auto requirements = stage.getWorkspaceRequirements(capacity);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), requirements.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(requirements));
+    stage.bindWorkspace(&workspace);
+    for (const int live : {capacity, 2, capacity})
+    {
+        SCOPED_TRACE(::testing::Message() << "live=" << live);
+        std::copy(initial.begin(), initial.end(), state.begin());
+        stage.updateDynamicParams(0, live);
+        ASSERT_TRUE(stage.execute(context.get()));
+        expectByteExactFP32(state.data(), initial.data(), state.size(), "compact replay preserves live input");
+        CPUGatedDeltaNet serial;
+        auto serial_state = initial;
+        std::vector<float> expected(live * heads * dv);
+        for (int row = 0; row < live; ++row)
+        {
+            ASSERT_TRUE(serial.recurrent_step(q.data() + row * heads * dk, k.data() + row * heads * dk,
+                v.data() + row * heads * dv, alpha.data() + row * heads, beta.data() + row * heads,
+                a.data(), bias.data(), expected.data() + row * heads * dv, serial_state.data(), heads, dk, dv, true));
+            ASSERT_TRUE(stage.restoreVerifierStateCaptureRow(row, nullptr));
+            expectByteExactFP32(state.data(), serial_state.data(), state.size(), "compact replay candidate bytes");
+        }
+        expectByteExactFP32(output->data(), expected.data(), expected.size(), "compact replay output bytes");
+        if (live < capacity)
+            for (int row = live; row < capacity; ++row)
+                EXPECT_FALSE(stage.planCPUVerifierStateRestoreRow(row).ready()) << "stale row=" << row;
+    }
+}
+
+/**
+ * @brief Pure compact plans reject a canonical live-state alias anywhere in slots.
+ *
+ * No mutable work allocation exists. A valid plan changes neither retained input
+ * nor live state, and a malformed destination at the end of the full logical
+ * slot extent is rejected before any output bytes are written.
+ */
+TEST(Test__GDNKernels, CPUCompactStageRejectsLiveSlotAliasBeforePublication)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet kernel;
+    const CPUGDNStateLayout layout(2,4,4);
+    std::vector<float> state(layout.floats(),-1234.0f);
+    GDNRecurrenceStage::Params params;
+    params.device_id=DeviceId::cpu(); params.kernel=&kernel;
+    params.seq_len=2; params.n_heads=2; params.n_k_heads=2; params.d_k=4; params.d_v=4;
+    params.verifier_state_capture_rows=2; params.speculative_state_slot_rows=2;
+    params.recurrence_state=state.data();
+    GDNRecurrenceStage stage(params);
+    const auto requirements=stage.getWorkspaceRequirements(2);
+    ASSERT_EQ(requirements.buffers.size(),1U);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(),requirements.total_bytes_with_alignment()+1024);
+    ASSERT_TRUE(workspace.allocate(requirements));
+    stage.bindWorkspace(&workspace);
+    float *slots=kernel.compact_slots;
+    ASSERT_NE(slots,nullptr);
+    seedCPUGDNCompactTestTransaction(slots,2,4,4,2,1000.0f);
+    const std::vector<float> slots_before(slots,slots+kernel.compact_slot_floats);
+    const auto live_before=state;
+    const auto pure_plan=stage.planCPUVerifierStateRestoreRow(1);
+    ASSERT_TRUE(pure_plan.ready());
+    ASSERT_TRUE(pure_plan.shared_gdn_prefix.has_value());
+    EXPECT_EQ(pure_plan.source,slots);
+    EXPECT_EQ(pure_plan.destination,state.data());
+    expectByteExactFP32(slots,slots_before.data(),slots_before.size(),"valid plan preserves immutable slots");
+    expectByteExactFP32(state.data(),live_before.data(),state.size(),"valid plan preserves canonical live state");
+    auto &malformed=const_cast<GDNRecurrenceStage::Params &>(stage.getParams());
+    malformed.recurrence_state=slots+kernel.compact_slot_floats-1;
+    const auto rejected=stage.planCPUVerifierStateRestoreRow(1);
+    EXPECT_EQ(rejected.status,CPUVerifierStateRestorePlanStatus::Invalid);
+    expectByteExactFP32(slots,slots_before.data(),slots_before.size(),"rejected alias preserves every slot byte");
+    expectByteExactFP32(state.data(),live_before.data(),state.size(),"rejected alias preserves original live state");
+}
+
+/**
+ * @brief Aligned equal-sized payloads never advertise rows beyond logical admission.
+ *
+ * The 1/2-row tiny geometry shares a physical span. The 8/9-row geometry also
+ * shares a span while moving the raw-log base by one checkpoint, so reverse byte
+ * inference could silently corrupt replay identity. Fixed declared capacity
+ * survives small/large parameter updates and rejects a physically fitting extra
+ * row before any production recurrence output or canonical state is changed.
+ */
+TEST(Test__GDNKernels, CPUCompactAlignedLogicalCapacityIgnoresPhysicalPadding)
+{
+    ensureCPUBackendForWorkspace();
+    for(const int requests : {1,3})
+        for(const int declared : {1,8})
+        {
+            const int dk=declared==1 ? 1 : 2,dv=dk,heads=2;
+            SCOPED_TRACE(::testing::Message()<<"requests="<<requests<<" declared="<<declared);
+            RecordingGatedDeltaNet recorder;
+            const CPUGDNStateLayout layout(heads,dk,dv);
+            const CPUSharedGDNLogicalCapacity capacity(requests*declared,requests);
+            ASSERT_EQ(CPUSharedGDNSnapshots::headFloats(layout,declared),
+                CPUSharedGDNSnapshots::headFloats(layout,declared+1));
+            std::vector<float> state(layout.floats(),0.0f);
+            GDNRecurrenceStage::Params params;
+            params.device_id=DeviceId::cpu(); params.kernel=&recorder;
+            params.seq_len=requests; params.request_count=requests; params.request_seq_len=1;
+            params.n_heads=heads; params.n_k_heads=heads; params.d_k=dk; params.d_v=dv;
+            params.speculative_state_slot_rows=capacity.flatRows(); params.recurrence_state=state.data();
+            GDNRecurrenceStage stage(params);
+            const auto requirements=stage.getWorkspaceRequirements(1);
+            ASSERT_EQ(requirements.buffers.size(),1u);
+            EXPECT_EQ(requirements.buffers.front().size_bytes,capacity.slotFloats(layout)*sizeof(float));
+            DeviceWorkspaceManager workspace(DeviceId::cpu(),requirements.total_bytes_with_alignment()+1024);
+            ASSERT_TRUE(workspace.allocate(requirements));
+            for(const int live_width : {declared,1,declared,declared+1})
+            {
+                stage.updateDynamicParams(0,live_width);
+                stage.bindWorkspace(&workspace);
+                EXPECT_EQ(recorder.capture_rows,capacity.flatRows());
+                EXPECT_EQ(recorder.compact_rows,capacity.flatRows());
+                EXPECT_EQ(recorder.compact_slot_floats,capacity.slotFloats(layout));
+            }
+            // Exercise the production admission check with the same exact
+            // manager-owned payload, rather than only inspecting mock metadata.
+            CPUGatedDeltaNet kernel;
+            kernel.bindVerifierStateCaptureWorkspace(recorder.compact_slots,capacity.flatRows(),layout.floats());
+            kernel.bindCPUSharedStateCapture(recorder.compact_slots,recorder.compact_slot_floats,capacity.flatRows());
+            const int attempted_width=declared+1,rows=requests*attempted_width;
+            std::vector<float> q(rows*heads*dk,0.125f),k(q.size(),0.25f),v(rows*heads*dv,0.375f),
+                gates(rows*heads,0.1f),a(heads,-0.3f),bias(heads,0.0f),output(v.size(),-1234.0f);
+            const auto before=state,poison=output;
+            bool admitted=false;
+            if(requests==1)
+                admitted=kernel.chunk_forward(q.data(),k.data(),v.data(),gates.data(),gates.data(),a.data(),bias.data(),
+                    output.data(),state.data(),rows,heads,dk,dv,8,false);
+            else
+            {
+                const std::vector<int> lengths(requests,attempted_width);
+                admitted=kernel.chunkForwardBatchedRequestsWithHostSeqLens(q.data(),k.data(),v.data(),gates.data(),gates.data(),
+                    a.data(),bias.data(),output.data(),state.data(),rows,requests,attempted_width,heads,dk,dv,8,false,lengths.data());
+            }
+            EXPECT_FALSE(admitted);
+            EXPECT_EQ(state,before);
+            EXPECT_EQ(output,poison);
+        }
+}
+
+/** @brief Production counters prove fused initial retention and boundary derivation. */
+TEST(Test__GDNKernels, CPUCompactFusedRetentionCountersExcludeCompleteCopyPasses)
+{
+    ScopedPerfStatsEnv perfstats;
+    constexpr int rows=9,heads=2,dk=7,dv=65;
+    const CPUGDNStateLayout layout(heads,dk,dv);
+    CPUGatedDeltaNet kernel;
+    CPUGDNCompactTestCapture capture(kernel,heads,dk,dv,rows);
+    std::vector<float> q(rows*heads*dk,0.125f),k(q.size(),0.25f),v(rows*heads*dv,0.375f),
+        gates(rows*heads,0.1f),a(heads,-0.3f),bias(heads,0.0f),state(layout.floats(),0.0f),output(v.size());
+    const auto initial=state;
+    ASSERT_TRUE(kernel.chunk_forward(q.data(),k.data(),v.data(),gates.data(),gates.data(),a.data(),bias.data(),
+        output.data(),state.data(),rows,heads,dk,dv,8,false));
+    EXPECT_EQ(state,initial);
+    const auto expect_counter=[](const char *name,double expected)
+    {
+        const auto records=PerfStatsCollector::snapshot({std::string("kernel.")+name});
+        EXPECT_FALSE(records.empty())<<name;
+        double value=0;
+        for(const auto &record : records) value+=record.value;
+        EXPECT_DOUBLE_EQ(value,expected)<<name;
+    };
+    const double matrix_bytes=static_cast<double>(heads)*dk*dv*sizeof(float);
+    expect_counter("cpu_gdn_shared_candidate_rows",heads*rows);
+    expect_counter("cpu_gdn_shared_initial_checkpoint_fused_stores",heads);
+    expect_counter("cpu_gdn_shared_initial_checkpoint_fused_store_bytes",matrix_bytes);
+    expect_counter("cpu_gdn_shared_derived_checkpoint_writes",heads);
+    expect_counter("cpu_gdn_shared_derived_checkpoint_write_bytes",matrix_bytes);
+    expect_counter("cpu_gdn_shared_explicit_checkpoint_copy_passes",0);
+    expect_counter("cpu_gdn_shared_explicit_checkpoint_copy_bytes",0);
+    expect_counter("cpu_gdn_shared_mutable_bank_copy_bytes",0);
 }

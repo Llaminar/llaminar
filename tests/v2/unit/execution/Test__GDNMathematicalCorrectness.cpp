@@ -1966,7 +1966,8 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
     std::vector<float> chunk_state = initial_state;
     std::vector<float> chunk_output(seq_len * n_heads * d_v);
     std::vector<float> snapshots(static_cast<size_t>(seq_len) * state_floats);
-    ASSERT_TRUE(chunk_kernel.chunkForwardWithStateSnapshots(
+    CPUGDNCompactTestCapture compact_capture(chunk_kernel, n_heads, d_k, d_v, seq_len);
+    ASSERT_TRUE(chunk_kernel.chunk_forward(
         q_data.data(),
         k_data.data(),
         v_data.data(),
@@ -1981,10 +1982,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
         d_k,
         d_v,
         /*chunk_size=*/64,
-        /*use_qk_l2norm=*/true,
-        snapshots.data(),
-        state_floats,
-        seq_len));
+        /*use_qk_l2norm=*/true));
 
     CPUGatedDeltaNet recurrent_kernel;
     std::vector<float> recurrent_state = initial_state;
@@ -2008,21 +2006,19 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
 
         const float *chunk_row = chunk_output.data() + static_cast<size_t>(t) * n_heads * d_v;
         std::vector<float> row_output(chunk_row, chunk_row + n_heads * d_v);
-        EXPECT_LT(maxAbsDiff(row_output, step_output), 2e-4f) << "output row " << t;
+        expectByteExactFP32(row_output.data(), step_output.data(), row_output.size(), "compact recurrence output");
 
+        ASSERT_TRUE(chunk_kernel.restoreVerifierStateCaptureRow(
+            snapshots.data() + static_cast<size_t>(t) * state_floats, t, nullptr));
         const float *snapshot = snapshots.data() + static_cast<size_t>(t) * state_floats;
         std::vector<float> row_state(snapshot, snapshot + state_floats);
-        EXPECT_LT(maxAbsDiff(row_state, recurrent_state), 2e-4f) << "snapshot row " << t;
+        expectByteExactFP32(row_state.data(), recurrent_state.data(), row_state.size(), "compact recurrence candidate");
     }
-    EXPECT_LT(maxAbsDiff(chunk_state, recurrent_state), 2e-4f);
+    expectByteExactFP32(chunk_state.data(), initial_state.data(), initial_state.size(), "compact capture preserves live state");
 
     std::vector<float> restored_state(state_floats);
-    ASSERT_TRUE(chunk_kernel.restoreStateFromSnapshot(
-        restored_state.data(),
-        snapshots.data(),
-        accepted_rows - 1,
-        state_floats,
-        state_floats));
+    ASSERT_TRUE(chunk_kernel.restoreVerifierStateCaptureRow(
+        restored_state.data(), accepted_rows - 1, nullptr));
 
     std::vector<float> accepted_replay_state = initial_state;
     for (int t = 0; t < accepted_rows; ++t)
@@ -2042,7 +2038,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
             d_v,
             /*use_qk_l2norm=*/true));
     }
-    EXPECT_LT(maxAbsDiff(restored_state, accepted_replay_state), 2e-4f);
+    expectByteExactFP32(restored_state.data(), accepted_replay_state.data(), restored_state.size(), "compact accepted state");
 }
 
 TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesLikeReplay)
@@ -2094,7 +2090,8 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesL
     std::vector<float> verifier_state = initial_state;
     std::vector<float> verifier_output(seq_len * v_stride);
     std::vector<float> snapshots(static_cast<size_t>(seq_len) * state_floats);
-    ASSERT_TRUE(verifier_kernel.chunkForwardWithStateSnapshots(
+    CPUGDNCompactTestCapture compact_capture(verifier_kernel, n_heads, d_k, d_v, seq_len);
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
         q_data.data(),
         k_data.data(),
         v_data.data(),
@@ -2109,18 +2106,11 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesL
         d_k,
         d_v,
         /*chunk_size=*/64,
-        /*use_qk_l2norm=*/true,
-        snapshots.data(),
-        state_floats,
-        seq_len));
+        /*use_qk_l2norm=*/true));
 
     std::vector<float> restored_state(state_floats);
-    ASSERT_TRUE(verifier_kernel.restoreStateFromSnapshot(
-        restored_state.data(),
-        snapshots.data(),
-        accepted_rows - 1,
-        state_floats,
-        state_floats));
+    ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+        restored_state.data(), accepted_rows - 1, nullptr));
 
     CPUGatedDeltaNet restored_kernel;
     std::vector<float> restored_continuation(continuation_rows * v_stride);
@@ -2162,13 +2152,19 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesL
             d_k,
             d_v,
             /*use_qk_l2norm=*/true));
+        ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+            snapshots.data() + static_cast<size_t>(row) * state_floats, row, nullptr));
+        expectByteExactFP32(snapshots.data() + static_cast<size_t>(row) * state_floats,
+            replay_state.data(), state_floats, "compact recurrence candidate continuation oracle");
     }
+    expectByteExactFP32(verifier_output.data(), replay_output.data(), replay_output.size(), "compact verifier outputs");
+    expectByteExactFP32(verifier_state.data(), initial_state.data(), initial_state.size(), "compact verifier preserves live state");
 
     const std::vector<float> replay_continuation(
         replay_output.begin() + static_cast<size_t>(accepted_rows) * v_stride,
         replay_output.end());
-    EXPECT_LT(maxAbsDiff(restored_continuation, replay_continuation), 2e-4f);
-    EXPECT_LT(maxAbsDiff(restored_state, replay_state), 2e-4f);
+    expectByteExactFP32(restored_continuation.data(), replay_continuation.data(), replay_continuation.size(), "compact accepted continuation output");
+    expectByteExactFP32(restored_state.data(), replay_state.data(), replay_state.size(), "compact accepted continuation state");
 }
 
 TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsRestoreAcceptedVerifierRows)

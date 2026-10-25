@@ -6,19 +6,27 @@
  * traverses its canonical raw history backwards, then applies value FMAs in
  * forward order. Rounded prefix advancement is shared at fixed eight-position
  * boundaries. Serial decode uses this same program with one live row. Snapshot
- * publication copies the complete phase/checkpoint/history value without adding
- * an arithmetic boundary. All temporary arrays are bounded thread-private
- * scratch; the caller owns state and snapshot storage.
+ * publication retains immutable checkpoints once per crossed epoch and appends
+ * each raw update once; acceptance copies the selected canonical prefix without
+ * adding an arithmetic boundary. Compact capture executes directly in those
+ * retained checkpoints and the shared raw log, so no mutable bank is cloned.
+ * Initial retention reuses each first-projection checkpoint load. Epoch-zero
+ * source-to-destination advancement similarly avoids a separate clone pass.
+ * Explicit dense serialization remains an oracle. All temporary arrays are
+ * bounded thread-private scratch; the caller owns state and snapshot storage.
  */
 #pragma once
 
 #include "kernels/CPUGDNStateLayout.h"
+#include "kernels/CPUSharedGDNSnapshots.h"
 #include "CPUAdjustedGDNReadout.h"
+#include "CPUFixedEpochQueryBlock.h"
 #include "utils/CPUFeatures.h"
 #include "utils/PerfStatsCollector.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -75,18 +83,22 @@ namespace llaminar2::cpu_gdn_epoch
      * @tparam SIMD ISA-specific independent value lanes.
      * @tparam Rows Number of live queries, fixed at 1..4 for register allocation.
      * @tparam Vectors Independent value vectors per query.
+     * @tparam Retain Whether this first readout also owns initial matrix retention.
      * @param layout Validated per-head state geometry.
-     * @param state Complete immutable checkpoint/history state.
+     * @param matrix Immutable key-major checkpoint with matrixFloats live elements.
+     * @param history Immutable contiguous epoch raw records.
      * @param x Contracted queries with a fixed 512-float row stride.
      * @param c Forward-indexed coefficients with an eight-float row stride.
      * @param phase History length preceding this group.
      * @param first First value column in this physical tile.
      * @param output First live output row.
      * @param stride Physical output row stride in floats.
+     * @param retained Exclusive retained matrix destination when Retain is true;
+     *        unused for ordinary readouts. Each loaded value is stored once.
      */
-    template<class SIMD, int Rows, int Vectors>
-    inline void projectTile(const CPUGDNStateLayout &layout, const float *state,
-        const float *x, const float *c, int phase, int first, float *output, int stride)
+    template<class SIMD, int Rows, int Vectors, bool Retain = false>
+    inline void projectTile(const CPUGDNStateLayout &layout, const float *matrix, const float *history,
+        const float *x, const float *c, int phase, int first, float *output, int stride, float *retained = nullptr)
     {
         typename SIMD::Value sums[Rows][Vectors];
 #pragma GCC unroll 4
@@ -98,7 +110,9 @@ namespace llaminar2::cpu_gdn_epoch
 #pragma GCC unroll 8
             for (int z = 0; z < Vectors; ++z)
             {
-                const auto s = SIMD::load(state + 1 + j * layout.valueWidth() + first + z * SIMD::width);
+                const auto s = SIMD::load(matrix + j * layout.valueWidth() + first + z * SIMD::width);
+                if constexpr (Retain)
+                    SIMD::store(retained + j * layout.valueWidth() + first + z * SIMD::width, s);
 #pragma GCC unroll 4
                 for (int r = 0; r < Rows; ++r)
                     sums[r][z] = SIMD::fma(s, SIMD::broadcast(x[r * 512 + j]), sums[r][z]);
@@ -110,7 +124,7 @@ namespace llaminar2::cpu_gdn_epoch
             for (int p = 0; p <= phase + r; ++p)
             {
                 const auto coefficient = SIMD::broadcast(c[r * CPUGDNStateLayout::kPeriod + p]);
-                const float *value = layout.record(state, p) + layout.keyWidth() + first;
+                const float *value = (history + static_cast<size_t>(p) * layout.recordFloats()) + layout.keyWidth() + first;
 #pragma GCC unroll 8
                 for (int z = 0; z < Vectors; ++z)
                     sums[r][z] = SIMD::fma(coefficient, SIMD::load(value + z * SIMD::width), sums[r][z]);
@@ -124,36 +138,47 @@ namespace llaminar2::cpu_gdn_epoch
     /**
      * @brief Dispatch a complete fixed-row readout without changing arithmetic.
      * @tparam Rows Live query count, 1..4.
+     * @tparam Retain Retain the initial matrix through this complete readout.
      * @param layout Validated per-head geometry.
-     * @param state Complete checkpoint/history value, borrowed read-only.
+     * @param matrix Immutable key-major checkpoint.
+     * @param history Immutable contiguous epoch raw records.
      * @param x Contracted queries, stride 512.
      * @param c Ordered coefficients, stride eight.
      * @param phase Pending history before this group.
      * @param output First live output row.
      * @param stride Output row stride in floats.
+     * @param retained Complete matrix destination required by Retain=true;
+     *        scalar tails store only for the first row to retain each value once.
      */
-    template<int Rows>
+    template<int Rows, bool Retain = false>
     __attribute__((noinline)) inline void project(const CPUGDNStateLayout &layout,
-        const float *state, const float *x, const float *c, int phase, float *output, int stride)
+        const float *matrix, const float *history, const float *x, const float *c, int phase, float *output, int stride, float *retained = nullptr)
     {
+        if constexpr (Retain)
+            if (!retained) throw std::invalid_argument("CPU GDN initial readout requires retained checkpoint storage");
         int vi = 0;
         constexpr int vectors = Rows == 1 ? 8 : Rows == 2 ? 4 : 2;
 #if defined(__AVX512F__)
         if (activeISALevel() == ISALevel::AVX512)
         {
             for (; vi + vectors * 16 <= layout.valueWidth(); vi += vectors * 16)
-                projectTile<SIMD512, Rows, vectors>(layout, state, x, c, phase, vi, output, stride);
+                projectTile<SIMD512, Rows, vectors, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
             for (; vi + 16 <= layout.valueWidth(); vi += 16)
-                projectTile<SIMD512, Rows, 1>(layout, state, x, c, phase, vi, output, stride);
+                projectTile<SIMD512, Rows, 1, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
         }
 #endif
 #if defined(__AVX2__)
+        // Three rows need more than six FMA chains to hide dependency latency.
+        // Four vectors retain twelve accumulators; three query broadcasts and
+        // one consumed matrix vector fill the sixteen-register AVX2 budget.
+        // Serial rows and all other row counts retain their proven geometry.
+        constexpr int vectors256 = Rows == 3 ? 4 : vectors;
         if (activeISALevel() >= ISALevel::AVX2)
         {
-            for (; vi + vectors * 8 <= layout.valueWidth(); vi += vectors * 8)
-                projectTile<SIMD256, Rows, vectors>(layout, state, x, c, phase, vi, output, stride);
+            for (; vi + vectors256 * 8 <= layout.valueWidth(); vi += vectors256 * 8)
+                projectTile<SIMD256, Rows, vectors256, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
             for (; vi + 8 <= layout.valueWidth(); vi += 8)
-                projectTile<SIMD256, Rows, 1>(layout, state, x, c, phase, vi, output, stride);
+                projectTile<SIMD256, Rows, 1, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
         }
 #endif
         for (; vi < layout.valueWidth(); ++vi)
@@ -161,28 +186,38 @@ namespace llaminar2::cpu_gdn_epoch
             {
                 float sum = 0;
                 for (int j = 0; j < layout.keyWidth(); ++j)
-                    sum = std::fma(state[1 + j * layout.valueWidth() + vi], x[r * 512 + j], sum);
+                {
+                    const float checkpoint = matrix[j * layout.valueWidth() + vi];
+                    if constexpr (Retain)
+                        if (r == 0) retained[j * layout.valueWidth() + vi] = checkpoint;
+                    sum = std::fma(checkpoint, x[r * 512 + j], sum);
+                }
                 for (int p = 0; p <= phase + r; ++p)
                     sum = std::fma(c[r * CPUGDNStateLayout::kPeriod + p],
-                        layout.record(state, p)[layout.keyWidth() + vi], sum);
+                        (history + static_cast<size_t>(p) * layout.recordFloats())[layout.keyWidth() + vi], sum);
                 output[r * stride + vi] = sum;
             }
     }
 
     /**
-     * @brief Share the ordered rounded prefix computation for one checkpoint.
+     * @brief Apply the ordered rounded epoch program to one exclusive checkpoint tile.
      * @tparam SIMD Independent value lanes.
      * @tparam Vectors Number of independent value vectors retained in registers.
      * @param layout Validated head geometry.
-     * @param state Complete mutable state with eight live raw updates.
+     * @param matrix Exclusive mutable next checkpoint.
+     * @param history Eight immutable raw records in canonical forward order.
      * @param first First value column in this tile.
+     * @param initial_source Immutable predecessor for update zero. Subsequent
+     *        updates borrow the newly computed destination in place. It may alias
+     *        matrix for ordinary encoded-state advancement.
      */
     template<class SIMD, int Vectors>
-    inline void flushTile(const CPUGDNStateLayout &layout, float *state, int first)
+    inline void flushTile(const CPUGDNStateLayout &layout, float *matrix, const float *history, int first, const float *initial_source)
     {
         for (int p = 0; p < CPUGDNStateLayout::kPeriod; ++p)
         {
-            const float *raw = layout.record(state, p);
+            const float *const parent = p == 0 ? initial_source : matrix;
+            const float *raw = (history + static_cast<size_t>(p) * layout.recordFloats());
             const auto decay = SIMD::broadcast(raw[layout.keyWidth() + layout.valueWidth()]);
             const auto beta = SIMD::broadcast(raw[layout.keyWidth() + layout.valueWidth() + 1]);
             typename SIMD::Value sums[Vectors];
@@ -193,7 +228,7 @@ namespace llaminar2::cpu_gdn_epoch
                 const auto key = SIMD::broadcast(raw[j]);
 #pragma GCC unroll 4
                 for (int z = 0; z < Vectors; ++z)
-                    sums[z] = SIMD::fma(SIMD::mul(SIMD::load(state + 1 + j * layout.valueWidth() + first + z * SIMD::width), decay), key, sums[z]);
+                    sums[z] = SIMD::fma(SIMD::mul(SIMD::load(parent + j * layout.valueWidth() + first + z * SIMD::width), decay), key, sums[z]);
             }
 #pragma GCC unroll 4
             for (int z = 0; z < Vectors; ++z)
@@ -204,54 +239,71 @@ namespace llaminar2::cpu_gdn_epoch
 #pragma GCC unroll 4
                 for (int z = 0; z < Vectors; ++z)
                 {
-                    float *target = state + 1 + j * layout.valueWidth() + first + z * SIMD::width;
-                    SIMD::store(target, SIMD::fma(key, sums[z], SIMD::mul(SIMD::load(target), decay)));
+                    float *target = matrix + j * layout.valueWidth() + first + z * SIMD::width;
+                    SIMD::store(target, SIMD::fma(key, sums[z], SIMD::mul(SIMD::load(parent + j * layout.valueWidth() + first + z * SIMD::width), decay)));
                 }
             }
         }
     }
 
     /**
-     * @brief Advance exactly eight updates, then retire all history to zero.
+     * @brief Advance exactly eight raw updates into an exclusively owned checkpoint.
      * @param layout Validated physical head geometry.
-     * @param state Complete mutable state with eight live raw records.
+     * @param matrix Mutable key-major checkpoint; may be a retained next-epoch slot.
+     * @param history Eight immutable raw records in increasing position order.
+     * @param initial_source Predecessor matrix, possibly equal to matrix. The
+     *        first update reads this source and writes matrix; later updates are
+     *        in place, avoiding a separate predecessor clone pass.
      */
-    inline void flush(const CPUGDNStateLayout &layout, float *state)
+    inline void flushCheckpoint(const CPUGDNStateLayout &layout, float *matrix, const float *history, const float *initial_source)
     {
         int vi = 0;
 #if defined(__AVX512F__)
         if (activeISALevel() == ISALevel::AVX512)
         {
-            for (; vi + 64 <= layout.valueWidth(); vi += 64) flushTile<SIMD512, 4>(layout, state, vi);
-            for (; vi + 16 <= layout.valueWidth(); vi += 16) flushTile<SIMD512, 1>(layout, state, vi);
+            for (; vi + 64 <= layout.valueWidth(); vi += 64) flushTile<SIMD512, 4>(layout, matrix, history, vi, initial_source);
+            for (; vi + 16 <= layout.valueWidth(); vi += 16) flushTile<SIMD512, 1>(layout, matrix, history, vi, initial_source);
         }
 #endif
 #if defined(__AVX2__)
         if (activeISALevel() >= ISALevel::AVX2)
         {
-            for (; vi + 32 <= layout.valueWidth(); vi += 32) flushTile<SIMD256, 4>(layout, state, vi);
-            for (; vi + 8 <= layout.valueWidth(); vi += 8) flushTile<SIMD256, 1>(layout, state, vi);
+            for (; vi + 32 <= layout.valueWidth(); vi += 32) flushTile<SIMD256, 4>(layout, matrix, history, vi, initial_source);
+            for (; vi + 8 <= layout.valueWidth(); vi += 8) flushTile<SIMD256, 1>(layout, matrix, history, vi, initial_source);
         }
 #endif
         for (; vi < layout.valueWidth(); ++vi)
             for (int p = 0; p < CPUGDNStateLayout::kPeriod; ++p)
             {
-                const float *raw = layout.record(state, p);
+                const float *const parent = p == 0 ? initial_source : matrix;
+                const float *raw = (history + static_cast<size_t>(p) * layout.recordFloats());
                 const float decay = raw[layout.keyWidth() + layout.valueWidth()];
                 float projection = 0;
                 for (int j = 0; j < layout.keyWidth(); ++j)
                 {
-                    float &s = state[1 + j * layout.valueWidth() + vi];
-                    s *= decay;
-                    projection = std::fma(s, raw[j], projection);
+                    // Match the SIMD program's separately rounded multiply.
+                    // No destination store may precede the complete projection:
+                    // update zero may borrow a distinct immutable predecessor.
+                    const float decayed = parent[j * layout.valueWidth() + vi] * decay;
+                    projection = std::fma(decayed, raw[j], projection);
                 }
                 const float delta = (raw[layout.keyWidth() + vi] - projection) * raw[layout.keyWidth() + layout.valueWidth() + 1];
                 for (int j = 0; j < layout.keyWidth(); ++j)
                 {
-                    float &s = state[1 + j * layout.valueWidth() + vi];
-                    s = std::fma(raw[j], delta, s);
+                    const float decayed = parent[j * layout.valueWidth() + vi] * decay;
+                    matrix[j * layout.valueWidth() + vi] = std::fma(raw[j], delta, decayed);
                 }
             }
+    }
+
+    /**
+     * @brief Advance an encoded ordinary state and retire its completed history.
+     * @param layout Validated complete-state geometry.
+     * @param state Exclusive encoded head with exactly eight pending records.
+     */
+    inline void flush(const CPUGDNStateLayout &layout, float *state)
+    {
+        flushCheckpoint(layout, state + 1, layout.record(state, 0), state + 1);
         std::fill(layout.record(state, 0), state + layout.headFloats(), 0.0f);
         state[0] = 0;
     }
@@ -291,7 +343,7 @@ namespace llaminar2::cpu_gdn_epoch
      * @param output First output row.
      * @param output_stride Physical output row stride.
      * @param snapshots Optional first post-row snapshot for this head.
-     * @param snapshot_stride Complete bank stride between snapshot rows.
+     * @param snapshot_stride Complete bank stride between dense oracle rows.
      */
     inline void run(const CPUGDNStateLayout &layout, const float *initial, float *working,
         const float *q, const float *k, const float *v, const float *decay, const float *beta,
@@ -314,23 +366,21 @@ namespace llaminar2::cpu_gdn_epoch
                 std::memcpy(raw + layout.keyWidth(), v + static_cast<std::size_t>(row) * v_stride, layout.valueWidth() * sizeof(float));
                 raw[layout.keyWidth() + layout.valueWidth()] = decay[row * gate_stride];
                 raw[layout.keyWidth() + layout.valueWidth() + 1] = beta[row * gate_stride];
-                float *query = x + r * 512;
-                std::memcpy(query, q + static_cast<std::size_t>(row) * qk_stride, layout.keyWidth() * sizeof(float));
-                for (int p = phase + r; p >= 0; --p)
-                {
-                    const float *u = layout.record(working, p);
-                    coefficients[r * CPUGDNStateLayout::kPeriod + p] = prepareAdjustedGDNReadout(
-                        query, u, u[layout.keyWidth() + layout.valueWidth()],
-                        u[layout.keyWidth() + layout.valueWidth() + 1], layout.keyWidth(), query);
-                }
+            }
+            const float *queries=q+static_cast<size_t>(first)*qk_stride;
+            switch(count) {
+                case 1: contractQueries<1>(layout,layout.record(working,0),queries,qk_stride,phase,x,coefficients); break;
+                case 2: contractQueries<2>(layout,layout.record(working,0),queries,qk_stride,phase,x,coefficients); break;
+                case 3: contractQueries<3>(layout,layout.record(working,0),queries,qk_stride,phase,x,coefficients); break;
+                case 4: contractQueries<4>(layout,layout.record(working,0),queries,qk_stride,phase,x,coefficients); break;
             }
             float *out = output + static_cast<std::size_t>(first) * output_stride;
             switch (count)
             {
-                case 1: project<1>(layout, working, x, coefficients, phase, out, output_stride); break;
-                case 2: project<2>(layout, working, x, coefficients, phase, out, output_stride); break;
-                case 3: project<3>(layout, working, x, coefficients, phase, out, output_stride); break;
-                case 4: project<4>(layout, working, x, coefficients, phase, out, output_stride); break;
+                case 1: project<1>(layout, working+1, layout.record(working,0), x, coefficients, phase, out, output_stride); break;
+                case 2: project<2>(layout, working+1, layout.record(working,0), x, coefficients, phase, out, output_stride); break;
+                case 3: project<3>(layout, working+1, layout.record(working,0), x, coefficients, phase, out, output_stride); break;
+                case 4: project<4>(layout, working+1, layout.record(working,0), x, coefficients, phase, out, output_stride); break;
             }
             ++projection_groups;
             if (count > 1) grouped_rows += count;
@@ -358,6 +408,132 @@ namespace llaminar2::cpu_gdn_epoch
                 grouped_rows, "recurrence", "cpu");
             PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_checkpoint_flushes",
                 checkpoint_flushes, "recurrence", "cpu");
+        }
+    }
+    /**
+     * @brief Execute compact capture directly in retained checkpoint/log slots.
+     * @param layout Validated per-head physical and arithmetic geometry.
+     * @param initial Immutable canonical input head; never modified or cloned by a separate pass.
+     * @param q Prepared query rows, separated by qk_stride floats.
+     * @param k Prepared key rows, separated by qk_stride floats.
+     * @param v Raw value rows, separated by v_stride floats.
+     * @param decay Rounded decay factors separated by gate_stride floats.
+     * @param beta Rounded write strengths separated by gate_stride floats.
+     * @param rows Positive live candidate count admitted by shared storage.
+     * @param qk_stride Prepared query/key physical row stride in floats.
+     * @param v_stride Raw value physical row stride in floats.
+     * @param gate_stride Rounded gate physical row stride in floats.
+     * @param output First live output row, overwritten completely.
+     * @param output_stride Output row stride in floats.
+     * @param shared Exclusive unpublished retained transaction; begin retains the
+     *        initial history once; the synchronous first readout retains cp0
+     *        before complete can publish any candidate.
+     *
+     * Current checkpoints are immutable. A fixed epoch boundary derives its
+     * next retained slot directly from the predecessor using exactly eight raw
+     * updates, without a separate matrix clone. Queries and projections borrow
+     * the same numeric helpers as ordinary encoded-state execution. No mutable canonical bank,
+     * row serialization, inactive-history clearing, or partial flush is needed.
+     */
+    inline void runShared(const CPUGDNStateLayout &layout, const float *initial,
+        const float *q, const float *k, const float *v, const float *decay, const float *beta,
+        int rows, int qk_stride, int v_stride, int gate_stride, float *output, int output_stride,
+        CPUSharedGDNSnapshots &shared)
+    {
+        if (rows <= 0)
+            throw std::invalid_argument("CPU GDN retained readout requires live rows; empty participants retire metadata");
+        alignas(64) float x[4 * 512], coefficients[4 * CPUGDNStateLayout::kPeriod];
+        int initial_phase = 0, first = 0;
+        int projection_groups = 0, grouped_rows = 0, checkpoint_flushes = 0;
+        // Both first-retaining and later readouts execute this one FP32 program.
+        // Retain is compile-time so ordinary readouts carry no conditional store
+        // inside the key loop. Scratch remains bounded and thread-private.
+        auto readout_group = [&]<bool Retain>(const float *matrix, float *retained)
+        {
+            const int prefix = initial_phase + first;
+            const int epoch = prefix / CPUGDNStateLayout::kPeriod;
+            const int phase = prefix % CPUGDNStateLayout::kPeriod;
+            const int count = std::min({4, rows - first, CPUGDNStateLayout::kPeriod - phase});
+            const float *const history = shared.record(epoch * CPUGDNStateLayout::kPeriod);
+            for (int r = 0; r < count; ++r)
+            {
+                const int row = first + r;
+                float *const raw = shared.record(initial_phase + row);
+                std::memcpy(raw, k + static_cast<size_t>(row) * qk_stride, layout.keyWidth() * sizeof(float));
+                std::memcpy(raw + layout.keyWidth(), v + static_cast<size_t>(row) * v_stride, layout.valueWidth() * sizeof(float));
+                raw[layout.keyWidth() + layout.valueWidth()] = decay[row * gate_stride];
+                raw[layout.keyWidth() + layout.valueWidth() + 1] = beta[row * gate_stride];
+            }
+            const float *const queries = q + static_cast<size_t>(first) * qk_stride;
+            switch (count)
+            {
+                case 1: contractQueries<1>(layout, history, queries, qk_stride, phase, x, coefficients); break;
+                case 2: contractQueries<2>(layout, history, queries, qk_stride, phase, x, coefficients); break;
+                case 3: contractQueries<3>(layout, history, queries, qk_stride, phase, x, coefficients); break;
+                case 4: contractQueries<4>(layout, history, queries, qk_stride, phase, x, coefficients); break;
+            }
+            float *const out = output + static_cast<size_t>(first) * output_stride;
+            switch (count)
+            {
+                case 1: project<1, Retain>(layout, matrix, history, x, coefficients, phase, out, output_stride, retained); break;
+                case 2: project<2, Retain>(layout, matrix, history, x, coefficients, phase, out, output_stride, retained); break;
+                case 3: project<3, Retain>(layout, matrix, history, x, coefficients, phase, out, output_stride, retained); break;
+                case 4: project<4, Retain>(layout, matrix, history, x, coefficients, phase, out, output_stride, retained); break;
+            }
+            ++projection_groups;
+            if (count > 1) grouped_rows += count;
+            first += count;
+        };
+        // The callback runs after phase/span validation. Its successful return
+        // proves every initial matrix value was retained through the first full
+        // projection, including scalar tails, before publication is permitted.
+        shared.beginWithInitialReadout(initial, rows,
+            [&](const float *source, float *retained)
+            {
+                initial_phase = static_cast<int>(initial[0]);
+                readout_group.template operator()<true>(source, retained);
+            });
+        auto advance_completed_epoch = [&]()
+        {
+            const int prefix = initial_phase + first;
+            if (prefix % CPUGDNStateLayout::kPeriod != 0) return;
+            const int epoch = prefix / CPUGDNStateLayout::kPeriod;
+            // Update zero reads the immutable predecessor and writes the next
+            // checkpoint directly. Updates one through seven are in place on
+            // that next slot, with the same rounded products and FMA order.
+            flushCheckpoint(layout, shared.checkpoint(epoch),
+                shared.record((epoch - 1) * CPUGDNStateLayout::kPeriod), shared.checkpoint(epoch - 1));
+            ++checkpoint_flushes;
+        };
+        advance_completed_epoch();
+        while (first < rows)
+        {
+            const int epoch = (initial_phase + first) / CPUGDNStateLayout::kPeriod;
+            readout_group.template operator()<false>(shared.checkpoint(epoch), nullptr);
+            advance_completed_epoch();
+        }
+        shared.complete();
+        if (PerfStatsCollector::isDomainEnabled("kernel"))
+        {
+            const double matrix_bytes = static_cast<double>(layout.matrixFloats()) * sizeof(float);
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_candidate_rows", rows, "recurrence", "cpu");
+            // Only cp0 copies predecessor bits. Crossed checkpoints are derived
+            // arithmetic writes, never raw matrix clones or copy-pass traffic.
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_checkpoint_copies", 1, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_checkpoint_copy_bytes", matrix_bytes, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_initial_checkpoint_fused_stores", 1, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_initial_checkpoint_fused_store_bytes", matrix_bytes, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_derived_checkpoint_writes", checkpoint_flushes, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_derived_checkpoint_write_bytes", checkpoint_flushes * matrix_bytes, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_explicit_checkpoint_copy_passes", 0, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_explicit_checkpoint_copy_bytes", 0, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_raw_log_records", initial_phase + rows, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_raw_log_copy_bytes",
+                static_cast<double>(initial_phase + rows) * layout.recordFloats() * sizeof(float), "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_shared_mutable_bank_copy_bytes", 0, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_projection_groups", projection_groups, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_grouped_projection_rows", grouped_rows, "recurrence", "cpu");
+            PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_checkpoint_flushes", checkpoint_flushes, "recurrence", "cpu");
         }
     }
 }

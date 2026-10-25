@@ -241,6 +241,12 @@ MTP_TRANSACTIONS_HEADER = (
     "dynamic_policy_witness_emitted_tokens,"
     "dynamic_policy_witness_serial_oracle_tokens"
 )
+MTP_ACCEPTANCE_WITNESS_HEADER = (
+    "reference_step,condition_token,authenticated_first_draft,"
+    "admitted_depth,attempted_drafts,verifier_transactions,accepted_drafts,"
+    "emitted_tokens,serial_tokens,continuation_tokens,state_byte_exact,"
+    "observed_depth,prefix_restored,adaptive_enabled"
+)
 NATIVE_VERIFIER_ROWS_HEADER = (
     "reference_step,condition_position,stage,physical_rows,row,row_elements,"
     "status,first_mismatch,grouped_bits,serial_bits,max_abs_diff,passed"
@@ -254,6 +260,7 @@ CSV_ARTIFACTS_REQUIRING_DATA = frozenset(
         "prefix_restore.csv",
         "production_path.csv",
         "mtp_native_verifier_rows.csv",
+        "mtp_acceptance_witness.csv",
     }
 )
 REQUIRED_CAMPAIGN_LABELS = {
@@ -2273,7 +2280,43 @@ def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
     ):
         headers["mtp_transactions.csv"] = MTP_TRANSACTIONS_HEADER
         headers["mtp_native_verifier_rows.csv"] = NATIVE_VERIFIER_ROWS_HEADER
+    if re.search(r"(?:^|_)MTPDynamicDepth(?:_|$)", gtest_case):
+        headers["mtp_acceptance_witness.csv"] = MTP_ACCEPTANCE_WITNESS_HEADER
     return headers
+
+
+def validate_mtp_acceptance_witness(rows: list[list[str]]) -> str | None:
+    """Authenticate one full-width accepting transaction and exact continuation.
+
+    Adaptive policy can legitimately reject every proposal at its original
+    workload edge. The independent positive checkpoint must still prove native
+    accepting tokens, full-depth real work and complete main-state byte parity.
+    """
+    if len(rows) != 2:
+        return "acceptance witness requires exactly one evidence row"
+    try:
+        row = dict(zip(rows[0], rows[1], strict=True))
+        emitted = [int(token) for token in row["emitted_tokens"].split(";")]
+        serial = [int(token) for token in row["serial_tokens"].split(";")]
+        condition = int(row["condition_token"])
+        draft = int(row["authenticated_first_draft"])
+        depth = int(row["admitted_depth"])
+        attempts = int(row["attempted_drafts"])
+        accepted = int(row["accepted_drafts"])
+        if (int(row["reference_step"]) < 0 or min(condition, draft) < 0 or
+                depth != 15 or int(row["observed_depth"]) != depth or
+                attempts < depth or accepted <= 0 or
+                accepted > attempts or int(row["verifier_transactions"]) <= 0):
+            return "acceptance witness has invalid checkpoint, depth or work counters"
+        if (len(emitted) < 2 or emitted != serial or min(emitted) < 0 or
+                emitted[0] != condition or emitted[1] != draft):
+            return "acceptance witness lacks authenticated serial-exact accepting tokens"
+        if (int(row["continuation_tokens"]) < 2 or row["state_byte_exact"] != "true" or
+                row["prefix_restored"] != "true" or row["adaptive_enabled"] != "true"):
+            return "acceptance witness lacks exact complete-state continuation"
+    except (ValueError, KeyError):
+        return "malformed acceptance witness evidence"
+    return None
 
 
 def validate_native_verifier_rows(rows: list[list[str]]) -> str | None:
@@ -2505,6 +2548,11 @@ def validate_campaign_artifacts(
             if requires_data and len(rows) < 2:
                 errors.append(f"{gtest_case}: {filename} has no evidence row")
                 continue
+            if filename == "mtp_acceptance_witness.csv":
+                acceptance_error = validate_mtp_acceptance_witness(rows)
+                if acceptance_error:
+                    errors.append(f"{gtest_case}: {filename}: {acceptance_error}")
+                    continue
             if filename == "mtp_native_verifier_rows.csv":
                 native_error = validate_native_verifier_rows(rows)
                 if native_error:

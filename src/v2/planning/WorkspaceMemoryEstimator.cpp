@@ -337,21 +337,14 @@ size_t exactHybridVerifierStateWorkspaceBytes(
         layer_count,
         per_layer_slots,
         "GDN layer count and verifier slots");
-    /*
-     * GPU recurrence kernels publish graph-stable staging rows beside the
-     * rollback slots. CPU kernels update their slot banks directly and do not
-     * declare those work buffers. Keep the backend distinction in this shared
-     * metadata contract so preflight does not invent CPU-only padding.
-     */
+    // CPU recurrence builds retained checkpoints/logs directly, so both CPU
+    // recurrence and short-convolution need only their per-layer slot payloads.
+    // GPU kernels retain one role-shared mutable bank for each state family.
     if (geometry.device.is_gpu())
     {
-        bytes = checkedAdd(
-            bytes,
-            alignedWorkspaceBytes(recurrence.work_bytes),
+        bytes=checkedAdd(bytes,alignedWorkspaceBytes(recurrence.work_bytes),
             "shared GDN recurrence verifier work");
-        bytes = checkedAdd(
-            bytes,
-            alignedWorkspaceBytes(short_conv.work_bytes),
+        bytes=checkedAdd(bytes,alignedWorkspaceBytes(short_conv.work_bytes),
             "shared GDN short-convolution verifier work");
     }
     return bytes;

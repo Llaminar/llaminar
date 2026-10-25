@@ -1,5 +1,23 @@
 # vLLM-Style MTP Project Plan
 
+## 2026-10-25 follow-up: shallow CPU GDN economy and develop comparison
+
+Immutable checkpoint retention, shared query SIMD, direct accepted-state scatter
+and correct terminal-logit publication close the selected CPU failures below.
+Complete prerequisites pass 737 Unit and 625 preflight entries; all 13 selected
+original-model cells pass, including positive dynamic acceptance. All 672
+production-layout depth-2/3/4 kernel cases preserve bytes and beat serial across
+the measured ISAs, phases, geometries and physical worker counts. All 48 isolated
+counter profiles pass; this is CPU evidence, not a release or GPU certificate.
+
+Twenty-four Release model runs compare the complete feature with exact develop
+`ef1f54b09`, using the same losslessly expanded FP32-router model fixture.
+Median paired decode gains are 1.9%, 5.5% and 5.9% at depths 2, 3 and 4.
+Dynamic depth gains 38.5% while performing fewer draft steps; changed arithmetic
+and accepted work contribute to these version deltas. Prefill remains slower.
+The user canceled 16k/64k testing before a paired long-context cohort completed.
+Implementation, limits and receipts: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
+
 ## 2026-10-25: CPU fixed-epoch production implementation and model timing
 
 The combined P=8 backward-query/shared-prefix candidate now runs in ordinary CPU

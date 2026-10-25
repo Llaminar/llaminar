@@ -11,6 +11,9 @@
  * Pipeline composition is owned by RankOrchestrator/GlobalOrchestrator. This
  * participant owns only its declared layer shard and injected collectives;
  * it cannot manufacture another pipeline or lazily discover TP domains.
+ * CPU accepted-state publication copies the selected verifier logits row into
+ * canonical storage alongside KV/recurrent/terminal-hidden publication; a
+ * retained multirow verifier allocation never implicitly owns scalar row zero.
  */
 
 #include "execution/moe/DeviceMoERebalancePerfStats.h"
@@ -29953,6 +29956,57 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::publishCPUAcceptedVerifierLogits(
+        const PrefixLogitsRowSelection &selection)
+    {
+        if (!state_.device_id.is_cpu())
+            throw std::logic_error("Host accepted-logit publication requires CPU ownership");
+        selection.requireCurrent(session_epoch_);
+        if (pp_stage_config_ && !pp_stage_config_->has_lm_head)
+            return true;
+        if (!graph_builder_ || graph_builder_->config().vocab_size <= 0)
+            return false;
+        TensorBase *const source = state_.all_position_logits.get();
+        TensorBase *const destination = state_.logits.get();
+        const size_t vocabulary = static_cast<size_t>(graph_builder_->config().vocab_size);
+        if (!source || !destination || source->native_type() != TensorType::FP32 ||
+            destination->native_type() != TensorType::FP32 ||
+            source->rows() <= 0 ||
+            static_cast<size_t>(source->rows()) != selection.rows() ||
+            source->cols() < static_cast<int64_t>(vocabulary) ||
+            destination->cols() < static_cast<int64_t>(vocabulary) ||
+            !source->raw_data() || !destination->raw_mutable_data())
+            return false;
+        const PrefixLogitsVocabularyRange full{0, vocabulary};
+        const auto slice = PrefixTerminalLogitsSlice::resolveSelectedRow(
+            full, full, fp32LogitsRowBytes(source), selection, session_epoch_);
+        // Stateful publication selected this same row for KV/GDN and terminal
+        // hidden. Copy only its live vocabulary, never the retained matrix or
+        // its unused capacity. Canonical storage survives the next verifier's
+        // reuse and keeps existing scalar samplers on a single-row authority.
+        const auto *bytes = static_cast<const uint8_t *>(source->raw_data());
+        std::memmove(destination->raw_mutable_data(), bytes + slice.byteOffset(), slice.byteCount());
+        TransferEngine::publishHostWrite(destination);
+        if (arena_ && arena_->isRegistered(BufferId::LOGITS))
+            arena_->markWrittenFlagsOnly(BufferId::LOGITS, DeviceId::cpu());
+        const bool published = publishCurrentMainLogits(destination,
+            {.execution_role = ForwardExecutionRole::MainInference,
+             .logical_all_position_logits = false,
+             .storage_surface = ForwardLogitsStorageSurface::CanonicalFull},
+            MainLogitsPublicationSource::AcceptedVerifierState,
+            "accepted_cpu_verifier_row");
+        if (published)
+        {
+            PerfStatsCollector::addCounter("mtp", "accepted_terminal_logits_rows", 1.0,
+                "decode", state_.device_id.toString(),
+                {{"selected_row", std::to_string(selection.row())},
+                 {"producer_rows", std::to_string(selection.rows())}});
+            PerfStatsCollector::addCounter("mtp", "accepted_terminal_logits_bytes",
+                static_cast<double>(slice.byteCount()), "decode", state_.device_id.toString());
+        }
+        return published;
+    }
+
     void DeviceGraphOrchestrator::clearCurrentMainLogitsPublication(
         const char *reason) noexcept
     {
@@ -35195,6 +35249,11 @@ namespace llaminar2
                  {"target_rows", std::to_string(verifier_graph->signature.seq_len)}});
         }
 
+        if (result.accepted_count > 0 && !publishCPUAcceptedVerifierLogits(
+                PrefixLogitsRowSelection(static_cast<size_t>(result.accepted_count - 1),
+                    static_cast<size_t>(verifier_graph->signature.seq_len), session_epoch_)))
+            return fail("MTP spec-state publication could not publish accepted terminal logits");
+
         if (!state_.positions.empty())
             state_.positions[0] = plan.target_cached_tokens;
         if (!state_.sequence_lengths.empty())
@@ -35449,6 +35508,13 @@ namespace llaminar2
                 return fail("MTP batched spec-state publication could not restore accepted terminal hidden rows");
             }
         }
+
+        // Request zero is the public scalar main-logit authority. The batch
+        // retains explicit request-row consumers for its other participants.
+        if (restore_rows.front() >= 0 && !publishCPUAcceptedVerifierLogits(
+                PrefixLogitsRowSelection(static_cast<size_t>(restore_rows.front()),
+                    static_cast<size_t>(padded_seq_len) * plans.request_count, session_epoch_)))
+            return fail("MTP batched spec-state publication could not publish accepted terminal logits");
 
         const LivePrefixMutationReason mutation_reason =
             any_correction

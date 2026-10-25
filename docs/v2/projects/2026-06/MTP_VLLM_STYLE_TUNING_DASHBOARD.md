@@ -3,10 +3,10 @@
 Serving frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)). Keep this file below 200 lines;
 history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md) and [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
 
-CPU GDN, 2026-10-25: P=8 production candidate passes 1,350 gates and 12 selected model cells.
-Dynamic acceptance fails 3/3; grouped economy fails at 1/7/14 workers. Keep experimental.
-Paired full-model throughput: 0.8B +8.3%, 4B −1.9%, MoE +32.8%; arithmetic changes tokens/work.
-Implementation, limits and evidence: [CPU GDN report](../2026-10/gated-deltanet-epoch-production-results.md).
+CPU GDN, 2026-10-25 follow-up: 1,362 gates and all 13 selected model cells pass, including dynamic acceptance.
+All 672 shallow-depth kernel cases pass bytes/economy; 48 isolated CPU profiles pass.
+Decode vs exact develop: depths 2/3/4 +1.9/+5.5/+5.9%; shared FP32-router fixture, changed tokens/work.
+CPU scope, prefill cost and canceled long-context tests: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
 
 ## Completed evidence
 

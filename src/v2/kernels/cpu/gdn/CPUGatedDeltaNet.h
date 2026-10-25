@@ -44,6 +44,20 @@ namespace llaminar2
          */
         bool resetGPUState(void *stream) override;
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
+        /** @copydoc ITensorGatedDeltaNet::restoreCPUSharedStateRows */
+        bool restoreCPUSharedStateRows(const CPUSharedGDNTransaction &transaction,
+            float *destination,const int *rows) override;
+        /**
+         * @brief Bind retained compact epoch storage without a mutable state clone.
+         * @param slots Arena-owned immutable checkpoint/raw-log transaction payload.
+         * @param slot_floats Admitted payload capacity in FP32-sized elements.
+         * @param rows Flattened row capacity; per-request geometry is authenticated at execution.
+         * @throws std::invalid_argument for partial bindings or unrepresentable capacities.
+         * Rebinding or clearing retires local direct-publication eligibility;
+         * independently owned stage transactions retain their own generation authority.
+         */
+        void bindCPUSharedStateCapture(float *slots,size_t slot_floats,int rows) override;
+
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
 
         /**
@@ -96,10 +110,10 @@ namespace llaminar2
         /**
          * @brief Advance separate Q/K/V rows and publish every post-row state.
          *
-         * Snapshot rows are direct recurrence destinations, not copies made
-         * after an alternate verifier kernel.  On successful return @p state is
-         * advanced to the final snapshot, preserving the historical explicit
-         * snapshot API contract while avoiding one copy per intermediate row.
+         * This explicit dense serialization boundary is a diagnostic oracle.
+         * On successful return @p state advances to the final snapshot. Bound
+         * production verifier calls instead require immutable shared checkpoints
+         * and a shared raw log; they never select dense serialization.
          *
          * @return true when all rows are byte-equivalent to serial decode and
          *         the terminal state is published; false is a fatal bad contract.
@@ -117,8 +131,9 @@ namespace llaminar2
         /**
          * @brief Run the production merged-QKV verifier without mutating live state.
          *
-         * The last snapshot owns the mutable working checkpoint/history bank.
-         * Earlier rows publish complete immutable prefixes of that history.
+         * Explicit dense storage materializes every row for diagnostics. Bound
+         * production storage builds immutable checkpoints and one shared raw log
+         * directly, materializing only the accepted row without a working clone.
          * Readouts share checkpoint loads while fixed-position boundaries alone
          * advance the rounded matrix; no production M=1 row replay is used.
          * The input state therefore remains authoritative until the MTP
@@ -242,8 +257,8 @@ namespace llaminar2
          * @param A_log Per-head recurrence decay coefficients.
          * @param dt_bias Per-head time-step biases.
          * @param output Destination rows in local-value-head order.
-         * @param state Complete CPUGDNStateLayout bank. Verifier execution uses
-         *        its last snapshot as workspace and preserves these initial bytes.
+         * @param state Complete CPUGDNStateLayout bank. Bound verifier execution
+         *        builds retained immutable checkpoints and preserves these initial bytes.
          * @param seq_len Number of rows to advance; every positive runtime M is
          *        accepted when the caller provides sufficient storage.
          * @param n_heads Number of local value heads.
@@ -298,6 +313,45 @@ namespace llaminar2
         std::vector<float> k_scratch_;        ///< Preprocessed K buffer
         std::vector<float> gate_scratch_;     ///< Gate values
         std::vector<float> beta_sig_scratch_; ///< Sigmoid of beta
+        float *shared_slots_ = nullptr; ///< Arena-owned immutable transaction payload.
+        size_t shared_slot_floats_ = 0; ///< Arena-admitted immutable checkpoint/log capacity.
+        int shared_rows_ = 0, shared_heads_ = 0, shared_dk_ = 0, shared_dv_ = 0;
+        int shared_width_ = 0, shared_requests_ = 0, shared_live_width_ = 0; ///< Published transaction identity.
+        bool shared_valid_ = false;
+        /**
+         * @brief Authenticate a bound transaction before any recurrence output.
+         * @param requests Fixed number of request partitions in this call.
+         * @param width Live input-row width per request, bounded by admitted width.
+         * @param heads Participant-local value-head count.
+         * @param dk Key width of each complete canonical head.
+         * @param dv Value width of each complete canonical head.
+         * @return True for a complete arena binding and sufficient
+         *         logical capacity; false retires local publication eligibility.
+         * @throws std::invalid_argument for unsupported canonical state geometry.
+         * @throws std::overflow_error if the canonical bank exceeds its INT ABI.
+         * Physical spans retain admitted width while accepted row indices retain
+         * live width. This method allocates nothing and changes no stage-owned
+         * generation or metadata belonging to a different graph's transaction.
+         */
+        bool prepareShared(int requests, int width, int heads, int dk, int dv);
+        /**
+         * @brief Serialize one locally bound completed candidate to canonical bytes.
+         * @param destination Writable complete state bank, disjoint from bound
+         *        immutable checkpoint/raw-log slots.
+         * @param row Flattened live row index identifying one request/candidate.
+         * @return True after copying every head; false for stale lifecycle,
+         *         invalid metadata/index, null destination, or arena overlap.
+         * All heads are validated before publication; no arithmetic is replayed.
+         */
+        bool materializeShared(float *destination, int row);
+        /**
+         * @brief Validate every head of a locally bound retained candidate.
+         * @param row Flattened index using the current live per-request row width.
+         * @return True only when local publication is valid and every head marks
+         *         that candidate complete; false leaves all state unchanged.
+         * This local guard is separate from explicit stage-owned generations.
+         */
+        bool validSharedRow(int row) const;
         float *verifier_state_capture_ = nullptr;
         int verifier_state_capture_rows_ = 0;
         int verifier_state_capture_size_ = 0;

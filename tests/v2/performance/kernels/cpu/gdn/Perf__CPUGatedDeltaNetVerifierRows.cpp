@@ -4,11 +4,16 @@
  *
  * This harness compares one grouped merged-QKV verifier transaction with the
  * exact production M=1 merged-QKV recurrence repeated in serial row order.  It
- * includes complete post-row checkpoint/history publication because acceptance
- * must retain pending updates without flushing. The final snapshot owns working
- * state; preceding snapshots receive their exact checkpoint/history prefix.
- * Vector construction, input generation, capacity growth, and state reset stay
- * outside canonical timing samples.
+ * includes production immutable checkpoint and shared raw-log publication.
+ * Acceptance retains pending updates without flushing; canonical flat snapshots
+ * are materialized only outside timing for byte authentication.
+ * Incoming epoch phases are explicit evidence, independent of grouping.
+ * Every persistent fixture buffer uses 256-byte backing matching the production
+ * arena contract. Retained capacity is declared independently of live M; set
+ * LLAMINAR_CPU_GDN_VERIFIER_CAPACITY to reproduce an admitted verifier bucket.
+ * Allocation, input generation, capacity setup, and state reset stay outside
+ * canonical timing samples. A poisoned borrowed input bank additionally proves
+ * every accepted row depends only on completed retained checkpoint/log bytes.
  *
  * Correctness is a byte contract.  Every grouped output row and every published
  * recurrence-state snapshot must match the corresponding production M=1 row.
@@ -16,10 +21,10 @@
  * row count, and the canonical extended runtime-M probes.
  */
 
-#include "../../../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
+#include "kernels/CPUSharedGDNSnapshots.h"
 #include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
@@ -33,7 +38,9 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <stdexcept>
 #include <vector>
+#include <new>
 
 using namespace llaminar2;
 
@@ -47,10 +54,36 @@ namespace
         int n_heads = 0;
         int d_k = 0;
         int d_v = 0;
+        int initial_phase = 0;
+        int retained_capacity = 0; ///< Declared row capacity, never inferred from bytes.
+        size_t snapshot_bytes = 0;
+        size_t work_bytes = 0;
+        bool byte_exact = false;
         double grouped_ms = 0.0;
         double serial_ms = 0.0;
         double speedup = 0.0;
     };
+
+    /** @return Explicit incoming phases, validated before constructing a case. */
+    std::vector<int> envPhases()
+    {
+        const char *raw = std::getenv("LLAMINAR_CPU_GDN_VERIFIER_PHASES");
+        if (!raw || !*raw) return {0};
+        if (std::strcmp(raw, "all") == 0) return {0, 1, 2, 3, 4, 5, 6, 7};
+        std::vector<int> result;
+        std::stringstream input(raw);
+        std::string field;
+        while (std::getline(input, field, ','))
+        {
+            char *end = nullptr;
+            const long phase = std::strtol(field.c_str(), &end, 10);
+            if (end == field.c_str() || *end != '\0' || phase < 0 || phase >= 8)
+                throw std::invalid_argument("CPU GDN verifier phases must be 0..7 or all");
+            result.push_back(static_cast<int>(phase));
+        }
+        if (result.empty()) throw std::invalid_argument("CPU GDN verifier phases cannot be empty");
+        return result;
+    }
 
     /** @brief Parse one strictly positive integer environment override. */
     int envInt(const char *name, int fallback)
@@ -155,12 +188,93 @@ namespace
     }
 
     /**
-     * @brief Own all persistent buffers and kernels for one measured geometry.
+     * @brief Stable 256-byte backing for persistent production-shaped fixture data.
      *
-     * The object is constructed before warmup and never changes capacity during
-     * a timing sample.  Q/K/V use the same merged row layout consumed by the real
-     * Qwen GDN recurrence stage.  Separate kernel instances prevent scratch or
-     * speculative workspace from leaking between grouped and serial samples.
+     * Allocation and copy construction are setup/oracle operations. Measured
+     * grouped/serial invocations never construct, grow, move, or rebind these
+     * buffers. Canonical state rows retain their real encoded head stride;
+     * aligning the allocation must not invent a different state representation.
+     */
+    class AlignedFloatStorage
+    {
+        float *data_ = nullptr; ///< Sole owner of this fixture allocation.
+        size_t size_ = 0; ///< Immutable live extent after initial setup.
+    public:
+        /** @brief Construct empty storage awaiting explicit fixture admission. */
+        AlignedFloatStorage() = default;
+        /** @brief Allocate a fixed extent before warmup. @param count Live floats. */
+        explicit AlignedFloatStorage(size_t count) { resize(count); }
+        /**
+         * @brief Preserve a correctness observation outside canonical measurement.
+         * @param other Immutable source with independently owned backing.
+         */
+        AlignedFloatStorage(const AlignedFloatStorage &other)
+        {
+            if (other.size_ == 0) return;
+            resize(other.size_);
+            std::memcpy(data_, other.data_, size_ * sizeof(float));
+        }
+        /**
+         * @brief Restore an oracle observation without reallocating or rebinding.
+         * @param other Equal-extent immutable source.
+         * @return This stable destination.
+         * @throws std::logic_error if a copy would change admitted geometry.
+         */
+        AlignedFloatStorage &operator=(const AlignedFloatStorage &other)
+        {
+            if (this == &other) return *this;
+            if (size_ != other.size_)
+                throw std::logic_error("CPU GDN fixture buffer extent cannot change after setup");
+            if (size_ != 0) std::memcpy(data_, other.data_, size_ * sizeof(float));
+            return *this;
+        }
+        /** @brief Release fixture backing after all measurement/oracle work. */
+        ~AlignedFloatStorage() { std::free(data_); }
+        /**
+         * @brief Admit the sole allocation for one persistent fixture buffer.
+         * @param count Positive live float count, without anonymous reserve.
+         * @throws std::logic_error if this storage was already admitted.
+         * @throws std::length_error for an absent or overflowing byte extent.
+         * @throws std::bad_alloc if aligned allocation cannot satisfy the request.
+         */
+        void resize(size_t count)
+        {
+            if (data_) throw std::logic_error("CPU GDN fixture buffer is already admitted");
+            if (count == 0 || count > std::numeric_limits<size_t>::max() / sizeof(float))
+                throw std::length_error("CPU GDN fixture float extent is invalid");
+            void *memory = nullptr;
+            if (posix_memalign(&memory,256,count * sizeof(float)) != 0)
+                throw std::bad_alloc();
+            data_ = static_cast<float *>(memory);
+            size_ = count;
+            std::fill_n(data_,size_,0.0f);
+        }
+        /** @return Stable mutable allocation base. */
+        float *data() { return data_; }
+        /** @return Stable immutable allocation base. */
+        const float *data() const { return data_; }
+        /** @return First mutable live element. */
+        float *begin() { return data_; }
+        /** @return Exclusive live endpoint. */
+        float *end() { return data_ ? data_ + size_ : nullptr; }
+        /** @return First immutable live element. */
+        const float *begin() const { return data_; }
+        /** @return Exclusive immutable live endpoint. */
+        const float *end() const { return data_ ? data_ + size_ : nullptr; }
+        /** @return Indexed mutable element within the declared fixture extent. */
+        float &operator[](size_t index) { return data_[index]; }
+        /** @return Indexed immutable element within the declared fixture extent. */
+        const float &operator[](size_t index) const { return data_[index]; }
+        /** @return Exact live float count; allocation alignment adds no logical rows. */
+        size_t size() const { return size_; }
+    };
+
+    /**
+     * @brief Own admitted persistent storage for one complete verifier workload.
+     *
+     * Grouped and serial kernels have distinct instances and state banks. Every
+     * persistent fixture allocation is 256-byte aligned before warmup. Logical
+     * live M and declared retained row capacity remain separate identities.
      */
     class GDNVerifierCase
     {
@@ -170,7 +284,8 @@ namespace
             int n_k_heads,
             int n_heads,
             int d_k,
-            int d_v)
+            int d_v,
+            int initial_phase)
             : rows_(rows),
               n_k_heads_(n_k_heads),
               n_heads_(n_heads),
@@ -194,7 +309,25 @@ namespace
               grouped_snapshots_(static_cast<size_t>(rows) * state_floats_),
               serial_snapshots_(static_cast<size_t>(rows) * state_floats_)
         {
+            const CPUGDNStateLayout layout(n_heads,d_k,d_v);
+            retained_capacity_ = envInt("LLAMINAR_CPU_GDN_VERIFIER_CAPACITY",rows);
+            if (retained_capacity_ < rows)
+                throw std::invalid_argument("CPU GDN retained capacity is smaller than live M");
+            const CPUSharedGDNLogicalCapacity capacity(retained_capacity_,1);
+            shared_slots_.resize(capacity.slotFloats(layout));
+            grouped_kernel_.bindVerifierStateCaptureWorkspace(shared_slots_.data(),capacity.flatRows(),state_floats_);
+            grouped_kernel_.bindCPUSharedStateCapture(shared_slots_.data(),shared_slots_.size(),capacity.flatRows());
             fillInputs();
+            // Establish real pending history outside timing using ordinary
+            // M=1 arithmetic, so phases include their actual live raw records.
+            CPUGatedDeltaNet phase_kernel;
+            std::vector<float> phase_output(value_dim_);
+            for (int p = 0; p < initial_phase; ++p)
+                if (!phase_kernel.chunkForwardMergedQKV(
+                        merged_qkv_.data(), qkv_stride_, alpha_.data(), beta_.data(),
+                        a_log_.data(), dt_bias_.data(), phase_output.data(), initial_state_.data(),
+                        1, n_k_heads_, n_heads_, d_k_, d_v_, 0, 64, true))
+                    throw std::runtime_error("CPU GDN verifier phase preparation failed");
             resetGrouped();
             resetSerial();
         }
@@ -220,12 +353,12 @@ namespace
         /**
          * @brief Run one grouped production-ABI verifier transaction.
          *
-         * Each immutable post-row snapshot is the direct recurrence destination;
-         * no live-to-work clone or post-row copy belongs in this path.
+         * Uses the same bound compact arena transaction as production serving;
+         * initial immutable checkpoint, crossed checkpoints and raw log are timed.
          */
         bool runGrouped()
         {
-            return grouped_kernel_.chunkForwardMergedQKVWithStateSnapshots(
+            return grouped_kernel_.chunkForwardMergedQKV(
                 merged_qkv_.data(),
                 qkv_stride_,
                 alpha_.data(),
@@ -241,10 +374,7 @@ namespace
                 d_v_,
                 /*global_v_head_offset=*/0,
                 /*chunk_size=*/64,
-                /*use_qk_l2norm=*/true,
-                grouped_snapshots_.data(),
-                state_floats_,
-                rows_);
+                /*use_qk_l2norm=*/true);
         }
 
         /**
@@ -294,6 +424,7 @@ namespace
         /** @brief Prove grouped output, snapshots, and live-state isolation. */
         void verifyByteEquality()
         {
+            byte_exact_ = false;
             resetGrouped();
             resetSerial();
             ASSERT_TRUE(runGrouped());
@@ -306,6 +437,11 @@ namespace
                 serial_output_.data(),
                 grouped_output_.size(),
                 prefix + " output");
+            const auto preserved_live = grouped_live_state_;
+            std::fill(grouped_live_state_.begin(), grouped_live_state_.end(), -777.0f);
+            for (int row=0;row<rows_;++row)
+                ASSERT_TRUE(grouped_kernel_.restoreVerifierStateCaptureRow(grouped_snapshots_.data()+static_cast<size_t>(row)*state_floats_,row,nullptr));
+            grouped_live_state_ = preserved_live;
             expectByteExact(
                 grouped_snapshots_.data(),
                 serial_snapshots_.data(),
@@ -316,11 +452,25 @@ namespace
                 initial_state_.data(),
                 initial_state_.size(),
                 prefix + " live-state isolation");
+            byte_exact_ = std::memcmp(grouped_output_.data(), serial_output_.data(), grouped_output_.size()*sizeof(float)) == 0 &&
+                std::memcmp(grouped_snapshots_.data(), serial_snapshots_.data(), serial_snapshots_.size()*sizeof(float)) == 0 &&
+                std::memcmp(grouped_live_state_.data(), initial_state_.data(), initial_state_.size()*sizeof(float)) == 0;
         }
 
+        /** @return Live verifier rows in this case. */
         int rows() const { return rows_; }
+        /** @return Explicit admitted row capacity, independent of physical rounding. */
+        int retainedCapacity() const { return retained_capacity_; }
+        /** @return Whether every output, candidate and initial-state byte matched. */
+        bool byteExact() const { return byte_exact_; }
+        /** @return Arena payload bytes of compact candidate capture. */
+        size_t snapshotBytes() const { return shared_slots_.size() * sizeof(float); }
+        /** @return Exclusive mutable bank bytes, separate from immutable capture. */
+        size_t workBytes() const { return 0; }
 
     private:
+        int retained_capacity_ = 0; ///< Explicit declared row capacity, independent of live M.
+        bool byte_exact_ = false; ///< Independent oracle result for the latest check.
         /** @brief Fill deterministic finite values spanning every source region. */
         void fillInputs()
         {
@@ -364,7 +514,12 @@ namespace
                 initial_state_[static_cast<size_t>(index)] =
                     0.0001f * static_cast<float>(index % 43 - 21);
             }
-            llaminar2::clearCPUGDNTestHistory(initial_state_,n_heads_,d_k_,d_v_);
+            const CPUGDNStateLayout canonical(n_heads_, d_k_, d_v_);
+            for (int head = 0; head < n_heads_; ++head) {
+                float *bank = initial_state_.data() + static_cast<size_t>(head) * canonical.headFloats();
+                bank[0] = 0;
+                std::fill(canonical.record(bank, 0), bank + canonical.headFloats(), 0.0f);
+            }
         }
 
         int rows_ = 0;
@@ -378,18 +533,19 @@ namespace
         int qkv_stride_ = 0;
         int state_floats_ = 0;
 
-        std::vector<float> merged_qkv_;
-        std::vector<float> alpha_;
-        std::vector<float> beta_;
-        std::vector<float> a_log_;
-        std::vector<float> dt_bias_;
-        std::vector<float> initial_state_;
-        std::vector<float> grouped_live_state_;
-        std::vector<float> serial_state_;
-        std::vector<float> grouped_output_;
-        std::vector<float> serial_output_;
-        std::vector<float> grouped_snapshots_;
-        std::vector<float> serial_snapshots_;
+        AlignedFloatStorage merged_qkv_;
+        AlignedFloatStorage alpha_;
+        AlignedFloatStorage beta_;
+        AlignedFloatStorage a_log_;
+        AlignedFloatStorage dt_bias_;
+        AlignedFloatStorage initial_state_;
+        AlignedFloatStorage grouped_live_state_;
+        AlignedFloatStorage serial_state_;
+        AlignedFloatStorage grouped_output_;
+        AlignedFloatStorage serial_output_;
+        AlignedFloatStorage shared_slots_; ///< Preallocated production transaction arenas.
+        AlignedFloatStorage grouped_snapshots_;
+        AlignedFloatStorage serial_snapshots_;
         CPUGatedDeltaNet grouped_kernel_;
         CPUGatedDeltaNet serial_kernel_;
     };
@@ -464,13 +620,15 @@ namespace
         int n_k_heads,
         int n_heads,
         int d_k,
-        int d_v)
+        int d_v,
+        int initial_phase)
     {
         const int warmups = envInt("LLAMINAR_CPU_GDN_VERIFIER_WARMUP", 3);
         const int iterations = envInt("LLAMINAR_CPU_GDN_VERIFIER_ITERS", 12);
-        GDNVerifierCase benchmark_case(rows, n_k_heads, n_heads, d_k, d_v);
+        GDNVerifierCase benchmark_case(rows, n_k_heads, n_heads, d_k, d_v, initial_phase);
 
         benchmark_case.verifyByteEquality();
+        const bool initial_byte_exact = benchmark_case.byteExact();
         for (int warmup = 0; warmup < warmups; ++warmup)
         {
             benchmark_case.resetGrouped();
@@ -485,6 +643,10 @@ namespace
         result.n_heads = n_heads;
         result.d_k = d_k;
         result.d_v = d_v;
+        result.initial_phase = initial_phase;
+        result.retained_capacity = benchmark_case.retainedCapacity();
+        result.snapshot_bytes = benchmark_case.snapshotBytes();
+        result.work_bytes = benchmark_case.workBytes();
         timePairedBestMs(
             &benchmark_case,
             iterations,
@@ -493,6 +655,7 @@ namespace
         result.speedup = result.serial_ms / std::max(result.grouped_ms, 1e-9);
 
         benchmark_case.verifyByteEquality();
+        result.byte_exact = initial_byte_exact && benchmark_case.byteExact();
         return result;
     }
 
@@ -508,12 +671,12 @@ namespace
         std::fprintf(
             file,
             "backend,phase,rows,n_k_heads,n_heads,d_k,d_v,grouped_ms,"
-            "serial_ms,speedup,byte_exact\n");
+            "serial_ms,speedup,byte_exact,initial_phase,snapshot_bytes,work_bytes,retained_capacity_rows,fixture_alignment_bytes\n");
         for (const BenchmarkResult &result : results)
         {
             std::fprintf(
                 file,
-                "cpu,gdn_verifier_rows,%d,%d,%d,%d,%d,%.9f,%.9f,%.9f,1\n",
+                "cpu,gdn_verifier_rows,%d,%d,%d,%d,%d,%.9f,%.9f,%.9f,%d,%d,%zu,%zu,%d,256\n",
                 result.rows,
                 result.n_k_heads,
                 result.n_heads,
@@ -521,7 +684,8 @@ namespace
                 result.d_v,
                 result.grouped_ms,
                 result.serial_ms,
-                result.speedup);
+                result.speedup, result.byte_exact ? 1 : 0, result.initial_phase,
+                result.snapshot_bytes, result.work_bytes, result.retained_capacity);
         }
         std::fclose(file);
     }
@@ -538,13 +702,17 @@ TEST(Perf__CPUGatedDeltaNetVerifierRows, RuntimeM_GroupedVsSerial_ProductionMerg
         envDouble("LLAMINAR_CPU_GDN_VERIFIER_MIN_SPEEDUP", 1.0);
 
     std::vector<BenchmarkResult> results;
+    for (const int initial_phase : envPhases())
     for (const int rows : envRows())
     {
         BenchmarkResult result =
-            runCase(rows, n_k_heads, n_heads, d_k, d_v);
+            runCase(rows, n_k_heads, n_heads, d_k, d_v, initial_phase);
         results.push_back(result);
 
         std::cerr << "[CPU GDN verifier rows] M=" << result.rows
+                  << " initial_phase=" << result.initial_phase
+                  << " retained_capacity=" << result.retained_capacity
+                  << " fixture_alignment=256"
                   << " k_heads=" << result.n_k_heads
                   << " v_heads=" << result.n_heads
                   << " d_k=" << result.d_k
@@ -552,7 +720,7 @@ TEST(Perf__CPUGatedDeltaNetVerifierRows, RuntimeM_GroupedVsSerial_ProductionMerg
                   << " grouped_ms=" << result.grouped_ms
                   << " serial_ms=" << result.serial_ms
                   << " speedup=" << result.speedup
-                  << " byte_exact=true\n";
+                  << " byte_exact=" << result.byte_exact << '\n';
 
         if (rows > 1)
         {

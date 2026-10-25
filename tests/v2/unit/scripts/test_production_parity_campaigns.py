@@ -1868,6 +1868,58 @@ time.sleep(30)
         self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS) + 2)
         self.assertEqual(errors, ())
 
+    def test_dynamic_acceptance_requires_authenticated_complete_continuation(self) -> None:
+        header = campaigns.MTP_ACCEPTANCE_WITNESS_HEADER.split(",")
+        row = "2,71093,12305,15,15,1,2,71093;12305;198;464,71093;12305;198;464,2,true,15,true,true".split(",")
+        rows = [header, row]
+        self.assertIsNone(campaigns.validate_mtp_acceptance_witness(rows))
+        self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness([header]))
+        self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness(rows + [row]))
+        for field, value in (
+            ("reference_step", "-1"), ("condition_token", "271"),
+            ("authenticated_first_draft", "760"), ("admitted_depth", "1"),
+            ("attempted_drafts", "14"), ("accepted_drafts", "0"),
+            ("accepted_drafts", "16"), ("verifier_transactions", "0"),
+            ("emitted_tokens", "71093"), ("serial_tokens", "71093;760;198;464"),
+            ("continuation_tokens", "1"), ("state_byte_exact", "false"),
+            ("accepted_drafts", "nan"), ("observed_depth", "1"),
+            ("prefix_restored", "false"), ("adaptive_enabled", "false"),
+        ):
+            mutated = [list(values) for values in rows]
+            mutated[1][header.index(field)] = value
+            with self.subTest(field=field, value=value):
+                self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness(mutated))
+        dynamic_headers = campaigns._required_csv_headers_for_case(
+            "Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDynamicDepth")
+        fixed_headers = campaigns._required_csv_headers_for_case(
+            "Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDepth15")
+        self.assertEqual(dynamic_headers["mtp_acceptance_witness.csv"],
+                         campaigns.MTP_ACCEPTANCE_WITNESS_HEADER)
+        self.assertNotIn("mtp_acceptance_witness.csv", fixed_headers)
+        self.assertIn("mtp_acceptance_witness.csv", campaigns.CSV_ARTIFACTS_REQUIRING_DATA)
+        cell = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=("Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDynamicDepth",),
+        )
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            result_directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+            self.write_canonical_artifacts(result_directory)
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertTrue(any("missing mtp_acceptance_witness.csv" in error for error in errors))
+            path = result_directory / "mtp_acceptance_witness.csv"
+            path.write_text(campaigns.MTP_ACCEPTANCE_WITNESS_HEADER + "\n" + ",".join(row) + "\n")
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertFalse(any("mtp_acceptance_witness.csv" in error for error in errors))
+            row[header.index("state_byte_exact")] = "false"
+            path.write_text(campaigns.MTP_ACCEPTANCE_WITNESS_HEADER + "\n" + ",".join(row) + "\n")
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertTrue(any("mtp_acceptance_witness.csv" in error for error in errors))
+
     def test_native_verifier_artifacts_reject_close_or_incomplete_evidence(self) -> None:
         header = campaigns.NATIVE_VERIFIER_ROWS_HEADER.split(",")
         rows = [header] + [

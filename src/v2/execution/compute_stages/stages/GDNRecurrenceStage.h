@@ -246,6 +246,17 @@ namespace llaminar2
             return verifierStateCaptureWorkspaceRequired();
         }
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        /**
+         * @brief Publish accepted CPU request prefixes from this stage's own slots.
+         * @param host_row_indices One flattened live-row index per request; a
+         *        negative entry rejects that request and preserves its live bank.
+         * @param request_count Fixed request partition count of this graph.
+         * @param stream Unused CPU stream argument retained by the common API.
+         * @return True after the request-bank owner validates every selected head
+         *         and publishes canonical bytes; false for an invalid transaction.
+         * No shared kernel binding is changed. The explicit view borrows this
+         * stage's generation authority and arena buffers through publication.
+         */
         bool restoreVerifierStateCaptureRows(
             const int *host_row_indices,
             int request_count,
@@ -253,9 +264,16 @@ namespace llaminar2
         /**
          * @brief Expose the selected CPU recurrence snapshot as a byte-copy plan.
          *
-         * Planning binds no shared backend state and performs no copy. The
-         * central MTP publisher validates every layer plan before committing
-         * all independent recurrence matrices in one OpenMP team.
+         * @param row Candidate row, or negative to request a no-op plan.
+         * @return Ready plan borrowing immutable compact slots, NoOp for
+         *         rejection, or Invalid before mutation for malformed bindings,
+         *         metadata, candidate extents, or overlapping publication spans.
+         *
+         * Planning validates every head and returns the selected typed prefix.
+         * It binds no shared backend state and changes no work or live bytes.
+         * The central publisher validates every layer/source span before directly
+         * scattering canonical bytes with one OpenMP team. Immutable slots remain
+         * valid until this stage starts another execution, reset, or rebind.
          */
         CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -314,6 +332,15 @@ namespace llaminar2
         bool prefill_replay_params_set_ = false;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         uint32_t workspace_slice_id_ = 0;
+        /**
+         * @brief Retire this stage's candidate headers and generation before reuse.
+         * @throws std::overflow_error if its monotonically increasing generation
+         *         cannot be represented; exhaustion is a fatal lifecycle error.
+         * Only this stage's arena payload is affected. Another graph may clear or
+         * rebind a shared backend without retiring these stage-owned candidates.
+         */
+        void retireCPUVerifierCandidates();
+        uint64_t cpu_capture_generation_ = 1; ///< Stage-owned transaction lifetime; kernel rebinding cannot change it.
         bool verifier_capture_workspace_bound_ = false;
         bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
@@ -323,6 +350,13 @@ namespace llaminar2
         std::string workspaceStableId() const;
         std::string deinterleaveScratchBufferName() const;
         std::string speculativeStateSlotsBufferName() const;
+        /**
+         * @brief Select a concurrency-correct mutable recurrence bank identity.
+         * @return Role-shared GPU work name; CPU requests no mutable work buffer.
+         * GPU dependencies serialize recurrence work within a role. CPU recurrence
+         * writes retained checkpoints directly; neither inference nor publication
+         * needs a cloned complete working bank.
+         */
         std::string speculativeStateWorkBufferName() const;
         int requestedSpeculativeStateSlotRows() const;
         bool verifierStateCaptureWorkspaceRequired() const;

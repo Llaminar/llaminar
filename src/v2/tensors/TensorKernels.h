@@ -10,6 +10,7 @@
 
 #pragma once
 #include "kernels/FloatingActivationOperandPrecision.h"
+#include "kernels/CPUSharedGDNSnapshots.h"
 
 #include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
@@ -4116,6 +4117,31 @@ namespace llaminar2
          * buffer. Each row contains a complete backend state: CPUGDNStateLayout
          * on CPU and [n_heads, d_k, d_v] FP32 matrices on GPU.
          */
+        /**
+         * @brief Publish accepted request prefixes from an explicitly owned transaction.
+         * @param transaction Stage-owned immutable slots and checked logical geometry.
+         * @param destination Public canonical request-zero state.
+         * @param rows Accepted flattened row for each request, or negative for rejection.
+         * @return Whether every candidate was validated and atomically published.
+         */
+        virtual bool restoreCPUSharedStateRows(const CPUSharedGDNTransaction &transaction,
+            float *destination,const int *rows) {
+            (void)transaction; (void)destination; (void)rows;
+            throw std::invalid_argument("Backend does not implement explicit CPU shared GDN publication");
+        }
+        /**
+         * @brief Bind arena-backed CPU epoch checkpoints and raw log.
+         * @param slots Persistent immutable candidate payload, or null to retire it.
+         * @param slot_floats Admitted FP32 capacity of the candidate payload.
+         * @param rows Admitted flattened candidate-row capacity.
+         * @throws std::invalid_argument if a backend receives a nonempty binding
+         *         without implementing shared CPU epoch snapshots.
+         */
+        virtual void bindCPUSharedStateCapture(float *slots,size_t slot_floats,int rows) {
+            if (slots || slot_floats || rows)
+                throw std::invalid_argument("Backend does not implement CPU shared epoch snapshot binding");
+        }
+
         virtual void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
         {
             (void)workspace;

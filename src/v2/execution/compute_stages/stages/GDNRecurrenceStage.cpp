@@ -103,7 +103,10 @@ namespace llaminar2
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
         if (speculative_slot_rows > 0)
         {
-            const int rows = std::min(speculative_slot_rows, max_seq_len);
+            // CPU retained storage follows the declared logical verifier ceiling,
+            // never current/live rows or capacity inferred from alignment padding.
+            const int rows=params_.device_id.is_cpu() ? speculative_slot_rows :
+                std::min(speculative_slot_rows,max_seq_len);
             const auto footprint =
                 gdn_workspace::recurrenceStateFootprint(
                     rows,
@@ -146,12 +149,14 @@ namespace llaminar2
 
     void GDNRecurrenceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        retireCPUVerifierCandidates();
         bound_workspace_ = workspace;
         bindKernelWorkspace();
     }
 
     void GDNRecurrenceStage::unbindWorkspace()
     {
+        retireCPUVerifierCandidates();
         bound_workspace_ = nullptr;
         bindKernelWorkspace();
     }
@@ -199,7 +204,14 @@ namespace llaminar2
             capture = static_cast<float *>(bound_workspace_->getBuffer(capture_name));
             const size_t available_floats =
                 bound_workspace_->getBufferSize(capture_name) / sizeof(float);
-            if (capture_state_size > 0)
+            if (params_.device_id.is_cpu()) {
+                const CPUGDNStateLayout layout(params_.n_heads,params_.d_k,params_.d_v);
+                const int requests=std::max(1,params_.request_count);
+                const CPUSharedGDNLogicalCapacity capacity(speculative_slot_rows,requests);
+                if (available_floats>=capacity.slotFloats(layout))
+                    capture_rows=capacity.flatRows();
+            }
+            else if (capture_state_size > 0)
             {
                 capture_rows = static_cast<int>(std::min<size_t>(
                     static_cast<size_t>(speculative_slot_rows),
@@ -239,10 +251,37 @@ namespace llaminar2
         params_.kernel->bindSpeculativeStateWorkspace(
             speculative_work,
             speculative_work_size);
+        if (params_.device_id.is_cpu())
+            params_.kernel->bindCPUSharedStateCapture(capture,
+                capture ? bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float) : 0,
+                capture_rows);
+    }
+
+    void GDNRecurrenceStage::retireCPUVerifierCandidates()
+    {
+        if (!params_.device_id.is_cpu()) return;
+        if (cpu_capture_generation_==std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("CPU GDN stage transaction generation exhausted");
+        ++cpu_capture_generation_;
+        if (!params_.device_id.is_cpu() || !bound_workspace_ || verifier_capture_rows_bound_<=0 ||
+            !bound_workspace_->hasBuffer(speculativeStateSlotsBufferName())) return;
+        const int requests=std::max(1,params_.request_count);
+        if (verifier_capture_rows_bound_%requests) return;
+        const int width=verifier_capture_rows_bound_/requests;
+        const CPUGDNStateLayout l(params_.n_heads,params_.d_k,params_.d_v);
+        const size_t span=CPUSharedGDNSnapshots::headFloats(l,width);
+        const size_t capacity=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float);
+        if (span>capacity/static_cast<size_t>(params_.n_heads)/requests) return;
+        auto *slots=static_cast<float *>(bound_workspace_->getBuffer(speculativeStateSlotsBufferName()));
+        if (!slots) return;
+        for(int request=0;request<requests;++request)
+            for(int head=0;head<params_.n_heads;++head)
+                CPUSharedGDNSnapshots(l,slots+(static_cast<size_t>(request)*params_.n_heads+head)*span,width).retire();
     }
 
     void GDNRecurrenceStage::clearKernelVerifierStateWorkspace()
     {
+        retireCPUVerifierCandidates();
         verifier_capture_workspace_bound_ = false;
         speculative_state_work_bound_ = false;
         verifier_capture_rows_bound_ = 0;
@@ -251,6 +290,7 @@ namespace llaminar2
         if (!params_.kernel)
             return;
 
+        params_.kernel->bindCPUSharedStateCapture(nullptr,0,0);
         params_.kernel->bindVerifierStateCaptureWorkspace(
             nullptr,
             0,
@@ -330,12 +370,9 @@ namespace llaminar2
     std::string GDNRecurrenceStage::speculativeStateWorkBufferName() const
     {
         /*
-         * This buffer is temporary input/output for one recurrence stage; unlike
-         * speculative state slots, it is not read after that layer completes.
-         * Transformer-layer dependencies serialize recurrence stages inside one
-         * graph role, so all layers can reuse one maximum-sized work allocation.
-         * Independently replayable roles retain separate names because they may
-         * execute concurrently on different streams.
+         * Only GPU recurrence needs a mutable state bank. GPU layer dependencies
+         * serialize its use within a graph role; independent roles retain names.
+         * CPU recurrence builds retained checkpoints directly and has no work bank.
          */
         if (params_.workspace_namespace.empty())
             return WS_SPECULATIVE_STATE_WORK;
@@ -418,10 +455,23 @@ namespace llaminar2
          * GPU stages still delegate to the backend restore kernel because their
          * slots live on device and must stay ordered on the explicit stream.
          */
-        std::memcpy(
-            plan.destination,
-            plan.source,
-            plan.bytes);
+        if (plan.shared_gdn_prefix)
+        {
+            const auto &accepted=*plan.shared_gdn_prefix;
+            const auto &t=accepted.transaction;
+            const CPUGDNStateLayout layout(t.heads,t.dk,t.dv);
+            const size_t span=CPUSharedGDNSnapshots::headFloats(layout,t.width);
+            for(int head=0;head<t.heads;++head)
+                CPUSharedGDNSnapshots(layout,t.slots+static_cast<size_t>(head)*span,t.width)
+                    .materialize(accepted.row,static_cast<float *>(plan.destination)+static_cast<size_t>(head)*layout.headFloats());
+            PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materializations",1,"publication","cpu");
+            PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materialization_bytes",
+                static_cast<double>(plan.bytes),"publication","cpu");
+        }
+        else
+        {
+            std::memcpy(plan.destination,plan.source,plan.bytes);
+        }
         return true;
     }
 
@@ -459,15 +509,31 @@ namespace llaminar2
             };
         }
 
-        return {
-            .status = CPUVerifierStateRestorePlanStatus::Ready,
-            .destination = params_.recurrence_state,
-            .source = capture +
-                static_cast<size_t>(row) *
-                    static_cast<size_t>(verifier_capture_state_size_bound_),
-            .bytes = static_cast<size_t>(verifier_capture_state_size_bound_) *
-                     sizeof(float),
-        };
+        const CPUGDNStateLayout layout(params_.n_heads,params_.d_k,params_.d_v);
+        const int requests=std::max(1,params_.request_count);
+        if (requests!=1) return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+        const int width=verifier_capture_rows_bound_;
+        const size_t span=CPUSharedGDNSnapshots::headFloats(layout,width);
+        const size_t slots=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float);
+        if (span>slots/static_cast<size_t>(params_.n_heads))
+            return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+        const size_t state_bytes=static_cast<size_t>(layout.floats())*sizeof(float);
+        const size_t slot_bytes=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName());
+        if (CPUSharedGDNSnapshots::buffersOverlap(params_.recurrence_state,state_bytes,capture,slot_bytes))
+            return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+        for(int head=0;head<params_.n_heads;++head)
+            if (!CPUSharedGDNSnapshots(layout,const_cast<float *>(capture)+static_cast<size_t>(head)*span,width).validRow(row))
+                return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+        CPUSharedGDNTransaction transaction{
+            .slots=const_cast<float *>(capture),.slot_floats=slots,
+            .width=width,.requests=1,
+            .live_width=params_.request_seq_len>0 ? params_.request_seq_len : params_.seq_len,
+            .heads=params_.n_heads,.dk=params_.d_k,.dv=params_.d_v,
+            .generation_authority=&cpu_capture_generation_,.generation=cpu_capture_generation_};
+        return {.status=CPUVerifierStateRestorePlanStatus::Ready,
+            .destination=params_.recurrence_state,.source=capture,
+            .bytes=static_cast<size_t>(layout.floats())*sizeof(float),
+            .shared_gdn_prefix=CPUSharedGDNAcceptedPrefix{transaction,row}};
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRow(int row, void *stream)
@@ -505,14 +571,16 @@ namespace llaminar2
         {
             return false;
         }
-        bindKernelWorkspace();
-        if (!ensureVerifierStateCaptureWorkspaceBound())
-            return false;
-        return params_.kernel->restoreVerifierStateCaptureRows(
-            params_.recurrence_state,
-            host_row_indices,
-            request_count,
-            stream);
+        if (!ensureVerifierStateCaptureWorkspaceBound() || !bound_workspace_ ||
+            request_count!=std::max(1,params_.request_count) || verifier_capture_rows_bound_%request_count) return false;
+        CPUSharedGDNTransaction transaction{
+            .slots=cpuVerifierStateCaptureWorkspace(),
+            .slot_floats=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float),
+            .width=verifier_capture_rows_bound_/request_count,.requests=request_count,
+            .live_width=params_.request_seq_len>0 ? params_.request_seq_len : params_.seq_len,
+            .heads=params_.n_heads,.dk=params_.d_k,.dv=params_.d_v,
+            .generation_authority=&cpu_capture_generation_,.generation=cpu_capture_generation_};
+        return params_.kernel->restoreCPUSharedStateRows(transaction,params_.recurrence_state,host_row_indices);
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -771,6 +839,7 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::execute(IDeviceContext *ctx)
     {
+        retireCPUVerifierCandidates();
         if (!ensureContext(ctx, "GDNRecurrenceStage"))
             return false;
 

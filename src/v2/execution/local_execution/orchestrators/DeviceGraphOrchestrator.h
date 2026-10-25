@@ -16,6 +16,7 @@
  * - Device context cache (lazy initialization)
  * - Graph cache (decode optimization)
  * - Execution state (position offset tracking)
+ * - Exact accepted-row terminal logits publication into canonical CPU storage
  *
  * Usage:
  * @code
@@ -7552,6 +7553,7 @@ namespace llaminar2
             None,
             ForwardGraph,
             PrefixTerminalRestore,
+            AcceptedVerifierState,
         };
 
         /**
@@ -7581,6 +7583,17 @@ namespace llaminar2
             const ForwardLogitsPublicationDescriptor &descriptor,
             MainLogitsPublicationSource source,
             const char *producer_name);
+
+        /**
+         * @brief Publish the accepted CPU verifier row into canonical main logits.
+         * @param selection Typed physical row and request epoch from state publication.
+         * @return Whether the exact vocabulary row was copied and published.
+         *
+         * Retained verifier storage remains a multirow producer and may be
+         * overwritten by the next verifier. Scalar consumers cannot treat that
+         * entire tensor as row zero; canonical storage retains one accepted row.
+         */
+        bool publishCPUAcceptedVerifierLogits(const PrefixLogitsRowSelection &selection);
 
         /** Invalidate tensor identity at a request or restore boundary. */
         void clearCurrentMainLogitsPublication(const char *reason) noexcept;

@@ -69,6 +69,7 @@ namespace llaminar2
     bool CPUGatedDeltaNet::resetGPUState(void *stream)
     {
         (void)stream;
+        shared_valid_=false;
         request_state_bank_.clear();
         request_state_size_ = 0;
         request_state_capacity_ = 0;
@@ -109,13 +110,142 @@ namespace llaminar2
 
     void CPUGatedDeltaNet::bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
     {
+        shared_valid_=false;
         verifier_state_capture_ = workspace;
         verifier_state_capture_rows_ = rows;
         verifier_state_capture_size_ = state_size;
     }
 
+    /**
+     * @brief Borrow compact arena buffers and retire local publication eligibility.
+     * @param slots Immutable checkpoint/raw-log payload, or null when clearing.
+     * @param slot_floats Logical admitted payload extent in FP32-sized elements.
+     * @param rows Fixed admitted flattened candidate capacity.
+     * @throws std::invalid_argument for partial bindings or byte/prefix overflow.
+     * A stage may own a completed capture when another graph rebinds this shared
+     * backend; this operation therefore must not retire stage-owned slot headers.
+     */
+    void CPUGatedDeltaNet::bindCPUSharedStateCapture(float *slots,size_t slot_floats,int rows)
+    {
+        shared_valid_=false;
+        if ((slots && (!slot_floats || rows<=0 || rows>std::numeric_limits<int>::max()-8)) ||
+            (!slots && (slot_floats || rows)) || slot_floats>std::numeric_limits<size_t>::max()/sizeof(float))
+            throw std::invalid_argument("CPU shared epoch capture requires complete admitted slot binding");
+        shared_slots_=slots; shared_slot_floats_=slot_floats; shared_rows_=rows;
+    }
+
+    /**
+     * @brief Authenticate logical capacity and geometry before recurrence writes.
+     * @param requests Fixed number of graph request partitions.
+     * @param width Live input-row width per request.
+     * @param heads Local value-head count.
+     * @param dk Key width of each canonical head.
+     * @param dv Value width of each canonical head.
+     * @return True for a complete immutable-slot binding with admitted capacity.
+     * @throws std::invalid_argument for unsupported canonical state geometry.
+     * @throws std::overflow_error if the canonical bank exceeds its INT ABI.
+     * Physical spans retain admitted width; accepted indices retain live width.
+     */
+    bool CPUGatedDeltaNet::prepareShared(int requests,int width,int heads,int dk,int dv)
+    {
+        shared_valid_=false;
+        const CPUGDNStateLayout l(heads,dk,dv);
+        if (requests<=0 || shared_rows_<=0 || shared_rows_%requests || width>shared_rows_/requests) return false;
+        shared_live_width_=width;
+        width=shared_rows_/requests;
+        if (!shared_slots_ || width<=0 || requests<=0 ||
+            static_cast<size_t>(requests)*width>static_cast<size_t>(shared_rows_) ||
+            CPUSharedGDNSnapshots::headFloats(l,width)>shared_slot_floats_/static_cast<size_t>(heads)/requests) return false;
+        shared_heads_=heads; shared_dk_=dk; shared_dv_=dv;
+        shared_width_=width; shared_requests_=requests;
+        return true;
+    }
+
+    /**
+     * @brief Check every head before publishing a locally bound candidate.
+     * @param row Flattened candidate index using the current live request width.
+     * @return True only for valid local lifecycle and complete candidate headers.
+     * Invalid candidates leave the immutable payload and canonical state intact.
+     */
+    bool CPUGatedDeltaNet::validSharedRow(int row) const
+    {
+        if (!shared_valid_ || row<0 || row>=shared_requests_*shared_live_width_) return false;
+        const CPUGDNStateLayout l(shared_heads_,shared_dk_,shared_dv_);
+        const int request=row/shared_live_width_,local=row%shared_live_width_;
+        const size_t span=CPUSharedGDNSnapshots::headFloats(l,shared_width_);
+        for(int head=0;head<shared_heads_;++head)
+            if (!CPUSharedGDNSnapshots(l,shared_slots_+(static_cast<size_t>(request)*shared_heads_+head)*span,shared_width_).validRow(local)) return false;
+        return true;
+    }
+
+    /**
+     * @brief Serialize one complete locally bound candidate without arithmetic.
+     * @param destination Writable canonical bank, disjoint from retained slots.
+     * @param row Flattened candidate index using the live request width.
+     * @return True after every head is copied, or false before mutation on invalid
+     *         lifecycle, candidate metadata, destination, or buffer overlap.
+     */
+    bool CPUGatedDeltaNet::materializeShared(float *destination,int row)
+    {
+        if (!destination || !validSharedRow(row)) return false;
+        const size_t bytes=static_cast<size_t>(CPUGDNStateLayout(shared_heads_,shared_dk_,shared_dv_).floats())*sizeof(float);
+        if (byteRangesOverlap(destination,bytes,shared_slots_,shared_slot_floats_*sizeof(float))) return false;
+        const CPUGDNStateLayout l(shared_heads_,shared_dk_,shared_dv_);
+        const int request=row/shared_live_width_,local=row%shared_live_width_;
+        const size_t span=CPUSharedGDNSnapshots::headFloats(l,shared_width_);
+        for(int head=0;head<shared_heads_;++head)
+            CPUSharedGDNSnapshots(l,shared_slots_+(static_cast<size_t>(request)*shared_heads_+head)*span,shared_width_)
+                .materialize(local,destination+static_cast<size_t>(head)*l.headFloats());
+        return true;
+    }
+
+    /**
+     * @copydoc ITensorGatedDeltaNet::restoreCPUSharedStateRows
+     *
+     * Validate the stage-owned generation and all selected head prefixes before
+     * modifying the canonical request bank. Rejection preserves that request's
+     * live bank. Explicit transactions borrow their stage's lifetime rather than
+     * this backend's current binding, so unrelated kernel clears remain harmless.
+     * No allocation, row replay, or partial checkpoint advancement occurs here.
+     */
+    bool CPUGatedDeltaNet::restoreCPUSharedStateRows(const CPUSharedGDNTransaction &t,
+        float *destination,const int *rows)
+    {
+        // The owning stage authenticates lifetime independently of the shared
+        // kernel binding. Another graph role may clear/rebind this backend while
+        // a completed stage-owned transaction is still awaiting publication.
+        if (!t.slots || !destination || !rows || t.requests<=0 || t.width<=0 || t.live_width<=0 || t.live_width>t.width ||
+            !t.generation_authority || *t.generation_authority!=t.generation) return false;
+        const CPUGDNStateLayout l(t.heads,t.dk,t.dv);
+        const size_t span=CPUSharedGDNSnapshots::headFloats(l,t.width);
+        if (span>t.slot_floats/static_cast<size_t>(t.heads)/t.requests ||
+            (t.requests>1 && (t.requests>request_state_capacity_ || request_state_size_!=l.floats())) ||
+            t.slot_floats>std::numeric_limits<size_t>::max()/sizeof(float) ||
+            byteRangesOverlap(destination,static_cast<size_t>(l.floats())*sizeof(float),t.slots,t.slot_floats*sizeof(float))) return false;
+        for(int request=0;request<t.requests;++request) {
+            if (rows[request]<0) continue;
+            if (rows[request]/t.live_width!=request) return false;
+            const int row=rows[request]%t.live_width;
+            for(int head=0;head<t.heads;++head)
+                if (!CPUSharedGDNSnapshots(l,t.slots+(static_cast<size_t>(request)*t.heads+head)*span,t.width).validRow(row)) return false;
+        }
+        for(int request=0;request<t.requests;++request) {
+            if (rows[request]<0) continue;
+            float *target=t.requests==1 ? destination : request_state_bank_.data()+static_cast<size_t>(request)*l.floats();
+            for(int head=0;head<t.heads;++head)
+                CPUSharedGDNSnapshots(l,t.slots+(static_cast<size_t>(request)*t.heads+head)*span,t.width)
+                    .materialize(rows[request]%t.live_width,target+static_cast<size_t>(head)*l.headFloats());
+            if (request==0 && t.requests>1) std::memcpy(destination,target,static_cast<size_t>(l.floats())*sizeof(float));
+            PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materializations",1,"publication","cpu");
+            PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materialization_bytes",
+                static_cast<double>(l.floats())*sizeof(float),"publication","cpu");
+        }
+        return true;
+    }
+
     bool CPUGatedDeltaNet::restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
     {
+        if (shared_slots_) return materializeShared(dst_state,row);
         if (row < 0 || row >= verifier_state_capture_rows_)
             return false;
         return restoreStateFromSnapshot(
@@ -148,7 +278,8 @@ namespace llaminar2
         for (int request = 0; request < request_count; ++request)
         {
             const int row = host_row_indices[request];
-            if (row >= verifier_state_capture_rows_)
+            if (row >= verifier_state_capture_rows_ ||
+                (shared_slots_ && row>=0 && (!validSharedRow(row) || row/shared_live_width_!=request)))
                 return false;
         }
 
@@ -164,7 +295,8 @@ namespace llaminar2
             const int row = host_row_indices[0];
             if (row >= 0)
             {
-                std::memcpy(
+                if (shared_slots_) { if (!materializeShared(dst_state,row)) return false; }
+                else std::memcpy(
                     dst_state,
                     verifier_state_capture_ +
                         static_cast<size_t>(row) * verifier_state_capture_size_,
@@ -197,10 +329,10 @@ namespace llaminar2
             float *destination =
                 request_state_bank_.data() +
                 static_cast<size_t>(request) * request_state_size_;
-            const float *source =
-                verifier_state_capture_ +
-                static_cast<size_t>(row) * verifier_state_capture_size_;
-            std::memcpy(
+            const float *source = shared_slots_ ? nullptr :
+                verifier_state_capture_ + static_cast<size_t>(row) * verifier_state_capture_size_;
+            if (shared_slots_) { if (!materializeShared(destination,row)) return false; }
+            else std::memcpy(
                 destination,
                 source,
                 static_cast<size_t>(request_state_size_) * sizeof(float));
@@ -578,16 +710,20 @@ namespace llaminar2
         float *output, float *state,
         int n_heads, int d_k, int d_v, bool use_qk_l2norm)
     {
+        shared_valid_=false;
         if (!q || !k || !v || !alpha || !beta_raw || !A_log || !dt_bias || !output || !state ||
             n_heads <= 0 || d_k <= 0 || d_v <= 0 || d_k > 512 || d_v > 512)
             return false;
         const CPUGDNStateLayout layout(n_heads, d_k, d_v);
         if (!layout.valid(state)) return false;
         const bool capture = verifier_state_capture_ != nullptr;
+        if (capture && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
+            throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
         if (capture && (verifier_state_capture_rows_ < 1 || verifier_state_capture_size_ < layout.floats() ||
             byteRangesOverlap(state, static_cast<size_t>(layout.floats()) * sizeof(float),
-                verifier_state_capture_, static_cast<size_t>(layout.floats()) * sizeof(float))))
+                verifier_state_capture_, shared_slot_floats_ * sizeof(float))))
             return false;
+        if (capture && !prepareShared(1,1,n_heads,d_k,d_v)) return false;
         PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_readout_rows",
             static_cast<double>(n_heads), "recurrence", "cpu");
         const float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
@@ -604,12 +740,19 @@ namespace llaminar2
                 const float decay = std::exp(A_log[h] * (x > 20.0f ? x : std::log1p(std::exp(x))));
                 const float beta = 1.0f / (1.0f + std::exp(-beta_raw[h]));
                 float *initial = state + static_cast<size_t>(h) * layout.headFloats();
-                float *destination = capture ? verifier_state_capture_ + static_cast<size_t>(h)*layout.headFloats() : initial;
-                cpu_gdn_epoch::run(layout, initial, destination, query, key, v + h*d_v,
-                    &decay, &beta, 1, d_k, d_v, 1, output + h*d_v, d_v);
+                if (capture)
+                {
+                    CPUSharedGDNSnapshots shared(layout,shared_slots_+static_cast<size_t>(h)*CPUSharedGDNSnapshots::headFloats(layout,shared_width_),shared_width_);
+                    cpu_gdn_epoch::runShared(layout,initial,query,key,v+h*d_v,&decay,&beta,
+                        1,d_k,d_v,1,output+h*d_v,d_v,shared);
+                }
+                else
+                    cpu_gdn_epoch::run(layout,initial,initial,query,key,v+h*d_v,
+                        &decay,&beta,1,d_k,d_v,1,output+h*d_v,d_v);
             }
         };
         OMP_WORKSHARE_REGION(work);
+        if (capture) shared_valid_=true;
         return true;
     }
 
@@ -621,9 +764,12 @@ namespace llaminar2
         int seq_len, int n_heads, int d_k, int d_v,
         int chunk_size, bool use_qk_l2norm)
     {
+        shared_valid_=false;
         if (n_heads <= 0 || d_k <= 0 || d_v <= 0 || d_k > 512 || d_v > 512)
             return false;
         const int state_floats = CPUGDNStateLayout(n_heads, d_k, d_v).floats();
+        if (verifier_state_capture_ && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
+            throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
         if (verifier_state_capture_ &&
             (verifier_state_capture_rows_ < seq_len || verifier_state_capture_size_ < state_floats))
             return false;
@@ -668,6 +814,7 @@ namespace llaminar2
         int global_v_head_offset, int chunk_size,
         bool use_qk_l2norm)
     {
+        shared_valid_=false;
         if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
             n_heads <= 0 || d_k <= 0 || d_v <= 0)
         {
@@ -683,6 +830,8 @@ namespace llaminar2
         if (n_heads <= 0 || d_k <= 0 || d_v <= 0 || d_k > 512 || d_v > 512)
             return false;
         const int state_floats = CPUGDNStateLayout(n_heads, d_k, d_v).floats();
+        if (verifier_state_capture_ && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
+            throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
         if (verifier_state_capture_ &&
             (verifier_state_capture_rows_ < seq_len || verifier_state_capture_size_ < state_floats))
             return false;
@@ -760,6 +909,7 @@ namespace llaminar2
         int state_floats, void *stream)
     {
         (void)stream;
+        if (shared_slots_ && state_snapshots==shared_slots_) return materializeShared(state,snapshot_row);
         if (!state || !state_snapshots || snapshot_row < 0 ||
             snapshot_stride_floats < state_floats || state_floats < 0)
             return false;
@@ -823,6 +973,7 @@ namespace llaminar2
         int n_heads, int d_k, int d_v, bool use_qk_l2norm,
         const int *host_request_seq_lens)
     {
+        shared_valid_=false;
         if (!alpha || !beta_raw || !A_log || !dt_bias || !output || !state || !host_request_seq_lens ||
             request_count <= 0 || request_seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
             d_k > 512 || d_v > 512 || request_seq_len > std::numeric_limits<int>::max()/request_count ||
@@ -837,11 +988,17 @@ namespace llaminar2
             if (host_request_seq_lens[request] < 0 || host_request_seq_lens[request] > request_seq_len) return false;
             live_rows += host_request_seq_lens[request];
         }
+        if (verifier_state_capture_ && shared_slots_ &&
+            byteRangesOverlap(state,static_cast<size_t>(layout.floats())*sizeof(float),shared_slots_,shared_slot_floats_*sizeof(float))) return false;
         if (!ensureRequestStateBank(request_count, layout.floats(), state)) return false;
         for (int request = 0; request < request_count; ++request)
             if (!layout.valid(request_state_bank_.data() + static_cast<size_t>(request)*layout.floats())) return false;
         const bool capture = verifier_state_capture_ != nullptr;
+        if (capture && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
+            throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
         if (capture && (verifier_state_capture_rows_ < seq_len || verifier_state_capture_size_ < layout.floats())) return false;
+        const bool shared_capture=capture && shared_slots_;
+        if (shared_capture && !prepareShared(request_count,request_seq_len,n_heads,d_k,d_v)) return false;
         ensureScratch(seq_len, n_heads, d_k, d_v);
         const int qk_stride = n_heads*d_k, output_stride = n_heads*d_v;
         const float scale = 1.0f/std::sqrt(static_cast<float>(d_k));
@@ -880,27 +1037,38 @@ namespace llaminar2
                 const int request=task/n_heads,head=task%n_heads,rows=host_request_seq_lens[request];
                 const size_t first=static_cast<size_t>(request)*request_seq_len;
                 float *initial=request_state_bank_.data()+static_cast<size_t>(request)*layout.floats()+static_cast<size_t>(head)*layout.headFloats();
-                float *snapshots=capture ? verifier_state_capture_+first*verifier_state_capture_size_+static_cast<size_t>(head)*layout.headFloats() : nullptr;
+                if (shared_capture && rows==0) {
+                    const size_t span=CPUSharedGDNSnapshots::headFloats(layout,shared_width_);
+                    CPUSharedGDNSnapshots(layout,shared_slots_+static_cast<size_t>(task)*span,shared_width_).retire();
+                }
                 if (rows > 0)
                 {
                     const float *q=nullptr,*k=nullptr,*v=nullptr;
                     row_accessor(request,0,head,q,k,v);
-                    float *working=capture ? snapshots+static_cast<size_t>(rows-1)*verifier_state_capture_size_ : initial;
-                    cpu_gdn_epoch::run(layout,initial,working,
-                        q_scratch_.data()+first*qk_stride+head*d_k,k_scratch_.data()+first*qk_stride+head*d_k,v,
-                        gate_scratch_.data()+first*n_heads+head,beta_sig_scratch_.data()+first*n_heads+head,
-                        rows,qk_stride,value_row_stride,n_heads,output+first*output_stride+head*d_v,output_stride,
-                        snapshots,verifier_state_capture_size_);
+                    const float *prepared_q=q_scratch_.data()+first*qk_stride+head*d_k;
+                    const float *prepared_k=k_scratch_.data()+first*qk_stride+head*d_k;
+                    float *out=output+first*output_stride+head*d_v;
+                    if (shared_capture)
+                    {
+                        CPUSharedGDNSnapshots shared(layout,shared_slots_+static_cast<size_t>(task)*CPUSharedGDNSnapshots::headFloats(layout,shared_width_),shared_width_);
+                        cpu_gdn_epoch::runShared(layout,initial,prepared_q,prepared_k,v,
+                            gate_scratch_.data()+first*n_heads+head,beta_sig_scratch_.data()+first*n_heads+head,
+                            rows,qk_stride,value_row_stride,n_heads,out,output_stride,shared);
+                    }
+                    else
+                        cpu_gdn_epoch::run(layout,initial,initial,prepared_q,prepared_k,v,
+                            gate_scratch_.data()+first*n_heads+head,beta_sig_scratch_.data()+first*n_heads+head,
+                            rows,qk_stride,value_row_stride,n_heads,out,output_stride);
                 }
                 for (int row=rows;row<request_seq_len;++row)
                 {
                     std::fill_n(output+(first+row)*output_stride+head*d_v,d_v,0.0f);
-                    if (capture) std::fill_n(snapshots+static_cast<size_t>(row)*verifier_state_capture_size_,layout.headFloats(),0.0f);
                 }
             }
         };
         OMP_WORKSHARE_REGION(work);
         if (failed.load(std::memory_order_relaxed)) return false;
+        if (shared_capture) shared_valid_=true;
         if (!capture) std::memcpy(state,request_state_bank_.data(),static_cast<size_t>(layout.floats())*sizeof(float));
         return true;
     }
@@ -997,6 +1165,7 @@ namespace llaminar2
         int max_snapshot_rows,
         InputStateDisposition input_state_disposition)
     {
+        shared_valid_=false;
         if (!input.q || !input.k || !input.v || !input.layout_name ||
             input.q_row_stride <= 0 || input.k_row_stride <= 0 ||
             input.v_row_stride <= 0 || input.n_k_heads <= 0 ||
@@ -1017,6 +1186,8 @@ namespace llaminar2
         }
         const int state_floats = static_cast<int>(state_floats_wide);
         const bool capture_state_snapshots = state_snapshots != nullptr;
+        const bool shared_capture = capture_state_snapshots && state_snapshots==shared_slots_;
+        if (shared_capture) shared_valid_=false;
         if (capture_state_snapshots &&
             (snapshot_stride_floats < state_floats ||
              max_snapshot_rows < seq_len))
@@ -1041,7 +1212,7 @@ namespace llaminar2
                 return false;
             }
             const size_t snapshot_span_floats =
-                preceding_snapshot_rows * snapshot_stride + state_floats_wide;
+                shared_capture ? shared_slot_floats_ : preceding_snapshot_rows * snapshot_stride + state_floats_wide;
             if (state_floats_wide >
                     std::numeric_limits<size_t>::max() / sizeof(float) ||
                 snapshot_span_floats >
@@ -1056,6 +1227,7 @@ namespace llaminar2
             }
         }
 
+        if (shared_capture && !prepareShared(1,seq_len,n_heads,d_k,d_v)) return false;
         ensureScratch(seq_len, n_heads, d_k, d_v);
 
         PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_readout_rows",
@@ -1090,7 +1262,7 @@ namespace llaminar2
                  {"whole_head_worker_count", std::to_string(whole_head_worker_count)},
                  {"execution_policy", "fixed_epoch_shared_checkpoint"},
                  {"kernel_variant", "epoch8_backward_shared_prefix"},
-                 {"snapshot_materialization", "complete_checkpoint_history"},
+                 {"snapshot_materialization", shared_capture ? "shared_epoch_checkpoint_raw_log" : "explicit_dense_serialization"},
                  {"arithmetic_order", "serial_decode_per_head"}});
         }
         else
@@ -1121,27 +1293,41 @@ namespace llaminar2
                 for (int h = 0; h < n_heads; ++h)
                 {
                     const int qk_off = t * qk_stride + h * d_k;
-                    const int out_off = t * v_stride + h * d_v;
                     float *q_dst = q_scratch_.data() + qk_off;
                     float *k_dst = k_scratch_.data() + qk_off;
-                    int source_head =
-                        (h + input.global_v_head_offset) % input.n_k_heads;
-                    if (source_head < 0)
-                        source_head += input.n_k_heads;
-                    const float *q_src =
-                        input.q + static_cast<size_t>(t) * input.q_row_stride +
-                        static_cast<size_t>(source_head) * d_k;
-                    const float *k_src =
-                        input.k + static_cast<size_t>(t) * input.k_row_stride +
-                        static_cast<size_t>(source_head) * d_k;
-
-                    if (use_qk_l2norm)
+                    if (h >= input.n_k_heads)
                     {
-                        gdn_preprocess_qk_l2norm(q_src, k_src, q_dst, k_dst, d_k, scale_val, l2_eps);
+                        // Modular source-head mapping repeats after n_k_heads,
+                        // including nonzero/negative offsets. The same token's
+                        // earlier head owns the already rounded normalization;
+                        // copying it avoids repeating reductions and square roots.
+                        // This whole token belongs to one worker, so no event or
+                        // additional worksharing barrier is required here.
+                        const int prepared_off = t * qk_stride + (h % input.n_k_heads) * d_k;
+                        std::memcpy(q_dst, q_scratch_.data() + prepared_off, d_k * sizeof(float));
+                        std::memcpy(k_dst, k_scratch_.data() + prepared_off, d_k * sizeof(float));
                     }
                     else
                     {
-                        gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
+                        int source_head =
+                            (h + input.global_v_head_offset) % input.n_k_heads;
+                        if (source_head < 0)
+                            source_head += input.n_k_heads;
+                        const float *q_src =
+                            input.q + static_cast<size_t>(t) * input.q_row_stride +
+                            static_cast<size_t>(source_head) * d_k;
+                        const float *k_src =
+                            input.k + static_cast<size_t>(t) * input.k_row_stride +
+                            static_cast<size_t>(source_head) * d_k;
+
+                        if (use_qk_l2norm)
+                        {
+                            gdn_preprocess_qk_l2norm(q_src, k_src, q_dst, k_dst, d_k, scale_val, l2_eps);
+                        }
+                        else
+                        {
+                            gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
+                        }
                     }
 
                     // Compute the exact decode gate expressions while tokens
@@ -1156,8 +1342,7 @@ namespace llaminar2
                     beta_sig_scratch_[gi] =
                         1.0f / (1.0f + std::exp(-beta_raw[gi]));
 
-                    // Zero output
-                    std::memset(output + out_off, 0, d_v * sizeof(float));
+                    // Projection owns and overwrites every live output value.
                 }
 
             }
@@ -1170,16 +1355,29 @@ namespace llaminar2
             {
                 const size_t offset = static_cast<size_t>(head) * layout.headFloats();
                 float *initial = state + offset;
-                float *snapshots = capture_state_snapshots ? state_snapshots + offset : nullptr;
-                float *working = capture_state_snapshots
-                    ? snapshots + static_cast<size_t>(seq_len - 1) * snapshot_stride_floats : initial;
-                cpu_gdn_epoch::run(layout, initial, working,
-                    q_scratch_.data() + head*d_k, k_scratch_.data() + head*d_k,
-                    input.v + head*d_v, gate_scratch_.data() + head, beta_sig_scratch_.data() + head,
-                    seq_len, qk_stride, input.v_row_stride, n_heads, output + head*d_v, v_stride,
-                    snapshots, snapshot_stride_floats);
-                if (capture_state_snapshots && input_state_disposition == InputStateDisposition::PublishTerminalState)
-                    std::memcpy(initial, working, static_cast<size_t>(layout.headFloats()) * sizeof(float));
+                float *snapshots = capture_state_snapshots && !shared_capture ? state_snapshots + offset : nullptr;
+                if (shared_capture)
+                {
+                    CPUSharedGDNSnapshots shared(layout,shared_slots_+static_cast<size_t>(head)*CPUSharedGDNSnapshots::headFloats(layout,shared_width_),shared_width_);
+                    cpu_gdn_epoch::runShared(layout,initial,
+                        q_scratch_.data()+head*d_k,k_scratch_.data()+head*d_k,input.v+head*d_v,
+                        gate_scratch_.data()+head,beta_sig_scratch_.data()+head,
+                        seq_len,qk_stride,input.v_row_stride,n_heads,output+head*d_v,v_stride,shared);
+                    if (input_state_disposition==InputStateDisposition::PublishTerminalState)
+                        shared.materialize(seq_len-1,initial);
+                }
+                else
+                {
+                    float *working=capture_state_snapshots
+                        ? snapshots+static_cast<size_t>(seq_len-1)*snapshot_stride_floats : initial;
+                    cpu_gdn_epoch::run(layout,initial,working,
+                        q_scratch_.data()+head*d_k,k_scratch_.data()+head*d_k,input.v+head*d_v,
+                        gate_scratch_.data()+head,beta_sig_scratch_.data()+head,
+                        seq_len,qk_stride,input.v_row_stride,n_heads,output+head*d_v,v_stride,
+                        snapshots,snapshot_stride_floats);
+                    if (capture_state_snapshots && input_state_disposition==InputStateDisposition::PublishTerminalState)
+                        std::memcpy(initial,working,static_cast<size_t>(layout.headFloats())*sizeof(float));
+                }
             }
         };
         /*
@@ -1191,6 +1389,7 @@ namespace llaminar2
          * preserving the process-wide team for the next captured CPU stage.
          */
         OMP_WORKSHARE_REGION(do_work);
+        if (shared_capture) shared_valid_=true;
 
 #if defined(__AVX512F__)
 #undef GDN_PREFETCH_S

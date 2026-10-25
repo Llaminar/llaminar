@@ -1,5 +1,9 @@
 # CPU GDN fixed-epoch production experiment
 
+Follow-up: the [CPU epoch tuning results](gated-deltanet-epoch-tuning-results.md)
+record the subsequent fixes, green selected qualification and exact-develop comparison.
+The measurements and failures below remain the original experiment's evidence.
+
 Date: 2026-10-25. Branch: `feat/gdn-speculative-leaf-harness`, based on
 `3dd32e833287f027924b595895f176af16fd29a5`. CPU only. The user authorized changing
 arithmetic while retaining one byte-identical serial/grouped contract and asked

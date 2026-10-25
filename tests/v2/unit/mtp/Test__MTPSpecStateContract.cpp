@@ -13,8 +13,11 @@
 #include "execution/mtp/MTPSpecStatePublisher.h"
 #include "execution/mtp/MTPSpecTransactionDriver.h"
 
+#include <algorithm>
+#include <cstring>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -190,6 +193,9 @@ namespace
             return true;
         }
 
+        std::optional<CPUSharedGDNTransaction> compact_transaction;
+        void *destination_override = nullptr;
+
         CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override
         {
             planned_rows.push_back(row);
@@ -211,9 +217,14 @@ namespace
                     .status = CPUVerifierStateRestorePlanStatus::Invalid,
                 };
             }
+            if (compact_transaction)
+                return {.status=CPUVerifierStateRestorePlanStatus::Ready,
+                    .destination=destination_override ? destination_override : live_.data(),
+                    .source=compact_transaction->slots,.bytes=bytes_per_row_,
+                    .shared_gdn_prefix=CPUSharedGDNAcceptedPrefix{*compact_transaction,row}};
             return {
                 .status = CPUVerifierStateRestorePlanStatus::Ready,
-                .destination = live_.data(),
+                .destination = destination_override ? destination_override : live_.data(),
                 .source = snapshots_.data() +
                           static_cast<size_t>(row) * bytes_per_row_,
                 .bytes = bytes_per_row_,
@@ -1309,6 +1320,157 @@ TEST(Test__MTPSpecStateContract, SingleRequestCPUStatePublicationValidatesAllPla
         << "A later invalid stage must fail before any earlier live state changes.";
     EXPECT_EQ(valid.capture_binding_clear_calls, 0);
     EXPECT_EQ(invalid.capture_binding_clear_calls, 0);
+}
+
+/** @brief Typed scatter publishes phase/history/zeros without a staging bank. */
+TEST(Test__MTPSpecStateContract, CPUSharedGDNScatterCopiesCanonicalBytesAndPreservesInputs)
+{
+    constexpr int heads=2,dk=7,dv=17,rows=3;
+    const CPUGDNStateLayout layout(heads,dk,dv);
+    const size_t span=CPUSharedGDNSnapshots::headFloats(layout,rows);
+    for(const int initial_phase : {0,1,2,3,4,5,6,7})
+        for(int selected=0;selected<rows;++selected)
+        {
+            std::vector<float> slots(span*heads),expected(layout.floats(),0.0f);
+            uint64_t generation=17;
+            for(int head=0;head<heads;++head)
+            {
+                std::vector<float> initial(layout.headFloats(),0.0f),crossed=initial;
+                initial[0]=static_cast<float>(initial_phase);
+                for(int j=0;j<layout.matrixFloats();++j) {
+                    initial[1+j]=(head*31+j+1)*0.001f;
+                    crossed[1+j]=(head*17-j-1)*0.002f;
+                }
+                for(int p=0;p<initial_phase;++p)
+                    for(int j=0;j<layout.recordFloats();++j)
+                        layout.record(initial.data(),p)[j]=(p*7+j+1)*0.01f;
+                CPUSharedGDNSnapshots view(layout,slots.data()+head*span,rows);
+                view.begin(initial.data(),rows);
+                for(int row=0;row<rows;++row) {
+                    std::vector<float> raw(layout.recordFloats());
+                    for(int j=0;j<layout.recordFloats();++j) raw[j]=(row*13+j+2)*0.03f;
+                    view.append(row,raw.data());
+                    if ((initial_phase+row+1)%8==0) view.crossed(row,crossed.data());
+                }
+                view.complete();
+                float *target=expected.data()+head*layout.headFloats();
+                const int end=initial_phase+selected+1,phase=end%8;
+                target[0]=static_cast<float>(phase);
+                const auto &checkpoint=end>=8 ? crossed : initial;
+                std::copy_n(checkpoint.data()+1,layout.matrixFloats(),target+1);
+                for(int p=0;p<phase;++p) {
+                    const int absolute=end-phase+p;
+                    if(absolute<initial_phase)
+                        std::copy_n(layout.record(initial.data(),absolute),layout.recordFloats(),layout.record(target,p));
+                    else
+                        for(int j=0;j<layout.recordFloats();++j)
+                            layout.record(target,p)[j]=((absolute-initial_phase)*13+j+2)*0.03f;
+                }
+            }
+            const auto retained=slots;
+            FakePlannedCPUVerifierStateStage compact(layout.floats()*sizeof(float),11);
+            compact.compact_transaction=CPUSharedGDNTransaction{.slots=slots.data(),.slot_floats=slots.size(),
+                .width=rows,.requests=1,.live_width=rows,.heads=heads,.dk=dk,.dv=dv,
+                .generation_authority=&generation,.generation=generation};
+            const int accepted[1]={selected};
+            auto batch=planBatch({participantPlan(0,selected+1)});
+            const auto result=publishAcceptedMTPSpecStateFromVerifierRows(batch,accepted,{&compact},
+                DeviceId::cpu(),nullptr,true);
+            ASSERT_TRUE(result.ok)<<result.error;
+            ASSERT_EQ(compact.live().size(),expected.size()*sizeof(float));
+            EXPECT_EQ(std::memcmp(compact.live().data(),expected.data(),compact.live().size()),0);
+            EXPECT_EQ(slots,retained);
+        }
+}
+
+/** @brief All typed inputs and global aliases are rejected before any live write. */
+TEST(Test__MTPSpecStateContract, CPUSharedGDNScatterRejectsLateInvalidPlanAndCrossStageInputAlias)
+{
+    const CPUGDNStateLayout layout(1,7,17);
+    constexpr int rows=3;
+    std::vector<float> slots(CPUSharedGDNSnapshots::headFloats(layout,rows)),initial(layout.floats(),0.0f);
+    CPUSharedGDNSnapshots view(layout,slots.data(),rows);
+    std::vector<float> raw(layout.recordFloats(),0.25f);
+    view.begin(initial.data(),rows);
+    for(int row=0;row<rows;++row) view.append(row,raw.data());
+    view.complete();
+    uint64_t generation=4;
+    FakePlannedCPUVerifierStateStage compact(layout.floats()*sizeof(float),11);
+    compact.compact_transaction=CPUSharedGDNTransaction{.slots=slots.data(),.slot_floats=slots.size(),
+        .width=rows,.requests=1,.live_width=rows,.heads=1,.dk=7,.dv=17,
+        .generation_authority=&generation,.generation=generation};
+    FakePlannedCPUVerifierStateStage invalid(4,19,CPUVerifierStateRestorePlanStatus::Invalid);
+    const auto live_before=compact.live();
+    const auto slots_before=slots;
+    const int selected[1]={1};
+    auto batch=planBatch({participantPlan(0,2)});
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(batch,selected,{&compact,&invalid},
+        DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(compact.live(),live_before);
+    EXPECT_EQ(slots,slots_before);
+    FakePlannedCPUVerifierStateStage aliases(4,23);
+    aliases.destination_override=slots.data()+slots.size()-1;
+    result=publishAcceptedMTPSpecStateFromVerifierRows(batch,selected,{&compact,&aliases},
+        DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(compact.live(),live_before);
+    EXPECT_EQ(slots,slots_before);
+    ++generation;
+    result=publishAcceptedMTPSpecStateFromVerifierRows(batch,selected,{&compact},DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(compact.live(),live_before);
+    EXPECT_EQ(slots,slots_before);
+}
+
+/**
+ * @brief Reject overflowing compact address domains before protocol dereferences.
+ *
+ * Both malformed plans otherwise carry valid admitted geometry and publication
+ * metadata. An earlier valid stage makes any accidental prevalidation live copy
+ * observable; its state and the real retained input must remain byte-identical.
+ */
+TEST(Test__MTPSpecStateContract, CPUSharedGDNScatterRejectsAddressOverflowBeforeMetadataReads)
+{
+    const CPUGDNStateLayout layout(1,7,17);
+    constexpr int rows=3;
+    std::vector<float> slots(CPUSharedGDNSnapshots::headFloats(layout,rows));
+    std::vector<float> initial(layout.floats(),0.0f),raw(layout.recordFloats(),0.25f);
+    CPUSharedGDNSnapshots view(layout,slots.data(),rows);
+    view.begin(initial.data(),rows);
+    for(int row=0;row<rows;++row) view.append(row,raw.data());
+    view.complete();
+    const auto slots_before=slots;
+    uint64_t generation=4;
+    enum class OverflowDomain { RetainedSlots, GenerationAuthority };
+    for(const auto domain : {OverflowDomain::RetainedSlots,OverflowDomain::GenerationAuthority})
+    {
+        SCOPED_TRACE(static_cast<int>(domain));
+        FakePlannedCPUVerifierStateStage earlier(4096,19);
+        FakePlannedCPUVerifierStateStage malformed(layout.floats()*sizeof(float),11);
+        auto transaction=CPUSharedGDNTransaction{.slots=slots.data(),.slot_floats=slots.size(),
+            .width=rows,.requests=1,.live_width=rows,.heads=1,.dk=7,.dv=17,
+            .generation_authority=&generation,.generation=generation};
+        if(domain==OverflowDomain::RetainedSlots)
+            transaction.slots=reinterpret_cast<float *>(
+                std::numeric_limits<uintptr_t>::max()-sizeof(float)+1);
+        else
+            transaction.generation_authority=reinterpret_cast<const uint64_t *>(
+                std::numeric_limits<uintptr_t>::max()-sizeof(uint64_t)+2);
+        malformed.compact_transaction=transaction;
+        const auto earlier_before=earlier.live(),malformed_before=malformed.live();
+        const int selected[1]={1};
+        const auto batch=planBatch({participantPlan(0,2)});
+        const auto result=publishAcceptedMTPSpecStateFromVerifierRows(batch,selected,{&earlier,&malformed},
+            DeviceId::cpu(),nullptr,true);
+        EXPECT_FALSE(result.ok);
+        EXPECT_THAT(result.error,HasSubstr("could not plan a native restore"));
+        EXPECT_EQ(earlier.live(),earlier_before);
+        EXPECT_EQ(malformed.live(),malformed_before);
+        EXPECT_EQ(slots,slots_before);
+        EXPECT_EQ(earlier.capture_binding_clear_calls,0);
+        EXPECT_EQ(malformed.capture_binding_clear_calls,0);
+    }
 }
 
 TEST(Test__MTPSpecStateContract, PublisherRejectsGpuNullStream)

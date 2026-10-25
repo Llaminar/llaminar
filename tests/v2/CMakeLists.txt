@@ -4321,6 +4321,15 @@ set_tests_properties(V2_Unit_ProductionParityCampaigns PROPERTIES
     LABELS "V2;Unit;Parity;ProductionPath;CampaignFramework;Regression"
     TIMEOUT 30
 )
+add_test(NAME V2_Integration_DynamicMTPAcceptanceEvidence
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+            ProductionParityCampaignTest.test_dynamic_acceptance_requires_authenticated_complete_continuation
+)
+set_tests_properties(V2_Integration_DynamicMTPAcceptanceEvidence PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;Parity;MTP;Evidence;Regression"
+    TIMEOUT 30
+)
 # Full-machine discovery can initialize an unselected GPU backend. This
 # device-free integration proof runs the real CMake registration and lane
 # expander so backend-filtered probes cannot contaminate graph-memory gates.
@@ -12450,6 +12459,19 @@ add_v2_test(V2_Integration_PrefixTerminalVocabularyGeometry
     LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;TensorParallel;Regression"
     MPI_PROCS 1 NO_MODELS)
 
+# Accepted terminal logits must follow the state-selected verifier row/session.
+add_v2_test(V2_Integration_MTPAcceptedTerminalLogitsPublication
+    COMMAND $<TARGET_FILE:v2_test_prefix_state_snapshot>
+        --gtest_filter=PrefixTerminalLogitsSlice.AcceptedVerifierRow*
+    LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;MTP;Lifecycle;Regression;CPU;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_MTPAcceptedTerminalLogitsOwner
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator>
+        --gtest_filter=Test__DeviceGraphOrchestrator.AcceptedVerifierTerminalLogitsPublishSelectedRowAndReset
+    LABELS "V2;Integration;ProductionTestPreflight;MTP;Lifecycle;Regression;CPU;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
 # Test: Prefix cache participant coordination
 add_executable(v2_test_prefix_cache_coordinator unit/prefix_cache/Test__PrefixCacheCoordinator.cpp)
 target_link_libraries(v2_test_prefix_cache_coordinator llaminar2_core GTest::gtest GTest::gtest_main)
@@ -12932,6 +12954,12 @@ add_v2_test(V2_Unit_MTPSpecStateContract
     LABELS "V2;Unit;MTP;SpecDecode;StateContract"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPUSharedGDNScatterPublication
+    COMMAND $<TARGET_FILE:v2_test_mtp_spec_state_contract>
+        --gtest_filter=Test__MTPSpecStateContract.CPUSharedGDNScatter*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MTP;GDN;ByteExact;Publication;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1")
 
 # Test: vLLM-style MTP accepted-count KV publication contract
 add_executable(v2_test_mtp_spec_kv_publisher unit/mtp/Test__MTPSpecKVPublisher.cpp)
@@ -21668,6 +21696,13 @@ add_v2_test(V2_Integration_ParityMTPCheckpointNamespaceLifecycle
     MPI_PROCS 1
     NO_MODELS
 )
+# Dynamic policy observation and positive acceptance own independently
+# authenticated checkpoints, so a valid total rejection cannot erase coverage.
+add_v2_test(V2_Integration_ParityMTPDynamicAcceptanceCheckpoint
+    COMMAND $<TARGET_FILE:v2_test_snapshot_capture>
+        --gtest_filter=Test__MTPParitySnapshotContext.DynamicAcceptanceUsesIndependentAuthenticatedCheckpoint
+    LABELS "V2;Integration;ProductionTestPreflight;Parity;MTP;Snapshot;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 # A quantized router may exchange one near-cutoff expert without making its
 # routed contribution mathematically different. Keep that adjudication in the
 # model-free preflight so the generic checkpoint gate and model-specific CSV
@@ -23003,8 +23038,47 @@ add_v2_test(V2_Unit_GDNLeafEliminationReference
 
 # Test: GDN Kernels — Phase C: GDNProjectionStage, ShortConv1dStage,
 # GDNRecurrenceStage (recurrent step + chunk-parallel prefill)
-add_executable(v2_test_cpu_fixed_epoch_gdn unit/execution/Test__CPUFixedEpochGDN.cpp)
+add_executable(v2_test_cpu_fixed_epoch_gdn
+    unit/execution/Test__CPUFixedEpochGDN.cpp
+    unit/execution/Test__CPUFixedEpochQueryBlock.cpp
+    unit/execution/Test__CPUGDNRepeatedHeadPreprocessing.cpp)
 target_link_libraries(v2_test_cpu_fixed_epoch_gdn llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Integration_CPUGDNDirectRetainedArithmetic
+    COMMAND $<TARGET_FILE:v2_test_cpu_fixed_epoch_gdn>
+        --gtest_filter=CPUFixedEpochQueryBlock.DirectRetainedTransactionsMatchIndependentProgram
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;ByteExact;Workspace;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1")
+add_v2_test(V2_Integration_CPUSharedGDNInitialReadoutLifecycle
+    COMMAND $<TARGET_FILE:v2_test_cpu_fixed_epoch_gdn>
+        --gtest_filter=CPUFixedEpochQueryBlock.InitialReadout*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;ByteExact;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1")
+add_v2_test(V2_Integration_CPUSharedGDNAlignedLogicalLayout
+    COMMAND $<TARGET_FILE:v2_test_cpu_fixed_epoch_gdn>
+        --gtest_filter=CPUFixedEpochGDN.SharedSnapshotAlignedPayloadUsesExplicitLogicalCapacity
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;Workspace;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1")
+add_v2_test(V2_Integration_CPUSharedGDNAlignedLogicalCapacity
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+        --gtest_filter=Test__GDNKernels.CPUCompactAlignedLogicalCapacityIgnoresPhysicalPadding
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;Workspace;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1")
+add_v2_test(V2_Integration_CPUSharedGDNSnapshotLifecycle
+    COMMAND $<TARGET_FILE:v2_test_cpu_fixed_epoch_gdn>
+        --gtest_filter=CPUFixedEpochGDN.SharedSnapshot*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;ByteExact;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1")
+add_v2_test(V2_Integration_CPUSharedGDNStagePublication
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+        --gtest_filter=Test__GDNKernels.CPUCompact*:Test__GDNKernels.RecurrencePublicationUsesStageBoundManagerCaptureAfterSharedKernelClear:Test__GDNKernels.RecurrenceCPUPublicationRestoresParallelStagesFromTheirOwnCaptureSlots
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;ByteExact;Publication;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1")
 add_v2_test(V2_Integration_CPUFixedEpochGDNZeroLayerAccounting
     COMMAND $<TARGET_FILE:v2_test_hybrid_kvcache>
         --gtest_filter=Test__HybridGDNStateGeometry.ZeroLayersOwnNoCPUCheckpointHistory
@@ -23654,6 +23728,11 @@ add_v2_test(V2_Unit_WorkspaceMemoryEstimator
     LABELS "V2;Unit;Planning;WorkspaceMemoryEstimator;Workspace"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPUSharedGDNWorkspaceAdmission
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+        --gtest_filter=Test__WorkspaceMemoryEstimator.CPUSharedGDNSnapshotPerLayerWorkspace*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Planning;GDN;Workspace;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_FP16PrefillWorkspaceGeometryAdmission
     COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
         --gtest_filter=Test__WorkspaceMemoryEstimator.FP16PrefillAdmissionCoversEnumeratedCaptureGeometry
@@ -24588,6 +24667,8 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixCacheShutdownMPI_8
     V2_Integration_PrefixArchiveIdempotentPublication
     V2_Integration_NativeVocabularyPrefixAdmission
+    V2_Integration_MTPAcceptedTerminalLogitsPublication
+    V2_Integration_MTPAcceptedTerminalLogitsOwner
     V2_Integration_ROCmDensePrefillOverlayAdmission
     V2_Integration_MTPDefaultSamplingPolicy
     ${V2_FP32_SUBNORMAL_PREFLIGHT_TESTS}

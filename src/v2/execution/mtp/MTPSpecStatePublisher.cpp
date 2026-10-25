@@ -6,7 +6,10 @@
  * The GPU resident path is intentionally shaped around device row-index
  * pointers.  Host step plans may still describe CPU/legacy publication, but the
  * promoted resident path must not recover accepted rows by copying compact
- * metadata to the CPU first.
+ * metadata to the CPU first. CPU single-request publication validates immutable
+ * compact GDN descriptors and every source/live span before constructing typed
+ * copy, zero-fill, and phase-word tasks for the existing persistent OpenMP team.
+ * Canonical states are written directly; no full mutable bank is staged first.
  */
 
 #include "MTPSpecStatePublisher.h"
@@ -27,6 +30,56 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Validate one compact accepted prefix without mutating any bank.
+         * @param plan Canonical publication plan containing a typed GDN prefix.
+         * @return True for complete geometry, generation, capacity, and head metadata.
+         * Malformed public plans fail before construction of any scatter task.
+         */
+        bool validSharedGDNPrefix(const CPUVerifierStateRestorePlan &plan)
+        {
+            if (!plan.shared_gdn_prefix) return true;
+            const auto &accepted=*plan.shared_gdn_prefix;
+            const auto &t=accepted.transaction;
+            if (!t.slots || plan.source!=t.slots || t.requests!=1 || t.heads<=0 ||
+                t.dk<=0 || t.dk>512 || t.dv<=0 || t.dv>512 || t.width<=0 ||
+                t.width>std::numeric_limits<int>::max()-8 || t.live_width<=0 || t.live_width>t.width ||
+                accepted.row<0 || accepted.row>=t.live_width ||
+                !t.generation_authority ||
+                t.slot_floats>std::numeric_limits<size_t>::max()/sizeof(float)) return false;
+            // Authenticate complete address domains before reading either
+            // protocol authority or head metadata. The later generic plan-span
+            // validation cannot protect these earlier compact metadata reads.
+            const uintptr_t source_begin=reinterpret_cast<uintptr_t>(t.slots);
+            const uintptr_t generation_begin=reinterpret_cast<uintptr_t>(t.generation_authority);
+            const size_t source_bytes=t.slot_floats*sizeof(float);
+            if (source_bytes>std::numeric_limits<uintptr_t>::max()-source_begin ||
+                sizeof(*t.generation_authority)>std::numeric_limits<uintptr_t>::max()-generation_begin)
+                return false;
+            if (*t.generation_authority!=t.generation) return false;
+            const CPUGDNStateLayout one_head(1,t.dk,t.dv);
+            if (t.heads>std::numeric_limits<int>::max()/one_head.headFloats()) return false;
+            const CPUGDNStateLayout layout(t.heads,t.dk,t.dv);
+            const size_t span=CPUSharedGDNSnapshots::headFloats(layout,t.width);
+            if (span>t.slot_floats/static_cast<size_t>(t.heads) ||
+                plan.bytes!=static_cast<size_t>(layout.floats())*sizeof(float)) return false;
+            for(int head=0;head<t.heads;++head)
+                if (!CPUSharedGDNSnapshots(layout,t.slots+static_cast<size_t>(head)*span,t.width).validRow(accepted.row)) return false;
+            return true;
+        }
+
+        /**
+         * @brief Resolve the entire immutable source span consumed by a publication.
+         * @param plan Validated contiguous or compact-GDN plan.
+         * @return Source byte extent, including retained compact headers/history.
+         */
+        size_t publicationSourceBytes(const CPUVerifierStateRestorePlan &plan)
+        {
+            return plan.shared_gdn_prefix
+                ? plan.shared_gdn_prefix->transaction.slot_floats*sizeof(float)
+                : plan.bytes;
+        }
+
         MTPSpecStatePublicationResult publicationFailure(
             const MTPSpecStepPlan &plan,
             std::string reason)
@@ -307,11 +360,14 @@ namespace llaminar2
              */
             std::vector<CPUVerifierStateRestorePlan> restore_plans;
             restore_plans.reserve(state_stages.size());
+            enum class RestoreOperation : uint8_t { Copy, Zero, PhaseWord };
             struct RestoreCopyChunk
             {
                 void *destination = nullptr;
                 const void *source = nullptr;
                 size_t bytes = 0;
+                RestoreOperation operation = RestoreOperation::Copy;
+                float phase_word = 0.0f;
             };
             constexpr size_t kRestoreCopyChunkBytes = 128u * 1024u;
             std::vector<RestoreCopyChunk> restore_chunks;
@@ -348,7 +404,7 @@ namespace llaminar2
 
                     CPUVerifierStateRestorePlan restore =
                         stage->planCPUVerifierStateRestoreRow(restore_row);
-                    if (!restore.ready())
+                    if (!restore.ready() || !validSharedGDNPrefix(restore))
                     {
                         std::ostringstream msg;
                         msg << "single-request CPU MTP publication could not plan a native restore for captured stage "
@@ -361,9 +417,10 @@ namespace llaminar2
                         reinterpret_cast<uintptr_t>(restore.destination);
                     const uintptr_t source_begin =
                         reinterpret_cast<uintptr_t>(restore.source);
+                    const size_t source_bytes=publicationSourceBytes(restore);
                     if (restore.bytes >
                             std::numeric_limits<uintptr_t>::max() - destination_begin ||
-                        restore.bytes >
+                        source_bytes >
                             std::numeric_limits<uintptr_t>::max() - source_begin ||
                         restore.bytes >
                             std::numeric_limits<size_t>::max() - restore_bytes)
@@ -374,7 +431,7 @@ namespace llaminar2
                     }
                     const uintptr_t destination_end =
                         destination_begin + restore.bytes;
-                    const uintptr_t source_end = source_begin + restore.bytes;
+                    const uintptr_t source_end = source_begin + source_bytes;
                     if (destination_begin < source_end &&
                         source_begin < destination_end)
                     {
@@ -402,24 +459,79 @@ namespace llaminar2
                     restore_plans.push_back(restore);
                 }
 
-                restore_chunks.reserve(
-                    restore_bytes / kRestoreCopyChunkBytes +
-                    restore_plans.size());
-                for (const CPUVerifierStateRestorePlan &restore : restore_plans)
+                // All inputs remain immutable until the entire transaction is
+                // copied. A live destination may alias neither another live bank
+                // nor another plan's full input span, including compact history.
+                for (const auto &destination_plan : restore_plans)
+                    for (const auto &source_plan : restore_plans)
+                        if (CPUSharedGDNSnapshots::buffersOverlap(
+                                destination_plan.destination,destination_plan.bytes,
+                                source_plan.source,publicationSourceBytes(source_plan)))
+                            return batchPublicationFailure(plans,
+                                "single-request CPU MTP publication live destination aliases a retained input span");
+
+                // Every task emits a nonempty disjoint piece of the already
+                // checked canonical byte total, so this exact task count cannot
+                // exceed restore_bytes or overflow its validated size domain.
+                const auto chunks_for=[](size_t bytes) {
+                    return bytes/kRestoreCopyChunkBytes+(bytes%kRestoreCopyChunkBytes!=0);
+                };
+                size_t restore_chunk_count=0;
+                for(const auto &restore : restore_plans)
                 {
-                    auto *destination = static_cast<std::byte *>(restore.destination);
-                    const auto *source = static_cast<const std::byte *>(restore.source);
-                    for (size_t offset = 0; offset < restore.bytes;
-                         offset += kRestoreCopyChunkBytes)
+                    if (!restore.shared_gdn_prefix) {
+                        restore_chunk_count+=chunks_for(restore.bytes);
+                        continue;
+                    }
+                    const auto &accepted=*restore.shared_gdn_prefix;
+                    const auto &t=accepted.transaction;
+                    const CPUGDNStateLayout layout(t.heads,t.dk,t.dv);
+                    const size_t span=CPUSharedGDNSnapshots::headFloats(layout,t.width);
+                    for(int head=0;head<t.heads;++head) {
+                        const auto candidate=CPUSharedGDNSnapshots(layout,
+                            t.slots+static_cast<size_t>(head)*span,t.width).candidate(accepted.row);
+                        restore_chunk_count+=1+chunks_for(static_cast<size_t>(layout.matrixFloats())*sizeof(float))
+                            +chunks_for(static_cast<size_t>(candidate.phase)*layout.recordFloats()*sizeof(float))
+                            +chunks_for(static_cast<size_t>(8-candidate.phase)*layout.recordFloats()*sizeof(float));
+                    }
+                }
+                restore_chunks.reserve(restore_chunk_count);
+                const auto append_chunks = [&](void *destination,const void *source,
+                    size_t bytes,RestoreOperation operation)
+                {
+                    auto *target=static_cast<std::byte *>(destination);
+                    const auto *input=static_cast<const std::byte *>(source);
+                    for(size_t offset=0;offset<bytes;offset+=kRestoreCopyChunkBytes)
+                        restore_chunks.push_back({.destination=target+offset,
+                            .source=operation==RestoreOperation::Copy ? input+offset : nullptr,
+                            .bytes=std::min(kRestoreCopyChunkBytes,bytes-offset),
+                            .operation=operation});
+                };
+                for (const auto &restore : restore_plans)
+                {
+                    if (!restore.shared_gdn_prefix)
                     {
-                        const size_t bytes = std::min(
-                            kRestoreCopyChunkBytes,
-                            restore.bytes - offset);
-                        restore_chunks.push_back({
-                            .destination = destination + offset,
-                            .source = source + offset,
-                            .bytes = bytes,
-                        });
+                        append_chunks(restore.destination,restore.source,restore.bytes,RestoreOperation::Copy);
+                        continue;
+                    }
+                    const auto &accepted=*restore.shared_gdn_prefix;
+                    const auto &t=accepted.transaction;
+                    const CPUGDNStateLayout layout(t.heads,t.dk,t.dv);
+                    const size_t span=CPUSharedGDNSnapshots::headFloats(layout,t.width);
+                    for(int head=0;head<t.heads;++head)
+                    {
+                        CPUSharedGDNSnapshots snapshot(layout,t.slots+static_cast<size_t>(head)*span,t.width);
+                        const auto candidate=snapshot.candidate(accepted.row);
+                        auto *target=static_cast<float *>(restore.destination)+static_cast<size_t>(head)*layout.headFloats();
+                        restore_chunks.push_back({.destination=target,.source=nullptr,
+                            .bytes=sizeof(float),.operation=RestoreOperation::PhaseWord,
+                            .phase_word=static_cast<float>(candidate.phase)});
+                        append_chunks(target+1,snapshot.checkpoint(candidate.checkpoint),
+                            static_cast<size_t>(layout.matrixFloats())*sizeof(float),RestoreOperation::Copy);
+                        append_chunks(layout.record(target,0),snapshot.record(candidate.prefix-candidate.phase),
+                            static_cast<size_t>(candidate.phase)*layout.recordFloats()*sizeof(float),RestoreOperation::Copy);
+                        append_chunks(layout.record(target,candidate.phase),nullptr,
+                            static_cast<size_t>(CPUGDNStateLayout::kPeriod-candidate.phase)*layout.recordFloats()*sizeof(float),RestoreOperation::Zero);
                     }
                 }
             }
@@ -438,14 +550,31 @@ namespace llaminar2
                 {
                     const RestoreCopyChunk &restore =
                         restore_chunks[static_cast<size_t>(i)];
-                        std::memcpy(
-                            restore.destination,
-                            restore.source,
-                            restore.bytes);
+                        switch(restore.operation)
+                        {
+                            case RestoreOperation::Copy:
+                                std::memcpy(restore.destination,restore.source,restore.bytes);
+                                break;
+                            case RestoreOperation::Zero:
+                                std::memset(restore.destination,0,restore.bytes);
+                                break;
+                            case RestoreOperation::PhaseWord:
+                                std::memcpy(restore.destination,&restore.phase_word,sizeof(float));
+                                break;
+                        }
                     }
                 };
                 OMP_WORKSHARE_REGION(copy_restore_plans);
             }
+
+            for (const auto &restore : restore_plans)
+                if (restore.shared_gdn_prefix)
+                {
+                    PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materializations",1,"publication","cpu");
+                    PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materialization_bytes",
+                        static_cast<double>(restore.bytes),"publication","cpu");
+                    PerfStatsCollector::addCounter("mtp","spec_state_cpu_compact_scatter_plans",1,"decode","cpu");
+                }
 
             {
                 PerfStatsCollector::ScopedTimer timer(

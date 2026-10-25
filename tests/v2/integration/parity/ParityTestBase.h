@@ -9496,32 +9496,299 @@ namespace llaminar2::test::parity
                     ASSERT_GE(
                         witness_after.mtp_accepted_tokens,
                         witness_before.mtp_accepted_tokens);
-                    boundary.acceptance_witness_executed = true;
-                    boundary.acceptance_witness_serial_token_exact =
-                        witness_comparison.exact;
-                    boundary.acceptance_witness_accepted_token_delta =
-                        witness_after.mtp_accepted_tokens -
-                        witness_before.mtp_accepted_tokens;
-                    boundary.acceptance_witness_attempted_draft_tokens =
-                        boundary
-                            .dynamic_policy_witness_attempted_draft_tokens;
-                    boundary.acceptance_witness_verifier_transactions =
-                        boundary
-                            .dynamic_policy_witness_verifier_transactions;
-                    boundary.acceptance_witness_emitted_tokens =
-                        boundary.dynamic_policy_witness_emitted_tokens;
-                    boundary.acceptance_witness_serial_oracle_tokens =
-                        boundary
-                            .dynamic_policy_witness_serial_oracle_tokens;
-                    EXPECT_GT(
-                        boundary.acceptance_witness_accepted_token_delta,
-                        0u)
-                        << "Dynamic-depth production MTP accepted no draft "
-                           "token across its full-width policy witness";
+                    // The adaptive workload retains rejection coverage even
+                    // when its first draft is wrong. Acceptance has its own
+                    // independently authenticated checkpoint and continuation.
+                    runProductionParityMTPAcceptanceWitness(boundary);
                 }
                 production_parity_mtp_transaction_boundaries_.push_back(
                     std::move(boundary));
             }
+        }
+
+        /**
+         * @brief Prove dynamic acceptance independently of the adaptive workload.
+         * @param boundary Receives the authenticated positive transaction evidence.
+         *
+         * A valid adaptive observation may reject every draft. The HF sidecar
+         * and certified native serial rows select a separate accepting edge;
+         * no seed search or forced token participates in this request. Two
+         * ordinary continuation rows then expose stale rejected KV, recurrence,
+         * convolution, and terminal state through a complete byte comparison.
+         */
+        void runProductionParityMTPAcceptanceWitness(
+            ProductionParityMTPTransactionBoundary &boundary)
+        {
+            const auto reference = productionParityMTPAcceptedDraftReference();
+            ASSERT_TRUE(reference.has_value())
+                << "Dynamic MTP needs an independently authenticated accepting edge";
+            const std::vector<int32_t> base_prompt(
+                config_.token_ids.begin(), config_.token_ids.end());
+            const auto prompt = mtpParityCheckpointPrompt(
+                base_prompt, readDecodeTokensFromMetadata(), *reference);
+            const int response_tokens = config_.mtp_expected_draft_depth + 2;
+            constexpr int continuation_tokens = 2;
+            const int total_tokens = response_tokens + continuation_tokens;
+            orch_runner_->setStopTokens({});
+            PrefixProbeCapturePolicy probe = PrefixProbeCapturePolicy::fromEnvironment();
+            probe.hash_full_kv_payloads = true;
+            probe.hash_gdn_device_state = true;
+            probe.hash_terminal_state = true;
+            probe.capture_terminal_hidden_values = true;
+            probe.capture_terminal_logits_values = true;
+            std::string error;
+            const auto serial_prefix =
+                restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                    prompt, ProductionParityCompletePrefixPayload::MainModelAndMTP,
+                    &error);
+            ASSERT_TRUE(serial_prefix.has_value()) << error;
+            std::vector<int32_t> serial;
+            std::vector<PrefixRuntimeStateSnapshot> serial_states;
+            // Capture the producing graph's independent LM-head diagnostic;
+            // the prefix probe instead follows the current publication owner.
+            const auto native_logits = [&]()
+            {
+                size_t elements = 0;
+                const float *values = activeSnapshot("LM_HEAD", elements);
+                return values ? std::vector<float>(values, values + elements)
+                              : std::vector<float>{};
+            };
+            std::vector<std::vector<float>> serial_native_logits;
+            for (int row = 0; row < total_tokens; ++row)
+            {
+                activeClearSnapshots();
+                orch_runner_->setDecodeStepTokenBudget(1);
+                const auto result = orch_runner_->decodeStep();
+                orch_runner_->setDecodeStepTokenBudget(0);
+                ASSERT_TRUE(result.success()) << result.error;
+                ASSERT_EQ(result.tokens.size(), 1u);
+                ASSERT_FALSE(result.is_complete);
+                serial.push_back(result.tokens.front());
+                serial_states.push_back(activePrefixStateProbe(probe));
+                serial_native_logits.push_back(native_logits());
+                ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(1u))
+                    << orch_runner_->lastError();
+            }
+            const auto grouped_prefix =
+                restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                    prompt, ProductionParityCompletePrefixPayload::MainModelAndMTP,
+                    &error);
+            ASSERT_TRUE(grouped_prefix.has_value()) << error;
+            const auto same_input = compareMTPRuntimeStateSnapshots(
+                serial_prefix->state, grouped_prefix->state);
+            ASSERT_TRUE(same_input) << same_input.reason;
+            const auto terminal_publication_counters = []()
+            {
+                std::pair<double, double> totals{};
+                for (const auto &record : PerfStatsCollector::snapshot({"mtp"}))
+                {
+                    if (record.kind != PerfStatRecord::Kind::Counter) continue;
+                    if (record.name == "accepted_terminal_logits_rows") totals.first += record.value;
+                    if (record.name == "accepted_terminal_logits_bytes") totals.second += record.value;
+                }
+                return totals;
+            };
+            const auto publication_before = terminal_publication_counters();
+            const auto before = activePrefixStateProbe();
+            activeClearSnapshots();
+            orch_runner_->setDecodeStepTokenBudget(response_tokens);
+            const auto result = orch_runner_->decodeStep();
+            orch_runner_->setDecodeStepTokenBudget(0);
+            ASSERT_TRUE(result.success()) << result.error;
+            ASSERT_FALSE(result.tokens.empty());
+            ASSERT_LE(result.tokens.size(), static_cast<size_t>(response_tokens));
+            ASSERT_FALSE(result.is_complete);
+            const auto after = activePrefixStateProbe();
+            ASSERT_GE(after.mtp_accepted_tokens, before.mtp_accepted_tokens);
+            boundary.acceptance_witness_executed = true;
+            boundary.acceptance_witness_accepted_token_delta =
+                after.mtp_accepted_tokens - before.mtp_accepted_tokens;
+            boundary.acceptance_witness_attempted_draft_tokens =
+                mtpParityAttemptedDraftTokenCount(
+                    {before.mtp_draft_steps, before.mtp_verifier_runs},
+                    {after.mtp_draft_steps, after.mtp_verifier_runs});
+            boundary.acceptance_witness_verifier_transactions =
+                mtpParityExecutedTransactionCount(
+                    {before.mtp_draft_steps, before.mtp_verifier_runs},
+                    {after.mtp_draft_steps, after.mtp_verifier_runs});
+            boundary.acceptance_witness_emitted_tokens = result.tokens;
+            boundary.acceptance_witness_serial_oracle_tokens.assign(
+                serial.begin(), serial.begin() + result.tokens.size());
+            boundary.acceptance_witness_serial_token_exact =
+                boundary.acceptance_witness_emitted_tokens ==
+                boundary.acceptance_witness_serial_oracle_tokens;
+            ASSERT_TRUE(boundary.acceptance_witness_serial_token_exact);
+            ASSERT_GE(boundary.acceptance_witness_attempted_draft_tokens,
+                      static_cast<uint64_t>(before.mtp_current_depth));
+            ASSERT_EQ(before.mtp_current_depth, config_.mtp_expected_draft_depth);
+            ASSERT_TRUE(before.mtp_request.adaptive_depth_enabled);
+            ASSERT_EQ(after.mtp_observed_verifier_draft_depth, before.mtp_current_depth);
+            ASSERT_TRUE(grouped_prefix->state.prefix_request.hit);
+            ASSERT_TRUE(grouped_prefix->state.prefix_request.mtp_state_restored);
+            ASSERT_GT(boundary.acceptance_witness_accepted_token_delta, 0u)
+                << "Authenticated accepting edge failed at reference step "
+                << reference->reference_step;
+            ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(result.tokens.size()))
+                << orch_runner_->lastError();
+            const size_t continuation_end = result.tokens.size() + continuation_tokens;
+            for (size_t row = result.tokens.size(); row < continuation_end; ++row)
+            {
+                activeClearSnapshots();
+                orch_runner_->setDecodeStepTokenBudget(1);
+                const auto continuation = orch_runner_->decodeStep();
+                orch_runner_->setDecodeStepTokenBudget(0);
+                ASSERT_TRUE(continuation.success()) << continuation.error;
+                ASSERT_EQ(continuation.tokens.size(), 1u);
+                ASSERT_EQ(continuation.tokens.front(), serial[row]);
+                ASSERT_FALSE(continuation.is_complete);
+                ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(1u))
+                    << orch_runner_->lastError();
+            }
+            // The independent serial oracle does not populate recursive sidecar
+            // KV. Main KV, full recurrent/conv state, terminal payloads and
+            // logical metadata retain the strict native-byte contract.
+            MTPRuntimeSnapshotComparisonOptions options;
+            options.compare_shifted_mtp_kv = false;
+            const auto candidate_state = activePrefixStateProbe(probe);
+            const auto candidate_native_logits = native_logits();
+            if (activePrimaryDevice().is_cpu())
+            {
+                const auto publication_after = terminal_publication_counters();
+                const double rows = publication_after.first - publication_before.first;
+                const double bytes = publication_after.second - publication_before.second;
+                ASSERT_GT(rows, 0.0) << "Accepted CPU verifier published no terminal logits";
+                ASSERT_EQ(bytes, rows * static_cast<double>(orch_runner_->vocabSize()) * sizeof(float))
+                    << "Accepted CPU verifier must copy exactly one live vocabulary row per publication";
+            }
+            ASSERT_TRUE(candidate_state.terminal_hidden_hash_available);
+            ASSERT_TRUE(candidate_state.terminal_logits_hash_available);
+            const auto state_match = compareMTPRuntimeStateSnapshots(
+                serial_states.at(continuation_end - 1u),
+                candidate_state, options);
+            // Diagnose each owning state bank even when the complete gate
+            // stops at terminal logits. These copies never certify a relaxed
+            // state: the unchanged complete state_match below remains fatal.
+            auto bank_oracle = serial_states.at(continuation_end - 1u);
+            auto bank_candidate = candidate_state;
+            bank_oracle.terminal_hidden_hash_available = false;
+            bank_oracle.terminal_logits_hash_available = false;
+            bank_candidate.terminal_hidden_hash_available = false;
+            bank_candidate.terminal_logits_hash_available = false;
+            const auto bank_diagnostic = compareMTPRuntimeStateSnapshots(
+                bank_oracle, bank_candidate, options);
+            const auto diagnostic_path = getResultsDir() / "mtp_acceptance_state_diagnostic.csv";
+            std::ofstream diagnostic(diagnostic_path);
+            ASSERT_TRUE(diagnostic.is_open()) << diagnostic_path;
+            diagnostic << "role,output_index,token,position,session_epoch,live_state_epoch,"
+                          "hidden_hash,logits_hash,logits_bytes,native_elements,"
+                          "probe_vs_native_status,first_mismatch,probe_bits,native_bits,"
+                          "max_abs_diff,matches_candidate_logits\n";
+            const auto diagnostic_row = [&](const char *role, size_t row, int32_t token,
+                                             const PrefixRuntimeStateSnapshot &state,
+                                             const std::vector<float> &native)
+            {
+                const auto evidence = compareNativeVerifierRow(
+                    state.terminal_logits_values, native);
+                diagnostic << role << ',' << row << ',' << token << ','
+                           << state.current_position << ',' << state.session_epoch << ','
+                           << state.live_state_epoch << ',' << state.terminal_hidden_hash << ','
+                           << state.terminal_logits_hash << ',' << state.terminal_logits_bytes << ','
+                           << native.size() << ',' << evidence.name() << ','
+                           << evidence.first_mismatch << ',' << evidence.grouped_bits << ','
+                           << evidence.serial_bits << ',' << evidence.max_abs_diff << ','
+                           << (state.terminal_logits_hash == candidate_state.terminal_logits_hash)
+                           << '\n';
+            };
+            for (size_t row = 0; row < serial_states.size(); ++row)
+                diagnostic_row("serial", row, serial[row], serial_states[row], serial_native_logits[row]);
+            diagnostic_row("candidate", continuation_end - 1u, serial[continuation_end - 1u],
+                           candidate_state, candidate_native_logits);
+            diagnostic << "# diagnostic_only_banks_exact=" << static_cast<bool>(bank_diagnostic)
+                       << ";reason=" << bank_diagnostic.reason << '\n';
+            diagnostic.flush();
+            ASSERT_TRUE(diagnostic.good()) << diagnostic_path;
+            const auto &oracle_logits = serial_states.at(continuation_end - 1u).terminal_logits_values;
+            const auto &candidate_logits = candidate_state.terminal_logits_values;
+            const auto logit_diff_path = getResultsDir() / "mtp_acceptance_logits_diff.csv";
+            std::ofstream logit_diff(logit_diff_path);
+            ASSERT_TRUE(logit_diff.is_open()) << logit_diff_path;
+            logit_diff << "vocab_index,serial_value,candidate_value,serial_bits,candidate_bits\n";
+            logit_diff << std::setprecision(17);
+            size_t mismatches = 0;
+            double maximum_difference = 0;
+            for (size_t i = 0; i < std::min(oracle_logits.size(), candidate_logits.size()); ++i)
+            {
+                uint32_t oracle_bits = 0, candidate_bits = 0;
+                std::memcpy(&oracle_bits, &oracle_logits[i], sizeof(oracle_bits));
+                std::memcpy(&candidate_bits, &candidate_logits[i], sizeof(candidate_bits));
+                if (oracle_bits == candidate_bits) continue;
+                if (mismatches < 8u)
+                    logit_diff << i << ',' << oracle_logits[i] << ',' << candidate_logits[i]
+                               << ',' << oracle_bits << ',' << candidate_bits << '\n';
+                ++mismatches;
+                maximum_difference = std::max(maximum_difference,
+                    std::abs(static_cast<double>(oracle_logits[i]) - candidate_logits[i]));
+            }
+            logit_diff << "# mismatches=" << mismatches << ";max_abs=" << maximum_difference
+                       << ";serial_elements=" << oracle_logits.size()
+                       << ";candidate_elements=" << candidate_logits.size() << '\n';
+            logit_diff.flush();
+            ASSERT_TRUE(logit_diff.good()) << logit_diff_path;
+            const auto native_rows_path = getResultsDir() / "mtp_acceptance_native_logit_rows.csv";
+            std::ofstream native_rows(native_rows_path);
+            ASSERT_TRUE(native_rows.is_open()) << native_rows_path;
+            native_rows << "row,hash,vs_serial_status,vs_probe_status,serial_max_abs,probe_max_abs\n";
+            if (!oracle_logits.empty() && candidate_native_logits.size() % oracle_logits.size() == 0)
+            {
+                for (size_t row = 0; row < candidate_native_logits.size() / oracle_logits.size(); ++row)
+                {
+                    const std::span<const float> values(candidate_native_logits.data() +
+                        row * oracle_logits.size(), oracle_logits.size());
+                    const auto serial_evidence = compareNativeVerifierRow(values, oracle_logits);
+                    const auto probe_evidence = compareNativeVerifierRow(values, candidate_logits);
+                    native_rows << row << ',' << hashByteBufferForPrefixProbe(values.data(), values.size_bytes())
+                                << ',' << serial_evidence.name() << ',' << probe_evidence.name() << ','
+                                << serial_evidence.max_abs_diff << ',' << probe_evidence.max_abs_diff << '\n';
+                }
+            }
+            native_rows.flush();
+            ASSERT_TRUE(native_rows.good()) << native_rows_path;
+            const auto witness_path = getResultsDir() / "mtp_acceptance_witness.csv";
+            std::ofstream witness_csv(witness_path);
+            ASSERT_TRUE(witness_csv.is_open()) << witness_path;
+            witness_csv << "reference_step,condition_token,authenticated_first_draft,"
+                           "admitted_depth,attempted_drafts,verifier_transactions,"
+                           "accepted_drafts,emitted_tokens,serial_tokens,"
+                           "continuation_tokens,state_byte_exact,observed_depth,"
+                           "prefix_restored,adaptive_enabled\n";
+            witness_csv << reference->reference_step << ',' << reference->base_token << ','
+                        << reference->first_draft_token << ',' << before.mtp_current_depth << ','
+                        << boundary.acceptance_witness_attempted_draft_tokens << ','
+                        << boundary.acceptance_witness_verifier_transactions << ','
+                        << boundary.acceptance_witness_accepted_token_delta << ',';
+            const auto write_tokens = [&](const std::vector<int32_t> &tokens)
+            {
+                for (size_t i = 0; i < tokens.size(); ++i)
+                {
+                    if (i != 0) witness_csv << ';';
+                    witness_csv << tokens[i];
+                }
+            };
+            write_tokens(boundary.acceptance_witness_emitted_tokens);
+            witness_csv << ',';
+            write_tokens(boundary.acceptance_witness_serial_oracle_tokens);
+            witness_csv << ',' << continuation_tokens << ','
+                        << (state_match ? "true" : "false") << ','
+                        << after.mtp_observed_verifier_draft_depth << ','
+                        << (grouped_prefix->state.prefix_request.hit &&
+                            grouped_prefix->state.prefix_request.mtp_state_restored ? "true" : "false")
+                        << ',' << (before.mtp_request.adaptive_depth_enabled ? "true" : "false")
+                        << '\n';
+            witness_csv.flush();
+            ASSERT_TRUE(witness_csv.good()) << witness_path;
+            ASSERT_TRUE(state_match)
+                << "Accepted dynamic MTP continuation state: " << state_match.reason;
+            activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics();
         }
 
         /**

@@ -20,6 +20,8 @@
 #include "backends/DeviceId.h"
 #include "config/GDNHeadAssignment.h"
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
+#include "execution/compute_stages/stages/GDNRecurrenceStage.h"
+#include "execution/compute_stages/stages/ShortConv1dStage.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
@@ -1610,6 +1612,150 @@ TEST(Test__WorkspaceMemoryEstimator,
             }
         }
     }
+}
+
+/**
+ * @brief Compare CPU MTP admission with the actual production stage name family.
+ *
+ * Each recurrence layer builds retained immutable checkpoints and one shared
+ * raw log directly, so no separate mutable work bank is admitted. Merge actual
+ * production requirements by stable names instead of reproducing the planner's
+ * footprint arithmetic or its layer multiplier. Canonical serialization still
+ * includes complete phase/history bytes without allocating an extra live bank.
+ * Request widths cover shallow verification, fixed-epoch boundaries, and a
+ * crossing epoch; layer ranges distinguish six-layer and full 36-layer banks.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     CPUSharedGDNSnapshotPerLayerWorkspaceMatchesProductionStageFamily)
+{
+    auto profile = qwen35MoEProfile(true);
+    profile.d_model = 3072;
+    profile.d_ff = 1024;
+    profile.n_heads = 32;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.expert_feed_forward_length = 1024;
+    installQwen122HybridLayerInventory(profile);
+
+    for (const int last_layer : {7, 47})
+        for (const int requests : {1, 2, 3})
+            for (const int width : {1, 2, 8, 9, 16})
+            {
+                SCOPED_TRACE(::testing::Message() << "last_layer=" << last_layer
+                    << " requests=" << requests << " width=" << width);
+                const int flattened_rows = requests * width;
+                auto geometry = graphGeometry(DeviceId::cpu(), /*local_d_ff=*/1024);
+                geometry.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+                geometry.device_compute_units = 28;
+                geometry.batch_size = requests;
+                geometry.resident_graph_rows = flattened_rows;
+                geometry.local_query_head_start = 0;
+                geometry.local_query_heads = profile.n_heads;
+                geometry.local_kv_heads = profile.n_kv_heads;
+                geometry.first_layer = 0;
+                geometry.last_layer = last_layer;
+                const size_t ordinary = WorkspaceMemoryEstimator::estimate(profile, geometry);
+                geometry.mtp_target_query_rows = flattened_rows;
+                const size_t retained = WorkspaceMemoryEstimator::estimate(profile, geometry);
+
+                const auto assignment = GDNHeadAssignment::fromPartition(
+                    profile.gdn_group_count, profile.gdn_time_step_rank,
+                    /*query_head_start=*/0, profile.n_heads, profile.n_heads);
+                WorkspaceRequirements stage_family;
+                size_t recurrent_layers = 0;
+                for (int layer = 0; layer <= last_layer; ++layer)
+                {
+                    if ((layer + 1) % profile.full_attention_interval == 0)
+                        continue;
+                    ++recurrent_layers;
+                    GDNRecurrenceStage::Params recurrence;
+                    recurrence.device_id = DeviceId::cpu();
+                    recurrence.seq_len = flattened_rows;
+                    recurrence.request_count = requests;
+                    recurrence.request_seq_len = width;
+                    recurrence.n_heads = assignment.localValueHeads();
+                    recurrence.n_k_heads = profile.gdn_group_count;
+                    recurrence.d_k = profile.gdn_state_size;
+                    recurrence.d_v = profile.gdn_state_size;
+                    recurrence.layer_idx = layer;
+                    recurrence.workspace_namespace = "grouped_mtp_verifier";
+                    recurrence.speculative_state_slot_rows = flattened_rows;
+                    GDNRecurrenceStage recurrence_stage(recurrence);
+                    const auto recurrence_requirements =
+                        recurrence_stage.getWorkspaceRequirements(width);
+                    ASSERT_EQ(recurrence_requirements.buffers.size(),1u);
+                    EXPECT_TRUE(recurrence_requirements.buffers.front().name.starts_with(
+                        GDNRecurrenceStage::WS_SPECULATIVE_STATE_SLOTS));
+                    stage_family.merge(recurrence_requirements);
+
+                    ShortConv1dStage::Params convolution;
+                    convolution.device_id = DeviceId::cpu();
+                    convolution.seq_len = flattened_rows;
+                    convolution.request_count = requests;
+                    convolution.request_seq_len = width;
+                    convolution.channels = static_cast<int>(
+                        assignment.localFusedRows(profile.gdn_state_size));
+                    convolution.kernel_size = profile.gdn_conv_kernel_size;
+                    convolution.layer_idx = layer;
+                    convolution.workspace_namespace = "grouped_mtp_verifier";
+                    convolution.speculative_state_slot_rows = flattened_rows;
+                    ShortConv1dStage convolution_stage(convolution);
+                    const auto convolution_requirements =
+                        convolution_stage.getWorkspaceRequirements(width);
+                    ASSERT_EQ(convolution_requirements.buffers.size(), 1u);
+                    stage_family.merge(convolution_requirements);
+                }
+                ASSERT_GT(recurrent_layers, 1u);
+                EXPECT_EQ(stage_family.buffers.size(),2u*recurrent_layers);
+                ASSERT_GE(retained, ordinary);
+                const size_t production_family_bytes = stage_family.total_bytes_with_alignment();
+                EXPECT_EQ(retained - ordinary, production_family_bytes);
+            }
+}
+
+/**
+ * @brief CPU recurrence admits only retained slots with independent role ownership.
+ *
+ * Different head geometries keep their own immutable payloads; serial layers and
+ * independently replayable roles all retain distinct slot names. No namespace
+ * can introduce a second complete mutable recurrence bank.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     CPUSharedGDNSnapshotPerLayerWorkspaceRetainsOnlyIndependentSlotPayloads)
+{
+    const auto requirements_for=[](int layer,int heads,const std::string &role)
+    {
+        GDNRecurrenceStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.seq_len = 6;
+        params.request_count = 2;
+        params.request_seq_len = 3;
+        params.n_heads = heads;
+        params.n_k_heads = 2;
+        params.d_k = 7;
+        params.d_v = 17;
+        params.layer_idx = layer;
+        params.workspace_namespace = role;
+        params.speculative_state_slot_rows = 6;
+        GDNRecurrenceStage stage(params);
+        return stage.getWorkspaceRequirements(3);
+    };
+    const auto small=requirements_for(0,2,"grouped_mtp_verifier");
+    const auto large=requirements_for(1,4,"grouped_mtp_verifier");
+    const auto independent=requirements_for(0,2,"live_mtp_request_batch");
+    ASSERT_EQ(small.buffers.size(),1u);
+    ASSERT_EQ(large.buffers.size(),1u);
+    ASSERT_EQ(independent.buffers.size(),1u);
+    EXPECT_TRUE(small.buffers.front().name.starts_with(GDNRecurrenceStage::WS_SPECULATIVE_STATE_SLOTS));
+    EXPECT_NE(small.buffers.front().name,large.buffers.front().name);
+    EXPECT_NE(independent.buffers.front().name,small.buffers.front().name);
+    EXPECT_GT(large.buffers.front().size_bytes,small.buffers.front().size_bytes);
+    WorkspaceRequirements family;
+    family.merge(small); family.merge(large); family.merge(independent);
+    ASSERT_EQ(family.buffers.size(),3u);
+    for(const auto &buffer : family.buffers)
+        EXPECT_FALSE(buffer.name.starts_with(GDNRecurrenceStage::WS_SPECULATIVE_STATE_WORK));
+    EXPECT_EQ(family.total_bytes(),small.total_bytes()+large.total_bytes()+independent.total_bytes());
 }
 
 TEST(Test__WorkspaceMemoryEstimator,

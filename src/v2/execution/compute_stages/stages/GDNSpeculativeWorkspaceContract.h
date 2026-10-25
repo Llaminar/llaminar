@@ -14,6 +14,7 @@
 #pragma once
 
 #include "kernels/CPUGDNStateLayout.h"
+#include "kernels/CPUSharedGDNSnapshots.h"
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -26,10 +27,11 @@ namespace llaminar2::gdn_workspace
 /**
  * @brief Raw byte footprint of one speculative-state buffer pair.
  *
- * The slot buffer retains one state image per verifier row.  The work buffer
- * holds one mutable state image per concurrently represented request.  Buffer
- * placement applies its own alignment to each member after this exact payload
- * calculation.
+ * GPU/short-convolution slots retain state images per verifier row. CPU
+ * recurrence slots instead retain immutable epoch checkpoints and a shared raw
+ * log; they need no complete mutable work bank. GPU work buffers hold one mutable
+ * state image per request. Arena placement applies alignment to these exact
+ * typed payload contributions.
  */
 struct SpeculativeStateFootprint
 {
@@ -125,6 +127,12 @@ namespace detail
     GDNStateStorage storage)
 {
     const std::size_t state_floats = gdnRecurrenceStateFloats(storage, value_heads, key_width, value_width);
+    if (storage == GDNStateStorage::CPUFixedEpoch) {
+        const CPUSharedGDNLogicalCapacity capacity(slot_rows,request_count);
+        const CPUGDNStateLayout layout(value_heads,key_width,value_width);
+        return {.slot_bytes=detail::checkedMultiply(capacity.slotFloats(layout),
+            sizeof(float),"aligned shared epoch bytes"),.work_bytes=0};
+    }
     return detail::footprintFromStateFloats(
         state_floats, slot_rows, request_count);
 }
