@@ -218,17 +218,22 @@ namespace llaminar2
          * @brief Reset request-local RoPE params without invalidating device-param storage.
          *
          * CUDA/HIP graphs capture the RoPE dynamic parameter buffer by address.
-         * The next replay updates that buffer on the graph stream before launch,
-         * so this hook clears host-side request mirrors but keeps the underlying
-         * kernel slot alive for the preserved executable.
+         * Device-owned position rows and their extent remain part of the
+         * preserved executable identity. Host-owned position values remain
+         * request-local and are cleared. The next replay publishes new device
+         * row contents through the existing ordered request lifecycle.
          */
         void resetSessionStatePreservingCapturedReplay() override
         {
             IComputeStage::resetSessionState();
             params_.pos_offset = 0;
-            params_.seq_len = 0;
+            // Device row storage and its extent are captured topology, not
+            // request data. The request publishes new rows into the same bank;
+            // clearing this binding would falsely make a retained parent need
+            // host preparation before replay. Hard reset still drops it.
+            if (!params_.position_ids_device)
+                params_.seq_len = 0;
             params_.position_ids = nullptr;
-            params_.position_ids_device = nullptr;
             position_ids_cache_.clear();
             if (cached_kernel_)
                 cached_kernel_->clearGPUStreamBinding();

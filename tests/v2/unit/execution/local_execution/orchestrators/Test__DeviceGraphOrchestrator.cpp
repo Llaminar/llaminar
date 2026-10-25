@@ -139,10 +139,179 @@ public:
         return preparedRefForGraphWeight(binding, device);
     }
 
+    /** @brief Observe the actual graph-builder owner selection without device work. */
+    void setBuffers(const ModelBuffers &buffers) override
+    {
+        captured_buffers = buffers;
+        QwenStandardGraph::setBuffers(buffers);
+    }
+
+    ModelBuffers captured_buffers;
     int binding_set_count = 0;
     ModelWeights captured_weights;
     ModelWeightBindings captured_bindings;
 };
+
+namespace llaminar2
+{
+/** @brief Exercise the actual private setup scope; no model capability is fabricated. */
+struct DeviceGraphOrchestratorServingBuffersTestAccess
+{
+    /** @brief Run one role sequence inside the production cold buffer binding. */
+    template <typename Action>
+    static void inProgram(DeviceGraphOrchestrator &owner, const ModelBuffers &ordinary,
+                          Action &&action)
+    {
+        DeviceGraphOrchestrator::ServingProgramBufferScope scope(owner, ordinary);
+        std::forward<Action>(action)();
+    }
+
+    /** @brief Read the same participant-owned selection updated by setBuffers(). */
+    static const ModelBuffers &selected(const DeviceGraphOrchestrator &owner)
+    {
+        return owner.managed_buffers_;
+    }
+};
+
+/**
+ * @brief Exercise real metadata cache owners without pretending to capture a GPU graph.
+ *
+ * Stages below are constructed but never validated/enqueued. Native output and
+ * capture proofs remain the explicit CUDA/ROCm integration fixtures.
+ */
+struct DeviceGraphOrchestratorPublicationProgramsTestAccess
+{
+    /** @brief Retain sibling hook identities and exercise exact selection/reset/retirement. */
+    static void prove(DeviceGraphOrchestrator &owner, IComputeStage *short_hook, IComputeStage *full_hook)
+    {
+        using Program = SparseQueryExecutionProgram;
+        const auto key = [&](Program program) {
+            ForwardGraphSignature signature;
+            signature.device = owner.state_.device_id;
+            signature.seq_len = signature.all_position_logit_rows = 3;
+            signature.batch_size = 1;
+            signature.decode = signature.all_position_logits = true;
+            signature.sparse_query_execution_program = program;
+            return signature;
+        };
+        const auto bind = [&](Program program, IComputeStage *hook) {
+            DeviceGraphOrchestrator::SparseQueryProgramCompilationScope selected(owner, program);
+            const auto signature = key(program);
+            auto &cache = owner.mtpStatePublicationCache(signature);
+            MTPSpeculativeStatePublicationStage::Params params;
+            params.device_id = owner.state_.device_id;
+            params.request_count = 1;
+            params.verifier_rows_per_request = 3;
+            params.verifier_state_stages = {hook};
+            auto stage = std::make_unique<MTPSpeculativeStatePublicationStage>(params);
+            cache.stage = stage.get();
+            cache.graph = std::make_unique<ComputeGraph>();
+            cache.graph->addNode("metadata_publication", std::move(stage), owner.state_.device_id);
+            cache.verifier_signature = signature;
+            cache.workspace_generation = 7;
+            cache.valid = true;
+            return cache.graph.get();
+        };
+        // The first actual request may be short; owner zero must not be a
+        // prerequisite for retaining the short child's exact stage pointers.
+        auto *short_graph = bind(Program::ProvenNoRanking, short_hook);
+        auto *full_graph = bind(Program::RankingPossible, full_hook);
+        ASSERT_NE(short_graph, full_graph);
+        for (const auto program : {Program::ProvenNoRanking, Program::RankingPossible, Program::ProvenNoRanking})
+        {
+            DeviceGraphOrchestrator::SparseQueryProgramCompilationScope selected(owner, program);
+            const auto signature = key(program);
+            auto &cache = owner.mtpStatePublicationCache(signature);
+            auto expected = cache.stage->getParams();
+            ASSERT_EQ(cache.graph.get(), program == Program::ProvenNoRanking ? short_graph : full_graph);
+            EXPECT_EQ(expected.verifier_state_stages,
+                std::vector<IComputeStage *>{program == Program::ProvenNoRanking ? short_hook : full_hook});
+            EXPECT_TRUE(cache.matches(signature, 7, nullptr, expected));
+            auto foreign = signature;
+            foreign.sparse_query_execution_program = program == Program::RankingPossible ?
+                Program::ProvenNoRanking : Program::RankingPossible;
+            EXPECT_THROW((void)owner.mtpStatePublicationCache(foreign), std::invalid_argument);
+            EXPECT_EQ(cache.graph.get(), program == Program::ProvenNoRanking ? short_graph : full_graph);
+            EXPECT_FALSE(cache.matches(foreign, 7, nullptr, expected));
+            EXPECT_FALSE(cache.matches(signature, 8, nullptr, expected));
+            foreign = signature;
+            ++foreign.seq_len;
+            EXPECT_FALSE(cache.matches(foreign, 7, nullptr, expected));
+            expected.verifier_state_stages = {program == Program::ProvenNoRanking ? full_hook : short_hook};
+            EXPECT_FALSE(cache.matches(signature, 7, nullptr, expected));
+            cache.resetSessionState();
+            EXPECT_EQ(cache.graph.get(), program == Program::ProvenNoRanking ? short_graph : full_graph);
+        }
+        // A new actual sampling/publication admission can change policy and
+        // outcome pointers without changing any verifier key or arena address.
+        // Rebuild metadata stages only: no GPU support or capture is fabricated.
+        const auto replaceStage = [](auto &cache, auto params) {
+            auto stage = std::make_unique<MTPSpeculativeStatePublicationStage>(std::move(params));
+            cache.stage = stage.get();
+            cache.graph->getNode("metadata_publication")->stage = std::move(stage);
+        };
+        int32_t outcomes[2] = {1, 2};
+        uint32_t boundary[4] = {};
+        int iteration = 0;
+        for (const auto original : {Program::ProvenNoRanking, Program::RankingPossible})
+        {
+            const auto original_key = key(original);
+            auto &source = owner.mtp_speculative_state_publication_graphs_.at(sparseQueryExecutionProgramIndex(original));
+            auto admitted = source.stage->getParams();
+            admitted.outcome_tokens_device = &outcomes[iteration];
+            if (iteration == 0)
+                admitted.dynamic_moe_commit_boundary = MTPSpeculativeStatePublicationStage::DynamicMoECommitBoundaryBinding{
+                    &boundary[0], &boundary[1], &boundary[2], &boundary[3]};
+            else
+                admitted.dynamic_moe_commit_boundary.reset();
+            replaceStage(source, admitted);
+            owner.mtp_publication_admission_authority_ = original_key;
+            for (const auto program : {Program::ProvenNoRanking, Program::RankingPossible})
+            {
+                DeviceGraphOrchestrator::SparseQueryProgramCompilationScope selected(owner, program);
+                const auto signature = key(program);
+                auto &target = owner.mtpStatePublicationCache(signature);
+                auto expected = owner.mtpStatePublicationAuthority(signature, 7);
+                EXPECT_EQ(expected.outcome_tokens_device, &outcomes[iteration]);
+                EXPECT_EQ(expected.dynamic_moe_commit_boundary.has_value(), iteration == 0);
+                expected.verifier_state_stages = {program == Program::ProvenNoRanking ? short_hook : full_hook};
+                if (program != original)
+                {
+                    EXPECT_FALSE(target.matches(signature, 7, nullptr, expected))
+                        << "A same-key sibling must reject old outcome/policy Params";
+                    for (auto &parent : owner.sparse_query_generation_parents_) parent.valid = true;
+                    const auto index = sparseQueryExecutionProgramIndex(program);
+                    const auto sibling = 1u - index;
+                    owner.sparse_query_generation_parents_[sibling].launched = true;
+                    EXPECT_THROW(owner.retireMTPPublicationParent(signature), std::logic_error);
+                    EXPECT_TRUE(owner.sparse_query_generation_parents_[index].valid);
+                    EXPECT_TRUE(owner.sparse_query_generation_parents_[sibling].valid);
+                    EXPECT_FALSE(target.matches(signature, 7, nullptr, expected));
+                    owner.sparse_query_generation_parents_[sibling].launched = false;
+                    owner.retireMTPPublicationParent(signature);
+                    EXPECT_FALSE(owner.sparse_query_generation_parents_[index].valid);
+                    EXPECT_TRUE(owner.sparse_query_generation_parents_[sibling].valid);
+                    replaceStage(target, expected);
+                }
+                EXPECT_TRUE(target.matches(signature, 7, nullptr, expected));
+                EXPECT_THROW((void)owner.mtpStatePublicationAuthority(signature, 8), std::logic_error);
+            }
+            ++iteration;
+        }
+        for (auto &parent : owner.sparse_query_generation_parents_) parent.valid = true;
+        owner.retireMTPPublicationVerifierBorrows();
+        for (const auto &parent : owner.sparse_query_generation_parents_) EXPECT_FALSE(parent.valid);
+        for (const auto &cache : owner.mtp_speculative_state_publication_graphs_)
+        {
+            EXPECT_FALSE(cache.valid);
+            EXPECT_FALSE(cache.graph);
+            EXPECT_EQ(cache.stage, nullptr);
+            EXPECT_FALSE(cache.verifier_signature);
+        }
+        EXPECT_FALSE(owner.mtp_publication_admission_authority_);
+    }
+};
+} // namespace llaminar2
 
 namespace
 {
@@ -1961,6 +2130,84 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
     EXPECT_TRUE(std::as_const(*orchestrator).graphBuilder()->isInitialized());
 }
 
+/**
+ * @brief Role-specific logits cannot leak between retained serving siblings.
+ *
+ * The actual DGO scope and actual CPU graph builder are exercised with small
+ * distinct tensor owners. This proves cold binding/reset ownership only; it
+ * does not advertise sparse GPU support or certify native model arithmetic.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, ServingProgramRestoresOrdinaryOwnersAcrossRolesAndFailures)
+{
+    FP32Tensor ordinary_full({1, 16}, DeviceId::cpu());
+    FP32Tensor ordinary_local({1, 8}, DeviceId::cpu());
+    FP32Tensor condition_full({1, 16}, DeviceId::cpu());
+    FP32Tensor condition_local({1, 8}, DeviceId::cpu());
+    FP32Tensor verifier_full({3, 16}, DeviceId::cpu());
+    FP32Tensor verifier_local({3, 8}, DeviceId::cpu());
+    auto builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator owner(builder, nullptr);
+    for (const bool sharded : {false, true})
+    {
+        SCOPED_TRACE(sharded);
+        ModelBuffers ordinary;
+        ordinary.logits = &ordinary_full;
+        ordinary.logits_local = sharded ? &ordinary_local : nullptr;
+        ModelBuffers condition = ordinary;
+        condition.logits = &condition_full;
+        condition.logits_local = sharded ? &condition_local : nullptr;
+        ModelBuffers verifier = ordinary;
+        verifier.logits = &verifier_full;
+        verifier.logits_local = sharded ? &verifier_local : nullptr;
+
+        const auto check = [&](const ModelBuffers &expected)
+        {
+            const auto &selected = DeviceGraphOrchestratorServingBuffersTestAccess::selected(owner);
+            EXPECT_EQ(selected.logits, expected.logits);
+            EXPECT_EQ(selected.logits_local, expected.logits_local);
+            EXPECT_EQ(builder->captured_buffers.logits, expected.logits);
+            EXPECT_EQ(builder->captured_buffers.logits_local, expected.logits_local);
+        };
+        owner.setBuffers(verifier); // Reproduce a preceding role's output binding.
+        for (int sibling = 0; sibling < 2; ++sibling)
+        {
+            SCOPED_TRACE(sibling);
+            DeviceGraphOrchestratorServingBuffersTestAccess::inProgram(owner, ordinary, [&]
+            {
+                check(ordinary);
+                owner.setBuffers(condition);
+                check(condition);
+                owner.setBuffers(verifier);
+                check(verifier);
+            });
+            check(ordinary);
+        }
+        EXPECT_THROW(
+            DeviceGraphOrchestratorServingBuffersTestAccess::inProgram(owner, ordinary, [&]
+            {
+                check(ordinary);
+                owner.setBuffers(condition);
+                throw std::runtime_error("stop cold materialization");
+            }),
+            std::runtime_error);
+        check(ordinary);
+    }
+}
+
+/** @test Query programs keep independent exact accepted-state children through reset and failed selection. */
+TEST_F(Test__DeviceGraphOrchestrator, SparseQueryPublicationChildrenRetainExactVerifierOwners)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(test::qwen4MetadataFixture(false), config);
+    config.default_device = DeviceId::cpu();
+    // Hook owners outlive the DGO metadata borrows, including exceptional cleanup.
+    llaminar2::testing::MockComputeStage short_hook;
+    llaminar2::testing::MockComputeStage full_hook;
+    auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator owner(builder, nullptr);
+    DeviceGraphOrchestratorPublicationProgramsTestAccess::prove(owner, &short_hook, &full_hook);
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
@@ -3380,6 +3627,12 @@ TEST_F(
     ASSERT_NE(context_release, std::string::npos);
     EXPECT_LT(parent_release, forward_release)
         << "The complete generation parent must die before its borrowed child captures";
+    const auto publication_release = topology_destruction_body.find(
+        "mtp_speculative_state_publication_graphs_.rbegin()");
+    ASSERT_NE(publication_release, std::string::npos);
+    EXPECT_LT(parent_release, publication_release);
+    EXPECT_LT(publication_release, forward_release)
+        << "Publication hooks must retire before their exact verifier stage owners";
     EXPECT_LT(forward_release, context_release)
         << "Captured forward graphs must die before graph-creation contexts";
 
@@ -3400,7 +3653,7 @@ TEST_F(
         return std::isspace(value);
     });
     const auto native_parent_release = retained_release_body.find(
-        "mtp_device_generation_loop_graph_.release();");
+        "for(auto&parent:sparse_query_generation_parents_)parent.release();");
     const auto terminal_fragment_release = retained_release_body.find(
         "retained_storage_terminal_fragment_={};");
     const auto terminal_capture_release = retained_release_body.find(
@@ -3412,7 +3665,7 @@ TEST_F(
     EXPECT_LT(terminal_fragment_release, terminal_capture_release);
 
     for (const char *required_release : {
-             "mtp_speculative_state_publication_graph_.invalidate();",
+             "mtp_speculative_state_publication_graphs_.rbegin()",
              "mtp_draft_token_publication_graphs_",
              "mtp_verifier_preparation_graphs_",
              "mtp_stochastic_outcome_graph_.invalidate();",

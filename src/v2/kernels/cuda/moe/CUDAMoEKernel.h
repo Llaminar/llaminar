@@ -21,6 +21,7 @@
  */
 
 #include "../../IMoEKernel.h"
+#include "../../../config/MoERouterArithmeticPolicy.h"
 #include "CUDARouterQ8Prefill.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
 #include "../CUDAKernelBase.h"
@@ -1281,17 +1282,38 @@ namespace llaminar2
         void invalidateRouterQ8HiddenPublication() noexcept;
 
         /**
+         * @brief Bind required original-Q8 scratch before capture, rejecting geometry drift.
+         * @param rows Immutable physical rows. @param width Original hidden width.
+         * @param top_k Admitted route width used by the existing CUDA scratch owner.
+         * @return Whether the explicit grouped-consumer contract is satisfied.
+         */
+        bool prepareRequiredRouterQ8Hidden(int rows, int width, int top_k);
+
+        /**
+         * @brief Record original-FP32 quantization only for a declared consumer.
+         * @param source Original FP32 hidden. @param rows Physical row capacity.
+         * @param width Hidden width. @param top_k Admitted route width.
+         * @param live_rows Device-owned live prefix, never downloaded.
+         * @return Whether preparation and publication succeeded.
+         */
+        bool publishRequiredRouterQ8Hidden(const float *source, int rows,
+            int width, int top_k, const int *live_rows);
+
+
+        /**
          * @brief Publish contiguous Q8 rows produced by the current router.
          *
          * @param source FP32 device row base quantized by the router.
          * @param rows Number of valid rows in decode hidden scratch.
          * @param recorded_during_capture True when the producer was recorded,
          *        but not yet executed, by the active CUDA graph capture.
+         * @param router_basis Actual router transformation; Original for hidden-only publication.
          */
         void publishRouterQ8Hidden(
             const float *source,
             int rows,
-            bool recorded_during_capture) noexcept;
+            bool recorded_during_capture,
+            RouterQ8Basis router_basis) noexcept;
 
         /**
          * @brief Return whether the following expert stage may consume the publication.

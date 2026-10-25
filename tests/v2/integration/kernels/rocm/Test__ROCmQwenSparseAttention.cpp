@@ -10,6 +10,7 @@ extern "C" bool hipOps_rope_populate_inv_freq(float *,int,float,int,void *);
 extern "C" bool hipOps_rope_fp32_decode(float *,float *,const float *,int,int,int,int,int,int,void *);
 #define QSA_APPLY_ROPE hipOps_rope_fp32_decode
 #define QSA_POPULATE_ROPE hipOps_rope_populate_inv_freq
+#define QSA_ROCM_RUNTIME 1
 #define QSA_RT(name) hip##name
 #define QSA_STREAM hipStream_t
 #define QSA_GRAPH hipGraph_t

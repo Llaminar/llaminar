@@ -145,8 +145,8 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         !active_device_generation_admission_ || !canonical.active_device_generation_admission_)fail();
     const auto &cfg=graph_builder_->config();const auto &other=canonical.graph_builder_->config();
     const auto &cohort=cfg.ngram_replicated_ple_cohort;
-    const auto &loop=mtp_device_generation_loop_graph_;
-    const auto &reference=canonical.mtp_device_generation_loop_graph_;
+    const auto &loop=deviceGenerationLoopGraph();
+    const auto &reference=canonical.deviceGenerationLoopGraph();
     if (!cohort || cohort != other.ngram_replicated_ple_cohort ||
         cohort->modelOwner() != injected_model_ctx_.get() ||
         injected_model_ctx_ != canonical.injected_model_ctx_ || cfg.tp_ctx != &cohort->context() ||
@@ -155,6 +155,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         loop.launched || loop.workspace_generation != workspaceGeneration(state_.device_id) ||
         !reference.valid || !reference.capture || reference.launched || loop.request_count != 1 ||
         loop.request_count != reference.request_count ||
+        sparseQueryGraphProgram() != canonical.sparseQueryGraphProgram() ||
         loop.execution_kind != reference.execution_kind ||
         loop.sampling_mode != reference.sampling_mode ||
         loop.draft_depth != reference.draft_depth ||
@@ -247,6 +248,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         }
     };
     const auto forward=[&](const ForwardGraphSignature &signature){
+        if(signature.sparse_query_execution_program!=sparseQueryGraphProgram())fail();
         const auto retained=forward_engine_->retainedDecodeGraph(signature);
         const auto native=forward_engine_->deviceLoopGraphTemplate(signature);
         if(!retained || !retained->graph_owner || retained->device!=state_.device_id ||
@@ -277,7 +279,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
     }
     else
     {
-        const auto &publication=mtp_speculative_state_publication_graph_;
+        const auto &publication=mtpStatePublicationCache();
         if(!publication.valid || !publication.stage || publication.workspace_generation!=loop.workspace_generation)fail();
         const auto &p=publication.stage->getParams();const auto &logical=device_resident_logical_sequence_state_storage_;
         if(p.authority!=MTPSpeculativeStatePublicationStage::Authority::BoundedGeneration || p.request_count!=1 ||
@@ -291,11 +293,15 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         bool verifier=false;
         for(const auto &preparation:mtp_verifier_preparation_graphs_)
         {
-            if(!preparation || !preparation->valid || !preparation->paired_forward_signature)continue;
-            const auto native=forward_engine_->deviceLoopGraphTemplate(*preparation->paired_forward_signature);
-            const auto retained=forward_engine_->retainedDecodeGraph(*preparation->paired_forward_signature);
+            if(!preparation || !preparation->valid)continue;
+            // The verifier preparation is shared, but each complete parent
+            // consumes its own authenticated immutable main-forward program.
+            const auto &paired=pairedVerifierForwardSignature(*preparation);
+            if(!paired)continue;
+            const auto native=forward_engine_->deviceLoopGraphTemplate(*paired);
+            const auto retained=forward_engine_->retainedDecodeGraph(*paired);
             if(!retained || !embedded(native?native->capture:nullptr,retained->graph_owner))continue;
-            const auto &signature=*preparation->paired_forward_signature;
+            const auto &signature=*paired;
             if(signature.execution_role!=ForwardExecutionRole::GroupedMTPVerifier ||
                 signature.device_token_ids!=mtp_verifier_input_tokens_dev_ ||
                 signature.device_sequence_lengths!=mtp_verifier_request_lengths_dev_)fail();
@@ -310,6 +316,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
             std::ranges::any_of(reference.hosted_fragments,[&](const auto &f){return (capture && f.capture==capture) || (graph && f.semantic_graph==graph);});
     };
     const auto referenceForward=[&](const ForwardGraphSignature &signature){
+        if(signature.sparse_query_execution_program!=canonical.sparseQueryGraphProgram())fail();
         const auto retained=canonical.forward_engine_->retainedDecodeGraph(signature);
         const auto native=canonical.forward_engine_->deviceLoopGraphTemplate(signature);
         if(!retained || !retained->graph_owner || !canonicalEmbedded(native?native->capture:nullptr,retained->graph_owner))fail();
@@ -325,14 +332,16 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
     else
         for(const auto &preparation:canonical.mtp_verifier_preparation_graphs_)
         {
-            if(!preparation || !preparation->valid || !preparation->paired_forward_signature)continue;
-            const auto native=canonical.forward_engine_->deviceLoopGraphTemplate(*preparation->paired_forward_signature);
-            const auto retained=canonical.forward_engine_->retainedDecodeGraph(*preparation->paired_forward_signature);
+            if(!preparation || !preparation->valid)continue;
+            const auto &paired=canonical.pairedVerifierForwardSignature(*preparation);
+            if(!paired)continue;
+            const auto native=canonical.forward_engine_->deviceLoopGraphTemplate(*paired);
+            const auto retained=canonical.forward_engine_->retainedDecodeGraph(*paired);
             if(retained && canonicalEmbedded(native?native->capture:nullptr,retained->graph_owner))
-                referenceForward(*preparation->paired_forward_signature);
+                referenceForward(*paired);
         }
     const auto sidecars=[&](const DeviceGraphOrchestrator &owner,std::vector<Head> &out){
-        const auto &parent=owner.mtp_device_generation_loop_graph_;
+        const auto &parent=owner.deviceGenerationLoopGraph();
         const auto visit=[&](const auto &cache){
             if(!cache.valid || !cache.graph || cache.workspace_generation!=parent.workspace_generation)return;
             const auto native=cache.segment_cache.deviceLoopGraphTemplate(*cache.graph);

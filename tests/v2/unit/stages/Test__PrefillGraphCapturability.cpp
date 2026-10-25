@@ -24,6 +24,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
+#include "execution/compute_stages/stages/RoPEStage.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "kernels/IMoEKernel.h"
@@ -3512,4 +3513,66 @@ TEST_F(GDNPrefillGraphCapture, LiveStateAllGatherCapturableRequiresRawAllgatherG
 #else
     GTEST_SKIP() << "GPU backend not compiled";
 #endif
+}
+
+/**
+ * @brief Retained device position rows survive request reset without host preparation.
+ *
+ * The pointers are identity-only host fixtures; this test never initializes a
+ * GPU backend or executes RoPE. Native PP lifecycle covers actual replay.
+ */
+TEST(RoPERetainedCaptureIdentity, DevicePositionBankSurvivesRequestReset)
+{
+    std::array<int32_t, 3> first{};
+    std::array<int32_t, 3> second{};
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        RoPEStage::Params params;
+        params.device_id = device;
+        params.seq_len = 3;
+        params.position_ids_device = first.data();
+        RoPEStage stage(params);
+        for (int reset = 0; reset < 2; ++reset)
+        {
+            stage.resetSessionStatePreservingCapturedReplay();
+            EXPECT_EQ(stage.getParams().position_ids_device, first.data());
+            EXPECT_EQ(stage.getParams().seq_len, 3);
+            EXPECT_EQ(stage.graphLaunchPreparationPolicy(),
+                      GraphLaunchPreparationPolicy::CaptureOnly);
+        }
+        stage.updateDynamicDevicePositionIds(second.data(), 2);
+        stage.resetSessionStatePreservingLazyInitialization();
+        EXPECT_EQ(stage.getParams().position_ids_device, second.data());
+        EXPECT_EQ(stage.getParams().seq_len, 2);
+        EXPECT_EQ(stage.graphLaunchPreparationPolicy(),
+                  GraphLaunchPreparationPolicy::CaptureOnly);
+        stage.resetSessionState();
+        EXPECT_EQ(stage.getParams().position_ids_device, nullptr);
+        EXPECT_EQ(stage.getParams().seq_len, 0);
+        EXPECT_EQ(stage.graphLaunchPreparationPolicy(),
+                  GraphLaunchPreparationPolicy::CaptureAndReplay);
+    }
+}
+
+/** @brief Host positions remain request-local and require their original preparation. */
+TEST(RoPERetainedCaptureIdentity, HostPositionStateStillClearsOnPreservingReset)
+{
+    const std::array<int, 3> positions{7, 9, 12};
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        RoPEStage::Params params;
+        params.device_id = device;
+        params.seq_len = 3;
+        params.position_ids = positions.data();
+        params.pos_offset = 7;
+        RoPEStage stage(params);
+        stage.resetSessionStatePreservingCapturedReplay();
+        EXPECT_EQ(stage.getParams().position_ids, nullptr);
+        EXPECT_EQ(stage.getParams().position_ids_device, nullptr);
+        EXPECT_EQ(stage.getParams().seq_len, 0);
+        EXPECT_EQ(stage.getParams().pos_offset, 0);
+        EXPECT_EQ(stage.graphLaunchPreparationPolicy(),
+                  device.is_gpu() ? GraphLaunchPreparationPolicy::CaptureAndReplay
+                                  : GraphLaunchPreparationPolicy::None);
+    }
 }

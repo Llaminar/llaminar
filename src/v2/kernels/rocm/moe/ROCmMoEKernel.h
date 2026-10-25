@@ -21,6 +21,7 @@
 #pragma once
 
 #include "../../IMoEKernel.h"
+#include "../../../config/MoERouterArithmeticPolicy.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
 #include "../ROCmKernelBase.h"
 #include "../gemm/ROCmMoERouteOwnedTuning.h"
@@ -1257,6 +1258,25 @@ namespace llaminar2
         void invalidateRouterQ8HiddenPublication() noexcept;
 
         /**
+         * @brief Bind required original-Q8 scratch before capture, rejecting geometry drift.
+         * @param rows Immutable physical rows. @param width Original hidden width.
+         * @param top_k Admitted route width used by the existing CUDA scratch owner.
+         * @return Whether the explicit grouped-consumer contract is satisfied.
+         */
+        bool prepareRequiredRouterQ8Hidden(int rows, int width, int top_k);
+
+        /**
+         * @brief Record original-FP32 quantization only for a declared consumer.
+         * @param source Original FP32 hidden. @param rows Physical row capacity.
+         * @param width Hidden width. @param top_k Admitted route width.
+         * @param live_rows Device-owned live prefix, never downloaded.
+         * @return Whether preparation and publication succeeded.
+         */
+        bool publishRequiredRouterQ8Hidden(const float *source, int rows,
+            int width, int top_k, const int *live_rows);
+
+
+        /**
          * @brief Publish Q8 hidden rows produced by the immediately preceding router.
          *
          * @param source FP32 device row base that was quantized by the router.
@@ -1264,11 +1284,13 @@ namespace llaminar2
          * @param recorded_during_capture True when the producer launch was
          *        recorded into the currently active HIP graph rather than run
          *        eagerly.
+         * @param router_basis Actual router transformation; Original for hidden-only publication.
          */
         void publishRouterQ8Hidden(
             const float *source,
             int rows,
-            bool recorded_during_capture) noexcept;
+            bool recorded_during_capture,
+            RouterQ8Basis router_basis) noexcept;
 
         /**
          * @brief Test whether grouped gate/up may consume the router Q8 rows.

@@ -28,7 +28,7 @@
 using namespace llaminar2;
 namespace {
 /** @brief Build the actual host-only role owners and exercise native executor setup on one backend. */
-void proveColdSnapshot(DeviceId device){
+void proveColdSnapshot(DeviceId device,bool noRanking=false){
     auto* backend=getBackendFor(device);if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP();
     if(!hasCPUBackend())initCPUBackend(-1);
     auto& worker=GPUDeviceContextPool::instance().getContext(device);
@@ -60,12 +60,14 @@ void proveColdSnapshot(DeviceId device){
         std::fill_n(gain.mutable_data(),gain.numel(),1.f);std::fill_n(cosine.mutable_data(),cosine.numel(),1.f);
         std::fill_n(sine.mutable_data(),sine.numel(),0.f);
         constexpr std::size_t offset=512*sizeof(float);
+        Stage::Indexer operation{Float(query,BufferId::QFN_QSA_QUERY),Float(raw,BufferId::QFN_QSA_RAW_KEY),
+            Float(partial,BufferId::QFN_QSA_PARTIAL_KEYS),Float(pools,BufferId::QFN_QSA_POOLED_KEYS),Weight(gain),Weight(gain),
+            Weight(cosine),Weight(sine),Float(prepared,BufferId::QFN_QSA_PREPARED_QUERY,offset),Float(score,BufferId::QFN_QSA_SCORES),
+            Int(selected,BufferId::QFN_QSA_SELECTED),Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),blocks,positions};
+        if (noRanking) operation.queryDemand=qwen4exp::QwenSparseQueryDemand::ProvenNoRanking;
         ComputeGraph graph;graph.addNode("layer3_qsa_indexer",std::make_unique<Stage>(Stage::Params{
             .device_id=device,.rowCapacity=rows,.tokenCapacity=context,.replay=Int(replay,BufferId::QFN_QSA_REPLAY),
-            .operation=Stage::Indexer{Float(query,BufferId::QFN_QSA_QUERY),Float(raw,BufferId::QFN_QSA_RAW_KEY),
-                Float(partial,BufferId::QFN_QSA_PARTIAL_KEYS),Float(pools,BufferId::QFN_QSA_POOLED_KEYS),Weight(gain),Weight(gain),
-                Weight(cosine),Weight(sine),Float(prepared,BufferId::QFN_QSA_PREPARED_QUERY,offset),Float(score,BufferId::QFN_QSA_SCORES),
-                Int(selected,BufferId::QFN_QSA_SELECTED),Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),blocks,positions}}),device);
+            .operation=operation}),device);
         int live=rows;std::map<std::string,std::size_t>observedRows;
         DeviceGraphExecutor executor;executor.setArena(&arena);
         executor.setSnapshotCallback([&](const std::string&,const StageDumpInfo&dump){
@@ -85,17 +87,24 @@ void proveColdSnapshot(DeviceId device){
         });
         // The sole cold materialization comes from declared production roles.
         ASSERT_TRUE(executor.allocateGraphStorageForCapture(graph,execution.get(),"cold_qsa_source"));
-        ASSERT_NE(prepared.gpu_data_ptr(),nullptr);ASSERT_EQ(prepared.current_device(),std::optional<DeviceId>(device));
+        if (noRanking) {
+            EXPECT_EQ(query.gpu_data_ptr(),nullptr);EXPECT_EQ(prepared.gpu_data_ptr(),nullptr);EXPECT_EQ(score.gpu_data_ptr(),nullptr);
+        } else {
+            ASSERT_NE(prepared.gpu_data_ptr(),nullptr);ASSERT_EQ(prepared.current_device(),std::optional<DeviceId>(device));
+        }
         const auto* sourceBase=prepared.gpu_data_ptr();
-        for(auto* input:{&query,&raw,&partial,&pools,&replay})TransferEngine::prepareDeviceInput(input,device,stream);
+        for(auto* input:{&raw,&partial,&pools,&replay})TransferEngine::prepareDeviceInput(input,device,stream);
+        if (!noRanking) TransferEngine::prepareDeviceInput(&query,device,stream);
         for(auto* weight:{&gain,&cosine,&sine})TransferEngine::prepareDeviceInput(weight,device,stream);
         ASSERT_TRUE(executor.prepareGraphStorageForCapture(graph,execution.get(),stream,"cold_qsa_frontier"));
         DeviceGraphExecutor::GraphSnapshotManifest manifest;
         ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(graph,execution.get(),stream,"cold_qsa_manifest",&manifest));
-        ASSERT_EQ(manifest.bound_slot_count,4u);ASSERT_EQ(manifest.storage_allocation_count,1u);
+        ASSERT_EQ(manifest.bound_slot_count,noRanking ? 3u : 4u);ASSERT_EQ(manifest.storage_allocation_count,1u);
         auto* snapshotBase=manifest.storage_arena->gpu_data_ptr();const auto snapshotCapacity=manifest.storage_capacity_bytes;
         const auto& descriptors=manifest.stage_copies.at("layer3_qsa_indexer").outputs;
-        for(const auto&copy:descriptors)if(copy.name=="prepared_query")EXPECT_EQ(copy.source_ptr,static_cast<const std::byte*>(sourceBase)+offset);
+        for(const auto&copy:descriptors)if(copy.name=="prepared_query") {
+            ASSERT_FALSE(noRanking);EXPECT_EQ(copy.source_ptr,static_cast<const std::byte*>(sourceBase)+offset);
+        }
         auto capture=worker.createGraphCapture(stream);ASSERT_TRUE(capture);
         {ScopedBackendGraphCapture recording(worker,*capture,"Cold QSA source and counted snapshots");ASSERT_TRUE(recording.begin());
             ASSERT_TRUE(executor.recordSetupGraphMaterialization(graph,execution.get(),nullptr,&manifest));recording.finish();}
@@ -105,10 +114,12 @@ void proveColdSnapshot(DeviceId device){
             TransferEngine::publishDeviceWrite(&replay,device,stream);observedRows.clear();
             ASSERT_TRUE(capture->launch());const auto before=manifest.observed_download_bytes;
             ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(graph,stream,"cold_qsa_retained_replay",&manifest));
-            const std::size_t expected=64+(std::size_t(live)+1)*8+std::size_t(live)*512*4+std::size_t(live)*4+
+            const std::size_t expected=(noRanking ? 48 : 64)+(std::size_t(live)+1)*8+
+                (noRanking ? 0 : std::size_t(live)*512*4)+std::size_t(live)*4+
                 std::size_t(live)*(live+1)/2*4+std::size_t(live/4)*128*4;
             EXPECT_EQ(manifest.observed_download_bytes-before,expected);
-            EXPECT_EQ(observedRows.size(),4u);EXPECT_EQ(prepared.gpu_data_ptr(),sourceBase);
+            EXPECT_EQ(observedRows.size(),noRanking ? 3u : 4u);
+            if (noRanking) EXPECT_EQ(observedRows.count("prepared_query"),0u);EXPECT_EQ(prepared.gpu_data_ptr(),sourceBase);
             EXPECT_EQ(manifest.storage_arena->gpu_data_ptr(),snapshotBase);EXPECT_EQ(manifest.storage_capacity_bytes,snapshotCapacity);
             EXPECT_EQ(manifest.storage_allocation_count,1u);
         }
@@ -120,3 +131,8 @@ void proveColdSnapshot(DeviceId device){
 TEST(QwenSparseColdSnapshot, CUDA){proveColdSnapshot(DeviceId::cuda(0));}
 /** @brief Explicit ROCm cold setup/native retained replay; excluded from Unit. */
 TEST(QwenSparseColdSnapshot, ROCm){proveColdSnapshot(DeviceId::rocm(0));}
+
+/** @test The actual CUDA cold arena/snapshot owner never materializes omitted query banks. */
+TEST(QwenSparseColdSnapshot, CUDAProvenNoRanking){proveColdSnapshot(DeviceId::cuda(0),true);}
+/** @test The actual ROCm cold arena/snapshot owner never materializes omitted query banks. */
+TEST(QwenSparseColdSnapshot, ROCmProvenNoRanking){proveColdSnapshot(DeviceId::rocm(0),true);}

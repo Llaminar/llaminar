@@ -94,6 +94,38 @@ namespace llaminar2
                 "model_free_terminal_producer");
         }
 
+        /** @return Existing one-shot main-logits owner, without consuming or clearing it. */
+        static void *pendingMainLogitsStream(const DeviceGraphOrchestrator &runner)
+        {
+            return runner.pendingLogitsStreamValue(
+                DeviceGraphOrchestrator::PendingLogitsStreamRole::MainDecode);
+        }
+
+        /**
+         * @brief Reject an inconsistent history span after the real scalar producer was queued.
+         * @param runner Actual native owner; only test-authored immutable admission metadata is corrupted.
+         * @param token Bounded valid teacher token passed to the production publisher.
+         * @return The production rejection result; the fixture expects false and retained handoff.
+         * @note No foreign device address or failing GPU kernel is introduced. Original
+         * policy/capacity restore even if the production publisher throws.
+         */
+        static bool publishForcedWithInvalidHistory(DeviceGraphOrchestrator &runner, int32_t token)
+        {
+            struct Restore
+            {
+                int &capacity;
+                MTPRequestPenaltyPolicy &policy;
+                int saved_capacity;
+                MTPRequestPenaltyPolicy saved_policy;
+                /** @brief Restore original immutable test admission views on every exit. */
+                ~Restore() { capacity = saved_capacity; policy = saved_policy; }
+            } restore{runner.mtp_generated_token_count_capacity_, runner.mtp_request_penalty_policy_,
+                runner.mtp_generated_token_count_capacity_, runner.mtp_request_penalty_policy_};
+            runner.mtp_generated_token_count_capacity_ = -1;
+            runner.mtp_request_penalty_policy_.presence_penalty = 1.0F;
+            return runner.publishForcedDeviceResidentConditionToken(token, 0);
+        }
+
         /** @return Exact last-forward producer for terminal-only device assertions. */
         static void *mainForwardProducerStream(DeviceGraphOrchestrator &runner)
         {
@@ -114,18 +146,31 @@ namespace llaminar2
         static void bindPipelineEdges(DeviceGraphOrchestrator &runner, PipelineForwardGraphEdges *edges)
         { runner.pipeline_forward_edges_ = edges; }
 
+        /** @brief Author only the immutable source key for this model-free native fixture. */
+        static ForwardGraphSignature publicationSignature(DeviceGraphOrchestrator &runner, int rows)
+        {
+            ForwardGraphSignature signature;
+            signature.device = runner.state_.device_id;
+            signature.decode = true;
+            signature.all_position_logits = true;
+            signature.batch_size = 1;
+            signature.seq_len = signature.all_position_logit_rows = rows;
+            signature.sparse_query_execution_program = runner.sparseQueryGraphProgram();
+            return signature;
+        }
+
         /** @brief Enter the real follower materializer without synthesizing a tail outcome. */
         static bool prepareFollowerPublication(DeviceGraphOrchestrator &runner,
             ComputeGraph &verifier, int rows, std::string *error)
-        { return runner.materializePipelineFollowerMTPPublicationGraph(verifier, rows, error); }
+        { return runner.materializePipelineFollowerMTPPublicationGraph(verifier, publicationSignature(runner, rows), rows, error); }
 
         /** @return The installed graph, borrowed only while its DGO owns the workspace. */
         static ComputeGraph *publicationGraph(DeviceGraphOrchestrator &runner)
-        { return runner.mtp_speculative_state_publication_graph_.graph.get(); }
+        { return runner.mtpStatePublicationCache().graph.get(); }
 
         /** @return Immutable production publication bindings, not device values. */
         static const MTPSpeculativeStatePublicationStage::Params &publicationParams(DeviceGraphOrchestrator &runner)
-        { return runner.mtp_speculative_state_publication_graph_.stage->getParams(); }
+        { return runner.mtpStatePublicationCache().stage->getParams(); }
 
         /** @brief Exercise exact-stream and retained-transport checks before publication. */
         static bool executePublication(DeviceGraphOrchestrator &runner, void *stream, std::string *error)
@@ -134,7 +179,10 @@ namespace llaminar2
         /** @brief Install test outcome bindings through the real canonical checkpoint materializer. */
         static bool installPublication(DeviceGraphOrchestrator &runner,
             MTPSpeculativeStatePublicationStage::Params params, ComputeGraph &verifier, std::string *error)
-        { return runner.installMTPStatePublicationGraph(std::move(params), verifier, error); }
+        {
+            const auto signature = publicationSignature(runner, params.verifier_rows_per_request);
+            return runner.installMTPStatePublicationGraph(std::move(params), verifier, signature, error);
+        }
 
         /** @brief Capture the complete local publication without launching a collective. */
         static bool capturePublication(DeviceGraphOrchestrator &runner, void *stream, std::string *error)
@@ -144,7 +192,7 @@ namespace llaminar2
         /** @return The exact compiled production parent, never its uncomposed local child. */
         static const IGPUGraphCapture *publicationCapture(DeviceGraphOrchestrator &runner)
         {
-            auto &cache = runner.mtp_speculative_state_publication_graph_;
+            auto &cache = runner.mtpStatePublicationCache();
             const auto &params = cache.stage->getParams();
             const auto view = params.authority == MTPSpeculativeStatePublicationStage::Authority::PipelineFollower
                 ? runner.mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
@@ -171,7 +219,13 @@ namespace llaminar2
 
         /** @brief Retire borrowed graph/stage identities before a topology-only fixture exits. */
         static void retirePublication(DeviceGraphOrchestrator &runner)
-        { runner.mtp_speculative_state_publication_graph_.invalidate(); }
+        {
+            runner.invalidateSparseQueryParents();
+            runner.mtp_publication_admission_authority_.reset();
+            for (auto cache = runner.mtp_speculative_state_publication_graphs_.rbegin();
+                 cache != runner.mtp_speculative_state_publication_graphs_.rend(); ++cache)
+                cache->invalidate();
+        }
 
         /** @brief Describe the canonical local input banks used by captured MTP forwards. */
         static ForwardInput followerInput(DeviceGraphOrchestrator &runner, int rows)

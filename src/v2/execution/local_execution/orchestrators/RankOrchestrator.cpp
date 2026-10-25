@@ -16724,6 +16724,21 @@ namespace llaminar2
         }
     }
 
+    bool RankOrchestrator::admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request)
+    {
+        const auto &participants = !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (!request.valid() || participants.empty()) return false;
+        for (const auto &child : participants)
+            if (!child || !child->admitSparseQueryExecutionProgram(request)) return false;
+        return true;
+    }
+
+    void RankOrchestrator::endSparseQueryExecutionProgram() noexcept
+    {
+        const auto &participants = !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        for (const auto &child : participants) if (child) child->endSparseQueryExecutionProgram();
+    }
+
     int RankOrchestrator::get_position() const
     {
         // PP mode: return position from first PP stage runner

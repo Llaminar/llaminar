@@ -1860,6 +1860,17 @@ namespace llaminar2
          * hidden state, and publication metadata remain device-owned.
          */
         std::optional<int> decode_transaction_planning_position_;
+        /** One immutable CPU/composed response admission; never a progress counter. */
+        std::optional<DeviceGenerationAdmissionRequest> host_sparse_query_admission_;
+        /**
+         * @brief Build host response metadata from the existing budget and host position authority.
+         * @param budget Existing caller response budget, or zero for existing context remainder.
+         * @param forward_only Explicit one-target-row forced transaction on either backend.
+         * @return No new admission for a resident path or nested host response.
+         * @throws std::invalid_argument When the existing boundary has invalid geometry.
+         */
+        std::optional<DeviceGenerationAdmissionRequest> hostSparseQueryAdmission(int budget, bool forward_only = false) const;
+
         /**
          * @brief Typed scheduler lifecycle for the resident generation controller.
          *

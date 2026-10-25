@@ -9,6 +9,7 @@
 #include "tensors/Tensors.h"
 #include "transfer/TransferEngine.h"
 #include <gtest/gtest.h>
+#include "QFNOuterPublicationTestSupport.h"
 #include <array>
 #include <vector>
 #include <cstring>
@@ -18,7 +19,7 @@ using namespace llaminar2;
 namespace {
 using Stage=QwenSparseAttentionStage;using Float=Qwen4ExpFloatBinding;using Int=Qwen4ExpIntBinding;
 void require(bool valid,const char *message){if(!valid)throw std::runtime_error(message);}
-void prove(DeviceId device)
+void prove(DeviceId device, bool outerLedger = false)
 {
     auto *backend=getBackendFor(device);
     if(!backend || backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"GPU unavailable";
@@ -69,14 +70,38 @@ void prove(DeviceId device)
         }
         EXPECT_EQ(graph->nodeCount(),requests*3u);
         require(graph->instantiate(),"GPU retained executable failed");
+        MTPSpeculativeStatePublicationStage::Params outerParams;
+        outerParams.device_id = device;
+        outerParams.authority = MTPSpeculativeStatePublicationStage::Authority::PipelineFollower;
+        for (auto &stage : stages)
+            outerParams.verifier_state_stages.push_back(stage.get());
+        MTPSpeculativeStatePublicationStage outer(outerParams);
+        auto outerPlan = qfn_outer_publication_test::plan(outer,
+            {{BufferId::QFN_QSA_PARTIAL_KEYS, &partial}});
+        if (outerLedger)
+        {
+            ASSERT_EQ(outerPlan.outputs.size(), 1u);
+            // Three request-local hooks share one physical partial-key owner.
+            outerPlan.retained_parent_inputs = {&prior, &retained};
+            qfn_outer_publication_test::rejectMissingWrites(worker, device, stream, outerPlan, [&] {
+                require(stages.front()->restoreVerifierStateCaptureRowsFromDeviceIndices(
+                    static_cast<const int *>(decisions.gpu_data_ptr()), requests, 2, stream),
+                    "QSA negative outer hook failed without a ledger diagnostic");
+            });
+        }
+        GraphCaptureDependencyLedger outerPublicationLedger(device, stream, {outerPlan},
+            "QSA outer MTP publication");
         // A later accepted-prefix revision must never resnapshot the now-mutated
         // accepted tail. Capture the publication-only consumer of original storage.
         auto publication=worker.createGraphCapture(stream);
         {
-            ScopedBackendGraphCapture capture(worker,*publication,"QSA immutable prior repeated publication");
+            ScopedBackendGraphCapture capture(worker,*publication,"QSA immutable prior repeated publication",
+                outerLedger ? &outerPublicationLedger : nullptr);
             require(capture.begin(),"GPU repeat-publication capture begin failed");
+            ScopedGraphCaptureStage publicationScope(&outer);
             for(auto &stage:stages)require(stage->restoreVerifierStateCaptureRowsFromDeviceIndices(
                 static_cast<const int *>(decisions.gpu_data_ptr()),requests,2,stream),"GPU repeat-publication capture failed");
+            publicationScope.complete();
             capture.finish();
         }
         EXPECT_EQ(publication->nodeCount(),requests*1u);
@@ -152,4 +177,19 @@ TEST(QwenSparseRetainedDevice, CUDA){prove(DeviceId::cuda(0));}
 #endif
 #ifdef HAVE_ROCM
 TEST(QwenSparseRetainedDevice, ROCm){prove(DeviceId::rocm(0));}
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Actual outer MTP write authority preserves captured accepted-prefix bytes. */
+TEST(QwenSparseRetainedDevice, CUDAOuterMTPPublicationLedger)
+{
+    prove(DeviceId::cuda(0), true);
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Actual outer MTP write authority preserves captured accepted-prefix bytes. */
+TEST(QwenSparseRetainedDevice, ROCmOuterMTPPublicationLedger)
+{
+    prove(DeviceId::rocm(0), true);
+}
 #endif

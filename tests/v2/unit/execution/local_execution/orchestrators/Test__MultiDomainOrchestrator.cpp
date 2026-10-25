@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/mtp/HostSparseQueryResponseScope.h"
 #include "execution/local_execution/orchestrators/MultiDomainOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
@@ -435,4 +436,122 @@ TEST(Test__MultiDomainOrchestrator, GetInnerRunnerReturnsInner)
     // getInnerOrchestrator returns nullptr for mocks (not actual DeviceGraphOrchestrator)
     DeviceGraphOrchestrator *inner_orch = orchestrator->getInnerOrchestrator();
     EXPECT_EQ(inner_orch, nullptr);
+}
+
+/** @brief Observe only immutable policy propagation; no model or live token ledger. */
+class SparseQueryObservedRunner final : public MockDeviceGraphOrchestrator
+{
+public:
+    int begins=0,ends=0;
+    bool reject=false,throw_on_begin=false;
+    SparseQueryExecutionProgram program=SparseQueryExecutionProgram::RankingPossible;
+    bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override
+    {
+        ++begins;
+        if(throw_on_begin)throw std::runtime_error("injected participant admission failure");
+        if(reject)return false;
+        program=resolveSparseQueryExecutionProgram(request);
+        return true;
+    }
+    void endSparseQueryExecutionProgram() noexcept override
+    {
+        ++ends;program=SparseQueryExecutionProgram::RankingPossible;
+    }
+};
+
+/** @test Nested decode borrows once; normal, exception and continuation exits expire only policy. */
+TEST(Test__MultiDomainOrchestrator, SparseQueryHostResponseScopeExpiresAndReissues)
+{
+    auto child=std::make_unique<SparseQueryObservedRunner>();auto *observed=child.get();
+    auto wrapper=MultiDomainOrchestrator::createForTest(std::move(child),std::make_unique<MultiDomainTPConfig>());
+    ASSERT_NE(wrapper,nullptr);
+    std::optional<DeviceGenerationAdmissionRequest> active;
+    DeviceGenerationAdmissionRequest request{.request_count=1,.max_new_tokens=256,
+        .depth_policy=sampling_math::DeviceGenerationPolicy::ordinary()};
+    request.initial_target_counts.emplace(std::vector<int>{512});
+    {
+        HostSparseQueryResponseScope outer(*wrapper,active,request);
+        ASSERT_TRUE(active);EXPECT_EQ(observed->begins,1);
+        for(int step=0;step<4;++step)
+        {
+            HostSparseQueryResponseScope inner(*wrapper,active,std::nullopt);
+            EXPECT_EQ(observed->program,SparseQueryExecutionProgram::ProvenNoRanking);
+        }
+        EXPECT_EQ(observed->ends,0);
+        EXPECT_THROW(HostSparseQueryResponseScope(*wrapper,active,request),std::invalid_argument);
+    }
+    EXPECT_FALSE(active);EXPECT_EQ(observed->ends,1);
+    // Raw forwards outside the window see the complete ranking-capable program.
+    const int token=1;EXPECT_TRUE(wrapper->forward(&token,1));
+    EXPECT_EQ(observed->program,SparseQueryExecutionProgram::RankingPossible);
+    request.initial_target_counts.emplace(std::vector<int>{2048});
+    request.kind=sampling_math::DeviceGenerationAdmissionKind::ContinueResponse;
+    try
+    {
+        HostSparseQueryResponseScope continuation(*wrapper,active,request);
+        EXPECT_EQ(observed->program,SparseQueryExecutionProgram::RankingPossible);
+        throw std::runtime_error("injected response exception");
+    }
+    catch(const std::runtime_error&){}
+    EXPECT_FALSE(active);EXPECT_EQ(observed->begins,2);EXPECT_EQ(observed->ends,2);
+    observed->throw_on_begin=true;
+    EXPECT_THROW(HostSparseQueryResponseScope(*wrapper,active,request),std::runtime_error);
+    EXPECT_FALSE(active);EXPECT_EQ(observed->ends,3);
+}
+
+/** @test Existing public CPU command boundaries reseal unchanged conservative remaining work. */
+TEST(Test__MultiDomainOrchestrator, SparseQueryRepeatedCommandAdmissionKeepsCanonicalExtent)
+{
+    auto child=std::make_unique<SparseQueryObservedRunner>();auto *observed=child.get();
+    auto wrapper=MultiDomainOrchestrator::createForTest(std::move(child),std::make_unique<MultiDomainTPConfig>());
+    ASSERT_NE(wrapper,nullptr);
+    std::optional<DeviceGenerationAdmissionRequest> active;
+    for(int completed=0;completed<8;++completed)
+    {
+        DeviceGenerationAdmissionRequest command{.request_count=1,.max_new_tokens=256-completed,
+            .depth_policy=sampling_math::DeviceGenerationPolicy::ordinary()};
+        command.initial_target_counts.emplace(std::vector<int>{512+completed});
+        EXPECT_EQ(*deviceGenerationMaximumVisibleTokens(command.initial_target_counts,1,
+            command.max_new_tokens,command.depth_policy),768);
+        {
+            HostSparseQueryResponseScope scope(*wrapper,active,command);
+            EXPECT_EQ(observed->program,SparseQueryExecutionProgram::ProvenNoRanking);
+        }
+        EXPECT_FALSE(active);
+    }
+    EXPECT_EQ(observed->begins,8);EXPECT_EQ(observed->ends,8);
+    DeviceGenerationAdmissionRequest continuation{.request_count=1,.max_new_tokens=256,
+        .kind=sampling_math::DeviceGenerationAdmissionKind::ContinueResponse,
+        .depth_policy=sampling_math::DeviceGenerationPolicy::ordinary()};
+    continuation.initial_target_counts.emplace(std::vector<int>{2048});
+    {
+        HostSparseQueryResponseScope scope(*wrapper,active,continuation);
+        EXPECT_EQ(observed->program,SparseQueryExecutionProgram::RankingPossible);
+    }
+    continuation.initial_target_counts.emplace(std::vector<int>{-1});
+    EXPECT_THROW(HostSparseQueryResponseScope(*wrapper,active,continuation),std::invalid_argument);
+    EXPECT_FALSE(active);EXPECT_EQ(observed->begins,9);EXPECT_EQ(observed->ends,9);
+}
+
+/** @test Forced one-row proof expires independently and errors never leak active host policy. */
+TEST(Test__MultiDomainOrchestrator, SparseQueryForcedResponseUsesExplicitOneRowProof)
+{
+    auto child=std::make_unique<SparseQueryObservedRunner>();auto *observed=child.get();
+    auto wrapper=MultiDomainOrchestrator::createForTest(std::move(child),std::make_unique<MultiDomainTPConfig>());
+    ASSERT_NE(wrapper,nullptr);
+    std::optional<DeviceGenerationAdmissionRequest> active;
+    DeviceGenerationAdmissionRequest forced{.request_count=1,.max_new_tokens=0,
+        .depth_policy=sampling_math::DeviceGenerationPolicy::forwardOnly(),
+        .initial_leading_row_disposition=sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted};
+    for(int prefix : {512,2050,2051})
+    {
+        forced.initial_target_counts.emplace(std::vector<int>{prefix});
+        {
+            HostSparseQueryResponseScope scope(*wrapper,active,forced);
+            EXPECT_EQ(observed->program,prefix<=2050?SparseQueryExecutionProgram::ProvenNoRanking:
+                SparseQueryExecutionProgram::RankingPossible);
+        }
+        EXPECT_FALSE(active);
+        EXPECT_EQ(observed->program,SparseQueryExecutionProgram::RankingPossible);
+    }
 }

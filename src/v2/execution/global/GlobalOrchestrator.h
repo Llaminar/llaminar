@@ -304,6 +304,10 @@ namespace llaminar2
          * @param tokens Complete request prefix token sequence.
          * @return Common locally restorable prefix and typed terminal requirements.
          */
+        /** @brief Install one immutable response policy on every local execution stage. */
+        bool admitSparseQueryExecutionProgramAll(const DeviceGenerationAdmissionRequest &request);
+        /** @brief Expire host response policy on every stage without retiring retained graphs. */
+        void endSparseQueryExecutionProgramAll() noexcept;
         PrefixLookupResult lookupPrefixAll(const std::vector<int32_t> &tokens);
         /** @copydoc IInferenceRunner::prefixRestoreMetadata */
         PrefixRestoreMetadata prefixRestoreMetadataAll(const PrefixLookupResult &hit) const;
@@ -470,6 +474,11 @@ namespace llaminar2
         // =================================================================
         // IInferenceRunner — Core Inference API
         // =================================================================
+
+        /** @copydoc IInferenceRunner::admitSparseQueryExecutionProgram */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override;
+        /** @copydoc IInferenceRunner::endSparseQueryExecutionProgram */
+        void endSparseQueryExecutionProgram() noexcept override;
 
         bool forward(const int *tokens, int seq_len) override;
         /**

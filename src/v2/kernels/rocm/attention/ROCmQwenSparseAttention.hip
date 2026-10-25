@@ -34,8 +34,16 @@ void rocmQwenSparseIndexer(const QwenSparseIndexer &p, hipStream_t stream)
 {
     requireStream(stream);
     validateQwenSparseIndexer(p);
-    const auto queryWork=qwenSparseIndexerQueryWork(p).repeatEachRow(4);
     const auto preparation = qwenSparsePreparationGrid(p.row_capacity);
+    if (p.query_demand == QwenSparseQueryDemand::ProvenNoRanking)
+    {
+        // Required pool history remains live; no query CTA or score dispatch exists.
+        rocm_sparse_detail::preparePools<<<preparation.pool_blocks, 128, 0, stream>>>(p);
+        checkLaunch();
+        rocmQwenSparseSelectPools(p, stream);
+        return;
+    }
+    const auto queryWork=qwenSparseIndexerQueryWork(p).repeatEachRow(4);
     // Geometry is immutable before capture: grouped decode retains one fused
     // dispatch; prefill retains its independently scheduled original programs.
     if (preparation.program == QwenSparsePreparationProgram::FusedGrouped)

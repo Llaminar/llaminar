@@ -3686,6 +3686,35 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAMoEKernel::prepareRequiredRouterQ8Hidden(int rows, int width, int top_k)
+    {
+        if (!router_q8_hidden_publication_ ||
+            !router_q8_hidden_publication_->hasRequiredConsumer())
+            return true;
+        if (router_q8_publication_access_ != MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+            !router_q8_hidden_publication_->acceptsProducerRows(rows, width))
+        {
+            LOG_ERROR("[CUDAMoEKernel] required Q8 producer geometry/access mismatch");
+            return false;
+        }
+        return ensureGroupedGateUpDecodeCapacity(top_k, width, rows);
+    }
+
+    bool CUDAMoEKernel::publishRequiredRouterQ8Hidden(
+        const float *source, int rows, int width, int top_k, const int *live_rows)
+    {
+        if (!router_q8_hidden_publication_ ||
+            !router_q8_hidden_publication_->hasRequiredConsumer())
+            return true;
+        if (!prepareRequiredRouterQ8Hidden(rows, width, top_k) ||
+            !cudaMoE_publish_original_hidden_q8_rows(source, d_decode_hidden_int8_,
+                d_decode_hidden_scales_, rows, width, device_ordinal_, getStream(), live_rows))
+            return false;
+        publishRouterQ8Hidden(source, rows, isCudaMoEDecodeCaptureActive(getStream()),
+            RouterQ8Basis::Original);
+        return true;
+    }
+
     void CUDAMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
         if (router_q8_publication_access_ ==
@@ -3727,7 +3756,8 @@ namespace llaminar2
     void CUDAMoEKernel::publishRouterQ8Hidden(
         const float *source,
         int rows,
-        bool recorded_during_capture) noexcept
+        bool recorded_during_capture,
+        RouterQ8Basis router_basis) noexcept
     {
         if (router_q8_publication_access_ !=
                 MoERouterQ8PublicationAccess::ProducerAndConsumer ||
@@ -3754,7 +3784,7 @@ namespace llaminar2
         publication.blocks_per_row_capacity =
             (decode_gateup_d_model_cap_ + 31) / 32;
         publication.capture_recorded = recorded_during_capture;
-        if (routerQ8Basis(debugEnv().gemm.moe_router_arithmetic) == RouterQ8Basis::SignedHadamard32)
+        if (router_basis == RouterQ8Basis::SignedHadamard32)
             PerfStatsCollector::addCounter("kernel", "cuda_moe_router_hadamard32_calls", 1.0,
                 "router", "cuda:" + std::to_string(device_ordinal_),
                 {{"rows", std::to_string(rows)}, {"expert_hidden_basis", "original"}, {"block", "32"}});
@@ -4073,7 +4103,8 @@ namespace llaminar2
         publishRouterQ8Hidden(
             d_hidden,
             /*rows=*/1,
-            isCudaMoEDecodeCaptureActive(stream));
+            isCudaMoEDecodeCaptureActive(stream),
+            routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         PerfStatsCollector::addCounter(
             "kernel", "cuda_moe_router_q8_decode_calls", 1.0, {}, {},
             {{"num_experts", std::to_string(num_experts)},
@@ -4698,6 +4729,12 @@ namespace llaminar2
         // cache and hidden bank; capture only consumes their retained addresses.
         const bool q8_prefill = gate_is_fp32 &&
             debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8;
+        invalidateRouterQ8HiddenPublication();
+        if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
+            return false;
+        if (!q8_prefill && !publishRequiredRouterQ8Hidden(
+                hidden, seq_len, d_model, top_k, device_effective_seq_len))
+            return false;
         if (q8_prefill)
         {
             if (!debugEnv().gemm.cuda_moe_router_q8 || d_model % 32 != 0 ||
@@ -4730,7 +4767,8 @@ namespace llaminar2
                         seq_len, num_experts, top_k, normalize_weights, device_ordinal_, stream,
                         device_effective_seq_len)) return false;
             }
-            publishRouterQ8Hidden(hidden, seq_len, isCudaMoEDecodeCaptureActive(stream));
+            publishRouterQ8Hidden(hidden, seq_len, isCudaMoEDecodeCaptureActive(stream),
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
             const auto geometry = cuda::routerQ8PrefillGeometry(
                 owned ? owned->partition.capacityFor(seq_len) : seq_len, d_model, num_experts, router_q8_prefill_hardware_);
             PerfStatsCollector::addCounter("kernel", "cuda_moe_router_q8_prefill_calls", 1.0,
@@ -5050,6 +5088,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!prepareRequiredRouterQ8Hidden(plan.physical_rows, plan.d_model, plan.top_k))
+            return false;
+
         const size_t logits_count =
             static_cast<size_t>(plan.physical_rows) *
             static_cast<size_t>(plan.num_experts);
@@ -5186,6 +5227,11 @@ namespace llaminar2
             return false;
         }
         invalidateRouterQ8HiddenPublication();
+        if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
+            return false;
+        if (!q8_router_requested && !publishRequiredRouterQ8Hidden(
+                d_hidden, seq_len, d_model, top_k, device_effective_seq_len))
+            return false;
 
         /*
          * Route all verifier rows as one grouped transaction while preserving
@@ -5227,7 +5273,8 @@ namespace llaminar2
             publishRouterQ8Hidden(
                 d_hidden,
                 seq_len,
-                isCudaMoEDecodeCaptureActive(stream));
+                isCudaMoEDecodeCaptureActive(stream),
+            routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         }
         else if (gate_is_fp32)
         {

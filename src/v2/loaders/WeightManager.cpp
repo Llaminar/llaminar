@@ -2571,6 +2571,10 @@ namespace llaminar2
             if (added.prepared)
                 added.prepared->binding_id = added.binding_id;
 
+            // Source/slice/residency and prepared-reference identity are final.
+            // Seal this declaration before adoption publishes a store-owned copy;
+            // freezing only the returned vector would leave that copy mutable.
+            added.immutable = true;
             if (added.prepared.has_value())
             {
                 if (auto store = preparedWeightStoreIfInitialized())

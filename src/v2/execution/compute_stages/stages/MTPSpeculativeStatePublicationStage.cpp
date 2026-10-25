@@ -22,6 +22,8 @@
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <cstring>
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -749,6 +751,29 @@ namespace llaminar2
     MTPSpeculativeStatePublicationStage::bufferContract() const
     {
         StageBufferContract contract;
+        // Restore hooks run beneath this stage's ledger, not their earlier
+        // verifier stage. Declare only the tensor owners those hooks publish;
+        // candidate scratch and raw backend state grant no arena write access.
+        for (const auto *stage : params_.verifier_state_stages)
+        {
+            if (!stage)
+                throw std::logic_error("MTP publication contract contains a null retained-state stage");
+            for (const auto &binding : stage->verifierStatePublicationOutputs())
+            {
+                if (binding.access != BufferAccess::WRITE || binding.prepare_write_storage ||
+                    !binding.dtype || !*binding.dtype)
+                    throw std::logic_error("MTP accepted-state output must be a typed preallocated write");
+                const auto existing = std::find_if(contract.outputs.begin(), contract.outputs.end(),
+                    [&](const auto &output) { return output.id == binding.id; });
+                if (existing != contract.outputs.end())
+                {
+                    if (std::strcmp(existing->dtype, binding.dtype) != 0)
+                        throw std::logic_error("MTP accepted-state output has conflicting tensor types");
+                }
+                else
+                    contract.addPreallocatedOutput(binding.id, binding.dtype);
+            }
+        }
         // Committed metadata and local cache/state bindings are persistent raw
         // addresses, not sampler arena slots. A follower must not reserve dummy
         // vocabulary, response or predictor buffers to satisfy this contract.

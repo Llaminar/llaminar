@@ -13635,6 +13635,31 @@ namespace llaminar2
             shared_params.prepared_ref_down = preparedRefForGraphWeight(
                 layer_bindings.shared_expert_down, shared_device);
             shared_params.prepared_store = prepared_weight_store_;
+            if (shared_requires_router_q8_publication)
+            {
+                // Use the same typed prepared descriptor as the shared stage.
+                // Floating triples do not consume Q8, even though their legacy
+                // publication binding/dependency remains unchanged.
+                DeviceMoEExpertDescriptor shared_descriptor;
+                if (!prepared_weight_store_ || !shared_params.prepared_ref_gate ||
+                    !shared_params.prepared_ref_up || !shared_params.prepared_ref_down ||
+                    !exportDeviceMoEExpertWeightDescriptors(
+                        prepared_weight_store_->gemmKernel(shared_params.prepared_ref_gate.value()),
+                        prepared_weight_store_->gemmKernel(shared_params.prepared_ref_up.value()),
+                        prepared_weight_store_->gemmKernel(shared_params.prepared_ref_down.value()),
+                        config_.d_model, shared_intermediate, shared_descriptor))
+                {
+                    throw std::invalid_argument(
+                        "shared expert required publication has no supported prepared descriptor triple");
+                }
+                if (!deviceMoEWeightFormatIsFloating(shared_descriptor.weight_format) &&
+                    !shared_params.required_router_q8_publication->requireConsumerRows(
+                        total_tokens, config_.d_model))
+                {
+                    throw std::invalid_argument(
+                        "shared expert Q8 publication geometry conflicts with its routed graph");
+                }
+            }
 
             graph.addNode(prefix + "shared_expert_ffn",
                           ComputeStageFactory::createSharedExpertFFN(shared_params),

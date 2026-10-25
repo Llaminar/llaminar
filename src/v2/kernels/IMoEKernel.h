@@ -163,6 +163,39 @@ namespace llaminar2
         bool capture_recorded = false;         ///< Producer is recorded in the active capture.
 
         /**
+         * @brief Declare the exact graph-local grouped consumer before planning.
+         * @param rows Immutable physical row extent, not a device live count.
+         * @param width Original FP32 hidden width, divisible by the Q8 block size.
+         * @return False for invalid, conflicting, or post-publication declarations.
+         *
+         * The declaration survives payload revocation. It belongs to this layer
+         * graph only; binding a consumer never changes another graph's program.
+         */
+        [[nodiscard]] bool requireConsumerRows(int rows, int width) noexcept
+        {
+            if (rows <= 0 || width <= 0 || width % 32 != 0 || source_rows)
+                return false;
+            if (required_rows_ != 0)
+                return required_rows_ == rows && required_width_ == width;
+            required_rows_ = rows;
+            required_width_ = width;
+            return true;
+        }
+
+        /** @brief Whether a cold grouped consumer requires original Q8 rows. */
+        [[nodiscard]] bool hasRequiredConsumer() const noexcept
+        {
+            return required_rows_ != 0;
+        }
+
+        /** @brief Check the complete immutable producer geometry. */
+        [[nodiscard]] bool acceptsProducerRows(int rows, int width) const noexcept
+        {
+            return !hasRequiredConsumer() ||
+                   (required_rows_ == rows && required_width_ == width);
+        }
+
+        /**
          * @brief Clear payload provenance while preserving the device binding.
          */
         void clearPayload() noexcept
@@ -175,6 +208,10 @@ namespace llaminar2
             blocks_per_row_capacity = 0;
             capture_recorded = false;
         }
+
+    private:
+        int required_rows_ = 0; ///< Cold graph capacity; never a live-row mirror.
+        int required_width_ = 0; ///< Exact hidden width of the required consumer.
     };
 
     /**

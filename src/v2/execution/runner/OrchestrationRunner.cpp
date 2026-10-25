@@ -59,6 +59,7 @@
 #include "../mtp/MTPStateTransaction.h"
 #include "../mtp/MTPDecodeCatchup.h"
 #include "../mtp/MTPDeviceGenerationPolicy.h"
+#include "../mtp/HostSparseQueryResponseScope.h"
 #include "../mtp/MTPRequestSamplingPolicy.h"
 #include "../mtp/MTPRejectionSampler.h"
 #include "../mtp/MTPSpecDecodeMetadata.h"
@@ -7413,6 +7414,8 @@ namespace llaminar2
             .initial_leading_row_disposition =
                 initial_leading_row_disposition,
             .sampling_seeds = generation_request_seeds_,
+            .initial_target_counts = DeviceGenerationInitialTargetCounts(
+                std::vector<int>{*decode_transaction_planning_position_}),
         };
         if (!runner_->beginDeviceResidentGeneration(admission))
         {
@@ -7459,6 +7462,10 @@ namespace llaminar2
         }
 
         int maximum_committed_tokens = 0;
+        // These completed-prefill origins include every request's restored
+        // history; no live device counter is copied into admission metadata.
+        std::vector<int> initial_target_counts;
+        initial_target_counts.reserve(static_cast<size_t>(request_count));
         std::vector<uint64_t> position_seeds;
         if (!active_sampling_params_.is_greedy())
             position_seeds.reserve(static_cast<size_t>(request_count));
@@ -7472,6 +7479,7 @@ namespace llaminar2
             }
             maximum_committed_tokens =
                 std::max(maximum_committed_tokens, state.logical_tokens);
+            initial_target_counts.push_back(state.logical_tokens);
             if (!active_sampling_params_.is_greedy())
                 position_seeds.push_back(state.stochastic_position_seed);
         }
@@ -7509,6 +7517,8 @@ namespace llaminar2
                             DeviceGenerationLeadingRowDisposition::
                                 PendingResponse,
                     .sampling_seeds = std::move(sampling_seeds),
+                    .initial_target_counts = DeviceGenerationInitialTargetCounts(
+                        std::move(initial_target_counts)),
                 }))
         {
             return setError(
@@ -14794,6 +14804,7 @@ namespace llaminar2
             .initial_leading_row_disposition = leading,
             .sampling_seeds = generation_request_seeds_,
             .ordinary_sampling = active_sampling_params_,
+            .initial_target_counts = DeviceGenerationInitialTargetCounts(std::vector<int>{base}),
         };
         if (!admission.valid())
             return fail("sampling law is not implemented by the captured ordinary sampler (bounded top-k and presence/frequency penalties are supported; DRY is not)");
@@ -15005,6 +15016,18 @@ namespace llaminar2
                      << " worker=" << (mpi_worker_rank ? "true" : "false")
                      << " prefill_logits_ready=" << (prefill_logits_ready_ ? "true" : "false")
                      << " position=" << trace_position("trace_decode_step_begin"));
+        }
+
+        std::optional<HostSparseQueryResponseScope> query_response_scope;
+        try
+        {
+            query_response_scope.emplace(*runner_, host_sparse_query_admission_,
+                hostSparseQueryAdmission(decode_step_token_budget_));
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = result.error = error.what();
+            return result;
         }
 
         const MTPRuntimeConfig mtp = activeMTPRequestConfig();
@@ -15543,6 +15566,11 @@ namespace llaminar2
     {
         GenerationResult result;
 
+        if (host_sparse_query_admission_)
+        {
+            result.error = "Forced decode cannot nest inside an admitted host response";
+            return result;
+        }
         if (!initialization_lifecycle_.readyForInference())
         {
             result.error = "Runner not initialized";
@@ -15699,6 +15727,17 @@ namespace llaminar2
 
         const bool token_is_stop =
             std::find(stop_tokens_.begin(), stop_tokens_.end(), token) != stop_tokens_.end();
+        std::optional<HostSparseQueryResponseScope> forced_query_scope;
+        try
+        {
+            forced_query_scope.emplace(*runner_, host_sparse_query_admission_,
+                token_is_stop ? std::nullopt : hostSparseQueryAdmission(0, true));
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = result.error = error.what();
+            return result;
+        }
         const bool gpu_mtp_force =
             shouldUseMTPDecode() &&
             runner_->primaryDeviceId().is_gpu();
@@ -16052,6 +16091,52 @@ namespace llaminar2
         return result;
     }
 
+    std::optional<DeviceGenerationAdmissionRequest>
+    OrchestrationRunner::hostSparseQueryAdmission(int budget, bool forward_only) const
+    {
+        if (!runner_ || (!forward_only && runner_->primaryDeviceId().is_gpu()) || host_sparse_query_admission_)
+            return std::nullopt;
+        std::string error;
+        const auto initial = currentDecodeTransactionPositionForPlanning("host_response_admission", &error);
+        if (!initial) throw std::invalid_argument(error);
+        if (*initial < 0)
+            throw std::invalid_argument("Host response initial target count is negative");
+        if (forward_only)
+        {
+            DeviceGenerationAdmissionRequest request{
+                .request_count = 1,
+                .max_new_tokens = 0,
+                .depth_policy = sampling_math::DeviceGenerationPolicy::forwardOnly(),
+                .initial_leading_row_disposition =
+                    sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted,
+            };
+            request.initial_target_counts.emplace(std::vector<int>{*initial});
+            if (!request.valid()) throw std::invalid_argument("Invalid forced sparse-query admission");
+            return request;
+        }
+        if (budget == 0)
+        {
+            const int capacity = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len : config_.max_seq_len;
+            const int64_t remaining = static_cast<int64_t>(capacity) - *initial;
+            if (remaining <= 0 || remaining > std::numeric_limits<int>::max())
+                throw std::invalid_argument("Host response has no valid context-derived budget");
+            budget = static_cast<int>(remaining);
+        }
+        if (budget <= 0)
+            throw std::invalid_argument("Host response budget is not positive");
+        // Positive caller budgets retain their existing semantics; the shared
+        // visibility resolver checks overflow without adding a context ceiling.
+        const auto mtp = activeMTPRequestConfig();
+        DeviceGenerationAdmissionRequest request{
+            .request_count = 1,
+            .max_new_tokens = budget,
+            .depth_policy = resolveSparseQueryHostDepthEnvelope(mtp),
+        };
+        request.initial_target_counts.emplace(std::vector<int>{*initial});
+        if (!request.valid()) throw std::invalid_argument("Invalid immutable host response admission");
+        return request;
+    }
+
     void OrchestrationRunner::setDecodeStepTokenBudget(int max_tokens)
     {
         decode_step_token_budget_ = std::max(0, max_tokens);
@@ -16087,6 +16172,18 @@ namespace llaminar2
         if (!prefill(prompt_tokens))
         {
             result.error = last_error_;
+            return result;
+        }
+
+        std::optional<HostSparseQueryResponseScope> query_response_scope;
+        try
+        {
+            query_response_scope.emplace(*runner_, host_sparse_query_admission_,
+                max_new_tokens > 0 ? hostSparseQueryAdmission(max_new_tokens) : std::nullopt);
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = result.error = error.what();
             return result;
         }
 

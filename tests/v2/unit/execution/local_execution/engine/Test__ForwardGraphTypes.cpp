@@ -1013,6 +1013,27 @@ TEST(Test__ForwardGraphSignature, DifferentDecodeNotEqual)
     EXPECT_NE(a, b);
 }
 
+/** @test Both main-query programs coexist under exact keys; request numeric values are not topology. */
+TEST(Test__ForwardGraphSignature, SparseQueryProgramsRetainIndependentCacheKeys)
+{
+    ForwardGraphSignature complete{.seq_len=1,.batch_size=1,.device=DeviceId::rocm(0),.decode=true};
+    auto short_request=complete;
+    short_request.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    EXPECT_NE(complete,short_request);
+    EXPECT_NE(ForwardGraphSignatureHash{}(complete),ForwardGraphSignatureHash{}(short_request));
+    std::unordered_map<ForwardGraphSignature,int,ForwardGraphSignatureHash> retained;
+    retained.emplace(complete,71);
+    retained.emplace(short_request,93);
+    for(int request=0;request<6;++request){
+        const auto selected=request%2?complete:short_request;
+        EXPECT_EQ(retained.at(selected),request%2?71:93);
+        EXPECT_EQ(retained.size(),2u);
+    }
+    // Copying an identical program/binding is an exact reuse, not another
+    // request-shaped native owner. Budget/prefix remain in admission metadata.
+    EXPECT_EQ(retained.find(ForwardGraphSignature(short_request))->second,93);
+}
+
 TEST(Test__ForwardGraphSignature, SnapshotTopologyHasDedicatedIdentity)
 {
     ForwardGraphSignature lean{

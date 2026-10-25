@@ -21,6 +21,7 @@
 
 #include "execution/config/RuntimeConfig.h"
 #include "backends/GPUGraphMemoryContract.h"
+#include "kernels/common/SparseQueryExecutionProgram.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -62,14 +63,18 @@ namespace llaminar2
         /**
          * @brief Compile the exact bounded owner plan from frozen MTP policy.
          * @param config Runtime execution and retained-capacity configuration.
+         * @param query_programs Immutable model-geometry main-query programs; sidecars remain shared.
          * @throws std::overflow_error when a configured geometry cannot be
          *         represented by the runtime's integer or size types.
          */
-        explicit MTPGraphOwnerPlan(const MTPRuntimeConfig &config)
+        explicit MTPGraphOwnerPlan(const MTPRuntimeConfig &config, std::size_t query_programs = 1u)
             : retains_graph_capacity_(retainsMTPGraphCapacity(config)),
+              query_programs_(query_programs),
               draft_depth_(resolveMTPMaximumDraftDepth(config)),
               request_capacity_(std::max(1, config.max_request_batch))
         {
+            if (query_programs_ == 0 || query_programs_ > kSparseQueryExecutionProgramCount)
+                throw std::invalid_argument("MTP graph inventory has an unknown query-program family");
             if (draft_depth_ <= 0)
             {
                 throw std::invalid_argument(
@@ -250,10 +255,18 @@ namespace llaminar2
             return verifier_preparation_graph_slots_;
         }
 
-        /** @return Fixed singleton controller/publication executable slots. */
+        /** @return Accepted-state publication owners, one per immutable main-query program. */
+        [[nodiscard]] std::size_t speculativePublicationGraphSlots() const noexcept
+        {
+            return retains_graph_capacity_ ? query_programs_ : 0u;
+        }
+
+        /** @return Controller owners including distinct parent and publication programs. */
         [[nodiscard]] std::size_t controllerGraphSlots() const noexcept
         {
-            return retains_graph_capacity_ ? kControllerGraphSlots : 0u;
+            // Dense0 sidecars and the outcome/distribution helpers stay shared.
+            // Both each main parent and its verifier-hook publication are owned.
+            return retains_graph_capacity_ ? kControllerGraphSlots + 2u * (query_programs_ - 1u) : 0u;
         }
 
         /**
@@ -391,6 +404,7 @@ namespace llaminar2
         }
 
         bool retains_graph_capacity_ = false;
+        std::size_t query_programs_ = 1u; ///< Closed immutable main-query program inventory.
         int draft_depth_ = 1;
         int request_capacity_ = 1;
         int verifier_rows_per_request_ = 2;

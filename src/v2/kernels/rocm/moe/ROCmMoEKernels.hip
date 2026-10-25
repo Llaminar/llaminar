@@ -48,6 +48,7 @@
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/DeviceRouterHadamardQ8.h"
+#include "kernels/common/RouterQ8Launch.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingWarp.h"
 #include "kernels/common/DeviceRowRange.h"
@@ -16700,6 +16701,24 @@ bool hipMoE_gate_logits_single_token_q8_weights(
         if (hipGetLastError() != hipSuccess) return false;
     }
     return true;
+}
+
+/** @copydoc hipMoE_publish_original_hidden_q8_rows */
+bool hipMoE_publish_original_hidden_q8_rows(
+    const float *hidden, int8_t *codes, float *scales,
+    int rows, int width, int device, void *stream, const int *live_rows)
+{
+    if (!hidden || !codes || !scales ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u || rows <= 0 ||
+        width <= 0 || width % 32 != 0 || device < 0 ||
+        static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device)) != hipSuccess)
+        return false;
+    const int threads = rows > 16 ? 256 : 32;
+    const int groups = threads / 32;
+    hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_kernel,
+        dim3((width / 32 + groups - 1) / groups, rows), dim3(threads), 0,
+        static_cast<hipStream_t>(stream), hidden, codes, scales, rows, width, live_rows);
+    return hipGetLastError() == hipSuccess;
 }
 
 /**

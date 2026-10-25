@@ -140,6 +140,24 @@ void validateNodes(const ComputeGraph &graph,const std::vector<Pending> &nodes)
     }
 }
 }
+qwen4exp::QwenSparseQueryDemand Qwen4ExpSparseAttentionBuilder::queryDemandForInvocation(
+    std::optional<ForwardExecutionPhase> phase, SparseQueryExecutionProgram program)
+{
+    using Demand = qwen4exp::QwenSparseQueryDemand;
+    switch (program) {
+    case SparseQueryExecutionProgram::RankingPossible:
+    case SparseQueryExecutionProgram::ProvenNoRanking: break;
+    default: throw std::invalid_argument("QSA builder requires a known retained query program");
+    }
+    if (phase) require(*phase == ForwardExecutionPhase::Prefill || *phase == ForwardExecutionPhase::Decode,
+        "QSA builder requires a known original execution phase");
+    require(phase == ForwardExecutionPhase::Decode || program == SparseQueryExecutionProgram::RankingPossible,
+        "QSA query omission requires explicit Decode");
+    if (phase != ForwardExecutionPhase::Decode) return Demand::AllLive;
+    return program == SparseQueryExecutionProgram::ProvenNoRanking
+        ? Demand::ProvenNoRanking : Demand::RankingOnly;
+}
+
 qwen4exp::QwenSparsePoolSelection Qwen4ExpSparseAttentionBuilder::poolSelectionForInvocation(
     ForwardExecutionPhase phase,DeviceId device,int rowCapacity)
 {
@@ -233,6 +251,10 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
         "Counted QSA projections require an explicitly selected decode-equivalent floating policy");
     require(p.publication==Qwen4ExpSparsePublication::AcceptAllLiveRows ||
         p.publication==Qwen4ExpSparsePublication::DeferredVerifierAcceptance,"QSA publication policy is invalid");
+    // The admitted program fixes topology for the whole response. Validate it
+    // before constructing any stage, even if another geometry check would fail.
+    const auto queryDemand = queryDemandForInvocation(p.executionPhase, p.queryExecutionProgram);
+    const bool omitQuery = queryDemand == qwen4exp::QwenSparseQueryDemand::ProvenNoRanking;
     // Reject policy corruption before preparing projections or publishing nodes.
     qwen4exp::validateQwenSparsePoolSelection(p.poolSelection, rows.rowsPerRequest());
     qwen4exp::validateQwenSparseAttentionArithmetic(p.attentionArithmetic,c.device.type);
@@ -249,11 +271,12 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
     std::vector<std::string> projectionDependencies{c.projectionInputReady};
     for(const auto &request:requests)projectionDependencies.push_back(request.buffers.replayReady);
     std::optional<ProjectionRowWorkDeclaration> queryWork;
-    const auto queryDemand=p.executionPhase==ForwardExecutionPhase::Decode ?
-        qwen4exp::QwenSparseQueryDemand::RankingOnly : qwen4exp::QwenSparseQueryDemand::AllLive;
-    if(queryDemand==qwen4exp::QwenSparseQueryDemand::RankingOnly) {
+    // Raw keys remain live under query omission, so grouped Decode must still
+    // select its serial-equivalent projection arithmetic before either stage.
+    if(p.executionPhase==ForwardExecutionPhase::Decode)
         require(c.queryRows==1||p.projectionArithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
-            "Selected decode query rows require original explicit grouped decode arithmetic for M>1");
+            "Grouped sparse Decode requires original explicit projection arithmetic for M>1");
+    if(queryDemand==qwen4exp::QwenSparseQueryDemand::RankingOnly) {
         queryWork.emplace(ProjectionRowWorkDeclaration{rows.rowsPerRequest(),p.tokenCapacity,
             qwen4exp::QwenSparseFirstRankingLogicalRow,{}});
         for(const auto &request:requests) {
@@ -263,7 +286,10 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
                 replay.byteOffset+offsetof(qwen4exp::QwenSparseReplay,live_rows)});
         }
     }
-    nodes.push_back({queryName,projection(c,p,w.query,Qwen4ExpFloatBinding(*first.query.tensor,first.query.buffer),512,rows,std::move(queryWork)),projectionDependencies});
+    // The omitted program has no projection stage or work-descriptor upload.
+    // Its retained sibling still owns the admitted query banks and weights.
+    if (!omitQuery)
+        nodes.push_back({queryName,projection(c,p,w.query,Qwen4ExpFloatBinding(*first.query.tensor,first.query.buffer),512,rows,std::move(queryWork)),projectionDependencies});
     nodes.push_back({keyName,projection(c,p,w.rawKey,Qwen4ExpFloatBinding(*first.rawKey.tensor,first.rawKey.buffer),128,rows),projectionDependencies});
     std::vector<std::string> terminals;
     using Stage=QwenSparseAttentionStage;
@@ -295,12 +321,14 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
                 .operation=Stage::RetainCandidates{b.rawKey,b.retained->rawKey,b.retained->copiedBytes,b.priorPartial,
                     requestIndex,rows.requests(),b.retained->verifierOrigins,b.retained->transactionPrior,b.retained->terminalCounters}}),{keyName,b.replayReady}});
         }
+        std::vector<std::string> indexerDependencies{keyName,b.replayReady};
+        if (!omitQuery) indexerDependencies.insert(indexerDependencies.begin(),queryName);
         nodes.push_back({indexerName,std::make_unique<Stage>(Stage::Params{.device_id=c.device,.mpi_ctx=p.mpi,
             .rowCapacity=rowCapacity,.tokenCapacity=p.tokenCapacity,.replay=b.replay,
             .operation=Stage::Indexer{b.query,b.rawKey,b.priorPartial,b.pooledKeys,w.queryNorm,w.keyNorm,w.cosine,w.sine,
                 b.preparedQuery,b.scores,b.selected,b.selectedCount,p.blockCapacity,p.positionCapacity,p.rotaryDimension,
                 p.epsilon,p.representation,p.rotarySource,p.ropeTheta,b.retained ? std::optional{b.retained->transactionPrior} : std::nullopt,
-                p.poolSelection,queryDemand}}),{queryName,keyName,b.replayReady}});
+                p.poolSelection,queryDemand}}),std::move(indexerDependencies)});
         const auto coreOffset=firstRow*c.queryHeads*256*sizeof(float);
         Stage::SelectedAttention attention{{*c.cache,c.cacheLayer,request.sequence,c.keyPolicy},
             Qwen4ExpFloatBinding(c.preparedQuery.tensor,c.preparedQuery.buffer,coreOffset),b.selected,b.selectedCount,

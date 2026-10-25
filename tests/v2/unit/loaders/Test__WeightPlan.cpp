@@ -1746,3 +1746,70 @@ TEST(Test__MoERouterArithmetic, QFNDefaultPlanningAndMaterializationUseOneResolv
     EXPECT_THROW(Contract::resolve(role, TensorType::FP32, name, "qwen4exp", gdn,
                                   static_cast<MoERouterArithmetic>(255)), std::invalid_argument);
 }
+
+/**
+ * @test Materialization seals every predictor projection before prepared adoption.
+ * @details Metadata-only existing handles reproduce bulk preparation without
+ * loading a GPU or executing GEMM. The real WeightManager path must publish
+ * identical frozen source48/device identities to both graph and prepared store.
+ */
+TEST(Test__WeightManagerMaterialize, PreparedAdoptionPublishesImmutablePredictorSources)
+{
+    using Factory = llaminar::v2::kernels::KernelFactory;
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const std::string suffix : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+                 "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight", "nextn.hc_head_down.weight",
+                 "nextn.hc_head_up.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+                 "nextn.eh_proj.weight", "output.weight"})
+        {
+            const std::string name = suffix == "output.weight" ? suffix : "blk.48." + suffix;
+            SCOPED_TRACE(::testing::Message() << name << " device=" << device.toString());
+            auto loader = MockModelLoaderBuilder().addFP32RandomTensor(name, {8, 8}).build();
+            WeightManager manager(*loader);
+            auto store = std::make_shared<PreparedWeightStore>(ModelContextId{1441});
+            manager.setPreparedWeightStore(store);
+            const auto kind = device.is_cpu() ? PreparedWeightKind::CpuPackedGemm :
+                device.is_cuda() ? PreparedWeightKind::CudaInt8PackedGemm : PreparedWeightKind::RocmInt8PackedGemm;
+            InferenceStrategy strategy;
+            strategy.mode = WeightInferenceMode::SingleDevice;
+            strategy.model_id = ModelContextId{1441};
+            strategy.devices = {device};
+            WeightPlan plan(strategy);
+            WeightRequirement requirement;
+            requirement.canonical_name = name;
+            requirement.layer = inferWeightLayer(name);
+            requirement.target_device = device;
+            requirement.lookup_device = DeviceId::cpu();
+            requirement.expected_prepared_kind = kind;
+            plan.add(requirement);
+            const auto first = manager.materialize(plan);
+            ASSERT_EQ(first.bindings().size(), 1u);
+            auto bulk = first.bindings().front();
+            bulk.binding_id = bulk.binding_id == 1 ? 2 : 1;
+            bulk.identity.instance_id = bulk.binding_id;
+            bulk.prepared.reset();
+            auto handle = std::make_shared<Factory::PreparedGemmHandle>();
+            handle->tensor = bulk.tensor;
+            handle->device_id = device;
+            handle->kind = Factory::GemmPreparationKind::FLOATING_POINT;
+            handle->prepared_weights = std::make_shared<Factory::PreparedGemmWeights>();
+            const auto bulk_ref = store->registerPreparedGemmHandle(bulk, kind, device, handle);
+            const auto frozen = manager.materialize(plan);
+            ASSERT_EQ(frozen.bindings().size(), 1u);
+            const auto &binding = frozen.bindings().front();
+            ASSERT_TRUE(binding.prepared.has_value());
+            ASSERT_NE(binding.binding_id, bulk.binding_id);
+            ASSERT_TRUE(store->contains(*binding.prepared));
+            const auto stored = store->binding(*binding.prepared);
+            ASSERT_TRUE(stored.has_value());
+            EXPECT_TRUE(binding.immutable);
+            EXPECT_TRUE(stored->immutable) << "Prepared adoption must not retain a pre-freeze copy";
+            EXPECT_EQ(stored->binding_id, binding.binding_id);
+            EXPECT_EQ(stored->identity, binding.identity);
+            EXPECT_EQ(stored->identity.layer, inferWeightLayer(name));
+            EXPECT_EQ(stored->tensor, binding.tensor);
+            EXPECT_EQ(stored->residency.home_device, device);
+            EXPECT_EQ(binding.prepared->device, device);
+            EXPECT_TRUE(store->binding(bulk_ref)->immutable);
+        }
+}

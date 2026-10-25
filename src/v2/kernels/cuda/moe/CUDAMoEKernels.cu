@@ -29,6 +29,7 @@
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/DeviceRouterHadamardQ8.h"
+#include "kernels/common/RouterQ8Launch.h"
 #include "kernels/common/DeviceOrderedRouteFold.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingWarp.h"
@@ -21361,6 +21362,21 @@ extern "C"
 
     /** @brief Explicit execution policy; both implementations retain serial Q8 arithmetic. */
     enum class RouterQ8RowsExecution { SerialEquivalent, TensorCorePrefill };
+
+    /** @copydoc cudaMoE_publish_original_hidden_q8_rows */
+    bool cudaMoE_publish_original_hidden_q8_rows(
+        const float *hidden, int8_t *codes, float *scales,
+        int rows, int width, int device, void *stream, const int *live_rows)
+    {
+        if (!hidden || !codes || !scales ||
+            reinterpret_cast<std::uintptr_t>(stream) <= 2u || rows <= 0 ||
+            width <= 0 || width % 32 != 0 || device < 0 ||
+            cudaSetDevice(device) != cudaSuccess)
+            return false;
+        grouped_hidden_quantize_blockwise_rows_kernel<<<dim3(width / 32, rows), 32, 0,
+            static_cast<cudaStream_t>(stream)>>>(hidden, codes, scales, rows, width, live_rows);
+        return finishLaunch("cudaMoE_publish_original_hidden_q8_rows");
+    }
 
     /**
      * @brief Share quantization and expert-bank publication across exact Q8 implementations.

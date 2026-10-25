@@ -5,7 +5,9 @@
  * Native fork submission retains this stage's precision and telemetry authority;
  * the explicit paired graph join, never an auxiliary-stream host shadow, owns
  * publication. Canonical folds consume the same live row authority as native
- * transport, preserving inactive in-place output bytes. Native sums and
+ * transport, preserving inactive in-place output bytes. Single-request declarations
+ * lower to that same live-prefix authority before stage publication, preserving
+ * rank-order arithmetic without entering the native-sum request-bank path. Native sums and
  * canonical rank folds share their ordinary
  * arithmetic implementation even when forked; control sidebands retain their
  * existing ordered execution contracts.
@@ -33,6 +35,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #ifdef HAVE_ROCM
@@ -89,27 +92,44 @@ namespace llaminar2
             "tp_allreduce_canonical_rank_banks";
 
         /**
-         * @brief Reject a malformed row binding before publishing stage parameters.
-         * @param params Immutable row-bank and participant declaration.
+         * @brief Validate and normalize one complete row binding before publication.
+         * @param params Private candidate row-bank and participant declaration.
+         * @return Validated immutable parameters using the canonical live-bank representation.
          * @throws std::invalid_argument If device, stride or membership is incomplete.
          *
          * Tensor binding may still occur later, but it cannot change the row
          * geometry already selected for a captured native call. Construction
          * and rebinding use this same admission check.
          */
-        void validateAllreduceRows(const TPAllreduceParams &params)
+        TPAllreduceParams validateAndNormalizeAllreduceRows(TPAllreduceParams params)
         {
             if (params.live_rows && (params.count == 0 ||
                 params.live_rows->bankElements() != params.count ||
                 !params.device_id.is_gpu() || params.sideband_device_index < 0))
                 throw std::invalid_argument("TP allreduce live prefix requires exact GPU bank and participant bindings");
+            if (params.request_rows &&
+                params.arithmetic_policy == TPAllreduceArithmeticPolicy::CanonicalRankOrder &&
+                params.request_rows->requests() != 1)
+                throw std::invalid_argument("Canonical rank-order request rows require exactly one request bank");
             if (params.request_rows && (params.live_rows || params.count == 0 ||
                 params.request_rows->storageElements() != params.count ||
                 !params.device_id.is_gpu() || params.sideband_device_index < 0 ||
                 (params.tensor && params.count > params.tensor->numel()) ||
-                params.arithmetic_policy != TPAllreduceArithmeticPolicy::NativeCollective ||
+                (params.arithmetic_policy != TPAllreduceArithmeticPolicy::NativeCollective &&
+                 !(params.arithmetic_policy == TPAllreduceArithmeticPolicy::CanonicalRankOrder &&
+                   params.request_rows->requests() == 1)) ||
                 !params.sidebands.empty() || !params.sideband_workspace_bindings.empty()))
                 throw std::invalid_argument("TP request-row allreduce requires independent native GPU banks without sidebands");
+            if (params.request_rows &&
+                params.arithmetic_policy == TPAllreduceArithmeticPolicy::CanonicalRankOrder)
+            {
+                // Normalize the private candidate before either constructor or
+                // rebind can publish it. The original count and receipt remain
+                // the same authority for canonical live gather/fold execution.
+                params.live_rows = params.request_rows->requestRows(0);
+                params.request_rows.reset();
+            }
+            return params;
         }
 
         const char *allreduceRoleForStage(const std::string &stage_name)
@@ -422,11 +442,9 @@ namespace llaminar2
     // =========================================================================
 
     TPAllreduceStage::TPAllreduceStage(Params params)
-        : IComputeStage(params.device_id), params_(std::move(params))
+        : IComputeStage(params.device_id),
+          params_(validateAndNormalizeAllreduceRows(std::move(params)))
     {
-        // Late-bound tensors remain legal, but immutable row-bank declarations
-        // must already agree. Never silently revert to a capacity-sized send.
-        validateAllreduceRows(params_);
     }
 
     // =========================================================================
@@ -746,7 +764,10 @@ namespace llaminar2
              effective_count * degree * sizeof(float),
              256u,
              true,
-             WorkspaceExecutionRegime::CompactDecodeOnly});
+             // Canonical arithmetic can also be required by a predictor inside
+             // prefill. Its exact declared count, not the enclosing phase,
+             // determines this bank; every executing participant must retain it.
+             WorkspaceExecutionRegime::Any});
         return requirements;
     }
 
@@ -822,8 +843,11 @@ namespace llaminar2
 
     void TPAllreduceStage::setParams(const Params &params)
     {
-        validateAllreduceRows(params);
-        params_ = params;
+        // All validation/copying happens before the no-throw ownership commit.
+        // Failed rebinding therefore preserves every prior pointer and policy.
+        auto next = validateAndNormalizeAllreduceRows(params);
+        static_assert(std::is_nothrow_move_assignable_v<Params>);
+        params_ = std::move(next);
         // Update base class device
         // Note: IComputeStage doesn't expose setDevice() publicly, so device
         // is fixed at construction. For reuse, create a new stage.

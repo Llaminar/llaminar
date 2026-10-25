@@ -75,7 +75,7 @@ bool PipelineDeviceGeneration::publishMTPOutcome(
         if (!stream || !stage.device_generation_state_ready_.handoff.borrowed() ||
             stage.device_generation_state_ready_.handoff.borrowerRole() != DeviceTimelineRole::AllPositionVerifier ||
             !stage.waitForPendingAllPositionVerifierStateReady(stream, "pipeline_initial_mtp_commit") ||
-            !stage.materializePipelineFollowerMTPPublicationGraph(*verifier->graph,
+            !stage.materializePipelineFollowerMTPPublicationGraph(*verifier->graph, verifier->signature,
                 verifier->signature.seq_len, &failures[index]) ||
             !stage.executeMTPStatePublicationGraph(stream, &failures[index]) ||
             !stage.recordAcceptedSpecPublicationReady(stream, "pipeline_initial_mtp_commit") ||
@@ -117,15 +117,35 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
             !verifier->signature.usesDevicePositionIds() ||
             !verifier->signature.usesDeviceSequenceLengths())
             throw std::logic_error("Pipeline follower requires its exact resident grouped verifier");
-        const auto forward = stage.forward_engine_->deviceLoopGraphTemplate(verifier->signature, &error);
-        const auto publication = stage.mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
-            1, verifier->signature.seq_len, &error);
-        if (!forward || !publication)
+        auto program_signature = verifier->signature;
+        program_signature.sparse_query_execution_program = stage.sparseQueryGraphProgram();
+        const auto forward = stage.forward_engine_->deviceLoopGraphTemplate(program_signature, &error);
+        // Each export owns its first failure. Publication preparation/export
+        // clears its error output and must not hide a rejected forward child.
+        if (!forward)
         {
-            LOG_ERROR("Pipeline follower cannot retain a complete transaction: " << error);
+            LOG_ERROR("Pipeline follower cannot export its exact grouped verifier"
+                      << " participant=" << index << " device=" << stage.state_.device_id.toString()
+                      << " program=" << sparseQueryExecutionProgramIndex(program_signature.sparse_query_execution_program)
+                      << " rows=" << program_signature.seq_len << ": " << error);
             return false;
         }
-        auto &loop = stage.mtp_device_generation_loop_graph_;
+        if (!stage.prepareMTPStatePublicationForVerifier(program_signature,
+                stage.deviceGenerationLoopGraph().stream.get(), &error))
+        {
+            LOG_ERROR("Pipeline follower cannot prepare accepted-state publication"
+                      << " participant=" << index << ": " << error);
+            return false;
+        }
+        const auto publication = stage.mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
+            1, verifier->signature.seq_len, &error);
+        if (!publication)
+        {
+            LOG_ERROR("Pipeline follower cannot export accepted-state publication"
+                      << " participant=" << index << ": " << error);
+            return false;
+        }
+        auto &loop = stage.deviceGenerationLoopGraph();
         std::vector<DeviceControlledLoopFragment> fragments;
         const bool owns_epoch = static_cast<bool>(stage.moe_overlay_epoch_execution_binding_);
         if (owns_epoch)
@@ -133,10 +153,11 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
             // The first, externally scheduled verifier has published its
             // release. Join the committed state and close any ambient reader
             // before the retained parent's first acquire, just as on the tail.
-            if (!stage.waitForLiveInferenceStateReadyForObservation(loop.stream.get(),
+            if (sparseQueryExecutionProgramIndex(stage.sparseQueryGraphProgram()) == 0 &&
+                (!stage.waitForLiveInferenceStateReadyForObservation(loop.stream.get(),
                     "pipeline_mtp_follower_materialization", DeviceTimelineRole::DeviceGenerationController) ||
                 !stage.prepareMoEOverlayEpochForInternalParent(loop.stream.get(),
-                    "pipeline_mtp_follower_materialization"))
+                    "pipeline_mtp_follower_materialization")))
                 return false;
             const auto acquire = stage.moeOverlayEpochBoundaryDeviceLoopGraphTemplate(
                 MoEOverlayEpochBoundaryStage::Operation::Acquire, &error);
@@ -164,7 +185,7 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
         }
         const auto generation = stage.workspaceGeneration(stage.state_.device_id);
         if (loop.valid && loop.workspace_generation == generation &&
-            loop.pipeline_verifier_identity == verifier->signature &&
+            loop.pipeline_verifier_identity == program_signature &&
             std::equal(loop.source_fragments.begin(), loop.source_fragments.end(),
                 fragments.begin(), fragments.end(),
                 [](const auto &left, const auto &right) { return left.capture == right.capture; }))
@@ -174,7 +195,7 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
             return true;
         }
         loop.invalidateGraph();
-        loop.pipeline_verifier_identity = verifier->signature;
+        loop.pipeline_verifier_identity = program_signature;
         loop.source_fragments = std::move(fragments);
         loop.workspace_generation = generation;
         loop.request_count = 1;
@@ -197,7 +218,7 @@ bool PipelineDeviceGeneration::composeSpeculativeParticipants()
     std::atomic<bool> failed{false};
     workers_->dispatch([&, this](size_t index) {
         auto &stage = *stages_[index];
-        auto &loop = stage.mtp_device_generation_loop_graph_;
+        auto &loop = stage.deviceGenerationLoopGraph();
         auto &context = GPUDeviceContextPool::instance().getContext(stage.state_.device_id);
         const bool tail = terminalParticipant(index);
         if (hosted)
@@ -316,7 +337,7 @@ bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
     for (size_t index = 0; index < terminalIndex(); ++index)
     {
         auto &stage = *stages_[index];
-        auto &loop = stage.mtp_device_generation_loop_graph_;
+        auto &loop = stage.deviceGenerationLoopGraph();
         if (!loop.valid || loop.launched || !loop.capture->hasExecutable() ||
             loop.workspace_generation != stage.workspaceGeneration(stage.state_.device_id) ||
             !stage.consumeDeviceGenerationStateReady(loop.stream.get(),
@@ -334,7 +355,7 @@ bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
             for (size_t index = 0; index < terminalIndex(); ++index)
             {
                 auto &stage = *stages_[index];
-                auto &loop = stage.mtp_device_generation_loop_graph_;
+                auto &loop = stage.deviceGenerationLoopGraph();
                 if (!loop.capture->launchOnStream(loop.stream.get())) return false;
                 PerfStatsCollector::addCounter("generation", "pipeline_mtp_follower_transaction_submissions", 1.0,
                     "decode", stage.state_.device_id.toString(),
@@ -347,7 +368,7 @@ bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
         {
             for (size_t index = 0; index < terminalIndex(); ++index)
                 if (!stages_[index]->submitRetainedStorageTerminal()||!stages_[index]->publishDeviceGenerationStateReady(
-                        stages_[index]->mtp_device_generation_loop_graph_.stream.get(), 1,
+                        stages_[index]->deviceGenerationLoopGraph().stream.get(), 1,
                         DeviceGenerationStatePublicationKind::Terminal)) return false;
             return true;
         }

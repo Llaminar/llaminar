@@ -1,3 +1,11 @@
+/**
+ * @file MoEGraphRoleRunner.cpp
+ * @brief Dispatch graph-role work and immutable response admission to local participants.
+ *
+ * Role ownership determines which participant executes each continuation. Response
+ * admission reaches every local owner before work starts and expires through the
+ * same participants; it does not duplicate token progress or device-owned state.
+ */
 #include "MoEGraphRoleRunner.h"
 
 #include "utils/Logger.h"
@@ -128,6 +136,19 @@ namespace llaminar2
             }
         }
         return true;
+    }
+
+    bool MoEGraphRoleRunner::admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request)
+    {
+        if (!request.valid() || config_.local_participant_runners.size() != local_specs_.size()) return false;
+        for (const auto &child : config_.local_participant_runners)
+            if (!child || !child->admitSparseQueryExecutionProgram(request)) return false;
+        return true;
+    }
+
+    void MoEGraphRoleRunner::endSparseQueryExecutionProgram() noexcept
+    {
+        for (const auto &child : config_.local_participant_runners) if (child) child->endSparseQueryExecutionProgram();
     }
 
     int MoEGraphRoleRunner::get_position() const

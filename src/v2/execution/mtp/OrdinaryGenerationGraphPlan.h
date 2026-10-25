@@ -10,6 +10,7 @@
  */
 #pragma once
 #include "backends/DeviceId.h"
+#include "kernels/common/SparseQueryExecutionProgram.h"
 #include <cstddef>
 #include <stdexcept>
 
@@ -25,15 +26,25 @@ struct OrdinaryGenerationGraphPlan
 
     /** @return Complete scalar no-sampling transaction owners for a native singleton PP stage.
      * Child model/transport recordings are imported, never independently instantiated. */
-    static constexpr std::size_t pipelineForwardOnlyExecutableCount() noexcept { return 1u; }
+    static std::size_t pipelineForwardOnlyExecutableCount(std::size_t query_programs = 1u)
+    {
+        if (query_programs == 0 || query_programs > kSparseQueryExecutionProgramCount)
+            throw std::invalid_argument("Pipeline forced graph inventory has an unknown query-program family");
+        return query_programs;
+    }
 
     /** @return Extra general executable owners beyond the existing forward/MTP BOM.
      *  @throws std::invalid_argument for a device without native GPU graphs. */
-    static std::size_t additionalExecutableCount(DeviceId device, bool retained_mtp)
+    static std::size_t additionalExecutableCount(DeviceId device, bool retained_mtp,
+        std::size_t query_programs = 1u)
     {
         if (!device.is_gpu())
             throw std::invalid_argument("Ordinary generation graph inventory requires a GPU");
-        return 1u + (retained_mtp ? 0u : 1u) + (device.is_rocm() ? 2u : 0u);
+        if (query_programs == 0 || query_programs > kSparseQueryExecutionProgramCount)
+            throw std::invalid_argument("Ordinary graph inventory has an unknown query-program family");
+        // Each program owns its resident-input forward, parent (shared with
+        // MTP when retained), and HIP initial/complete hosted transaction.
+        return query_programs * (1u + (retained_mtp ? 0u : 1u) + (device.is_rocm() ? 2u : 0u));
     }
 };
 }

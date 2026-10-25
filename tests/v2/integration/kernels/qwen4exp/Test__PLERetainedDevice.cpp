@@ -8,6 +8,7 @@
  * native integration test, not a Unit or full model/controller lifetime proof.
  */
 #include <gtest/gtest.h>
+#include "QFNOuterPublicationTestSupport.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLERetainedStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -36,7 +37,7 @@ template<class T>std::vector<T>observe(IBackend&backend,DeviceId device,void*str
  std::vector<T>values(elements);require(backend.deviceToHostOnStream(values.data(),source,elements*sizeof(T),device.ordinal,stream),"PLE native terminal copy failed");require(backend.synchronizeStream(stream,device.ordinal),"PLE native terminal completion failed");return values;
 }
 /** @brief Prove native snapshot-before-publication, repeated acceptance and exact payload counters. */
-void prove(DeviceId device){
+void prove(DeviceId device, bool outerLedger = false){
  auto*backend=getBackendFor(device);if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested backend unavailable";
  auto context=IDeviceContext::create(device,1);require(bool(context),"PLE native context failed");
  auto&worker=GPUDeviceContextPool::instance().getContext(device);
@@ -75,8 +76,28 @@ void prove(DeviceId device){
     {ScopedGraphCaptureStage scope(&snapshot);require(snapshot.execute(context.get()),"PLE snapshot capture failed");for(TensorBase*t:std::array<TensorBase*,4>{&priorTokens,&priorConv,&frozen,&counters})TransferEngine::publishDeviceWrite(t,device,stream);scope.complete();}
     {ScopedGraphCaptureStage scope(&retain);require(retain.execute(context.get()),"PLE retain capture failed");for(TensorBase*t:std::array<TensorBase*,3>{&retainedTokens,&retainedNorm,&counters})TransferEngine::publishDeviceWrite(t,device,stream);scope.complete();}
     capture.finish();}
+   MTPSpeculativeStatePublicationStage::Params outerParams;
+   outerParams.device_id = device;
+   outerParams.authority = MTPSpeculativeStatePublicationStage::Authority::PipelineFollower;
+   outerParams.verifier_state_stages = {&retain};
+   MTPSpeculativeStatePublicationStage outer(outerParams);
+   auto outerPlan = qfn_outer_publication_test::plan(outer, {
+       {BufferId::QFN_PLE_TOKEN_HISTORY, &acceptedTokens},
+       {BufferId::QFN_PLE_CONV_HISTORY, &acceptedConv}});
+   if (outerLedger)
+   {
+       ASSERT_EQ(outerPlan.outputs.size(), 2u);
+       outerPlan.retained_parent_inputs = {&priorTokens, &priorConv, &frozen,
+           &retainedTokens, &retainedNorm};
+       qfn_outer_publication_test::rejectMissingWrites(worker, device, stream, outerPlan, [&] {
+           require(retain.restoreVerifierStateCaptureRowFromDeviceIndex(deviceControls + 1, stream),
+               "PLE negative outer hook failed without a ledger diagnostic");
+       });
+   }
+   GraphCaptureDependencyLedger outerPublicationLedger(device, stream, {outerPlan},
+       "PLE outer MTP publication");
    GraphCaptureDependencyLedger publicationLedger(device,stream,{Plan{.stage_identity=&retain,.stage_name="publish_accepted",.external_inputs={&acceptedTokens,&acceptedConv,&normalized},.retained_parent_inputs={&priorTokens,&priorConv,&frozen,&retainedTokens,&retainedNorm,&counters},.outputs={&acceptedTokens,&acceptedConv}}},"PLE native publication");
-   {ScopedBackendGraphCapture capture(worker,*retirement.publication,"PLE native publication",&publicationLedger);require(capture.begin(),"PLE publication capture begin failed");ScopedGraphCaptureStage scope(&retain);require(retain.restoreVerifierStateCaptureRowFromDeviceIndex(deviceControls+1,stream),"PLE publication capture failed");scope.complete();capture.finish();}
+   {ScopedBackendGraphCapture capture(worker,*retirement.publication,"PLE native publication",outerLedger ? &outerPublicationLedger : &publicationLedger);require(capture.begin(),"PLE publication capture begin failed");ScopedGraphCaptureStage scope(outerLedger ? static_cast<const void *>(&outer) : static_cast<const void *>(&retain));require(retain.restoreVerifierStateCaptureRowFromDeviceIndex(deviceControls+1,stream),"PLE publication capture failed");scope.complete();capture.finish();}
    for(auto*graph:{retirement.transaction.get(),retirement.publication.get()}){std::vector<GPUGraphKernelNodeInfo>nodes;std::string error;require(graph->inspectKernelNodes(nodes,&error),error.c_str());ASSERT_EQ(nodes.size(),2u);for(const auto&node:nodes)EXPECT_EQ(node.local_memory_bytes_per_thread,0u);require(graph->instantiate(),"PLE native graph instantiation failed");}
    require(retirement.transaction->launch(),"PLE native transaction replay failed");
    auto bytes=observe<std::uint64_t>(*backend,device,stream,counters.gpu_data_ptr(),2);EXPECT_EQ(bytes[0],8+std::size_t(channels)*36);EXPECT_EQ(bytes[1],std::size_t(m)*(channels+1)*4);
@@ -118,4 +139,19 @@ TEST(PLERetainedDevice, CUDACapturedPublication){prove(DeviceId::cuda(0));}
 #endif
 #ifdef HAVE_ROCM
 TEST(PLERetainedDevice, ROCmCapturedPublication){prove(DeviceId::rocm(0));}
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Actual outer MTP write authority preserves captured accepted-prefix bytes. */
+TEST(PLERetainedDevice, CUDAOuterMTPPublicationLedger)
+{
+    prove(DeviceId::cuda(0), true);
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Actual outer MTP write authority preserves captured accepted-prefix bytes. */
+TEST(PLERetainedDevice, ROCmOuterMTPPublicationLedger)
+{
+    prove(DeviceId::rocm(0), true);
+}
 #endif

@@ -253,7 +253,9 @@ namespace
                         ASSERT_EQ(actual.buffers.size(), 1u);
                         EXPECT_EQ(actual.buffers[0].name, expected.buffers[0].name);
                         EXPECT_EQ(actual.buffers[0].size_bytes, live_count * degree * sizeof(float));
-                        EXPECT_EQ(actual.buffers[0].regime, WorkspaceExecutionRegime::CompactDecodeOnly);
+                        // Canonical predictor reductions can also execute in
+                        // prefill; both edges retain the same exact bank.
+                        EXPECT_EQ(actual.buffers[0].regime, WorkspaceExecutionRegime::Any);
                     }
                     submit->bindWorkspace(&workspace);
                     EXPECT_EQ(join->getWorkspace(), &workspace);

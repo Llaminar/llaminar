@@ -3171,6 +3171,39 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmMoEKernel::prepareRequiredRouterQ8Hidden(int rows, int width, int top_k)
+    {
+        (void)top_k;
+        if (!router_q8_hidden_publication_ ||
+            !router_q8_hidden_publication_->hasRequiredConsumer())
+            return true;
+        if (router_q8_publication_access_ != MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+            !router_q8_hidden_publication_->acceptsProducerRows(rows, width))
+        {
+            LOG_ERROR("[ROCmMoEKernel] required Q8 producer geometry/access mismatch");
+            return false;
+        }
+        return ensureRouterQ8HiddenScratchCapacity(rows, width);
+    }
+
+    bool ROCmMoEKernel::publishRequiredRouterQ8Hidden(
+        const float *source, int rows, int width, int top_k, const int *live_rows)
+    {
+        if (!router_q8_hidden_publication_ ||
+            !router_q8_hidden_publication_->hasRequiredConsumer())
+            return true;
+        if (!prepareRequiredRouterQ8Hidden(rows, width, top_k) ||
+            !hipMoE_publish_original_hidden_q8_rows(source, d_router_q8_hidden_,
+                d_router_q8_hidden_scales_, rows, width, device_ordinal_, getStream(), live_rows))
+            return false;
+        publishRouterQ8Hidden(source, rows,
+            isGraphCaptureActive() ||
+                (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
+                isHipStreamCapturing(getStream()),
+            RouterQ8Basis::Original);
+        return true;
+    }
+
     void ROCmMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
         if (router_q8_publication_access_ ==
@@ -3212,7 +3245,8 @@ namespace llaminar2
     void ROCmMoEKernel::publishRouterQ8Hidden(
         const float *source,
         int rows,
-        bool recorded_during_capture) noexcept
+        bool recorded_during_capture,
+        RouterQ8Basis router_basis) noexcept
     {
         if (router_q8_publication_access_ !=
                 MoERouterQ8PublicationAccess::ProducerAndConsumer ||
@@ -3240,7 +3274,7 @@ namespace llaminar2
         publication.blocks_per_row_capacity =
             router_q8_hidden_blocks_cap_;
         publication.capture_recorded = recorded_during_capture;
-        if (routerQ8Basis(debugEnv().gemm.moe_router_arithmetic) == RouterQ8Basis::SignedHadamard32)
+        if (router_basis == RouterQ8Basis::SignedHadamard32)
             PerfStatsCollector::addCounter("kernel", "rocm_moe_router_hadamard32_calls", 1.0,
                 "router", "rocm:" + std::to_string(device_ordinal_),
                 {{"rows", std::to_string(rows)}, {"expert_hidden_basis", "original"}, {"block", "32"}});
@@ -3553,6 +3587,13 @@ namespace llaminar2
         bool used_q8_grouped_router = false;
         bool used_fp16_grouped_router = false;
         invalidateRouterQ8HiddenPublication();
+        if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
+            return false;
+        const bool router_publishes_q8 = !decode_single_token &&
+            gate_type == TensorType::FP32 && debugEnv().rocm.moe_router_q8;
+        if (!router_publishes_q8 && !publishRequiredRouterQ8Hidden(
+                hidden, seq_len, d_model, top_k, device_effective_seq_len))
+            return false;
         if (decode_single_token)
         {
             if (!launchDecodeGateLogitsForGateType(
@@ -3620,7 +3661,8 @@ namespace llaminar2
                             seq_len,
                             isGraphCaptureActive() ||
                                 (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
-                                isHipStreamCapturing(getStream()));
+                                isHipStreamCapturing(getStream()),
+                            routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
                     }
                 }
                 else
@@ -4801,6 +4843,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!prepareRequiredRouterQ8Hidden(plan.physical_rows, plan.d_model, plan.top_k))
+            return false;
+
         const size_t logits_count =
             static_cast<size_t>(plan.physical_rows) *
             static_cast<size_t>(plan.num_experts);
@@ -4980,6 +5025,11 @@ namespace llaminar2
         bool used_q8_grouped_router = false;
         bool used_fp16_grouped_router = false;
         invalidateRouterQ8HiddenPublication();
+        if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
+            return false;
+        if (!q8_router_requested && !publishRequiredRouterQ8Hidden(
+                d_hidden, seq_len, d_model, top_k, device_effective_seq_len))
+            return false;
         if (q8_router_requested)
         {
             if (!ensureRouterQ8HiddenScratchCapacity(seq_len, d_model))
@@ -5016,7 +5066,8 @@ namespace llaminar2
             publishRouterQ8Hidden(
                 d_hidden,
                 seq_len,
-                isDecodeGraphCaptureActive());
+                isDecodeGraphCaptureActive(),
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         }
         else if (gate_is_fp32)
         {
@@ -5221,7 +5272,8 @@ namespace llaminar2
             publishRouterQ8Hidden(
                 h,
                 /*rows=*/1,
-                isDecodeGraphCaptureActive());
+                isDecodeGraphCaptureActive(),
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
@@ -5517,7 +5569,8 @@ namespace llaminar2
             publishRouterQ8Hidden(
                 h,
                 /*rows=*/1,
-                isDecodeGraphCaptureActive());
+                isDecodeGraphCaptureActive(),
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)

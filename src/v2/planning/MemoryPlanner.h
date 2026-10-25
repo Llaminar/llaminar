@@ -31,6 +31,7 @@
 #include "loaders/GPUVramPreflight.h"
 
 #include <optional>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <algorithm>
@@ -148,6 +149,8 @@ struct CapturedServingGraphMemoryInventory
     std::vector<int> prefill_bucket_rows;
     /** Complete forward executables retained independently of prefill rows. */
     std::size_t fixed_executable_count = 0u;
+    /** Closed main-query programs; numeric request visibility never changes this inventory. */
+    std::size_t sparse_query_program_count = 1u;
     /** Canonical MTP helper/controller cache geometry and graph owners. */
     MTPGraphOwnerPlan mtp_graph_owners{MTPRuntimeConfig{}};
     /** Present only when the complete ordinary request program is retained. */
@@ -179,16 +182,22 @@ struct CapturedServingGraphMemoryInventory
 [[nodiscard]] inline CapturedServingGraphMemoryInventory
 resolveCapturedServingGraphMemoryInventory(
     std::vector<int> prefill_bucket_rows,
-    const MTPRuntimeConfig &mtp)
+    const MTPRuntimeConfig &mtp,
+    std::size_t query_programs = 1u)
 {
+    if (query_programs == 0 || query_programs > kSparseQueryExecutionProgramCount)
+        throw std::invalid_argument("Serving graph inventory has an unknown query-program family");
     const bool retains_mtp = retainsMTPGraphCapacity(mtp);
+    const auto fixed = 1u + (retains_mtp ? 1u : 0u) +
+        resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp);
+    if (fixed > std::numeric_limits<std::size_t>::max() / query_programs)
+        throw std::overflow_error("Serving sparse-query native-owner inventory overflows");
     return CapturedServingGraphMemoryInventory{
         .prefill_bucket_rows = std::move(prefill_bucket_rows),
         .fixed_executable_count =
-            1u +
-            (retains_mtp ? 1u : 0u) +
-            resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp),
-        .mtp_graph_owners = MTPGraphOwnerPlan(mtp),
+            query_programs * fixed,
+        .sparse_query_program_count = query_programs,
+        .mtp_graph_owners = MTPGraphOwnerPlan(mtp, query_programs),
         .ordinary_generation = OrdinaryGenerationGraphPlan{},
     };
 }

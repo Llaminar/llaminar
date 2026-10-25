@@ -118,9 +118,21 @@ void validateQwenSparsePoolSelection(QwenSparsePoolSelection policy, int rows)
     if (rows <= 0) throw std::invalid_argument("QSA selector requires positive admitted row capacity");
 }
 
+void validateQwenSparseQueryDemand(QwenSparseQueryDemand demand)
+{
+    switch (demand)
+    {
+    case QwenSparseQueryDemand::AllLive:
+    case QwenSparseQueryDemand::RankingOnly:
+    case QwenSparseQueryDemand::ProvenNoRanking: return;
+    }
+    throw std::invalid_argument("QSA query program is unknown");
+}
 void validateQwenSparseSelection(const QwenSparseIndexer &p)
 {
-    if (!p.replay || !p.scores || !p.selected || !p.selected_count ||
+    validateQwenSparseQueryDemand(p.query_demand);
+    const bool noRanking = p.query_demand == QwenSparseQueryDemand::ProvenNoRanking;
+    if (!p.replay || (!noRanking && !p.scores) || !p.selected || !p.selected_count ||
         p.row_capacity <= 0 || p.token_capacity <= 0 ||
         p.block_capacity < (std::int64_t(p.token_capacity) + 3) / QwenSparsePool)
         throw std::invalid_argument("QSA selection requires original replay, distinct banks and admitted geometry");
@@ -142,7 +154,7 @@ void validateQwenSparseSelection(const QwenSparseIndexer &p)
         throw std::invalid_argument("QSA selection admitted row product overflows");
     const Span banks[] = {
         span(p.replay, 1, sizeof(*p.replay), alignof(QwenSparseReplay)),
-        span(p.scores, rows * std::size_t(p.block_capacity), sizeof(float), alignof(float)),
+        noRanking ? Span{0,0} : span(p.scores, rows * std::size_t(p.block_capacity), sizeof(float), alignof(float)),
         span(p.selected, rows * QwenSparseSelected, sizeof(std::int32_t), alignof(std::int32_t)),
         span(p.selected_count, rows, sizeof(std::int32_t), alignof(std::int32_t)),
         span(p.selection_observations, p.selection_observations ? rows : 0,
@@ -167,17 +179,13 @@ QwenSparsePreparationGrid qwenSparsePreparationGrid(int rows)
 }
 void validateQwenSparseIndexer(const QwenSparseIndexer &p)
 {
-    switch(p.query_demand){
-    case QwenSparseQueryDemand::AllLive:
-    case QwenSparseQueryDemand::RankingOnly:break;
-    default:throw std::invalid_argument("Qwen sparse indexer: unknown query demand policy");
-    }
+    const bool noRanking = p.query_demand == QwenSparseQueryDemand::ProvenNoRanking;
     validateQwenSparseSelection(p);
     if(p.transaction_prior && (p.replay!=&p.transaction_prior->replay || p.partial_keys!=p.transaction_prior->partial))
         throw std::invalid_argument("QSA indexer immutable prior codec does not own its replay and raw tail");
-    if (!p.replay || !p.query || !p.raw_keys || !p.partial_keys || !p.pooled_keys ||
-        !p.query_norm || !p.key_norm || !p.prepared_query ||
-        !p.scores || !p.selected || !p.selected_count)
+    if (!p.replay || !p.raw_keys || !p.partial_keys || !p.pooled_keys || !p.key_norm ||
+        !p.selected || !p.selected_count ||
+        (!noRanking && (!p.query || !p.query_norm || !p.prepared_query || !p.scores)))
         throw std::invalid_argument("Qwen sparse indexer: every persistent binding is required");
     if (p.row_capacity <= 0 || p.token_capacity <= 0 ||
         p.block_capacity < (static_cast<std::int64_t>(p.token_capacity) + 3) / 4 ||
@@ -210,10 +218,11 @@ void validateQwenSparseIndexer(const QwenSparseIndexer &p)
     if(rows>SIZE_MAX/512||std::size_t(p.block_capacity)>SIZE_MAX/128||
         std::size_t(p.position_capacity)>SIZE_MAX/std::size_t(p.rotary_dim/2))
         throw std::invalid_argument("QSA preparation element-count product overflows");
-    const auto queries=span(p.prepared_query,rows*512,sizeof(float));
+    const auto queries=noRanking ? Span{0,0} : span(p.prepared_query,rows*512,sizeof(float));
     const auto pools=span(p.pooled_keys,std::size_t(p.block_capacity)*128,sizeof(float));
     if(overlaps(queries,pools))throw std::invalid_argument("QSA concurrent preparation outputs overlap");
-    const Span query_reads[]{span(p.query,rows*512,sizeof(float)),span(p.query_norm,128,sizeof(float))};
+    const Span query_reads[]{noRanking ? Span{0,0} : span(p.query,rows*512,sizeof(float)),
+        noRanking ? Span{0,0} : span(p.query_norm,128,sizeof(float))};
     const Span pool_reads[]{span(p.raw_keys,rows*128,sizeof(float)),
         span(p.partial_keys,(p.transaction_prior?3u:4u)*128,sizeof(float)),span(p.key_norm,128,sizeof(float))};
     for(const auto& input:query_reads)if(overlaps(pools,input))

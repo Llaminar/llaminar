@@ -32,6 +32,13 @@ Qwen4ExpPLERetainedStage::Qwen4ExpPLERetainedStage(Params p):IComputeStage(p.dev
  (void)DeviceRequestRowRanges::fullyActiveRequests(params_.requests,params_.rowCapacity);
  const auto c=std::size_t(params_.channels),m=std::size_t(params_.rowCapacity);require(c<=std::numeric_limits<std::size_t>::max()/36&&m<=std::numeric_limits<std::size_t>::max()/4/c);
  const bool snapshot=params_.operation==Operation::SnapshotPrior;
+ if (!snapshot)
+ {
+     acceptedPublicationOutputs_ = {{
+         {params_.acceptedTokens.buffer, BufferAccess::WRITE, "INT32", false},
+         {params_.acceptedConvolution.buffer, BufferAccess::WRITE, "FP32", false}}};
+ }
+
  add(params_.transactionLiveCounts,std::size_t(params_.requests)*4,snapshot,"transaction_live_counts");
  add(params_.priorTokens,8,snapshot,"transaction_prior_tokens");add(params_.priorConvolution,c*36,snapshot,"transaction_prior_convolution");
  if(snapshot){if(params_.liveCounts)std::visit([&](const auto&binding){using B=std::decay_t<decltype(binding)>;if constexpr(std::is_same_v<B,Qwen4ExpIntBinding>)add(binding,std::size_t(params_.requests)*4,false,"canonical_live_counts");else require(binding.owner==device()&&binding.data&&binding.capacity>=std::size_t(params_.requests)&&reinterpret_cast<std::uintptr_t>(binding.data)%4==0&&binding.capacity<=(std::numeric_limits<std::uintptr_t>::max()-reinterpret_cast<std::uintptr_t>(binding.data))/4);},params_.liveCounts->value);add(params_.acceptedTokens,8,false,"accepted_tokens");add(params_.acceptedConvolution,c*36,false,"accepted_convolution");}
@@ -87,6 +94,13 @@ bool Qwen4ExpPLERetainedStage::publish(const int*rows,int requests,int stride,vo
 }
 bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRow(int row,void*s){return !device().is_gpu()&&params_.requests==1&&publish(&row,1,1,s);}
 bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRows(const int*r,int n,void*s){return !device().is_gpu()&&publish(r,n,1,s);}
+std::span<const BufferBinding> Qwen4ExpPLERetainedStage::verifierStatePublicationOutputs() const noexcept
+{
+    return params_.operation == Operation::RetainCandidates
+        ? std::span<const BufferBinding>{acceptedPublicationOutputs_}
+        : std::span<const BufferBinding>{};
+}
+
 bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRowFromDeviceIndex(const int*r,void*s){return device().is_gpu()&&params_.requests==1&&publish(r,1,1,s);}
 bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRowsFromDeviceIndices(const int*r,int n,int stride,void*s){return device().is_gpu()&&publish(r,n,stride,s);}
 ComputeStageType Qwen4ExpPLERetainedStage::type()const{return params_.operation==Operation::SnapshotPrior?ComputeStageType::QWEN4EXP_PLE_SNAPSHOT_PRIOR:ComputeStageType::QWEN4EXP_PLE_RETAIN_CANDIDATES;}

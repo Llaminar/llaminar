@@ -10,6 +10,7 @@
  */
 #pragma once
 #include <cstddef>
+#include "kernels/common/SparseQueryExecutionProgram.h"
 #include <limits>
 #include <stdexcept>
 
@@ -39,16 +40,19 @@ public:
      * @param retains_mtp Whether condition/verifier forwards are retained, independent of active request depth.
      * @param sidecars Canonical MTPGraphOwnerPlan sidecar slots, separate from main state.
      * @param condition_requests Exact retained request capacity for MTP conditions; zero when absent.
+     * @param query_programs Main-query program count; scalar snapshots remain dedicated per actual forward.
      * @throws std::invalid_argument for an inconsistent retained sidecar family.
      * @throws std::overflow_error for unrepresentable populations.
      */
     static ServingSnapshotArenaInventory ordinary(bool has_prefill, bool retains_mtp,
-        std::size_t sidecars, std::size_t condition_requests)
+        std::size_t sidecars, std::size_t condition_requests, std::size_t query_programs = 1u)
     {
+        if (query_programs == 0 || query_programs > kSparseQueryExecutionProgramCount)
+            throw std::invalid_argument("Serving snapshot inventory has an unknown query-program family");
         if ((!retains_mtp && (sidecars || condition_requests)) || (retains_mtp && !condition_requests))
             throw std::invalid_argument("Serving snapshot inventory has inconsistent retained family geometry");
         return ServingSnapshotArenaInventory(
-            has_prefill || retains_mtp ? 1u : 0u, 2u,
+            has_prefill || retains_mtp ? 1u : 0u, snapshotPopulationProduct(2u, query_programs),
             retains_mtp ? 1u : 0u, sidecars, condition_requests);
     }
     /** @return Shared prefill/grouped-verifier lanes; bucket count is not an owner multiplier. */

@@ -79,6 +79,7 @@
 #include "../../../collective/ILocalTPContext.h"       // For unique_ptr<ILocalTPContext> in maps
 #include "../../../collective/IGlobalTPContext.h"      // For shared_ptr<IGlobalTPContext> ownership
 #include <memory>
+#include <utility>
 #include <atomic>
 #include <optional>
 #include <algorithm>
@@ -3000,6 +3001,15 @@ namespace llaminar2
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
         /**
+         * @brief Admit the same bounded query program for CPU/segmented response execution.
+         * @param request Immutable completed origins and existing response/depth policy.
+         * @return False before mutation for invalid policy or a live resident controller.
+         */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override;
+        /** @brief Close only a host response scope, preserving every retained parent and controller. */
+        void endSparseQueryExecutionProgram() noexcept override;
+
+        /**
          * @brief Admit one algorithm into the shared resident response/controller banks.
          * @param request Immutable budget, algorithm/depth and leading-row ownership.
          * @return Whether the complete admission and exact-stream event publication succeeded.
@@ -3712,6 +3722,7 @@ namespace llaminar2
             reset_transaction.enter(
                 RequestStateResetTransaction::Phase::
                     ResetReplaySessions);
+            admitted_sparse_query_program_.reset();
             for (auto &entry : layer_graph_cache_)
             {
                 entry.resetSessionState();
@@ -3838,7 +3849,7 @@ namespace llaminar2
                 if (cache)
                     cache->resetSessionState();
             }
-            mtp_speculative_state_publication_graph_.resetSessionState();
+            for (auto &cache : mtp_speculative_state_publication_graphs_) cache.resetSessionState();
             mtp_stochastic_outcome_graph_.resetSessionState();
             mtp_stochastic_target_distribution_graph_.resetSessionState();
             last_pos_offset_ = -1;
@@ -4471,6 +4482,10 @@ namespace llaminar2
         friend struct DeviceGraphOrchestratorLiveStateTestAccess;
         /** @brief Device-free peer of the actual CPU bootstrap producer and mailbox read lease. */
         friend struct DeviceGraphOrchestratorMTPZeroHiddenTestAccess;
+        /** @brief Device-free peer of the actual cold serving-family buffer scope. */
+        friend struct DeviceGraphOrchestratorServingBuffersTestAccess;
+        /** @brief Device-free peer of exact publication-child ownership and retirement. */
+        friend struct DeviceGraphOrchestratorPublicationProgramsTestAccess;
         // =========================================================================
         // Private Helpers
         // =========================================================================
@@ -7954,7 +7969,25 @@ namespace llaminar2
             uint64_t workspace_generation = 0;
             /** Frozen collective owner is part of every embedded transport identity. */
             const PipelineForwardGraphEdges *pipeline_edges = nullptr;
+            std::optional<ForwardGraphSignature> verifier_signature; ///< Exact program/source owner of retained hooks.
             bool valid = false;
+
+            /**
+             * @brief Compare the complete immutable publication source before reuse.
+             * @param signature Exact original verifier key including its query program.
+             * @param generation Arena lifetime of every captured binding.
+             * @param edges Original participant-local transport authority.
+             * @param params Original outcome/state bindings and exact verifier hook pointers.
+             * @return Whether this one owner can be retained without any mutation.
+             */
+            bool matches(const ForwardGraphSignature &signature, uint64_t generation,
+                         const PipelineForwardGraphEdges *edges,
+                         const MTPSpeculativeStatePublicationStage::Params &params) const noexcept
+            {
+                return valid && graph && stage && workspace_generation == generation &&
+                    pipeline_edges == edges && verifier_signature == signature &&
+                    stage->hasSameCaptureIdentity(params);
+            }
 
             void resetSessionState()
             {
@@ -7997,6 +8030,7 @@ namespace llaminar2
                 stage = nullptr;
                 workspace_generation = 0;
                 pipeline_edges = nullptr;
+                verifier_signature.reset();
                 valid = false;
             }
 
@@ -8018,6 +8052,7 @@ namespace llaminar2
                 stage = nullptr;
                 workspace_generation = 0;
                 pipeline_edges = nullptr;
+                verifier_signature.reset();
                 valid = false;
             }
         };
@@ -8133,8 +8168,9 @@ namespace llaminar2
             std::unique_ptr<ComputeGraph> graph;
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
             MTPVerifierPreparationStage *stage = nullptr;
-            /** Exact replay-ready forward capture paired with this preparation. */
-            std::optional<ForwardGraphSignature> paired_forward_signature;
+            /** Exact replay-ready main forward per program; preparation arithmetic is shared. */
+            std::array<std::optional<ForwardGraphSignature>, kSparseQueryExecutionProgramCount>
+                paired_forward_signatures;
             uint64_t workspace_generation = 0;
             bool valid = false;
 
@@ -8162,11 +8198,19 @@ namespace llaminar2
                 graph.reset();
                 key = {};
                 stage = nullptr;
-                paired_forward_signature.reset();
+                for (auto &signature : paired_forward_signatures) signature.reset();
                 workspace_generation = 0;
                 valid = false;
             }
         };
+
+        /**
+         * @brief Borrow one exact main-verifier identity authenticated by the original preparation.
+         * @param cache Original unchanged preparation recording with authenticated source identity.
+         * @return Exact verified cached key, or empty when that program was never retained.
+         */
+        std::optional<ForwardGraphSignature> &pairedVerifierForwardSignature(
+            MTPVerifierPreparationGraphCache &cache) const;
 
         /**
          * @brief One semantic unit in a hosted retained generation branch.
@@ -8572,8 +8616,106 @@ namespace llaminar2
             mtp_shifted_prefill_hidden_rows_select_caches_;
 
         /// Active geometry/policy publication fragment used by resident MTP.
-        MTPSpeculativeStatePublicationGraphCache
-            mtp_speculative_state_publication_graph_;
+        std::array<MTPSpeculativeStatePublicationGraphCache, kSparseQueryExecutionProgramCount>
+            mtp_speculative_state_publication_graphs_;
+
+        /** Original successful tail/follower materialization; never a compile-selected sibling. */
+        std::optional<ForwardGraphSignature> mtp_publication_admission_authority_;
+
+        /** @brief Borrow the current immutable program's accepted-state child. */
+        MTPSpeculativeStatePublicationGraphCache &mtpStatePublicationCache()
+        {
+            return mtp_speculative_state_publication_graphs_.at(
+                sparseQueryExecutionProgramIndex(sparseQueryGraphProgram()));
+        }
+        /** @brief Inspect the current immutable program's accepted-state child. */
+        const MTPSpeculativeStatePublicationGraphCache &mtpStatePublicationCache() const
+        {
+            return mtp_speculative_state_publication_graphs_.at(
+                sparseQueryExecutionProgramIndex(sparseQueryGraphProgram()));
+        }
+        /**
+         * @brief Select a child only from the exact retained verifier signature.
+         * @param signature Original immutable model-forward cache key.
+         * @return The one program-owned publication cache.
+         * @throws std::invalid_argument Before mutation for foreign device, role or program.
+         */
+        MTPSpeculativeStatePublicationGraphCache &mtpStatePublicationCache(
+            const ForwardGraphSignature &signature)
+        {
+            const auto index = sparseQueryExecutionProgramIndex(signature.sparse_query_execution_program);
+            if (signature.device != state_.device_id || !signature.decode || !signature.all_position_logits ||
+                signature.batch_size <= 0 || signature.seq_len <= 0 || index >= sparseQueryProgramCount() ||
+                signature.sparse_query_execution_program != sparseQueryGraphProgram())
+                throw std::invalid_argument("Publication requires the original active-program verifier signature");
+            return mtp_speculative_state_publication_graphs_.at(index);
+        }
+        /**
+         * @brief Borrow original admission Params only through its exact retained source key.
+         * @param target Original immutable key of the sibling being prepared.
+         * @param generation Current arena lifetime; zero and stale sources are fatal.
+         * @return Original outcome/policy authority; graph-local hooks are rebuilt separately.
+         * @throws std::logic_error If source ownership or any non-program key differs.
+         */
+        const MTPSpeculativeStatePublicationStage::Params &mtpStatePublicationAuthority(
+            const ForwardGraphSignature &target, uint64_t generation) const
+        {
+            if (!mtp_publication_admission_authority_ || generation == 0 ||
+                sparseQueryExecutionProgramIndex(target.sparse_query_execution_program) >= sparseQueryProgramCount())
+                throw std::logic_error("Publication child has no original admission authority");
+            const auto &signature = *mtp_publication_admission_authority_;
+            const auto &source = mtp_speculative_state_publication_graphs_.at(
+                sparseQueryExecutionProgramIndex(signature.sparse_query_execution_program));
+            auto expected = target;
+            expected.sparse_query_execution_program = signature.sparse_query_execution_program;
+            if (!source.valid || !source.graph || !source.stage || source.verifier_signature != signature ||
+                source.workspace_generation != generation || source.pipeline_edges != pipeline_forward_edges_ ||
+                signature != expected || source.stage->getParams().request_count != target.batch_size ||
+                source.stage->getParams().verifier_rows_per_request != target.seq_len)
+                throw std::logic_error("Publication child lost its exact original admission source");
+            return source.stage->getParams();
+        }
+
+        /**
+         * @brief Retire only the exact parent borrowing a replaced program-local child.
+         * @param signature Exact active-program verifier identity, validated before mutation.
+         * @throws std::logic_error While any parent uses the shared stream/state authority.
+         */
+        void retireMTPPublicationParent(const ForwardGraphSignature &signature)
+        {
+            (void)mtpStatePublicationCache(signature);
+            if (sparseQueryParentLaunched())
+                throw std::logic_error("Cannot replace a publication child while any query parent is in flight");
+            sparse_query_generation_parents_.at(
+                sparseQueryExecutionProgramIndex(signature.sparse_query_execution_program)).invalidateGraph();
+        }
+
+        /**
+         * @brief Materialize an exact sibling publication child before parent composition.
+         * @param signature Existing replay-ready verifier cache key, never reconstructed rows.
+         * @param producer_stream Exact already-admitted outcome/parent preparation stream.
+         * @param error Receives the first ownership failure.
+         * @return False without fallback when no authenticated publication authority exists.
+         */
+        bool prepareMTPStatePublicationForVerifier(const ForwardGraphSignature &signature,
+            void *producer_stream, std::string *error);
+
+        /**
+         * @brief Retire publication hook borrows before their model-forward owners change.
+         *
+         * Enclosing parents retire first. Both child recordings and their raw
+         * verifier-stage pointers then retire, while the single certified
+         * histogram/capture producer stream stays alive until final teardown.
+         * Ordinary request reset deliberately does not call this operation.
+         */
+        void retireMTPPublicationVerifierBorrows()
+        {
+            invalidateSparseQueryParents();
+            mtp_publication_admission_authority_.reset();
+            for (auto cache = mtp_speculative_state_publication_graphs_.rbegin();
+                 cache != mtp_speculative_state_publication_graphs_.rend(); ++cache)
+                cache->replaceIdentityPreservingProducerStream();
+        }
 
         /// One immutable proposal publication graph for every legal draft slot.
         std::vector<std::unique_ptr<MTPDraftTokenPublicationGraphCache>>
@@ -8590,8 +8732,142 @@ namespace llaminar2
         std::vector<std::unique_ptr<MTPVerifierPreparationGraphCache>>
             mtp_verifier_preparation_graphs_;
 
-        /// CUDA conditional parent assembled from the exact active MTP fragments.
-        MTPDeviceGenerationLoopGraphCache mtp_device_generation_loop_graph_;
+        /**
+         * @brief Independently retained complete parents for the two closed query programs.
+         *
+         * Native children and enclosing parents never move between slots. Both
+         * programs borrow the same admitted activation/control banks and exact
+         * stream, because admission permits only one launched request. Numeric
+         * prefix/budget contents do not create another cache key or allocation.
+         */
+        std::array<MTPDeviceGenerationLoopGraphCache, kSparseQueryExecutionProgramCount>
+            sparse_query_generation_parents_;
+        /** The public host-response bridge and resident controller are distinct authorities. */
+        enum class SparseQueryAdmissionBoundary { ResidentGeneration, HostControlledResponse };
+        struct SparseQueryProgramAdmission {
+            SparseQueryExecutionProgram program;
+            SparseQueryAdmissionBoundary boundary;
+        };
+        std::optional<SparseQueryProgramAdmission> admitted_sparse_query_program_;
+        std::optional<SparseQueryExecutionProgram> compiling_sparse_query_program_;
+
+        /** @return Exact model-geometry-owned program count; never a live request heuristic. */
+        std::size_t sparseQueryProgramCount() const;
+        /** @return Program whose immutable topology is being materialized or executed. */
+        SparseQueryExecutionProgram sparseQueryGraphProgram() const noexcept
+        {
+            return compiling_sparse_query_program_.value_or(admitted_sparse_query_program_ ?
+                admitted_sparse_query_program_->program : SparseQueryExecutionProgram::RankingPossible);
+        }
+        /** @return Exact currently selected parent owner, without moving any recording. */
+        MTPDeviceGenerationLoopGraphCache &deviceGenerationLoopGraph()
+        {
+            return sparse_query_generation_parents_[sparseQueryExecutionProgramIndex(sparseQueryGraphProgram())];
+        }
+        /** @return Exact retained parent observation; no live device value is read. */
+        const MTPDeviceGenerationLoopGraphCache &deviceGenerationLoopGraph() const
+        {
+            return sparse_query_generation_parents_[sparseQueryExecutionProgramIndex(sparseQueryGraphProgram())];
+        }
+        /** @return Whether any retained program still owns an in-flight request. */
+        bool sparseQueryParentLaunched() const noexcept
+        {
+            return std::any_of(sparse_query_generation_parents_.begin(), sparse_query_generation_parents_.end(),
+                [](const auto &parent) { return parent.launched; });
+        }
+        /** @brief Retire every enclosing parent before a shared child/address owner changes. */
+        void invalidateSparseQueryParents() noexcept
+        {
+            if (sparseQueryParentLaunched()) std::terminate();
+            for (auto &parent : sparse_query_generation_parents_) parent.invalidateGraph();
+        }
+        /**
+         * @brief Select an immutable program at the existing idle admission boundary.
+         * @param admission Complete original target origins, budget and algorithm.
+         * @param boundary Original host-response or resident-controller ownership.
+         * @throws std::logic_error For a live parent, nested compilation or invalid admission.
+         */
+        void admitSparseQueryProgram(const DeviceGenerationAdmissionRequest &admission,
+            SparseQueryAdmissionBoundary boundary = SparseQueryAdmissionBoundary::ResidentGeneration);
+        /** @return Explicit per-forward topology; outside response admission the complete program applies. */
+        SparseQueryExecutionProgram sparseQueryForwardProgram(ForwardExecutionPhase phase) const noexcept
+        {
+            if (phase != ForwardExecutionPhase::Decode) return SparseQueryExecutionProgram::RankingPossible;
+            if (compiling_sparse_query_program_) return *compiling_sparse_query_program_;
+            if (admitted_sparse_query_program_ &&
+                (admitted_sparse_query_program_->boundary == SparseQueryAdmissionBoundary::HostControlledResponse ||
+                 device_generation_storage_.active_request_count != 0))
+                return admitted_sparse_query_program_->program;
+            return SparseQueryExecutionProgram::RankingPossible;
+        }
+        /**
+         * @brief Keep one serving program's ordinary output owners lexical.
+         *
+         * Condition/verifier materialization temporarily binds different logits
+         * owners. Each sibling must start from the same ordinary selection;
+         * restoring it on every exit also prevents a final role from leaking
+         * into the following setup phase. No tensor data or arena binding moves.
+         */
+        class ServingProgramBufferScope final
+        {
+        public:
+            /**
+             * @brief Bind the complete ordinary selection before building a sibling.
+             * @param owner Participant-local graph and managed-buffer authority.
+             * @param ordinary Original selection; its metadata is retained by value.
+             */
+            ServingProgramBufferScope(DeviceGraphOrchestrator &owner,
+                                      const ModelBuffers &ordinary)
+                : owner_(owner), ordinary_(ordinary)
+            {
+                owner_.setBuffers(ordinary_);
+            }
+            /** @brief Restore ordinary owners on normal and exceptional setup exits. */
+            ~ServingProgramBufferScope() noexcept
+            {
+                owner_.setBuffers(ordinary_);
+            }
+            ServingProgramBufferScope(const ServingProgramBufferScope &) = delete;
+            ServingProgramBufferScope &operator=(const ServingProgramBufferScope &) = delete;
+
+        private:
+            DeviceGraphOrchestrator &owner_; ///< Participant outlives setup.
+            const ModelBuffers ordinary_; ///< Immutable tensor-owner metadata, not tensor data.
+        };
+
+        /**
+         * @brief Cold-only lexical program selection while retaining both native owners.
+         *
+         * The selected request program never changes. This scope compiles both
+         * families under the actual admitted sampling law before their first
+         * launch, or both model forwards during unlaunched serving setup.
+         */
+        class SparseQueryProgramCompilationScope final
+        {
+        public:
+            /** @brief Borrow one idle participant's closed compile-time family. */
+            SparseQueryProgramCompilationScope(DeviceGraphOrchestrator &owner, SparseQueryExecutionProgram program)
+                : owner_(&owner)
+            {
+                const auto slot = sparseQueryExecutionProgramIndex(program);
+                if (owner.compiling_sparse_query_program_ || owner.sparseQueryParentLaunched() ||
+                    slot >= owner.sparseQueryProgramCount())
+                    throw std::logic_error("Sparse-query compilation requires one admitted idle program owner");
+                owner.compiling_sparse_query_program_ = program;
+            }
+            /** @brief Transfer lexical restoration into a cold participant-scope vector. */
+            SparseQueryProgramCompilationScope(SparseQueryProgramCompilationScope &&other) noexcept
+                : owner_(std::exchange(other.owner_, nullptr)) {}
+            /** @brief Restore the unchanged admission-selected program before launch. */
+            ~SparseQueryProgramCompilationScope()
+            {
+                if (owner_) owner_->compiling_sparse_query_program_.reset();
+            }
+            SparseQueryProgramCompilationScope(const SparseQueryProgramCompilationScope &) = delete;
+            SparseQueryProgramCompilationScope &operator=(const SparseQueryProgramCompilationScope &) = delete;
+        private:
+            DeviceGraphOrchestrator *owner_; ///< The participant outlives this setup scope.
+        };
 
         /**
          * @brief Allocation-free named child-capture transaction assembled in
@@ -11593,32 +11869,44 @@ namespace llaminar2
          *
          * This is graph-setup work only. It resolves persistent device pointers
          * and verifier-stage identities but enqueues no publication kernel.
+         * @param request Original admitted outcome and committed-state publication authority.
+         * @param publication_metadata Persistent participant-local metadata and output bindings.
+         * @param verifier_graph Exact retained verifier whose stage hooks restore accepted state.
+         * @param verifier_signature Complete original cache key paired with that verifier.
+         * @param verifier_rows_per_request Fixed physical width of the captured verifier.
+         * @param error Optional first failed ownership, geometry or lifecycle invariant.
+         * @return Whether the exact original publication identity was installed or retained.
          */
         bool materializeMTPSpeculativeStatePublicationGraph(
             const DeviceSpeculativePublicationRequest &request,
             const MTPSpecDecodeMetadataDevicePointers &publication_metadata,
             ComputeGraph &verifier_graph,
+            const ForwardGraphSignature &verifier_signature,
             int verifier_rows_per_request,
             std::string *error = nullptr);
 
         /** @brief Bind only received committed metadata and this follower's main state.
          * @param verifier_graph Exact participant-local verifier whose state is published.
+         * @param verifier_signature Immutable source key belonging to that verifier.
          * @param verifier_rows_per_request Physical captured verifier capacity.
          * @param error Optional first violated ownership or capture invariant.
          * @return Whether the local publication graph is ready for collective capture.
          * No outcome, response, penalty or predictor authority is accepted here. */
         bool materializePipelineFollowerMTPPublicationGraph(
-            ComputeGraph &verifier_graph, int verifier_rows_per_request, std::string *error = nullptr);
+            ComputeGraph &verifier_graph, const ForwardGraphSignature &verifier_signature,
+            int verifier_rows_per_request, std::string *error = nullptr);
 
         /** @brief Install one canonical publication graph for either local authority.
          * @param params Authority-specific persistent bindings, without caller-supplied checkpoints.
          * @param verifier_graph Local source of recurrent and routing-history stage identities.
+         * @param verifier_signature Exact immutable source key paired with that graph.
          * @param error Optional first violated binding invariant.
          * @return Whether the graph matches or replaces the retained identity.
          * This participant contributes its own checkpoints; shared native transport
          * is explicit graph topology and participates in cache identity. */
         bool installMTPStatePublicationGraph(MTPSpeculativeStatePublicationStage::Params params,
-            ComputeGraph &verifier_graph, std::string *error = nullptr);
+            const ComputeGraph &verifier_graph, const ForwardGraphSignature &verifier_signature,
+            std::string *error = nullptr);
 
         /**
          * @brief Replay the publication graph between two explicit event edges.

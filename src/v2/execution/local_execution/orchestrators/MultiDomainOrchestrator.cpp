@@ -200,6 +200,16 @@ namespace llaminar2
         return !inner_runner_ || inner_runner_->purgePrefixCache();
     }
 
+    bool MultiDomainOrchestrator::admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request)
+    {
+        return initialized_ && inner_runner_ && inner_runner_->admitSparseQueryExecutionProgram(request);
+    }
+
+    void MultiDomainOrchestrator::endSparseQueryExecutionProgram() noexcept
+    {
+        if (inner_runner_) inner_runner_->endSparseQueryExecutionProgram();
+    }
+
     int MultiDomainOrchestrator::get_position() const
     {
         if (!initialized_)

@@ -16807,7 +16807,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         << "The forward exporter must validate the exact preparation producer first.";
     EXPECT_NE(
         verifier_exporter.find(
-            "cache.paired_forward_signature"),
+            "pairedVerifierForwardSignature(cache)"),
         std::string::npos);
     EXPECT_NE(
         verifier_exporter.find(
@@ -17141,16 +17141,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         std::string::npos)
         << "Parent composition is a distinct all-participant prelaunch phase, not part of mailbox publication.";
     EXPECT_EQ(
-        admission.find("mtp_device_generation_loop_graph_.invalidateGraph()"),
+        admission.find("invalidateSparseQueryParents()"),
         std::string::npos)
         << "Request-content admission must preserve a parent whose complete child identity is unchanged.";
     EXPECT_NE(
-        admission.find("mtp_device_generation_loop_graph_.launched"),
+        admission.find("sparseQueryParentLaunched()"),
         std::string::npos)
         << "Admission must reject a parent launch that did not cross terminal retirement.";
     EXPECT_NE(
         terminal.find(
-            "mtp_device_generation_loop_graph_.retireCompletedLaunch()"),
+            "deviceGenerationLoopGraph().retireCompletedLaunch()"),
         std::string::npos)
         << "Only successful terminal materialization may release parent launch ownership for request reuse.";
     EXPECT_NE(

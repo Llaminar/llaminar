@@ -176,4 +176,38 @@ TEST(CPURouterQ8Publication, InvalidPublicationLeavesDestinationUntouched)
     EXPECT_FALSE(invoke({}, output.size()));
     EXPECT_EQ(std::memcmp(output.data(), poisoned.data(), sizeof(output)), 0);
 }
+/** @brief Grouped demand is exact, cold, and independent of payload lifetime. */
+TEST(CPURouterQ8Publication, GroupedConsumerDemandIsColdExactAndSurvivesRevocation)
+{
+    MoERouterQ8HiddenPublication publication;
+    EXPECT_FALSE(publication.hasRequiredConsumer());
+    EXPECT_TRUE(publication.acceptsProducerRows(1, 2560));
+    EXPECT_FALSE(publication.requireConsumerRows(0, 2560));
+    EXPECT_FALSE(publication.requireConsumerRows(-1, 2560));
+    EXPECT_FALSE(publication.requireConsumerRows(3, 0));
+    EXPECT_FALSE(publication.requireConsumerRows(3, -32));
+    EXPECT_FALSE(publication.requireConsumerRows(3, 2559));
+    EXPECT_FALSE(publication.hasRequiredConsumer());
+    ASSERT_TRUE(publication.requireConsumerRows(3, 2560));
+    EXPECT_TRUE(publication.requireConsumerRows(3, 2560));
+    EXPECT_FALSE(publication.requireConsumerRows(1, 2560));
+    EXPECT_FALSE(publication.requireConsumerRows(3, 1280));
+    EXPECT_FALSE(publication.acceptsProducerRows(1, 2560));
+    EXPECT_FALSE(publication.acceptsProducerRows(3, 1280));
+    EXPECT_TRUE(publication.acceptsProducerRows(3, 2560));
+
+    const float source = 1.0f;
+    publication.source_rows = &source;
+    EXPECT_FALSE(publication.requireConsumerRows(3, 2560));
+    publication.clearPayload();
+    EXPECT_TRUE(publication.hasRequiredConsumer());
+    EXPECT_TRUE(publication.acceptsProducerRows(3, 2560));
+    EXPECT_FALSE(publication.acceptsProducerRows(1, 2560));
+
+    // Each ordinary layer graph owns a fresh publication, not this verifier's demand.
+    MoERoutedPipelineKernelOwner ordinary_graph;
+    EXPECT_FALSE(ordinary_graph.router_q8_publication->hasRequiredConsumer());
+    EXPECT_TRUE(ordinary_graph.router_q8_publication->acceptsProducerRows(1, 2560));
+}
+
 } // namespace llaminar2::test

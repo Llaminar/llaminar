@@ -462,7 +462,11 @@ namespace llaminar2
             const CapturedServingGraphMemoryInventory graph_inventory =
                 resolveCapturedServingGraphMemoryInventory(
                     configured_prefill_buckets,
-                    request.plan.runtime.mtp);
+                    request.plan.runtime.mtp,
+                    profile.flash_next && std::any_of(profile.flash_next->sparse_decoder_layers.begin(),
+                        profile.flash_next->sparse_decoder_layers.end(), [&](auto layer) {
+                            return layer < static_cast<std::uint32_t>(profile.n_layers);
+                        }) ? kSparseQueryExecutionProgramCount : 1u);
             for (auto &cfg : device_configs)
             {
                 if (!cfg.device.is_gpu())
@@ -475,7 +479,8 @@ namespace llaminar2
                         graph_inventory.mtp_graph_owners.retainsGraphCapacity(),
                         graph_inventory.mtp_graph_owners.sidecarGraphSlots(),
                         graph_inventory.mtp_graph_owners.retainsGraphCapacity()
-                            ? graph_inventory.mtp_graph_owners.requestCapacity() : 0u);
+                            ? graph_inventory.mtp_graph_owners.requestCapacity() : 0u,
+                        graph_inventory.sparse_query_program_count);
                     cfg.graph_snapshot_memory.serving_arenas = arenas;
                     cfg.graph_snapshot_memory.retained_main_forward_arena_count = arenas.mainOwners();
                     cfg.graph_snapshot_memory.retained_forward_arena_count = arenas.allOwners();

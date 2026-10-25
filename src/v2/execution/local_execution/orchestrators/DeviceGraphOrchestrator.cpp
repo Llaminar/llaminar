@@ -5055,6 +5055,12 @@ namespace llaminar2
              */
             releaseRetainedStorageGenerationTopology();
 
+            mtp_publication_admission_authority_.reset();
+            // Publication hooks borrow verifier stages. Retire both children
+            // before the forward graph owners, borrowers before stream owner.
+            for (auto cache = mtp_speculative_state_publication_graphs_.rbegin();
+                 cache != mtp_speculative_state_publication_graphs_.rend(); ++cache) cache->invalidate();
+
             if (forward_engine_)
                 forward_engine_->discardAllCachedGraphs();
 
@@ -5100,7 +5106,6 @@ namespace llaminar2
                     cache->invalidate();
             }
 
-            mtp_speculative_state_publication_graph_.invalidate();
             // The rank's frozen topology outlives participants, but this native
             // recording embeds participant arena pointers. Release its lease
             // after all enclosing parents and before workspace reuse admission.
@@ -5624,6 +5629,7 @@ namespace llaminar2
             if (ownership_changes.empty())
                 return true;
 
+            invalidateSparseQueryParents();
             ExpertTransferResult received;
             auto manifest = ExpertWeightTransfer::buildManifest(
                 old_ownership,
@@ -5636,6 +5642,7 @@ namespace llaminar2
             applyExpertMasks(
                 masks, received.serialized, received.prepared);
 
+            retireMTPPublicationVerifierBorrows();
             if (forward_engine_)
                 forward_engine_->discardAllCachedGraphs();
             mtp_sidecar_depth0_cache_.invalidate();
@@ -5677,7 +5684,6 @@ namespace llaminar2
                 if (cache)
                     cache->invalidate();
             }
-            mtp_device_generation_loop_graph_.invalidateGraph();
             for (auto &cache : layer_graph_cache_)
                 cache.invalidate();
             device_moe_rebalance_maintenance_graph_.invalidate();
@@ -6419,6 +6425,9 @@ namespace llaminar2
         // Reinitialization replaces the arena and therefore invalidates every
         // non-owning typed view into its old allocation before the new one is
         // constructed.
+        if (sparseQueryParentLaunched() || compiling_sparse_query_program_)
+            throw std::logic_error("Arena replacement cannot retire a live sparse-query parent family");
+        releaseRetainedStorageGenerationTopology();
         clearDeviceResidentLogicalSequenceStateMailbox();
         device_resident_logical_state_access_epoch_.clear();
         device_resident_logical_sequence_state_storage_.clear();
@@ -6590,7 +6599,10 @@ namespace llaminar2
          * configured requests. Neither value is an implementation maximum:
          * changing runtime policy produces a correspondingly larger graph.
          */
-        mtp_graph_owner_plan_ = MTPGraphOwnerPlan(config.mtp);
+        mtp_graph_owner_plan_ = MTPGraphOwnerPlan(config.mtp, sparseQueryProgramCount());
+        if (mtp_graph_owner_plan_.retainsGraphCapacity() &&
+            mtp_graph_owner_plan_.speculativePublicationGraphSlots() != sparseQueryProgramCount())
+            throw std::logic_error("MTP publication owners differ from the typed native graph BOM");
         mtp_max_draft_depth_ = mtp_graph_owner_plan_.draftDepth();
         mtp_max_verifier_rows_ =
             mtp_graph_owner_plan_.verifierRowsPerRequest();
@@ -6884,7 +6896,7 @@ namespace llaminar2
                         MTPDraftTokenPublicationGraphCache>());
             }
             mtp_verifier_preparation_graphs_.clear();
-            mtp_device_generation_loop_graph_.invalidateGraph();
+            invalidateSparseQueryParents();
             const size_t verifier_preparation_registry_size =
                 mtp_graph_owner_plan_.retainsGraphCapacity()
                     ? mtp_graph_owner_plan_
@@ -6924,15 +6936,21 @@ namespace llaminar2
             mtp_device_generation_loop_fragment_scratch_.clear();
             mtp_device_generation_loop_fragment_scratch_.reserve(
                 device_generation_dynamic_fragment_capacity);
-            mtp_device_generation_loop_graph_.source_fragments.clear();
-            mtp_device_generation_loop_graph_.source_fragments.reserve(
-                device_generation_dynamic_fragment_capacity);
+            for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
+            {
+                auto &parent = sparse_query_generation_parents_[program];
+                parent.source_fragments.clear();
+                parent.source_fragments.reserve(device_generation_dynamic_fragment_capacity);
+            }
             mtp_device_generation_loop_hosted_fragment_scratch_.clear();
             mtp_device_generation_loop_hosted_fragment_scratch_.reserve(
                 device_generation_dynamic_fragment_capacity);
-            mtp_device_generation_loop_graph_.hosted_fragments.clear();
-            mtp_device_generation_loop_graph_.hosted_fragments.reserve(
-                device_generation_dynamic_fragment_capacity);
+            for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
+            {
+                auto &parent = sparse_query_generation_parents_[program];
+                parent.hosted_fragments.clear();
+                parent.hosted_fragments.reserve(device_generation_dynamic_fragment_capacity);
+            }
             const size_t stochastic_topk_partial_capacity =
                 static_cast<size_t>(stochastic_target_row_capacity_) *
                 kStochasticTopKPartialBlocks *
@@ -7926,7 +7944,7 @@ namespace llaminar2
                 return false;
             }
             const int loop_device_ordinal = state_.device_id.gpu_ordinal();
-            mtp_device_generation_loop_graph_.stream.reset(
+            sparse_query_generation_parents_[0].stream.reset(
                 raw_loop_stream,
                 [backend, loop_device_ordinal](void *stream)
                 {
@@ -7938,8 +7956,14 @@ namespace llaminar2
                 auto &gpu_context =
                     GPUDeviceContextPool::instance().getContext(
                         state_.device_id);
-                mtp_device_generation_loop_graph_.capture =
-                    gpu_context.createGraphCapture(raw_loop_stream);
+                for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
+                {
+                    auto &parent = sparse_query_generation_parents_[program];
+                    parent.stream = sparse_query_generation_parents_[0].stream;
+                    parent.capture = gpu_context.createGraphCapture(raw_loop_stream);
+                    if (!parent.capture)
+                        throw std::runtime_error("Sparse-query generation family has no exact native capture owner");
+                }
             }
             catch (const std::exception &exception)
             {
@@ -7949,7 +7973,7 @@ namespace llaminar2
                 releaseRetainedStorageGenerationTopology();
                 return false;
             }
-            if (!mtp_device_generation_loop_graph_.capture)
+            if (!deviceGenerationLoopGraph().capture)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] GPU context returned no device-generation graph owner on "
                           << state_.device_id.toString());
@@ -7969,7 +7993,7 @@ namespace llaminar2
                 "initialization",
                 state_.device_id.toString(),
                 {{"backend",
-                  mtp_device_generation_loop_graph_.capture->backendName()}});
+                  deviceGenerationLoopGraph().capture->backendName()}});
         }
         else
         {
@@ -8691,6 +8715,7 @@ namespace llaminar2
          */
         std::vector<int> position_ids_storage;
         ForwardInput effective_input = input;
+        effective_input.sparse_query_execution_program = sparseQueryForwardProgram(input.execution_phase);
 
         if (!input.position_ids && !input.position_ids_device)
         {
@@ -8744,6 +8769,16 @@ namespace llaminar2
             }
             return false;
         }
+        if (effective_input.execution_phase == ForwardExecutionPhase::Decode &&
+            effective_input.graph_submission_intent == ForwardGraphSubmissionIntent::Execute &&
+            sparseQueryProgramCount() > 1u)
+            PerfStatsCollector::addCounter("qsa", "query_program_forward_submissions", 1.0,
+                "decode", state_.device_id.toString(),
+                {{"program", effective_input.sparse_query_execution_program == SparseQueryExecutionProgram::ProvenNoRanking ?
+                    "proven_no_ranking" : "ranking_possible"},
+                 {"role", std::to_string(static_cast<int>(effective_input.execution_role))},
+                 {"physical_rows", std::to_string(effective_input.seq_len)},
+                 {"observation", "successful_forward_submission_not_native_replay_count"}});
         /*
          * Expert maintenance is a decode-transaction operation, not a raw
          * forward epilogue.  In particular, an MTP grouped verifier forward is
@@ -11775,9 +11810,9 @@ namespace llaminar2
         {
             if (!retire_pending_release_before_identity_change())
                 return false;
+            invalidateSparseQueryParents();
             moe_overlay_epoch_acquire_graph_.invalidate();
             moe_overlay_epoch_release_graph_.invalidate();
-            mtp_device_generation_loop_graph_.invalidateGraph();
             moe_overlay_epoch_acquired_event_.reset();
             moe_overlay_epoch_released_event_.reset();
             moe_overlay_epoch_acquire_producer_stream_ = nullptr;
@@ -11889,7 +11924,7 @@ namespace llaminar2
             auto graph = std::make_unique<ComputeGraph>();
             graph->addNode(node_name, std::move(stage), state_.device_id);
 
-            mtp_device_generation_loop_graph_.invalidateGraph();
+            invalidateSparseQueryParents();
             cache.invalidate();
             cache.graph = std::move(graph);
             cache.stage = stage_view;
@@ -17236,204 +17271,73 @@ namespace llaminar2
             return false;
         }
 
-        ForwardInput decode_input;
-        decode_input.token_ids = nullptr;
-        decode_input.token_ids_device = request_token_ids_dev_;
-        decode_input.position_ids = nullptr;
-        decode_input.position_ids_device = request_position_ids_dev_;
-        decode_input.device_decode_position = DeviceDecodePositionBinding{
-            .backend = getBackendFor(state_.device_id),
-            .cached_tokens = state_.kv_cache->deviceSequenceCachedTokenCountPtr(0),
-            .position = static_cast<int32_t *>(request_position_ids_dev_)};
-        decode_input.position_policy = ForwardPositionPolicy::ExplicitRows;
-        decode_input.execution_role = ForwardExecutionRole::MainInference;
-        decode_input.execution_phase = ForwardExecutionPhase::Decode;
-        decode_input.graph_submission_intent =
-            ForwardGraphSubmissionIntent::
-                MaterializeExecutableWithoutLaunch;
-        decode_input.batch_size = 1;
-        decode_input.seq_len = 1;
-        decode_input.real_seq_len = 1;
-        decode_input.bucket_seq_len = 0;
-        decode_input.position_offset = 1;
-        decode_input.token_offset = 1;
-        decode_input.moe_overlay_collective_generation_id = 1;
-        decode_input.moe_overlay_collective_step_id = 1;
-        decode_input.device_state_publication_stream = publication_stream;
-        decode_input.device = state_.device_id;
-        decode_input.kv_cache = state_.kv_cache.get();
-        decode_input.sequence_lengths = nullptr;
-        decode_input.sequence_lengths_device = nullptr;
-        decode_input.rehydrate_prefix_runtime_on_device = false;
-        decode_input.external_hidden_state = plan.pipeline_hidden_input;
-        if (!bindShiftedMTPPrefillTransaction(
-                decode_input, /*request_count=*/1))
+        for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
         {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving decode graph setup could "
-                "not bind its production MTP contract");
-            return false;
-        }
-        if (!bindMTPMainTerminalHiddenTransaction(
-                decode_input, /*request_count=*/1))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving decode graph setup could "
-                "not bind its graph-integrated MTP terminal publication");
-            return false;
-        }
-
-        ForwardOutput decode_output;
-        decode_output.logits = state_.logits.get();
-        decode_output.hidden = state_.hidden.get();
-        bool decode_materialized = false;
-        {
-            ServingGraphMaterializationPhaseTrace phase(
-                state_.device_id, "history_bearing_serial_decode");
-            decode_materialized = executeForward(
-                decode_input, decode_output);
-        }
-        if (!decode_materialized)
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Failed to capture and instantiate "
-                "the history-bearing serial decode executable without launch");
-            return false;
-        }
-        PerfStatsCollector::addCounter(
-            "forward_graph",
-            "serving_graph_family_materializations",
-            1.0,
-            "setup",
-            state_.device_id.toString(),
-            {{"role", "main_decode"},
-             {"physical_rows", "1"},
-             {"decode_history", "present"},
-             {"submission", "materialized_unlaunched"},
-             {"capacity_authority", "orchestration_memory_plan"}});
-
-        {
-            // The complete generation controller consumes a device-owned
-            // condition token. Its input address and pipeline ingress differ
-            // from the host-token serial graph above. Retain that exact
-            // forward now; OrdinaryGenerationGraphPlan already prices its
-            // independent executable. No request or sampler is admitted here.
-            ServingGraphMaterializationPhaseTrace phase(
-                state_.device_id, "device_resident_ordinary_forward");
-            std::string error;
-            if (!materializeOrdinaryGenerationForward(
-                    device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
-                    ordinaryForwardRetentionKind(), &error))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Serving graph setup could not retain "
-                          "its device-resident ordinary forward: " << error);
-                return false;
-            }
-            PerfStatsCollector::addCounter(
-                "forward_graph", "serving_graph_family_materializations", 1.0,
-                "setup", state_.device_id.toString(),
-                {{"role", "device_resident_main_decode"}, {"physical_rows", "1"},
-                 {"submission", "materialized_unlaunched"},
-                 {"capacity_authority", "orchestration_memory_plan"}});
-        }
-
-        if (graph_builder_ && graph_builder_->config().mtp.enabled)
-        {
-            /*
-             * A one-token suffix following prefix restore shares decode math
-             * with the ordinary history-bearing graph, but its terminal node
-             * additionally advances shifted depth-zero MTP KV. Capture that
-             * complete transaction as a distinct typed family member. The
-             * device token/geometry addresses are the same request-admission
-             * owners used at runtime; no synthetic inference is launched.
-             */
-            if (!device_resident_logical_sequence_state_storage_.validFor(
-                    /*request_count=*/1))
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Serving graph setup has no "
-                    "persistent MTP logical-state mailbox storage");
-                return false;
-            }
-
-            TensorBase *bridge_logits_output = state_.logits.get();
-            TensorBase *bridge_logits_local_output =
-                state_.logits_local.get();
-            if (!bindAllPositionLogitsOutputs(
-                    ForwardExecutionRole::MTPCondition,
-                    /*rows=*/1,
-                    bridge_logits_output,
-                    bridge_logits_local_output))
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Serving graph setup could not "
-                    "bind the restored-prefix MTP condition logits surface");
-                return false;
-            }
-            ModelBuffers bridge_model_buffers = state_.toModelBuffers();
-            bridge_model_buffers.logits = bridge_logits_output;
-            bridge_model_buffers.logits_local =
-                bridge_logits_local_output;
-            setBuffers(bridge_model_buffers);
-
-            ForwardInput bridge_input = decode_input;
-            bridge_input.token_ids = nullptr;
-            bridge_input.token_ids_device =
-                device_resident_logical_sequence_state_storage_
-                    .next_condition_tokens_device;
-            bridge_input.position_ids_device =
-                device_resident_logical_sequence_state_storage_
-                    .target_cached_tokens_device;
-            bridge_input.sequence_lengths_device =
-                device_resident_logical_sequence_state_storage_
-                    .target_cached_tokens_device;
-            bridge_input.device_decode_position.reset();
-            bridge_input.position_offset = 0;
-            bridge_input.token_offset = 0;
-            bridge_input.execution_role =
-                ForwardExecutionRole::MTPCondition;
-            bridge_input.state_transaction =
-                ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
-            bridge_input.shifted_mtp_prefill.reset();
-            bridge_input.mtp_main_terminal_hidden.reset();
+            ServingProgramBufferScope buffer_scope(*this, model_buffers);
+            SparseQueryProgramCompilationScope program_scope(*this,
+                program == 0 ? SparseQueryExecutionProgram::RankingPossible : SparseQueryExecutionProgram::ProvenNoRanking);
+            ForwardInput decode_input;
+            decode_input.token_ids = nullptr;
+            decode_input.token_ids_device = request_token_ids_dev_;
+            decode_input.position_ids = nullptr;
+            decode_input.position_ids_device = request_position_ids_dev_;
+            decode_input.device_decode_position = DeviceDecodePositionBinding{
+                .backend = getBackendFor(state_.device_id),
+                .cached_tokens = state_.kv_cache->deviceSequenceCachedTokenCountPtr(0),
+                .position = static_cast<int32_t *>(request_position_ids_dev_)};
+            decode_input.position_policy = ForwardPositionPolicy::ExplicitRows;
+            decode_input.execution_role = ForwardExecutionRole::MainInference;
+            decode_input.execution_phase = ForwardExecutionPhase::Decode;
+            decode_input.graph_submission_intent =
+                ForwardGraphSubmissionIntent::
+                    MaterializeExecutableWithoutLaunch;
+            decode_input.batch_size = 1;
+            decode_input.seq_len = 1;
+            decode_input.real_seq_len = 1;
+            decode_input.bucket_seq_len = 0;
+            decode_input.position_offset = 1;
+            decode_input.token_offset = 1;
+            decode_input.moe_overlay_collective_generation_id = 1;
+            decode_input.moe_overlay_collective_step_id = 1;
+            decode_input.device_state_publication_stream = publication_stream;
+            decode_input.device = state_.device_id;
+            decode_input.kv_cache = state_.kv_cache.get();
+            decode_input.sequence_lengths = nullptr;
+            decode_input.sequence_lengths_device = nullptr;
+            decode_input.rehydrate_prefix_runtime_on_device = false;
+            decode_input.external_hidden_state = plan.pipeline_hidden_input;
             if (!bindShiftedMTPPrefillTransaction(
-                    bridge_input, /*request_count=*/1) ||
-                !bindMTPMainTerminalHiddenTransaction(
-                    bridge_input, /*request_count=*/1))
+                    decode_input, /*request_count=*/1))
             {
                 LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Serving graph setup could not "
-                    "bind its restored-prefix MTP decode bridge");
+                    "[DeviceGraphOrchestrator] Serving decode graph setup could "
+                    "not bind its production MTP contract");
+                return false;
+            }
+            if (!bindMTPMainTerminalHiddenTransaction(
+                    decode_input, /*request_count=*/1))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Serving decode graph setup could "
+                    "not bind its graph-integrated MTP terminal publication");
                 return false;
             }
 
-            ForwardOutput bridge_output;
-            bridge_output.logits = bridge_logits_output;
-            bridge_output.hidden = state_.hidden.get();
-            ScopedLiveMTPRequestBatchConditionPolicy condition_scope(
-                graph_builder_.get(),
-                &live_mtp_request_batch_condition_,
-                /*enable=*/true);
-            if (!condition_scope.ready())
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Serving graph setup could not "
-                    "install its restored-prefix MTP condition policy");
-                return false;
-            }
-            bool bridge_materialized = false;
+            ForwardOutput decode_output;
+            decode_output.logits = state_.logits.get();
+            decode_output.hidden = state_.hidden.get();
+            bool decode_materialized = false;
             {
                 ServingGraphMaterializationPhaseTrace phase(
-                    state_.device_id,
-                    "restored_prefix_mtp_decode_bridge");
-                bridge_materialized = executeForward(
-                    bridge_input, bridge_output);
+                    state_.device_id, "history_bearing_serial_decode");
+                decode_materialized = executeForward(
+                    decode_input, decode_output);
             }
-            if (!bridge_materialized)
+            if (!decode_materialized)
             {
                 LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Failed to capture and "
-                    "instantiate the restored-prefix MTP decode bridge");
+                    "[DeviceGraphOrchestrator] Failed to capture and instantiate "
+                    "the history-bearing serial decode executable without launch");
                 return false;
             }
             PerfStatsCollector::addCounter(
@@ -17442,25 +17346,163 @@ namespace llaminar2
                 1.0,
                 "setup",
                 state_.device_id.toString(),
-                {{"role", "restored_prefix_mtp_decode_bridge"},
+                {{"role", "main_decode"},
                  {"physical_rows", "1"},
                  {"decode_history", "present"},
                  {"submission", "materialized_unlaunched"},
                  {"capacity_authority", "orchestration_memory_plan"}});
-        }
 
-        {
-            ServingGraphMaterializationPhaseTrace phase(
-                state_.device_id, "mtp_forward_executable_family");
-            if (!materializeMTPServingForwardExecutablesWithoutLaunch(
-                    plan.pipeline_hidden_input,
-                    publication_stream))
             {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Serving graph setup could not "
-                    "materialize its complete MTP forward family");
-                return false;
+                // The complete generation controller consumes a device-owned
+                // condition token. Its input address and pipeline ingress differ
+                // from the host-token serial graph above. Retain that exact
+                // forward now; OrdinaryGenerationGraphPlan already prices its
+                // independent executable. No request or sampler is admitted here.
+                ServingGraphMaterializationPhaseTrace phase(
+                    state_.device_id, "device_resident_ordinary_forward");
+                std::string error;
+                if (!materializeOrdinaryGenerationForward(
+                        device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
+                        ordinaryForwardRetentionKind(), &error))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Serving graph setup could not retain "
+                              "its device-resident ordinary forward: " << error);
+                    return false;
+                }
+                PerfStatsCollector::addCounter(
+                    "forward_graph", "serving_graph_family_materializations", 1.0,
+                    "setup", state_.device_id.toString(),
+                    {{"role", "device_resident_main_decode"}, {"physical_rows", "1"},
+                     {"submission", "materialized_unlaunched"},
+                     {"capacity_authority", "orchestration_memory_plan"}});
             }
+
+            if (graph_builder_ && graph_builder_->config().mtp.enabled)
+            {
+                /*
+                 * A one-token suffix following prefix restore shares decode math
+                 * with the ordinary history-bearing graph, but its terminal node
+                 * additionally advances shifted depth-zero MTP KV. Capture that
+                 * complete transaction as a distinct typed family member. The
+                 * device token/geometry addresses are the same request-admission
+                 * owners used at runtime; no synthetic inference is launched.
+                 */
+                if (!device_resident_logical_sequence_state_storage_.validFor(
+                        /*request_count=*/1))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Serving graph setup has no "
+                        "persistent MTP logical-state mailbox storage");
+                    return false;
+                }
+
+                TensorBase *bridge_logits_output = state_.logits.get();
+                TensorBase *bridge_logits_local_output =
+                    state_.logits_local.get();
+                if (!bindAllPositionLogitsOutputs(
+                        ForwardExecutionRole::MTPCondition,
+                        /*rows=*/1,
+                        bridge_logits_output,
+                        bridge_logits_local_output))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Serving graph setup could not "
+                        "bind the restored-prefix MTP condition logits surface");
+                    return false;
+                }
+                ModelBuffers bridge_model_buffers = state_.toModelBuffers();
+                bridge_model_buffers.logits = bridge_logits_output;
+                bridge_model_buffers.logits_local =
+                    bridge_logits_local_output;
+                setBuffers(bridge_model_buffers);
+
+                ForwardInput bridge_input = decode_input;
+                bridge_input.token_ids = nullptr;
+                bridge_input.token_ids_device =
+                    device_resident_logical_sequence_state_storage_
+                        .next_condition_tokens_device;
+                bridge_input.position_ids_device =
+                    device_resident_logical_sequence_state_storage_
+                        .target_cached_tokens_device;
+                bridge_input.sequence_lengths_device =
+                    device_resident_logical_sequence_state_storage_
+                        .target_cached_tokens_device;
+                bridge_input.device_decode_position.reset();
+                bridge_input.position_offset = 0;
+                bridge_input.token_offset = 0;
+                bridge_input.execution_role =
+                    ForwardExecutionRole::MTPCondition;
+                bridge_input.state_transaction =
+                    ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
+                bridge_input.shifted_mtp_prefill.reset();
+                bridge_input.mtp_main_terminal_hidden.reset();
+                if (!bindShiftedMTPPrefillTransaction(
+                        bridge_input, /*request_count=*/1) ||
+                    !bindMTPMainTerminalHiddenTransaction(
+                        bridge_input, /*request_count=*/1))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Serving graph setup could not "
+                        "bind its restored-prefix MTP decode bridge");
+                    return false;
+                }
+
+                ForwardOutput bridge_output;
+                bridge_output.logits = bridge_logits_output;
+                bridge_output.hidden = state_.hidden.get();
+                ScopedLiveMTPRequestBatchConditionPolicy condition_scope(
+                    graph_builder_.get(),
+                    &live_mtp_request_batch_condition_,
+                    /*enable=*/true);
+                if (!condition_scope.ready())
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Serving graph setup could not "
+                        "install its restored-prefix MTP condition policy");
+                    return false;
+                }
+                bool bridge_materialized = false;
+                {
+                    ServingGraphMaterializationPhaseTrace phase(
+                        state_.device_id,
+                        "restored_prefix_mtp_decode_bridge");
+                    bridge_materialized = executeForward(
+                        bridge_input, bridge_output);
+                }
+                if (!bridge_materialized)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Failed to capture and "
+                        "instantiate the restored-prefix MTP decode bridge");
+                    return false;
+                }
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "serving_graph_family_materializations",
+                    1.0,
+                    "setup",
+                    state_.device_id.toString(),
+                    {{"role", "restored_prefix_mtp_decode_bridge"},
+                     {"physical_rows", "1"},
+                     {"decode_history", "present"},
+                     {"submission", "materialized_unlaunched"},
+                     {"capacity_authority", "orchestration_memory_plan"}});
+            }
+
+            {
+                ServingGraphMaterializationPhaseTrace phase(
+                    state_.device_id, "mtp_forward_executable_family");
+                if (!materializeMTPServingForwardExecutablesWithoutLaunch(
+                        plan.pipeline_hidden_input,
+                        publication_stream))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Serving graph setup could not "
+                        "materialize its complete MTP forward family");
+                    return false;
+                }
+            }
+
         }
 
         if (mtp_wide_checkpoint_lane_first &&
@@ -20919,7 +20961,7 @@ namespace llaminar2
             std::move(stage),
             state_.device_id);
 
-        mtp_device_generation_loop_graph_.invalidateGraph();
+        invalidateSparseQueryParents();
         cache.invalidate();
         cache.graph = std::move(graph);
         cache.stage = rows_select_stage;
@@ -23096,7 +23138,7 @@ namespace llaminar2
         if (!cache || cache->graph.get() != validated_graph)
             return fail("hosted MTP sidecar cache identity changed after validation");
         void *const replay_stream = cache->segment_cache.capture_stream;
-        auto &loop = mtp_device_generation_loop_graph_;
+        auto &loop = deviceGenerationLoopGraph();
         IWorkerGPUContext *const replay_context =
             cache->segment_cache.gpu_ctx_ref;
         if (!loop.stream || !replay_context ||
@@ -23363,7 +23405,7 @@ namespace llaminar2
             *params,
             launch_dependency,
             *this,
-            mtp_device_generation_loop_graph_.stream.get(),
+            deviceGenerationLoopGraph().stream.get(),
             &producer_stream,
             &retained_error);
         std::string finish_error;
@@ -23674,9 +23716,9 @@ namespace llaminar2
             mtpVerifierPreparationRegistryIndex(key, &registry_error);
         if (!registry_index)
             return reject(registry_error);
-        const auto &cache =
+        auto &cache =
             *mtp_verifier_preparation_graphs_[*registry_index];
-        if (!cache.paired_forward_signature)
+        if (!pairedVerifierForwardSignature(cache))
         {
             return reject(
                 "exact grouped-verifier preparation has no paired forward signature");
@@ -23684,7 +23726,7 @@ namespace llaminar2
 
         std::string forward_error;
         auto forward = forward_engine_->deviceLoopGraphTemplate(
-            *cache.paired_forward_signature,
+            *pairedVerifierForwardSignature(cache),
             &forward_error);
         if (!forward)
         {
@@ -23761,6 +23803,7 @@ namespace llaminar2
         const auto &signature = forward->signature;
         if (forward->device != state_.device_id ||
             signature.device != state_.device_id || !signature.decode ||
+            signature.sparse_query_execution_program != sparseQueryGraphProgram() ||
             !signature.all_position_logits ||
             signature.seq_len != key.padded_seq_len ||
             signature.batch_size != key.request_count ||
@@ -23861,12 +23904,26 @@ namespace llaminar2
                 replay_error);
         }
 
-        if (cache.paired_forward_signature &&
-            !(*cache.paired_forward_signature == signature))
+        std::array<std::optional<ForwardGraphSignature>, kSparseQueryExecutionProgramCount> paired;
+        for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
         {
-            mtp_device_generation_loop_graph_.invalidateGraph();
+            auto sibling = signature;
+            sibling.sparse_query_execution_program = program == 0 ? SparseQueryExecutionProgram::RankingPossible :
+                SparseQueryExecutionProgram::ProvenNoRanking;
+            std::string sibling_error;
+            const bool sibling_ready = execution_policy == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions ?
+                static_cast<bool>(forward_engine_->retainedDecodeGraph(sibling, &sibling_error)) :
+                static_cast<bool>(forward_engine_->deviceLoopGraphTemplate(sibling, &sibling_error));
+            if (!sibling_ready)
+                return fail("Grouped verifier lacks its exact sealed query-program sibling: " + sibling_error);
+            paired[program] = sibling;
         }
-        cache.paired_forward_signature = signature;
+        bool changed = false;
+        for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
+            changed = changed || (cache.paired_forward_signatures[program] &&
+                cache.paired_forward_signatures[program] != paired[program]);
+        if (changed) invalidateSparseQueryParents();
+        cache.paired_forward_signatures = std::move(paired);
         return true;
     }
 
@@ -23961,7 +24018,7 @@ namespace llaminar2
                 "speculative state-publication loop composition requires a GPU runner");
         }
 
-        const auto &cache = mtp_speculative_state_publication_graph_;
+        const auto &cache = mtpStatePublicationCache();
         if (!cache.valid || !cache.graph || !cache.stage)
             return reject("speculative state-publication graph is not initialized");
         if (cache.workspace_generation == 0 ||
@@ -23972,7 +24029,9 @@ namespace llaminar2
                 "speculative state-publication graph belongs to a stale workspace generation");
         }
         const auto &params = cache.stage->getParams();
-        if (request_count <= 0 || verifier_rows_per_request <= 0 ||
+        if (!cache.verifier_signature ||
+            cache.verifier_signature->sparse_query_execution_program != sparseQueryGraphProgram() ||
+            request_count <= 0 || verifier_rows_per_request <= 0 ||
             params.request_count != request_count ||
             params.verifier_rows_per_request != verifier_rows_per_request)
         {
@@ -24173,7 +24232,7 @@ namespace llaminar2
     {
         using namespace sampling_math;
 
-        auto &loop = mtp_device_generation_loop_graph_;
+        auto &loop = deviceGenerationLoopGraph();
         auto fail = [&](const std::string &reason) -> bool
         {
             loop.invalidateGraph();
@@ -24620,16 +24679,16 @@ namespace llaminar2
                         key, &fragment_error);
                 if (!registry_index)
                     return false;
-                const auto &preparation_cache =
+                auto &preparation_cache =
                     *mtp_verifier_preparation_graphs_[*registry_index];
-                if (!preparation_cache.paired_forward_signature ||
+                if (!pairedVerifierForwardSignature(preparation_cache) ||
                     !forward_engine_)
                 {
                     return fail(
                         "hosted grouped verifier has no exact paired forward signature");
                 }
                 const ForwardGraphSignature &signature =
-                    *preparation_cache.paired_forward_signature;
+                    *pairedVerifierForwardSignature(preparation_cache);
                 const MTPVerifierOutcomeGraphMode expected_outcome_mode =
                     sampling_mode == DeviceGenerationSamplingMode::Greedy
                         ? MTPVerifierOutcomeGraphMode::Greedy
@@ -24706,6 +24765,16 @@ namespace llaminar2
             }
 
             fragment_error.clear();
+            const MTPVerifierPreparationGraphKey publication_key{
+                .control_policy = MTPVerifierPreparationControlPolicy::DeviceGenerationControlled,
+                .request_count = request_count, .padded_seq_len = physical_verifier_rows_per_request};
+            const auto publication_index = mtpVerifierPreparationRegistryIndex(publication_key, &fragment_error);
+            if (!publication_index || !mtp_verifier_preparation_graphs_[*publication_index] ||
+                !pairedVerifierForwardSignature(*mtp_verifier_preparation_graphs_[*publication_index]) ||
+                !prepareMTPStatePublicationForVerifier(
+                    *pairedVerifierForwardSignature(*mtp_verifier_preparation_graphs_[*publication_index]),
+                    loop.stream.get(), &fragment_error))
+                return fail("Exact verifier publication child is not prepared: " + fragment_error);
             auto state_publication =
                 mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
                     request_count,
@@ -33873,7 +33942,7 @@ namespace llaminar2
             std::move(stage),
             state_.device_id);
 
-        mtp_device_generation_loop_graph_.invalidateGraph();
+        invalidateSparseQueryParents();
         cache.invalidate();
         cache.graph = std::move(graph);
         cache.stage = draft_stage;
@@ -34092,7 +34161,7 @@ namespace llaminar2
             std::move(stage),
             state_.device_id);
 
-        mtp_device_generation_loop_graph_.invalidateGraph();
+        invalidateSparseQueryParents();
         cache.invalidate();
         cache.key = requested_key;
         cache.graph = std::move(graph);
@@ -34391,7 +34460,7 @@ namespace llaminar2
             std::move(stage),
             state_.device_id);
 
-        mtp_device_generation_loop_graph_.invalidateGraph();
+        invalidateSparseQueryParents();
         cache.invalidate();
         cache.graph = std::move(graph);
         cache.stage = target_stage;
@@ -34851,7 +34920,7 @@ namespace llaminar2
             std::move(stage),
             state_.device_id);
 
-        mtp_device_generation_loop_graph_.invalidateGraph();
+        invalidateSparseQueryParents();
         cache.invalidate();
         cache.graph = std::move(graph);
         cache.stage = outcome_stage;
@@ -36097,6 +36166,7 @@ namespace llaminar2
                 request,
                 publication_ptrs,
                 *verifier_graph->graph,
+                verifier_graph->signature,
                 verifier_graph->signature.seq_len,
                 error))
         {
@@ -52148,7 +52218,7 @@ namespace llaminar2
         if (!state_.device_id.is_gpu() || !graph_builder_)
             return DeviceGenerationExecutionPolicy::Unsupported;
 
-        const auto &capture = mtp_device_generation_loop_graph_.capture;
+        const auto &capture = deviceGenerationLoopGraph().capture;
         if (!capture)
             return DeviceGenerationExecutionPolicy::Unsupported;
 
@@ -52264,7 +52334,7 @@ namespace llaminar2
                       << active_device_generation_admission_.has_value());
             return false;
         }
-        if (mtp_device_generation_loop_graph_.launched)
+        if (sparseQueryParentLaunched())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found an unretired loop launch");
             return false;
@@ -52279,7 +52349,7 @@ namespace llaminar2
             return false;
         }
         if (!hosted_device_generation_cursor_.inactive() ||
-            !mtp_device_generation_loop_graph_.hosted_advance.idle())
+            !deviceGenerationLoopGraph().hosted_advance.idle())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found an unretired hosted scheduler lifecycle");
             return false;
@@ -52292,6 +52362,8 @@ namespace llaminar2
                 stream, DeviceTimelineRole::RequestAdmissionTransfer,
                 "beginDeviceResidentGeneration"))
             return false;
+
+        admitSparseQueryProgram(request);
 
         const auto forward_failure_policy=graph_builder_->deviceGenerationForwardFailurePolicy();
         using ForwardFailurePolicy=sampling_math::DeviceGenerationForwardFailurePolicy;
@@ -52489,7 +52561,8 @@ namespace llaminar2
             1.0,
             "decode",
             state_.device_id.toString(),
-            {{"request_count", std::to_string(request.request_count)},
+            {{"sparse_query_program", sparseQueryGraphProgram() == SparseQueryExecutionProgram::ProvenNoRanking ? "proven_no_ranking" : "ranking_possible"},
+             {"request_count", std::to_string(request.request_count)},
              {"admission_boundary", request.kind == sampling_math::DeviceGenerationAdmissionKind::ContinueResponse
                  ? "continue_response" : "new_request"},
              {"max_new_tokens", std::to_string(request.max_new_tokens)},
@@ -52570,6 +52643,8 @@ namespace llaminar2
          * outstanding event makes it impossible to substitute an uncaptured
          * graph or silently omit the first maintenance transaction.
          */
+        const bool prepare_first_transaction_boundary = !compiling_sparse_query_program_ ||
+            sparseQueryExecutionProgramIndex(*compiling_sparse_query_program_) == 0;
         const bool owns_dynamic_device_maintenance =
             usesParticipantLocalDeviceMoERebalanceController();
         /*
@@ -52581,7 +52656,7 @@ namespace llaminar2
          * a non-due boundary cheap, while a due edge must reset its countdown
          * before the parent's next verifier admission.
          */
-        if (owns_dynamic_device_maintenance &&
+        if (prepare_first_transaction_boundary && owns_dynamic_device_maintenance &&
             !maybeRunDeviceMoERebalanceMaintenanceGraph())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation parent preparation could not launch the first committed MoE maintenance boundary"
@@ -52598,9 +52673,9 @@ namespace llaminar2
          * first use and makes the first internal acquire legal. Static overlay
          * reaches the same path without manufacturing a maintenance graph.
          */
-        if (moe_overlay_epoch_execution_binding_)
+        if (prepare_first_transaction_boundary && moe_overlay_epoch_execution_binding_)
         {
-            auto &loop = mtp_device_generation_loop_graph_;
+            auto &loop = deviceGenerationLoopGraph();
             void *const parent_stream = loop.stream.get();
             const char *const parent_name =
                 configured_depth_policy.isOrdinary()
@@ -52626,39 +52701,52 @@ namespace llaminar2
             }
         }
 
-        std::string error;
-        if (configured_depth_policy.isOrdinary())
+        const auto compile_program = [&]() -> bool
         {
-            // Pipeline placement and sparse request ownership are independent
-            // axes. Their combined terminal retains both captured PP edges and
-            // the ExpertOverlay semantic replay used to bind sparse identity.
-            const bool pipeline_domain = pipeline_forward_edges_ &&
-                pipeline_forward_edges_->hasHeterogeneousBoundary();
-            const auto composition = moe_overlay_epoch_execution_binding_
-                ? (pipeline_domain ? OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail
-                                   : OrdinaryGenerationComposition::ExpertOverlay)
-                : (pipeline_domain ? OrdinaryGenerationComposition::PipelineDomainTail
-                                   : OrdinaryGenerationComposition::CompleteLocal);
-            if (draft_depth != 0 ||
-                !materializeOrdinaryDeviceGenerationLoopGraph(
-                    sampling_mode,
-                    &error,
-                    composition))
+            std::string error;
+            if (configured_depth_policy.isOrdinary())
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Ordinary generation preparation failed: " << error);
+                // Pipeline placement and sparse request ownership are independent
+                // axes. Their combined terminal retains both captured PP edges and
+                // the ExpertOverlay semantic replay used to bind sparse identity.
+                const bool pipeline_domain = pipeline_forward_edges_ &&
+                    pipeline_forward_edges_->hasHeterogeneousBoundary();
+                const auto composition = moe_overlay_epoch_execution_binding_
+                    ? (pipeline_domain ? OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail
+                                       : OrdinaryGenerationComposition::ExpertOverlay)
+                    : (pipeline_domain ? OrdinaryGenerationComposition::PipelineDomainTail
+                                       : OrdinaryGenerationComposition::CompleteLocal);
+                if (draft_depth != 0 ||
+                    !materializeOrdinaryDeviceGenerationLoopGraph(
+                        sampling_mode,
+                        &error,
+                        composition))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Ordinary generation preparation failed: " << error);
+                    return false;
+                }
+                return true;
+            }
+            if (!materializeMTPDeviceGenerationLoopGraph(
+                    request_count,
+                    draft_depth,
+                    sampling_mode,
+                    &error))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Device-generation parent preparation failed: "
+                          << error);
                 return false;
             }
             return true;
-        }
-        if (!materializeMTPDeviceGenerationLoopGraph(
-                request_count,
-                draft_depth,
-                sampling_mode,
-                &error))
+        };
+        // A pipeline coordinator already scopes the same program on every
+        // participant; it owns the outer two-family composition order.
+        if (compiling_sparse_query_program_) return compile_program();
+        for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation parent preparation failed: "
-                      << error);
-            return false;
+            SparseQueryProgramCompilationScope program_scope(*this,
+                program == 0 ? SparseQueryExecutionProgram::RankingPossible : SparseQueryExecutionProgram::ProvenNoRanking);
+            if (!compile_program()) return false;
         }
         return true;
     }
@@ -52666,7 +52754,7 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::
         enqueueDeviceGenerationDispatchTicketObservation()
     {
-        auto &loop = mtp_device_generation_loop_graph_;
+        auto &loop = deviceGenerationLoopGraph();
         const int request_count =
             device_generation_storage_.active_request_count;
         IBackend *const backend = getBackendFor(state_.device_id);
@@ -52750,7 +52838,7 @@ namespace llaminar2
         if (out_ticket)
             *out_ticket = DeviceGenerationDispatchTicket{};
 
-        auto &loop = mtp_device_generation_loop_graph_;
+        auto &loop = deviceGenerationLoopGraph();
         const int request_count =
             device_generation_storage_.active_request_count;
         const uint64_t generation = workspaceGeneration(state_.device_id);
@@ -52945,7 +53033,7 @@ namespace llaminar2
     {
         if (out_fragment_count)
             *out_fragment_count = 0;
-        auto &loop = mtp_device_generation_loop_graph_;
+        auto &loop = deviceGenerationLoopGraph();
         const int request_count =
             device_generation_storage_.active_request_count;
         if (!out_fragment_count || !last_device_generation_dispatch_ticket_ ||
@@ -53076,7 +53164,7 @@ namespace llaminar2
             const sampling_math::DeviceGenerationDispatchTicket &ticket,
             size_t fragment_index)
     {
-        auto &loop = mtp_device_generation_loop_graph_;
+        auto &loop = deviceGenerationLoopGraph();
         if (!hosted_device_generation_cursor_.submitting() ||
             !last_device_generation_dispatch_ticket_ ||
             !ticket.hasSameDispatchDecision(
@@ -53194,7 +53282,7 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::finishHostScheduledDeviceGenerationAdvance(
         const sampling_math::DeviceGenerationDispatchTicket &ticket)
     {
-        auto &loop = mtp_device_generation_loop_graph_;
+        auto &loop = deviceGenerationLoopGraph();
         const int request_count =
             device_generation_storage_.active_request_count;
         if (!hosted_device_generation_cursor_.submitting() ||
@@ -53242,7 +53330,8 @@ namespace llaminar2
                 1.0,
                 "decode",
                 state_.device_id.toString(),
-                {{"backend", loop.capture->backendName()},
+                {{"sparse_query_program", sparseQueryGraphProgram() == SparseQueryExecutionProgram::ProvenNoRanking ? "proven_no_ranking" : "ranking_possible"},
+                 {"backend", loop.capture->backendName()},
                  {"requests", std::to_string(request_count)},
                  {"draft_depth", std::to_string(loop.draft_depth)},
                  {"minimum_draft_depth", std::to_string(loop.minimum_draft_depth)},
@@ -53303,7 +53392,7 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::launchDeviceResidentGeneration()
     {
-        auto &loop = mtp_device_generation_loop_graph_;
+        auto &loop = deviceGenerationLoopGraph();
         const int request_count =
             device_generation_storage_.active_request_count;
         const uint64_t generation = workspaceGeneration(state_.device_id);
@@ -53426,7 +53515,8 @@ namespace llaminar2
             1.0,
             "decode",
             state_.device_id.toString(),
-             {{"backend", loop.capture->backendName()},
+             {{"sparse_query_program", sparseQueryGraphProgram() == SparseQueryExecutionProgram::ProvenNoRanking ? "proven_no_ranking" : "ranking_possible"},
+                 {"backend", loop.capture->backendName()},
               {"requests", std::to_string(request_count)},
               {"draft_depth", std::to_string(loop.draft_depth)},
               {"minimum_draft_depth",
@@ -54272,7 +54362,7 @@ namespace llaminar2
          */
         if ((!hosted_device_generation_cursor_.inactive() &&
              !hosted_device_generation_cursor_.terminalSubmitted()) ||
-            !mtp_device_generation_loop_graph_.retireCompletedLaunch())
+            !deviceGenerationLoopGraph().retireCompletedLaunch())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Terminal device-generation response could not retire one complete loop lifecycle on "
                       << state_.device_id.toString());
@@ -54382,13 +54472,13 @@ namespace llaminar2
             terminal_multiplier_tags;
         compact_reducer_tags.emplace(
             "source",
-            mtp_device_generation_loop_graph_.sampling_mode ==
+            deviceGenerationLoopGraph().sampling_mode ==
                     DeviceGenerationSamplingMode::Stochastic
                 ? "captured_stochastic_compact_outcome"
                 : "captured_greedy_compact_outcome");
         compact_reducer_tags.emplace(
             "execution",
-            mtp_device_generation_loop_graph_.execution_kind ==
+            deviceGenerationLoopGraph().execution_kind ==
                     MTPDeviceGenerationLoopGraphCache::ExecutionKind::
                         NativeConditionalParent
                 ? "native_conditional_graph"
@@ -54396,7 +54486,7 @@ namespace llaminar2
         // Ordinary sampling shares the terminal ledger but executes no MTP
         // verifier/reducer. Do not manufacture speculative path evidence from
         // its ordinary transaction count.
-        if (!mtp_device_generation_loop_graph_.ordinary_sampling_identity)
+        if (!deviceGenerationLoopGraph().ordinary_sampling_identity)
             PerfStatsCollector::addCounter(
                 "mtp",
                 "device_generation_terminal_compact_outcome_reductions",
@@ -54614,7 +54704,7 @@ namespace llaminar2
             active_device_generation_admission_.reset();
             last_device_generation_dispatch_ticket_.reset();
             hosted_device_generation_cursor_.reset();
-            mtp_device_generation_loop_graph_.hosted_advance.reset();
+            deviceGenerationLoopGraph().hosted_advance.reset();
         }
         // Standalone prefill can own live immutable I/O without ever launching
         // a complete generation parent. Retire that interval after every old
@@ -58170,6 +58260,20 @@ namespace llaminar2
         {
             return false;
         }
+        /*
+         * The forced policy token is now the canonical next-condition owner.
+         * Its scalar/history/mailbox writes were queued on the exact observed
+         * logits producer and the mailbox published its own readiness event.
+         * This is the final semantic consumer of the replaced logits row,
+         * matching the target-sample MTP condition path. Retire the one-shot
+         * handoff only after successful publication: the next retained forward
+         * may have another capture stream, while every failure above leaves
+         * the previous handoff owned and the durable output event intact.
+         */
+        (void)consumePendingLogitsStream(
+            PendingLogitsStreamRole::MainDecode,
+            "publishForcedDeviceResidentConditionToken");
+
         PerfStatsCollector::addCounter(
             "generation",
             "forced_device_resident_condition_publications",
@@ -61320,7 +61424,8 @@ namespace llaminar2
         if (graph_stable_gpu_rebalance && forward_engine_)
         {
             const size_t invalidated =
-                forward_engine_->invalidateMoEPlacementSensitiveGraphsForStablePlacement();
+                forward_engine_->invalidateMoEPlacementSensitiveGraphsForStablePlacement(
+                    [this] { retireMTPPublicationVerifierBorrows(); });
             if (invalidated > 0)
             {
                 PerfStatsCollector::addCounter(

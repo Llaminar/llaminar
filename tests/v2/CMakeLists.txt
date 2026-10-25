@@ -988,6 +988,22 @@ foreach(V2_QFN_BACKEND IN ITEMS CUDA ROCm)
     endif()
 endforeach()
 
+# Attach the test-owned evaluator beside its callers, outside Integration-only guards.
+# Both Release measurements and Integration assertions retain the same canonical
+# HIP configuration/spill guard; serving core has no diagnostic evaluator API.
+if(HAVE_ROCM)
+    set_source_files_properties(integration/kernels/rocm/QwenSparseFP16OnlineRescaleProbe.hip
+        PROPERTIES LANGUAGE HIP)
+    foreach(QSA_RESCALE_TARGET IN ITEMS v2_test_rocm_qwen_sparse_attention v2_perf_rocm_qwen_sparse_attention)
+        if(TARGET ${QSA_RESCALE_TARGET})
+            target_sources(${QSA_RESCALE_TARGET} PRIVATE
+                integration/kernels/rocm/QwenSparseFP16OnlineRescaleProbe.hip)
+            target_link_libraries(${QSA_RESCALE_TARGET} PRIVATE hip::host)
+            set_target_properties(${QSA_RESCALE_TARGET} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        endif()
+    endforeach()
+endif()
+
 add_executable(v2_unit_expert_gemm_registry unit/loaders/Test__ExpertGemmRegistry.cpp)
 target_link_libraries(v2_unit_expert_gemm_registry
     llaminar2_core
@@ -27008,6 +27024,19 @@ foreach(QFN_BACKEND IN ITEMS CUDA ROCm)
                 --gtest_filter=QwenSparseRetainedDevice.${QFN_BACKEND}
             LABELS "V2;Integration;ProductionTestPreflight;${QFN_BACKEND};Qwen4Exp;Capture;MTP;Regression"
             ENVIRONMENT ${QFN_ENV} MPI_PROCS 1 NO_MODELS)
+        if(QFN_BACKEND STREQUAL "CUDA")
+            set(QFN_OUTER_PUBLICATION_LOCK cuda_gpu_0)
+        else()
+            set(QFN_OUTER_PUBLICATION_LOCK rocm_gpu_0)
+        endif()
+        add_v2_test(V2_Integration_${QFN_BACKEND}_QFNOuterMTPPublication
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=QwenSparseRetainedDevice.${QFN_BACKEND}OuterMTPPublicationLedger:PLERetainedDevice.${QFN_BACKEND}OuterMTPPublicationLedger
+            LABELS "V2;Integration;ProductionTestPreflight;${QFN_BACKEND};QwenFlashNext;Capture;MTP;ByteExact;Regression"
+            ENVIRONMENT ${QFN_ENV} MPI_PROCS 1 NO_MODELS TIMEOUT 120
+            RESOURCE_LOCK ${QFN_OUTER_PUBLICATION_LOCK})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_${QFN_BACKEND}_QFNOuterMTPPublication)
         add_v2_test(V2_Integration_${QFN_BACKEND}FloatingProjectionRequestRows
             COMMAND $<TARGET_FILE:${QFN_PROJECTION_TARGET}>
                 --gtest_filter=${QFN_BACKEND}FloatingRequestProjection.CapturedRequestHolesCrossTilesAndPreserveDirtyRows
@@ -27690,20 +27719,6 @@ if(TARGET v2_test_rocm_qwen_sparse_attention)
         V2_Integration_ROCm_QwenSparseFP16TileArithmetic)
 endif()
 
-# The evaluator witness belongs only to native callers, with the same canonical
-# HIP configuration and global spill guard; serving core has no diagnostic API.
-if(HAVE_ROCM)
-    set_source_files_properties(integration/kernels/rocm/QwenSparseFP16OnlineRescaleProbe.hip
-        PROPERTIES LANGUAGE HIP)
-    foreach(QSA_RESCALE_TARGET IN ITEMS v2_test_rocm_qwen_sparse_attention v2_perf_rocm_qwen_sparse_attention)
-        if(TARGET ${QSA_RESCALE_TARGET})
-            target_sources(${QSA_RESCALE_TARGET} PRIVATE
-                integration/kernels/rocm/QwenSparseFP16OnlineRescaleProbe.hip)
-            target_link_libraries(${QSA_RESCALE_TARGET} PRIVATE hip::host)
-            set_target_properties(${QSA_RESCALE_TARGET} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
-        endif()
-    endforeach()
-endif()
 if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_rocm_qwen_sparse_attention)
     add_v2_test(V2_Integration_ROCm_QwenSparseOnlineRescaleEvaluator
         COMMAND $<TARGET_FILE:v2_test_rocm_qwen_sparse_attention>
@@ -32646,6 +32661,276 @@ if(NOT V2_PERF_TESTS_ONLY AND HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primi
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
             V2_Integration_ROCm_GEMMStageQueryWork_Native16ColumnStrides${V2_QUERY_COLUMNS_MODE})
     endforeach()
+endif()
+
+# Exact program identity and native/snapshot owner population; no accelerator work.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_SparseQueryForwardProgramIdentity
+        COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+            --gtest_filter=Test__ForwardGraphSignature.SparseQueryProgramsRetainIndependentCacheKeys
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;QSA;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_SparseQueryRetainedOwnerInventory
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=Test__MemoryPlanner.SparseQueryProgramInventoryPricesOnlyAdditionalMainOwners:Test__MemoryPlanner.SparseQueryProgramSnapshotOwnersMatchPhysicalSharing
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;QSA;PhysicalMemoryAuthority;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_SparseQueryForwardProgramRetention
+        COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+            --gtest_filter=Test__ForwardExecutionEngine.SparseQueryProgramCachesSurviveRequestReset:Test__ForwardExecutionEngine.SparseQueryChildEvictionRetiresParentsBeforeAnyChild:Test__ForwardExecutionEngine.SparseQueryMalformedProgramRejectedCold
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;QSA;GraphCapture;Ownership;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_SparseQueryForwardProgramIdentity V2_Integration_SparseQueryRetainedOwnerInventory
+        V2_Integration_SparseQueryForwardProgramRetention)
+endif()
+
+
+if(NOT V2_PERF_TESTS_ONLY)
+# Insert inside NOT V2_PERF_TESTS_ONLY before canonical preflight closure.
+add_v2_test(V2_Integration_SparseQueryVisibilityAdmission
+    COMMAND $<TARGET_FILE:v2_test_ordinary_generation_controller>
+        --gtest_filter=Test__OrdinaryGenerationController.SparseQueryVisibility*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;QSA;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SparseQueryVisibilityAdmission)
+
+# Within NOT V2_PERF_TESTS_ONLY, before canonical preflight closure.
+add_v2_test(V2_Integration_SparseQueryHostResponseScope
+    COMMAND $<TARGET_FILE:v2_test_multi_domain_orchestrator>
+        --gtest_filter=Test__MultiDomainOrchestrator.SparseQueryHostResponseScopeExpiresAndReissues:Test__MultiDomainOrchestrator.SparseQueryRepeatedCommandAdmissionKeepsCanonicalExtent:Test__MultiDomainOrchestrator.SparseQueryForcedResponseUsesExplicitOneRowProof
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;QSA;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+add_v2_test(V2_Integration_SparseQueryMixedResponseAdmission
+    COMMAND $<TARGET_FILE:v2_test_global_orchestrator>
+        --gtest_filter=Test__GlobalOrchestrator.SparseQueryHostResponseAdmissionFansOutAcrossMixedStages
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;QSA;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_SparseQueryHostResponseScope V2_Integration_SparseQueryMixedResponseAdmission)
+
+# Physical sparse-query node omission is a named production regression.
+add_v2_test(V2_Integration_QwenSparseProvenNoRankingBuilder
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=Qwen4ExpSparseAttentionBuilder.ProvenNoRanking*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;QwenFlashNext;Capture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseProvenNoRankingBuilder)
+
+endif()
+
+# Insert before the canonical V2_PRODUCTION_TEST_PREFLIGHT_TESTS validation foreach.
+# These are focused omission regressions, not substitutes for the existing QSA gates.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_QwenSparseProvenNoRankingCPU
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=QwenSparseAttention.ProvenNoRanking*:QwenSparseAttentionStage.ProvenNoRanking*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseProvenNoRankingCPU)
+    foreach(QSA_OMIT_BACKEND IN ITEMS CUDA ROCm)
+        if(QSA_OMIT_BACKEND STREQUAL "CUDA")
+            set(QSA_OMIT_DIRECTORY cuda)
+            set(QSA_OMIT_ENV "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+            set(QSA_OMIT_LOCK cuda_gpu_0)
+        else()
+            set(QSA_OMIT_DIRECTORY rocm)
+            set(QSA_OMIT_ENV "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            set(QSA_OMIT_LOCK rocm_gpu_0)
+        endif()
+        if(TARGET v2_test_${QSA_OMIT_DIRECTORY}_qwen_sparse_attention)
+            add_v2_test(V2_Integration_${QSA_OMIT_BACKEND}_QwenSparseProvenNoRanking
+                COMMAND $<TARGET_FILE:v2_test_${QSA_OMIT_DIRECTORY}_qwen_sparse_attention>
+                    --gtest_filter=${QSA_OMIT_BACKEND}QwenSparseAttention.CapturedProvenNoRankingOmitsQueryWorkAndPreservesRequiredBytes
+                LABELS "V2;Integration;ProductionTestPreflight;${QSA_OMIT_BACKEND};Qwen4Exp;Capture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK ${QSA_OMIT_LOCK}
+                ENVIRONMENT ${QSA_OMIT_ENV})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_${QSA_OMIT_BACKEND}_QwenSparseProvenNoRanking)
+        endif()
+        if(TARGET v2_test_qwen4exp_device_primitives AND
+           ((QSA_OMIT_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
+            (QSA_OMIT_BACKEND STREQUAL "ROCm" AND HAVE_ROCM)))
+            add_v2_test(V2_Integration_${QSA_OMIT_BACKEND}_QwenSparseProvenNoRankingColdSnapshot
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=QwenSparseColdSnapshot.${QSA_OMIT_BACKEND}ProvenNoRanking
+                LABELS "V2;Integration;ProductionTestPreflight;${QSA_OMIT_BACKEND};Qwen4Exp;Capture;Snapshots;Ownership;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK ${QSA_OMIT_LOCK}
+                ENVIRONMENT ${QSA_OMIT_ENV})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_${QSA_OMIT_BACKEND}_QwenSparseProvenNoRankingColdSnapshot)
+        endif()
+    endforeach()
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY)
+# Inside NOT V2_PERF_TESTS_ONLY before canonical preflight closure.
+add_v2_test(V2_Integration_SparseQueryHostDepthZeroEnvelope
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__PrefillDecodeTransition.DynamicMTPDepthZeroBypassesDraftVerifierWithoutDisablingMTP:Test__PrefillDecodeTransition.DynamicMTPDepthCanReachConfiguredMaximumWithoutGeneratedPolicy
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;QSA;MTP;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SparseQueryHostDepthZeroEnvelope)
+endif()
+
+# Exact forced-token final-consumer handoff, real native DGO and existing kernels.
+if(NOT V2_PERF_TESTS_ONLY)
+    foreach(_backend CUDA ROCm)
+        if((_backend STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+           (_backend STREQUAL "ROCm" AND NOT HAVE_ROCM))
+            continue()
+        endif()
+        if(_backend STREQUAL "CUDA")
+            set(_forced_handoff_lock cuda_gpu_0)
+            set(_forced_handoff_startup "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+        else()
+            set(_forced_handoff_lock rocm_gpu_0)
+            set(_forced_handoff_startup "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+        endif()
+        set(_forced_handoff_test V2_Integration_ForcedOrdinaryLogitsHandoff_${_backend})
+        add_v2_test(${_forced_handoff_test}
+            COMMAND $<TARGET_FILE:v2_integration_pipeline_mtp_state>
+                --gtest_filter=Backends/PipelineMTPStateOwnership.ForcedOrdinaryPublicationRetiresExactLogitsHandoff/${_backend}
+            LABELS "V2;Integration;ProductionTestPreflight;${_backend};DeviceResident;GraphCapture;Ownership;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30 RESOURCE_LOCK ${_forced_handoff_lock}
+            ENVIRONMENT "${_forced_handoff_startup}")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_forced_handoff_test})
+    endforeach()
+endif()
+
+# Single-request MTP row declarations retain the existing canonical native rank fold.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_tp_allreduce_stage)
+    add_v2_test(V2_Integration_TPCanonicalSingleRequestDeclaration
+        COMMAND $<TARGET_FILE:v2_test_tp_allreduce_stage>
+            --gtest_filter=Test__TPAllreduceStage.CanonicalSingleRequestLowersToExactLiveBank:Test__TPAllreduceStage.CanonicalSingleRequestRejectsInvalidDeclarations:Test__TPAllreduceStage.CanonicalSingleRequestRebindNormalizesAndRejectsTransactionally
+        LABELS "V2;Integration;ProductionTestPreflight;LocalTP;DeviceFree;MTP;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_TPCanonicalSingleRequestDeclaration)
+endif()
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_tp_reduce_overlap)
+    foreach(single_request_backend CUDA ROCm)
+        if((single_request_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (single_request_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            if(single_request_backend STREQUAL "CUDA")
+                set(single_request_lock cuda_gpu_0)
+                set(single_request_degrees 2)
+            else()
+                set(single_request_lock rocm_gpu_0)
+                set(single_request_degrees 2 4)
+            endif()
+            foreach(single_request_degree IN LISTS single_request_degrees)
+                set(single_request_alias V2_Integration_TPCanonicalSingleRequest_${single_request_backend}${single_request_degree})
+                add_v2_test(${single_request_alias}
+                    COMMAND $<TARGET_FILE:v2_integration_tp_reduce_overlap>
+                        --gtest_filter=Test__TPCanonicalSingleRequest.${single_request_backend}${single_request_degree}
+                    LABELS "V2;Integration;ProductionTestPreflight;LocalTP;${single_request_backend};MTP;LiveExtent;ByteExact;Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 30 RESOURCE_LOCK ${single_request_lock})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${single_request_alias})
+            endforeach()
+        endif()
+    endforeach()
+endif()
+
+# Prepared adoption must publish the same immutable source metadata as the frozen graph.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_unit_weight_plan)
+    add_v2_test(V2_Integration_PreparedPredictorAdoptionImmutable
+        COMMAND $<TARGET_FILE:v2_unit_weight_plan>
+            --gtest_filter=Test__WeightManagerMaterialize.PreparedAdoptionPublishesImmutablePredictorSources
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;Qwen4Exp;MTP;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_PreparedPredictorAdoptionImmutable)
+endif()
+
+# Predictor decode-equivalent collectives also execute inside retained prefill graphs.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_unit_workspace_allocator)
+    add_v2_test(V2_Integration_TPCanonicalPredictorPrefillWorkspace
+        COMMAND $<TARGET_FILE:v2_unit_workspace_allocator>
+            --gtest_filter=Test__WorkspaceAllocator.CanonicalPredictorRankBanksSurvivePrefillParticipants
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Workspace;LocalTP;MTP;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_TPCanonicalPredictorPrefillWorkspace)
+endif()
+
+# Required shared-expert Q8 publication is a cold, graph-local geometry contract.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_cpu_router_q8_publication)
+    add_v2_test(V2_Integration_MoERouterQ8RequiredConsumerGeometry
+        COMMAND $<TARGET_FILE:v2_test_cpu_router_q8_publication>
+            --gtest_filter=CPURouterQ8Publication.GroupedConsumerDemandIsColdExactAndSurvivesRevocation
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MTP;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_MoERouterQ8RequiredConsumerGeometry)
+endif()
+if(NOT V2_PERF_TESTS_ONLY AND HAVE_CUDA AND TARGET v2_integration_cuda_moe_kernel)
+    add_v2_test(V2_Integration_CUDA_SharedExpertHalfRouterQ8Publication
+        COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.FloatingRouterRequiredSharedQ8PublicationMatchesSerialBytes:Test__CUDAMoEKernel.SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 120 RESOURCE_LOCK cuda_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CUDA_SharedExpertHalfRouterQ8Publication)
+endif()
+if(NOT V2_PERF_TESTS_ONLY AND HAVE_ROCM AND TARGET v2_integration_rocm_moe_kernel)
+    add_v2_test(V2_Integration_ROCm_SharedExpertHalfRouterQ8Publication
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.SharedExpertHalfRouterRequiredQ8PublicationMatchesSerial:Test__ROCmMoEKernel.HalfRouterQ8DemandPublishesOriginalRowsAndPreservesNoDemandM1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCm_SharedExpertHalfRouterQ8Publication)
+endif()
+
+# Each retained serving sibling owns its ordinary head binding around role setup.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_device_graph_orchestrator)
+    add_v2_test(V2_Integration_ServingProgramBufferOwnership
+        COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator>
+            --gtest_filter=Test__DeviceGraphOrchestrator.ServingProgramRestoresOrdinaryOwnersAcrossRolesAndFailures
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GraphCapture;Ownership;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ServingProgramBufferOwnership)
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_mtp_spec_state_contract)
+    add_v2_test(V2_Integration_MTPAcceptedStateOutputContract
+        COMMAND $<TARGET_FILE:v2_test_mtp_spec_state_contract>
+            --gtest_filter=Test__MTPSpecStateContract.AcceptedArenaOutputsMergeWithoutCandidateOrAllocationAuthority:Test__MTPSpecStateContract.AcceptedArenaOutputsRejectConflictingOrAllocatingBindings
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GraphCapture;Ownership;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_MTPAcceptedStateOutputContract)
+endif()
+
+# Accepted-state children borrow exact program-local verifier owners.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_device_graph_orchestrator)
+    add_v2_test(V2_Integration_SparseQueryPublicationChildOwners
+        COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator>
+            --gtest_filter=Test__DeviceGraphOrchestrator.SparseQueryPublicationChildrenRetainExactVerifierOwners:Test__DeviceGraphOrchestrator.MTPPublicationIdentityReplacementPreservesCertifiedProducerStream
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;QSA;MTP;GraphCapture;Ownership;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_SparseQueryPublicationChildOwners)
+endif()
+
+# Request reset preserves device-owned RoPE rows embedded in retained parents.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_prefill_graph_capturability)
+    add_v2_test(V2_Integration_RoPERetainedDevicePositionIdentity
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_capturability>
+            --gtest_filter=RoPERetainedCaptureIdentity.*
+        LABELS "V2;Integration;ProductionTestPreflight;MTP;GraphCapture;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_RoPERetainedDevicePositionIdentity)
 endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)

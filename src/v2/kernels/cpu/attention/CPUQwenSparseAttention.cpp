@@ -275,6 +275,13 @@ bool selectRow(const QwenSparseIndexer &p, int row)
     p.selected_count[row] = keep * QwenSparsePool + visible % QwenSparsePool;
     return true;
 }
+/** @brief Fail a stale no-ranking program before any CPU-owned output publication. */
+void validateQueryProgramReplay(const QwenSparseIndexer &p)
+{
+    if (p.query_demand == QwenSparseQueryDemand::ProvenNoRanking &&
+        static_cast<std::int64_t>(p.replay->prefix_tokens) + p.replay->live_rows > QwenSparseFirstRankingLogicalRow)
+        throw std::invalid_argument("QSA ProvenNoRanking replay exceeds admitted query omission boundary");
+}
 } // namespace
 
 void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
@@ -282,6 +289,7 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
     validateQwenSparseIndexer(p);
     const auto isa = nativeISA();
     validateReplay(*p.replay, p.row_capacity, p.token_capacity);
+    validateQueryProgramReplay(p);
     if(p.transaction_prior && p.transaction_prior->row_capacity!=p.row_capacity)
         throw std::invalid_argument("QSA indexer transaction prior row geometry changed");
     const auto replay = *p.replay;
@@ -290,9 +298,11 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
         throw std::invalid_argument("CPU Qwen sparse indexer: RoPE position capacity exceeded");
     // CPU owns these words. Resolve once before the OpenMP region; no query
     // operand outside this original row/head span is an authored value.
-    const auto queryHeads=p.query_demand==QwenSparseQueryDemand::RankingOnly
-        ? qwenSparseIndexerQueryWork(p).repeatEachRow(4).resolveHost()
-        : ProjectionRowSpan{0,replay.live_rows*4};
+    const bool noRanking = p.query_demand == QwenSparseQueryDemand::ProvenNoRanking;
+    const auto queryHeads = noRanking ? ProjectionRowSpan{0,0} :
+        p.query_demand==QwenSparseQueryDemand::RankingOnly
+            ? qwenSparseIndexerQueryWork(p).repeatEachRow(4).resolveHost()
+            : ProjectionRowSpan{0,replay.live_rows*4};
     const int first_block = replay.prefix_tokens / 4;
     const int complete_blocks = (replay.prefix_tokens + replay.live_rows) / 4;
     auto preparation = [&]()
@@ -328,7 +338,7 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
             if (row < replay.live_rows)
             {
                 const int blocks = (replay.prefix_tokens + row + 1) / QwenSparsePool;
-                if (blocks > QwenSparseBlocks)
+                if (!noRanking && blocks > QwenSparseBlocks)
                     for (int block = 0; block < blocks; ++block)
                     {
                         float score = 0.0f;
@@ -350,6 +360,7 @@ void cpuQwenSparseSelectPools(const QwenSparseIndexer &p)
 {
     validateQwenSparseSelection(p);
     validateReplay(*p.replay, p.row_capacity, p.token_capacity);
+    validateQueryProgramReplay(p);
     // No exception may escape OpenMP. Validate only scores actually consumed by
     // a long active row before changing ANY selection/count/diagnostic output.
     for (int row = 0; row < p.replay->live_rows; ++row)

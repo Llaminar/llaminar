@@ -77,7 +77,7 @@ PipelineDeviceGeneration::PipelineDeviceGeneration(
                 stage->pp_stage_config_->has_embedding != (i == 0) ||
                 stage->pp_stage_config_->has_lm_head != (i + 1 == stages.size()) ||
                 !stage->state_.hidden || !stage->state_.kv_cache || !stage->arena_ ||
-                !stage->mtp_device_generation_loop_graph_.capture ||
+                !stage->deviceGenerationLoopGraph().capture ||
                 stage->deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::FixedDepth) ==
                     DeviceGenerationExecutionPolicy::Unsupported ||
                 !unique.insert(stage->state_.device_id).second ||
@@ -159,18 +159,29 @@ struct PipelineDeviceGeneration::ForwardOnlyFamily
     }
 };
 
+std::unique_ptr<PipelineDeviceGeneration::ForwardOnlyFamily> &PipelineDeviceGeneration::forwardOnlyFamily()
+{
+    return forward_only_families_[sparseQueryExecutionProgramIndex(
+        stages_.back()->sparseQueryForwardProgram(ForwardExecutionPhase::Decode))];
+}
+const std::unique_ptr<PipelineDeviceGeneration::ForwardOnlyFamily> &PipelineDeviceGeneration::forwardOnlyFamily() const
+{
+    return forward_only_families_[sparseQueryExecutionProgramIndex(
+        stages_.back()->sparseQueryForwardProgram(ForwardExecutionPhase::Decode))];
+}
+
 bool PipelineDeviceGeneration::forwardOnlyFamilyCurrent() const
 {
-    if (transport_ != Transport::NativePipeline || !collective_ || !forward_only_ ||
-        forward_only_->participants.size() != stages_.size() || domains_.size() != stages_.size()) return false;
+    if (transport_ != Transport::NativePipeline || !collective_ || !forwardOnlyFamily() ||
+        forwardOnlyFamily()->participants.size() != stages_.size() || domains_.size() != stages_.size()) return false;
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         const auto &stage = *stages_[i];
-        const auto &part = forward_only_->participants[i];
+        const auto &part = forwardOnlyFamily()->participants[i];
         std::string error;
         if (domains_[i].count != 1 || part.device != stage.state_.device_id ||
             part.workspace != stage.workspaceGeneration(stage.state_.device_id) ||
-            part.stream != stage.mtp_device_generation_loop_graph_.stream.get() ||
+            part.stream != stage.deviceGenerationLoopGraph().stream.get() ||
             part.arena != stage.arena_.get() ||
             part.hidden != stage.state_.hidden->gpu_data_ptr() ||
             part.width != stage.graph_builder_->config().residualWidth() || part.width <= 0 ||
@@ -182,6 +193,7 @@ bool PipelineDeviceGeneration::forwardOnlyFamilyCurrent() const
             part.storage_terminal != stage.retained_storage_terminal_capture_.get() ||
             part.publication != ForwardOnlyFamily::publicationFor(stage) ||
             !part.parent || !part.parent->hasExecutable() || part.parent->executionStream() != part.stream || !part.forward || !part.forward->native() ||
+            part.forward->signature.sparse_query_execution_program != stage.sparseQueryForwardProgram(ForwardExecutionPhase::Decode) ||
             !stage.forward_engine_ || !stage.forward_engine_->observeComposedForwardCompletion(
                 part.forward->signature, part.forward->native()->capture, 0, &error)) return false;
     }
@@ -193,142 +205,159 @@ bool PipelineDeviceGeneration::prepareForwardOnlyFamily()
     // Cross-vendor and nested TP need their own complete transaction compiler.
     // Never relabel them as a singleton native cohort or choose an eager path.
     if (transport_ != Transport::NativePipeline) return true;
-    if (forward_only_) return forwardOnlyFamilyCurrent();
-    auto family = std::make_unique<ForwardOnlyFamily>();
-    family->participants.resize(stages_.size());
-    std::barrier boundary(static_cast<ptrdiff_t>(stages_.size()));
-    std::atomic<bool> failed{false};
-    workers_->dispatch([&, this](size_t index) {
-        auto &stage = *stages_[index];
-        auto &part = family->participants[index];
-        IWorkerGPUContext *context = nullptr;
-        // Every potentially rejecting setup operation is inside this boundary:
-        // one failed member must still arrive at every cohort capture barrier.
-        try {
-            context = &GPUDeviceContextPool::instance().getContext(stage.state_.device_id);
-            part.device = stage.state_.device_id;
-            part.workspace = stage.workspaceGeneration(part.device);
-            part.stream = stage.mtp_device_generation_loop_graph_.stream.get();
-            part.arena = stage.arena_.get();
-            part.hidden = stage.state_.hidden->gpu_data_ptr();
-            part.width = stage.graph_builder_->config().residualWidth();
-            part.logits = stage.state_.logits->gpu_data_ptr();
-            std::string error;
-            // Serving setup already retained this exact original resident-input body.
-            // Export does not launch it or admit a controller/sampler/request.
-            part.forward = stage.materializeOrdinaryGenerationForward(
-                stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
-                OrdinaryForwardRetentionKind::NativeComposable, &error);
-            part.publication = ForwardOnlyFamily::publicationFor(stage);
-            stage.prepareRetainedStorageBinding();
-            (void)stage.retainedStorageTerminalFragments();
-            part.storage_boundary = stage.retained_storage_boundary_.get();
-            part.storage_terminal = stage.retained_storage_terminal_capture_.get();
-            if (!part.workspace || !part.stream || !part.forward || !part.forward->native() ||
-                part.width <= 0 || stage.state_.hidden->native_type() != TensorType::FP32 ||
-                static_cast<size_t>(part.width) > stage.state_.hidden->numel() ||
-                !part.publication.valid()) failed = true;
-        } catch (const std::exception &failure) {
-            failed = true;
-            LOG_ERROR("Pipeline ForwardOnly source preparation failed: " << failure.what());
-        } catch (...) {
-            failed = true;
-            LOG_ERROR("Pipeline ForwardOnly source preparation failed with an unknown exception");
-        }
-        boundary.arrive_and_wait();
-        // Every participant enters every capture phase, even on setup failure.
-        // This is setup fanout only; no host token/row/control decides a replay.
-        const auto record = [&](std::unique_ptr<IGPUGraphCapture> &child, auto &&enqueue) {
-            std::optional<ScopedBackendGraphCapture> capture;
-            bool began = false;
+    const auto count = stages_.front()->sparseQueryProgramCount();
+    if (std::any_of(stages_.begin(), stages_.end(), [count](auto *stage) {
+            return stage->sparseQueryProgramCount() != count; }))
+        throw std::logic_error("Pipeline forced-query family disagrees with original model geometry");
+    const auto compile_program = [&]() -> bool
+    {
+        if (forwardOnlyFamily()) return forwardOnlyFamilyCurrent();
+        auto family = std::make_unique<ForwardOnlyFamily>();
+        family->participants.resize(stages_.size());
+        std::barrier boundary(static_cast<ptrdiff_t>(stages_.size()));
+        std::atomic<bool> failed{false};
+        workers_->dispatch([&, this](size_t index) {
+            auto &stage = *stages_[index];
+            auto &part = family->participants[index];
+            IWorkerGPUContext *context = nullptr;
+            // Every potentially rejecting setup operation is inside this boundary:
+            // one failed member must still arrive at every cohort capture barrier.
             try {
-                if (!failed.load() && context)
-                {
-                    child = context->createGraphCapture(part.stream);
-                    if (child) capture.emplace(*context, *child, "pipeline_forward_only_collective");
-                    began = capture && capture->begin();
-                }
+                context = &GPUDeviceContextPool::instance().getContext(stage.state_.device_id);
+                part.device = stage.state_.device_id;
+                part.workspace = stage.workspaceGeneration(part.device);
+                part.stream = stage.deviceGenerationLoopGraph().stream.get();
+                part.arena = stage.arena_.get();
+                part.hidden = stage.state_.hidden->gpu_data_ptr();
+                part.width = stage.graph_builder_->config().residualWidth();
+                part.logits = stage.state_.logits->gpu_data_ptr();
+                std::string error;
+                // Serving setup already retained this exact original resident-input body.
+                // Export does not launch it or admit a controller/sampler/request.
+                part.forward = stage.materializeOrdinaryGenerationForward(
+                    stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
+                    OrdinaryForwardRetentionKind::NativeComposable, &error);
+                part.publication = ForwardOnlyFamily::publicationFor(stage);
+                stage.prepareRetainedStorageBinding();
+                (void)stage.retainedStorageTerminalFragments();
+                part.storage_boundary = stage.retained_storage_boundary_.get();
+                part.storage_terminal = stage.retained_storage_terminal_capture_.get();
+                if (!part.workspace || !part.stream || !part.forward || !part.forward->native() ||
+                    part.width <= 0 || stage.state_.hidden->native_type() != TensorType::FP32 ||
+                    static_cast<size_t>(part.width) > stage.state_.hidden->numel() ||
+                    !part.publication.valid()) failed = true;
             } catch (const std::exception &failure) {
                 failed = true;
-                LOG_ERROR("Pipeline ForwardOnly capture admission failed: " << failure.what());
-            } catch (...) { failed = true; }
-            if (!began) failed = true;
-            boundary.arrive_and_wait();
-            const bool admitted = !failed.load();
-            boundary.arrive_and_wait();
-            try { if (admitted && !enqueue()) failed = true; }
-            catch (const std::exception &failure) {
+                LOG_ERROR("Pipeline ForwardOnly source preparation failed: " << failure.what());
+            } catch (...) {
                 failed = true;
-                collective_->requestAbort();
-                LOG_ERROR("Pipeline ForwardOnly recording failed: " << failure.what());
-            } catch (...) { failed = true; collective_->requestAbort(); }
+                LOG_ERROR("Pipeline ForwardOnly source preparation failed with an unknown exception");
+            }
             boundary.arrive_and_wait();
-            try { if (began) capture->finish(); }
-            catch (const std::exception &failure) {
-                failed = true;
-                LOG_ERROR("Pipeline ForwardOnly recording retirement failed: " << failure.what());
-            } catch (...) { failed = true; }
-            boundary.arrive_and_wait();
-        };
-        using namespace sampling_math;
-        const auto exchange = [&](bool terminal) {
-            std::vector<LocalTPCollectiveSidebandBuffer> fields;
-            const auto add = [&](int32_t *field) {
-                fields.push_back({.kind = LocalTPCollectiveSidebandKind::Broadcast,
-                    .send_buffer = field, .recv_buffer = field, .element_count = 1,
-                    .dtype = CollectiveDataType::INT32, .root_device_index = static_cast<int>(stages_.size() - 1),
-                    .name = "pipeline_forward_only_command"});
+            // Every participant enters every capture phase, even on setup failure.
+            // This is setup fanout only; no host token/row/control decides a replay.
+            const auto record = [&](std::unique_ptr<IGPUGraphCapture> &child, auto &&enqueue) {
+                std::optional<ScopedBackendGraphCapture> capture;
+                bool began = false;
+                try {
+                    if (!failed.load() && context)
+                    {
+                        child = context->createGraphCapture(part.stream);
+                        if (child) capture.emplace(*context, *child, "pipeline_forward_only_collective");
+                        began = capture && capture->begin();
+                    }
+                } catch (const std::exception &failure) {
+                    failed = true;
+                    LOG_ERROR("Pipeline ForwardOnly capture admission failed: " << failure.what());
+                } catch (...) { failed = true; }
+                if (!began) failed = true;
+                boundary.arrive_and_wait();
+                const bool admitted = !failed.load();
+                boundary.arrive_and_wait();
+                try { if (admitted && !enqueue()) failed = true; }
+                catch (const std::exception &failure) {
+                    failed = true;
+                    collective_->requestAbort();
+                    LOG_ERROR("Pipeline ForwardOnly recording failed: " << failure.what());
+                } catch (...) { failed = true; collective_->requestAbort(); }
+                boundary.arrive_and_wait();
+                try { if (began) capture->finish(); }
+                catch (const std::exception &failure) {
+                    failed = true;
+                    LOG_ERROR("Pipeline ForwardOnly recording retirement failed: " << failure.what());
+                } catch (...) { failed = true; }
+                boundary.arrive_and_wait();
             };
-            add(stage.device_generation_storage_.control_device + kDeviceGenerationControlRequestComplete);
-            if (!terminal) add(stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device);
-            // Terminal must not overwrite a follower's own failed health word.
-            return collective_->collectiveSidebandSpanOnStream(fields, static_cast<int>(index),
-                part.stream, terminal ? "pipeline_forward_only_complete" : "pipeline_forward_only_input");
-        };
-        record(part.children[0], [&] { return exchange(false); });
-        for (size_t edge = 0; edge + 1 < stages_.size(); ++edge)
-        {
-            const bool sender = index == edge, receiver = index == edge + 1;
-            std::unique_ptr<IGPUGraphCapture> empty;
-            auto &child = sender ? part.children[2] : receiver ? part.children[1] : empty;
-            record(child, [&] {
-                if (!sender && !receiver) return true;
-                const CollectiveP2POp operation{
-                    .kind = sender ? CollectiveP2POpKind::Send : CollectiveP2POpKind::Recv,
-                    .send_buffer = sender ? stage.state_.hidden->gpu_data_ptr() : nullptr,
-                    .recv_buffer = receiver ? stage.state_.hidden->gpu_data_ptr() : nullptr,
-                    .count = static_cast<size_t>(part.width),
-                    .dtype = CollectiveDataType::FLOAT32, .peer = static_cast<int>(sender ? edge + 1 : edge)};
-                return collective_->groupedP2PRawOnStream({operation}, static_cast<int>(index), part.stream,
-                    "pipeline_forward_only_activation");
+            using namespace sampling_math;
+            const auto exchange = [&](bool terminal) {
+                std::vector<LocalTPCollectiveSidebandBuffer> fields;
+                const auto add = [&](int32_t *field) {
+                    fields.push_back({.kind = LocalTPCollectiveSidebandKind::Broadcast,
+                        .send_buffer = field, .recv_buffer = field, .element_count = 1,
+                        .dtype = CollectiveDataType::INT32, .root_device_index = static_cast<int>(stages_.size() - 1),
+                        .name = "pipeline_forward_only_command"});
+                };
+                add(stage.device_generation_storage_.control_device + kDeviceGenerationControlRequestComplete);
+                if (!terminal) add(stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device);
+                // Terminal must not overwrite a follower's own failed health word.
+                return collective_->collectiveSidebandSpanOnStream(fields, static_cast<int>(index),
+                    part.stream, terminal ? "pipeline_forward_only_complete" : "pipeline_forward_only_input");
+            };
+            record(part.children[0], [&] { return exchange(false); });
+            for (size_t edge = 0; edge + 1 < stages_.size(); ++edge)
+            {
+                const bool sender = index == edge, receiver = index == edge + 1;
+                std::unique_ptr<IGPUGraphCapture> empty;
+                auto &child = sender ? part.children[2] : receiver ? part.children[1] : empty;
+                record(child, [&] {
+                    if (!sender && !receiver) return true;
+                    const CollectiveP2POp operation{
+                        .kind = sender ? CollectiveP2POpKind::Send : CollectiveP2POpKind::Recv,
+                        .send_buffer = sender ? stage.state_.hidden->gpu_data_ptr() : nullptr,
+                        .recv_buffer = receiver ? stage.state_.hidden->gpu_data_ptr() : nullptr,
+                        .count = static_cast<size_t>(part.width),
+                        .dtype = CollectiveDataType::FLOAT32, .peer = static_cast<int>(sender ? edge + 1 : edge)};
+                    return collective_->groupedP2PRawOnStream({operation}, static_cast<int>(index), part.stream,
+                        "pipeline_forward_only_activation");
+                });
+            }
+            const bool tail = index + 1 == stages_.size();
+            record(part.children[3], [&] {
+                // The existing backend publisher branches on ForwardOnly before
+                // reading sampled_tokens, stop policy or history. No sampler node exists.
+                return !tail || getBackendFor(part.device)->enqueuePublishOrdinaryGenerationSample(
+                    part.publication, part.device.ordinal, part.stream);
             });
-        }
-        const bool tail = index + 1 == stages_.size();
-        record(part.children[3], [&] {
-            // The existing backend publisher branches on ForwardOnly before
-            // reading sampled_tokens, stop policy or history. No sampler node exists.
-            return !tail || getBackendFor(part.device)->enqueuePublishOrdinaryGenerationSample(
-                part.publication, part.device.ordinal, part.stream);
+            record(part.children[4], [&] { return exchange(true); });
+            if (failed.load()) return false;
+            std::vector<GPUOrderedTimelineStep> steps{{.name = "original tail condition", .capture = part.children[0].get()}};
+            if (index) steps.push_back({.name = "receive scalar activation", .capture = part.children[1].get()});
+            steps.push_back({.name = "original resident model", .capture = part.forward->native()->capture});
+            if (!tail) steps.push_back({.name = "send scalar activation", .capture = part.children[2].get()});
+            else steps.push_back({.name = "forward-only state commit", .capture = part.children[3].get()});
+            steps.push_back({.name = "tail completion", .capture = part.children[4].get()});
+            for (const auto &fragment : stage.retainedStorageTerminalFragments())
+                steps.push_back({.name = fragment.name, .capture = fragment.capture});
+            part.parent = context->createGraphCapture(part.stream);
+            if (!part.parent || !part.parent->buildOrderedTimelineTransaction(steps) || !part.parent->instantiate()) return false;
+            PerfStatsCollector::addCounter("generation", "pipeline_forward_only_graph_materializations", 1.0,
+                "graph_setup", part.device.toString(), {{"executable_owners", "1"}, {"sampler", "absent"}});
+            return true;
         });
-        record(part.children[4], [&] { return exchange(true); });
-        if (failed.load()) return false;
-        std::vector<GPUOrderedTimelineStep> steps{{.name = "original tail condition", .capture = part.children[0].get()}};
-        if (index) steps.push_back({.name = "receive scalar activation", .capture = part.children[1].get()});
-        steps.push_back({.name = "original resident model", .capture = part.forward->native()->capture});
-        if (!tail) steps.push_back({.name = "send scalar activation", .capture = part.children[2].get()});
-        else steps.push_back({.name = "forward-only state commit", .capture = part.children[3].get()});
-        steps.push_back({.name = "tail completion", .capture = part.children[4].get()});
-        for (const auto &fragment : stage.retainedStorageTerminalFragments())
-            steps.push_back({.name = fragment.name, .capture = fragment.capture});
-        part.parent = context->createGraphCapture(part.stream);
-        if (!part.parent || !part.parent->buildOrderedTimelineTransaction(steps) || !part.parent->instantiate()) return false;
-        PerfStatsCollector::addCounter("generation", "pipeline_forward_only_graph_materializations", 1.0,
-            "graph_setup", part.device.toString(), {{"executable_owners", "1"}, {"sampler", "absent"}});
-        return true;
-    });
-    if (!collectPreparation(*workers_)) { abortParticipants(); return false; }
-    forward_only_ = std::move(family);
-    return forwardOnlyFamilyCurrent();
+        if (!collectPreparation(*workers_)) { abortParticipants(); return false; }
+        forwardOnlyFamily() = std::move(family);
+        return forwardOnlyFamilyCurrent();
+    };
+    for (std::size_t program = 0; program < count; ++program)
+    {
+        std::vector<DeviceGraphOrchestrator::SparseQueryProgramCompilationScope> participants;
+        participants.reserve(stages_.size());
+        for (auto *stage : stages_)
+            participants.emplace_back(*stage, program == 0 ? SparseQueryExecutionProgram::RankingPossible :
+                SparseQueryExecutionProgram::ProvenNoRanking);
+        if (!compile_program()) return false;
+    }
+    return true;
 }
 
 bool PipelineDeviceGeneration::advanceOrdinaryCondition(
@@ -361,7 +390,7 @@ bool PipelineDeviceGeneration::advanceOrdinaryCondition(
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
-        auto &part = forward_only_->participants[i];
+        auto &part = forwardOnlyFamily()->participants[i];
         if (!stage.consumeDeviceGenerationStateReady(part.stream, DeviceTimelineRole::DeviceGenerationController,
                 1, "pipeline_forward_only_parent") ||
             !stage.waitForLiveInferenceStateReadyForObservation(part.stream,
@@ -374,7 +403,7 @@ bool PipelineDeviceGeneration::advanceOrdinaryCondition(
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
-        auto &part = forward_only_->participants[i];
+        auto &part = forwardOnlyFamily()->participants[i];
         try
         {
             // The exclusive row lease closes through the actual post-launch event
@@ -451,7 +480,7 @@ bool PipelineDeviceGeneration::finishForwardOnly()
         try {
             for (size_t i = 0; i < stages_.size(); ++i)
             {
-                const auto &part = forward_only_->participants[i];
+                const auto &part = forwardOnlyFamily()->participants[i];
                 if (!part.terminal_copies_pending) continue;
                 auto &stage = *stages_[i];
                 auto *backend = getBackendFor(part.device);
@@ -461,7 +490,7 @@ bool PipelineDeviceGeneration::finishForwardOnly()
             }
             for (size_t i = 0; i < stages_.size(); ++i)
             {
-                auto &part = forward_only_->participants[i];
+                auto &part = forwardOnlyFamily()->participants[i];
                 if (!part.terminal_copies_pending) continue;
                 if (!getBackendFor(part.device)->waitForEvent(
                         stages_[i]->device_generation_terminal_host_ready_event_.get(), part.device.ordinal))
@@ -479,11 +508,11 @@ bool PipelineDeviceGeneration::finishForwardOnly()
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
-        const auto &part = forward_only_->participants[i];
+        const auto &part = forwardOnlyFamily()->participants[i];
         auto *backend = getBackendFor(part.device);
         if (!stage.consumeDeviceGenerationStateReady(part.stream, DeviceTimelineRole::HostResultBridge,
                 1, "pipeline_forward_only_terminal")) return false;
-        forward_only_->participants[i].terminal_copies_pending = true;
+        forwardOnlyFamily()->participants[i].terminal_copies_pending = true;
         const std::array<const int *, 3> sources{
             stage.state_.kv_cache->deviceSequenceCachedTokenCountPtr(0),
             stage.device_generation_storage_.control_device + kDeviceGenerationControlOk,
@@ -517,7 +546,7 @@ bool PipelineDeviceGeneration::finishForwardOnly()
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
-        auto &part = forward_only_->participants[i];
+        auto &part = forwardOnlyFamily()->participants[i];
         std::string error;
         if (!stage.forward_engine_->observeComposedForwardCompletion(part.forward->signature,
                 part.forward->native()->capture, 1, &error) ||
@@ -527,7 +556,7 @@ bool PipelineDeviceGeneration::finishForwardOnly()
         part.submitted = false;
         stage.clearDeviceResidentLogicalSequenceStateMailbox();
     }
-    auto &part = forward_only_->participants.back();
+    auto &part = forwardOnlyFamily()->participants.back();
     TransferEngine::publishDeviceWrite(tail.state_.logits.get(), tail.state_.device_id, part.stream);
     ForwardOutput output;
     output.logits = tail.state_.logits.get();
@@ -537,7 +566,9 @@ bool PipelineDeviceGeneration::finishForwardOnly()
         .completion_scope = ForwardCompletionScope::ModelForwardOnly, .graph_seq_len = 1, .graph_batch_size = 1};
     if (!tail.publishForwardGraphOutputReady(output)) return false;
     PerfStatsCollector::addCounter("generation", "pipeline_forward_only_completed_transactions", 1.0,
-        "decode", "rank", {{"sampler", "absent"}, {"response_tokens", "0"}, {"model_commits", "1"}});
+        "decode", "rank", {{"sparse_query_program", stages_.back()->sparseQueryForwardProgram(ForwardExecutionPhase::Decode) ==
+            SparseQueryExecutionProgram::ProvenNoRanking ? "proven_no_ranking" : "ranking_possible"},
+         {"sampler", "absent"}, {"response_tokens", "0"}, {"model_commits", "1"}});
     phase_ = Phase::Idle;
     return true;
 }
@@ -549,22 +580,22 @@ PipelineDeviceGeneration::~PipelineDeviceGeneration()
 
 void PipelineDeviceGeneration::retireForwardOnlyBeforeStageRelease() noexcept
 {
-    workers_.reset(); // Join any setup wave while every borrowed source/cohort is alive.
-    // This owner's complete parents borrow DGO recordings. An absorbing failure
-    // still owes the original published event before any parent can retire.
-    if (forward_only_)
+    workers_.reset(); // Join setup before any borrowed participant owner can retire.
+    for (auto &family : forward_only_families_)
+    {
+        if (!family) continue;
+        // A failed submitted transaction still owes its exact original event.
         for (size_t i = 0; i < stages_.size(); ++i)
-            if (forward_only_->participants[i].submitted)
+            if (family->participants[i].submitted)
             {
                 auto &stage = *stages_[i];
                 auto *backend = getBackendFor(stage.state_.device_id);
-                // This operation's accepted parent publishes this exact event.
-                // General forward-output teardown alone does not cover it.
                 if (!backend || !stage.device_generation_state_ready_.event ||
                     !backend->waitForEvent(stage.device_generation_state_ready_.event.get(), stage.state_.device_id.ordinal))
                     std::terminate();
             }
-    forward_only_.reset(); // Parents retire before their original collective and DGO recordings.
+        family.reset(); // Parent dies before its original collective/DGO sources.
+    }
 }
 
 bool PipelineDeviceGeneration::isGPUStageSet(std::span<const std::unique_ptr<IInferenceRunner>> stages)
@@ -614,8 +645,8 @@ void PipelineDeviceGeneration::prepareDomainBoundaries()
         auto &transfer = TransferEngine::instance();
         const auto create = [&](auto &source, auto &destination, size_t capacity) {
             return transfer.createCapturedTransferChannel(*earlier.physical_memory_authority_, DeviceId::cpu(),
-                source.state_.device_id, source.mtp_device_generation_loop_graph_.stream.get(),
-                destination.state_.device_id, destination.mtp_device_generation_loop_graph_.stream.get(), capacity);
+                source.state_.device_id, source.deviceGenerationLoopGraph().stream.get(),
+                destination.state_.device_id, destination.deviceGenerationLoopGraph().stream.get(), capacity);
         };
         boundaries_.push_back({create(earlier, later, geometry.activation_capacity_bytes),
             create(later, earlier, geometry.metadata_capacity_bytes)});
@@ -900,7 +931,7 @@ bool PipelineDeviceGeneration::begin(const DeviceGenerationAdmissionRequest &req
         auto &stage = *stages_[i];
         void *stream = stage.explicitGPUStreamForOperation("pipeline_follower_admission");
         if (!stream || stage.device_generation_storage_.active_request_count != 0 ||
-            stage.active_device_generation_admission_ || stage.mtp_device_generation_loop_graph_.launched ||
+            stage.active_device_generation_admission_ || stage.deviceGenerationLoopGraph().launched ||
             !stage.device_generation_state_ready_.handoff.inactive() ||
             !stage.waitForPendingRequestStateReset(stream, DeviceTimelineRole::RequestAdmissionTransfer,
                 "pipeline_follower_admission") ||
@@ -931,6 +962,7 @@ bool PipelineDeviceGeneration::begin(const DeviceGenerationAdmissionRequest &req
                      .prior_tickets = stage.device_generation_storage_.dispatch_tickets_device,
                      .forward_failure_policy = stage.graph_builder_->deviceGenerationForwardFailurePolicy()})) return false;
         }
+        stage.admitSparseQueryProgram(request);
         stage.device_generation_storage_.active_request_count = 1;
         if(!stage.beginRetainedStorageAdmission(stream))return false;
         // Do not reset the received command. Arrival unconditionally replaces
@@ -968,7 +1000,7 @@ bool PipelineDeviceGeneration::prepareParticipants(DeviceGenerationSamplingMode 
             stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
             OrdinaryForwardRetentionKind::NativeComposable, &error);
         if (!forward || !forward->native()) { LOG_ERROR("Pipeline follower requires a native-composable forward: " << error); return false; }
-        auto &loop = stage.mtp_device_generation_loop_graph_;
+        auto &loop = stage.deviceGenerationLoopGraph();
         const auto generation = stage.workspaceGeneration(stage.state_.device_id);
         if (loop.valid && loop.workspace_generation == generation &&
             loop.ordinary_forward_identity == forward->signature && loop.source_fragments.size() == 1 &&
@@ -997,7 +1029,7 @@ bool PipelineDeviceGeneration::composeParticipants()
         // already owns its sampler and authenticated ticket publisher.
         workers_->dispatch([this](size_t index) {
             if (terminalParticipant(index)) return true;
-            auto &loop = stages_[index]->mtp_device_generation_loop_graph_;
+            auto &loop = stages_[index]->deviceGenerationLoopGraph();
             loop.capture->reset();
             const GPUOrderedTimelineStep forward{.name = "complete pipeline domain forward",
                 .capture = loop.source_fragments.front().capture};
@@ -1012,7 +1044,7 @@ bool PipelineDeviceGeneration::composeParticipants()
     std::atomic<bool> failed{false};
     workers_->dispatch([&, this](size_t index) {
         auto &stage = *stages_[index];
-        auto &loop = stage.mtp_device_generation_loop_graph_;
+        auto &loop = stage.deviceGenerationLoopGraph();
         auto &context = GPUDeviceContextPool::instance().getContext(stage.state_.device_id);
         void *const stream = loop.stream.get();
         const bool tail = index + 1 == stages_.size();
@@ -1167,26 +1199,43 @@ bool PipelineDeviceGeneration::materialize(int requests, int depth,
     if (phase_ != Phase::Admitted || requests != 1 || depth < 0 ||
         !isValidDeviceGenerationSamplingMode(sampling))
         return false;
-    phase_ = Phase::Failed;
-    if (depth > 0)
+    const auto count = stages_.front()->sparseQueryProgramCount();
+    if (std::any_of(stages_.begin(), stages_.end(), [count](auto *stage) {
+            return stage->sparseQueryProgramCount() != count; }))
+        throw std::logic_error("Pipeline sparse-query programs disagree with the original model geometry");
+    const auto compile_program = [&]() -> bool
     {
-        if (!prepareSpeculativeParticipants(depth, topology, sampling)) return false;
-        const bool reusable = std::all_of(stages_.begin(), stages_.end(), [this](auto *stage) {
-            const auto &loop = stage->mtp_device_generation_loop_graph_;
-            return loop.capture->hasExecutable() &&
-                (execution_policy_ != DeviceGenerationExecutionPolicy::NativeConditionalGraph ||
-                 loop.pipeline_children[0]);
-        });
-        if (!reusable && !composeSpeculativeParticipants()) return false;
+        phase_ = Phase::Failed;
+        if (depth > 0)
+        {
+            if (!prepareSpeculativeParticipants(depth, topology, sampling)) return false;
+            const bool reusable = std::all_of(stages_.begin(), stages_.end(), [this](auto *stage) {
+                const auto &loop = stage->deviceGenerationLoopGraph();
+                return loop.capture->hasExecutable() &&
+                    (execution_policy_ != DeviceGenerationExecutionPolicy::NativeConditionalGraph ||
+                     loop.pipeline_children[0]);
+            });
+            if (!reusable && !composeSpeculativeParticipants()) return false;
+            phase_ = Phase::Materialized;
+            return true;
+        }
+        if (topology != DeviceGenerationLoopTopology::FixedDepth) return false;
+        if (!prepareParticipants(sampling)) return false;
+        const bool reusable = std::all_of(stages_.begin(), stages_.end(), [](auto *stage) {
+            return stage->deviceGenerationLoopGraph().capture->hasExecutable(); });
+        if (!reusable && !composeParticipants()) return false;
         phase_ = Phase::Materialized;
         return true;
+    };
+    for (std::size_t program = 0; program < count; ++program)
+    {
+        std::vector<DeviceGraphOrchestrator::SparseQueryProgramCompilationScope> participants;
+        participants.reserve(stages_.size());
+        for (auto *stage : stages_)
+            participants.emplace_back(*stage, program == 0 ? SparseQueryExecutionProgram::RankingPossible :
+                SparseQueryExecutionProgram::ProvenNoRanking);
+        if (!compile_program()) return false;
     }
-    if (topology != DeviceGenerationLoopTopology::FixedDepth) return false;
-    if (!prepareParticipants(sampling)) return false;
-    const bool reusable = std::all_of(stages_.begin(), stages_.end(), [](auto *stage) {
-        return stage->mtp_device_generation_loop_graph_.capture->hasExecutable(); });
-    if (!reusable && !composeParticipants()) return false;
-    phase_ = Phase::Materialized;
     return true;
 }
 
@@ -1196,7 +1245,7 @@ bool PipelineDeviceGeneration::launch()
     phase_ = Phase::Failed;
     if (execution_policy_ == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions)
     {
-        const bool speculative = stages_[terminalIndex()]->mtp_device_generation_loop_graph_.draft_depth > 0;
+        const bool speculative = stages_[terminalIndex()]->deviceGenerationLoopGraph().draft_depth > 0;
         if (!(speculative ? launchHostedSpeculativeTransactions() : launchHostedTransactions()))
         {
             abortParticipants();
@@ -1219,10 +1268,10 @@ bool PipelineDeviceGeneration::launchHostedTransactions()
 {
     if (transport_ == Transport::CapturedDomains) return launchHostedDomainTransactions();
     auto &tail = *stages_.back();
-    auto &tail_loop = tail.mtp_device_generation_loop_graph_;
+    auto &tail_loop = tail.deviceGenerationLoopGraph();
     for (auto *stage : stages_)
     {
-        auto &loop = stage->mtp_device_generation_loop_graph_;
+        auto &loop = stage->deviceGenerationLoopGraph();
         if (!loop.valid || loop.launched || !loop.capture->hasExecutable() ||
             loop.workspace_generation != stage->workspaceGeneration(stage->state_.device_id) ||
             !stage->consumeDeviceGenerationStateReady(loop.stream.get(),
@@ -1236,7 +1285,7 @@ bool PipelineDeviceGeneration::launchHostedTransactions()
     const auto submit_followers = [&] {
         for (size_t i = 0; i + 1 < stages_.size(); ++i)
         {
-            auto &loop = stages_[i]->mtp_device_generation_loop_graph_;
+            auto &loop = stages_[i]->deviceGenerationLoopGraph();
             if (!loop.capture->launchOnStream(loop.stream.get())) return false;
         }
         return true;
@@ -1266,7 +1315,7 @@ bool PipelineDeviceGeneration::launchHostedTransactions()
             // request without reading a stale follower command.
             for (size_t i = 0; i + 1 < stages_.size(); ++i)
                 if (!stages_[i]->submitRetainedStorageTerminal()||!stages_[i]->publishDeviceGenerationStateReady(
-                        stages_[i]->mtp_device_generation_loop_graph_.stream.get(), 1,
+                        stages_[i]->deviceGenerationLoopGraph().stream.get(), 1,
                         DeviceGenerationStatePublicationKind::Terminal)) return false;
             return true;
         }
@@ -1281,7 +1330,7 @@ bool PipelineDeviceGeneration::launchHostedDomainTransactions()
     for (size_t i = 0; i < terminalIndex(); ++i)
     {
         auto &stage = *stages_[i];
-        auto &loop = stage.mtp_device_generation_loop_graph_;
+        auto &loop = stage.deviceGenerationLoopGraph();
         if (!loop.valid || loop.launched || !loop.capture->hasExecutable() ||
             loop.workspace_generation != stage.workspaceGeneration(stage.state_.device_id) ||
             !stage.consumeDeviceGenerationStateReady(loop.stream.get(),
@@ -1293,12 +1342,12 @@ bool PipelineDeviceGeneration::launchHostedDomainTransactions()
         // for a ticket. Native broadcasts remain on their exact device streams.
         for (size_t i = 0; i < terminalIndex(); ++i)
         {
-            auto &loop = stages_[i]->mtp_device_generation_loop_graph_;
+            auto &loop = stages_[i]->deviceGenerationLoopGraph();
             if (!loop.capture->launchOnStream(loop.stream.get())) return false;
         }
         return true;
     };
-    if (tail.mtp_device_generation_loop_graph_.ordinary_leading ==
+    if (tail.deviceGenerationLoopGraph().ordinary_leading ==
             sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted && !submit_followers())
         return false;
     const int bound = tail.active_device_generation_admission_->max_new_tokens;
@@ -1310,7 +1359,7 @@ bool PipelineDeviceGeneration::launchHostedDomainTransactions()
             !owner.submitHostScheduledDeviceGenerationAdvance(ticket)) return false;
         if (!ticket.complete) continue;
         for (size_t i = 0; i < terminalIndex(); ++i)
-            if (!stages_[i]->submitRetainedStorageTerminal()||!stages_[i]->publishDeviceGenerationStateReady(stages_[i]->mtp_device_generation_loop_graph_.stream.get(),
+            if (!stages_[i]->submitRetainedStorageTerminal()||!stages_[i]->publishDeviceGenerationStateReady(stages_[i]->deviceGenerationLoopGraph().stream.get(),
                     1, DeviceGenerationStatePublicationKind::Terminal)) return false;
         return true;
     }
@@ -1331,7 +1380,7 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
     {
         auto &stage = *stages_[i];
         auto *backend = getBackendFor(stage.state_.device_id);
-        void *stream = stage.mtp_device_generation_loop_graph_.stream.get();
+        void *stream = stage.deviceGenerationLoopGraph().stream.get();
         const bool follower = !terminalParticipant(i);
         if (follower && !stage.consumeDeviceGenerationStateReady(stream, DeviceTimelineRole::HostResultBridge,
                 1, "pipeline_follower_terminal")) return false;
@@ -1369,7 +1418,7 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
         if (!terminalParticipant(i))
         {
             stage.awaitRetainedStorageTerminal();
-            if (!stage.mtp_device_generation_loop_graph_.retireCompletedLaunch() ||
+            if (!stage.deviceGenerationLoopGraph().retireCompletedLaunch() ||
                 !stage.device_generation_state_ready_.handoff.retireAfterHostCompletion(1)) return false;
             stage.device_generation_storage_.active_request_count = 0;
         }
@@ -1381,7 +1430,7 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
     // terminal. Followers report only after the independent KV check above;
     // they borrow its authenticated count, never a mirrored response ledger.
     for (size_t i = 0; i < terminalIndex(); ++i)
-        if (stages_[i]->mtp_device_generation_loop_graph_.draft_depth == 0 &&
+        if (stages_[i]->deviceGenerationLoopGraph().draft_depth == 0 &&
             !stages_[i]->observeOrdinaryGenerationForwardCompletion(
                 result->requests.front().published_state_commit_count)) return false;
     // Every participant's complete event, health and canonical KV position is

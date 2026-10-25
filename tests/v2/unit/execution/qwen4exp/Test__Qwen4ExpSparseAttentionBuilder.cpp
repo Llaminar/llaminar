@@ -606,3 +606,113 @@ TEST(Qwen4ExpSparseAttentionBuilder, QueryDemandRejectsUnknownPhaseBeforeGraphMu
         DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}}),std::invalid_argument);
     EXPECT_EQ(graph.size(),1u);
 }
+
+/** @test An admission-selected short program omits the node and all of its edges. */
+TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingOmitsProjectionOnlyForExplicitDecode)
+{
+    using Phase=ForwardExecutionPhase;
+    using Program=SparseQueryExecutionProgram;
+    using Demand=qwen4exp::QwenSparseQueryDemand;
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture f;
+    for (const auto phase : {Phase::Prefill,Phase::Decode})
+        for (const auto program : {Program::RankingPossible,Program::ProvenNoRanking})
+            for (const bool requestsEntry : {false,true})
+            {
+                SCOPED_TRACE(::testing::Message()<<"phase="<<int(phase)<<" program="<<int(program)<<" requests="<<requestsEntry);
+                ComputeGraph graph;f.seed(graph);
+                auto policy=f.policy();policy.executionPhase=phase;policy.queryExecutionProgram=program;
+                policy.projectionArithmetic=Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
+                if(phase==Phase::Prefill && program==Program::ProvenNoRanking) {
+                    EXPECT_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()),std::invalid_argument);
+                    EXPECT_EQ(graph.size(),1u);
+                    continue;
+                }
+                if(requestsEntry)
+                    (void)Builder::appendRequests(graph,f.consumer(),policy,f.weights(),
+                        DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}});
+                else (void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers());
+                const bool omit=phase==Phase::Decode && program==Program::ProvenNoRanking;
+                EXPECT_EQ(graph.size(),omit?5u:6u);
+                EXPECT_EQ(graph.getNode("qsa.qsa_query_proj")==nullptr,omit);
+                const auto *node=graph.getNode("qsa.qsa_indexer");ASSERT_NE(node,nullptr);
+                const auto *stage=dynamic_cast<const QwenSparseAttentionStage *>(node->stage.get());ASSERT_NE(stage,nullptr);
+                EXPECT_EQ(std::get<QwenSparseAttentionStage::Indexer>(stage->getParams().operation).queryDemand,
+                    omit?Demand::ProvenNoRanking:phase==Phase::Decode?Demand::RankingOnly:Demand::AllLive);
+                EXPECT_EQ(std::find(node->dependencies.begin(),node->dependencies.end(),"qsa.qsa_query_proj")
+                    ==node->dependencies.end(),omit);
+                for(const auto *name:{"qsa.qsa_key_proj","ready"})
+                    EXPECT_NE(std::find(node->dependencies.begin(),node->dependencies.end(),name),node->dependencies.end());
+                const auto *key=dynamic_cast<const GEMMStage *>(graph.getNode("qsa.qsa_key_proj")->stage.get());ASSERT_NE(key,nullptr);
+                EXPECT_FALSE(key->getParams().projection_row_work);
+                EXPECT_EQ(key->getParams().C,&f.raw);
+                ASSERT_NE(graph.getNode("qsa.attention"),nullptr);
+                ASSERT_NE(graph.getNode("qsa.qsa_commit_partial"),nullptr);
+            }
+}
+
+/** @test Physical omission leaves required output/state bytes and unauthored query banks unchanged. */
+TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingPreservesCompleteCPUOperationBytes)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture full,shortWindow;
+    for(auto *f:{&full,&shortWindow}) {
+        for(auto *tensor:{&f->query,&f->prepared,&f->scores,&f->raw,&f->pools,&f->output})
+            std::fill_n(tensor->mutable_data(),tensor->numel(),-37.25f);
+        std::fill_n(static_cast<int *>(f->selected.raw_mutable_data()),f->selected.numel(),-97);
+        std::fill_n(static_cast<int *>(f->count.raw_mutable_data()),f->count.numel(),-98);
+    }
+    for(auto *f:{&full,&shortWindow}) {
+        ComputeGraph graph;f->seed(graph);
+        auto policy=f->policy();policy.executionPhase=ForwardExecutionPhase::Decode;
+        policy.projectionArithmetic=Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
+        policy.queryExecutionProgram=f==&full ? SparseQueryExecutionProgram::RankingPossible : SparseQueryExecutionProgram::ProvenNoRanking;
+        (void)Builder::append(graph,f->consumer(),policy,f->weights(),f->buffers());
+        CPUDeviceContext context(DeviceId::cpu(),1);
+        // The complete sibling owns a causal query-work descriptor. Prepare
+        // its immutable source addresses at the same cold launch boundary as
+        // the graph executor before comparing either program's numeric work.
+        for(auto *stage:graph.getExecutionStages())ASSERT_TRUE(stage->prepareGraphLaunch(&context,nullptr));
+        for(auto *stage:graph.getExecutionStages())ASSERT_TRUE(stage->execute(&context));
+    }
+    for(const auto &[a,b]:{std::pair{&full.raw,&shortWindow.raw},std::pair{&full.prior,&shortWindow.prior},
+            std::pair{&full.pools,&shortWindow.pools},std::pair{&full.output,&shortWindow.output}})
+        EXPECT_EQ(std::memcmp(a->data(),b->data(),a->size_bytes()),0);
+    EXPECT_EQ(std::memcmp(full.selected.raw_data(),shortWindow.selected.raw_data(),full.selected.size_bytes()),0);
+    EXPECT_EQ(std::memcmp(full.count.raw_data(),shortWindow.count.raw_data(),full.count.size_bytes()),0);
+    for(const auto *tensor:{&shortWindow.query,&shortWindow.prepared,&shortWindow.scores})
+        for(std::size_t i=0;i<tensor->numel();++i)EXPECT_EQ(tensor->data()[i],-37.25f);
+}
+
+/** @test Invalid programs and unphased omission cannot mutate a graph or manufacture a proof. */
+TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingRejectsInvalidProgramBeforeGraphMutation)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture f;
+    for(const auto program:{SparseQueryExecutionProgram::ProvenNoRanking,static_cast<SparseQueryExecutionProgram>(-1),static_cast<SparseQueryExecutionProgram>(2)})
+        for(const auto phase:std::array<std::optional<ForwardExecutionPhase>,3>{std::nullopt,ForwardExecutionPhase::Prefill,ForwardExecutionPhase::Decode}) {
+            if(program==SparseQueryExecutionProgram::ProvenNoRanking && phase==ForwardExecutionPhase::Decode)continue;
+            ComputeGraph graph;f.seed(graph);
+            auto policy=f.policy();policy.queryExecutionProgram=program;policy.executionPhase=phase;
+            EXPECT_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()),std::invalid_argument);
+            EXPECT_EQ(graph.size(),1u);
+            EXPECT_THROW((void)Builder::appendRequests(graph,f.consumer(),policy,f.weights(),
+                DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}}),std::invalid_argument);
+            EXPECT_EQ(graph.size(),1u);
+        }
+}
+
+/** @test Omitting indexer queries cannot weaken the retained raw-key arithmetic contract. */
+TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingStillRequiresExplicitGroupedProjectionArithmetic)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture f; ComputeGraph graph; f.seed(graph);
+    auto policy=f.policy(); policy.executionPhase=ForwardExecutionPhase::Decode;
+    policy.queryExecutionProgram=SparseQueryExecutionProgram::ProvenNoRanking;
+    ASSERT_EQ(policy.projectionArithmetic,Qwen4ExpProjectionArithmetic::Ordinary);
+    EXPECT_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()),std::invalid_argument);
+    EXPECT_EQ(graph.size(),1u);
+    policy.projectionArithmetic=Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
+    EXPECT_NO_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()));
+    EXPECT_EQ(graph.size(),5u);
+}

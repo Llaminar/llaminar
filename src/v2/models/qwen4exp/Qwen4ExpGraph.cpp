@@ -550,7 +550,8 @@ std::optional<std::string> Qwen4ExpGraph::addModelAttentionConsumer(ComputeGraph
             .poolSelection=Qwen4ExpSparseAttentionBuilder::poolSelectionForInvocation(
                 input.execution_phase,binding.device,binding.queryRows),
             .attentionArithmetic=arithmetic,.executionPhase=input.execution_phase,
-            .retainedMtpCandidateRows=retainedRows},
+            .retainedMtpCandidateRows=retainedRows,
+            .queryExecutionProgram=input.sparse_query_execution_program},
         {projection(weights.query,binding.device),projection(weights.key,binding.device),gain(weights.query_norm),gain(weights.key_norm),{},{}},
         {replay,fp32(BufferId::QFN_QSA_QUERY),fp32(BufferId::QFN_QSA_RAW_KEY),
             pool.partialKeys,pool.pooledKeys,fp32(BufferId::QFN_QSA_PREPARED_QUERY),fp32(BufferId::QFN_QSA_SCORES),

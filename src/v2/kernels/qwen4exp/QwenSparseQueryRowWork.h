@@ -23,6 +23,8 @@ namespace llaminar2::qwen4exp {
     switch(indexer.query_demand) {
     case QwenSparseQueryDemand::AllLive:
         return ProjectionRowWork::fromPrefix(DeviceRowRange::deviceCounted(indexer.row_capacity,&indexer.replay->live_rows));
+    case QwenSparseQueryDemand::ProvenNoRanking:
+        throw std::invalid_argument("ProvenNoRanking has no query projection/preparation work descriptor");
     case QwenSparseQueryDemand::RankingOnly:
         return ProjectionRowWork::causalStrided(1,indexer.row_capacity,&indexer.replay->prefix_tokens,&indexer.replay->live_rows,
             1,indexer.token_capacity,QwenSparseFirstRankingLogicalRow);

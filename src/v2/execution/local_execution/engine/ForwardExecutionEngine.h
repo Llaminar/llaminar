@@ -1271,9 +1271,12 @@ namespace llaminar2
          * graphs are not yet proven placement-stable and must not replay after
          * a mask publication under a stable MoE epoch.
          *
+         * @param before_invalidation Cold owner hook, called once before the first
+         * child recording is destroyed so enclosing retained parents retire first.
          * @return Number of valid cached graphs invalidated.
          */
-        size_t invalidateMoEPlacementSensitiveGraphsForStablePlacement();
+        size_t invalidateMoEPlacementSensitiveGraphsForStablePlacement(
+            const std::function<void()> &before_invalidation = {});
 
         /**
          * @brief Drop captured GPU replay state while keeping cached ComputeGraphs.

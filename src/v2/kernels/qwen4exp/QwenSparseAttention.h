@@ -36,7 +36,17 @@ inline constexpr int QwenSparsePartitions = 8; ///< Fixed selected-index arithme
 inline constexpr int QwenSparsePartitionTokens = 257; ///< Covers 2051 indices in eight partitions.
 
 /** @brief Explicit query authorship; keys and accepted history always remain live. */
-enum class QwenSparseQueryDemand : std::uint8_t { AllLive, RankingOnly };
+enum class QwenSparseQueryDemand : std::uint8_t {
+    AllLive,
+    RankingOnly,
+    ProvenNoRanking ///< Admission proves every submitted decode row has visible tokens <=2051.
+};
+/**
+ * @brief Reject unknown immutable query programs before staging or capture.
+ * @param demand Closed admission-selected indexer query program.
+ * @throws std::invalid_argument For an unknown enum representation.
+ */
+void validateQwenSparseQueryDemand(QwenSparseQueryDemand demand);
 
 /** @brief Explicit representation; unsupported codecs cannot enter a native reader. */
 enum class QwenSparseScalar : std::uint8_t { FP32, FP16, BF16 };
@@ -102,16 +112,16 @@ static_assert(sizeof(QwenSparseSelectionObservation) == 32);
 struct QwenSparseIndexer
 {
     const QwenSparseReplay *replay = nullptr; ///< Ordered immutable transaction base.
-    const float *query = nullptr; ///< Raw Q projection [row_capacity,4,128].
+    const float *query = nullptr; ///< Raw indexer Q; unused/optional only under explicit ProvenNoRanking.
     const float *raw_keys = nullptr; ///< Raw K projection [row_capacity,128].
     const float *partial_keys = nullptr; ///< Prior raw tail [4,128], first prefix%4 rows live.
     float *pooled_keys = nullptr; ///< Persistent prepared complete pools [block_capacity,128].
-    const float *query_norm = nullptr; ///< Converted RMSNorm weights [128].
+    const float *query_norm = nullptr; ///< Converted query RMSNorm weights; unused under ProvenNoRanking.
     const float *key_norm = nullptr; ///< Converted RMSNorm weights [128].
     const float *cosine = nullptr; ///< Absolute-position plane [position_capacity,rotary_dim/2].
     const float *sine = nullptr; ///< Same shape as cosine.
-    float *prepared_query = nullptr; ///< Exclusive prepared Q scratch [row_capacity,4,128].
-    float *scores = nullptr; ///< Exclusive complete-pool scores [row_capacity,block_capacity].
+    float *prepared_query = nullptr; ///< Exclusive prepared Q; never published by ProvenNoRanking.
+    float *scores = nullptr; ///< Complete-pool scores; never consumed/published by ProvenNoRanking.
     std::int32_t *selected = nullptr; ///< Exclusive sorted logical indices [row_capacity,2051].
     std::int32_t *selected_count = nullptr; ///< Live count for every admitted row.
     int row_capacity = 0; ///< Capture geometry, independent of live_rows.

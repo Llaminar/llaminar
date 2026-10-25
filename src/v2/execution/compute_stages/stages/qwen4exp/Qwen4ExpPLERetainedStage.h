@@ -69,6 +69,9 @@ public:
  bool restoreVerifierStateCaptureRows(const int *rows,int requests,void *stream) override;
  /** @brief Consume one device decision only for a single-request transaction. */
  bool restoreVerifierStateCaptureRowFromDeviceIndex(const int *row,void *stream) override;
+ /** @brief Accepted PLE publication writes only token and convolution history banks. */
+ std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept override;
+
  /** @brief Consume the complete independently-strided device decision vector. */
  bool restoreVerifierStateCaptureRowsFromDeviceIndices(const int *rows,int requests,int stride,void *stream) override;
  /** @brief Seal normally prepared storage once before native graph recording. */
@@ -96,6 +99,7 @@ private:
  qwen4exp::PLEPublishAccepted publication(const int*rows,int stride)const;
  /** @brief Execute exact-stream validated publication and publish its output events. */
  bool publish(const int*rows,int requests,int stride,void*stream);
+ std::array<BufferBinding, 2> acceptedPublicationOutputs_{}; ///< Immutable accepted-history declaration.
  Params params_;qwen4exp::PLETransactionOperations operations_;
  std::vector<Operand>operands_;
  std::optional<Qwen4ExpPreparedStorage>storage_;

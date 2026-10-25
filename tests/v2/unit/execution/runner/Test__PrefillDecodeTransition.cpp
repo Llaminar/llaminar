@@ -226,6 +226,29 @@ namespace
         }
 
         // Core API
+        /** @return Test-owned immutable topology admissions, never controller progress. */
+        const std::vector<DeviceGenerationAdmissionRequest> &sparseQueryAdmissions() const
+        {
+            return sparse_query_admissions_;
+        }
+        /** Immutable admissions observed by this mock; never runtime token progress. */
+        std::vector<DeviceGenerationAdmissionRequest> sparse_query_admissions_;
+
+        /**
+         * @brief Admit response policy in this model-free protocol/sampling witness.
+         * @param request Existing immutable admission, including any target-count proof.
+         * @return True only for a valid closed program; no QSA/indexer graph exists here.
+         */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override
+        {
+            if (!request.valid()) return false;
+            (void)resolveSparseQueryExecutionProgram(request);
+            sparse_query_admissions_.push_back(request);
+            return true;
+        }
+        /** @brief No query graph policy is retained by this explicit no-consumer witness. */
+        void endSparseQueryExecutionProgram() noexcept override {}
+
         bool forward(const int *tokens, int seq_len) override
         {
             forward_call_count_++;
@@ -10342,6 +10365,11 @@ namespace
 
         GenerationResult step1 = runner->decodeStep();
         ASSERT_TRUE(step1.success()) << step1.error;
+        ASSERT_EQ(mock->sparseQueryAdmissions().size(),1u);
+        EXPECT_EQ(mock->sparseQueryAdmissions().back().depth_policy.maximum_depth,3);
+        EXPECT_EQ(mock->sparseQueryAdmissions().back().depth_policy.mode,
+                  sampling_math::DeviceGenerationPolicyMode::Fixed);
+        EXPECT_TRUE(mock->sparseQueryAdmissions().back().initial_target_counts.has_value());
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 0);
         auto probe = runner->prefixStateProbe();
@@ -10356,6 +10384,9 @@ namespace
         const int shifted_commit_count_after_demote = mock->commitMTPShiftedCount();
         GenerationResult step2 = runner->decodeStep();
         ASSERT_TRUE(step2.success()) << step2.error;
+        ASSERT_EQ(mock->sparseQueryAdmissions().size(),2u);
+        EXPECT_EQ(mock->sparseQueryAdmissions().back().depth_policy.maximum_depth,3)
+            << "Current zero/demoted/promoted depth must not shrink the admitted execution envelope";
 
         EXPECT_EQ(mock->forwardMTPCount(), forward_mtp_count_after_demote)
             << "depth-zero adaptive bypass must not run MTP draft sidecars";
@@ -10370,6 +10401,20 @@ namespace
         EXPECT_EQ(probe.mtp_bypasses, 0u);
         EXPECT_EQ(probe.mtp_current_depth, 0);
         EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "depth_zero_bypass");
+        EXPECT_EQ(probe.mtp_request.depth_policy_mode,"dynamic");
+        // The live controller is at zero, but future promotion still permits3.
+        // Reuse its actual topology admission to prove both threshold neighbors.
+        auto envelope=mock->sparseQueryAdmissions().back();
+        envelope.max_new_tokens=1;
+        for(int initial : {2046,2047})
+        {
+            envelope.initial_target_counts.emplace(std::vector<int>{initial});
+            ASSERT_TRUE(envelope.valid());
+            EXPECT_EQ(resolveSparseQueryExecutionProgram(envelope),initial==2046
+                ? SparseQueryExecutionProgram::ProvenNoRanking
+                : SparseQueryExecutionProgram::RankingPossible);
+        }
+
     }
 
     TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthResetsAcrossClearCachePrefillCycles)
@@ -10457,6 +10502,11 @@ namespace
 
         GenerationResult step1 = runner->decodeStep();
         ASSERT_TRUE(step1.success()) << step1.error;
+        ASSERT_EQ(mock->sparseQueryAdmissions().size(),1u);
+        EXPECT_EQ(mock->sparseQueryAdmissions().back().depth_policy.maximum_depth,3);
+        EXPECT_EQ(mock->sparseQueryAdmissions().back().depth_policy.mode,
+                  sampling_math::DeviceGenerationPolicyMode::Fixed);
+        EXPECT_TRUE(mock->sparseQueryAdmissions().back().initial_target_counts.has_value());
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 0);
         auto probe = runner->prefixStateProbe();
@@ -10465,6 +10515,9 @@ namespace
 
         GenerationResult step2 = runner->decodeStep();
         ASSERT_TRUE(step2.success()) << step2.error;
+        ASSERT_EQ(mock->sparseQueryAdmissions().size(),2u);
+        EXPECT_EQ(mock->sparseQueryAdmissions().back().depth_policy.maximum_depth,3)
+            << "Current zero/demoted/promoted depth must not shrink the admitted execution envelope";
         EXPECT_EQ(mock->forwardMTPCount(), 2);
         EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 1)
             << "second step should use depth 2 before evaluating the deepest lane";
@@ -10472,6 +10525,7 @@ namespace
         EXPECT_EQ(probe.mtp_current_depth, 3)
             << "The generic controller must not reserve the configured maximum as an unreachable special case.";
         EXPECT_EQ(probe.mtp_depth_policy_promotions, 2u);
+        EXPECT_EQ(probe.mtp_request.depth_policy_mode,"dynamic");
         EXPECT_EQ(probe.mtp_depth_policy_updates, 2u);
         EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "promote_full_accept_rate");
     }

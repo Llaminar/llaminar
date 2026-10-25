@@ -8,6 +8,7 @@
 #include <gmock/gmock.h>
 
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "execution/mtp/MTPSpecStatePublisher.h"
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -442,6 +444,22 @@ namespace
         batch.steps.assign(steps.begin(), steps.end());
         return batch;
     }
+    /** @brief Supply exact immutable accepted-write declarations to the real outer stage. */
+    class DeclaredPublicationStage final : public FakeVerifierStateStage
+    {
+    public:
+        /** @brief Own only cold buffer metadata; no device or model state is simulated. */
+        explicit DeclaredPublicationStage(std::vector<BufferBinding> outputs)
+            : FakeVerifierStateStage(true), outputs_(std::move(outputs)) {}
+
+        std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept override
+        {
+            return outputs_;
+        }
+
+    private:
+        std::vector<BufferBinding> outputs_;
+    };
 } // namespace
 
 TEST(Test__MTPSpecStateContract, BuildsAcceptAllPlanWithBonusReadyRow)
@@ -2017,4 +2035,86 @@ TEST(Test__MTPSpecStateContract, CPUBatchPublishesValidatedNativePrefixesAndPres
     EXPECT_EQ(first.planned,1);EXPECT_EQ(second.planned,1);
     EXPECT_EQ(first.commits,1);EXPECT_EQ(second.commits,1);
     EXPECT_EQ(first.clears,1);EXPECT_EQ(second.clears,1);
+}
+
+/** @brief Outer publication owns only actual accepted tensor writes, including follower graphs. */
+TEST(Test__MTPSpecStateContract, AcceptedArenaOutputsMergeWithoutCandidateOrAllocationAuthority)
+{
+    DeclaredPublicationStage qsa({
+        {BufferId::QFN_QSA_PARTIAL_KEYS, BufferAccess::WRITE, "FP32", false}});
+    DeclaredPublicationStage ple({
+        {BufferId::QFN_PLE_TOKEN_HISTORY, BufferAccess::WRITE, "INT32", false},
+        {BufferId::QFN_PLE_CONV_HISTORY, BufferAccess::WRITE, "FP32", false}});
+    DeclaredPublicationStage duplicate({
+        {BufferId::QFN_QSA_PARTIAL_KEYS, BufferAccess::WRITE, "FP32", false}});
+    FakeVerifierStateStage raw_state(true);
+    EXPECT_TRUE(raw_state.verifierStatePublicationOutputs().empty());
+    using Publication = MTPSpeculativeStatePublicationStage;
+    for (const auto authority : {Publication::Authority::PipelineFollower,
+                                Publication::Authority::CompactOutcome,
+                                Publication::Authority::BoundedGeneration})
+    {
+        Publication::Params params;
+        params.device_id = DeviceId::cpu();
+        params.authority = authority;
+        params.request_count = 1;
+        params.verifier_state_stages = {&qsa, &ple, &duplicate, &raw_state};
+        Publication stage(params); // Contract-only: no validate/execute or GPU capability claim.
+        const auto contract = stage.bufferContract();
+        const std::array expected{
+            std::pair{BufferId::QFN_QSA_PARTIAL_KEYS, "FP32"},
+            std::pair{BufferId::QFN_PLE_TOKEN_HISTORY, "INT32"},
+            std::pair{BufferId::QFN_PLE_CONV_HISTORY, "FP32"}};
+        for (const auto &[id, dtype] : expected)
+        {
+            ASSERT_EQ(std::count_if(contract.outputs.begin(), contract.outputs.end(),
+                [&](const auto &binding) { return binding.id == id; }), 1);
+            const auto binding = std::find_if(contract.outputs.begin(), contract.outputs.end(),
+                [&](const auto &candidate) { return candidate.id == id; });
+            EXPECT_EQ(binding->access, BufferAccess::WRITE);
+            EXPECT_FALSE(binding->prepare_write_storage);
+            EXPECT_STREQ(binding->dtype, dtype);
+        }
+        for (const auto &binding : contract.outputs)
+        {
+            EXPECT_NE(binding.id, BufferId::QFN_QSA_CANDIDATE_RAW_KEYS);
+            EXPECT_NE(binding.id, BufferId::QFN_PLE_RETAINED_TOKENS);
+        }
+        EXPECT_TRUE(contract.workspaces.empty());
+        if (authority == Publication::Authority::PipelineFollower)
+        {
+            EXPECT_EQ(contract.outputs.size(), expected.size());
+            EXPECT_TRUE(contract.inputs.empty());
+            EXPECT_TRUE(contract.inouts.empty());
+        }
+    }
+}
+
+/** @brief Malformed child declarations cannot broaden an enclosing capture's authority. */
+TEST(Test__MTPSpecStateContract, AcceptedArenaOutputsRejectConflictingOrAllocatingBindings)
+{
+    using Publication = MTPSpeculativeStatePublicationStage;
+    DeclaredPublicationStage valid({
+        {BufferId::QFN_QSA_PARTIAL_KEYS, BufferAccess::WRITE, "FP32", false}});
+    for (const BufferBinding invalid : {
+        BufferBinding{BufferId::QFN_QSA_PARTIAL_KEYS, BufferAccess::WRITE, "INT32", false},
+        BufferBinding{BufferId::QFN_QSA_PARTIAL_KEYS, BufferAccess::READ, "FP32", false},
+        BufferBinding{BufferId::QFN_QSA_PARTIAL_KEYS, BufferAccess::READWRITE, "FP32", false},
+        BufferBinding{BufferId::QFN_QSA_PARTIAL_KEYS, BufferAccess::WRITE, "FP32", true},
+        BufferBinding{BufferId::QFN_QSA_PARTIAL_KEYS, BufferAccess::WRITE, nullptr, false}})
+    {
+        DeclaredPublicationStage malformed({invalid});
+        Publication::Params params;
+        params.device_id = DeviceId::cpu();
+        params.authority = Publication::Authority::PipelineFollower;
+        params.verifier_state_stages = {&valid, &malformed};
+        Publication stage(params);
+        EXPECT_THROW(stage.bufferContract(), std::logic_error);
+    }
+    Publication::Params params;
+    params.device_id = DeviceId::cpu();
+    params.authority = Publication::Authority::PipelineFollower;
+    params.verifier_state_stages = {nullptr};
+    Publication null_stage(params);
+    EXPECT_THROW(null_stage.bufferContract(), std::logic_error);
 }

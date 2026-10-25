@@ -191,6 +191,11 @@ namespace llaminar2
         ~MoEOverlayParticipantGraphRunner() override;
 
         /** @brief Execute one matched sparse-collective step. */
+        /** @copydoc IInferenceRunner::admitSparseQueryExecutionProgram */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override;
+        /** @copydoc IInferenceRunner::endSparseQueryExecutionProgram */
+        void endSparseQueryExecutionProgram() noexcept override;
+
         bool forward(const int *tokens, int seq_len) override;
         /**
          * @brief Execute a prompt transaction with explicit prefill semantics.

@@ -2644,4 +2644,42 @@ namespace llaminar2::test
         EXPECT_EQ(transfers[0]->to_stage, 1);
     }
 
+    /** @test Every mixed-domain participant receives the same immutable window and expiry. */
+    TEST_F(Test__GlobalOrchestrator, SparseQueryHostResponseAdmissionFansOutAcrossMixedStages)
+    {
+        class Participant final : public MockDeviceRunner
+        {
+        public:
+            DeviceId device=DeviceId::cpu();
+            int begins=0,ends=0;
+            SparseQueryExecutionProgram program=SparseQueryExecutionProgram::RankingPossible;
+            DeviceId primaryDeviceId() const override { return device; }
+            bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override
+            {
+                ++begins;program=resolveSparseQueryExecutionProgram(request);return true;
+            }
+            void endSparseQueryExecutionProgram() noexcept override
+            {
+                ++ends;program=SparseQueryExecutionProgram::RankingPossible;
+            }
+        };
+        const auto topology=buildNamedDomainHybridTopo(0);
+        auto gpu=std::make_unique<Participant>();gpu->device=DeviceId::rocm(0);auto *g=gpu.get();
+        auto cpu=std::make_unique<Participant>();auto *c=cpu.get();
+        StageRunnerRegistry registry;
+        registry.add(makeStageRunnerEntry(topology,0,0,std::move(gpu)));
+        registry.add(makeStageRunnerEntry(topology,0,1,std::move(cpu)));
+        DeviceGenerationAdmissionRequest request{.request_count=1,.max_new_tokens=256,
+            .depth_policy=sampling_math::DeviceGenerationPolicy::ordinary()};
+        request.initial_target_counts.emplace(std::vector<int>{512});
+        ASSERT_TRUE(registry.admitSparseQueryExecutionProgramAll(request));
+        EXPECT_EQ(g->begins,1);EXPECT_EQ(c->begins,1);
+        EXPECT_EQ(g->program,SparseQueryExecutionProgram::ProvenNoRanking);
+        EXPECT_EQ(g->program,c->program);
+        registry.endSparseQueryExecutionProgramAll();
+        EXPECT_EQ(g->ends,1);EXPECT_EQ(c->ends,1);
+        EXPECT_EQ(g->program,SparseQueryExecutionProgram::RankingPossible);
+        EXPECT_EQ(c->program,g->program);
+    }
+
 } // namespace llaminar2::test

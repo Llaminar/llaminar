@@ -1,9 +1,10 @@
 # Retained QFN graphs without unnecessary indexer launches
 
-Status: implementation plan, 2026-10-25. The user requested complete omission
-of empty launches. This is the next priority after the qualified attention
-rescale change. The separate column-grid candidate improves active projection
-work as well, but does not implement omission.
+Status: scoped accuracy, lifecycle and matched Release gates green,
+2026-10-25. The no-ranking program physically omits empty indexer launches.
+Final combined-source performance is 819.673 prefill / 43.453 decode tok/s,
+against 820.881 / 43.268 for its control. Decode improves 0.426% in median,
+with overlapping samples; prefill changes -0.147%. No MTP speedup is claimed.
 
 ## Intended behavior
 
@@ -46,8 +47,9 @@ context capacity remains 4,096; changing capacity is not this optimization.
 3. Retain both forward programs through the existing forward cache. Extend the
    existing generation-parent owner to retain both corresponding complete parent
    families, including admitted MTP geometries. Select only at idle admission.
-   Current parent ownership is a singleton and invalidates on a changed child;
-   merely changing the stage signature would recapture and is insufficient.
+   Parent ownership now has a closed slot for each program; each slot authenticates
+   its exact child signature. Changing only a stage signature would have
+   invalidated the singleton parent and caused recapture.
    Setup seals both model-forward programs. The complete generation parents
    require the actual sampling law, so idle sampling-law admission composes
    both before the first launch and retains them afterward. Do not invent a
@@ -63,8 +65,8 @@ context capacity remains 4,096; changing capacity is not this optimization.
    dependency. The indexer stage omits query-only input waits, queryNorm weight
    binding, prepared-query/score output publication and associated snapshots.
    The core attention query is a different value and remains required.
-6. CPU, CUDA and ROCm consume the same explicit no-ranking program. Grouped GPU
-   preparation currently fuses required pool work with query work: select the
+6. CPU, CUDA and ROCm consume the same explicit no-ranking program. Complete
+   grouped GPU preparation fuses required pool work with query work: select the
    existing pool-only kernel, then the existing selector. Skip query and scoring
    dispatches. Preserve required pool arithmetic, raw-tail retention, acceptance,
    counts and state updates. Validate actual device replay against the selected
@@ -111,4 +113,120 @@ not an admission-accounting refactor.
 Local source audits: [admission/parent seams](/tmp/qfn-shortquery-admission-current-private/REPORT.md),
 [bound derivation](/tmp/qfn-qsa-request-bound-audit-private/REPORT.md), and
 [backend/contract changes](/tmp/qfn-shortquery-omission-backend-private/PLAN.md).
-These are design evidence; none claims implemented or certified omission.
+These are historical design evidence, not substitutes for executed tests.
+
+## Qualification and adjacent defects
+
+The first accepted real-model panel has 185 final-logit rows across 26 files,
+byte-identical to all five retained references. Each ROCm participant recorded
+154 successful no-ranking and five complete scalar forward submissions. This
+includes visibility 2,048 through 2,056 and reset/replay. The ordinary and
+teacher-forced TP4 short→long→short lifecycle tests also passed. Their stable
+capture census and source-owned construction paths prove retained reuse; the
+native API does not expose opaque executable IDs, so the test does not claim
+to have compared those handles directly.
+
+Qualification exposed lifecycle defects, each receiving an explicit
+production-preflight regression:
+
+- Forced-token publication left a consumed logits stream pending. Publication
+  now retires that handoff only after success; failure preserves ownership.
+  Native CUDA/ROCm tests cross streams and repeat dirty request resets.
+- Canonical TP reduction rejected a single live request bank. Constructor and
+  rebind now normalize it into the existing canonical live-row implementation.
+  CUDA2/ROCm2/ROCm4 tests prove rank-order arithmetic, inactive bytes and exact
+  communicated extents. Its bank also survives prefill phase filtering when
+  the predictor requires canonical arithmetic there; the real allocator/PMA
+  regression checks exact capacity and a zero-scratch native-sum control.
+  Multi-request canonical banks still reject precisely.
+- Weight materialization adopted a prepared binding before marking its
+  store-owned copy immutable. It now seals the finalized declaration before
+  publication. A real WeightManager regression covers predictor projection
+  identities across CPU/CUDA/ROCm without creating a device context.
+- Floating routers omitted the original-FP32 Q8 activation publication needed
+  by quantized grouped shared experts. CUDA and ROCm now publish it only when
+  that consumer is declared. Native tests prove exact Q8 bytes, dirty/live-row
+  replay and no extra packing for ordinary scalar decode.
+- One serving-program setup iteration left verifier logits owners bound for
+  its sibling. A lexical scope restores ordinary full/sharded logits owners
+  on entry and every exit; the strict output validator remains unchanged.
+
+The final Integration-r14 / Release-r15 source passes all 778 Unit
+registrations, 13 omission aliases and 17 defect aliases. The existing 95 inner
+Unit skips are unchanged. Actual TP4 and singleton-stage PP4 ordinary,
+teacher-forced and MTP short→long→short lifecycles all pass. Within each
+topology, ordinary and MTP prompts and all 12 emitted IDs match exactly.
+Parent/forward and publication-child census stays flat across resets; each MTP
+participant retains one publication child per program. TP forced mode proves
+retained forward submissions and census, without claiming an unobserved
+separate generation-parent ID. Driver and retirement checks pass.
+
+Accepted QSA/PLE writes are declared exactly by the outer publication contract,
+and each program retains its own authenticated publication child. A further
+preexisting defect surfaced in PP MTP: RoPE's replay-preserving reset cleared
+the captured device-position pointer and row extent. Executing a graph first
+restamped the fields and hid the fault; exporting its inactive sibling exposed
+it. Reset now preserves this device binding; host-position data and hard-reset
+behavior remain unchanged. No capture validator or arithmetic was relaxed.
+`V2_Integration_RoPERetainedDevicePositionIdentity` reproduced the original
+pointer/extent/policy failure with a passing host control, then passed with the
+repair. The real PP MTP lifecycle also passes after the repair.
+
+The fresh canonical panel has all 185 final-logit rows byte-identical to five
+retained references; required short/heldout KL and agreement groups pass.
+The threshold history remains a diagnostic group. Final-linked allocation
+inspection covers CUDA SM80/86/89/90 and HIP gfx906 with no memory spills.
+These scoped results do not certify the complete production-preflight suite,
+continuous stochastic MTP matrix, broader topology matrix or a release image.
+
+Current local evidence: `shortquery-omission-unit-r11`, `-focused-r14`,
+`-defect-regressions-r9`, `-lifecycle-ordinary-r5`, `-lifecycle-forced-r3`,
+`-lifecycle-mtp-r8`, `-lifecycle-pp-ordinary-r3`, `-lifecycle-pp-forced-r3`,
+`-qfn-pp4-mtp-r3`, and `-model-fp16-r4`, all under
+`parity-results/qwen-flash-next/` with the common `shortquery-omission` prefix.
+Independent lifecycle review: `/tmp/qfn-shortquery-lifecycle-final-review-r14-private/`.
+The successful final timing packet is `/tmp/qfn-shortquery-omission-model-benchmark-r5/`.
+
+## Final matched ordinary Release result
+
+The control is the immutable `cbdaf88c` grid checkpoint. Control→candidate→control
+used one warmup and three measurements per arm, without profiling. All nine
+natural 256-token trajectories were identical. All three owned runs, actual
+runtime/environment checks, driver windows, quiet-window checks and retirement
+passed. PerfStats program selection is proved by the same-source model/lifecycle
+tests; the timed runs were uninstrumented.
+
+| Median tok/s | Control, six samples | Omission, three samples | Change |
+|---|---:|---:|---:|
+| Prefill | 820.881 | 819.673 | -0.147% |
+| Decode | 43.268 | 43.453 | +0.426% |
+
+Decode ranges were 43.212–43.529 for control and 43.425–43.527 for omission.
+Prefill ranges were 820.077–821.091 and 818.870–820.075, respectively.
+The decode samples overlap, so this is a small median improvement rather than
+proof of a statistically resolved gain. Both phases retain the cumulative
+target: roughly 815 prefill tok/s and more than the recorded Castagna 42.959
+decode tok/s. All nine 256-token trajectories match exactly.
+
+Settings match the [grid workload](QFN_SCOPED_QUERY_COLUMN_GRID.md): four MI50s,
+one MPI rank, uniform full TP with gate/up-owned and down-column routed work,
+all experts on GPU, vocabulary sharded, RAM ngrams, FP16 KV and FP32 activation
+storage. The model is Qwen3.8-Flash-Next UD-Q4_K_XL. The prompt is 512 repetitions
+of ` test`, authenticated as exactly 512 tokens; response256, context4096,
+prefill bucket512, greedy sampling with seed42, 28 physical workers on NUMA1
+(CPUs28–55). MTP, prefix cache and residency maintenance are disabled; arithmetic
+and kernel debug overrides are absent.
+
+Local evidence: `parity-results/qwen-flash-next/shortquery-omission-model-fp16-r4/`
+and `shortquery-omission-model-host-window-r5/`. The frozen A/B/A packet and all
+samples are in `/tmp/qfn-shortquery-omission-model-benchmark-r5/summary.json`.
+The candidate runtime is `/tmp/qfn-shortquery-omission-qualified-runtime-r4/`,
+prepared from Release-r15 and the same source as Integration-r14. These
+receipts bind the measured pre-commit source and frozen runtime, including all
+the lifecycle repairs above. Host, driver, native worker, loaded-library and
+retirement checks pass for every arm.
+
+Earlier r3 timing remains separate historical evidence. The r4 wrapper failed
+before native inference because it reused an existing output path. Packet r5
+uses independent arm directories and authenticates its own host collector;
+the benchmark workload and acceptance checks are unchanged.

@@ -31,6 +31,20 @@ namespace
     class PrefixFlowMockRunner : public IInferenceRunner
     {
     public:
+        /**
+         * @brief Preserve public response admission in this model-free prefix witness.
+         * @param request Original immutable budget/depth and completed-cache extent.
+         * @return Valid closed admission; this mock owns no QSA/indexer graph.
+         */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override
+        {
+            if (!request.valid()) return false;
+            (void)resolveSparseQueryExecutionProgram(request);
+            return true;
+        }
+        /** @brief No query program is retained by the prefix-only model-free witness. */
+        void endSparseQueryExecutionProgram() noexcept override {}
+
         bool forward(const int *tokens, int seq_len) override
         {
             ++forward_calls;

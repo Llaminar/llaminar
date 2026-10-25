@@ -821,3 +821,137 @@ TEST(OrdinaryGenerationController, PipelineForwardOnlyAdmissionAndTerminalAreExa
         EXPECT_NE(validateDeviceGenerationTerminal(corrupt, request, 8, 0, 0), DeviceGenerationTerminalError::None);
     }
 }
+
+/** @test Immutable bounds preserve missing-proof safety, threshold and all request origins. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityAdmissionIsConservative)
+{
+    using namespace llaminar2;
+    using Program = SparseQueryExecutionProgram;
+    DeviceGenerationAdmissionRequest a{.request_count=1, .max_new_tokens=1,
+        .depth_policy=DeviceGenerationPolicy::ordinary()};
+    ASSERT_TRUE(a.valid());
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(a), Program::RankingPossible);
+    for (int visible : {2050, 2051, 2052})
+    {
+        a.initial_target_counts.emplace(std::vector<int>{visible-1});
+        ASSERT_TRUE(a.valid());
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a), visible <= 2051
+            ? Program::ProvenNoRanking : Program::RankingPossible);
+    }
+    a.request_count=3;
+    a.initial_target_counts.emplace(std::vector<int>{0,2050,12});
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::ProvenNoRanking);
+    a.initial_target_counts.emplace(std::vector<int>{0,2051,12});
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::RankingPossible);
+    for (auto bad : {std::vector<int>{},std::vector<int>{0},std::vector<int>{0,-1,0},
+                    std::vector<int>{0,std::numeric_limits<int>::max(),0}})
+    {
+        a.initial_target_counts.emplace(std::move(bad));
+        EXPECT_FALSE(a.valid());
+        EXPECT_THROW(resolveSparseQueryExecutionProgram(a),std::invalid_argument);
+    }
+}
+
+/** @test Maximum executed depth protects clipped/observed/dynamic verifier overshoot. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityCoversDepthLeadingAndContinuation)
+{
+    using namespace llaminar2;
+    using Program = SparseQueryExecutionProgram;
+    for (auto mode : {DeviceGenerationPolicyMode::Fixed,DeviceGenerationPolicyMode::Observe,
+                      DeviceGenerationPolicyMode::Dynamic})
+    for (auto leading : {DeviceGenerationLeadingRowDisposition::PendingResponse,
+                         DeviceGenerationLeadingRowDisposition::AlreadyEmitted})
+    {
+        auto policy=DeviceGenerationPolicy::fixed(4);
+        policy.mode=mode;
+        if(mode!=DeviceGenerationPolicyMode::Fixed){policy.minimum_depth=1;policy.initial_depth=1;}
+        DeviceGenerationAdmissionRequest a{.request_count=1,.max_new_tokens=1,
+            .depth_policy=policy,.initial_leading_row_disposition=leading};
+        a.initial_target_counts.emplace(std::vector<int>{2045});
+        ASSERT_TRUE(a.valid());
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::ProvenNoRanking);
+        a.initial_target_counts.emplace(std::vector<int>{2046});
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::RankingPossible);
+        a.kind=DeviceGenerationAdmissionKind::ContinueResponse;
+        a.initial_target_counts.emplace(std::vector<int>{2045});
+        a.max_new_tokens=2;
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::RankingPossible);
+    }
+    DeviceGenerationAdmissionRequest restored{.request_count=1,.max_new_tokens=256,
+        .depth_policy=DeviceGenerationPolicy::ordinary()};
+    restored.initial_target_counts.emplace(std::vector<int>{512});
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(restored),Program::ProvenNoRanking);
+    restored.initial_target_counts.emplace(std::vector<int>{4096});
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(restored),Program::RankingPossible);
+}
+
+/** @test Every supported maximum depth and leading disposition uses one checked bound. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilitySweepsSupportedExecutionDepths)
+{
+    using namespace llaminar2;
+    using Program = SparseQueryExecutionProgram;
+    for (int depth=1;depth<=DeviceGenerationPolicy::kMaximumSupportedDraftDepth;++depth)
+    for (auto mode : {DeviceGenerationPolicyMode::Fixed,DeviceGenerationPolicyMode::Observe,
+                      DeviceGenerationPolicyMode::Dynamic})
+    for (auto leading : {DeviceGenerationLeadingRowDisposition::PendingResponse,
+                         DeviceGenerationLeadingRowDisposition::AlreadyEmitted})
+    {
+        SCOPED_TRACE(::testing::Message()<<"depth="<<depth<<" mode="<<int(mode)<<" leading="<<int(leading));
+        auto policy=DeviceGenerationPolicy::fixed(depth);
+        policy.mode=mode;
+        if(mode!=DeviceGenerationPolicyMode::Fixed){policy.minimum_depth=1;policy.initial_depth=1;}
+        DeviceGenerationAdmissionRequest a{.request_count=1,.max_new_tokens=1,
+            .depth_policy=policy,.initial_leading_row_disposition=leading};
+        a.initial_target_counts.emplace(std::vector<int>{2051-depth-2});
+        ASSERT_TRUE(a.valid());
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::ProvenNoRanking);
+        a.initial_target_counts.emplace(std::vector<int>{2052-depth-2});
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(a),Program::RankingPossible);
+        for(int invalid_budget : {-1,0,std::numeric_limits<int>::max()})
+        {
+            a.max_new_tokens=invalid_budget;
+            EXPECT_FALSE(a.valid());
+            EXPECT_THROW(resolveSparseQueryExecutionProgram(a),std::invalid_argument);
+        }
+        a.max_new_tokens=1;
+        a.initial_target_counts.emplace(std::vector<int>{std::numeric_limits<int>::max()-depth-1});
+        EXPECT_FALSE(a.valid());
+        EXPECT_THROW(resolveSparseQueryExecutionProgram(a),std::invalid_argument);
+    }
+}
+
+/** @test A supplied completed-prefix proof certifies one forced target row, never budget zero alone. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityForwardOnlyRequiresExplicitExtent)
+{
+    using namespace llaminar2;
+    DeviceGenerationAdmissionRequest request{.request_count=1,.max_new_tokens=0,
+        .depth_policy=DeviceGenerationPolicy::forwardOnly(),
+        .initial_leading_row_disposition=DeviceGenerationLeadingRowDisposition::AlreadyEmitted};
+    EXPECT_EQ(resolveSparseQueryExecutionProgram(request),SparseQueryExecutionProgram::RankingPossible);
+    for(int initial : {2050,2051})
+    {
+        request.initial_target_counts.emplace(std::vector<int>{initial});
+        ASSERT_TRUE(request.valid());
+        EXPECT_EQ(resolveSparseQueryExecutionProgram(request),initial==2050
+            ? SparseQueryExecutionProgram::ProvenNoRanking : SparseQueryExecutionProgram::RankingPossible);
+    }
+    request.initial_target_counts.emplace(std::vector<int>{std::numeric_limits<int>::max()});
+    EXPECT_FALSE(request.valid());
+    EXPECT_THROW(resolveSparseQueryExecutionProgram(request),std::invalid_argument);
+    request.initial_target_counts.emplace(std::vector<int>{512});
+    request.initial_leading_row_disposition=DeviceGenerationLeadingRowDisposition::PendingResponse;
+    EXPECT_FALSE(request.valid());
+}
+
+/** @test Closed retained-program slots reject unknown values before owner access. */
+TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityProgramSlotsAreClosed)
+{
+    using namespace llaminar2;
+    static_assert(kSparseQueryExecutionProgramCount == 2);
+    static_assert(sparseQueryExecutionProgramIndex(SparseQueryExecutionProgram::RankingPossible) == 0);
+    static_assert(sparseQueryExecutionProgramIndex(SparseQueryExecutionProgram::ProvenNoRanking) == 1);
+    EXPECT_THROW(sparseQueryExecutionProgramIndex(static_cast<SparseQueryExecutionProgram>(-1)),
+                 std::invalid_argument);
+    EXPECT_THROW(sparseQueryExecutionProgramIndex(static_cast<SparseQueryExecutionProgram>(2)),
+                 std::invalid_argument);
+}

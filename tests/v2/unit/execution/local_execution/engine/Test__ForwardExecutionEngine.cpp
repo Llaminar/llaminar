@@ -4146,3 +4146,80 @@ TEST_F(Test__ForwardExecutionEngine, DiscardAllCachedGraphs_AfterExecute)
     engine.discardAllCachedGraphs();
     EXPECT_TRUE(engine.cacheEmpty());
 }
+
+
+/** @test Two actual engine cache programs survive request reset and alternating request selection. */
+TEST_F(Test__ForwardExecutionEngine, SparseQueryProgramCachesSurviveRequestReset)
+{
+    auto engine=makeEngine(true);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    int token=42,position=7;
+    auto complete=makeTestInput(1,1,DeviceId::cpu(),&token,&position);
+    auto no_ranking=complete;
+    no_ranking.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(complete,output,host));
+    ASSERT_TRUE(engine.execute(no_ranking,output,host));
+    ASSERT_EQ(host.build_forward_graph_calls,2);
+    engine.resetSessionReplayState(true);
+    for(int request=0;request<6;++request){
+        ++token;++position;
+        ASSERT_TRUE(engine.execute(request%2?complete:no_ranking,output,host));
+        EXPECT_EQ(host.build_forward_graph_calls,2);
+    }
+    const auto entries=engine.replayCacheObservations(1);
+    ASSERT_EQ(entries.size(),2u);
+    for(const auto &entry:entries)EXPECT_TRUE(entry.valid);
+}
+
+/** @test Parent owners retire once while all replaced shared child entries are still valid. */
+TEST_F(Test__ForwardExecutionEngine, SparseQueryChildEvictionRetiresParentsBeforeAnyChild)
+{
+    int retired=0;
+    {
+    auto engine=makeEngine(true);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    int tokens[]{31,32,33},positions[]{7,8,9};
+    auto complete=makeTestInput(3,1,DeviceId::cpu(),tokens,positions);
+    auto no_ranking=complete;
+    no_ranking.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(complete,output,host));
+    ASSERT_TRUE(engine.execute(no_ranking,output,host));
+    std::weak_ptr<int> callback_lifetime;
+    {
+        auto lease=std::make_shared<int>(1);
+        callback_lifetime=lease;
+        EXPECT_EQ(engine.invalidateMoEPlacementSensitiveGraphsForStablePlacement([&,lease]{
+            ++retired;
+            const auto entries=engine.replayCacheObservations(1);
+            ASSERT_EQ(entries.size(),2u);
+            for(const auto &entry:entries)EXPECT_TRUE(entry.valid);
+        }),2u);
+    }
+    EXPECT_TRUE(callback_lifetime.expired()) << "The engine may not retain a DGO callback borrow";
+    EXPECT_EQ(retired,1);
+    for(const auto &entry:engine.replayCacheObservations(1))EXPECT_FALSE(entry.valid);
+    EXPECT_EQ(engine.invalidateMoEPlacementSensitiveGraphsForStablePlacement(),0u);
+    engine.discardAllCachedGraphs();
+    EXPECT_EQ(retired,1) << "Explicit cleanup has no deferred callback";
+    }
+    EXPECT_EQ(retired,1) << "Engine destruction has no retained DGO callback borrow";
+}
+
+/** @test Malformed programs fail before a context, graph build or cache lookup can hide them. */
+TEST_F(Test__ForwardExecutionEngine, SparseQueryMalformedProgramRejectedCold)
+{
+    auto engine=makeEngine(true);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    int token=1,position=0;
+    auto input=makeTestInput(1,1,DeviceId::cpu(),&token,&position);
+    input.execution_phase=ForwardExecutionPhase::Prefill;
+    input.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input,output,host));
+    EXPECT_EQ(host.build_forward_graph_calls,0);
+    input.sparse_query_execution_program=static_cast<SparseQueryExecutionProgram>(99);
+    EXPECT_THROW((void)engine.execute(input,output,host),std::invalid_argument);
+    EXPECT_EQ(host.build_forward_graph_calls,0);
+}

@@ -11,6 +11,7 @@
 #include "QwenSparseAttentionStage.h"
 #include "Qwen4ExpHyperconnectionBuilder.h"
 #include "../AttentionConsumerBinding.h"
+#include "../../../../kernels/common/SparseQueryExecutionProgram.h"
 #include <cstdint>
 
 namespace llaminar2
@@ -38,6 +39,7 @@ struct Qwen4ExpSparseAttentionPolicy
     qwen4exp::QwenSparseAttentionArithmetic attentionArithmetic = qwen4exp::kDefaultQwenSparseAttentionArithmetic; ///< Resolved selected-core arithmetic; no native phase decision.
     std::optional<ForwardExecutionPhase> executionPhase; ///< Exact construction phase for diagnostic/capture identity; absent preserves legacy direct builders.
     int retainedMtpCandidateRows = 0; ///< Original canonical retained R, copied from immutable setup geometry.
+    SparseQueryExecutionProgram queryExecutionProgram = SparseQueryExecutionProgram::RankingPossible; ///< Retained admission-selected topology, never a live frontier hint.
 };
 /** @brief Replicated production GGUF projection identities and immutable indexer gains/planes. */
 struct Qwen4ExpSparseAttentionWeights
@@ -76,6 +78,19 @@ struct Qwen4ExpSparseAttentionRequest
 class Qwen4ExpSparseAttentionBuilder final
 {
 public:
+    /**
+     * @brief Lower the retained admission program to explicit indexer authorship.
+     * @param phase Original forward phase; legacy direct builders may leave it absent.
+     * @param program Immutable topology chosen by authenticated generation admission.
+     * @return AllLive for Prefill, RankingOnly for ordinary complete Decode, or
+     * ProvenNoRanking for a certified short Decode response window.
+     * @throws std::invalid_argument For unknown enum values or omission without
+     * explicit Decode, before any graph nodes or prepared operands are created.
+     * @details The response owner stamps RankingPossible on Prefill. A graph
+     * claiming both Prefill and ProvenNoRanking is invalid, never normalized.
+     */
+    static qwen4exp::QwenSparseQueryDemand queryDemandForInvocation(
+        std::optional<ForwardExecutionPhase> phase, SparseQueryExecutionProgram program);
     /**
      * @brief Declare the native pool selector for one typed production invocation.
      * @param phase Original forward phase; a one-row prefill remains Prefill.
@@ -119,7 +134,7 @@ public:
      * or drops an explicit M1 count. Ordinary prefill must select its own row policy.
      */
     static std::optional<DeviceRowRange> verifierProjectionRows(DeviceId device,Qwen4ExpStageRows rows);
-    /** @brief Append two prepared indexer GEMMs, causal selection and native core attention.
+    /** @brief Append required prepared indexer projections, causal selection and native core attention.
      * @param graph Existing participant-local graph; all dependencies must already exist.
      * @param consumer Ordinary prepared-Q/native-cache handoff before any dense source selection.
      * @param policy Immutable projection/indexer arithmetic and capture geometry.
@@ -131,7 +146,7 @@ public:
     static std::string append(ComputeGraph &graph,const AttentionConsumerBinding &consumer,
         const Qwen4ExpSparseAttentionPolicy &policy,const Qwen4ExpSparseAttentionWeights &weights,
         const Qwen4ExpSparseAttentionBuffers &buffers);
-    /** @brief Append two shared flat projections and independent native request-local consumers.
+    /** @brief Append shared required projections and independent native request-local consumers.
      * @param rows Sole canonical physical request geometry; inactive holes remain request-local.
      * @param requests Exact cache slots and per-request arena views, in canonical matrix order.
      * @return Actual independent terminal dependencies for the next ordinary consumer.

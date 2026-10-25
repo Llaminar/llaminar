@@ -989,3 +989,56 @@ TEST(QwenSparseAttentionStage, AdmittedDefaultProjectionRejectsMissingDuplicateA
                      {{DeviceId::rocm(3), half, 0, 3}, {DeviceId::rocm(3), half, 3, 7}}),
                  std::invalid_argument);
 }
+
+/** @test No-ranking retains required contracts while never publishing or observing query-only banks. */
+TEST(QwenSparseAttentionStage, ProvenNoRankingOmitsQueryContractsAndSnapshots)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    CPUDeviceContext context(DeviceId::cpu(),1);
+    constexpr int rows=3,tokens=8,positions=16;
+    FP32Tensor query({rows,512}),raw({rows,128}),partial({4,128}),pools({2,128}),
+        prepared({rows,512}),scores({rows,2}),queryGain({128}),keyGain({128}),cosine({positions,32}),sine({positions,32});
+    INT32Tensor replay({3}),selected({rows,2051}),counts({rows});
+    auto *state=static_cast<int *>(replay.raw_mutable_data());
+    state[0]=2;state[1]=rows;state[2]=0;
+    for (auto *unused : {&query,&prepared,&scores,&queryGain})
+        std::fill_n(unused->mutable_data(),unused->numel(),std::numeric_limits<float>::quiet_NaN());
+    std::fill_n(raw.mutable_data(),raw.numel(),0.75f);
+    std::fill_n(partial.mutable_data(),partial.numel(),0.25f);
+    std::fill_n(pools.mutable_data(),pools.numel(),-111.0f);
+    std::fill_n(keyGain.mutable_data(),keyGain.numel(),1.0f);
+    std::fill_n(cosine.mutable_data(),cosine.numel(),1.0f);
+    std::fill_n(sine.mutable_data(),sine.numel(),0.0f);
+    Stage::Indexer operation{Float(query,BufferId::QFN_QSA_QUERY),Float(raw,BufferId::QFN_QSA_RAW_KEY),
+        Float(partial,BufferId::QFN_QSA_PARTIAL_KEYS),Float(pools,BufferId::QFN_QSA_POOLED_KEYS),
+        Weight(queryGain),Weight(keyGain),Weight(cosine),Weight(sine),Float(prepared,BufferId::QFN_QSA_PREPARED_QUERY),
+        Float(scores,BufferId::QFN_QSA_SCORES),Int(selected,BufferId::QFN_QSA_SELECTED),
+        Int(counts,BufferId::QFN_QSA_SELECTED_COUNT),2,positions};
+    operation.queryDemand=qwen4exp::QwenSparseQueryDemand::ProvenNoRanking;
+    Stage omitted({.rowCapacity=rows,.tokenCapacity=tokens,.replay=Int(replay,BufferId::QFN_QSA_REPLAY),.operation=operation});
+    const auto contract=omitted.bufferContract();
+    for (const auto role : {BufferId::QFN_QSA_QUERY,BufferId::QFN_QSA_PREPARED_QUERY,BufferId::QFN_QSA_SCORES}) {
+        EXPECT_TRUE(std::none_of(contract.inputs.begin(),contract.inputs.end(),[&](const auto &v){return v.id==role;}));
+        EXPECT_TRUE(std::none_of(contract.outputs.begin(),contract.outputs.end(),[&](const auto &v){return v.id==role;}));
+        EXPECT_TRUE(std::none_of(contract.inouts.begin(),contract.inouts.end(),[&](const auto &v){return v.id==role;}));
+    }
+    ASSERT_EQ(contract.weight_tensors.size(),3u);
+    EXPECT_TRUE(std::none_of(contract.weight_tensors.begin(),contract.weight_tensors.end(),
+        [&](const auto *weight){return weight==&queryGain;}));
+    ASSERT_EQ(contract.inouts.size(),1u);EXPECT_EQ(contract.inouts[0].id,BufferId::QFN_QSA_POOLED_KEYS);
+    EXPECT_EQ(contract.outputs.size(),2u);
+    EXPECT_TRUE(omitted.execute(&context));
+    const auto dump=omitted.getDumpInfoSnapshot();
+    for (const auto &input : dump.inputs) EXPECT_NE(std::string_view(input.name),"query");
+    ASSERT_EQ(dump.outputs.size(),3u);
+    for (const auto &output : dump.outputs) {
+        EXPECT_NE(std::string_view(output.name),"prepared_query");
+        EXPECT_NE(std::string_view(output.name),"scores");
+    }
+    for (auto *unused : {&query,&prepared,&scores,&queryGain})
+        for (std::size_t i=0;i<unused->numel();++i) EXPECT_TRUE(std::isnan(unused->data()[i]));
+    EXPECT_EQ(static_cast<const int *>(counts.raw_data())[0],3);
+    operation.queryDemand=qwen4exp::QwenSparseQueryDemand::RankingOnly;
+    Stage full({.rowCapacity=rows,.tokenCapacity=tokens,.replay=Int(replay,BufferId::QFN_QSA_REPLAY),.operation=operation});
+    EXPECT_NE(omitted.graphCaptureVariantSignature(),full.graphCaptureVariantSignature());
+}

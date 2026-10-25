@@ -4764,6 +4764,21 @@ namespace llaminar2
          *        leading-row response ownership for this admission.
          * @return true when generation may begin.
          */
+        /**
+         * @brief Install immutable sparse-query topology for a host-owned response window.
+         * @param request Existing response budget/depth with optional completed-prefix proof.
+         * @return True only when this runner explicitly implements the admission.
+         *
+         * Unsupported wrappers fail rather than silently drop a query program.
+         * This does not initialize or advance a resident generation controller.
+         */
+        virtual bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &)
+        {
+            return false;
+        }
+        /** @brief Expire host-window policy only; retained native families remain owned. */
+        virtual void endSparseQueryExecutionProgram() noexcept {}
+
         virtual bool beginDeviceResidentGeneration(
             const DeviceGenerationAdmissionRequest &request)
         {

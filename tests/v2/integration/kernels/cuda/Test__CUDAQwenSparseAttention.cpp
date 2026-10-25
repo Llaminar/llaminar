@@ -10,6 +10,7 @@ extern "C" bool cudaOps_rope_populate_inv_freq(float *,int,float,int,cudaStream_
 extern "C" bool cudaOps_rope_fp32_decode_v3(float *,float *,const float *,int,int,int,int,int,int,cudaStream_t);
 #define QSA_APPLY_ROPE cudaOps_rope_fp32_decode_v3
 #define QSA_POPULATE_ROPE cudaOps_rope_populate_inv_freq
+#define QSA_CUDA_RUNTIME 1
 #define QSA_RT(name) cuda##name
 #define QSA_STREAM cudaStream_t
 #define QSA_GRAPH cudaGraph_t

@@ -118,8 +118,8 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             add(a.traffic,sizeof(qwen4exp::QwenSparsePriorTraffic),Access::Output,"prior_traffic");
         },
         [&](const Indexer &a) {
-            if(a.queryDemand!=qwen4exp::QwenSparseQueryDemand::AllLive&&a.queryDemand!=qwen4exp::QwenSparseQueryDemand::RankingOnly)
-                throw std::invalid_argument("QSA indexer has an unknown original-query demand policy");
+            qwen4exp::validateQwenSparseQueryDemand(a.queryDemand);
+            const bool noRanking = a.queryDemand == qwen4exp::QwenSparseQueryDemand::ProvenNoRanking;
             qwen4exp::validateQwenSparsePoolSelection(a.poolSelection, params_.rowCapacity);
             // The arena/cache contract owns one exact native bank per layer.
             // A larger containing allocation uses an exact byte subview; it
@@ -133,13 +133,14 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
                     std::isfinite(a.epsilon) && a.epsilon > 0,"QSA indexer has invalid immutable geometry/policy");
             require(a.representation == qwen4exp::QwenSparseScalar::FP32 || a.representation == qwen4exp::QwenSparseScalar::FP16 ||
                     a.representation == qwen4exp::QwenSparseScalar::BF16,"QSA indexer has invalid representation");
-            add(a.query,bytes(m,512),Access::Input,"query");
+            if (!noRanking) add(a.query,bytes(m,512),Access::Input,"query");
             add(a.rawKey,bytes(m,128),Access::Input,"raw_key");
             if(a.transactionPrior)addTransactionPrior(*a.transactionPrior,Access::Input);
             else add(a.priorPartial,bytes(4,128),Access::Input,"prior_partial");
             add(a.pooledKeys,bytes(a.blockCapacity,128),Access::Input,"pooled_keys",true);
             add(a.pooledKeys,bytes(a.blockCapacity,128),Access::Output,"pooled_keys");
-            addWeight(a.queryNorm,128,"query_norm"); addWeight(a.keyNorm,128,"key_norm");
+            if (!noRanking) addWeight(a.queryNorm,128,"query_norm");
+            addWeight(a.keyNorm,128,"key_norm");
             if(a.rotarySource==qwen4exp::QwenSparseRotarySource::TablePlanes) {
                 require(a.cosine && a.sine,"QSA table rotary source requires explicit immutable planes");
                 const auto plane=bytes(a.positionCapacity,a.rotaryDim/2)/4;
@@ -148,8 +149,10 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
                 std::isfinite(a.ropeTheta) && a.ropeTheta>0,"QSA analytic rotary source requires finite positive theta without table aliases");
             if(a.rotarySource==qwen4exp::QwenSparseRotarySource::AnalyticTheta)
                 indexerFrequencies_=qwen4exp::makeQwenSparsePowerFrequencies(a.ropeTheta,a.rotaryDim);
-            add(a.preparedQuery,bytes(m,512),Access::Output,"prepared_query");
-            add(a.scores,bytes(m,a.blockCapacity),Access::Output,"scores");
+            if (!noRanking) {
+                add(a.preparedQuery,bytes(m,512),Access::Output,"prepared_query");
+                add(a.scores,bytes(m,a.blockCapacity),Access::Output,"scores");
+            }
             add(a.selected,bytes(m,qwen4exp::QwenSparseSelected),Access::Output,"selected");
             add(a.selectedCount,bytes(m,1),Access::Output,"selected_count");
         },
@@ -199,6 +202,8 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             } else require(!a.keyCosine && !a.keySine,"QSA post-RoPE cache must not declare unused transform planes");
         },
         [&](const RetainCandidates &a) {
+            acceptedPublicationOutputs_[0] = {
+                a.priorPartial.buffer, BufferAccess::WRITE, "FP32", false};
             if(a.terminalCounters)a.terminalCounters->requireRequest(device(),a.requestIndex);
             require(a.rawKey.buffer==BufferId::QFN_QSA_RAW_KEY &&
                 a.retainedRawKey.buffer==BufferId::QFN_QSA_CANDIDATE_RAW_KEYS &&
@@ -226,6 +231,16 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
     },params_.operation);
     validateAliases();
     kernels_ = llaminar::v2::kernels::KernelFactory::createQwenSparseAttention(device());
+    if (const auto *indexer = std::get_if<Indexer>(&params_.operation);
+        indexer && PerfStatsCollector::isDomainEnabled("qsa")) {
+        const char *program = indexer->queryDemand == qwen4exp::QwenSparseQueryDemand::ProvenNoRanking ?
+            "proven_no_ranking" : indexer->queryDemand == qwen4exp::QwenSparseQueryDemand::RankingOnly ?
+            "ranking_only" : "all_live";
+        // A setup observation names the immutable retained program, never replay work counts.
+        PerfStatsCollector::addCounter("qsa", "indexer_query_program", 1.0, "setup", device().to_string(),
+            {{"program", program}, {"rows", std::to_string(params_.rowCapacity)},
+             {"query_projection_required", indexer->queryDemand == qwen4exp::QwenSparseQueryDemand::ProvenNoRanking ? "0" : "1"}});
+    }
     if(const auto *attention=std::get_if<SelectedAttention>(&params_.operation)) {
         // Setup observes the exact policy forwarded below. No replay counter,
         // synchronization, environment read or device-state read occurs here.
@@ -341,9 +356,10 @@ bool QwenSparseAttentionStage::execute(IDeviceContext *context)
             }
         },
         [&](const Indexer &a) {
-            kernels_->indexer({.replay=replay,.query=f(a.query),.raw_keys=f(a.rawKey),.partial_keys=a.transactionPrior ? transactionPrior(*a.transactionPrior)->partial : f(a.priorPartial),
-                .pooled_keys=out(a.pooledKeys),.query_norm=weightPointer(a.queryNorm),.key_norm=weightPointer(a.keyNorm),
-                .cosine=a.cosine ? weightPointer(*a.cosine) : nullptr,.sine=a.sine ? weightPointer(*a.sine) : nullptr,.prepared_query=out(a.preparedQuery),.scores=out(a.scores),
+            const bool noRanking = a.queryDemand == qwen4exp::QwenSparseQueryDemand::ProvenNoRanking;
+            kernels_->indexer({.replay=replay,.query=noRanking ? nullptr : f(a.query),.raw_keys=f(a.rawKey),.partial_keys=a.transactionPrior ? transactionPrior(*a.transactionPrior)->partial : f(a.priorPartial),
+                .pooled_keys=out(a.pooledKeys),.query_norm=noRanking ? nullptr : weightPointer(a.queryNorm),.key_norm=weightPointer(a.keyNorm),
+                .cosine=a.cosine ? weightPointer(*a.cosine) : nullptr,.sine=a.sine ? weightPointer(*a.sine) : nullptr,.prepared_query=noRanking ? nullptr : out(a.preparedQuery),.scores=noRanking ? nullptr : out(a.scores),
                 .selected=pointer<std::int32_t>(a.selected,Access::Output),.selected_count=pointer<std::int32_t>(a.selectedCount,Access::Output),
                 .row_capacity=params_.rowCapacity,.token_capacity=params_.tokenCapacity,.block_capacity=a.blockCapacity,
                 .position_capacity=a.positionCapacity,.rotary_dim=a.rotaryDim,.norm_epsilon=a.epsilon,.representation=a.representation,.rotary_source=a.rotarySource,.rope_theta=a.ropeTheta,.inverse_frequencies=indexerFrequencies_,
@@ -465,6 +481,13 @@ bool QwenSparseAttentionStage::restoreVerifierStateCaptureRows(const int *rows,i
     if(requestCount!=a.requestCount)return false;
     return publishRetained(rows+a.requestIndex,stream);
 }
+std::span<const BufferBinding> QwenSparseAttentionStage::verifierStatePublicationOutputs() const noexcept
+{
+    return std::holds_alternative<RetainCandidates>(params_.operation)
+        ? std::span<const BufferBinding>{acceptedPublicationOutputs_}
+        : std::span<const BufferBinding>{};
+}
+
 bool QwenSparseAttentionStage::restoreVerifierStateCaptureRowFromDeviceIndex(const int *row,void *stream)
 {
     if(!device().is_gpu() || !hasVerifierStateCapture())return false;

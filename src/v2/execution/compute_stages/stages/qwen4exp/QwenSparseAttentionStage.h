@@ -45,7 +45,13 @@ public:
         Qwen4ExpIntBinding traffic;
         std::optional<QwenSparseCounterBinding> terminalCounters; ///< Original controller-row borrow, outside per-writer coherence.
     };
-    /** @brief Pool/norm/rotate indexer keys and publish exact causal token indices. */
+    /**
+     * @brief Pool/norm/rotate indexer keys and publish exact causal token indices.
+     * @details ProvenNoRanking is a decode-admission program: query/queryNorm,
+     * preparedQuery and scores are not registered, waited on, published or
+     * exposed as mathematical snapshots. Their containing arena may remain
+     * admitted for mutually exclusive full-program graphs; no bytes are mirrored.
+     */
     struct Indexer
     {
         Qwen4ExpFloatBinding query, rawKey, priorPartial, pooledKeys;
@@ -169,6 +175,9 @@ public:
     bool restoreVerifierStateCaptureRows(const int *rows,int requestCount,void *stream) override;
     /** @brief Publish one GPU-owned accepted flat row without readback or conversion storage. */
     bool restoreVerifierStateCaptureRowFromDeviceIndex(const int *row,void *stream) override;
+    /** @brief Accepted QSA publication writes only the persistent raw partial-key bank. */
+    std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept override;
+
     /** @brief Publish this request's retained state from the canonical independently-strided vector. */
     bool restoreVerifierStateCaptureRowsFromDeviceIndices(const int *rows,int requestCount,int rowIndexStride,void *stream) override;
     /** @brief Inspect sealed operation identity without reading live state. */
@@ -211,6 +220,7 @@ private:
     RequestRowOrigins retainedOrigins() const;
     /** @brief Enqueue one validated native tail splice and publish its exact output event. */
     bool publishRetained(const int *flatRow,void *stream);
+    std::array<BufferBinding, 1> acceptedPublicationOutputs_{}; ///< Immutable cold accepted-state declaration.
     std::array<CPUVerifierStateRestoreDestination,1> cpuPublicationWrites_{}; ///< CPU-only immutable planning span.
     Params params_;
     qwen4exp::QwenSparsePowerFrequencies indexerFrequencies_{}; ///< Setup-baked exact HF power invariants; theta/dimension define capture identity.

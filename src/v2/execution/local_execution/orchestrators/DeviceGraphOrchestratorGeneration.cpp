@@ -9,6 +9,7 @@
  * retains one complete transaction, never a host-submitted list of model stages.
  */
 #include "DeviceGraphOrchestrator.h"
+#include "models/qwen4exp/Qwen4ExpConfig.h"
 #include "PipelineForwardGraphEdges.h"
 #include "backends/BackendManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -22,6 +23,59 @@
 
 namespace llaminar2
 {
+std::size_t DeviceGraphOrchestrator::sparseQueryProgramCount() const
+{
+    if (!graph_builder_ || !graph_builder_->config().flash_next) return 1u;
+    const auto &model = *graph_builder_->config().flash_next;
+    const auto &mixers = model.mixers();
+    if (model.mainLayers() > mixers.size())
+        throw std::logic_error("Sparse-query program inventory lost validated main-layer geometry");
+    return std::any_of(mixers.begin(), mixers.begin() + model.mainLayers(),
+        [](auto mixer) { return mixer == Qwen4ExpMixer::SparseAttention; }) ? kSparseQueryExecutionProgramCount : 1u;
+}
+
+void DeviceGraphOrchestrator::admitSparseQueryProgram(const DeviceGenerationAdmissionRequest &admission,
+    SparseQueryAdmissionBoundary boundary)
+{
+    if (!admission.valid() || compiling_sparse_query_program_ || sparseQueryParentLaunched())
+        throw std::logic_error("Sparse-query program selection requires a valid idle generation admission");
+    // A local forced controller has no response budget authority. Preserve
+    // the already-proved outer host response rather than deriving a program
+    // from its budget0. Standalone proved forced admissions resolve P+1 in
+    // the same common contract; missing proof retains the complete program.
+    if (boundary == SparseQueryAdmissionBoundary::ResidentGeneration &&
+        admission.depth_policy.isForwardOnly() && admitted_sparse_query_program_ &&
+        admitted_sparse_query_program_->boundary == SparseQueryAdmissionBoundary::HostControlledResponse)
+        return;
+    admitted_sparse_query_program_ = SparseQueryProgramAdmission{
+        sparseQueryProgramCount() == 1u ? SparseQueryExecutionProgram::RankingPossible :
+            resolveSparseQueryExecutionProgram(admission), boundary};
+}
+
+bool DeviceGraphOrchestrator::admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &admission)
+{
+    if (!admission.valid() || device_generation_storage_.active_request_count != 0 ||
+        active_device_generation_admission_ || compiling_sparse_query_program_ || sparseQueryParentLaunched() ||
+        (admitted_sparse_query_program_ &&
+         admitted_sparse_query_program_->boundary == SparseQueryAdmissionBoundary::HostControlledResponse))
+        return false;
+    admitSparseQueryProgram(admission, SparseQueryAdmissionBoundary::HostControlledResponse);
+    return true;
+}
+
+void DeviceGraphOrchestrator::endSparseQueryExecutionProgram() noexcept
+{
+    if (admitted_sparse_query_program_ &&
+        admitted_sparse_query_program_->boundary == SparseQueryAdmissionBoundary::HostControlledResponse)
+        admitted_sparse_query_program_.reset();
+}
+
+std::optional<ForwardGraphSignature> &DeviceGraphOrchestrator::pairedVerifierForwardSignature(
+    MTPVerifierPreparationGraphCache &cache) const
+{
+    return cache.paired_forward_signatures[sparseQueryExecutionProgramIndex(sparseQueryGraphProgram())];
+}
+
 void DeviceGraphOrchestrator::prepareRetainedStorageBinding()
 {
     const auto declared=graph_builder_?graph_builder_->retainedStorageBoundary(state_.device_id):nullptr;
@@ -46,14 +100,14 @@ bool DeviceGraphOrchestrator::beginRetainedStorageAdmission(void *stream)
 std::span<const DeviceControlledLoopEntryFragment> DeviceGraphOrchestrator::retainedStorageTerminalFragments()
 {
     if(!retained_storage_boundary_)return {};
-    void *stream=mtp_device_generation_loop_graph_.stream.get();
+    void *stream=deviceGenerationLoopGraph().stream.get();
     if(!stream)throw std::logic_error("Immutable storage terminal requires its exact generation stream");
     if(retained_storage_terminal_capture_&&retained_storage_terminal_capture_->executionStream()!=stream)
         throw std::logic_error("Immutable storage terminal stream changed before retained graph retirement");
     if(!retained_storage_terminal_capture_)
     {
         auto &worker=GPUDeviceContextPool::instance().getContext(state_.device_id);
-        retained_storage_terminal_capture_.bind(mtp_device_generation_loop_graph_.stream,worker.createGraphCapture(stream));
+        retained_storage_terminal_capture_.bind(deviceGenerationLoopGraph().stream,worker.createGraphCapture(stream));
         ScopedBackendGraphCapture recording(worker,*retained_storage_terminal_capture_.get(),"immutable_storage_generation_close");
         if(!recording.begin())throw std::runtime_error("Immutable storage terminal recording failed");
         retained_storage_boundary_->recordTerminalClose(stream);recording.finish();
@@ -70,11 +124,13 @@ bool DeviceGraphOrchestrator::submitRetainedStorageTerminal()
     retained_storage_boundary_->requireArmedForLaunch();
     if(!retained_storage_terminal_capture_||!retained_storage_terminal_capture_->hasExecutable())
         throw std::logic_error("Hosted terminal ticket names an unprepared immutable storage close branch");
-    return retained_storage_terminal_capture_->launchOnStream(mtp_device_generation_loop_graph_.stream.get());
+    return retained_storage_terminal_capture_->launchOnStream(deviceGenerationLoopGraph().stream.get());
 }
 void DeviceGraphOrchestrator::releaseRetainedStorageGenerationTopology() noexcept
 {
-    mtp_device_generation_loop_graph_.release();
+    for (auto &parent : sparse_query_generation_parents_) parent.release();
+    compiling_sparse_query_program_.reset();
+    admitted_sparse_query_program_.reset();
     // The terminal owner retained the original stream while the parent and its
     // child family retired. Its own recording now retires before the last stream.
     retained_storage_terminal_fragment_={};
@@ -120,7 +176,7 @@ void DeviceGraphOrchestrator::awaitRetainedStorageTerminal()
 
 bool DeviceGraphOrchestrator::observeOrdinaryGenerationForwardCompletion(int64_t completed_invocations)
 {
-    const auto &loop = mtp_device_generation_loop_graph_;
+    const auto &loop = deviceGenerationLoopGraph();
     std::string error;
     if (loop.ordinary_hosted_forward &&
         loop.execution_kind == MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher)
@@ -198,7 +254,7 @@ DeviceGraphOrchestrator::materializeOrdinaryGenerationForward(
         retention != OrdinaryForwardRetentionKind::HostedExpertOverlay)
         return fail("Unknown ordinary forward retention kind");
     auto *const backend = getBackendFor(state_.device_id);
-    void *const stream = mtp_device_generation_loop_graph_.stream.get();
+    void *const stream = deviceGenerationLoopGraph().stream.get();
     if (!backend || !stream || !condition || !state_.kv_cache || !request_position_ids_dev_ ||
         condition != device_resident_logical_sequence_state_storage_.next_condition_tokens_device)
         return fail("Resident ordinary forward requires its exact logical token owner, stream and owned KV position");
@@ -216,6 +272,7 @@ DeviceGraphOrchestrator::materializeOrdinaryGenerationForward(
     input.position_policy = ForwardPositionPolicy::ExplicitRows;
     input.execution_role = ForwardExecutionRole::MainInference;
     input.execution_phase = ForwardExecutionPhase::Decode;
+    input.sparse_query_execution_program = sparseQueryForwardProgram(input.execution_phase);
     input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
     if (pipeline_forward_edges_ && !pipeline_forward_edges_->hasHeterogeneousBoundary())
         input.pipeline_activation_ownership = ForwardPipelineActivationOwnership::NativeGenerationParent;
@@ -257,7 +314,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     using namespace sampling_math;
     using SamplerStage = OrdinaryGenerationSamplingStage;
     using Plan = OrdinaryGenerationGraphPlan;
-    auto &loop = mtp_device_generation_loop_graph_;
+    auto &loop = deviceGenerationLoopGraph();
     const auto fail = [&](const std::string &reason) {
         // An invalid second materialization must not destroy a graph which
         // already owns an in-flight request. Its existing terminal/reset edge
@@ -594,7 +651,7 @@ bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
     if (out_producer_stream)
         *out_producer_stream = nullptr;
 
-    auto &loop = mtp_device_generation_loop_graph_;
+    auto &loop = deviceGenerationLoopGraph();
     if (!forward_engine_ || !sampler || !sampler->hasExecutable() ||
         !loop.stream ||
         (loop.ordinary_composition != OrdinaryGenerationComposition::ExpertOverlay &&

@@ -472,6 +472,95 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryGenerationRunsThroughPublicRequestBoun
     });
 }
 
+/**
+ * @test The forced ordinary publisher consumes the replaced logits only after successful mailbox publication.
+ *
+ * A genuine host-ingress forward and the prebuilt resident forward own distinct
+ * native streams. The old implementation leaves the first handoff pending and
+ * throws on the second producer, reproducing the real retained-family switch.
+ * An intentionally inconsistent history span rejects after the real scalar
+ * enqueue and must preserve ownership. No new kernel or sparse capability is
+ * invented; the canonical threshold history separately proves actual QSA math.
+ */
+TEST_P(PipelineMTPStateOwnership, ForcedOrdinaryPublicationRetiresExactLogitsHandoff)
+{
+    if (GetParam() == "CPU") return; // CPU does not publish GPU stream handoffs.
+    initCPUBackend(-1);
+    const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+    ASSERT_NE(getBackendFor(device), nullptr);
+    auto &context = GPUDeviceContextPool::instance().getContext(device);
+    context.submitAndWait([&] {
+        using Peer = DeviceGraphOrchestratorLiveStateTestAccess;
+        auto config = stateConfig(device);
+        config.n_layers = config.total_n_layers = 1;
+        config.layer_types.assign(1, "full_attention");
+        config.max_seq_len = 512;
+        config.mtp.enabled = false;
+        config.prefix_cache.enabled = false;
+        config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
+        auto graph = std::make_shared<OrdinaryDGOGraph>(config);
+        ASSERT_TRUE(graph->table.ensureOnDevice(device, context.defaultStream()));
+        TransferEngine::publishDeviceWrite(&graph->table, device, context.defaultStream());
+        DeviceGraphOrchestrator runner(graph, nullptr);
+        IForwardExecutionHost &host = runner; // Existing public producer interface; DGO override stays private.
+        ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, 512, device));
+        ASSERT_TRUE(runner.materializeServingGraphFamilyWithoutLaunch({
+            .prefill_bucket_rows = {256, 512}, .prefill_pad_token_id = 0,
+            .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
+        auto *const backend = getBackendFor(device);
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            SCOPED_TRACE(replay);
+            runner.resetInferenceState(InferenceStateResetRequest::requestBoundary("forced-logits-handoff"));
+            const int prompt = replay % 32;
+            // The public prefill transaction owns initial KV/logits and host
+            // request metadata together; direct executeForward would bypass
+            // that lifecycle and could miss the retained history-bearing key.
+            ASSERT_TRUE(runner.forwardPrefill(&prompt, 1));
+            void *const first = Peer::mainForwardProducerStream(runner);
+            ASSERT_NE(first, nullptr);
+            host.setPendingMainDecodeStream(first); // Exact real producer, including its synchronized first use.
+            EXPECT_NO_THROW(host.setPendingMainDecodeStream(first));
+            const int32_t teacher = (replay + 7) % 32;
+            EXPECT_FALSE(Peer::publishForcedWithInvalidHistory(runner, teacher));
+            EXPECT_EQ(Peer::pendingMainLogitsStream(runner), first);
+            ASSERT_TRUE(runner.publishForcedDeviceResidentConditionToken(teacher, 0));
+            EXPECT_EQ(Peer::pendingMainLogitsStream(runner), nullptr);
+            auto logical = runner.deviceResidentLogicalSequenceState();
+            ASSERT_TRUE(logical.coversRequest(0));
+            runner.setMTPMainDecodeSyncDeferralEnabled(true);
+            ASSERT_TRUE(runner.advanceOrdinaryMainConditionFromDeviceResidentLogicalState(teacher, logical, 0));
+            void *const second = Peer::mainForwardProducerStream(runner);
+            ASSERT_NE(second, nullptr);
+            ASSERT_NE(second, first) << "The actual host/native-input graph identities must own distinct capture streams";
+            ASSERT_EQ(Peer::pendingMainLogitsStream(runner), second);
+            EXPECT_NO_THROW(host.setPendingMainDecodeStream(second));
+            EXPECT_THROW(host.setPendingMainDecodeStream(first), std::logic_error);
+            EXPECT_FALSE(Peer::publishForcedWithInvalidHistory(runner, teacher));
+            EXPECT_EQ(Peer::pendingMainLogitsStream(runner), second);
+            EXPECT_THROW(host.setPendingMainDecodeStream(first), std::logic_error);
+            const int32_t next = (teacher + 1) % 32;
+            ASSERT_TRUE(runner.publishForcedDeviceResidentConditionToken(next, 0));
+            EXPECT_EQ(Peer::pendingMainLogitsStream(runner), nullptr);
+            logical = runner.deviceResidentLogicalSequenceState();
+            ASSERT_TRUE(logical.coversRequest(0));
+            int32_t actual = -1;
+            ASSERT_TRUE(backend->deviceToHost(&actual, logical.nextConditionTokenDeviceForRequest(0),
+                sizeof(actual), device.ordinal, second)); // Joined diagnostic boundary only.
+            EXPECT_EQ(actual, next);
+            // A second transaction on the same retained native program must
+            // retain ordinary behavior, in addition to the distinct-stream case.
+            runner.setMTPMainDecodeSyncDeferralEnabled(true);
+            ASSERT_TRUE(runner.advanceOrdinaryMainConditionFromDeviceResidentLogicalState(next, logical, 0));
+            EXPECT_EQ(Peer::mainForwardProducerStream(runner), second);
+            EXPECT_EQ(Peer::pendingMainLogitsStream(runner), second);
+            ASSERT_TRUE(runner.publishForcedDeviceResidentConditionToken((next + 1) % 32, 0));
+            EXPECT_EQ(Peer::pendingMainLogitsStream(runner), nullptr);
+            EXPECT_NO_THROW(host.setPendingMainDecodeStream(first));
+        }
+    });
+}
+
 /** @test Original pending teachers cross one complete sampler-free native PP parent.
  * Real public forceDecodeToken consumes its previous teacher exactly once,
  * preserves raw logits under penalties, and reuses both independent parent

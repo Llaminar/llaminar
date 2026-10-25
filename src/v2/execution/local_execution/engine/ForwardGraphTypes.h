@@ -262,6 +262,7 @@ namespace llaminar2
         ForwardStateTransaction state_transaction =
             ForwardStateTransaction::Ordinary; ///< Persistent-state topology embedded by this graph.
         bool decode = false;
+        SparseQueryExecutionProgram sparse_query_execution_program = SparseQueryExecutionProgram::RankingPossible; ///< Exact captured query topology.
         bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
         bool all_position_logits = false;
         bool live_mtp_request_batch_condition = false; ///< True for one live main-model row per MTP request.
@@ -320,6 +321,7 @@ namespace llaminar2
                    execution_role == other.execution_role &&
                    state_transaction == other.state_transaction &&
                    decode == other.decode &&
+                   sparse_query_execution_program == other.sparse_query_execution_program &&
                    decode_has_history == other.decode_has_history &&
                    all_position_logits == other.all_position_logits &&
                    live_mtp_request_batch_condition ==
@@ -428,6 +430,8 @@ namespace llaminar2
                       static_cast<uint8_t>(sig.state_transaction)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<int>{}(static_cast<int>(sig.sparse_query_execution_program)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode_has_history) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.live_mtp_request_batch_condition) + 0x9e3779b9 + (h << 6) + (h >> 2));

@@ -165,6 +165,18 @@ namespace llaminar2
         return stages_[my_stage_index_].runner->purgePrefixCache();
     }
 
+    bool PipelineRunner::admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request)
+    {
+        if (!request.valid() || my_stage_index_ < 0 || !stages_[my_stage_index_].runner) return false;
+        return stages_[my_stage_index_].runner->admitSparseQueryExecutionProgram(request);
+    }
+
+    void PipelineRunner::endSparseQueryExecutionProgram() noexcept
+    {
+        if (my_stage_index_ >= 0 && stages_[my_stage_index_].runner)
+            stages_[my_stage_index_].runner->endSparseQueryExecutionProgram();
+    }
+
     int PipelineRunner::get_position() const
     {
         // Return position from our stage runner if available

@@ -10,6 +10,11 @@
  * logical degrees1..8 on one device, without implying eight physical devices.
  */
 #pragma once
+
+// Host-compiled adapters own the runtime; compiler-driver macros do not.
+#if defined(QSA_CUDA_RUNTIME) == defined(QSA_ROCM_RUNTIME)
+#error "QSA conformance requires exactly one explicit runtime adapter"
+#endif
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseMath.h"
 #include "kernels/qwen4exp/QwenSparseReplay.h"
@@ -18,6 +23,7 @@
 #include "QwenSparseNativeCodecFixture.h"
 #include "QwenSparseRotaryReference.h"
 #include <gtest/gtest.h>
+#include <cxxabi.h>
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -181,7 +187,8 @@ struct Fixture
         check(QSA_RT(StreamEndCapture)(stream, &graph));
         std::size_t nodes = 0;
         check(QSA_RT(GraphGetNodes)(graph, nullptr, &nodes));
-        const std::size_t indexerNodes = rows <= llaminar2::attention::kMaxGroupedVerifierAttentionRows ? 3u : 4u;
+        const std::size_t indexerNodes = indexer.query_demand == QwenSparseQueryDemand::ProvenNoRanking ? 2u :
+            rows <= llaminar2::attention::kMaxGroupedVerifierAttentionRows ? 3u : 4u;
         EXPECT_EQ(nodes, indexerNodes + (detail::isRotated(attention.kv.keys) ? 3u : 2u));
         check(QSA_RT(GraphInstantiate)(&executable, graph, nullptr, nullptr, 0));
     }
@@ -1324,6 +1331,156 @@ TEST(QSA_SUITE, CapturedRankingOnlyQueryPreparationPreservesNativeResults)
             EXPECT_EQ(std::memcmp(gatedPools.data(),serialPools.data(),gatedPools.size()*sizeof(float)),0);
             EXPECT_EQ(ordinary.executable,ordinaryExecutable);EXPECT_EQ(gated.executable,gatedExecutable);
             ASSERT_FALSE(::testing::Test::HasFailure());
+        }
+    }
+}
+/** @brief Ordinary completion edges retain the selected SDK's exact graph ABI. */
+inline auto noRankingParents(QSA_RT(GraphNode_t) node, QSA_RT(GraphNode_t) *parents, std::size_t *count)
+{
+#if defined(QSA_CUDA_RUNTIME) && defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    return QSA_RT(GraphNodeGetDependencies)(node,parents,nullptr,count);
+#else
+    return QSA_RT(GraphNodeGetDependencies)(node,parents,count);
+#endif
+}
+
+/** @brief Prove the two first native nodes are exactly pool preparation then selection. */
+void inspectNoRankingIndexer(Fixture &f)
+{
+    std::size_t count=0;
+    check(QSA_RT(GraphGetNodes)(f.graph,nullptr,&count));
+    std::vector<QSA_RT(GraphNode_t)> nodes(count);
+    check(QSA_RT(GraphGetNodes)(f.graph,nodes.data(),&count));
+    ASSERT_EQ(count,4u); // pool + select + unchanged post-RoPE attention producer/reducer
+    QSA_RT(GraphNode_t) current=nullptr;
+    for (const auto node : nodes) {
+        std::size_t parents=0;check(noRankingParents(node,nullptr,&parents));
+        if (!parents) { ASSERT_EQ(current,nullptr);current=node; }
+    }
+    ASSERT_NE(current,nullptr);
+    for (int role=0;role<2;++role) {
+        QSA_RT(GraphNodeType) type;check(QSA_RT(GraphNodeGetType)(current,&type));
+        ASSERT_EQ(type,QSA_RT(GraphNodeTypeKernel));
+        QSA_RT(KernelNodeParams) native{};check(QSA_RT(GraphKernelNodeGetParams)(current,&native));
+        ASSERT_NE(native.func,nullptr);ASSERT_NE(native.kernelParams,nullptr);
+        ASSERT_EQ(native.extra,nullptr);ASSERT_EQ(native.sharedMemBytes,0u);
+        EXPECT_EQ(native.gridDim.x,role==0 ? unsigned((f.rows+6)/4) : unsigned(f.rows));
+        EXPECT_EQ(native.gridDim.y,1u);EXPECT_EQ(native.gridDim.z,1u);
+        EXPECT_EQ(native.blockDim.x,role==0 ? 128u : 256u);
+        EXPECT_EQ(native.blockDim.y,1u);EXPECT_EQ(native.blockDim.z,1u);
+        QwenSparseIndexer p;
+        std::memcpy(&p,native.kernelParams[0],sizeof(p));
+        EXPECT_EQ(p.replay,f.indexer.replay);EXPECT_EQ(p.raw_keys,f.indexer.raw_keys);
+        EXPECT_EQ(p.partial_keys,f.indexer.partial_keys);EXPECT_EQ(p.pooled_keys,f.indexer.pooled_keys);
+        EXPECT_EQ(p.key_norm,f.indexer.key_norm);EXPECT_EQ(p.cosine,f.indexer.cosine);EXPECT_EQ(p.sine,f.indexer.sine);
+        EXPECT_EQ(p.selected,f.indexer.selected);EXPECT_EQ(p.selected_count,f.indexer.selected_count);
+        EXPECT_EQ(p.row_capacity,f.rows);EXPECT_EQ(p.token_capacity,f.capacity);EXPECT_EQ(p.block_capacity,f.blocks);
+        EXPECT_EQ(p.position_capacity,f.positions);EXPECT_EQ(p.rotary_dim,f.indexer.rotary_dim);
+        EXPECT_EQ(p.norm_epsilon,f.indexer.norm_epsilon);EXPECT_EQ(p.representation,f.indexer.representation);
+        EXPECT_EQ(p.rotary_source,f.indexer.rotary_source);EXPECT_EQ(p.rope_theta,f.indexer.rope_theta);
+        EXPECT_EQ(p.inverse_frequencies,f.indexer.inverse_frequencies);EXPECT_EQ(p.transaction_prior,nullptr);
+        EXPECT_EQ(p.pool_selection,f.indexer.pool_selection);EXPECT_EQ(p.selection_observations,nullptr);
+        EXPECT_FALSE(p.work_counters.bound());
+        EXPECT_EQ(p.query_demand,QwenSparseQueryDemand::ProvenNoRanking);
+        EXPECT_EQ(p.query,nullptr);EXPECT_EQ(p.query_norm,nullptr);
+        EXPECT_EQ(p.prepared_query,nullptr);EXPECT_EQ(p.scores,nullptr);
+        const char *raw=nullptr;
+#if defined(QSA_ROCM_RUNTIME)
+        raw=hipKernelNameRefByPtr(native.func,f.stream);
+        const std::string space="llaminar2::qwen4exp::rocm_sparse_detail::";
+#else
+        check(cudaFuncGetName(&raw,native.func));
+        const std::string space="llaminar2::qwen4exp::cuda_sparse_detail::";
+#endif
+        ASSERT_NE(raw,nullptr);
+        int status=-1;char *decoded=abi::__cxa_demangle(raw,nullptr,nullptr,&status);
+        const std::string name=decoded ? decoded : "";std::free(decoded);
+        ASSERT_EQ(status,0);
+        const auto policy=f.indexer.pool_selection;
+        const std::string expected=role==0 ? space+"preparePools(llaminar2::qwen4exp::QwenSparseIndexer)" :
+            policy==QwenSparsePoolSelection::Installed ? space+"selectPoolsWide(llaminar2::qwen4exp::QwenSparseIndexer)" :
+            "void "+space+"selectPoolsBounded<"+
+                std::string(policy==QwenSparsePoolSelection::Bounded256_512 ? "256, 512" :
+                            policy==QwenSparsePoolSelection::Bounded512_512 ? "512, 512" : "1024, 1024")+
+                ">(llaminar2::qwen4exp::QwenSparseIndexer)";
+        EXPECT_EQ(name,expected);
+        QSA_RT(FuncAttributes) resources{};check(QSA_RT(FuncGetAttributes)(&resources,native.func));
+        // CUDA's inherited accurate AnalyticTheta sinf/cosf slow reduction
+        // owns 28 explicit local bytes, rounded to a 32-byte linked frame.
+        // This is not a register spill; selection and HIP retain zero frames.
+#if defined(QSA_CUDA_RUNTIME)
+        EXPECT_EQ(resources.localSizeBytes,role==0 ? 32u : 0u);
+#else
+        EXPECT_EQ(resources.localSizeBytes,0u);
+#endif
+        if (!role) EXPECT_EQ(resources.sharedSizeBytes,512u);
+        // Locate the unique ordinary child; inspecting a name elsewhere in the
+        // graph cannot substitute for the actual ordered producer-consumer edge.
+        QSA_RT(GraphNode_t) next=nullptr;
+        for (const auto node : nodes) {
+            std::size_t n=0;check(noRankingParents(node,nullptr,&n));
+            if (n==1) {
+                QSA_RT(GraphNode_t) parent=nullptr;check(noRankingParents(node,&parent,&n));
+                if (parent==current) { ASSERT_EQ(next,nullptr);next=node; }
+            }
+        }
+        ASSERT_NE(next,nullptr);current=next;
+    }
+}
+
+/** @test Omitted query/score launches preserve complete attention and state on retained dirty graphs. */
+TEST(QSA_SUITE, CapturedProvenNoRankingOmitsQueryWorkAndPreservesRequiredBytes)
+{
+    constexpr int tokens=2080;
+    for (int rows=1;rows<=16;++rows)
+    for (const auto representation : {QwenSparseScalar::FP32,QwenSparseScalar::FP16,QwenSparseScalar::BF16})
+    {
+        // Every row capacity is covered; other selector geometries are sampled
+        // at the endpoints while the common replay guard is exercised everywhere.
+        const std::vector<QwenSparsePoolSelection> policies=rows==1 || rows==16 ?
+            std::vector<QwenSparsePoolSelection>{QwenSparsePoolSelection::Installed,QwenSparsePoolSelection::Bounded256_512,
+                QwenSparsePoolSelection::Bounded512_512,QwenSparsePoolSelection::Bounded1024_1024} :
+            std::vector<QwenSparsePoolSelection>{QwenSparsePoolSelection::Installed};
+        for (const auto policy : policies) {
+            SCOPED_TRACE(::testing::Message()<<"M="<<rows<<" repr="<<int(representation)<<" selector="<<int(policy));
+            Fixture full(rows,3,tokens,representation),omitted(rows,3,tokens,representation);
+            full.attention.query_heads=omitted.attention.query_heads=1;
+            full.indexer.pool_selection=omitted.indexer.pool_selection=policy;
+            omitted.indexer.query_demand=QwenSparseQueryDemand::ProvenNoRanking;
+            omitted.indexer.query=nullptr;omitted.indexer.query_norm=nullptr;
+            omitted.indexer.prepared_query=nullptr;omitted.indexer.scores=nullptr;
+            std::vector<float> queryPoison(omitted.query.size,-333.5f),preparedPoison(omitted.prepared.size,-777.25f),
+                scorePoison(omitted.scores.size,-999.5f),outputPoison(omitted.output.size,-3125.5f);
+            std::vector<int> selectedPoison(omitted.selected.size,-91),countPoison(rows,-91);
+            BoundedPipelineRetirement fullRetirement{full.stream},omittedRetirement{omitted.stream};
+            full.capture();omitted.capture();inspectNoRankingIndexer(omitted);
+            const auto fullExec=full.executable,omittedExec=omitted.executable;
+            for (const auto replay : {QwenSparseReplay{3,rows,17},QwenSparseReplay{2051-rows,rows,17},
+                    QwenSparseReplay{2051,0,17},QwenSparseReplay{2,std::min(rows,2),17},QwenSparseReplay{3,rows,17}}) {
+                full.replay=omitted.replay=replay;
+                for (auto *f : {&full,&omitted}) {
+                    f->state.upload(&f->replay,f->stream);
+                    f->selected.upload(selectedPoison.data(),f->stream);f->count.upload(countPoison.data(),f->stream);
+                    f->output.upload(outputPoison.data(),f->stream);
+                }
+                omitted.query.upload(queryPoison.data(),omitted.stream);
+                omitted.prepared.upload(preparedPoison.data(),omitted.stream);
+                omitted.scores.upload(scorePoison.data(),omitted.stream);
+                full.launch();omitted.launch();
+                EXPECT_EQ(full.selected.download(full.stream),omitted.selected.download(omitted.stream));
+                EXPECT_EQ(full.count.download(full.stream),omitted.count.download(omitted.stream));
+                const auto fullPools=full.pools.download(full.stream),omittedPools=omitted.pools.download(omitted.stream);
+                EXPECT_EQ(std::memcmp(fullPools.data(),omittedPools.data(),fullPools.size()*sizeof(float)),0);
+                const auto fullOutput=full.output.download(full.stream),omittedOutput=omitted.output.download(omitted.stream);
+                EXPECT_EQ(std::memcmp(fullOutput.data(),omittedOutput.data(),fullOutput.size()*sizeof(float)),0);
+                EXPECT_EQ(omitted.query.download(omitted.stream),queryPoison);
+                EXPECT_EQ(omitted.prepared.download(omitted.stream),preparedPoison);
+                EXPECT_EQ(omitted.scores.download(omitted.stream),scorePoison);
+                EXPECT_EQ(omitted.raw.download(omitted.stream),omitted.host_raw);
+                EXPECT_EQ(omitted.partial.download(omitted.stream),omitted.host_partial);
+                EXPECT_EQ(full.executable,fullExec);EXPECT_EQ(omitted.executable,omittedExec);
+                ASSERT_FALSE(::testing::Test::HasFailure());
+            }
         }
     }
 }

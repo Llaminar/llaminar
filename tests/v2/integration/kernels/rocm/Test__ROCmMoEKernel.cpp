@@ -22,6 +22,7 @@
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
  */
 
+#include "kernels/common/RouterQ8Launch.h"
 #include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
@@ -24772,16 +24773,18 @@ TEST(Test__ROCmMoEKernel, SharedExpertGroupedPrefillMatchesSequentialPath)
 
 template <typename GateFactory, typename UpFactory, typename DownFactory>
 void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecode(
-    const char *format_label,
-    GateFactory make_gate,
-    UpFactory make_up,
-    DownFactory make_down,
-    int intermediate = 512)
+    const char *format_label, GateFactory make_gate, UpFactory make_up, DownFactory make_down,
+    int intermediate = 512, TensorType router_type = TensorType::FP32)
 {
     SKIP_IF_NO_ROCM();
 
     const DeviceId device = DeviceId::rocm(0);
     const std::string format_name = format_label ? format_label : "unknown_format";
+    const bool half_router = router_type == TensorType::FP16 || router_type == TensorType::BF16;
+    const std::vector<int> runtime_rows =
+        half_router ? std::vector<int>{3}
+                    : std::vector<int>(kGroupedVerifierRuntimeRows.begin(),
+                                       kGroupedVerifierRuntimeRows.end());
     constexpr int d_model = 2048;
 
     /*
@@ -24947,15 +24950,44 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
      * from accidentally proving only an isolated singleton pipeline.
      */
     constexpr int routed_top_k = 8;
-    auto router_gate = TestTensorFactory::createFP32(
-        {static_cast<size_t>(routed_experts), static_cast<size_t>(d_model)});
-    for (size_t i = 0; i < router_gate->numel(); ++i)
+    std::vector<float> router_values(size_t(routed_experts) * d_model);
+    for (size_t i = 0; i < router_values.size(); ++i)
     {
-        router_gate->mutable_data()[i] =
-            0.017f * std::sin(0.0017f * static_cast<float>(i + 29)) +
-            0.011f * std::cos(0.0023f * static_cast<float>(i + 47));
+        router_values[i] = 0.017f * std::sin(0.0017f * static_cast<float>(i + 29)) +
+                           0.011f * std::cos(0.0023f * static_cast<float>(i + 47));
+    }
+    std::unique_ptr<TensorBase> router_gate;
+    if (router_type == TensorType::FP16)
+    {
+        auto gate = TestTensorFactory::createFP16({size_t(routed_experts), size_t(d_model)});
+        gate->from_fp32(router_values.data(), router_values.size());
+        router_gate = std::move(gate);
+    }
+    else if (router_type == TensorType::BF16)
+    {
+        auto gate = TestTensorFactory::createBF16({size_t(routed_experts), size_t(d_model)});
+        gate->from_fp32(router_values.data(), router_values.size());
+        router_gate = std::move(gate);
+    }
+    else
+    {
+        auto gate = TestTensorFactory::createFP32({size_t(routed_experts), size_t(d_model)});
+        std::copy(router_values.begin(), router_values.end(), gate->mutable_data());
+        router_gate = std::move(gate);
     }
     ASSERT_TRUE(router_gate->ensureOnDevice(device, stream));
+    if (half_router)
+    {
+        ASSERT_TRUE(router_q8_publication->requireConsumerRows(3, d_model));
+        TransferEngine::requireDeviceInput(router_gate.get(), device, stream);
+        ASSERT_TRUE(moe_kernel.prepareRouteLaunch(
+            router_gate.get(),
+            MoERouteLaunchPlan{.kind = MoERouteLaunchKind::DecodeEquivalentVerifier,
+                               .physical_rows = 3,
+                               .d_model = d_model,
+                               .num_experts = routed_experts,
+                               .top_k = routed_top_k}));
+    }
 
     DeviceNativeVNNIMatrixDesc serial_gate_desc{};
     DeviceNativeVNNIMatrixDesc serial_up_desc{};
@@ -25112,7 +25144,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
         kLayer31ProductionM2HiddenBits.size() ==
         static_cast<size_t>(2 * d_model));
 
-    for (const int seq_len : kGroupedVerifierRuntimeRows)
+    for (const int seq_len : runtime_rows)
     {
         SCOPED_TRACE("format=" + format_name + " seq_len=" + std::to_string(seq_len));
 
@@ -25158,6 +25190,16 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
         ASSERT_TRUE(grouped_routing_indices->ensureOnDevice(device, stream));
         ASSERT_TRUE(grouped_routing_weights->ensureOnDevice(device, stream));
 
+        HIPGraphCapture graph_owner(stream, 0);
+        struct SharedCellRetirement final
+        {
+            hipStream_t stream;
+            ~SharedCellRetirement() noexcept
+            {
+                if (hipSetDevice(0) != hipSuccess || hipStreamSynchronize(stream) != hipSuccess)
+                    std::terminate();
+            }
+        } cell_retirement{stream};
         ASSERT_TRUE(moe_kernel.routeVerifierRowsDecodeEquivalent(
             grouped_input.get(),
             router_gate.get(),
@@ -25203,6 +25245,12 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
             grouped_output->data(),
             grouped_output->data() + grouped_output->numel());
 
+        // The serial oracle is an independent no-demand router owner. It must
+        // never widen or overwrite the exact grouped publication admission.
+        auto serial_publication = std::make_shared<MoERouterQ8HiddenPublication>();
+        if (half_router)
+            ASSERT_TRUE(moe_kernel.bindRouterQ8HiddenPublication(
+                serial_publication, MoERouterQ8PublicationAccess::ProducerAndConsumer));
         std::vector<float> serial_host(static_cast<size_t>(seq_len) * d_model);
         for (int row = 0; row < seq_len; ++row)
         {
@@ -25278,10 +25326,13 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
          * without it the consumer correctly refuses to treat not-yet-executed
          * recording work as an eager publication.
          */
+        if (half_router)
+            ASSERT_TRUE(moe_kernel.bindRouterQ8HiddenPublication(
+                router_q8_publication, MoERouterQ8PublicationAccess::ProducerAndConsumer));
         hipGraph_t graph = nullptr;
-        ASSERT_EQ(
-            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-            hipSuccess);
+        ScopedBackendGraphCapture capture_transaction(graph_owner,
+                                                      "shared expert router Q8 publication");
+        ASSERT_TRUE(capture_transaction.begin());
         bool captured_router = false;
         bool captured_routed_grouping = false;
         bool captured_routed_experts = false;
@@ -25316,7 +25367,9 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
                 routed_top_k);
             captured_shared = grouped_stage->execute(&ctx);
         }
-        const hipError_t capture_status = hipStreamEndCapture(stream, &graph);
+        capture_transaction.finish();
+        const hipError_t capture_status = hipSuccess;
+        graph = graph_owner.graph();
         ASSERT_TRUE(captured_router)
             << "captured grouped router failed";
         ASSERT_TRUE(captured_routed_grouping)
@@ -25329,11 +25382,8 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
             << hipGetErrorString(capture_status);
         ASSERT_NE(graph, nullptr);
 
-        hipGraphExec_t graph_exec = nullptr;
-        ASSERT_EQ(
-            hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
-            hipSuccess);
-        ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+        ASSERT_TRUE(graph_owner.instantiate());
+        ASSERT_TRUE(graph_owner.launch());
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
         ASSERT_TRUE(grouped_output->ensureOnHost(stream));
         expectBitwiseVerifierRowsEqual(
@@ -25376,8 +25426,6 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
                        {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
         }
 
-        EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
-        EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
         grouped_stage->unbindWorkspace();
     }
 
@@ -25401,7 +25449,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
         }
     }
     int expected_grouped_table_rows = 0;
-    for (const int seq_len : kGroupedVerifierRuntimeRows)
+    for (const int seq_len : runtime_rows)
         expected_grouped_table_rows += 2 * seq_len;
     EXPECT_EQ(static_cast<int>(grouped_table_rows), expected_grouped_table_rows)
         << "Every eager and captured runtime-M row must be counted on the ROCm grouped table-prefill route\n"
@@ -25412,7 +25460,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
 
     const auto reuse_records = PerfStatsCollector::snapshot(
         {"kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls"});
-    for (const int seq_len : kGroupedVerifierRuntimeRows)
+    for (const int seq_len : runtime_rows)
     {
         double routed_reuse_calls = 0.0;
         double shared_reuse_calls = 0.0;
@@ -25514,6 +25562,18 @@ TEST(Test__ROCmMoERouteScratch,
         sidecar_table.hostLayerState(0).route_expert_ids,
         stable_route_ids);
 #endif
+}
+
+/** @test Actual half routers publish original FP32 Q8 for a separate required shared consumer. */
+TEST(Test__ROCmMoEKernel, SharedExpertHalfRouterRequiredQ8PublicationMatchesSerial)
+{
+    const auto formats = allMoEVerifierFormatCases();
+    const auto q8 = std::find_if(formats.begin(), formats.end(),
+                                 [](const auto &f) { return std::string(f.name) == "Q8_0"; });
+    ASSERT_NE(q8, formats.end());
+    for (auto type : {TensorType::FP16, TensorType::BF16})
+        runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecode(
+            q8->name, q8->make, q8->make, q8->make, 256, type);
 }
 
 TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_RuntimeMMatchSerialStageDecode)
@@ -29715,3 +29775,278 @@ namespace
 
 } // namespace
 #endif
+
+/**
+ * @test Half router arithmetic and original-FP32 expert publication are independent programs.
+ *
+ * Cold setup captures each real public router once. The exact demanded owner is
+ * immutable; full/partial/empty/dirty replay changes only external input/count
+ * words. A separate canonical GEMM quantizer observes the original FP32 input.
+ */
+TEST(Test__ROCmMoEKernel, HalfRouterQ8DemandPublishesOriginalRowsAndPreservesNoDemandM1)
+{
+    SKIP_IF_NO_ROCM();
+    constexpr int K = 2560, E = 17, Top = 4;
+    const auto device = DeviceId::rocm(0);
+    const auto stream = rocmMoETestStream();
+    for (const auto type : {TensorType::FP16, TensorType::BF16})
+        for (const int M : {1, 3})
+            for (const bool owned : {false, true})
+            {
+                if (owned && M == 1)
+                    continue;
+                SCOPED_TRACE(::testing::Message()
+                             << "type=" << int(type) << " rows=" << M << " owned=" << owned);
+                std::vector<float> gate_values(size_t(E) * K), source(size_t(M) * K),
+                    read_source(source.size());
+                for (size_t i = 0; i < gate_values.size(); ++i)
+                    gate_values[i] = float(int(i % 29) - 14) / 1024.f;
+                std::unique_ptr<TensorBase> gate;
+                if (type == TensorType::FP16)
+                {
+                    auto t = TestTensorFactory::createFP16({E, K});
+                    t->from_fp32(gate_values.data(), gate_values.size());
+                    gate = std::move(t);
+                }
+                else
+                {
+                    auto t = TestTensorFactory::createBF16({E, K});
+                    t->from_fp32(gate_values.data(), gate_values.size());
+                    gate = std::move(t);
+                }
+                auto hidden = TestTensorFactory::createFP32Zeros({size_t(M), K});
+                auto indices = TestTensorFactory::createFP32Zeros({size_t(M), Top});
+                auto weights = TestTensorFactory::createFP32Zeros({size_t(M), Top});
+                const MoERouterRowPacketLayout layout{DeviceRowPartition::balanced(1, 2), M, Top};
+                auto packet = TestTensorFactory::createFP32Zeros(
+                    {owned ? layout.packetBytes() / sizeof(float) : 1});
+                HipAllocation count_storage(sizeof(int)), extent_storage(sizeof(uint64_t));
+                HipAllocation reference_codes(size_t(M) * K),
+                    reference_scales(size_t(M) * (K / 32) * sizeof(float));
+                auto *count = static_cast<int *>(count_storage.get());
+                auto *extent = static_cast<uint64_t *>(extent_storage.get());
+                ROCmMoEKernel kernel(0);
+                kernel.setGPUStream(stream);
+                auto workspace = bindDefaultMoEWorkspace(kernel, M, K, 256, E, Top);
+                auto publication = std::make_shared<MoERouterQ8HiddenPublication>();
+                if (M > 1)
+                    ASSERT_TRUE(publication->requireConsumerRows(M, K));
+                ASSERT_TRUE(kernel.bindRouterQ8HiddenPublication(
+                    publication, MoERouterQ8PublicationAccess::ProducerAndConsumer));
+                TransferEngine::prepareDeviceInput(hidden.get(), device, stream);
+                TransferEngine::prepareDeviceInput(gate.get(), device, stream);
+                TransferEngine::requireDeviceInput(hidden.get(), device, stream);
+                TransferEngine::requireDeviceInput(gate.get(), device, stream);
+                TransferEngine::prepareDeviceOutput(indices.get(), device, stream);
+                TransferEngine::prepareDeviceOutput(weights.get(), device, stream);
+                TransferEngine::prepareDeviceOutput(packet.get(), device, stream);
+                const MoERouteLaunchKind kind = owned
+                                                    ? MoERouteLaunchKind::GroupedPrefill
+                                                    : MoERouteLaunchKind::DecodeEquivalentVerifier;
+                ASSERT_TRUE(
+                    kernel.prepareRouteLaunch(gate.get(), MoERouteLaunchPlan{.kind = kind,
+                                                                             .physical_rows = M,
+                                                                             .d_model = K,
+                                                                             .num_experts = E,
+                                                                             .top_k = Top}));
+                int live = M;
+                std::vector<int8_t> actual_codes(size_t(M) * K),
+                    expected_codes(actual_codes.size());
+                std::vector<float> actual_scales(size_t(M) * (K / 32)),
+                    expected_scales(actual_scales.size());
+                HIPGraphCapture graph(stream, 0);
+                struct Retirement final
+                {
+                    hipStream_t stream;
+                    ~Retirement() noexcept
+                    {
+                        if (hipSetDevice(0) != hipSuccess ||
+                            hipStreamSynchronize(stream) != hipSuccess)
+                            std::terminate();
+                    }
+                } retirement{stream};
+                ASSERT_EQ(hipMemcpyAsync(count, &live, sizeof(live), hipMemcpyHostToDevice, stream),
+                          hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                {
+                    ScopedBackendGraphCapture capture(graph,
+                                                      "half router original Q8 publication demand");
+                    ASSERT_TRUE(capture.begin());
+                    if (owned)
+                        ASSERT_TRUE(kernel.routeOwnedRowsWithTensors(hidden.get(), gate.get(),
+                                                                     layout, K, E, true,
+                                                                     packet.get(), extent, count));
+                    else
+                        ASSERT_TRUE(kernel.routeVerifierRowsDecodeEquivalent(
+                            hidden.get(), gate.get(), M, K, E, Top, true, indices.get(),
+                            weights.get(), count));
+                    capture.finish();
+                }
+                ASSERT_TRUE(graph.instantiate());
+                std::vector<GPUGraphKernelNodeInfo> nodes;
+                std::string error;
+                ASSERT_TRUE(graph.inspectKernelNodes(nodes, &error)) << error;
+                int producers = 0;
+                for (const auto &node : nodes)
+                {
+                    ASSERT_TRUE(node.name_resolved);
+                    if (node.name.find("rocm_moe_router_hidden_quantize_q8_rows_kernel") !=
+                        std::string::npos)
+                        ++producers;
+                }
+                EXPECT_EQ(producers, M > 1 ? 1 : 0)
+                    << "No-demand ordinary M1 must not gain an expert-Q8 producer";
+                if (M > 1)
+                {
+                    const auto producer = std::find_if(
+                        nodes.begin(), nodes.end(),
+                        [](const auto &node) {
+                            return node.name.find(
+                                       "rocm_moe_router_hidden_quantize_q8_rows_kernel") !=
+                                   std::string::npos;
+                        });
+                    ASSERT_NE(producer, nodes.end());
+                    EXPECT_EQ(producer->grid_x, K / 32);
+                    EXPECT_EQ(producer->grid_y, unsigned(M));
+                    EXPECT_EQ(producer->block_x, 32u);
+                    EXPECT_EQ(producer->dynamic_shared_memory_bytes, 0u);
+                    EXPECT_EQ(producer->local_memory_bytes_per_thread, 0u);
+                    size_t native_count = 0;
+                    ASSERT_EQ(hipGraphGetNodes(graph.graph(), nullptr, &native_count), hipSuccess);
+                    std::vector<hipGraphNode_t> native_nodes(native_count);
+                    ASSERT_EQ(hipGraphGetNodes(graph.graph(), native_nodes.data(), &native_count),
+                              hipSuccess);
+                    int inspected = 0;
+                    for (auto node : native_nodes)
+                    {
+                        hipGraphNodeType kind;
+                        ASSERT_EQ(hipGraphNodeGetType(node, &kind), hipSuccess);
+                        if (kind != hipGraphNodeTypeKernel)
+                            continue;
+                        hipKernelNodeParams args{};
+                        ASSERT_EQ(hipGraphKernelNodeGetParams(node, &args), hipSuccess);
+                        if (reinterpret_cast<uintptr_t>(args.func) != producer->function_identity)
+                            continue;
+                        ASSERT_NE(args.kernelParams, nullptr);
+                        for (int arg = 0; arg < 6; ++arg)
+                            ASSERT_NE(args.kernelParams[arg], nullptr);
+                        const float *arg_hidden = nullptr;
+                        int8_t *arg_codes = nullptr;
+                        float *arg_scales = nullptr;
+                        int arg_rows = 0, arg_width = 0;
+                        const int *arg_live = nullptr;
+                        std::memcpy(&arg_hidden, args.kernelParams[0], sizeof(arg_hidden));
+                        std::memcpy(&arg_codes, args.kernelParams[1], sizeof(arg_codes));
+                        std::memcpy(&arg_scales, args.kernelParams[2], sizeof(arg_scales));
+                        std::memcpy(&arg_rows, args.kernelParams[3], sizeof(arg_rows));
+                        std::memcpy(&arg_width, args.kernelParams[4], sizeof(arg_width));
+                        std::memcpy(&arg_live, args.kernelParams[5], sizeof(arg_live));
+                        EXPECT_EQ(arg_hidden, hidden->gpu_data_ptr());
+                        EXPECT_EQ(arg_codes, publication->quantized_rows);
+                        EXPECT_EQ(arg_scales, publication->row_scales);
+                        EXPECT_EQ(arg_rows, M);
+                        EXPECT_EQ(arg_width, K);
+                        EXPECT_EQ(arg_live, count);
+                        ++inspected;
+                    }
+                    EXPECT_EQ(inspected, 1);
+                }
+
+                if (M == 1)
+                {
+                    EXPECT_EQ(publication->source_rows, nullptr);
+                    EXPECT_EQ(publication->quantized_rows, nullptr);
+                }
+                else
+                {
+                    ASSERT_EQ(publication->source_rows, hidden->gpu_data_ptr());
+                    ASSERT_EQ(publication->published_rows, M);
+                    ASSERT_NE(publication->quantized_rows, nullptr);
+                    ASSERT_NE(publication->row_scales, nullptr);
+                    for (uintptr_t invalid : {uintptr_t(0), uintptr_t(1), uintptr_t(2)})
+                        EXPECT_FALSE(hipMoE_publish_original_hidden_q8_rows(
+                            static_cast<const float *>(hidden->gpu_data_ptr()),
+                            const_cast<int8_t *>(publication->quantized_rows),
+                            const_cast<float *>(publication->row_scales), M, K, 0,
+                            reinterpret_cast<void *>(invalid), count));
+                }
+                for (const int active : {M, std::min(M, 2), 0, 1, M})
+                {
+                    live = active;
+                    for (int row = 0; row < M; ++row)
+                        for (int k = 0; k < K; ++k)
+                            source[size_t(row) * K + k] =
+                                (k % 32 == 0)
+                                    ? 127.f
+                                    : (k % 32 == 1 ? 0.5001f : float((k + row) % 13 - 6) / 3.f);
+                    ASSERT_EQ(hipMemcpyAsync(hidden->gpu_data_ptr(), source.data(),
+                                             source.size() * sizeof(float), hipMemcpyHostToDevice,
+                                             stream),
+                              hipSuccess);
+                    TransferEngine::publishCurrentDeviceWrite(hidden.get(), stream);
+                    TransferEngine::requireDeviceInput(hidden.get(), device, stream);
+                    ASSERT_EQ(
+                        hipMemcpyAsync(count, &live, sizeof(live), hipMemcpyHostToDevice, stream),
+                        hipSuccess);
+                    if (M > 1)
+                    {
+                        ASSERT_EQ(hipMemsetAsync(const_cast<int8_t *>(publication->quantized_rows),
+                                                 0x55, actual_codes.size(), stream),
+                                  hipSuccess);
+                        ASSERT_EQ(hipMemsetAsync(const_cast<float *>(publication->row_scales), 0x55,
+                                                 actual_scales.size() * sizeof(float), stream),
+                                  hipSuccess);
+                    }
+                    ASSERT_TRUE(graph.launch());
+                    if (M > 1)
+                    {
+                        ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwise(
+                            static_cast<const float *>(hidden->gpu_data_ptr()),
+                            static_cast<int8_t *>(reference_codes.get()),
+                            static_cast<float *>(reference_scales.get()), M, K, 0, stream, 32));
+                        ASSERT_EQ(hipMemcpyAsync(actual_codes.data(), publication->quantized_rows,
+                                                 actual_codes.size(), hipMemcpyDeviceToHost,
+                                                 stream),
+                                  hipSuccess);
+                        ASSERT_EQ(hipMemcpyAsync(actual_scales.data(), publication->row_scales,
+                                                 actual_scales.size() * sizeof(float),
+                                                 hipMemcpyDeviceToHost, stream),
+                                  hipSuccess);
+                        ASSERT_EQ(hipMemcpyAsync(expected_codes.data(), reference_codes.get(),
+                                                 expected_codes.size(), hipMemcpyDeviceToHost,
+                                                 stream),
+                                  hipSuccess);
+                        ASSERT_EQ(hipMemcpyAsync(expected_scales.data(), reference_scales.get(),
+                                                 expected_scales.size() * sizeof(float),
+                                                 hipMemcpyDeviceToHost, stream),
+                                  hipSuccess);
+                    }
+                    ASSERT_EQ(hipMemcpyAsync(read_source.data(), hidden->gpu_data_ptr(),
+                                             source.size() * sizeof(float), hipMemcpyDeviceToHost,
+                                             stream),
+                              hipSuccess);
+                    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                    EXPECT_EQ(std::memcmp(source.data(), read_source.data(),
+                                          source.size() * sizeof(float)),
+                              0);
+                    if (M > 1)
+                    {
+                        EXPECT_EQ(std::memcmp(actual_codes.data(), expected_codes.data(),
+                                              size_t(live) * K),
+                                  0);
+                        EXPECT_EQ(std::memcmp(actual_scales.data(), expected_scales.data(),
+                                              size_t(live) * (K / 32) * sizeof(float)),
+                                  0);
+                        for (size_t i = size_t(live) * K; i < actual_codes.size(); ++i)
+                            EXPECT_EQ(actual_codes[i], int8_t(0x55));
+                        for (size_t i = size_t(live) * (K / 32); i < actual_scales.size(); ++i)
+                            EXPECT_EQ(std::bit_cast<uint32_t>(actual_scales[i]),
+                                      UINT32_C(0x55555555));
+                        if (live)
+                            EXPECT_EQ(actual_codes[1], 1)
+                                << "FP16/BF16-rounded0.5 would incorrectly quantize to0";
+                    }
+                }
+                kernel.unbindWorkspace();
+            }
+}

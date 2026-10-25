@@ -3738,9 +3738,11 @@ TEST(Test__Qwen35MoEGraph,
     EXPECT_EQ(
         serial_workspace.buffers.front().size_bytes,
         static_cast<size_t>(config.d_model) * 4u * sizeof(float));
+    // A canonical predictor reduction can also execute inside prefill; phase
+    // filtering must preserve the exact bank selected by its arithmetic policy.
     EXPECT_EQ(
         serial_workspace.buffers.front().regime,
-        WorkspaceExecutionRegime::CompactDecodeOnly);
+        WorkspaceExecutionRegime::Any);
 
     GraphConfig grouped_config = config;
     grouped_config.grouped_mtp_verifier = true;

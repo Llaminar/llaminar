@@ -9,13 +9,14 @@ analysis in the linked tuning notes, not in this dashboard.
 **Goal:** beat Castagna's **42.959 decode tok/s** on four MI50s while preserving
 roughly 815 prefill tok/s and canonical numerical accuracy.
 
-**Current green performance slice: scoped query grid — 819.900 prefill /
-43.388 decode tok/s.** Matched A/B/A control:820.877 /42.372; decode gains
-**2.396%**, prefill changes−0.119%. All three candidate responses exceed the
-recorded Castagna42.959 rate (range43.257–43.463). All nine trajectories match;
-185 final-logit rows are byte-identical to five references. Six device aliases
-and778/778 Unit plus two build-selection aliases pass, with the same95 historical
-inner Unit omissions. [Settings, profiles and evidence][column-grid].
+**Query-launch omission: scoped qualification green.**
+Current source: 778 Unit registrations and 30 focused aliases pass, with 95
+unchanged historical inner skips. TP4 and PP4 ordinary/forced/MTP lifecycles
+pass; ordinary/MTP tokens match within each topology. The RoPE retained-reset
+fault is fixed and regressed. All 185 final-logit rows match five references.
+Final timing: 819.673 P / 43.453 D vs 820.881 / 43.268 control (+0.426% D,
+overlapping samples; -0.147% P). All nine 256-token outputs match. [Evidence](QFN_SHORT_CONTEXT_QUERY_OMISSION.md).
+Previous committed grid slice:819.900 /43.388, +2.396% decode. [Evidence][column-grid].
 
 Earlier committed slices `f52896b8` and `8baf5c58` retain prepared GDN Q/K,
 grouped QSA preparation, attention defaults, norm/SingleQ8 fusion and redundant
@@ -28,7 +29,7 @@ matched cumulative model timing was neutral. [Norm/preparation evidence][qsa];
 |---|---|
 | Elide online rescale exponentials | Native/accuracy green; ≈0.75% prefill and ≈0.6% short-decode component savings. Model 820.812 P / 42.211 D vs 820.343 / 42.416: no overall gain. [Evidence][online-rescale]. |
 | Fuse GDN output normalization with SingleQ8 preparation | Focused gates, model panel, profiles and matched run green; 185 exact rows. Component 6.9% faster; cumulative model timing neutral. |
-| Omit unnecessary indexer launches | Next: retained no-ranking program selected at admission. Backend/builder/CPU drafts are under review; parent ownership is being closed. [Plan](QFN_SHORT_CONTEXT_QUERY_OMISSION.md). |
+| Omit unnecessary indexer launches | Accuracy, Unit, TP4/PP4 lifecycles and matched timing green; two retained programs omit provably unused query work. [Evidence](QFN_SHORT_CONTEXT_QUERY_OMISSION.md). |
 | Complete CUDA QSA component timings | First M1/512 cell saves 22.685%; remaining shapes pending. No CUDA model-speed claim. |
 | Broader topology tuning | Tune admitted A rows first, then admit and qualify B–D. Obtain applicable reference baselines before tuning. |
 
@@ -47,7 +48,7 @@ speed or an image. G60 is the last complete topology gate; later A1 gates are sc
 
 | ID | Topology and ngrams | Accuracy | Llaminar P | Reference P | Strata P | Llaminar D | Reference D | Strata D | Next / limitation |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 current185 exact rows | 819.900 | 467.821 C | — | 43.388 | 42.959 C | — | Recorded decode target passed; finish complete query-launch omission. |
+| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 current 185 exact rows | 819.673 | 467.821 C | — | 43.453 | 42.959 C | — | Scoped gates green; full preflight pending. |
 | A2 | ROCm1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a2] | 156.707 | 159.177 C | 45.270≈ | 15.164 | 11.600 C | 24.024≈ | Prefill trails Castagna; decode trails Strata. |
 | A3 | CUDA1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a3] | 180.920 | 129.020 U⚠ | 74.301≈ | 18.231 | 13.059 U⚠ | 31.253≈ | Resolve upstream variance; decode trails Strata. |
 | A4 | CPU1, 28 physical workers; SSD mmap ngrams | [🟢 G60][a4] | 98.466 | 48.408 C | n/a | 5.797 | 4.611 C | n/a | Both recorded phases lead Castagna. |
@@ -111,7 +112,7 @@ Never switch GGUF or placement silently. Strata baselines remain pending.
 | C6 | ROCm PP2; unequal contiguous layer ranges | ⚪ | — | — | — | — | C; pipeline admission and ranges. |
 | C7 | CUDA PP2; equal contiguous layer ranges | ⚪ | — | — | — | — | U; pipeline admission and ranges. |
 | C8 | CUDA PP2; unequal contiguous layer ranges | ⚪ | — | — | — | — | U; pipeline admission and ranges. |
-| C9 | ROCm PP4; equal ranges, one stage/card | ⚪ | — | — | — | — | C; singleton-stage control for C12. |
+| C9 | ROCm PP4; equal ranges, one stage/card | ⚪ | — | — | — | — | C; lifecycle green; accuracy/perf pending. |
 | C10 | ROCm PP4; unequal layer ranges | ⚪ | — | — | — | — | C; source owners/capacity. |
 | C11 | ROCm PP(TP2, TP2) | ⚪ | — | — | — | — | C; TP cohorts and pipeline boundary. |
 | C12 | ROCm interleaved PP; 12 stages, 0/1/2/3 repeated ×3 | ⚪ | — | — | — | — | C; repeated ownership/concurrency-aware admission. |

@@ -18,6 +18,7 @@
 #include "utils/Logger.h"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace llaminar2
 {
@@ -25,6 +26,7 @@ namespace llaminar2
         const DeviceSpeculativePublicationRequest &request,
         const MTPSpecDecodeMetadataDevicePointers &publication_metadata,
         ComputeGraph &verifier_graph,
+        const ForwardGraphSignature &verifier_signature,
         int verifier_rows_per_request,
         std::string *error)
     {
@@ -230,12 +232,18 @@ namespace llaminar2
         params.require_captured_verifier_state =
             mtpSpecStatePublicationRequiresCapturedStage();
 
-        return installMTPStatePublicationGraph(std::move(params), verifier_graph, error);
+        if (!installMTPStatePublicationGraph(std::move(params), verifier_graph, verifier_signature, error))
+            return false;
+        // Only the real externally admitted publication can author this borrow.
+        // Cold sibling preparation never replaces the policy/outcome authority.
+        mtp_publication_admission_authority_ = verifier_signature;
+        return true;
     }
 
     bool DeviceGraphOrchestrator::installMTPStatePublicationGraph(
         MTPSpeculativeStatePublicationStage::Params params,
-        ComputeGraph &verifier_graph, std::string *error)
+        const ComputeGraph &verifier_graph, const ForwardGraphSignature &verifier_signature,
+        std::string *error)
     {
         const auto fail = [&](const std::string &reason) {
             if (error) *error = reason;
@@ -245,6 +253,9 @@ namespace llaminar2
         const auto generation = workspaceGeneration(state_.device_id);
         const int request_count = params.request_count;
         const int verifier_rows_per_request = params.verifier_rows_per_request;
+        if (verifier_signature.batch_size != request_count ||
+            verifier_signature.seq_len != verifier_rows_per_request)
+            return fail("Publication geometry must equal its original immutable verifier signature");
         if (!state_.device_id.is_gpu() || generation == 0 || params.device_id != state_.device_id ||
             request_count <= 0 || verifier_rows_per_request <= 0 || !state_.kv_cache ||
             !params.main_kv_bindings.empty() ||
@@ -285,7 +296,7 @@ namespace llaminar2
         for (const std::string &node_name :
              verifier_graph.getExecutionOrder())
         {
-            ComputeNode *node = verifier_graph.getNode(node_name);
+            const ComputeNode *node = verifier_graph.getNode(node_name);
             if (!node || !node->stage)
             {
                 return fail(
@@ -355,15 +366,14 @@ namespace llaminar2
         params.moe_histogram_publication_stream =
             histogram_boundary_resolution.publication_stream;
 
-        auto &cache = mtp_speculative_state_publication_graph_;
-        if (cache.valid && cache.graph && cache.stage &&
-            cache.workspace_generation == generation &&
-            cache.pipeline_edges == pipeline_forward_edges_ &&
-            cache.stage->hasSameCaptureIdentity(params))
+        auto &cache = mtpStatePublicationCache(verifier_signature);
+        if (cache.matches(verifier_signature, generation, pipeline_forward_edges_, params))
         {
             return true;
         }
 
+        if (sparseQueryParentLaunched())
+            return fail("Cannot replace a publication child while any query parent is in flight");
         auto graph = std::make_unique<ComputeGraph>();
         MTPSpeculativeStatePublicationStage *publication_stage = nullptr;
         try
@@ -386,7 +396,9 @@ namespace llaminar2
             return fail("MTP publication graph rejected ownership: " + std::string(exception.what()));
         }
 
-        mtp_device_generation_loop_graph_.invalidateGraph();
+        // An empty sibling owns no borrowed executable. Initial cold materialization
+        // must not discard the already-prepared other program's complete parent.
+        if (cache.valid || cache.graph) retireMTPPublicationParent(verifier_signature);
         /* All publication identities are sequential and share one exact MoE
          * histogram producer.  Retain its certified stream across geometry or
          * pointer-identity replacement; only final topology teardown destroys
@@ -396,6 +408,7 @@ namespace llaminar2
         cache.stage = publication_stage;
         cache.workspace_generation = generation;
         cache.pipeline_edges = pipeline_forward_edges_;
+        cache.verifier_signature = verifier_signature;
         cache.valid = true;
 
         PerfStatsCollector::addCounter(
@@ -404,7 +417,9 @@ namespace llaminar2
             1.0,
             "graph_setup",
             state_.device_id.toString(),
-            {{"requests", std::to_string(request_count)},
+            {{"sparse_query_program", verifier_signature.sparse_query_execution_program ==
+                  SparseQueryExecutionProgram::ProvenNoRanking ? "proven_no_ranking" : "ranking_possible"},
+             {"requests", std::to_string(request_count)},
              {"verifier_rows",
               std::to_string(verifier_rows_per_request)},
              {"workspace_generation", std::to_string(generation)}});
@@ -412,7 +427,8 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::materializePipelineFollowerMTPPublicationGraph(
-        ComputeGraph &verifier_graph, int verifier_rows_per_request, std::string *error)
+        ComputeGraph &verifier_graph, const ForwardGraphSignature &verifier_signature,
+        int verifier_rows_per_request, std::string *error)
     {
         const auto fail = [&](const char *reason) {
             if (error) *error = reason;
@@ -439,7 +455,48 @@ namespace llaminar2
         params.accepted_state_counts_device = metadata.accepted_state_counts;
         params.publication_ok_flags_device = metadata.publication_ok_flags;
         params.require_captured_verifier_state = mtpSpecStatePublicationRequiresCapturedStage();
-        return installMTPStatePublicationGraph(std::move(params), verifier_graph, error);
+        if (!installMTPStatePublicationGraph(std::move(params), verifier_graph, verifier_signature, error))
+            return false;
+        // Only the real externally admitted publication can author this borrow.
+        // Cold sibling preparation never replaces the policy/outcome authority.
+        mtp_publication_admission_authority_ = verifier_signature;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::prepareMTPStatePublicationForVerifier(
+        const ForwardGraphSignature &signature, void *producer_stream, std::string *error)
+    {
+        const auto fail = [&](const std::string &why) { if (error) *error = why; return false; };
+        if (!forward_engine_ || reinterpret_cast<std::uintptr_t>(producer_stream) <= 2)
+            return fail("Publication child requires its existing retained verifier and exact preparation stream");
+        const auto retained = forward_engine_->retainedDecodeGraph(signature, error);
+        if (!retained || !retained->graph_owner || retained->device != state_.device_id)
+            return fail("Publication child has no exact replay-ready verifier owner");
+        if (sparseQueryParentLaunched())
+            return fail("Publication child preparation requires every shared-stream parent to be idle");
+        (void)mtpStatePublicationCache(signature); // Validate the exact active target before any mutation.
+        MTPSpeculativeStatePublicationStage::Params params;
+        try
+        {
+            // A complete dynamic parent fixes one maximum physical width.
+            // Every cold reuse compares the latest original admission's full
+            // outcome/policy Params, even when the verifier key is unchanged.
+            params = mtpStatePublicationAuthority(signature, workspaceGeneration(state_.device_id));
+        }
+        catch (const std::exception &exception)
+        {
+            return fail(exception.what());
+        }
+        // Reconstruct only target-local borrows from the exact retained graph;
+        // no first-valid sibling or compile-selected cache supplies authority.
+        params.main_kv_bindings.clear();
+        params.verifier_state_stages.clear();
+        params.moe_histogram_publishers.clear();
+        params.moe_histogram_publication_stream = nullptr;
+        if (!installMTPStatePublicationGraph(std::move(params), *retained->graph_owner, signature, error))
+            return false;
+        return executeMTPStatePublicationGraph(producer_stream, error,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch);
     }
 
     bool DeviceGraphOrchestrator::executeMTPStatePublicationGraph(
@@ -455,7 +512,7 @@ namespace llaminar2
             return false;
         };
 
-        auto &cache = mtp_speculative_state_publication_graph_;
+        auto &cache = mtpStatePublicationCache();
         const uint64_t generation = workspaceGeneration(state_.device_id);
         if (!state_.device_id.is_gpu() || !producer_stream ||
             !cache.valid || !cache.graph || !cache.stage ||
@@ -489,17 +546,18 @@ namespace llaminar2
             GPUDeviceContextPool::instance().getContext(state_.device_id);
         void *const histogram_publication_stream =
             cache.stage->getParams().moe_histogram_publication_stream;
-        const bool capture_stream_ready =
-            histogram_publication_stream
-                ? cache.segment_cache.bindBorrowedCaptureStream(
-                      &gpu_ctx,
-                      histogram_publication_stream,
-                      state_.device_id,
-                      /*context_from_process_pool=*/true)
-                : cache.segment_cache.ensureCaptureStream(
-                      &gpu_ctx,
-                      state_.device_id,
-                      /*context_from_process_pool=*/true);
+        // Slot zero retains the original single stream owner even when the
+        // first request selects NoRanking. Other graph children only borrow it.
+        // Histogram-backed owners borrow the already-certified table stream;
+        // no second producer or event authority is created per program.
+        auto &producer = mtp_speculative_state_publication_graphs_.front().segment_cache;
+        const bool producer_ready = histogram_publication_stream
+            ? producer.bindBorrowedCaptureStream(&gpu_ctx, histogram_publication_stream,
+                  state_.device_id, /*context_from_process_pool=*/true)
+            : producer.ensureCaptureStream(&gpu_ctx, state_.device_id, /*context_from_process_pool=*/true);
+        const bool capture_stream_ready = producer_ready &&
+            (&producer == &cache.segment_cache || cache.segment_cache.bindBorrowedCaptureStream(
+                &gpu_ctx, producer.capture_stream, state_.device_id, /*context_from_process_pool=*/true));
         if (!capture_stream_ready ||
             !cache.segment_cache.orderCaptureStreamAfter(
                 &gpu_ctx,

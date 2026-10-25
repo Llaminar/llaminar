@@ -6331,6 +6331,20 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayParticipantGraphRunner::admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request)
+    {
+        // This participant owns expert-only projections, never an attention/indexer graph.
+        // Validate the complete admission even though no query program is consumed here.
+        if (!request.valid()) return false;
+        (void)resolveSparseQueryExecutionProgram(request);
+        return true;
+    }
+
+    void MoEOverlayParticipantGraphRunner::endSparseQueryExecutionProgram() noexcept
+    {
+        // Expert-only participants retain no sparse-query topology or response ledger.
+    }
+
     int MoEOverlayParticipantGraphRunner::get_position() const
     {
         return position_;

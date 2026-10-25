@@ -564,6 +564,11 @@ namespace llaminar2
          * @param seq_len Sequence length
          * @return true if forward pass succeeded on all devices
          */
+        /** @copydoc IInferenceRunner::admitSparseQueryExecutionProgram */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override;
+        /** @copydoc IInferenceRunner::endSparseQueryExecutionProgram */
+        void endSparseQueryExecutionProgram() noexcept override;
+
         bool forward(const int *tokens, int seq_len) override;
         bool forwardPrefill(const int *tokens, int seq_len) override;
         /** @copydoc IInferenceRunner::forwardRestoredPrefixMTPDecodeBridge */

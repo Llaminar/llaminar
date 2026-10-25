@@ -195,6 +195,20 @@ namespace
             logits_[3] = 10.0f; // Token 3 is always argmax
         }
 
+        /**
+         * @brief Admit response policy in this model-free protocol/sampling witness.
+         * @param request Existing immutable admission, including any target-count proof.
+         * @return True only for a valid closed program; no QSA/indexer graph exists here.
+         */
+        bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override
+        {
+            if (!request.valid()) return false;
+            (void)resolveSparseQueryExecutionProgram(request);
+            return true;
+        }
+        /** @brief No query graph policy is retained by this explicit no-consumer witness. */
+        void endSparseQueryExecutionProgram() noexcept override {}
+
         bool forward(const int *tokens, int seq_len) override
         {
             forward_call_count_++;

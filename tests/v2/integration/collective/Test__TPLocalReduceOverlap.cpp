@@ -28,6 +28,7 @@
 #include <array>
 #include <barrier>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <exception>
 #include <thread>
@@ -68,8 +69,10 @@ namespace
     /** @brief Exercise the selected native operation through its unchanged public builder. */
     void verifyCapturedOverlap(DeviceId first, Operation operation = Operation::RootedReduce,
                                int rows = 1, int columns = 16384, RowExtent extent = RowExtent::Fixed,
-                               int degree = 2)
+                               int degree = 2, bool canonical_request_bank = false)
     {
+        ASSERT_FALSE(canonical_request_bank && (operation != Operation::CanonicalRankOrder ||
+            extent == RowExtent::Fixed));
         auto *backend = getBackendFor(first);
         ASSERT_NE(backend, nullptr);
         if (backend->deviceCount() < degree) GTEST_SKIP() << "Requires " << degree << " native GPUs";
@@ -147,8 +150,8 @@ namespace
                         FP32Tensor input({64, 256}, device);
                         FP32Tensor output({64, 256}, device);
                         FP32Tensor gamma({256}, device);
-                        FP32Tensor live_count({2}, device);
-                        std::fill_n(live_count.mutable_data(), 2, 0.0f);
+                        FP32Tensor live_count({canonical_request_bank ? 4u : 2u}, device);
+                        std::fill_n(live_count.mutable_data(), live_count.numel(), 0.0f);
                         std::fill_n(partial.mutable_data(), count, 1.0f);
                         std::fill_n(serial.mutable_data(), count, 1.0f);
                         std::fill_n(gathered.mutable_data(), std::size_t(degree) * count, 0.0f);
@@ -234,7 +237,11 @@ namespace
                             sum.tensor_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
                             sum.sideband_device_index = participant;
                             if (canonical) sum.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
-                            if (extent != RowExtent::Fixed) sum.live_rows.emplace(device_rows, columns);
+                            if (canonical_request_bank)
+                                sum.request_rows = NativeAllreduceRequestRows(1, rows, columns,
+                                    static_cast<const std::int32_t *>(live_count.gpu_data_ptr())).withPayloadReceipt(
+                                    reinterpret_cast<unsigned long long *>(static_cast<std::byte *>(live_count.gpu_data_ptr()) + 8));
+                            else if (extent != RowExtent::Fixed) sum.live_rows.emplace(device_rows, columns);
                             if (grouped_sideband)
                             {
                                 LocalTPCollectiveSidebandBuffer sideband;
@@ -245,7 +252,10 @@ namespace
                                 sideband.name = "live_prefix_control";
                                 sum.sidebands.push_back(sideband);
                             }
-                            graph.addNode("reduce", std::make_unique<TPAllreduceStage>(sum), device);
+                            auto sum_stage = std::make_unique<TPAllreduceStage>(sum);
+                            if (canonical_request_bank)
+                                sum_stage->setParams(sum); // Rebind the original request declaration before capture.
+                            graph.addNode("reduce", std::move(sum_stage), device);
                             graph.addDependency("reduce", "producer");
                             // Production control sidebands deliberately stay in
                             // their grouped anchor, not an unsupported fork.
@@ -298,6 +308,11 @@ namespace
                                     else if (allreduce || participant == 0) plan.outputs = {&partial};
                                 }
                             }
+                            if (canonical_request_bank && (name == "reduce" || name == "reduce_submit"))
+                            {
+                                plan.external_inputs.push_back(&live_count);
+                                plan.outputs.push_back(&live_count);
+                            }
                             plans.push_back(std::move(plan));
                         }
                         require(gpu.synchronizeStreamChecked(stream), "preparation completion");
@@ -306,6 +321,8 @@ namespace
                         // even when a fixture has already observed it on host.
                         for (auto *tensor : {&partial, &input, &gamma})
                             TransferEngine::requireDeviceInput(tensor, device, stream);
+                        if (canonical_request_bank)
+                            TransferEngine::requireDeviceInput(&live_count, device, stream);
                         GraphCaptureDependencyLedger ledger(device, stream, std::move(plans), "reduce_overlap");
                         auto capture = gpu.createGraphCapture(stream);
                         rendezvous.arrive_and_wait();
@@ -359,6 +376,11 @@ namespace
                                 require(backend->hostToDeviceOnStream(gathered.gpu_data_ptr(), actual.data(),
                                     actual.size() * sizeof(float), participant, stream), "poison gather tails");
                             }
+                            unsigned long long observed_wire_bytes = 0;
+                            if (canonical_request_bank)
+                                require(backend->hostToDeviceOnStream(
+                                    static_cast<std::byte *>(live_count.gpu_data_ptr()) + 8, &observed_wire_bytes,
+                                    sizeof(observed_wire_bytes), participant, stream), "reset native ring-send receipt");
                             rendezvous.arrive_and_wait();
                             require(capture->launch(), "replay");
                             require(backend->deviceToHostOnStream(actual.data(), result->gpu_data_ptr(),
@@ -378,7 +400,14 @@ namespace
                                 require(backend->deviceToHostOnStream(expected.data(), serial.gpu_data_ptr(),
                                     count * sizeof(float), participant, stream), "serial control observation");
                             }
+                            if (canonical_request_bank)
+                                require(backend->deviceToHostOnStream(&observed_wire_bytes,
+                                    static_cast<std::byte *>(live_count.gpu_data_ptr()) + 8,
+                                    sizeof(observed_wire_bytes), participant, stream), "observe native ring-send receipt");
                             require(gpu.synchronizeStreamChecked(stream), "terminal completion");
+                            if (canonical_request_bank)
+                                require(observed_wire_bytes == active_count * sizeof(float) * (degree - 1),
+                                    "canonical single-request gather sent inactive capacity or lost a ring link");
                             if (grouped_sideband)
                                 require(observed_metadata[0] == live && observed_metadata[1] == degree * (degree + 1) / 2,
                                     "anchor clipped sideband or changed count authority");
@@ -530,4 +559,26 @@ TEST(Test__TPColumnReduceScatter, ROCm) { verifyColumns(DeviceId::rocm(0)); }
 TEST(Test__TPLiveRowsOverlap, ROCm) { verifyLivePrefixes(DeviceId::rocm(0)); }
 /** @test Both precision modes preserve all inactive FP32 bytes across every live prefix. */
 TEST(Test__TPLocalAllreduceInactiveRows, ROCm) { verifyInactiveFP32Prefixes(DeviceId::rocm(0)); }
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Single-request canonical lowering retains every live prefix and exact native send bytes. */
+TEST(Test__TPCanonicalSingleRequest, CUDA2)
+{
+    verifyCapturedOverlap(DeviceId::cuda(0), Operation::CanonicalRankOrder, 17, 256,
+        RowExtent::EveryDevicePrefix, 2, true);
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Both native two-rank and cancellation-sensitive four-rank folds retain request liveness. */
+TEST(Test__TPCanonicalSingleRequest, ROCm2)
+{
+    verifyCapturedOverlap(DeviceId::rocm(0), Operation::CanonicalRankOrder, 17, 256,
+        RowExtent::EveryDevicePrefix, 2, true);
+}
+TEST(Test__TPCanonicalSingleRequest, ROCm4)
+{
+    verifyCapturedOverlap(DeviceId::rocm(0), Operation::CanonicalRankOrder, 17, 256,
+        RowExtent::EveryDevicePrefix, 4, true);
+}
 #endif

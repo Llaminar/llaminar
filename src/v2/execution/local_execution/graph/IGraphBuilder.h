@@ -18,6 +18,7 @@
 
 #include "DeviceGraphExecutor.h"
 #include "DeviceDecodePositionBinding.h"
+#include "kernels/common/SparseQueryExecutionProgram.h"
 #include "DeviceRequestQueryBinding.h"
 #include "models/qwen4exp/Qwen4ExpReplicatedPLEQuery.h"
 #include "../../../kernels/common/DeviceGenerationInitialization.h"
@@ -638,6 +639,8 @@ namespace llaminar2
             ForwardExecutionRole::MainInference; ///< Semantic owner of this invocation.
         ForwardExecutionPhase execution_phase =
             ForwardExecutionPhase::Prefill; ///< Typed math/topology phase; never inferred from M.
+        /** Immutable whole-response query program; numeric admission counts are request data. */
+        SparseQueryExecutionProgram sparse_query_execution_program = SparseQueryExecutionProgram::RankingPossible;
         ForwardStateTransaction state_transaction =
             ForwardStateTransaction::Ordinary; ///< Typed persistent-state transition embedded by this graph.
         ForwardGraphSubmissionIntent graph_submission_intent =

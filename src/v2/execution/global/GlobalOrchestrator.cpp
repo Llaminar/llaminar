@@ -1938,6 +1938,29 @@ namespace llaminar2
         return local_success;
     }
 
+    bool StageRunnerRegistry::admitSparseQueryExecutionProgramAll(const DeviceGenerationAdmissionRequest &request)
+    {
+        if (!request.valid() || entries_.empty()) return false;
+        for (const auto &entry : entries_)
+            if (!entry.runner || !entry.runner->admitSparseQueryExecutionProgram(request)) return false;
+        return true;
+    }
+
+    void StageRunnerRegistry::endSparseQueryExecutionProgramAll() noexcept
+    {
+        for (const auto &entry : entries_) if (entry.runner) entry.runner->endSparseQueryExecutionProgram();
+    }
+
+    bool GlobalOrchestrator::admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request)
+    {
+        return stage_runners_.admitSparseQueryExecutionProgramAll(request);
+    }
+
+    void GlobalOrchestrator::endSparseQueryExecutionProgram() noexcept
+    {
+        stage_runners_.endSparseQueryExecutionProgramAll();
+    }
+
     int GlobalOrchestrator::get_position() const
     {
         const IInferenceRunner *runner = stage_runners_.defaultRunner();

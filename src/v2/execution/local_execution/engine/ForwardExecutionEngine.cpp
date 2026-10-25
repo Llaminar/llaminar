@@ -1518,7 +1518,8 @@ namespace llaminar2
         cache_.clear();
     }
 
-    size_t ForwardExecutionEngine::invalidateMoEPlacementSensitiveGraphsForStablePlacement()
+    size_t ForwardExecutionEngine::invalidateMoEPlacementSensitiveGraphsForStablePlacement(
+        const std::function<void()> &before_invalidation)
     {
         size_t invalidated = 0;
         for (auto &[signature, cache] : cache_)
@@ -1536,6 +1537,7 @@ namespace llaminar2
                 continue;
             }
 
+            if (invalidated == 0 && before_invalidation) before_invalidation();
             cache.invalidate();
             ++invalidated;
         }
@@ -1802,6 +1804,13 @@ namespace llaminar2
         if(!executableForwardSubmissionIntent(input.graph_submission_intent))
         {
             LOG_ERROR("[ForwardExecutionEngine] Workspace declaration or unknown submission intent is not executable");
+            return false;
+        }
+        (void)sparseQueryExecutionProgramIndex(input.sparse_query_execution_program);
+        if (input.sparse_query_execution_program == SparseQueryExecutionProgram::ProvenNoRanking &&
+            input.execution_phase != ForwardExecutionPhase::Decode)
+        {
+            LOG_ERROR("[ForwardExecutionEngine] No-ranking topology requires explicit Decode admission");
             return false;
         }
         if(input.device_request_query)requireDeviceRequestQueryOwnsInput(input);
@@ -2128,6 +2137,7 @@ namespace llaminar2
                 .execution_role = effective_input.execution_role,
                 .state_transaction = effective_input.state_transaction,
                 .decode = is_decode,
+                .sparse_query_execution_program = effective_input.sparse_query_execution_program,
                 .decode_has_history = decode_has_history,
                 .all_position_logits = all_position_logits,
                 .live_mtp_request_batch_condition =

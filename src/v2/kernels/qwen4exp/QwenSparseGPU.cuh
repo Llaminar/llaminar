@@ -56,6 +56,18 @@ __device__ __forceinline__ QwenSparseReplay replay(const QwenSparseReplay *state
             static_cast<long long>(r.position_origin) + r.prefix_tokens + r.live_rows <= 0x7fffffff);
     return r;
 }
+/**
+ * @brief Authenticate the selected indexer program before any pool/selection write.
+ * @details Admission owns the whole-request proof. This device check rejects a
+ * stale or wrong retained program using only the original replay publication.
+ */
+__device__ __forceinline__ QwenSparseReplay indexerReplay(const QwenSparseIndexer &p)
+{
+    const auto original = replay(p.replay, p.row_capacity, p.token_capacity);
+    require(p.query_demand != QwenSparseQueryDemand::ProvenNoRanking ||
+            static_cast<long long>(original.prefix_tokens) + original.live_rows <= QwenSparseFirstRankingLogicalRow);
+    return original;
+}
 /** @brief Freeze only original live tail payload plus required immutable metadata. */
 __global__ __launch_bounds__(128,2) void snapshotPrior(QwenSparsePriorSnapshot p)
 {
@@ -131,7 +143,7 @@ template<bool RankingOnly>
 __device__ __forceinline__ void prepareQueryHead(const QwenSparseIndexer &p,
     const ProjectionRowWork &queryWork, int row_head, float *shared)
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    const auto r = indexerReplay(p);
     require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
     if (row_head >= r.live_rows * 4) return;
     if constexpr (RankingOnly)
@@ -150,7 +162,7 @@ __device__ __forceinline__ void prepareQueryHead(const QwenSparseIndexer &p,
 __device__ __forceinline__ void preparePoolBlock(const QwenSparseIndexer &p,
     int logical_block, float *shared)
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    const auto r = indexerReplay(p);
     require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
     const int block = r.prefix_tokens / 4 + logical_block;
     if (block >= (r.prefix_tokens + r.live_rows) / 4) return;
@@ -216,7 +228,7 @@ __global__ __launch_bounds__(128, 2) void prepareQueries(
 /** @brief Score eight complete pools with fixed 32-lane index-head reductions. */
 __global__ __launch_bounds__(256, 2) void scorePools(QwenSparseIndexer p)
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    const auto r = indexerReplay(p);
     require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
     const int row = int(blockIdx.y);
     if (row >= r.live_rows) return;
@@ -270,7 +282,7 @@ __device__ __forceinline__ std::uint32_t ballot(bool predicate)
 /** @brief Exact deterministic top-512 threshold and sorted sparse-index compaction. */
 __global__ __launch_bounds__(256, 2) void selectPools(QwenSparseIndexer p)
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    const auto r = indexerReplay(p);
     require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
     const int row = int(blockIdx.x) * 8 + int(threadIdx.x) / 32;
     const int lane = int(threadIdx.x) % 32;
@@ -423,7 +435,7 @@ __device__ __forceinline__ void selectPoolsWideRow(const QwenSparseIndexer& p,
 /** @brief Original Installed Wide entrypoint; geometry and static storage remain explicit. */
 __global__ __launch_bounds__(256, 2) void selectPoolsWide(QwenSparseIndexer p)
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    const auto r = indexerReplay(p);
     require(!p.transaction_prior || p.transaction_prior->row_capacity==p.row_capacity);
     __shared__ WideSelectionStorage storage;
     selectPoolsWideRow(p, r, int(blockIdx.x), storage);
@@ -745,7 +757,7 @@ __device__ __forceinline__ void selectPoolsBoundedRow(const QwenSparseIndexer& p
 template<int Block, int Slack>
 __global__ __launch_bounds__(256, 1) void selectPoolsBounded(QwenSparseIndexer p)
 {
-    const auto r = replay(p.replay, p.row_capacity, p.token_capacity);
+    const auto r = indexerReplay(p);
     require(!p.transaction_prior || p.transaction_prior->row_capacity == p.row_capacity);
     __shared__ bounded_selection::Storage<Block, Slack> storage;
     selectPoolsBoundedRow(p, r, int(blockIdx.x), storage);

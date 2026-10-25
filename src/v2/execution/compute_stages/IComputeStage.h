@@ -1424,6 +1424,21 @@ namespace llaminar2
         }
 
         /**
+         * @brief Exact arena tensor writes performed by accepted-state restore hooks.
+         * @return Immutable preallocated WRITE bindings owned by this stage.
+         *
+         * A containing publication stage must declare these writes under its
+         * own capture ledger. Raw backend-owned cache/state bytes have no arena
+         * tensor publication and retain the empty default. This is not the
+         * verifier's ordinary output contract: candidate scratch is not accepted
+         * state and must never be granted publication authority here.
+         */
+        virtual std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept
+        {
+            return {};
+        }
+
+        /**
          * @brief Restore mutable model state captured after a verifier row chosen on device.
          *
          * Device-resident stochastic MTP publication receives accepted-count

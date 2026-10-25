@@ -11,6 +11,7 @@
  */
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseMath.h"
+#include "kernels/qwen4exp/QwenSparseQueryRowWork.h"
 #include "../../integration/kernels/qwen4exp/QwenSparseNativeCodecFixture.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -764,6 +765,91 @@ TEST(QwenSparseAttention, DISABLED_RankingOnlyQueryPreparationPreservesNativeRes
                 ASSERT_FALSE(::testing::Test::HasFailure());
             }
         }
+    }
+}
+/** @test Explicit omission needs no query binding and preserves every required short-context byte. */
+TEST(QwenSparseAttention, ProvenNoRankingPreservesRequiredStateWithoutQueryBanks)
+{
+    ThreadPolicy workers;
+    omp_set_num_threads(1);
+    for (const auto policy : {QwenSparsePoolSelection::Installed, QwenSparsePoolSelection::Bounded256_512,
+                              QwenSparsePoolSelection::Bounded512_512, QwenSparsePoolSelection::Bounded1024_1024})
+    for (const auto representation : {QwenSparseScalar::FP32, QwenSparseScalar::FP16, QwenSparseScalar::BF16})
+    for (const int rows : {1,3,16})
+    {
+        SparseFixture full(3,rows,2080,17), omitted(3,rows,2080,17);
+        std::vector<QwenSparseSelectionObservation> fullWork(rows), omittedWork(rows);
+        for (auto *fixture : {&full,&omitted}) {
+            fixture->p.pool_selection=policy;
+            fixture->p.representation=representation;
+        }
+        if (policy != QwenSparsePoolSelection::Installed) {
+            full.p.selection_observations=fullWork.data();
+            omitted.p.selection_observations=omittedWork.data();
+        }
+        omitted.p.query_demand=QwenSparseQueryDemand::ProvenNoRanking;
+        omitted.p.query=nullptr; omitted.p.query_norm=nullptr;
+        omitted.p.prepared_query=nullptr; omitted.p.scores=nullptr;
+        ASSERT_NO_THROW(validateQwenSparseIndexer(omitted.p));
+        EXPECT_THROW((void)qwenSparseIndexerQueryWork(omitted.p),std::invalid_argument);
+        for (const auto replay : {QwenSparseReplay{3,rows,17}, QwenSparseReplay{2051-rows,rows,17},
+                                  QwenSparseReplay{2051,0,17}, QwenSparseReplay{2,std::min(rows,2),17},
+                                  QwenSparseReplay{3,rows,17}})
+        {
+            SCOPED_TRACE(::testing::Message()<<"M="<<rows<<" prefix="<<replay.prefix_tokens
+                <<" live="<<replay.live_rows<<" policy="<<int(policy)<<" repr="<<int(representation));
+            full.replay=omitted.replay=replay;
+            std::fill(full.selected.begin(),full.selected.end(),-91);
+            std::fill(omitted.selected.begin(),omitted.selected.end(),-91);
+            std::fill(full.count.begin(),full.count.end(),-91);
+            std::fill(omitted.count.begin(),omitted.count.end(),-91);
+            const auto query=omitted.query, prepared=omitted.prepared, scores=omitted.scores;
+            const auto raw=omitted.raw, prior=omitted.partial;
+            ASSERT_NO_THROW(cpuQwenSparseIndexer(full.p));
+            ASSERT_NO_THROW(cpuQwenSparseIndexer(omitted.p));
+            EXPECT_EQ(std::memcmp(full.pools.data(),omitted.pools.data(),full.pools.size()*sizeof(float)),0);
+            EXPECT_EQ(full.selected,omitted.selected); EXPECT_EQ(full.count,omitted.count);
+            EXPECT_EQ(std::memcmp(omitted.query.data(),query.data(),query.size()*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(omitted.prepared.data(),prepared.data(),prepared.size()*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(omitted.scores.data(),scores.data(),scores.size()*sizeof(float)),0);
+            EXPECT_EQ(omitted.raw,raw); EXPECT_EQ(omitted.partial,prior);
+            if (policy != QwenSparsePoolSelection::Installed)
+                EXPECT_EQ(std::memcmp(fullWork.data(),omittedWork.data(),rows*sizeof(QwenSparseSelectionObservation)),0);
+            // Acceptance owns the tail independently; omission cannot change any accepted prefix.
+            for (int accepted=0;accepted<=replay.live_rows;++accepted) {
+                std::copy(prior.begin(),prior.end(),full.partial.begin());
+                std::copy(prior.begin(),prior.end(),omitted.partial.begin());
+                for (auto *fixture : {&full,&omitted})
+                    ASSERT_NO_THROW(cpuQwenSparseCommitPartial({.replay=&fixture->replay,
+                        .prior_partial=fixture->partial.data(),.raw_keys=fixture->raw.data(),
+                        .acceptance=AcceptedRequestPrefixes::fixed(
+                            DeviceRequestRowRanges::deviceCounted(1,rows,&fixture->replay.live_rows),accepted),
+                        .partial_keys=fixture->partial.data()}));
+                EXPECT_EQ(full.partial,omitted.partial);
+            }
+            std::copy(prior.begin(),prior.end(),full.partial.begin());
+                std::copy(prior.begin(),prior.end(),omitted.partial.begin());
+            ASSERT_FALSE(::testing::Test::HasFailure());
+        }
+    }
+}
+
+/** @test All selector implementations reject a wrong retained short program before any write. */
+TEST(QwenSparseAttention, ProvenNoRankingRejectsCrossingReplayBeforePublication)
+{
+    ThreadPolicy workers;omp_set_num_threads(1);
+    for (const auto policy : {QwenSparsePoolSelection::Installed,QwenSparsePoolSelection::Bounded256_512,
+                              QwenSparsePoolSelection::Bounded512_512,QwenSparsePoolSelection::Bounded1024_1024})
+    {
+        SparseFixture f(2051,1,2080);
+        f.p.pool_selection=policy;f.p.query_demand=QwenSparseQueryDemand::ProvenNoRanking;
+        f.p.query=nullptr;f.p.query_norm=nullptr;f.p.prepared_query=nullptr;f.p.scores=nullptr;
+        const auto pools=f.pools;const auto selected=f.selected;const auto count=f.count;
+        EXPECT_THROW(cpuQwenSparseIndexer(f.p),std::invalid_argument);
+        EXPECT_THROW(cpuQwenSparseSelectPools(f.p),std::invalid_argument);
+        EXPECT_EQ(f.pools,pools);EXPECT_EQ(f.selected,selected);EXPECT_EQ(f.count,count);
+        f.p.query_demand=static_cast<QwenSparseQueryDemand>(255);
+        EXPECT_THROW(validateQwenSparseSelection(f.p),std::invalid_argument);
     }
 }
 } // namespace llaminar2::qwen4exp

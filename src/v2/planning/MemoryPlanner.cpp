@@ -970,9 +970,11 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         .auxiliary_executable_count =
                             (cfg.captured_serving_graphs.ordinary_generation
                                 ? OrdinaryGenerationGraphPlan::additionalExecutableCount(
-                                    cfg.device, cfg.captured_serving_graphs.mtp_graph_owners.retainsGraphCapacity()) +
+                                    cfg.device, cfg.captured_serving_graphs.mtp_graph_owners.retainsGraphCapacity(),
+                                    cfg.captured_serving_graphs.sparse_query_program_count) +
                                     (cfg.local_pipeline_backend
-                                        ? OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount() : 0u)
+                                        ? OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+                                            cfg.captured_serving_graphs.sparse_query_program_count) : 0u)
                                 : 0u) +
                             cfg.captured_serving_graphs
                                 .mtp_graph_owners

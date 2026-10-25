@@ -19,6 +19,8 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/common/FloatingExpertNumericalContract.h"
 #include "kernels/common/SamplingMath.h"
+#include "kernels/common/RouterQ8Launch.h"
+#include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
@@ -61,6 +63,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -2003,6 +2006,14 @@ namespace
          */
         template <int num_experts>
         void proveRuntimeDecodeGraphReplayCompleteDescriptors();
+
+        /**
+         * @brief Reuse the production routed/shared byte oracle with an explicit router dtype.
+         * @param router_type Prepared FP32, FP16 or BF16 gate operands.
+         * @param focused Required-publication defect cell: Q8_0, M3, intermediate256.
+         */
+        void proveSharedVerifierRouterPublication(llaminar2::TensorType router_type, bool focused);
+
 
         void SetUp() override
         {
@@ -19341,7 +19352,8 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerial
  * serial oracle, while exact layer-31 activation words make Q8 rounding drift
  * reproducible instead of relying on a low-amplitude synthetic coincidence.
  */
-TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode)
+void Test__CUDAMoEKernel::proveSharedVerifierRouterPublication(
+    llaminar2::TensorType router_type, bool focused)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -19358,7 +19370,17 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
         /*reuse_router_q8_hidden=*/true);
     llaminar2::PerfStatsCollector::reset();
 
-    const auto formats = cudaMoEGroupedNativeFormats();
+    auto formats = cudaMoEGroupedNativeFormats();
+    std::vector<int> runtime_rows(llaminar2::test::kGroupedVerifierRuntimeRows.begin(),
+                                  llaminar2::test::kGroupedVerifierRuntimeRows.end());
+    if (focused)
+    {
+        std::erase_if(formats, [](const auto &format) {
+            return std::string_view(format.label) != "Q8_0";
+        });
+        ASSERT_EQ(formats.size(), 1u);
+        runtime_rows = {3};
+    }
     constexpr int routed_experts = 256;
     constexpr int routed_top_k = 8;
 
@@ -19370,9 +19392,22 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
             0.017f * std::sin(0.0017f * static_cast<float>(i + 29)) +
             0.011f * std::cos(0.0023f * static_cast<float>(i + 47));
     }
-    auto router_gate = makeTensor(
-        {static_cast<size_t>(routed_experts), static_cast<size_t>(d_model)},
-        router_values);
+    const std::vector<size_t> router_shape{
+        static_cast<size_t>(routed_experts), static_cast<size_t>(d_model)};
+    std::shared_ptr<llaminar2::TensorBase> router_gate;
+    if (router_type == llaminar2::TensorType::FP16)
+    {
+        auto half_gate = std::make_shared<llaminar2::FP16Tensor>(router_shape);
+        half_gate->from_fp32(router_values.data(), router_values.size());
+        router_gate = std::move(half_gate);
+    }
+    else if (router_type == llaminar2::TensorType::BF16)
+        router_gate = makeBF16Tensor(router_shape, router_values);
+    else
+    {
+        ASSERT_EQ(router_type, llaminar2::TensorType::FP32);
+        router_gate = makeTensor(router_shape, router_values);
+    }
     ASSERT_TRUE(router_gate->ensureOnDevice(device, stream_));
 
     static constexpr std::array<uint32_t, 2 * d_model>
@@ -19383,7 +19418,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
         kLayer31ProductionM2HiddenBits.size() ==
         static_cast<size_t>(2 * d_model));
 
-    for (const int intermediate : {512, 256})
+    for (const int intermediate : focused ? std::vector<int>{256} : std::vector<int>{512, 256})
     {
         SCOPED_TRACE(std::string("shared_intermediate=") + std::to_string(intermediate));
         for (size_t format_index = 0; format_index < formats.size(); ++format_index)
@@ -19685,8 +19720,25 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
 
             llaminar2::CUDADeviceContext ctx(device, 0);
 
-            for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
+            for (const int seq_len : runtime_rows)
             {
+                if (focused)
+                {
+                    // A fresh graph publication per immutable row geometry.
+                    router_q8_publication =
+                        std::make_shared<llaminar2::MoERouterQ8HiddenPublication>();
+                    ASSERT_TRUE(router_q8_publication->requireConsumerRows(seq_len, d_model));
+                    ASSERT_TRUE(moe_kernel.bindRouterQ8HiddenPublication(
+                        router_q8_publication,
+                        llaminar2::MoERouterQ8PublicationAccess::ProducerAndConsumer));
+                    ASSERT_TRUE(shared_moe_kernel.bindRouterQ8HiddenPublication(
+                        router_q8_publication,
+                        llaminar2::MoERouterQ8PublicationAccess::RequiredConsumer));
+                    ASSERT_TRUE(moe_kernel.prepareRouteLaunch(router_gate.get(),
+                        {.kind = llaminar2::MoERouteLaunchKind::DecodeEquivalentVerifier,
+                         .physical_rows = seq_len, .d_model = d_model,
+                         .num_experts = routed_experts, .top_k = routed_top_k}));
+                }
                 std::vector<float> input_values(static_cast<size_t>(seq_len) * d_model);
                 for (size_t i = 0; i < input_values.size(); ++i)
                 {
@@ -19709,6 +19761,16 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                             0.0006f *
                                 static_cast<float>(static_cast<int>(i % 37) - 18);
                     }
+                }
+
+                if (focused)
+                {
+                    // This value rounds to the exact Q8 half-integer in both
+                    // FP16 and BF16, but its original FP32 Q8 byte is one.
+                    std::fill_n(input_values.data(), 32, 0.0f);
+                    input_values[0] = 127.0f; // Exact block scale 1.
+                    input_values[1] = 0.5001f; // Half/BF16 RNE becomes 0.5.
+
                 }
 
                 auto grouped_input = makeTensor(
@@ -19776,6 +19838,46 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                     << " format=" << format.label;
                 ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
                 const auto grouped_host = copyCudaFP32TensorToHost(grouped_output, stream_);
+
+                if (focused)
+                {
+                    ASSERT_EQ(router_q8_publication->source_rows, grouped_input->gpu_data_ptr());
+                    ASSERT_EQ(router_q8_publication->published_rows, seq_len);
+                    ASSERT_NE(router_q8_publication->quantized_rows, nullptr);
+                    ASSERT_NE(router_q8_publication->row_scales, nullptr);
+                    std::vector<int8_t> codes(input_values.size());
+                    std::vector<float> scales(input_values.size() / 32);
+                    const auto code_copy = cudaMemcpyAsync(codes.data(), router_q8_publication->quantized_rows,
+                        codes.size(), cudaMemcpyDeviceToHost, stream_);
+                    const auto scale_copy = cudaMemcpyAsync(scales.data(), router_q8_publication->row_scales,
+                        scales.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_);
+                    if (cudaStreamSynchronize(stream_) != cudaSuccess) std::terminate();
+                    ASSERT_EQ(code_copy, cudaSuccess);
+                    ASSERT_EQ(scale_copy, cudaSuccess);
+                    for (size_t block = 0; block < scales.size(); ++block)
+                    {
+                        float maximum = 0.0f;
+                        for (size_t lane = 0; lane < 32; ++lane)
+                            maximum = llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                                maximum, input_values[block * 32 + lane]);
+                        const float expected_scale =
+                            llaminar2::device_q8_activation_contract::scale(maximum);
+                        EXPECT_EQ(std::bit_cast<uint32_t>(scales[block]),
+                                  std::bit_cast<uint32_t>(expected_scale));
+                        for (size_t lane = 0; lane < 32; ++lane)
+                            EXPECT_EQ(codes[block * 32 + lane],
+                                llaminar2::device_q8_activation_contract::quantize(
+                                    input_values[block * 32 + lane], expected_scale));
+                    }
+                    ASSERT_EQ(codes[1], 1);
+                    ASSERT_EQ(llaminar2::device_q8_activation_contract::quantize(
+                        0.5f * scales[0], scales[0]), 0);
+                    // The serial diagnostic is a different ordinary graph and
+                    // must not mutate/widen this verifier's immutable demand.
+                    ASSERT_TRUE(moe_kernel.bindRouterQ8HiddenPublication(
+                        std::make_shared<llaminar2::MoERouterQ8HiddenPublication>(),
+                        llaminar2::MoERouterQ8PublicationAccess::ProducerAndConsumer));
+                }
 
                 std::vector<float> serial_host(static_cast<size_t>(seq_len) * d_model);
                 for (int row = 0; row < seq_len; ++row)
@@ -19865,6 +19967,30 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                  * the same router -> routed experts -> shared expert publication
                  * chain used by the production verifier graph.
                  */
+                if (focused)
+                    ASSERT_TRUE(moe_kernel.bindRouterQ8HiddenPublication(
+                        router_q8_publication,
+                        llaminar2::MoERouterQ8PublicationAccess::ProducerAndConsumer));
+                if (focused)
+                {
+                    for (std::uintptr_t sentinel : {0u, 1u, 2u})
+                        EXPECT_FALSE(cudaMoE_publish_original_hidden_q8_rows(
+                            static_cast<const float *>(grouped_input->gpu_data_ptr()),
+                            const_cast<int8_t *>(router_q8_publication->quantized_rows),
+                            const_cast<float *>(router_q8_publication->row_scales),
+                            seq_len, d_model, 0, reinterpret_cast<void *>(sentinel), nullptr));
+                    // Existing declared bank capacity includes a fourth guard row.
+                    ASSERT_LT(seq_len, kVerifierRowCapacity);
+                    const auto code_poison = cudaMemsetAsync(const_cast<int8_t *>(router_q8_publication->quantized_rows),
+                        0x5a, static_cast<size_t>(seq_len + 1) * d_model, stream_);
+                    const auto scale_poison = cudaMemsetAsync(const_cast<float *>(router_q8_publication->row_scales),
+                        0xa5, static_cast<size_t>(seq_len + 1) * (d_model / 32) * sizeof(float), stream_);
+                    if (cudaStreamSynchronize(stream_) != cudaSuccess) std::terminate();
+                    ASSERT_EQ(code_poison, cudaSuccess);
+                    ASSERT_EQ(scale_poison, cudaSuccess);
+                    llaminar2::TransferEngine::requireDeviceInput(grouped_input.get(), device, stream_);
+                    llaminar2::TransferEngine::requireDeviceInput(router_gate.get(), device, stream_);
+                }
                 ScopedCudaTestGraph graph(
                     stream_,
                     "all-format routed plus shared verifier capture");
@@ -19921,6 +20047,26 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                     replay_host.size(),
                     static_cast<size_t>(d_model));
 
+                if (focused)
+                {
+                    std::array<int8_t, d_model> code_guard{};
+                    std::array<uint32_t, d_model / 32> scale_guard{};
+                    const auto code_copy = cudaMemcpyAsync(code_guard.data(),
+                        router_q8_publication->quantized_rows + static_cast<size_t>(seq_len) * d_model,
+                        sizeof(code_guard), cudaMemcpyDeviceToHost, stream_);
+                    const auto scale_copy = cudaMemcpyAsync(scale_guard.data(),
+                        router_q8_publication->row_scales + static_cast<size_t>(seq_len) * (d_model / 32),
+                        sizeof(scale_guard), cudaMemcpyDeviceToHost, stream_);
+                    if (cudaStreamSynchronize(stream_) != cudaSuccess) std::terminate();
+                    ASSERT_EQ(code_copy, cudaSuccess);
+                    ASSERT_EQ(scale_copy, cudaSuccess);
+                    for (auto value : code_guard) EXPECT_EQ(value, 0x5a);
+                    for (auto word : scale_guard) EXPECT_EQ(word, 0xa5a5a5a5u);
+                    const auto unchanged_input = copyCudaFP32TensorToHost(grouped_input, stream_);
+                    expectBitwiseFP32RowsEqual("FP16/BF16 router must retain original hidden",
+                        unchanged_input.data(), input_values.data(), input_values.size(), d_model);
+                }
+
                 grouped_stage->unbindWorkspace();
             }
 
@@ -19965,14 +20111,14 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                 }
             }
             int expected_grouped_table_rows = 0;
-            for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
+            for (const int seq_len : runtime_rows)
                 expected_grouped_table_rows += 2 * seq_len;
             EXPECT_EQ(static_cast<int>(grouped_table_rows), expected_grouped_table_rows)
                 << "Every eager and captured runtime-M row must execute the CUDA grouped table-prefill route for "
                 << format.label << "\n"
                 << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
 
-            for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
+            for (const int seq_len : runtime_rows)
             {
                 double routed_reuse_calls = 0.0;
                 double shared_reuse_calls = 0.0;
@@ -20045,6 +20191,21 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
     }
     llaminar2::PerfStatsCollector::reset();
 #endif
+}
+
+TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode)
+{
+    proveSharedVerifierRouterPublication(llaminar2::TensorType::FP32, false);
+}
+
+/** @brief Default half-router logits retain original-FP32 required shared Q8 rows. */
+TEST_F(Test__CUDAMoEKernel, FloatingRouterRequiredSharedQ8PublicationMatchesSerialBytes)
+{
+    for (auto type : {llaminar2::TensorType::FP16, llaminar2::TensorType::BF16})
+    {
+        SCOPED_TRACE(llaminar2::tensorTypeName(type));
+        proveSharedVerifierRouterPublication(type, true);
+    }
 }
 
 TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddEffectiveSeqLenZeroesPaddedRowsAcrossGraphReplay)

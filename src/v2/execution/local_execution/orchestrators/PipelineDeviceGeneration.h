@@ -13,6 +13,7 @@
 #include "IInferenceRunner.h"
 #include "execution/mtp/MTPMainForwardPolicy.h"
 #include <functional>
+#include <array>
 #include <memory>
 #include <span>
 #include <vector>
@@ -186,7 +187,12 @@ private:
     bool forwardOnlyFamilyCurrent() const;
     /** @brief Observe only fixed terminal control/KV metadata and retire the actual admission. */
     bool finishForwardOnly();
-    std::unique_ptr<ForwardOnlyFamily> forward_only_;
+    /** One complete forced transaction per program; all borrow the same original state banks. */
+    std::array<std::unique_ptr<ForwardOnlyFamily>, kSparseQueryExecutionProgramCount> forward_only_families_;
+    /** @return Family proved for this exact forced/outer-response transaction, never budget0 inference. */
+    std::unique_ptr<ForwardOnlyFamily> &forwardOnlyFamily();
+    /** @return Same retained family for immutable identity/lifetime checks. */
+    const std::unique_ptr<ForwardOnlyFamily> &forwardOnlyFamily() const;
     std::vector<DeviceGraphOrchestrator *> stages_;
     std::vector<Domain> domains_;
     std::vector<Boundary> boundaries_;

@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
+#include "planning/ServingSnapshotArenaInventory.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "loaders/ImmutableRowTable.h"
 #include "planning/PlanningModelMetadata.h"
@@ -3999,4 +4000,54 @@ TEST(Test__MemoryPlanner, OrdinaryProjectedRowsPriceExactNativeBank)
     const auto diagnostic = MemoryPlanner::plan(profile, {cpu});
     EXPECT_EQ(cpu.terminalLogitsCollective(true), MTPTerminalLogitsCollective::None);
     EXPECT_EQ(diagnostic.devices.front().workspace_bytes(), singleton.devices.front().workspace_bytes());
+}
+
+
+/** @test Extra main-query programs add only their real native owners, never duplicated sidecars/helpers. */
+TEST(Test__MemoryPlanner, SparseQueryProgramInventoryPricesOnlyAdditionalMainOwners)
+{
+    for(bool retains:{false,true}){
+        MTPRuntimeConfig policy;
+        policy.enabled=false;
+        policy.graph_capacity_draft_tokens=retains?15:0;
+        const auto one=resolveCapturedServingGraphMemoryInventory({32,64},policy);
+        const auto two=resolveCapturedServingGraphMemoryInventory({32,64},policy,2u);
+        EXPECT_EQ(one.sparse_query_program_count,1u);
+        EXPECT_EQ(two.sparse_query_program_count,2u);
+        EXPECT_EQ(two.prefill_bucket_rows,one.prefill_bucket_rows);
+        EXPECT_EQ(two.fixed_executable_count,2u*one.fixed_executable_count);
+        EXPECT_EQ(two.mtp_graph_owners.sidecarGraphSlots(),one.mtp_graph_owners.sidecarGraphSlots());
+        EXPECT_EQ(two.mtp_graph_owners.boundedHelperExecutableSlotCount(),one.mtp_graph_owners.boundedHelperExecutableSlotCount());
+        EXPECT_EQ(two.mtp_graph_owners.controllerGraphSlots(),one.mtp_graph_owners.controllerGraphSlots()+(retains?2u:0u));
+        EXPECT_EQ(one.mtp_graph_owners.speculativePublicationGraphSlots(), retains ? 1u : 0u);
+        EXPECT_EQ(two.mtp_graph_owners.speculativePublicationGraphSlots(), retains ? 2u : 0u);
+        EXPECT_EQ(two.mtp_graph_owners.generalAuxiliaryExecutableSlotCount(),
+            one.mtp_graph_owners.generalAuxiliaryExecutableSlotCount() + (retains ? 2u : 0u));
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(),1u);
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(2u),2u);
+        for(auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+            EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(device,retains,2u),
+                2u*OrdinaryGenerationGraphPlan::additionalExecutableCount(device,retains));
+    }
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory({32},MTPRuntimeConfig{},0u),std::invalid_argument);
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory({32},MTPRuntimeConfig{},3u),std::invalid_argument);
+    EXPECT_THROW((void)MTPGraphOwnerPlan(MTPRuntimeConfig{},3u),std::invalid_argument);
+    EXPECT_THROW((void)OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::rocm(0),false,3u),std::invalid_argument);
+    EXPECT_THROW((void)OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(3u),std::invalid_argument);
+}
+
+/** @test Dedicated scalar diagnostic arenas multiply; proven wide/condition lanes and Dense0 stay shared. */
+TEST(Test__MemoryPlanner, SparseQueryProgramSnapshotOwnersMatchPhysicalSharing)
+{
+    const auto one=ServingSnapshotArenaInventory::ordinary(true,true,7u,1u);
+    const auto two=ServingSnapshotArenaInventory::ordinary(true,true,7u,1u,2u);
+    EXPECT_EQ(one.scalarMainOwners(),2u);
+    EXPECT_EQ(two.scalarMainOwners(),4u);
+    EXPECT_EQ(two.wideMainOwners(),one.wideMainOwners());
+    EXPECT_EQ(two.conditionMainOwners(),one.conditionMainOwners());
+    EXPECT_EQ(two.predictorOwners(),one.predictorOwners());
+    const MainSnapshotPhasePayload payload{.wide_main_bytes=1024u,.scalar_main_bytes=128u,.separate_reference_bytes=17u};
+    EXPECT_EQ(payload.bytesFor(two)-payload.bytesFor(one),2u*128u);
+    EXPECT_THROW((void)ServingSnapshotArenaInventory::ordinary(true,false,0u,0u,0u),std::invalid_argument);
+    EXPECT_THROW((void)ServingSnapshotArenaInventory::ordinary(true,false,0u,0u,3u),std::invalid_argument);
 }
