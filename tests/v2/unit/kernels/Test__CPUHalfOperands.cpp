@@ -1,6 +1,6 @@
 /**
  * @file Test__CPUHalfOperands.cpp
- * @brief Independently prove explicit physical-half CPU linear/router contracts.
+ * @brief Prove CPU physical-half linear and native BF16 router contracts.
  *
  * FP32 buffers use the public shape allocation followed by typed host writes;
  * no unsupported std::vector constructor or storage ownership is assumed.
@@ -121,6 +121,72 @@ void proveRouter(int m,int workers){
     EXPECT_EQ(std::memcmp(hidden.data(),source.data(),source.size()*sizeof(float)),0);
     for(int row=0;row<m;++row)for(int slot=0;slot<Top;++slot)EXPECT_EQ(actual.expert_indices[row*Top+slot],E-1-slot);
 }
+
+/**
+ * @brief Authenticate native BF16 gates, serial row bytes and live publication.
+ * @param m Live rows within a retained bank with two poisoned inactive rows.
+ * @param k Hidden width, including tail and production MTP dimensions.
+ * @param workers Physical CPU worker budget for both serial and grouped calls.
+ *
+ * A double dot/softmax checks the numerical result independently. Real M=1
+ * routing owns the byte oracle; non-half FP32 inputs distinguish this native
+ * BF16 path from the explicitly rounded FP16 operand policy.
+ */
+void proveBF16Router(int m, int k, int workers) {
+    SCOPED_TRACE("BF16 M="+std::to_string(m)+" K="+std::to_string(k)+" workers="+std::to_string(workers));
+    Workers team(workers);
+    constexpr int E=17, Top=4;
+    std::vector<uint16_t> words(size_t(E)*k);
+    std::vector<float> weights(words.size()), source(size_t(m+2)*k);
+    for(int e=0;e<E;++e)for(int c=0;c<k;++c) {
+        const float value=float((e+1)*(c%7+1))/2048.f;
+        words[e*k+c]=uint16_t(std::bit_cast<uint32_t>(value)>>16);
+        weights[e*k+c]=std::bit_cast<float>(uint32_t(words[e*k+c])<<16);
+    }
+    for(int row=0;row<m+2;++row)for(int c=0;c<k;++c)
+        source[row*k+c]=float(4099+4*row+2*(c%3))/4096.f;
+    BF16Tensor gate({E,size_t(k)},words);
+    FP32Tensor hidden({size_t(m+2),size_t(k)}), ids({size_t(m+2),Top}), coeff({size_t(m+2),Top});
+    std::copy(source.begin(),source.end(),hidden.mutable_data());
+    CPUMoEKernel grouped, serial, q8;
+    MoERoutingResult actual, expected;
+    // Reuse the large bank after shrinking the live geometry to one row.
+    for(int live : {m,1}) {
+        std::fill_n(ids.mutable_data(),(m+2)*Top,-777.f);
+        std::fill_n(coeff.mutable_data(),(m+2)*Top,-777.f);
+        ASSERT_TRUE(grouped.routeWithTensors(&hidden,&gate,live,k,E,Top,true,&ids,&coeff,actual));
+        for(int row=0;row<live;++row) {
+            FP32Tensor one({1,size_t(k)}), one_ids({1,Top}), one_weights({1,Top});
+            std::copy_n(source.data()+row*k,k,one.mutable_data());
+            ASSERT_TRUE(serial.routeWithTensors(&one,&gate,1,k,E,Top,true,&one_ids,&one_weights,expected));
+            EXPECT_EQ(std::memcmp(ids.data()+row*Top,one_ids.data(),Top*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(coeff.data()+row*Top,one_weights.data(),Top*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(actual.router_logits.data()+row*E,expected.router_logits.data(),E*sizeof(float)),0);
+            std::array<double,E> logits{}, probabilities{};
+            for(int e=0;e<E;++e)for(int c=0;c<k;++c)
+                logits[e]+=double(source[row*k+c])*weights[e*k+c];
+            double denominator=0;
+            for(int e=0;e<E;++e)denominator+=(probabilities[e]=std::exp(logits[e]-logits[E-1]));
+            double selected=0;
+            for(int slot=0;slot<Top;++slot)selected+=probabilities[E-1-slot];
+            for(int e=0;e<E;++e)EXPECT_NEAR(actual.router_logits[row*E+e],probabilities[e]/denominator,2e-6);
+            for(int slot=0;slot<Top;++slot) {
+                EXPECT_EQ(ids.data()[row*Top+slot],E-1-slot);
+                EXPECT_NEAR(coeff.data()[row*Top+slot],probabilities[E-1-slot]/selected,2e-6);
+            }
+        }
+        for(int i=live*Top;i<(m+2)*Top;++i) {
+            EXPECT_EQ(ids.data()[i],-777.f);
+            EXPECT_EQ(coeff.data()[i],-777.f);
+        }
+        ASSERT_TRUE(q8.publishTransportedRouterQ8Hidden(hidden.data(),live,k));
+        const auto *a=grouped.publishedRouterQ8Hidden(hidden.data(),live,k),*b=q8.publishedRouterQ8Hidden(hidden.data(),live,k);
+        ASSERT_NE(a,nullptr);ASSERT_NE(b,nullptr);
+        EXPECT_EQ(std::memcmp(a,b,size_t(live)*((k+31)/32)*sizeof(Q8_1Block)),0);
+    }
+    EXPECT_EQ(std::memcmp(hidden.data(),source.data(),source.size()*sizeof(float)),0);
+    EXPECT_EQ(std::memcmp(gate.typed_data(),words.data(),words.size()*sizeof(uint16_t)),0);
+}
 }
 
 TEST(CPUHalfOperands, ExactDyadicAllRowsAndReductionBoundaries){
@@ -190,10 +256,17 @@ TEST(CPUHalfOperands, ImmutableIdentityAndMixedBundlesRejectBeforeWrite){
 TEST(CPUHalfOperands, TypedRouterRoundsBothOperandsPreservesOriginalQ8){
     for(int workers:{1,2,3,7})for(int m:{1,3,8,17})proveRouter(m,workers);
 }
+TEST(CPUHalfOperands, NativeBF16RouterSerialRowsAndRetainedBank){
+    for(int workers:{1,3})for(int k:{1,7,65,128,257}) {
+        for(int m=1;m<=16;++m)proveBF16Router(m,k,workers);
+        for(int m:{31,63})proveBF16Router(m,k,workers);
+    }
+    proveBF16Router(3,2048,3);
+}
 /** @test Explicit preflight scaling sweep; excluded from the fast Unit alias. */
 TEST(CPUHalfOperands, EveryPositiveWorkerBudget){
     const int maximum=physicalWorkerCount();
     ASSERT_GT(maximum,0);
-    for(int workers=1;workers<=maximum;++workers){proveLinear(3,65,workers);proveRouter(3,workers);}
+    for(int workers=1;workers<=maximum;++workers){proveLinear(3,65,workers);proveRouter(3,workers);proveBF16Router(3,65,workers);}
 }
 }

@@ -741,6 +741,17 @@ protected:
     void *rocm_default_stream_ = nullptr;
 };
 
+/** @brief Typed lookup consumes explicit factories even without native GPU libraries. */
+TEST_F(Test__GraphExecutorStreamBinding, TypedLookupUsesRegisteredFactories)
+{
+    auto &pool = GPUDeviceContextPool::instance();
+    EXPECT_EQ(&pool.getContext(DeviceId::cuda(0)), &pool.getNvidiaContext(0));
+    EXPECT_EQ(&pool.getContext(DeviceId::rocm(0)), &pool.getAMDContext(0));
+    EXPECT_THROW(pool.getContext(DeviceId::cuda(1)), std::runtime_error);
+    EXPECT_THROW(pool.getContext(DeviceId::rocm(1)), std::runtime_error);
+    EXPECT_THROW(pool.getContext(DeviceId::cpu()), std::invalid_argument);
+}
+
 TEST_F(Test__GraphExecutorStreamBinding, NullStageStream_BindsToNodeDeviceDefaultStream)
 {
     GraphExecutorConfig config;

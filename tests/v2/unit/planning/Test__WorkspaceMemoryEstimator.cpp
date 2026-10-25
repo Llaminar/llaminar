@@ -1585,7 +1585,8 @@ TEST(Test__WorkspaceMemoryEstimator,
                         /*request_count=*/1,
                         assignment.localValueHeads(),
                         /*key_width=*/128,
-                        /*value_width=*/128);
+                        /*value_width=*/128,
+                        geometry.device.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense);
                 const auto short_conv =
                     gdn_workspace::shortConvStateFootprint(
                         /*slot_rows=*/16,

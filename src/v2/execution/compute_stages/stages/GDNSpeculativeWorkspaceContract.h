@@ -3,7 +3,8 @@
  * @brief Exact byte contract for retained GDN speculative-state workspace.
  *
  * Grouped MTP verification snapshots both short-convolution history and GDN
- * recurrence state after every candidate row.  Those buffers are persistent
+ * recurrence state after every candidate row. CPU images include pending epoch
+ * history, so publication never silently invents a checkpoint boundary.  Those buffers are persistent
  * members of the captured serial graph family: the graph stages allocate them
  * later, while model admission must price them before expert weights consume
  * VRAM.  This header is the single arithmetic authority used at both lifecycle
@@ -12,6 +13,7 @@
 
 #pragma once
 
+#include "kernels/CPUGDNStateLayout.h"
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -111,6 +113,7 @@ namespace detail
  * @param value_heads Participant-local GDN value-head count.
  * @param key_width Per-head key-state width.
  * @param value_width Per-head value-state width.
+ * @param storage CPU complete epoch history or device dense matrix representation.
  * @return Exact raw bytes for the persistent slot and mutable work buffers.
  */
 [[nodiscard]] inline SpeculativeStateFootprint recurrenceStateFootprint(
@@ -118,18 +121,10 @@ namespace detail
     int request_count,
     int value_heads,
     int key_width,
-    int value_width)
+    int value_width,
+    GDNStateStorage storage)
 {
-    std::size_t state_floats = detail::positiveSize(
-        value_heads, "value_heads");
-    state_floats = detail::checkedMultiply(
-        state_floats,
-        detail::positiveSize(key_width, "key_width"),
-        "value heads and key width");
-    state_floats = detail::checkedMultiply(
-        state_floats,
-        detail::positiveSize(value_width, "value_width"),
-        "recurrence key and value widths");
+    const std::size_t state_floats = gdnRecurrenceStateFloats(storage, value_heads, key_width, value_width);
     return detail::footprintFromStateFloats(
         state_floats, slot_rows, request_count);
 }

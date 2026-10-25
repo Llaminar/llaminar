@@ -110,7 +110,8 @@ namespace llaminar2
                     std::max(1, params_.request_count),
                     params_.n_heads,
                     params_.d_k,
-                    params_.d_v);
+                    params_.d_v,
+                    params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense);
             reqs.buffers.push_back({speculativeStateSlotsBufferName(),
                                     footprint.slot_bytes,
                                     256,
@@ -171,7 +172,7 @@ namespace llaminar2
 
         params_.kernel->bindDeinterleaveWorkspace(scratch, scratch_floats);
 
-        const int capture_state_size = params_.n_heads * params_.d_k * params_.d_v;
+        const int capture_state_size = gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
         verifier_capture_state_size_bound_ = capture_state_size;
 
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
@@ -245,7 +246,7 @@ namespace llaminar2
         verifier_capture_workspace_bound_ = false;
         speculative_state_work_bound_ = false;
         verifier_capture_rows_bound_ = 0;
-        verifier_capture_state_size_bound_ = params_.n_heads * params_.d_k * params_.d_v;
+        verifier_capture_state_size_bound_ = gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
 
         if (!params_.kernel)
             return;
@@ -635,7 +636,7 @@ namespace llaminar2
             return false;
         }
         const int state_size =
-            params_.n_heads * params_.d_k * params_.d_v;
+            gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
         return params_.kernel->supportsRequestLiveStateBank(
                    request_count,
                    state_size) &&
@@ -721,7 +722,7 @@ namespace llaminar2
                 return params_.kernel->supportsPaddedPrefillRealLength();
 
             const int state_size =
-                params_.n_heads * params_.d_k * params_.d_v;
+                gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
             return params_.kernel->supportsRequestLiveStateBank(
                 params_.request_count,
                 state_size);
@@ -1004,7 +1005,7 @@ namespace llaminar2
                         LOG_ERROR("[GDNRecurrenceStage] GPU recurrence with dynamic real lengths requires device-owned request lengths");
                         return false;
                     }
-                    const int state_size = params_.n_heads * params_.d_k * params_.d_v;
+                    const int state_size = gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
                     if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
                     {
                         LOG_ERROR("[GDNRecurrenceStage] Backend lacks device-owned live recurrence-state bank for "
@@ -1130,7 +1131,7 @@ namespace llaminar2
         if (request_batched)
         {
             const int state_size =
-                params_.n_heads * params_.d_k * params_.d_v;
+                gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
             if (!params_.kernel->supportsRequestLiveStateBank(
                     params_.request_count, state_size))
             {
@@ -1448,9 +1449,12 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::isGraphCapturable() const
     {
-        // Decode: always capturable (single kernel launch, stable pointers)
+        // Decode has stable pointers, but an absent implementation cannot
+        // advertise capture merely because its device identifier is a GPU.
         if (params_.seq_len == 1)
-            return params_.device_id.is_gpu();
+            return params_.device_id.is_cuda()
+                ? supportsBackend(ComputeBackendType::GPU_CUDA)
+                : params_.device_id.is_rocm() && supportsBackend(ComputeBackendType::GPU_ROCM);
 
         // Prefill: capturable only on compiled GPU backends when GPU state is pre-allocated.
         // chunk_forward() will skip its lazy allocateState() if state is ready.
@@ -1477,7 +1481,7 @@ namespace llaminar2
             return false;
         }
 
-        const int required_state_size = params_.n_heads * params_.d_k * params_.d_v;
+        const int required_state_size = gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
         return params_.kernel->isGPUStateReady(required_state_size);
     }
 

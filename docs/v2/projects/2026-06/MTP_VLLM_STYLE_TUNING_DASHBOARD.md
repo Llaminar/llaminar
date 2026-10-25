@@ -1,9 +1,12 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Current qualification frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)).
-This dashboard stays below 200 lines. Older measurements and investigations are
-preserved in [the October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md)
-and [the project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
+Serving frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)). Keep this file below 200 lines;
+history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md) and [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
+
+CPU GDN, 2026-10-25: P=8 production candidate passes 1,350 gates and 12 selected model cells.
+Dynamic acceptance fails 3/3; grouped economy fails at 1/7/14 workers. Keep experimental.
+Paired full-model throughput: 0.8B +8.3%, 4B −1.9%, MoE +32.8%; arithmetic changes tokens/work.
+Implementation, limits and evidence: [CPU GDN report](../2026-10/gated-deltanet-epoch-production-results.md).
 
 ## Completed evidence
 

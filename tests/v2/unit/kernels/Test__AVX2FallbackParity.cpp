@@ -20,6 +20,7 @@
  * Qwen/FLA even when testing the combined query-scale helper independently.
  */
 
+#include "../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 #include <immintrin.h>
 #include <cstdint>
@@ -493,6 +494,7 @@ TEST(AVX2GDNParity, RecurrentStep_MatchesReference)
     // Two copies of state for comparison
     std::vector<float> state1(n_heads * d_k * d_v, 0.01f);
     auto state2 = state1;
+    state1 = llaminar2::encodeCPUGDNTestState(state1,n_heads,d_k,d_v);
 
     std::vector<float> output1(n_heads * d_v, 0.0f);
     std::vector<float> output2(n_heads * d_v, 0.0f);
@@ -571,7 +573,8 @@ TEST(AVX2GDNParity, RecurrentStep_MatchesReference)
     EXPECT_LT(max_diff, 0.05f) << "GDN recurrent_step output diverged";
 
     // Compare state
-    float state_diff = max_abs_diff(state1.data(), state2.data(), n_heads * d_k * d_v);
+    const auto dense_state = llaminar2::materializeCPUGDNTestState(state1,n_heads,d_k,d_v);
+    float state_diff = max_abs_diff(dense_state.data(), state2.data(), n_heads * d_k * d_v);
     EXPECT_LT(state_diff, 0.05f) << "GDN recurrent_step state diverged";
 }
 

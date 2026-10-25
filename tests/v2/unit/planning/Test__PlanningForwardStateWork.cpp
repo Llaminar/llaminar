@@ -181,7 +181,8 @@ TEST(PlanningForwardStateWork, HybridUsesCanonicalMappingAndOnlyLocalLiveBanks)
             const auto &b = std::get<PlanningGDNStateWork>(late[layer].operation);
             const auto geometry = HybridGDNStateGeometry::resolve(32, 16, 16, 8, 32, 64, 2048, 4);
             EXPECT_EQ(a.geometry.local_recurrence_state_floats, geometry.local_recurrence_state_floats);
-            EXPECT_DOUBLE_EQ(a.state_bytes, 2 * geometry.localPayloadBytes(1));
+            EXPECT_DOUBLE_EQ(a.state_bytes, 2 * (endpoint.is_cpu() ? geometry.localPayloadBytes(1) :
+                sizeof(float) * static_cast<size_t>(geometry.local_conv_state_floats + geometry.local_recurrence_state_floats)));
             EXPECT_DOUBLE_EQ(a.operations, 7 * 65536 + 3 * 1024 + 2 * 4 * 1536 + 10 * 4 * 64);
             EXPECT_DOUBLE_EQ(a.operations, b.operations);
             EXPECT_DOUBLE_EQ(a.state_bytes, b.state_bytes);

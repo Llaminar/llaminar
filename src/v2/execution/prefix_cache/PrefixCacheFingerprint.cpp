@@ -10,6 +10,7 @@
  */
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "kernels/cpu/gdn/CPUAdjustedGDNReadout.h"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -63,7 +64,8 @@ namespace llaminar2
             if (field.name == "projection_arithmetic_revision" ||
                 field.name == "gdn_projection_arithmetic" ||
                 field.name == "moe_router_arithmetic" ||
-                field.name == "cuda_router_prefill_arithmetic")
+                field.name == "cuda_router_prefill_arithmetic" ||
+                field.name == "cpu_gdn_readout_arithmetic")
                 throw std::invalid_argument("Duplicate projection prefix arithmetic authority");
         // This revision also distinguishes historical diagnostic FP16 decode,
         // whose accumulator order did not certify grouped verifier equivalence.
@@ -71,6 +73,9 @@ namespace llaminar2
         fields.push_back({"gdn_projection_arithmetic", gdn_name});
         fields.push_back({"moe_router_arithmetic", router_name});
         fields.push_back({"cuda_router_prefill_arithmetic", prefill_name});
+        // Changed readouts affect later layers' KV and recurrent state even
+        // when the current layer retains the same state-update arithmetic.
+        fields.push_back({"cpu_gdn_readout_arithmetic", std::string(kCPUGDNReadoutArithmetic)});
     }
 
     uint64_t hashPrefixFingerprintFields(

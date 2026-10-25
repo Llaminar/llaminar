@@ -4,9 +4,9 @@
  *
  * This harness compares one grouped merged-QKV verifier transaction with the
  * exact production M=1 merged-QKV recurrence repeated in serial row order.  It
- * includes direct post-row snapshot materialization because it is required by
- * MTP state commitment. The optimized verifier writes recurrence results into
- * those slots directly, so no speculative clone or post-row copy is permitted.
+ * includes complete post-row checkpoint/history publication because acceptance
+ * must retain pending updates without flushing. The final snapshot owns working
+ * state; preceding snapshots receive their exact checkpoint/history prefix.
  * Vector construction, input generation, capacity growth, and state reset stay
  * outside canonical timing samples.
  *
@@ -16,6 +16,7 @@
  * row count, and the canonical extended runtime-M probes.
  */
 
+#include "../../../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
@@ -179,7 +180,7 @@ namespace
               k_src_dim_(n_k_heads * d_k),
               value_dim_(n_heads * d_v),
               qkv_stride_(q_src_dim_ + k_src_dim_ + value_dim_),
-              state_floats_(n_heads * d_k * d_v),
+              state_floats_(llaminar2::CPUGDNStateLayout(n_heads,d_k,d_v).floats()),
               merged_qkv_(static_cast<size_t>(rows) * qkv_stride_),
               alpha_(static_cast<size_t>(rows) * n_heads),
               beta_(static_cast<size_t>(rows) * n_heads),
@@ -363,6 +364,7 @@ namespace
                 initial_state_[static_cast<size_t>(index)] =
                     0.0001f * static_cast<float>(index % 43 - 21);
             }
+            llaminar2::clearCPUGDNTestHistory(initial_state_,n_heads_,d_k_,d_v_);
         }
 
         int rows_ = 0;

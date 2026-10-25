@@ -13,6 +13,7 @@
  *                 Qwen35Graph.cpp QKV dimension computation fix
  */
 
+#include "../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 #include <cmath>
 #include <cstring>
@@ -108,7 +109,7 @@ TEST(Test__GDNRepeatInterleave, MergedQKV_RepeatInterleave_Decode)
     auto dt_bias = makeFP32Const({static_cast<size_t>(n_v_heads)}, 0.0f);
     auto output = makeFP32({1, static_cast<size_t>(n_v_heads * d_v)});
 
-    std::vector<float> state(n_v_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_v_heads,d_k,d_v).floats(), 0.0f);
 
     GDNRecurrenceStage::Params p;
     p.kernel = &g_cpu_gdn;
@@ -181,7 +182,7 @@ TEST(Test__GDNRepeatInterleave, MergedQKV_RepeatInterleave_Prefill)
     auto dt_bias = makeFP32Const({static_cast<size_t>(n_v_heads)}, 0.0f);
     auto output = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_v_heads * d_v)});
 
-    std::vector<float> state(n_v_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_v_heads,d_k,d_v).floats(), 0.0f);
 
     GDNRecurrenceStage::Params p;
     p.kernel = &g_cpu_gdn;
@@ -242,7 +243,7 @@ TEST(Test__GDNRepeatInterleave, MergedQKV_NoRepeat_SameHeadCount)
     auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.0f);
     auto output = makeFP32({1, static_cast<size_t>(n_heads * d_v)});
 
-    std::vector<float> state(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
 
     GDNRecurrenceStage::Params p;
     p.kernel = &g_cpu_gdn;
@@ -299,7 +300,7 @@ TEST(Test__GDNRepeatInterleave, MergedQKV_NKHeadsZero_DefaultsToNHeads)
     auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.0f);
     auto output = makeFP32({1, static_cast<size_t>(n_heads * d_v)});
 
-    std::vector<float> state(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
 
     GDNRecurrenceStage::Params p;
     p.kernel = &g_cpu_gdn;

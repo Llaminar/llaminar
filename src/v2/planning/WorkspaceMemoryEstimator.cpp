@@ -321,7 +321,8 @@ size_t exactHybridVerifierStateWorkspaceBytes(
         std::max(1, geometry.batch_size),
         assignment.localValueHeads(),
         profile.gdn_state_size,
-        profile.gdn_state_size);
+        profile.gdn_state_size,
+        geometry.device.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense);
     const auto short_conv = gdn_workspace::shortConvStateFootprint(
         geometry.mtp_target_query_rows,
         std::max(1, geometry.batch_size),

@@ -633,9 +633,13 @@ TEST_F(MoERoutingPrefillGraphCapture, GroupedVerifierUsesCaptureOnlyLaunchPrepar
     params.force_decode_equivalent_verifier_prefill = true;
     MoERoutingStage stage(params);
 
+#if defined(HAVE_ROCM)
     EXPECT_EQ(
         stage.graphLaunchPreparationPolicy(),
         GraphLaunchPreparationPolicy::CaptureOnly);
+#else
+    EXPECT_EQ(stage.graphLaunchPreparationPolicy(), GraphLaunchPreparationPolicy::None);
+#endif
     EXPECT_EQ(stage.activeRowCountDeviceForTesting(), &active_rows_);
 }
 
@@ -3089,9 +3093,13 @@ TEST_F(SharedExpertGatePrefillGraphCapture, GroupedVerifierUsesCaptureOnlyLaunch
     auto params = makeValidPrefillParams();
     SharedExpertGateStage stage(params);
 
+#if defined(HAVE_ROCM)
     EXPECT_EQ(
         stage.graphLaunchPreparationPolicy(),
         GraphLaunchPreparationPolicy::CaptureOnly);
+#else
+    EXPECT_EQ(stage.graphLaunchPreparationPolicy(), GraphLaunchPreparationPolicy::None);
+#endif
     EXPECT_EQ(stage.activeRowCountDeviceForTesting(), &active_rows_);
 }
 

@@ -2,6 +2,11 @@
 
 Date: 2026-10-24.
 
+Follow-up: the authorized CPU arithmetic change, model qualification, and the
+individual/combined backward-query experiments are recorded in
+[the shared-readout report](gated-deltanet-shared-readout-and-backward-query-results.md).
+The implementation boundary and measurements below describe the earlier slice.
+
 The adjusted-query proposal passes exact-arithmetic reference checks but fails
 Llaminar's existing serial-row byte contract. A different compact-state variant
 passes native CPU byte checks: keep the original correction calculation and

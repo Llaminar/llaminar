@@ -17,6 +17,7 @@
  * torch_causal_conv1d_update).
  */
 
+#include "../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
 #include <gmock/gmock.h>
@@ -297,7 +298,7 @@ namespace
         const int qk_stride = n_heads * d_k;
         const int v_stride = n_heads * d_v;
         result.output.assign(static_cast<size_t>(seq_len) * static_cast<size_t>(v_stride), 0.0f);
-        result.state.assign(static_cast<size_t>(n_heads) * static_cast<size_t>(d_k) * static_cast<size_t>(d_v), 0.0f);
+        result.state.assign(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
 
         for (int t = 0; t < seq_len; ++t)
         {
@@ -490,9 +491,9 @@ namespace
                      tag_equals("d_k", d_k) &&
                      tag_equals("d_v", d_v) &&
                      policy != record.tags.end() &&
-                     policy->second == "head_grouped_recurrence" &&
+                     policy->second == "fixed_epoch_shared_checkpoint" &&
                      materialization != record.tags.end() &&
-                     materialization->second == "direct_row_destination");
+                     materialization->second == "complete_checkpoint_history");
         }
         EXPECT_TRUE(found)
             << "CPU grouped verifier recurrence did not publish its production route counter\n"
@@ -1175,10 +1176,10 @@ TEST(Test__GDNKernels, NonVerifierRecurrenceStageClearsStaleSpeculativeStateBind
     EXPECT_EQ(kernel.capture_bind_calls, 1);
     EXPECT_EQ(kernel.capture_workspace, nullptr);
     EXPECT_EQ(kernel.capture_rows, 0);
-    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.capture_state_size, CPUGDNStateLayout(2,4,4).floats());
     EXPECT_EQ(kernel.speculative_bind_calls, 1);
     EXPECT_EQ(kernel.speculative_workspace, nullptr);
-    EXPECT_EQ(kernel.speculative_state_size, 32);
+    EXPECT_EQ(kernel.speculative_state_size, CPUGDNStateLayout(2,4,4).floats());
 }
 
 TEST(Test__GDNKernels, CPUShortConvVerifierStageRequiresManagerOwnedCaptureSlots)
@@ -1226,7 +1227,7 @@ TEST(Test__GDNKernels, CPURecurrenceVerifierStageRequiresManagerOwnedCaptureSlot
 {
     ensureCPUBackendForWorkspace();
     RecordingGatedDeltaNet kernel;
-    std::vector<float> recurrence_state(32, 0.0f);
+    std::vector<float> recurrence_state(CPUGDNStateLayout(2,4,4).floats(), 0.0f);
 
     GDNRecurrenceStage::Params p;
     p.device_id = DeviceId::cpu();
@@ -1245,10 +1246,10 @@ TEST(Test__GDNKernels, CPURecurrenceVerifierStageRequiresManagerOwnedCaptureSlot
     EXPECT_EQ(kernel.capture_bind_calls, 1);
     EXPECT_EQ(kernel.capture_workspace, nullptr);
     EXPECT_EQ(kernel.capture_rows, 0);
-    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.capture_state_size, CPUGDNStateLayout(2,4,4).floats());
     EXPECT_EQ(kernel.speculative_bind_calls, 1);
     EXPECT_EQ(kernel.speculative_workspace, nullptr);
-    EXPECT_EQ(kernel.speculative_state_size, 32);
+    EXPECT_EQ(kernel.speculative_state_size, CPUGDNStateLayout(2,4,4).floats());
     EXPECT_TRUE(stage.hasVerifierStateCapture());
 
     const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(/*m=*/2);
@@ -1309,10 +1310,10 @@ TEST(Test__GDNKernels, RecurrenceStageResetClearsStaleSpeculativeStateBinding)
     EXPECT_EQ(kernel.capture_bind_calls, 1);
     EXPECT_EQ(kernel.capture_workspace, nullptr);
     EXPECT_EQ(kernel.capture_rows, 0);
-    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.capture_state_size, CPUGDNStateLayout(2,4,4).floats());
     EXPECT_EQ(kernel.speculative_bind_calls, 1);
     EXPECT_EQ(kernel.speculative_workspace, nullptr);
-    EXPECT_EQ(kernel.speculative_state_size, 32);
+    EXPECT_EQ(kernel.speculative_state_size, CPUGDNStateLayout(2,4,4).floats());
 }
 
 TEST(Test__GDNKernels, ShortConvGraphReplayRequiresNoHostWorkspaceRebind)
@@ -1495,7 +1496,7 @@ TEST(Test__GDNKernels, RecurrenceGraphReplayRequiresNoHostWorkspaceRebind)
     float *verifier_capture = kernel.capture_workspace;
     ASSERT_NE(verifier_capture, nullptr);
     EXPECT_EQ(kernel.capture_rows, 2);
-    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.capture_state_size, CPUGDNStateLayout(2,4,4).floats());
     GDNRecurrenceStage::Params normal_p = verifier_p;
     normal_p.verifier_state_capture_rows = 0;
     GDNRecurrenceStage normal_stage(normal_p);
@@ -1512,7 +1513,7 @@ TEST(Test__GDNKernels, RecurrencePublicationUsesStageBoundManagerCaptureAfterSha
 {
     ensureCPUBackendForWorkspace();
     RecordingGatedDeltaNet kernel;
-    std::vector<float> recurrence_state(32, 0.0f);
+    std::vector<float> recurrence_state(CPUGDNStateLayout(2,4,4).floats(), 0.0f);
 
     GDNRecurrenceStage::Params verifier_p;
     verifier_p.device_id = DeviceId::cpu();
@@ -1536,7 +1537,7 @@ TEST(Test__GDNKernels, RecurrencePublicationUsesStageBoundManagerCaptureAfterSha
     verifier_stage.bindWorkspace(&workspace);
     float *verifier_capture = kernel.capture_workspace;
     ASSERT_NE(verifier_capture, nullptr);
-    for (int i = 0; i < 64; ++i)
+    for (int i = 0; i < 2*CPUGDNStateLayout(2,4,4).floats(); ++i)
         verifier_capture[i] = 2000.0f + static_cast<float>(i);
 
     GDNRecurrenceStage::Params normal_p = verifier_p;
@@ -1548,10 +1549,10 @@ TEST(Test__GDNKernels, RecurrencePublicationUsesStageBoundManagerCaptureAfterSha
     ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, nullptr));
     EXPECT_EQ(kernel.restore_row_calls, 0)
         << "CPU publication must not route through a shared kernel binding";
-    for (int i = 0; i < 32; ++i)
+    for (int i = 0; i < CPUGDNStateLayout(2,4,4).floats(); ++i)
     {
         EXPECT_EQ(recurrence_state[static_cast<size_t>(i)],
-                  verifier_capture[32 + i]);
+                  verifier_capture[CPUGDNStateLayout(2,4,4).floats() + i]);
     }
 
     normal_stage.bindWorkspace(nullptr);
@@ -1566,7 +1567,7 @@ TEST(Test__GDNKernels, RecurrencePublicationUsesStageBoundManagerCaptureAfterSha
     EXPECT_EQ(kernel.restore_capture_workspace, verifier_capture)
         << "Device-indexed publication must also rebind the verifier workspace";
     EXPECT_EQ(kernel.restore_capture_rows, 2);
-    EXPECT_EQ(kernel.restore_capture_state_size, 32);
+    EXPECT_EQ(kernel.restore_capture_state_size, CPUGDNStateLayout(2,4,4).floats());
     EXPECT_EQ(kernel.restore_dst_state, nullptr)
         << "Device-indexed publication restores backend-owned live state only; "
            "host mirror refresh must stay out of the hot path.";
@@ -1632,8 +1633,8 @@ TEST(Test__GDNKernels, RecurrenceCPUPublicationRestoresParallelStagesFromTheirOw
     ensureCPUBackendForWorkspace();
     RecordingGatedDeltaNet shared_kernel;
 
-    std::vector<float> state0(32, 0.0f);
-    std::vector<float> state1(32, 0.0f);
+    std::vector<float> state0(CPUGDNStateLayout(2,4,4).floats(), 0.0f);
+    std::vector<float> state1(CPUGDNStateLayout(2,4,4).floats(), 0.0f);
 
     auto make_stage =
         [&](int layer, std::vector<float> &state)
@@ -1671,14 +1672,14 @@ TEST(Test__GDNKernels, RecurrenceCPUPublicationRestoresParallelStagesFromTheirOw
     stage0->bindWorkspace(&workspace0);
     float *capture0 = shared_kernel.capture_workspace;
     ASSERT_NE(capture0, nullptr);
-    for (int i = 0; i < 64; ++i)
+    for (int i = 0; i < 2*CPUGDNStateLayout(2,4,4).floats(); ++i)
         capture0[i] = 3000.0f + static_cast<float>(i);
 
     stage1->bindWorkspace(&workspace1);
     float *capture1 = shared_kernel.capture_workspace;
     ASSERT_NE(capture1, nullptr);
     ASSERT_NE(capture0, capture1);
-    for (int i = 0; i < 64; ++i)
+    for (int i = 0; i < 2*CPUGDNStateLayout(2,4,4).floats(); ++i)
         capture1[i] = 4000.0f + static_cast<float>(i);
 
     /*
@@ -1711,10 +1712,10 @@ TEST(Test__GDNKernels, RecurrenceCPUPublicationRestoresParallelStagesFromTheirOw
     EXPECT_EQ(shared_kernel.restore_row_calls, 0)
         << "Parallel CPU publication must not use the shared kernel restore path";
 
-    for (int i = 0; i < 32; ++i)
+    for (int i = 0; i < CPUGDNStateLayout(2,4,4).floats(); ++i)
     {
-        EXPECT_EQ(state0[static_cast<size_t>(i)], capture0[32 + i]);
-        EXPECT_EQ(state1[static_cast<size_t>(i)], capture1[32 + i]);
+        EXPECT_EQ(state0[static_cast<size_t>(i)], capture0[CPUGDNStateLayout(2,4,4).floats() + i]);
+        EXPECT_EQ(state1[static_cast<size_t>(i)], capture1[CPUGDNStateLayout(2,4,4).floats() + i]);
     }
 }
 
@@ -1724,7 +1725,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
     static constexpr int n_heads = 2;
     static constexpr int d_k = 4;
     static constexpr int d_v = 3;
-    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
     static constexpr int qk_stride = n_heads * d_k;
     static constexpr int v_stride = n_heads * d_v;
 
@@ -1765,7 +1766,9 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
     for (int i = 0; i < state_floats; ++i)
         initial_state[static_cast<size_t>(i)] =
             0.001f * static_cast<float>((i % 19) - 9);
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     verifier_state = initial_state;
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     serial_state = initial_state;
 
     verifier_kernel.bindVerifierStateCaptureWorkspace(
@@ -1832,7 +1835,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
     static constexpr int n_heads = 32;
     static constexpr int d_k = 128;
     static constexpr int d_v = 128;
-    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
     static constexpr int qk_stride = n_heads * d_k;
     static constexpr int v_stride = n_heads * d_v;
 
@@ -1873,7 +1876,9 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
     for (int i = 0; i < state_floats; ++i)
         initial_state[static_cast<size_t>(i)] =
             0.0001f * static_cast<float>((i % 43) - 21);
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     verifier_state = initial_state;
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     serial_state = initial_state;
 
     verifier_kernel.bindVerifierStateCaptureWorkspace(
@@ -1948,7 +1953,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
     static constexpr int n_heads = 32;
     static constexpr int d_k = 128;
     static constexpr int d_v = 128;
-    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
     static constexpr int qk_stride = n_heads * d_k;
     static constexpr int v_stride = n_heads * d_v;
 
@@ -1992,6 +1997,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
         PerfStatsCollector::reset();
         CPUGatedDeltaNet verifier_kernel;
         CPUGatedDeltaNet serial_kernel;
+        clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
         std::vector<float> verifier_state = initial_state;
         std::vector<float> serial_state = initial_state;
         std::vector<float> verifier_output(static_cast<size_t>(rows) * v_stride, 0.0f);
@@ -2103,7 +2109,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetLongPrefillMTotalityMatchesSerialDecodeBy
     {
         const int qk_stride = n_heads * d_k;
         const int v_stride = n_heads * d_v;
-        const int state_floats = n_heads * d_k * d_v;
+        const int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
 
         for (const int rows : row_counts)
         {
@@ -2151,7 +2157,9 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetLongPrefillMTotalityMatchesSerialDecodeBy
             {
                 CPUGatedDeltaNet prefill_kernel;
                 CPUGatedDeltaNet serial_kernel;
+                clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
                 std::vector<float> prefill_state = initial_state;
+                clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
                 std::vector<float> serial_state = initial_state;
                 std::vector<float> prefill_output(
                     static_cast<size_t>(rows) * v_stride, 0.0f);
@@ -2235,7 +2243,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact)
     {
         const int qk_stride = heads * dk;
         const int v_stride = heads * dv;
-        const int state_size = heads * dk * dv;
+        const int state_size = CPUGDNStateLayout(heads,dk,dv).floats();
         const int snapshot_stride = state_size + 19;
         std::vector<float> q(rows * qk_stride), k(q.size()), v(rows * v_stride);
         std::vector<float> alpha(rows * heads), beta(alpha.size(), 0.17f);
@@ -2269,6 +2277,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact)
                                     : 0.0001f * ((i % 43) - 21);
         ASSERT_EQ(std::fpclassify(std::exp(a_log[0] * std::log1p(std::exp(0.0f)))), FP_SUBNORMAL);
 
+        clearCPUGDNTestHistory(initial,heads,dk,dv);
         std::vector<float> serial_state = initial;
         std::vector<float> serial_output(v.size());
         std::vector<float> serial_snapshots(rows * snapshot_stride, guard);
@@ -2294,6 +2303,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact)
                 " workers=" + std::to_string(workers) + " normalize=" + std::to_string(normalize));
             llaminar::v2::ThreadCountGuard team(workers);
             CPUGatedDeltaNet kernel;
+            clearCPUGDNTestHistory(initial,heads,dk,dv);
             std::vector<float> state = initial;
             std::vector<float> output(v.size(), guard);
             ASSERT_TRUE(kernel.chunk_forward(
@@ -2303,6 +2313,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact)
             expectByteExactFP32(output.data(), serial_output.data(), output.size(), "subnormal output");
             expectByteExactFP32(state.data(), serial_state.data(), state.size(), "subnormal state");
 
+            clearCPUGDNTestHistory(initial,heads,dk,dv);
             state = initial;
             std::fill(output.begin(), output.end(), guard);
             std::vector<float> snapshots(rows * snapshot_stride, guard);
@@ -2318,6 +2329,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact)
             // The production MTP input stays immutable while the accepted
             // snapshot is still undecided. Poison every destination again so
             // successful ordinary recurrence cannot mask an unwritten lane.
+            clearCPUGDNTestHistory(initial,heads,dk,dv);
             state = initial;
             std::fill(output.begin(), output.end(), guard);
             std::fill(snapshots.begin(), snapshots.end(), guard);
@@ -2334,7 +2346,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact)
                 "subnormal merged verifier snapshots and padding");
         }
     }
-    ASSERT_FALSE(PerfStatsCollector::snapshot({"kernel.cpu_gdn_subnormal_head_column_tasks"}).empty());
+    ASSERT_FALSE(PerfStatsCollector::snapshot({"kernel.cpu_gdn_epoch_readout_rows"}).empty());
 }
 
 /**
@@ -2395,7 +2407,7 @@ TEST(Test__GDNKernels, CPUMergedQKVOrdinaryPathMatchesSerialDecodeByteExact)
         const int qkv_stride = compact_stride + geometry.row_padding;
         const int local_qk_stride = geometry.n_heads * geometry.d_k;
         const int state_floats =
-            geometry.n_heads * geometry.d_k * geometry.d_v;
+            CPUGDNStateLayout(geometry.n_heads,geometry.d_k,geometry.d_v).floats();
 
         for (const int rows : {1, 2, 9, 64})
         {
@@ -2476,7 +2488,9 @@ TEST(Test__GDNKernels, CPUMergedQKVOrdinaryPathMatchesSerialDecodeByteExact)
             {
                 CPUGatedDeltaNet merged_kernel;
                 CPUGatedDeltaNet serial_kernel;
+                clearCPUGDNTestHistory(initial_state,geometry.n_heads,geometry.d_k,geometry.d_v);
                 std::vector<float> merged_state = initial_state;
+                clearCPUGDNTestHistory(initial_state,geometry.n_heads,geometry.d_k,geometry.d_v);
                 std::vector<float> serial_state = initial_state;
                 std::vector<float> merged_output(
                     static_cast<size_t>(rows) * v_stride,
@@ -2551,7 +2565,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetPrefillIsByteExactAcrossPositiveThreadCou
     static constexpr int d_v = 128;
     static constexpr int qk_stride = n_heads * d_k;
     static constexpr int v_stride = n_heads * d_v;
-    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
 
     std::vector<float> q(static_cast<size_t>(rows) * qk_stride);
     std::vector<float> k(q.size());
@@ -2587,6 +2601,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetPrefillIsByteExactAcrossPositiveThreadCou
 
     for (const bool use_qk_l2norm : {false, true})
     {
+        clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
         std::vector<float> reference_state = initial_state;
         std::vector<float> reference_output(
             static_cast<size_t>(rows) * v_stride,
@@ -2604,6 +2619,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetPrefillIsByteExactAcrossPositiveThreadCou
 
         for (const int thread_count : {2, 3, 4, 5, 7, 8, 16, 31})
         {
+            clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
             std::vector<float> candidate_state = initial_state;
             std::vector<float> candidate_output(reference_output.size(), 0.0f);
             {
@@ -2646,7 +2662,7 @@ TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDe
     static constexpr int k_src_dim = n_k_heads * d_k;
     static constexpr int v_dim = n_heads * d_v;
     static constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
-    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
     static constexpr int output_stride = n_heads * d_v;
 
     /*
@@ -2693,6 +2709,7 @@ TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDe
     auto verifier_output = makeFP32(
         {static_cast<size_t>(seq_len), static_cast<size_t>(output_stride)});
 
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     std::vector<float> verifier_state = initial_state;
     auto ctx = makeCPUContext();
 
@@ -2731,6 +2748,7 @@ TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDe
         << "Verifier chunk capture must not mutate live recurrence state";
     ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, nullptr));
 
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     std::vector<float> serial_state = initial_state;
     std::vector<float> serial_output(static_cast<size_t>(seq_len) * output_stride);
     CPUGatedDeltaNet serial_kernel;
@@ -2795,7 +2813,7 @@ TEST(Test__GDNKernels, CPUMergedQKVVerifierRejectsOverlappingStateAndSnapshots)
     static constexpr int d_v = 8;
     static constexpr int qkv_stride =
         2 * n_heads * d_k + n_heads * d_v;
-    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
 
     std::vector<float> merged_qkv(
         static_cast<size_t>(seq_len) * qkv_stride,
@@ -4000,7 +4018,7 @@ TEST(Test__GDNKernels, Recurrence_Decode_ZeroState)
     auto output = makeFP32({1, static_cast<size_t>(n_heads * d_v)});
 
     // Zero state
-    std::vector<float> state(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
 
     auto ctx = makeCPUContext();
 
@@ -4069,7 +4087,7 @@ TEST(Test__GDNKernels, Recurrence_Decode_StateDecay)
     auto output = makeFP32({1, static_cast<size_t>(n_heads * d_v)});
 
     // Initial state: all 1.0
-    std::vector<float> state(d_k * d_v, 1.0f);
+    auto state = encodeCPUGDNTestState(std::vector<float>(d_k*d_v,1.0f),1,d_k,d_v);
 
     auto ctx = makeCPUContext();
 
@@ -4097,10 +4115,11 @@ TEST(Test__GDNKernels, Recurrence_Decode_StateDecay)
     // decay = exp(g) ≈ 0.5
     // beta_sig ≈ 0, so delta ≈ 0 and state is only decayed
     // State should be approximately 0.5 (decayed from 1.0)
+    const auto dense_state = materializeCPUGDNTestState(state,n_heads,d_k,d_v);
     const float expected_decay = std::exp(-std::log(2.0f)); // 0.5
     for (int i = 0; i < d_k * d_v; ++i)
     {
-        EXPECT_NEAR(state[i], expected_decay, 0.01f)
+        EXPECT_NEAR(dense_state[i], expected_decay, 0.01f)
             << "State[" << i << "] should have decayed by exp(g)";
     }
 }
@@ -4134,7 +4153,7 @@ TEST(Test__GDNKernels, Recurrence_Decode_SingleHeadReference)
     auto dt_bias = makeFP32Const({1}, 0.0f);
     auto output = makeFP32({1, 3});
 
-    std::vector<float> state(d_k * d_v, 0.5f); // Initial state
+    auto state = encodeCPUGDNTestState(std::vector<float>(d_k*d_v,0.5f),1,d_k,d_v); // Initial state
 
     auto ctx = makeCPUContext();
 
@@ -4195,7 +4214,7 @@ TEST(Test__GDNKernels, Recurrence_Prefill_MatchesSequentialDecode)
 
     // Path 1: Prefill
     auto output_prefill = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * d_v)});
-    std::vector<float> state_prefill(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state_prefill(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
 
     auto ctx = makeCPUContext();
     {
@@ -4222,7 +4241,7 @@ TEST(Test__GDNKernels, Recurrence_Prefill_MatchesSequentialDecode)
 
     // Path 2: Sequential decode steps
     auto output_decode = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * d_v)});
-    std::vector<float> state_decode(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state_decode(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
 
     const float *q_data = Q->data();
     const float *k_data = K->data();
@@ -4304,7 +4323,7 @@ TEST(Test__GDNKernels, Recurrence_ChunkForwardFromNonZeroStateMatchesSequentialD
 
     auto prompt_output = makeFP32({static_cast<size_t>(prompt_len), static_cast<size_t>(v_stride)});
     auto suffix_output = makeFP32({static_cast<size_t>(suffix_len), static_cast<size_t>(v_stride)});
-    std::vector<float> chunk_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+    std::vector<float> chunk_state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
 
     ASSERT_TRUE(g_cpu_gdn.chunk_forward(
         Q->data(), K->data(), V->data(),
@@ -4326,7 +4345,7 @@ TEST(Test__GDNKernels, Recurrence_ChunkForwardFromNonZeroStateMatchesSequentialD
         /*chunk_size=*/64, /*use_qk_l2norm=*/false));
 
     auto ref_output = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
-    std::vector<float> ref_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+    std::vector<float> ref_state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
     for (int t = 0; t < total_len; ++t)
     {
         ASSERT_TRUE(g_cpu_gdn.recurrent_step(
@@ -4598,8 +4617,8 @@ TEST(Test__GDNKernels, Recurrence_PaddedPrefillStateMatchesUnpaddedDecode)
     auto decode_beta = makeFP32({1, static_cast<size_t>(n_heads)}, beta_decode.data());
     auto padded_decode_out = makeFP32({1, static_cast<size_t>(v_dim)});
     auto ref_decode_out = makeFP32({1, static_cast<size_t>(v_dim)});
-    std::vector<float> padded_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
-    std::vector<float> ref_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+    std::vector<float> padded_state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
+    std::vector<float> ref_state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
     auto ctx = makeCPUContext();
 
     GDNRecurrenceStage::Params padded_params;
@@ -4882,7 +4901,7 @@ TEST(Test__GDNKernels, ROCmSequentialDecodeMatchesCPUReferenceQwen36Shape)
     const float *out_data = output->data();
     std::vector<float> device_output(out_data, out_data + static_cast<size_t>(seq_len) * v_stride);
     expectVectorsNear(device_output, reference.output, "ROCm GDN sequential output", 5e-4f, 5e-4);
-    expectVectorsNear(device_state, reference.state, "ROCm GDN sequential state", 5e-4f, 5e-4);
+    expectVectorsNear(device_state, materializeCPUGDNTestState(reference.state,n_heads,d_k,d_v), "ROCm GDN sequential state", 5e-4f, 5e-4);
 }
 
 TEST(Test__GDNKernels, ROCmPrefillThenDecodeMatchesCPUReferenceQwen36DenseShape)
@@ -4995,7 +5014,7 @@ TEST(Test__GDNKernels, ROCmPrefillThenDecodeMatchesCPUReferenceQwen36DenseShape)
     const float *out_data = output->data();
     std::vector<float> device_output(out_data, out_data + output_elems);
     expectVectorsNear(device_output, reference.output, "ROCm GDN prefill+decode output Qwen3.6 dense shape", 7e-4f, 7e-4);
-    expectVectorsNear(device_state, reference.state, "ROCm GDN prefill+decode state Qwen3.6 dense shape", 7e-4f, 7e-4);
+    expectVectorsNear(device_state, materializeCPUGDNTestState(reference.state,n_heads,d_k,d_v), "ROCm GDN prefill+decode state Qwen3.6 dense shape", 7e-4f, 7e-4);
 }
 
 TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
@@ -5823,7 +5842,7 @@ TEST(Test__GDNKernels, Recurrence_L2Norm)
 
     // Run with L2 norm enabled
     auto output_l2 = makeFP32({1, 4});
-    std::vector<float> state_l2(d_k * d_v, 0.0f);
+    std::vector<float> state_l2(CPUGDNStateLayout(1,d_k,d_v).floats(), 0.0f);
 
     auto ctx = makeCPUContext();
     {
@@ -5850,7 +5869,7 @@ TEST(Test__GDNKernels, Recurrence_L2Norm)
 
     // Run without L2 norm
     auto output_no_l2 = makeFP32({1, 4});
-    std::vector<float> state_no_l2(d_k * d_v, 0.0f);
+    std::vector<float> state_no_l2(CPUGDNStateLayout(1,d_k,d_v).floats(), 0.0f);
 
     // Re-create tensors (data was modified by l2norm)
     auto Q2 = makeFP32({1, 4}, q_data.data());
@@ -5964,7 +5983,7 @@ TEST(Test__GDNKernels, StateIntegration_HybridCacheManager)
         EXPECT_EQ(state->conv_kernel_size, 4);
 
         // Recurrence state: [n_heads, head_dim, head_dim] = [2, 4, 4] = 32
-        EXPECT_EQ(state->recurrence_state.size(), 32u);
+        EXPECT_EQ(state->recurrence_state.size(), 194u);
 
         // Conv state: [n_heads, conv_kernel-1, head_dim] = [2, 3, 4] = 24
         EXPECT_EQ(state->conv_state.size(), 24u);
@@ -6184,7 +6203,7 @@ TEST(Test__GDNKernels, Pipeline_Conv1dThenRecurrence)
     auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, 1.0f);
     auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.0f);
     auto rec_output = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * d_v)});
-    std::vector<float> state(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
 
     {
         GDNRecurrenceStage::Params p;
@@ -6306,7 +6325,7 @@ TEST(Test__GDNKernels, Recurrence_NullKernel_Fails)
     auto A_log = makeFP32({2});
     auto dt_bias = makeFP32({2});
     auto output = makeFP32({1, 8});
-    std::vector<float> state(2 * 4 * 4, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(2,4,4).floats(), 0.0f);
     auto ctx = makeCPUContext();
 
     GDNRecurrenceStage::Params p;
@@ -6340,7 +6359,7 @@ TEST(Test__GDNKernels, Recurrence_Decode_DelegatesToRecurrentStep)
     auto A_log = makeFP32Const({2}, 0.0f);
     auto dt_bias = makeFP32Const({2}, 0.0f);
     auto output = makeFP32({1, 8});
-    std::vector<float> state(2 * 4 * 4, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(2,4,4).floats(), 0.0f);
     auto ctx = makeCPUContext();
 
     MockGatedDeltaNet mock;
@@ -6381,7 +6400,7 @@ TEST(Test__GDNKernels, Recurrence_Prefill_DelegatesToChunkForward)
     auto A_log = makeFP32Const({2}, 0.0f);
     auto dt_bias = makeFP32Const({2}, 0.0f);
     auto output = makeFP32({4, 8});
-    std::vector<float> state(2 * 4 * 4, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(2,4,4).floats(), 0.0f);
     auto ctx = makeCPUContext();
 
     MockGatedDeltaNet mock;
@@ -6437,7 +6456,7 @@ TEST(Test__GDNKernels, Recurrence_CPUMergedQKVUsesMandatoryDirectKernel)
     auto a_log = makeFP32Const({n_heads}, -0.5f);
     auto dt_bias = makeFP32Const({n_heads}, 0.0f);
     auto output = makeFP32({rows, n_heads * d_v});
-    std::vector<float> state(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
     auto ctx = makeCPUContext();
 
     MockGatedDeltaNet mock;
@@ -6494,7 +6513,7 @@ TEST(Test__GDNKernels, Recurrence_KernelFailurePropagates)
     auto A_log = makeFP32Const({2}, 0.0f);
     auto dt_bias = makeFP32Const({2}, 0.0f);
     auto output = makeFP32({1, 8});
-    std::vector<float> state(2 * 4 * 4, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(2,4,4).floats(), 0.0f);
     auto ctx = makeCPUContext();
 
     MockGatedDeltaNet mock;
@@ -6725,7 +6744,7 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
     constexpr int k_src_dim = n_k_heads * d_k;
     constexpr int v_dim = n_heads * d_v;
     constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
-    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
     const std::array<int, request_count> real_rows = {4, 2};
     const std::array<int, request_count> accepted_rows = {3, 1};
 
@@ -6755,6 +6774,7 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
         request_zero_state[static_cast<size_t>(i)] =
             0.0007f * static_cast<float>((i % 17) - 8);
 
+    clearCPUGDNTestHistory(request_zero_state,n_heads,d_k,d_v);
     CPUGatedDeltaNet grouped;
     std::array<CPUGatedDeltaNet, request_count> serial;
     std::array<std::vector<float>, request_count> serial_state = {
@@ -6948,7 +6968,7 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
         const auto policy = record.tags.find("execution_policy");
         grouped_counter = grouped_counter ||
                           (policy != record.tags.end() &&
-                           policy->second == "request_head_grouped_recurrence");
+                           policy->second == "request_head_fixed_epoch");
     }
     EXPECT_TRUE(grouped_counter);
 

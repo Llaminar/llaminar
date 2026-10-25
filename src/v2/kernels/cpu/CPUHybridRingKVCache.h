@@ -4,7 +4,8 @@
  *
  * Inherits from CPURingKVCache and adds:
  * - Layer index remapping (global → compressed KV index for FA layers)
- * - Per-layer GDN state management (recurrence + conv state)
+ * - Per-layer GDN state management (complete epoch history + conv state)
+ *   Prefix export/import copies every pending update without partial flushes.
  * - Memory savings by not allocating KV entries for GDN layers
  *
  * All KV cache operations are delegated to the parent CPURingKVCache with
@@ -765,7 +766,7 @@ namespace llaminar2
                 state.d_v = geometry.d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
                 state.full_recurrence_state_size =
-                    geometry.full_recurrence_state_floats;
+                    geometry.cpuFullRecurrenceStateFloats();
                 state.full_conv_state_size =
                     geometry.full_conv_state_floats;
                 state.initializeCPUState(geometry.local_qkv_dim);

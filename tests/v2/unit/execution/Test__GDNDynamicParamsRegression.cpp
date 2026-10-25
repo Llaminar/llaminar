@@ -17,6 +17,7 @@
  *                 updateDynamicParams() override addition
  */
 
+#include "../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 #include <cmath>
 #include <cstring>
@@ -76,7 +77,7 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_HasDynamicParams)
     params.d_v = 4;
 
     // Need minimal valid state to construct (won't execute)
-    std::vector<float> state(params.n_heads * params.d_k * params.d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(params.n_heads,params.d_k,params.d_v).floats(), 0.0f);
     params.recurrence_state = state.data();
     params.kernel = &cpu_gdn;
 
@@ -108,7 +109,7 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ChangesSeqLe
     params.use_qk_l2norm = true;
     params.kernel = &cpu_gdn;
 
-    std::vector<float> state(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
     params.recurrence_state = state.data();
 
     // Minimal tensors — won't execute, just checking param updates
@@ -238,7 +239,7 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ExecutesDeco
     params.use_qk_l2norm = true;
     params.kernel = &cpu_gdn;
 
-    std::vector<float> state(n_heads * d_k * d_v, 0.0f);
+    std::vector<float> state(CPUGDNStateLayout(n_heads,d_k,d_v).floats(), 0.0f);
     params.recurrence_state = state.data();
 
     // Single-token tensors (decode shape)

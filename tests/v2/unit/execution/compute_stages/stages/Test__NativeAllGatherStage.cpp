@@ -302,7 +302,7 @@ namespace
     }
 } // namespace
 
-/** @brief Native terminal geometry is validated without GPU discovery or allocation. */
+/** @brief Validate native geometry and compiled capture support without device access. */
 TEST_F(NativeAllGatherContract, VocabularyPublicationRetainsShardedProjectionOwnership)
 {
     NativeVocabularyAllGatherStage::Params declaration;
@@ -316,7 +316,12 @@ TEST_F(NativeAllGatherContract, VocabularyPublicationRetainsShardedProjectionOwn
     declaration.participant = 0;
     declaration.stage_name = "lm_head_allgather";
     NativeVocabularyAllGatherStage stage(declaration);
+#ifdef HAVE_ROCM
     EXPECT_TRUE(stage.isGraphCapturable());
+#else
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "A CPU-only build must not advertise native ROCm capture support";
+#endif
     EXPECT_EQ(stage.getWorkspaceRequirements(4).buffers.front().size_bytes, 4u * 32u * sizeof(float));
     EXPECT_EQ(stage.bufferContract().inputs.front().id, BufferId::LOGITS_LOCAL);
     EXPECT_EQ(stage.bufferContract().outputs.front().id, BufferId::LOGITS);

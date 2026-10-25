@@ -2,7 +2,9 @@
  * @file CPUGatedDeltaNet.h
  * @brief CPU implementation of ITensorGatedDeltaNet
  *
- * Delta rule recurrence for GDN linear attention.
+ * Fixed-epoch CPU recurrence with shared-prefix and backward-query readout.
+ * Serial, grouped and request-batched CPU paths share the same FP32 definition;
+ * retained prefix state is identified by its readout arithmetic generation.
  * OpenMP-parallelized across heads.
  *
  * The kernel owns ALL preprocessing:
@@ -11,12 +13,14 @@
  * - Gate computation: g = -exp(A_log) * softplus(alpha + dt_bias)
  * - Beta sigmoid: beta_sig = sigmoid(beta_raw)
  *
- * This ensures a future CUDA kernel can do all math on-device.
+ * CPU workers own all recurrence and preprocessing storage; no device shadow
+ * or alternate readout is selected for grouped execution.
  */
 
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
+#include "kernels/CPUGDNStateLayout.h"
 
 #include <vector>
 
@@ -40,7 +44,6 @@ namespace llaminar2
          */
         bool resetGPUState(void *stream) override;
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
-        void bindSpeculativeStateWorkspace(float *workspace, int state_size) override;
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
 
         /**
@@ -114,8 +117,10 @@ namespace llaminar2
         /**
          * @brief Run the production merged-QKV verifier without mutating live state.
          *
-         * Row zero advances directly from @p state into snapshot zero. Every
-         * later row advances the prior immutable snapshot into the next slot.
+         * The last snapshot owns the mutable working checkpoint/history bank.
+         * Earlier rows publish complete immutable prefixes of that history.
+         * Readouts share checkpoint loads while fixed-position boundaries alone
+         * advance the rounded matrix; no production M=1 row replay is used.
          * The input state therefore remains authoritative until the MTP
          * transaction explicitly publishes its accepted row.
          *
@@ -211,7 +216,15 @@ namespace llaminar2
         /// L2 normalize vectors per head
         static void l2normalize(float *data, int seq_len, int n_heads, int head_dim);
 
-        /// Ensure scratch buffers are large enough, reallocating only when needed
+        /**
+         * @brief Admit persistent query/key and scalar-gate tables before execution.
+         * @param seq_len Admitted row capacity for the upcoming grouped call.
+         * @param n_heads Local value-head count.
+         * @param d_k Key width of each normalized/adjusted query.
+         * @param d_v Value width, unused by query/gate storage admission.
+         * Existing capacities are reused; prepared queries, keys and gates share
+         * token/head ownership and are published before epoch contraction.
+         */
         void ensureScratch(int seq_len, int n_heads, int d_k, int d_v);
 
         /**
@@ -229,8 +242,8 @@ namespace llaminar2
          * @param A_log Per-head recurrence decay coefficients.
          * @param dt_bias Per-head time-step biases.
          * @param output Destination rows in local-value-head order.
-         * @param state Mutable working recurrence state. Verifier callers pass a
-         *        private speculative copy so live decode state is not mutated.
+         * @param state Complete CPUGDNStateLayout bank. Verifier execution uses
+         *        its last snapshot as workspace and preserves these initial bytes.
          * @param seq_len Number of rows to advance; every positive runtime M is
          *        accepted when the caller provides sufficient storage.
          * @param n_heads Number of local value heads.
@@ -266,7 +279,7 @@ namespace llaminar2
          */
         template <typename RowAccessor>
         bool chunkForwardBatchedDecodeEquivalentRows(
-            RowAccessor &&row_accessor,
+            RowAccessor &&row_accessor, int value_row_stride,
             const float *alpha, const float *beta_raw,
             const float *A_log, const float *dt_bias,
             float *output, float *state,
@@ -275,23 +288,19 @@ namespace llaminar2
             bool use_qk_l2norm,
             const int *host_request_seq_lens);
 
-        float *prepareSpeculativeState(float *live_state, int state_floats);
         bool ensureRequestStateBank(
             int request_count,
             int state_floats,
             const float *request_zero_state);
 
         // Reusable scratch buffers (grow-only, never shrink during lifetime)
-        std::vector<float> q_scratch_;        ///< Preprocessed Q buffer
+        std::vector<float> q_scratch_;        ///< Canonical normalized/scaled Q buffer
         std::vector<float> k_scratch_;        ///< Preprocessed K buffer
         std::vector<float> gate_scratch_;     ///< Gate values
         std::vector<float> beta_sig_scratch_; ///< Sigmoid of beta
         float *verifier_state_capture_ = nullptr;
         int verifier_state_capture_rows_ = 0;
         int verifier_state_capture_size_ = 0;
-        float *speculative_state_work_ = nullptr;
-        int speculative_state_work_size_ = 0;
-        std::vector<float> owned_speculative_state_work_;
         std::vector<float> request_state_bank_;
         int request_state_size_ = 0;
         int request_state_capacity_ = 0;

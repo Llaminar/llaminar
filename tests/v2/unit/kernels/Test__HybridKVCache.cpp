@@ -162,6 +162,17 @@ namespace llaminar2::test
     // =============================================================================
 
     /** @brief Equal local/full geometry owns one request-backed live bank. */
+    TEST(Test__HybridGDNStateGeometry, ZeroLayersOwnNoCPUCheckpointHistory)
+    {
+        const HybridGDNStateGeometry absent;
+        EXPECT_EQ(absent.localPayloadBytes(0), 0u);
+        EXPECT_THROW((void)absent.localPayloadBytes(-1), std::invalid_argument);
+        EXPECT_THROW((void)absent.localPayloadBytes(1), std::invalid_argument);
+        const auto present = HybridGDNStateGeometry::resolve(4, 0, 4, 2, 4, 2, 8, 4);
+        EXPECT_EQ(present.localPayloadBytes(0), 0u);
+        EXPECT_GT(present.localPayloadBytes(1), 0u);
+    }
+
     TEST(Test__HybridGDNStateGeometry,
          UnshardedArenaDoesNotPriceAnImaginaryPrimaryBank)
     {
@@ -192,7 +203,9 @@ namespace llaminar2::test
                 /*request_capacity=*/1),
             320u);
         EXPECT_EQ(geometry.deviceSerializedPayloadBytes(1), 192u);
-        EXPECT_EQ(geometry.localPayloadBytes(1), 192u);
+        // Four heads: phase + 2x2 checkpoint + eight (2+2+2) raw records.
+        EXPECT_EQ(geometry.cpuLocalRecurrenceStateFloats(), 212);
+        EXPECT_EQ(geometry.localPayloadBytes(1), 976u);
     }
 
     /** @brief Modulo-linked K/V sharding uses exact weight/runtime ownership. */
@@ -344,8 +357,8 @@ namespace llaminar2::test
         EXPECT_EQ(state->d_v, 64);
         EXPECT_EQ(state->conv_kernel_size, 4);
 
-        // Recurrence state: n_v_heads * d_k * d_v = 16 * 64 * 64 = 65536
-        EXPECT_EQ(state->recurrence_state.size(), 65536u);
+        // Sixteen complete heads: phase + 64x64 checkpoint + eight 130-float records.
+        EXPECT_EQ(state->recurrence_state.size(), 82192u);
 
         // Conv state: qkv_dim * (conv_kernel - 1)
         // qkv_dim = 2 * n_k_heads * d_k + n_v_heads * d_v = 2*4*64 + 16*64 = 512 + 1024 = 1536

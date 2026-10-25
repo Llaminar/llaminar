@@ -4113,7 +4113,8 @@ namespace llaminar2
          *
          * When enabled for an all-position MTP verifier graph, implementations may
          * write the recurrence state after each candidate verifier row into this
-         * buffer. Layout is [rows, n_heads, d_k, d_v] in FP32.
+         * buffer. Each row contains a complete backend state: CPUGDNStateLayout
+         * on CPU and [n_heads, d_k, d_v] FP32 matrices on GPU.
          */
         virtual void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
         {
@@ -4331,7 +4332,8 @@ namespace llaminar2
          * @param A_log     Learnable log-space gate [n_heads]
          * @param dt_bias   Learnable dt bias [n_heads]
          * @param output    Output context [seq_len, n_heads * d_v]
-         * @param state     Recurrence state [n_heads, d_k, d_v] (updated in-place)
+         * @param state     Backend-owned state: CPU CPUGDNStateLayout checkpoint/history;
+         *                  GPU dense [n_heads,d_k,d_v]. Updated without partial-epoch flushes.
          * @param seq_len   Sequence length
          * @param n_heads   Number of attention heads
          * @param d_k       Key head dimension
@@ -4402,7 +4404,9 @@ namespace llaminar2
          *
          * Snapshot rows are laid out as:
          *   state_snapshots[row * snapshot_stride_floats + state_index]
-         * where state_index spans [n_heads, d_k, d_v].
+         * where state_index spans the complete backend state extent. CPU snapshots
+         * include phase and raw history from CPUGDNStateLayout; GPU snapshots
+         * contain dense [n_heads,d_k,d_v] matrices.
          * CPU implementations publish the terminal snapshot back to @p state.
          * A backend may materialize snapshots directly during recurrence, but it
          * must preserve serial-row arithmetic and may not replay rows afterward.
@@ -4712,7 +4716,8 @@ namespace llaminar2
          * @param A_log     Learnable log-space gate [n_heads]
          * @param dt_bias   Learnable dt bias [n_heads]
          * @param output    Output context [n_heads * d_v]
-         * @param state     Recurrence state [n_heads, d_k, d_v] (updated in-place)
+         * @param state     Backend-owned state: CPU CPUGDNStateLayout checkpoint/history;
+         *                  GPU dense [n_heads,d_k,d_v]. Updated without partial-epoch flushes.
          * @param n_heads   Number of attention heads
          * @param d_k       Key head dimension
          * @param d_v       Value head dimension

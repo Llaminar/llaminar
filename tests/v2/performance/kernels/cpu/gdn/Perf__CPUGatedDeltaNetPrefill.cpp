@@ -9,6 +9,7 @@
  * the per-rank geometry produced by two-way tensor parallelism.
  */
 
+#include "../../../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
@@ -60,7 +61,7 @@ namespace
               beta(alpha.size()),
               a_log(static_cast<size_t>(n_heads)),
               dt_bias(static_cast<size_t>(n_heads)),
-              initial_state(static_cast<size_t>(n_heads) * d_k * d_v),
+              initial_state(llaminar2::CPUGDNStateLayout(n_heads,d_k,d_v).floats()),
               state(initial_state.size()),
               output(v.size())
         {
@@ -87,6 +88,7 @@ namespace
                 initial_state[i] =
                     0.0001f * static_cast<float>(static_cast<int>(i % 43) - 21);
             }
+            llaminar2::clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
         }
     };
 

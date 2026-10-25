@@ -43,7 +43,35 @@ TEST(Test__PrefixCacheFingerprint, ProjectionArithmeticSeparatesEveryPrecisionPa
     EXPECT_EQ(keys.size(), 30u);
 }
 
-/** @brief Callers cannot relabel a persisted entry with conflicting arithmetic metadata. */
+/** @brief Changed CPU readout bytes cannot restore prefixes from the old definition. */
+TEST(Test__PrefixCacheFingerprint, CPUFixedEpochRejectsLegacyArithmetic)
+{
+    std::vector<PrefixFingerprintField> current;
+    appendProjectionArithmeticFingerprintFields(current,
+        GDNProjectionArithmetic::Native, MoERouterArithmetic::Native);
+    auto legacy = current;
+    const auto readout = std::find_if(legacy.begin(), legacy.end(), [](const auto &field) {
+        return field.name == "cpu_gdn_readout_arithmetic";
+    });
+    ASSERT_NE(readout, legacy.end());
+    EXPECT_EQ(readout->value, "fixed-epoch8-backward-fma-v1");
+    readout->value = "adjusted-parent-fma-v1";
+    EXPECT_NE(hashPrefixFingerprintFields("runtime", legacy),
+              hashPrefixFingerprintFields("runtime", current));
+    legacy.erase(readout);
+    EXPECT_NE(hashPrefixFingerprintFields("runtime", legacy),
+              hashPrefixFingerprintFields("runtime", current));
+    std::vector<PrefixFingerprintField> restarted;
+    appendProjectionArithmeticFingerprintFields(restarted,
+        GDNProjectionArithmetic::Native, MoERouterArithmetic::Native);
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime", current),
+              hashPrefixFingerprintFields("runtime", restarted));
+    std::vector<PrefixFingerprintField> forged{{"cpu_gdn_readout_arithmetic", "old"}};
+    EXPECT_THROW(appendProjectionArithmeticFingerprintFields(forged,
+        GDNProjectionArithmetic::Native, MoERouterArithmetic::Native), std::invalid_argument);
+}
+
+/** @brief Callers cannot forge or duplicate the arithmetic compatibility authority. */
 TEST(Test__PrefixCacheFingerprint, ProjectionArithmeticRejectsDuplicateAuthority)
 {
     for (const auto name : {"projection_arithmetic_revision", "gdn_projection_arithmetic",
