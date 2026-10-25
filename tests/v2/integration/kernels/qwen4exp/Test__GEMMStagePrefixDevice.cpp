@@ -7,6 +7,8 @@
  * active row to an independent exactly-representable one-hot projection.
  * The direct fixture mirrors graph setup: the stage declares its complete named
  * workspace, one PMA admits it, and capture/replay borrow that persistent arena.
+ * Scoped native16 wide-column cases additionally use dense cancellation inputs
+ * against the independently captured, unscoped original production projection.
  * Captured work retires before workspace or prepared tensor owners on every exit.
  */
 #include "backends/BackendManager.h"
@@ -219,29 +221,52 @@ struct QueryWorkBank {
     std::string name;std::size_t width,element;bool blockMajor,emptyOnly;
     std::vector<std::uint8_t> poison,observed;
 };
+/** @brief Keep the original all-format witness distinct from dense native16 coverage. */
+enum class QueryWorkSource { OneHotAllFormats, DenseNative16 };
+/** @brief Immutable projection geometry; defaults preserve the existing all-format gate. */
+struct QueryWorkGeometry {
+    int columns=33; ///< Original output width unless a focused case authors another.
+    int reduction=512; ///< Original K, with no production partition-policy override.
+    QueryWorkSource source=QueryWorkSource::OneHotAllFormats; ///< Independent serial input family.
+};
 /**
  * @brief Exercise actual prepared stage authorship against ordinary captured M1.
  * @param device Exact native participant owning every graph and storage lease.
  * @param grouped Whether to sweep1..16 rows per three independent request owners.
+ * @param geometry Typed dimensions/input family; defaults keep all existing formats.
  * @test No-work rows preserve poisoned source/Q8/scales/sums/output, empty work
  * preserves every partial byte, and the first2052-visible row matches ordinary
  * production M1 without a verifier/work scope. One capture survives dirty replay.
  */
-void proveQueryWork(DeviceId device,bool grouped)
+void proveQueryWork(DeviceId device,bool grouped,QueryWorkGeometry geometry={})
 {
     auto* backend=getBackendFor(device);if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"GPU unavailable";
     auto context=IDeviceContext::create(device,1);auto& worker=GPUDeviceContextPool::instance().getContext(device);
     worker.submitAsync([&]{
-        constexpr int n=33,k=512,maxRows=48;const auto stream=ExplicitGPUStream(worker.defaultStream()).get();
-        for(const auto& format:queryWorkFormats()){
-            SCOPED_TRACE(format.label);auto weight=format.create({n,k},7391);
+        const int n=geometry.columns,k=geometry.reduction;
+        constexpr int maxRows=48;
+        const auto columns=static_cast<std::size_t>(n),reduction=static_cast<std::size_t>(k);
+        checked(n>0&&k>0,"Invalid authored query-work geometry");
+        const auto stream=ExplicitGPUStream(worker.defaultStream()).get();
+        auto formats=queryWorkFormats();
+        if(geometry.source==QueryWorkSource::DenseNative16){
+            formats.erase(std::remove_if(formats.begin(),formats.end(),[](const auto& format){
+                return format.label!="FP16"&&format.label!="BF16";
+            }),formats.end());
+            // This focused geometry must neither omit a native16 encoding nor
+            // silently broaden into the separate all-format certification sweep.
+            ASSERT_EQ(formats.size(),2u);ASSERT_EQ(formats[0].label,"FP16");ASSERT_EQ(formats[1].label,"BF16");
+            ASSERT_FALSE(formats[0].quantized);ASSERT_FALSE(formats[1].quantized);
+        }
+        for(const auto& format:formats){
+            SCOPED_TRACE(format.label);auto weight=format.create({columns,reduction},7391);
             if(!format.quantized){TransferEngine::prepareDeviceInput(weight.get(),device,stream);TransferEngine::requireDeviceInput(weight.get(),device,stream);}
             std::optional<test::GpuPreparedGemm> gpu;std::optional<test::PreparedGemmFixture> floating;
             PreparedWeightStore* store=nullptr;PreparedWeightRef ref;
             if(format.quantized){gpu.emplace(test::makeGpuPreparedGemm(weight.get(),device,"qsa.query.work."+format.label,ModelContextId{99731}));store=gpu->store.get();ref=gpu->ref;}
             else{floating.emplace(test::makePreparedGemmFixture(weight.get(),device,"qsa.query.work."+format.label,ModelContextId{99731}));store=floating->store.get();ref=floating->ref;}
             auto* kernel=store->gemmKernel(ref);checked(kernel!=nullptr,"Prepared query kernel missing");kernel->setGPUStream(stream);
-            FP32Tensor serialInput({1,k}),serialOutput({1,n});
+            FP32Tensor serialInput({1,reduction}),serialOutput({1,columns});
             for(auto* t:{&serialInput,&serialOutput}){std::fill_n(t->mutable_data(),t->numel(),0.0f);TransferEngine::prepareDeviceInput(t,device,stream);TransferEngine::requireDeviceInput(t,device,stream);}
             GEMMStage serial({.device_id=device,.A=&serialInput,.B=weight.get(),.C=&serialOutput,.m=1,.n=n,.k=k,
                 .prepared_ref=ref,.prepared_store=store});serial.setGPUStream(stream);
@@ -254,7 +279,20 @@ void proveQueryWork(DeviceId device,bool grouped)
             {ScopedBackendGraphCapture capture(worker,*oracleGraph,"ordinary M1 query oracle");checked(capture.begin(),"Query oracle begin failed");checked(serial.execute(context.get()),"Query oracle capture failed");capture.finish();}
             checked(oracleGraph->instantiate(),"Query oracle instantiate failed");
             for(int pattern=0;pattern<2;++pattern){source[pattern].assign(maxRows*k,0.0f);oracle[pattern].resize(maxRows*n);
-                for(int row=0;row<maxRows;++row){source[pattern][row*k+(row*17+3)%k]=pattern?-0.5f:0.5f;
+                for(int row=0;row<maxRows;++row){if(geometry.source==QueryWorkSource::OneHotAllFormats)
+                        source[pattern][row*k+(row*17+3)%k]=pattern?-0.5f:0.5f;
+                    else {
+                        // Every lane owns several nonzero, differently scaled K
+                        // terms. Opposing large/small terms expose reassociation
+                        // that a one-hot oracle cannot detect. Expected bytes
+                        // still come solely from the original captured program.
+                        constexpr std::array<float,10> terms{65536.0f,0.125f,-65536.0f,
+                            0.0009765625f,32.0f,-32.0f,0.0625f,-0.03125f,1024.0f,-1024.0f};
+                        for(int col=0;col<k;++col){
+                            const float sign=((col+row+pattern)&1)?-1.0f:1.0f;
+                            source[pattern][row*k+col]=sign*terms[(col/256+row+pattern)%terms.size()];
+                        }
+                    }
                     checked(backend->hostToDeviceOnStream(serialInput.gpu_data_ptr(),source[pattern].data()+row*k,k*sizeof(float),device.ordinal,stream),"Serial query source failed");
                     checked(oracleGraph->launch(),"Serial query oracle replay failed");
                     checked(backend->deviceToHostOnStream(oracle[pattern].data()+row*n,serialOutput.gpu_data_ptr(),n*sizeof(float),device.ordinal,stream),"Serial query oracle download failed");
@@ -264,7 +302,7 @@ void proveQueryWork(DeviceId device,bool grouped)
             const int requests=grouped?3:1;
             for(int rows=1;rows<=(grouped?16:1);++rows){
                 SCOPED_TRACE(rows);const int physical=requests*rows;
-                FP32Tensor input({std::size_t(physical),k}),output({std::size_t(physical+1),n});
+                FP32Tensor input({std::size_t(physical),reduction}),output({std::size_t(physical+1),columns});
                 std::fill_n(input.mutable_data(),input.numel(),0.0f);std::fill_n(output.mutable_data(),output.numel(),-71.0f);
                 std::vector<std::unique_ptr<INT32Tensor>> owners;ProjectionRowWorkDeclaration declaration{.rowsPerRequest=rows,.sourceCapacity=4096,.firstRequiredLogicalRow=qwen4exp::QwenSparseFirstRankingLogicalRow};
                 for(int request=0;request<requests;++request){auto owner=std::make_unique<INT32Tensor>(std::vector<std::size_t>{2});std::fill_n(static_cast<std::int32_t*>(owner->raw_mutable_data()),2,0);
@@ -337,4 +375,20 @@ TEST(GEMMStageQueryWorkDevice,CUDAGroupedOwnersAllFormats){proveQueryWork(Device
 #ifdef HAVE_ROCM
 TEST(GEMMStageQueryWorkDevice,ROCmOrdinaryM1AllFormats){proveQueryWork(DeviceId::rocm(0),false);}
 TEST(GEMMStageQueryWorkDevice,ROCmGroupedOwnersAllFormats){proveQueryWork(DeviceId::rocm(0),true);}
+/** @test Native16 cap/stripe tails retain dense ordinary serial bytes under one capture. */
+TEST(GEMMStageQueryWorkDevice,ROCmNative16ColumnStridesOrdinary)
+{
+    for(int columns:{127,128,129,511,512,513}){
+        SCOPED_TRACE(columns);
+        proveQueryWork(DeviceId::rocm(0),false,{columns,2560,QueryWorkSource::DenseNative16});
+    }
+}
+/** @test M1..16, three owner holes and empty/partial/full dirty reuse retain serial bytes. */
+TEST(GEMMStageQueryWorkDevice,ROCmNative16ColumnStridesGrouped)
+{
+    for(int columns:{127,128,129,511,512,513}){
+        SCOPED_TRACE(columns);
+        proveQueryWork(DeviceId::rocm(0),true,{columns,2560,QueryWorkSource::DenseNative16});
+    }
+}
 #endif

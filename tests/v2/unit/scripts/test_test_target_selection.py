@@ -169,7 +169,8 @@ if(HAVE_CUDA)
     set_target_properties(v2_perf_q8_residual_prepared_projection PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 if(HAVE_ROCM)
-    foreach(native_target IN ITEMS v2_perf_rocm_floating_reduction
+    foreach(native_target IN ITEMS v2_perf_rocm_qwen_sparse_observations
+                                   v2_perf_rocm_floating_reduction
                                    v2_perf_qwen4exp_branch_norm
                                    v2_perf_q8_residual_prepared_projection)
         get_target_property(native_sources ${{native_target}} SOURCES)
@@ -190,8 +191,11 @@ if(HAVE_ROCM)
                 set_source_files_properties("${{source}}" PROPERTIES HEADER_FILE_ONLY TRUE)
             endif()
         endforeach()
+        # The QSA observation target retains its test-owned evaluator probe.
         # Floating reduction retains its existing HIP fixture plus the frozen
         # pointer-pipeline oracle. Branch norm and HC control each retain one oracle.
+        # All are native HIP in production; only this CXX-only metadata mock
+        # marks the authenticated source header-only before CMake generation.
         set(expected_native_sources 1)
         if(native_target STREQUAL "v2_perf_rocm_floating_reduction")
             set(expected_native_sources 2)

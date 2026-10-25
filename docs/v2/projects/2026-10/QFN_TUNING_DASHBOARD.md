@@ -9,28 +9,26 @@ analysis in the linked tuning notes, not in this dashboard.
 **Goal:** beat Castagna's **42.959 decode tok/s** on four MI50s while preserving
 roughly 815 prefill tok/s and canonical numerical accuracy.
 
-**Qualified performance checkpoint: 196 — 821.541 prefill / 42.229 decode tok/s.**
-Its matched decode gain is 1.264%; prefill is preserved. All nine generated
-sequences and 185 final-logit rows match. The complete 796-registration
-Unit/affected selection passed; full production preflight remains pending.
-[Checkpoint settings and evidence][checkpoint196].
+**Current green performance slice: scoped query grid — 819.900 prefill /
+43.388 decode tok/s.** Matched A/B/A control:820.877 /42.372; decode gains
+**2.396%**, prefill changes−0.119%. All three candidate responses exceed the
+recorded Castagna42.959 rate (range43.257–43.463). All nine trajectories match;
+185 final-logit rows are byte-identical to five references. Six device aliases
+and778/778 Unit plus two build-selection aliases pass, with the same95 historical
+inner Unit omissions. [Settings, profiles and evidence][column-grid].
 
-**Committed slice `f52896b8`:** prepared GDN Q/K, grouped QSA preparation,
-admitted attention defaults and norm/SingleQ8 fusion. That checkpoint passes
-**828/828 Unit/affected registrations**, with the same 95 explicit historical
-Unit omissions. All 185 model-logit rows match five references; actual policies
-are verified on all four MI50s. This is scoped qualification, not full preflight.
-The earlier bundle measures **820.974 P / 42.464 D** versus 820.638 / 42.244
-(+0.522% decode). With norm fusion, a separate A/B/A measures
-**820.173 P / 42.335 D** versus 821.057 / 42.281, neutral (+0.130% decode).
-All nine trajectories match within each run. Separate trials do not isolate the
-norm increment; no new speed promotion. [Evidence and limitations][qsa].
+Earlier committed slices `f52896b8` and `8baf5c58` retain prepared GDN Q/K,
+grouped QSA preparation, attention defaults, norm/SingleQ8 fusion and redundant
+rescale-exp removal. The first passed828/828 Unit/affected registrations with95
+explicit historical Unit omissions. Their component gains were green but
+matched cumulative model timing was neutral. [Norm/preparation evidence][qsa];
+[rescale evidence][online-rescale]. Full production preflight remains pending.
 
 | Next action | State / decision |
 |---|---|
 | Elide online rescale exponentials | Native/accuracy green; ≈0.75% prefill and ≈0.6% short-decode component savings. Model 820.812 P / 42.211 D vs 820.343 / 42.416: no overall gain. [Evidence][online-rescale]. |
 | Fuse GDN output normalization with SingleQ8 preparation | Focused gates, model panel, profiles and matched run green; 185 exact rows. Component 6.9% faster; cumulative model timing neutral. |
-| Fuse branch normalization with HC-down SingleQ8 preparation | Private component prototype ready; retain the FP32 output used by ResidualRead. No measured win yet. |
+| Omit unnecessary indexer launches | Next: retained no-ranking program selected at admission. Backend/builder/CPU drafts are under review; parent ownership is being closed. [Plan](QFN_SHORT_CONTEXT_QUERY_OMISSION.md). |
 | Complete CUDA QSA component timings | First M1/512 cell saves 22.685%; remaining shapes pending. No CUDA model-speed claim. |
 | Broader topology tuning | Tune admitted A rows first, then admit and qualify B–D. Obtain applicable reference baselines before tuning. |
 
@@ -49,7 +47,7 @@ speed or an image. G60 is the last complete topology gate; later A1 gates are sc
 
 | ID | Topology and ngrams | Accuracy | Llaminar P | Reference P | Strata P | Llaminar D | Reference D | Strata D | Next / limitation |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 196 + current exact panel | 821.541 | 467.821 C | — | 42.229 | 42.959 C | — | Close decode gap; next branch norm/HC-down fusion. |
+| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 current185 exact rows | 819.900 | 467.821 C | — | 43.388 | 42.959 C | — | Recorded decode target passed; finish complete query-launch omission. |
 | A2 | ROCm1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a2] | 156.707 | 159.177 C | 45.270≈ | 15.164 | 11.600 C | 24.024≈ | Prefill trails Castagna; decode trails Strata. |
 | A3 | CUDA1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a3] | 180.920 | 129.020 U⚠ | 74.301≈ | 18.231 | 13.059 U⚠ | 31.253≈ | Resolve upstream variance; decode trails Strata. |
 | A4 | CPU1, 28 physical workers; SSD mmap ngrams | [🟢 G60][a4] | 98.466 | 48.408 C | n/a | 5.797 | 4.611 C | n/a | Both recorded phases lead Castagna. |
@@ -58,8 +56,8 @@ speed or an image. G60 is the last complete topology gate; later A1 gates are sc
 **A1 policy:** `TensorParallel` dense compute + `GateUpOwnedDownColumns` experts,
 `VocabularySharded` terminal head, Automatic-resolved Four-worker owner gate/up,
 shape-selected Q5 down publication, ValueMajor GDN and FP16 Prefill8/Decode33
-attention. The current unpromoted bundle selects that attention policy through
-admission instead of diagnostic overrides. Do not mix it with the policy pairs
+attention. The feature branch selects that attention policy through admission
+instead of diagnostic overrides. Do not mix it with the policy pairs
 below or substitute their throughput.
 
 | A1 policy variant | Dense compute | Experts | Accuracy | Llaminar P | Castagna P | Llaminar D | Castagna D | Decision |
@@ -197,6 +195,7 @@ owns full geometry, ownership and live-communication coverage.
 [stages]: QFN_CASTAGNA_STAGE_COMPARISON.md
 [attention]: QFN_PACKED_ATTENTION_TUNING.md
 [online-rescale]: QFN_ATTENTION_ONLINE_RESCALE.md
+[column-grid]: QFN_SCOPED_QUERY_COLUMN_GRID.md
 [scaling]: QFN_TP_COMPUTE_SCALING.md
 [cases]: ../../../../tests/v2/integration/parity/qwen4exp/Qwen4ExpLocalPairedCases.h
 [a2]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/rocm-cpu-static8-adaptive-hc-up-two-term/report.json

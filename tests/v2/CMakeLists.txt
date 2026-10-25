@@ -32634,6 +32634,20 @@ if(NOT V2_PERF_TESTS_ONLY)
     endif()
 endif()
 
+# Scoped native16 grid-stride regression; retain the broader all-format aliases.
+if(NOT V2_PERF_TESTS_ONLY AND HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
+    foreach(V2_QUERY_COLUMNS_MODE Ordinary Grouped)
+        add_v2_test(V2_Integration_ROCm_GEMMStageQueryWork_Native16ColumnStrides${V2_QUERY_COLUMNS_MODE}
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=GEMMStageQueryWorkDevice.ROCmNative16ColumnStrides${V2_QUERY_COLUMNS_MODE}
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;QwenFlashNext;Capture;ByteExact;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_ROCm_GEMMStageQueryWork_Native16ColumnStrides${V2_QUERY_COLUMNS_MODE})
+    endforeach()
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR

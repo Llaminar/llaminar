@@ -176,6 +176,10 @@ public:
         mix(reinterpret_cast<std::uintptr_t>(rows.lengthOwner()));
         return result ? result : 1;
     }
+    /** @return Complete immutable publication/geometry identity, excluding mutable live values. */
+    LLAMINAR_FLOAT_ROWS_HD ProjectionRowWork::CaptureIdentity captureIdentity() const noexcept {
+        return work_.captureIdentity();
+    }
     /** @return Immutable complete matrix row capacity. */
     LLAMINAR_FLOAT_ROWS_HD int physicalRows() const noexcept {return work_.physicalRows();}
     /** @brief Pure admission against original live and frontier words. */

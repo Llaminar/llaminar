@@ -7,6 +7,14 @@
  */
 #pragma once
 #include "ROCmFloatingRegressionSupport.h"
+#include <bit>
+#include <cmath>
+#include <cstddef>
+#include <exception>
+#include <iomanip>
+#include <string>
+#include <type_traits>
+#include <cxxabi.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "kernels/common/FloatingPointVerifierLaunch.h"
@@ -489,4 +497,407 @@ TEST(ROCmFloatingReduction,DISABLED_ExactShapePairedEvents){
     const int m=read("QFN_REDUCTION_M",1),n=read("QFN_REDUCTION_N",4),k=read("QFN_REDUCTION_K",10240);
     ASSERT_GE(type,0);ASSERT_LE(type,2);ASSERT_GE(fused,0);ASSERT_LE(fused,1);
     ASSERT_GT(m,0);ASSERT_GT(n,0);ASSERT_GT(k,0);runCase(type,fused,m,n,k,0,true);
+}
+
+/**
+ * @brief Scoped native16 query projection screen over the public production bridge.
+ *
+ * Only test-owned geometry/state selectors are read here. The loaded serving
+ * core supplies the one production program under test; the historical full-LDS
+ * kernel is an independent byte oracle and never appears in a timed graph.
+ */
+namespace qfn_reduction_regression::guard_grid_screen {
+constexpr int columns = 512;
+constexpr int reduction = 2560;
+constexpr int guard = 32;
+constexpr int threshold = 2051;
+
+/** @brief Reject infrastructure and cold identity failures before retained replay. */
+inline void require(bool condition, const char *message)
+{
+    if (!condition)
+        throw std::runtime_error(message);
+}
+
+/** @brief Parse a test-only integer completely, with no serving-policy selection. */
+inline int setting(const char *name, int fallback)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return fallback;
+    std::size_t used = 0;
+    const std::string text(value);
+    const int parsed = std::stoi(text, &used);
+    require(used == text.size(), "Incomplete guard-grid test integer");
+    return parsed;
+}
+
+/** @brief Drain exact streams before any captured pointer or DMA staging can retire. */
+struct Retirement final {
+    Captured &production;
+    Captured &historical;
+    ~Retirement()
+    {
+        if (hipStreamSynchronize(production.stream) != hipSuccess ||
+            hipStreamSynchronize(historical.stream) != hipSuccess)
+            std::terminate();
+    }
+};
+
+/** @brief Capture once, including exception-safe closure of a failed native capture. */
+template<class Launch>
+inline void capture(Captured &owner, Launch launch, int copies)
+{
+    checked(hipStreamBeginCapture(owner.stream, hipStreamCaptureModeThreadLocal));
+    try
+    {
+        for (int copy = 0; copy < copies; ++copy)
+            launch(owner.stream);
+    }
+    catch (...)
+    {
+        hipGraph_t discarded = nullptr;
+        const auto status = hipStreamEndCapture(owner.stream, &discarded);
+        if (discarded)
+            checked(hipGraphDestroy(discarded));
+        if (status != hipSuccess && status != hipErrorStreamCaptureInvalidated)
+            std::terminate();
+        throw;
+    }
+    checked(hipStreamEndCapture(owner.stream, &owner.graph));
+    checked(hipGraphInstantiate(&owner.exec, owner.graph, nullptr, nullptr, 0));
+}
+
+/** @brief Read a captured argument without aliasing its typed host storage. */
+template<class T>
+inline T argument(const hipKernelNodeParams &node, int index)
+{
+    static_assert(std::is_trivially_copyable_v<T>);
+    require(node.kernelParams && node.kernelParams[index], "Missing captured projection argument");
+    // The complete tuple is checked by callers; its descriptor is not default constructible.
+    std::array<std::byte, sizeof(T)> bytes;
+    std::memcpy(bytes.data(), node.kernelParams[index], sizeof(T));
+    return std::bit_cast<T>(bytes);
+}
+
+/** @brief Authenticate exact source format, all five arguments and a single retained chain. */
+inline void inspect(Captured &owner, int copies, int expectedColumns, int dtype,
+                    int physical, const float *input, const uint16_t *weight, float *output,
+                    const llaminar2::FloatingProjectionRows &rows,
+                    const llaminar2::ProjectionRowWork &work)
+{
+    std::size_t count = 0;
+    checked(hipGraphGetNodes(owner.graph, nullptr, &count));
+    require(count == std::size_t(copies), "Projection capture has extra or missing nodes");
+    std::vector<hipGraphNode_t> nodes(count);
+    checked(hipGraphGetNodes(owner.graph, nodes.data(), &count));
+    std::size_t edges = 0;
+    checked(hipGraphGetEdges(owner.graph, nullptr, nullptr, &edges));
+    require(edges == std::size_t(copies - 1), "Projection capture is not one complete chain");
+    std::vector<hipGraphNode_t> from(edges), to(edges);
+    if (edges)
+        checked(hipGraphGetEdges(owner.graph, from.data(), to.data(), &edges));
+    std::vector<int> incoming(count), outgoing(count);
+    for (std::size_t edge = 0; edge < edges; ++edge)
+    {
+        const auto first = std::find(nodes.begin(), nodes.end(), from[edge]);
+        const auto last = std::find(nodes.begin(), nodes.end(), to[edge]);
+        require(first != nodes.end() && last != nodes.end() && first != last,
+                "Projection edge references an alien/self node");
+        require(++outgoing[first - nodes.begin()] == 1 && ++incoming[last - nodes.begin()] == 1,
+                "Projection capture branches or merges");
+    }
+    require(std::count(incoming.begin(), incoming.end(), 0) == 1 &&
+            std::count(outgoing.begin(), outgoing.end(), 0) == 1,
+            "Projection capture has multiple roots or terminals");
+    auto cursor = std::size_t(std::find(incoming.begin(), incoming.end(), 0) - incoming.begin());
+    std::vector<bool> visited(count);
+    void *function = nullptr;
+    std::string raw;
+    hipFuncAttributes attributes{};
+    for (std::size_t ordinal = 0; ordinal < count; ++ordinal)
+    {
+        require(!visited[cursor], "Projection capture contains a cycle");
+        visited[cursor] = true;
+        hipGraphNodeType kind;
+        checked(hipGraphNodeGetType(nodes[cursor], &kind));
+        require(kind == hipGraphNodeTypeKernel, "Non-kernel work entered timed projection graph");
+        hipKernelNodeParams node{};
+        checked(hipGraphKernelNodeGetParams(nodes[cursor], &node));
+        require(node.gridDim.x == unsigned(expectedColumns) && node.gridDim.y == unsigned(physical) &&
+                node.gridDim.z == 1 && node.blockDim.x == 256 && node.blockDim.y == 1 &&
+                node.blockDim.z == 1 && node.sharedMemBytes == 0 && node.extra == nullptr,
+                "Captured projection grid/block/dynamic LDS differs from declared side");
+        const auto group = argument<llaminar2::FixedFP32x16ProjectionGroup>(node, 0);
+        require(group.size() == 1 && group.input(0) == input && group.weight(0) == weight &&
+                group.output(0) == output && argument<int>(node, 1) == physical &&
+                argument<int>(node, 2) == columns && argument<int>(node, 3) == reduction,
+                "Captured production operand/shape tuple differs");
+        const auto recorded = argument<llaminar2::FloatingProjectionRows>(node, 4);
+        for (int row = 0; row < physical; ++row)
+            for (int live : {0, work.logicalRowsPerRequest()})
+                for (int frontier : {threshold - 1, threshold})
+                    require(recorded.rowAdmissionFor(row, live, frontier) ==
+                            rows.rowAdmissionFor(row, live, frontier), "Captured causal admission differs");
+        require(recorded.captureIdentity() == work.captureIdentity(),
+                "Captured complete row publication/geometry identity differs");
+        require(node.func && (!function || function == node.func), "Projection copies change native function");
+        function = node.func;
+        if (raw.empty())
+        {
+            const char *name = hipKernelNameRefByPtr(function, owner.stream);
+            require(name && *name, "Missing actual native projection name");
+            raw = name;
+            int status = -1;
+            char *decoded = abi::__cxa_demangle(raw.c_str(), nullptr, nullptr, &status);
+            const std::string readable = decoded ? decoded : "";
+            std::free(decoded);
+            const bool scopedColumns = expectedColumns != columns;
+            const std::string expected = "void (anonymous namespace)::" +
+                std::string(scopedColumns ? "fp32x16_scoped_projection_columns_kernel<" :
+                                             "fp32x16_batched_projection_kernel<") +
+                "((anonymous namespace)::SmallProjectionWeightDtype)" + std::to_string(dtype) +
+                (scopedColumns ? ">(" : ", llaminar2::FloatingProjectionRows>(") +
+                "llaminar2::FixedFloatingProjectionGroup<unsigned short>, "
+                "int, int, int, llaminar2::FloatingProjectionRows)";
+            require(status == 0 && readable == expected, "Foreign native projection/template/argument signature");
+            checked(hipFuncGetAttributes(&attributes, function));
+            require(attributes.localSizeBytes == 0 && attributes.sharedSizeBytes == 1024 &&
+                    attributes.numRegs > 0 && attributes.numRegs <= 256 &&
+                    attributes.maxThreadsPerBlock >= 256,
+                    "Projection native resources or thread admission differ");
+        }
+        if (ordinal + 1 < count)
+        {
+            const auto edge = std::find(from.begin(), from.end(), nodes[cursor]);
+            require(edge != from.end(), "Projection chain terminates early");
+            cursor = std::size_t(std::find(nodes.begin(), nodes.end(), to[edge - from.begin()]) - nodes.begin());
+        }
+    }
+    require(std::all_of(visited.begin(), visited.end(), [](bool value) { return value; }),
+            "Projection capture has unreachable nodes");
+    const auto id = work.captureIdentity();
+    std::cout << "GUARD_GRID_CAPTURE dtype=" << dtype << " M=" << work.logicalRowsPerRequest()
+              << " requests=" << work.requests() << " physical=" << physical
+              << " N=" << columns << " K=" << reduction << " copies=" << copies
+              << " nodes=" << count << " edges=" << edges << " grid=" << expectedColumns << 'x'
+              << physical << "x1 block=256x1x1 function=" << function << " raw_symbol=" << raw
+              << " registers=" << attributes.numRegs << " static_lds=" << attributes.sharedSizeBytes
+              << " dynamic_lds=0 private=" << attributes.localSizeBytes
+              << " input=" << static_cast<const void *>(input) << " weight=" << static_cast<const void *>(weight)
+              << " output=" << static_cast<void *>(output) << " frontier=" << id.frontiers
+              << " live=" << id.counts << " stride=" << id.publication_stride_words
+              << " source_capacity=" << id.source_capacity << " threshold=" << id.first_required_logical_row
+              << " args=5 full_chain=1 passed=1\n";
+}
+
+/**
+ * @brief One production graph and one untimed historical oracle with original publication owners.
+ * @param dtype Native FP16=0 or BF16=1 source words.
+ * @param m Original rows per request,1 or16 in the initial bounded screen.
+ * @param requests Original request count,1 or3; physical strides are never compacted.
+ * @param copies One operation or32 identical out-of-place operations per timed graph.
+ * @param timing Whether to collect native events after all four dirty states pass.
+ * @param timedState Full=0,partial=1,empty=2,mixed=3; setup state is outside events.
+ */
+inline void run(int dtype, int m, int requests, int copies, bool timing, int timedState)
+{
+    require((dtype == 0 || dtype == 1) && (m == 1 || m == 16) &&
+            (requests == 1 || requests == 3) && (copies == 1 || copies == 32) &&
+            timedState >= 0 && timedState < 4, "Unsupported initial guard-grid screen geometry");
+    const int expectedColumns = setting("QFN_GUARD_GRID_EXPECTED_COLUMNS", columns);
+    require(expectedColumns == columns || expectedColumns == 64 || expectedColumns == 128 ||
+            expectedColumns == 256, "Expected columns must declare old512 or an explicit candidate side");
+    const int physical = m * requests;
+    const std::size_t inputCount = std::size_t(physical) * reduction;
+    const std::size_t weightCount = std::size_t(columns) * reduction;
+    const std::size_t outputCount = std::size_t(physical) * columns;
+    Allocation<float> input(inputCount + 2 * guard), output(outputCount + 2 * guard),
+        reference(outputCount + 2 * guard);
+    Allocation<uint16_t> weights(weightCount + 2 * guard);
+    Allocation<int32_t> publication(2 * requests);
+    Allocation<const float *> aa(1), bb(1);
+    Allocation<float *> cc(1);
+    std::vector<float> a(inputCount + 2 * guard, -93.25f), poison(outputCount + 2 * guard),
+        observed(outputCount + 2 * guard), gold(outputCount + 2 * guard),
+        sourceObserved(inputCount + 2 * guard);
+    std::vector<uint16_t> b(weightCount + 2 * guard, 0xa55a), weightObserved(b.size());
+    std::vector<int32_t> words(2 * requests), published(words.size());
+    const float *ap = input.p + guard;
+    const float *bp = reinterpret_cast<const float *>(weights.p + guard);
+    float *cp = reference.p + guard;
+    const auto finite = [](std::size_t index, uint32_t seed) {
+        uint32_t word = uint32_t(index) + seed;
+        word ^= word >> 16;
+        word *= 0x7feb352du;
+        word ^= word >> 15;
+        word *= 0x846ca68bu;
+        word ^= word >> 16;
+        const uint32_t bits = (word & 0x807fffffu) | ((123u + (word >> 24) % 7u) << 23);
+        return std::bit_cast<float>(bits);
+    };
+    for (std::size_t i = 0; i < inputCount; ++i)
+        a[guard + i] = i % 257 == 0 ? -0.0f : finite(i, 0x159a73du);
+    for (std::size_t i = 0; i < weightCount; ++i)
+    {
+        const float value = finite(i, 0x24ba8d3u);
+        if (dtype == 0)
+            b[guard + i] = __half_as_ushort(__float2half(value));
+        else
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            b[guard + i] = uint16_t(bits >> 16);
+        }
+    }
+    // Setup and each later publication are joined by the exact producer event;
+    // neither graph embeds a host copy or reads a mutable host count.
+    hipEvent_t ready = nullptr;
+    checked(hipEventCreateWithFlags(&ready, hipEventDisableTiming));
+    struct EventOwner {
+        hipEvent_t value;
+        ~EventOwner() { if (hipEventDestroy(value) != hipSuccess) std::terminate(); }
+    } readyOwner{ready};
+    Captured production, historical;
+    Retirement retirement{production, historical};
+    upload(input.p, a, production.stream);
+    upload(weights.p, b, production.stream);
+    upload(publication.p, words, production.stream);
+    checked(hipMemcpyAsync(aa.p, &ap, sizeof(ap), hipMemcpyHostToDevice, production.stream));
+    checked(hipMemcpyAsync(bb.p, &bp, sizeof(bp), hipMemcpyHostToDevice, production.stream));
+    checked(hipMemcpyAsync(cc.p, &cp, sizeof(cp), hipMemcpyHostToDevice, production.stream));
+    const auto work = llaminar2::ProjectionRowWork::causalStrided(
+        requests, m, publication.p, publication.p + 1, 2, 4096, threshold);
+    llaminar2::ProjectionRowWorkScope scope(work);
+    const auto rows = llaminar2::FloatingProjectionRows::bind(physical, nullptr, nullptr);
+    // Finish setup transfers before either cold capture begins. Later updates
+    // retain the same owners/addresses and order through this exact ready event.
+    checked(hipEventRecord(ready, production.stream));
+    checked(hipEventSynchronize(ready));
+    capture(production, [&](hipStream_t stream) {
+        require(rocmFp32x16_batched_projection(
+                    llaminar2::FixedFP32x16ProjectionGroup::single(input.p + guard, weights.p + guard,
+                                                                  output.p + guard),
+                    physical, columns, reduction, dtype, 0, stream),
+                "Public production projection bridge rejected scoped screen");
+    }, copies);
+    capture(historical, [&](hipStream_t stream) {
+        legacy_fp32x16_batched_projection_kernel<<<dim3(columns, physical), 256, 0, stream>>>(
+            aa.p, bb.p, cc.p, physical, columns, reduction, dtype, rows);
+        checked(hipGetLastError());
+    }, 1);
+    inspect(production, copies, expectedColumns, dtype, physical,
+            input.p + guard, weights.p + guard, output.p + guard, rows, work);
+    const auto publish = [&](int state, int ordinal) {
+        for (int request = 0; request < requests; ++request)
+        {
+            int frontier = threshold;
+            int live = m;
+            if (state == 1) { frontier = threshold - std::max(1, m / 2); live = m; }
+            if (state == 2) { frontier = 0; live = m; }
+            if (state == 3)
+            {
+                if (request % 3 == 1) live = 0;
+                if (request % 3 == 2) frontier = threshold - std::max(1, m / 2);
+            }
+            words[2 * request] = frontier;
+            words[2 * request + 1] = live;
+        }
+        std::fill(poison.begin(), poison.end(), -701.25f - ordinal);
+        upload(publication.p, words, production.stream);
+        upload(output.p, poison, production.stream);
+        upload(reference.p, poison, production.stream);
+        checked(hipEventRecord(ready, production.stream));
+        checked(hipStreamWaitEvent(historical.stream, ready, 0));
+        checked(hipGraphLaunch(historical.exec, historical.stream));
+        checked(hipMemcpyAsync(gold.data(), reference.p, gold.size() * sizeof(float),
+                               hipMemcpyDeviceToHost, historical.stream));
+        checked(hipStreamSynchronize(historical.stream));
+        // Gold is retained before timing, never regenerated by the observed replay.
+        require(std::memcmp(gold.data(), poison.data(), guard * sizeof(float)) == 0 &&
+                std::memcmp(gold.data() + guard + outputCount,
+                            poison.data() + guard + outputCount, guard * sizeof(float)) == 0,
+                "Historical output guard was modified");
+        for (int row = 0; row < physical; ++row)
+        {
+            const int request = row / m;
+            const auto span = work.resolveFor(request, words[2 * request + 1], words[2 * request]);
+            require(span.valid(), "Authored screen publication is invalid");
+            if (!span.contains(row))
+                require(std::memcmp(gold.data() + guard + std::size_t(row) * columns,
+                                    poison.data() + guard + std::size_t(row) * columns,
+                                    columns * sizeof(float)) == 0, "Historical inactive output was touched");
+        }
+    };
+    const auto observe = [&] {
+        // This observes the ACTUAL preceding replay, including a timed replay;
+        // it never launches/restores/re-publishes anything before reading C.
+        checked(hipMemcpyAsync(observed.data(), output.p, observed.size() * sizeof(float),
+                               hipMemcpyDeviceToHost, production.stream));
+        checked(hipMemcpyAsync(sourceObserved.data(), input.p, a.size() * sizeof(float),
+                               hipMemcpyDeviceToHost, production.stream));
+        checked(hipMemcpyAsync(weightObserved.data(), weights.p, b.size() * sizeof(uint16_t),
+                               hipMemcpyDeviceToHost, production.stream));
+        checked(hipMemcpyAsync(published.data(), publication.p, words.size() * sizeof(int32_t),
+                               hipMemcpyDeviceToHost, production.stream));
+        checked(hipStreamSynchronize(production.stream));
+        require(std::memcmp(observed.data(), gold.data(), gold.size() * sizeof(float)) == 0,
+                "Production output/guards differ from historical original arithmetic");
+        require(std::memcmp(sourceObserved.data(), a.data(), a.size() * sizeof(float)) == 0 &&
+                std::memcmp(weightObserved.data(), b.data(), b.size() * sizeof(uint16_t)) == 0 &&
+                published == words, "Projection modified retained input/weight/publication bytes");
+    };
+    for (int dirty = 0; dirty < 5; ++dirty)
+    {
+        publish(dirty % 4, dirty);
+        checked(hipGraphLaunch(production.exec, production.stream));
+        observe();
+    }
+    std::cout << "GUARD_GRID_BYTES dtype=" << dtype << " M=" << m << " requests=" << requests
+              << " physical=" << physical << " N=" << columns << " K=" << reduction
+              << " copies=" << copies << " dirty_states=5 sequence=full_partial_empty_mixed_full"
+              << " output=full guards=both source=immutable publication=original passed=1\n";
+    if (!timing)
+        return;
+    Events events;
+    publish(timedState, 10);
+    for (int warm = 0; warm < 5; ++warm)
+        (void)events.sample(production, copies);
+    observe();
+    for (int sample = 0; sample < 12; ++sample)
+    {
+        publish(timedState, 20 + sample);
+        const float microseconds = events.sample(production, copies);
+        observe();
+        require(std::isfinite(microseconds) && microseconds > 0, "Invalid native event duration");
+        std::cout << std::setprecision(10) << "GUARD_GRID_EVENT sample=" << sample << " dtype=" << dtype
+                  << " M=" << m << " requests=" << requests << " physical=" << physical
+                  << " N=" << columns << " K=" << reduction << " copies=" << copies
+                  << " state=" << timedState << " warmups=5 us=" << microseconds
+                  << " unit=us_per_complete_projection actual_timed_bytes=1 oracle_timed=0 passed=1\n";
+    }
+}
+} // namespace qfn_reduction_regression::guard_grid_screen
+
+/** @test Real causal publications preserve historical native16 bytes with immutable captures. */
+TEST(ROCmFloatingReduction, ScopedNative16QueryWorkCapturedBytes)
+{
+    using namespace qfn_reduction_regression;
+    checked(hipSetDevice(0));
+    for (int dtype : {0, 1})
+        for (const auto geometry : {std::pair{1, 1}, std::pair{16, 3}})
+            guard_grid_screen::run(dtype, geometry.first, geometry.second, 1, false, 0);
+}
+
+/** @test One loaded production core supplies all timed operations; old/new are separate processes. */
+TEST(ROCmFloatingReduction, DISABLED_ScopedNative16QueryWorkEvents)
+{
+    using namespace qfn_reduction_regression;
+    checked(hipSetDevice(0));
+    guard_grid_screen::run(
+        guard_grid_screen::setting("QFN_GUARD_GRID_DTYPE", 0),
+        guard_grid_screen::setting("QFN_GUARD_GRID_M", 1),
+        guard_grid_screen::setting("QFN_GUARD_GRID_REQUESTS", 1),
+        guard_grid_screen::setting("QFN_GUARD_GRID_COPIES", 32), true,
+        guard_grid_screen::setting("QFN_GUARD_GRID_STATE", 2));
 }

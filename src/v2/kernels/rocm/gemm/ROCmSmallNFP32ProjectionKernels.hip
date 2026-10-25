@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <type_traits>
 
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 
@@ -318,6 +319,76 @@ namespace
 
         if (threadIdx.x == 0)
             C[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = reduced;
+    }
+
+    /**
+     * @brief Reuse at most128 column CTAs for explicitly scoped FP32/native16 work.
+     * @tparam WeightDtype Original FP16 or BF16 source encoding.
+     * @param projections Immutable input/weight/output addresses, one set per batch.
+     * @param M Admitted physical rows; the device publication decides live work.
+     * @param N Independent output columns, each retaining its original dot/tree.
+     * @param K Original reduction width, with unchanged256-lane K ownership.
+     * @param row_range Typed execution-owned row/ranking demand publication.
+     *
+     * Inactive rows return uniformly before operand reads. Active CTAs visit only
+     * their own columns; no partial sum crosses a column or CTA. The reducer's
+     * final wave reads scratch without a closing CTA barrier, so every continuing
+     * CTA explicitly retires those reads before reusing the same LDS bank. The
+     * subtraction guard proves the next signed addition remains below N.
+     * Ordinary prefix/request and unscoped programs retain the original kernel.
+     */
+    template<SmallProjectionWeightDtype WeightDtype>
+    __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
+        void fp32x16_scoped_projection_columns_kernel(
+            llaminar2::FixedFP32x16ProjectionGroup projections,
+            int M,
+            int N,
+            int K,
+            llaminar2::FloatingProjectionRows row_range)
+    {
+        static_assert(WeightDtype == SMALL_PROJECTION_WEIGHT_FP16 ||
+                      WeightDtype == SMALL_PROJECTION_WEIGHT_BF16);
+        int n = static_cast<int>(blockIdx.x);
+        const int m = static_cast<int>(blockIdx.y);
+        const int batch = static_cast<int>(blockIdx.z);
+        if (!row_range.rowIsActiveUniform(m) || n >= N)
+            return;
+
+        const float *A = projections.input(batch);
+        const uint16_t *B = projections.weight(batch);
+        float *C = projections.output(batch);
+        if (!A || !B || !C)
+            return;
+
+        __shared__ float scratch[SMALL_N_FP32_BLOCK];
+        const int column_stride = static_cast<int>(gridDim.x);
+        for (;;)
+        {
+            float sum = 0.0f;
+            for (int k = static_cast<int>(threadIdx.x); k < K; k += SMALL_N_FP32_BLOCK)
+            {
+                const uint16_t weight_bits =
+                    B[static_cast<size_t>(n) * static_cast<size_t>(K) + static_cast<size_t>(k)];
+                float weight;
+                if constexpr (WeightDtype == SMALL_PROJECTION_WEIGHT_BF16)
+                    weight = bf16_bits_to_float(weight_bits);
+                else
+                    weight = fp16_bits_to_float(weight_bits);
+                const size_t activation_index =
+                    static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k);
+                const float activation = A[activation_index];
+                sum += activation * weight;
+            }
+            const float reduced = reduceFloating256(sum, scratch);
+            if (threadIdx.x == 0)
+                C[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = reduced;
+
+            if (N - n <= column_stride)
+                break;
+            // All256 lanes retire the previous column's LDS reads before overwrite.
+            __syncthreads();
+            n += column_stride;
+        }
     }
 
     /**
@@ -713,41 +784,67 @@ extern "C" bool rocmFp32x16_batched_projection(
             return false;
         }
 
-        dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
-        dim3 block(SMALL_N_FP32_BLOCK);
-        // Admission above authenticates the original native encoding once. Each
-        // retained graph records its exact specialization; live rows remain device
-        // owned and never participate in this immutable source-format selection.
-        if (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
+        if constexpr (std::is_same_v<Rows, llaminar2::FloatingProjectionRows>)
         {
-            hipLaunchKernelGGL(
-                (fp32x16_batched_projection_kernel<SMALL_PROJECTION_WEIGHT_BF16, Rows>),
-                grid,
-                block,
-                0,
-                hip_stream,
-                projections,
-                M,
-                N,
-                K,
-                rows);
-        }
-        else
-        {
-            hipLaunchKernelGGL(
-                (fp32x16_batched_projection_kernel<SMALL_PROJECTION_WEIGHT_FP16, Rows>),
-                grid,
-                block,
-                0,
-                hip_stream,
-                projections,
-                M,
-                N,
-                K,
-                rows);
+            // Only explicit ranking-demand work shares column CTAs. Its geometry
+            // is immutable capture identity; device live words never choose a grid.
+            constexpr int scoped_column_ctas = 128;
+            const unsigned columns = static_cast<unsigned>(N < scoped_column_ctas ? N : scoped_column_ctas);
+            dim3 scoped_grid(columns, static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
+            dim3 scoped_block(SMALL_N_FP32_BLOCK);
+            if (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
+            {
+                hipLaunchKernelGGL(
+                    (fp32x16_scoped_projection_columns_kernel<SMALL_PROJECTION_WEIGHT_BF16>),
+                    scoped_grid, scoped_block, 0, hip_stream, projections, M, N, K, rows);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    (fp32x16_scoped_projection_columns_kernel<SMALL_PROJECTION_WEIGHT_FP16>),
+                    scoped_grid, scoped_block, 0, hip_stream, projections, M, N, K, rows);
+            }
+            return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
         }
 
-        return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
+        else
+        {
+            dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
+            dim3 block(SMALL_N_FP32_BLOCK);
+            // Admission above authenticates the original native encoding once. Each
+            // retained graph records its exact specialization; live rows remain device
+            // owned and never participate in this immutable source-format selection.
+            if (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
+            {
+                hipLaunchKernelGGL(
+                    (fp32x16_batched_projection_kernel<SMALL_PROJECTION_WEIGHT_BF16, Rows>),
+                    grid,
+                    block,
+                    0,
+                    hip_stream,
+                    projections,
+                    M,
+                    N,
+                    K,
+                    rows);
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    (fp32x16_batched_projection_kernel<SMALL_PROJECTION_WEIGHT_FP16, Rows>),
+                    grid,
+                    block,
+                    0,
+                    hip_stream,
+                    projections,
+                    M,
+                    N,
+                    K,
+                    rows);
+            }
+
+            return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
+        }
     });
 }
 
