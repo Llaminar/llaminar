@@ -5,6 +5,8 @@
  * These architecture checks forbid hidden allocation, transfer and lifetime
  * repair paths. Named capture boundaries must share the production lowering
  * authority; device integration tests separately prove their runtime behavior.
+ * Local rollback guards require typed LocalCheckpoint purpose while preserving
+ * asynchronous event handoffs and the original source/snapshot lifetimes.
  */
 
 #include <gtest/gtest.h>
@@ -5424,8 +5426,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LiveLogicalCheckpointsUseEventBackedSou
     EXPECT_NE(compact_source_wait.find("streamWaitEvent("), std::string::npos);
     EXPECT_NE(compact_source_wait.find("clearPendingLivePrefixCheckpointReady();"), std::string::npos);
 
-    EXPECT_NE(compact_capture.find("&handle,false,stream)"), std::string::npos)
-        << "Hybrid logical checkpoints should stay async and be ordered by events, not host syncs.";
+    EXPECT_NE(compact_capture.find(
+                  "exportHybridPrefixPayload(*state_.kv_cache,seq_idx,cached_tokens,"
+                  "&handle,false,stream,HybridPrefixStatePurpose::LocalCheckpoint)"),
+              std::string::npos)
+        << "Main logical checkpoints require explicit local images and event-ordered async export.";
+    EXPECT_NE(compact_capture.find(
+                  "exportHybridPrefixPayload(*cache,seq_idx,plan.cached_tokens,"
+                  "&handle,false,stream,HybridPrefixStatePurpose::LocalCheckpoint)"),
+              std::string::npos)
+        << "Shifted logical checkpoints require the same explicit local async export contract.";
     EXPECT_EQ(compact_capture.find("payload_fallback_mtp_hybrid_state_failed"),
               std::string::npos)
         << "Shifted recurrent state is a normal logical-checkpoint payload, not a reason to replay KV through host RAM.";
@@ -5453,10 +5463,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LiveLogicalCheckpointsUseEventBackedSou
     EXPECT_EQ(compact_capture.find("captureLivePrefixState("), std::string::npos)
         << "The device checkpoint cannot fall back to host payload replay.";
     EXPECT_NE(compact_restore.find(
-                  "importHybridPrefixPayload(*cache,*shifted_hybrid_handle,"
-                  "seq_idx,false,false,stream)"),
+                  "importHybridPrefixPayload(*state_.kv_cache,*hybrid_handle,"
+                  "seq_idx,false,false,stream,HybridPrefixStatePurpose::LocalCheckpoint)"),
               std::string::npos)
-        << "Logical restore must import every shifted recurrent bank after truncation.";
+        << "Main logical restore requires explicit local images with async event handoff.";
+    EXPECT_NE(compact_restore.find(
+                  "importHybridPrefixPayload(*cache,*shifted_hybrid_handle,"
+                  "seq_idx,false,false,stream,HybridPrefixStatePurpose::LocalCheckpoint)"),
+              std::string::npos)
+        << "Logical restore must import every shifted local recurrent bank asynchronously after truncation.";
     EXPECT_TRUE(llaminar2::test::hasPrefixCheckpointRestoreSourceRetention(restore_body))
         << "The completion callback must retain main, shifted and opaque device checkpoint sources until the import stream completes.";
     EXPECT_NE(compact_capture.find("queued_async_device_checkpoint_payload"), std::string::npos);
@@ -7748,7 +7763,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecDeviceIndexedPublicationNeverFal
         publisher,
         "MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(\n"
         "        const MTPSpecStepPlan &plan,\n"
-        "        const int *device_verifier_restore_row,\n"
+        "        std::span<const int> device_verifier_restore_row,\n"
         "        const std::vector<IComputeStage *> &state_stages,",
         "MTPSpecStatePublicationResult publishAcceptedMTPSpecState(");
     const auto compact_device_publish =
@@ -7762,7 +7777,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecDeviceIndexedPublicationNeverFal
      */
     EXPECT_NE(compact_device_publish.find("!device.is_gpu()"), std::string::npos);
     EXPECT_NE(compact_device_publish.find("stream==nullptr"), std::string::npos);
-    EXPECT_NE(compact_device_publish.find("!device_verifier_restore_row"), std::string::npos);
+    EXPECT_NE(compact_device_publish.find(
+                  "!deviceVerifierStateMetadataCovers(device_verifier_restore_row,1,1)"),
+              std::string::npos);
     EXPECT_NE(compact_device_publish.find(
                   "stage->restoreVerifierStateCaptureRowFromDeviceIndex("),
               std::string::npos);
@@ -16112,7 +16129,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "ExpertTransferResult DeviceGraphOrchestrator::transferExpertWeights(");
     const auto grouped_participant = sliceBetween(
         materialization_body,
-        "ForwardInput grouped_input = input;",
+        "ForwardInput grouped_input = groupedVerifierWorkspaceInput(",
         "forward_workspace_family_grouped_verifier");
     const auto compact_grouped = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(grouped_participant));

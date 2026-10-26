@@ -15730,6 +15730,9 @@ namespace
         hybrid_layout.total_layers = 2;
         hybrid_layout.gdn_layers = 1;
         hybrid_layout.hybrid_host_state_bytes = 16;
+        // This mock owns an internal rollback image, never a durable archive record.
+        hybrid_layout.hybrid_host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        hybrid_layout.hybrid_host_state_capacity_bytes = 16;
         hybrid_layout.hybrid_state_bytes = 16;
         hybrid_layout.includes_hybrid_state = true;
 

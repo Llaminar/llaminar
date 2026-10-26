@@ -322,6 +322,36 @@ namespace llaminar2::test::parity
                 .has_value());
     }
 
+    /** A rejecting adaptive workload cannot certify an unrelated accepting edge. */
+    TEST(Test__MTPParitySnapshotContext,
+         DynamicAcceptanceUsesIndependentAuthenticatedCheckpoint)
+    {
+        constexpr std::array<int32_t, 5> reference = {13, 271, 71093, 3841, 13477};
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{0u, 13, 271},
+            MTPParityCertifiedDecodeRow{1u, 271, 71093},
+            MTPParityCertifiedDecodeRow{2u, 71093, 12305},
+            MTPParityCertifiedDecodeRow{3u, 3841, 198}};
+        constexpr std::array<MTPParityDraftPrediction, 4> drafts = {{
+            {198, 2.0f}, {760, 2.0f}, {12305, 2.0f}, {727, 2.0f}}};
+        const auto selected = selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, rows, drafts);
+        ASSERT_TRUE(selected);
+        EXPECT_EQ(selected->reference_step, 2u);
+        EXPECT_EQ(selected->base_token, 71093);
+        EXPECT_EQ(selected->first_draft_token, 12305);
+        // The checkpoint reconstructs its authenticated teacher-forced prefix,
+        // while the native row owns its condition and the accepted successor.
+        constexpr std::array<int32_t, 2> prompt = {41, 42};
+        EXPECT_EQ(mtpParityCheckpointPrompt(prompt, reference, *selected),
+                  (std::vector<int32_t>{41, 42, 13, 271}));
+        const auto adaptive = makeMTPParityAdaptiveWitnessPlan(15);
+        ASSERT_TRUE(adaptive.valid());
+        EXPECT_EQ(adaptive.warmup_tokens, 1);
+        EXPECT_NE(selected->reference_step,
+                  static_cast<size_t>(adaptive.warmup_tokens));
+    }
+
     TEST(Test__MTPParitySnapshotContext,
          TeacherForcedRowsCertifyAFreeRunningSerialTrajectoryByInduction)
     {

@@ -69,14 +69,19 @@ def require_identity(expected_soname: str, actual_soname: str, runtime: Path) ->
             f"loaded {actual_soname} from {runtime}")
 
 
-def verify_binding(binary: Path, expected_soname: str, readelf: str,
-                   environment: dict[str, str] | None = None) -> Path:
-    """Authenticate the loader's actual selection without executing inference."""
+def trace_loader(binary: Path, environment: dict[str, str] | None = None) -> str:
+    """Trace a real ELF dependency closure before main without runtime/device initialization."""
     env = dict(os.environ if environment is None else environment)
     env["LD_TRACE_LOADED_OBJECTS"] = "1"
     trace = subprocess.run([str(binary)], env=env, text=True, capture_output=True,
                            check=True, timeout=30)
-    runtime = parse_loader_runtime(trace.stdout, expected_soname)
+    return trace.stdout
+
+
+def verify_binding(binary: Path, expected_soname: str, readelf: str,
+                   environment: dict[str, str] | None = None) -> Path:
+    """Authenticate the loader's actual selection without executing inference."""
+    runtime = parse_loader_runtime(trace_loader(binary, environment), expected_soname)
     # Dereferencing the selected file is essential: an alias called libgomp
     # can contain LLVM libomp even though the dependency trace names libgomp.
     dynamic = subprocess.run([readelf, "-d", str(runtime)], text=True,

@@ -71,7 +71,7 @@ TEST_P(PipelineMTPStateOwnership, FollowerPublicationUsesCanonicalLocalOwnership
             EXPECT_EQ(params.main_kv_bindings.front().base_checkpoint_bytes, checkpoint.checkpoint.checkpoint_bytes);
             EXPECT_EQ(params.verifier_rows_per_request, rows);
             EXPECT_EQ(params.verifier_state_stages.size(), 1u);
-            EXPECT_NE(params.accepted_restore_rows_device, nullptr);
+            EXPECT_FALSE(params.accepted_restore_rows_device.empty());
             EXPECT_NE(params.target_cached_tokens_device, nullptr);
             EXPECT_NE(params.accepted_state_counts_device, nullptr);
             EXPECT_NE(params.publication_ok_flags_device, nullptr);

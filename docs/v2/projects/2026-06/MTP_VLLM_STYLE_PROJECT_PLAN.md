@@ -1,5 +1,96 @@
 # vLLM-Style MTP Project Plan
 
+## Current branch integration and backend port
+
+The October 25 CPU results below originated on the incoming GDN harness branch
+against its pinned develop control. Current `feat/qwen-flash-next` integration,
+fresh correctness/economy evidence and CUDA/ROCm work are tracked in the
+[backend port plan](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md). Historical
+passes and speedups do not certify this merged source or its experimental GPU
+leaves. The complete production integration and model qualification remain open.
+
+## 2026-10-25 follow-up: shallow CPU GDN economy and develop comparison
+
+Immutable checkpoint retention, shared query SIMD, direct accepted-state scatter
+and correct terminal-logit publication close the selected CPU failures below.
+Complete prerequisites pass 737 Unit and 625 preflight entries; all 13 selected
+original-model cells pass, including positive dynamic acceptance. All 672
+production-layout depth-2/3/4 kernel cases preserve bytes and beat serial across
+the measured ISAs, phases, geometries and physical worker counts. All 48 isolated
+counter profiles pass; this is CPU evidence, not a release or GPU certificate.
+
+Twenty-four Release model runs compare the complete feature with exact develop
+`ef1f54b09`, using the same losslessly expanded FP32-router model fixture.
+Median paired decode gains are 1.9%, 5.5% and 5.9% at depths 2, 3 and 4.
+Dynamic depth gains 38.5% while performing fewer draft steps; changed arithmetic
+and accepted work contribute to these version deltas. Prefill remains slower.
+The user canceled 16k/64k testing before a paired long-context cohort completed.
+Implementation, limits and receipts: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
+
+## 2026-10-25: CPU fixed-epoch production implementation and model timing
+
+The combined P=8 backward-query/shared-prefix candidate now runs in ordinary CPU
+decode, prefill and grouped verification. Complete checkpoint/history storage is
+owned consistently by request banks, workspace, admission and prefix snapshots;
+the new arithmetic identity invalidates old CPU prefix entries. AVX2 and AVX-512
+independent-oracle tests preserve serial/grouped output and continuation bytes.
+Complete prerequisites pass 737 Unit and 613 preflight entries. Seven dense and
+five selected IQ3S MoE model cells pass unchanged references. The dynamic-depth
+acceptance witness fails three times with zero accepted drafts, although its HF
+numeric and serial-token comparisons pass. Qualification remains red.
+
+Eighteen alternating Release runs compare the implemented candidate with the
+frozen, previously qualified one-hop binary on one 28-core CPU socket. Median
+paired prefill-plus-decode throughput changes are +8.3% for 0.8B Q4_0, −1.9% for
+4B Q8_0 and +32.8% for 35B-A3B IQ3S with stochastic dynamic MTP. Generated tokens
+are repeatable within each implementation but differ between arithmetic
+contracts. The MoE gain includes fewer draft steps and verifier tokens, so it
+cannot be attributed entirely to GDN kernel speed. Median prefill regresses on
+all three models. The grouped M=8 kernel beats serial at 28 workers but loses at
+1, 7 and 14. State storage grows 12.6% per 128×128 head. Keep the candidate
+experimental until both qualification and economy gates pass; no release is
+certified.
+
+Implementation, arithmetic contract, paired ranges, failed gates and local
+receipts: [CPU fixed-epoch production results](../2026-10/gated-deltanet-epoch-production-results.md).
+
+## 2026-10-24: CPU shared GDN readout and backward-query experiments
+
+In the isolated `feat/gdn-speculative-leaf-harness` worktree, the authorized new
+CPU readout makes serial and grouped adjusted queries byte identical while
+retaining rounded dense state advancement. This changes old serial output bytes;
+prefix-cache identity records the arithmetic revision. Complete CPU prerequisites
+pass 737 Unit and 612 preflight entries. The seven dense Qwen3.5 CPU model cells
+and six selected Qwen3.6 IQ3S MTP cells pass unchanged HF/reference gates. A native
+BF16 router repair closes a preexisting CPU MTP failure, with focused preflight
+coverage. Release stochastic dynamic MTP completes 384 tokens and proves both
+new kernel counters.
+
+Leaf projection elimination remains in the research tree harness. Complete
+two-round lifecycle timing improves 1.71x at four siblings and 2.18x at 39 against
+the previous compact algorithm, but one sibling regresses. Backward-query-only
+and combined prefix/two-update-suffix experiments pass exact algebra and accepted
+state bytes, yet fail output bytes in 44/81 and 29/81 cases. Their 2.12x and 1.90x
+gains over leaf-only on a ternary depth-three tree are inadmissible under the
+one-hop contract.
+
+A subsequent fixed-epoch contract rebases ordinary M=1 as well as grouped
+execution. Complete checkpoint/history snapshots preserve rounding boundaries
+independently of grouping and acceptance. Backward and combined implementations
+pass 837 tree/phase/geometry cases against an independent serial interpreter,
+plus repartitioning and adversarial lifecycle tests; all six research CTests pass.
+At P=8, including every checkpoint phase, combined shared-prefix/backward
+execution is 1.265x faster than qualified leaf-only on a ternary depth-three tree
+and 1.262x on a binary depth-four tree. Backward alone loses there. Stars regress
+and chains show no reliable combined gain. The full research state costs 12.6%
+more per 128-by-128 head. Keep the combination as a branching-tree candidate;
+its production state/cache integration and fresh model qualification remain open.
+Whole-model timing does not establish a speed win, and low-worker grouped-GDN
+economy diagnostics fail on both old and new cores. No release is certified.
+
+Definitions, counters, exact counterexample, baseline comparison and local
+receipts: [CPU GDN report](../2026-10/gated-deltanet-shared-readout-and-backward-query-results.md).
+
 ## 2026-10-20 QFN: CPU direct-emission checkpoint origin
 
 The real QFN CPU fixed-depth-1 parity cell now reaches generation, but its

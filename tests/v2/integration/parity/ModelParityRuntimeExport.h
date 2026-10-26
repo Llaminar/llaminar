@@ -741,6 +741,12 @@ namespace llaminar2::test::parity
      */
     inline void PrintTo(const ModelParityCase &cell, std::ostream *out)
     {
+        // Reject unknown roles and contradictory runtime eligibility before
+        // writing partial metadata. Numerical campaigns remain registered in CTest.
+        const auto *inventory_role = modelParityInventoryRoleName(cell.inventory_role);
+        if (cell.inventory_role == ModelParityInventoryRole::NumericalDiagnostic &&
+            (cell.e2e_certification || !cell.remote_cpu_overlays.empty()))
+            throw std::invalid_argument("Numerical diagnostics cannot declare runtime certification eligibility");
         // Reject incomplete direct-constructed cases before writing partial JSON.
         if (cell.paired_workload)
             cell.paired_workload->validate(cell.model.model_path,
@@ -754,6 +760,10 @@ namespace llaminar2::test::parity
              << ",\"model\":" << modelParityJsonString(cell.model.model_path)
              << (cell.model.shared_predictor ? ",\"shared_predictor\":" +
                  modelParityJsonString(cell.model.shared_predictor->path()) : std::string{});
+        // Canonical is the original schema1 default: do not change ordinary
+        // configuration bytes or their approved corpus/control identities.
+        if (cell.inventory_role != ModelParityInventoryRole::Canonical)
+            *out << ",\"inventory_role\":" << modelParityJsonString(inventory_role);
         writeModelParityPairedWorkload(cell, *out);
         *out << ",\"runtime\":{\"context_length\":" << cell.model.max_seq_len
              << ",\"generation\":{\"max_tokens\":" << cell.generation_workload.maximumTokens()

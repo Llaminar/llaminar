@@ -542,3 +542,104 @@ TEST(Q8ResidualCorrection, HCUpSubmissionRetainsActualFloatingRequestRows)
     }
     stage.unbindWorkspace();
 }
+
+namespace
+{
+/** @return Exact GDN-output family records, excluding unchanged HC observations. */
+std::vector<PerfStatRecord> gdnOutputSubmissions()
+{
+    auto records = PerfStatsCollector::snapshot({"kernel.gdn_output_projection_submissions"});
+    records.erase(std::remove_if(records.begin(), records.end(), [](const auto &record) {
+        return record.domain != "kernel" || record.name != "gdn_output_projection_submissions";
+    }), records.end());
+    return records;
+}
+/** @brief Select the existing passive family without changing any arithmetic policy. */
+void selectGDNOutputObservation()
+{
+    setenv("LLAMINAR_PERF_STATS_FILTER", "kernel", 1);
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    PerfStatsCollector::reset();
+}
+}
+
+/** @test Actual prepared residual success records physical ownership, never live rows or completion. */
+TEST(Q8ResidualCorrection, GDNOutputSubmissionCountsSuccessfulResidualAndRetainsRowBinding)
+{
+    llaminar::v2::ThreadCountGuard workers(1);
+    HCObservationSettings settings;
+    selectGDNOutputObservation();
+    CPUDeviceContext context(DeviceId::cpu(), 1);
+    Fixture source(3, 64, 64, nullptr, "blk.2.ssm_out.weight");
+    ASSERT_EQ(source.binding.identity.role, WeightRole::GDNProjection);
+    int count = 2;
+    auto stage = hcStage(source, QuantizedActivationOperandPrecision::TwoTermQ8, true, &count);
+    for (int live : {2, 0, 1})
+    {
+        count = live;
+        ASSERT_TRUE(stage->execute(&context));
+    }
+    const auto records = gdnOutputSubmissions();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].count, 3u);
+    EXPECT_EQ(records[0].device, DeviceId::cpu().toString());
+    EXPECT_EQ(records[0].phase, "submission");
+    EXPECT_EQ(records[0].tags.at("canonical_name"), "blk.2.ssm_out.weight");
+    EXPECT_EQ(records[0].tags.at("weight_role"), "GDNProjection");
+    EXPECT_EQ(records[0].tags.at("operand_precision"), "two_term_q8");
+    EXPECT_EQ(records[0].tags.at("operation"), "q8_residual_corrected");
+    EXPECT_EQ(records[0].tags.at("observation"), "host_execute_or_capture");
+    EXPECT_EQ(records[0].tags.at("row_binding"), "counted_prefix");
+    EXPECT_EQ(records[0].tags.at("physical_rows"), "3");
+    EXPECT_FALSE(records[0].tags.contains("live_rows"));
+    EXPECT_TRUE(hcSubmissions().empty());
+    PerfStatsCollector::reset();
+    setenv("LLAMINAR_PERF_STATS_FILTER", "forward_graph", 1);
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    ASSERT_TRUE(stage->execute(&context));
+    EXPECT_TRUE(gdnOutputSubmissions().empty());
+}
+
+/** @test Failed calls, ordinary policy and foreign sources cannot mint residual success. */
+TEST(Q8ResidualCorrection, GDNOutputSubmissionRejectsFailureAndPreservesHCMeaning)
+{
+    llaminar::v2::ThreadCountGuard workers(1);
+    HCObservationSettings settings;
+    selectGDNOutputObservation();
+    CPUDeviceContext context(DeviceId::cpu(), 1);
+    Fixture source(1, 64, 64, nullptr, "blk.2.ssm_out.weight");
+    auto stage = hcStage(source, QuantizedActivationOperandPrecision::TwoTermQ8);
+    EXPECT_FALSE(stage->execute(nullptr));
+    EXPECT_TRUE(gdnOutputSubmissions().empty());
+    source.input.mutable_data()[0] = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_THROW(stage->execute(&context), std::invalid_argument);
+    EXPECT_TRUE(gdnOutputSubmissions().empty());
+    source.input.mutable_data()[0] = .25f;
+    auto single = hcStage(source, QuantizedActivationOperandPrecision::SingleQ8);
+    ASSERT_TRUE(single->execute(&context));
+    EXPECT_TRUE(gdnOutputSubmissions().empty());
+    Fixture hc(1, 64, 64, nullptr, "blk.2.hc_ffn_up.weight");
+    ASSERT_TRUE(hcStage(hc, QuantizedActivationOperandPrecision::TwoTermQ8)->execute(&context));
+    EXPECT_TRUE(gdnOutputSubmissions().empty());
+    ASSERT_EQ(hcSubmissions().size(), 1u);
+    EXPECT_EQ(hcSubmissions()[0].count, 1u);
+}
+
+/** @test Existing CPU worksharing reports one successful submission, not one per worker. */
+TEST(Q8ResidualCorrection, GDNOutputSubmissionCPUWorkshareHasOneObserver)
+{
+    llaminar::v2::ThreadCountGuard workers(3);
+    HCObservationSettings settings;
+    selectGDNOutputObservation();
+    CPUDeviceContext context(DeviceId::cpu(), 3);
+    Fixture source(3, 64, 64, nullptr, "blk.2.ssm_out.weight");
+    auto stage = hcStage(source, QuantizedActivationOperandPrecision::TwoTermQ8);
+    ASSERT_TRUE(stage->execute(&context));
+    PerfStatsCollector::reset();
+    std::array<int, 3> success{};
+#pragma omp parallel num_threads(3)
+    {success[omp_get_thread_num()] = stage->execute(&context) ? 1 : 0;}
+    for (int value : success) ASSERT_EQ(value, 1);
+    ASSERT_EQ(gdnOutputSubmissions().size(), 1u);
+    EXPECT_EQ(gdnOutputSubmissions()[0].count, 1u);
+}

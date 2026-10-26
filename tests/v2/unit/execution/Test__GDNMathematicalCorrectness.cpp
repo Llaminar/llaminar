@@ -19,6 +19,7 @@
  * the optimized kernel code paths (AVX512, OpenMP, etc.).
  */
 
+#include "../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 #include "../../utils/GDNAdditiveEpsilonFixture.h"
 #include <algorithm>
@@ -338,6 +339,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_Single
     auto dt_bias = makeFP32({1}, &dt_bias_val);
     auto output = makeFP32({1, static_cast<size_t>(d_v)});
     std::vector<float> kernel_state(d_k * d_v, 0.0f);
+    kernel_state = encodeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
     auto ctx = makeCPUContext();
     GDNRecurrenceStage::Params p;
@@ -359,6 +361,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_Single
 
     GDNRecurrenceStage stage(p);
     ASSERT_TRUE(stage.execute(ctx.get()));
+        const auto observed_state = materializeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
     // Compare output element-by-element
     const float *out = output->data();
@@ -372,8 +375,8 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_Single
     // Compare state element-by-element
     for (int i = 0; i < d_k * d_v; ++i)
     {
-        EXPECT_NEAR(kernel_state[i], ref.state[i], 1e-5f)
-            << "State[" << i << "] mismatch: kernel=" << kernel_state[i]
+        EXPECT_NEAR(observed_state[i], ref.state[i], 1e-5f)
+            << "State[" << i << "] mismatch: kernel=" << observed_state[i]
             << " ref=" << ref.state[i];
     }
 }
@@ -426,6 +429,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_MultiH
     auto dt_bias_t = makeFP32({static_cast<size_t>(n_heads)}, dt_bias_data.data());
     auto output = makeFP32({1, static_cast<size_t>(n_heads * d_v)});
     std::vector<float> kernel_state(n_heads * d_k * d_v, 0.0f);
+    kernel_state = encodeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
     auto ctx = makeCPUContext();
     GDNRecurrenceStage::Params p;
@@ -447,6 +451,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_MultiH
 
     GDNRecurrenceStage stage(p);
     ASSERT_TRUE(stage.execute(ctx.get()));
+        const auto observed_state = materializeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
     const float *out = output->data();
     for (int i = 0; i < n_heads * d_v; ++i)
@@ -456,7 +461,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_MultiH
     }
     for (int i = 0; i < n_heads * d_k * d_v; ++i)
     {
-        EXPECT_NEAR(kernel_state[i], ref_state[i], 1e-5f)
+        EXPECT_NEAR(observed_state[i], ref_state[i], 1e-5f)
             << "State[" << i << "]";
     }
 }
@@ -490,7 +495,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_WithL2
     std::uniform_real_distribution<float> state_dist(-0.1f, 0.1f);
     for (auto &x : ref_state)
         x = state_dist(rng);
-    std::vector<float> kernel_state = ref_state;
+    auto kernel_state = encodeCPUGDNTestState(ref_state,1,d_k,d_v);
 
     auto ref = ref_recurrent_step(
         q_data.data(), k_data.data(), v_data.data(),
@@ -526,6 +531,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_WithL2
 
     GDNRecurrenceStage stage(p);
     ASSERT_TRUE(stage.execute(ctx.get()));
+        const auto observed_state = materializeCPUGDNTestState(kernel_state,1,d_k,d_v);
 
     const float *out = output->data();
     for (int i = 0; i < d_v; ++i)
@@ -535,7 +541,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Decode_MatchesReference_WithL2
     }
     for (int i = 0; i < d_k * d_v; ++i)
     {
-        EXPECT_NEAR(kernel_state[i], ref.state[i], 1e-5f)
+        EXPECT_NEAR(observed_state[i], ref.state[i], 1e-5f)
             << "State[" << i << "] with L2 norm";
     }
 }
@@ -632,6 +638,7 @@ TEST(Test__GDNMathematicalCorrectness, GateComputation_KnownValues)
         p.A_log = A_log_t.get();
         p.dt_bias = dt_bias_t.get();
         p.output = output.get();
+        state = encodeCPUGDNTestState(state,1,d_k,d_v);
         p.recurrence_state = state.data();
         p.seq_len = 1;
         p.n_heads = 1;
@@ -641,6 +648,7 @@ TEST(Test__GDNMathematicalCorrectness, GateComputation_KnownValues)
 
         GDNRecurrenceStage stage(p);
         ASSERT_TRUE(stage.execute(ctx.get()));
+        const auto observed_state = materializeCPUGDNTestState(state,1,d_k,d_v);
 
         // Compute expected via reference
         std::vector<float> ref_state = {1.0f, 0.0f, 0.0f, 1.0f};
@@ -650,7 +658,7 @@ TEST(Test__GDNMathematicalCorrectness, GateComputation_KnownValues)
             ref_state.data(), d_k, d_v, false);
 
         for (int i = 0; i < d_k * d_v; ++i)
-            EXPECT_NEAR(state[i], ref_state[i], 1e-5f) << "State[" << i << "]";
+            EXPECT_NEAR(observed_state[i], ref_state[i], 1e-5f) << "State[" << i << "]";
 
         const float *out = output->data();
         for (int i = 0; i < d_v; ++i)
@@ -717,6 +725,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_MultiStepDecode_20Steps)
 
     // State trackers
     std::vector<float> kernel_state(n_heads * d_k * d_v, 0.0f);
+    kernel_state = encodeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
     std::vector<float> ref_state(n_heads * d_k * d_v, 0.0f);
 
     auto A_log = makeFP32({static_cast<size_t>(n_heads)}, A_log_data.data());
@@ -782,6 +791,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_MultiStepDecode_20Steps)
 
         GDNRecurrenceStage stage(p);
         ASSERT_TRUE(stage.execute(ctx.get())) << "Step " << step << " failed";
+        const auto observed_state = materializeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
         // Compare output
         const float *out = output->data();
@@ -795,7 +805,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_MultiStepDecode_20Steps)
         // Compare state
         for (int i = 0; i < n_heads * d_k * d_v; ++i)
         {
-            EXPECT_NEAR(kernel_state[i], ref_state[i], 1e-4f)
+            EXPECT_NEAR(observed_state[i], ref_state[i], 1e-4f)
                 << "Step " << step << " state[" << i << "]";
         }
     }
@@ -816,6 +826,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_MultiStepDecode_WithL2Norm)
     const float dt_bias_val = 0.1f;
 
     std::vector<float> kernel_state(d_k * d_v, 0.0f);
+    kernel_state = encodeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
     std::vector<float> ref_state(d_k * d_v, 0.0f);
 
     auto A_log = makeFP32({1}, &A_log_val);
@@ -867,6 +878,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_MultiStepDecode_WithL2Norm)
 
         GDNRecurrenceStage stage(p);
         ASSERT_TRUE(stage.execute(ctx.get())) << "Step " << step;
+        const auto observed_state = materializeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
         const float *out = output->data();
         for (int i = 0; i < d_v; ++i)
@@ -1328,6 +1340,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_OddDimensions_ScalarTail)
     for (auto &x : kernel_state)
         x = state_dist(rng);
     std::vector<float> ref_state = kernel_state;
+    kernel_state = encodeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
     // Reference
     std::vector<float> ref_output(n_heads * d_v);
@@ -1371,6 +1384,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_OddDimensions_ScalarTail)
 
     GDNRecurrenceStage stage(p);
     ASSERT_TRUE(stage.execute(ctx.get()));
+        const auto observed_state = materializeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
     const float *out = output->data();
     for (int i = 0; i < n_heads * d_v; ++i)
@@ -1380,7 +1394,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_OddDimensions_ScalarTail)
     }
     for (int i = 0; i < n_heads * d_k * d_v; ++i)
     {
-        EXPECT_NEAR(kernel_state[i], ref_state[i], 1e-5f) << "State[" << i << "]";
+        EXPECT_NEAR(observed_state[i], ref_state[i], 1e-5f) << "State[" << i << "]";
     }
 }
 
@@ -1438,6 +1452,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_OddDimensions_Prefill)
     auto dt_bias_t = makeFP32({1}, &dt_bias_val);
     auto output = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_v)});
     std::vector<float> kernel_state(d_k * d_v, 0.0f);
+    kernel_state = encodeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
     auto ctx = makeCPUContext();
     GDNRecurrenceStage::Params p;
@@ -1459,6 +1474,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_OddDimensions_Prefill)
 
     GDNRecurrenceStage stage(p);
     ASSERT_TRUE(stage.execute(ctx.get()));
+        const auto observed_state = materializeCPUGDNTestState(kernel_state,n_heads,d_k,d_v);
 
     const float *out = output->data();
     for (int i = 0; i < seq_len * d_v; ++i)
@@ -1559,6 +1575,7 @@ TEST(Test__GDNMathematicalCorrectness, Softplus_TransitionPoint)
         p.A_log = A_log.get();
         p.dt_bias = dt_bias_t.get();
         p.output = output.get();
+        state = encodeCPUGDNTestState(state,1,d_k,d_v);
         p.recurrence_state = state.data();
         p.seq_len = 1;
         p.n_heads = 1;
@@ -1568,11 +1585,12 @@ TEST(Test__GDNMathematicalCorrectness, Softplus_TransitionPoint)
 
         GDNRecurrenceStage stage(p);
         ASSERT_TRUE(stage.execute(ctx.get())) << tc.desc;
+        const auto observed_state = materializeCPUGDNTestState(state,1,d_k,d_v);
 
         // State should match reference
         for (int i = 0; i < d_k * d_v; ++i)
         {
-            EXPECT_NEAR(state[i], ref_state[i], 1e-5f)
+            EXPECT_NEAR(observed_state[i], ref_state[i], 1e-5f)
                 << tc.desc << " state[" << i << "]";
         }
 
@@ -1620,7 +1638,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_NonZeroInitialState)
         x = state_dist(rng);
 
     std::vector<float> ref_state = initial_state;
-    std::vector<float> kernel_state = initial_state;
+    auto kernel_state = encodeCPUGDNTestState(initial_state,1,d_k,d_v);
 
     auto ref = ref_recurrent_step(
         q_data.data(), k_data.data(), v_data.data(),
@@ -1656,6 +1674,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_NonZeroInitialState)
 
     GDNRecurrenceStage stage(p);
     ASSERT_TRUE(stage.execute(ctx.get()));
+        const auto observed_state = materializeCPUGDNTestState(kernel_state,1,d_k,d_v);
 
     const float *out = output->data();
     for (int i = 0; i < d_v; ++i)
@@ -1664,7 +1683,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_NonZeroInitialState)
     }
     for (int i = 0; i < d_k * d_v; ++i)
     {
-        EXPECT_NEAR(kernel_state[i], ref_state[i], 1e-5f) << "State[" << i << "]";
+        EXPECT_NEAR(observed_state[i], ref_state[i], 1e-5f) << "State[" << i << "]";
     }
 }
 
@@ -1707,9 +1726,10 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_Qwen35ChunkContinuationMatches
         dt_bias[h] = gate_dist(rng);
     }
 
-    std::vector<float> initial_state(n_heads * d_k * d_v);
+    std::vector<float> initial_state(CPUGDNStateLayout(n_heads,d_k,d_v).floats());
     for (auto &x : initial_state)
         x = state_dist(rng);
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
 
     CPUGatedDeltaNet recurrent_kernel;
     std::vector<float> recurrent_state = initial_state;
@@ -1906,7 +1926,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
     const int n_heads = 2;
     const int d_k = 16;
     const int d_v = 128;
-    const int state_floats = n_heads * d_k * d_v;
+    const int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
     const int accepted_rows = 2;
 
     std::mt19937 rng(88888);
@@ -1935,6 +1955,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
         x = gate_dist(rng);
     for (auto &x : initial_state)
         x = state_dist(rng);
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     for (int h = 0; h < n_heads; ++h)
     {
         A_log[h] = -std::exp(gate_dist(rng));
@@ -1945,7 +1966,8 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
     std::vector<float> chunk_state = initial_state;
     std::vector<float> chunk_output(seq_len * n_heads * d_v);
     std::vector<float> snapshots(static_cast<size_t>(seq_len) * state_floats);
-    ASSERT_TRUE(chunk_kernel.chunkForwardWithStateSnapshots(
+    CPUGDNCompactTestCapture compact_capture(chunk_kernel, n_heads, d_k, d_v, seq_len);
+    ASSERT_TRUE(chunk_kernel.chunk_forward(
         q_data.data(),
         k_data.data(),
         v_data.data(),
@@ -1960,10 +1982,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
         d_k,
         d_v,
         /*chunk_size=*/64,
-        /*use_qk_l2norm=*/true,
-        snapshots.data(),
-        state_floats,
-        seq_len));
+        /*use_qk_l2norm=*/true));
 
     CPUGatedDeltaNet recurrent_kernel;
     std::vector<float> recurrent_state = initial_state;
@@ -1987,21 +2006,19 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
 
         const float *chunk_row = chunk_output.data() + static_cast<size_t>(t) * n_heads * d_v;
         std::vector<float> row_output(chunk_row, chunk_row + n_heads * d_v);
-        EXPECT_LT(maxAbsDiff(row_output, step_output), 2e-4f) << "output row " << t;
+        expectByteExactFP32(row_output.data(), step_output.data(), row_output.size(), "compact recurrence output");
 
+        ASSERT_TRUE(chunk_kernel.restoreVerifierStateCaptureRow(
+            snapshots.data() + static_cast<size_t>(t) * state_floats, t, nullptr));
         const float *snapshot = snapshots.data() + static_cast<size_t>(t) * state_floats;
         std::vector<float> row_state(snapshot, snapshot + state_floats);
-        EXPECT_LT(maxAbsDiff(row_state, recurrent_state), 2e-4f) << "snapshot row " << t;
+        expectByteExactFP32(row_state.data(), recurrent_state.data(), row_state.size(), "compact recurrence candidate");
     }
-    EXPECT_LT(maxAbsDiff(chunk_state, recurrent_state), 2e-4f);
+    expectByteExactFP32(chunk_state.data(), initial_state.data(), initial_state.size(), "compact capture preserves live state");
 
     std::vector<float> restored_state(state_floats);
-    ASSERT_TRUE(chunk_kernel.restoreStateFromSnapshot(
-        restored_state.data(),
-        snapshots.data(),
-        accepted_rows - 1,
-        state_floats,
-        state_floats));
+    ASSERT_TRUE(chunk_kernel.restoreVerifierStateCaptureRow(
+        restored_state.data(), accepted_rows - 1, nullptr));
 
     std::vector<float> accepted_replay_state = initial_state;
     for (int t = 0; t < accepted_rows; ++t)
@@ -2021,7 +2038,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotsRestoreAcceptedV
             d_v,
             /*use_qk_l2norm=*/true));
     }
-    EXPECT_LT(maxAbsDiff(restored_state, accepted_replay_state), 2e-4f);
+    expectByteExactFP32(restored_state.data(), accepted_replay_state.data(), restored_state.size(), "compact accepted state");
 }
 
 TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesLikeReplay)
@@ -2034,7 +2051,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesL
     const int d_v = 128;
     const int qk_stride = n_heads * d_k;
     const int v_stride = n_heads * d_v;
-    const int state_floats = n_heads * d_k * d_v;
+    const int state_floats = CPUGDNStateLayout(n_heads,d_k,d_v).floats();
 
     std::mt19937 rng(88889);
     std::normal_distribution<float> activation_dist(0.0f, 0.08f);
@@ -2062,6 +2079,7 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesL
         x = gate_dist(rng);
     for (auto &x : initial_state)
         x = state_dist(rng);
+    clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
     for (int h = 0; h < n_heads; ++h)
     {
         A_log[h] = -std::exp(gate_dist(rng));
@@ -2072,7 +2090,8 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesL
     std::vector<float> verifier_state = initial_state;
     std::vector<float> verifier_output(seq_len * v_stride);
     std::vector<float> snapshots(static_cast<size_t>(seq_len) * state_floats);
-    ASSERT_TRUE(verifier_kernel.chunkForwardWithStateSnapshots(
+    CPUGDNCompactTestCapture compact_capture(verifier_kernel, n_heads, d_k, d_v, seq_len);
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
         q_data.data(),
         k_data.data(),
         v_data.data(),
@@ -2087,18 +2106,11 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesL
         d_k,
         d_v,
         /*chunk_size=*/64,
-        /*use_qk_l2norm=*/true,
-        snapshots.data(),
-        state_floats,
-        seq_len));
+        /*use_qk_l2norm=*/true));
 
     std::vector<float> restored_state(state_floats);
-    ASSERT_TRUE(verifier_kernel.restoreStateFromSnapshot(
-        restored_state.data(),
-        snapshots.data(),
-        accepted_rows - 1,
-        state_floats,
-        state_floats));
+    ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+        restored_state.data(), accepted_rows - 1, nullptr));
 
     CPUGatedDeltaNet restored_kernel;
     std::vector<float> restored_continuation(continuation_rows * v_stride);
@@ -2140,13 +2152,19 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_StateSnapshotRestoreContinuesL
             d_k,
             d_v,
             /*use_qk_l2norm=*/true));
+        ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+            snapshots.data() + static_cast<size_t>(row) * state_floats, row, nullptr));
+        expectByteExactFP32(snapshots.data() + static_cast<size_t>(row) * state_floats,
+            replay_state.data(), state_floats, "compact recurrence candidate continuation oracle");
     }
+    expectByteExactFP32(verifier_output.data(), replay_output.data(), replay_output.size(), "compact verifier outputs");
+    expectByteExactFP32(verifier_state.data(), initial_state.data(), initial_state.size(), "compact verifier preserves live state");
 
     const std::vector<float> replay_continuation(
         replay_output.begin() + static_cast<size_t>(accepted_rows) * v_stride,
         replay_output.end());
-    EXPECT_LT(maxAbsDiff(restored_continuation, replay_continuation), 2e-4f);
-    EXPECT_LT(maxAbsDiff(restored_state, replay_state), 2e-4f);
+    expectByteExactFP32(restored_continuation.data(), replay_continuation.data(), replay_continuation.size(), "compact accepted continuation output");
+    expectByteExactFP32(restored_state.data(), replay_state.data(), replay_state.size(), "compact accepted continuation state");
 }
 
 TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsRestoreAcceptedVerifierRows)
@@ -2674,7 +2692,8 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_AdditiveEpsilonNearZero)
             SCOPED_TRACE("dk=" + std::to_string(dk) + " rows=" + std::to_string(rows));
             llaminar2::test::GDNAdditiveEpsilonFixture f(rows, dk);
             CPUGatedDeltaNet chunk, serial;
-            auto chunk_state = f.zero_state, serial_state = f.zero_state;
+            auto chunk_state = encodeCPUGDNTestState(f.zero_state,f.heads,dk,f.dv);
+            auto serial_state = chunk_state;
             std::vector<float> chunk_output(rows * f.heads * f.dv), serial_output(chunk_output.size());
             ASSERT_TRUE(chunk.chunk_forward(f.q.data(), f.k.data(), f.v.data(),
                 f.alpha.data(), f.beta.data(), f.a_log.data(), f.dt_bias.data(),
@@ -2687,8 +2706,8 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_AdditiveEpsilonNearZero)
                     f.a_log.data(), f.dt_bias.data(), serial_output.data() + row * f.heads * f.dv,
                     serial_state.data(), f.heads, dk, f.dv, true));
             }
-            f.expect(chunk_output, chunk_state);
-            f.expect(serial_output, serial_state);
+            f.expect(chunk_output, materializeCPUGDNTestState(chunk_state,f.heads,dk,f.dv));
+            f.expect(serial_output, materializeCPUGDNTestState(serial_state,f.heads,dk,f.dv));
         }
     }
 }

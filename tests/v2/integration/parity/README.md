@@ -69,7 +69,14 @@ canonical cell, not only E2E tags. `scripts/ci/model_parity_inventory.py` owns
 the shared CTest/GoogleTest discovery join. Its default `all` scope includes
 untagged cells; `--scope e2e` projects only the tagged subset. Saved manifests
 declare that scope, and an E2E-only manifest cannot certify full-matrix
-coverage. Listing/exporting metadata does not load weights or run inference:
+coverage. Definitions explicitly marked with
+`ModelParityInventoryRole::NumericalDiagnostic` remain registered for numerical
+campaigns but do not enter generation-control, HTTP or benchmark inventories.
+Discovery still verifies their complete raw CTest/GoogleTest membership before
+applying that role. Unknown roles and conflicting canonical control identities
+are errors; filtering must never select an arbitrary duplicate. Ordinary
+canonical exports retain their existing configuration and corpus identities.
+Listing/exporting metadata does not load weights or run inference:
 
 ```bash
 python3 scripts/ci/model_parity_inventory.py \

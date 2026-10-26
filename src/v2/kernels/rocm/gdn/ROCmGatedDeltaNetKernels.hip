@@ -5,6 +5,12 @@
  * ROCm/HIP port of the CUDA GDN kernels. Implements:
  * - Delta rule recurrence (decode + prefill), with Q/K epsilon inside squared norm
  * - Short causal conv1d + SiLU
+ * Exact compact retention is an explicit sink over the same dense arithmetic;
+ * its erased legacy policy preserves ordinary and prepared production paths.
+ *
+ * ValueMajor retained checkpoints reuse the original aligned float4 endpoint;
+ * arithmetic and scalar KeyMajor/Dense input/terminal handling remain unchanged.
+ *
  * - Gated RMSNorm
  * - Attention output gate (sigmoid)
  *
@@ -38,6 +44,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNDenseCompactSnapshots.h"
 #include "kernels/gdn/GDNPreparedQK.h"
 #include "kernels/gdn/GDNPlanarRecurrence.h"
 
@@ -164,16 +171,131 @@ __device__ __forceinline__ int gdnRecurrenceStateOffset(int key,int value,int dk
     else return value*dk+key;
 }
 
+/** @brief Compile-time erased sink for every unchanged production dense program. */
+struct ROCmGDNNoCompactCapture final
+{
+    static constexpr bool enabled = false; ///< No retention code in legacy specializations.
+    static constexpr bool materialize_terminal = true; ///< Legacy terminal/snapshot stores stay unchanged.
+};
+
+/** @brief Borrowed exact-correction sink, never a phase or allocation authority.
+ * @tparam MaterializeTerminal True for DenseDestination; false erases every terminal endpoint.
+ * @details Distinct columns/key partitions write exclusive matrix words. Header
+ * publication is ordered by whole-kernel completion, never a grid semaphore.
+ */
+template<bool MaterializeTerminal>
+struct ROCmGDNDenseCompactCapture final
+{
+    static constexpr bool enabled = true; ///< Explicit transaction retention only.
+    static constexpr bool materialize_terminal = MaterializeTerminal; ///< Erases absent terminal addressing and stores.
+    llaminar2::gdn::GDNDenseCompactTransaction transaction; ///< Immutable capture identity.
+    unsigned observed_rows = 0; ///< Register-local observation of executed prefix rows.
+    unsigned planned_rows = 0; ///< Device count captured before this request writes any state.
+
+    /** @return Exact compact head owner for the current request/head CTA. */
+    __device__ float *head() const
+    {
+        return transaction.storage + std::size_t(blockIdx.x) * transaction.geometry.headStrideFloats();
+    }
+
+    /** @brief Retain one actual resident matrix word, including explicit LDS tail.
+     * @tparam DK Native key width64/128.
+     * @tparam Axes Exact admitted matrix axes.
+     * @param checkpoint Relative checkpoint index, including cp0.
+     * @param key,value Logical key/value coordinate owned by this thread.
+     * @param dv Admitted value width.
+     * @param state Actual original resident state word, without new arithmetic. */
+    template<int DK, llaminar2::GDNRecurrenceStateLayout Axes>
+    __device__ void checkpoint(unsigned checkpoint, int key, int value, int dv, float state) const
+    {
+        head()[transaction.geometry.checkpointOffsetFloats() +
+            std::size_t(checkpoint) * transaction.geometry.checkpointStrideFloats() +
+            gdnRecurrenceStateOffset<Axes>(key, value, DK, dv)] = state;
+    }
+
+    /** @brief Store one ValueMajor quarter using the existing aligned float4 endpoint.
+     * @tparam DK Native key width64/128.
+     * @tparam RegisterRows Exact existing resident array extent16/22; never enlarged.
+     * @param checkpoint Already selected immutable retained matrix slot.
+     * @param state Existing post-update register words, borrowed without recomputation.
+     * @param tail Existing lane-owned LDS tail; only DK128 reads its10 words.
+     * @param first_key Original increasing-key quarter origin.
+     * @param value Exclusive value column.
+     * @param tid Original CTA lane owning each strided LDS tail word.
+     * @details Compact storage, header and checkpoint/head strides are64B aligned.
+     * DK64/128 and quarter offsets are multiples of4 floats, so this destination
+     * is16B aligned even when the separate Dense input/terminal is only float aligned.
+     * Definition follows the original vector/scalar endpoint helper; no duplicate primitive.
+     */
+    template<int DK, int RegisterRows>
+    __device__ __forceinline__ void checkpointPartition(unsigned checkpoint,
+        const float (&state)[RegisterRows], const float *tail, int first_key, int value, int tid) const;
+
+    /** @brief Retain actual normalized K and rounded decay once per head/row.
+     * @tparam DK Native64/128 key width.
+     * @param row Executed request-local row, not a host-derived live count.
+     * @param key Original normalized shared K plane.
+     * @param decay Actual original FP32 gate value. */
+    template<int DK>
+    __device__ void record(unsigned row, const float *key, float decay)
+    {
+        observed_rows = row + 1;
+        if (!transaction.geometry.retainRecordForRow(planned_rows, row) || blockIdx.y != 0) return;
+        float *record = head() + transaction.geometry.recordsOffsetFloats() +
+            std::size_t(row) * transaction.geometry.recordStrideFloats();
+        for (int key_index = threadIdx.x; key_index < DK; key_index += blockDim.x)
+            record[key_index] = key[key_index];
+        if (threadIdx.x == 0) record[transaction.geometry.recordDecayOffsetFloats()] = decay;
+    }
+
+    /** @brief Retain the actual delta; split0 alone owns each value column.
+     * @param row Executed request-local row.
+     * @param value Exclusive value column.
+     * @param delta Actual dense forward correction, never raw V/beta. */
+    __device__ void correction(unsigned row, int value, float delta) const
+    {
+        if (!transaction.geometry.retainRecordForRow(planned_rows, row)) return;
+        head()[transaction.geometry.recordsOffsetFloats() +
+            std::size_t(row) * transaction.geometry.recordStrideFloats() +
+            transaction.geometry.recordCorrectionOffsetFloats() + value] = delta;
+    }
+
+    /** @brief Publish full-width identity after local work; kernel completion orders all heads. */
+    __device__ void finish() const
+    {
+        if (blockIdx.y != 0 || threadIdx.x != 0) return;
+        using G = llaminar2::gdn::GDNDenseCompactGeometry;
+        float *words = head();
+        words[G::format_word] = __uint_as_float(std::uint32_t(transaction.encoding));
+        words[G::published_rows_word] = __uint_as_float(observed_rows);
+        words[G::planned_rows_word] = __uint_as_float(planned_rows);
+        words[G::generation_low_word] = __uint_as_float(std::uint32_t(transaction.generation));
+        words[G::generation_high_word] = __uint_as_float(std::uint32_t(transaction.generation >> 32));
+        words[G::layout_word] = __uint_as_float(std::uint32_t(transaction.layout));
+        words[G::arithmetic_word] = __uint_as_float(std::uint32_t(transaction.arithmetic));
+        if (transaction.encoding == llaminar2::gdn::GDNDenseCompactEncoding::SplitRetentionV1)
+        {
+            llaminar2::gdn::GDNDenseRetentionMode mode{};
+            if (!transaction.geometry.retentionForLiveRows(planned_rows, mode)) __builtin_trap();
+            const auto policy = transaction.geometry.retentionProgram();
+            words[G::retention_mode_word] = __uint_as_float(std::uint32_t(mode));
+            words[G::retention_program_word] = __uint_as_float(std::uint32_t(policy.mode));
+            words[G::compact_min_live_rows_word] = __uint_as_float(policy.compact_min_live_rows);
+        }
+    }
+};
+
 /**
  * @brief One original raw recurrence body over explicit planar or merged coordinates.
  * @tparam D_K Original64/128 key width.
  * @tparam Layout Explicit physical planar or merged input coordinates.
  * @tparam StateLayout Canonical immutable physical format; only addresses differ.
+ * @tparam CompactCapture Erased legacy or explicit retained sink; terminal presence is compile-time.
  * @param q,k,v Original planar inputs, or merged QKV in q for explicit merged layout.
  * @param alpha,beta_raw Original projected gates without preparation or changed rounding.
  * @param A_log,dt_bias Original local-head gate parameters.
  * @param output Original physical row-major output plane.
- * @param initial_state,updated_state Borrowed initial and exclusive terminal state banks.
+ * @param initial_state,updated_state Borrowed initial and Dense terminal banks; updated is absent only in an explicit terminal-false sink.
  * @param request_count,request_seq_len Original request-major physical row geometry.
  * @param n_heads,d_v Original local head and value width dimensions.
  * @param use_qk_l2norm Original raw normalization policy.
@@ -184,12 +306,14 @@ __device__ __forceinline__ int gdnRecurrenceStateOffset(int key,int value,int dk
  * @param max_snapshot_rows Admitted physical snapshot row capacity.
  * @param merged_key_heads Merged source head count; unused for planar layout.
  * @param global_value_offset Signed modular head coordinate; unused for planar layout.
+ * @param compact_capture Explicit retention sink; erased for every legacy caller.
  * @details Both physical layouts retain literal original raw gate/normalization,
  * state arithmetic and snapshot/publication ordering.
  */
 template <int D_K,
           GDNRecurrentInputLayout Layout = GDNRecurrentInputLayout::ExpandedPlanar,
-          llaminar2::GDNRecurrenceStateLayout StateLayout = llaminar2::GDNRecurrenceStateLayout::KeyMajorValueContiguous>
+          llaminar2::GDNRecurrenceStateLayout StateLayout = llaminar2::GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+          class CompactCapture = ROCmGDNNoCompactCapture>
 __device__ __forceinline__
 void rocm_gdn_recurrent_step_body(
     const float *__restrict__ q,
@@ -210,7 +334,8 @@ void rocm_gdn_recurrent_step_body(
     float *__restrict__ state_snapshots,
     int snapshot_stride_floats,
     int max_snapshot_rows,
-    int merged_key_heads = 0, int global_value_offset = 0)
+    int merged_key_heads = 0, int global_value_offset = 0,
+    CompactCapture compact_capture = {})
 {
     const int request_head = blockIdx.x;
     const int request = request_head / n_heads;
@@ -245,9 +370,12 @@ void rocm_gdn_recurrent_step_body(
     const float *S_initial =
         initial_state + static_cast<size_t>(request) * request_state_stride +
         static_cast<size_t>(h) * D_K * d_v;
-    float *S_updated =
-        updated_state + static_cast<size_t>(request) * request_state_stride +
-        static_cast<size_t>(h) * D_K * d_v;
+    float *S_updated = nullptr;
+    if constexpr (CompactCapture::materialize_terminal)
+    {
+        S_updated = updated_state + static_cast<size_t>(request) * request_state_stride +
+            static_cast<size_t>(h) * D_K * d_v;
+    }
 
     extern __shared__ float smem[];
     float *q_local = smem;
@@ -305,6 +433,26 @@ void rocm_gdn_recurrent_step_body(
         }
     }
     __syncthreads();
+
+    if constexpr (CompactCapture::enabled)
+    {
+        if (vi < d_v)
+        {
+            if constexpr (StateLayout == llaminar2::GDNRecurrenceStateLayout::ValueMajorKeyContiguous)
+                compact_capture.template checkpointPartition<D_K>(0, state_rows, state_tail, row_begin, vi, tid);
+            else
+            {
+#pragma unroll
+            for (int row = 0; row < kRegisterRowsPerSplit; ++row)
+                compact_capture.template checkpoint<D_K, StateLayout>(0, row_begin + row, vi, d_v, state_rows[row]);
+#pragma clang loop unroll(disable)
+            for (int row = 0; row < kLdsRowsPerSplit; ++row)
+                compact_capture.template checkpoint<D_K, StateLayout>(0,
+                    row_begin + kRegisterRowsPerSplit + row, vi, d_v,
+                    state_tail[row * kGdnRecurrentThreads + tid]);
+            }
+        }
+    }
 
     // Merged coordinates are invariant across this request's live rows.
     int merged_source_head = 0;
@@ -455,6 +603,8 @@ void rocm_gdn_recurrent_step_body(
         __syncthreads();
         const float decay = wave_sums[0];
         const float beta_h = wave_sums[1];
+        if constexpr (CompactCapture::enabled)
+            compact_capture.template record<D_K>(request_row, k_local, decay);
 
         /*
          * Pass 1 installs the rounded decay into resident state and then uses
@@ -512,6 +662,20 @@ void rocm_gdn_recurrent_step_body(
             delta = (v_head[vi] - kv) * beta_h;
         }
 
+        if constexpr (CompactCapture::enabled)
+        {
+            if (vi < d_v && split_id == 0)
+                compact_capture.correction(request_row, vi, delta);
+        }
+
+        // Retention changes only stores of already rounded state. Resolve the
+        // request's immutable checkpoint slot once, outside both state loops.
+        std::size_t retained_checkpoint = 0;
+        bool retain_checkpoint = false;
+        if constexpr (CompactCapture::enabled)
+            retain_checkpoint = compact_capture.transaction.geometry.checkpointForCompletedRow(
+                compact_capture.planned_rows, request_row + 1, retained_checkpoint);
+
         // Pass 2 updates VGPR state and writes the optional accepted-row image.
         float partial_out = 0.0f;
         float *snapshot =
@@ -534,6 +698,13 @@ void rocm_gdn_recurrent_step_body(
                     state_rows[local_row] +
                     k_local[qk_row] * delta;
                 state_rows[local_row] = s_new;
+                if constexpr (CompactCapture::enabled &&
+                    StateLayout == llaminar2::GDNRecurrenceStateLayout::KeyMajorValueContiguous)
+                {
+                    if (retain_checkpoint)
+                        compact_capture.template checkpoint<D_K, StateLayout>(
+                            retained_checkpoint, state_row, vi, d_v, s_new);
+                }
                 if (snapshot)
                     snapshot[gdnRecurrenceStateOffset<StateLayout>(state_row,vi,D_K,d_v)] = s_new;
                 partial_out += s_new * q_local[qk_row];
@@ -552,10 +723,25 @@ void rocm_gdn_recurrent_step_body(
                     state_tail[lds_index] +
                     k_local[qk_row] * delta;
                 state_tail[lds_index] = s_new;
+                if constexpr (CompactCapture::enabled &&
+                    StateLayout == llaminar2::GDNRecurrenceStateLayout::KeyMajorValueContiguous)
+                {
+                    if (retain_checkpoint)
+                        compact_capture.template checkpoint<D_K, StateLayout>(
+                            retained_checkpoint, state_row, vi, d_v, s_new);
+                }
                 if (snapshot)
                     snapshot[gdnRecurrenceStateOffset<StateLayout>(state_row,vi,D_K,d_v)] = s_new;
                 partial_out += s_new * q_local[qk_row];
             }
+        }
+
+        if constexpr (CompactCapture::enabled &&
+            StateLayout == llaminar2::GDNRecurrenceStateLayout::ValueMajorKeyContiguous)
+        {
+            if (vi < d_v && retain_checkpoint)
+                compact_capture.template checkpointPartition<D_K>(
+                    retained_checkpoint, state_rows, state_tail, row_begin, vi, tid);
         }
 
         reduce_out[tid] = partial_out;
@@ -581,26 +767,32 @@ void rocm_gdn_recurrent_step_body(
         __syncthreads();
     }
 
-    const bool terminal_state_is_snapshotted =
-        state_snapshots != nullptr &&
-        max_snapshot_rows >= request_count * request_seq_len;
-    if (vi < d_v && !terminal_state_is_snapshotted)
+    if constexpr (CompactCapture::enabled)
+        compact_capture.finish();
+
+    if constexpr (CompactCapture::materialize_terminal)
     {
-#pragma unroll
-        for (int local_row = 0;
-             local_row < kRegisterRowsPerSplit;
-             ++local_row)
+        const bool terminal_state_is_snapshotted =
+            state_snapshots != nullptr &&
+            max_snapshot_rows >= request_count * request_seq_len;
+        if (vi < d_v && !terminal_state_is_snapshotted)
         {
-            const int state_row = row_begin + local_row;
-            S_updated[gdnRecurrenceStateOffset<StateLayout>(state_row,vi,D_K,d_v)] = state_rows[local_row];
-        }
-#pragma clang loop unroll(disable)
-        for (int tail_row = 0; tail_row < kLdsRowsPerSplit; ++tail_row)
-        {
-            const int state_row =
-                row_begin + kRegisterRowsPerSplit + tail_row;
-            S_updated[gdnRecurrenceStateOffset<StateLayout>(state_row,vi,D_K,d_v)] =
-                state_tail[tail_row * kGdnRecurrentThreads + tid];
+    #pragma unroll
+            for (int local_row = 0;
+                 local_row < kRegisterRowsPerSplit;
+                 ++local_row)
+            {
+                const int state_row = row_begin + local_row;
+                S_updated[gdnRecurrenceStateOffset<StateLayout>(state_row,vi,D_K,d_v)] = state_rows[local_row];
+            }
+    #pragma clang loop unroll(disable)
+            for (int tail_row = 0; tail_row < kLdsRowsPerSplit; ++tail_row)
+            {
+                const int state_row =
+                    row_begin + kRegisterRowsPerSplit + tail_row;
+                S_updated[gdnRecurrenceStateOffset<StateLayout>(state_row,vi,D_K,d_v)] =
+                    state_tail[tail_row * kGdnRecurrentThreads + tid];
+            }
         }
     }
 }
@@ -2626,6 +2818,11 @@ __global__ void rocm_gdn_publish_capture_rows_from_device_indices_kernel(
         const int request = linear / state_size;
         const int state_offset = linear - request * state_size;
         const int metadata_value = row_indices[request * row_index_stride];
+        // A terminal length is request-local. Flattening zero first would
+        // select the preceding request's last snapshot for request > 0.
+        // Leave empty requests untouched, as negative explicit indices do.
+        if (request_row_width > 0 && metadata_value == 0)
+            continue;
         const int row =
             request_row_width > 0
                 ? request * request_row_width + metadata_value - 1
@@ -3999,6 +4196,48 @@ __device__ __forceinline__ void gdnRecurrenceStoreFour(float* p,float4 bits)
     if constexpr(Access==GdnRecurrenceEndpointAccess::VectorAligned)*reinterpret_cast<float4*>(p)=bits;
     else {p[0]=bits.x;p[1]=bits.y;p[2]=bits.z;p[3]=bits.w;}
 }
+/** @brief Emit retained ValueMajor endpoint packs after unchanged state updates.
+ * @tparam MaterializeTerminal Existing terminal contract; no addressing/store change here.
+ * @tparam DK Original key width64/128.
+ * @tparam RegisterRows Existing array length16/22; no persistent temporary array.
+ * @param checkpoint Selected cp0 or completed-row checkpoint/image.
+ * @param state Actual resident register state after the original numeric loops.
+ * @param tail Actual lane-owned LDS words after the same original updates.
+ * @param first_key This lane's disjoint original key quarter.
+ * @param value Exclusive ValueMajor value column.
+ * @param tid Original owner of every strided tail element.
+ * @details DK128 packs20/21 with tail0/1, then tail2..5 and6..9. Extra tail
+ * reads consume only this thread's just-written words; no additional CTA edge
+ * is needed. KeyMajor retains its old scalar hooks. Initial Dense loads and
+ * required terminal endpoints are untouched, including their float-only alignment.
+ */
+template<bool MaterializeTerminal>
+template<int DK, int RegisterRows>
+__device__ __forceinline__ void ROCmGDNDenseCompactCapture<MaterializeTerminal>::checkpointPartition(unsigned checkpoint,
+    const float (&state)[RegisterRows], const float *tail, int first_key, int value, int tid) const
+{
+    static_assert(DK == 64 || DK == 128);
+    static_assert(RegisterRows == (DK == 64 ? 16 : 22));
+    float *destination = head() + transaction.geometry.checkpointOffsetFloats() +
+        std::size_t(checkpoint) * transaction.geometry.checkpointStrideFloats() +
+        std::size_t(value) * DK + first_key;
+#pragma unroll
+    for (int pack = 0; pack < RegisterRows / 4; ++pack)
+        gdnRecurrenceStoreFour<GdnRecurrenceEndpointAccess::VectorAligned>(destination + pack * 4,
+            make_float4(state[pack * 4], state[pack * 4 + 1], state[pack * 4 + 2], state[pack * 4 + 3]));
+    if constexpr (DK == 128)
+    {
+        gdnRecurrenceStoreFour<GdnRecurrenceEndpointAccess::VectorAligned>(destination + 20,
+            make_float4(state[20], state[21], tail[tid], tail[kGdnRecurrentThreads + tid]));
+        gdnRecurrenceStoreFour<GdnRecurrenceEndpointAccess::VectorAligned>(destination + 24,
+            make_float4(tail[2 * kGdnRecurrentThreads + tid], tail[3 * kGdnRecurrentThreads + tid],
+                tail[4 * kGdnRecurrentThreads + tid], tail[5 * kGdnRecurrentThreads + tid]));
+        gdnRecurrenceStoreFour<GdnRecurrenceEndpointAccess::VectorAligned>(destination + 28,
+            make_float4(tail[6 * kGdnRecurrentThreads + tid], tail[7 * kGdnRecurrentThreads + tid],
+                tail[8 * kGdnRecurrentThreads + tid], tail[9 * kGdnRecurrentThreads + tid]));
+    }
+}
+
 /**
  * @brief Carry each original quarter's accumulator through consecutive key owners.
  * @tparam OwnedKeys Four/eight consecutive keys per lane at DK64/128.
@@ -5282,3 +5521,5 @@ bool launchGatedNormSingleQ8(const GatedNormSingleQ8Input& input,int device,void
     return hipGetLastError()==hipSuccess;
 }
 } // namespace llaminar2::rocm
+
+#include "ROCmDenseCompactSnapshots.hip.inc"

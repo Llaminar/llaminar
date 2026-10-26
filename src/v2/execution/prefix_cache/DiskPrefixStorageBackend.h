@@ -387,10 +387,24 @@ namespace llaminar2
             uint64_t bytes = 0;
         };
 
-        /** @brief Journal put extent, immutable payload inode identity and logical recency. */
+        /** @brief Whether an indexed record may supply current runtime state. */
+        enum class RecordLayoutSupport
+        {
+            Supported,
+            UnsupportedCPUHost
+        };
+
+        /**
+         * @brief Journal extent, immutable payload identity and logical recency.
+         *
+         * Unsupported CPU encodings retain their original bounded metadata in
+         * this same journal extent. Compaction copies it verbatim; no lookup
+         * may hydrate it. Its payload remains under ordinary capacity eviction.
+         */
         struct RecordIndex
         {
             PrefixBlockHandle handle;
+            RecordLayoutSupport layout_support = RecordLayoutSupport::Supported;
             PrefixPayloadIdentity storage_identity;
             std::weak_ptr<PrefixArchiveReadInode> lookup_inode;
             uint64_t record_offset = 0;

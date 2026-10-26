@@ -13,8 +13,10 @@
  *
  * GPU path: The executor and TransferEngine prepare arena bindings on the
  * stage's explicit stream; this stage consumes device pointers only. Merged
- * Nonidentity merged M1 decode reads its original row directly. Multi-row
- * execution retains device deinterleave in its admitted prefill workspace.
+ * Nonidentity merged M1 decode reads its original row directly. Ordinary
+ * multi-row execution deinterleaves into admitted workspace. Grouped retained
+ * verification reads the original merged rows through its immutable prepared
+ * invocation and leases; it retains exact corrections for accepted publication.
  * No H2D/D2H copies occur in the hot path.
  *
  * CPU execution never materializes temporary Q/K/V matrices in the stage.
@@ -25,6 +27,8 @@
  */
 
 #include "GDNRecurrenceStage.h"
+#include "transfer/TransferEngine.h"
+#include "backends/ExplicitGPUStream.h"
 #include "kernels/common/CPURequestStateBankView.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "GDNSpeculativeWorkspaceContract.h"
@@ -56,13 +60,237 @@ namespace llaminar2
         if (!validGDNRecurrenceStateLayout(layout))
             throw std::invalid_argument(
                 "GDN recurrence capture identity has an unknown persistent state layout");
-        return (0x47444e4c00000000ULL | static_cast<uint64_t>(layout)) ^
-            gdnQKCaptureIdentity(params_.qk_contract);
+        auto identity = (0x47444e4c00000000ULL | static_cast<uint64_t>(layout)) ^ gdnQKCaptureIdentity(params_.qk_contract);
+        if (params_.gpu_retained_workspace)
+        {
+            const auto &g = params_.gpu_retained_workspace->geometry();
+            for (auto word : {std::uint64_t(g.requests()), std::uint64_t(g.rowsPerRequest()), std::uint64_t(g.heads()),
+                    std::uint64_t(g.keyWidth()), std::uint64_t(g.valueWidth()), std::uint64_t(g.encoding()),
+                    std::uint64_t(g.retentionProgram().mode), std::uint64_t(g.retentionProgram().compact_min_live_rows),
+                    std::uint64_t(params_.gpu_retained_workspace->terminalKind()), std::uint64_t{0x52455441494e4544}})
+                identity ^= word + 0x9e3779b97f4a7c15ULL + (identity << 6) + (identity >> 2);
+        }
+        return identity;
+    }
+
+    std::array<const TensorBase *, 6> GDNRecurrenceStage::retainedTensors() const
+    {
+        return {dynamic_cast<const TensorBase *>(params_.Q), dynamic_cast<const TensorBase *>(params_.alpha),
+            dynamic_cast<const TensorBase *>(params_.beta), dynamic_cast<const TensorBase *>(params_.A_log),
+            dynamic_cast<const TensorBase *>(params_.dt_bias), dynamic_cast<const TensorBase *>(params_.output)};
+    }
+
+    gdn::MergedRecurrenceInput GDNRecurrenceStage::retainedSources() const
+    {
+        const auto &g = params_.gpu_retained_workspace->geometry();
+        const auto tensors = retainedTensors();
+        for (const auto *tensor : tensors)
+            if (!tensor || tensor->native_type() != TensorType::FP32 || !tensor->gpu_data_ptr() ||
+                tensor->current_device() != std::optional{params_.device_id})
+                throw std::logic_error("Retained GDN requires original allocation-prebound FP32 operands on its device");
+        const auto rows = params_.request_seq_lens_device
+            ? DeviceRequestRowRanges::deviceCounted(g.requests(), g.rowsPerRequest(), params_.request_seq_lens_device)
+            : DeviceRequestRowRanges::fullyActiveRequests(g.requests(), g.rowsPerRequest());
+        return {.rows = rows, .key_heads = params_.n_k_heads > 0 ? params_.n_k_heads : params_.n_heads,
+            .value_heads = g.heads(), .key_width = g.keyWidth(), .value_width = g.valueWidth(),
+            .global_value_offset = params_.global_v_head_offset, .use_qk_l2norm = params_.use_qk_l2norm,
+            .merged = static_cast<const float *>(tensors[0]->gpu_data_ptr()),
+            .alpha = static_cast<const float *>(tensors[1]->gpu_data_ptr()),
+            .beta_raw = static_cast<const float *>(tensors[2]->gpu_data_ptr()),
+            .A_log = static_cast<const float *>(tensors[3]->gpu_data_ptr()),
+            .dt_bias = static_cast<const float *>(tensors[4]->gpu_data_ptr()),
+            .output = static_cast<float *>(const_cast<TensorBase *>(tensors[5])->gpu_data_ptr()),
+            .initial_state = nullptr, .updated_state = nullptr, .snapshots = nullptr,
+            .snapshot_stride_floats = 0, .max_snapshot_rows = 0,
+            .recurrence_layout = params_.kernel->recurrenceStateLayout()};
+    }
+
+    void GDNRecurrenceStage::requireRetainedInvocation() const
+    {
+        if (!params_.gpu_retained_workspace || !retained_gpu_ || !retained_gpu_->invocation ||
+            !bound_workspace_ || bound_workspace_ != retained_gpu_->workspace || !bound_workspace_->isAllocated() ||
+            bound_workspace_->device() != device() || bound_workspace_->id() != retained_gpu_->workspace_owner_identity)
+            throw std::logic_error("Retained GDN lost its exact prepared workspace owner");
+        const auto &binding = retained_gpu_->invocation->binding();
+        const auto &g = params_.gpu_retained_workspace->geometry();
+        const auto &actual = binding.geometry;
+        if (g.requests() != actual.requests() || g.rowsPerRequest() != actual.rowsPerRequest() ||
+            g.heads() != actual.heads() || g.keyWidth() != actual.keyWidth() || g.valueWidth() != actual.valueWidth() ||
+            g.encoding() != actual.encoding() || g.retentionProgram().mode != actual.retentionProgram().mode ||
+            g.retentionProgram().compact_min_live_rows != actual.retentionProgram().compact_min_live_rows ||
+            params_.gpu_retained_workspace->terminalKind() != binding.terminal_kind ||
+            params_.seq_len != params_.gpu_retained_workspace->physicalRows() || params_.request_count != g.requests() ||
+            params_.request_seq_len != g.rowsPerRequest() || !binding.capture_stream ||
+            binding.workspace_owner_identity != retained_gpu_->workspace_owner_identity)
+            throw std::logic_error("Retained GDN immutable geometry/output identity changed");
+        const auto &lease = retained_gpu_->storage;
+        if (!lease || lease->device() != device() || lease->data() != binding.storage.data() ||
+            lease->sizeBytes() != binding.storage.size_bytes() ||
+            bound_workspace_->getBuffer(speculativeStateSlotsBufferName()) != lease->data() ||
+            bound_workspace_->getBufferSize(speculativeStateSlotsBufferName()) != lease->sizeBytes())
+            throw std::logic_error("Retained GDN named storage changed after preparation");
+        if (binding.terminal_kind == gdn::GDNDenseCompactTerminalKind::DenseDestination)
+        {
+            const auto &terminal = retained_gpu_->terminal;
+            if (!terminal || terminal->device() != device() || terminal->data() != binding.terminal.data() ||
+                terminal->sizeBytes() != binding.terminal.size_bytes() ||
+                bound_workspace_->getBuffer(speculativeStateWorkBufferName()) != terminal->data() ||
+                bound_workspace_->getBufferSize(speculativeStateWorkBufferName()) != terminal->sizeBytes())
+                throw std::logic_error("Retained GDN terminal owner changed after preparation");
+        }
+        else if (!binding.terminal.empty() || binding.terminal.data() || retained_gpu_->terminal)
+            throw std::logic_error("Retained-prefixes-only GDN cannot borrow a terminal destination");
+        const auto tensors = retainedTensors();
+        const auto now = retainedSources();
+        const auto &frozen = retained_gpu_->invocation->captureInput().sources;
+        const std::array<const void *, 6> pointers{now.merged, now.alpha, now.beta_raw, now.A_log, now.dt_bias, now.output};
+        const std::array<const void *, 6> originals{frozen.merged, frozen.alpha, frozen.beta_raw, frozen.A_log, frozen.dt_bias, frozen.output};
+        if (pointers != originals || now.rows.lengthOwner() != frozen.rows.lengthOwner() ||
+            now.key_heads != frozen.key_heads || now.global_value_offset != frozen.global_value_offset ||
+            now.use_qk_l2norm != frozen.use_qk_l2norm || now.recurrence_layout != frozen.recurrence_layout)
+            throw std::logic_error("Retained GDN original source/length/axes identity changed");
+        for (std::size_t i = 0; i < tensors.size(); ++i)
+        {
+            if (!retained_gpu_->operands[i] || tensors[i]->shape() != retained_gpu_->shapes[i])
+                throw std::logic_error("Retained GDN tensor shape/physical borrower changed");
+            TransferEngine{}.requireCapturedDeviceStorage(*retained_gpu_->operands[i], *tensors[i], device(), retained_gpu_->bytes[i]);
+        }
+    }
+
+    bool GDNRecurrenceStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+    {
+        if (!params_.gpu_retained_workspace) return IComputeStage::prepareGraphLaunch(ctx, stream);
+        (void)ExplicitGPUStream(stream);
+        if (!ctx || ctx->deviceId() != device() || isGraphCaptureActive())
+            throw std::logic_error("Retained GDN preparation requires its exact cold participant/stream boundary");
+        setGPUStream(stream);
+        if (retained_gpu_)
+        {
+            requireRetainedInvocation();
+            if (retained_gpu_->invocation->binding().capture_stream != stream)
+                throw std::logic_error("Retained GDN recording stream changed after preparation");
+            // Repeated cold preparation authenticates backend-owned live-bank
+            // and compiled scheduling identity too; no mutable shared binding.
+            const auto observed = params_.kernel->prepareRetainedInvocation(
+                retainedSources(), retained_gpu_->invocation->binding());
+            if (!observed || !retained_gpu_->invocation->sameCaptureIdentity(*observed))
+                throw std::logic_error("Retained GDN backend state/program identity changed");
+            return true;
+        }
+        if (!bound_workspace_ || !bound_workspace_->isAllocated() || bound_workspace_->device() != device() ||
+            !bound_workspace_->id() || !params_.kernel)
+            throw std::logic_error("Retained GDN requires its original admitted workspace and canonical state owner");
+        const auto &g = params_.gpu_retained_workspace->geometry();
+        const auto sources = retainedSources();
+        const auto tensors = retainedTensors();
+        const auto merged_per_request = gdnDeinterleaveElementsPerRequest(sources.rows,
+            sources.key_heads, sources.value_heads, sources.key_width, sources.value_width);
+        if (merged_per_request <= 0) throw std::invalid_argument("Retained GDN merged source extent is invalid");
+        RetainedGPUInvocation pending;
+        pending.workspace = bound_workspace_;
+        pending.workspace_owner_identity = bound_workspace_->id();
+        // Admission above proves both source and expanded indexing; lease only
+        // the ORIGINAL merged source width, never expanded Q/K scratch bytes.
+        const auto source_width = 2 * std::size_t(sources.key_heads) * std::size_t(g.keyWidth()) +
+            std::size_t(g.heads()) * std::size_t(g.valueWidth());
+        pending.bytes = {gdn_workspace::detail::checkedMultiply(source_width,
+                std::size_t(params_.seq_len) * sizeof(float), "retained merged input bytes"),
+            g.gateFloats() * sizeof(float), g.gateFloats() * sizeof(float),
+            std::size_t(g.heads()) * sizeof(float), std::size_t(g.heads()) * sizeof(float),
+            g.outputFloats() * sizeof(float)};
+        for (std::size_t i = 0; i < tensors.size(); ++i)
+        {
+            pending.shapes[i] = tensors[i]->shape();
+            pending.operands[i] = TransferEngine{}.retainCapturedDeviceStorage(*tensors[i], device(), pending.bytes[i]);
+        }
+        const auto slots_bytes = bound_workspace_->getBufferSize(speculativeStateSlotsBufferName());
+        if (slots_bytes < g.bankBytes() || slots_bytes % sizeof(float))
+            throw std::logic_error("Retained GDN exact payload exceeds its admitted named storage");
+        pending.storage = bound_workspace_->retainBuffer(speculativeStateSlotsBufferName(), 0, slots_bytes);
+        std::span<float> terminal;
+        if (params_.gpu_retained_workspace->terminalKind() == gdn::GDNDenseCompactTerminalKind::DenseDestination)
+        {
+            const auto bytes = bound_workspace_->getBufferSize(speculativeStateWorkBufferName());
+            if (bytes < g.denseBankBytes() || bytes % sizeof(float))
+                throw std::logic_error("Retained GDN required terminal exceeds its admitted named storage");
+            pending.terminal = bound_workspace_->retainBuffer(speculativeStateWorkBufferName(), 0, bytes);
+            terminal = {static_cast<float *>(pending.terminal->data()), bytes / sizeof(float)};
+        }
+        const gdn::GDNRetainedInvocationBinding binding{.geometry = g,
+            .terminal_kind = params_.gpu_retained_workspace->terminalKind(),
+            .storage = {static_cast<float *>(pending.storage->data()), slots_bytes / sizeof(float)},
+            .terminal = terminal, .workspace_owner_identity = pending.workspace_owner_identity,
+            .capture_stream = stream};
+        pending.invocation = params_.kernel->prepareRetainedInvocation(sources, binding);
+        if (!pending.invocation) throw std::logic_error("Retained GDN backend did not prepare its selected native program");
+        retained_gpu_.emplace(std::move(pending));
+        try { requireRetainedInvocation(); }
+        catch (...) { retained_gpu_.reset(); throw; } // No partial preparation may advertise capture/publication readiness.
+        // This is a successful cold install, not a replay/submission count.
+        // Immutable inventory survives the benchmark's measured-window reset;
+        // constructor policy selection alone cannot prove a native program exists.
+        if (PerfStatsCollector::isDomainEnabled("gpu_graph_inventory"))
+            PerfStatsCollector::addCounter("gpu_graph_inventory", "gdn_retained_prepared_programs", 1,
+                "capture_setup", device().toString(),
+                {{"program", g.retentionProgram().mode == gdn::GDNDenseRetentionMode::ExactCorrections
+                    ? "exact_corrections" : g.retentionProgram().mode == gdn::GDNDenseRetentionMode::FullSnapshots
+                    ? "full_snapshots" : "live_row_threshold"},
+                 {"terminal", binding.terminal_kind == gdn::GDNDenseCompactTerminalKind::RetainedPrefixesOnly
+                    ? "retained_prefixes_only" : "dense_destination"},
+                 {"native_program", std::to_string(retained_gpu_->invocation->captureProgramIdentity())},
+                 {"layer", std::to_string(params_.layer_idx)},
+                 {"requests", std::to_string(g.requests())},
+                 {"rows_per_request", std::to_string(g.rowsPerRequest())},
+                 {"heads", std::to_string(g.heads())},
+                 {"key_width", std::to_string(g.keyWidth())},
+                 {"value_width", std::to_string(g.valueWidth())},
+                 {"layout", std::string(gdnRecurrenceStateLayoutName(sources.recurrence_layout))}});
+        return true;
+    }
+
+    bool GDNRecurrenceStage::executeRetainedInvocation()
+    {
+        requireRetainedInvocation();
+        const auto execution = gpuExecution();
+        if (execution.nativeStream() != retained_gpu_->invocation->binding().capture_stream)
+            throw std::logic_error("Retained GDN execution escaped its prepared recording stream");
+        if (!retained_gpu_->invocation->capture()) return false;
+        if (PerfStatsCollector::isDomainEnabled("gdn_recurrence"))
+            PerfStatsCollector::addCounter("gdn_recurrence", "retained_capture_submissions", 1,
+                isGraphCaptureActive() ? "capture" : "execute", device().toString(),
+                {{"program", params_.gpu_retained_workspace->geometry().retentionProgram().mode == gdn::GDNDenseRetentionMode::ExactCorrections
+                    ? "exact_corrections" : params_.gpu_retained_workspace->geometry().retentionProgram().mode == gdn::GDNDenseRetentionMode::FullSnapshots
+                    ? "full_snapshots" : "live_row_threshold"},
+                 {"terminal", params_.gpu_retained_workspace->terminalKind() == gdn::GDNDenseCompactTerminalKind::RetainedPrefixesOnly
+                    ? "retained_prefixes_only" : "dense_destination"},
+                 {"layer", std::to_string(params_.layer_idx)}, {"rows", std::to_string(params_.seq_len)},
+                 {"requests", std::to_string(params_.request_count)},
+                 {"native_program", std::to_string(retained_gpu_->invocation->captureProgramIdentity())}});
+        return !params_.sequence_state_cache || params_.sequence_state_cache->advanceRecurrentSequenceState(
+            params_.layer_idx, params_.request_count, params_.request_seq_lens_device,
+            params_.request_seq_len, execution.nativeStream());
+    }
+
+    bool GDNRecurrenceStage::publishRetainedInvocation(
+        const gdn::GDNDenseAcceptedSelection &selection, void *stream)
+    {
+        requireRetainedInvocation();
+        const auto execution = gpuExecutionForVerifierPublication(stream);
+        if (!selection.matchesGeometry(params_.gpu_retained_workspace->geometry()))
+            throw std::invalid_argument("Retained GDN publication selection has foreign physical geometry");
+        if (!retained_gpu_->invocation->publish(selection, execution.nativeStream())) return false;
+        if (PerfStatsCollector::isDomainEnabled("gdn_recurrence"))
+            PerfStatsCollector::addCounter("gdn_recurrence", "retained_publication_submissions", 1,
+                isGraphCaptureActive() ? "capture" : "execute", device().toString(),
+                {{"layer", std::to_string(params_.layer_idx)}, {"requests", std::to_string(params_.request_count)}});
+        return true;
     }
 
     void GDNRecurrenceStage::updateDynamicParams(int pos_offset, int seq_len)
     {
         (void)pos_offset;
+        if (params_.gpu_retained_workspace && seq_len != params_.gpu_retained_workspace->geometry().rowsPerRequest())
+            throw std::invalid_argument("Retained GDN cannot change physical rows behind its captured program");
         if(std::holds_alternative<GDNPreparedQKBinding>(params_.qk_contract)&&seq_len!=1)
             throw std::invalid_argument("Scalar prepared GDN recurrence cannot change captured row geometry");
 
@@ -101,6 +329,17 @@ namespace llaminar2
           params_(std::move(params)),
           workspace_slice_id_(g_gdn_recurrence_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
+        if (params_.gpu_retained_workspace)
+        {
+            const auto &g = params_.gpu_retained_workspace->geometry();
+            if (!device().is_gpu() || !std::holds_alternative<GDNRawQKInput>(params_.qk_contract) ||
+                params_.Q != params_.K || params_.K != params_.V ||
+                params_.seq_len != params_.gpu_retained_workspace->physicalRows() || params_.request_count != g.requests() ||
+                params_.request_seq_len != g.rowsPerRequest() || params_.n_heads != g.heads() ||
+                params_.d_k != g.keyWidth() || params_.d_v != g.valueWidth() ||
+                params_.speculative_state_slot_rows <= 0 || !params_.request_seq_lens_device)
+                throw std::invalid_argument("Retained GDN stage differs from its exact grouped raw-input contract");
+        }
         if(const auto *p=std::get_if<GDNPreparedQKBinding>(&params_.qk_contract))
         {
             const auto layout=p->layout();
@@ -126,6 +365,14 @@ namespace llaminar2
         (void)k;
 
         WorkspaceRequirements reqs;
+        if (params_.gpu_retained_workspace)
+        {
+            const auto footprint = params_.gpu_retained_workspace->footprint();
+            reqs.buffers.push_back({speculativeStateSlotsBufferName(), footprint.slot_bytes, 256, true,
+                WorkspaceExecutionRegime::Any, WorkspaceContentLifetime::SerialGraphFamily});
+            if (footprint.work_bytes) reqs.buffers.push_back({speculativeStateWorkBufferName(), footprint.work_bytes, 256, true});
+            return reqs;
+        }
         if (params_.n_heads <= 0 || params_.d_k <= 0 || params_.d_v <= 0)
             return reqs;
 
@@ -140,14 +387,18 @@ namespace llaminar2
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
         if (speculative_slot_rows > 0)
         {
-            const int rows = std::min(speculative_slot_rows, max_seq_len);
+            // CPU retained storage follows the declared logical verifier ceiling,
+            // never current/live rows or capacity inferred from alignment padding.
+            const int rows=params_.device_id.is_cpu() ? speculative_slot_rows :
+                std::min(speculative_slot_rows,max_seq_len);
             const auto footprint =
                 gdn_workspace::recurrenceStateFootprint(
                     rows,
                     std::max(1, params_.request_count),
                     params_.n_heads,
                     params_.d_k,
-                    params_.d_v);
+                    params_.d_v,
+                    params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense);
             reqs.buffers.push_back({speculativeStateSlotsBufferName(),
                                     footprint.slot_bytes,
                                     256,
@@ -185,18 +436,29 @@ namespace llaminar2
 
     void GDNRecurrenceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        retireCPUVerifierCandidates();
+        if (params_.gpu_retained_workspace)
+        {
+            if (bound_workspace_ == workspace && retained_gpu_) { requireRetainedInvocation(); return; }
+            retained_gpu_.reset();
+            bound_workspace_ = workspace;
+            return;
+        }
         bound_workspace_ = workspace;
         bindKernelWorkspace();
     }
 
     void GDNRecurrenceStage::unbindWorkspace()
     {
+        retireCPUVerifierCandidates();
+        if (params_.gpu_retained_workspace) { retained_gpu_.reset(); bound_workspace_ = nullptr; return; }
         bound_workspace_ = nullptr;
         bindKernelWorkspace();
     }
 
     void GDNRecurrenceStage::bindKernelWorkspace()
     {
+        if (params_.gpu_retained_workspace) return;
         if (!params_.kernel)
             return;
 
@@ -211,7 +473,7 @@ namespace llaminar2
 
         params_.kernel->bindDeinterleaveWorkspace(scratch, scratch_floats);
 
-        const int capture_state_size = params_.n_heads * params_.d_k * params_.d_v;
+        const int capture_state_size = gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
         verifier_capture_state_size_bound_ = capture_state_size;
 
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
@@ -238,7 +500,14 @@ namespace llaminar2
             capture = static_cast<float *>(bound_workspace_->getBuffer(capture_name));
             const size_t available_floats =
                 bound_workspace_->getBufferSize(capture_name) / sizeof(float);
-            if (capture_state_size > 0)
+            if (params_.device_id.is_cpu()) {
+                const CPUGDNStateLayout layout(params_.n_heads,params_.d_k,params_.d_v);
+                const int requests=std::max(1,params_.request_count);
+                const CPUSharedGDNLogicalCapacity capacity(speculative_slot_rows,requests);
+                if (available_floats>=capacity.slotFloats(layout))
+                    capture_rows=capacity.flatRows();
+            }
+            else if (capture_state_size > 0)
             {
                 capture_rows = static_cast<int>(std::min<size_t>(
                     static_cast<size_t>(speculative_slot_rows),
@@ -275,18 +544,46 @@ namespace llaminar2
             speculative_work != nullptr || !params_.device_id.is_gpu();
         params_.kernel->bindRecurrenceSpeculativeWorkspace(
             speculative_work, speculative_work_size, params_.kernel->recurrenceStateLayout());
+        if (params_.device_id.is_cpu())
+            params_.kernel->bindCPUSharedStateCapture(capture,
+                capture ? bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float) : 0,
+                capture_rows);
+    }
+
+    void GDNRecurrenceStage::retireCPUVerifierCandidates()
+    {
+        if (!params_.device_id.is_cpu()) return;
+        if (cpu_capture_generation_==std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("CPU GDN stage transaction generation exhausted");
+        ++cpu_capture_generation_;
+        if (!params_.device_id.is_cpu() || !bound_workspace_ || verifier_capture_rows_bound_<=0 ||
+            !bound_workspace_->hasBuffer(speculativeStateSlotsBufferName())) return;
+        const int requests=std::max(1,params_.request_count);
+        if (verifier_capture_rows_bound_%requests) return;
+        const int width=verifier_capture_rows_bound_/requests;
+        const CPUGDNStateLayout l(params_.n_heads,params_.d_k,params_.d_v);
+        const size_t span=CPUSharedGDNSnapshots::headFloats(l,width);
+        const size_t capacity=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float);
+        if (span>capacity/static_cast<size_t>(params_.n_heads)/requests) return;
+        auto *slots=static_cast<float *>(bound_workspace_->getBuffer(speculativeStateSlotsBufferName()));
+        if (!slots) return;
+        for(int request=0;request<requests;++request)
+            for(int head=0;head<params_.n_heads;++head)
+                CPUSharedGDNSnapshots(l,slots+(static_cast<size_t>(request)*params_.n_heads+head)*span,width).retire();
     }
 
     void GDNRecurrenceStage::clearKernelVerifierStateWorkspace()
     {
+        retireCPUVerifierCandidates();
         verifier_capture_workspace_bound_ = false;
         speculative_state_work_bound_ = false;
         verifier_capture_rows_bound_ = 0;
-        verifier_capture_state_size_bound_ = params_.n_heads * params_.d_k * params_.d_v;
+        verifier_capture_state_size_bound_ = gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
 
         if (!params_.kernel)
             return;
 
+        params_.kernel->bindCPUSharedStateCapture(nullptr,0,0);
         params_.kernel->bindRecurrenceStateCaptureWorkspace(
             nullptr,
             0,
@@ -360,18 +657,15 @@ namespace llaminar2
 
     std::string GDNRecurrenceStage::speculativeStateSlotsBufferName() const
     {
-        return std::string(WS_SPECULATIVE_STATE_SLOTS) + "_" + workspaceStableId();
+        return std::string(params_.gpu_retained_workspace ? WS_RETAINED_STATE_SLOTS : WS_SPECULATIVE_STATE_SLOTS) + "_" + workspaceStableId();
     }
 
     std::string GDNRecurrenceStage::speculativeStateWorkBufferName() const
     {
         /*
-         * This buffer is temporary input/output for one recurrence stage; unlike
-         * speculative state slots, it is not read after that layer completes.
-         * Transformer-layer dependencies serialize recurrence stages inside one
-         * graph role, so all layers can reuse one maximum-sized work allocation.
-         * Independently replayable roles retain separate names because they may
-         * execute concurrently on different streams.
+         * Only GPU recurrence needs a mutable state bank. GPU layer dependencies
+         * serialize its use within a graph role; independent roles retain names.
+         * CPU recurrence builds retained checkpoints directly and has no work bank.
          */
         if (params_.workspace_namespace.empty())
             return WS_SPECULATIVE_STATE_WORK;
@@ -381,6 +675,7 @@ namespace llaminar2
 
     int GDNRecurrenceStage::requestedSpeculativeStateSlotRows() const
     {
+        if (params_.gpu_retained_workspace) return params_.gpu_retained_workspace->physicalRows();
         return std::max(
             params_.speculative_state_slot_rows,
             params_.verifier_state_capture_rows);
@@ -388,6 +683,9 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::hasVerifierStateCapture() const
     {
+        // Producer discovery is declarative, exactly as for legacy capture.
+        // Actual capture/publication separately require the immutable prepared handle.
+        if (params_.gpu_retained_workspace) return params_.kernel && verifierStateCaptureWorkspaceRequired();
         return params_.kernel &&
                verifierStateCaptureWorkspaceRequired() &&
                (params_.device_id.is_gpu() || params_.recurrence_state != nullptr);
@@ -403,6 +701,7 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::ensureVerifierStateCaptureWorkspaceBound() const
     {
+        if (params_.gpu_retained_workspace) { requireRetainedInvocation(); return true; }
         if (!verifierStateCaptureWorkspaceRequired())
             return true;
         if (verifier_capture_workspace_bound_ && speculative_state_work_bound_)
@@ -454,10 +753,23 @@ namespace llaminar2
          * GPU stages still delegate to the backend restore kernel because their
          * slots live on device and must stay ordered on the explicit stream.
          */
-        std::memcpy(
-            plan.destination,
-            plan.source,
-            plan.bytes);
+        if (plan.shared_gdn_prefix)
+        {
+            const auto &accepted=*plan.shared_gdn_prefix;
+            const auto &t=accepted.transaction;
+            const CPUGDNStateLayout layout(t.heads,t.dk,t.dv);
+            const size_t span=CPUSharedGDNSnapshots::headFloats(layout,t.width);
+            for(int head=0;head<t.heads;++head)
+                CPUSharedGDNSnapshots(layout,t.slots+static_cast<size_t>(head)*span,t.width)
+                    .materialize(accepted.row,static_cast<float *>(plan.destination)+static_cast<size_t>(head)*layout.headFloats());
+            PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materializations",1,"publication","cpu");
+            PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materialization_bytes",
+                static_cast<double>(plan.bytes),"publication","cpu");
+        }
+        else
+        {
+            std::memcpy(plan.destination,plan.source,plan.bytes);
+        }
         return true;
     }
 
@@ -495,15 +807,32 @@ namespace llaminar2
             };
         }
 
-        return {
-            .status = CPUVerifierStateRestorePlanStatus::Ready,
-            .destination = params_.recurrence_state,
-            .source = capture +
-                static_cast<size_t>(row) *
-                    static_cast<size_t>(verifier_capture_state_size_bound_),
-            .bytes = static_cast<size_t>(verifier_capture_state_size_bound_) *
-                     sizeof(float),
-        };
+        const CPUGDNStateLayout layout(params_.n_heads,params_.d_k,params_.d_v);
+        const int requests=std::max(1,params_.request_count);
+        if (requests!=1) return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+        const int width=verifier_capture_rows_bound_;
+        const size_t span=CPUSharedGDNSnapshots::headFloats(layout,width);
+        const size_t slots=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float);
+        if (span>slots/static_cast<size_t>(params_.n_heads))
+            return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+        const size_t state_bytes=static_cast<size_t>(layout.floats())*sizeof(float);
+        const size_t slot_bytes=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName());
+        if (CPUSharedGDNSnapshots::buffersOverlap(params_.recurrence_state,state_bytes,capture,slot_bytes))
+            return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+        for(int head=0;head<params_.n_heads;++head)
+            if (!CPUSharedGDNSnapshots(layout,const_cast<float *>(capture)+static_cast<size_t>(head)*span,width).validRow(row))
+                return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+        CPUSharedGDNTransaction transaction{
+            .slots=const_cast<float *>(capture),.slot_floats=slots,
+            .width=width,.requests=1,
+            .live_width=params_.request_seq_len>0 ? params_.request_seq_len : params_.seq_len,
+            .heads=params_.n_heads,.dk=params_.d_k,.dv=params_.d_v,
+            .generation_authority=&cpu_capture_generation_,.generation=cpu_capture_generation_};
+        return {.status=CPUVerifierStateRestorePlanStatus::Ready,
+            .destination=params_.recurrence_state,.source=capture,
+            .bytes=static_cast<size_t>(layout.floats())*sizeof(float),
+            .kind=CPUVerifierStateRestorePlanKind::SharedGDNPrefixScatter,
+            .shared_gdn_prefix=CPUSharedGDNAcceptedPrefix{transaction,row}};
     }
 
     bool GDNRecurrenceStage::planCPUVerifierStateRestoreRows(const int *rows,int requests,
@@ -517,32 +846,55 @@ namespace llaminar2
         const auto bank=owner->cpuRequestStateBankView();
         const auto *capture=cpuVerifierStateCaptureWorkspace();
         const int stride=params_.request_seq_len;
+        const CPUGDNStateLayout layout(params_.n_heads,params_.d_k,params_.d_v);
         if(!capture || stride<=0 || !bank.contains(requests,bank.stateElements) ||
-            verifier_capture_state_size_bound_<bank.stateElements ||
+            bank.stateElements!=layout.floats() ||
+            verifier_capture_state_size_bound_!=bank.stateElements ||
+            verifier_capture_rows_bound_%requests ||
             (params_.request_seq_lens_host && params_.request_seq_lens_host->size()!=std::size_t(requests)))return false;
-        // Only address metadata is borrowed from the current owner. No shared
-        // backend workspace is rebound, and every request is checked before
-        // the publisher can write any accepted state or clear capture bindings.
+        const int width=verifier_capture_rows_bound_/requests;
+        const size_t head_span=CPUSharedGDNSnapshots::headFloats(layout,width);
+        const size_t slots=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float);
+        if(stride>width || head_span>slots/static_cast<size_t>(requests)/params_.n_heads)return false;
+        const size_t request_span=head_span*static_cast<size_t>(params_.n_heads);
+        // The current owner supplies addresses only. Each request borrows its
+        // own immutable checkpoint/log slice: flattened candidate rows are not
+        // full state snapshots. The publisher validates every slice and all
+        // destination spans before scattering any accepted state.
         for(int request=0;request<requests;++request) {
             const int row=rows[request];
             const int live=params_.request_seq_lens_host ? (*params_.request_seq_lens_host)[request] : stride;
             const auto first=std::int64_t(request)*stride;
             if(live<0 || live>stride || (row>=0 && (row<first || row>=first+live || row>=verifier_capture_rows_bound_)))return false;
             if(row<0)continue;
+            const int local_row=static_cast<int>(row-first);
+            auto *selected=const_cast<float *>(capture)+static_cast<size_t>(request)*request_span;
+            for(int head=0;head<params_.n_heads;++head)
+                if(!CPUSharedGDNSnapshots(layout,selected+static_cast<size_t>(head)*head_span,width).validRow(local_row))
+                    return false;
+            CPUSharedGDNTransaction transaction{
+                .slots=selected,.slot_floats=request_span,.width=width,.requests=1,
+                .live_width=live,.heads=params_.n_heads,.dk=params_.d_k,.dv=params_.d_v,
+                .generation_authority=&cpu_capture_generation_,.generation=cpu_capture_generation_};
             const auto bytes=std::size_t(bank.stateElements)*sizeof(float);
             auto *destination=bank.storage.data()+std::size_t(request)*bank.stateElements;
-            const auto *selected=capture+std::size_t(row)*verifier_capture_state_size_bound_;
             plans.push_back({.status=CPUVerifierStateRestorePlanStatus::Ready,
-                .destination=destination,.source=selected,.bytes=bytes});
+                .destination=destination,.source=selected,.bytes=bytes,
+                .kind=CPUVerifierStateRestorePlanKind::SharedGDNPrefixScatter,
+                .shared_gdn_prefix=CPUSharedGDNAcceptedPrefix{transaction,local_row}});
             if(request==0 && params_.recurrence_state!=destination)
                 plans.push_back({.status=CPUVerifierStateRestorePlanStatus::Ready,
-                    .destination=params_.recurrence_state,.source=selected,.bytes=bytes});
+                    .destination=params_.recurrence_state,.source=selected,.bytes=bytes,
+                    .kind=CPUVerifierStateRestorePlanKind::SharedGDNPrefixScatter,
+                    .shared_gdn_prefix=CPUSharedGDNAcceptedPrefix{transaction,local_row}});
         }
         return true;
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRow(int row, void *stream)
     {
+        if (params_.gpu_retained_workspace)
+            throw std::logic_error("Retained GPU verifier publication requires its existing ordered device selection");
         if (!hasVerifierStateCapture())
             return false;
         if (!params_.device_id.is_gpu())
@@ -576,20 +928,31 @@ namespace llaminar2
         {
             return false;
         }
-        bindKernelWorkspace();
-        if (!ensureVerifierStateCaptureWorkspaceBound())
-            return false;
-        return params_.kernel->restoreVerifierStateCaptureRows(
-            params_.recurrence_state,
-            host_row_indices,
-            request_count,
-            stream);
+        if (!ensureVerifierStateCaptureWorkspaceBound() || !bound_workspace_ ||
+            request_count!=std::max(1,params_.request_count) || verifier_capture_rows_bound_%request_count) return false;
+        CPUSharedGDNTransaction transaction{
+            .slots=cpuVerifierStateCaptureWorkspace(),
+            .slot_floats=bound_workspace_->getBufferSize(speculativeStateSlotsBufferName())/sizeof(float),
+            .width=verifier_capture_rows_bound_/request_count,.requests=request_count,
+            .live_width=params_.request_seq_len>0 ? params_.request_seq_len : params_.seq_len,
+            .heads=params_.n_heads,.dk=params_.d_k,.dv=params_.d_v,
+            .generation_authority=&cpu_capture_generation_,.generation=cpu_capture_generation_};
+        return params_.kernel->restoreCPUSharedStateRows(transaction,params_.recurrence_state,host_row_indices);
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRowFromDeviceIndex(
-        const int *device_row_index,
+        std::span<const int> device_row_index_view,
         void *stream)
     {
+        if (!deviceVerifierStateMetadataCovers(device_row_index_view, 1, 1)) return false;
+        if (params_.gpu_retained_workspace)
+        {
+            if (params_.gpu_retained_workspace->geometry().requests() != 1)
+                throw std::invalid_argument("Scalar retained GDN publication requires its scalar request geometry");
+            return publishRetainedInvocation(gdn::GDNDenseAcceptedSelection::ownRequestFlattenedRows(
+                params_.gpu_retained_workspace->geometry(), device_row_index_view.data(), device_row_index_view.size()), stream);
+        }
+        const int *device_row_index = device_row_index_view.data();
         if (!hasVerifierStateCapture() || !device_row_index || !stream)
             return false;
         // Device-resident publication has the same ownership requirement as
@@ -616,11 +979,20 @@ namespace llaminar2
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRowsFromDeviceIndices(
-        const int *device_row_indices,
+        std::span<const int> device_row_indices_view,
         int request_count,
         int row_index_stride,
         void *stream)
     {
+        if (!deviceVerifierStateMetadataCovers(device_row_indices_view, request_count, row_index_stride)) return false;
+        if (params_.gpu_retained_workspace)
+        {
+            if (request_count != params_.gpu_retained_workspace->geometry().requests())
+                throw std::invalid_argument("Retained GDN publication request count changed");
+            return publishRetainedInvocation(gdn::GDNDenseAcceptedSelection::ownRequestFlattenedRows(
+                params_.gpu_retained_workspace->geometry(), device_row_indices_view.data(), device_row_indices_view.size(), row_index_stride), stream);
+        }
+        const int *device_row_indices = device_row_indices_view.data();
         if (!hasVerifierStateCapture() ||
             !device_row_indices ||
             request_count <= 0 ||
@@ -673,6 +1045,8 @@ namespace llaminar2
         int request_row_width,
         void *stream)
     {
+        if (params_.gpu_retained_workspace)
+            throw std::logic_error("Retained grouped GPU verifier publication requires an owner-backed device selection, not raw terminal lengths");
         if (!hasVerifierStateCapture() ||
             !params_.device_id.is_gpu() ||
             !device_request_seq_lens ||
@@ -698,6 +1072,7 @@ namespace llaminar2
         int request_count,
         int request_row_width) const
     {
+        if (params_.gpu_retained_workspace) return false;
         if (!params_.kernel ||
             request_count <= 1 ||
             request_row_width <= 0 ||
@@ -707,7 +1082,7 @@ namespace llaminar2
             return false;
         }
         const int state_size =
-            params_.n_heads * params_.d_k * params_.d_v;
+            gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
         return params_.kernel->supportsRequestLiveStateBank(
                    request_count,
                    state_size) &&
@@ -716,6 +1091,7 @@ namespace llaminar2
 
     void GDNRecurrenceStage::clearVerifierStateCaptureBindingAfterPublication()
     {
+        if (params_.gpu_retained_workspace) { requireRetainedInvocation(); return; }
         if (!params_.device_id.is_gpu())
             return;
 
@@ -793,7 +1169,7 @@ namespace llaminar2
                 return params_.kernel->supportsPaddedPrefillRealLength();
 
             const int state_size =
-                params_.n_heads * params_.d_k * params_.d_v;
+                gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
             return params_.kernel->supportsRequestLiveStateBank(
                 params_.request_count,
                 state_size);
@@ -842,6 +1218,7 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::execute(IDeviceContext *ctx)
     {
+        retireCPUVerifierCandidates();
         if (!ensureContext(ctx, "GDNRecurrenceStage"))
             return false;
 
@@ -868,6 +1245,8 @@ namespace llaminar2
             {"request_count", std::to_string(params_.request_count)},
             {"capture_rows", std::to_string(requestedSpeculativeStateSlotRows())},
         };
+
+        if (params_.gpu_retained_workspace) return executeRetainedInvocation();
 
         // Bind stage stream to kernel before execution.
         bindStageStream(params_.kernel);
@@ -1118,7 +1497,7 @@ namespace llaminar2
                         LOG_ERROR("[GDNRecurrenceStage] GPU recurrence with dynamic real lengths requires device-owned request lengths");
                         return false;
                     }
-                    const int state_size = params_.n_heads * params_.d_k * params_.d_v;
+                    const int state_size = gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
                     if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
                     {
                         LOG_ERROR("[GDNRecurrenceStage] Backend lacks device-owned live recurrence-state bank for "
@@ -1265,7 +1644,7 @@ namespace llaminar2
         if (request_batched)
         {
             const int state_size =
-                params_.n_heads * params_.d_k * params_.d_v;
+                gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
             if (!params_.kernel->supportsRequestLiveStateBank(
                     params_.request_count, state_size))
             {
@@ -1583,9 +1962,13 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::isGraphCapturable() const
     {
-        // Decode: always capturable (single kernel launch, stable pointers)
+        if (params_.gpu_retained_workspace) return retained_gpu_ && retained_gpu_->invocation;
+        // Decode has stable pointers, but an absent implementation cannot
+        // advertise capture merely because its device identifier is a GPU.
         if (params_.seq_len == 1)
-            return params_.device_id.is_gpu();
+            return params_.device_id.is_cuda()
+                ? supportsBackend(ComputeBackendType::GPU_CUDA)
+                : params_.device_id.is_rocm() && supportsBackend(ComputeBackendType::GPU_ROCM);
 
         // Prefill: capturable only on compiled GPU backends when GPU state is pre-allocated.
         // chunk_forward() will skip its lazy allocateState() if state is ready.
@@ -1612,7 +1995,7 @@ namespace llaminar2
             return false;
         }
 
-        const int required_state_size = params_.n_heads * params_.d_k * params_.d_v;
+        const int required_state_size = gdnRecurrenceStateFloats(params_.device_id.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense, params_.n_heads, params_.d_k, params_.d_v);
         return params_.kernel->isGPUStateReady(required_state_size);
     }
 

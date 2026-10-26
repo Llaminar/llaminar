@@ -51,8 +51,9 @@ TEST_P(PipelineMTPStateOwnership, CapturedFollowerPublishesOnlyTailCommittedStat
         ASSERT_GT(checkpoint_bytes, 0u);
         std::unique_ptr<void, decltype(release)> checkpoint(
             backend->allocate(checkpoint_bytes, device.gpu_ordinal()), release);
+        const size_t metadata_bytes = 4 * sizeof(int32_t);
         std::unique_ptr<void, decltype(release)> metadata(
-            backend->allocate(4 * sizeof(int32_t), device.gpu_ordinal()), release);
+            backend->allocate(metadata_bytes, device.gpu_ordinal()), release);
         ASSERT_TRUE(checkpoint && metadata);
         auto *const words = static_cast<int32_t *>(metadata.get());
         for (const int width : {2, 3, 4, 16})
@@ -118,7 +119,7 @@ TEST_P(PipelineMTPStateOwnership, CapturedFollowerPublishesOnlyTailCommittedStat
             params.authority = MTPSpeculativeStatePublicationStage::Authority::PipelineFollower;
             params.request_count = 1;
             params.verifier_rows_per_request = width;
-            params.accepted_restore_rows_device = words;
+            params.accepted_restore_rows_device = std::span(words, metadata_bytes / sizeof(int32_t));
             params.target_cached_tokens_device = words + 1;
             params.accepted_state_counts_device = words + 2;
             params.publication_ok_flags_device = words + 3;

@@ -694,6 +694,7 @@ TEST(Test__MemoryPlanner,
     cfg.device_total_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
     cfg.device_free_bytes = cfg.device_total_bytes;
     cfg.batch_size = 2;
+    cfg.generation_request_capacity = 2; // The two declared request banks own the retained rows.
     cfg.max_seq_len = 128;
     cfg.kv_precision = "fp16";
     cfg.total_shards = 4;

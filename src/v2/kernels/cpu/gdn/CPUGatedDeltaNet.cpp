@@ -2,16 +2,14 @@
  * @file CPUGatedDeltaNet.cpp
  * @brief CPU implementation of delta rule recurrence for GDN linear attention
  *
- * Two execution modes:
- *
- * 1. Recurrent step (decode, seq_len=1):
- *    Direct state update following torch_recurrent_gated_delta_rule.
- *    Per-head: S = exp(g)*S, kv = S*k, delta = (v - kv)*beta, S += outer(k, delta), o = S*q
- *
- * 2. Chunk-forward (prefill, seq_len>1):
- *    Strictly ordered recurrence parallelized across independent heads. Normal
- *    heads retain whole-head ownership; subnormal-gated heads may distribute
- *    independent value columns to spare workers without changing any reduction.
+ * CPU state owns a fixed eight-position checkpoint, phase, and raw update log.
+ * Serial and grouped queries use identical backwards contractions and increasing-
+ * key FP32 FMAs. Grouped queries share checkpoint loads; rounded prefix updates
+ * construct each required checkpoint once. Acceptance and snapshots preserve
+ * pending history and never flush a partial epoch. Independent heads own the
+ * same program for decode, prefill, merged-QKV and ragged request batches.
+ * Per-head completed observations are integer-reduced by that same team and
+ * published once per call, retaining both original counts and numeric sums.
  *
  * The kernel owns ALL preprocessing:
  * - Q/K normalization by sqrt(sum(x*x) + 1e-6) when use_qk_l2norm is true
@@ -24,6 +22,7 @@
  */
 
 #include "CPUGatedDeltaNet.h"
+#include "CPUFixedEpochGDN.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -47,6 +46,67 @@
 
 namespace llaminar2
 {
+    CPUGatedDeltaNet::CPUGatedDeltaNet()
+        : epoch_counter_identities_{
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_epoch_projection_groups", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_epoch_grouped_projection_rows", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_epoch_checkpoint_flushes", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_candidate_rows", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_checkpoint_copies", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_checkpoint_copy_bytes", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_initial_checkpoint_fused_stores", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_initial_checkpoint_fused_store_bytes", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_derived_checkpoint_writes", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_derived_checkpoint_write_bytes", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_explicit_checkpoint_copy_passes", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_explicit_checkpoint_copy_bytes", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_raw_log_records", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_raw_log_copy_bytes", "recurrence", "cpu"),
+            PerfStatsCollector::bindCounter("kernel", "cpu_gdn_shared_mutable_bank_copy_bytes", "recurrence", "cpu")}
+    {
+    }
+
+    bool CPUGatedDeltaNet::beginEpochCounterObservations()
+    {
+        // A concurrently published collector generation may differ between
+        // arriving workers. Only this existing team owner selects the branch;
+        // its implicit barrier makes one choice visible before any workshare.
+        OMP_SINGLE([&]() {
+            epoch_counter_collection_enabled_ = PerfStatsCollector::isDomainEnabled("kernel");
+            if (epoch_counter_collection_enabled_) epoch_counter_observations_ = {};
+        });
+        return epoch_counter_collection_enabled_;
+    }
+
+    void CPUGatedDeltaNet::publishEpochCounterObservations(int dk, int dv) const
+    {
+        const auto &o = epoch_counter_observations_;
+        if (o.heads == 0) return;
+        const CPUGDNStateLayout layout(1, dk, dv);
+        const double matrix_bytes = static_cast<double>(layout.matrixFloats()) * sizeof(float);
+        const auto emit = [&](size_t index, std::uint64_t count, double value)
+        {
+            PerfStatsCollector::addCounter(epoch_counter_identities_[index],
+                PerfStatsCollector::CounterObservationBatch{.observations=count, .value=value});
+        };
+        emit(0, o.heads, static_cast<double>(o.projection_groups));
+        emit(1, o.heads, static_cast<double>(o.grouped_rows));
+        emit(2, o.heads, static_cast<double>(o.checkpoint_flushes));
+        if (o.shared_heads == 0) return;
+        emit(3, o.shared_heads, static_cast<double>(o.candidate_rows));
+        emit(4, o.shared_heads, static_cast<double>(o.shared_heads));
+        emit(5, o.shared_heads, o.shared_heads * matrix_bytes);
+        emit(6, o.shared_heads, static_cast<double>(o.shared_heads));
+        emit(7, o.shared_heads, o.shared_heads * matrix_bytes);
+        emit(8, o.shared_heads, static_cast<double>(o.shared_flushes));
+        emit(9, o.shared_heads, o.shared_flushes * matrix_bytes);
+        emit(10, o.shared_heads, 0.0);
+        emit(11, o.shared_heads, 0.0);
+        emit(12, o.shared_heads, static_cast<double>(o.raw_records));
+        emit(13, o.shared_heads, static_cast<double>(o.raw_records) * layout.recordFloats() * sizeof(float));
+        emit(14, o.shared_heads, 0.0);
+    }
+
     /**
      * @brief Test two byte ranges for overlap and fail closed on address overflow.
      */
@@ -72,10 +132,10 @@ namespace llaminar2
     bool CPUGatedDeltaNet::resetGPUState(void *stream)
     {
         (void)stream;
+        shared_valid_=false;
         request_state_bank_.clear();
         request_state_size_ = 0;
         request_state_capacity_ = 0;
-        owned_speculative_state_work_.clear();
         return true;
     }
 
@@ -113,19 +173,142 @@ namespace llaminar2
 
     void CPUGatedDeltaNet::bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
     {
+        shared_valid_=false;
         verifier_state_capture_ = workspace;
         verifier_state_capture_rows_ = rows;
         verifier_state_capture_size_ = state_size;
     }
 
-    void CPUGatedDeltaNet::bindSpeculativeStateWorkspace(float *workspace, int state_size)
+    /**
+     * @brief Borrow compact arena buffers and retire local publication eligibility.
+     * @param slots Immutable checkpoint/raw-log payload, or null when clearing.
+     * @param slot_floats Logical admitted payload extent in FP32-sized elements.
+     * @param rows Fixed admitted flattened candidate capacity.
+     * @throws std::invalid_argument for partial bindings or byte/prefix overflow.
+     * A stage may own a completed capture when another graph rebinds this shared
+     * backend; this operation therefore must not retire stage-owned slot headers.
+     */
+    void CPUGatedDeltaNet::bindCPUSharedStateCapture(float *slots,size_t slot_floats,int rows)
     {
-        speculative_state_work_ = workspace;
-        speculative_state_work_size_ = state_size;
+        shared_valid_=false;
+        if ((slots && (!slot_floats || rows<=0 || rows>std::numeric_limits<int>::max()-8)) ||
+            (!slots && (slot_floats || rows)) || slot_floats>std::numeric_limits<size_t>::max()/sizeof(float))
+            throw std::invalid_argument("CPU shared epoch capture requires complete admitted slot binding");
+        shared_slots_=slots; shared_slot_floats_=slot_floats; shared_rows_=rows;
+    }
+
+    /**
+     * @brief Authenticate logical capacity and geometry before recurrence writes.
+     * @param requests Fixed number of graph request partitions.
+     * @param width Live input-row width per request.
+     * @param heads Local value-head count.
+     * @param dk Key width of each canonical head.
+     * @param dv Value width of each canonical head.
+     * @return True for a complete immutable-slot binding with admitted capacity.
+     * @throws std::invalid_argument for unsupported canonical state geometry.
+     * @throws std::overflow_error if the canonical bank exceeds its INT ABI.
+     * Physical spans retain admitted width; accepted indices retain live width.
+     */
+    bool CPUGatedDeltaNet::prepareShared(int requests,int width,int heads,int dk,int dv)
+    {
+        shared_valid_=false;
+        const CPUGDNStateLayout l(heads,dk,dv);
+        if (requests<=0 || shared_rows_<=0 || shared_rows_%requests || width>shared_rows_/requests) return false;
+        shared_live_width_=width;
+        width=shared_rows_/requests;
+        if (!shared_slots_ || width<=0 || requests<=0 ||
+            static_cast<size_t>(requests)*width>static_cast<size_t>(shared_rows_) ||
+            CPUSharedGDNSnapshots::headFloats(l,width)>shared_slot_floats_/static_cast<size_t>(heads)/requests) return false;
+        shared_heads_=heads; shared_dk_=dk; shared_dv_=dv;
+        shared_width_=width; shared_requests_=requests;
+        return true;
+    }
+
+    /**
+     * @brief Check every head before publishing a locally bound candidate.
+     * @param row Flattened candidate index using the current live request width.
+     * @return True only for valid local lifecycle and complete candidate headers.
+     * Invalid candidates leave the immutable payload and canonical state intact.
+     */
+    bool CPUGatedDeltaNet::validSharedRow(int row) const
+    {
+        if (!shared_valid_ || row<0 || row>=shared_requests_*shared_live_width_) return false;
+        const CPUGDNStateLayout l(shared_heads_,shared_dk_,shared_dv_);
+        const int request=row/shared_live_width_,local=row%shared_live_width_;
+        const size_t span=CPUSharedGDNSnapshots::headFloats(l,shared_width_);
+        for(int head=0;head<shared_heads_;++head)
+            if (!CPUSharedGDNSnapshots(l,shared_slots_+(static_cast<size_t>(request)*shared_heads_+head)*span,shared_width_).validRow(local)) return false;
+        return true;
+    }
+
+    /**
+     * @brief Serialize one complete locally bound candidate without arithmetic.
+     * @param destination Writable canonical bank, disjoint from retained slots.
+     * @param row Flattened candidate index using the live request width.
+     * @return True after every head is copied, or false before mutation on invalid
+     *         lifecycle, candidate metadata, destination, or buffer overlap.
+     */
+    bool CPUGatedDeltaNet::materializeShared(float *destination,int row)
+    {
+        if (!destination || !validSharedRow(row)) return false;
+        const size_t bytes=static_cast<size_t>(CPUGDNStateLayout(shared_heads_,shared_dk_,shared_dv_).floats())*sizeof(float);
+        if (byteRangesOverlap(destination,bytes,shared_slots_,shared_slot_floats_*sizeof(float))) return false;
+        const CPUGDNStateLayout l(shared_heads_,shared_dk_,shared_dv_);
+        const int request=row/shared_live_width_,local=row%shared_live_width_;
+        const size_t span=CPUSharedGDNSnapshots::headFloats(l,shared_width_);
+        for(int head=0;head<shared_heads_;++head)
+            CPUSharedGDNSnapshots(l,shared_slots_+(static_cast<size_t>(request)*shared_heads_+head)*span,shared_width_)
+                .materialize(local,destination+static_cast<size_t>(head)*l.headFloats());
+        return true;
+    }
+
+    /**
+     * @copydoc ITensorGatedDeltaNet::restoreCPUSharedStateRows
+     *
+     * Validate the stage-owned generation and all selected head prefixes before
+     * modifying the canonical request bank. Rejection preserves that request's
+     * live bank. Explicit transactions borrow their stage's lifetime rather than
+     * this backend's current binding, so unrelated kernel clears remain harmless.
+     * No allocation, row replay, or partial checkpoint advancement occurs here.
+     */
+    bool CPUGatedDeltaNet::restoreCPUSharedStateRows(const CPUSharedGDNTransaction &t,
+        float *destination,const int *rows)
+    {
+        // The owning stage authenticates lifetime independently of the shared
+        // kernel binding. Another graph role may clear/rebind this backend while
+        // a completed stage-owned transaction is still awaiting publication.
+        if (!t.slots || !destination || !rows || t.requests<=0 || t.width<=0 || t.live_width<=0 || t.live_width>t.width ||
+            !t.generation_authority || *t.generation_authority!=t.generation) return false;
+        const CPUGDNStateLayout l(t.heads,t.dk,t.dv);
+        const size_t span=CPUSharedGDNSnapshots::headFloats(l,t.width);
+        if (span>t.slot_floats/static_cast<size_t>(t.heads)/t.requests ||
+            (t.requests>1 && (t.requests>request_state_capacity_ || request_state_size_!=l.floats())) ||
+            t.slot_floats>std::numeric_limits<size_t>::max()/sizeof(float) ||
+            byteRangesOverlap(destination,static_cast<size_t>(l.floats())*sizeof(float),t.slots,t.slot_floats*sizeof(float))) return false;
+        for(int request=0;request<t.requests;++request) {
+            if (rows[request]<0) continue;
+            if (rows[request]/t.live_width!=request) return false;
+            const int row=rows[request]%t.live_width;
+            for(int head=0;head<t.heads;++head)
+                if (!CPUSharedGDNSnapshots(l,t.slots+(static_cast<size_t>(request)*t.heads+head)*span,t.width).validRow(row)) return false;
+        }
+        for(int request=0;request<t.requests;++request) {
+            if (rows[request]<0) continue;
+            float *target=t.requests==1 ? destination : request_state_bank_.data()+static_cast<size_t>(request)*l.floats();
+            for(int head=0;head<t.heads;++head)
+                CPUSharedGDNSnapshots(l,t.slots+(static_cast<size_t>(request)*t.heads+head)*span,t.width)
+                    .materialize(rows[request]%t.live_width,target+static_cast<size_t>(head)*l.headFloats());
+            if (request==0 && t.requests>1) std::memcpy(destination,target,static_cast<size_t>(l.floats())*sizeof(float));
+            PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materializations",1,"publication","cpu");
+            PerfStatsCollector::addCounter("kernel","cpu_gdn_shared_accepted_materialization_bytes",
+                static_cast<double>(l.floats())*sizeof(float),"publication","cpu");
+        }
+        return true;
     }
 
     bool CPUGatedDeltaNet::restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
     {
+        if (shared_slots_) return materializeShared(dst_state,row);
         if (row < 0 || row >= verifier_state_capture_rows_)
             return false;
         return restoreStateFromSnapshot(
@@ -158,7 +341,8 @@ namespace llaminar2
         for (int request = 0; request < request_count; ++request)
         {
             const int row = host_row_indices[request];
-            if (row >= verifier_state_capture_rows_)
+            if (row >= verifier_state_capture_rows_ ||
+                (shared_slots_ && row>=0 && (!validSharedRow(row) || row/shared_live_width_!=request)))
                 return false;
         }
 
@@ -174,7 +358,8 @@ namespace llaminar2
             const int row = host_row_indices[0];
             if (row >= 0)
             {
-                std::memcpy(
+                if (shared_slots_) { if (!materializeShared(dst_state,row)) return false; }
+                else std::memcpy(
                     dst_state,
                     verifier_state_capture_ +
                         static_cast<size_t>(row) * verifier_state_capture_size_,
@@ -207,10 +392,10 @@ namespace llaminar2
             float *destination =
                 request_state_bank_.data() +
                 static_cast<size_t>(request) * request_state_size_;
-            const float *source =
-                verifier_state_capture_ +
-                static_cast<size_t>(row) * verifier_state_capture_size_;
-            std::memcpy(
+            const float *source = shared_slots_ ? nullptr :
+                verifier_state_capture_ + static_cast<size_t>(row) * verifier_state_capture_size_;
+            if (shared_slots_) { if (!materializeShared(destination,row)) return false; }
+            else std::memcpy(
                 destination,
                 source,
                 static_cast<size_t>(request_state_size_) * sizeof(float));
@@ -232,27 +417,6 @@ namespace llaminar2
             {{"request_count", std::to_string(request_count)},
              {"publication_policy", "request_bank_snapshot_copy"}});
         return true;
-    }
-
-    float *CPUGatedDeltaNet::prepareSpeculativeState(float *live_state, int state_floats)
-    {
-        if (!live_state || state_floats <= 0)
-            return nullptr;
-
-        float *work = nullptr;
-        if (speculative_state_work_ && speculative_state_work_size_ >= state_floats)
-        {
-            work = speculative_state_work_;
-        }
-        else
-        {
-            owned_speculative_state_work_.resize(static_cast<size_t>(state_floats));
-            work = owned_speculative_state_work_.data();
-            speculative_state_work_size_ = std::max(speculative_state_work_size_, state_floats);
-        }
-
-        std::memcpy(work, live_state, static_cast<size_t>(state_floats) * sizeof(float));
-        return work;
     }
 
     // =========================================================================
@@ -602,578 +766,74 @@ namespace llaminar2
         }
     }
 
-    // =========================================================================
-    // Named ISA implementations: core delta recurrence (5-step)
-    // =========================================================================
-
-    static void gdn_delta_recurrence_scalar(
-        float *S, const float *q, const float *k, const float *v,
-        float *o, float decay, float beta, int d_k, int d_v)
-    {
-        // Step 1: Decay state
-        for (int ij = 0; ij < d_k * d_v; ++ij)
-            S[ij] *= decay;
-
-        // Step 2: kv_mem = S^T * k
-        alignas(64) float kv_mem[512];
-        std::memset(kv_mem, 0, d_v * sizeof(float));
-        for (int j = 0; j < d_k; ++j)
-        {
-            const float k_j = k[j];
-            for (int vi = 0; vi < d_v; ++vi)
-                kv_mem[vi] += S[j * d_v + vi] * k_j;
-        }
-
-        // Step 3: delta = (v - kv_mem) * beta
-        alignas(64) float delta[512];
-        for (int vi = 0; vi < d_v; ++vi)
-            delta[vi] = (v[vi] - kv_mem[vi]) * beta;
-
-        // Step 4: S += outer(k, delta)
-        for (int j = 0; j < d_k; ++j)
-        {
-            const float k_j = k[j];
-            for (int vi = 0; vi < d_v; ++vi)
-                S[j * d_v + vi] += k_j * delta[vi];
-        }
-
-        // Step 5: output = S^T * q
-        std::memset(o, 0, d_v * sizeof(float));
-        for (int j = 0; j < d_k; ++j)
-        {
-            const float q_j = q[j];
-            for (int vi = 0; vi < d_v; ++vi)
-                o[vi] += S[j * d_v + vi] * q_j;
-        }
-    }
-
-#if defined(__AVX2__)
-    static void gdn_delta_recurrence_avx2(
-        float *S, const float *q, const float *k, const float *v,
-        float *o, float decay, float beta, int d_k, int d_v)
-    {
-        avx2::scale(S, d_k * d_v, decay);
-
-        alignas(64) float kv_mem[512];
-        avx2::zero(kv_mem, d_v);
-        for (int j = 0; j < d_k; ++j)
-            avx2::axpy(kv_mem, S + j * d_v, k[j], d_v);
-
-        alignas(64) float delta[512];
-        avx2::sub_mul(delta, v, kv_mem, beta, d_v);
-
-        for (int j = 0; j < d_k; ++j)
-            avx2::axpy(S + j * d_v, delta, k[j], d_v);
-
-        avx2::zero(o, d_v);
-        for (int j = 0; j < d_k; ++j)
-            avx2::axpy(o, S + j * d_v, q[j], d_v);
-    }
-#endif
-
-#if defined(__AVX512F__)
-    static void gdn_delta_recurrence_avx512(
-        float *S, const float *q, const float *k, const float *v,
-        float *o, float decay, float beta, int d_k, int d_v)
-    {
-        const int d_v_vec = d_v & ~15;
-
-        // Step 1: Decay state
-        {
-            const __m512 vdecay = _mm512_set1_ps(decay);
-            const int total = d_k * d_v;
-            const int total_vec = total & ~15;
-            int ij = 0;
-            for (; ij < total_vec; ij += 16)
-            {
-                __m512 s = _mm512_loadu_ps(S + ij);
-                _mm512_storeu_ps(S + ij, _mm512_mul_ps(s, vdecay));
-            }
-            for (; ij < total; ++ij)
-                S[ij] *= decay;
-        }
-
-        // Step 2: kv_mem = S^T * k
-        alignas(64) float kv_mem[512];
-        {
-            int vi = 0;
-            for (; vi < d_v_vec; vi += 16)
-                _mm512_store_ps(kv_mem + vi, _mm512_setzero_ps());
-            for (; vi < d_v; ++vi)
-                kv_mem[vi] = 0.0f;
-
-            for (int j = 0; j < d_k; ++j)
-            {
-                const __m512 vk = _mm512_set1_ps(k[j]);
-                const float *S_row = S + j * d_v;
-                vi = 0;
-                for (; vi < d_v_vec; vi += 16)
-                {
-                    __m512 acc = _mm512_load_ps(kv_mem + vi);
-                    __m512 sv = _mm512_loadu_ps(S_row + vi);
-                    _mm512_store_ps(kv_mem + vi, _mm512_fmadd_ps(sv, vk, acc));
-                }
-                for (; vi < d_v; ++vi)
-                    kv_mem[vi] += S_row[vi] * k[j];
-            }
-        }
-
-        // Step 3: delta = (v - kv_mem) * beta
-        alignas(64) float delta[512];
-        {
-            const __m512 vbeta = _mm512_set1_ps(beta);
-            int vi = 0;
-            for (; vi < d_v_vec; vi += 16)
-            {
-                __m512 vv = _mm512_loadu_ps(v + vi);
-                __m512 vkv = _mm512_load_ps(kv_mem + vi);
-                _mm512_store_ps(delta + vi, _mm512_mul_ps(_mm512_sub_ps(vv, vkv), vbeta));
-            }
-            for (; vi < d_v; ++vi)
-                delta[vi] = (v[vi] - kv_mem[vi]) * beta;
-        }
-
-        // Step 4: S += outer(k, delta)
-        for (int j = 0; j < d_k; ++j)
-        {
-            const __m512 vk = _mm512_set1_ps(k[j]);
-            float *S_row = S + j * d_v;
-            int vi = 0;
-            for (; vi < d_v_vec; vi += 16)
-            {
-                __m512 sv = _mm512_loadu_ps(S_row + vi);
-                __m512 vd = _mm512_load_ps(delta + vi);
-                _mm512_storeu_ps(S_row + vi, _mm512_fmadd_ps(vk, vd, sv));
-            }
-            for (; vi < d_v; ++vi)
-                S_row[vi] += k[j] * delta[vi];
-        }
-
-        // Step 5: output = S^T * q
-        {
-            int vi = 0;
-            for (; vi < d_v_vec; vi += 16)
-                _mm512_storeu_ps(o + vi, _mm512_setzero_ps());
-            for (; vi < d_v; ++vi)
-                o[vi] = 0.0f;
-
-            for (int j = 0; j < d_k; ++j)
-            {
-                const __m512 vq = _mm512_set1_ps(q[j]);
-                const float *S_row = S + j * d_v;
-                vi = 0;
-                for (; vi < d_v_vec; vi += 16)
-                {
-                    __m512 acc = _mm512_loadu_ps(o + vi);
-                    __m512 sv = _mm512_loadu_ps(S_row + vi);
-                    _mm512_storeu_ps(o + vi, _mm512_fmadd_ps(sv, vq, acc));
-                }
-                for (; vi < d_v; ++vi)
-                    o[vi] += S_row[vi] * q[j];
-            }
-        }
-    }
-#endif
-
-// Stubs for when ISA is unavailable at compile time
-#if !defined(__AVX2__)
-    static void gdn_delta_recurrence_avx2(
-        float *S, const float *q, const float *k, const float *v,
-        float *o, float decay, float beta, int d_k, int d_v)
-    {
-        gdn_delta_recurrence_scalar(S, q, k, v, o, decay, beta, d_k, d_v);
-    }
-#endif
-#if !defined(__AVX512F__)
-    static void gdn_delta_recurrence_avx512(
-        float *S, const float *q, const float *k, const float *v,
-        float *o, float decay, float beta, int d_k, int d_v)
-    {
-        gdn_delta_recurrence_avx2(S, q, k, v, o, decay, beta, d_k, d_v);
-    }
-#endif
-
-    static inline void gdn_delta_recurrence(
-        float *S, const float *q, const float *k, const float *v,
-        float *o, float decay, float beta, int d_k, int d_v)
-    {
-        ISA_DISPATCH_VOID(gdn_delta_recurrence, S, q, k, v, o, decay, beta, d_k, d_v);
-    }
-
-    // =========================================================================
-    // Recurrent step (decode, seq_len=1)
-    // =========================================================================
-
     bool CPUGatedDeltaNet::recurrent_step(
         const float *q, const float *k, const float *v,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
         float *output, float *state,
-        int n_heads, int d_k, int d_v,
-        bool use_qk_l2norm)
+        int n_heads, int d_k, int d_v, bool use_qk_l2norm)
     {
-        const int state_floats = n_heads * d_k * d_v;
-        const bool verifier_capture_active =
-            verifier_state_capture_ &&
-            verifier_state_capture_rows_ > 0 &&
-            verifier_state_capture_size_ >= state_floats &&
-            state_floats > 0;
-        float *state_for_compute = state;
-        if (verifier_capture_active)
+        shared_valid_=false;
+        if (!q || !k || !v || !alpha || !beta_raw || !A_log || !dt_bias || !output || !state ||
+            n_heads <= 0 || d_k <= 0 || d_v <= 0 || d_k > 512 || d_v > 512)
+            return false;
+        const CPUGDNStateLayout layout(n_heads, d_k, d_v);
+        if (!layout.valid(state)) return false;
+        const bool capture = verifier_state_capture_ != nullptr;
+        if (capture && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
+            throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
+        if (capture && (verifier_state_capture_rows_ < 1 || verifier_state_capture_size_ < layout.floats() ||
+            byteRangesOverlap(state, static_cast<size_t>(layout.floats()) * sizeof(float),
+                verifier_state_capture_, shared_slot_floats_ * sizeof(float))))
+            return false;
+        if (capture && !prepareShared(1,1,n_heads,d_k,d_v)) return false;
+        PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_readout_rows",
+            static_cast<double>(n_heads), "recurrence", "cpu");
+        const float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
+        const bool observe_epoch = beginEpochCounterObservations();
+        auto &observations = epoch_counter_observations_;
+        // Each member keeps its returned local choice through publication;
+        // subsequent collector reloads cannot change workshare control flow.
+        const auto advance_head = [&](int h) -> CPUFixedEpochObservations
         {
-            state_for_compute = prepareSpeculativeState(state, state_floats);
-            if (!state_for_compute)
-                return false;
-        }
-
-        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
-        constexpr float l2_eps = 1e-6f;
-
-        // Fold ALL preprocessing into the per-head parallel loop.
-        // Each thread uses stack-local Q/K — no shared scratch, no sequential
-        // bottleneck, no OMP barrier between preprocessing and recurrence.
-        auto do_work = [&]()
-        {
-#pragma omp for schedule(static)
-            for (int h = 0; h < n_heads; ++h)
-            {
-                // ── Per-head preprocessing (stack-local buffers) ──
-                alignas(64) float q_local[512]; // d_k <= 512
-                alignas(64) float k_local[512];
-
-                const float *q_src = q + h * d_k;
-                const float *k_src = k + h * d_k;
-
+                alignas(64) float query[512], key[512];
                 if (use_qk_l2norm)
+                    gdn_preprocess_qk_l2norm(q + h*d_k, k + h*d_k, query, key, d_k, scale, 1e-6f);
+                else gdn_preprocess_qk_scale(q + h*d_k, k + h*d_k, query, key, d_k, scale);
+                const float x = alpha[h] + dt_bias[h];
+                const float decay = std::exp(A_log[h] * (x > 20.0f ? x : std::log1p(std::exp(x))));
+                const float beta = 1.0f / (1.0f + std::exp(-beta_raw[h]));
+                float *initial = state + static_cast<size_t>(h) * layout.headFloats();
+                if (capture)
                 {
-                    gdn_preprocess_qk_l2norm(q_src, k_src, q_local, k_local, d_k, scale_val, l2_eps);
+                    CPUSharedGDNSnapshots shared(layout,shared_slots_+static_cast<size_t>(h)*CPUSharedGDNSnapshots::headFloats(layout,shared_width_),shared_width_);
+                    return cpu_gdn_epoch::runShared(layout,initial,query,key,v+h*d_v,&decay,&beta,
+                        1,d_k,d_v,1,output+h*d_v,d_v,shared);
                 }
                 else
-                {
-                    gdn_preprocess_qk_scale(q_src, k_src, q_local, k_local, d_k, scale_val);
-                }
-
-                // ── Gate + beta (combined, saves one exp() call) ──
-                const float x = alpha[h] + dt_bias[h];
-                const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
-                const float decay = std::exp(A_log[h] * sp);
-                const float beta_h = 1.0f / (1.0f + std::exp(-beta_raw[h]));
-
-                // ── Core recurrence ──
-                float *S = state_for_compute + static_cast<size_t>(h) * d_k * d_v;
-                const float *q_h = q_local;
-                const float *k_h = k_local;
-                const float *v_h = v + h * d_v;
-                float *o_h = output + h * d_v;
-
-                gdn_delta_recurrence(S, q_h, k_h, v_h, o_h, decay, beta_h, d_k, d_v);
-            }
+                    return cpu_gdn_epoch::run(layout,initial,initial,query,key,v+h*d_v,
+                        &decay,&beta,1,d_k,d_v,1,output+h*d_v,d_v);
         };
-        OMP_WORKSHARE_REGION(do_work);
-
-        if (verifier_capture_active)
+        auto work = [&]()
         {
-            std::memcpy(verifier_state_capture_,
-                        state_for_compute,
-                        static_cast<size_t>(state_floats) * sizeof(float));
-        }
-
-        return true;
-    }
-
-    // =========================================================================
-    // Chunk forward (prefill, seq_len>1)
-    //
-    // Optimizations over naive per-timestep recurrence:
-    //   1. Preprocessing (copy+normalize+scale Q/K, gates, output zero) is
-    //      parallelised across tokens — all cores contribute, not just 1.
-    //   2. Steps 1+2 (decay S, kv_mem = S^T*k) fused into a single pass
-    //      over S rows, eliminating one full read of the state matrix.
-    //   3. Steps 4+5 (S += k⊗δ, output = S^T*q) fused similarly.
-    //   4. Software prefetch: next S-row prefetched into the cache level
-    //      where S resides (L1 if S fits, L2 otherwise), based on runtime
-    //      cache detection via CPUFeatures.h.
-    //
-    // Normal heads retain whole-head ownership: indiscriminate value tiling
-    // duplicates Q/K traffic and reduces instruction-level parallelism. A
-    // subnormal decay factor is different: hardware gradual-underflow assists
-    // make that one head dominate the whole team's barrier. Split only those
-    // heads, and only when the team has more workers than heads. This preserves
-    // gradual underflow instead of changing arithmetic with FTZ/DAZ.
-    // =========================================================================
-
-    /** @brief A disjoint value-column interval with unchanged full state stride. */
-    struct GDNValueTile
-    {
-        int first; ///< First value column, aligned to a sixteen-float boundary.
-        int count; ///< Positive number of independent columns owned by the task.
-    };
-
-    /**
-     * @brief Assign spare workers only to subnormal-gated recurrence heads.
-     * @param gates Immutable decay factors published by the preprocessing barrier.
-     * @param rows Number of strictly ordered recurrence timesteps.
-     * @param heads Physical local head count and gate row stride.
-     * @param head Head whose independent columns are being assigned.
-     * @param width Full value width, never changed by tiling.
-     * @param slot Candidate value-column task within the head.
-     * @param slots One for whole-head work, otherwise the number of cache-line tiles.
-     * @return Owned interval, or no work for an unused slot of a normal head.
-     *
-     * Classification reads exact FP32 bits, including under fast-math builds.
-     * Zero decay is cheap and does not qualify. A normal head remains one task;
-     * scanning its small, already-hot gate vector avoids allocating a second
-     * per-head policy buffer or adding another preprocessing barrier. Only
-     * independent columns move between workers: token and key reduction order,
-     * snapshot ownership, and the gradual-underflow arithmetic are unchanged.
-     */
-    static std::optional<GDNValueTile> gdnValueTile(
-        const float *gates, int rows, int heads, int head,
-        int width, int slot, int slots)
-    {
-        bool has_subnormal_gate = false;
-        if (slots > 1)
-        {
-            for (int row = 0; row < rows; ++row)
+            if (observe_epoch)
             {
-                const uint32_t magnitude = std::bit_cast<uint32_t>(
-                    gates[static_cast<size_t>(row) * heads + head]) & 0x7fffffffu;
-                if (magnitude != 0 && magnitude < 0x00800000u)
-                {
-                    has_subnormal_gate = true;
-                    break;
-                }
-            }
-        }
-        if (!has_subnormal_gate)
-            return slot == 0 ? std::optional<GDNValueTile>{{0, width}} : std::nullopt;
-
-        // Whole cache-line columns also preserve the SIMD/scalar tail boundary
-        // of the serial kernel. No two tasks write the same state/output lane.
-        constexpr int line_floats = 64 / sizeof(float);
-        const int tile_width = ((width + slots - 1) / slots + line_floats - 1) /
-                               line_floats * line_floats;
-        const int first = slot * tile_width;
-        if (first >= width)
-            return std::nullopt;
-        return GDNValueTile{first, std::min(tile_width, width - first)};
-    }
-
-// Prefetch to L1 or L2 depending on runtime bool (GCC 14 requires
-// compile-time constant for _mm_prefetch hint parameter).
-#if defined(__AVX512F__) || defined(__AVX2__)
-#define GDN_PREFETCH_S(addr, to_l1)                          \
-    do                                                       \
-    {                                                        \
-        if (to_l1)                                           \
-            _mm_prefetch((const char *)(addr), _MM_HINT_T0); \
-        else                                                 \
-            _mm_prefetch((const char *)(addr), _MM_HINT_T1); \
-    } while (0)
-#endif
-
-#if defined(__AVX512F__)
-    /**
-     * @brief Advance independent columns of a d_v=128 head with ZMM-resident vectors.
-     * @tparam VectorCount Eight vectors for a whole head or one for a split head.
-     *
-     * @param q_scratch Canonically normalized/scaled Q rows.
-     * @param k_scratch Canonically normalized K rows.
-     * @param values Original V rows.
-     * @param gate_scratch Per-row decay factors.
-     * @param beta_scratch Per-row sigmoid(beta) factors.
-     * @param output Complete output tensor.
-     * @param state Initial recurrence state, or mutable state without snapshots.
-     * @param seq_len Number of rows advanced in strict ascending order.
-     * @param n_heads Number of local value heads.
-     * @param d_k Key width and state-row count.
-     * @param head Local head owned by this task.
-     * @param first_column First value column exclusively owned by this task.
-     * @param value_row_stride Distance between source V rows in FP32 elements.
-     * @param prefetch_rows Number of future state rows to prefetch.
-     * @param prefetch_to_l1 Whether state geometry fits the detected L1 policy.
-     * @param state_snapshots Optional full-head snapshot storage.
-     * @param snapshot_stride_floats Distance between snapshot rows.
-     *
-     * The value vectors remain in ZMM registers, while every lane preserves
-     * the serial-decode `j=0..d_k-1` accumulation order. After the first decay
-     * pass, a token's state update also computes the next token's decay/key
-     * reduction. This removes one full state read/write walk per later token,
-     * not any arithmetic. The ordinary mutable state temporarily holds the
-     * next decayed row; its final value is the undecayed terminal state.
-     *
-     * With snapshots, the updated state is additionally saved in the current
-     * snapshot before its decayed value is written into the next destination.
-     * Every completed snapshot remains immutable, including when input state
-     * must be preserved for MTP acceptance. No extra state buffer is needed.
-     */
-    template <int VectorCount>
-    static void gdnChunkForwardAVX512DV128(
-        const float *q_scratch,
-        const float *k_scratch,
-        const float *values,
-        const float *gate_scratch,
-        const float *beta_scratch,
-        float *output,
-        float *state,
-        int seq_len,
-        int n_heads,
-        int d_k,
-        int head,
-        int first_column,
-        int value_row_stride,
-        int prefetch_rows,
-        bool prefetch_to_l1,
-        float *state_snapshots,
-        int snapshot_stride_floats)
-    {
-        static_assert(VectorCount == 1 || VectorCount == 8);
-        constexpr int kVectorWidth = 16;
-        constexpr int kValueWidth = 128;
-        const int qk_stride = n_heads * d_k;
-        const int output_stride = n_heads * kValueWidth;
-        const size_t head_state_floats =
-            static_cast<size_t>(d_k) * kValueWidth;
-        float *input_head_state =
-            state + static_cast<size_t>(head) * head_state_floats + first_column;
-
-        // Seed the first token exactly as serial decode does. Later key
-        // reductions are produced while updating the preceding token below.
-        float *decayed_head_state = state_snapshots
-            ? state_snapshots + static_cast<size_t>(head) * head_state_floats + first_column
-            : input_head_state;
-        __m512 kv[VectorCount];
-#pragma GCC unroll 8
-        for (int vector = 0; vector < VectorCount; ++vector)
-            kv[vector] = _mm512_setzero_ps();
-        const __m512 first_decay = _mm512_set1_ps(gate_scratch[head]);
-        const float *first_key = k_scratch + static_cast<size_t>(head) * d_k;
-        for (int row = 0; row < d_k; ++row)
-        {
-            const __m512 key = _mm512_set1_ps(first_key[row]);
-#pragma GCC unroll 8
-            for (int vector = 0; vector < VectorCount; ++vector)
-            {
-                const size_t offset = static_cast<size_t>(row) * kValueWidth +
-                                      vector * kVectorWidth;
-                const __m512 decayed = _mm512_mul_ps(
-                    _mm512_loadu_ps(input_head_state + offset), first_decay);
-                _mm512_storeu_ps(decayed_head_state + offset, decayed);
-                kv[vector] = _mm512_fmadd_ps(decayed, key, kv[vector]);
-            }
-        }
-
-        for (int token = 0; token < seq_len; ++token)
-        {
-            const float *q = q_scratch +
-                             static_cast<size_t>(token) * qk_stride +
-                             static_cast<size_t>(head) * d_k;
-            const float *k = k_scratch +
-                             static_cast<size_t>(token) * qk_stride +
-                             static_cast<size_t>(head) * d_k;
-            const float *v = values +
-                             static_cast<size_t>(token) * value_row_stride +
-                             static_cast<size_t>(head) * kValueWidth + first_column;
-            float *o = output +
-                       static_cast<size_t>(token) * output_stride +
-                       static_cast<size_t>(head) * kValueWidth + first_column;
-
-            const __m512 beta = _mm512_set1_ps(
-                beta_scratch[static_cast<size_t>(token) * n_heads + head]);
-#pragma GCC unroll 8
-            for (int vector = 0; vector < VectorCount; ++vector)
-            {
-                kv[vector] = _mm512_mul_ps(
-                    _mm512_sub_ps(
-                        _mm512_loadu_ps(v + vector * kVectorWidth),
-                        kv[vector]),
-                    beta);
-            }
-
-            __m512 accumulated_output[VectorCount];
-#pragma GCC unroll 8
-            for (int vector = 0; vector < VectorCount; ++vector)
-                accumulated_output[vector] = _mm512_setzero_ps();
-
-            if (token + 1 < seq_len)
-            {
-                __m512 next_kv[VectorCount];
-#pragma GCC unroll 8
-                for (int vector = 0; vector < VectorCount; ++vector)
-                    next_kv[vector] = _mm512_setzero_ps();
-                const float *next_key = k + qk_stride;
-                const __m512 next_decay = _mm512_set1_ps(
-                    gate_scratch[static_cast<size_t>(token + 1) * n_heads + head]);
-                float *next_head_state = state_snapshots
-                    ? decayed_head_state + snapshot_stride_floats : decayed_head_state;
-
-                // The current output and next key sum have independent
-                // accumulators. Interleave them, but retain ascending key-row
-                // order and the same rounded multiply/FMA for every lane.
-                for (int row = 0; row < d_k; ++row)
-                {
-                    if (row + prefetch_rows < d_k)
-                        GDN_PREFETCH_S(
-                            decayed_head_state + static_cast<size_t>(row + prefetch_rows) * kValueWidth,
-                            prefetch_to_l1);
-                    const __m512 key = _mm512_set1_ps(k[row]);
-                    const __m512 query = _mm512_set1_ps(q[row]);
-                    const __m512 following_key = _mm512_set1_ps(next_key[row]);
-#pragma GCC unroll 8
-                    for (int vector = 0; vector < VectorCount; ++vector)
-                    {
-                        const size_t offset = static_cast<size_t>(row) * kValueWidth +
-                                              vector * kVectorWidth;
-                        const __m512 updated = _mm512_fmadd_ps(
-                            key, kv[vector], _mm512_loadu_ps(decayed_head_state + offset));
-                        accumulated_output[vector] = _mm512_fmadd_ps(
-                            updated, query, accumulated_output[vector]);
-                        if (state_snapshots)
-                            _mm512_storeu_ps(decayed_head_state + offset, updated);
-                        const __m512 next_decayed = _mm512_mul_ps(updated, next_decay);
-                        next_kv[vector] = _mm512_fmadd_ps(
-                            next_decayed, following_key, next_kv[vector]);
-                        _mm512_storeu_ps(next_head_state + offset, next_decayed);
-                    }
-                }
-                decayed_head_state = next_head_state;
-#pragma GCC unroll 8
-                for (int vector = 0; vector < VectorCount; ++vector)
-                    kv[vector] = next_kv[vector];
+#pragma omp for schedule(static) reduction(cpu_gdn_epoch_observations : observations)
+                for (int h = 0; h < n_heads; ++h)
+                    observations += advance_head(h);
             }
             else
             {
-                // Publish an ordinary, fully updated terminal state. There is
-                // no speculative next decay after the last requested token.
-                for (int row = 0; row < d_k; ++row)
-                {
-                    const __m512 key = _mm512_set1_ps(k[row]);
-                    const __m512 query = _mm512_set1_ps(q[row]);
-#pragma GCC unroll 8
-                    for (int vector = 0; vector < VectorCount; ++vector)
-                    {
-                        float *segment = decayed_head_state +
-                            static_cast<size_t>(row) * kValueWidth + vector * kVectorWidth;
-                        const __m512 updated = _mm512_fmadd_ps(
-                            key, kv[vector], _mm512_loadu_ps(segment));
-                        _mm512_storeu_ps(segment, updated);
-                        accumulated_output[vector] = _mm512_fmadd_ps(
-                            updated, query, accumulated_output[vector]);
-                    }
-                }
+#pragma omp for schedule(static)
+                for (int h = 0; h < n_heads; ++h)
+                    (void)advance_head(h);
             }
-
-#pragma GCC unroll 8
-            for (int vector = 0; vector < VectorCount; ++vector)
-            {
-                _mm512_storeu_ps(
-                    o + vector * kVectorWidth,
-                    accumulated_output[vector]);
-            }
-
-        }
+        };
+        OMP_WORKSHARE_REGION(work);
+        if (observe_epoch) OMP_SINGLE([&]() { publishEpochCounterObservations(d_k, d_v); });
+        if (capture) shared_valid_=true;
+        return true;
     }
-#endif
 
     bool CPUGatedDeltaNet::chunk_forward(
         const float *Q, const float *K, const float *V,
@@ -1183,7 +843,15 @@ namespace llaminar2
         int seq_len, int n_heads, int d_k, int d_v,
         int chunk_size, bool use_qk_l2norm)
     {
-        const int state_floats = n_heads * d_k * d_v;
+        shared_valid_=false;
+        if (n_heads <= 0 || d_k <= 0 || d_v <= 0 || d_k > 512 || d_v > 512)
+            return false;
+        const int state_floats = CPUGDNStateLayout(n_heads, d_k, d_v).floats();
+        if (verifier_state_capture_ && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
+            throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
+        if (verifier_state_capture_ &&
+            (verifier_state_capture_rows_ < seq_len || verifier_state_capture_size_ < state_floats))
+            return false;
         float *state_snapshots = nullptr;
         int snapshot_stride_floats = 0;
         int max_snapshot_rows = 0;
@@ -1225,6 +893,7 @@ namespace llaminar2
         int global_v_head_offset, int chunk_size,
         bool use_qk_l2norm)
     {
+        shared_valid_=false;
         if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
             n_heads <= 0 || d_k <= 0 || d_v <= 0)
         {
@@ -1237,7 +906,14 @@ namespace llaminar2
         if (qkv_stride < q_src_dim + k_src_dim + v_dim)
             return false;
 
-        const int state_floats = n_heads * d_k * d_v;
+        if (n_heads <= 0 || d_k <= 0 || d_v <= 0 || d_k > 512 || d_v > 512)
+            return false;
+        const int state_floats = CPUGDNStateLayout(n_heads, d_k, d_v).floats();
+        if (verifier_state_capture_ && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
+            throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
+        if (verifier_state_capture_ &&
+            (verifier_state_capture_rows_ < seq_len || verifier_state_capture_size_ < state_floats))
+            return false;
         float *state_snapshots = nullptr;
         int snapshot_stride_floats = 0;
         int max_snapshot_rows = 0;
@@ -1312,6 +988,7 @@ namespace llaminar2
         int state_floats, void *stream)
     {
         (void)stream;
+        if (shared_slots_ && state_snapshots==shared_slots_) return materializeShared(state,snapshot_row);
         if (!state || !state_snapshots || snapshot_row < 0 ||
             snapshot_stride_floats < state_floats || state_floats < 0)
             return false;
@@ -1368,190 +1045,128 @@ namespace llaminar2
 
     template <typename RowAccessor>
     bool CPUGatedDeltaNet::chunkForwardBatchedDecodeEquivalentRows(
-        RowAccessor &&row_accessor,
+        RowAccessor &&row_accessor, int value_row_stride,
         const float *alpha, const float *beta_raw,
-        const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        const float *A_log, const float *dt_bias, float *output, float *state,
         int seq_len, int request_count, int request_seq_len,
-        int n_heads, int d_k, int d_v,
-        bool use_qk_l2norm,
+        int n_heads, int d_k, int d_v, bool use_qk_l2norm,
         const int *host_request_seq_lens)
     {
-        if (!alpha || !beta_raw || !A_log || !dt_bias || !output || !state ||
-            !host_request_seq_lens || seq_len <= 0 || request_count <= 0 ||
-            request_seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-            request_seq_len > std::numeric_limits<int>::max() / request_count ||
-            seq_len != request_count * request_seq_len ||
-            d_k > 512 || d_v > 512)
-        {
+        shared_valid_=false;
+        if (!alpha || !beta_raw || !A_log || !dt_bias || !output || !state || !host_request_seq_lens ||
+            request_count <= 0 || request_seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+            d_k > 512 || d_v > 512 || request_seq_len > std::numeric_limits<int>::max()/request_count ||
+            seq_len != request_count * request_seq_len)
             return false;
+        const CPUGDNStateLayout layout(n_heads, d_k, d_v);
+        if (!layout.valid(state) || layout.floats() > std::numeric_limits<int>::max()/request_count ||
+            n_heads > std::numeric_limits<int>::max()/request_count) return false;
+        int64_t live_rows = 0;
+        for (int request = 0; request < request_count; ++request)
+        {
+            if (host_request_seq_lens[request] < 0 || host_request_seq_lens[request] > request_seq_len) return false;
+            live_rows += host_request_seq_lens[request];
         }
-
-        const size_t state_floats_wide =
-            static_cast<size_t>(n_heads) * d_k * d_v;
-        if (state_floats_wide > static_cast<size_t>(std::numeric_limits<int>::max()))
-            return false;
-        const int state_floats = static_cast<int>(state_floats_wide);
-        if (state_floats <= 0 ||
-            state_floats > std::numeric_limits<int>::max() / request_count ||
-            n_heads > std::numeric_limits<int>::max() / request_count)
+        if (verifier_state_capture_ && shared_slots_ &&
+            byteRangesOverlap(state,static_cast<size_t>(layout.floats())*sizeof(float),shared_slots_,shared_slot_floats_*sizeof(float))) return false;
+        if (!ensureRequestStateBank(request_count, layout.floats(), state)) return false;
+        for (int request = 0; request < request_count; ++request)
+            if (!layout.valid(request_state_bank_.data() + static_cast<size_t>(request)*layout.floats())) return false;
+        const bool capture = verifier_state_capture_ != nullptr;
+        if (capture && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
+            throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
+        if (capture && (verifier_state_capture_rows_ < seq_len || verifier_state_capture_size_ < layout.floats())) return false;
+        const bool shared_capture=capture && shared_slots_;
+        if (shared_capture && !prepareShared(request_count,request_seq_len,n_heads,d_k,d_v)) return false;
+        ensureScratch(seq_len, n_heads, d_k, d_v);
+        const int qk_stride = n_heads*d_k, output_stride = n_heads*d_v;
+        const float scale = 1.0f/std::sqrt(static_cast<float>(d_k));
+        std::atomic<bool> failed{false};
+        PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_readout_rows",
+            static_cast<double>(live_rows*n_heads), "recurrence", "cpu");
+        PerfStatsCollector::addCounter("kernel", "cpu_gdn_request_batched_grouped_calls", 1.0,
+            "prefill", "cpu", {{"request_count", std::to_string(request_count)},
+            {"request_row_width", std::to_string(request_seq_len)}, {"execution_policy", "request_head_fixed_epoch"}});
+        const bool observe_epoch = beginEpochCounterObservations();
+        auto &observations = epoch_counter_observations_;
+        // Each member keeps its returned local choice through publication;
+        // subsequent collector reloads cannot change workshare control flow.
+        const auto advance_head = [&](int task) -> CPUFixedEpochObservations
         {
-            return false;
-        }
-        const int total_state_floats = request_count * state_floats;
-        if (!ensureRequestStateBank(request_count, state_floats, state))
-            return false;
-
-        const bool capture_active =
-            verifier_state_capture_ != nullptr &&
-            verifier_state_capture_rows_ >= seq_len &&
-            verifier_state_capture_size_ >= state_floats;
-        float *effective_states = request_state_bank_.data();
-        if (capture_active)
+                if (failed.load(std::memory_order_relaxed)) return CPUFixedEpochObservations{};
+                const int request=task/n_heads,head=task%n_heads,rows=host_request_seq_lens[request];
+                const size_t first=static_cast<size_t>(request)*request_seq_len;
+                float *initial=request_state_bank_.data()+static_cast<size_t>(request)*layout.floats()+static_cast<size_t>(head)*layout.headFloats();
+                if (shared_capture && rows==0) {
+                    const size_t span=CPUSharedGDNSnapshots::headFloats(layout,shared_width_);
+                    CPUSharedGDNSnapshots(layout,shared_slots_+static_cast<size_t>(task)*span,shared_width_).retire();
+                }
+                CPUFixedEpochObservations observed{};
+                if (rows > 0)
+                {
+                    const float *q=nullptr,*k=nullptr,*v=nullptr;
+                    row_accessor(request,0,head,q,k,v);
+                    const float *prepared_q=q_scratch_.data()+first*qk_stride+head*d_k;
+                    const float *prepared_k=k_scratch_.data()+first*qk_stride+head*d_k;
+                    float *out=output+first*output_stride+head*d_v;
+                    if (shared_capture)
+                    {
+                        CPUSharedGDNSnapshots shared(layout,shared_slots_+static_cast<size_t>(task)*CPUSharedGDNSnapshots::headFloats(layout,shared_width_),shared_width_);
+                        observed = cpu_gdn_epoch::runShared(layout,initial,prepared_q,prepared_k,v,
+                            gate_scratch_.data()+first*n_heads+head,beta_sig_scratch_.data()+first*n_heads+head,
+                            rows,qk_stride,value_row_stride,n_heads,out,output_stride,shared);
+                    }
+                    else
+                        observed = cpu_gdn_epoch::run(layout,initial,initial,prepared_q,prepared_k,v,
+                            gate_scratch_.data()+first*n_heads+head,beta_sig_scratch_.data()+first*n_heads+head,
+                            rows,qk_stride,value_row_stride,n_heads,out,output_stride);
+                }
+                for (int row=rows;row<request_seq_len;++row)
+                {
+                    std::fill_n(output+(first+row)*output_stride+head*d_v,d_v,0.0f);
+                }
+                return observed;
+        };
+        auto work = [&]()
         {
-            if (speculative_state_work_)
+#pragma omp for schedule(static)
+            for (int flat = 0; flat < seq_len; ++flat)
             {
-                if (speculative_state_work_size_ < total_state_floats)
-                    return false;
-                effective_states = speculative_state_work_;
+                const int request = flat/request_seq_len, row = flat%request_seq_len;
+                if (row >= host_request_seq_lens[request]) continue;
+                for (int head = 0; head < n_heads; ++head)
+                {
+                    const float *q=nullptr,*k=nullptr,*v=nullptr;
+                    row_accessor(request,row,head,q,k,v);
+                    if (!q || !k || !v) { failed.store(true, std::memory_order_relaxed); continue; }
+                    float *qd=q_scratch_.data()+static_cast<size_t>(flat)*qk_stride+head*d_k;
+                    float *kd=k_scratch_.data()+static_cast<size_t>(flat)*qk_stride+head*d_k;
+                    if (use_qk_l2norm) gdn_preprocess_qk_l2norm(q,k,qd,kd,d_k,scale,1e-6f);
+                    else gdn_preprocess_qk_scale(q,k,qd,kd,d_k,scale);
+                    const size_t index=static_cast<size_t>(flat)*n_heads+head;
+                    const float x=alpha[index]+dt_bias[head];
+                    gate_scratch_[index]=std::exp(A_log[head]*(x>20.0f ? x : std::log1p(std::exp(x))));
+                    beta_sig_scratch_[index]=1.0f/(1.0f+std::exp(-beta_raw[index]));
+                }
+            }
+            if (observe_epoch)
+            {
+#pragma omp for schedule(static) reduction(cpu_gdn_epoch_observations : observations)
+                for (int task = 0; task < request_count*n_heads; ++task)
+                    observations += advance_head(task);
             }
             else
             {
-                owned_speculative_state_work_.resize(
-                    static_cast<size_t>(total_state_floats));
-                effective_states = owned_speculative_state_work_.data();
-            }
-            std::memcpy(
-                effective_states,
-                request_state_bank_.data(),
-                static_cast<size_t>(total_state_floats) * sizeof(float));
-        }
-
-        PerfStatsCollector::addCounter(
-            "kernel",
-            "cpu_gdn_request_batched_grouped_calls",
-            1.0,
-            "prefill",
-            "cpu",
-            {{"request_count", std::to_string(request_count)},
-             {"request_row_width", std::to_string(request_seq_len)},
-             {"n_heads", std::to_string(n_heads)},
-             {"execution_policy", "request_head_grouped_recurrence"}});
-
-        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
-        constexpr float l2_eps = 1e-6f;
-        const int v_stride = n_heads * d_v;
-        const size_t head_state_floats =
-            static_cast<size_t>(d_k) * d_v;
-        std::atomic<bool> row_binding_failed{false};
-
-        auto grouped_requests = [&]()
-        {
 #pragma omp for schedule(static)
-            for (int work = 0; work < request_count * n_heads; ++work)
-            {
-                const int request = work / n_heads;
-                const int head = work % n_heads;
-                const int real_rows = std::clamp(
-                    host_request_seq_lens[request], 0, request_seq_len);
-                float *S =
-                    effective_states +
-                    static_cast<size_t>(request) * state_floats +
-                    static_cast<size_t>(head) * head_state_floats;
-                alignas(64) float q_local[512];
-                alignas(64) float k_local[512];
-
-                for (int row = 0; row < real_rows; ++row)
-                {
-                    const int flat_row = request * request_seq_len + row;
-                    const float *q_row = nullptr;
-                    const float *k_row = nullptr;
-                    const float *v_row = nullptr;
-                    row_accessor(request, row, head, q_row, k_row, v_row);
-                    if (!q_row || !k_row || !v_row)
-                    {
-                        /*
-                         * Accessors are private, shape-checked production
-                         * adapters.  Keep this fail-closed guard nevertheless:
-                         * silently skipping one head would publish plausible
-                         * but mathematically incomplete verifier state.
-                         */
-                        row_binding_failed.store(true, std::memory_order_relaxed);
-                        break;
-                    }
-
-                    if (use_qk_l2norm)
-                    {
-                        gdn_preprocess_qk_l2norm(
-                            q_row, k_row, q_local, k_local,
-                            d_k, scale_val, l2_eps);
-                    }
-                    else
-                    {
-                        gdn_preprocess_qk_scale(
-                            q_row, k_row, q_local, k_local,
-                            d_k, scale_val);
-                    }
-
-                    const size_t gate_index =
-                        static_cast<size_t>(flat_row) * n_heads + head;
-                    const float x = alpha[gate_index] + dt_bias[head];
-                    const float softplus =
-                        x > 20.0f ? x : std::log1p(std::exp(x));
-                    const float decay = std::exp(A_log[head] * softplus);
-                    const float beta =
-                        1.0f / (1.0f + std::exp(-beta_raw[gate_index]));
-                    float *output_row =
-                        output + static_cast<size_t>(flat_row) * v_stride +
-                        head * d_v;
-                    gdn_delta_recurrence(
-                        S, q_local, k_local, v_row, output_row,
-                        decay, beta, d_k, d_v);
-
-                    if (capture_active)
-                    {
-                        float *snapshot =
-                            verifier_state_capture_ +
-                            static_cast<size_t>(flat_row) * verifier_state_capture_size_ +
-                            static_cast<size_t>(head) * head_state_floats;
-                        std::memcpy(
-                            snapshot, S,
-                            head_state_floats * sizeof(float));
-                    }
-                }
-
-                for (int row = real_rows; row < request_seq_len; ++row)
-                {
-                    const int flat_row = request * request_seq_len + row;
-                    std::memset(
-                        output + static_cast<size_t>(flat_row) * v_stride +
-                            head * d_v,
-                        0,
-                        static_cast<size_t>(d_v) * sizeof(float));
-                    if (capture_active)
-                    {
-                        std::memset(
-                            verifier_state_capture_ +
-                                static_cast<size_t>(flat_row) * verifier_state_capture_size_ +
-                                static_cast<size_t>(head) * head_state_floats,
-                            0,
-                            head_state_floats * sizeof(float));
-                    }
-                }
+                for (int task = 0; task < request_count*n_heads; ++task)
+                    (void)advance_head(task);
             }
         };
-        OMP_WORKSHARE_REGION(grouped_requests);
-
-        if (row_binding_failed.load(std::memory_order_relaxed))
-            return false;
-
-        if (!capture_active)
-        {
-            std::memcpy(
-                state,
-                request_state_bank_.data(),
-                static_cast<size_t>(state_floats) * sizeof(float));
-        }
+        OMP_WORKSHARE_REGION(work);
+        if (observe_epoch) OMP_SINGLE([&]() { publishEpochCounterObservations(d_k, d_v); });
+        if (failed.load(std::memory_order_relaxed)) return false;
+        if (shared_capture) shared_valid_=true;
+        if (!capture) std::memcpy(state,request_state_bank_.data(),static_cast<size_t>(layout.floats())*sizeof(float));
         return true;
     }
 
@@ -1583,7 +1198,7 @@ namespace llaminar2
             v_row = V + static_cast<size_t>(flat_row) * v_stride + head * d_v;
         };
         return chunkForwardBatchedDecodeEquivalentRows(
-            contiguous_rows,
+            contiguous_rows, v_stride,
             alpha, beta_raw, A_log, dt_bias, output, state,
             seq_len, request_count, request_seq_len,
             n_heads, d_k, d_v, use_qk_l2norm,
@@ -1629,7 +1244,7 @@ namespace llaminar2
                     static_cast<size_t>(head) * d_v;
         };
         return chunkForwardBatchedDecodeEquivalentRows(
-            merged_rows,
+            merged_rows, qkv_stride,
             alpha, beta_raw, A_log, dt_bias, output, state,
             seq_len, request_count, request_seq_len,
             n_heads, d_k, d_v, use_qk_l2norm,
@@ -1647,6 +1262,7 @@ namespace llaminar2
         int max_snapshot_rows,
         InputStateDisposition input_state_disposition)
     {
+        shared_valid_=false;
         if (!input.q || !input.k || !input.v || !input.layout_name ||
             input.q_row_stride <= 0 || input.k_row_stride <= 0 ||
             input.v_row_stride <= 0 || input.n_k_heads <= 0 ||
@@ -1657,8 +1273,9 @@ namespace llaminar2
             return false;
         }
 
-        const size_t state_floats_wide =
-            static_cast<size_t>(n_heads) * d_k * d_v;
+        const CPUGDNStateLayout layout(n_heads, d_k, d_v);
+        const size_t state_floats_wide = layout.floats();
+        if (!layout.valid(state)) return false;
         if (state_floats_wide >
             static_cast<size_t>(std::numeric_limits<int>::max()))
         {
@@ -1666,6 +1283,8 @@ namespace llaminar2
         }
         const int state_floats = static_cast<int>(state_floats_wide);
         const bool capture_state_snapshots = state_snapshots != nullptr;
+        const bool shared_capture = capture_state_snapshots && state_snapshots==shared_slots_;
+        if (shared_capture) shared_valid_=false;
         if (capture_state_snapshots &&
             (snapshot_stride_floats < state_floats ||
              max_snapshot_rows < seq_len))
@@ -1690,7 +1309,7 @@ namespace llaminar2
                 return false;
             }
             const size_t snapshot_span_floats =
-                preceding_snapshot_rows * snapshot_stride + state_floats_wide;
+                shared_capture ? shared_slot_floats_ : preceding_snapshot_rows * snapshot_stride + state_floats_wide;
             if (state_floats_wide >
                     std::numeric_limits<size_t>::max() / sizeof(float) ||
                 snapshot_span_floats >
@@ -1705,7 +1324,11 @@ namespace llaminar2
             }
         }
 
+        if (shared_capture && !prepareShared(1,seq_len,n_heads,d_k,d_v)) return false;
         ensureScratch(seq_len, n_heads, d_k, d_v);
+
+        PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_readout_rows",
+            static_cast<double>(seq_len * n_heads), "recurrence", "cpu");
 
         const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
         constexpr float l2_eps = 1e-6f;
@@ -1714,25 +1337,8 @@ namespace llaminar2
         const int qk_stride = n_heads * d_k;
         const int v_stride = n_heads * d_v;
 
-        // Prefetch hint: if S per head fits in L1, prefetch to L1 (T0);
-        // otherwise to L2 (T1) so it doesn't evict working-set scratch.
-        const auto &ci = cache_info();
-        const size_t S_head_bytes = static_cast<size_t>(d_k) * d_v * sizeof(float);
-        const bool pf_to_l1 = ci.fits_l1(S_head_bytes);
-        // How many S-rows ahead to prefetch, scaled by cache line count per row.
-        // Each row = d_v×4 bytes; at d_v=128 → 512 B = 8 cache lines.
-        // Prefetch 2 rows ahead gives the hw ~16 cache-line fetches of runway.
-        const int pf_rows_ahead = std::max(1, std::min(4,
-                                                       static_cast<int>(ci.l2_size / (4u * S_head_bytes))));
-        const int active_or_requested_workers = omp_in_parallel()
-                                                    ? omp_get_num_threads()
-                                                    : omp_get_max_threads();
-        const int whole_head_worker_count = std::max(
-            1,
-            std::min(active_or_requested_workers, n_heads));
-        const int value_task_slots =
-            active_or_requested_workers > n_heads && d_v >= 64 && seq_len > 1
-                ? (d_v + 15) / 16 : 1;
+        const int active_or_requested_workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
+        const int whole_head_worker_count = std::min(active_or_requested_workers, n_heads);
 
         if (capture_state_snapshots)
         {
@@ -1748,12 +1354,12 @@ namespace llaminar2
                  {"d_v", std::to_string(d_v)},
                  {"snapshot_rows", std::to_string(seq_len)},
                  {"input_layout", input.layout_name},
-                 {"parallel_axis", "head_or_subnormal_value_columns"},
+                 {"parallel_axis", "independent_epoch_heads"},
                  {"active_or_requested_workers", std::to_string(active_or_requested_workers)},
                  {"whole_head_worker_count", std::to_string(whole_head_worker_count)},
-                 {"execution_policy", "head_grouped_recurrence"},
-                 {"kernel_variant", "canonical_chunk_forward"},
-                 {"snapshot_materialization", "direct_row_destination"},
+                 {"execution_policy", "fixed_epoch_shared_checkpoint"},
+                 {"kernel_variant", "epoch8_backward_shared_prefix"},
+                 {"snapshot_materialization", shared_capture ? "shared_epoch_checkpoint_raw_log" : "explicit_dense_serialization"},
                  {"arithmetic_order", "serial_decode_per_head"}});
         }
         else
@@ -1769,12 +1375,46 @@ namespace llaminar2
                  {"d_k", std::to_string(d_k)},
                  {"d_v", std::to_string(d_v)},
                  {"input_layout", input.layout_name},
-                 {"parallel_axis", "head_or_subnormal_value_columns"},
+                 {"parallel_axis", "independent_epoch_heads"},
                  {"active_or_requested_workers", std::to_string(active_or_requested_workers)},
                  {"whole_head_worker_count", std::to_string(whole_head_worker_count)},
                  {"arithmetic_order", "serial_decode_per_head"}});
         }
 
+        const bool observe_epoch = beginEpochCounterObservations();
+        auto &observations = epoch_counter_observations_;
+        // Each member keeps its returned local choice through publication;
+        // subsequent collector reloads cannot change workshare control flow.
+        const auto advance_head = [&](int head) -> CPUFixedEpochObservations
+        {
+                const size_t offset = static_cast<size_t>(head) * layout.headFloats();
+                float *initial = state + offset;
+                float *snapshots = capture_state_snapshots && !shared_capture ? state_snapshots + offset : nullptr;
+                if (shared_capture)
+                {
+                    CPUSharedGDNSnapshots shared(layout,shared_slots_+static_cast<size_t>(head)*CPUSharedGDNSnapshots::headFloats(layout,shared_width_),shared_width_);
+                    const auto observed = cpu_gdn_epoch::runShared(layout,initial,
+                        q_scratch_.data()+head*d_k,k_scratch_.data()+head*d_k,input.v+head*d_v,
+                        gate_scratch_.data()+head,beta_sig_scratch_.data()+head,
+                        seq_len,qk_stride,input.v_row_stride,n_heads,output+head*d_v,v_stride,shared);
+                    if (input_state_disposition==InputStateDisposition::PublishTerminalState)
+                        shared.materialize(seq_len-1,initial);
+                    return observed;
+                }
+                else
+                {
+                    float *working=capture_state_snapshots
+                        ? snapshots+static_cast<size_t>(seq_len-1)*snapshot_stride_floats : initial;
+                    const auto observed = cpu_gdn_epoch::run(layout,initial,working,
+                        q_scratch_.data()+head*d_k,k_scratch_.data()+head*d_k,input.v+head*d_v,
+                        gate_scratch_.data()+head,beta_sig_scratch_.data()+head,
+                        seq_len,qk_stride,input.v_row_stride,n_heads,output+head*d_v,v_stride,
+                        snapshots,snapshot_stride_floats);
+                    if (capture_state_snapshots && input_state_disposition==InputStateDisposition::PublishTerminalState)
+                        std::memcpy(initial,working,static_cast<size_t>(layout.headFloats())*sizeof(float));
+                    return observed;
+                }
+        };
         auto do_work = [&]()
         {
         // ── Phase 1: Parallel preprocessing (across tokens) ──────────
@@ -1784,27 +1424,41 @@ namespace llaminar2
                 for (int h = 0; h < n_heads; ++h)
                 {
                     const int qk_off = t * qk_stride + h * d_k;
-                    const int out_off = t * v_stride + h * d_v;
                     float *q_dst = q_scratch_.data() + qk_off;
                     float *k_dst = k_scratch_.data() + qk_off;
-                    int source_head =
-                        (h + input.global_v_head_offset) % input.n_k_heads;
-                    if (source_head < 0)
-                        source_head += input.n_k_heads;
-                    const float *q_src =
-                        input.q + static_cast<size_t>(t) * input.q_row_stride +
-                        static_cast<size_t>(source_head) * d_k;
-                    const float *k_src =
-                        input.k + static_cast<size_t>(t) * input.k_row_stride +
-                        static_cast<size_t>(source_head) * d_k;
-
-                    if (use_qk_l2norm)
+                    if (h >= input.n_k_heads)
                     {
-                        gdn_preprocess_qk_l2norm(q_src, k_src, q_dst, k_dst, d_k, scale_val, l2_eps);
+                        // Modular source-head mapping repeats after n_k_heads,
+                        // including nonzero/negative offsets. The same token's
+                        // earlier head owns the already rounded normalization;
+                        // copying it avoids repeating reductions and square roots.
+                        // This whole token belongs to one worker, so no event or
+                        // additional worksharing barrier is required here.
+                        const int prepared_off = t * qk_stride + (h % input.n_k_heads) * d_k;
+                        std::memcpy(q_dst, q_scratch_.data() + prepared_off, d_k * sizeof(float));
+                        std::memcpy(k_dst, k_scratch_.data() + prepared_off, d_k * sizeof(float));
                     }
                     else
                     {
-                        gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
+                        int source_head =
+                            (h + input.global_v_head_offset) % input.n_k_heads;
+                        if (source_head < 0)
+                            source_head += input.n_k_heads;
+                        const float *q_src =
+                            input.q + static_cast<size_t>(t) * input.q_row_stride +
+                            static_cast<size_t>(source_head) * d_k;
+                        const float *k_src =
+                            input.k + static_cast<size_t>(t) * input.k_row_stride +
+                            static_cast<size_t>(source_head) * d_k;
+
+                        if (use_qk_l2norm)
+                        {
+                            gdn_preprocess_qk_l2norm(q_src, k_src, q_dst, k_dst, d_k, scale_val, l2_eps);
+                        }
+                        else
+                        {
+                            gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
+                        }
                     }
 
                     // Compute the exact decode gate expressions while tokens
@@ -1819,209 +1473,25 @@ namespace llaminar2
                     beta_sig_scratch_[gi] =
                         1.0f / (1.0f + std::exp(-beta_raw[gi]));
 
-                    // Zero output
-                    std::memset(output + out_off, 0, d_v * sizeof(float));
+                    // Projection owns and overwrites every live output value.
                 }
 
             }
             // implicit barrier between omp-for regions
 
-            // Phase 2: whole heads for ordinary gates, disjoint value columns
-            // for assist-bound heads. Interleave heads before column slots.
-            // Dynamic task ownership prevents one worker from receiving two
-            // assist-bound tiles while other workers have only empty slots;
-            // ownership never changes a column's arithmetic or token order.
-#pragma omp for schedule(dynamic, 1)
-            for (int64_t task = 0; task < static_cast<int64_t>(n_heads) * value_task_slots; ++task)
+            // Each head owns one canonical checkpoint and ordered raw log.
+            // Groups share checkpoint actions; only fixed epoch boundaries flush.
+            if (observe_epoch)
             {
-                const int head = static_cast<int>(task % n_heads);
-                const int slot = static_cast<int>(task / n_heads);
-                const auto tile = gdnValueTile(
-                    gate_scratch_.data(), seq_len, n_heads, head, d_v, slot, value_task_slots);
-                if (!tile)
-                    continue;
-                const int column_count = tile->count;
-                const size_t head_state_floats =
-                    static_cast<size_t>(d_k) * d_v;
-                float *input_head_state =
-                    state + static_cast<size_t>(head) * head_state_floats + tile->first;
-
-                if (slot == 0 && column_count < d_v)
-                    PerfStatsCollector::addCounter(
-                        "kernel", "cpu_gdn_subnormal_head_column_tasks",
-                        static_cast<double>((d_v + column_count - 1) / column_count),
-                        capture_state_snapshots ? "verifier" : "prefill", "cpu",
-                        {{"rows", std::to_string(seq_len)}, {"head", std::to_string(head)},
-                         {"d_v", std::to_string(d_v)}, {"columns_per_task", std::to_string(column_count)}});
-
-#if defined(__AVX512F__)
-                if (d_v == 128 && activeISALevel() == ISALevel::AVX512)
-                {
-                    const auto advance = [&]<int Vectors>() {
-                        gdnChunkForwardAVX512DV128<Vectors>(
-                            q_scratch_.data(), k_scratch_.data(), input.v,
-                            gate_scratch_.data(), beta_sig_scratch_.data(),
-                            output, state, seq_len, n_heads, d_k, head, tile->first,
-                            input.v_row_stride, pf_rows_ahead, pf_to_l1,
-                            state_snapshots, snapshot_stride_floats);
-                    };
-                    if (column_count == 128)
-                        advance.template operator()<8>();
-                    else
-                        advance.template operator()<1>();
-                    continue;
-                }
-#endif
-
-                // Generic AVX2/scalar column-range implementation. Scratch is
-                // private to this task, including when a head has many owners.
-                alignas(64) float kv_mem[512];
-                alignas(64) float delta[512];
-                for (int token = 0; token < seq_len; ++token)
-                {
-                    const float *q = q_scratch_.data() +
-                                     static_cast<size_t>(token) * qk_stride +
-                                     static_cast<size_t>(head) * d_k;
-                    const float *k = k_scratch_.data() +
-                                     static_cast<size_t>(token) * qk_stride +
-                                     static_cast<size_t>(head) * d_k;
-                    const float *v = input.v +
-                                     static_cast<size_t>(token) * input.v_row_stride +
-                                     static_cast<size_t>(head) * d_v + tile->first;
-                    float *o = output +
-                               static_cast<size_t>(token) * v_stride +
-                               static_cast<size_t>(head) * d_v + tile->first;
-                    const float decay = gate_scratch_[
-                        static_cast<size_t>(token) * n_heads + head];
-                    const float beta = beta_sig_scratch_[
-                        static_cast<size_t>(token) * n_heads + head];
-                    const float *source_head_state = input_head_state;
-                    float *destination_head_state = input_head_state;
-                    if (capture_state_snapshots)
-                    {
-                        if (token > 0)
-                        {
-                            source_head_state =
-                                state_snapshots +
-                                static_cast<size_t>(token - 1) *
-                                    snapshot_stride_floats +
-                                static_cast<size_t>(head) * head_state_floats + tile->first;
-                        }
-                        destination_head_state =
-                            state_snapshots +
-                            static_cast<size_t>(token) * snapshot_stride_floats +
-                            static_cast<size_t>(head) * head_state_floats + tile->first;
-                    }
-
-#if defined(__AVX2__)
-                    avx2::zero(kv_mem, column_count);
-                    for (int row = 0; row < d_k; ++row)
-                    {
-#if defined(__AVX512F__) || defined(__AVX2__)
-                        if (row + pf_rows_ahead < d_k)
-                        {
-                            GDN_PREFETCH_S(
-                                source_head_state +
-                                    static_cast<size_t>(row + pf_rows_ahead) * d_v,
-                                pf_to_l1);
-                        }
-#endif
-                        const float *source_state_range =
-                            source_head_state + static_cast<size_t>(row) * d_v;
-                        float *destination_state_range =
-                            destination_head_state +
-                            static_cast<size_t>(row) * d_v;
-                        avx2::copy_scale(
-                            destination_state_range,
-                            source_state_range,
-                            decay,
-                            column_count);
-                        avx2::axpy(
-                            kv_mem,
-                            destination_state_range,
-                            k[row],
-                            column_count);
-                    }
-                    avx2::sub_mul(delta, v, kv_mem, beta, column_count);
-                    avx2::zero(o, column_count);
-                    for (int row = 0; row < d_k; ++row)
-                    {
-#if defined(__AVX512F__) || defined(__AVX2__)
-                        if (row + pf_rows_ahead < d_k)
-                        {
-                            GDN_PREFETCH_S(
-                                destination_head_state +
-                                    static_cast<size_t>(row + pf_rows_ahead) * d_v,
-                                pf_to_l1);
-                        }
-#endif
-                        float *state_range =
-                            destination_head_state +
-                            static_cast<size_t>(row) * d_v;
-                        avx2::axpy(state_range, delta, k[row], column_count);
-                        avx2::axpy(o, state_range, q[row], column_count);
-                    }
-#else
-                    std::memset(
-                        kv_mem,
-                        0,
-                        static_cast<size_t>(column_count) * sizeof(float));
-                    for (int row = 0; row < d_k; ++row)
-                    {
-                        const float *source_state_range =
-                            source_head_state + static_cast<size_t>(row) * d_v;
-                        float *destination_state_range =
-                            destination_head_state +
-                            static_cast<size_t>(row) * d_v;
-                        for (int column = 0; column < column_count; ++column)
-                        {
-                            destination_state_range[column] =
-                                source_state_range[column] * decay;
-                            kv_mem[column] +=
-                                destination_state_range[column] * k[row];
-                        }
-                    }
-                    for (int column = 0; column < column_count; ++column)
-                        delta[column] = (v[column] - kv_mem[column]) * beta;
-
-                    std::memset(
-                        o,
-                        0,
-                        static_cast<size_t>(column_count) * sizeof(float));
-                    for (int row = 0; row < d_k; ++row)
-                    {
-                        float *state_range =
-                            destination_head_state +
-                            static_cast<size_t>(row) * d_v;
-                        for (int column = 0; column < column_count; ++column)
-                        {
-                            state_range[column] += k[row] * delta[column];
-                            o[column] += state_range[column] * q[row];
-                        }
-                    }
-#endif
-
-                }
+#pragma omp for schedule(static) reduction(cpu_gdn_epoch_observations : observations)
+                for (int head = 0; head < n_heads; ++head)
+                    observations += advance_head(head);
             }
-
-            if (capture_state_snapshots &&
-                input_state_disposition ==
-                    InputStateDisposition::PublishTerminalState)
+            else
             {
-                const float *terminal_snapshot =
-                    state_snapshots +
-                    static_cast<size_t>(seq_len - 1) * snapshot_stride_floats;
 #pragma omp for schedule(static)
                 for (int head = 0; head < n_heads; ++head)
-                {
-                    const size_t head_state_floats =
-                        static_cast<size_t>(d_k) * d_v;
-                    std::memcpy(
-                        state + static_cast<size_t>(head) * head_state_floats,
-                        terminal_snapshot +
-                            static_cast<size_t>(head) * head_state_floats,
-                        head_state_floats * sizeof(float));
-                }
+                    (void)advance_head(head);
             }
         };
         /*
@@ -2033,6 +1503,8 @@ namespace llaminar2
          * preserving the process-wide team for the next captured CPU stage.
          */
         OMP_WORKSHARE_REGION(do_work);
+        if (observe_epoch) OMP_SINGLE([&]() { publishEpochCounterObservations(d_k, d_v); });
+        if (shared_capture) shared_valid_=true;
 
 #if defined(__AVX512F__)
 #undef GDN_PREFETCH_S

@@ -1384,6 +1384,23 @@ namespace llaminar2
             const PrefixGDNLayerProbe &rhs = candidate.gdn_layers[i];
             if (lhs.global_layer != rhs.global_layer)
                 return mismatch("GDN layer id mismatch");
+            const auto known_storage = [](GDNStateStorage storage) {
+                return storage == GDNStateStorage::DeviceDense ||
+                       storage == GDNStateStorage::CPUFixedEpoch;
+            };
+            if (!known_storage(lhs.recurrence_storage) ||
+                !known_storage(rhs.recurrence_storage) ||
+                lhs.recurrence_storage != rhs.recurrence_storage)
+                return mismatch("GDN diagnostic recurrence storage format mismatch");
+            // Phase is protocol identity, not a numerically tolerant matrix
+            // element. Even movement-aware comparison must not hide a changed
+            // phase beneath the much larger checkpoint/history norm.
+            if (lhs.recurrence_storage == GDNStateStorage::CPUFixedEpoch &&
+                (lhs.recurrence_epoch_phase_words.empty() ||
+                 lhs.recurrence_epoch_phase_words != rhs.recurrence_epoch_phase_words ||
+                 lhs.recurrence_layout != GDNRecurrenceStateLayout::KeyMajorValueContiguous ||
+                 rhs.recurrence_layout != GDNRecurrenceStateLayout::KeyMajorValueContiguous))
+                return mismatch("GDN diagnostic CPU epoch phase/layout metadata mismatch");
             if (lhs.recurrence_values != rhs.recurrence_values)
                 return mismatch("GDN recurrence value count mismatch");
             if (lhs.conv_values != rhs.conv_values)

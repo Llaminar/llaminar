@@ -10,6 +10,8 @@
  *
  * These tests verify the structural workspace contract without CUDA hardware.
  * The kernel constructor and getWorkspaceRequirements() are pure host work.
+ * Their definitions still require a compiled CUDA backend. CPU-only builds
+ * retain the backend-independent side-stream declaration helper regression.
  */
 
 #include <gtest/gtest.h>
@@ -95,6 +97,7 @@ protected:
     static constexpr int kFakeCudaDeviceId = 0;
 };
 
+#ifdef HAVE_CUDA
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        TwoInstances_DeclareSharedStableTempCFp32BufferName)
 {
@@ -388,6 +391,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
            "required.";
 }
 
+#endif
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        ConcurrentDecodeGemvPartials_HelperNoOpsForNonCudaAndSingleProjection)
 {
@@ -418,6 +422,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
         << "A single projection has no side stream and should not reserve side slots.";
 }
 
+#ifdef HAVE_CUDA
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        NativeVNNIPrefillGenericDirectScheduleDeclaresNoKpartScratch)
 {
@@ -594,3 +599,4 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     EXPECT_GE(prefill.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS)
                   ->size_bytes, expected);
 }
+#endif

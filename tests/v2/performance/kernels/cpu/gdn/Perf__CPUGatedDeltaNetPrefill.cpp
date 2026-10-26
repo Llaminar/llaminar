@@ -7,8 +7,12 @@
  * collectives, and routing so kernel changes can be judged against stable
  * warmed measurements. It covers both the full single-socket head geometry and
  * the per-rank geometry produced by two-way tensor parallelism.
+ * A separate595-row/H32 case checks every actual timed ordinary endpoint
+ * against public M1 serial execution and verifies512+83 continuation outside
+ * the intervals; its original short/TP controls and sample counts stay intact.
  */
 
+#include "../../../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
@@ -18,6 +22,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <numeric>
@@ -60,7 +65,7 @@ namespace
               beta(alpha.size()),
               a_log(static_cast<size_t>(n_heads)),
               dt_bias(static_cast<size_t>(n_heads)),
-              initial_state(static_cast<size_t>(n_heads) * d_k * d_v),
+              initial_state(llaminar2::CPUGDNStateLayout(n_heads,d_k,d_v).floats()),
               state(initial_state.size()),
               output(v.size())
         {
@@ -87,6 +92,7 @@ namespace
                 initial_state[i] =
                     0.0001f * static_cast<float>(static_cast<int>(i % 43) - 21);
             }
+            llaminar2::clearCPUGDNTestHistory(initial_state,n_heads,d_k,d_v);
         }
     };
 
@@ -270,4 +276,112 @@ TEST(Perf__CPUGatedDeltaNetPrefill, Qwen36SingleAndTwoWayTPHeadGeometries)
               << " tp2_local_heads8_ms=" << tp2_rank_ms
               << " head_halving_speedup=" << (single_ms / tp2_rank_ms)
               << '\n';
+}
+
+/**
+ * @brief Measure the actual595-row/H32 ordinary CPU recurrence with exact endpoints.
+ *
+ * This is the existing prefill fixture's actual model-shaped geometry: sixteen
+ * source Q/K heads, thirty-two value heads, DK/DV128, and twenty-eight workers.
+ * M1 serial execution supplies a byte oracle before warmup; it is diagnostic
+ * only, never timed or substituted for the grouped production path. Every
+ * actual timed output and complete encoded terminal state is checked before
+ * any reset/relaunch. A512+83 call split must preserve the same bytes without
+ * an artificial checkpoint boundary. Raw sample records and the median are
+ * emitted only after the corresponding actual endpoint passes.
+ *
+ * Allocation, source packing, input generation, serial oracle, reset, poison,
+ * endpoint comparison and logging remain outside every measurement interval.
+ * Normalization/gates/recurrence stay inside the public merged producer call.
+ * This is a component diagnostic, not model/publisher throughput qualification.
+ */
+TEST(Perf__CPUGatedDeltaNetPrefill, Actual595Head32ExactOrdinaryEndpoints)
+{
+    constexpr int rows = 595, heads = 32, key_heads = 16, dk = 128, dv = 128;
+    constexpr int threads = 28, warmups = 3, iterations = 11, first_chunk = 512;
+    constexpr int qk_source = key_heads * dk, value_stride = heads * dv;
+    constexpr int merged_stride = 2 * qk_source + value_stride;
+    if (const char *configured = std::getenv("LLAMINAR_CPU_GDN_PERF_THREADS"))
+        ASSERT_EQ(std::stoi(configured), threads)
+            << "Actual595 geometry requires28 workers; use existing cases for other team sizes";
+    omp_set_dynamic(0);
+    omp_set_num_threads(threads);
+    int actual_workers = 0;
+#pragma omp parallel
+    {
+#pragma omp single
+        actual_workers = omp_get_num_threads();
+    }
+    ASSERT_EQ(actual_workers, threads) << "Actual595 geometry requires an active28-worker team";
+    PrefillFixture fixture(rows, heads, dk, dv);
+    AlignedVector<float> merged(static_cast<size_t>(rows) * merged_stride);
+    for (int row = 0; row < rows; ++row)
+    {
+        float *target = merged.data() + static_cast<size_t>(row) * merged_stride;
+        std::copy_n(fixture.q.data() + static_cast<size_t>(row) * heads * dk, qk_source, target);
+        std::copy_n(fixture.k.data() + static_cast<size_t>(row) * heads * dk, qk_source, target + qk_source);
+        std::copy_n(fixture.v.data() + static_cast<size_t>(row) * value_stride, value_stride, target + 2 * qk_source);
+    }
+    CPUGatedDeltaNet serial;
+    auto oracle_state = fixture.initial_state;
+    AlignedVector<float> oracle_output(fixture.output.size()), serial_q(heads * dk), serial_k(heads * dk);
+    for (int row = 0; row < rows; ++row)
+    {
+        const float *source = merged.data() + static_cast<size_t>(row) * merged_stride;
+        for (int head = 0; head < heads; ++head)
+        {
+            std::copy_n(source + (head % key_heads) * dk, dk, serial_q.data() + head * dk);
+            std::copy_n(source + qk_source + (head % key_heads) * dk, dk, serial_k.data() + head * dk);
+        }
+        ASSERT_TRUE(serial.recurrent_step(serial_q.data(), serial_k.data(), source + 2 * qk_source,
+            fixture.alpha.data() + row * heads, fixture.beta.data() + row * heads,
+            fixture.a_log.data(), fixture.dt_bias.data(), oracle_output.data() + row * value_stride,
+            oracle_state.data(), heads, dk, dv, true));
+    }
+    CPUGatedDeltaNet kernel;
+    // The one persistent kernel owns scratch throughout warmup and measurement.
+    auto invoke = [&](int first, int count)
+    {
+        return kernel.chunkForwardMergedQKV(merged.data() + static_cast<size_t>(first) * merged_stride,
+            merged_stride, fixture.alpha.data() + first * heads, fixture.beta.data() + first * heads,
+            fixture.a_log.data(), fixture.dt_bias.data(), fixture.output.data() + first * value_stride,
+            fixture.state.data(), count, key_heads, heads, dk, dv, 0, 64, true);
+    };
+    auto reset = [&]()
+    {
+        std::copy(fixture.initial_state.begin(), fixture.initial_state.end(), fixture.state.begin());
+        std::fill(fixture.output.begin(), fixture.output.end(), -1234.0f);
+    };
+    reset();
+    ASSERT_TRUE(invoke(0, first_chunk));
+    ASSERT_TRUE(invoke(first_chunk, rows - first_chunk));
+    ASSERT_EQ(0, std::memcmp(fixture.output.data(), oracle_output.data(), oracle_output.size() * sizeof(float)));
+    ASSERT_EQ(0, std::memcmp(fixture.state.data(), oracle_state.data(), oracle_state.size() * sizeof(float)));
+    for (int warmup = 0; warmup < warmups; ++warmup)
+    {
+        reset();
+        ASSERT_TRUE(invoke(0, rows));
+        ASSERT_EQ(0, std::memcmp(fixture.output.data(), oracle_output.data(), oracle_output.size() * sizeof(float)));
+        ASSERT_EQ(0, std::memcmp(fixture.state.data(), oracle_state.data(), oracle_state.size() * sizeof(float)));
+    }
+    std::vector<double> samples;
+    samples.reserve(iterations);
+    for (int sample = 0; sample < iterations; ++sample)
+    {
+        reset();
+        const auto begin = std::chrono::steady_clock::now();
+        const bool success = invoke(0, rows);
+        const auto end = std::chrono::steady_clock::now();
+        const double milliseconds = std::chrono::duration<double, std::milli>(end - begin).count();
+        ASSERT_TRUE(success);
+        // Check the actual measured endpoint now, before any fresh publication,
+        // reset or replay can conceal a stale or incorrectly advanced result.
+        ASSERT_EQ(0, std::memcmp(fixture.output.data(), oracle_output.data(), oracle_output.size() * sizeof(float)));
+        ASSERT_EQ(0, std::memcmp(fixture.state.data(), oracle_state.data(), oracle_state.size() * sizeof(float)));
+        ASSERT_GT(milliseconds, 0.0);
+        samples.push_back(milliseconds);
+        std::printf("CPU_GDN_PREFILL_EXACT_SAMPLE rows=595 heads=32 key_heads=16 dk=128 dv=128 workers=28 phase=0 sample=%d merged_ms=%.17g endpoint_exact=true\n", sample, milliseconds);
+    }
+    std::sort(samples.begin(), samples.end());
+    std::printf("CPU_GDN_PREFILL_EXACT_SUMMARY rows=595 heads=32 key_heads=16 dk=128 dv=128 workers=28 phase=0 warmups=3 samples=11 median_ms=%.17g split_512_83_exact=true endpoint_exact=true\n", samples[samples.size() / 2]);
 }

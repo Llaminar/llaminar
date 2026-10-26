@@ -5412,3 +5412,114 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedValueMajorMergedRestoreAndBindings
 }
 
 #endif
+
+
+
+#include "CUDADenseCompactSnapshotsRegression.h"
+
+#ifdef HAVE_CUDA
+namespace
+{
+/**
+ * @brief Replay terminal-count and flattened-index publication with request holes.
+ * @tparam Kernel Production recurrence or short-convolution state owner.
+ * @param ordinal Native backend device ordinal.
+ * @details Empty requests retain their own prior bytes. Distinct request-zero
+ * and scalar owners prove publication coherence as well as aliasing. Changing
+ * only device metadata exercises full, partial and empty replays without
+ * rebuilding either captured graph; the host oracle never executes a kernel.
+ */
+template <class Kernel>
+void verifyCUDACaptureRequestHoles(int ordinal)
+{
+    constexpr int requests = 3, width = 4, metadata_stride = 3;
+    for (const int state_size : {1, 257, 1025})
+    for (const bool alias_zero : {false, true})
+    {
+        SCOPED_TRACE("state_size=" + std::to_string(state_size) +
+                     " alias_zero=" + std::to_string(alias_zero));
+        std::vector<float> snapshots(requests * width * state_size);
+        // Distinct scalar storage is legal only with two LocalTP geometries.
+        // The unused second geometry and request-bank tail remain guards.
+        std::vector<float> expected(requests * (state_size + (alias_zero ? 0 : 1)));
+        for (size_t i = 0; i < snapshots.size(); ++i)
+            snapshots[i] = 1024.0f + static_cast<float>(i) * 0.25f;
+        for (size_t i = 0; i < expected.size(); ++i)
+            expected[i] = -1024.0f - static_cast<float>(i) * 0.25f;
+        CudaFloatBuffer capture(snapshots), states(expected);
+        CudaFloatBuffer scalar(std::vector<float>(expected.begin(), expected.begin() + state_size));
+        CudaFloatBuffer secondary(state_size + 1, -8192.0f);
+        CudaIntBuffer lengths(std::vector<int>(requests, 0));
+        CudaIntBuffer indices(std::vector<int>(requests * metadata_stride, -99));
+        CudaStreamHandle stream;
+        Kernel kernel(ordinal);
+        ASSERT_TRUE(kernel.bindDeviceState(GDNDeviceStateBinding{
+            .primary_state = alias_zero ? states.ptr : scalar.ptr,
+            .primary_state_floats = state_size,
+            .secondary_state = alias_zero ? nullptr : secondary.ptr,
+            .secondary_state_floats = alias_zero ? 0 : state_size + 1,
+            .request_state_bank = states.ptr,
+            .request_state_bank_floats = states.count,
+            .request_capacity = requests,
+        }));
+        kernel.setGPUStream(stream.stream);
+        kernel.bindVerifierStateCaptureWorkspace(capture.ptr, requests * width, state_size);
+        CudaCapturedGraph terminal(stream.stream, [&] {
+            return kernel.restoreVerifierStateCaptureRequestTerminalRows(
+                nullptr, lengths.ptr, requests, width, stream.stream);
+        });
+        CudaCapturedGraph indexed(stream.stream, [&] {
+            return kernel.restoreVerifierStateCaptureRowsFromDeviceIndices(
+                nullptr, state_size, indices.ptr, requests, metadata_stride, stream.stream);
+        });
+        const std::array<std::array<int, requests>, 6> patterns{{
+            {{4, 4, 4}}, {{3, 0, 1}}, {{0, 2, 0}},
+            {{0, 0, 0}}, {{1, 0, 4}}, {{4, 4, 4}},
+        }};
+        for (const auto &counts : patterns)
+        for (const bool use_indices : {false, true})
+        {
+            SCOPED_TRACE("counts=" + std::to_string(counts[0]) + "," +
+                         std::to_string(counts[1]) + "," + std::to_string(counts[2]) +
+                         " indexed=" + std::to_string(use_indices));
+            std::array<int, requests * metadata_stride> selectors{};
+            selectors.fill(-99); // Unused stride words must never be consumed.
+            for (int request = 0; request < requests; ++request)
+            {
+                const int count = counts[request];
+                selectors[request * metadata_stride] =
+                    count == 0 ? -1 : request * width + count - 1;
+                if (count != 0)
+                    std::copy_n(snapshots.begin() +
+                                    (request * width + count - 1) * state_size,
+                                state_size, expected.begin() + request * state_size);
+            }
+            // Staging remains alive through the exact test-stream completion.
+            checkCuda(cudaMemcpyAsync(lengths.ptr, counts.data(), sizeof(counts),
+                cudaMemcpyHostToDevice, stream.stream), "publish terminal lengths");
+            checkCuda(cudaMemcpyAsync(indices.ptr, selectors.data(), sizeof(selectors),
+                cudaMemcpyHostToDevice, stream.stream), "publish strided indices");
+            if (use_indices) indexed.launch(stream.stream);
+            else terminal.launch(stream.stream);
+            checkCuda(cudaStreamSynchronize(stream.stream), "join request-hole publication");
+            expectByteExactEquivalent("request-local publication", states.toHost(), expected, 0, expected.size());
+            if (!alias_zero)
+                expectByteExactEquivalent("scalar request-zero owner", scalar.toHost(),
+                    expected, 0, state_size);
+            expectByteExactEquivalent("immutable capture rows", capture.toHost(),
+                snapshots, 0, snapshots.size());
+            expectByteExactEquivalent("unused LocalTP geometry", secondary.toHost(),
+                std::vector<float>(state_size + 1, -8192.0f), 0, state_size + 1);
+        }
+    }
+}
+} // namespace
+
+TEST_F(Test__CUDAGDNPaddedRealLength, EmptyRequestTerminalPublication)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+    verifyCUDACaptureRequestHoles<CUDAGatedDeltaNet>(cuda_ordinal_);
+    verifyCUDACaptureRequestHoles<CUDAShortConvolution>(cuda_ordinal_);
+}
+#endif

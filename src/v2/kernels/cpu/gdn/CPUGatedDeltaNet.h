@@ -2,7 +2,9 @@
  * @file CPUGatedDeltaNet.h
  * @brief CPU implementation of ITensorGatedDeltaNet
  *
- * Delta rule recurrence for GDN linear attention.
+ * Fixed-epoch CPU recurrence with shared-prefix and backward-query readout.
+ * Serial, grouped and request-batched CPU paths share the same FP32 definition;
+ * retained prefix state is identified by its readout arithmetic generation.
  * OpenMP-parallelized across heads.
  *
  * The kernel owns ALL preprocessing:
@@ -11,14 +13,21 @@
  * - Gate computation: g = -exp(A_log) * softplus(alpha + dt_bias)
  * - Beta sigmoid: beta_sig = sigmoid(beta_raw)
  *
- * This ensures a future CUDA kernel can do all math on-device.
+ * CPU workers own all recurrence and preprocessing storage; no device shadow
+ * or alternate readout is selected for grouped execution.
+ * Completed per-head telemetry is reduced by this same CPU team; it is not
+ * recurrence state, a lifecycle authority, or a second memory/accounting ledger.
  */
 
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
+#include "kernels/CPUGDNStateLayout.h"
 
 #include <vector>
+#include <array>
+#include "CPUFixedEpochObservations.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../common/CPURequestStateBankView.h"
 
 namespace llaminar2
@@ -27,6 +36,9 @@ namespace llaminar2
     class CPUGatedDeltaNet : public ITensorGatedDeltaNet, public ICPURequestStateBankView
     {
     public:
+        /** @brief Bind immutable telemetry identities before any CPU execution. */
+        CPUGatedDeltaNet();
+
         /** @return CPU recurrence matrices always use key-major storage. */
         GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override
         {
@@ -50,7 +62,20 @@ namespace llaminar2
          */
         bool resetGPUState(void *stream) override;
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
-        void bindSpeculativeStateWorkspace(float *workspace, int state_size) override;
+        /** @copydoc ITensorGatedDeltaNet::restoreCPUSharedStateRows */
+        bool restoreCPUSharedStateRows(const CPUSharedGDNTransaction &transaction,
+            float *destination,const int *rows) override;
+        /**
+         * @brief Bind retained compact epoch storage without a mutable state clone.
+         * @param slots Arena-owned immutable checkpoint/raw-log transaction payload.
+         * @param slot_floats Admitted payload capacity in FP32-sized elements.
+         * @param rows Flattened row capacity; per-request geometry is authenticated at execution.
+         * @throws std::invalid_argument for partial bindings or unrepresentable capacities.
+         * Rebinding or clearing retires local direct-publication eligibility;
+         * independently owned stage transactions retain their own generation authority.
+         */
+        void bindCPUSharedStateCapture(float *slots,size_t slot_floats,int rows) override;
+
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
 
         /**
@@ -103,10 +128,10 @@ namespace llaminar2
         /**
          * @brief Advance separate Q/K/V rows and publish every post-row state.
          *
-         * Snapshot rows are direct recurrence destinations, not copies made
-         * after an alternate verifier kernel.  On successful return @p state is
-         * advanced to the final snapshot, preserving the historical explicit
-         * snapshot API contract while avoiding one copy per intermediate row.
+         * This explicit dense serialization boundary is a diagnostic oracle.
+         * On successful return @p state advances to the final snapshot. Bound
+         * production verifier calls instead require immutable shared checkpoints
+         * and a shared raw log; they never select dense serialization.
          *
          * @return true when all rows are byte-equivalent to serial decode and
          *         the terminal state is published; false is a fatal bad contract.
@@ -124,8 +149,11 @@ namespace llaminar2
         /**
          * @brief Run the production merged-QKV verifier without mutating live state.
          *
-         * Row zero advances directly from @p state into snapshot zero. Every
-         * later row advances the prior immutable snapshot into the next slot.
+         * Explicit dense storage materializes every row for diagnostics. Bound
+         * production storage builds immutable checkpoints and one shared raw log
+         * directly, materializing only the accepted row without a working clone.
+         * Readouts share checkpoint loads while fixed-position boundaries alone
+         * advance the rounded matrix; no production M=1 row replay is used.
          * The input state therefore remains authoritative until the MTP
          * transaction explicitly publishes its accepted row.
          *
@@ -176,6 +204,29 @@ namespace llaminar2
             bool use_qk_l2norm) override;
 
     private:
+        /** @brief Same-kernel per-call telemetry, reset/reduced/published by its existing team. */
+        CPUFixedEpochObservations epoch_counter_observations_{};
+        /** @brief One team-owner-sealed choice for this call, never model policy. */
+        bool epoch_counter_collection_enabled_ = false;
+        /**
+         * @brief Seal one collection choice and initialize its transient total.
+         * @return The same immutable local choice to every current team member.
+         * All members enter the unconditional existing single-owner boundary;
+         * its barrier publishes the flag before any conditional workshare.
+         */
+        bool beginEpochCounterObservations();
+        /** @brief Narrow device-free peer authenticates only team-choice sealing. */
+        friend class CPUGDNObservationTestPeer;
+        /** @brief Cold metadata only; collector records/epochs remain collector-owned. */
+        std::array<PerfStatsCollector::CounterIdentity, 15> epoch_counter_identities_;
+        /**
+         * @brief Publish reduced actual work once after the numeric workshare.
+         * @param dk Key width of each observed head.
+         * @param dv Value width of each observed head.
+         * Zero completed heads create no records; no model/lifecycle value is read.
+         */
+        void publishEpochCounterObservations(int dk, int dv) const;
+
         /**
          * @brief Read-only source layout consumed by the shared prefill kernel.
          *
@@ -221,7 +272,15 @@ namespace llaminar2
         /// L2 normalize vectors per head
         static void l2normalize(float *data, int seq_len, int n_heads, int head_dim);
 
-        /// Ensure scratch buffers are large enough, reallocating only when needed
+        /**
+         * @brief Admit persistent query/key and scalar-gate tables before execution.
+         * @param seq_len Admitted row capacity for the upcoming grouped call.
+         * @param n_heads Local value-head count.
+         * @param d_k Key width of each normalized/adjusted query.
+         * @param d_v Value width, unused by query/gate storage admission.
+         * Existing capacities are reused; prepared queries, keys and gates share
+         * token/head ownership and are published before epoch contraction.
+         */
         void ensureScratch(int seq_len, int n_heads, int d_k, int d_v);
 
         /**
@@ -239,8 +298,8 @@ namespace llaminar2
          * @param A_log Per-head recurrence decay coefficients.
          * @param dt_bias Per-head time-step biases.
          * @param output Destination rows in local-value-head order.
-         * @param state Mutable working recurrence state. Verifier callers pass a
-         *        private speculative copy so live decode state is not mutated.
+         * @param state Complete CPUGDNStateLayout bank. Bound verifier execution
+         *        builds retained immutable checkpoints and preserves these initial bytes.
          * @param seq_len Number of rows to advance; every positive runtime M is
          *        accepted when the caller provides sufficient storage.
          * @param n_heads Number of local value heads.
@@ -276,7 +335,7 @@ namespace llaminar2
          */
         template <typename RowAccessor>
         bool chunkForwardBatchedDecodeEquivalentRows(
-            RowAccessor &&row_accessor,
+            RowAccessor &&row_accessor, int value_row_stride,
             const float *alpha, const float *beta_raw,
             const float *A_log, const float *dt_bias,
             float *output, float *state,
@@ -285,23 +344,58 @@ namespace llaminar2
             bool use_qk_l2norm,
             const int *host_request_seq_lens);
 
-        float *prepareSpeculativeState(float *live_state, int state_floats);
         bool ensureRequestStateBank(
             int request_count,
             int state_floats,
             const float *request_zero_state);
 
         // Reusable scratch buffers (grow-only, never shrink during lifetime)
-        std::vector<float> q_scratch_;        ///< Preprocessed Q buffer
+        std::vector<float> q_scratch_;        ///< Canonical normalized/scaled Q buffer
         std::vector<float> k_scratch_;        ///< Preprocessed K buffer
         std::vector<float> gate_scratch_;     ///< Gate values
         std::vector<float> beta_sig_scratch_; ///< Sigmoid of beta
+        float *shared_slots_ = nullptr; ///< Arena-owned immutable transaction payload.
+        size_t shared_slot_floats_ = 0; ///< Arena-admitted immutable checkpoint/log capacity.
+        int shared_rows_ = 0, shared_heads_ = 0, shared_dk_ = 0, shared_dv_ = 0;
+        int shared_width_ = 0, shared_requests_ = 0, shared_live_width_ = 0; ///< Published transaction identity.
+        bool shared_valid_ = false;
+        /**
+         * @brief Authenticate a bound transaction before any recurrence output.
+         * @param requests Fixed number of request partitions in this call.
+         * @param width Live input-row width per request, bounded by admitted width.
+         * @param heads Participant-local value-head count.
+         * @param dk Key width of each complete canonical head.
+         * @param dv Value width of each complete canonical head.
+         * @return True for a complete arena binding and sufficient
+         *         logical capacity; false retires local publication eligibility.
+         * @throws std::invalid_argument for unsupported canonical state geometry.
+         * @throws std::overflow_error if the canonical bank exceeds its INT ABI.
+         * Physical spans retain admitted width while accepted row indices retain
+         * live width. This method allocates nothing and changes no stage-owned
+         * generation or metadata belonging to a different graph's transaction.
+         */
+        bool prepareShared(int requests, int width, int heads, int dk, int dv);
+        /**
+         * @brief Serialize one locally bound completed candidate to canonical bytes.
+         * @param destination Writable complete state bank, disjoint from bound
+         *        immutable checkpoint/raw-log slots.
+         * @param row Flattened live row index identifying one request/candidate.
+         * @return True after copying every head; false for stale lifecycle,
+         *         invalid metadata/index, null destination, or arena overlap.
+         * All heads are validated before publication; no arithmetic is replayed.
+         */
+        bool materializeShared(float *destination, int row);
+        /**
+         * @brief Validate every head of a locally bound retained candidate.
+         * @param row Flattened index using the current live per-request row width.
+         * @return True only when local publication is valid and every head marks
+         *         that candidate complete; false leaves all state unchanged.
+         * This local guard is separate from explicit stage-owned generations.
+         */
+        bool validSharedRow(int row) const;
         float *verifier_state_capture_ = nullptr;
         int verifier_state_capture_rows_ = 0;
         int verifier_state_capture_size_ = 0;
-        float *speculative_state_work_ = nullptr;
-        int speculative_state_work_size_ = 0;
-        std::vector<float> owned_speculative_state_work_;
         std::vector<float> request_state_bank_;
         int request_state_size_ = 0;
         int request_state_capacity_ = 0;

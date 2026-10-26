@@ -12,6 +12,8 @@
  * dispatch; unsupported typed fused bias declarations fail before submission.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
+ * GDN-output residual counters observe successful host submission using the
+ * same immutable prepared binding, never device live rows or replay completion.
  */
 
 #include "GEMMStage.h"
@@ -30,6 +32,7 @@
 
 #include "utils/OpenMPUtils.h"
 #include "models/qwen4exp/Qwen4ExpHCUpArithmetic.h"
+#include "models/qwen4exp/Qwen4ExpProjectionWorkspace.h"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -278,6 +281,7 @@ namespace llaminar2
             throw std::invalid_argument("GEMM activation operand precision is invalid");
         (void)typedProjectionBias(params_,params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size()));
         initializeHCUpSubmissionIdentities();
+        initializeGDNOutputResidualSubmissionIdentity();
         if(params_.projection_row_work) {
             params_.validate();
             if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8||
@@ -782,6 +786,59 @@ namespace llaminar2
         PerfStatsCollector::addCounter(*hc_submission_identities_[index]);
     }
 
+    void GEMMStage::initializeGDNOutputResidualSubmissionIdentity()
+    {
+        if (params_.quantized_operand_precision != QuantizedActivationOperandPrecision::TwoTermQ8)
+            return;
+        const auto binding = params_.prepared_store && params_.prepared_ref
+            ? params_.prepared_store->binding(*params_.prepared_ref) : std::nullopt;
+        // Reuse the canonical role/name selector. The stage already owns the
+        // selected TwoTerm policy; this observation does not resolve a default.
+        if (!binding || Qwen4ExpProjectionWorkspace::gdnOutputPrecision(
+                params_.quantized_operand_precision, true, binding->identity.role,
+                binding->identity.canonical_name) != QuantizedActivationOperandPrecision::TwoTermQ8)
+            return;
+        if (!binding->immutable || !params_.B || binding->tensor != params_.B ||
+            params_.prepared_ref->device != params_.device_id)
+            throw std::invalid_argument("GDN-output observation requires its exact immutable prepared source/device");
+        const auto rows = params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m));
+        const auto identity = rows.captureIdentity();
+        PerfStatsCollector::Tags tags{
+            {"canonical_name", binding->identity.canonical_name},
+            {"weight_role", "GDNProjection"},
+            {"source_format", tensorTypeName(params_.B->native_type())},
+            {"operand_precision", "two_term_q8"},
+            {"operation", "q8_residual_corrected"},
+            {"observation", "host_execute_or_capture"},
+            {"m", std::to_string(params_.m)},
+            {"n", std::to_string(params_.output_range.empty() ? params_.n : static_cast<int>(params_.output_range.size()))},
+            {"k", std::to_string(params_.k)},
+            {"row_binding", identity.count ? "counted_prefix" : "fully_active"},
+            {"count_owner", std::to_string(reinterpret_cast<uintptr_t>(identity.count))},
+            {"count_capacity", std::to_string(identity.count_capacity)},
+            {"first_physical_row", std::to_string(identity.first_physical_row)},
+            {"physical_rows", std::to_string(identity.physical_rows)},
+            {"row_schema_version", std::to_string(identity.schema_version)},
+            {"repeats_per_row", std::to_string(identity.repeats_per_row)}};
+        gdn_output_residual_submission_identity_.emplace(PerfStatsCollector::bindCounter(
+            "kernel", "gdn_output_projection_submissions", "submission",
+            params_.device_id.toString(), std::move(tags)));
+    }
+
+    void GEMMStage::recordGDNOutputResidualSubmission(int columns)
+    {
+        if (!gdn_output_residual_submission_identity_)
+            return;
+        if ((params_.device_id.is_cpu() && omp_in_parallel() && omp_get_thread_num() != 0) ||
+            !PerfStatsCollector::isDomainEnabled("kernel"))
+            return;
+        const int bound_columns = params_.output_range.empty()
+            ? params_.n : static_cast<int>(params_.output_range.size());
+        if (columns != bound_columns)
+            throw std::logic_error("GDN-output submission changed its prepared output geometry");
+        PerfStatsCollector::addCounter(*gdn_output_residual_submission_identity_);
+    }
+
     bool GEMMStage::execute(IDeviceContext *ctx)
     {
         ScopedGemmContext gemm_ctx(params_.gemm_context);
@@ -937,6 +994,7 @@ namespace llaminar2
             } else gemm->multiply_q8_residual_corrected(A_extent,C_extent,rows,effective_n,params_.k,getWorkspace());
             publishStageOutput(C_extent);
             recordHCUpSubmission(effective_n, HCUpSubmissionOperation::ResidualCorrected);
+            recordGDNOutputResidualSubmission(effective_n);
             traceOutput("C",params_.C);
             return true;
         }

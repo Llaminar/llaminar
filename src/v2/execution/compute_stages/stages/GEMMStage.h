@@ -6,6 +6,8 @@
  * Typed bias retains its original tensor/view through ordinary and verifier dispatch.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
+ * GDN-output TwoTerm observations retain cold prepared source/row identity and
+ * count successful host submissions without sampling device live state.
  */
 
 #pragma once
@@ -337,6 +339,21 @@ namespace llaminar2
          */
         void recordHCUpSubmission(int columns, HCUpSubmissionOperation operation);
         std::array<std::optional<PerfStatsCollector::CounterIdentity>, 4> hc_submission_identities_;
+
+        /**
+         * @brief Bind the exact prepared GDN-output residual program during construction.
+         * @throws std::invalid_argument For a foreign mutable tensor/device binding.
+         * @details This immutable observation reads no device-owned live count.
+         */
+        void initializeGDNOutputResidualSubmissionIdentity();
+        /**
+         * @brief Count one successful host execute/capture submission, never native completion.
+         * @param columns Actual output width, checked against the prepared stage.
+         * @throws std::logic_error If execution changes the prepared output width.
+         * @details CPU workshare observes only on team zero; replay does not call execute.
+         */
+        void recordGDNOutputResidualSubmission(int columns);
+        std::optional<PerfStatsCollector::CounterIdentity> gdn_output_residual_submission_identity_;
 
         bool executeDecodeEquivalentVerifierPrefill(
             const TensorBase *A_base,

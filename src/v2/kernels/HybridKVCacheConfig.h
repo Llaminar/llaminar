@@ -9,7 +9,8 @@
  *
  * Key design:
  * - FA layers use the standard KV cache (inherited from the parent class)
- * - GDN layers store fixed-size recurrence + conv state (O(1) per layer)
+ * - GDN layers store bounded recurrence + conv state (O(1) per layer)
+ * - CPU recurrence snapshots retain epoch phase and raw history without flushing
  * - The parent cache is constructed with only the FA layer count, saving
  *   memory by not allocating KV entries for GDN layers
  * - All layer-indexed methods remap global layer indices to compressed
@@ -39,7 +40,7 @@ namespace llaminar2
      * @brief Per-layer GDN state (recurrence + short conv) for hybrid caches
      *
      * This state is fixed-size O(1) per layer regardless of sequence length:
-     * - Recurrence state: delta-rule S matrix, updated in-place each step
+     * - Recurrence state: CPU fixed-epoch checkpoint/history or device dense matrix
      * - Conv state: causal convolution sliding window of (kernel-1) tokens
      *
      * CPU backends store the live state in the FP32 vectors below. GPU
@@ -86,7 +87,7 @@ namespace llaminar2
          */
         int full_conv_state_size = 0;
 
-        /// CPU-owned recurrence state S: [n_v_heads, d_k, d_v] (FP32).
+        /// CPU-owned complete checkpoint/phase/raw-history bank (CPUGDNStateLayout).
         /// GPU caches deliberately leave this vector empty.
         std::vector<float> recurrence_state;
 
@@ -123,6 +124,7 @@ namespace llaminar2
         void initializeCPUState(int qkv_dim)
         {
             initializeShape(qkv_dim);
+            local_recurrence_state_size = CPUGDNStateLayout(n_v_heads, d_k, d_v).floats();
             recurrence_state.assign(
                 static_cast<size_t>(local_recurrence_state_size), 0.0f);
 

@@ -2317,7 +2317,10 @@ namespace
         constexpr int ROWS_PER_LANE = Geometry::rows_per_lane;
         const int n_base = Geometry::columnBase(blockIdx.x, threadIdx.x);
         const int split_idx = blockIdx.y;
-        llaminar2::ProjectionWorkCursor rowWork(rows,int(blockIdx.z),int(gridDim.z),ROWS_PER_TILE);
+        // Register bounds can split one logical row policy across Z CTAs.
+        // The cursor must step by the same physical width used by the launcher.
+        llaminar2::ProjectionWorkCursor rowWork(
+            rows, int(blockIdx.z), int(gridDim.z), Geometry::rows_per_block);
         int tile_first,active_m;
         while(rowWork.next(tile_first,active_m))
         {

@@ -22,6 +22,8 @@
  * arithmetic. Persistent state is loaded/committed once per captured launch.
  * The cache binding fixes KeyMajor or ValueMajor state for its entire lifetime;
  * state/snapshot endpoints implement that physical format without conversion.
+ * An explicit compile-time compact sink retains actual dense corrections and
+ * relative checkpoints; its disabled policy leaves legacy arithmetic unchanged.
  */
 
 #include "../../common/GatedNormActivation.h"
@@ -29,6 +31,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
+#include "kernels/gdn/GDNDenseCompactSnapshots.h"
 #include "kernels/gdn/GDNPlanarRecurrence.h"
 #include <cstdio>
 #include <cstdint>
@@ -316,12 +319,158 @@ namespace
     /** @brief Physical operand coordinates; CUDA arithmetic is layout-independent. */
     enum class CUDAGDNInputLayout { ExpandedPlanar, MergedPostConvolution };
 
+    /** @brief Erased compile-time policy preserving every legacy dense specialization. */
+    struct CUDAGDNNoCompactCapture final
+    {
+        static constexpr bool enabled = false; ///< Erases every compact branch for legacy kernels.
+        static constexpr bool word_checkpoints = false; ///< Erased no-sink scheduling property.
+        static constexpr bool materialize_terminal = true; ///< Legacy terminal/snapshot stores stay unchanged.
+    };
+
+    /** @brief Per-thread borrowed compact sink; no phase or execution-state authority.
+     * @tparam MaterializeTerminal True for DenseDestination; false erases every terminal endpoint.
+     * @tparam WordCheckpoints Closed compiled address schedule selected by the cold plan.
+     * @details Disjoint column/key owners retain the exact values already computed
+     * by the original body. Whole-kernel completion orders readers; the header is
+     * never a cross-CTA semaphore. observed_rows follows only executed prefix rows.
+     */
+    template<bool MaterializeTerminal, bool WordCheckpoints>
+    struct CUDAGDNDenseCompactCapture final
+    {
+        static constexpr bool enabled = true; ///< Explicit transaction-only compact capture.
+        static constexpr bool word_checkpoints = WordCheckpoints; ///< Exact global function scheduling identity.
+        static constexpr bool materialize_terminal = MaterializeTerminal; ///< Erases absent terminal addressing and stores.
+        llaminar2::gdn::GDNDenseCompactTransaction transaction; ///< Borrowed immutable capture identity.
+        unsigned observed_rows = 0; ///< Register-local count of rows this body actually executes.
+        unsigned planned_rows = 0; ///< Device count captured before this request writes any state.
+        llaminar2::gdn::GDNDenseRetentionMode retained_mode; ///< Once-selected request-local representation.
+
+        /** @brief Validate and select this request's retention once before the numeric body's cp0 writes.
+         * @param captured Immutable cold-admitted transaction and policy.
+         * @param live Validated existing device request count; no host mirror or new metadata.
+         * @details Wrapper first validates every request count and joins its CTA. The
+         * original body visits only active rows, so hooks reuse this selected mode.
+         */
+        __device__ CUDAGDNDenseCompactCapture(llaminar2::gdn::GDNDenseCompactTransaction captured, int live)
+            : transaction(captured), planned_rows(unsigned(live))
+        {
+            if (!transaction.geometry.retentionForLiveRows(live, retained_mode)) asm volatile("trap;");
+        }
+
+        /** @brief Retain only a valid completed row using the once-authenticated representation.
+         * @param completed Original body's completed count1..planned_rows.
+         * @param slot Reset on failure; immutable full image or relative eight-row checkpoint.
+         * @return Whether this completed row owns a matrix image.
+         */
+        __device__ bool checkpointSlot(unsigned completed, std::size_t &slot) const
+        {
+            slot = 0;
+            if (!completed || completed > planned_rows) return false;
+            if (retained_mode == llaminar2::gdn::GDNDenseRetentionMode::FullSnapshots)
+            {
+                slot = completed;
+                return true;
+            }
+            constexpr auto period = llaminar2::gdn::GDNDenseCompactGeometry::checkpoint_interval;
+            if (completed % period) return false;
+            slot = completed / period;
+            return true;
+        }
+
+
+        /** @return This CTA's immutable transaction-relative head storage. */
+        __device__ float *head() const
+        {
+            return transaction.storage + std::size_t(blockIdx.x) * transaction.geometry.headStrideFloats();
+        }
+
+        /** @brief Retain actual resident matrix words; each column/key partition is exclusive.
+         * @param checkpoint Relative checkpoint index, including mandatory cp0.
+         * @param state Actual resident words from the unchanged dense recurrence.
+         * @param row_begin First key coordinate owned by this thread.
+         * @param vi Value column, checked by the original body.
+         * @param dv Exact value width.
+         */
+        template<int DK, GDNRecurrenceStateLayout Axes, int N>
+        __device__ void checkpoint(unsigned checkpoint, const float (&state)[N], int row_begin, int vi, int dv) const
+        {
+            float *destination = head() + transaction.geometry.checkpointOffsetFloats() +
+                std::size_t(checkpoint) * transaction.geometry.checkpointStrideFloats();
+#pragma unroll
+            for (int j = 0; j < N; ++j)
+                destination[cuda_gdn_state_offset<Axes, DK>(row_begin + j, vi, dv)] = state[j];
+        }
+
+        /** @brief Store an already rounded row word beside its original update/readout.
+         * @tparam DK Original key width.
+         * @tparam Axes Captured matrix axes; neither arithmetic nor ownership changes.
+         * @param checkpoint Immutable matrix slot selected before the update loop.
+         * @param key Exclusive logical key coordinate owned by this thread.
+         * @param vi Exclusive value coordinate guarded by the original body.
+         * @param dv Exact value width including tails.
+         * @param state Original s_new register word, not a recomputed update.
+         * @details One word's address can retire before the next key update;
+         * cp0 retains the existing complete-partition store before causal rows.
+         */
+        template<int DK, GDNRecurrenceStateLayout Axes>
+        __device__ __forceinline__ void checkpointWord(unsigned checkpoint, int key, int vi, int dv, float state) const
+        {
+            float *destination = head() + transaction.geometry.checkpointOffsetFloats() +
+                std::size_t(checkpoint) * transaction.geometry.checkpointStrideFloats();
+            destination[cuda_gdn_state_offset<Axes, DK>(key, vi, dv)] = state;
+        }
+
+        /** @brief Retain normalized K and rounded decay once, without recomputation. */
+        template<int DK>
+        __device__ void record(unsigned row, const float *key, float decay)
+        {
+            observed_rows = row + 1;
+            if (retained_mode != llaminar2::gdn::GDNDenseRetentionMode::ExactCorrections || blockIdx.y != 0) return;
+            float *record = head() + transaction.geometry.recordsOffsetFloats() +
+                std::size_t(row) * transaction.geometry.recordStrideFloats();
+            for (int k = threadIdx.x; k < DK; k += blockDim.x) record[k] = key[k];
+            if (threadIdx.x == 0) record[transaction.geometry.recordDecayOffsetFloats()] = decay;
+        }
+
+        /** @brief Store one actual delta per value column; split0 alone owns it. */
+        __device__ void correction(unsigned row, int vi, float delta) const
+        {
+            if (retained_mode != llaminar2::gdn::GDNDenseRetentionMode::ExactCorrections) return;
+            head()[transaction.geometry.recordsOffsetFloats() +
+                std::size_t(row) * transaction.geometry.recordStrideFloats() +
+                transaction.geometry.recordCorrectionOffsetFloats() + vi] = delta;
+        }
+
+        /** @brief Publish exact protocol after local work; consumer still requires kernel completion. */
+        __device__ void finish() const
+        {
+            if (blockIdx.y != 0 || threadIdx.x != 0) return;
+            float *words = head();
+            using G = llaminar2::gdn::GDNDenseCompactGeometry;
+            words[G::format_word] = __uint_as_float(std::uint32_t(transaction.encoding));
+            words[G::published_rows_word] = __uint_as_float(observed_rows);
+            words[G::planned_rows_word] = __uint_as_float(planned_rows);
+            words[G::generation_low_word] = __uint_as_float(std::uint32_t(transaction.generation));
+            words[G::generation_high_word] = __uint_as_float(std::uint32_t(transaction.generation >> 32));
+            words[G::layout_word] = __uint_as_float(std::uint32_t(transaction.layout));
+            words[G::arithmetic_word] = __uint_as_float(std::uint32_t(transaction.arithmetic));
+            if (transaction.encoding == llaminar2::gdn::GDNDenseCompactEncoding::SplitRetentionV1)
+            {
+                const auto policy = transaction.geometry.retentionProgram();
+                words[G::retention_mode_word] = __uint_as_float(std::uint32_t(retained_mode));
+                words[G::retention_program_word] = __uint_as_float(std::uint32_t(policy.mode));
+                words[G::compact_min_live_rows_word] = __uint_as_float(policy.compact_min_live_rows);
+            }
+        }
+    };
+
     /**
      * @brief Single CUDA numeric body for planar and direct merged recurrence.
      * @tparam D_K Native64/128 key width.
      * @tparam OutOfPlaceState Preserve original live versus speculative state access.
      * @tparam Layout Explicit immutable physical input coordinates.
      * @tparam StateLayout Canonical immutable persistent/snapshot matrix format.
+     * @tparam CompactCapture Erased legacy or explicit retained sink; terminal presence is compile-time.
      * @param q Planar Q or the original merged post-convolution row.
      * @param k Planar K; unused for merged coordinates.
      * @param v Planar V; unused for merged coordinates.
@@ -331,7 +480,7 @@ namespace
      * @param dt_bias Local-head learned time-step bias.
      * @param output Exclusive original physical output plane.
      * @param initial_state Borrowed canonical live state.
-     * @param updated_state Bound live or speculative terminal destination.
+     * @param updated_state Bound Dense destination; absent only for a terminal-false retained sink.
      * @param request_count Independent state-bank count.
      * @param request_seq_len Original physical rows per request.
      * @param n_heads Participant-local value-head count.
@@ -344,12 +493,14 @@ namespace
      * @param max_snapshot_rows Original admitted snapshot row envelope.
      * @param merged_key_heads Merged source Q/K heads; unused for planar input.
      * @param global_value_offset Signed modular Q/K head coordinate.
+     * @param compact_capture Explicit sink; erased for every legacy wrapper.
      * @details Only input address calculation changes with Layout. CUDA's
      * one-warp norm tree, eight-part ascending reductions, query-scale constants,
      * rounded state arithmetic and all publication barriers remain literal.
      */
     template <int D_K, bool OutOfPlaceState, CUDAGDNInputLayout Layout,
-        GDNRecurrenceStateLayout StateLayout = GDNRecurrenceStateLayout::KeyMajorValueContiguous>
+        GDNRecurrenceStateLayout StateLayout = GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+        class CompactCapture = CUDAGDNNoCompactCapture>
     __device__ __forceinline__
     void cuda_gdn_recurrent_step_body(
         const float *__restrict__ q,        // [n_heads * d_k]
@@ -370,8 +521,11 @@ namespace
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
         int max_snapshot_rows,
-        int merged_key_heads = 0, int global_value_offset = 0)
+        int merged_key_heads = 0, int global_value_offset = 0,
+        CompactCapture compact_capture = {})
     {
+        static_assert(CompactCapture::materialize_terminal || OutOfPlaceState,
+            "Retained-only CUDA capture must read its explicit independent initial state");
         const int request_head = blockIdx.x;
         const int request = request_head / n_heads;
         const int h = request_head - request * n_heads;
@@ -400,9 +554,12 @@ namespace
         const float *S_initial =
             state_source + static_cast<size_t>(request) * request_state_stride +
             static_cast<size_t>(h) * D_K * d_v;
-        float *S_updated =
-            updated_state + static_cast<size_t>(request) * request_state_stride +
-            static_cast<size_t>(h) * D_K * d_v;
+        float *S_updated = nullptr;
+        if constexpr (CompactCapture::materialize_terminal)
+        {
+            S_updated = updated_state + static_cast<size_t>(request) * request_state_stride +
+                static_cast<size_t>(h) * D_K * d_v;
+        }
 
         // Shared memory for preprocessed Q and K
         extern __shared__ float smem[];
@@ -433,6 +590,12 @@ namespace
 #pragma unroll
             for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
                 state_rows[local_row] = 0.0f;
+        }
+
+        if constexpr (CompactCapture::enabled)
+        {
+            if (vi < d_v)
+                compact_capture.template checkpoint<D_K, StateLayout>(0, state_rows, row_begin, vi, d_v);
         }
 
         // Source ownership is invariant across causal rows. Preserve the full
@@ -561,6 +724,8 @@ namespace
             __syncthreads();
             const float decay = decay_shared;
             const float beta_h = beta_shared;
+            if constexpr (CompactCapture::enabled)
+                compact_capture.template record<D_K>(request_row, k_local, decay);
 
             float partial_kv = 0.0f;
             if (vi < d_v)
@@ -594,6 +759,24 @@ namespace
                 delta = (v_head[vi] - kv) * beta_h;
             }
 
+            if constexpr (CompactCapture::enabled)
+            {
+                if (vi < d_v && split_id == 0)
+                    compact_capture.correction(request_row, vi, delta);
+            }
+
+            // DK128 KeyMajor's sixteen-word checkpoint otherwise extends its
+            // store addresses across the numeric loop. Retire each address at
+            // its actual s_new while keeping the original arithmetic literal.
+            // Other geometries keep their measured lower-pressure partition
+            // stores; this is only a compile-time memory scheduling choice.
+            constexpr bool interleaved_retention = CompactCapture::enabled && CompactCapture::word_checkpoints;
+            std::size_t retained_checkpoint = 0;
+            bool retain_checkpoint = false;
+            if constexpr (interleaved_retention)
+                retain_checkpoint = vi < d_v && compact_capture.checkpointSlot(
+                    request_row + 1, retained_checkpoint);
+
             float partial_out = 0.0f;
             float *snapshot =
                 state_snapshots && flat_row < max_snapshot_rows
@@ -616,8 +799,20 @@ namespace
                     state_rows[local_row] = s_new;
                     if (snapshot)
                         snapshot[cuda_gdn_state_offset<StateLayout, D_K>(state_row, vi, d_v)] = s_new;
+                    if constexpr (interleaved_retention)
+                        if (retain_checkpoint)
+                            compact_capture.template checkpointWord<D_K, StateLayout>(
+                                retained_checkpoint, state_row, vi, d_v, s_new);
                     partial_out += s_new * q_local[state_row];
                 }
+            }
+            if constexpr (CompactCapture::enabled && !interleaved_retention)
+            {
+                std::size_t checkpoint = 0;
+                if (vi < d_v && compact_capture.checkpointSlot(
+                        request_row + 1, checkpoint))
+                    compact_capture.template checkpoint<D_K, StateLayout>(
+                        checkpoint, state_rows, row_begin, vi, d_v);
             }
             reduce_out[tid] = partial_out;
             __syncthreads();
@@ -641,13 +836,19 @@ namespace
             __syncthreads();
         }
 
-        const bool terminal_state_is_snapshotted =
-            state_snapshots != nullptr &&
-            max_snapshot_rows >= request_count * request_seq_len;
-        if (vi < d_v && !terminal_state_is_snapshotted)
+        if constexpr (CompactCapture::enabled)
+            compact_capture.finish();
+
+        if constexpr (CompactCapture::materialize_terminal)
         {
-            cuda_gdn_store_state_partition<StateLayout, D_K>(
-                S_updated, state_rows, row_begin, vi, d_v);
+            const bool terminal_state_is_snapshotted =
+                state_snapshots != nullptr &&
+                max_snapshot_rows >= request_count * request_seq_len;
+            if (vi < d_v && !terminal_state_is_snapshotted)
+            {
+                cuda_gdn_store_state_partition<StateLayout, D_K>(
+                    S_updated, state_rows, row_begin, vi, d_v);
+            }
         }
     }
 
@@ -2113,6 +2314,11 @@ namespace
             const int request = linear / state_size;
             const int state_offset = linear - request * state_size;
             const int metadata_value = row_indices[request * row_index_stride];
+            // A terminal length is request-local. Flattening zero first would
+            // select the preceding request's last snapshot for request > 0.
+            // Leave empty requests untouched, as negative explicit indices do.
+            if (request_row_width > 0 && metadata_value == 0)
+                continue;
             const int row =
                 request_row_width > 0
                     ? request * request_row_width + metadata_value - 1
@@ -3468,3 +3674,5 @@ namespace llaminar2::gdn
     }
 
 }
+
+#include "CUDADenseCompactSnapshots.cuh"

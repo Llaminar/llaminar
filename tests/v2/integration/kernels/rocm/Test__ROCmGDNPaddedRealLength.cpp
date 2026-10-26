@@ -9,6 +9,8 @@
  * recurrence or convolution state carried into decode.
  * Long-prefill head-shard coverage additionally proves captured recurrence is
  * byte-identical to serial decode across TP widths, resets and live lengths.
+ * Exact Dense compact retention additionally checks every accepted revision
+ * and complete capture/publication/continuation event boundaries.
  */
 
 #include <gtest/gtest.h>
@@ -4352,5 +4354,114 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceAdditiveEpsilonNearZeroCaptured)
 #include "ROCmGDNMergedExtendedTrial.h"
 #include "ROCmGDNValueMajorProductionTest.h"
 #include "ROCmGDNValueMajorCompletePerf.h"
+#include "ROCmGDNDenseCompactSnapshotsRegression.h"
+
+#ifdef HAVE_ROCM
+namespace
+{
+/**
+ * @brief Replay terminal-count and flattened-index publication with request holes.
+ * @tparam Kernel Production recurrence or short-convolution state owner.
+ * @param ordinal Native backend device ordinal.
+ * @details Empty requests retain their own prior bytes. Distinct request-zero
+ * and scalar owners prove publication coherence as well as aliasing. Changing
+ * only device metadata exercises full, partial and empty replays without
+ * rebuilding either captured graph; the host oracle never executes a kernel.
+ */
+template <class Kernel>
+void verifyROCmCaptureRequestHoles(int ordinal)
+{
+    constexpr int requests = 3, width = 4, metadata_stride = 3;
+    for (const int state_size : {1, 257, 1025})
+    for (const bool alias_zero : {false, true})
+    {
+        SCOPED_TRACE("state_size=" + std::to_string(state_size) +
+                     " alias_zero=" + std::to_string(alias_zero));
+        std::vector<float> snapshots(requests * width * state_size);
+        // Distinct scalar storage is legal only with two LocalTP geometries.
+        // The unused second geometry and request-bank tail remain guards.
+        std::vector<float> expected(requests * (state_size + (alias_zero ? 0 : 1)));
+        for (size_t i = 0; i < snapshots.size(); ++i)
+            snapshots[i] = 1024.0f + static_cast<float>(i) * 0.25f;
+        for (size_t i = 0; i < expected.size(); ++i)
+            expected[i] = -1024.0f - static_cast<float>(i) * 0.25f;
+        HipFloatBuffer capture(snapshots), states(expected);
+        HipFloatBuffer scalar(std::vector<float>(expected.begin(), expected.begin() + state_size));
+        HipFloatBuffer secondary(state_size + 1, -8192.0f);
+        HipIntBuffer lengths(std::vector<int>(requests, 0));
+        HipIntBuffer indices(std::vector<int>(requests * metadata_stride, -99));
+        HipStreamHandle stream;
+        Kernel kernel(ordinal);
+        ASSERT_TRUE(kernel.bindDeviceState(GDNDeviceStateBinding{
+            .primary_state = alias_zero ? states.ptr : scalar.ptr,
+            .primary_state_floats = state_size,
+            .secondary_state = alias_zero ? nullptr : secondary.ptr,
+            .secondary_state_floats = alias_zero ? 0 : state_size + 1,
+            .request_state_bank = states.ptr,
+            .request_state_bank_floats = states.count,
+            .request_capacity = requests,
+        }));
+        kernel.setGPUStream(stream.stream);
+        kernel.bindVerifierStateCaptureWorkspace(capture.ptr, requests * width, state_size);
+        HipCapturedGraph terminal(stream.stream, [&] {
+            return kernel.restoreVerifierStateCaptureRequestTerminalRows(
+                nullptr, lengths.ptr, requests, width, stream.stream);
+        });
+        HipCapturedGraph indexed(stream.stream, [&] {
+            return kernel.restoreVerifierStateCaptureRowsFromDeviceIndices(
+                nullptr, state_size, indices.ptr, requests, metadata_stride, stream.stream);
+        });
+        const std::array<std::array<int, requests>, 6> patterns{{
+            {{4, 4, 4}}, {{3, 0, 1}}, {{0, 2, 0}},
+            {{0, 0, 0}}, {{1, 0, 4}}, {{4, 4, 4}},
+        }};
+        for (const auto &counts : patterns)
+        for (const bool use_indices : {false, true})
+        {
+            SCOPED_TRACE("counts=" + std::to_string(counts[0]) + "," +
+                         std::to_string(counts[1]) + "," + std::to_string(counts[2]) +
+                         " indexed=" + std::to_string(use_indices));
+            std::array<int, requests * metadata_stride> selectors{};
+            selectors.fill(-99); // Unused stride words must never be consumed.
+            for (int request = 0; request < requests; ++request)
+            {
+                const int count = counts[request];
+                selectors[request * metadata_stride] =
+                    count == 0 ? -1 : request * width + count - 1;
+                if (count != 0)
+                    std::copy_n(snapshots.begin() +
+                                    (request * width + count - 1) * state_size,
+                                state_size, expected.begin() + request * state_size);
+            }
+            // Staging remains alive through the exact test-stream completion.
+            checkHip(hipMemcpyAsync(lengths.ptr, counts.data(), sizeof(counts),
+                hipMemcpyHostToDevice, stream.stream), "publish terminal lengths");
+            checkHip(hipMemcpyAsync(indices.ptr, selectors.data(), sizeof(selectors),
+                hipMemcpyHostToDevice, stream.stream), "publish strided indices");
+            if (use_indices) indexed.launch(stream.stream);
+            else terminal.launch(stream.stream);
+            checkHip(hipStreamSynchronize(stream.stream), "join request-hole publication");
+            expectByteExactEquivalent("request-local publication", states.toHost(), expected, 0, expected.size());
+            if (!alias_zero)
+                expectByteExactEquivalent("scalar request-zero owner", scalar.toHost(),
+                    expected, 0, state_size);
+            expectByteExactEquivalent("immutable capture rows", capture.toHost(),
+                snapshots, 0, snapshots.size());
+            expectByteExactEquivalent("unused LocalTP geometry", secondary.toHost(),
+                std::vector<float>(state_size + 1, -8192.0f), 0, state_size + 1);
+        }
+    }
+}
+} // namespace
+
+TEST(Test__ROCmGDNPaddedRealLength, EmptyRequestTerminalPublication)
+{
+    if (!hasROCm()) GTEST_SKIP() << "ROCm device unavailable";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+    verifyROCmCaptureRequestHoles<ROCmGatedDeltaNet>(0);
+    verifyROCmCaptureRequestHoles<ROCmShortConvolution>(0);
+}
+#endif
+
 
 #endif

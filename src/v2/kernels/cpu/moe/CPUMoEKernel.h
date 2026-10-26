@@ -5,8 +5,9 @@
  * Implements IMoEKernel for CPU execution using ISA-dispatched vector
  * primitives (AVX2/AVX-512). This is the reference implementation;
  * GPU implementations (CUDA/ROCm) can override for device-native execution.
- * Typed half router gates consume half-rounded hidden operands with FP32
- * accumulation, retaining original FP32 hidden/Q8 authority for the experts.
+ * Typed FP16 gates consume half-rounded hidden operands; native BF16 gates
+ * retain FP32 hidden operands and widen weights in registers. Both use fixed
+ * FP32 accumulation and preserve original hidden/Q8 authority for the experts.
  */
 
 #pragma once
@@ -75,8 +76,20 @@ namespace llaminar2
          * one backend where @p host_result is a production output rather than
          * an obsolete GPU mirror. A physical FP16 gate selects half-RNE hidden
          * and half weights with fixed FP32 accumulation. Expert Q8 publication
-         * still consumes the original FP32 hidden; the raw float route stays Native. FP16 gate tensors select physical half A/B
-         * with FP32 accumulation; the raw float route() interface stays Native.
+         * still consumes the original FP32 hidden. Native BF16 gates widen
+         * original weight words in registers and retain FP32 hidden operands.
+         * Neither 16-bit path creates an FP32 weight cache.
+         * @param hidden Original FP32 hidden matrix with at least seq_len rows.
+         * @param gate_weights Typed FP32, FP16 or BF16 matrix [num_experts,d_model].
+         * @param seq_len Positive live row count, independent of retained capacity.
+         * @param d_model Common hidden/weight row width.
+         * @param num_experts Number of router output columns.
+         * @param top_k Positive retained expert count no greater than num_experts.
+         * @param normalize_weights Whether selected probabilities sum to one.
+         * @param output_indices FP32 tensor receiving exactly seq_len*top_k IDs.
+         * @param output_weights FP32 tensor receiving matching probabilities.
+         * @param host_result Authoritative CPU route and original-hidden Q8 publication.
+         * @return True after joined routing and publication; false for an invalid contract.
          */
         bool routeWithTensors(
             ITensor *hidden, ITensor *gate_weights,
@@ -259,10 +272,11 @@ namespace llaminar2
 
     private:
         /**
-         * @brief Route already prepared FP32 or FP16 gates without a weight cache.
+         * @brief Route prepared FP32, FP16 or BF16 gates without a weight cache.
          * @param hidden Original FP32 rows retained as the expert-Q8 publication source.
          * @param gate_weights Contiguous N-by-K bytes in exactly @p gate_type.
-         * @param gate_type FP32 selects old arithmetic; FP16 selects half A/B + FP32 tree.
+         * @param gate_type FP32 selects native dots; FP16 rounds A to half;
+         *        BF16 widens B with unchanged FP32 A. Both 16-bit paths use a fixed tree.
          * @param seq_len Positive row count; @p d_model and @p num_experts are matrix K/N.
          * @param top_k Unique retained experts per row.
          * @param normalize_weights Normalize the selected original per-row probabilities.

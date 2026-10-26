@@ -714,19 +714,33 @@ namespace llaminar2
 
     void PerfStatsCollector::addCounter(const CounterIdentity &identity, double value)
     {
+        addCounter(identity, CounterObservationBatch{.observations=1u, .value=value});
+    }
+
+    void PerfStatsCollector::addCounter(const CounterIdentity &identity, CounterObservationBatch batch)
+    {
         if (!identity.impl_)
             throw std::invalid_argument("Counter identity has been moved from");
+        if (batch.observations == 0)
+        {
+            if (batch.value != 0.0)
+                throw std::invalid_argument("An empty counter observation batch has a nonzero value");
+            return;
+        }
         const auto &key = identity.impl_->key;
         if (!isDomainEnabled(key.domain))
             return;
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
-        auto &record = s.records[key];
+        auto entry = s.records.try_emplace(key).first;
+        auto &record = entry->second;
         if (record.sequence_word_count != 0u)
             throw std::logic_error("PerfStats counter family omitted its lifecycle evidence");
+        if (batch.observations > std::numeric_limits<uint64_t>::max() - record.count)
+            throw std::overflow_error("PerfStats counter observation count overflow");
         record.kind = PerfStatRecord::Kind::Counter;
-        ++record.count;
-        record.value += value;
+        record.count += batch.observations;
+        record.value += batch.value;
         ++s.version;
     }
 

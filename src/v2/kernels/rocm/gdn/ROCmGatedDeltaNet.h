@@ -21,6 +21,7 @@
 #include "kernels/gdn/GDNDeinterleaveRows.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
 #include "kernels/gdn/GDNPlanarRecurrence.h"
+#include "kernels/gdn/GDNPreparedRetainedInvocation.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -320,6 +321,14 @@ namespace llaminar2
         {
             return hasState(required_state_size);
         }
+        /** @brief Prepare an immutable retained invocation without allocating or rebinding live state.
+         * @param sources Frozen raw merged operands and device live-count owner.
+         * @param binding Actual leased views, physical geometry, owner identity and exact capture stream.
+         * @return Prepared backend program; all borrowed owners must outlive its graphs.
+         * @throws std::invalid_argument For unsupported or incomplete immutable bindings. */
+        std::unique_ptr<gdn::IGDNPreparedRetainedInvocation>
+        prepareRetainedInvocation(const gdn::MergedRecurrenceInput &sources,
+                                  const gdn::GDNRetainedInvocationBinding &binding) const override;
         bool supportsRequestLiveStateBank(int request_count, int state_size) const override
         {
             return device_state_bound_ &&
@@ -1230,6 +1239,144 @@ namespace llaminar2
             }
             return true;
         }
+
+        /** @brief Immutable backend program; leases and source/kernel lifetimes remain with the stage. */
+        class PreparedRetainedInvocation final : public gdn::IGDNPreparedRetainedInvocation
+        {
+          public:
+            /** @brief Freeze validated canonical banks and native capture identity cold.
+             * @param owner Existing immutable device-state owner.
+             * @param sources Raw source tuple without legacy state/snapshot bindings.
+             * @param binding Caller-leased exact workspace and capture stream.
+             * @param state_size Exact per-request live image size from native geometry. */
+            PreparedRetainedInvocation(const ROCmGatedDeltaNet &owner,
+                                       const gdn::MergedRecurrenceInput &sources,
+                                       const gdn::GDNRetainedInvocationBinding &binding, int state_size)
+                : owner_(owner), binding_(binding), state_size_(state_size),
+                  scalar_(owner.stateForSize(state_size)), packed_(owner.request_state_bank_),
+                  input_(gdn::makeGDNRetainedCaptureInput(
+                      sources, binding, binding.geometry.requests() == 1 ? scalar_ : packed_,
+                      owner.recurrence_layout_, gdn::GDNDenseCompactArithmetic::ROCmFourPartFusedUpdateV1))
+            {
+                if (!gdn::prepareROCmGDNRetainedCaptureStream(owner.device_ordinal_,
+                                                              binding.capture_stream))
+                    throw std::invalid_argument(
+                        "ROCm retained capture requires its exact idle device stream");
+                if (!gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {owner.gpu_state_, static_cast<std::size_t>(owner.state_size_)}) ||
+                    !gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {owner.secondary_gpu_state_,
+                                 static_cast<std::size_t>(owner.secondary_state_size_)}) ||
+                    !gdn::retainedCaptureWritesDisjointFromState(
+                        input_, {packed_, owner.request_state_bank_floats_}))
+                    throw std::invalid_argument(
+                        "Retained GDN speculative writes overlap canonical live state");
+            }
+            /** @return Frozen complete native input. */
+            const gdn::GDNDenseCompactCaptureInput &captureInput() const noexcept override
+            {
+                return input_;
+            }
+            /** @return Frozen actual leased views and stable manager identity. */
+            const gdn::GDNRetainedInvocationBinding &binding() const noexcept override { return binding_; }
+            /** @return Exact canonical scalar or packed publication destination. */
+            float *publicationDestination() const noexcept override
+            {
+                return binding_.geometry.requests() == 1 ? scalar_ : packed_;
+            }
+            /** @return Backend, terminal and compiled scheduling identity. */
+            std::uint64_t captureProgramIdentity() const noexcept override
+            {
+                return 512ULL + (static_cast<std::uint64_t>(binding_.terminal_kind) << 4);
+            }
+            /** @brief Authenticate complete immutable backend/source/workspace identity.
+             * @param candidate Proposed reused invocation.
+             * @return Exact identity match, without inspecting device payload. */
+            bool sameCaptureIdentity(
+                const gdn::IGDNPreparedRetainedInvocation &candidate) const noexcept override
+            {
+                const auto *other = dynamic_cast<const PreparedRetainedInvocation *>(&candidate);
+                return other && &owner_ == &other->owner_ && state_size_ == other->state_size_ &&
+                       scalar_ == other->scalar_ && packed_ == other->packed_ &&
+                       gdn::sameGDNRetainedBindingViews(binding_, other->binding_) &&
+                       gdn::sameGDNRetainedCaptureInput(input_, other->input_);
+            }
+            /** @brief Record the frozen recurrence on its authenticated capture stream.
+             * @return Native submission succeeded; no shared kernel binding is modified. */
+            bool capture() const override
+            {
+                if (!stateBindingCurrent())
+                    return false;
+                rocmGDN_gpu_set_device(owner_.device_ordinal_);
+                return gdn::launchROCmDenseCompactRecurrence(input_, binding_.capture_stream);
+            }
+            /** @brief Publish under the existing exact device/event authority, possibly on another stream.
+             * @param selection Immutable typed metadata view authenticated by the native whole-plan guard.
+             * @param stream Explicit same-device publication stream with producer-event ordering
+             * established.
+             * @return Publication and the one necessary scalar/request-zero visibility edge succeeded. */
+            bool publish(const gdn::GDNDenseAcceptedSelection &selection, void *stream) const override
+            {
+                if (reinterpret_cast<std::uintptr_t>(stream) <= 2 || !stateBindingCurrent() ||
+                    !selection.matchesGeometry(binding_.geometry) ||
+                    !gdn::retainedSelectionDisjointFromState(
+                        selection, {owner_.gpu_state_, static_cast<std::size_t>(owner_.state_size_)}) ||
+                    !gdn::retainedSelectionDisjointFromState(
+                        selection, {owner_.secondary_gpu_state_,
+                                    static_cast<std::size_t>(owner_.secondary_state_size_)}) ||
+                    !gdn::retainedSelectionDisjointFromState(selection,
+                                                             {packed_, owner_.request_state_bank_floats_}))
+                    return false;
+                const auto mirror = scalar_ == packed_ ? gdn::GDNDenseCompactRequestZeroMirror::none() :
+                    gdn::GDNDenseCompactRequestZeroMirror::borrow(binding_.geometry,
+                        binding_.geometry.requests() == 1 ? packed_ : scalar_,
+                        static_cast<std::size_t>(state_size_));
+                const gdn::GDNDenseCompactAcceptedPrefixInput publication{input_.transaction, selection,
+                    publicationDestination(), mirror};
+                rocmGDN_gpu_set_device(owner_.device_ordinal_);
+                if (!gdn::launchROCmDenseCompactAcceptedPrefix(publication, stream))
+                    return false;
+                return true;
+            }
+
+          private:
+            /** @brief Reject any changed canonical state topology before enqueue.
+             * @return Original immutable bound state owners and request capacity remain valid. */
+            bool stateBindingCurrent() const noexcept
+            {
+                return owner_.device_state_bound_ && owner_.stateForSize(state_size_) == scalar_ &&
+                       owner_.request_state_bank_ == packed_ &&
+                       owner_.supportsRequestLiveStateBank(binding_.geometry.requests(), state_size_);
+            }
+            const ROCmGatedDeltaNet &owner_;
+            const gdn::GDNRetainedInvocationBinding binding_;
+            const int state_size_;
+            float *const scalar_;
+            float *const packed_;
+            const gdn::GDNDenseCompactCaptureInput input_;
+        };
     };
+
+
+    /** @brief Freeze native geometry over already-bound canonical GPU state.
+     * @param sources Frozen raw inputs; no legacy speculative state bindings.
+     * @param binding Actual workspace views, terminal requirement and exact cold stream.
+     * @return Immutable borrowing invocation; unsupported state/geometry fails before recording.
+     * @throws std::invalid_argument For absent device state or unsupported native dimensions. */
+    inline std::unique_ptr<gdn::IGDNPreparedRetainedInvocation>
+    ROCmGatedDeltaNet::prepareRetainedInvocation(const gdn::MergedRecurrenceInput &sources,
+                                                 const gdn::GDNRetainedInvocationBinding &binding) const
+    {
+        const auto &g = binding.geometry;
+        const auto state_size = g.denseBankFloats() / static_cast<std::size_t>(g.requests());
+        if ((g.keyWidth() != 64 && g.keyWidth() != 128) ||
+            state_size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            !device_state_bound_ ||
+            !supportsRequestLiveStateBank(g.requests(), static_cast<int>(state_size)))
+            throw std::invalid_argument("Prepared retained GDN requires supported geometry and "
+                                        "existing canonical device state");
+        return std::make_unique<PreparedRetainedInvocation>(*this, sources, binding,
+                                                            static_cast<int>(state_size));
+    }
 
 } // namespace llaminar2

@@ -11,13 +11,19 @@
 #include "execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/mtp/MTPSpecStateContract.h"
+#include "execution/mtp/MTPSpecDecodeMetadata.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "backends/BackendManager.h"
 #include "execution/mtp/MTPSpecStatePublisher.h"
 #include "execution/mtp/MTPSpecTransactionDriver.h"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <limits>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -77,21 +83,22 @@ namespace
         }
 
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
-            const int *device_row_index,
+            std::span<const int> device_row_index,
             void *stream) override
         {
-            device_restored_rows.push_back(device_row_index);
+            device_restored_rows.push_back(device_row_index.data());
             device_streams.push_back(stream);
             return restore_ok_;
         }
 
         bool restoreVerifierStateCaptureRowsFromDeviceIndices(
-            const int *device_row_indices,
+            std::span<const int> device_row_indices,
             int request_count,
             int row_index_stride,
             void *stream) override
         {
-            batch_device_restored_rows.push_back(device_row_indices);
+            batch_device_restored_rows.push_back(device_row_indices.data());
+            batch_device_owner_sizes.push_back(device_row_indices.size());
             batch_request_counts.push_back(request_count);
             batch_row_index_strides.push_back(row_index_stride);
             batch_streams.push_back(stream);
@@ -143,6 +150,7 @@ namespace
         std::vector<const int *> device_restored_rows;
         std::vector<void *> device_streams;
         std::vector<const int *> batch_device_restored_rows;
+        std::vector<std::size_t> batch_device_owner_sizes;
         std::vector<int> batch_request_counts;
         std::vector<int> batch_row_index_strides;
         std::vector<void *> batch_streams;
@@ -209,6 +217,10 @@ namespace
             return true;
         }
 
+        std::optional<CPUSharedGDNTransaction> compact_transaction;
+        CPUVerifierStateRestorePlanKind compact_kind = CPUVerifierStateRestorePlanKind::SharedGDNPrefixScatter;
+        void *destination_override = nullptr;
+
         CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override
         {
             planned_rows.push_back(row);
@@ -230,9 +242,15 @@ namespace
                     .status = CPUVerifierStateRestorePlanStatus::Invalid,
                 };
             }
+            if (compact_transaction)
+                return {.status=CPUVerifierStateRestorePlanStatus::Ready,
+                    .destination=destination_override ? destination_override : live_.data(),
+                    .source=compact_transaction->slots,.bytes=bytes_per_row_,
+                    .kind=compact_kind,
+                    .shared_gdn_prefix=CPUSharedGDNAcceptedPrefix{*compact_transaction,row}};
             return {
                 .status = CPUVerifierStateRestorePlanStatus::Ready,
-                .destination = live_.data(),
+                .destination = destination_override ? destination_override : live_.data(),
                 .source = snapshots_.data() +
                           static_cast<size_t>(row) * bytes_per_row_,
                 .bytes = bytes_per_row_,
@@ -1448,6 +1466,270 @@ TEST(Test__MTPSpecStateContract, SingleRequestCPUStatePublicationValidatesAllPla
     EXPECT_EQ(invalid.capture_binding_clear_calls, 0);
 }
 
+/** @brief Plan kind and typed payload agree before publisher span validation can begin. */
+TEST(Test__MTPSpecStateContract, CPUSharedGDNScatterPlanKindAndPayloadMustAgree)
+{
+    const CPUGDNStateLayout layout(1, 1, 1);
+    std::vector<float> initial(layout.floats(), 0.0f), destination = initial;
+    std::vector<float> slots(CPUSharedGDNSnapshots::headFloats(layout, 1));
+    std::vector<float> raw(layout.recordFloats(), 0.25f);
+    CPUSharedGDNSnapshots retained(layout, slots.data(), 1);
+    retained.begin(initial.data(), 1);
+    retained.append(0, raw.data());
+    retained.complete();
+    uint64_t generation = 1;
+    const CPUSharedGDNTransaction transaction{
+        .slots = slots.data(), .slot_floats = slots.size(), .width = 1,
+        .requests = 1, .live_width = 1, .heads = 1, .dk = 1, .dv = 1,
+        .generation_authority = &generation, .generation = generation};
+    const CPUVerifierStateRestoreDestination write{destination.data(), destination.size() * sizeof(float)};
+    CPUVerifierStateRestorePlan plan{
+        .status = CPUVerifierStateRestorePlanStatus::Ready,
+        .destination = destination.data(), .source = slots.data(),
+        .bytes = destination.size() * sizeof(float),
+        .kind = CPUVerifierStateRestorePlanKind::SharedGDNPrefixScatter,
+        .shared_gdn_prefix = CPUSharedGDNAcceptedPrefix{transaction, 0}};
+    ASSERT_TRUE(plan.ready());
+    auto invalid = plan;
+    invalid.kind = CPUVerifierStateRestorePlanKind::SnapshotCopy;
+    EXPECT_FALSE(invalid.ready());
+    invalid.kind = CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit;
+    EXPECT_FALSE(invalid.ready());
+    invalid.destination = nullptr;
+    invalid.source = nullptr;
+    invalid.bytes = 0;
+    EXPECT_FALSE(invalid.ready()) << "A native splice cannot carry a compact scatter payload";
+    invalid = plan;
+    invalid.shared_gdn_prefix.reset();
+    EXPECT_FALSE(invalid.ready()) << "Compact scatter requires its typed prefix";
+    invalid = plan;
+    invalid.native_destinations = std::span<const CPUVerifierStateRestoreDestination>(&write, 1);
+    EXPECT_FALSE(invalid.ready()) << "Scatter and native write-set authorities cannot mix";
+    invalid = plan;
+    invalid.kind = static_cast<CPUVerifierStateRestorePlanKind>(255);
+    EXPECT_FALSE(invalid.ready());
+    EXPECT_EQ(destination, initial) << "Readiness never publishes accepted bytes";
+}
+
+/** @brief Compact and native accepted-prefix plans share one atomic validated publication. */
+TEST(Test__MTPSpecStateContract, CPUSharedGDNScatterMixesNativePrefixesWithoutBroadeningWriteAuthority)
+{
+    const CPUGDNStateLayout layout(1, 3, 5);
+    constexpr int rows = 3;
+    for (const bool native_first : {false, true})
+    {
+        SCOPED_TRACE(native_first);
+        std::vector<float> initial(layout.floats(), 0.0f), expected = initial;
+        std::vector<float> slots(CPUSharedGDNSnapshots::headFloats(layout, rows));
+        CPUSharedGDNSnapshots retained(layout, slots.data(), rows);
+        retained.begin(initial.data(), rows);
+        for (int row = 0; row < rows; ++row)
+        {
+            std::vector<float> raw(layout.recordFloats(), 0.125f * (row + 1));
+            retained.append(row, raw.data());
+        }
+        retained.complete();
+        retained.materialize(1, expected.data());
+        uint64_t generation = 7;
+        FakePlannedCPUVerifierStateStage compact(layout.floats() * sizeof(float), 11);
+        compact.compact_transaction = CPUSharedGDNTransaction{
+            .slots = slots.data(), .slot_floats = slots.size(), .width = rows,
+            .requests = 1, .live_width = rows, .heads = 1, .dk = 3, .dv = 5,
+            .generation_authority = &generation, .generation = generation};
+        const auto original_live = compact.live();
+        const auto original_slots = slots;
+        const int selected[]{1};
+        const auto batch = planBatch({participantPlan(0, 2)});
+
+        // A later bad kind/payload must not partially commit an earlier native stage.
+        FakeNativeCPUPrefixStage native;
+        for (const auto malformed : {CPUVerifierStateRestorePlanKind::SnapshotCopy,
+                 CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit})
+        {
+            compact.compact_kind = malformed;
+            const auto rejected = publishAcceptedMTPSpecStateFromVerifierRows(
+                batch, selected, {&native, &compact}, DeviceId::cpu(), nullptr, true);
+            EXPECT_FALSE(rejected.ok);
+            EXPECT_EQ(native.commits, 0);
+            EXPECT_EQ(native.clears, 0);
+            EXPECT_EQ(compact.live(), original_live);
+            EXPECT_EQ(slots, original_slots);
+        }
+        compact.compact_kind = CPUVerifierStateRestorePlanKind::SharedGDNPrefixScatter;
+        FakeNativeCPUPrefixStage aliases(reinterpret_cast<int *>(slots.data() + slots.size() - 2));
+        const auto rejected = publishAcceptedMTPSpecStateFromVerifierRows(
+            batch, selected, {&compact, &aliases}, DeviceId::cpu(), nullptr, true);
+        EXPECT_FALSE(rejected.ok);
+        EXPECT_EQ(aliases.commits, 0);
+        EXPECT_EQ(compact.live(), original_live);
+        EXPECT_EQ(slots, original_slots);
+
+        std::vector<IComputeStage *> stages = native_first
+            ? std::vector<IComputeStage *>{&native, &compact}
+            : std::vector<IComputeStage *>{&compact, &native};
+        const auto published = publishAcceptedMTPSpecStateFromVerifierRows(
+            batch, selected, stages, DeviceId::cpu(), nullptr, true);
+        ASSERT_TRUE(published.ok) << published.error;
+        EXPECT_EQ(std::memcmp(compact.live().data(), expected.data(), expected.size() * sizeof(float)), 0);
+        EXPECT_EQ(native.live_[0], 20);
+        EXPECT_EQ(native.live_[1], 21);
+        EXPECT_EQ(native.commits, 1);
+        EXPECT_EQ(native.clears, 1);
+        EXPECT_EQ(slots, original_slots);
+    }
+}
+
+/** @brief Typed scatter publishes phase/history/zeros without a staging bank. */
+TEST(Test__MTPSpecStateContract, CPUSharedGDNScatterCopiesCanonicalBytesAndPreservesInputs)
+{
+    constexpr int heads=2,dk=7,dv=17,rows=3;
+    const CPUGDNStateLayout layout(heads,dk,dv);
+    const size_t span=CPUSharedGDNSnapshots::headFloats(layout,rows);
+    for(const int initial_phase : {0,1,2,3,4,5,6,7})
+        for(int selected=0;selected<rows;++selected)
+        {
+            std::vector<float> slots(span*heads),expected(layout.floats(),0.0f);
+            uint64_t generation=17;
+            for(int head=0;head<heads;++head)
+            {
+                std::vector<float> initial(layout.headFloats(),0.0f),crossed=initial;
+                initial[0]=static_cast<float>(initial_phase);
+                for(int j=0;j<layout.matrixFloats();++j) {
+                    initial[1+j]=(head*31+j+1)*0.001f;
+                    crossed[1+j]=(head*17-j-1)*0.002f;
+                }
+                for(int p=0;p<initial_phase;++p)
+                    for(int j=0;j<layout.recordFloats();++j)
+                        layout.record(initial.data(),p)[j]=(p*7+j+1)*0.01f;
+                CPUSharedGDNSnapshots view(layout,slots.data()+head*span,rows);
+                view.begin(initial.data(),rows);
+                for(int row=0;row<rows;++row) {
+                    std::vector<float> raw(layout.recordFloats());
+                    for(int j=0;j<layout.recordFloats();++j) raw[j]=(row*13+j+2)*0.03f;
+                    view.append(row,raw.data());
+                    if ((initial_phase+row+1)%8==0) view.crossed(row,crossed.data());
+                }
+                view.complete();
+                float *target=expected.data()+head*layout.headFloats();
+                const int end=initial_phase+selected+1,phase=end%8;
+                target[0]=static_cast<float>(phase);
+                const auto &checkpoint=end>=8 ? crossed : initial;
+                std::copy_n(checkpoint.data()+1,layout.matrixFloats(),target+1);
+                for(int p=0;p<phase;++p) {
+                    const int absolute=end-phase+p;
+                    if(absolute<initial_phase)
+                        std::copy_n(layout.record(initial.data(),absolute),layout.recordFloats(),layout.record(target,p));
+                    else
+                        for(int j=0;j<layout.recordFloats();++j)
+                            layout.record(target,p)[j]=((absolute-initial_phase)*13+j+2)*0.03f;
+                }
+            }
+            const auto retained=slots;
+            FakePlannedCPUVerifierStateStage compact(layout.floats()*sizeof(float),11);
+            compact.compact_transaction=CPUSharedGDNTransaction{.slots=slots.data(),.slot_floats=slots.size(),
+                .width=rows,.requests=1,.live_width=rows,.heads=heads,.dk=dk,.dv=dv,
+                .generation_authority=&generation,.generation=generation};
+            const int accepted[1]={selected};
+            auto batch=planBatch({participantPlan(0,selected+1)});
+            const auto result=publishAcceptedMTPSpecStateFromVerifierRows(batch,accepted,{&compact},
+                DeviceId::cpu(),nullptr,true);
+            ASSERT_TRUE(result.ok)<<result.error;
+            ASSERT_EQ(compact.live().size(),expected.size()*sizeof(float));
+            EXPECT_EQ(std::memcmp(compact.live().data(),expected.data(),compact.live().size()),0);
+            EXPECT_EQ(slots,retained);
+        }
+}
+
+/** @brief All typed inputs and global aliases are rejected before any live write. */
+TEST(Test__MTPSpecStateContract, CPUSharedGDNScatterRejectsLateInvalidPlanAndCrossStageInputAlias)
+{
+    const CPUGDNStateLayout layout(1,7,17);
+    constexpr int rows=3;
+    std::vector<float> slots(CPUSharedGDNSnapshots::headFloats(layout,rows)),initial(layout.floats(),0.0f);
+    CPUSharedGDNSnapshots view(layout,slots.data(),rows);
+    std::vector<float> raw(layout.recordFloats(),0.25f);
+    view.begin(initial.data(),rows);
+    for(int row=0;row<rows;++row) view.append(row,raw.data());
+    view.complete();
+    uint64_t generation=4;
+    FakePlannedCPUVerifierStateStage compact(layout.floats()*sizeof(float),11);
+    compact.compact_transaction=CPUSharedGDNTransaction{.slots=slots.data(),.slot_floats=slots.size(),
+        .width=rows,.requests=1,.live_width=rows,.heads=1,.dk=7,.dv=17,
+        .generation_authority=&generation,.generation=generation};
+    FakePlannedCPUVerifierStateStage invalid(4,19,CPUVerifierStateRestorePlanStatus::Invalid);
+    const auto live_before=compact.live();
+    const auto slots_before=slots;
+    const int selected[1]={1};
+    auto batch=planBatch({participantPlan(0,2)});
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(batch,selected,{&compact,&invalid},
+        DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(compact.live(),live_before);
+    EXPECT_EQ(slots,slots_before);
+    FakePlannedCPUVerifierStateStage aliases(4,23);
+    aliases.destination_override=slots.data()+slots.size()-1;
+    result=publishAcceptedMTPSpecStateFromVerifierRows(batch,selected,{&compact,&aliases},
+        DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(compact.live(),live_before);
+    EXPECT_EQ(slots,slots_before);
+    ++generation;
+    result=publishAcceptedMTPSpecStateFromVerifierRows(batch,selected,{&compact},DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(compact.live(),live_before);
+    EXPECT_EQ(slots,slots_before);
+}
+
+/**
+ * @brief Reject overflowing compact address domains before protocol dereferences.
+ *
+ * Both malformed plans otherwise carry valid admitted geometry and publication
+ * metadata. An earlier valid stage makes any accidental prevalidation live copy
+ * observable; its state and the real retained input must remain byte-identical.
+ */
+TEST(Test__MTPSpecStateContract, CPUSharedGDNScatterRejectsAddressOverflowBeforeMetadataReads)
+{
+    const CPUGDNStateLayout layout(1,7,17);
+    constexpr int rows=3;
+    std::vector<float> slots(CPUSharedGDNSnapshots::headFloats(layout,rows));
+    std::vector<float> initial(layout.floats(),0.0f),raw(layout.recordFloats(),0.25f);
+    CPUSharedGDNSnapshots view(layout,slots.data(),rows);
+    view.begin(initial.data(),rows);
+    for(int row=0;row<rows;++row) view.append(row,raw.data());
+    view.complete();
+    const auto slots_before=slots;
+    uint64_t generation=4;
+    enum class OverflowDomain { RetainedSlots, GenerationAuthority };
+    for(const auto domain : {OverflowDomain::RetainedSlots,OverflowDomain::GenerationAuthority})
+    {
+        SCOPED_TRACE(static_cast<int>(domain));
+        FakePlannedCPUVerifierStateStage earlier(4096,19);
+        FakePlannedCPUVerifierStateStage malformed(layout.floats()*sizeof(float),11);
+        auto transaction=CPUSharedGDNTransaction{.slots=slots.data(),.slot_floats=slots.size(),
+            .width=rows,.requests=1,.live_width=rows,.heads=1,.dk=7,.dv=17,
+            .generation_authority=&generation,.generation=generation};
+        if(domain==OverflowDomain::RetainedSlots)
+            transaction.slots=reinterpret_cast<float *>(
+                std::numeric_limits<uintptr_t>::max()-sizeof(float)+1);
+        else
+            transaction.generation_authority=reinterpret_cast<const uint64_t *>(
+                std::numeric_limits<uintptr_t>::max()-sizeof(uint64_t)+2);
+        malformed.compact_transaction=transaction;
+        const auto earlier_before=earlier.live(),malformed_before=malformed.live();
+        const int selected[1]={1};
+        const auto batch=planBatch({participantPlan(0,2)});
+        const auto result=publishAcceptedMTPSpecStateFromVerifierRows(batch,selected,{&earlier,&malformed},
+            DeviceId::cpu(),nullptr,true);
+        EXPECT_FALSE(result.ok);
+        EXPECT_THAT(result.error,HasSubstr("returned an invalid immutable restore plan"));
+        EXPECT_EQ(earlier.live(),earlier_before);
+        EXPECT_EQ(malformed.live(),malformed_before);
+        EXPECT_EQ(slots,slots_before);
+        EXPECT_EQ(earlier.capture_binding_clear_calls,0);
+        EXPECT_EQ(malformed.capture_binding_clear_calls,0);
+    }
+}
+
 TEST(Test__MTPSpecStateContract, PublisherRejectsGpuNullStream)
 {
     FakeVerifierStateStage captured(/*captures=*/true);
@@ -1536,7 +1818,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRestoresCapturedStagesOnE
     MTPSpecStatePublicationResult result =
         publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             publishPlan(/*accepted_count=*/3),
-            &device_row,
+            std::span(&device_row, 1),
             {&captured0, &skipped, &captured1},
             DeviceId::cuda(0),
             &explicit_stream,
@@ -1567,7 +1849,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherAcceptsShapeWithoutHostPl
     MTPSpecStatePublicationResult result =
         publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             devicePublicationShape(),
-            &device_row,
+            std::span(&device_row, 1),
             {&captured},
             DeviceId::cuda(0),
             &explicit_stream,
@@ -1594,7 +1876,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsMissingMandatoryVe
     MTPSpecStatePublicationResult result =
         publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             publishPlan(/*accepted_count=*/1),
-            &device_row,
+            std::span(&device_row, 1),
             {&mandatory_skipped},
             DeviceId::cuda(0),
             &explicit_stream,
@@ -1614,7 +1896,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsCpuDevice)
     MTPSpecStatePublicationResult result =
         publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             publishPlan(/*accepted_count=*/1),
-            &device_row,
+            std::span(&device_row, 1),
             {&captured},
             DeviceId::cpu(),
             &explicit_stream,
@@ -1634,7 +1916,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsNullStreamAndRow)
     MTPSpecStatePublicationResult null_stream =
         publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             publishPlan(/*accepted_count=*/1),
-            &device_row,
+            std::span(&device_row, 1),
             {&captured},
             DeviceId::cuda(0),
             /*stream=*/nullptr,
@@ -1645,7 +1927,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsNullStreamAndRow)
     MTPSpecStatePublicationResult null_row =
         publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             publishPlan(/*accepted_count=*/1),
-            /*device_verifier_restore_row=*/nullptr,
+            /*device_verifier_restore_row=*/{},
             {&captured},
             DeviceId::cuda(0),
             &explicit_stream,
@@ -1737,7 +2019,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsInvalidShapes)
     MTPSpecStatePublicationResult scalar_result =
         publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             scalar_shape,
-            &device_row,
+            std::span(&device_row, 1),
             {&captured},
             DeviceId::cuda(0),
             &explicit_stream,
@@ -1750,7 +2032,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsInvalidShapes)
     MTPSpecStatePublicationResult batch_result =
         publishAcceptedMTPSpecStateFromDeviceVerifierRows(
             batch_shape,
-            &device_row,
+            std::span(&device_row, 1),
             /*row_index_stride=*/1,
             {&captured},
             DeviceId::cuda(0),
@@ -1843,7 +2125,7 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedGraphPublisherRestoresExecutionOrd
     MTPSpecStatePublicationResult result =
         publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             publishPlan(/*accepted_count=*/3),
-            &device_row,
+            std::span(&device_row, 1),
             graph,
             DeviceId::cuda(0),
             &explicit_stream,
@@ -2117,4 +2399,69 @@ TEST(Test__MTPSpecStateContract, AcceptedArenaOutputsRejectConflictingOrAllocati
     params.verifier_state_stages = {nullptr};
     Publication null_stage(params);
     EXPECT_THROW(null_stage.bufferContract(), std::logic_error);
+}
+
+/** @test Real workspace capacity survives production publication and rejects a truncated owner before any stage call. */
+TEST(Test__MTPSpecStateContract, DeviceMetadataOwnerSpanSurvivesPublication)
+{
+    if (!hasCPUBackend()) initCPUBackend(-1);
+    MTPSpecDecodeMetadataShape capacity;
+    capacity.max_requests = 8;
+    capacity.max_draft_tokens = 3;
+    MTPSpecDecodeMetadataWorkspaceBinding binding(capacity);
+    EXPECT_TRUE(binding.acceptedStateSlotIndicesView().empty());
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+    const auto owner = binding.acceptedStateSlotIndicesView();
+    ASSERT_EQ(owner.data(), binding.devicePointers().accepted_state_slot_indices);
+    ASSERT_EQ(owner.size_bytes(), workspace.getBufferSize(
+        MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_SLOT_INDICES));
+    ASSERT_GE(owner.size(), 8u);
+    const MTPDeviceVerifierStatePublicationShape shape{3, 4, 0};
+    FakeVerifierStateStage stage(true);
+    int stream = 0;
+    const auto published = publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+        shape, owner, 2, {&stage}, DeviceId::cuda(0), &stream, true);
+    ASSERT_TRUE(published.ok) << published.error;
+    ASSERT_EQ(stage.batch_device_restored_rows.size(), 1u);
+    EXPECT_EQ(stage.batch_device_restored_rows.front(), owner.data());
+    EXPECT_EQ(stage.batch_device_owner_sizes.front(), owner.size());
+    EXPECT_EQ(stage.batch_row_index_strides.front(), 2);
+    const auto rejected = publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+        shape, owner.first(4), 2, {&stage}, DeviceId::rocm(0), &stream, true);
+    EXPECT_FALSE(rejected.ok);
+    EXPECT_THAT(rejected.error, HasSubstr("owner span is too short"));
+    EXPECT_EQ(stage.batch_device_restored_rows.size(), 1u);
+    EXPECT_FALSE(publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+        MTPDeviceVerifierStatePublicationShape{1, 4, 0}, {}, {&stage},
+        DeviceId::cuda(0), &stream, true).ok);
+    binding.bindWorkspace(nullptr);
+    EXPECT_TRUE(binding.acceptedStateSlotIndicesView().empty());
+}
+
+/** @test The actual publication identity rejects an extent change even at the same device address. */
+TEST(Test__MTPSpecStateContract, DeviceMetadataOwnerSpanParticipatesInCaptureIdentity)
+{
+    using Publication = MTPSpeculativeStatePublicationStage;
+    std::array<int32_t, 8> owner{};
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        Publication::Params params;
+        params.device_id = device;
+        params.authority = Publication::Authority::CompactOutcome;
+        params.request_count = 1;
+        params.verifier_rows_per_request = 4;
+        params.accepted_restore_rows_device = owner;
+        Publication stage(params);
+        EXPECT_TRUE(stage.hasSameCaptureIdentity(params));
+        auto shortened = params;
+        shortened.accepted_restore_rows_device = std::span(owner).first(4);
+        ASSERT_EQ(shortened.accepted_restore_rows_device.data(), params.accepted_restore_rows_device.data());
+        EXPECT_FALSE(stage.hasSameCaptureIdentity(shortened));
+        auto shifted = params;
+        shifted.accepted_restore_rows_device = std::span(owner).subspan(1);
+        EXPECT_FALSE(stage.hasSameCaptureIdentity(shifted));
+    }
 }

@@ -33,6 +33,11 @@
  * Each cached index retains its metadata inode until refresh replaces that
  * generation. Native read errors preserve the journal and fail the operation;
  * they do not authorize the incomplete-append recovery truncation.
+ * Once commit framing is verified, semantic errors preserve the journal and payloads.
+ * Old CPU encodings remain opaque records under the same index and byte budget:
+ * lookup cannot hydrate them, while compaction preserves their original metadata
+ * and ordinary eviction may retire their payload. A malformed current CPU
+ * encoding fails initialization without truncating a committed journal.
  */
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
@@ -376,6 +381,15 @@ namespace llaminar2
                 {"includes_terminal_hidden", layout.includes_terminal_hidden},
                 {"includes_terminal_logits", layout.includes_terminal_logits},
             };
+            if (layout.device.is_cpu() && layout.gdn_layers > 0 && layout.hybrid_host_state_bytes > 0)
+                {
+                    if (layout.hybrid_host_encoding != HybridPrefixHostEncoding::CPUFixedEpochPackedV2 ||
+                        layout.hybrid_host_state_capacity_bytes == 0 ||
+                        layout.hybrid_host_state_bytes > layout.hybrid_host_state_capacity_bytes)
+                        throw std::invalid_argument("CPU durable archive rejects local/legacy host images");
+                    result["hybrid_host_encoding"] = static_cast<uint32_t>(layout.hybrid_host_encoding);
+                    result["hybrid_host_state_capacity_bytes"] = layout.hybrid_host_state_capacity_bytes;
+                }
             if (layout.includes_hybrid_state)
             {
                 if (layout.hybrid_host_state_bytes > 0)
@@ -388,20 +402,42 @@ namespace llaminar2
             return result;
         }
 
-        bool layoutFromJson(const json &value, PrefixPayloadLayout *layout)
+        /** @brief Parsed layout support, distinct from committed metadata corruption. */
+        enum class LayoutDecodeStatus { Supported, UnsupportedCPUHost, Malformed, MalformedCPUHost };
+
+        /**
+         * @brief Decode bounded geometry without treating old CPU formats as usable.
+         * @param value Original metadata retained verbatim by the journal index.
+         * @param layout Destination for common section geometry and known format fields.
+         * @return Supported, opaque CPU generation, or malformed committed metadata.
+         */
+        LayoutDecodeStatus layoutFromJson(const json &value, PrefixPayloadLayout *layout)
         {
             if (!layout || !value.is_object())
-                return false;
+                return LayoutDecodeStatus::Malformed;
+            bool cpu_host = false;
+            bool cpu_generation = false;
+            bool supported = true;
             try
             {
                 layout->device = DeviceId(
                     static_cast<DeviceType>(value.at("device_type").get<int>()),
                     value.at("device_ordinal").get<int>());
+                // Ownership precedes fallible geometry parsing. A committed
+                // CPU GDN record with an early malformed/missing field cannot
+                // become an incomplete-tail truncation merely because parsing
+                // has not reached gdn_layers yet. Known pure-attention CPU
+                // records retain their existing classification.
+                cpu_generation = layout->device.is_cpu();
+                if (cpu_generation && value.contains("gdn_layers") &&
+                    value.at("gdn_layers").is_number_integer() && value.at("gdn_layers").get<int64_t>() == 0)
+                    cpu_generation = false;
                 layout->block_size = value.at("block_size").get<int>();
                 layout->first_layer_index = value.at("first_layer_index").get<int>();
                 layout->total_layers = value.at("total_layers").get<int>();
                 layout->fa_layers = value.at("fa_layers").get<int>();
                 layout->gdn_layers = value.at("gdn_layers").get<int>();
+                cpu_generation = layout->device.is_cpu() && layout->gdn_layers > 0;
                 layout->local_kv_heads = value.at("local_kv_heads").get<int>();
                 layout->kv_head_start = value.at("kv_head_start").get<int>();
                 layout->head_dim = value.at("head_dim").get<int>();
@@ -421,6 +457,37 @@ namespace llaminar2
                     value.at("hybrid_device_state_bytes").get<size_t>();
                 layout->hybrid_state_bytes =
                     value.at("hybrid_state_bytes").get<size_t>();
+                cpu_host = layout->device.is_cpu() && layout->gdn_layers > 0 &&
+                    layout->hybrid_host_state_bytes > 0;
+                if (cpu_host)
+                {
+                    supported = false;
+                    if (value.contains("hybrid_host_encoding"))
+                    {
+                        const auto &word = value.at("hybrid_host_encoding");
+                        if (!word.is_number_integer() ||
+                            (word.is_number_integer() && !word.is_number_unsigned() && word.get<int64_t>() < 0) ||
+                            word.get<uint64_t>() > std::numeric_limits<uint32_t>::max())
+                            throw std::invalid_argument("Malformed CPU host encoding word");
+                        supported = word.get<uint64_t>() ==
+                            static_cast<uint32_t>(HybridPrefixHostEncoding::CPUFixedEpochPackedV2);
+                    }
+                    if (supported)
+                    {
+                        layout->hybrid_host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+                        const auto &capacity = value.at("hybrid_host_state_capacity_bytes");
+                        if (!capacity.is_number_integer() ||
+                            (!capacity.is_number_unsigned() && capacity.get<int64_t>() < 0))
+                            throw std::invalid_argument("Malformed CPU packed capacity");
+                        layout->hybrid_host_state_capacity_bytes = capacity.get<size_t>();
+                        if (layout->hybrid_host_state_capacity_bytes == 0 ||
+                            layout->hybrid_host_state_bytes > layout->hybrid_host_state_capacity_bytes)
+                            throw std::invalid_argument("Invalid CPU packed live/capacity extent");
+                    }
+                    // Unknown CPU encodings retain only their common bounded
+                    // geometry here; the exact opaque JSON stays in RecordIndex's
+                    // original committed journal extent, including unknown fields.
+                }
                 // Pure-attention and omitted state sections preserve their legacy archive identity.
                 // A real recurrent payload must authenticate its format before any hydration.
                 if (value.at("includes_hybrid_state").get<bool>())
@@ -435,7 +502,7 @@ namespace llaminar2
                             throw std::invalid_argument("Unknown archived GDN recurrence layout");
                         return static_cast<GDNRecurrenceStateLayout>(word);
                     };
-                    if (layout->hybrid_host_state_bytes > 0)
+                    if (layout->hybrid_host_state_bytes > 0 && (!cpu_host || supported))
                         layout->hybrid_host_recurrence_layout =
                             read_layout("hybrid_host_recurrence_layout");
                     if (layout->hybrid_device_state_bytes > 0)
@@ -475,13 +542,22 @@ namespace llaminar2
                     value.at("includes_terminal_hidden").get<bool>();
                 layout->includes_terminal_logits =
                     value.at("includes_terminal_logits").get<bool>();
-                return layout->device.is_valid() &&
-                       layout->block_size > 0 &&
-                       layout->totalBytes() > 0;
+                if (!layout->device.is_valid() || layout->block_size <= 0 ||
+                    layout->total_layers < 0 || layout->gdn_layers < 0 ||
+                    layout->gdn_layers > layout->total_layers ||
+                    (cpu_generation && (layout->hybrid_host_state_bytes > std::numeric_limits<size_t>::max() - layout->hybrid_device_state_bytes ||
+                     layout->hybrid_state_bytes != layout->hybrid_host_state_bytes + layout->hybrid_device_state_bytes)))
+                    throw std::invalid_argument("Malformed prefix section geometry");
+                const auto common = PrefixPayloadAllocationPlan::archive(*layout);
+                if (!common.totalBytes())
+                    throw std::invalid_argument("Empty prefix record geometry");
+                if (!supported) return LayoutDecodeStatus::UnsupportedCPUHost;
+                if (!layout->totalBytes()) throw std::invalid_argument("Invalid supported prefix layout");
+                return LayoutDecodeStatus::Supported;
             }
             catch (const std::exception &)
             {
-                return false;
+                return cpu_generation ? LayoutDecodeStatus::MalformedCPUHost : LayoutDecodeStatus::Malformed;
             }
         }
 
@@ -514,6 +590,23 @@ namespace llaminar2
                    lhs.includes_terminal_hidden == rhs.includes_terminal_hidden &&
                    lhs.includes_terminal_logits == rhs.includes_terminal_logits &&
                    lhs.totalBytes() == rhs.totalBytes();
+        }
+
+        /**
+         * @brief Match a lookup schema while retaining the record's exact CPU live extent.
+         * @param record Stored layout with authenticated exact section lengths.
+         * @param runtime Stable runtime capacity schema.
+         * @return True only when all non-live geometry and section flags match.
+         */
+        bool lookupLayoutMatch(const PrefixPayloadLayout &record, PrefixPayloadLayout runtime)
+        {
+            if (record.hybrid_host_encoding == HybridPrefixHostEncoding::CPUFixedEpochPackedV2 &&
+                record.compatiblePayloadShape(runtime))
+            {
+                runtime.hybrid_host_state_bytes = record.hybrid_host_state_bytes;
+                runtime.hybrid_state_bytes = record.hybrid_state_bytes;
+            }
+            return fullLayoutMatch(record, runtime);
         }
 
         bool runtimeLayoutMatch(
@@ -1309,34 +1402,59 @@ namespace llaminar2
                 if (payload_bytes != 0 ||
                     !applyTouchRecord(key, sequence))
                 {
-                    break;
+                    if (error) *error = "Invalid committed prefix touch target; archive preserved";
+                    return false;
                 }
             }
             else
             {
                 PrefixPayloadLayout layout;
                 const json sections = parsed.value("sections", json::array());
-                if (!layoutFromJson(parsed.value("layout", json::object()), &layout) ||
-                    !sections.is_array() ||
+                const auto decoded = layoutFromJson(parsed.value("layout", json::object()), &layout);
+                if (decoded == LayoutDecodeStatus::MalformedCPUHost)
+                {
+                    if (error) *error = "Malformed committed CPU prefix layout; archive preserved";
+                    return false;
+                }
+                if (decoded == LayoutDecodeStatus::Malformed || !sections.is_array() ||
                     sections.size() != kSectionNames.size())
                 {
-                    break;
+                    if (error) *error = "Malformed committed prefix layout or sections; archive preserved";
+                    return false;
                 }
 
                 RecordIndex record;
+                record.layout_support = decoded == LayoutDecodeStatus::UnsupportedCPUHost
+                    ? RecordLayoutSupport::UnsupportedCPUHost : RecordLayoutSupport::Supported;
                 record.handle.key = key;
                 record.handle.tier = PrefixStorageTier::Disk;
                 record.handle.layout = layout;
                 const auto identity = parsed.value("payload_identity", json::array());
                 if (!identity.is_array() || identity.size() != 2u ||
-                    !identity[0].is_number_unsigned() || !identity[1].is_number_unsigned()) break;
+                    !identity[0].is_number_unsigned() || !identity[1].is_number_unsigned())
+                {
+                    if (error) *error = "Malformed committed prefix payload identity; archive preserved";
+                    return false;
+                }
                 record.handle.payload_identity = {identity[0].get<uint64_t>(), identity[1].get<uint64_t>()};
-                if (!record.handle.payload_identity.valid()) break;
+                if (!record.handle.payload_identity.valid())
+                {
+                    if (error) *error = "Invalid committed prefix payload identity; archive preserved";
+                    return false;
+                }
                 const auto storage = parsed.value("storage_identity", json::array());
                 if (!storage.is_array() || storage.size() != 2u ||
-                    !storage[0].is_number_unsigned() || !storage[1].is_number_unsigned()) break;
+                    !storage[0].is_number_unsigned() || !storage[1].is_number_unsigned())
+                {
+                    if (error) *error = "Malformed committed prefix storage identity; archive preserved";
+                    return false;
+                }
                 record.storage_identity = {storage[0].get<uint64_t>(), storage[1].get<uint64_t>()};
-                if (!record.storage_identity.valid()) break;
+                if (!record.storage_identity.valid())
+                {
+                    if (error) *error = "Invalid committed prefix storage identity; archive preserved";
+                    return false;
+                }
                 record.handle.has_hybrid_state =
                     parsed.value("has_hybrid_state", false);
                 record.handle.has_terminal_hidden =
@@ -1378,9 +1496,16 @@ namespace llaminar2
                 if (!sections_valid ||
                     section_total != stored_payload_bytes ||
                     section_total != parsed.value("total_bytes", uint64_t{0}) ||
-                    section_total < layout.totalBytes())
+                    section_total < (decoded == LayoutDecodeStatus::UnsupportedCPUHost
+                        ? PrefixPayloadAllocationPlan::archive(layout).totalBytes() : layout.totalBytes()))
                 {
-                    break;
+                    if (layout.device.is_cpu() && layout.gdn_layers > 0)
+                    {
+                        if (error) *error = "Malformed committed CPU prefix sections; archive preserved";
+                        return false;
+                    }
+                    if (error) *error = "Malformed committed prefix section extents; archive preserved";
+                    return false;
                 }
                 // Geometry authenticates section extents without examining
                 // their contents. Malformed metadata cannot invent padding or
@@ -1399,7 +1524,16 @@ namespace llaminar2
                 {
                     sections_valid = false;
                 }
-                if (!sections_valid) break;
+                if (!sections_valid)
+                {
+                    if (layout.device.is_cpu() && layout.gdn_layers > 0)
+                    {
+                        if (error) *error = "Malformed committed CPU prefix sections; archive preserved";
+                        return false;
+                    }
+                    if (error) *error = "Malformed committed prefix section geometry; archive preserved";
+                    return false;
+                }
                 record.handle.total_bytes = static_cast<size_t>(section_total);
                 applyPutRecord(std::move(record));
             }
@@ -1672,7 +1806,8 @@ namespace llaminar2
         if (same_key != records_.end())
         {
             const auto &existing = same_key->second;
-            bool identical = existing.handle.payload_identity == handle.payload_identity &&
+            bool identical = existing.layout_support == RecordLayoutSupport::Supported &&
+                existing.handle.payload_identity == handle.payload_identity &&
                 fullLayoutMatch(existing.handle.layout, handle.layout) &&
                 existing.handle.total_bytes == handle.total_bytes &&
                 existing.handle.has_hybrid_state == handle.has_hybrid_state &&
@@ -1969,7 +2104,8 @@ namespace llaminar2
 
         const auto record_it = records_.find(key);
         if (record_it == records_.end() ||
-            !fullLayoutMatch(record_it->second.handle.layout, layout))
+            record_it->second.layout_support != RecordLayoutSupport::Supported ||
+            !lookupLayoutMatch(record_it->second.handle.layout, layout))
         {
             return std::nullopt;
         }
@@ -2235,7 +2371,8 @@ namespace llaminar2
 
         auto record_it = records_.find(key);
         if (record_it == records_.end() ||
-            !fullLayoutMatch(record_it->second.handle.layout, layout))
+            record_it->second.layout_support != RecordLayoutSupport::Supported ||
+            !lookupLayoutMatch(record_it->second.handle.layout, layout))
         {
             if (error)
                 *error = "prefix archive record not found or layout mismatch";
@@ -2245,7 +2382,7 @@ namespace llaminar2
         const auto payload = openPayloadLocked(record, error);
         if (!payload) return false;
 
-        PrefixBlockHandle out = ram_backend.allocate(key, layout);
+        PrefixBlockHandle out = ram_backend.allocate(key, record.handle.layout);
         if (!out.valid())
         {
             if (error)
@@ -2384,6 +2521,7 @@ namespace llaminar2
         for (const auto &[key, record] : records_)
         {
             if (key.fingerprint == fingerprint &&
+                record.layout_support == RecordLayoutSupport::Supported &&
                 runtimeLayoutMatch(record.handle.layout, layout))
             {
                 ordered.push_back(&record);

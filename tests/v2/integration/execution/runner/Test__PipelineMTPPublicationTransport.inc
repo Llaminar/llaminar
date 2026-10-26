@@ -165,7 +165,7 @@ TEST_P(PipelineMTPStateOwnership, CapturedAcceptanceCrossesNativeParticipants)
                         params.authority = tail ? Publication::Authority::CompactOutcome : Publication::Authority::PipelineFollower;
                         params.request_count = 1;
                         params.verifier_rows_per_request = width;
-                        params.accepted_restore_rows_device = word(0);
+                        params.accepted_restore_rows_device = std::span(static_cast<int32_t *>(banks[0]->gpu_data_ptr()), banks[0]->numel()).subspan(1);
                         params.target_cached_tokens_device = word(1);
                         params.accepted_state_counts_device = word(2);
                         params.publication_ok_flags_device = word(3);

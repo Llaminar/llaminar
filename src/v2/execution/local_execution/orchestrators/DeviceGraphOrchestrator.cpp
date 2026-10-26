@@ -11,6 +11,9 @@
  * Pipeline composition is owned by RankOrchestrator/GlobalOrchestrator. This
  * participant owns only its declared layer shard and injected collectives;
  * it cannot manufacture another pipeline or lazily discover TP domains.
+ * CPU accepted-state publication copies the selected verifier logits row into
+ * canonical storage alongside KV/recurrent/terminal-hidden publication; a
+ * retained multirow verifier allocation never implicitly owns scalar row zero.
  */
 
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
@@ -3770,13 +3773,25 @@ namespace llaminar2
             return handle.deviceHybridData();
         }
 
+        /**
+         * @brief Export only the selected explicit durable/local representation.
+         * @param cache Canonical recurrent state owner.
+         * @param seq_idx Authenticated request sequence index.
+         * @param logical_token_count Existing logical checkpoint coordinate.
+         * @param handle Mutable result-owned payload with exact host extent.
+         * @param synchronize Existing intentional durable/local completion policy.
+         * @param stream Exact native stream for selected device state, unused by CPU copies.
+         * @param purpose Closed durable/local format authority; never inferred from byte size.
+         * @return True after a valid complete operation, false without accepting foreign formats.
+         */
         bool exportHybridPrefixPayload(
             const IKVCache &cache,
             int seq_idx,
             int logical_token_count,
             PrefixBlockHandle *handle,
             bool synchronize = true,
-            void *stream = nullptr)
+            void *stream = nullptr,
+            HybridPrefixStatePurpose purpose = HybridPrefixStatePurpose::DurablePrefix)
         {
             if (!handle || !handle->layout.includes_hybrid_state)
             {
@@ -3801,6 +3816,9 @@ namespace llaminar2
             }
 
             HybridPrefixStateDescriptor desc;
+            desc.purpose = purpose;
+            desc.host_encoding = handle->layout.hybrid_host_encoding;
+            desc.host_payload_bytes = handle->layout.hybrid_host_state_bytes;
             desc.seq_idx = seq_idx;
             desc.logical_token_count = logical_token_count;
             desc.stream = stream;
@@ -3820,13 +3838,25 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Import only the authenticated explicit durable/local representation.
+         * @param cache Canonical recurrent state owner.
+         * @param seq_idx Authenticated request sequence index.
+         * @param handle Immutable payload retained throughout validated import.
+         * @param restore_for_suffix_prefill Existing exact restore-to-prefill policy.
+         * @param synchronize Existing intentional durable/local completion policy.
+         * @param stream Exact native stream for selected device state, unused by CPU copies.
+         * @param purpose Closed durable/local format authority; never inferred from byte size.
+         * @return True after a valid complete operation, false without accepting foreign formats.
+         */
         bool importHybridPrefixPayload(
             IKVCache &cache,
             const PrefixBlockHandle &handle,
             int seq_idx,
             bool restore_for_suffix_prefill,
             bool synchronize = true,
-            void *stream = nullptr)
+            void *stream = nullptr,
+            HybridPrefixStatePurpose purpose = HybridPrefixStatePurpose::DurablePrefix)
         {
             if (!handle.layout.includes_hybrid_state)
             {
@@ -3851,6 +3881,9 @@ namespace llaminar2
             }
 
             HybridPrefixStateDescriptor desc;
+            desc.purpose = purpose;
+            desc.host_encoding = handle.layout.hybrid_host_encoding;
+            desc.host_payload_bytes = handle.layout.hybrid_host_state_bytes;
             desc.seq_idx = seq_idx;
             desc.logical_token_count = handle.key.token_start + handle.key.token_count;
             desc.stream = stream;
@@ -3968,17 +4001,40 @@ namespace llaminar2
         }
 
         /**
+         * @brief Preserve the existing complete CPU physical image for local rollback only.
+         * @param layout Process-local checkpoint layout, never a durable record schema.
+         * @param cache Original physical owner; its full host extent remains unchanged.
+         * @throws std::logic_error For a host section without its canonical cache owner.
+         */
+        void applyLocalHybridCheckpointExtent(PrefixPayloadLayout &layout, const IKVCache &cache)
+        {
+            if (!layout.device.is_cpu() || layout.hybrid_host_state_bytes == 0) return;
+            const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
+            if (!hybrid) throw std::logic_error("Local GDN checkpoint requires its cache owner");
+            const auto metadata = hybrid->hybridPrefixStateMetadata();
+            layout.hybrid_host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+            layout.hybrid_host_state_capacity_bytes = metadata.host_bytes;
+            layout.hybrid_host_state_bytes = metadata.host_bytes;
+            layout.hybrid_state_bytes = metadata.host_bytes + layout.hybrid_device_state_bytes;
+        }
+
+        /**
          * @brief Build the hybrid-state payload layout used by live rollback checkpoints.
          *
          * Live MTP checkpoints are not portable prefix-cache records; they are
          * process-local rollback handles. GPU checkpoints retain only the
          * kernel-owned local/full device banks. CPU checkpoints retain the
          * host-owned vectors that are CPU's actual live state.
+         * @param layout Stable canonical prefix schema owned by this participant.
+         * @param device_only True for the existing GPU local/full-only rollback scope.
+         * @param cache Original recurrence owner, never a second state mirror.
+         * @return Process-local checkpoint geometry with original full physical bytes.
          */
         PrefixPayloadLayout liveHybridCheckpointLayout(const PrefixPayloadLayout &layout,
-                                                       bool device_only)
+                                                       bool device_only, const IKVCache &cache)
         {
             PrefixPayloadLayout hybrid_layout = hybridOnlyCheckpointLayout(layout);
+            applyLocalHybridCheckpointExtent(hybrid_layout, cache);
             if (device_only && hybrid_layout.hybrid_device_state_bytes > 0)
             {
                 hybrid_layout.hybrid_host_state_bytes = 0;
@@ -30277,6 +30333,57 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::publishCPUAcceptedVerifierLogits(
+        const PrefixLogitsRowSelection &selection)
+    {
+        if (!state_.device_id.is_cpu())
+            throw std::logic_error("Host accepted-logit publication requires CPU ownership");
+        selection.requireCurrent(session_epoch_);
+        if (pp_stage_config_ && !pp_stage_config_->has_lm_head)
+            return true;
+        if (!graph_builder_ || graph_builder_->config().vocab_size <= 0)
+            return false;
+        TensorBase *const source = state_.all_position_logits.get();
+        TensorBase *const destination = state_.logits.get();
+        const size_t vocabulary = static_cast<size_t>(graph_builder_->config().vocab_size);
+        if (!source || !destination || source->native_type() != TensorType::FP32 ||
+            destination->native_type() != TensorType::FP32 ||
+            source->rows() <= 0 ||
+            static_cast<size_t>(source->rows()) != selection.rows() ||
+            source->cols() < static_cast<int64_t>(vocabulary) ||
+            destination->cols() < static_cast<int64_t>(vocabulary) ||
+            !source->raw_data() || !destination->raw_mutable_data())
+            return false;
+        const PrefixLogitsVocabularyRange full{0, vocabulary};
+        const auto slice = PrefixTerminalLogitsSlice::resolveSelectedRow(
+            full, full, fp32LogitsRowBytes(source), selection, session_epoch_);
+        // Stateful publication selected this same row for KV/GDN and terminal
+        // hidden. Copy only its live vocabulary, never the retained matrix or
+        // its unused capacity. Canonical storage survives the next verifier's
+        // reuse and keeps existing scalar samplers on a single-row authority.
+        const auto *bytes = static_cast<const uint8_t *>(source->raw_data());
+        std::memmove(destination->raw_mutable_data(), bytes + slice.byteOffset(), slice.byteCount());
+        TransferEngine::publishHostWrite(destination);
+        if (arena_ && arena_->isRegistered(BufferId::LOGITS))
+            arena_->markWrittenFlagsOnly(BufferId::LOGITS, DeviceId::cpu());
+        const bool published = publishCurrentMainLogits(destination,
+            {.execution_role = ForwardExecutionRole::MainInference,
+             .logical_all_position_logits = false,
+             .storage_surface = ForwardLogitsStorageSurface::CanonicalFull},
+            MainLogitsPublicationSource::AcceptedVerifierState,
+            "accepted_cpu_verifier_row");
+        if (published)
+        {
+            PerfStatsCollector::addCounter("mtp", "accepted_terminal_logits_rows", 1.0,
+                "decode", state_.device_id.toString(),
+                {{"selected_row", std::to_string(selection.row())},
+                 {"producer_rows", std::to_string(selection.rows())}});
+            PerfStatsCollector::addCounter("mtp", "accepted_terminal_logits_bytes",
+                static_cast<double>(slice.byteCount()), "decode", state_.device_id.toString());
+        }
+        return published;
+    }
+
     void DeviceGraphOrchestrator::clearCurrentMainLogitsPublication(
         const char *reason) noexcept
     {
@@ -35560,6 +35667,11 @@ namespace llaminar2
                  {"target_rows", std::to_string(verifier_graph->signature.seq_len)}});
         }
 
+        if (result.accepted_count > 0 && !publishCPUAcceptedVerifierLogits(
+                PrefixLogitsRowSelection(static_cast<size_t>(result.accepted_count - 1),
+                    static_cast<size_t>(verifier_graph->signature.seq_len), session_epoch_)))
+            return fail("MTP spec-state publication could not publish accepted terminal logits");
+
         if (!state_.positions.empty())
             state_.positions[0] = plan.target_cached_tokens;
         if (!state_.sequence_lengths.empty())
@@ -35814,6 +35926,13 @@ namespace llaminar2
                 return fail("MTP batched spec-state publication could not restore accepted terminal hidden rows");
             }
         }
+
+        // Request zero is the public scalar main-logit authority. The batch
+        // retains explicit request-row consumers for its other participants.
+        if (restore_rows.front() >= 0 && !publishCPUAcceptedVerifierLogits(
+                PrefixLogitsRowSelection(static_cast<size_t>(restore_rows.front()),
+                    static_cast<size_t>(padded_seq_len) * plans.request_count, session_epoch_)))
+            return fail("MTP batched spec-state publication could not publish accepted terminal logits");
 
         const LivePrefixMutationReason mutation_reason =
             any_correction
@@ -46221,6 +46340,8 @@ namespace llaminar2
                                         : std::nullopt,
                 metadata.device_bytes > 0 ? std::optional{metadata.device_recurrence_layout}
                                           : std::nullopt);
+            if (metadata.host_bytes > 0)
+                appendCPUHostPrefixEncodingFingerprintFields(material.hybrid, metadata.host_encoding);
         }
         material.mtp = config.mtp.enabled
                            ? std::vector<PrefixFingerprintField>{
@@ -48589,6 +48710,8 @@ namespace llaminar2
                 state_.mtp_kv_caches.empty()?nullptr:state_.mtp_kv_caches[0].get(),0,
                 key.token_start,key.token_count,key.token_start+key.token_count,terminal_block);
 
+            applyHybridPrefixPayloadExtent(block_layout, *state_.kv_cache, 0);
+
             std::shared_ptr<std::vector<uint8_t>> model_runtime_state;
             if (terminal_block && graph_builder_)
             {
@@ -49411,6 +49534,7 @@ namespace llaminar2
             handle.key.token_start = 0;
             handle.key.token_count = cached_tokens;
             handle.layout = layout;
+            applyLocalHybridCheckpointExtent(handle.layout, *state_.kv_cache);
             if (state_.device_id.is_gpu() &&
                 handle.layout.hybrid_device_state_bytes > 0)
             {
@@ -49473,7 +49597,7 @@ namespace llaminar2
                     cached_tokens,
                     &handle,
                     /*synchronize=*/true,
-                    stream))
+                    stream, HybridPrefixStatePurpose::LocalCheckpoint))
             {
                 return fail("main_hybrid_payload_export_failed");
             }
@@ -49736,7 +49860,7 @@ namespace llaminar2
             /*cached_tokens=*/1);
         main_layout = liveHybridCheckpointLayout(
             main_layout,
-            /*device_only=*/state_.device_id.is_gpu());
+            /*device_only=*/state_.device_id.is_gpu(), *state_.kv_cache);
         main_layout.terminal_hidden_bytes =
             ResidualRowGeometry(graph_builder_->config().residualWidth()).rowBytes();
         main_layout.includes_terminal_hidden = true;
@@ -49753,7 +49877,7 @@ namespace llaminar2
                         *cache,
                         state_.device_id,
                         /*block_size=*/1),
-                    /*device_only=*/state_.device_id.is_gpu());
+                    /*device_only=*/state_.device_id.is_gpu(), *cache);
             /*
              * Shifted full-attention caches archive sequence metadata in the
              * dedicated metadata pool below, but captureLivePrefixCheckpoint()
@@ -50488,7 +50612,7 @@ namespace llaminar2
                         *cache,
                         state_.device_id,
                         mtp_cached_tokens),
-                    /*device_only=*/state_.device_id.is_gpu());
+                    /*device_only=*/state_.device_id.is_gpu(), *cache);
                 plan.captures_hybrid_state =
                     plan.hybrid_layout.includes_hybrid_state &&
                     plan.hybrid_layout.hybrid_state_bytes > 0;
@@ -50671,7 +50795,7 @@ namespace llaminar2
             const bool device_only_checkpoint = state_.device_id.is_gpu();
             handle.layout = liveHybridCheckpointLayout(
                 main_layout,
-                device_only_checkpoint);
+                device_only_checkpoint, *state_.kv_cache);
             if (live_terminal_hidden_bytes > 0)
             {
                 handle.layout.terminal_hidden_bytes = live_terminal_hidden_bytes;
@@ -50722,7 +50846,7 @@ namespace llaminar2
                         cached_tokens,
                         &handle,
                         /*synchronize=*/false,
-                        stream))
+                        stream, HybridPrefixStatePurpose::LocalCheckpoint))
                 {
                     return fail("hybrid_checkpoint_export_failed");
                 }
@@ -50838,7 +50962,7 @@ namespace llaminar2
                     plan.cached_tokens,
                     &handle,
                     /*synchronize=*/false,
-                    stream))
+                    stream, HybridPrefixStatePurpose::LocalCheckpoint))
             {
                 return fail(
                     "shifted_hybrid_checkpoint_export_failed_depth_" +
@@ -51203,7 +51327,7 @@ namespace llaminar2
                             *cache,
                             state_.device_id,
                             mtp_cached_tokens),
-                        /*device_only=*/state_.device_id.is_gpu());
+                        /*device_only=*/state_.device_id.is_gpu(), *cache);
                 const bool source_available =
                     state_.device_id.is_gpu()
                         ? hybridPayloadDevicePtr(handle) != nullptr
@@ -51298,7 +51422,7 @@ namespace llaminar2
                             seq_idx,
                             /*restore_for_suffix_prefill=*/false,
                             /*synchronize=*/false,
-                            stream))
+                            stream, HybridPrefixStatePurpose::LocalCheckpoint))
                     {
                         return fail("logical checkpoint hybrid payload import failed");
                     }
@@ -51410,7 +51534,7 @@ namespace llaminar2
                         seq_idx,
                         /*restore_for_suffix_prefill=*/false,
                         /*synchronize=*/false,
-                        stream))
+                        stream, HybridPrefixStatePurpose::LocalCheckpoint))
                 {
                     return fail(
                         "logical checkpoint shifted hybrid payload import failed for depth=" +
@@ -51518,6 +51642,7 @@ namespace llaminar2
                 handle.key.token_count,
                 handle.layout.terminal_hidden_bytes,
                 handle.layout.terminal_logits_bytes);
+            applyLocalHybridCheckpointExtent(expected, *state_.kv_cache);
             if (!handle.layout.compatiblePayloadShape(expected))
             {
                 return fail("main KV block layout is incompatible");
@@ -51558,7 +51683,7 @@ namespace llaminar2
                 seq_idx,
                 /*restore_for_suffix_prefill=*/false,
                 /*synchronize=*/true,
-                stream))
+                stream, HybridPrefixStatePurpose::LocalCheckpoint))
         {
             return fail("hybrid payload import failed");
         }
@@ -62765,6 +62890,36 @@ namespace llaminar2
             "mtp_workspace_family_manifest_complete");
     }
 
+    ForwardInput DeviceGraphOrchestrator::groupedVerifierWorkspaceInput(
+        const ForwardInput &ordinary, const MTPGraphOwnerPlan &owner)
+    {
+        if ((!ordinary.device.is_cpu() && !ordinary.device.is_gpu()) ||
+            ordinary.batch_size <= 0 ||
+            ordinary.graph_submission_intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            throw std::invalid_argument("Grouped verifier workspace requires an ordinary cold declaration");
+        if (!owner.retainsGraphCapacity())
+            throw std::logic_error("Grouped verifier workspace requires its retained generation owner");
+        const auto rows = ordinary.device.is_gpu()
+            ? owner.retainedVerifierRequestRows()
+            : DeviceRequestRowRanges::fullyActiveRequests(
+                  ordinary.batch_size, owner.verifierRowsPerRequest());
+        ForwardInput grouped = ordinary;
+        grouped.batch_size = rows.requests();
+        grouped.seq_len = rows.rowsPerRequest();
+        grouped.token_ids = nullptr;
+        grouped.token_ids_device = nullptr;
+        grouped.position_ids = nullptr;
+        grouped.position_ids_device = nullptr;
+        grouped.sequence_lengths = nullptr;
+        grouped.sequence_lengths_device = nullptr;
+        grouped.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+        grouped.execution_phase = ForwardExecutionPhase::Decode;
+        grouped.position_offset = 1;
+        grouped.real_seq_len = 0;
+        grouped.bucket_seq_len = 0;
+        return grouped;
+    }
+
     bool DeviceGraphOrchestrator::materializeForwardGraphForShape(
         int seq_len,
         int batch_size,
@@ -63172,10 +63327,13 @@ namespace llaminar2
              * impossible to materialize; retaining host rows beside GPU rows
              * would instead create two competing authorities.
              */
-            const int grouped_rows =
-                mtp_max_verifier_rows_;
-            const int grouped_total_rows =
-                batch_size * grouped_rows;
+            // GPU metadata has exactly the admitted generation R entries,
+            // independently of the ordinary/prefill batch passed to this method.
+            ForwardInput grouped_input = groupedVerifierWorkspaceInput(input, mtp_graph_owner_plan_);
+            const int grouped_requests = grouped_input.batch_size;
+            const int grouped_rows = grouped_input.seq_len;
+            const int grouped_total_rows = DeviceRequestRowRanges::fullyActiveRequests(
+                grouped_requests, grouped_rows).physicalRows();
             ScopedGroupedMTPVerifierGraphPolicy grouped_verifier_scope(
                 graph_builder_.get(),
                 &compute_all_position_logits_,
@@ -63194,7 +63352,7 @@ namespace llaminar2
                 0);
             grouped_verifier_positions.resize(
                 static_cast<size_t>(grouped_total_rows));
-            for (int request = 0; request < batch_size; ++request)
+            for (int request = 0; request < grouped_requests; ++request)
             {
                 std::iota(
                     grouped_verifier_positions.begin() +
@@ -63204,13 +63362,6 @@ namespace llaminar2
                     1);
             }
 
-            ForwardInput grouped_input = input;
-            grouped_input.token_ids = nullptr;
-            grouped_input.token_ids_device = nullptr;
-            grouped_input.position_ids = nullptr;
-            grouped_input.position_ids_device = nullptr;
-            grouped_input.sequence_lengths = nullptr;
-            grouped_input.sequence_lengths_device = nullptr;
             if (state_.device_id.is_gpu())
             {
                 if (!mtp_verifier_input_tokens_dev_ ||
@@ -63234,23 +63385,15 @@ namespace llaminar2
                     grouped_verifier_tokens.data();
                 grouped_input.position_ids =
                     grouped_verifier_positions.data();
-                if (batch_size > 1)
+                if (grouped_requests > 1)
                 {
                     grouped_verifier_request_lengths.assign(
-                        static_cast<size_t>(batch_size),
+                        static_cast<size_t>(grouped_requests),
                         grouped_rows);
                     grouped_input.sequence_lengths =
                         &grouped_verifier_request_lengths;
                 }
             }
-            grouped_input.execution_role =
-                ForwardExecutionRole::GroupedMTPVerifier;
-            grouped_input.execution_phase =
-                ForwardExecutionPhase::Decode;
-            grouped_input.seq_len = grouped_rows;
-            grouped_input.position_offset = 1;
-            grouped_input.real_seq_len = 0;
-            grouped_input.bucket_seq_len = 0;
             if (!append_forward_participant(
                     grouped_input,
                     WorkspaceGraphParticipantRole::

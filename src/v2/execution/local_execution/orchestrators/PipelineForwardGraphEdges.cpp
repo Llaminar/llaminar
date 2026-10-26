@@ -75,7 +75,7 @@ bool PipelineForwardGraphEdges::PublicationBanks::valid() const noexcept
 PipelineForwardGraphEdges::PublicationBanks PipelineForwardGraphEdges::PublicationBanks::from(
     const MTPSpeculativeStatePublicationStage::Params &params) noexcept
 {
-    return {params.accepted_restore_rows_device, params.target_cached_tokens_device,
+    return {params.accepted_restore_rows_device.data(), params.target_cached_tokens_device,
         params.accepted_state_counts_device, params.publication_ok_flags_device};
 }
 

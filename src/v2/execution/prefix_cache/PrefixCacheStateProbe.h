@@ -11,6 +11,7 @@
 
 #pragma once
 #include "kernels/common/GDNRecurrenceStateLayout.h"
+#include "kernels/CPUGDNStateLayout.h"
 
 #include "backends/DeviceId.h"
 #include "execution/config/RuntimeConfig.h"
@@ -273,6 +274,10 @@ namespace llaminar2
             GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Physical source format;
                                                                ///< diagnostic values are canonical
                                                                ///< key-major.
+        GDNStateStorage recurrence_storage = GDNStateStorage::DeviceDense;
+            ///< Exact arithmetic/storage contract; CPU epoch banks are not dense matrices.
+        std::vector<uint32_t> recurrence_epoch_phase_words;
+            ///< Exact per-head CPU protocol words, retained even in hash-only probes.
         size_t recurrence_values = 0;
         size_t conv_values = 0;
         uint64_t recurrence_hash = 0;
@@ -306,7 +311,9 @@ namespace llaminar2
          * Normal prefix probes only carry hashes so request summaries stay
          * cheap. Setting LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES=1 asks the
          * probe to copy the complete authoritative FP32 bank into these
-         * vectors. On GPU this is the full replicated decode bank exported on
+         * vectors. CPU epoch state retains every physical checkpoint/history
+         * value; only dense device matrices are canonicalized to key-major axes.
+         * On GPU this is the full replicated decode bank exported on
          * the probe's exact stream, never the potentially stale host mirror.
          */
         std::vector<float> recurrence_sample_values;

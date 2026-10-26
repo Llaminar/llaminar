@@ -68,12 +68,12 @@ public:
  /** @brief Publish this request after the publisher has validated all request plans. */
  bool restoreVerifierStateCaptureRows(const int *rows,int requests,void *stream) override;
  /** @brief Consume one device decision only for a single-request transaction. */
- bool restoreVerifierStateCaptureRowFromDeviceIndex(const int *row,void *stream) override;
+ bool restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int> row_view,void *stream) override;
  /** @brief Accepted PLE publication writes only token and convolution history banks. */
  std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept override;
 
  /** @brief Consume the complete independently-strided device decision vector. */
- bool restoreVerifierStateCaptureRowsFromDeviceIndices(const int *rows,int requests,int stride,void *stream) override;
+ bool restoreVerifierStateCaptureRowsFromDeviceIndices(std::span<const int> rows_view,int requests,int stride,void *stream) override;
  /** @brief Seal normally prepared storage once before native graph recording. */
  bool prepareGraphLaunch(IDeviceContext*context,void*stream)override;
  /** @brief Storage seals run only during initial capture preparation, never native replay. */

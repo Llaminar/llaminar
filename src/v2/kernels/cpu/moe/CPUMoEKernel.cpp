@@ -4,7 +4,9 @@
  *
  * Typed FP16 router gates round hidden operands to half in SIMD registers,
  * accumulate/output FP32, and leave the original hidden/Q8 expert publication
- * untouched. No second gate cache or activation mirror is introduced.
+ * untouched. Native BF16 gates widen their original words inside the existing
+ * fixed-tree SIMD matmul and consume unchanged FP32 activations. No second
+ * gate cache or activation mirror is introduced.
  * Owns CPU routing, placement-epoch operations and canonical Q8 input
  * publication. Ordinary and transported expert inputs share the same exact
  * block arithmetic; worksharing changes row ownership, never numerical order.
@@ -39,6 +41,13 @@ namespace llaminar2
 {
     namespace
     {
+        /** @return Whether the CPU router directly consumes this physical format. */
+        constexpr bool isCPURouterFormat(TensorType type) noexcept
+        {
+            return type == TensorType::FP32 || type == TensorType::FP16 ||
+                   type == TensorType::BF16;
+        }
+
         /** @brief Publish one complete CPU epoch-operation diagnostic. */
         void writeOverlayEpochStatus(
             DeviceMoEOverlayEpochStatus *status,
@@ -894,7 +903,7 @@ namespace llaminar2
         invalidateRouterQ8HiddenPublication();
         if (!hidden || !gate_weights || seq_len <= 0 || d_model <= 0 ||
             num_experts <= 0 || top_k <= 0 || top_k > num_experts ||
-            (gate_type != TensorType::FP32 && gate_type != TensorType::FP16))
+            !isCPURouterFormat(gate_type))
         {
             LOG_ERROR("[CPUMoEKernel::route] invalid routing pointer or dimensions");
             return false;
@@ -950,6 +959,22 @@ namespace llaminar2
                     {"hidden_operand","half_rne"},{"gate_weights","fp16"},{"accumulation","fp32"},
                     {"expert_q8_source","original_fp32_hidden"},{"reduction","fixed_256_lane_tree"}});
             }
+        }
+        else if (gate_type == TensorType::BF16)
+        {
+            // Native BF16 is a source representation, not the FP16 operand
+            // policy. Widen weights in registers and keep original FP32 A.
+            // The existing fixed tree is identical for serial and grouped M.
+            if (!gemm::run_gpu_aligned_expert_fp32_matmul<TensorType::BF16>(
+                    hidden, gate_weights, result.router_logits.data(),
+                    seq_len, num_experts, d_model))
+                return false;
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
+                PerfStatsCollector::addCounter("kernel", "cpu_moe_bf16_router_calls", 1.0,
+                    "router", "cpu", {{"rows", std::to_string(seq_len)},
+                    {"num_experts", std::to_string(num_experts)},
+                    {"hidden_operand", "fp32"}, {"gate_weights", "bf16"},
+                    {"accumulation", "fp32"}, {"reduction", "fixed_256_lane_tree"}});
         }
         const int row_tiles = seq_len / 4 + (seq_len % 4 != 0);
         auto route_rows = [&]()
@@ -1067,18 +1092,31 @@ namespace llaminar2
 
         if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts ||
             hidden->native_type() != TensorType::FP32 ||
-            (gate_weights->native_type() != TensorType::FP32 && gate_weights->native_type() != TensorType::FP16) ||
+            !isCPURouterFormat(gate_weights->native_type()) ||
             output_indices->native_type() != TensorType::FP32 || output_weights->native_type() != TensorType::FP32 ||
             hidden->numel() / static_cast<size_t>(d_model) < static_cast<size_t>(seq_len) ||
             gate_weights->numel() / static_cast<size_t>(d_model) < static_cast<size_t>(num_experts) ||
             output_indices->numel() / static_cast<size_t>(top_k) < static_cast<size_t>(seq_len) ||
             output_weights->numel() / static_cast<size_t>(top_k) < static_cast<size_t>(seq_len))
+        {
+            LOG_ERROR("[CPUMoEKernel::routeWithTensors] invalid router format or live geometry: "
+                      << "hidden=" << hidden->dtype_name() << ", gate=" << gate_weights->dtype_name()
+                      << ", indices=" << output_indices->dtype_name() << ", weights=" << output_weights->dtype_name()
+                      << ", rows=" << seq_len << ", width=" << d_model
+                      << ", experts=" << num_experts << ", top_k=" << top_k);
             return false;
+        }
         const auto *half_gate = dynamic_cast<const FP16Tensor *>(gate_weights);
-        if (gate_weights->native_type() == TensorType::FP16 &&
-            (!half_gate || hidden->cols() != static_cast<size_t>(d_model) ||
-             half_gate->cols() != static_cast<size_t>(d_model))) return false;
+        const auto *bfloat_gate = dynamic_cast<const BF16Tensor *>(gate_weights);
+        if (gate_weights->native_type() != TensorType::FP32 &&
+            ((!half_gate && !bfloat_gate) || hidden->cols() != static_cast<size_t>(d_model) ||
+             gate_weights->cols() != static_cast<size_t>(d_model)))
+        {
+            LOG_ERROR("[CPUMoEKernel::routeWithTensors] native 16-bit router requires typed contiguous matrix rows");
+            return false;
+        }
         const void *gate_data = half_gate ? static_cast<const void *>(half_gate->typed_data())
+                              : bfloat_gate ? static_cast<const void *>(bfloat_gate->typed_data())
                                          : static_cast<const void *>(gate_weights->data());
         if (!routePrepared(hidden->data(),
                    gate_data, gate_weights->native_type(),

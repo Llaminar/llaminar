@@ -136,6 +136,9 @@ namespace llaminar2
         if (fa_layers > 0 &&
             (bytes_per_fa_layer_k == 0 || bytes_per_fa_layer_v == 0))
             return false;
+        if (includes_hybrid_state && device.is_cpu() && gdn_layers > 0 && hybrid_host_state_bytes > 0 &&
+            hybrid_host_encoding != HybridPrefixHostEncoding::CPUFixedEpochPackedV2 &&
+            hybrid_host_encoding != HybridPrefixHostEncoding::CPUFixedEpochLocalImage) return false;
         // Missing attention is valid only when the complete recurrent owner
         // supplies the state. Terminal logits alone cannot certify a cache.
         return gdn_layers == 0 ||
@@ -158,6 +161,18 @@ namespace llaminar2
              (hybrid_device_state_bytes > 0 &&
               !validGDNRecurrenceStateLayout(hybrid_device_recurrence_layout))))
             throw std::invalid_argument("Unknown prefix payload recurrence layout");
+        if (includes_hybrid_state && hybrid_host_state_bytes > 0)
+        {
+            const bool packed = hybrid_host_encoding == HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+            const bool local = hybrid_host_encoding == HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+            if ((device.is_cpu() && gdn_layers > 0 && !packed && !local) ||
+                (hybrid_host_encoding != HybridPrefixHostEncoding::None && !packed && !local) ||
+                ((packed || local) && (hybrid_host_state_capacity_bytes == 0 ||
+                                      hybrid_host_state_bytes > hybrid_host_state_capacity_bytes)) ||
+                hybrid_host_state_bytes > std::numeric_limits<size_t>::max() - hybrid_device_state_bytes ||
+                hybrid_state_bytes != hybrid_host_state_bytes + hybrid_device_state_bytes)
+                throw std::invalid_argument("Invalid CPU GDN prefix host encoding/extent");
+        }
         size_t total = faKVBytes();
         if (includes_hybrid_state)
         {
@@ -189,9 +204,20 @@ namespace llaminar2
                v_precision == other.v_precision && kv_layout == other.kv_layout &&
                bytes_per_fa_layer_k == other.bytes_per_fa_layer_k &&
                bytes_per_fa_layer_v == other.bytes_per_fa_layer_v &&
-               hybrid_host_state_bytes == other.hybrid_host_state_bytes &&
+               hybrid_host_encoding == other.hybrid_host_encoding &&
+               hybrid_host_state_capacity_bytes == other.hybrid_host_state_capacity_bytes &&
+               (hybrid_host_encoding == HybridPrefixHostEncoding::CPUFixedEpochPackedV2
+                    ? (hybrid_host_state_capacity_bytes > 0 && hybrid_host_state_bytes > 0 &&
+                       other.hybrid_host_state_bytes > 0 &&
+                       hybrid_host_state_bytes <= hybrid_host_state_capacity_bytes &&
+                       other.hybrid_host_state_bytes <= other.hybrid_host_state_capacity_bytes &&
+                       hybrid_host_state_bytes <= std::numeric_limits<size_t>::max() - hybrid_device_state_bytes &&
+                       other.hybrid_host_state_bytes <= std::numeric_limits<size_t>::max() - other.hybrid_device_state_bytes &&
+                       hybrid_state_bytes == hybrid_host_state_bytes + hybrid_device_state_bytes &&
+                       other.hybrid_state_bytes == other.hybrid_host_state_bytes + other.hybrid_device_state_bytes)
+                    : (hybrid_host_state_bytes == other.hybrid_host_state_bytes &&
+                       hybrid_state_bytes == other.hybrid_state_bytes)) &&
                hybrid_device_state_bytes == other.hybrid_device_state_bytes &&
-               hybrid_state_bytes == other.hybrid_state_bytes &&
                (!(includes_hybrid_state && other.includes_hybrid_state &&
                   hybrid_host_state_bytes > 0) ||
                 hybrid_host_recurrence_layout == other.hybrid_host_recurrence_layout) &&
@@ -209,6 +235,28 @@ namespace llaminar2
                terminal_hidden_bytes == other.terminal_hidden_bytes &&
                terminal_logits_bytes == other.terminal_logits_bytes &&
                includes_mtp_state == other.includes_mtp_state;
+    }
+
+    void applyHybridPrefixPayloadExtent(PrefixPayloadLayout &layout, const IKVCache &cache, int sequence)
+    {
+        if (!layout.includes_hybrid_state || layout.hybrid_host_state_bytes == 0) return;
+        const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
+        if (!hybrid) throw std::invalid_argument("Hybrid prefix extent requires its canonical cache owner");
+        const auto metadata = hybrid->hybridPrefixStateMetadata();
+        if (layout.hybrid_host_encoding != metadata.host_encoding ||
+            layout.hybrid_host_state_capacity_bytes != metadata.host_serialized_capacity_bytes ||
+            layout.hybrid_host_recurrence_layout != metadata.host_recurrence_layout)
+            throw std::invalid_argument("Hybrid prefix host capacity/format identity changed");
+        HybridPrefixStateDescriptor request;
+        request.seq_idx = sequence;
+        request.include_device_state = false;
+        request.host_encoding = layout.hybrid_host_encoding;
+        request.host_recurrence_layout = layout.hybrid_host_recurrence_layout;
+        const auto bytes = hybrid->hybridPrefixHostPayloadBytes(request);
+        if (!bytes || *bytes == 0 || *bytes > layout.hybrid_host_state_capacity_bytes)
+            throw std::invalid_argument("Hybrid prefix host phase/serialized extent is invalid");
+        layout.hybrid_host_state_bytes = *bytes;
+        layout.hybrid_state_bytes = addBytes(*bytes, layout.hybrid_device_state_bytes);
     }
 
     PrefixPayloadLayout buildDensePrefixPayloadLayout(
@@ -232,9 +280,12 @@ namespace llaminar2
             const HybridPrefixStateMetadata metadata = hybrid->hybridPrefixStateMetadata();
             layout.hybrid_host_recurrence_layout = metadata.host_recurrence_layout;
             layout.hybrid_device_recurrence_layout = metadata.device_recurrence_layout;
-            layout.hybrid_host_state_bytes = metadata.host_bytes;
+            layout.hybrid_host_encoding = metadata.host_encoding;
+            layout.hybrid_host_state_capacity_bytes = metadata.host_serialized_capacity_bytes;
+            layout.hybrid_host_state_bytes = metadata.host_encoding == HybridPrefixHostEncoding::CPUFixedEpochPackedV2
+                                                ? metadata.host_serialized_capacity_bytes : metadata.host_bytes;
             layout.hybrid_device_state_bytes = metadata.device_bytes;
-            layout.hybrid_state_bytes = metadata.host_bytes + metadata.device_bytes;
+            layout.hybrid_state_bytes = addBytes(layout.hybrid_host_state_bytes, metadata.device_bytes);
             layout.includes_hybrid_state = layout.hybrid_state_bytes > 0;
         }
 

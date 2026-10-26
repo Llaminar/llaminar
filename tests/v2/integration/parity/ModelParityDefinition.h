@@ -10,7 +10,8 @@
  * production case must prove a fresh fill, a full restore, and a partial
  * restore through one retained runner. Generated test names are output only;
  * runtime policy is projected directly from the typed case and is never
- * recovered by parsing a GoogleTest name.
+ * recovered by parsing a GoogleTest name. Explicit numerical-only candidates
+ * retain their diagnostic campaigns without becoming runtime/control authorities.
  */
 
 #pragma once
@@ -661,6 +662,27 @@ namespace llaminar2::test::parity
         std::vector<ModelParityRemoteCPUHosts> remote_cpu_overlays;
     };
 
+    /** @brief Source-owned authority for runtime inventories versus numerical-only diagnostics. */
+    enum class ModelParityInventoryRole : std::uint8_t
+    {
+        Canonical = 0, ///< Existing generation/control, HTTP and benchmark inventory authority.
+        NumericalDiagnostic = 1 ///< Explicit numerical campaign only; never runtime eligibility.
+    };
+
+    /** @brief Validate the closed inventory role before export or matrix expansion.
+     * @param role Producer-declared authority, independent of names or numerical limits.
+     * @return Stable metadata spelling. Canonical remains implicit in schema1 exports.
+     * @throws std::invalid_argument For an unknown role. */
+    [[nodiscard]] inline const char *modelParityInventoryRoleName(ModelParityInventoryRole role)
+    {
+        switch (role)
+        {
+        case ModelParityInventoryRole::Canonical: return "canonical";
+        case ModelParityInventoryRole::NumericalDiagnostic: return "numerical_diagnostic";
+        }
+        throw std::invalid_argument("Unknown model parity inventory role");
+    }
+
     /**
      * @brief Complete suite-owned declaration for one model and one topology.
      *
@@ -686,6 +708,8 @@ namespace llaminar2::test::parity
         ModelParityGenerationWorkload generation_workload;
         /** Optional source-bound accuracy/timing obligations, never an eligibility grant. */
         std::optional<ModelParityPairedWorkload> paired_workload;
+        /** Numerical diagnostics retain their tests without claiming runtime/control authority. */
+        ModelParityInventoryRole inventory_role = ModelParityInventoryRole::Canonical;
     };
 
     /** Placement and durable movement axes present only on ExpertOverlay. */
@@ -774,6 +798,8 @@ namespace llaminar2::test::parity
         ModelParityGenerationWorkload generation_workload;
         /** Optional source-bound accuracy/timing obligations, never an eligibility grant. */
         std::optional<ModelParityPairedWorkload> paired_workload;
+        /** Numerical diagnostics retain their tests without claiming runtime/control authority. */
+        ModelParityInventoryRole inventory_role = ModelParityInventoryRole::Canonical;
 
         /** @return Whether this cell executes an MTP generation policy. */
         [[nodiscard]] constexpr bool mtpEnabled() const noexcept
@@ -1569,6 +1595,10 @@ namespace llaminar2::test::parity
     {
         const auto &model = definition.model;
         const auto &topology = definition.topology;
+        (void)modelParityInventoryRoleName(definition.inventory_role);
+        if (definition.inventory_role == ModelParityInventoryRole::NumericalDiagnostic &&
+            !definition.e2e_certifiable.empty())
+            throw std::invalid_argument("Numerical diagnostics cannot declare runtime certification eligibility");
         if (definition.paired_workload)
             definition.paired_workload->validate(model.model_path,
                 model.shared_predictor ? std::optional<std::string>(model.shared_predictor->path())
@@ -2195,6 +2225,7 @@ namespace llaminar2::test::parity
                                     definition.tp_allreduce_precision_override,
                                 .generation_workload = definition.generation_workload,
                                 .paired_workload = definition.paired_workload,
+                                .inventory_role = definition.inventory_role,
                             };
                             if (!names.insert(test_case.testName()).second)
                             {

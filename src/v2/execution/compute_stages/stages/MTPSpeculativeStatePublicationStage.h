@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include <span>
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
@@ -142,7 +143,7 @@ namespace llaminar2
             int outcome_meta_stride = 0;
 
             const int32_t *base_cached_tokens_device = nullptr;
-            int32_t *accepted_restore_rows_device = nullptr;
+            std::span<int32_t> accepted_restore_rows_device{}; ///< Actual setup-owned device allocation.
             int32_t *target_cached_tokens_device = nullptr;
             int32_t *accepted_state_counts_device = nullptr;
             int32_t *publication_ok_flags_device = nullptr;

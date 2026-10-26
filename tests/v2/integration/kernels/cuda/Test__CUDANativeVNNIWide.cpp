@@ -13,6 +13,8 @@
  * IQ2_S synthetic metadata uses original half bases and raw coefficient bytes.
  * IQ4_XS physical24 uses independently authored original half bases/raw6
  * coefficients and retains source4 arithmetic policy in captured comparisons.
+ * Register-capped logical64-row policies must traverse their physical32-row
+ * Z tiles, including partial final tiles; replay also poisons consumed partials.
  */
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
@@ -248,6 +250,11 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
         // This poison is part of the replay, not just setup: stale outputs
         // cannot masquerade as complete publication on a later launch.
         checked(cudaMemsetAsync(destination, 0x5a, (elements + 8) * sizeof(float), stream));
+        // The oracle reuses one row's scratch while grouped publication reads
+        // a physical row tile. Poison both before each replay so a missing
+        // producer row cannot match recycled allocator bytes by accident.
+        checked(cudaMemsetAsync(partials.data, 0x5a,
+                                elements * partitions * sizeof(float), stream));
         if (path == 1 && m > 1)
         {
             ASSERT_TRUE(cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
@@ -319,6 +326,37 @@ TEST(CUDANativeVNNIWide, CapturedGroupedRegisterBoundsMatchSerialAllFormats)
                                    m, rows, partitions);
                         if (::testing::Test::HasFatalFailure()) return;
                     }
+}
+
+/**
+ * @brief Exercise actual cursor construction when a logical64-row policy owns32 rows/CTA.
+ *
+ * The128-thread column geometries cap row groups at two; row32 and the
+ * row64/65 boundary therefore require additional physical Z tiles. The
+ * production captured producer/reducer and independent serial oracle prove
+ * ownership, rather than duplicating the cursor formula in a host assertion.
+ */
+TEST(CUDANativeVNNIWide, CapturedGroupedPhysicalRowCursorMatchesSerial)
+{
+    int count = 0;
+    checked(cudaGetDeviceCount(&count));
+    ASSERT_GT(count, 0);
+    checked(cudaSetDevice(0));
+    ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned());
+    constexpr auto &format = llaminar2::native_vnni_formats::Q4_0;
+    static_assert(format.codebook_id == 0);
+    for (const auto &[tile, cpt] : std::array{
+             std::pair{128, 1}, std::pair{256, 2}, std::pair{512, 4}})
+        for (int m : {32, 33, 64, 65})
+            for (int partitions : {1, 3})
+            {
+                SCOPED_TRACE(::testing::Message() << "physical cursor tile=" << tile
+                    << " cpt=" << cpt << " logical_rows=64 M=" << m
+                    << " K partitions=" << partitions);
+                verifyWide(format.codebook_id, format.payload_bytes,
+                           tile, cpt, tile + 1, 160, m, 64, partitions);
+                if (::testing::Test::HasFatalFailure()) return;
+            }
 }
 
 /** @brief Sweep every physical codebook and every compiled WIDE output geometry. */

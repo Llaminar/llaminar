@@ -226,7 +226,7 @@ namespace llaminar2
             params_.max_state_commit_rows < 0 ||
             params_.max_state_commit_rows >
                 params_.verifier_rows_per_request ||
-            !params_.accepted_restore_rows_device ||
+            !deviceVerifierStateMetadataCovers(params_.accepted_restore_rows_device, params_.request_count, 1) ||
             !params_.target_cached_tokens_device ||
             !params_.accepted_state_counts_device ||
             !params_.publication_ok_flags_device)
@@ -619,7 +619,7 @@ namespace llaminar2
                           params_.generation_control_stride,
                           params_.device_id.gpu_ordinal(),
                           stream,
-                          params_.accepted_restore_rows_device,
+                          params_.accepted_restore_rows_device.data(),
                           params_.target_cached_tokens_device,
                           params_.accepted_state_counts_device,
                           params_.publication_ok_flags_device,
@@ -642,7 +642,7 @@ namespace llaminar2
                           params_.max_state_commit_rows,
                           params_.device_id.gpu_ordinal(),
                           stream,
-                          params_.accepted_restore_rows_device,
+                          params_.accepted_restore_rows_device.data(),
                           params_.target_cached_tokens_device,
                           params_.accepted_state_counts_device,
                           params_.publication_ok_flags_device,
@@ -834,8 +834,8 @@ namespace llaminar2
                self.outcome_meta_stride == other.outcome_meta_stride &&
                self.base_cached_tokens_device ==
                    other.base_cached_tokens_device &&
-               self.accepted_restore_rows_device ==
-                   other.accepted_restore_rows_device &&
+               self.accepted_restore_rows_device.data() == other.accepted_restore_rows_device.data() &&
+               self.accepted_restore_rows_device.size() == other.accepted_restore_rows_device.size() &&
                self.target_cached_tokens_device ==
                    other.target_cached_tokens_device &&
                self.accepted_state_counts_device ==

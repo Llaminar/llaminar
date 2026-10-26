@@ -1,22 +1,22 @@
 # vLLM-Style MTP Tuning Dashboard
 
-Current qualification frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)).
-This dashboard stays below 200 lines. Older measurements and investigations are
-preserved in [the October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md)
-and [the project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
+Serving frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)). Keep below 200 lines and 15,000 bytes;
+history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md) and [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
+
+GDN integration, 2026-10-26: Unit 781/781; census's two fixture failures pass focused repairs.
+Committed-archive preservation passes 54 cases/108 reopens. Fresh full prerequisites pending.
+GPU candidates improve deep groups but matched ordinary controls still win;
+CPU packed-prefix/restart and CUDA column tests pass. [Current port plan](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).
+The incoming branch's 1,362 gates, 13 model cells and +1.9/+5.5/+5.9% depth-2/3/4 decode
+results compare against older develop, with changed work; they do not qualify this merge.
+Historical CPU scope and prefill cost: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
 
 ## QFN implementation frontier — 2026-10-20
 
-The QFN CPU fixed-depth-1 numerical cell reaches generation but fails the
-budget-limited direct-emission shifted-cache boundary: a generic `+1` is
-incorrect for QFN's token-zero bootstrap. Build46 installs a typed
-checkpoint-origin repair and two explicit model-free preflight regressions,
-including the actual CPU cache validator. Build and focused tests are in
-progress; the original real-model rerun is not yet qualified. GPU transaction
-ownership, default precision and numerical gates remain unchanged. See the
-[QFN plan](../2026-10/QWEN_FLASH_NEXT_IMPLEMENTATION.md) for the separate
-remaining all-layer numerical and multi-tier storage work. The historical
-hybrid measurements below are not QFN qualification.
+The October 20 CPU depth-one run exposed an incorrect shifted-cache `+1` at
+QFN's token-zero bootstrap. Build46 installed a typed checkpoint-origin repair
+and two preflight regressions; that original model rerun was not qualified.
+See the [QFN plan](../2026-10/QWEN_FLASH_NEXT_IMPLEMENTATION.md); hybrid results below do not qualify QFN.
 
 ## Completed evidence
 
@@ -75,24 +75,14 @@ post-run artifact collector rejected the stage-scoped movement schema. The
 server retired normally with clean driver diagnostics; the preserved native
 evidence passes after correcting the collector. MoE timing was not started.
 
-## Current r39 qualification
+## Historical r39 qualification
 
-The movement-artifact reader and prefix-epoch observer now preserve every PP
-stage. Their focused cases, old-code negative controls and matching builds pass.
-r39 completed 1,682 passed tests and 26 hardware skips, with no test failures;
-its driver audit failed on one archived MI50 `SetWorkloadMask` firmware message.
-All 100 targeted follow-up executions passed with clean driver windows and
-complete retirement. The user waived only that archived firmware finding for
-local progress; later driver checks remain mandatory. Fresh dense/MoE smoke
-passed at context 262,144 with dynamic MTP, emoji and full/partial prefix reuse.
-r39 benchmark medians were dense 692.26/33.25 and MoE 1,661.09/182.49 prefill/decode
-tokens/s. The native processes retired normally with clean driver diagnostics.
-The corrected benchmark reader admits unused prepared buckets while proving all
-consumed rows; its old-reader negative control and twelve corruption variants
-pass. No inference source changed or benchmark was rerun for that reader fix.
-The resource observer originally rejected a valid MiB DRM mapping. r90 integrates
-explicit binary-unit parsing, 53 passing scope/resource tests and its focused
-preflight entry without repeating the app sessions.
+r39 passed 1,682 tests with 26 hardware skips. The user waived one archived MI50
+firmware finding only; 100 follow-ups and later driver windows were clean.
+Dense/MoE smoke passed at context 262,144 with dynamic MTP and prefix reuse.
+Prefill/decode medians: dense 692.26/33.25, MoE 1,661.09/182.49 tokens/s.
+The project plan retains movement, benchmark-reader and MiB-observer repair
+evidence. Those collector repairs did not require repeating the app sessions.
 
 ## Remaining gates
 

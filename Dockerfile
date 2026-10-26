@@ -485,7 +485,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
         -delete \
  && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} + \
- && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas \
+ && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas /src/runtime-hip \
  && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
  && cp build_v2_release/llaminar_native_tool_evidence_decoder /src/runtime-bin/ \
  && cp build_v2_release/llaminar_model_kld_canary /src/runtime-bin/ \
@@ -497,8 +497,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -P /usr/local/lib/libllaminar_nccl.so* /src/runtime-libs/; fi \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
-        cp -L "${ROCM_PATH}/lib/libamdhip64.so.7" /src/runtime-libs/libamdhip64.so.7; \
-        cp -r "${ROCM_PATH}/share/licenses/llaminar-hip" /src/runtime-licenses/; \
+        HIP_RUNTIME_STAGE_PREFIX=/src/runtime-hip bash scripts/docker/install-hip-graph-runtime.sh; \
         mkdir -p /src/runtime-rocblas/lib/rocblas /src/runtime-rocblas/share/llaminar; \
         cp -L "${ROCM_PATH}/lib/librocblas.so" /src/runtime-rocblas/lib/librocblas.so.5; \
         ln -s librocblas.so.5 /src/runtime-rocblas/lib/librocblas.so; \
@@ -603,6 +602,10 @@ ENV LLAMINAR_CPU_ISA=${LLAMINAR_CPU_ISA}
 # installed above (CUDA shared libs, ROCm runtime, MPI, OpenBLAS).
 COPY --from=builder /src/runtime-bin/ /usr/local/bin/
 COPY --from=builder /src/runtime-libs/ /usr/local/lib/
+# Replace the SDK package's HIP file/aliases with its authenticated builder
+# component. RUNPATH, dependent $ORIGIN paths and ldconfig now name one owner;
+# LD_LIBRARY_PATH is not required to bypass a stock SDK copy.
+COPY --from=builder /src/runtime-hip/ /opt/rocm-sdk/
 COPY --from=builder /src/runtime-licenses/ /usr/local/share/licenses/
 # Keep the rocBLAS DSO and its gfx906 Tensile tree at their SDK-relative paths.
 # The DSO resolves code objects relative to itself, not from a foreign package.

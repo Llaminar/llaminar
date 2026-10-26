@@ -15,6 +15,7 @@
 #include "kernels/common/Q8ResidualCorrection.h"
 #include "kernels/common/OriginalOutputSlice.h"
 #include "kernels/common/GatedRMSNormProjection.h"
+#include "kernels/CPUSharedGDNSnapshots.h"
 
 #include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
@@ -42,6 +43,13 @@
 
 namespace llaminar2
 {
+    namespace gdn
+    {
+        struct MergedRecurrenceInput;
+        struct GDNRetainedInvocationBinding;
+        class IGDNPreparedRetainedInvocation;
+    }
+
     namespace cpu::native_vnni
     {
         struct CPUNativeVNNIPackedWeights;
@@ -4293,6 +4301,23 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Freeze a GPU retained transaction over caller-leased workspace and canonical state.
+         * @param sources Immutable raw merged inputs; no legacy state or snapshot bindings.
+         * @param binding Exact geometry, workspace views, stable manager identity and capture stream.
+         * @return Immutable invocation borrowing this kernel and caller-owned storage/source lifetimes.
+         * @throws std::logic_error On a backend without this explicit implementation.
+         * @details Preparation is cold; it never provisions live state or changes shared stream bindings.
+         */
+        virtual std::unique_ptr<gdn::IGDNPreparedRetainedInvocation> prepareRetainedInvocation(
+            const gdn::MergedRecurrenceInput &sources,
+            const gdn::GDNRetainedInvocationBinding &binding) const
+        {
+            (void)sources;
+            (void)binding;
+            throw std::logic_error("This backend has no prepared GPU retained GDN implementation");
+        }
+
         /// Reset bound GPU state on the exact producer stream.
         virtual bool resetGPUState(void *stream)
         {
@@ -4361,9 +4386,35 @@ namespace llaminar2
          *
          * When enabled for an all-position MTP verifier graph, implementations may
          * write the recurrence state after each candidate verifier row into this
-         * buffer. Layout is [rows, heads, native head matrix] in FP32; the immutable owner names
-         * its inner axes.
+         * buffer. Each row contains a complete backend state: CPUGDNStateLayout
+         * on CPU and [heads, native head matrix] FP32 storage on GPU. The
+         * immutable device owner names the matrix's inner axes.
          */
+        /**
+         * @brief Publish accepted request prefixes from an explicitly owned transaction.
+         * @param transaction Stage-owned immutable slots and checked logical geometry.
+         * @param destination Public canonical request-zero state.
+         * @param rows Accepted flattened row for each request, or negative for rejection.
+         * @return Whether every candidate was validated and atomically published.
+         */
+        virtual bool restoreCPUSharedStateRows(const CPUSharedGDNTransaction &transaction,
+            float *destination,const int *rows) {
+            (void)transaction; (void)destination; (void)rows;
+            throw std::invalid_argument("Backend does not implement explicit CPU shared GDN publication");
+        }
+        /**
+         * @brief Bind arena-backed CPU epoch checkpoints and raw log.
+         * @param slots Persistent immutable candidate payload, or null to retire it.
+         * @param slot_floats Admitted FP32 capacity of the candidate payload.
+         * @param rows Admitted flattened candidate-row capacity.
+         * @throws std::invalid_argument if a backend receives a nonempty binding
+         *         without implementing shared CPU epoch snapshots.
+         */
+        virtual void bindCPUSharedStateCapture(float *slots,size_t slot_floats,int rows) {
+            if (slots || slot_floats || rows)
+                throw std::invalid_argument("Backend does not implement CPU shared epoch snapshot binding");
+        }
+
         virtual void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
         {
             (void)workspace;
@@ -4580,7 +4631,8 @@ namespace llaminar2
          * @param A_log     Learnable log-space gate [n_heads]
          * @param dt_bias   Learnable dt bias [n_heads]
          * @param output    Output context [seq_len, n_heads * d_v]
-         * @param state     Recurrence state [n_heads, d_k, d_v] (updated in-place)
+         * @param state     Backend-owned state: CPU CPUGDNStateLayout checkpoint/history;
+         *                  GPU dense [n_heads,d_k,d_v]. Updated without partial-epoch flushes.
          * @param seq_len   Sequence length
          * @param n_heads   Number of attention heads
          * @param d_k       Key head dimension
@@ -4663,7 +4715,9 @@ namespace llaminar2
          *
          * Snapshot rows are laid out as:
          *   state_snapshots[row * snapshot_stride_floats + state_index]
-         * where state_index spans [n_heads, d_k, d_v].
+         * where state_index spans the complete backend state extent. CPU snapshots
+         * include phase and raw history from CPUGDNStateLayout; GPU snapshots
+         * contain dense [n_heads,d_k,d_v] matrices.
          * CPU implementations publish the terminal snapshot back to @p state.
          * A backend may materialize snapshots directly during recurrence, but it
          * must preserve serial-row arithmetic and may not replay rows afterward.
@@ -4973,7 +5027,8 @@ namespace llaminar2
          * @param A_log     Learnable log-space gate [n_heads]
          * @param dt_bias   Learnable dt bias [n_heads]
          * @param output    Output context [n_heads * d_v]
-         * @param state     Recurrence state [n_heads, d_k, d_v] (updated in-place)
+         * @param state     Backend-owned state: CPU CPUGDNStateLayout checkpoint/history;
+         *                  GPU dense [n_heads,d_k,d_v]. Updated without partial-epoch flushes.
          * @param n_heads   Number of attention heads
          * @param d_k       Key head dimension
          * @param d_v       Value head dimension

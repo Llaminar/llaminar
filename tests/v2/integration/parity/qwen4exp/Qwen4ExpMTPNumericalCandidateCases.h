@@ -27,6 +27,10 @@ namespace llaminar2::test::parity::qwen4exp
 inline ModelParityDefinition qwen4ExpMTPNumericalCandidateDefinition(Qwen4ExpParityTopology topology)
 {
     auto definition = qwen4ExpProductionDefinition(topology);
+    // Its paired-source retained15 Off control is distinct from main-only Off.
+    // Keep the complete numerical campaign without advertising the still
+    // unqualified sidecar as a canonical runtime/control inventory authority.
+    definition.inventory_role = ModelParityInventoryRole::NumericalDiagnostic;
     definition.model.shared_predictor = SharedPredictorGGUFSource{std::string(kPredictorModelPath)};
     definition.model.maximum_mtp_draft_depth = kModelParityRequiredMaximumMTPDepth;
     definition.features.mtp = ModelParityAxisProfile::Standard;

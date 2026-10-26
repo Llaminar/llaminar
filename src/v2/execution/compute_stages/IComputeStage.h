@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "kernels/CPUSharedGDNSnapshots.h"
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -41,6 +43,18 @@
 
 namespace llaminar2
 {
+    /** @brief Validate addressed device metadata against its actual borrowed allocation extent.
+     * @param owner Existing owner-backed device-address span, never host-loaded here.
+     * @param requests Positive request count.
+     * @param stride Positive int32 element stride between request selections.
+     * @return Whether every addressed value is inside the admitted owner view. */
+    inline bool deviceVerifierStateMetadataCovers(std::span<const int> owner,
+        int requests, int stride) noexcept
+    {
+        return owner.data() && requests > 0 && stride > 0 && !owner.empty() &&
+            std::size_t(requests - 1) <= (owner.size() - 1) / std::size_t(stride);
+    }
+
 
     // Forward declarations
     namespace verification
@@ -785,6 +799,7 @@ namespace llaminar2
     enum class CPUVerifierStateRestorePlanKind : uint8_t
     {
         SnapshotCopy,
+        SharedGDNPrefixScatter,
         NativeAcceptedPrefixCommit,
     };
 
@@ -799,11 +814,14 @@ namespace llaminar2
      * @brief Immutable snapshot-copy or native-prefix plan for one CPU state stage.
      *
      * SnapshotCopy exposes an already-computed source and live destination.
+     * SharedGDNPrefixScatter names immutable compact checkpoints/history and a
+     * typed accepted prefix; bytes is the complete canonical live-bank extent.
      * NativeAcceptedPrefixCommit exposes exact stage-owned write intervals;
      * its stage validates candidate indices before returning Ready. All sources,
      * intervals and owners remain stable until publication completes. The
-     * publisher validates every plan before any mutation, then runs only the
-     * explicitly declared native prefix splice, never recurrence or row replay.
+     * publisher validates every plan and source/live span before any mutation,
+     * then copies/zeros canonical bytes or performs the declared native splice.
+     * Publication never stages another full bank or replays recurrence arithmetic.
      */
     struct CPUVerifierStateRestorePlan
     {
@@ -818,15 +836,22 @@ namespace llaminar2
          * Planning validates candidate indices before returning Ready and never mutates live state.
          */
         std::span<const CPUVerifierStateRestoreDestination> native_destinations{};
+        /** @brief Immutable compact source, present only for SharedGDNPrefixScatter. */
+        std::optional<CPUSharedGDNAcceptedPrefix> shared_gdn_prefix;
 
-        /** @brief Return true for a concrete snapshot copy or a validated native prefix commit. */
+        /** @brief Reject inconsistent kind/payload combinations before publication. */
         [[nodiscard]] bool ready() const noexcept
         {
             return status == CPUVerifierStateRestorePlanStatus::Ready &&
                    ((kind == CPUVerifierStateRestorePlanKind::SnapshotCopy &&
-                     destination != nullptr && source != nullptr && bytes > 0) ||
+                     destination != nullptr && source != nullptr && bytes > 0 &&
+                     !shared_gdn_prefix && native_destinations.empty()) ||
+                    (kind == CPUVerifierStateRestorePlanKind::SharedGDNPrefixScatter &&
+                     destination != nullptr && source != nullptr && bytes > 0 &&
+                     shared_gdn_prefix.has_value() && native_destinations.empty()) ||
                     (kind == CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit &&
-                     destination == nullptr && source == nullptr && bytes == 0));
+                     destination == nullptr && source == nullptr && bytes == 0 &&
+                     !shared_gdn_prefix));
         }
     };
 
@@ -1443,15 +1468,17 @@ namespace llaminar2
          *
          * Device-resident stochastic MTP publication receives accepted-count
          * metadata in GPU memory.  Stages that implement this method must read
-         * @p device_row_index on @p stream and restore the corresponding
+         * the owner-backed device row-index view on @p stream and restore the corresponding
          * captured row without synchronizing that index or mutable stage state
          * to the host. This is the device-owned hot path used by resident MTP
          * publication; host mirror refresh must be a separate explicit action.
          */
         virtual bool restoreVerifierStateCaptureRowFromDeviceIndex(
-            const int *device_row_index,
+            std::span<const int> device_row_index_view,
             void *stream)
         {
+            if (!deviceVerifierStateMetadataCovers(device_row_index_view, 1, 1)) return false;
+            const int *device_row_index = device_row_index_view.data();
             (void)device_row_index;
             (void)stream;
             return false;
@@ -1462,7 +1489,7 @@ namespace llaminar2
          *
          * Batched device-resident MTP publication receives a device array of
          * accepted verifier rows. Implementations that override this method
-         * must read `device_row_indices[request * row_index_stride]` on
+         * must read `device_row_indices_view[request * row_index_stride]` on
          * @p stream and restore that request's mutable model state into a
          * request-owned live-state slot. A negative row index means that
          * request accepted no verifier row and its live state must be left at
@@ -1476,11 +1503,13 @@ namespace llaminar2
          * are request-aware.
          */
         virtual bool restoreVerifierStateCaptureRowsFromDeviceIndices(
-            const int *device_row_indices,
+            std::span<const int> device_row_indices_view,
             int request_count,
             int row_index_stride,
             void *stream)
         {
+            if (!deviceVerifierStateMetadataCovers(device_row_indices_view, request_count, row_index_stride)) return false;
+            const int *device_row_indices = device_row_indices_view.data();
             (void)device_row_indices;
             (void)request_count;
             (void)row_index_stride;

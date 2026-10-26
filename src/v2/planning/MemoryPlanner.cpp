@@ -1678,6 +1678,22 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     primary.local_recurrence_state_floats != primary.full_recurrence_state_floats)
                     gdn_handoff = candidate;
             }
+            // One shared source-owned candidate policy is used by this BOM
+            // and Qwen35's grouped graph lowering. Ordinary/prefill stays original.
+            std::optional<gdn_workspace::GPURetainedRecurrenceWorkspace> gdn_retained;
+            const bool owns_gdn = std::any_of(profile.tensors.begin(), profile.tensors.end(),
+                [&](const auto &tensor) { return tensor.layer_index >= cfg.first_layer &&
+                    tensor.layer_index <= last_layer && tensor.name.ends_with(".ssm_out.weight"); });
+            if (cfg.device.is_gpu() && cfg.mtp_enabled && owns_gdn)
+            {
+                const int head_start = replicated_dense_decode ? 0 :
+                    cfg.tensor_parallel_assignment ? cfg.tensor_parallel_assignment->head_start : cfg.shard_index * local_n_heads;
+                const auto state = HybridGDNStateGeometry::resolve(profile.n_heads,
+                    head_start, local_n_heads, profile.gdn_group_count, profile.gdn_time_step_rank,
+                    profile.gdn_state_size, profile.gdn_inner_size, profile.gdn_conv_kernel_size);
+                gdn_retained = gdn_workspace::selectGPUVerifierWorkspace(cfg.mtp_target_query_rows,
+                    cfg.generation_request_capacity, state.local_value_heads, state.d_k, state.d_v);
+            }
             // Workspace estimation
             workspace_bytes = WorkspaceMemoryEstimator::estimate(
                 profile,
@@ -1735,6 +1751,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         cfg.mtp_enabled
                             ? cfg.mtp_target_query_rows
                             : 0,
+                    .generation_request_capacity = cfg.generation_request_capacity,
+                    .gpu_gdn_retention = gdn_retained,
                     .mtp_dense_layout = cfg.mtp_enabled && profile.flash_next_predictor
                         ? std::optional{cfg.mtp_shifted_kv_head_layout} : std::nullopt,
                     .mtp_terminal_logits_layout =
@@ -1804,6 +1822,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         .last_layer = last_layer,
                         .total_shards = cfg.total_shards,
                         .apportioned_routed_experts = true,
+                        .generation_request_capacity = cfg.generation_request_capacity,
                         .compact_routed_expert_token_rows = compact_routed_expert_token_rows,
                     });
         }

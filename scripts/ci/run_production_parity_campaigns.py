@@ -145,7 +145,7 @@ REQUIRED_CSV_HEADERS = {
           "observed_prefix_rows,observed_live_rows,observed_row_capacity,observed_source_capacity,"
           "observed_first_required_logical_row,observed_row_offset,observed_first_row,observed_end_row,"
           "observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,observed_slice_first_row,"
-          "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row"
+          "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row,query_program_observation"
     ),
     "decode_steps.csv": (
         "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,"
@@ -172,7 +172,7 @@ REQUIRED_CSV_HEADERS = {
           "observed_prefix_rows,observed_live_rows,observed_row_capacity,observed_source_capacity,"
           "observed_first_required_logical_row,observed_row_offset,observed_first_row,observed_end_row,"
           "observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,observed_slice_first_row,"
-          "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row"
+          "observed_payload_rows,observed_payload_columns,observed_payload_elements,reference_rows,reference_first_row,query_program_observation"
     ),
     "prefix_restore.csv": (
         "backend,phase,cache_config_enabled,cache_ready,cache_bypassed,"
@@ -262,6 +262,12 @@ MTP_TRANSACTIONS_HEADER = (
     "dynamic_policy_witness_emitted_tokens,"
     "dynamic_policy_witness_serial_oracle_tokens"
 )
+MTP_ACCEPTANCE_WITNESS_HEADER = (
+    "reference_step,condition_token,authenticated_first_draft,"
+    "admitted_depth,attempted_drafts,verifier_transactions,accepted_drafts,"
+    "emitted_tokens,serial_tokens,continuation_tokens,state_byte_exact,"
+    "observed_depth,prefix_restored,adaptive_enabled"
+)
 NATIVE_VERIFIER_ROWS_HEADER = (
     "reference_step,condition_position,stage,physical_rows,row,row_elements,"
     "status,first_mismatch,grouped_bits,serial_bits,max_abs_diff,passed"
@@ -275,6 +281,7 @@ CSV_ARTIFACTS_REQUIRING_DATA = frozenset(
         "prefix_restore.csv",
         "production_path.csv",
         "mtp_native_verifier_rows.csv",
+        "mtp_acceptance_witness.csv",
     }
 )
 REQUIRED_CAMPAIGN_LABELS = {
@@ -1138,8 +1145,18 @@ def _validate_campaign_registration(
         raise ValueError(
             "campaign WORKING_DIRECTORY must be an absolute path"
         )
+    exact_cases = _exact_gtest_cases(test)
+    if any(case.startswith("Qwen4ExpMain/") for case in exact_cases):
+        # Query producers may legitimately be absent. The parity consumer must
+        # observe the actual selected program as well as independent history;
+        # authenticate the final registered environment, including overrides.
+        filters = [entry.split("=", 1)[1]
+                   for entry in _as_string_list(properties.get("ENVIRONMENT", []))
+                   if entry.startswith("LLAMINAR_PERF_STATS_FILTER=")]
+        if len(filters) != 1 or "qsa" not in filters[0].split(","):
+            raise ValueError("QFN campaign does not collect required qsa query-program PerfStats")
     return (
-        _exact_gtest_cases(test),
+        exact_cases,
         model_files,
         command,
         tuple(_as_string_list(properties.get("ENVIRONMENT", []))),
@@ -2294,6 +2311,8 @@ def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
     ):
         headers["mtp_transactions.csv"] = MTP_TRANSACTIONS_HEADER
         headers["mtp_native_verifier_rows.csv"] = NATIVE_VERIFIER_ROWS_HEADER
+    if re.search(r"(?:^|_)MTPDynamicDepth(?:_|$)", gtest_case):
+        headers["mtp_acceptance_witness.csv"] = MTP_ACCEPTANCE_WITNESS_HEADER
     return headers
 
 
@@ -2307,6 +2326,67 @@ def expected_query_snapshot_interval(prompt, decode_rows_before, live, capacity)
     # Independent complete-pool demand: floor((prefix+row+1)/4)>512.
     first = min(live, max(0, 4 * (512 + 1) - 1 - prefix))
     return prefix, first, live
+
+
+def validate_query_program_omission(text):
+    """Independently authenticate native path metadata; original history remains separate authority."""
+    import json
+    import re
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate program-observation key")
+            result[key] = value
+        return result
+    try:
+        witness = json.loads(text, object_pairs_hook=unique_object)
+        if (type(witness) is not dict or set(witness) !=
+                {"schema", "participant_source", "expected_devices", "before", "after"} or
+                witness["schema"] != "qsa.program_omission.v1" or
+                witness["participant_source"] != "admitted_rank_local_model_devices"):
+            return "invalid query program observation schema"
+        devices = witness["expected_devices"]
+        if (type(devices) is not list or not devices or
+                any(type(device) is not str or re.fullmatch(r"CPU|CUDA:[0-9]+|ROCm:[0-9]+", device) is None
+                    for device in devices) or len(set(devices)) != len(devices)):
+            return "invalid admitted query participant witness"
+        def counts(rows):
+            if type(rows) is not list:
+                raise ValueError("program records must be an array")
+            result = {}
+            for record in rows:
+                if (type(record) is not dict or set(record) != {"device", "phase", "kind", "count", "tags"} or
+                        type(record["device"]) is not str or type(record["phase"]) is not str or
+                        type(record["kind"]) is not int or type(record["count"]) is not int or
+                        not 0 <= record["count"] <= 18446744073709551615 or type(record["tags"]) is not dict or
+                        any(type(k) is not str or type(v) is not str for k, v in record["tags"].items())):
+                    raise ValueError("invalid query submission record")
+                key = (record["device"], record["phase"], record["kind"], tuple(sorted(record["tags"].items())))
+                result[key] = result.get(key, 0) + record["count"]
+                if result[key] > 18446744073709551615:
+                    raise ValueError("query counter overflow")
+            return result
+        before, after = counts(witness["before"]), counts(witness["after"])
+        if any(key not in after or after[key] < value for key, value in before.items()):
+            return "query counters reset or disappeared"
+        expected_tags = tuple(sorted({"program": "proven_no_ranking", "role": "0", "physical_rows": "1",
+            "observation": "successful_forward_submission_not_native_replay_count"}.items()))
+        submitted = set()
+        for key, value in after.items():
+            prior = before.get(key, 0)
+            if value == prior:
+                continue
+            device, phase, kind, tags = key
+            if (value - prior != 1 or device not in devices or device in submitted or
+                    phase != "decode" or kind != 0 or tags != expected_tags):
+                return "incompatible or non-fresh query program submission"
+            submitted.add(device)
+        if submitted != set(devices):
+            return "missing actual query participant submission"
+    except (ValueError, KeyError, TypeError, OverflowError) as error:
+        return f"malformed query program observation: {error}"
+    return None
 
 
 def validate_stage_checkpoint_evidence(rows, *, decode):
@@ -2326,7 +2406,7 @@ def validate_stage_checkpoint_evidence(rows, *, decode):
         "observed_row_offset", "observed_first_row", "observed_end_row", "observed_payload_row_offset",
         "observed_physical_rows", "observed_repeats_per_row", "observed_slice_first_row",
         "observed_payload_rows", "observed_payload_columns", "observed_payload_elements",
-        "reference_rows", "reference_first_row",
+        "reference_rows", "reference_first_row", "query_program_observation",
     )
     metrics = ("cosine", "cosine_drop", "rel_l2", "max_abs_diff", "snr_db", "rmse",
                "error_entropy", "routing_overlap", "routing_top1_match", "routing_weight_l1")
@@ -2363,30 +2443,50 @@ def validate_stage_checkpoint_evidence(rows, *, decode):
             # requires its own immutable transaction history, never M1 extrapolation.
             if live != 1 or before != int(row["step"]):
                 return "query checkpoint has no canonical submitted-row history"
-            integers = {field: int(row[field]) for field in proof_fields
-                        if field not in ("structural_valid", "query_empty_reason")}
-            row_capacity = integers["observed_row_capacity"]
-            expected = {
-                "observed_request_count": 1, "observed_prefix_rows": prefix,
-                "observed_live_rows": live, "observed_source_capacity": capacity,
-                "observed_first_required_logical_row": 2051, "observed_row_offset": 0,
-                "observed_first_row": first, "observed_end_row": end,
-                "observed_payload_row_offset": 0, "observed_physical_rows": row_capacity,
-                "observed_repeats_per_row": 1, "observed_slice_first_row": 0,
-                "observed_payload_rows": end-first, "observed_payload_columns": 512,
-                "observed_payload_elements": (end-first)*512,
-            }
-            if not live <= row_capacity <= capacity or any(integers[key] != value for key, value in expected.items()):
-                return "query snapshot disagrees with independent original history or coordinates"
-            reference_rows = integers["reference_rows"]
-            if reference_rows not in (live, prefix+live):
-                return "query reference extent is not original live/history rows"
-            reference_first = first if reference_rows == live else prefix+first
-            if integers["reference_first_row"] != reference_first:
-                return "query reference crop lost original row coordinates"
+            omitted = row["query_empty_reason"] == "program_omitted_ranking_not_required"
+            if omitted:
+                if first != end or kind != "unauthored_query":
+                    return "program omission contradicts independent ranking history"
+                native_fields = [field for field in proof_fields if field.startswith("observed_")]
+                if any(row[field] for field in native_fields):
+                    return "omitted query fabricates native snapshot fields"
+                program_error = validate_query_program_omission(row.get("query_program_observation", ""))
+                if program_error:
+                    return program_error
+                reference_rows = int(row["reference_rows"])
+                if reference_rows not in (live, prefix + live):
+                    return "omitted query reference extent is not original history"
+                expected_reference = first if reference_rows == live else prefix + first
+                if int(row["reference_first_row"]) != expected_reference:
+                    return "omitted query reference coordinates disagree with history"
+            else:
+                if row.get("query_program_observation", ""):
+                    return "snapshot-backed query has unexpected program witness"
+                integers = {field: int(row[field]) for field in proof_fields
+                            if field not in ("structural_valid", "query_empty_reason", "query_program_observation")}
+                row_capacity = integers["observed_row_capacity"]
+                expected = {
+                    "observed_request_count": 1, "observed_prefix_rows": prefix,
+                    "observed_live_rows": live, "observed_source_capacity": capacity,
+                    "observed_first_required_logical_row": 2051, "observed_row_offset": 0,
+                    "observed_first_row": first, "observed_end_row": end,
+                    "observed_payload_row_offset": 0, "observed_physical_rows": row_capacity,
+                    "observed_repeats_per_row": 1, "observed_slice_first_row": 0,
+                    "observed_payload_rows": end-first, "observed_payload_columns": 512,
+                    "observed_payload_elements": (end-first)*512,
+                }
+                if not live <= row_capacity <= capacity or any(integers[key] != value for key, value in expected.items()):
+                    return "query snapshot disagrees with independent original history or coordinates"
+                reference_rows = integers["reference_rows"]
+                if reference_rows not in (live, prefix+live):
+                    return "query reference extent is not original live/history rows"
+                reference_first = first if reference_rows == live else prefix+first
+                if integers["reference_first_row"] != reference_first:
+                    return "query reference crop lost original row coordinates"
+
             empty = first == end
-            if ((row["query_empty_reason"] != ("ranking_not_required" if empty else "none")) or
-                    (kind == "unauthored_query") != empty):
+            expected_reason = "program_omitted_ranking_not_required" if omitted else ("ranking_not_required" if empty else "none")
+            if row["query_empty_reason"] != expected_reason or (kind == "unauthored_query") != empty:
                 return "wrong query empty reason or authored suffix"
             if empty:
                 if (row["passed"] != "0" or row["canonical_passed"] != "0" or
@@ -2409,6 +2509,40 @@ def validate_stage_checkpoint_evidence(rows, *, decode):
             return "missing required raw or prepared query checkpoint"
     except (ValueError, KeyError, TypeError, OverflowError) as error:
         return f"malformed query checkpoint evidence: {error}"
+    return None
+
+
+def validate_mtp_acceptance_witness(rows: list[list[str]]) -> str | None:
+    """Authenticate one full-width accepting transaction and exact continuation.
+
+    Adaptive policy can legitimately reject every proposal at its original
+    workload edge. The independent positive checkpoint must still prove native
+    accepting tokens, full-depth real work and complete main-state byte parity.
+    """
+    if len(rows) != 2:
+        return "acceptance witness requires exactly one evidence row"
+    try:
+        row = dict(zip(rows[0], rows[1], strict=True))
+        emitted = [int(token) for token in row["emitted_tokens"].split(";")]
+        serial = [int(token) for token in row["serial_tokens"].split(";")]
+        condition = int(row["condition_token"])
+        draft = int(row["authenticated_first_draft"])
+        depth = int(row["admitted_depth"])
+        attempts = int(row["attempted_drafts"])
+        accepted = int(row["accepted_drafts"])
+        if (int(row["reference_step"]) < 0 or min(condition, draft) < 0 or
+                depth != 15 or int(row["observed_depth"]) != depth or
+                attempts < depth or accepted <= 0 or
+                accepted > attempts or int(row["verifier_transactions"]) <= 0):
+            return "acceptance witness has invalid checkpoint, depth or work counters"
+        if (len(emitted) < 2 or emitted != serial or min(emitted) < 0 or
+                emitted[0] != condition or emitted[1] != draft):
+            return "acceptance witness lacks authenticated serial-exact accepting tokens"
+        if (int(row["continuation_tokens"]) < 2 or row["state_byte_exact"] != "true" or
+                row["prefix_restored"] != "true" or row["adaptive_enabled"] != "true"):
+            return "acceptance witness lacks exact complete-state continuation"
+    except (ValueError, KeyError):
+        return "malformed acceptance witness evidence"
     return None
 
 
@@ -2645,6 +2779,11 @@ def validate_campaign_artifacts(
                 stage_error = validate_stage_checkpoint_evidence(rows, decode=filename == "decode_stages.csv")
                 if stage_error:
                     errors.append(f"{gtest_case}: {filename}: {stage_error}")
+                    continue
+            if filename == "mtp_acceptance_witness.csv":
+                acceptance_error = validate_mtp_acceptance_witness(rows)
+                if acceptance_error:
+                    errors.append(f"{gtest_case}: {filename}: {acceptance_error}")
                     continue
             if filename == "mtp_native_verifier_rows.csv":
                 native_error = validate_native_verifier_rows(rows)

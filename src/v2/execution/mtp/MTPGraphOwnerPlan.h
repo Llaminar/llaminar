@@ -22,6 +22,7 @@
 #include "execution/config/RuntimeConfig.h"
 #include "backends/GPUGraphMemoryContract.h"
 #include "kernels/common/SparseQueryExecutionProgram.h"
+#include "kernels/common/DeviceRequestRowRanges.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -174,6 +175,22 @@ namespace llaminar2
         [[nodiscard]] int flattenedTargetRows() const noexcept
         {
             return flattened_target_rows_;
+        }
+
+        /**
+         * @brief Publish original retained verifier request partitions for GPU setup.
+         * @return Exact request capacity and physical per-request row stride from this owner.
+         * @throws std::logic_error When this owner retains no verifier graph family.
+         * @details Generic prefill batching is deliberately not an input. The
+         * constructor already checked R*M; this cold value reads no live count
+         * and borrows no payload or independent allocation/accounting authority.
+         */
+        [[nodiscard]] DeviceRequestRowRanges retainedVerifierRequestRows() const
+        {
+            if (!retains_graph_capacity_)
+                throw std::logic_error("Verifier workspace rows require a retained MTP graph owner");
+            return DeviceRequestRowRanges::fullyActiveRequests(
+                request_capacity_, verifier_rows_per_request_);
         }
 
         /** @return Target-distribution scratch rows retained by the arena. */

@@ -6,6 +6,8 @@
  * sampling run around tiny deterministic CPU stages. Only the terminal stage
  * exposes logits; copying them to the command rank cannot hide a misplaced
  * authority. Reversing stage owners prevents rank zero/last-rank heuristics.
+ * Each model-free stage explicitly admits the host response law and records
+ * balanced begin/end forwarding; no sparse-query numerical capability is mocked.
  */
 #include "execution/global/GlobalOrchestrator.h"
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
@@ -16,6 +18,7 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <array>
+#include <optional>
 
 namespace llaminar2::test
 {
@@ -27,6 +30,34 @@ namespace llaminar2::test
         public:
             /** @param terminal Whether this stage owns the vocabulary head. */
             explicit PipelineStage(bool terminal) : terminal_(terminal) {}
+            /**
+             * @brief Admit the real immutable response policy in this no-query-consumer witness.
+             * @param request Existing response budget/depth and optional prefix provenance.
+             * @return True only for a valid, idle admission of a closed query program.
+             * No QSA/indexer graph exists here; the production registry must
+             * still forward admission to every participant instead of dropping it.
+             */
+            bool admitSparseQueryExecutionProgram(const DeviceGenerationAdmissionRequest &request) override
+            {
+                if (active_admission_ || !request.valid()) return false;
+                (void)resolveSparseQueryExecutionProgram(request);
+                active_admission_.emplace(request);
+                ++admission_begins_;
+                return true;
+            }
+            /** @brief End only an accepted response law; repeated/rollback cleanup is idempotent. */
+            void endSparseQueryExecutionProgram() noexcept override
+            {
+                if (!active_admission_) return;
+                active_admission_.reset();
+                ++admission_ends_;
+            }
+            /** @return Actual successful local admission count, retained across request resets. */
+            int admissionBegins() const noexcept { return admission_begins_; }
+            /** @return Actual local response cleanup count, retained across request resets. */
+            int admissionEnds() const noexcept { return admission_ends_; }
+            /** @return Whether the fixture still owns an unclosed response law. */
+            bool hasActiveAdmission() const noexcept { return active_admission_.has_value(); }
             /** Execute one stage; the real global runner transfers the hidden row. */
             bool forward(const int *tokens, int count) override
             {
@@ -62,6 +93,9 @@ namespace llaminar2::test
             bool configureMTPRequestStopTokens(const std::vector<int32_t> &) override { return true; }
         private:
             bool terminal_;
+            std::optional<DeviceGenerationAdmissionRequest> active_admission_;
+            int admission_begins_ = 0;
+            int admission_ends_ = 0;
             int position_ = 0;
             TensorBase *input_ = nullptr;
             std::unique_ptr<FP32Tensor> hidden_;
@@ -101,7 +135,9 @@ namespace llaminar2::test
             entry.action = *local_plan.executeStages().front();
             entry.stage_id = entry.action.stage_id;
             entry.domain_name = entry.action.domain_name;
-            entry.runner = std::make_unique<PipelineStage>(rank == tail);
+            auto local_stage = std::make_unique<PipelineStage>(rank == tail);
+            const PipelineStage *local_observer = local_stage.get();
+            entry.runner = std::move(local_stage);
             global.stage_runners.push_back(std::move(entry));
 
             RankExecutionPlan plan;
@@ -126,6 +162,9 @@ namespace llaminar2::test
             if (rank != tail)
             {
                 runner.runMPIWorkerLoop();
+                EXPECT_EQ(local_observer->admissionBegins(), 16);
+                EXPECT_EQ(local_observer->admissionEnds(), 16);
+                EXPECT_FALSE(local_observer->hasActiveAdmission());
                 return;
             }
             SamplingParams params;
@@ -155,7 +194,35 @@ namespace llaminar2::test
                 }
             }
             runner.shutdownMPIWorkers();
+            EXPECT_EQ(local_observer->admissionBegins(), 16);
+            EXPECT_EQ(local_observer->admissionEnds(), 16);
+            EXPECT_FALSE(local_observer->hasActiveAdmission());
         }
+    }
+
+    /** @brief The explicit no-consumer participant rejects invalid/replacement laws and balances cleanup. */
+    TEST(PipelineRequestAuthorityMPI, SparseQueryAdmissionIsExplicitAndBalanced)
+    {
+        PipelineStage stage(false);
+        EXPECT_FALSE(stage.admitSparseQueryExecutionProgram({}));
+        EXPECT_EQ(stage.admissionBegins(), 0);
+        EXPECT_EQ(stage.admissionEnds(), 0);
+        DeviceGenerationAdmissionRequest request{
+            .request_count = 1, .max_new_tokens = 8,
+            .depth_policy = sampling_math::DeviceGenerationPolicy::ordinary()};
+        request.initial_target_counts.emplace(std::vector<int>{3});
+        ASSERT_TRUE(stage.admitSparseQueryExecutionProgram(request));
+        EXPECT_TRUE(stage.hasActiveAdmission());
+        EXPECT_FALSE(stage.admitSparseQueryExecutionProgram(request));
+        EXPECT_EQ(stage.admissionBegins(), 1);
+        stage.endSparseQueryExecutionProgram();
+        stage.endSparseQueryExecutionProgram();
+        EXPECT_FALSE(stage.hasActiveAdmission());
+        EXPECT_EQ(stage.admissionEnds(), 1);
+        ASSERT_TRUE(stage.admitSparseQueryExecutionProgram(request));
+        stage.endSparseQueryExecutionProgram();
+        EXPECT_EQ(stage.admissionBegins(), 2);
+        EXPECT_EQ(stage.admissionEnds(), 2);
     }
 
     TEST(PipelineRequestAuthorityMPI, RankOneTailStochastic) { provePipeline(1, 0.7f); }

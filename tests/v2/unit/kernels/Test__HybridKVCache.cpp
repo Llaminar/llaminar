@@ -12,9 +12,11 @@
 
 #include <gtest/gtest.h>
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
+#include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
 #include "kernels/HybridKVCacheConfig.h"
 #include "kernels/HybridGDNStateGeometry.h"
+#include "kernels/CPUSharedGDNSnapshots.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
@@ -26,6 +28,10 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <bit>
+#include <limits>
+#include <cmath>
+#include "utils/OpenMPUtils.h"
 #include <utility>
 #include <vector>
 
@@ -166,6 +172,17 @@ namespace llaminar2::test
     // =============================================================================
 
     /** @brief Equal local/full geometry owns one request-backed live bank. */
+    TEST(Test__HybridGDNStateGeometry, ZeroLayersOwnNoCPUCheckpointHistory)
+    {
+        const HybridGDNStateGeometry absent;
+        EXPECT_EQ(absent.localPayloadBytes(0), 0u);
+        EXPECT_THROW((void)absent.localPayloadBytes(-1), std::invalid_argument);
+        EXPECT_THROW((void)absent.localPayloadBytes(1), std::invalid_argument);
+        const auto present = HybridGDNStateGeometry::resolve(4, 0, 4, 2, 4, 2, 8, 4);
+        EXPECT_EQ(present.localPayloadBytes(0), 0u);
+        EXPECT_GT(present.localPayloadBytes(1), 0u);
+    }
+
     TEST(Test__HybridGDNStateGeometry,
          UnshardedArenaDoesNotPriceAnImaginaryPrimaryBank)
     {
@@ -196,7 +213,9 @@ namespace llaminar2::test
                 /*request_capacity=*/1),
             320u);
         EXPECT_EQ(geometry.deviceSerializedPayloadBytes(1), 192u);
-        EXPECT_EQ(geometry.localPayloadBytes(1), 192u);
+        // Four heads: phase + 2x2 checkpoint + eight (2+2+2) raw records.
+        EXPECT_EQ(geometry.cpuLocalRecurrenceStateFloats(), 212);
+        EXPECT_EQ(geometry.localPayloadBytes(1), 976u);
     }
 
     /** @brief Modulo-linked K/V sharding uses exact weight/runtime ownership. */
@@ -348,8 +367,8 @@ namespace llaminar2::test
         EXPECT_EQ(state->d_v, 64);
         EXPECT_EQ(state->conv_kernel_size, 4);
 
-        // Recurrence state: n_v_heads * d_k * d_v = 16 * 64 * 64 = 65536
-        EXPECT_EQ(state->recurrence_state.size(), 65536u);
+        // Sixteen complete heads: phase + 64x64 checkpoint + eight 130-float records.
+        EXPECT_EQ(state->recurrence_state.size(), 82192u);
 
         // Conv state: qkv_dim * (conv_kernel - 1)
         // qkv_dim = 2 * n_k_heads * d_k + n_v_heads * d_v = 2*4*64 + 16*64 = 512 + 1024 = 1536
@@ -549,6 +568,8 @@ namespace llaminar2::test
         EXPECT_GT(metadata.host_bytes, 0u);
         EXPECT_EQ(metadata.device_bytes, 0u);
         EXPECT_FALSE(metadata.has_device_kernel_state);
+        EXPECT_EQ(metadata.host_encoding, HybridPrefixHostEncoding::CPUFixedEpochPackedV2);
+        EXPECT_GT(metadata.host_serialized_capacity_bytes, 0u);
     }
 
     TEST_F(Test__CPUHybridKVCache, HybridPrefixStateDescriptorDefaultsToSynchronousCompletion)
@@ -557,6 +578,9 @@ namespace llaminar2::test
         EXPECT_TRUE(desc.synchronize);
         EXPECT_TRUE(desc.include_host_state);
         EXPECT_TRUE(desc.include_device_state);
+        EXPECT_EQ(desc.purpose, HybridPrefixStatePurpose::DurablePrefix);
+        EXPECT_EQ(desc.host_encoding, HybridPrefixHostEncoding::None);
+        EXPECT_EQ(desc.host_payload_bytes, 0u);
     }
 
     TEST_F(Test__CPUHybridKVCache, PrefixPayloadLayoutCountsFALayersAndHybridState)
@@ -574,10 +598,12 @@ namespace llaminar2::test
         EXPECT_GT(layout.bytes_per_fa_layer_k, 0u);
         EXPECT_GT(layout.bytes_per_fa_layer_v, 0u);
         EXPECT_TRUE(layout.includes_hybrid_state);
-        EXPECT_EQ(layout.hybrid_host_state_bytes, cache->gdnMemoryBytes());
+        EXPECT_EQ(layout.hybrid_host_state_bytes, cache->hybridPrefixStateMetadata().host_serialized_capacity_bytes);
+        EXPECT_EQ(layout.hybrid_host_state_capacity_bytes, layout.hybrid_host_state_bytes);
+        EXPECT_EQ(layout.hybrid_host_encoding, HybridPrefixHostEncoding::CPUFixedEpochPackedV2);
         EXPECT_EQ(layout.hybrid_device_state_bytes, 0u);
-        EXPECT_EQ(layout.hybrid_state_bytes, cache->gdnMemoryBytes());
-        EXPECT_EQ(layout.totalBytes(), layout.faKVBytes() + cache->gdnMemoryBytes());
+        EXPECT_EQ(layout.hybrid_state_bytes, layout.hybrid_host_state_bytes);
+        EXPECT_EQ(layout.totalBytes(), layout.faKVBytes() + layout.hybrid_host_state_bytes);
     }
 
     TEST_F(Test__CPUHybridKVCache, PrefixPayloadLayoutAndLogicalIOUsePPStageGlobalLayerIds)
@@ -692,6 +718,9 @@ namespace llaminar2::test
         constexpr uint8_t kGuard = 0xCD;
         std::vector<uint8_t> payload(metadata.host_bytes + 4096u, kGuard);
         HybridPrefixStateDescriptor desc;
+        desc.purpose = HybridPrefixStatePurpose::LocalCheckpoint;
+        desc.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        desc.host_payload_bytes = metadata.host_bytes;
         desc.seq_idx = 0;
         desc.logical_token_count = 13;
         ASSERT_TRUE(cache->exportHybridPrefixState(desc, payload.data(), nullptr));
@@ -736,6 +765,9 @@ namespace llaminar2::test
         const HybridPrefixStateMetadata metadata = cache->hybridPrefixStateMetadata();
         std::vector<uint8_t> payload(metadata.host_bytes);
         HybridPrefixStateDescriptor desc;
+        desc.purpose = HybridPrefixStatePurpose::LocalCheckpoint;
+        desc.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        desc.host_payload_bytes = metadata.host_bytes;
         desc.seq_idx = 0;
         desc.logical_token_count = 7;
         ASSERT_TRUE(cache->exportHybridPrefixState(desc, payload.data(), nullptr));
@@ -797,6 +829,9 @@ namespace llaminar2::test
             << "fixture should exercise the parallel host-state copy threshold";
         std::vector<uint8_t> payload(metadata.host_bytes);
         HybridPrefixStateDescriptor desc;
+        desc.purpose = HybridPrefixStatePurpose::LocalCheckpoint;
+        desc.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        desc.host_payload_bytes = metadata.host_bytes;
         desc.seq_idx = 0;
         desc.logical_token_count = 11;
         ASSERT_TRUE(cache->exportHybridPrefixState(desc, payload.data(), nullptr));
@@ -827,6 +862,9 @@ namespace llaminar2::test
         ASSERT_GT(metadata.host_bytes, 0u);
 
         HybridPrefixStateDescriptor desc;
+        desc.purpose = HybridPrefixStatePurpose::LocalCheckpoint;
+        desc.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        desc.host_payload_bytes = metadata.host_bytes;
         desc.seq_idx = 0;
         desc.logical_token_count = 7;
 
@@ -961,6 +999,9 @@ namespace llaminar2::test
         const HybridPrefixStateMetadata metadata = hybrid->hybridPrefixStateMetadata();
         std::vector<uint8_t> payload(metadata.host_bytes);
         HybridPrefixStateDescriptor desc;
+        desc.purpose = HybridPrefixStatePurpose::LocalCheckpoint;
+        desc.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        desc.host_payload_bytes = metadata.host_bytes;
         desc.seq_idx = 0;
         desc.logical_token_count = 5;
         ASSERT_TRUE(hybrid->exportHybridPrefixState(desc, payload.data(), nullptr));
@@ -1167,6 +1208,9 @@ namespace llaminar2::test
         const auto metadata = cache->hybridPrefixStateMetadata();
         ASSERT_GT(metadata.host_bytes, 0u);
         HybridPrefixStateDescriptor request;
+        request.purpose = HybridPrefixStatePurpose::LocalCheckpoint;
+        request.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        request.host_payload_bytes = metadata.host_bytes;
         request.seq_idx = 0;
         request.include_device_state = false;
         request.host_recurrence_layout = L::ValueMajorKeyContiguous;
@@ -1240,6 +1284,393 @@ namespace llaminar2::test
         EXPECT_THROW(
             canonicalizeRecurrenceValuesForPrefixProbe(physical, 2, 3, static_cast<L>(255)),
             std::invalid_argument);
+    }
+
+    /** @brief Construct the real admitted square-head CPU cache on a nonzero PP interval. */
+    static std::unique_ptr<CPUHybridRingKVCacheFP32> packedEpochCache(int width)
+    {
+        HybridKVCacheConfig config;
+        config.first_layer_index = 5;
+        config.layer_types = {"gdn", "full_attention", "gdn"};
+        config.gdn_conv_kernel_size = 4;
+        config.gdn_state_size = width;
+        config.gdn_group_count = config.gdn_time_step_rank = config.n_heads = 2;
+        return std::make_unique<CPUHybridRingKVCacheFP32>(config, getTestMPIContext(),
+            3, 1, 16, 2, width, DeviceId::cpu());
+    }
+
+    /**
+     * @brief Seed original checkpoint/live history through actual scalar recurrence.
+     * @param cache Original CPU state owner on the admitted PP interval.
+     * @param incoming Base phase; heads intentionally retain unequal valid phases.
+     * @param poison_inactive True authors defensive fixture-only dead-history poison.
+     */
+    static void seedPackedEpochCache(CPUHybridRingKVCacheFP32 &cache, int incoming, bool poison_inactive = true)
+    {
+        for (int layer : {5, 7})
+        {
+            auto *state = cache.getGDNState(layer);
+            if (!state) throw std::logic_error("Missing actual CPU prefix state owner");
+            const CPUGDNStateLayout one(1, state->d_k, state->d_v);
+            const CPUGDNStateLayout full(state->n_v_heads, state->d_k, state->d_v);
+            for (int head = 0; head < state->n_v_heads; ++head)
+            {
+                CPUGatedDeltaNet kernel;
+                std::vector<float> bank(one.floats(), 0.0f), q(state->d_k), k(state->d_k),
+                    v(state->d_v), out(state->d_v);
+                const float alpha = 0.13f, beta = -0.21f, a = -0.3f, bias = 0.07f;
+                const int phase = (incoming + head * 3 + layer - 5) % CPUGDNStateLayout::kPeriod;
+                for (int row = 0; row < 8 + phase; ++row)
+                {
+                    for (int key = 0; key < state->d_k; ++key)
+                    {
+                        q[key] = std::sin(float(key * 3 + row + head + 1)) * 0.2f;
+                        k[key] = std::cos(float(key + row * 2 + layer)) * 0.3f;
+                    }
+                    for (int value = 0; value < state->d_v; ++value)
+                        v[value] = float((value * 7 + row + layer) % 13 - 6) / 32.0f;
+                    if (!kernel.recurrent_step(q.data(), k.data(), v.data(), &alpha, &beta, &a, &bias,
+                            out.data(), bank.data(), 1, state->d_k, state->d_v, true))
+                        throw std::runtime_error("Actual scalar CPU epoch seed failed");
+                }
+                // Dead history is deliberately dirty. Durable wire must omit it;
+                // internal rollback must retain those exact original bytes.
+                if (poison_inactive)
+                    std::fill(bank.begin() + one.packedHeadBytes(phase) / sizeof(float), bank.end(), -777.25f);
+                std::memcpy(state->recurrence_state.data() + static_cast<size_t>(head) * full.headFloats(),
+                            bank.data(), bank.size() * sizeof(float));
+            }
+            for (size_t value = 0; value < state->conv_state.size(); ++value)
+                state->conv_state[value] = float(static_cast<int>((value + layer) % 19) - 9) / 64.0f;
+        }
+    }
+
+    /** @return Immutable full physical bytes for an atomicity/local-image oracle only. */
+    static std::vector<uint8_t> packedEpochPhysicalBytes(const CPUHybridRingKVCacheFP32 &cache)
+    {
+        std::vector<uint8_t> bytes;
+        for (int layer : {5, 7})
+        {
+            const auto *state = cache.getGDNState(layer);
+            for (const auto *bank : {&state->recurrence_state, &state->conv_state})
+            {
+                const auto *first = reinterpret_cast<const uint8_t *>(bank->data());
+                bytes.insert(bytes.end(), first, first + bank->size() * sizeof(float));
+            }
+        }
+        return bytes;
+    }
+
+    /**
+     * @brief Compare exact live epoch spans while allowing only dead-history representation changes.
+     * @param left Original complete state before durable packing.
+     * @param right Restored complete bank with canonical inactive zeros.
+     * @param layout Original immutable head geometry.
+     * @return True for exact phase/checkpoint/live history, without materializing an epoch.
+     */
+    static bool packedEpochLogicalEqual(const std::vector<float> &left, const std::vector<float> &right,
+                                         const CPUGDNStateLayout &layout)
+    {
+        if (left.size() != static_cast<size_t>(layout.floats()) || right.size() != left.size() ||
+            !layout.valid(left.data()) || !layout.valid(right.data())) return false;
+        for (int head = 0; head < layout.heads(); ++head)
+        {
+            const auto first = static_cast<size_t>(head) * layout.headFloats();
+            if (std::bit_cast<uint32_t>(left[first]) != std::bit_cast<uint32_t>(right[first])) return false;
+            const int phase = CPUGDNStateLayout::prefixPhase(std::bit_cast<uint32_t>(left[first]));
+            if (std::memcmp(left.data() + first, right.data() + first, layout.packedHeadBytes(phase))) return false;
+        }
+        return true;
+    }
+
+    /** @brief Real cache round trips keep stable identity, compact live bytes and subsequent grouped output. */
+    TEST(Test__CPUFixedEpochPrefix, PackedPhasesAndContinuationUseStableCapacity)
+    {
+        llaminar::v2::ThreadCountGuard threads(1);
+        for (int width : {1, 3, 64, 128})
+        {
+            auto source = packedEpochCache(width), restored = packedEpochCache(width);
+            const auto stable = buildDensePrefixPayloadLayout(*source, DeviceId::cpu(), 4);
+            const auto metadata = source->hybridPrefixStateMetadata();
+            size_t smallest = std::numeric_limits<size_t>::max(), largest = 0;
+            for (int phase = 0; phase < CPUGDNStateLayout::kPeriod; ++phase)
+            {
+                SCOPED_TRACE(::testing::Message() << "DK=DV=" << width << " phase=" << phase);
+                seedPackedEpochCache(*source, phase);
+                EXPECT_EQ(buildDensePrefixPayloadLayout(*source, DeviceId::cpu(), 4), stable);
+                EXPECT_EQ(source->hybridPrefixStateMetadata().host_bytes, metadata.host_bytes);
+                EXPECT_EQ(source->hybridPrefixStateMetadata().host_serialized_capacity_bytes,
+                          metadata.host_serialized_capacity_bytes);
+                auto live = stable;
+                applyHybridPrefixPayloadExtent(live, *source, 0);
+                EXPECT_TRUE(live.compatiblePayloadShape(stable));
+                EXPECT_TRUE(stable.compatiblePayloadShape(live));
+                smallest = std::min(smallest, live.hybrid_host_state_bytes);
+                largest = std::max(largest, live.hybrid_host_state_bytes);
+                HybridPrefixStateDescriptor desc;
+                desc.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+                desc.host_payload_bytes = live.hybrid_host_state_bytes;
+                std::vector<uint8_t> wire(desc.host_payload_bytes + 16, 0x5a);
+                ASSERT_TRUE(source->exportHybridPrefixState(desc, wire.data(), nullptr));
+                for (size_t tail = desc.host_payload_bytes; tail < wire.size(); ++tail) EXPECT_EQ(wire[tail], 0x5a);
+                ASSERT_TRUE(restored->importHybridPrefixState(desc, wire.data(), nullptr));
+                for (int layer : {5, 7})
+                {
+                    const auto *original = source->getGDNState(layer);
+                    const auto *imported = restored->getGDNState(layer);
+                    const CPUGDNStateLayout layout(original->n_v_heads, original->d_k, original->d_v);
+                    EXPECT_TRUE(packedEpochLogicalEqual(original->recurrence_state, imported->recurrence_state, layout));
+                    EXPECT_EQ(std::memcmp(original->conv_state.data(), imported->conv_state.data(),
+                                          original->conv_state.size() * sizeof(float)), 0);
+                    for (int head = 0; head < layout.heads(); ++head)
+                    {
+                        const size_t first = static_cast<size_t>(head) * layout.headFloats();
+                        const int incoming = CPUGDNStateLayout::prefixPhase(std::bit_cast<uint32_t>(imported->recurrence_state[first]));
+                        for (size_t index = first + layout.packedHeadBytes(incoming) / sizeof(float);
+                             index < first + layout.headFloats(); ++index)
+                            EXPECT_EQ(std::bit_cast<uint32_t>(imported->recurrence_state[index]), 0u);
+                    }
+                    constexpr int rows = 3;
+                    const int heads = layout.heads(), dk = layout.keyWidth(), dv = layout.valueWidth();
+                    std::vector<float> q(rows * heads * dk), k(q.size()), v(rows * heads * dv),
+                        alpha(rows * heads, 0.11f), beta(rows * heads, -0.2f), a(heads, -0.3f), bias(heads, 0.07f),
+                        expected(v.size()), actual(v.size()), serial = original->recurrence_state,
+                        grouped = imported->recurrence_state;
+                    for (size_t i = 0; i < q.size(); ++i) { q[i] = float(static_cast<int>(i % 17) - 8) / 32.0f; k[i] = q[i] * 0.5f; }
+                    for (size_t i = 0; i < v.size(); ++i) v[i] = float(static_cast<int>(i % 19) - 9) / 64.0f;
+                    CPUGatedDeltaNet serial_kernel, grouped_kernel;
+                    for (int row = 0; row < rows; ++row)
+                        ASSERT_TRUE(serial_kernel.recurrent_step(q.data() + row * heads * dk, k.data() + row * heads * dk,
+                            v.data() + row * heads * dv, alpha.data() + row * heads, beta.data() + row * heads,
+                            a.data(), bias.data(), expected.data() + row * heads * dv, serial.data(), heads, dk, dv, true));
+                    ASSERT_TRUE(grouped_kernel.chunk_forward(q.data(), k.data(), v.data(), alpha.data(), beta.data(),
+                        a.data(), bias.data(), actual.data(), grouped.data(), rows, heads, dk, dv, 8, true));
+                    EXPECT_EQ(std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)), 0);
+                    EXPECT_TRUE(packedEpochLogicalEqual(serial, grouped, layout));
+                }
+            }
+            EXPECT_LT(smallest, largest);
+        }
+    }
+
+    /** @brief Every malformed durable source is rejected before any layer or convolution mutates. */
+    TEST(Test__CPUFixedEpochPrefix, PackedImportIsBoundedAtomicAndRejectsForeignEncoding)
+    {
+        llaminar::v2::ThreadCountGuard threads(1);
+        auto source = packedEpochCache(3), restored = packedEpochCache(3);
+        seedPackedEpochCache(*source, 2);
+        seedPackedEpochCache(*restored, 5);
+        auto layout = buildDensePrefixPayloadLayout(*source, DeviceId::cpu(), 4);
+        applyHybridPrefixPayloadExtent(layout, *source, 0);
+        HybridPrefixStateDescriptor desc;
+        desc.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+        desc.host_payload_bytes = layout.hybrid_host_state_bytes;
+        std::vector<uint8_t> wire(desc.host_payload_bytes);
+        ASSERT_TRUE(source->exportHybridPrefixState(desc, wire.data(), nullptr));
+        const auto before = packedEpochPhysicalBytes(*restored);
+        const auto reject = [&](const void *payload, HybridPrefixStateDescriptor request) {
+            EXPECT_FALSE(restored->importHybridPrefixState(request, payload, nullptr));
+            EXPECT_EQ(packedEpochPhysicalBytes(*restored), before);
+        };
+        for (auto encoding : {HybridPrefixHostEncoding::None, HybridPrefixHostEncoding::CPUFixedEpochLocalImage,
+                              static_cast<HybridPrefixHostEncoding>(255)})
+        {
+            auto wrong = desc; wrong.host_encoding = encoding;
+            reject(reinterpret_cast<const void *>(std::uintptr_t{1}), wrong);
+        }
+        for (size_t bytes : {size_t{0}, wire.size() - 1, wire.size() + 1, std::numeric_limits<size_t>::max()})
+        { auto wrong = desc; wrong.host_payload_bytes = bytes; reject(wire.data(), wrong); }
+        auto damaged = wire;
+        CPUGDNPrefixSectionHeader section;
+        std::memcpy(&section, wire.data(), sizeof(section));
+        section.version = 1;
+        std::memcpy(damaged.data(), &section, sizeof(section)); reject(damaged.data(), desc);
+        damaged = wire;
+        CPUGDNPrefixLayerHeader first;
+        std::memcpy(&first, wire.data() + sizeof(section), sizeof(first));
+        const size_t second = sizeof(section) + sizeof(first) + first.recurrence_bytes + first.conv_bytes;
+        CPUGDNPrefixLayerHeader last;
+        std::memcpy(&last, wire.data() + second, sizeof(last));
+        ++last.key_width;
+        std::memcpy(damaged.data() + second, &last, sizeof(last)); reject(damaged.data(), desc);
+        damaged = wire;
+        const uint32_t invalid_phase = std::bit_cast<uint32_t>(0.5f);
+        std::memcpy(damaged.data() + second + sizeof(last), &invalid_phase, sizeof(invalid_phase));
+        reject(damaged.data(), desc);
+        damaged = wire;
+        std::memcpy(&last, wire.data() + second, sizeof(last));
+        last.recurrence_bytes = std::numeric_limits<uint64_t>::max();
+        std::memcpy(damaged.data() + second, &last, sizeof(last)); reject(damaged.data(), desc);
+        auto extra = wire; extra.resize(wire.size() + 4, 0);
+        auto trailing = desc; trailing.host_payload_bytes = extra.size();
+        std::memcpy(&section, extra.data(), sizeof(section)); section.bytes = extra.size();
+        std::memcpy(extra.data(), &section, sizeof(section)); reject(extra.data(), trailing);
+        reject(restored->getGDNState(5)->recurrence_state.data(), desc);
+        reject(restored->getGDNState(7)->conv_state.data(), desc);
+        EXPECT_FALSE(source->exportHybridPrefixState(desc, source->getGDNState(7)->conv_state.data(), nullptr));
+        std::vector<uint8_t> poison(desc.host_payload_bytes, 0x6d);
+        source->getGDNState(7)->recurrence_state[0] = 8.0f;
+        EXPECT_FALSE(source->exportHybridPrefixState(desc, poison.data(), nullptr));
+        EXPECT_TRUE(std::all_of(poison.begin(), poison.end(), [](uint8_t value) { return value == 0x6d; }));
+    }
+
+    /** @brief Local rollback is a bounded complete image, including deliberately dirty inactive slots. */
+    TEST(Test__CPUFixedEpochPrefix, LocalRollbackImageRemainsByteExactAndNeverDurable)
+    {
+        llaminar::v2::ThreadCountGuard threads(1);
+        auto source = packedEpochCache(3), restored = packedEpochCache(3);
+        seedPackedEpochCache(*source, 6);
+        const auto metadata = source->hybridPrefixStateMetadata();
+        HybridPrefixStateDescriptor local;
+        local.purpose = HybridPrefixStatePurpose::LocalCheckpoint;
+        local.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochLocalImage;
+        local.host_payload_bytes = metadata.host_bytes;
+        std::vector<uint8_t> full(local.host_payload_bytes);
+        const auto before = packedEpochPhysicalBytes(*source);
+        ASSERT_TRUE(source->exportHybridPrefixState(local, full.data(), nullptr));
+        EXPECT_EQ(full, before);
+        ASSERT_TRUE(restored->importHybridPrefixState(local, full.data(), nullptr));
+        EXPECT_EQ(packedEpochPhysicalBytes(*restored), before);
+        const auto unchanged = packedEpochPhysicalBytes(*restored);
+        auto durable = local; durable.purpose = HybridPrefixStatePurpose::DurablePrefix;
+        EXPECT_FALSE(restored->importHybridPrefixState(durable, full.data(), nullptr));
+        EXPECT_EQ(packedEpochPhysicalBytes(*restored), unchanged);
+        auto packed_local = local; packed_local.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+        EXPECT_FALSE(restored->importHybridPrefixState(packed_local, full.data(), nullptr));
+        auto truncated = local; --truncated.host_payload_bytes;
+        EXPECT_FALSE(restored->importHybridPrefixState(truncated, full.data(), nullptr));
+        EXPECT_EQ(packedEpochPhysicalBytes(*restored), unchanged);
+    }
+
+    /** @brief Rectangular kernel-storage spans remain checked without inventing rectangular cache admission. */
+    TEST(Test__CPUFixedEpochPrefix, RectangularPackedHeadSpansAreChecked)
+    {
+        for (const auto [dk, dv] : {std::pair{3, 5}, std::pair{5, 3}, std::pair{1, 511}})
+        {
+            const CPUGDNStateLayout layout(2, dk, dv);
+            for (int phase = 0; phase < 8; ++phase)
+            {
+                const int other = (phase + 3) % 8;
+                std::vector<float> state(layout.floats(), -7.0f);
+                state[0] = static_cast<float>(phase); state[layout.headFloats()] = static_cast<float>(other);
+                const size_t expected = (2u * (1u + dk * dv) + (phase + other) * (dk + dv + 2u)) * sizeof(float);
+                EXPECT_EQ(layout.packedPrefixBytes(state.data()), expected);
+                std::vector<std::byte> wire(expected);
+                const size_t first = layout.packedHeadBytes(phase);
+                std::memcpy(wire.data(), state.data(), first);
+                std::memcpy(wire.data() + first, state.data() + layout.headFloats(), expected - first);
+                EXPECT_TRUE(layout.validPackedPrefix(wire));
+                EXPECT_FALSE(layout.validPackedPrefix(std::span<const std::byte>(wire.data(), wire.size() - 1)));
+                const uint32_t negative_zero = 0x80000000u;
+                std::memcpy(wire.data() + first, &negative_zero, sizeof(negative_zero));
+                EXPECT_FALSE(layout.validPackedPrefix(wire));
+            }
+        }
+        EXPECT_THROW((void)CPUGDNStateLayout(std::numeric_limits<int>::max(), 512, 512), std::overflow_error);
+    }
+
+    /** @test Durable format identity is explicit and independent of live phase or local-image length. */
+    TEST(Test__CPUFixedEpochPrefix, DurableFingerprintRejectsLocalAndDuplicateAuthorities)
+    {
+        std::vector<PrefixFingerprintField> fields;
+        for (const auto encoding : {HybridPrefixHostEncoding::None,
+             HybridPrefixHostEncoding::CPUFixedEpochLocalImage, static_cast<HybridPrefixHostEncoding>(77)})
+            EXPECT_THROW(appendCPUHostPrefixEncodingFingerprintFields(fields, encoding), std::invalid_argument);
+        EXPECT_TRUE(fields.empty());
+        appendCPUHostPrefixEncodingFingerprintFields(fields, HybridPrefixHostEncoding::CPUFixedEpochPackedV2);
+        ASSERT_EQ(fields.size(), 1u);
+        EXPECT_EQ(fields[0].name, "cpu_gdn_host_prefix_encoding");
+        EXPECT_EQ(fields[0].value, "cpu-fixed-epoch-packed-v2");
+        EXPECT_THROW(appendCPUHostPrefixEncodingFingerprintFields(fields,
+            HybridPrefixHostEncoding::CPUFixedEpochPackedV2), std::invalid_argument);
+        EXPECT_EQ(fields.size(), 1u);
+    }
+
+    /**
+     * @test Every real producer/publication preserves canonical inactive history.
+     *
+     * Dirty inactive bytes in the defensive packing tests are authored fixture
+     * poison. Cache reset, ordinary/grouped recurrence, explicit dense oracle
+     * snapshots and production compact accepted-state publication all retain
+     * exact +0 tails, so the existing physical prefix probe remains byte-valid.
+     */
+    TEST(Test__CPUFixedEpochPrefix, ProductionCanonicalTailsKeepPhysicalProbeExact)
+    {
+        llaminar::v2::ThreadCountGuard threads(1);
+        for (int width : {3, 64})
+            for (int phase = 0; phase < 8; ++phase)
+            {
+                SCOPED_TRACE(::testing::Message() << "width=" << width << " phase=" << phase);
+                auto cache = packedEpochCache(width), restored = packedEpochCache(width);
+                seedPackedEpochCache(*cache, phase, false);
+                const auto *source = cache->getGDNState(5);
+                const CPUGDNStateLayout layout(source->n_v_heads, source->d_k, source->d_v);
+                const auto canonical = [&](const float *bank) {
+                    if (!layout.valid(bank)) return false;
+                    for (int head = 0; head < layout.heads(); ++head)
+                    {
+                        const auto first = static_cast<size_t>(head) * layout.headFloats();
+                        const auto p = CPUGDNStateLayout::prefixPhase(std::bit_cast<uint32_t>(bank[first]));
+                        for (size_t i = first + layout.packedHeadBytes(p) / sizeof(float);
+                             i < first + layout.headFloats(); ++i)
+                            if (std::bit_cast<uint32_t>(bank[i]) != 0u) return false;
+                    }
+                    return true;
+                };
+                ASSERT_TRUE(canonical(source->recurrence_state.data()));
+                auto wire_layout = buildDensePrefixPayloadLayout(*cache, DeviceId::cpu(), 4);
+                applyHybridPrefixPayloadExtent(wire_layout, *cache, 0);
+                HybridPrefixStateDescriptor descriptor;
+                descriptor.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+                descriptor.host_payload_bytes = wire_layout.hybrid_host_state_bytes;
+                std::vector<uint8_t> wire(descriptor.host_payload_bytes);
+                ASSERT_TRUE(cache->exportHybridPrefixState(descriptor, wire.data(), nullptr));
+                ASSERT_TRUE(restored->importHybridPrefixState(descriptor, wire.data(), nullptr));
+                EXPECT_EQ(packedEpochPhysicalBytes(*cache), packedEpochPhysicalBytes(*restored));
+                constexpr int rows = 3;
+                const int heads=layout.heads(), dk=layout.keyWidth(), dv=layout.valueWidth();
+                std::vector<float> q(rows*heads*dk), k(q.size()), v(rows*heads*dv), alpha(rows*heads,0.12f),
+                    beta(rows*heads,-0.2f), alog(heads,-0.3f), bias(heads,0.04f);
+                for (size_t i=0;i<q.size();++i) { q[i]=float(static_cast<int>(i%13)-6)/32.0f; k[i]=q[i]*0.75f; }
+                for (size_t i=0;i<v.size();++i) v[i]=float(static_cast<int>(i%17)-8)/64.0f;
+                auto ordinary=source->recurrence_state, grouped=ordinary, dense=ordinary, compact=ordinary;
+                const auto initial=ordinary;
+                std::vector<float> serial_out(v.size()), grouped_out(v.size()), dense_out(v.size()), compact_out(v.size()),
+                    serial_states(rows*layout.floats()), snapshots(serial_states.size(),-19.0f);
+                CPUGatedDeltaNet serial_kernel, grouped_kernel, dense_kernel, compact_kernel;
+                for (int row=0;row<rows;++row)
+                {
+                    ASSERT_TRUE(serial_kernel.recurrent_step(q.data()+row*heads*dk,k.data()+row*heads*dk,
+                        v.data()+row*heads*dv,alpha.data()+row*heads,beta.data()+row*heads,alog.data(),bias.data(),
+                        serial_out.data()+row*heads*dv,ordinary.data(),heads,dk,dv,true));
+                    ASSERT_TRUE(canonical(ordinary.data()));
+                    std::copy(ordinary.begin(),ordinary.end(),serial_states.begin()+row*layout.floats());
+                }
+                ASSERT_TRUE(grouped_kernel.chunk_forward(q.data(),k.data(),v.data(),alpha.data(),beta.data(),
+                    alog.data(),bias.data(),grouped_out.data(),grouped.data(),rows,heads,dk,dv,8,true));
+                ASSERT_TRUE(canonical(grouped.data()));
+                EXPECT_EQ(std::memcmp(grouped.data(),ordinary.data(),ordinary.size()*sizeof(float)),0);
+                ASSERT_TRUE(dense_kernel.chunkForwardWithStateSnapshots(q.data(),k.data(),v.data(),alpha.data(),beta.data(),
+                    alog.data(),bias.data(),dense_out.data(),dense.data(),rows,heads,dk,dv,8,true,
+                    snapshots.data(),layout.floats(),rows));
+                EXPECT_EQ(std::memcmp(snapshots.data(),serial_states.data(),serial_states.size()*sizeof(float)),0);
+                std::vector<float> slots(CPUSharedGDNLogicalCapacity(rows,1).slotFloats(layout),-23.0f);
+                compact_kernel.bindVerifierStateCaptureWorkspace(slots.data(),rows,layout.floats());
+                compact_kernel.bindCPUSharedStateCapture(slots.data(),slots.size(),rows);
+                ASSERT_TRUE(compact_kernel.chunk_forward(q.data(),k.data(),v.data(),alpha.data(),beta.data(),
+                    alog.data(),bias.data(),compact_out.data(),compact.data(),rows,heads,dk,dv,8,true));
+                EXPECT_EQ(std::memcmp(compact.data(),initial.data(),initial.size()*sizeof(float)),0)
+                    << "Candidates never mutate the canonical owner before publication";
+                for (int row=0;row<rows;++row)
+                {
+                    ASSERT_TRUE(compact_kernel.restoreVerifierStateCaptureRow(compact.data(),row,nullptr));
+                    ASSERT_TRUE(canonical(compact.data()));
+                    EXPECT_EQ(std::memcmp(compact.data(),serial_states.data()+row*layout.floats(),
+                                          compact.size()*sizeof(float)),0);
+                }
+                for (const auto *out : {&grouped_out,&dense_out,&compact_out})
+                    EXPECT_EQ(std::memcmp(serial_out.data(),out->data(),out->size()*sizeof(float)),0);
+            }
     }
 
 } // namespace llaminar2::test

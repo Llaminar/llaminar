@@ -7,10 +7,13 @@
  * One retained graph replays large/small/empty live prefixes without recapture.
  * Independent prepared serial calls are the byte oracle; actual SingleQ8
  * dispatches authenticate primary bytes/scales, including adversarial blocks.
+ * Capture geometry follows the original source codebook and ordered short-K
+ * precedence before the grouped row/matrix policy on both native backends.
  */
 #include <gtest/gtest.h>
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/Q8ResidualGroupedGeometry.h"
+#include "kernels/common/Q8ResidualShortKGeometry.h"
 #include "kernels/common/Q8ResidualCorrection.h"
 #include "backends/BackendManager.h"
 #include "backends/ExplicitGPUStream.h"
@@ -179,15 +182,19 @@ void prove(DeviceId device){auto*backend=getBackendFor(device);require(backend&&
   const auto serialResidualScaleBytes=s.download(serialResidualScales,std::size_t(m)*k/32);
   bool checkedPrecision=false;const auto ordinaryOutput=s.download(static_cast<const float*>(baseline.gpu_data_ptr()),std::size_t(m)*n);
   s.graph=worker.createGraphCapture(s.stream);{ScopedBackendGraphCapture capture(worker,*s.graph,"Prepared two-term Q8 HC-up");require(capture.begin(),"Correction stage capture failed");require(stage.execute(context.get()),"Correction stage submission failed");capture.finish();}require(s.graph->instantiate(),"Correction stage graph instantiation failed");std::vector<GPUGraphKernelNodeInfo>nodes;std::string error;require(s.graph->inspectKernelNodes(nodes,&error),"Correction graph inspection failed");ASSERT_EQ(nodes.size(),2u);
-  const auto capturedGeometry=q8ResidualGroupedGeometry(device.is_cuda()?Q8ResidualGroupedBackend::CUDA:Q8ResidualGroupedBackend::ROCm,m,n);
+  const auto capturedBackend=device.is_cuda()?Q8ResidualGroupedBackend::CUDA:Q8ResidualGroupedBackend::ROCm;
+  const auto capturedGeometry=q8ResidualGroupedGeometry(capturedBackend,m,n,before.codebook_id);
+  const auto shortGeometry=q8ResidualShortKGeometry(capturedBackend,m,n,k,before.codebook_id);
   unsigned capturedProjectionCount=0;
   for(const auto&node:nodes) {
    EXPECT_EQ(node.local_memory_bytes_per_thread,0u);
    if(node.name.find("project")==std::string::npos)continue;
    ++capturedProjectionCount;EXPECT_TRUE(node.name_resolved);
-   EXPECT_EQ(node.block_x,static_cast<unsigned>(capturedGeometry.threads));
-   EXPECT_EQ(node.grid_x,capturedGeometry.blocks);EXPECT_EQ(node.grid_y,1u);EXPECT_EQ(node.grid_z,1u);
-   EXPECT_EQ(node.name.find("projectGrouped")!=std::string::npos,capturedGeometry.strategy==Q8ResidualGroupedStrategy::CooperativeMatrix);
+   EXPECT_EQ(node.block_x,static_cast<unsigned>(shortGeometry?shortGeometry->threads:capturedGeometry.threads));
+   EXPECT_EQ(node.grid_x,shortGeometry?shortGeometry->blocks:capturedGeometry.blocks);EXPECT_EQ(node.grid_y,1u);EXPECT_EQ(node.grid_z,1u);
+   EXPECT_EQ(node.name.find("projectShortK")!=std::string::npos,shortGeometry.has_value());
+   EXPECT_EQ(node.name.find("projectGrouped")!=std::string::npos,!shortGeometry&&capturedGeometry.strategy==Q8ResidualGroupedStrategy::CooperativeMatrix);
+   if(shortGeometry){EXPECT_EQ(node.static_shared_memory_bytes,shortGeometry->shared_bytes);EXPECT_EQ(node.dynamic_shared_memory_bytes,0u);}
   }
   ASSERT_EQ(capturedProjectionCount,1u);
   const auto signature=stage.graphCaptureVariantSignature(),ownerCount=s.owners->size(),workspaceUsed=correction.value->used();

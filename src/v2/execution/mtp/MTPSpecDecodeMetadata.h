@@ -1,4 +1,12 @@
+/**
+ * @file MTPSpecDecodeMetadata.h
+ * @brief Canonical speculative metadata workspace geometry and checked device-address projections.
+ *
+ * The workspace binding owns setup capacity; publication borrows its actual allocation
+ * extent without reading GPU values or inventing active-request-sized capacity.
+ */
 #pragma once
+#include <span>
 
 #include "MTPSpecDecodeTransaction.h"
 #include "../../backends/DeviceId.h"
@@ -458,6 +466,11 @@ namespace llaminar2
         {
             return device_pointers_;
         }
+
+        /** @brief Borrow the checked setup-owned accepted-row allocation, never an active-R extent.
+         * @return Writable device-address span; empty when the workspace binding is incomplete.
+         * @details The workspace/parent owns lifetime. No device value is read. */
+        std::span<int32_t> acceptedStateSlotIndicesView() const;
 
         const std::string &bindingError() const { return binding_error_; }
 

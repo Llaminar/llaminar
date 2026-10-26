@@ -174,12 +174,12 @@ public:
     /** @brief Consume the complete CPU publication vector with an explicit request-local slot. */
     bool restoreVerifierStateCaptureRows(const int *rows,int requestCount,void *stream) override;
     /** @brief Publish one GPU-owned accepted flat row without readback or conversion storage. */
-    bool restoreVerifierStateCaptureRowFromDeviceIndex(const int *row,void *stream) override;
+    bool restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int> row_view,void *stream) override;
     /** @brief Accepted QSA publication writes only the persistent raw partial-key bank. */
     std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept override;
 
     /** @brief Publish this request's retained state from the canonical independently-strided vector. */
-    bool restoreVerifierStateCaptureRowsFromDeviceIndices(const int *rows,int requestCount,int rowIndexStride,void *stream) override;
+    bool restoreVerifierStateCaptureRowsFromDeviceIndices(std::span<const int> rows_view,int requestCount,int rowIndexStride,void *stream) override;
     /** @brief Inspect sealed operation identity without reading live state. */
     const Params &getParams() const noexcept { return params_; }
 private:

@@ -4603,6 +4603,11 @@ TEST(Test__KVPrefixMTPStateProbe,
         state->recurrence_state[index] =
             1.0f + static_cast<float>(index) * 0.01f;
     }
+    const CPUGDNStateLayout epoch_layout(state->n_v_heads, state->d_k, state->d_v);
+    ASSERT_EQ(state->recurrence_state.size(), static_cast<size_t>(epoch_layout.floats()));
+    for (int head = 0; head < state->n_v_heads; ++head)
+        state->recurrence_state[static_cast<size_t>(head) * epoch_layout.headFloats()] = 3.0f;
+    ASSERT_TRUE(epoch_layout.valid(state->recurrence_state.data()));
     for (size_t index = 0; index < state->conv_state.size(); ++index)
     {
         state->conv_state[index] =
@@ -4622,8 +4627,12 @@ TEST(Test__KVPrefixMTPStateProbe,
         /*stream=*/nullptr,
         capture_policy);
     ASSERT_EQ(oracle.gdn_layers.size(), 1u);
+    EXPECT_EQ(oracle.gdn_layers[0].recurrence_storage, GDNStateStorage::CPUFixedEpoch);
+    EXPECT_EQ(oracle.gdn_layers[0].recurrence_epoch_phase_words.size(),
+              static_cast<size_t>(state->n_v_heads));
+    EXPECT_EQ(oracle.gdn_layers[0].recurrence_sample_values, state->recurrence_state);
 
-    state->recurrence_state[1] += 1e-4f;
+    state->recurrence_state[1] += 1e-4f; // Checkpoint payload, never phase metadata.
     state->conv_state[2] += 1e-4f;
     PrefixRuntimeStateSnapshot candidate = oracle;
     candidate.gdn_layers = inspectHybridGDNForPrefixProbe(
@@ -4654,7 +4663,43 @@ TEST(Test__KVPrefixMTPStateProbe,
         changed_epoch.gdn_numerical.elements,
         state->recurrence_state.size() + state->conv_state.size());
 
+    // Extremely permissive payload tolerances still cannot admit another
+    // epoch phase or format. Hash-only observation must retain this metadata.
+    MTPRuntimeSnapshotComparisonOptions loose = options;
+    loose.gdn_relative_l2_tolerance = 100.0;
+    loose.gdn_max_abs_tolerance = 100.0;
+    loose.gdn_min_cosine = 0.0;
+    state->recurrence_state[0] = 4.0f;
+    PrefixRuntimeStateSnapshot different_phase = candidate;
+    different_phase.gdn_layers = inspectHybridGDNForPrefixProbe(cache, nullptr, capture_policy);
+    const auto phase_mismatch = compareMTPRuntimeStateSnapshots(oracle, different_phase, loose);
+    ASSERT_FALSE(phase_mismatch);
+    EXPECT_NE(phase_mismatch.reason.find("phase/layout metadata"), std::string::npos);
     PrefixProbeCapturePolicy hashes_only;
+    different_phase.gdn_layers = inspectHybridGDNForPrefixProbe(cache, nullptr, hashes_only);
+    const auto hash_phase_mismatch = compareMTPRuntimeStateSnapshots(oracle, different_phase, loose);
+    ASSERT_FALSE(hash_phase_mismatch);
+    EXPECT_NE(hash_phase_mismatch.reason.find("phase/layout metadata"), std::string::npos);
+    state->recurrence_state[0] = 3.0f;
+    PrefixRuntimeStateSnapshot different_format = candidate;
+    different_format.gdn_layers[0].recurrence_storage = GDNStateStorage::DeviceDense;
+    const auto format_mismatch = compareMTPRuntimeStateSnapshots(oracle, different_format, loose);
+    ASSERT_FALSE(format_mismatch);
+    EXPECT_NE(format_mismatch.reason.find("storage format mismatch"), std::string::npos);
+    for (float invalid_phase : {-1.0f, 0.5f, 8.0f})
+    {
+        state->recurrence_state[0] = invalid_phase;
+        EXPECT_THROW(inspectHybridGDNForPrefixProbe(cache, nullptr, capture_policy), std::invalid_argument);
+        EXPECT_THROW(inspectHybridGDNForPrefixProbe(cache, nullptr, hashes_only), std::invalid_argument);
+    }
+    state->recurrence_state[0] = 3.0f;
+    const float last = state->recurrence_state.back();
+    state->recurrence_state.pop_back();
+    EXPECT_THROW(inspectHybridGDNForPrefixProbe(cache, nullptr, capture_policy), std::invalid_argument);
+    EXPECT_THROW(inspectHybridGDNForPrefixProbe(cache, nullptr, hashes_only), std::invalid_argument);
+    state->recurrence_state.push_back(last);
+    ASSERT_TRUE(epoch_layout.valid(state->recurrence_state.data()));
+
     PrefixRuntimeStateSnapshot incomplete_candidate = candidate;
     incomplete_candidate.gdn_layers = inspectHybridGDNForPrefixProbe(
         cache,

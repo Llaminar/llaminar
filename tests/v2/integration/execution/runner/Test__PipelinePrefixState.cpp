@@ -17,12 +17,14 @@
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
+#include "kernels/HybridKVCacheConfig.h"
 #include "kernels/IHybridKVCache.h"
 #include "models/qwen35/Qwen35Graph.h"
 #include "planning/MemoryPlanner.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/TensorKernels.h"
 #include "../../../mocks/MockModelContext.h"
+#include "../../../fixtures/CPUGDNStateTestUtils.h"
 #include "../../backends/MTPMainForwardReadRetirementProof.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/global/GlobalOrchestrator.h"
@@ -319,7 +321,18 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                             ASSERT_TRUE(hybrid->getRecurrenceKernel(0)->importState(
                                 state_values.data(), nullptr, stream));
                         else
-                            std::copy(state_values.begin(), state_values.end(), hybrid->getRecurrenceState(0));
+                        {
+                            // CPU owns phase/checkpoint/history, not a dense matrix
+                            // beginning at element zero. Preserve the original dense
+                            // checkpoint pattern at a canonical phase-zero boundary.
+                            auto *state = hybrid->getGDNState(0);
+                            ASSERT_NE(state, nullptr);
+                            const auto encoded = encodeCPUGDNTestState(state_values,
+                                state->n_v_heads, state->d_k, state->d_v);
+                            ASSERT_EQ(encoded.size(), state->recurrence_state.size());
+                            ASSERT_EQ(hybrid->getRecurrenceState(0), state->recurrence_state.data());
+                            std::copy(encoded.begin(), encoded.end(), state->recurrence_state.begin());
+                        }
                     };
                     const auto expect_state = [&](float expected)
                     {
@@ -330,7 +343,20 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                             ASSERT_TRUE(getBackendFor(device)->synchronizeStream(stream, 0));
                         }
                         else
-                            std::copy_n(hybrid->getRecurrenceState(0), state_values.size(), state_values.begin());
+                        {
+                            const auto *state = hybrid->getGDNState(0);
+                            ASSERT_NE(state, nullptr);
+                            const std::vector<float> dense_expected(state_values.size(), expected);
+                            const auto encoded_expected = encodeCPUGDNTestState(dense_expected,
+                                state->n_v_heads, state->d_k, state->d_v);
+                            ASSERT_EQ(encoded_expected.size(), state->recurrence_state.size());
+                            // Verify the physical phase and inactive zeros as well as
+                            // the independently interpreted original matrix payload.
+                            EXPECT_EQ(std::memcmp(state->recurrence_state.data(), encoded_expected.data(),
+                                                  encoded_expected.size() * sizeof(float)), 0);
+                            state_values = materializeCPUGDNTestState(state->recurrence_state,
+                                state->n_v_heads, state->d_k, state->d_v);
+                        }
                         EXPECT_TRUE(std::all_of(state_values.begin(), state_values.end(),
                             [expected](float value) { return value == expected; }));
                     };

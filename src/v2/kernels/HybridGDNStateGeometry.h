@@ -14,6 +14,7 @@
 
 #include "config/GDNHeadAssignment.h"
 #include "kernels/common/GDNRecurrenceStateLayout.h"
+#include "kernels/CPUGDNStateLayout.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -221,15 +222,31 @@ namespace llaminar2
                        full_recurrence_state_floats;
         }
 
+        /** @return Complete local CPU checkpoint/history bank, including phase. */
+        [[nodiscard]] int cpuLocalRecurrenceStateFloats() const
+        {
+            return CPUGDNStateLayout(local_value_heads, d_k, d_v).floats();
+        }
+
+        /** @return Complete global CPU checkpoint/history bank. */
+        [[nodiscard]] int cpuFullRecurrenceStateFloats() const
+        {
+            return CPUGDNStateLayout(full_value_heads, d_k, d_v).floats();
+        }
+
         /**
          * @brief Bytes in CPU-owned local state for @p gdn_layers layers.
          */
         [[nodiscard]] std::size_t localPayloadBytes(int gdn_layers) const
         {
             validateLayerCount(gdn_layers);
+            // Attention-only MTP still asks for its recurrent rollback BOM.
+            // Zero layers own no bank and need no recurrence geometry.
+            if (gdn_layers == 0)
+                return 0;
             const std::size_t floats = checkedSum(
                 static_cast<std::size_t>(local_conv_state_floats),
-                static_cast<std::size_t>(local_recurrence_state_floats),
+                static_cast<std::size_t>(cpuLocalRecurrenceStateFloats()),
                 "local GDN layer payload");
             return checkedProduct(
                 checkedProduct(

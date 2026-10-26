@@ -28,6 +28,9 @@
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/GDNRecurrenceStage.h"
+#include "execution/compute_stages/stages/ShortConv1dStage.h"
+#include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoERebalanceController.h"
@@ -53,6 +56,7 @@
 #include "utils/Sha256.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
+#include "transfer/TransferEngine.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/HybridKVCacheConfig.h"
@@ -68,6 +72,54 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace llaminar2
+{
+    /** @brief Model-free access to the actual accepted CPU logits publication boundary. */
+    struct DeviceGraphOrchestratorLiveStateTestAccess
+    {
+        /**
+         * @brief Invoke the actual production grouped workspace input constructor.
+         * @param ordinary Existing ordinary/prefill metadata declaration.
+         * @param owner Existing immutable generation request/row authority.
+         * @return The same grouped input metadata submitted by the family manifest.
+         */
+        static ForwardInput groupedWorkspaceInput(
+            const ForwardInput &ordinary, const MTPGraphOwnerPlan &owner)
+        {
+            return DeviceGraphOrchestrator::groupedVerifierWorkspaceInput(ordinary, owner);
+        }
+        /** @brief Bind small CPU-owned producer/destination tensors and request identity. */
+        static void seed(DeviceGraphOrchestrator &runner,
+                         std::shared_ptr<TensorBase> producer,
+                         std::shared_ptr<TensorBase> canonical, uint64_t epoch)
+        {
+            runner.state_.device_id = DeviceId::cpu();
+            runner.state_.all_position_logits = std::move(producer);
+            runner.state_.logits = std::move(canonical);
+            runner.session_epoch_ = epoch;
+            runner.prefix_layout_.terminal_logits_bytes = 8 * sizeof(float);
+        }
+        /** @brief Invoke the production copy, coherence and scalar-publication operation. */
+        static bool publish(DeviceGraphOrchestrator &runner,
+                            const PrefixLogitsRowSelection &selection)
+        {
+            return runner.publishCPUAcceptedVerifierLogits(selection);
+        }
+        /** @brief Observe the real prefix/archive authority, not just canonical tensor bytes. */
+        static const TensorBase *current(DeviceGraphOrchestrator &runner)
+        {
+            const auto view = runner.currentPrefixArchiveLogits();
+            return view ? view->tensor : nullptr;
+        }
+        /** @brief Cross the production publication's request-epoch invalidation boundary. */
+        static void resetPublication(DeviceGraphOrchestrator &runner)
+        {
+            ++runner.session_epoch_;
+            runner.clearCurrentMainLogitsPublication("accepted_logits_unit_request_reset");
+        }
+    };
+}
 
 using namespace llaminar2;
 
@@ -6179,3 +6231,161 @@ TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPCallbackRejectingOut
     EXPECT_EQ(lw0.wq, nullptr);
 }
 // - DeviceWorkspaceManager allocation verification
+
+/** @brief Accepted row bytes, coherence and current scalar owner advance together. */
+TEST_F(Test__DeviceGraphOrchestrator, AcceptedVerifierTerminalLogitsPublishSelectedRowAndReset)
+{
+    auto config = config_;
+    config.vocab_size = 8;
+    auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator runner(builder);
+    auto producer = std::make_shared<FP32Tensor>(std::vector<size_t>{3, 8});
+    auto canonical = std::make_shared<FP32Tensor>(std::vector<size_t>{1, 8});
+    auto *values = static_cast<float *>(producer->raw_mutable_data());
+    ASSERT_NE(values, nullptr);
+    for (size_t row = 0; row < 3; ++row)
+        for (size_t column = 0; column < 8; ++column)
+            values[row * 8 + column] = static_cast<float>(100 * row + column);
+    TransferEngine::publishHostWrite(producer.get());
+    DeviceGraphOrchestratorLiveStateTestAccess::seed(runner, producer, canonical, 17);
+    const PrefixLogitsRowSelection accepted(1, 3, 17);
+    ASSERT_TRUE(DeviceGraphOrchestratorLiveStateTestAccess::publish(runner, accepted));
+    EXPECT_EQ(DeviceGraphOrchestratorLiveStateTestAccess::current(runner), canonical.get());
+    ASSERT_TRUE(canonical->hostValid());
+    const auto *published = canonical->fp32_data();
+    ASSERT_NE(published, nullptr);
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    // Producer reuse cannot alter the accepted scalar authority.
+    std::fill_n(values, 24, -777.0f);
+    TransferEngine::publishHostWrite(producer.get());
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    DeviceGraphOrchestratorLiveStateTestAccess::resetPublication(runner);
+    EXPECT_EQ(DeviceGraphOrchestratorLiveStateTestAccess::current(runner), nullptr);
+    EXPECT_THROW(DeviceGraphOrchestratorLiveStateTestAccess::publish(runner, accepted),
+                 std::invalid_argument);
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], static_cast<float>(100 + column));
+    // A capacity-shaped tensor cannot certify a narrower live producer view.
+    EXPECT_FALSE(DeviceGraphOrchestratorLiveStateTestAccess::publish(
+        runner, PrefixLogitsRowSelection(0, 2, 18)));
+    ASSERT_TRUE(DeviceGraphOrchestratorLiveStateTestAccess::publish(
+        runner, PrefixLogitsRowSelection(2, 3, 18)));
+    for (size_t column = 0; column < 8; ++column)
+        EXPECT_EQ(published[column], -777.0f);
+}
+
+
+/**
+ * @test The actual grouped manifest input uses generation R rather than generic batch.
+ * @details Calls the production cold input constructor through its existing test
+ * peer, then constructs actual GPU stage requirement owners from that input.
+ * No GPU context, native memory, model, graph launch or source scan is involved.
+ */
+TEST(DeviceGraphOrchestratorWorkspaceInput, GroupedVerifierUsesGenerationRequestOwner)
+{
+    MTPRuntimeConfig config;
+    config.enabled = true;
+    config.draft_tokens = 15;
+    config.max_request_batch = 3;
+    const MTPGraphOwnerPlan owner(config);
+    int token = 4, position = 0;
+    std::vector<int> ordinary_lengths(7, 9);
+    ForwardInput ordinary;
+    ordinary.graph_submission_intent = ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+    ordinary.execution_role = ForwardExecutionRole::MainInference;
+    ordinary.execution_phase = ForwardExecutionPhase::Prefill;
+    ordinary.batch_size = 7;
+    ordinary.seq_len = 9;
+    ordinary.real_seq_len = 9;
+    ordinary.bucket_seq_len = 16;
+    // Borrowed sentinels prove the constructor clears prefill authorities;
+    // neither it nor this test dereferences an alleged native device address.
+    ordinary.token_ids = &token;
+    ordinary.token_ids_device = &token;
+    ordinary.position_ids = &position;
+    ordinary.position_ids_device = &position;
+    ordinary.sequence_lengths = &ordinary_lengths;
+    ordinary.sequence_lengths_device = ordinary_lengths.data();
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        ordinary.device = device;
+        const auto grouped = DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(ordinary, owner);
+        EXPECT_EQ(grouped.batch_size, 3);
+        EXPECT_EQ(grouped.seq_len, 16);
+        EXPECT_EQ(grouped.batch_size * grouped.seq_len, owner.flattenedTargetRows());
+        EXPECT_EQ(grouped.execution_role, ForwardExecutionRole::GroupedMTPVerifier);
+        EXPECT_EQ(grouped.execution_phase, ForwardExecutionPhase::Decode);
+        EXPECT_EQ(grouped.graph_submission_intent, ForwardGraphSubmissionIntent::WorkspaceDeclaration);
+        EXPECT_EQ(grouped.position_offset, 1);
+        EXPECT_EQ(grouped.real_seq_len, 0);
+        EXPECT_EQ(grouped.bucket_seq_len, 0);
+        EXPECT_EQ(grouped.token_ids, nullptr);
+        EXPECT_EQ(grouped.token_ids_device, nullptr);
+        EXPECT_EQ(grouped.position_ids, nullptr);
+        EXPECT_EQ(grouped.position_ids_device, nullptr);
+        EXPECT_EQ(grouped.sequence_lengths, nullptr);
+        EXPECT_EQ(grouped.sequence_lengths_device, nullptr);
+        EXPECT_EQ(ordinary.batch_size, 7);
+        EXPECT_EQ(ordinary.seq_len, 9);
+        EXPECT_EQ(ordinary.execution_phase, ForwardExecutionPhase::Prefill);
+        EXPECT_EQ(ordinary.sequence_lengths, &ordinary_lengths);
+        EXPECT_EQ(ordinary.token_ids, &token);
+
+        GDNRecurrenceStage::Params rec;
+        rec.device_id = device;
+        rec.seq_len = grouped.batch_size * grouped.seq_len;
+        rec.request_count = grouped.batch_size;
+        rec.request_seq_len = grouped.seq_len;
+        rec.n_heads = 32;
+        rec.n_k_heads = 16;
+        rec.d_k = rec.d_v = 128;
+        rec.speculative_state_slot_rows = owner.flattenedTargetRows();
+        GDNRecurrenceStage recurrence(rec);
+        const auto recurrence_requirements = recurrence.getWorkspaceRequirements(grouped.seq_len);
+        const auto expected_rec = gdn_workspace::recurrenceStateFootprint(owner.flattenedTargetRows(),
+            owner.requestCapacity(), 32, 128, 128, GDNStateStorage::DeviceDense);
+        const auto actual_rec_work = std::find_if(recurrence_requirements.buffers.begin(),
+            recurrence_requirements.buffers.end(), [](const auto &buffer) {
+                return buffer.name.starts_with(GDNRecurrenceStage::WS_SPECULATIVE_STATE_WORK);
+            });
+        ASSERT_NE(actual_rec_work, recurrence_requirements.buffers.end());
+        EXPECT_EQ(actual_rec_work->size_bytes, expected_rec.work_bytes);
+
+        ShortConv1dStage::Params conv;
+        conv.device_id = device;
+        conv.seq_len = grouped.batch_size * grouped.seq_len;
+        conv.request_count = grouped.batch_size;
+        conv.request_seq_len = grouped.seq_len;
+        conv.channels = 8192;
+        conv.kernel_size = 4;
+        conv.speculative_state_slot_rows = owner.flattenedTargetRows();
+        ShortConv1dStage convolution(conv);
+        const auto conv_requirements = convolution.getWorkspaceRequirements(grouped.seq_len);
+        const auto expected_conv = gdn_workspace::shortConvStateFootprint(owner.flattenedTargetRows(),
+            owner.requestCapacity(), 8192, 4);
+        const auto actual_conv_work = std::find_if(conv_requirements.buffers.begin(),
+            conv_requirements.buffers.end(), [](const auto &buffer) {
+                return buffer.name.starts_with(ShortConv1dStage::WS_SPECULATIVE_STATE_WORK);
+            });
+        ASSERT_NE(actual_conv_work, conv_requirements.buffers.end());
+        EXPECT_EQ(actual_conv_work->size_bytes, expected_conv.work_bytes);
+    }
+    // CPU workspace discovery preserves its existing host batch semantics.
+    ordinary.device = DeviceId::cpu();
+    const auto cpu = DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(ordinary, owner);
+    EXPECT_EQ(cpu.batch_size, ordinary.batch_size);
+    EXPECT_EQ(cpu.seq_len, owner.verifierRowsPerRequest());
+    EXPECT_EQ(ordinary.batch_size, 7);
+    auto malformed = ordinary;
+    malformed.batch_size = 0;
+    EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(malformed, owner),
+        std::invalid_argument);
+    malformed = ordinary;
+    malformed.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+    EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(malformed, owner),
+        std::invalid_argument);
+    EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(
+        ordinary, MTPGraphOwnerPlan(MTPRuntimeConfig{})), std::logic_error);
+}

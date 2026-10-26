@@ -10,6 +10,7 @@
  */
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "kernels/cpu/gdn/CPUAdjustedGDNReadout.h"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -79,7 +80,8 @@ namespace llaminar2
             if (field.name == "projection_arithmetic_revision" ||
                 field.name == "gdn_projection_arithmetic" ||
                 field.name == "moe_router_arithmetic" ||
-                field.name == "cuda_router_prefill_arithmetic")
+                field.name == "cuda_router_prefill_arithmetic" ||
+                field.name == "cpu_gdn_readout_arithmetic")
                 throw std::invalid_argument("Duplicate projection prefix arithmetic authority");
         // This revision also distinguishes historical diagnostic FP16 decode,
         // whose accumulator order did not certify grouped verifier equivalence.
@@ -87,6 +89,9 @@ namespace llaminar2
         fields.push_back({"gdn_projection_arithmetic", gdn_name});
         fields.push_back({"moe_router_arithmetic", router_name});
         fields.push_back({"cuda_router_prefill_arithmetic", prefill_name});
+        // Changed readouts affect later layers' KV and recurrent state even
+        // when the current layer retains the same state-update arithmetic.
+        fields.push_back({"cpu_gdn_readout_arithmetic", std::string(kCPUGDNReadoutArithmetic)});
     }
 
     void appendQwen4ExpArithmeticFingerprintFields(
@@ -177,6 +182,17 @@ namespace llaminar2
                               std::string(gdnRecurrenceStateLayoutName(*device_layout))});
     }
 
+    void appendCPUHostPrefixEncodingFingerprintFields(std::vector<PrefixFingerprintField> &fields,
+                                                       HybridPrefixHostEncoding encoding)
+    {
+        if (encoding != HybridPrefixHostEncoding::CPUFixedEpochPackedV2)
+            throw std::invalid_argument("Durable CPU GDN prefix requires PackedV2 encoding");
+        for (const auto &field : fields)
+            if (field.name == "cpu_gdn_host_prefix_encoding")
+                throw std::invalid_argument("Duplicate CPU GDN prefix serialization authority");
+        fields.push_back({"cpu_gdn_host_prefix_encoding", "cpu-fixed-epoch-packed-v2"});
+    }
+
     PrefixFingerprintParts buildPrefixFingerprintParts(
         const PrefixFingerprintMaterial &material)
     {
@@ -232,7 +248,13 @@ namespace llaminar2
         // V16 preserves IQ4_XS source base/coefficient products instead of
         // narrowing the derived factor. Fence V15 state before payload access.
         // V17 preserves IQ3_S original factors and rejects V16 state before payload I/O.
-        hash = fnvUpdateString(hash, "prefix-cache-v17");
+        // V18 corrects CUDA grouped DP4A physical-row cursor ownership when
+        // register-bounded CTAs cover fewer rows than the logical tuning tile.
+        // V17 can retain incorrect projection outputs and all downstream KV,
+        // hybrid recurrent state and terminal observations under identical
+        // model/policy fields. Fence those archives before payload access;
+        // storage generations and CPU readout identities do not version this fix.
+        hash = fnvUpdateString(hash, "prefix-cache-v18");
 
         const std::array<std::pair<const char *, uint64_t>, 7> ordered_parts{{
             {"model", parts.model},

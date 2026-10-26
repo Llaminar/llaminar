@@ -8306,6 +8306,7 @@ TEST(Test__MTPGraphConstruction, GDNPreparedQKGraphBindingIsExplicitAndCaptureSt
     const auto* producer=std::get_if<GDNPreparedQKBinding>(&conv->getParams().qk_contract);
     const auto* consumer=std::get_if<GDNPreparedQKBinding>(&rec->getParams().qk_contract);
     ASSERT_NE(producer,nullptr);ASSERT_NE(consumer,nullptr);
+    EXPECT_FALSE(rec->getParams().gpu_retained_workspace);
     EXPECT_EQ(producer->storage,&bank);EXPECT_EQ(consumer->storage,&bank);
     auto pending=rec_node->dependencies;
     std::unordered_set<std::string> visited;
@@ -8357,9 +8358,26 @@ TEST(Test__MTPGraphConstruction, GDNPreparedQKGraphBindingIsExplicitAndCaptureSt
     verifier_config.mtp.enabled=true;verifier_config.mtp.draft_tokens=2;
     verifier_config.compute_all_position_logits=true;
     Qwen35Graph verifier_builder(verifier_config,mpi);
-    auto verifier_graph=verifier_builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,&cache,nullptr,DeviceId::rocm(0),nullptr);
+    // A selected grouped GPU program requires its declared device-count address.
+    // This device-free graph fixture borrows an inert, owned address identity:
+    // construction must propagate it without reading it or preparing GPU storage.
+    // Real device Tensor ownership/replay is covered by the native stage suite.
+    const int32_t verifier_count_identity = 1;
+    EXPECT_THROW((void)verifier_builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,
+        &cache,nullptr,DeviceId::rocm(0),nullptr),std::invalid_argument);
+    auto verifier_graph=verifier_builder.buildAttentionGraph(weights.layer,activations.buffers,0,1,1,
+        &cache,nullptr,DeviceId::rocm(0),nullptr,nullptr,&verifier_count_identity);
     const auto* verifier_rec=dynamic_cast<const GDNRecurrenceStage*>(verifier_graph.getNode("layer0_gdn_recurrence")->stage.get());
     ASSERT_NE(verifier_rec,nullptr);EXPECT_TRUE(std::holds_alternative<GDNRawQKInput>(verifier_rec->getParams().qk_contract));
+    ASSERT_TRUE(verifier_rec->getParams().gpu_retained_workspace);
+    const auto &verifier_workspace=*verifier_rec->getParams().gpu_retained_workspace;
+    EXPECT_EQ(verifier_workspace.geometry().requests(),1);
+    EXPECT_EQ(verifier_workspace.geometry().rowsPerRequest(),1);
+    EXPECT_EQ(verifier_workspace.geometry().retentionProgram().mode,gdn::GDNDenseRetentionMode::ExactCorrections);
+    EXPECT_EQ(verifier_workspace.terminalKind(),gdn::GDNDenseCompactTerminalKind::RetainedPrefixesOnly);
+    EXPECT_EQ(verifier_rec->getParams().request_seq_lens_device,&verifier_count_identity);
+    EXPECT_TRUE(verifier_rec->hasVerifierStateCapture());
+    EXPECT_FALSE(verifier_rec->isGraphCapturable());
     auto raw_owner=std::make_shared<CPUGatedDeltaNet>();state->rec_kernel=raw_owner;
     state->recurrence_layout=GDNRecurrenceStateLayout::KeyMajorValueContiguous;
     for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})

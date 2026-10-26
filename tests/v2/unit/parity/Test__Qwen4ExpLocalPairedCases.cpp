@@ -55,7 +55,22 @@ json document(const QFNCaseFamilies &families)
 TEST(Qwen4ExpLocalPairedCases, FiveExactCasesKeepAllOrdinaryAxesAndParserIntent)
 {
     const auto original = qfnOriginalCaseFamilies();
-    const auto input = document(original);
+    auto input = document(original);
+    // The source-owned CPU pilot changes numerical acceptance only. Bind the
+    // literal original case; ordinary topology, arithmetic and siblings stay
+    // under their existing declarative owners.
+    const std::string cpu_case = "Qwen4ExpMain/Qwen4ExpMainParityTest.ProductionParity/"
+        "Qwen38FlashNext_UDQ4KXL_CPU0_NgramMmap_ActFP32_KVFP16_MTPOff";
+    const json cpu_pilot = {{"path","tests/v2/integration/parity/qwen4exp/policies/cpu-mmap-hc-up-two-term-epoch-row-kl-1p2.json"},
+        {"sha256","7d9656ef9676f49494a15c21a079d1477093841b0404e42b18099e91a1bf1e3e"}};
+    size_t cpu_bindings = 0;
+    for (auto &entry : input.at("bindings"))
+        if (entry.at("exact_cell") == cpu_case)
+        {
+            entry["pilot"] = cpu_pilot;
+            ++cpu_bindings;
+        }
+    ASSERT_EQ(cpu_bindings,1u);
     ASSERT_EQ(input.at("bindings").size(),5u);
     const auto arithmetic_before = accuracy::qfnActualArithmeticIntent();
     const auto selected = qfnAttachLocalPairedCases(original,input);
@@ -84,6 +99,16 @@ TEST(Qwen4ExpLocalPairedCases, FiveExactCasesKeepAllOrdinaryAxesAndParserIntent)
             EXPECT_EQ(result[i].model.shared_predictor->path(),kPredictorModelPath);
             ASSERT_TRUE(result[i].paired_workload->qfn_arithmetic);
             EXPECT_EQ(result[i].paired_workload->qfn_arithmetic->hc_up,QuantizedActivationOperandPrecision::TwoTermQ8);
+            const auto *pilot = std::get_if<ModelParityInitialAbsolutePilot>(&result[i].paired_workload->accuracy_policy);
+            ASSERT_NE(pilot,nullptr);
+            if (family+"/Qwen4ExpMainParityTest.ProductionParity/"+result[i].testName() == cpu_case)
+            {
+                EXPECT_EQ(pilot->pilot.path,cpu_pilot.at("path").get<std::string>());
+                EXPECT_EQ(pilot->pilot.sha256,cpu_pilot.at("sha256").get<std::string>());
+                EXPECT_EQ(result[i].paired_workload->qfn_arithmetic->gdn_output,QuantizedActivationOperandPrecision::SingleQ8);
+                EXPECT_EQ(result[i].paired_workload->qfn_arithmetic->gdn_qkv,QuantizedActivationOperandPrecision::SingleQ8);
+            }
+            else EXPECT_EQ(pilot->pilot.path,"synthetic/pilot.json");
             EXPECT_EQ(result[i].mtp,ModelParityMTP::Off);
             EXPECT_EQ(result[i].retained_mtp_draft_capacity,cases[i].retained_mtp_draft_capacity);
         }

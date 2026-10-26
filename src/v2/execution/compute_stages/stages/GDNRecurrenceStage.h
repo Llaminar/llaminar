@@ -27,6 +27,11 @@
 
 #include "../IComputeStage.h"
 #include "GDNPreparedQKBinding.h"
+#include "GDNSpeculativeWorkspaceContract.h"
+#include "kernels/gdn/GDNPreparedRetainedInvocation.h"
+#include "execution/local_execution/device/WorkspaceBufferLease.h"
+#include <array>
+#include <memory>
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -41,6 +46,7 @@ namespace llaminar2
 
     class ITensorGatedDeltaNet;
     class IKVCache;
+    class CapturedDeviceStorageLease;
 
     /**
      * @brief Delta rule recurrence for GDN linear attention
@@ -60,11 +66,14 @@ namespace llaminar2
         static constexpr const char *WS_DEINTERLEAVE_SCRATCH = "gdn_deinterleave_scratch";
         static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_speculative_state_slots";
         static constexpr const char *WS_SPECULATIVE_STATE_WORK = "gdn_speculative_state_work";
+        static constexpr const char *WS_RETAINED_STATE_SLOTS = "gdn_exact_retained_state_slots_v1";
 
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
             GDNQKInputContract qk_contract=GDNRawQKInput{}; ///< Immutable raw or paired prepared program.
+            /// Cold grouped-verifier selection: exact geometry/output shared by requirements and native launch.
+            std::optional<gdn_workspace::GPURetainedRecurrenceWorkspace> gpu_retained_workspace;
 
             // Input tensors (all FP32, already projected + conv'd + RoPE'd)
             const ITensor *Q = nullptr; ///< Query  [seq_len, n_heads * d_k]
@@ -167,6 +176,19 @@ namespace llaminar2
 
         ~GDNRecurrenceStage() override = default;
 
+        /** @brief Prepare an immutable retained invocation and physical borrows before recording.
+         * @param ctx Exact participant context.
+         * @param stream Exact non-default capture stream.
+         * @return Prepared or already-identical; no arithmetic or host state read occurs.
+         * @throws std::logic_error For missing/stale ownership or a foreign recording stream.
+         * @throws std::invalid_argument For malformed native extents or default streams. */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        /** @return Retained programs prepare only at capture, never at replay. */
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        { return params_.gpu_retained_workspace ? GraphLaunchPreparationPolicy::CaptureOnly : GraphLaunchPreparationPolicy::None; }
+        /** @return Whether cold preparation can bind this exact native program. */
+        bool supportsGraphCaptureAfterLaunchPreparation() const override
+        { return params_.gpu_retained_workspace.has_value(); }
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::GDN_RECURRENCE; }
         size_t estimatedFlops() const override;
@@ -207,6 +229,7 @@ namespace llaminar2
             prefill_effective_seq_len_ = 0;
             prefill_bucket_seq_len_ = 0;
             prefill_replay_params_set_ = false;
+            if (params_.gpu_retained_workspace) return;
             if (params_.kernel)
             {
                 params_.kernel->clearGPUStreamBinding();
@@ -230,7 +253,7 @@ namespace llaminar2
             prefill_effective_seq_len_ = 0;
             prefill_bucket_seq_len_ = 0;
             prefill_replay_params_set_ = false;
-            if (params_.kernel)
+            if (params_.kernel && !params_.gpu_retained_workspace)
                 params_.kernel->clearGPUStreamBinding();
         }
 
@@ -251,6 +274,17 @@ namespace llaminar2
             return verifierStateCaptureWorkspaceRequired();
         }
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        /**
+         * @brief Publish accepted CPU request prefixes from this stage's own slots.
+         * @param host_row_indices One flattened live-row index per request; a
+         *        negative entry rejects that request and preserves its live bank.
+         * @param request_count Fixed request partition count of this graph.
+         * @param stream Unused CPU stream argument retained by the common API.
+         * @return True after the request-bank owner validates every selected head
+         *         and publishes canonical bytes; false for an invalid transaction.
+         * No shared kernel binding is changed. The explicit view borrows this
+         * stage's generation authority and arena buffers through publication.
+         */
         bool restoreVerifierStateCaptureRows(
             const int *host_row_indices,
             int request_count,
@@ -258,16 +292,23 @@ namespace llaminar2
         /**
          * @brief Expose the selected CPU recurrence snapshot as a byte-copy plan.
          *
-         * Planning binds no shared backend state and performs no copy. The
-         * central MTP publisher validates every layer plan before committing
-         * all independent recurrence matrices in one OpenMP team.
+         * @param row Candidate row, or negative to request a no-op plan.
+         * @return Ready plan borrowing immutable compact slots, NoOp for
+         *         rejection, or Invalid before mutation for malformed bindings,
+         *         metadata, candidate extents, or overlapping publication spans.
+         *
+         * Planning validates every head and returns the selected typed prefix.
+         * It binds no shared backend state and changes no work or live bytes.
+         * The central publisher validates every layer/source span before directly
+         * scattering canonical bytes with one OpenMP team. Immutable slots remain
+         * valid until this stage starts another execution, reset, or rebind.
          */
         CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override;
         /** @brief Validate every CPU request and expose exact native snapshot-copy plans before mutation. */
         bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
             std::vector<CPUVerifierStateRestorePlan> &plans) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
-            const int *device_row_index,
+            std::span<const int> device_row_index_view,
             void *stream) override;
         /**
          * @brief Restore one captured recurrent state row per request.
@@ -278,7 +319,7 @@ namespace llaminar2
          * state must be request-owned before batched publication is correct.
          */
         bool restoreVerifierStateCaptureRowsFromDeviceIndices(
-            const int *device_row_indices,
+            std::span<const int> device_row_indices_view,
             int request_count,
             int row_index_stride,
             void *stream) override;
@@ -316,12 +357,50 @@ namespace llaminar2
         const Params &getParams() const { return params_; }
 
     private:
+        /** @brief Physical owner borrows for one immutable prepared retained invocation. */
+        struct RetainedGPUInvocation final
+        {
+            DeviceWorkspaceManager *workspace = nullptr; ///< Borrowed original named-buffer manager.
+            std::uint64_t workspace_owner_identity = 0; ///< Stable manager ID, not allocator address epoch.
+            std::shared_ptr<const WorkspaceBufferLease> storage, terminal; ///< Retain original PMA claims.
+            std::array<std::shared_ptr<const CapturedDeviceStorageLease>, 6> operands;
+            std::array<std::vector<std::size_t>, 6> shapes;
+            std::array<std::size_t, 6> bytes{};
+            std::unique_ptr<gdn::IGDNPreparedRetainedInvocation> invocation; ///< Destroy before physical leases.
+        };
+        std::optional<RetainedGPUInvocation> retained_gpu_; ///< Immutable metadata only, never a live-state ledger.
+        /** @return Current exact six tensor owners in native source/output order. */
+        std::array<const TensorBase *, 6> retainedTensors() const;
+        /** @return Raw original tuple without state/snapshot owners, borrowing device live lengths.
+         * @throws std::logic_error For missing/non-FP32/foreign-device source storage. */
+        gdn::MergedRecurrenceInput retainedSources() const;
+        /** @brief Reject stale named buffers, tensor pointers/shapes, geometry or owner identity.
+         * @throws std::logic_error On any changed or absent immutable preparation. */
+        void requireRetainedInvocation() const;
+        /** @brief Launch only this stage's frozen invocation under its exact execution token.
+         * @return Native capture succeeded and normal sequence-frontier publication succeeded.
+         * @throws std::logic_error For absent/stale preparation or a foreign execution stream. */
+        bool executeRetainedInvocation();
+        /** @brief Publish an existing typed device selection without rebinding a shared kernel.
+         * @param selection Original owner-backed metadata meaning/extent.
+         * @param stream Exact publisher invocation stream, possibly different from capture.
+         * @return Successful publication; invalid or stale identity throws. */
+        bool publishRetainedInvocation(const gdn::GDNDenseAcceptedSelection &selection, void *stream);
         Params params_;
         int prefill_effective_seq_len_ = 0;
         int prefill_bucket_seq_len_ = 0;
         bool prefill_replay_params_set_ = false;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         uint32_t workspace_slice_id_ = 0;
+        /**
+         * @brief Retire this stage's candidate headers and generation before reuse.
+         * @throws std::overflow_error if its monotonically increasing generation
+         *         cannot be represented; exhaustion is a fatal lifecycle error.
+         * Only this stage's arena payload is affected. Another graph may clear or
+         * rebind a shared backend without retiring these stage-owned candidates.
+         */
+        void retireCPUVerifierCandidates();
+        uint64_t cpu_capture_generation_ = 1; ///< Stage-owned transaction lifetime; kernel rebinding cannot change it.
         bool verifier_capture_workspace_bound_ = false;
         bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
@@ -331,6 +410,13 @@ namespace llaminar2
         std::string workspaceStableId() const;
         std::string deinterleaveScratchBufferName() const;
         std::string speculativeStateSlotsBufferName() const;
+        /**
+         * @brief Select a concurrency-correct mutable recurrence bank identity.
+         * @return Role-shared GPU work name; CPU requests no mutable work buffer.
+         * GPU dependencies serialize recurrence work within a role. CPU recurrence
+         * writes retained checkpoints directly; neither inference nor publication
+         * needs a cloned complete working bank.
+         */
         std::string speculativeStateWorkBufferName() const;
         int requestedSpeculativeStateSlotRows() const;
         bool verifierStateCaptureWorkspaceRequired() const;

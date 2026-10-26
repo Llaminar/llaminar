@@ -572,9 +572,11 @@ namespace llaminar2
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRowFromDeviceIndex(
-        const int *device_row_index,
+        std::span<const int> device_row_index_view,
         void *stream)
     {
+        if (!deviceVerifierStateMetadataCovers(device_row_index_view, 1, 1)) return false;
+        const int *device_row_index = device_row_index_view.data();
         if (!hasVerifierStateCapture() || !device_row_index || !stream)
             return false;
         // Device-indexed publication must also re-establish this stage's
@@ -600,11 +602,13 @@ namespace llaminar2
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRowsFromDeviceIndices(
-        const int *device_row_indices,
+        std::span<const int> device_row_indices_view,
         int request_count,
         int row_index_stride,
         void *stream)
     {
+        if (!deviceVerifierStateMetadataCovers(device_row_indices_view, request_count, row_index_stride)) return false;
+        const int *device_row_indices = device_row_indices_view.data();
         if (!hasVerifierStateCapture() ||
             !device_row_indices ||
             request_count <= 0 ||

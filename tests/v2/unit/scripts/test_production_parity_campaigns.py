@@ -530,6 +530,37 @@ def unit_ctest_document(*names: str) -> str:
 
 
 class ProductionParityCampaignTest(unittest.TestCase):
+    def test_qfn_campaign_requires_query_program_observer_domain(self) -> None:
+        """Actual discovery admission authenticates explicit CTest filter overrides."""
+        test = json.loads(ctest_document("V2_Campaign_CPU_FP16"))["tests"][0]
+        test["command"][-1] = (
+            "--gtest_filter=Qwen4ExpMain/Qwen4ExpMainParityTest.ProductionParity/CPU0")
+        environment = next(prop["value"] for prop in test["properties"]
+                           if prop["name"] == "ENVIRONMENT")
+        for domains in ("forward_graph", "forward_graph,qsa.query_program_forward_submissions",
+                        "forward_graph,not_qsa"):
+            with self.subTest(domains=domains):
+                environment[:] = [entry for entry in environment
+                                  if not entry.startswith("LLAMINAR_PERF_STATS_FILTER=")]
+                environment.append("LLAMINAR_PERF_STATS_FILTER=" + domains)
+                with self.assertRaisesRegex(ValueError, "required qsa"):
+                    campaigns._validate_campaign_registration(test)
+        environment[:] = [entry for entry in environment
+                          if not entry.startswith("LLAMINAR_PERF_STATS_FILTER=")]
+        environment.append("LLAMINAR_PERF_STATS_FILTER=forward_graph,qsa")
+        cases, _, _, actual_environment, _ = campaigns._validate_campaign_registration(test)
+        self.assertEqual(len(cases), 1)
+        self.assertIn("LLAMINAR_PERF_STATS_FILTER=forward_graph,qsa", actual_environment)
+        environment.append("LLAMINAR_PERF_STATS_FILTER=forward_graph")
+        with self.assertRaisesRegex(ValueError, "required qsa"):
+            campaigns._validate_campaign_registration(test)
+        environment[-1] = "LLAMINAR_PERF_STATS_FILTER=forward_graph,qsa"
+        with self.assertRaisesRegex(ValueError, "required qsa"):
+            campaigns._validate_campaign_registration(test)
+        # Unrelated canonical model families retain their existing domain contract.
+        generic = json.loads(ctest_document("V2_Campaign_CPU_FP16"))["tests"][0]
+        campaigns._validate_campaign_registration(generic)
+
     def test_gpu_adaptive_complete_artifact_names_fit_without_request_identity_loss(self) -> None:
         """The real writer projection accepts all four source-declared cells and both bodies.
 
@@ -605,7 +636,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "observed_live_rows,observed_row_capacity,observed_source_capacity,observed_first_required_logical_row,"
             "observed_row_offset,observed_first_row,observed_end_row,observed_payload_row_offset,observed_physical_rows,"
             "observed_repeats_per_row,observed_slice_first_row,observed_payload_rows,observed_payload_columns,"
-            "observed_payload_elements,reference_rows,reference_first_row"
+            "observed_payload_elements,reference_rows,reference_first_row,query_program_observation"
         ).split(",")
         rows = [columns]
         for scalar_type, stage, mismatches, authority, passed in (
@@ -2265,6 +2296,58 @@ time.sleep(30)
 
         self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS) + 2)
         self.assertEqual(errors, ())
+
+    def test_dynamic_acceptance_requires_authenticated_complete_continuation(self) -> None:
+        header = campaigns.MTP_ACCEPTANCE_WITNESS_HEADER.split(",")
+        row = "2,71093,12305,15,15,1,2,71093;12305;198;464,71093;12305;198;464,2,true,15,true,true".split(",")
+        rows = [header, row]
+        self.assertIsNone(campaigns.validate_mtp_acceptance_witness(rows))
+        self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness([header]))
+        self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness(rows + [row]))
+        for field, value in (
+            ("reference_step", "-1"), ("condition_token", "271"),
+            ("authenticated_first_draft", "760"), ("admitted_depth", "1"),
+            ("attempted_drafts", "14"), ("accepted_drafts", "0"),
+            ("accepted_drafts", "16"), ("verifier_transactions", "0"),
+            ("emitted_tokens", "71093"), ("serial_tokens", "71093;760;198;464"),
+            ("continuation_tokens", "1"), ("state_byte_exact", "false"),
+            ("accepted_drafts", "nan"), ("observed_depth", "1"),
+            ("prefix_restored", "false"), ("adaptive_enabled", "false"),
+        ):
+            mutated = [list(values) for values in rows]
+            mutated[1][header.index(field)] = value
+            with self.subTest(field=field, value=value):
+                self.assertIsNotNone(campaigns.validate_mtp_acceptance_witness(mutated))
+        dynamic_headers = campaigns._required_csv_headers_for_case(
+            "Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDynamicDepth")
+        fixed_headers = campaigns._required_csv_headers_for_case(
+            "Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDepth15")
+        self.assertEqual(dynamic_headers["mtp_acceptance_witness.csv"],
+                         campaigns.MTP_ACCEPTANCE_WITNESS_HEADER)
+        self.assertNotIn("mtp_acceptance_witness.csv", fixed_headers)
+        self.assertIn("mtp_acceptance_witness.csv", campaigns.CSV_ARTIFACTS_REQUIRING_DATA)
+        cell = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=("Matrix.ProductionParity/Qwen36MoE_CPU0_MTPDynamicDepth",),
+        )
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            result_directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+            self.write_canonical_artifacts(result_directory)
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertTrue(any("missing mtp_acceptance_witness.csv" in error for error in errors))
+            path = result_directory / "mtp_acceptance_witness.csv"
+            path.write_text(campaigns.MTP_ACCEPTANCE_WITNESS_HEADER + "\n" + ",".join(row) + "\n")
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertFalse(any("mtp_acceptance_witness.csv" in error for error in errors))
+            row[header.index("state_byte_exact")] = "false"
+            path.write_text(campaigns.MTP_ACCEPTANCE_WITNESS_HEADER + "\n" + ",".join(row) + "\n")
+            _, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertTrue(any("mtp_acceptance_witness.csv" in error for error in errors))
 
     def test_native_verifier_artifacts_reject_close_or_incomplete_evidence(self) -> None:
         header = campaigns.NATIVE_VERIFIER_ROWS_HEADER.split(",")

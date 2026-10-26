@@ -102,6 +102,11 @@ class PrerequisiteReuseTests(unittest.TestCase):
                         os.utime(source, ns=(1, 1))
                 elif mutation == "delete":
                     source.unlink()
+                    # Directory timestamps may coalesce unlink with the setup
+                    # writes in one filesystem clock tick. Establish the exact
+                    # post-receipt boundary this negative control requires;
+                    # elapsed wall time is not a portable filesystem clock.
+                    os.utime(source.parent, ns=(completed + 1, completed + 1))
                 elif mutation == "add":
                     (source.parent / "new.py").write_text("new\n")
                     names += b"scripts/ci/new.py\0"

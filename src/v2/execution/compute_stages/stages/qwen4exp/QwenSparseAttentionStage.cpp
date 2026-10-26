@@ -488,15 +488,19 @@ std::span<const BufferBinding> QwenSparseAttentionStage::verifierStatePublicatio
         : std::span<const BufferBinding>{};
 }
 
-bool QwenSparseAttentionStage::restoreVerifierStateCaptureRowFromDeviceIndex(const int *row,void *stream)
+bool QwenSparseAttentionStage::restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int> row_view,void *stream)
 {
+    if (!deviceVerifierStateMetadataCovers(row_view, 1, 1)) return false;
+    const int *row = row_view.data();
     if(!device().is_gpu() || !hasVerifierStateCapture())return false;
     const auto &a=std::get<RetainCandidates>(params_.operation);
     return a.requestCount==1 && publishRetained(row,stream);
 }
 bool QwenSparseAttentionStage::restoreVerifierStateCaptureRowsFromDeviceIndices(
-    const int *rows,int requestCount,int rowIndexStride,void *stream)
+    std::span<const int> rows_view,int requestCount,int rowIndexStride,void *stream)
 {
+    if (!deviceVerifierStateMetadataCovers(rows_view, requestCount, rowIndexStride)) return false;
+    const int *rows = rows_view.data();
     if(!device().is_gpu() || !hasVerifierStateCapture() || !rows || rowIndexStride<=0)return false;
     const auto &a=std::get<RetainCandidates>(params_.operation);
     if(requestCount!=a.requestCount)return false;

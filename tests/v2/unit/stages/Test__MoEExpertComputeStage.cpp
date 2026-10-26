@@ -3125,9 +3125,15 @@ TEST_F(
         MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
 
     MoEExpertComputeStage stage(std::move(params));
+#if defined(HAVE_CUDA)
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
+#else
+    EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
+#endif
 #if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_ROCM));
+#else
+    EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::GPU_ROCM));
 #endif
 }
 

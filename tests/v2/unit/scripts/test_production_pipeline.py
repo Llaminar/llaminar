@@ -1495,6 +1495,93 @@ class RoutineGenerationPolicyTests(unittest.TestCase):
                              ["serial", "dynamic"])
             self.assertEqual(len(generation_runner.select_cells(args, generation_corpus.InventoryScope.ALL)), 6)
 
+    def test_full_inventory_excludes_only_declared_numerical_controls(self):
+        """Three real discovery roles preserve both QFN tests and unrelated Qwen36 selection."""
+        import model_parity_inventory as inventory_reader
+        helper = GenerationHTTPTests()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model, predictor = root / "model.gguf", root / "predictor.gguf"
+            model.write_bytes(b"metadata-only model identity")
+            predictor.write_bytes(b"metadata-only predictor identity")
+            main = helper.record()
+            main["model"] = str(model)
+            diagnostic = copy.deepcopy(main)
+            diagnostic.update(inventory_role="numerical_diagnostic", shared_predictor=str(predictor))
+            serial, dynamic = copy.deepcopy(main), helper.record(True)
+            serial["id"] = serial["runtime"]["generation"]["serial_control_id"] = "qwen36_serial"
+            dynamic.update(id="qwen36_dynamic", model=str(model))
+            dynamic["runtime"]["generation"].update(serial_control_id="qwen36_serial", mtp_policy="dynamic")
+            definitions = [("Main", "CPU", [main]), ("Candidate", "CPU", [diagnostic]),
+                           ("Qwen36", "CUDA", [serial, dynamic])]
+            campaigns, by_binary = [], {}
+            for suite, backend, records in definitions:
+                binary = str(root / ("v2_integration_parity_" + suite.lower() + "_matrix"))
+                cases = tuple(suite + ".ProductionParity/" + record["id"] for record in records)
+                campaigns.append(parity.CampaignCell(suite, parity.CampaignGroup(backend, "ALL"),
+                    command=(binary,), gtest_cases=cases,
+                    model_files=(str(model), str(predictor)) if suite == "Candidate" else (str(model),),
+                    working_directory=str(root)))
+                by_binary[binary] = (suite, records)
+            listed = []
+            omit_diagnostic = False
+            def list_parameters(command, **kwargs):
+                suite, records = by_binary[command[0]]
+                listed.append(suite)
+                rows = [] if omit_diagnostic and suite == "Candidate" else [
+                    {"name": "ProductionParity/" + record["id"], "value_param": json.dumps(record)} for record in records]
+                Path(command[2].removeprefix("--gtest_output=json:")).write_text(json.dumps(
+                    {"testsuites": [{"name": suite, "testsuite": rows}]}))
+            args = argparse.Namespace(mode=generation_runner.RunMode.REGRESSION, manifest=None,
+                build_dir=root, backend=".*", campaign=".*", cell=".*")
+            with patch.object(parity, "discover_campaigns", return_value=campaigns), \
+                 patch.object(inventory_reader.subprocess, "run", side_effect=list_parameters):
+                selected = generation_runner.select_cells(args)
+                self.assertEqual([item.configuration["id"] for item in selected],
+                                 ["serial", "qwen36_serial", "qwen36_dynamic"])
+                self.assertEqual(listed, ["Main", "Candidate", "Qwen36"])
+                raw = inventory_reader.discover(args, inventory_reader.InventoryScope.ALL)
+                manifest = inventory_reader.export_manifest(raw, "revision", inventory_reader.InventoryScope.ALL)
+                self.assertEqual(len(manifest["cells"]), 3)
+                self.assertFalse(any("inventory_role" in item["configuration"] for item in manifest["cells"]))
+                args.backend, args.campaign = "CUDA", ".*Qwen36.*"
+                self.assertEqual([item.configuration["id"] for item in generation_runner.select_cells(args)],
+                                 ["qwen36_serial", "qwen36_dynamic"])
+                # Numerical role never hides a missing raw CTest/GTest member.
+                omit_diagnostic = True
+                with self.assertRaisesRegex(ValueError, "CTest/GoogleTest inventory mismatch"):
+                    generation_runner.select_cells(args)
+                omit_diagnostic = False
+                # A second actual canonical authority remains fatal even when unrelated to selectors.
+                diagnostic.pop("inventory_role")
+                for backend, campaign in ((".*", ".*"), ("CUDA", ".*Qwen36.*")):
+                    args.backend, args.campaign = backend, campaign
+                    with self.subTest(backend=backend), self.assertRaisesRegex(
+                            ValueError, "ambiguous canonical generation cell identity: serial"):
+                        generation_runner.select_cells(args)
+
+    def test_inventory_roles_are_closed_and_never_runtime_eligibility(self):
+        """Unknown roles cannot silently disappear, and diagnostics cannot own HTTP tags."""
+        record = GenerationHTTPTests().record()
+        for role in (None, "", "other", 0, [], {}):
+            with self.subTest(role=role), self.assertRaisesRegex(ValueError, "unknown inventory role"):
+                generation_corpus.InventoryScope.ALL.accepts({**record, "inventory_role": role})
+        for scope in generation_corpus.InventoryScope:
+            self.assertFalse(scope.accepts({**record, "inventory_role": "numerical_diagnostic"}))
+        with self.assertRaisesRegex(ValueError, "runtime certification eligibility"):
+            generation_corpus.InventoryScope.ALL.accepts({**record, "inventory_role": "numerical_diagnostic", "e2e": {}})
+        self.assertTrue(generation_corpus.InventoryScope.ALL.accepts(record))
+        self.assertTrue(generation_corpus.InventoryScope.ALL.accepts({**record, "inventory_role": "canonical"}))
+        # A hand-written full manifest cannot smuggle a diagnostic back into
+        # corpus approval or image projection after discovery excluded it.
+        document = full_manifest()
+        document["cells"][0]["configuration"].update(inventory_role="numerical_diagnostic", e2e=None)
+        with self.assertRaisesRegex(ValueError, "outside canonical inventory authority"):
+            pipeline.e2e_projection(document, "revision")
+        sources = {path: [1, 1, 2, 1, 1] for row in document["cells"] for path in row["model_files"]}
+        with self.assertRaisesRegex(ValueError, "outside canonical inventory authority"):
+            generation_corpus.portable_inventory(document, sources)
+
     def test_mathematical_matrix_is_explicit_and_receipts_cannot_change_policy(self):
         self.assertNotIn(pipeline.Phase.PARITY, pipeline.pipeline_phases())
         self.assertIn(pipeline.Phase.PARITY, pipeline.pipeline_phases(True))
@@ -4036,11 +4123,15 @@ class InfrastructureTests(unittest.TestCase):
             self.assertIn(f"{variable}={active_prefix}", development)
         self.assertIn(f":{active_prefix}/bin:{active_prefix}/lib/llvm/bin:", development)
         self.assertIn(f"LD_LIBRARY_PATH=/usr/local/cuda/lib64:{active_prefix}/lib", development)
-        self.assertIn('cp -L "${ROCM_PATH}/lib/libamdhip64.so.7" /src/runtime-libs/libamdhip64.so.7', dockerfile)
-        self.assertIn('${ROCM_PATH}/share/licenses/llaminar-hip', dockerfile)
+        self.assertIn('HIP_RUNTIME_STAGE_PREFIX=/src/runtime-hip bash scripts/docker/install-hip-graph-runtime.sh', dockerfile)
+        self.assertNotIn('cp -L "${ROCM_PATH}/lib/libamdhip64.so.7" /src/runtime-libs/', dockerfile)
         runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1].split(
             "FROM runtime AS test-runner", 1)[0]
         self.assertIn("COPY --from=builder /src/runtime-libs/ /usr/local/lib/", runtime)
+        self.assertIn("COPY --from=builder /src/runtime-hip/ /opt/rocm-sdk/", runtime)
+        self.assertNotIn("runtime-share", dockerfile)
+        self.assertIn('/etc/ld.so.conf.d/llaminar-rocm-sdk.conf', installer)
+        self.assertIn('printf \'%s/lib\\n\' "${LLAMINAR_ROCM_ACTIVE_PREFIX}"', installer)
         self.assertIn("LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm-sdk/lib", runtime)
 
     def test_hip_runtime_reuse_authenticates_every_graph_repair(self):

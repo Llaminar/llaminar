@@ -55,6 +55,11 @@ apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-
 # compiler/library root without independently spelling a release version.
 test "$(<"${LLAMINAR_ROCM_SDK_PREFIX}/.info/version")" = "${LLAMINAR_ROCM_VERSION}"
 ln -sfn "${LLAMINAR_ROCM_SDK_PREFIX}" "${LLAMINAR_ROCM_ACTIVE_PREFIX}"
+# Core SDK packages trigger ldconfig but do not register their versioned root.
+# Only the canonical public library directory belongs in the process loader
+# cache: compiler-private LLVM paths could replace the selected OpenMP ABI.
+printf '%s/lib\n' "${LLAMINAR_ROCM_ACTIVE_PREFIX}" > /etc/ld.so.conf.d/llaminar-rocm-sdk.conf
+ldconfig
 export ROCM_PATH="${LLAMINAR_ROCM_ACTIVE_PREFIX}" HIP_PATH="${LLAMINAR_ROCM_ACTIVE_PREFIX}"
 export PATH="${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}"
 export LD_LIBRARY_PATH="${ROCM_PATH}/lib:${ROCM_PATH}/lib/llvm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"

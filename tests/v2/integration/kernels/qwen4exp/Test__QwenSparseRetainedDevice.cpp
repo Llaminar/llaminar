@@ -65,7 +65,7 @@ void prove(DeviceId device, bool outerLedger = false)
             for(auto &stage:snapshots)require(stage->execute(context.get()),"GPU immutable prior snapshot capture failed");
             for(auto &stage:stages)require(stage->execute(context.get()),"GPU retention capture failed");
             for(auto &stage:stages)require(stage->restoreVerifierStateCaptureRowsFromDeviceIndices(
-                static_cast<const int *>(decisions.gpu_data_ptr()),requests,2,stream),"GPU accepted publication capture failed");
+                std::span(static_cast<const int *>(decisions.gpu_data_ptr()), decisions.numel()),requests,2,stream),"GPU accepted publication capture failed");
             capture.finish();
         }
         EXPECT_EQ(graph->nodeCount(),requests*3u);
@@ -85,7 +85,7 @@ void prove(DeviceId device, bool outerLedger = false)
             outerPlan.retained_parent_inputs = {&prior, &retained};
             qfn_outer_publication_test::rejectMissingWrites(worker, device, stream, outerPlan, [&] {
                 require(stages.front()->restoreVerifierStateCaptureRowsFromDeviceIndices(
-                    static_cast<const int *>(decisions.gpu_data_ptr()), requests, 2, stream),
+                    std::span(static_cast<const int *>(decisions.gpu_data_ptr()), decisions.numel()), requests, 2, stream),
                     "QSA negative outer hook failed without a ledger diagnostic");
             });
         }
@@ -100,7 +100,7 @@ void prove(DeviceId device, bool outerLedger = false)
             require(capture.begin(),"GPU repeat-publication capture begin failed");
             ScopedGraphCaptureStage publicationScope(&outer);
             for(auto &stage:stages)require(stage->restoreVerifierStateCaptureRowsFromDeviceIndices(
-                static_cast<const int *>(decisions.gpu_data_ptr()),requests,2,stream),"GPU repeat-publication capture failed");
+                std::span(static_cast<const int *>(decisions.gpu_data_ptr()), decisions.numel()),requests,2,stream),"GPU repeat-publication capture failed");
             publicationScope.complete();
             capture.finish();
         }

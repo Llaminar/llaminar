@@ -8,6 +8,8 @@ import ast
 import copy
 from enum import Enum, auto
 import math
+import json
+import csv
 from pathlib import Path
 import unittest
 
@@ -17,7 +19,7 @@ ROOT=Path(__file__).resolve().parents[4]
 def pure_validators():
     """Compile only the two pure canonical validator definitions, never module imports."""
     path=ROOT/'scripts/ci/run_production_parity_campaigns.py'
-    names={'expected_query_snapshot_interval','validate_stage_checkpoint_evidence'}
+    names={'expected_query_snapshot_interval','validate_stage_checkpoint_evidence','validate_query_program_omission'}
     body=[node for node in ast.parse(path.read_text()).body
           if isinstance(node,ast.FunctionDef) and node.name in names]
     if {node.name for node in body}!=names:
@@ -39,7 +41,7 @@ def fixture(prefix):
         'observed_row_capacity,observed_source_capacity,observed_first_required_logical_row,observed_row_offset,'
         'observed_first_row,observed_end_row,observed_payload_row_offset,observed_physical_rows,observed_repeats_per_row,'
         'observed_slice_first_row,observed_payload_rows,observed_payload_columns,observed_payload_elements,'
-        'reference_rows,reference_first_row').split(',')
+        'reference_rows,reference_first_row,query_program_observation').split(',')
     empty=prefix<2051
     result=[columns]
     for stage in ('QSA_INDEXER_RAW_QUERY','QSA_INDEXER_QUERY'):
@@ -173,6 +175,81 @@ class QwenSparseQuerySnapshotEvidence(unittest.TestCase):
         self.assertEqual(mapping[stage.QSA_INDEXER_RAW_QUERY],'QSA_INDEXER_RAW_QUERY')
         self.assertEqual(mapping[stage.QSA_INDEXER_QUERY],'QSA_INDEXER_QUERY')
         self.assertNotEqual(stage.QSA_INDEXER_RAW_QUERY,stage.QSA_INDEXER_QUERY)
+
+
+
+def omission_fixture():
+    """Author actual path metadata independently of native snapshot coordinates."""
+    rows = fixture(2050)
+    tags = {"program": "proven_no_ranking", "role": "0", "physical_rows": "1",
+            "observation": "successful_forward_submission_not_native_replay_count"}
+    witness = {"schema": "qsa.program_omission.v1", "participant_source": "admitted_rank_local_model_devices",
+        "expected_devices": ["CPU"], "before": [{"device": "CPU", "phase": "decode", "kind": 0, "count": 7, "tags": tags}],
+        "after": [{"device": "CPU", "phase": "decode", "kind": 0, "count": 8, "tags": tags}]}
+    for values in rows[1:]:
+        for i, field in enumerate(rows[0]):
+            if field.startswith("observed_"): values[i] = ""
+            if field == "query_empty_reason": values[i] = "program_omitted_ranking_not_required"
+            if field == "query_program_observation": values[i] = json.dumps(witness)
+    return rows
+
+
+class ProgramOmissionCSV(unittest.TestCase):
+    def test_admitted_cuda_rocm_and_mixed_participant_sets_are_exact(self):
+        """Every actual participant witness needs one fresh matching path record."""
+        check = pure_validators()["validate_stage_checkpoint_evidence"]
+        sets = [[f"{backend}:{ordinal}" for ordinal in range(degree)]
+                for backend in ("CUDA", "ROCm") for degree in (1, 2, 4, 8)]
+        sets.append(["CPU", "CUDA:0", "ROCm:1"])
+        for devices in sets:
+            with self.subTest(devices=devices):
+                rows = omission_fixture()
+                index = rows[0].index("query_program_observation")
+                for values in rows[1:]:
+                    witness = json.loads(values[index])
+                    before, after = witness["before"][0], witness["after"][0]
+                    witness["expected_devices"] = devices
+                    witness["before"] = [{**before, "device": device} for device in devices]
+                    witness["after"] = [{**after, "device": device} for device in devices]
+                    values[index] = json.dumps(witness)
+                self.assertIsNone(check(rows, decode=True))
+                mutations = (
+                    lambda w: w["after"].pop(),
+                    lambda w: w["expected_devices"].append(devices[0]),
+                    lambda w: w["expected_devices"].pop(),
+                    lambda w: w["after"].append({**w["after"][0], "device": "CUDA:99", "count": 1}),
+                    lambda w: w["after"].append(copy.deepcopy(w["after"][0])),
+                    lambda w: w["after"][-1].update(count=6),
+                    lambda w: w["after"][-1].update(count=7),
+                )
+                for mutation in mutations:
+                    broken = copy.deepcopy(rows)
+                    for values in broken[1:]:
+                        witness = json.loads(values[index])
+                        mutation(witness)
+                        values[index] = json.dumps(witness)
+                    self.assertIsNotNone(check(broken, decode=True))
+
+    def test_typed_program_rows_require_both_path_and_history(self):
+        check = pure_validators()["validate_stage_checkpoint_evidence"]
+        rows = omission_fixture()
+        self.assertIsNone(check(rows, decode=True))
+        for mutate in (lambda w: w["after"][0].update(count=7),
+                       lambda w: w["after"][0].update(device="CUDA:9"),
+                       lambda w: w["expected_devices"].append("CPU"),
+                       lambda w: w["after"][0]["tags"].update(program="ranking_possible"),
+                       lambda w: w["after"].append({**w["after"][0], "tags": {**w["after"][0]["tags"], "role": "1"}})):
+            broken = copy.deepcopy(rows)
+            index = broken[0].index("query_program_observation")
+            for values in broken[1:]:
+                witness = json.loads(values[index]); mutate(witness); values[index] = json.dumps(witness)
+            self.assertIsNotNone(check(broken, decode=True))
+        for field, value in (("history_prompt_rows", "2051"), ("observed_payload_elements", "0"),
+                             ("reference_first_row", "0"), ("cosine", "1")):
+            broken = copy.deepcopy(rows)
+            for values in broken[1:]: values[broken[0].index(field)] = value
+            self.assertIsNotNone(check(broken, decode=True))
+
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -7,6 +7,7 @@
  * of expert placement; callers retain both through lookup and harvest.
  */
 #pragma once
+#include "kernels/CPUGDNStateLayout.h"
 
 #include "execution/config/RuntimeConfig.h"
 #include "config/GDNProjectionArithmeticPolicy.h"
@@ -65,6 +66,15 @@ namespace llaminar2
     appendGDNStateLayoutFingerprintFields(std::vector<PrefixFingerprintField> &fields,
                                           std::optional<GDNRecurrenceStateLayout> host_layout,
                                           std::optional<GDNRecurrenceStateLayout> device_layout);
+
+    /**
+     * @brief Bind only real CPU host-GDN prefixes to their durable wire representation.
+     * @param fields Existing hybrid compatibility category; phase never enters its identity.
+     * @param encoding Actual cache-owned durable encoding, never a local rollback image.
+     * @throws std::invalid_argument For legacy/local/unknown formats or duplicate authority.
+     */
+    void appendCPUHostPrefixEncodingFingerprintFields(std::vector<PrefixFingerprintField> &fields,
+                                                       HybridPrefixHostEncoding encoding);
 
     /**
      * @brief Bind persisted state to the immutable projection arithmetic choices.

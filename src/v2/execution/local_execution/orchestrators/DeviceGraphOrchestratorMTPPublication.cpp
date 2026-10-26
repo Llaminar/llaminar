@@ -93,7 +93,9 @@ namespace llaminar2
         params.base_cached_tokens_device =
             publication_metadata.base_cached_tokens;
         params.accepted_restore_rows_device =
-            publication_metadata.accepted_state_slot_indices;
+            mtp_spec_decode_metadata_binding_.acceptedStateSlotIndicesView();
+        if (params.accepted_restore_rows_device.data() != publication_metadata.accepted_state_slot_indices)
+            return fail("MTP accepted-row publication metadata does not belong to its bound workspace");
         params.target_cached_tokens_device =
             publication_metadata.target_cached_tokens;
         params.accepted_state_counts_device =
@@ -450,7 +452,7 @@ namespace llaminar2
         params.authority = MTPSpeculativeStatePublicationStage::Authority::PipelineFollower;
         params.request_count = 1;
         params.verifier_rows_per_request = verifier_rows_per_request;
-        params.accepted_restore_rows_device = metadata.accepted_state_slot_indices;
+        params.accepted_restore_rows_device = mtp_spec_decode_metadata_binding_.acceptedStateSlotIndicesView();
         params.target_cached_tokens_device = metadata.target_cached_tokens;
         params.accepted_state_counts_device = metadata.accepted_state_counts;
         params.publication_ok_flags_device = metadata.publication_ok_flags;

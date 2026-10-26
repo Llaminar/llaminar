@@ -212,7 +212,7 @@ namespace llaminar2
         bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
             std::vector<CPUVerifierStateRestorePlan> &plans) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
-            const int *device_row_index,
+            std::span<const int> device_row_index_view,
             void *stream) override;
         /**
          * @brief Restore one captured short-conv state row per request.
@@ -223,7 +223,7 @@ namespace llaminar2
          * banks are implemented; it must not be replaced by a scalar loop.
          */
         bool restoreVerifierStateCaptureRowsFromDeviceIndices(
-            const int *device_row_indices,
+            std::span<const int> device_row_indices_view,
             int request_count,
             int row_index_stride,
             void *stream) override;

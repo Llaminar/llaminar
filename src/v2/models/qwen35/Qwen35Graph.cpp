@@ -14,6 +14,7 @@
  */
 
 #include "Qwen35Graph.h"
+#include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "kernels/gdn/GDNPreparedQK.h"
 #include "../../config/GDNHeadAssignment.h"
 #include "Qwen35Schema.h"
@@ -1543,6 +1544,12 @@ namespace llaminar2
         rec_params.use_qk_l2norm = true;
         rec_params.verifier_state_capture_rows = verifier_state_capture_rows;
         rec_params.speculative_state_slot_rows = verifier_state_capture_rows;
+        if (verifier_state_capture_supported && device.is_gpu())
+        {
+            rec_params.gpu_retained_workspace = gdn_workspace::selectGPUVerifierWorkspace(
+                total_tokens, batch_size, n_v_heads, d_k, d_v);
+        }
+
 
         /* Every backend packs V repeats beside the local Q/K interval in
          * dependency-closed order. The recurrence's local modular relation is

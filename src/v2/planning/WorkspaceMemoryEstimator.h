@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <optional>
 #include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
+#include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 
 namespace llaminar2
 {
@@ -39,7 +40,7 @@ struct WorkspaceMemoryGeometry
      */
     int device_compute_units = 0;
     CPUExecutionGeometry cpu_execution; ///< Exact participant cache/ISA observation for CPU admission.
-    int batch_size = 1; ///< Maximum simultaneously admitted requests.
+    int batch_size = 1; ///< Ordinary/prefill graph batch, independent of verifier request capacity.
     /** Maximum authored ordinary output demand; independent of retained MTP. */
     OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
     int resident_graph_rows = 1; ///< Largest token-row capture bucket.
@@ -84,6 +85,18 @@ struct WorkspaceMemoryGeometry
      * Zero means no MTP graph family is materialized on this participant.
      */
     int mtp_target_query_rows = 0;
+    /**
+     * Exact generation request capacity from DevicePlanConfig, independent of
+     * the prefill batch. GPU verifier flat rows must partition it exactly.
+     */
+    int generation_request_capacity = 1;
+    /**
+     * Explicit typed GPU retained workspace contribution for prerequisite
+     * planning/tests. Production builders leave this absent until one shared
+     * stage/planner policy is qualified; absence retains legacy row snapshots.
+     * This is not a CLI policy, inferred fallback or second geometry ledger.
+     */
+    std::optional<gdn_workspace::GPURetainedRecurrenceWorkspace> gpu_gdn_retention;
     /**
      * Exact admitted dense/cache layout of an authenticated QFN predictor.
      * Null preserves existing non-QFN pricing; QFN MTP requires this value

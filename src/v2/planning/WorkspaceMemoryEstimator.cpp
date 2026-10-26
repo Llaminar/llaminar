@@ -273,7 +273,11 @@ size_t exactHybridVerifierStateWorkspaceBytes(
     const std::size_t layer_count = hybridRecurrentLayerCount(
         profile, geometry.first_layer, geometry.last_layer);
     if (layer_count == 0u)
+    {
+        if (geometry.gpu_gdn_retention)
+            throw std::invalid_argument("Explicit retained GDN workspace requires an owned recurrent layer");
         return 0;
+    }
     if (profile.gdn_state_size <= 0 ||
         profile.gdn_group_count <= 0 ||
         profile.gdn_time_step_rank <= 0 ||
@@ -318,17 +322,32 @@ size_t exactHybridVerifierStateWorkspaceBytes(
         throw std::runtime_error(
             "Participant-local GDN fused width exceeds int");
     }
-    const auto recurrence = gdn_workspace::recurrenceStateFootprint(
-        geometry.mtp_target_query_rows,
-        std::max(1, geometry.batch_size),
-        assignment.localValueHeads(),
-        profile.gdn_state_size,
-        profile.gdn_state_size);
+    // CPU keeps its current host batch contract. GPU request capacity comes
+    // from the generation owner, never generic prefill batching or a ceiling.
+    const int request_capacity = geometry.device.is_gpu()
+        ? gdn_workspace::gpuVerifierRequestRows(geometry.mtp_target_query_rows,
+              geometry.generation_request_capacity).requests()
+        : std::max(1, geometry.batch_size);
+    const auto recurrence = [&] {
+        if (geometry.gpu_gdn_retention)
+        {
+            const auto &contract = *geometry.gpu_gdn_retention;
+            const auto &native = contract.geometry();
+            if (contract.physicalRows() != geometry.mtp_target_query_rows ||
+                native.requests() != request_capacity ||
+                native.heads() != assignment.localValueHeads() ||
+                native.keyWidth() != profile.gdn_state_size || native.valueWidth() != profile.gdn_state_size)
+                throw std::invalid_argument("Explicit retained GDN geometry differs from admitted verifier ownership");
+            return gdn_workspace::recurrenceStateFootprint(contract);
+        }
+        return gdn_workspace::recurrenceStateFootprint(
+            geometry.mtp_target_query_rows, request_capacity, assignment.localValueHeads(),
+            profile.gdn_state_size, profile.gdn_state_size,
+            geometry.device.is_cpu() ? GDNStateStorage::CPUFixedEpoch : GDNStateStorage::DeviceDense);
+    }();
     const auto short_conv = gdn_workspace::shortConvStateFootprint(
-        geometry.mtp_target_query_rows,
-        std::max(1, geometry.batch_size),
-        static_cast<int>(local_channels),
-        profile.gdn_conv_kernel_size);
+        geometry.mtp_target_query_rows, request_capacity,
+        static_cast<int>(local_channels), profile.gdn_conv_kernel_size);
 
     const std::size_t per_layer_slots = checkedAdd(
         alignedWorkspaceBytes(recurrence.slot_bytes),
@@ -338,21 +357,14 @@ size_t exactHybridVerifierStateWorkspaceBytes(
         layer_count,
         per_layer_slots,
         "GDN layer count and verifier slots");
-    /*
-     * GPU recurrence kernels publish graph-stable staging rows beside the
-     * rollback slots. CPU kernels update their slot banks directly and do not
-     * declare those work buffers. Keep the backend distinction in this shared
-     * metadata contract so preflight does not invent CPU-only padding.
-     */
+    // CPU recurrence builds retained checkpoints/logs directly, so both CPU
+    // recurrence and short-convolution need only their per-layer slot payloads.
+    // GPU kernels retain one role-shared mutable bank for each state family.
     if (geometry.device.is_gpu())
     {
-        bytes = checkedAdd(
-            bytes,
-            alignedWorkspaceBytes(recurrence.work_bytes),
+        bytes=checkedAdd(bytes,alignedWorkspaceBytes(recurrence.work_bytes),
             "shared GDN recurrence verifier work");
-        bytes = checkedAdd(
-            bytes,
-            alignedWorkspaceBytes(short_conv.work_bytes),
+        bytes=checkedAdd(bytes,alignedWorkspaceBytes(short_conv.work_bytes),
             "shared GDN short-convolution verifier work");
     }
     return bytes;
@@ -1706,6 +1718,7 @@ std::optional<WorkspaceMemoryGeometry> retainedMTPAttentionGeometry(
         .first_layer = profile.mainLayerCount(),
         .last_layer = profile.totalLayerCount() - 1,
         .total_shards = replicated ? 1 : geometry.total_shards,
+        .generation_request_capacity = geometry.generation_request_capacity,
         .attention_kv_format = geometry.attention_kv_format,
         .attention_visibility = geometry.attention_visibility,
     };
@@ -2081,6 +2094,9 @@ size_t WorkspaceMemoryEstimator::estimate(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
+    if (geometry.gpu_gdn_retention &&
+        (!geometry.device.is_gpu() || geometry.mtp_target_query_rows <= 0))
+        throw std::invalid_argument("Explicit retained GDN workspace requires a GPU verifier envelope");
     // Validate the selected source contract before adding any BOM contributions,
     // including floating selected weights that ordinary quantized loops do not visit.
     (void)Qwen4ExpProjectionWorkspace::selected(geometry.qfn_hc_up_activation, geometry.qfn_gdn_output_activation,
@@ -2312,6 +2328,9 @@ size_t WorkspaceMemoryEstimator::estimate(
         mtp_geometry.resident_graph_rows =
             std::max(1, geometry.mtp_target_query_rows);
         mtp_geometry.mtp_target_query_rows = 0;
+        // This recursive call prices only transient compact-family scratch.
+        // Its retained GDN payload is contributed once by the parent below.
+        mtp_geometry.gpu_gdn_retention.reset();
         // The shared main-prefill handoff was already priced above.
         mtp_geometry.gdn_live_state_handoff.reset();
         compact_family_bytes = estimate(profile, mtp_geometry);
@@ -2380,6 +2399,8 @@ size_t WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
+    if (geometry.gpu_gdn_retention)
+        throw std::invalid_argument("Expert-only workspace cannot own a retained GDN continuation");
     if (!geometry.device.is_gpu() && !geometry.device.is_cpu())
     {
         throw std::runtime_error(

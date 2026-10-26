@@ -4,7 +4,9 @@
  *
  * Inherits from CPURingKVCache and adds:
  * - Layer index remapping (global → compressed KV index for FA layers)
- * - Per-layer GDN state management (recurrence + conv state)
+ * - Per-layer GDN state management (complete epoch history + conv state)
+ *   Durable prefixes pack only live epoch records; local rollback keeps full images.
+ *   Both preserve pending-update arithmetic without partial flushes.
  * - Memory savings by not allocating KV entries for GDN layers
  *
  * All KV cache operations are delegated to the parent CPURingKVCache with
@@ -23,6 +25,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <span>
+#include <type_traits>
 #include <vector>
 
 namespace llaminar2
@@ -482,6 +487,20 @@ namespace llaminar2
             return buildHybridPrefixStateMetadata();
         }
 
+        /** @copydoc IHybridKVCache::hybridPrefixHostPayloadBytes */
+        std::optional<size_t> hybridPrefixHostPayloadBytes(
+            const HybridPrefixStateDescriptor &desc) const override
+        {
+            const auto metadata = buildHybridPrefixStateMetadata();
+            if (desc.seq_idx < 0 || !hybridPrefixStateLayoutsMatch(metadata, desc)) return std::nullopt;
+            if (!desc.include_host_state || metadata.host_bytes == 0) return size_t{0};
+            if (desc.purpose == HybridPrefixStatePurpose::LocalCheckpoint) return metadata.host_bytes;
+            try { return packedHostStateBytes(/*capacity=*/false); }
+            catch (const std::invalid_argument &) { return std::nullopt; }
+            catch (const std::overflow_error &) { return std::nullopt; }
+        }
+
+        /** @copydoc IHybridKVCache::exportHybridPrefixState */
         bool exportHybridPrefixState(
             const HybridPrefixStateDescriptor &desc,
             void *dst_host,
@@ -501,6 +520,12 @@ namespace llaminar2
                 return false;
             }
 
+            const auto bytes = hybridPrefixHostPayloadBytes(desc);
+            if (!bytes || desc.host_payload_bytes != *bytes ||
+                (needs_host && !hostPayloadDisjoint(dst_host, *bytes))) return false;
+            if (needs_host && desc.purpose == HybridPrefixStatePurpose::DurablePrefix)
+                return !needs_device && exportPackedHostState(dst_host, *bytes);
+
             auto *host_cursor = needs_host ? reinterpret_cast<uint8_t *>(dst_host) : nullptr;
             auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
             return exportHybridStatePayload(
@@ -511,6 +536,7 @@ namespace llaminar2
                 desc.include_device_state);
         }
 
+        /** @copydoc IHybridKVCache::importHybridPrefixState */
         bool importHybridPrefixState(
             const HybridPrefixStateDescriptor &desc,
             const void *src_host,
@@ -529,6 +555,17 @@ namespace llaminar2
             {
                 return false;
             }
+
+            // Import trusts the authored source extent, never the destination's
+            // current phases. Local physical images retain their original size.
+            const bool local = desc.purpose == HybridPrefixStatePurpose::LocalCheckpoint;
+            const size_t capacity = local ? metadata.host_bytes : metadata.host_serialized_capacity_bytes;
+            if ((!needs_host && desc.host_payload_bytes != 0) ||
+                (needs_host && (desc.host_payload_bytes == 0 || desc.host_payload_bytes > capacity ||
+                                !hostPayloadDisjoint(src_host, desc.host_payload_bytes)))) return false;
+            if (needs_host && !local)
+                return !needs_device && importPackedHostState(src_host, desc.host_payload_bytes);
+            if (needs_host && desc.host_payload_bytes != metadata.host_bytes) return false;
 
             const auto *host_cursor = needs_host ? reinterpret_cast<const uint8_t *>(src_host) : nullptr;
             const auto *device_cursor = needs_device ? reinterpret_cast<const uint8_t *>(src_device) : nullptr;
@@ -611,6 +648,11 @@ namespace llaminar2
             metadata.total_layers = total_layers_;
             metadata.gdn_layers = layer_map_.gdnLayerCount();
             metadata.host_bytes = gdnMemoryBytes();
+            if (metadata.host_bytes > 0)
+            {
+                metadata.host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+                metadata.host_serialized_capacity_bytes = packedHostStateBytes(/*capacity=*/true);
+            }
 
             for (int layer = 0; layer < total_layers_; ++layer)
             {
@@ -627,6 +669,173 @@ namespace llaminar2
             }
             metadata.has_device_kernel_state = metadata.device_bytes > 0;
             return metadata;
+        }
+
+        /**
+         * @brief Add checked section bytes using the existing owner's exact geometry.
+         * @param left Accumulated bounded byte count.
+         * @param right Next complete live/header span.
+         * @return Checked sum; no capacity admission or allocation is performed.
+         * @throws std::overflow_error For an unrepresentable section.
+         */
+        static size_t prefixAdd(size_t left, size_t right)
+        {
+            if (right > std::numeric_limits<size_t>::max() - left)
+                throw std::overflow_error("CPU GDN prefix extent overflow");
+            return left + right;
+        }
+
+        /**
+         * @brief Project stable maximum or actual packed bytes from the same typed owner.
+         * @param capacity True selects the immutable maximum phase7; false reads actual phases.
+         * @return Entire CPU host section including immutable geometry headers and live convolution.
+         * @throws std::invalid_argument For malformed source geometry/phase.
+         * @throws std::overflow_error For an unrepresentable sum.
+         */
+        size_t packedHostStateBytes(bool capacity) const
+        {
+            if (gdn_states_.empty()) return 0;
+            size_t bytes = sizeof(CPUGDNPrefixSectionHeader);
+            for (const auto &state : gdn_states_)
+            {
+                const CPUGDNStateLayout layout(state.n_v_heads, state.d_k, state.d_v);
+                if (state.recurrence_state.size() != static_cast<size_t>(layout.floats()))
+                    throw std::invalid_argument("CPU GDN prefix state extent changed");
+                bytes = prefixAdd(bytes, sizeof(CPUGDNPrefixLayerHeader));
+                bytes = prefixAdd(bytes, capacity ? layout.packedPrefixCapacityBytes()
+                                                 : layout.packedPrefixBytes(state.recurrence_state.data()));
+                bytes = prefixAdd(bytes, state.conv_state.size() * sizeof(float));
+            }
+            return bytes;
+        }
+
+        /**
+         * @brief Reject full-section overlap with every original CPU state bank before access.
+         * @param payload Bounded serialized source or destination.
+         * @param bytes Its exact declared extent.
+         * @return True only for finite address ranges disjoint from all full physical live banks.
+         */
+        bool hostPayloadDisjoint(const void *payload, size_t bytes) const noexcept
+        {
+            const auto begin = reinterpret_cast<std::uintptr_t>(payload);
+            if (!payload || bytes > std::numeric_limits<std::uintptr_t>::max() - begin) return false;
+            const auto end = begin + bytes;
+            for (const auto &state : gdn_states_)
+                for (const auto *bank : {&state.recurrence_state, &state.conv_state})
+                {
+                    const auto first = reinterpret_cast<std::uintptr_t>(bank->data());
+                    const auto count = bank->size() * sizeof(float);
+                    if (count > std::numeric_limits<std::uintptr_t>::max() - first ||
+                        (count && begin < first + count && first < end)) return false;
+                }
+            return true;
+        }
+
+        /**
+         * @brief Serialize only original phase/checkpoint/live history, after whole-source admission.
+         * @param destination Disjoint bounded CPU destination.
+         * @param bytes Exact size already projected from all source phases.
+         * @return False before writes for malformed source; true after all declared bytes are copied.
+         */
+        bool exportPackedHostState(void *destination, size_t bytes) const
+        {
+            if (bytes != packedHostStateBytes(/*capacity=*/false)) return false;
+            auto *base = static_cast<uint8_t *>(destination);
+            const CPUGDNPrefixSectionHeader section{CPUGDNStateLayout::kPrefixMagic,
+                CPUGDNStateLayout::kPrefixVersion, first_layer_index_, static_cast<uint32_t>(total_layers_),
+                static_cast<uint32_t>(gdn_states_.size()), static_cast<uint64_t>(bytes)};
+            std::vector<CPUGDNPrefixLayerHeader> headers;
+            headers.reserve(gdn_states_.size());
+            std::vector<HostStateCopySpan> spans;
+            spans.push_back({base, reinterpret_cast<const uint8_t *>(&section), sizeof(section)});
+            size_t cursor = sizeof(section);
+            for (int local = 0; local < total_layers_; ++local)
+            {
+                const int index = layer_map_.toGDNIndex(local);
+                if (index < 0) continue;
+                const auto &state = gdn_states_[static_cast<size_t>(index)];
+                const CPUGDNStateLayout layout(state.n_v_heads, state.d_k, state.d_v);
+                headers.push_back({first_layer_index_ + local, static_cast<uint32_t>(state.n_v_heads),
+                    static_cast<uint32_t>(state.d_k), static_cast<uint32_t>(state.d_v),
+                    static_cast<uint64_t>(layout.packedPrefixBytes(state.recurrence_state.data())),
+                    static_cast<uint64_t>(state.conv_state.size() * sizeof(float))});
+                spans.push_back({base + cursor, reinterpret_cast<const uint8_t *>(&headers.back()), sizeof(headers.back())});
+                cursor += sizeof(headers.back());
+                for (int head = 0; head < state.n_v_heads; ++head)
+                {
+                    const float *source = state.recurrence_state.data() + static_cast<size_t>(head) * layout.headFloats();
+                    const size_t count = layout.packedHeadBytes(CPUGDNStateLayout::prefixPhase(std::bit_cast<uint32_t>(*source)));
+                    spans.push_back({base + cursor, reinterpret_cast<const uint8_t *>(source), count});
+                    cursor += count;
+                }
+                const size_t conv_bytes = state.conv_state.size() * sizeof(float);
+                if (conv_bytes) spans.push_back({base + cursor,
+                    reinterpret_cast<const uint8_t *>(state.conv_state.data()), conv_bytes});
+                cursor += conv_bytes;
+            }
+            return cursor == bytes && spans.size() <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+                   copyHostStateSpans(spans);
+        }
+
+        /**
+         * @brief Parse every bounded layer/head before atomically committing disjoint live spans.
+         * @param source Immutable source retained by the existing archive owner throughout import.
+         * @param bytes Exact declared record bytes; truncation and trailing capacity are rejected.
+         * @return False without any destination mutation on malformed metadata; otherwise true.
+         * @details Only inactive raw records are zeroed. Checkpoints/live records
+         * retain original bits and no pending epoch is flushed or materialized.
+         */
+        bool importPackedHostState(const void *source, size_t bytes)
+        {
+            if (bytes < sizeof(CPUGDNPrefixSectionHeader)) return false;
+            const auto *base = static_cast<const uint8_t *>(source);
+            CPUGDNPrefixSectionHeader section{};
+            std::memcpy(&section, base, sizeof(section));
+            if (section.magic != CPUGDNStateLayout::kPrefixMagic ||
+                section.version != CPUGDNStateLayout::kPrefixVersion || section.first_layer != first_layer_index_ ||
+                section.total_layers != static_cast<uint32_t>(total_layers_) ||
+                section.gdn_layers != gdn_states_.size() || section.bytes != bytes) return false;
+            std::vector<HostStateCopySpan> spans, inactive;
+            size_t cursor = sizeof(section);
+            for (int local = 0; local < total_layers_; ++local)
+            {
+                const int index = layer_map_.toGDNIndex(local);
+                if (index < 0) continue;
+                auto &state = gdn_states_[static_cast<size_t>(index)];
+                const CPUGDNStateLayout layout(state.n_v_heads, state.d_k, state.d_v);
+                if (bytes - cursor < sizeof(CPUGDNPrefixLayerHeader)) return false;
+                CPUGDNPrefixLayerHeader header{};
+                std::memcpy(&header, base + cursor, sizeof(header));
+                cursor += sizeof(header);
+                if (header.global_layer != first_layer_index_ + local || header.heads != static_cast<uint32_t>(state.n_v_heads) ||
+                    header.key_width != static_cast<uint32_t>(state.d_k) || header.value_width != static_cast<uint32_t>(state.d_v) ||
+                    header.conv_bytes != state.conv_state.size() * sizeof(float) ||
+                    header.recurrence_bytes > bytes - cursor) return false;
+                const size_t recurrence_bytes = static_cast<size_t>(header.recurrence_bytes);
+                if (!layout.validPackedPrefix(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte *>(base + cursor), recurrence_bytes))) return false;
+                for (int head = 0; head < state.n_v_heads; ++head)
+                {
+                    uint32_t phase_word;
+                    std::memcpy(&phase_word, base + cursor, sizeof(phase_word));
+                    const size_t count = layout.packedHeadBytes(CPUGDNStateLayout::prefixPhase(phase_word));
+                    auto *target = reinterpret_cast<uint8_t *>(state.recurrence_state.data() +
+                                                             static_cast<size_t>(head) * layout.headFloats());
+                    spans.push_back({target, base + cursor, count});
+                    const size_t tail = static_cast<size_t>(layout.headFloats()) * sizeof(float) - count;
+                    if (tail) inactive.push_back({target + count, nullptr, tail});
+                    cursor += count;
+                }
+                if (header.conv_bytes > bytes - cursor) return false;
+                if (header.conv_bytes) spans.push_back({reinterpret_cast<uint8_t *>(state.conv_state.data()),
+                    base + cursor, static_cast<size_t>(header.conv_bytes)});
+                cursor += static_cast<size_t>(header.conv_bytes);
+            }
+            if (cursor != bytes || spans.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
+            // All headers, phases, source bounds and cross-bank aliases passed.
+            // These small tail clears never scan or rewrite a checkpoint matrix.
+            for (const auto &tail : inactive) std::memset(tail.dst, 0, tail.bytes);
+            return copyHostStateSpans(spans);
         }
 
         bool exportHybridStatePayload(
@@ -799,7 +1008,7 @@ namespace llaminar2
                 state.d_v = geometry.d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
                 state.full_recurrence_state_size =
-                    geometry.full_recurrence_state_floats;
+                    geometry.cpuFullRecurrenceStateFloats();
                 state.full_conv_state_size =
                     geometry.full_conv_state_floats;
                 state.initializeCPUState(geometry.local_qkv_dim);

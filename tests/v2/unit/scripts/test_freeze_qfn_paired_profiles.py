@@ -1,7 +1,7 @@
 """Toy-file configure boundary for opt-in paired metadata; no model/device work.
 
 All source files contain one byte, descriptors are actual temporary-file stats,
-and every numerical policy is the existing pure fixture. No real model, result,
+and numerical policies use tiny observations, including the source-owned CPU pilot. No real model, result,
 reference payload, subprocess, backend or qualification receipt is consumed.
 """
 import copy
@@ -17,7 +17,9 @@ ROOT=Path(__file__).resolve().parents[4]
 sys.path.insert(0,str(ROOT/'scripts/ci'))
 import freeze_qfn_paired_profiles as freezer
 from model_kld_corpus import identity, metadata_digest
-from test_model_kld_corpus_v2 import manifest, absolute_pilot
+from test_model_kld_corpus_v2 import manifest, absolute_pilot, observation
+import model_kld_corpus_v2 as corpus
+from full_vocabulary_metrics import full_vocabulary_metrics
 
 
 def write_json(path,value):
@@ -70,6 +72,72 @@ class FreezeQFNPairedProfilesTests(unittest.TestCase):
             output=root/'generated.h';freezer.write_if_changed(output,header)
             before=identity(output);freezer.write_if_changed(output,header)
             self.assertEqual(identity(output),before)
+
+    def test_approved_cpu_epoch_policy_binding_and_unchanged_mean_guards(self):
+        """Apply the actual small policy to synthetic full-vocabulary observations.
+
+        Only the manifest digest is rebound to toy files. Groups, roles and all
+        limits are the source document; no old-policy copy or model result is
+        used. The real original CPU case is separately checked by the typed
+        Qwen4ExpLocalPairedCases fixture.
+        """
+        policy_path=ROOT/'tests/v2/integration/parity/qwen4exp/policies/cpu-mmap-hc-up-two-term-epoch-row-kl-1p2.json'
+        approved=json.loads(policy_path.read_text())
+        exact='Qwen4ExpMain/Qwen4ExpMainParityTest.ProductionParity/Qwen38FlashNext_UDQ4KXL_CPU0_NgramMmap_ActFP32_KVFP16_MTPOff'
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);binding,d,m=fixture(root);t=m['topologies'][0]
+            t.update(id='cpu-mmap-hc-up-two-term',backend='CPU',canonical_cell=exact)
+            seed=m['histories'][0]
+            histories=[(context,i)for context,count in
+                [('short',16),('heldout-short',16),('qsa-threshold',1)]for i in range(count)]
+            m['histories']=[dict(copy.deepcopy(seed),id=f'{context}-{i}',context_group=context,
+                prompt=f'Fixture {context} {i}',prompt_ids=[index//6,index%6,0,1],
+                decode_rows=4,continuation_ids=[2]*5) for index,(context,i)in enumerate(histories)]
+            m['reset_control'].update(history_id='short-0')
+            policy=copy.deepcopy(approved);policy['corpus_manifest_digest']=metadata_digest(m)
+            d['bindings'][0].update(exact_cell=exact,arithmetic=t['arithmetic'],
+                workload=write_json(root/'manifest.json',m),
+                catalog=write_json(root/'catalog.json',dict(schema=2,manifest_digest=metadata_digest(m))),
+                pilot=write_json(root/'approved-pilot.json',policy))
+            write_json(binding,d);header,metadata=freezer.freeze(binding,root)
+            self.assertEqual(metadata['exact_cells'],[exact])
+            self.assertIn(str(root/'approved-pilot.json'),metadata['dependencies'])
+            self.assertIn(d['bindings'][0]['pilot']['sha256'],header)
+            policy_without_digest=copy.deepcopy(policy);policy_without_digest['corpus_manifest_digest']=approved['corpus_manifest_digest']
+            self.assertEqual(policy_without_digest,approved)
+            self.assertEqual(next(g for g in approved['groups'] if g['context_group']=='short' and
+                g['phase']=='decode')['maximum']['row_kl_nats'],1.2)
+            for group in approved['groups']:
+                if group['role']=='required' and (group['context_group'],group['phase'])!=('short','decode'):
+                    self.assertEqual(group['maximum']['row_kl_nats'],1.0)
+
+            reference=[6.,5.,4.,3.,2.,1.]
+            def logits_at_kl(target):
+                # Positive rescaling retains all top IDs. Canonical FP64 math
+                # supplies the KL witness instead of authored metric scalars.
+                low,high=1.,8.
+                for _ in range(60):
+                    middle=(low+high)/2
+                    if full_vocabulary_metrics(reference,[middle*v for v in reference],vocabulary=6)['kl_nats']<target:low=middle
+                    else:high=middle
+                return [((low+high)/2)*v for v in reference]
+            witness=logits_at_kl(1.10)
+            def summarize(replacements):
+                return corpus.summarize(m,observation(m,replacements=replacements),absolute_pilot=policy)
+            accepted=summarize({'short-0:decode:0':witness})
+            self.assertTrue(accepted['passed'])
+            short=next(g for g in accepted['groups']if g['context_group']=='short'and g['phase']=='decode')
+            self.assertAlmostEqual(short['row_kl_nats'],1.10,places=12)
+            self.assertEqual(short['top1_agreement'],1.)
+            over=summarize({'short-0:decode:0':logits_at_kl(1.21)})
+            self.assertIn('row_kl_nats',[f['criterion']for f in over['failures']])
+            foreign=summarize({'heldout-short-0:decode:0':witness})
+            self.assertIn(dict(backend='CPU',topology_id=t['id'],context_group='heldout-short',phase='decode',criterion='row_kl_nats'),foreign['failures'])
+            step=summarize({f'short-{i}:decode:0':witness for i in range(2)})
+            self.assertIn('step_mean_kl_nats',[f['criterion']for f in step['failures']])
+            self.assertNotIn('mean_kl_nats',[f['criterion']for f in step['failures']])
+            mean=summarize({f'short-{i}:decode:{j}':witness for i in range(2)for j in range(4)})
+            self.assertIn('mean_kl_nats',[f['criterion']for f in mean['failures']])
 
     def test_manifest_policy_selector_and_benchmark_reject_before_output(self):
         mutations=(

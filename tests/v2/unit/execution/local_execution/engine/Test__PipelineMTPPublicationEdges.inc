@@ -9,9 +9,10 @@
 
 /** @brief Construct a complete immutable publication identity without device work. */
 static MTPSpeculativeStatePublicationStage::Params pipelinePublicationIdentity(
-    DeviceId device, int32_t *words, int width, bool tail)
+    DeviceId device, std::span<int32_t> owner, int width, bool tail)
 {
     using Publication = MTPSpeculativeStatePublicationStage;
+    auto *words = owner.data();
     const auto follower = pipelineFollowerIdentity(words);
     Publication::Params params;
     params.device_id = device;
@@ -19,7 +20,7 @@ static MTPSpeculativeStatePublicationStage::Params pipelinePublicationIdentity(
     params.authority = tail ? Publication::Authority::CompactOutcome : Publication::Authority::PipelineFollower;
     params.request_count = 1;
     params.verifier_rows_per_request = width;
-    params.accepted_restore_rows_device = words + 1;
+    params.accepted_restore_rows_device = owner.subspan(1);
     params.target_cached_tokens_device = words + 2;
     params.accepted_state_counts_device = words + 3;
     params.publication_ok_flags_device = words + 4;

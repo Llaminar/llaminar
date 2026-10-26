@@ -5,7 +5,9 @@ CTest owns exact membership; GoogleTest's typed JSON owns each configuration.
 Routine generation regression projects MTP-off and dynamic MTP, while HTTP certification,
 remote MPI certification and benchmarks consume their explicitly tagged subsets. No consumer
 may reconstruct a topology from a test name or maintain another axis expander.
-Discovery never loads model tensors, stages weights, or initializes devices.
+Numerical-only candidates keep their complete CTest/GoogleTest membership proof
+but do not enter canonical runtime/control projections. Discovery never loads
+model tensors, stages weights, or initializes devices.
 """
 from __future__ import annotations
 
@@ -154,6 +156,16 @@ class InventoryScope(str, Enum):
             raise ValueError("canonical cell omitted its explicit E2E eligibility")
         if record["e2e"] is not None and not isinstance(record["e2e"], dict):
             raise ValueError("canonical E2E eligibility must be a profile or null")
+        # Schema1 originally contains only canonical records. Keep that default
+        # byte-compatible; a source-owned numerical diagnostic must opt out
+        # explicitly. Unknown values are stale/malformed, never an exclusion.
+        role = record.get("inventory_role", "canonical")
+        if not isinstance(role, str) or role not in ("canonical", "numerical_diagnostic"):
+            raise ValueError("canonical cell has an unknown inventory role")
+        if role == "numerical_diagnostic":
+            if record["e2e"] is not None or record.get("cross_host_e2e"):
+                raise ValueError("numerical diagnostic cannot declare runtime certification eligibility")
+            return False
         if self == InventoryScope.CROSS_HOST_E2E:
             return bool(cross_host_scenarios(record))
         if self == InventoryScope.GENERATION:

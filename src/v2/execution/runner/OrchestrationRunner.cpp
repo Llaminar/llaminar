@@ -689,6 +689,25 @@ namespace llaminar2
             return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
         }
 
+        /**
+         * @brief Format existing immutable GDN diagnostic protocol metadata.
+         * @param layer Complete copied probe, never a live state owner.
+         * @return Storage-format id and every exact CPU phase word, without payload reads.
+         */
+        std::string gdnDiagnosticStorageSuffix(const PrefixGDNLayerProbe &layer)
+        {
+            std::ostringstream out;
+            out << "/storage=" << static_cast<unsigned>(layer.recurrence_storage)
+                << "/epoch_phase_words=[";
+            for (size_t head = 0; head < layer.recurrence_epoch_phase_words.size(); ++head)
+            {
+                if (head > 0) out << ',';
+                out << layer.recurrence_epoch_phase_words[head];
+            }
+            out << ']';
+            return out.str();
+        }
+
         std::string summarizePrefixProbeForTrace(const PrefixRuntimeStateSnapshot &probe)
         {
             /*
@@ -777,6 +796,10 @@ namespace llaminar2
             {
                 fold_u64(gdn_digest, static_cast<uint64_t>(layer.global_layer));
                 fold_u64(gdn_digest, static_cast<uint64_t>(layer.recurrence_layout));
+                fold_u64(gdn_digest, static_cast<uint64_t>(layer.recurrence_storage));
+                fold_u64(gdn_digest, layer.recurrence_epoch_phase_words.size());
+                for (uint32_t phase_word : layer.recurrence_epoch_phase_words)
+                    fold_u64(gdn_digest, phase_word);
                 fold_u64(gdn_digest, layer.recurrence_hash);
                 fold_u64(gdn_digest, layer.conv_hash);
                 if (layer.device_state_hash_available)
@@ -836,6 +859,7 @@ namespace llaminar2
                 const auto &layer = probe.gdn_layers[i];
                 oss << " L" << layer.global_layer
                     << "/layout=" << gdnRecurrenceStateLayoutName(layer.recurrence_layout)
+                    << gdnDiagnosticStorageSuffix(layer)
                     << "/rh=" << layer.recurrence_hash << "/ch=" << layer.conv_hash;
                 if (layer.device_state_hash_available)
                     oss << "/rdh=" << layer.recurrence_device_hash
@@ -11722,6 +11746,7 @@ namespace llaminar2
                         gdn += ",";
                     const auto &layer = probe.gdn_layers[i];
                     gdn += "L" + std::to_string(layer.global_layer) +
+                           gdnDiagnosticStorageSuffix(layer) +
                            "/r=" + std::to_string(layer.recurrence_hash) +
                            "/c=" + std::to_string(layer.conv_hash);
                     if (layer.device_state_hash_available)
@@ -11843,6 +11868,8 @@ namespace llaminar2
                     const bool mismatch =
                         a.global_layer != b.global_layer ||
                         a.recurrence_layout != b.recurrence_layout ||
+                        a.recurrence_storage != b.recurrence_storage ||
+                        a.recurrence_epoch_phase_words != b.recurrence_epoch_phase_words ||
                         (both_have_device_state
                              ? (a.recurrence_device_bytes != b.recurrence_device_bytes ||
                                 a.conv_device_bytes != b.conv_device_bytes ||
@@ -11858,8 +11885,10 @@ namespace llaminar2
                         std::ostringstream oss;
                         oss << "layer=" << a.global_layer << " " << lhs_name
                             << "_layout=" << gdnRecurrenceStateLayoutName(a.recurrence_layout)
+                            << gdnDiagnosticStorageSuffix(a)
                             << " " << rhs_name
                             << "_layout=" << gdnRecurrenceStateLayoutName(b.recurrence_layout)
+                            << gdnDiagnosticStorageSuffix(b)
                             << " " << lhs_name << "_rec=" << a.recurrence_hash << " " << rhs_name
                             << "_rec=" << b.recurrence_hash << " " << lhs_name
                             << "_conv=" << a.conv_hash << " " << rhs_name << "_conv=" << b.conv_hash

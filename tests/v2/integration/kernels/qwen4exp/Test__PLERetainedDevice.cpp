@@ -90,14 +90,14 @@ void prove(DeviceId device, bool outerLedger = false){
        outerPlan.retained_parent_inputs = {&priorTokens, &priorConv, &frozen,
            &retainedTokens, &retainedNorm};
        qfn_outer_publication_test::rejectMissingWrites(worker, device, stream, outerPlan, [&] {
-           require(retain.restoreVerifierStateCaptureRowFromDeviceIndex(deviceControls + 1, stream),
+           require(retain.restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int>(deviceControls, controls.numel()).subspan(1), stream),
                "PLE negative outer hook failed without a ledger diagnostic");
        });
    }
    GraphCaptureDependencyLedger outerPublicationLedger(device, stream, {outerPlan},
        "PLE outer MTP publication");
    GraphCaptureDependencyLedger publicationLedger(device,stream,{Plan{.stage_identity=&retain,.stage_name="publish_accepted",.external_inputs={&acceptedTokens,&acceptedConv,&normalized},.retained_parent_inputs={&priorTokens,&priorConv,&frozen,&retainedTokens,&retainedNorm,&counters},.outputs={&acceptedTokens,&acceptedConv}}},"PLE native publication");
-   {ScopedBackendGraphCapture capture(worker,*retirement.publication,"PLE native publication",outerLedger ? &outerPublicationLedger : &publicationLedger);require(capture.begin(),"PLE publication capture begin failed");ScopedGraphCaptureStage scope(outerLedger ? static_cast<const void *>(&outer) : static_cast<const void *>(&retain));require(retain.restoreVerifierStateCaptureRowFromDeviceIndex(deviceControls+1,stream),"PLE publication capture failed");scope.complete();capture.finish();}
+   {ScopedBackendGraphCapture capture(worker,*retirement.publication,"PLE native publication",outerLedger ? &outerPublicationLedger : &publicationLedger);require(capture.begin(),"PLE publication capture begin failed");ScopedGraphCaptureStage scope(outerLedger ? static_cast<const void *>(&outer) : static_cast<const void *>(&retain));require(retain.restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int>(deviceControls, controls.numel()).subspan(1),stream),"PLE publication capture failed");scope.complete();capture.finish();}
    for(auto*graph:{retirement.transaction.get(),retirement.publication.get()}){std::vector<GPUGraphKernelNodeInfo>nodes;std::string error;require(graph->inspectKernelNodes(nodes,&error),error.c_str());ASSERT_EQ(nodes.size(),2u);for(const auto&node:nodes)EXPECT_EQ(node.local_memory_bytes_per_thread,0u);require(graph->instantiate(),"PLE native graph instantiation failed");}
    require(retirement.transaction->launch(),"PLE native transaction replay failed");
    auto bytes=observe<std::uint64_t>(*backend,device,stream,counters.gpu_data_ptr(),2);EXPECT_EQ(bytes[0],8+std::size_t(channels)*36);EXPECT_EQ(bytes[1],std::size_t(m)*(channels+1)*4);

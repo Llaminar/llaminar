@@ -1,0 +1,96 @@
+{
+  "schema": "llaminar.model-kld-absolute-pilot.v1",
+  "corpus_manifest_digest": "0017dab82e24960b8c3cafe15457895e279c6ecb6ea9e5b8f33f5cb10c0123d8",
+  "groups": [
+    {
+      "backend": "CPU",
+      "topology_id": "cpu-mmap-hc-up-two-term",
+      "context_group": "short",
+      "phase": "prefill",
+      "role": "required",
+      "maximum": {
+        "row_kl_nats": 1.0,
+        "tail_fraction": 0.125,
+        "mean_kl_nats": 0.05,
+        "step_mean_kl_nats": 0.05,
+        "mean_total_variation": 0.1
+      },
+      "minimum": {
+        "mean_top5_overlap": 0.8,
+        "top1_agreement": 0.75
+      },
+      "tail_threshold_kl_nats": 0.1
+    },
+    {
+      "backend": "CPU",
+      "topology_id": "cpu-mmap-hc-up-two-term",
+      "context_group": "short",
+      "phase": "decode",
+      "role": "required",
+      "maximum": {
+        "row_kl_nats": 1.2,
+        "tail_fraction": 0.125,
+        "mean_kl_nats": 0.1,
+        "step_mean_kl_nats": 0.1,
+        "mean_total_variation": 0.075
+      },
+      "minimum": {
+        "mean_top5_overlap": 0.8,
+        "top1_agreement": 0.875
+      },
+      "tail_threshold_kl_nats": 0.1
+    },
+    {
+      "backend": "CPU",
+      "topology_id": "cpu-mmap-hc-up-two-term",
+      "context_group": "heldout-short",
+      "phase": "prefill",
+      "role": "required",
+      "maximum": {
+        "row_kl_nats": 1.0,
+        "tail_fraction": 0.125,
+        "mean_kl_nats": 0.05,
+        "step_mean_kl_nats": 0.05,
+        "mean_total_variation": 0.1
+      },
+      "minimum": {
+        "mean_top5_overlap": 0.8,
+        "top1_agreement": 0.75
+      },
+      "tail_threshold_kl_nats": 0.1
+    },
+    {
+      "backend": "CPU",
+      "topology_id": "cpu-mmap-hc-up-two-term",
+      "context_group": "heldout-short",
+      "phase": "decode",
+      "role": "required",
+      "maximum": {
+        "row_kl_nats": 1.0,
+        "tail_fraction": 0.125,
+        "mean_kl_nats": 0.1,
+        "step_mean_kl_nats": 0.1,
+        "mean_total_variation": 0.075
+      },
+      "minimum": {
+        "mean_top5_overlap": 0.8,
+        "top1_agreement": 0.875
+      },
+      "tail_threshold_kl_nats": 0.1
+    },
+    {
+      "backend": "CPU",
+      "topology_id": "cpu-mmap-hc-up-two-term",
+      "context_group": "qsa-threshold",
+      "phase": "prefill",
+      "role": "diagnostic"
+    },
+    {
+      "backend": "CPU",
+      "topology_id": "cpu-mmap-hc-up-two-term",
+      "context_group": "qsa-threshold",
+      "phase": "decode",
+      "role": "diagnostic"
+    }
+  ]
+}

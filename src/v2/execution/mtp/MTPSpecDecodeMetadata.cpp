@@ -1,3 +1,10 @@
+/**
+ * @file MTPSpecDecodeMetadata.cpp
+ * @brief Canonical speculative metadata workspace geometry and checked device-address projections.
+ *
+ * The workspace binding owns setup capacity; publication borrows its actual allocation
+ * extent without reading GPU values or inventing active-request-sized capacity.
+ */
 #include "MTPSpecDecodeMetadata.h"
 
 #include "MTPDecodeCatchup.h"
@@ -1498,6 +1505,18 @@ namespace llaminar2
     bool MTPSpecDecodeMetadataWorkspaceBinding::hasWorkspace() const
     {
         return workspace_ != nullptr && device_pointers_.complete();
+    }
+
+    std::span<int32_t> MTPSpecDecodeMetadataWorkspaceBinding::acceptedStateSlotIndicesView() const
+    {
+        if (!hasWorkspace()) return {};
+        const auto name = MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_SLOT_INDICES;
+        const auto bytes = workspace_->getBufferSize(name);
+        auto *pointer = static_cast<int32_t *>(workspace_->getBuffer(name));
+        if (!pointer || pointer != device_pointers_.accepted_state_slot_indices ||
+            bytes % sizeof(int32_t) != 0 ||
+            reinterpret_cast<std::uintptr_t>(pointer) % alignof(int32_t) != 0) return {};
+        return {pointer, bytes / sizeof(int32_t)};
     }
 
     void MTPSpecDecodeMetadataWorkspaceBinding::refreshDevicePointers()

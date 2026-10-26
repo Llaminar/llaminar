@@ -24,6 +24,8 @@
 # that same artifact. Otherwise ldconfig can silently resurrect a stock DSO
 # even though a separately named repaired file still has a valid receipt.
 # HIP_RUNTIME_INSTALL_PREFIX may stage an isolated installation for validation.
+# HIP_RUNTIME_STAGE_PREFIX exports that authenticated component for SDK-relative
+# shipping without compiling, downloading, or creating another runtime authority.
 set -euo pipefail
 
 hip_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,8 +67,59 @@ if [[ -f "${hip_library}" && -f "${hip_marker}" &&
       "${hip_library}" -ef "${hip_prefix}/lib/libamdhip64.so.7" &&
       "${hip_library}" -ef "${hip_prefix}/lib/libamdhip64.so" &&
       "$(<"${hip_marker}")" == "${hip_identity}:$(sha256sum "${hip_library}" | cut -d ' ' -f 1)" ]]; then
-    echo "HIP graph runtime already installed: ${hip_library}"
+    if [[ -n "${HIP_RUNTIME_STAGE_PREFIX:-}" ]]; then
+        # Export only the installer-owned component, including the package name
+        # that must replace stock HIP in the runtime SDK. Relative aliases make
+        # this component relocatable; no second /usr/local authority is created.
+        hip_stage_requested="${HIP_RUNTIME_STAGE_PREFIX}"
+        [[ "${hip_stage_requested}" == /* ]] || {
+            echo "HIP staging requires an absolute component prefix" >&2; exit 1;
+        }
+        hip_stage="$(realpath -m -- "${hip_stage_requested}")"
+        hip_installed_prefix="$(realpath -e -- "${hip_prefix}")"
+        if [[ "${hip_stage}" == "${hip_installed_prefix}" ||
+              "${hip_stage}" == "${hip_installed_prefix}/"* ]]; then
+            echo "HIP staging must not resolve to the installed SDK or its descendants" >&2; exit 1;
+        fi
+        if [[ -L "${hip_stage_requested}" ||
+              ( -e "${hip_stage_requested}" && ! -d "${hip_stage_requested}" ) ]]; then
+            echo "HIP staging requires a fresh prefix or an owned directory, not a link/file" >&2; exit 1;
+        fi
+        # Check both existence and links: -e alone misses dangling symlinks.
+        # No destination path is created or copied before the complete check.
+        for hip_component in lib share; do
+            if [[ -e "${hip_stage}/${hip_component}" || -L "${hip_stage}/${hip_component}" ]]; then
+                echo "HIP staging destination already owns ${hip_component}" >&2; exit 1;
+            fi
+        done
+        [[ ! -L "${hip_library}" &&
+           "$(readlink "${hip_package_library}")" == "libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}" &&
+           "$(readlink "${hip_prefix}/lib/libamdhip64.so.7")" == "libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}" &&
+           "$(readlink "${hip_prefix}/lib/libamdhip64.so")" == libamdhip64.so.7 ]] || {
+            echo "HIP component requires canonical self-contained aliases" >&2; exit 1;
+        }
+        for hip_patch in "${hip_patches[@]}"; do
+            cmp -s "${hip_patch}" "${hip_prefix}/share/licenses/llaminar-hip/$(basename -- "${hip_patch}")" || {
+                echo "HIP installed repair differs from staging authority" >&2; exit 1;
+            }
+        done
+        install -d "${hip_stage}/lib" "${hip_stage}/share/llaminar" "${hip_stage}/share/licenses"
+        cp -P "${hip_library}" "${hip_package_library}" \
+            "${hip_prefix}/lib/libamdhip64.so.7" "${hip_prefix}/lib/libamdhip64.so" "${hip_stage}/lib/"
+        cp "${hip_marker}" "${hip_stage}/share/llaminar/"
+        cp -a "${hip_prefix}/share/licenses/llaminar-hip" "${hip_stage}/share/licenses/"
+        echo "HIP graph runtime component staged: ${hip_stage}"
+    else
+        echo "HIP graph runtime already installed: ${hip_library}"
+    fi
     exit 0
+fi
+
+# Packaging consumes an already authenticated builder installation. It must
+# never turn an absent/stale component into a hidden source build or download.
+if [[ -n "${HIP_RUNTIME_STAGE_PREFIX:-}" ]]; then
+    echo "HIP staging requires an authenticated installed runtime" >&2
+    exit 1
 fi
 
 for dependency in cmake ninja ccache curl git python3; do

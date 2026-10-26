@@ -183,6 +183,24 @@ namespace llaminar2
          */
         static void addCounter(const CounterIdentity &identity, double value = 1.0);
 
+        /** @brief Sum and multiplicity of completed observations, not sampling intent. */
+        struct CounterObservationBatch
+        {
+            std::uint64_t observations;
+            double value;
+        };
+
+        /**
+         * @brief Publish completed homogeneous observations with one collector lock.
+         * @param identity Cold-bound original family dimensions.
+         * @param batch Original observation count and aggregate numeric increment.
+         * @details Positive counts retain zero-valued records. Zero observations
+         * require zero value and publish nothing. Sequence families and count
+         * overflow reject before mutation; filtering/reset keep their existing
+         * authority. No caller retains a mutable record address or measurement epoch.
+         */
+        static void addCounter(const CounterIdentity &identity, CounterObservationBatch batch);
+
         static void addCounter(
             std::string domain,
             std::string name,

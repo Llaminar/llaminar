@@ -5,6 +5,8 @@
  * This file does NOT include any CUDA/HIP headers directly. Instead, it uses
  * factory functions registered by cuda_backend and rocm_backend libraries.
  * This keeps GPUDeviceContextPool in llaminar2_core without GPU dependencies.
+ * Typed and named lookups share the same registered-factory authority. Device-
+ * free tests can register explicit contexts; absent factories still fail hard.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -222,28 +224,12 @@ namespace llaminar2
 
         if (device.is_cuda())
         {
-#ifdef HAVE_CUDA
-            if (!hasNvidiaSupport())
-            {
-                ensureNvidiaFactoryRegistered();
-            }
             return getNvidiaContext(device.cuda_ordinal());
-#else
-            throw std::runtime_error("[GPUDeviceContextPool] CUDA support not compiled in");
-#endif
         }
 
         if (device.is_rocm())
         {
-#ifdef HAVE_ROCM
-            if (!hasAMDSupport())
-            {
-                ensureAMDFactoryRegistered();
-            }
             return getAMDContext(device.rocm_ordinal());
-#else
-            throw std::runtime_error("[GPUDeviceContextPool] ROCm support not compiled in");
-#endif
         }
 
         throw std::invalid_argument("[GPUDeviceContextPool] Unsupported GPU device: '" + device.to_string() + "'");

@@ -101,8 +101,12 @@ std::span<const BufferBinding> Qwen4ExpPLERetainedStage::verifierStatePublicatio
         : std::span<const BufferBinding>{};
 }
 
-bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRowFromDeviceIndex(const int*r,void*s){return device().is_gpu()&&params_.requests==1&&publish(r,1,1,s);}
-bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRowsFromDeviceIndices(const int*r,int n,int stride,void*s){return device().is_gpu()&&publish(r,n,stride,s);}
+bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int> r_view,void*s){
+    if (!deviceVerifierStateMetadataCovers(r_view, 1, 1)) return false;
+    const int *r = r_view.data();return device().is_gpu()&&params_.requests==1&&publish(r,1,1,s);}
+bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRowsFromDeviceIndices(std::span<const int> r_view,int n,int stride,void*s){
+    if (!deviceVerifierStateMetadataCovers(r_view, n, stride)) return false;
+    const int *r = r_view.data();return device().is_gpu()&&publish(r,n,stride,s);}
 ComputeStageType Qwen4ExpPLERetainedStage::type()const{return params_.operation==Operation::SnapshotPrior?ComputeStageType::QWEN4EXP_PLE_SNAPSHOT_PRIOR:ComputeStageType::QWEN4EXP_PLE_RETAIN_CANDIDATES;}
 std::size_t Qwen4ExpPLERetainedStage::estimatedMemoryBytes()const{std::size_t n=0;for(const auto&o:operands_)n+=o.bytes;return n;}
 bool Qwen4ExpPLERetainedStage::supportsBackend(ComputeBackendType b)const{return (device().is_cpu()&&b==ComputeBackendType::CPU)||(device().is_cuda()&&b==ComputeBackendType::GPU_CUDA)||(device().is_rocm()&&b==ComputeBackendType::GPU_ROCM);}

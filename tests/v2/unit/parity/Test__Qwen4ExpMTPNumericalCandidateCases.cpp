@@ -8,9 +8,12 @@
  */
 #include "integration/parity/qwen4exp/Qwen4ExpMTPNumericalCandidateCases.h"
 #include "integration/parity/ModelParityRuntimeExport.h"
+#include "integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
 #include "config/OrchestrationConfigParser.h"
 #include <gtest/gtest.h>
 #include <map>
+#include <sstream>
+#include <nlohmann/json.hpp>
 #include <iterator>
 #include <set>
 
@@ -145,5 +148,53 @@ TEST(Qwen4ExpMTPNumericalCandidates, FirstCPUCellHasExactIdentityAndPublicPredic
     EXPECT_EQ(parsed.mtp.draft_tokens, 1);
     EXPECT_EQ(parsed.mtp.graph_capacity_draft_tokens, 15);
     EXPECT_EQ(parsed.mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
+}
+} // namespace llaminar2::test::parity::qwen4exp
+
+namespace llaminar2::test::parity::qwen4exp
+{
+/** @test Both real QFN definitions retain numerical tests but only main owns canonical controls. */
+TEST(Qwen4ExpMTPNumericalCandidates, InventoryRoleSeparatesNumericalAndRuntimeControlAuthority)
+{
+    std::set<std::string> canonical, diagnostics;
+    for (const auto &cell : qwen4ExpProductionCases())
+    {
+        EXPECT_EQ(cell.inventory_role, ModelParityInventoryRole::Canonical);
+        std::ostringstream original;
+        PrintTo(cell, &original);
+        const auto record = nlohmann::json::parse(original.str());
+        EXPECT_FALSE(record.contains("inventory_role"));
+        EXPECT_TRUE(canonical.insert(record.at("id").get<std::string>()).second);
+    }
+    for (const auto &cell : qwen4ExpMTPNumericalCandidateCases())
+    {
+        EXPECT_EQ(cell.inventory_role, ModelParityInventoryRole::NumericalDiagnostic);
+        std::ostringstream output;
+        PrintTo(cell, &output);
+        const auto record = nlohmann::json::parse(output.str());
+        EXPECT_EQ(record.at("inventory_role"), "numerical_diagnostic");
+        EXPECT_TRUE(diagnostics.insert(record.at("id").get<std::string>()).second);
+        EXPECT_TRUE(record.contains("shared_predictor"));
+    }
+    unsigned overlaps = 0;
+    for (const auto &id : diagnostics) overlaps += canonical.count(id);
+    EXPECT_EQ(overlaps, 4u); // Distinct paired-source Off records must not be first-wins deduplicated.
+    const auto other_definition = qwen36::qwen36DenseParityDefinition(
+        qwen36::qwen36SingleDeviceTopology("CUDA0", GlobalDeviceAddress::cuda(0)), "fixture/reference");
+    for (const auto &cell : expandModelParityDefinition(other_definition))
+    {
+        EXPECT_EQ(cell.inventory_role, ModelParityInventoryRole::Canonical);
+        EXPECT_TRUE(canonical.insert(cell.testName()).second);
+    }
+    EXPECT_EQ(canonical.size(), 26u);
+    EXPECT_EQ(diagnostics.size(), 24u);
+    auto invalid = qwen4ExpMTPNumericalCandidateDefinition(Qwen4ExpParityTopology::CPU);
+    invalid.inventory_role = static_cast<ModelParityInventoryRole>(255);
+    EXPECT_THROW((void)expandModelParityDefinition(invalid), std::invalid_argument);
+    auto invalid_cell = qwen4ExpProductionCases().front();
+    invalid_cell.inventory_role = static_cast<ModelParityInventoryRole>(255);
+    std::ostringstream rejected;
+    EXPECT_THROW(PrintTo(invalid_cell, &rejected), std::invalid_argument);
+    EXPECT_TRUE(rejected.str().empty());
 }
 } // namespace llaminar2::test::parity::qwen4exp

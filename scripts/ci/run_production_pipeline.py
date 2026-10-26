@@ -528,7 +528,8 @@ def e2e_projection(inventory: dict, revision: str) -> dict:
                 or len(set(files)) != len(files) or any(path not in files
                     for path in model_source_fields(config).values())):
             raise ValueError("full inventory omitted a valid configuration or model-file declaration")
-        InventoryScope.ALL.accepts(config)
+        if not InventoryScope.ALL.accepts(config):
+            raise ValueError("full inventory contains a cell outside canonical inventory authority")
         if row["case"] in cases or config["id"] in identities:
             raise ValueError("the full canonical inventory contains duplicate cell identities")
         cases.add(row["case"])

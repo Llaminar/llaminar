@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1597,5 +1598,32 @@ TEST(PerfStatsCollector, BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy
         PerfStatsCollector::addCounter(key);
     }
     rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,1u);
+    // Batch the original observations, not merely one larger numeric value.
+    PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=3u, .value=0.0});
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(rows[0].count,4u); EXPECT_DOUBLE_EQ(rows[0].value,1.0);
+    PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=2u, .value=7.0});
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(rows[0].count,6u); EXPECT_DOUBLE_EQ(rows[0].value,8.0);
+    PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=0u, .value=0.0});
+    EXPECT_THROW(PerfStatsCollector::addCounter(key,
+        (PerfStatsCollector::CounterObservationBatch{.observations=0u, .value=1.0})),std::invalid_argument);
+    EXPECT_THROW(PerfStatsCollector::addCounter(key,
+        (PerfStatsCollector::CounterObservationBatch{.observations=std::numeric_limits<std::uint64_t>::max(), .value=0.0})),std::overflow_error);
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(rows[0].count,6u); EXPECT_DOUBLE_EQ(rows[0].value,8.0);
+    {
+        ScopedEnv disabled("LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=9u, .value=11.0});
+    }
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,6u);
+    PerfStatsCollector::reset();
+    PerfStatsCollector::addCounter(key, PerfStatsCollector::CounterObservationBatch{.observations=2u, .value=0.0});
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u);
+    EXPECT_EQ(rows[0].count,2u); EXPECT_DOUBLE_EQ(rows[0].value,0.0);
+    const auto sequenced=PerfStatsCollector::bindCounter("kernel","bound_sequence","submission","cpu:0");
+    PerfStatsCollector::addCounterWithSequence("kernel","bound_sequence",1.0,{7u},"submission","cpu:0");
+    EXPECT_THROW(PerfStatsCollector::addCounter(sequenced,
+        (PerfStatsCollector::CounterObservationBatch{.observations=2u, .value=0.0})),std::logic_error);
     PerfStatsCollector::reset();
 }

@@ -16,6 +16,7 @@
  * - Device context cache (lazy initialization)
  * - Graph cache (decode optimization)
  * - Execution state (position offset tracking)
+ * - Exact accepted-row terminal logits publication into canonical CPU storage
  *
  * Usage:
  * @code
@@ -4491,6 +4492,20 @@ namespace llaminar2
         // =========================================================================
 
         /**
+         * @brief Construct the actual cold grouped-verifier workspace declaration.
+         * @param ordinary Original ordinary/prefill declaration; it remains unchanged.
+         * @param owner Existing admitted generation owner, never a generic batch estimate.
+         * @return Grouped Decode metadata with exact GPU R/M and no borrowed prefill rows.
+         * @throws std::invalid_argument For a malformed or non-declaration ordinary input.
+         * @throws std::logic_error When the owner retains no verifier family.
+         * @details GPU coordinates come from the same owner as permanent verifier
+         * tokens/lengths. CPU preserves its existing host batch contract. Native
+         * row pointers are bound by the caller only after this cold construction.
+         */
+        [[nodiscard]] static ForwardInput groupedVerifierWorkspaceInput(
+            const ForwardInput &ordinary, const MTPGraphOwnerPlan &owner);
+
+        /**
          * @brief Backend-owned pinned host scratch for compact stochastic outcomes.
          *
          * GPU D2H copies are only truly asynchronous when the host destination is
@@ -7636,6 +7651,7 @@ namespace llaminar2
             None,
             ForwardGraph,
             PrefixTerminalRestore,
+            AcceptedVerifierState,
         };
 
         /**
@@ -7665,6 +7681,17 @@ namespace llaminar2
             const ForwardLogitsPublicationDescriptor &descriptor,
             MainLogitsPublicationSource source,
             const char *producer_name);
+
+        /**
+         * @brief Publish the accepted CPU verifier row into canonical main logits.
+         * @param selection Typed physical row and request epoch from state publication.
+         * @return Whether the exact vocabulary row was copied and published.
+         *
+         * Retained verifier storage remains a multirow producer and may be
+         * overwritten by the next verifier. Scalar consumers cannot treat that
+         * entire tensor as row zero; canonical storage retains one accepted row.
+         */
+        bool publishCPUAcceptedVerifierLogits(const PrefixLogitsRowSelection &selection);
 
         /** Invalidate tensor identity at a request or restore boundary. */
         void clearCurrentMainLogitsPublication(const char *reason) noexcept;

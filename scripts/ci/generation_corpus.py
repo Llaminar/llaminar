@@ -82,7 +82,8 @@ def portable_inventory(inventory: dict, model_sources: dict) -> list[dict]:
                     for path in model_source_fields(config).values())):
             raise ValueError("canonical corpus cell omitted its full configuration or model shards")
         generation_profile(config)
-        InventoryScope.ALL.accepts(config)
+        if not InventoryScope.ALL.accepts(config):
+            raise ValueError("generation corpus contains a cell outside canonical inventory authority")
         if config["id"] in identities or row["case"] in cases:
             raise ValueError("canonical corpus inventory contains duplicate cells")
         identities.add(config["id"])

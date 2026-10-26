@@ -445,6 +445,8 @@ TEST(Test__RamPrefixStorageBackend, RecurrentOnlyLayoutOwnsNoAttentionBytes)
     layout.fa_layers = 0;
     layout.gdn_layers = 1;
     layout.hybrid_host_state_bytes = layout.hybrid_state_bytes = 32;
+    layout.hybrid_host_encoding = HybridPrefixHostEncoding::CPUFixedEpochPackedV2;
+    layout.hybrid_host_state_capacity_bytes = layout.hybrid_host_state_bytes;
     layout.includes_hybrid_state = true;
     ASSERT_TRUE(layout.hasRestorableMainState());
     EXPECT_EQ(layout.organization(), PrefixPayloadOrganization::RecurrentCheckpoint);

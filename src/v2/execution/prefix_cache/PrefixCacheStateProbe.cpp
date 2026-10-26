@@ -18,6 +18,7 @@
 #include "utils/FNV1a.h"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
@@ -600,6 +601,22 @@ namespace llaminar2
             probe.recurrence_layout = has_authoritative_device_state
                                           ? metadata.device_recurrence_layout
                                           : metadata.host_recurrence_layout;
+            // CPU cache metadata certifies host-owned epoch storage. Preserve
+            // its full checkpoint/history extent: interpreting it as a dense
+            // matrix would lose the arithmetic state of an unfinished epoch.
+            if (!has_authoritative_device_state && metadata.host_bytes > 0)
+            {
+                const CPUGDNStateLayout layout(state->n_v_heads, state->d_k, state->d_v);
+                if (probe.recurrence_layout != GDNRecurrenceStateLayout::KeyMajorValueContiguous ||
+                    state->recurrence_state.size() != static_cast<size_t>(layout.floats()) ||
+                    !layout.valid(state->recurrence_state.data()))
+                    throw std::invalid_argument("Invalid CPU GDN diagnostic epoch extent/layout/phase");
+                probe.recurrence_storage = GDNStateStorage::CPUFixedEpoch;
+                probe.recurrence_epoch_phase_words.reserve(static_cast<size_t>(state->n_v_heads));
+                for (int head = 0; head < state->n_v_heads; ++head)
+                    probe.recurrence_epoch_phase_words.push_back(std::bit_cast<uint32_t>(
+                        state->recurrence_state[static_cast<size_t>(head) * layout.headFloats()]));
+            }
             probe.recurrence_values = state->recurrence_state.size();
             probe.conv_values = state->conv_state.size();
             probe.recurrence_hash = hashFloatVector(state->recurrence_state);
@@ -751,7 +768,8 @@ namespace llaminar2
                 probe.recurrence_sample_values = state->recurrence_state;
                 probe.conv_sample_values = state->conv_state;
             }
-            if (capture_policy.capture_gdn_values)
+            if (capture_policy.capture_gdn_values &&
+                probe.recurrence_storage == GDNStateStorage::DeviceDense)
                 canonicalizeRecurrenceValuesForPrefixProbe(probe.recurrence_sample_values,
                                                            state->d_k,
                                                            state->d_v,

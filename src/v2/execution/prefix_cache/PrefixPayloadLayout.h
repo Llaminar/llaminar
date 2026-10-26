@@ -10,6 +10,7 @@
 #pragma once
 #include "execution/mtp/MTPShiftedCacheOrigin.h"
 #include "kernels/common/GDNRecurrenceStateLayout.h"
+#include "kernels/CPUGDNStateLayout.h"
 #include "kernels/qwen4exp/Qwen4ExpArchiveGeometry.h"
 
 #include "backends/DeviceId.h"
@@ -62,7 +63,9 @@ namespace llaminar2
         TensorLayout kv_layout = TensorLayout::KV_POS_HEAD_DIM;
         size_t bytes_per_fa_layer_k = 0;
         size_t bytes_per_fa_layer_v = 0;
-        size_t hybrid_host_state_bytes = 0;
+        size_t hybrid_host_state_bytes = 0; ///< Exact bytes for this record, not current destination phase.
+        size_t hybrid_host_state_capacity_bytes = 0; ///< Stable packed/local capacity identity.
+        HybridPrefixHostEncoding hybrid_host_encoding = HybridPrefixHostEncoding::None;
         size_t hybrid_device_state_bytes = 0;
         size_t hybrid_state_bytes = 0;
         GDNRecurrenceStateLayout hybrid_host_recurrence_layout =
@@ -129,6 +132,16 @@ namespace llaminar2
         int block_size,
         size_t terminal_hidden_bytes = 0,
         size_t terminal_logits_bytes = 0);
+
+    /**
+     * @brief Author an exact CPU durable host extent before payload allocation.
+     * @param layout Stable owner-authenticated schema or one record derived from it.
+     * @param cache Canonical source whose current CPU phases own the live extent.
+     * @param sequence Existing cache request slot.
+     * @throws std::invalid_argument For missing/incompatible host ownership or invalid phases.
+     * @details Capacity/encoding remain unchanged, so phase never changes compatibility.
+     */
+    void applyHybridPrefixPayloadExtent(PrefixPayloadLayout &layout, const IKVCache &cache, int sequence);
 
     /**
      * @brief Resolve one valid largest QFN record layout for fixed-slot admission.
