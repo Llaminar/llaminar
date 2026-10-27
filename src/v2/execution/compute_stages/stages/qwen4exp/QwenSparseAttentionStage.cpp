@@ -5,6 +5,8 @@
  * Constructor-created views own extent validation and coherence declarations.
  * Execute resolves only already-prepared addresses. Native selected reads use
  * the exact canonical per-row mapping produced earlier on the executor DAG.
+ * Completed native recording publishes the same sealed policy signature as
+ * setup; failed recording never becomes execution evidence.
  */
 #include "QwenSparseAttentionStage.h"
 #include "kernels/qwen4exp/QwenSparseQueryRowWork.h"
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <string_view>
 #include "utils/PerfStatsCollector.h"
+#include "utils/Logger.h"
 #include "snapshots/Qwen4ExpSnapshotGeometry.h"
 
 namespace llaminar2
@@ -241,18 +244,48 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             {{"program", program}, {"rows", std::to_string(params_.rowCapacity)},
              {"query_projection_required", indexer->queryDemand == qwen4exp::QwenSparseQueryDemand::ProvenNoRanking ? "0" : "1"}});
     }
-    if(const auto *attention=std::get_if<SelectedAttention>(&params_.operation)) {
-        // Setup observes the exact policy forwarded below. No replay counter,
-        // synchronization, environment read or device-state read occurs here.
-        PerfStatsCollector::addCounter("qsa","attention_arithmetic_policy",1.0,"setup",device().to_string(),
-            {{"policy",std::string(qwen4exp::qwenSparseAttentionArithmeticName(attention->arithmetic))},
-             {"rows",std::to_string(params_.rowCapacity)},{"query_heads",std::to_string(attention->queryHeads)},
-             {"kv_heads",std::to_string(attention->kvHeads)},{"query_head_start",std::to_string(attention->queryHeadStart)},
-             {"kv_head_start",std::to_string(attention->kvHeadStart)},
-             {"phase",attention->executionPhase ? (*attention->executionPhase==ForwardExecutionPhase::Prefill ? "prefill" : "decode") : "unspecified"},
-             {"program",std::string(qwen4exp::qwenSparseAttentionArithmeticName(attention->arithmetic))},
-             {"parts",std::to_string(qwen4exp::qwenSparseAttentionPartialCount(attention->arithmetic))}});
+    publishAttentionProgram("qsa", "attention_arithmetic_policy", "setup");
+}
+
+void QwenSparseAttentionStage::publishAttentionProgram(
+    const char *domain, const char *name, const char *phase) const
+{
+    const auto *attention = std::get_if<SelectedAttention>(&params_.operation);
+    if (!attention || !PerfStatsCollector::isDomainEnabled(domain)) return;
+    // The same immutable identity binds constructor policy to successful native
+    // recording. Rows are geometry only: multi-row MTP remains Decode.
+    PerfStatsCollector::addCounter(domain, name, 1.0, phase, device().to_string(),
+        {{"policy", std::string(qwen4exp::qwenSparseAttentionArithmeticName(attention->arithmetic))},
+         {"rows", std::to_string(params_.rowCapacity)}, {"query_heads", std::to_string(attention->queryHeads)},
+         {"kv_heads", std::to_string(attention->kvHeads)},
+         {"query_head_start", std::to_string(attention->queryHeadStart)},
+         {"kv_head_start", std::to_string(attention->kvHeadStart)},
+         {"phase", attention->executionPhase ?
+             (*attention->executionPhase == ForwardExecutionPhase::Prefill ? "prefill" : "decode") : "unspecified"},
+         {"program", std::string(qwen4exp::qwenSparseAttentionArithmeticName(attention->arithmetic))},
+         {"parts", std::to_string(qwen4exp::qwenSparseAttentionPartialCount(attention->arithmetic))},
+         {"capture_signature", std::to_string(graphCaptureVariantSignature())}});
+}
+
+bool QwenSparseAttentionStage::transitionGraphCaptureActivity(
+    IDeviceContext *context, void *stream, GraphCaptureActivityTransition transition)
+{
+    if (!context || context->deviceId() != device() || !device().is_gpu() || !stream)
+    {
+        LOG_ERROR("[QwenSparseAttentionStage] Capture observation requires its exact GPU context and non-null stream");
+        return false;
     }
+    switch (transition)
+    {
+    case GraphCaptureActivityTransition::Entering:
+    case GraphCaptureActivityTransition::Aborted:
+        return true;
+    case GraphCaptureActivityTransition::Completed:
+        publishAttentionProgram("gpu_graph_inventory", "qsa_attention_program_captures", "capture_setup");
+        return true;
+    }
+    LOG_ERROR("[QwenSparseAttentionStage] Capture observation received an invalid lifecycle transition");
+    return false;
 }
 
 void QwenSparseAttentionStage::addTransactionPrior(QwenSparseTransactionPriorBinding binding,Access access)
@@ -381,6 +414,8 @@ bool QwenSparseAttentionStage::execute(IDeviceContext *context)
                 .observations=a.observations ? pointer<qwen4exp::QwenSparseAttentionObservation>(*a.observations,Access::Output) : nullptr,
                 .row_capacity=params_.rowCapacity,.token_capacity=params_.tokenCapacity,.query_heads=a.queryHeads,.kv_heads=a.kvHeads,
                 .query_head_start=a.queryHeadStart,.kv_head_start=a.kvHeadStart,.arithmetic=a.arithmetic},stream);
+            if (device().is_cpu())
+                publishAttentionProgram("qsa", "attention_program_executions", "execute");
         },
         [&](const RetainCandidates &a) {
             if(a.terminalCounters)a.terminalCounters->requireRequest(device(),a.requestIndex);

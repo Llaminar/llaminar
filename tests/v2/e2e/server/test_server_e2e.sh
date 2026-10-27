@@ -2035,7 +2035,6 @@ sys.path.insert(0, policy_module_dir)
 from graph_capture_perf_policy import DecodeGraphRequirement, validate_graph_capture_policy
 from flash_attention_perf_policy import (
     validate_cpu_flash_attention_execution_policy,
-    validate_flash_attention_plan_policy,
 )
 from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from llep_verifier_perf_policy import validate_llep_verifier_policy
@@ -2050,6 +2049,7 @@ from ranked_perf_artifacts import collect_and_publish_ranked_perf_stats, validat
 from moe_route_scratch_perf_policy import validate_moe_route_scratch_policy
 from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy
 from server_execution_contract import validate_server_execution_contract, validate_automatic_selection
+from attention_execution_perf_policy import validate_attention_execution_policy
 
 suite_option_set = {
     option.strip()
@@ -2145,14 +2145,6 @@ if is_gpu:
         print(f"FAIL: {graph_capture_validation.error}")
         sys.exit(0)
 
-    flash_attention_validation = validate_flash_attention_plan_policy(
-        records,
-        execution.attention_device_kinds,
-    )
-    if flash_attention_validation.error:
-        print(f"FAIL: {flash_attention_validation.error}")
-        sys.exit(0)
-
     request_input_validation = validate_request_input_lifetime_policy(records)
     if request_input_validation.error:
         print(f"FAIL: {request_input_validation.error}")
@@ -2163,6 +2155,12 @@ if is_gpu:
     if host_transfer_validation.error:
         print(f"FAIL: {host_transfer_validation.error}")
         sys.exit(0)
+
+attention_validation = validate_attention_execution_policy(
+    records, execution, require_prefill=(expect_prefill_phase or require_prefill_capture))
+if attention_validation.error:
+    print(f"FAIL: {attention_validation.error}")
+    sys.exit(0)
 
 if require_cpu_fa2_context_parallel:
     if execution.device_kinds != {"cpu"}:

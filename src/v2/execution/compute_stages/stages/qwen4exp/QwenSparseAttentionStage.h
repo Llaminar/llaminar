@@ -133,6 +133,14 @@ public:
      * @return True once CPU work or GPU submission succeeds.
      */
     bool execute(IDeviceContext *context) override;
+    /** @brief Publish immutable attention evidence only for completed native recording.
+     * @param context Exact GPU context owning this graph unit.
+     * @param stream Non-null stream owned by the native capture transaction.
+     * @param transition Typed Entering, Completed or Aborted edge from the graph owner.
+     * @return True after accepting the edge; aborted units publish no evidence.
+     */
+    bool transitionGraphCaptureActivity(IDeviceContext *context, void *stream,
+        GraphCaptureActivityTransition transition) override;
     /** @brief Semantic graph-stage operation tag. */
     ComputeStageType type() const override;
     /** @brief Authenticate every indexer selector/geometry/binding and retained publication identity. */
@@ -183,6 +191,12 @@ public:
     /** @brief Inspect sealed operation identity without reading live state. */
     const Params &getParams() const noexcept { return params_; }
 private:
+    /** @brief Observe the exact sealed selected-attention policy without reading live device state.
+     * @param domain PerfStats domain for setup, actual recording or CPU execution.
+     * @param name Stable observation name for that lifecycle edge.
+     * @param phase Observer boundary; semantic Prefill/Decode is a separate immutable tag.
+     */
+    void publishAttentionProgram(const char *domain, const char *name, const char *phase) const;
     enum class Access { Input, Output }; ///< Declared executor preparation/publication policy.
     /** @brief Setup-created native byte view; shared by validation, contracts and diagnostics. */
     struct Operand

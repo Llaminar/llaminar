@@ -112,23 +112,41 @@ namespace llaminar2
         const std::map<DeviceId, ServerParticipantRole> &participants,
         const RankExecutionPlan &plan, const ModelMemoryProfile &model)
     {
-        if (model.n_layers <= 0 || model.mtp_layer_count < 0 || model.mtp_layer_count >= model.n_layers)
+        // Flash Next declares main blocks separately from its exported predictor;
+        // other Qwen exports include that trailing block in n_layers. Reuse the
+        // canonical profile boundary rather than subtracting nextn twice.
+        const int main_layers = model.mainLayerCount();
+        const int total_layers = model.totalLayerCount();
+        if (main_layers <= 0 || total_layers < main_layers)
             throw std::invalid_argument("Server attention evidence requires complete model layer geometry");
-        const int main_layers = model.n_layers - model.mtp_layer_count;
         const auto has_attention = [&](int first, int end) {
-            if (first < 0 || end < first || end > model.n_layers)
+            if (first < 0 || end < first || end > total_layers)
                 throw std::invalid_argument("Server attention evidence has an invalid layer interval");
             for (int layer = first; layer < end; ++layer)
                 if (PersistentStateMemoryEstimator::isFullAttentionLayer(model, layer)) return true;
             return false;
         };
         const bool predictor_attention = plan.runtime.mtp.enabled && plan.has_lm_head &&
-            has_attention(main_layers, model.n_layers);
+            has_attention(main_layers, total_layers);
         const size_t stages = plan.local_pp_devices.size();
         if (stages && (plan.local_pp_layer_boundaries.size() != stages + 1 ||
             (!plan.local_pp_stage_tp_info.empty() && plan.local_pp_stage_tp_info.size() != stages)))
             throw std::invalid_argument("Server attention evidence requires complete pipeline ownership");
-        std::string devices, attention;
+        // Family obligations are independent: a dense MTP sidecar cannot certify
+        // missing sparse-trunk work on the same device.
+        enum class AttentionFamily { Flash, Sparse };
+        const auto has_family = [&](int first, int end, AttentionFamily family) {
+            for (int layer = first; layer < end; ++layer)
+            {
+                if (!PersistentStateMemoryEstimator::isFullAttentionLayer(model, layer)) continue;
+                const auto selected = model.flash_next &&
+                    model.flashNextLayerKind(layer) == Qwen4ExpLayerKind::QSA
+                    ? AttentionFamily::Sparse : AttentionFamily::Flash;
+                if (selected == family) return true;
+            }
+            return false;
+        };
+        std::string devices, attention, flash_attention, sparse_attention;
         for (const auto &[device, role] : participants)
         {
             if (!devices.empty()) devices += ',';
@@ -166,10 +184,20 @@ namespace llaminar2
                 if (!has_attention(first, end) && !owns_predictor) continue;
                 if (!attention.empty()) attention += ',';
                 attention += device.toString();
+                const auto append_family = [&](std::string &list, AttentionFamily family) {
+                    if (!has_family(first, end, family) &&
+                        !(owns_predictor && has_family(main_layers, total_layers, family))) return;
+                    if (!list.empty()) list += ',';
+                    list += device.toString();
+                };
+                append_family(flash_attention, AttentionFamily::Flash);
+                append_family(sparse_attention, AttentionFamily::Sparse);
             }
         }
         return {{"schema", "1"}, {"source", "resolved_execution_plan"},
-                {"devices", devices}, {"attention_devices", attention}};
+                {"devices", devices}, {"attention_devices", attention},
+                {"flash_attention_devices", flash_attention},
+                {"sparse_attention_devices", sparse_attention}};
     }
 
     /**

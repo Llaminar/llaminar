@@ -17,10 +17,16 @@
 #include "kernels/qwen4exp/QwenSparseMath.h"
 #include "kernels/qwen4exp/QwenSparseAttentionArithmetic.h"
 #include <stdexcept>
+#include <cstdlib>
+#include <optional>
+#include <string>
+#include <vector>
 #include "tensors/Tensors.h"
 #include "tensors/TensorVerification.h"
 #include "tensors/GPUTensorVerification.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
+#include "../../../mocks/MockComputeStage.h"
 #include "utils/MPIContext.h"
 #include "utils/OpenMPUtils.h"
 #include "../../../integration/kernels/qwen4exp/QwenSparseNativeCodecFixture.h"
@@ -1041,4 +1047,167 @@ TEST(QwenSparseAttentionStage, ProvenNoRankingOmitsQueryContractsAndSnapshots)
     operation.queryDemand=qwen4exp::QwenSparseQueryDemand::RankingOnly;
     Stage full({.rowCapacity=rows,.tokenCapacity=tokens,.replay=Int(replay,BufferId::QFN_QSA_REPLAY),.operation=operation});
     EXPECT_NE(omitted.graphCaptureVariantSignature(),full.graphCaptureVariantSignature());
+}
+
+namespace
+{
+/** @brief Scope bounded QSA setup/capture observations without initializing a backend. */
+class ScopedSparseAttentionEvidence final
+{
+public:
+    /** @brief Save and enable only the two relevant observation domains. */
+    ScopedSparseAttentionEvidence()
+    {
+        for (std::size_t i = 0; i < names_.size(); ++i)
+            if (const auto *value = std::getenv(names_[i])) previous_[i] = value;
+        ::setenv(names_[0], "1", 1);
+        ::setenv(names_[1], "qsa,gpu_graph_inventory", 1);
+        mutableDebugEnv().reload();
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+        PerfStatsCollector::reset();
+    }
+    /** @brief Clear records and restore the exact prior observation policy. */
+    ~ScopedSparseAttentionEvidence()
+    {
+        PerfStatsCollector::reset();
+        for (std::size_t i = 0; i < names_.size(); ++i)
+            if (previous_[i]) ::setenv(names_[i], previous_[i]->c_str(), 1);
+            else ::unsetenv(names_[i]);
+        mutableDebugEnv().reload();
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+    }
+private:
+    const std::array<const char *, 2> names_{"LLAMINAR_PERF_STATS_JSON", "LLAMINAR_PERF_STATS_FILTER"};
+    std::array<std::optional<std::string>, 2> previous_;
+};
+}
+
+/** @test Only completed exact-owner native recording publishes the sealed program, including multi-row Decode. */
+TEST(QwenSparseAttentionStage, AttentionEvidenceCompletedCaptureKeepsPhaseAndSignature)
+{
+    ScopedSparseAttentionEvidence evidence;
+    MPIContext mpi(0, 1, MPI_COMM_WORLD);
+    SparseArithmeticMetadataCache cache(mpi);
+    SparseArithmeticCaptureFixture fixture;
+    INT32Tensor partials33{{4 * 24 * 33 * sizeof(qwen4exp::QwenSparseAttentionPartial) / 4}};
+    std::vector<std::pair<DeviceId, ComputeBackendType>> participants;
+#ifdef HAVE_CUDA
+    participants.emplace_back(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+#endif
+#ifdef HAVE_ROCM
+    participants.emplace_back(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+#endif
+    for (const auto &[device, backend] : participants)
+        for (const auto phase : {ForwardExecutionPhase::Prefill, ForwardExecutionPhase::Decode})
+        for (const auto arithmetic : {SparseArithmetic::FixedFP32, SparseArithmetic::TileFP16WithFP32Totals,
+                                     SparseArithmetic::TileFP16WithFP32Totals33})
+        {
+            // These are the complete supported immutable programs. The 33-part
+            // program belongs only to explicit Decode and needs its admitted R
+            // plus a real 33-part scratch extent, even in this metadata fixture.
+            if (!device.is_rocm() && arithmetic != SparseArithmetic::FixedFP32) continue;
+            if (arithmetic == SparseArithmetic::TileFP16WithFP32Totals33 && phase != ForwardExecutionPhase::Decode) continue;
+            SCOPED_TRACE(device.toString() + " " + std::string(qwen4exp::qwenSparseAttentionArithmeticName(arithmetic)));
+            PerfStatsCollector::reset();
+            auto params = fixture.params(cache, device);
+            auto &attention = std::get<Stage::SelectedAttention>(params.operation);
+            attention.executionPhase = phase;
+            attention.arithmetic = arithmetic;
+            if (arithmetic == SparseArithmetic::TileFP16WithFP32Totals33)
+            {
+                attention.retainedMtpCandidateRows = params.rowCapacity;
+                attention.gpuPartials = Int(partials33, BufferId::QFN_QSA_PARTIALS);
+            }
+            Stage stage(params);
+            llaminar2::testing::MockDeviceContext context(device, backend);
+            CPUDeviceContext wrong_context(DeviceId::cpu(), 1);
+            void *const stream = reinterpret_cast<void *>(0x1234);
+            EXPECT_FALSE(stage.transitionGraphCaptureActivity(nullptr, stream, GraphCaptureActivityTransition::Entering));
+            EXPECT_FALSE(stage.transitionGraphCaptureActivity(&wrong_context, stream, GraphCaptureActivityTransition::Entering));
+            EXPECT_FALSE(stage.transitionGraphCaptureActivity(&context, nullptr, GraphCaptureActivityTransition::Entering));
+            ASSERT_TRUE(stage.transitionGraphCaptureActivity(&context, stream, GraphCaptureActivityTransition::Entering));
+            ASSERT_TRUE(stage.transitionGraphCaptureActivity(&context, stream, GraphCaptureActivityTransition::Aborted));
+            EXPECT_TRUE(PerfStatsCollector::snapshot({"gpu_graph_inventory"}).empty());
+            ASSERT_TRUE(stage.transitionGraphCaptureActivity(&context, stream, GraphCaptureActivityTransition::Entering));
+            ASSERT_TRUE(stage.transitionGraphCaptureActivity(&context, stream, GraphCaptureActivityTransition::Completed));
+            const auto setup = PerfStatsCollector::snapshot({"qsa"});
+            const auto captures = PerfStatsCollector::snapshot({"gpu_graph_inventory"});
+            ASSERT_EQ(setup.size(), 1u);
+            ASSERT_EQ(captures.size(), 1u);
+            EXPECT_EQ(captures.front().name, "qsa_attention_program_captures");
+            EXPECT_EQ(captures.front().phase, "capture_setup");
+            EXPECT_EQ(captures.front().device, device.toString());
+            EXPECT_EQ(captures.front().tags, setup.front().tags);
+            EXPECT_EQ(captures.front().tags.at("phase"), phase == ForwardExecutionPhase::Prefill ? "prefill" : "decode");
+            EXPECT_EQ(captures.front().tags.at("rows"), "3");
+            EXPECT_EQ(captures.front().tags.at("policy"), std::string(qwen4exp::qwenSparseAttentionArithmeticName(arithmetic)));
+            EXPECT_EQ(captures.front().tags.at("parts"), arithmetic == SparseArithmetic::TileFP16WithFP32Totals33 ? "33" : "8");
+            EXPECT_EQ(captures.front().tags.at("capture_signature"), std::to_string(stage.graphCaptureVariantSignature()));
+            EXPECT_EQ(context.syncCount(), 0);
+            EXPECT_EQ(context.barrierCount(), 0);
+        }
+}
+
+/** @test Real CPU selected attention publishes only after successful execution, for both semantic phases. */
+TEST(QwenSparseAttentionStage, AttentionEvidenceCPUExecutionRequiresSuccessfulNativeWork)
+{
+    ScopedSparseAttentionEvidence evidence;
+    llaminar::v2::ThreadCountGuard threads(1);
+    CPUDeviceContext context(DeviceId::cpu(), 1);
+    MPIContext mpi(0, 1, MPI_COMM_WORLD);
+    CPURingKVCacheFP32 cache(mpi, 1, 1, 8, 2, 256);
+    SparseArithmeticCaptureFixture fixture;
+    // Every selected value is exactly one; zero queries and keys make the
+    // independent output oracle exactly one without sharing softmax arithmetic.
+    FP32Tensor keys({3, 512}), values({3, 512});
+    std::fill_n(keys.mutable_data(), keys.numel(), 0.0f);
+    std::fill_n(values.mutable_data(), values.numel(), 1.0f);
+    ASSERT_TRUE(cache.importLogicalBlock({0, 0, 0, 3, nullptr}, keys.data(), values.data()));
+    std::fill_n(fixture.query.mutable_data(), fixture.query.numel(), 0.0f);
+    auto *replay = static_cast<int *>(fixture.replay.raw_mutable_data());
+    replay[0] = 0; replay[1] = 3; replay[2] = 0;
+    auto *selected = static_cast<int *>(fixture.selected.raw_mutable_data());
+    auto *counts = static_cast<int *>(fixture.counts.raw_mutable_data());
+    for (int row = 0; row < 3; ++row)
+    {
+        selected[row * 2051] = 0;
+        counts[row] = 1;
+    }
+    for (const auto phase : {ForwardExecutionPhase::Prefill, ForwardExecutionPhase::Decode})
+    {
+        PerfStatsCollector::reset();
+        auto params = fixture.params(cache);
+        std::get<Stage::SelectedAttention>(params.operation).executionPhase = phase;
+        Stage stage(params);
+        const auto setup = PerfStatsCollector::snapshot({"qsa"});
+        ASSERT_EQ(setup.size(), 1u);
+        ASSERT_EQ(setup.front().name, "attention_arithmetic_policy");
+        // Invalid live selection fails inside the real CPU native entrypoint,
+        // after the canonical cache view is acquired and before its work loop.
+        counts[0] = 0;
+        EXPECT_THROW(stage.execute(&context), std::invalid_argument);
+        EXPECT_EQ(PerfStatsCollector::snapshot({"qsa"}).size(), 1u);
+        counts[0] = 1;
+        std::fill_n(fixture.output.mutable_data(), fixture.output.numel(), -123.0f);
+        ASSERT_TRUE(stage.execute(&context));
+        const auto records = PerfStatsCollector::snapshot({"qsa"});
+        ASSERT_EQ(records.size(), 2u);
+        const auto execution = std::find_if(records.begin(), records.end(), [](const auto &record) {
+            return record.name == "attention_program_executions";
+        });
+        ASSERT_NE(execution, records.end());
+        EXPECT_EQ(execution->phase, "execute");
+        EXPECT_EQ(execution->device, "CPU");
+        EXPECT_EQ(execution->value, 1.0);
+        EXPECT_EQ(execution->tags, setup.front().tags);
+        EXPECT_EQ(execution->tags.at("phase"), phase == ForwardExecutionPhase::Prefill ? "prefill" : "decode");
+        EXPECT_EQ(execution->tags.at("rows"), "3");
+        EXPECT_EQ(execution->tags.at("policy"), "fp32");
+        EXPECT_EQ(execution->tags.at("program"), "fp32");
+        EXPECT_EQ(execution->tags.at("parts"), "8");
+        EXPECT_EQ(execution->tags.at("capture_signature"), std::to_string(stage.graphCaptureVariantSignature()));
+        EXPECT_TRUE(PerfStatsCollector::snapshot({"gpu_graph_inventory"}).empty());
+        EXPECT_TRUE(std::all_of(fixture.output.data(), fixture.output.data() + 3 * 6144,
+            [](float value) { return value == 1.0f; }));
+    }
 }

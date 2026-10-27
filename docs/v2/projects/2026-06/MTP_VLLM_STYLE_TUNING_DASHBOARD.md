@@ -3,20 +3,21 @@
 Serving frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)). Keep below 200 lines and 15,000 bytes;
 history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md) and [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
 
-GDN integration, 2026-10-26: Unit 781/781; census's two fixture failures pass focused repairs.
-Committed-archive preservation passes 54 cases/108 reopens. Fresh full prerequisites pending.
-GPU candidates improve deep groups but matched ordinary controls still win;
-CPU packed-prefix/restart and CUDA column tests pass. [Current port plan](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).
+GDN integration, 2026-10-26: `e2c971301` pushed; full prerequisites2841pass/29skip,
+post-packaging Unit782/782 and five loader checks pass. Matched Qwen3.6 ROCm
+decode improves10–15%; CUDA is flat with683MiB less workspace. CPU counter
+batching gains5.91%. [Limits and evidence](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).
 The incoming branch's 1,362 gates, 13 model cells and +1.9/+5.5/+5.9% depth-2/3/4 decode
 results compare against older develop, with changed work; they do not qualify this merge.
 Historical CPU scope and prefill cost: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
 
-## QFN implementation frontier — 2026-10-20
+## Active QFN frontier — 2026-10-27
 
-The October 20 CPU depth-one run exposed an incorrect shifted-cache `+1` at
-QFN's token-zero bootstrap. Build46 installed a typed checkpoint-origin repair
-and two preflight regressions; that original model rerun was not qualified.
-See the [QFN plan](../2026-10/QWEN_FLASH_NEXT_IMPLEMENTATION.md); hybrid results below do not qualify QFN.
+QFN TP4 Off/fixed1/2/3/15/dynamic HTTP pass 24 requests/9,216 tokens with exact
+serial agreement; Unit 783 + preflight 2065 pass/29 hardware skips. Checkpoint, then
+matched MTP tuning against Castagna; full ten-phase OpenCode remains pending.
+[Live plan](../2026-10/QFN_MTP_TP4_TUNING.md). Historical hybrid results below
+do not qualify QFN or replace this new goal's complete coding session.
 
 ## Completed evidence
 

@@ -26,7 +26,7 @@ import docker_paths
 from production_artifacts import write_json
 from run_model_parity_benchmarks import benchmark_profile
 from run_model_parity_e2e import readiness_timeout_seconds
-from flash_attention_perf_policy import validate_flash_attention_plan_policy
+from attention_execution_perf_policy import validate_attention_execution_policy
 from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from graph_capture_perf_policy import DecodeGraphRequirement, validate_graph_capture_policy
 from llep_verifier_perf_policy import validate_llep_verifier_policy
@@ -311,12 +311,11 @@ def runtime_evidence(perf: dict, configuration: dict) -> dict:
             features.mtp_depth_policy != 'fixed'
             or features.mtp_max_depth != int(expected_mtp.removeprefix('depth_'))):
         raise ValueError('App runtime changed the selected fixed MTP depth')
-    checks = {}
+    checks = {'attention': validate_attention_execution_policy(records, contract)}
     if contract.uses_gpu:
         checks['graph'] = validate_graph_capture_policy(records, contract.device_kinds,
             require_prefill_lifecycle=True, decode_requirement=DecodeGraphRequirement.REPLAY)
         checks['transfers'] = validate_gpu_host_transfer_policy(records, device_kinds=contract.device_kinds)
-        checks['attention'] = validate_flash_attention_plan_policy(records, contract.attention_device_kinds)
         if features.mtp and features.mtp_depth_policy == 'dynamic':
             if contract.device_kinds == frozenset({'cuda'}):
                 checks['mtp'] = validate_cuda_dynamic_mtp_device_generation_policy(records,

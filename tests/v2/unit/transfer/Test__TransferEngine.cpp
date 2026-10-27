@@ -3014,3 +3014,137 @@ TEST_F(Test__TransferEngine_Execute, InputForkRequiresPublishedDistinctControlle
     const auto stats=mock_backend_->getTransferStats();
     EXPECT_EQ(stats.h2d_count,0u);EXPECT_EQ(stats.d2h_count,0u);EXPECT_EQ(stats.d2d_count,0u);
 }
+
+namespace
+{
+/** @brief One original allocation token; replay must never revisit its registry. */
+class CapturedStorageBackendSpy final : public MockBackend
+{
+public:
+    explicit CapturedStorageBackendSpy(DeviceType type) : MockBackend(type), type_(type) {}
+    /** @copydoc IBackend::retainNativeAllocation */
+    NativeAllocationCaptureLease retainNativeAllocation(const void *pointer, size_t bytes, int ordinal) override
+    {
+        ++acquisitions;
+        if (sealed) throw std::logic_error("Replay reacquired native allocation registry");
+        return NativeAllocationCaptureLease::acquire(token, base, extent, device_,
+                                                     pointer, bytes, DeviceId(type_, ordinal));
+    }
+    std::shared_ptr<const NativeAllocationCaptureIdentity> token =
+        std::make_shared<NativeAllocationCaptureIdentity>();
+    const void *base = nullptr;
+    size_t extent = 0;
+    int acquisitions = 0;
+    bool sealed = false;
+    inline static IBackend *selected = nullptr;
+    DeviceType type_;
+    DeviceId device_ = DeviceId::invalid();
+};
+
+/** @brief Expose only the mapped/native kind switch for a rejected-binding negative. */
+class CapturedStorageTensor final : public FP32Tensor
+{
+public:
+    CapturedStorageTensor() : FP32Tensor({4, 4}) {}
+    void setMappedKindForNegative(bool mapped) { is_mapped_ = mapped; }
+};
+
+/** @brief Existing FP32 tensor semantics with an explicitly mutable borrowed view identity. */
+class CapturedStorageView final : public FP32Tensor
+{
+public:
+    explicit CapturedStorageView(TensorBase &tensor) : FP32Tensor({4, 4}), owner(&tensor) {}
+    TensorBase *transferStorageOwner() override { return owner; }
+    const TensorBase *transferStorageOwner() const override { return owner; }
+    void *gpu_data_ptr() override { return const_cast<void *>(std::as_const(*this).gpu_data_ptr()); }
+    const void *gpu_data_ptr() const override
+    {
+        return pointer_override ? pointer_override : owner->gpu_data_ptr();
+    }
+    std::optional<DeviceId> current_device() const override
+    {
+        return device_override ? device_override : owner->current_device();
+    }
+    TensorBase *owner;
+    const void *pointer_override = nullptr;
+    std::optional<DeviceId> device_override;
+};
+} // namespace
+
+/** @test Actual TransferEngine replay validates immutable bindings without registry access. */
+void proveCapturedStorageReplay(DeviceId device)
+{
+    llaminar2::testing::installHardwareFreeGPUContextFactories();
+    CapturedStorageBackendSpy backend(device.type);
+    backend.device_ = device;
+    CapturedStorageBackendSpy::selected = &backend;
+    /** @brief Retire the test resolver on fatal assertions as well as normal exit. */
+    struct SelectionRetirement
+    {
+        ~SelectionRetirement() { CapturedStorageBackendSpy::selected = nullptr; }
+    } selection_retirement;
+    TransferEngine engine([](DeviceId) { return CapturedStorageBackendSpy::selected; });
+    auto tensor = std::make_unique<CapturedStorageTensor>();
+    tensor->setBackendForTesting(&backend);
+    ASSERT_TRUE(engine.upload(tensor.get(), device).success);
+    backend.base = tensor->gpu_data_ptr();
+    backend.extent = tensor->size_bytes();
+    CapturedStorageView view(*tensor);
+    auto lease = engine.retainCapturedDeviceStorage(view, device, 64);
+    ASSERT_EQ(backend.acquisitions, 1);
+    backend.sealed = true;
+    {
+        GraphCaptureGuard capture;
+        for (int replay = 0; replay < 256; ++replay)
+            EXPECT_NO_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64));
+        EXPECT_THROW(engine.retainCapturedDeviceStorage(view, device, 64), std::logic_error);
+    }
+    EXPECT_EQ(backend.acquisitions, 1);
+    EXPECT_THROW(NativeAllocationCaptureLease::requireUnborrowed(backend.token), std::logic_error);
+
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, DeviceId(device.type, 1), 64), std::logic_error);
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 60), std::logic_error);
+    view.pointer_override = static_cast<const std::byte *>(backend.base) + 4;
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    view.pointer_override = nullptr;
+    view.device_override = DeviceId(device.type, 1);
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    view.device_override.reset();
+
+    // Equal bytes/pointer/device cannot authorize a different tensor storage owner.
+    auto foreign = TestTensorFactory::createFP32Ones({4, 4});
+    view.pointer_override = backend.base;
+    view.device_override = device;
+    view.owner = foreign.get();
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    view.owner = tensor.get();
+    tensor->setMappedKindForNegative(true);
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    tensor->setMappedKindForNegative(false);
+    CapturedStorageBackendSpy other(device.type);
+    CapturedStorageBackendSpy::selected = &other;
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    CapturedStorageBackendSpy::selected = &backend;
+    EXPECT_EQ(backend.acquisitions, 1);
+    EXPECT_EQ(other.acquisitions, 0);
+    CapturedStorageBackendSpy::selected = nullptr;
+    EXPECT_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64), std::logic_error);
+    CapturedStorageBackendSpy::selected = &backend;
+    EXPECT_NO_THROW(engine.requireCapturedDeviceStorage(*lease, view, device, 64));
+    EXPECT_EQ(backend.acquisitions, 1);
+    CapturedStorageBackendSpy::selected = nullptr;
+    lease.reset();
+    EXPECT_NO_THROW(NativeAllocationCaptureLease::requireUnborrowed(backend.token));
+}
+
+/** @test CUDA replay preserves its original native allocation authority without registry reads. */
+TEST(TransferCapturedStorageReplay, CUDAOneColdBorrowAndConstantRegistryFreeValidation)
+{
+    proveCapturedStorageReplay(DeviceId::cuda(0));
+}
+
+/** @test ROCm replay obeys the same original-allocation and stale-binding contract. */
+TEST(TransferCapturedStorageReplay, ROCmOneColdBorrowAndConstantRegistryFreeValidation)
+{
+    proveCapturedStorageReplay(DeviceId::rocm(0));
+}

@@ -3598,6 +3598,18 @@ set_tests_properties(V2_Integration_HTTPToolCallingEvidence PROPERTIES
     TIMEOUT 30
 )
 
+# Both attention implementations retain their own rank/device/phase obligations.
+add_test(NAME V2_Unit_AttentionExecutionPerfPolicy
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_attention_execution_perf_policy.py)
+set_tests_properties(V2_Unit_AttentionExecutionPerfPolicy PROPERTIES
+    LABELS "V2;Unit;DeviceFree;E2E;Attention;PerfStats;Regression" TIMEOUT 30)
+add_test(NAME V2_Integration_HTTPAttentionFamilyEvidence
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_attention_execution_perf_policy.py)
+set_tests_properties(V2_Integration_HTTPAttentionFamilyEvidence PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;E2E;Attention;PerfStats;Regression" TIMEOUT 30)
+
 add_test(NAME V2_Unit_ServerExecutionContract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_execution_contract.py
@@ -12114,6 +12126,19 @@ if(ZLIB_FOUND)
                     "LLAMINAR_SKIP_ROCM_STARTUP=${_qfn_skip_rocm}")
         endforeach()
     endforeach()
+    if(HAVE_ROCM)
+        foreach(_a1_policy Fixed1 Fixed2 Fixed3 Fixed15 Dynamic)
+            set(_a1_case "Qwen38FlashNext_UDQ4KXL_ROCm0123_TP4_AllGPUExperts_NgramRAM_Static_Ordinal_ActFP32_KVFP16_MTPR1${_a1_policy}Retained15")
+            set(_a1_test "V2_Integration_Qwen4ExpFullROCmTP4MTPAdmission_${_a1_policy}")
+            add_v2_test(${_a1_test}
+                COMMAND $<TARGET_FILE:v2_integration_qwen4exp_mtp_admission>
+                    "--gtest_filter=Qwen4ExpFullROCmTP4MTPAdmission/Qwen4ExpMTPAdmissionTest.PairedSourceInitializesWithoutReferencePack/${_a1_case}"
+                LABELS "V2;Integration;RealModel;FullModel;Qwen4Exp;MTP;Admission;ROCm;TP"
+                MPI_PROCS 1 TIMEOUT 900 REQUIRED_FILES ${_qfn_mtp_admission_files}
+                RESOURCE_LOCK "rocm_gpu_0;rocm_gpu_1;rocm_gpu_2;rocm_gpu_3"
+                ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+        endforeach()
+    endif()
     add_v2_test(V2_Integration_Qwen4ExpMTPAdmission_ExplicitNoMTP
         COMMAND $<TARGET_FILE:v2_integration_qwen4exp_mtp_admission>
             --gtest_filter=Qwen4ExpMTPPairedSourceControl.CPU0MmapExplicitNoMTP
@@ -29498,6 +29523,15 @@ add_v2_test(V2_Integration_TransferForkCompanionAuthority
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_NativeAllGatherArenaCountContract
     V2_Integration_TransferForkCompanionAuthority)
+# Captured tensor replay must not reacquire the native allocation registry.
+add_v2_test(V2_Integration_TransferCapturedStorageReplay
+    COMMAND $<TARGET_FILE:v2_test_transfer_engine>
+        --gtest_filter=TransferCapturedStorageReplay.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Ownership;GraphCapture;Regression"
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TransferCapturedStorageReplay)
+
 # Both prerequisite native families reuse their existing actual MPI-aware target.
 foreach(QFN_FIXED_GATHER_BACKEND IN ITEMS CUDA ROCm)
     if((QFN_FIXED_GATHER_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
@@ -30636,6 +30670,23 @@ add_v2_test(V2_Integration_QwenSparseDefaultSetupWire
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseDefaultSetupWire)
 
+add_v2_test(V2_Integration_PrefillAttentionCaptureEvidence
+    COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+        --gtest_filter=Test__ForwardExecutionEngine.AttentionEvidence*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Attention;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PrefillAttentionCaptureEvidence)
+
+add_v2_test(V2_Integration_QwenSparseAttentionCaptureEvidence
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=QwenSparseAttentionStage.AttentionEvidenceCompletedCaptureKeepsPhaseAndSignature:QwenSparseAttentionStage.AttentionEvidenceCPUExecutionRequiresSuccessfulNativeWork
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Capture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseAttentionCaptureEvidence
+    V2_Integration_HTTPAttentionFamilyEvidence)
+
 # Typed selected-attention arithmetic and capture identity require no device startup.
 add_v2_test(V2_Integration_QwenSparseAttentionArithmeticPolicy
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
@@ -31312,6 +31363,19 @@ if(TARGET v2_test_model_parity_definition)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
     if(TEST V2_Integration_Qwen4ExpFullROCmTP4CanonicalCell)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpFullROCmTP4CanonicalCell)
+    endif()
+endif()
+
+# Exact A1 runtime policy admission stays separate from absent sidecar gold.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpFullROCmTP4MTPDeclarations
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpMTPAdmissionCases.FullROCmTP4RuntimePoliciesKeepNumericalOffSeparate
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;ROCm;TP;MTP;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
+    if(TEST V2_Integration_Qwen4ExpFullROCmTP4MTPDeclarations)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpFullROCmTP4MTPDeclarations)
     endif()
 endif()
 

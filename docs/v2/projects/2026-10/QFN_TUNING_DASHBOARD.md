@@ -1,29 +1,31 @@
 # QFN tuning dashboard
 
-Updated 2026-10-25. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-10-27. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
-**Goal:** beat Castagna's **42.959 decode tok/s** on four MI50s while preserving
-roughly 815 prefill tok/s and canonical numerical accuracy.
+**Active goal:** beat fresh Castagna **MTP** throughput on ROCm TP4, then complete
+the full OpenCode coding session. [Contract and live MTP table](QFN_MTP_TP4_TUNING.md).
+The 42.959 Castagna target and A1 rates below are historical **MTP-off** results.
 
-**Query-launch omission: scoped qualification green.**
-Current source: 778 Unit registrations and 30 focused aliases pass, with 95
-unchanged historical inner skips. TP4 and PP4 ordinary/forced/MTP lifecycles
-pass; ordinary/MTP tokens match within each topology. The RoPE retained-reset
-fault is fixed and regressed. All 185 final-logit rows match five references.
-Final timing: 819.673 P / 43.453 D vs 820.881 / 43.268 control (+0.426% D,
-overlapping samples; -0.147% P). All nine 256-token outputs match. [Evidence](QFN_SHORT_CONTEXT_QUERY_OMISSION.md).
-Previous committed grid slice:819.900 /43.388, +2.396% decode. [Evidence][column-grid].
+**Checkpoint `e2c971301`: GDN qualified and pushed.** Current lease, attention
+evidence and runtime-export fixes pass Unit 783 + preflight 2065,29 hardware skips.
+HTTP Off/fixed1/2/3/15/dynamic pass 24 requests/9,216 tokens with exact serial
+agreement. Checkpoint, then tune; [live status](QFN_MTP_TP4_TUNING.md). App pending.
+
+Retained QFN query-omission evidence:185 exact logit rows, TP4/PP4 short MTP
+lifecycles and matching ordinary/MTP tokens. Serial timing819.673 P/43.453 D
+vs820.881/43.268 control overlaps in decode; all nine256-token streams match.
+[Evidence](QFN_SHORT_CONTEXT_QUERY_OMISSION.md); [prior grid slice][column-grid].
 
 Earlier committed slices `f52896b8` and `8baf5c58` retain prepared GDN Q/K,
 grouped QSA preparation, attention defaults, norm/SingleQ8 fusion and redundant
 rescale-exp removal. The first passed828/828 Unit/affected registrations with95
 explicit historical Unit omissions. Their component gains were green but
 matched cumulative model timing was neutral. [Norm/preparation evidence][qsa];
-[rescale evidence][online-rescale]. Full production preflight remains pending.
+[rescale evidence][online-rescale]. QFN MTP qualification is a separate next gate.
 
 | Next action | State / decision |
 |---|---|
@@ -48,7 +50,7 @@ speed or an image. G60 is the last complete topology gate; later A1 gates are sc
 
 | ID | Topology and ngrams | Accuracy | Llaminar P | Reference P | Strata P | Llaminar D | Reference D | Strata D | Next / limitation |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 current 185 exact rows | 819.673 | 467.821 C | — | 43.453 | 42.959 C | — | Scoped gates green; full preflight pending. |
+| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 serial panel + MTP HTTP | 819.456 | 466.222 C | — | 43.362 | 42.668 C | — | Off; MTP D3 89.91 vs91.38 C; tune next. |
 | A2 | ROCm1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a2] | 156.707 | 159.177 C | 45.270≈ | 15.164 | 11.600 C | 24.024≈ | Prefill trails Castagna; decode trails Strata. |
 | A3 | CUDA1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a3] | 180.920 | 129.020 U⚠ | 74.301≈ | 18.231 | 13.059 U⚠ | 31.253≈ | Resolve upstream variance; decode trails Strata. |
 | A4 | CPU1, 28 physical workers; SSD mmap ngrams | [🟢 G60][a4] | 98.466 | 48.408 C | n/a | 5.797 | 4.611 C | n/a | Both recorded phases lead Castagna. |

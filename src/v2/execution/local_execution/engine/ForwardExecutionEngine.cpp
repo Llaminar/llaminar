@@ -19,6 +19,7 @@
  */
 
 #include "ForwardExecutionEngine.h"
+#include "execution/local_execution/graph/GraphCaptureStageActivity.h"
 #include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
 #include "PrefillBucketUtils.h"
 #include "../graph/DeviceGraphCaptureController.h"
@@ -5296,6 +5297,19 @@ namespace llaminar2
              * callback cannot strand the native stream in capture mode, and a
              * failed graph body cannot enter eager recovery.
              */
+            // Match decode's stage-owned capture lifecycle. Completed is emitted
+            // only after this exact prefill unit has successfully instantiated;
+            // the RAII owner aborts every entered stage on failures/exceptions.
+            std::vector<IComputeStage *> capture_stages;
+            for (const auto &name : forward_cache.graph->getExecutionOrder())
+            {
+                const auto *node = forward_cache.graph->getNode(name);
+                if (!node || !node->stage) return false;
+                capture_stages.push_back(node->stage.get());
+            }
+            ScopedGraphCaptureStageActivity stage_capture_activity(
+                capture_stages, ctx, stream, "monolithic prefill capture");
+            if (!stage_capture_activity.begin()) return false;
             if (!cache.captureAndInstantiate(
                     key,
                     gpu_ctx,
@@ -5321,6 +5335,12 @@ namespace llaminar2
                 LOG_ERROR(
                     "[ForwardExecutionEngine] Mandatory prefill graph capture transaction failed for seq_len="
                     << input.seq_len);
+                return false;
+            }
+
+            if (!stage_capture_activity.finish(GraphCaptureActivityTransition::Completed))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill stage capture terminal publication failed");
                 return false;
             }
 

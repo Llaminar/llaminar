@@ -35,7 +35,8 @@ def evidence(devices: list[tuple[str, str]], *, authority: int = 0,
         rows.append({"domain": "server", "name": "execution_topology", "rank": rank,
                      "value": 1.0, "phase": "startup", "tags": {
                          "schema": "1", "source": "resolved_execution_plan",
-                         "devices": selected, "attention_devices": attention}})
+                         "devices": selected, "attention_devices": attention,
+                         "flash_attention_devices": attention, "sparse_attention_devices": ""}})
     policy = {key: str(value).lower() if isinstance(value, bool) else str(value)
               for key, value in asdict(features).items()}
     rows.append({"domain": "server", "name": "execution_policy", "rank": authority,
@@ -101,6 +102,7 @@ class TestPipelineDomainEvidence(unittest.TestCase):
             with self.subTest(groups=groups):
                 data = self.observed(groups, split=1)
                 data["records"][0]["tags"]["attention_devices"] = groups[1]
+                data["records"][0]["tags"]["flash_attention_devices"] = groups[1]
                 contract = validate_server_execution_contract(data)
                 self.assertEqual(contract.device_kinds, {"cuda", "rocm"})
                 backend = groups[1].partition(":")[0].lower()

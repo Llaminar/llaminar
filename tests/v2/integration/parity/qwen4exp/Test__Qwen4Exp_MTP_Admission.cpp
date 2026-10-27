@@ -8,6 +8,8 @@
  * MPI integration main retires collective/GPU owners after runner destruction.
  */
 #include "Qwen4ExpMTPAdmissionCases.h"
+#include "config/OrchestrationConfigDocument.h"
+#include "config/OrchestrationConfigParser.h"
 #include "utils/TestOrchestrationHelper.h"
 #include "backends/BackendManager.h"
 #include "config/OrchestrationStartupPolicy.h"
@@ -23,6 +25,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <sstream>
+#include <nlohmann/json.hpp>
 #include <fstream>
 #include <set>
 
@@ -190,7 +194,7 @@ void expectResolvedDomainInventory(OrchestrationConfig authored, const Orchestra
  */
 void admitPairedSource(const Qwen4ExpMTPAdmissionCase &cell, Qwen4ExpMTPAdmissionExecution execution)
 {
-    const bool active = execution == Qwen4ExpMTPAdmissionExecution::FixedOne;
+    const bool active = execution == Qwen4ExpMTPAdmissionExecution::Active;
     auto config = cell.config(execution);
     publishOrchestrationStartupPolicy(config);
     initCPUBackend(-1);
@@ -237,11 +241,12 @@ void admitPairedSource(const Qwen4ExpMTPAdmissionCase &cell, Qwen4ExpMTPAdmissio
     const auto &runtime = runner->executionPlan().runtime;
     EXPECT_EQ(runtime.max_seq_len, 4096);
     EXPECT_EQ(runtime.mtp.enabled, active);
-    EXPECT_EQ(runtime.mtp.draft_tokens, 1);
-    EXPECT_EQ(runtime.mtp.graph_capacity_draft_tokens, active ? 1 : 0);
+    EXPECT_EQ(runtime.mtp.draft_tokens, cell.requestedDepth());
+    EXPECT_EQ(runtime.mtp.graph_capacity_draft_tokens, active ? cell.retained_depth : 0);
     EXPECT_EQ(runtime.mtp.max_request_batch, 1);
-    EXPECT_EQ(runtime.mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
-    EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(runtime.mtp), 1);
+    EXPECT_EQ(runtime.mtp.depth_policy.mode, config.mtp.depth_policy.mode);
+    EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(runtime.mtp),
+              cell.policy == ModelParityMTP::DynamicDepth ? cell.retained_depth : cell.requestedDepth());
     EXPECT_EQ(retainsMTPGraphCapacity(runtime.mtp), active);
     expectResolvedDomainInventory(std::move(authored_topology), runner->config());
     EXPECT_EQ(runner->config().pp_stage_definitions.size(), config.pp_stage_definitions.size());
@@ -385,7 +390,7 @@ void admitPairedSource(const Qwen4ExpMTPAdmissionCase &cell, Qwen4ExpMTPAdmissio
     ASSERT_TRUE(csv.is_open());
     csv << "cell,main_source,predictor_source,main_layers,source_layer,cache_layer,mtp_active,retained_depth,snapshots_enabled,numerical_inference_executed,native_table_bytes\n"
         << identity << ',' << config.model_path << ',' << config.shared_predictor->path()
-        << ",48,48," << (active ? 0 : -1) << ',' << active << ',' << (active ? 1 : 0) << ",0,0," << table->source().tensorBytes() << '\n';
+        << ",48,48," << (active ? 0 : -1) << ',' << active << ',' << (active ? cell.retained_depth : 0) << ",0,0," << table->source().tensorBytes() << '\n';
     csv.flush();
     ASSERT_TRUE(csv.good());
     runner->shutdown();
@@ -394,11 +399,133 @@ void admitPairedSource(const Qwen4ExpMTPAdmissionCase &cell, Qwen4ExpMTPAdmissio
 
 /** @brief Eight full-model source admissions; no parity/gold fixture lifecycle. */
 class Qwen4ExpMTPAdmissionTest : public ::testing::TestWithParam<Qwen4ExpMTPAdmissionCase> {};
-/** @test Actual fixed1/R1 paired source is prepared under its complete serving certificate. */
+/** @test The declared R1 paired source and depth are prepared under the serving contract. */
 TEST_P(Qwen4ExpMTPAdmissionTest, PairedSourceInitializesWithoutReferencePack)
-{ admitPairedSource(GetParam(), Qwen4ExpMTPAdmissionExecution::FixedOne); }
+{ admitPairedSource(GetParam(), Qwen4ExpMTPAdmissionExecution::Active); }
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpMTPAdmission, Qwen4ExpMTPAdmissionTest,
     ::testing::ValuesIn(qwen4ExpMTPAdmissionCases()),
+    [](const ::testing::TestParamInfo<Qwen4ExpMTPAdmissionCase> &info) { return info.param.testName(); });
+
+/**
+ * @test Export the actual declared production configuration without model/device work.
+ * @note Select one exact parameter with --gtest_filter and CPU-only startup.
+ *       The existing artifact-root variable names a NEW owned output directory.
+ */
+TEST_P(Qwen4ExpMTPAdmissionTest, ExportProductionConfiguration)
+{
+    const char *root = std::getenv("LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT");
+    ASSERT_NE(root, nullptr);
+    const std::filesystem::path output(root);
+    ASSERT_TRUE(output.is_absolute());
+    ASSERT_FALSE(std::filesystem::exists(output));
+    ASSERT_TRUE(std::filesystem::create_directories(output));
+    const auto config = GetParam().config(Qwen4ExpMTPAdmissionExecution::Active,
+        Qwen4ExpMTPAdmissionPurpose::RuntimeQualification);
+    ASSERT_FALSE(config.deterministic);
+    const auto document = serializeOrchestrationConfig(config);
+    ASSERT_EQ(serializeOrchestrationConfig(deserializeOrchestrationConfig(document)), document);
+    std::ofstream file(output / "config.json");
+    ASSERT_TRUE(file.is_open());
+    file << document << '\n';
+    file.close();
+    ASSERT_TRUE(file.good());
+    std::string path = (output / "config.json").string();
+    std::string program = "llaminar2";
+    std::string option = "--config";
+    char *argv[] = {program.data(), option.data(), path.data()};
+    const auto parsed = OrchestrationConfigParser{}.parseArgs(3, argv);
+    ASSERT_FALSE(parsed.deterministic);
+    EXPECT_EQ(parsed.model_path, config.model_path);
+    EXPECT_EQ(parsed.mtp.draft_tokens, config.mtp.draft_tokens);
+    EXPECT_EQ(parsed.mtp.graph_capacity_draft_tokens, config.mtp.graph_capacity_draft_tokens);
+    EXPECT_EQ(parsed.mtp.terminal_head_policy, config.mtp.terminal_head_policy);
+}
+
+/**
+ * @brief Export a typed runtime projection through the existing admission case inventory.
+ * @param cell Original source/topology/precision and explicit admission envelope.
+ * @param purpose Explicit production HTTP qualification or production workload tuning.
+ * @note Both projections remain local diagnostic metadata without sidecar gold;
+ *       neither grants canonical inventory, image, corpus or benchmark eligibility.
+ */
+void exportQwen4ExpMTPRuntimeConfiguration(const Qwen4ExpMTPAdmissionCase &cell,
+    Qwen4ExpMTPAdmissionPurpose purpose)
+{
+    const auto purpose_name = qwen4ExpMTPRuntimePurposeName(purpose);
+    const char *root = std::getenv("LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT");
+    ASSERT_NE(root, nullptr);
+    const std::filesystem::path output(root);
+    ASSERT_TRUE(output.is_absolute());
+    ASSERT_FALSE(std::filesystem::exists(output));
+    ASSERT_TRUE(std::filesystem::create_directories(output));
+    std::ostringstream original;
+    PrintTo(cell.main, &original);
+    const auto source = nlohmann::json::parse(original.str());
+    for (const auto execution : {Qwen4ExpMTPAdmissionExecution::Inactive,
+                                 Qwen4ExpMTPAdmissionExecution::Active})
+    {
+        const bool active = execution == Qwen4ExpMTPAdmissionExecution::Active;
+        const std::string role = active ? "active" : "off";
+        const auto config = cell.config(execution, purpose);
+        ASSERT_FALSE(config.deterministic);
+        ASSERT_EQ(config.mtp.verify_mode, modelParityHttpMTPVerifyMode());
+        const auto config_path = output / (role + "-config.json");
+        const auto document = serializeOrchestrationConfig(config);
+        ASSERT_EQ(serializeOrchestrationConfig(deserializeOrchestrationConfig(document)), document);
+        auto record = source;
+        // Gold-free runtime metadata must not retain Off benchmark arguments
+        // or advertise image/corpus eligibility inherited from another projection.
+        for (const char *field : {"diagnostic_benchmark", "paired_workload",
+                                  "e2e", "benchmark", "cross_host_e2e"})
+            record.erase(field);
+        record["certification_eligible"] = false;
+        ASSERT_FALSE(record.contains("diagnostic_benchmark"));
+        ASSERT_FALSE(record.contains("paired_workload"));
+        ASSERT_FALSE(record.contains("e2e"));
+        ASSERT_FALSE(record.contains("benchmark"));
+        ASSERT_FALSE(record.contains("cross_host_e2e"));
+        ASSERT_FALSE(record["certification_eligible"].get<bool>());
+        record["id"] = active ? cell.testName() : cell.main.testName();
+        record["diagnostic_scope"] = "source_declared_runtime_admission_no_sidecar_gold";
+        record["runtime"]["server_args"] = std::vector<std::string>{"--config", config_path.string()};
+        record["runtime"]["configuration_policy"] = purpose_name;
+        auto &generation = record["runtime"]["generation"];
+        generation["serial_control_id"] = cell.main.testName();
+        generation["mtp_policy"] = modelParityMTPPolicyName(active ? cell.policy : ModelParityMTP::Off);
+        generation["mtp_verify_mode"] = mtpVerifyModeToString(config.mtp.verify_mode);
+        ASSERT_EQ(record["model"].get<std::string>(), config.model_path);
+        ASSERT_EQ(record["shared_predictor"].get<std::string>(), config.shared_predictor->path());
+        ASSERT_EQ(record["runtime"]["context_length"].get<int>(), config.max_seq_len);
+        ASSERT_EQ(generation["requests"], source["runtime"]["generation"]["requests"]);
+        std::ofstream config_file(config_path);
+        ASSERT_TRUE(config_file.is_open());
+        config_file << document << '\n';
+        config_file.close();
+        ASSERT_TRUE(config_file.good());
+        std::ofstream record_file(output / (role + "-generation.json"));
+        ASSERT_TRUE(record_file.is_open());
+        record_file << record.dump(2) << '\n';
+        record_file.close();
+        ASSERT_TRUE(record_file.good());
+    }
+}
+
+/** @test Export stochastic HTTP qualification with its explicit retained/depth axes. */
+TEST_P(Qwen4ExpMTPAdmissionTest, ExportHTTPGenerationConfiguration)
+{
+    exportQwen4ExpMTPRuntimeConfiguration(GetParam(), Qwen4ExpMTPAdmissionPurpose::RuntimeQualification);
+}
+
+/** @test Project the same source admission case onto native production workload tuning. */
+TEST_P(Qwen4ExpMTPAdmissionTest, ExportProductionServingConfiguration)
+{
+    exportQwen4ExpMTPRuntimeConfiguration(GetParam(),
+        Qwen4ExpMTPAdmissionPurpose::ProductionServing);
+}
+
+// Explicit A1 runtime admission: no mathematical sidecar reference is advertised.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpFullROCmTP4MTPAdmission, Qwen4ExpMTPAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpFullROCmTP4MTPAdmissionCases()),
     [](const ::testing::TestParamInfo<Qwen4ExpMTPAdmissionCase> &info) { return info.param.testName(); });
 
 /** @test Selecting a sidecar with explicit no-MTP admits metadata but no predictor materialization. */

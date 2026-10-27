@@ -81,6 +81,8 @@ TEST(ServerExecutionEvidence, OrdinaryCPUAndBothGPUsUseSelectedParticipants)
         const auto tags = serverExecutionTopologyTags(selected, plan, {.n_layers = 4});
         EXPECT_EQ(tags.at("devices"), device.toString());
         EXPECT_EQ(tags.at("attention_devices"), device.toString());
+        EXPECT_EQ(tags.at("flash_attention_devices"), device.toString());
+        EXPECT_TRUE(tags.at("sparse_attention_devices").empty());
     }
 }
 
@@ -369,4 +371,34 @@ TEST(ServerExecutionEvidence, ReportsActualRoutedComputeAndRejectsUniformAssumpt
     EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("routed_compute"), "gate-up-owned-down-columns");
     overlay->domains.push_back({.name = "second", .routed_compute_policy = RoutedExpertComputePolicy::Apportioned});
     EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("routed_compute"), "mixed");
+}
+
+/** @test A dense exported predictor and QSA trunk retain independent obligations on the same owner. */
+TEST(ServerExecutionEvidence, SparseTrunkAndDensePredictorHaveIndependentAttentionOwners)
+{
+    ModelMemoryProfile model{.architecture = "qwen4exp", .n_layers = 4};
+    model.flash_next.emplace();
+    model.flash_next->sparse_decoder_layers = {1, 3};
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        RankExecutionPlan plan;
+        plan.primary_device = GlobalDeviceAddress::fromLocalDeviceId(device);
+        const auto selected = serverExecutionParticipants(plan, {}, 1);
+        const auto off = serverExecutionTopologyTags(selected, plan, model);
+        EXPECT_EQ(off.at("sparse_attention_devices"), device.toString());
+        EXPECT_TRUE(off.at("flash_attention_devices").empty());
+
+        model.mtp_layer_count = 1;
+        model.flash_next_predictor = Qwen4ExpPredictorMetadata{4, Qwen4ExpPredictorAttention::Dense,
+            Qwen4ExpPredictorHiddenNorm::PerBranch, Qwen4ExpPredictorSource::SharedGGUF};
+        plan.runtime.mtp.enabled = true;
+        plan.has_lm_head = true;
+        const auto mixed = serverExecutionTopologyTags(selected, plan, model);
+        EXPECT_EQ(mixed.at("sparse_attention_devices"), device.toString());
+        EXPECT_EQ(mixed.at("flash_attention_devices"), device.toString());
+        plan.has_lm_head = false;
+        EXPECT_TRUE(serverExecutionTopologyTags(selected, plan, model).at("flash_attention_devices").empty());
+        model.mtp_layer_count = 0;
+        model.flash_next_predictor.reset();
+    }
 }

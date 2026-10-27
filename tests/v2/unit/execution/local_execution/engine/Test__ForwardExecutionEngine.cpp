@@ -4223,3 +4223,103 @@ TEST_F(Test__ForwardExecutionEngine, SparseQueryMalformedProgramRejectedCold)
     EXPECT_THROW((void)engine.execute(input,output,host),std::invalid_argument);
     EXPECT_EQ(host.build_forward_graph_calls,0);
 }
+
+namespace
+{
+/** @brief Observe the real engine's capture lifecycle with no backend or model work. */
+class PrefillAttentionCaptureProbe final : public llaminar2::testing::MockComputeStage
+{
+public:
+    /** @brief Borrow an observation vector that outlives graph/cache retirement. */
+    PrefillAttentionCaptureProbe(std::string name, DeviceId device,
+        std::vector<GraphCaptureActivityTransition> &transitions, bool fail_body)
+        : MockComputeStage(ComputeStageType::ATTENTION, std::move(name), device),
+          transitions_(transitions), fail_body_(fail_body) {}
+    /** @brief Model a native submission failure only while the mock worker is recording. */
+    bool execute(IDeviceContext *context) override
+    {
+        if (fail_body_ && llaminar2::testing::sharedMockWorkerGPUContext().isDeviceGraphCaptureActive())
+            return false;
+        return MockComputeStage::execute(context);
+    }
+    /** @brief Authenticate owner/stream and observe that native recording closed before its terminal edge. */
+    bool transitionGraphCaptureActivity(IDeviceContext *context, void *stream,
+        GraphCaptureActivityTransition transition) override
+    {
+        EXPECT_NE(context, nullptr);
+        EXPECT_EQ(context->deviceId(), device());
+        EXPECT_NE(stream, nullptr);
+        EXPECT_FALSE(llaminar2::testing::sharedMockWorkerGPUContext().isDeviceGraphCaptureActive());
+        transitions_.push_back(transition);
+        return true;
+    }
+private:
+    std::vector<GraphCaptureActivityTransition> &transitions_;
+    bool fail_body_;
+};
+}
+
+/** @test Monolithic materialization emits one complete stage interval; cache-hit replay never republishes capture. */
+TEST_F(Test__ForwardExecutionEngine, AttentionEvidencePrefillCaptureAndReplayHaveOneLifecycle)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"}, {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"}, {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        std::vector<GraphCaptureActivityTransition> transitions;
+        auto engine = makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,
+            device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.graph_stage_factories.push_back([&](const std::string &name, DeviceId owner) {
+            return std::make_unique<PrefillAttentionCaptureProbe>(name, owner, transitions, false);
+        });
+        std::array<int, 64> tokens{}, positions{};
+        // Mock device storage has one authoritative input owner, as production
+        // bucket admission requires; host shadows must remain absent.
+        auto input = makeTestInput(64, 1, device, nullptr, nullptr);
+        input.token_ids_device = tokens.data(); input.position_ids_device = positions.data();
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+        const std::vector<GraphCaptureActivityTransition> expected{
+            GraphCaptureActivityTransition::Entering, GraphCaptureActivityTransition::Completed};
+        ASSERT_EQ(transitions, expected);
+        ASSERT_TRUE(engine.execute(input, output, host));
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        ASSERT_TRUE(engine.execute(input, output, host));
+        ASSERT_TRUE(engine.execute(input, output, host));
+        EXPECT_EQ(transitions, expected);
+    }
+}
+
+/** @test A failed native body closes capture and aborts its entered stage without publishing Completed. */
+TEST_F(Test__ForwardExecutionEngine, AttentionEvidenceFailedPrefillCaptureAbortsAfterNativeClose)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"}, {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"}, {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        std::vector<GraphCaptureActivityTransition> transitions;
+        auto engine = makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,
+            device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.graph_stage_factories.push_back([&](const std::string &name, DeviceId owner) {
+            return std::make_unique<PrefillAttentionCaptureProbe>(name, owner, transitions, true);
+        });
+        std::array<int, 64> tokens{}, positions{};
+        auto input = makeTestInput(64, 1, device, nullptr, nullptr);
+        input.token_ids_device = tokens.data(); input.position_ids_device = positions.data();
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output{};
+        EXPECT_FALSE(engine.execute(input, output, host));
+        EXPECT_EQ(transitions, (std::vector<GraphCaptureActivityTransition>{
+            GraphCaptureActivityTransition::Entering, GraphCaptureActivityTransition::Aborted}));
+        EXPECT_FALSE(llaminar2::testing::sharedMockWorkerGPUContext().isDeviceGraphCaptureActive());
+    }
+}

@@ -1130,6 +1130,9 @@ namespace llaminar2
      * Native records reject physical release while borrowed. Mapped storage
      * retains its original region owner; no new mapping or PMA claim exists.
      * Graph/executable completion must retire before the final lease is dropped.
+     * The original tensor storage owner and backend are immutable binding
+     * identities. Replay checks these identities without reacquiring allocation
+     * registry locks: the retained native borrow already prevents free/reuse.
      */
     class CapturedDeviceStorageLease final {
     private:
@@ -1138,6 +1141,8 @@ namespace llaminar2
         CapturedDeviceStorageLease() = default;
         std::optional<NativeAllocationCaptureLease> native_;
         std::shared_ptr<MappedHostTransferRegion> mapped_;
+        const TensorBase* storage_owner_ = nullptr;
+        const IBackend* native_backend_ = nullptr;
         const void* pointer_ = nullptr;
         size_t bytes_ = 0;
         DeviceId device_ = DeviceId::invalid();

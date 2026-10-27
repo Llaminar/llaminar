@@ -898,6 +898,7 @@ namespace llaminar2
             !pointer || !bytes || bytes > tensor.size_bytes())
             throw std::invalid_argument("Captured tensor has no exact materialized device span");
         auto lease = std::shared_ptr<CapturedDeviceStorageLease>(new CapturedDeviceStorageLease());
+        lease->storage_owner_ = owner;
         lease->pointer_ = pointer; lease->bytes_ = bytes; lease->device_ = device;
         if (owner->isMapped()) {
             lease->mapped_ = owner->mappedHostTransferRegion();
@@ -912,6 +913,7 @@ namespace llaminar2
             auto* backend = resolveBackend(device);
             if (!backend) throw std::logic_error("Captured tensor backend is unavailable");
             lease->native_.emplace(backend->retainNativeAllocation(pointer, bytes, device.gpu_ordinal()));
+            lease->native_backend_ = backend;
         }
         return lease;
     }
@@ -921,7 +923,8 @@ namespace llaminar2
         DeviceId device, size_t bytes) const
     {
         const auto* owner = tensor.transferStorageOwner();
-        if (!owner || device != lease.device_ || bytes != lease.bytes_ ||
+        if (!owner || owner != lease.storage_owner_ ||
+            device != lease.device_ || bytes != lease.bytes_ ||
             tensor.current_device() != std::optional{device} ||
             tensor.gpu_data_ptr() != lease.pointer_ || bytes > tensor.size_bytes())
             throw std::logic_error("Captured tensor storage binding changed after preparation");
@@ -931,9 +934,20 @@ namespace llaminar2
                 throw std::logic_error("Captured mapped storage owner was replaced");
         } else {
             auto* backend = resolveBackend(device);
-            if (!backend || owner->isMapped() || !lease.native_ ||
-                !backend->retainNativeAllocation(lease.pointer_, bytes, device.gpu_ordinal()).sameStorage(*lease.native_))
-                throw std::logic_error("Captured native allocation identity was replaced");
+            /*
+             * Cold preparation retained the allocator's immutable allocation
+             * token for this exact span/device. Native free/reset must reject
+             * live borrowers under the allocator lifecycle lock, before any
+             * physical release; therefore these bytes cannot be freed and
+             * reused while this lease lives. Reacquiring the same token here
+             * would only repeat a global allocation-registry scan on every
+             * graph signature check. The frozen storage owner above detects
+             * tensor moves/rebinding even when their byte address is unchanged.
+             * This borrow adds neither allocation ownership nor a PMA ledger.
+             */
+            if (!backend || backend != lease.native_backend_ ||
+                owner->isMapped() || !lease.native_)
+                throw std::logic_error("Captured native allocation authority was replaced");
         }
     }
 

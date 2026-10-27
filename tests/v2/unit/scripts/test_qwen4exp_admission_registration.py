@@ -8,6 +8,9 @@ Release must omit the tests and their properties together; missing admitted
 targets and malformed source closures remain fatal. The numerical MTP filter
 also preserves the main matrix's exact arithmetic counter families without
 broad-domain collection or changing execution policy.
+The full ROCm TP4 policies retain both the canonical Integration lock and all
+four participant locks; naming device locks must never replace shared lifecycle
+serialization against other integration fixtures.
 """
 from pathlib import Path
 import argparse
@@ -107,6 +110,10 @@ endif()
                         f"V2_Integration_Qwen4ExpMTPAdmission_{topology}_{storage}"
                         for topology in topologies for storage in ("RAM", "Mmap")
                     } | {"V2_Integration_Qwen4ExpMTPAdmission_ExplicitNoMTP"}
+                    tp4_policies = ("Fixed1", "Fixed2", "Fixed3", "Fixed15", "Dynamic")
+                    tp4_prefix = "V2_Integration_Qwen4ExpFullROCmTP4MTPAdmission_"
+                    if rocm:
+                        names.update(tp4_prefix + policy for policy in tp4_policies)
                     self.assertEqual({test["name"] for test in tests}, names)
                     self.assertEqual(len(tests), len(names))
                     for test in tests:
@@ -120,6 +127,22 @@ endif()
                         self.assertNotIn("ProductionTestPreflight", props["LABELS"])
                         self.assertEqual("CUDA" in props["LABELS"], "CUDA" in test["name"])
                         self.assertEqual("ROCm" in props["LABELS"], "ROCm" in test["name"])
+                        if test["name"].startswith(tp4_prefix):
+                            policy = test["name"].removeprefix(tp4_prefix)
+                            self.assertIn(policy, tp4_policies)
+                            self.assertEqual(set(props["RESOURCE_LOCK"]), {
+                                "Integration_Serial", "rocm_gpu_0", "rocm_gpu_1",
+                                "rocm_gpu_2", "rocm_gpu_3"})
+                            environment = dict(item.split("=", 1) for item in props["ENVIRONMENT"])
+                            self.assertEqual(environment["LLAMINAR_FORCE_CPU_ONLY_STARTUP"], "0")
+                            self.assertEqual(environment["LLAMINAR_SKIP_CUDA_STARTUP"], "1")
+                            self.assertEqual(environment["LLAMINAR_SKIP_ROCM_STARTUP"], "0")
+                            filters = [arg for arg in test["command"] if arg.startswith("--gtest_filter=")]
+                            self.assertEqual(filters, [
+                                "--gtest_filter=Qwen4ExpFullROCmTP4MTPAdmission/"
+                                "Qwen4ExpMTPAdmissionTest.PairedSourceInitializesWithoutReferencePack/"
+                                "Qwen38FlashNext_UDQ4KXL_ROCm0123_TP4_AllGPUExperts_NgramRAM_"
+                                f"Static_Ordinal_ActFP32_KVFP16_MTPR1{policy}Retained15"])
 
     def test_mtp_arithmetic_filter_matches_main_without_broad_domains(self):
         """Paired MTP exports the same precise default-arithmetic witnesses as main."""
