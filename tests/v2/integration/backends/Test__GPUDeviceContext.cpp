@@ -563,6 +563,9 @@ namespace
  * and transaction owners. Both algorithms may serve this admitted model, even
  * when the current request has MTP disabled. Price their shared parent once and
  * the additional ordinary owners through the same typed runtime inventory.
+ * Retained controller capacity additionally owns one bounded scalar direct-token
+ * history publisher, independent of verifier width or current Off request. Its
+ * executable adds one to total/bounded counts without adding a general owner.
  */
 TEST(Test__GPUDeviceContextPool,
      RetainedMTPGraphCapacityIsPricedBeforeExecution)
@@ -571,17 +574,33 @@ TEST(Test__GPUDeviceContextPool,
     retained_mtp.enabled = false;
     retained_mtp.graph_capacity_draft_tokens = 15;
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+    const auto planned_device = DeviceId::rocm(0);
+#else
+    const auto planned_device = DeviceId::cuda(0);
+#endif
+    const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+        declaredDeviceGenerationExecutionPolicy(planned_device.type, DeviceGenerationExecutionDomain::NativeDomain)));
+    const bool exact = family == MTPVerifierGraphFamily::ExactRows;
     const CapturedServingGraphMemoryInventory inventory =
         resolveCapturedServingGraphMemoryInventory(
             {32, 64, 128},
-            retained_mtp);
-    const MTPGraphOwnerPlan owner_plan(retained_mtp);
-    ASSERT_EQ(inventory.fixed_executable_count, 12u);
+            retained_mtp,
+            family,
+            MTPGenerationParentRole::Controller,
+            DeviceGenerationExecutionDomain::NativeDomain);
+    const MTPGraphOwnerPlan owner_plan(retained_mtp, family, MTPGenerationParentRole::Controller);
+    ASSERT_EQ(inventory.fixed_executable_count, exact ? 34u : 12u);
+    // The one controller-owned direct history helper is retained even for
+    // this Off request. It is a bounded flat executable, not a general parent.
+    ASSERT_EQ(inventory.mtp_graph_owners.directTokenHistoryGraphSlots(), 1u);
+    ASSERT_EQ(owner_plan.directTokenHistoryGraphSlots(), 1u);
+    ASSERT_EQ(owner_plan.controllerGraphSlots(), exact ? 47u : 5u);
     ASSERT_EQ(
         inventory.mtp_graph_owners.auxiliaryExecutableSlotCount(),
-        107u);
-    ASSERT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
-    ASSERT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
+        exact ? 150u : 108u);
+    ASSERT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), exact ? 67u : 25u);
+    ASSERT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 83u);
 
     ModelMemoryProfile profile;
     // Workspace planning consults the production architecture's typed
@@ -621,14 +640,17 @@ TEST(Test__GPUDeviceContextPool,
             cfg.device,
             CapturedGraphExecutableInventory{
                 .model_graph_identity_count =
-                    /*two prefill + decode + prefix bridge + ten MTP forwards=*/14u,
+                    /*Two admitted prefill buckets plus the canonical fixed family.*/2u + inventory.fixed_executable_count,
                 .model_graph_topology_variant_count = 1u,
                 // Match the physical classes declared by runtime graph owners;
                 // the total slot count alone overprices bounded CUDA helpers.
                 .auxiliary_executable_count =
                     owner_plan.generalAuxiliaryExecutableSlotCount() +
                     OrdinaryGenerationGraphPlan::additionalExecutableCount(
-                        cfg.device, /*has_mtp_graph_owners=*/true),
+                        cfg.device,
+                        /*has_mtp_graph_owners=*/true,
+                        declaredDeviceGenerationExecutionPolicy(cfg.device.type, *inventory.generation_domain),
+                        MTPGenerationParentRole::Controller),
                 .bounded_helper_executable_count =
                     owner_plan.boundedHelperExecutableSlotCount(),
             }));
@@ -636,7 +658,7 @@ TEST(Test__GPUDeviceContextPool,
         plan.devices.front().captured_graph_bytes(),
         estimateCapturedGraphExecutableBytes(
             cfg.device,
-            /*two prefill + decode + prefix bridge + ten MTP forwards=*/14u));
+            /*Two admitted prefill buckets plus the canonical fixed family.*/2u + inventory.fixed_executable_count));
 }
 
 TEST(Test__GPUDeviceContextPool, SingletonInstance)

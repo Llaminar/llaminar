@@ -10,6 +10,7 @@
  * supported head degree without loading model tensors or initializing GPUs.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "planning/PlanningModelMetadata.h"
@@ -195,7 +196,15 @@ TEST(RankMemoryPlanInputs, MTPBoundedAndRetainedOffKeepTheFullFamily)
                     resolveMTPTerminalLogitsLayout(true, mtp.terminal_head_policy));
                 if (backend != DeviceType::CPU)
                 {
-                    const auto expected = resolveCapturedServingGraphMemoryInventory({32, 64, 128, 256}, mtp);
+                    const auto execution = declaredDeviceGenerationExecutionPolicy(
+                        backend, DeviceGenerationExecutionDomain::NativeDomain);
+                    const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(execution));
+                    const auto expected = resolveCapturedServingGraphMemoryInventory(
+                        {32, 64, 128, 256},
+                        mtp,
+                        family,
+                        MTPGenerationParentRole::Controller,
+                        DeviceGenerationExecutionDomain::NativeDomain);
                     EXPECT_EQ(cfg.captured_serving_graphs.fixed_executable_count, expected.fixed_executable_count);
                     EXPECT_EQ(cfg.captured_serving_graphs.mtp_graph_owners.sidecarGraphSlots(),
                               expected.mtp_graph_owners.sidecarGraphSlots());
@@ -826,4 +835,111 @@ TEST(RankMemoryPlanInputs, AdmittedAttentionDefaultsKeepMixedParticipantsAndCold
         EXPECT_THROW(resolveQwenSparseAttentionDeviceProgram(source.metadata().memoryProfile(), declared_storage, omitted), std::invalid_argument);
     }
 
+}
+
+/** @test Admission uses actual members, including nested and remote domain peers. */
+TEST(RankMemoryPlanInputs, DeclaredGenerationDomainUsesParticipantsRatherThanInventory)
+{
+    Fixture fixture(DeviceType::CUDA, 1);
+    fixture.plan.runtime.mtp.enabled = true;
+    fixture.plan.runtime.mtp.graph_capacity_draft_tokens = 15;
+    const auto native = buildRankMemoryPlanInputs(fixture.request()).front().captured_serving_graphs;
+    const auto bounded = resolveCapturedServingGraphMemoryInventory(
+        {32, 64, 128, 256},
+        fixture.plan.runtime.mtp,
+        MTPVerifierGraphFamily::BoundedBuckets,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain);
+    EXPECT_EQ(native.fixed_executable_count, bounded.fixed_executable_count);
+    // An unused discovered GPU is not a member of the captured generation domain.
+    fixture.inventory.gpus.push_back({.type = DeviceType::ROCm, .local_device_id = 0,
+        .memory_bytes = 32ull << 30, .free_memory_bytes = 24ull << 30, .compute_units = 60});
+    EXPECT_EQ(declaredRankDeviceGenerationDomain(fixture.plan), DeviceGenerationExecutionDomain::NativeDomain);
+    fixture.plan.my_domains.push_back({});
+    fixture.plan.my_domains.back().devices = {fixture.plan.primary_device,
+        GlobalDeviceAddress::fromLocalDeviceId(DeviceId::rocm(7), "remote", 1)};
+    EXPECT_EQ(declaredRankDeviceGenerationDomain(fixture.plan), DeviceGenerationExecutionDomain::HostedBoundary);
+    const auto hosted = buildRankMemoryPlanInputs(fixture.request()).front().captured_serving_graphs;
+    const auto exact = resolveCapturedServingGraphMemoryInventory(
+        {32, 64, 128, 256},
+        fixture.plan.runtime.mtp,
+        MTPVerifierGraphFamily::ExactRows,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::HostedBoundary);
+    EXPECT_EQ(hosted.fixed_executable_count, exact.fixed_executable_count);
+    EXPECT_EQ(hosted.mtp_graph_owners.generalAuxiliaryExecutableSlotCount(),
+              exact.mtp_graph_owners.generalAuxiliaryExecutableSlotCount());
+    EXPECT_GT(hosted.fixed_executable_count, native.fixed_executable_count);
+    fixture.plan.my_domains.clear();
+    fixture.plan.local_pp_stage_tp_info.resize(1);
+    fixture.plan.local_pp_stage_tp_info[0].devices = {GlobalDeviceAddress::cpu()};
+    EXPECT_EQ(declaredRankDeviceGenerationDomain(fixture.plan), DeviceGenerationExecutionDomain::HostedBoundary);
+}
+
+/** @test Exact hosted follower parents belong only to actual nonterminal PP stages. */
+TEST(RankMemoryPlanInputs, LocalPipelinePricesExactFollowersAndTerminalControllerSeparately)
+{
+    Fixture fixture(DeviceType::ROCm, 2);
+    fixture.plan.runtime.mtp.enabled = true;
+    fixture.plan.runtime.mtp.graph_capacity_draft_tokens = 15;
+    fixture.plan.local_pp_devices = fixture.plan.local_tp_devices;
+    fixture.plan.local_tp_devices.clear();
+    fixture.plan.local_pp_layer_boundaries = {0, 2, 4};
+    const auto configs = buildRankMemoryPlanInputs(fixture.request());
+    ASSERT_EQ(configs.size(), 2u);
+    for (size_t stage = 0; stage < configs.size(); ++stage)
+    {
+        const auto role = stage == 0 ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller;
+        const MTPGraphOwnerPlan owners(fixture.plan.runtime.mtp, MTPVerifierGraphFamily::ExactRows, role);
+        EXPECT_EQ(configs[stage].captured_serving_graphs.mtp_graph_owners.generationParentGraphSlots(),
+                  owners.generationParentGraphSlots());
+        EXPECT_EQ(configs[stage].captured_serving_graphs.mtp_graph_owners.generalAuxiliaryExecutableSlotCount(),
+                  owners.generalAuxiliaryExecutableSlotCount());
+    }
+    EXPECT_GT(configs[0].captured_serving_graphs.mtp_graph_owners.generationParentGraphSlots(),
+              configs[1].captured_serving_graphs.mtp_graph_owners.generationParentGraphSlots());
+    fixture.plan.local_pp_devices.clear();
+    fixture.plan.local_pp_layer_boundaries.clear();
+    fixture.plan.last_layer = 1;
+    fixture.plan.has_lm_head = false;
+    // Partial layer ownership alone must not turn a standalone owner into a follower.
+    EXPECT_EQ(buildRankMemoryPlanInputs(fixture.request()).front().captured_serving_graphs
+                  .mtp_graph_owners.generationParentGraphSlots(), 1u);
+}
+
+/** @test Only actual terminal sampling participants own a direct-history helper. */
+TEST(RankMemoryPlanInputs, DirectTokenHistoryOwnerFollowsTerminalAcrossOneToEightDevices)
+{
+    for (auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (int devices = 1; devices <= 8; ++devices)
+    for (bool pipeline : {false, true})
+    for (bool retained : {false, true})
+    {
+        Fixture fixture(backend, devices);
+        fixture.plan.runtime.mtp.enabled = false; // Admission must support later MTP requests.
+        fixture.plan.runtime.mtp.graph_capacity_draft_tokens = retained ? 15 : 0;
+        if (pipeline)
+        {
+            fixture.model.n_layers = devices;
+            fixture.plan.last_layer = devices - 1;
+            fixture.plan.local_tp_devices.clear();
+            for (int stage = 0; stage < devices; ++stage)
+            {
+                fixture.plan.local_pp_devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                    DeviceId(backend, stage), "node", 0));
+                fixture.plan.local_pp_layer_boundaries.push_back(stage);
+            }
+            fixture.plan.local_pp_layer_boundaries.push_back(devices);
+        }
+        const auto inputs = buildRankMemoryPlanInputs(fixture.request());
+        ASSERT_EQ(inputs.size(), size_t(devices));
+        for (size_t participant = 0; participant < inputs.size(); ++participant)
+        {
+            const bool controller = !pipeline || participant + 1 == inputs.size();
+            const auto &owners = inputs[participant].captured_serving_graphs.mtp_graph_owners;
+            EXPECT_EQ(owners.directTokenHistoryGraphSlots(), retained && controller ? 1u : 0u)
+                << "backend=" << int(backend) << " devices=" << devices
+                << " pipeline=" << pipeline << " participant=" << participant;
+        }
+    }
 }

@@ -8,6 +8,11 @@ description: Tune, benchmark, profile, train, certify, and install Llaminar Nati
 Use the common evidence and policy pipeline. Do not create a backend-local
 heuristic, model-shape override, CSV parser, or installation path.
 
+Isolated candidate experiments follow the canonical
+[production kernel replay procedure](../llaminar-testing/references/kernel-replay.md).
+Apply it through the existing trainer/collector and all-format oracles; retain
+this skill's corpus, dispatch-certification and installation requirements.
+
 ## Non-Negotiable Invariants
 
 1. Require grouped MTP rows to be byte-identical to independent serial M=1

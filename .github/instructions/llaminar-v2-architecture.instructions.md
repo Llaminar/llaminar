@@ -977,6 +977,35 @@ the helper's actual node count and kinds; nested/control graphs cannot claim a
 small flat-helper reservation. Request reset preserves this class and graph
 identity. The guard adds no replay-time queries or ordering edges.
 
+`DeviceGenerationExecutionPolicy` declares the complete parent boundary before
+capture and memory admission. Hosted MTP retains every verifier width from two
+through capacity plus one, selected by the existing authenticated depth ticket.
+Native conditional parents retain their bounded family and dynamic maximum
+shape. Each exact width owns its original model-forward identity, preparation,
+publication and stochastic helper geometry; cold capture never fabricates a
+sibling signature by editing a live key. Publication and pipeline follower
+parents are counted per query program, while stochastic helper families remain
+shared. `MTPGraphOwnerPlan` owns these directory counts. Serving inventory requires
+explicit family, parent role and generation domain; each GPU validates their
+consistency. Pipeline scope authentication and retained admission identity also
+include that domain. Ordinary auxiliary owners follow the declared policy and
+sampling role, so hosted CUDA has the same required children as hosted ROCm.
+Prefill has one query program; fixed decode/condition/verifier forwards retain
+all main-model query programs independently of snapshot topology variants.
+The initial transaction executes only its selected depth. Before publishing the
+complete hosted family, setup materializes any unused chained predictor and
+draft-publication slots from authenticated persistent owners without launching
+them. A shallow first request cannot leave deeper branches uninitialized, and
+request reset cannot depend on executing drafts to recreate graph topology.
+Hosted dynamic response continuation enters this retained family through the
+native admission ticket at transaction zero, preserving the device-owned learned
+depth. Typed entry authenticates the unchanged family without materializing or
+replacing children; later tickets retain strict positive contiguous ordinals.
+Publication exports resolve their requested physical width directly, independent
+of any setup-selected child. Continuation stages its condition and terminal
+hidden state through their ordered device publications, with no host depth or
+token shadow becoming execution authority.
+
 ### 6.2 Weight lifecycle
 
 `ModelLoader` and `ModelContext` own GGUF metadata and raw model tensors.

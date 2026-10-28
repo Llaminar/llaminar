@@ -40,6 +40,9 @@ endif()
 # The build type flags are picked up by the compiler setup during project()
 project(llaminar2 LANGUAGES C CXX)
 
+# Compile the same small semantic source identity into capture and offline replay.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/MTPDepthReplayIdentity.cmake")
+
 # =============================================================================
 # Enable ccache if available
 find_program(CCACHE_PROGRAM ccache)
@@ -2037,6 +2040,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     utils/ToolCallParser.cpp
     utils/PerfStatsCollector.cpp
     utils/BenchmarkRunner.cpp
+    utils/BenchmarkCampaign.cpp
     # Collective communication infrastructure
     collective/DeviceGroup.cpp
     collective/BackendRouter.cpp

@@ -1,0 +1,19 @@
+/**
+ * @file MTPDepthReplayBuildIdentity.h
+ * @brief Source-only identities compiled into both trace producer and replay.
+ *
+ * CMake reconfigures when any semantic source changes. Replay compares captured
+ * identities with these actual compiled constants; an artifact's own claimed
+ * expected hash cannot authenticate a different installed policy. Companion
+ * source/build receipts retain compiler/runtime custody separately.
+ */
+#pragma once
+#include <array>
+#include <string_view>
+#include <utility>
+namespace llaminar2::mtp_depth_replay_identity
+{
+inline constexpr std::string_view kSchema = "llaminar.mtp.depth_replay_source_identity.v1";
+inline constexpr std::array<std::pair<std::string_view, std::string_view>, @MTP_REPLAY_SOURCE_COUNT@> kSourceHashes{{
+@MTP_REPLAY_SOURCE_ROWS@}};
+}

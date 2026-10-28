@@ -7,6 +7,8 @@
  * event. Ordinary and speculative algorithms share that lifecycle but have
  * different state-commit and depth semantics. Keeping validation here makes
  * those differences explicit and testable without loading a backend or model.
+ * Measured terminal publication authenticates the same typed confirmation and
+ * independent trial/reference ownership used before each device observation.
  */
 #pragma once
 
@@ -216,6 +218,37 @@ enum class DeviceGenerationTerminalError
     const auto &policy = admission.depth_policy;
     if (!device_generation_policy_matches(row.data(), policy))
         return Error::ChangedPolicy;
+
+    // State survives ContinueResponse; reporting counters deliberately do not.
+    // Validate each event independently, never sum keeps/returns against probes
+    // from this response: its probe may have begun in a previous response.
+    for (int i = kDeviceGenerationControlDepthUtilityPhase; i <= kDeviceGenerationControlDepthUtilityReturns; ++i)
+        if (row[i] < 0) return Error::InvalidDepthStatistics;
+    for (int i = kDeviceGenerationControlDepthUtilityProbes; i <= kDeviceGenerationControlDepthUtilityReturns; ++i)
+        if (row[i] > transactions) return Error::InvalidDepthStatistics;
+    const bool utility_active = policy.mode == DeviceGenerationPolicyMode::Dynamic &&
+        resolveMTPDepthCostProfile(policy.learned).active();
+    if (!utility_active)
+    {
+        // Ordinary/ForwardOnly/Fixed/Observe and unmeasured domains own no
+        // reversible-probe state. None may expose a stale or fabricated event.
+        for (int i = kDeviceGenerationControlDepthUtilityPhase; i <= kDeviceGenerationControlDepthUtilityReturns; ++i)
+            if (row[i] != 0) return Error::InvalidDepthStatistics;
+    }
+    else
+    {
+        const int runs = row[kDeviceGenerationControlDepthWindowVerifierRuns];
+        const int depth = row[kDeviceGenerationControlCurrentDraftDepth];
+        // One shared authority validates both confirmation words and the
+        // independent trial/Y bank; a deferred target may differ from current.
+        if (!valid_device_generation_measured_confirmation(row.data(),depth,
+                policy.minimum_depth,policy.maximum_depth,
+                policy.promote_consecutive_windows,policy.minimum_samples) ||
+            (row[kDeviceGenerationControlDepthUtilityPhase] ==
+                static_cast<int>(MTPReversibleProposalPhase::ProbePending) &&
+                runs >= policy.minimum_samples))
+            return Error::InvalidDepthStatistics;
+    }
 
     const int learned_matches = row[kDeviceGenerationControlLearnedDepthMatchedWindows];
     if (learned_matches < 0 ||

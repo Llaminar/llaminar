@@ -144,6 +144,11 @@ substitute for the production path.
 
 ## Choose the workflow
 
+- For isolated kernel correctness and economy, use the canonical
+  [production kernel replay procedure](references/kernel-replay.md): fixed
+  production inputs/routes, retained capture, dirty-buffer byte checks,
+  unprofiled timing and separate profiler evidence. Extend existing fixtures;
+  component results still require the applicable model qualification.
 - For the full model-free Unit and production-preflight gate, use
   `scripts/ci/run_production_prerequisites.py --build-dir BUILD --output NEW_DIR`
   or the direct CMake/CTest commands below. Refresh once after a build or test

@@ -2665,4 +2665,88 @@ namespace llaminar2::test
         EXPECT_TRUE(owner.beginCommand(command(10, 1, 50)));
     }
 
+    /** @brief Native admission zero opens exactly one real sparse sequence without fake progress. */
+    TEST(Test__MoEOverlayInferenceTransaction, HostedContinuationAdmissionStartsOnceWithoutPredecessorRetirement)
+    {
+        using Transition = MoEOverlayInferenceTransactionCoordinator::HostedGraphSequenceTransition;
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        std::uint64_t progress = 0;
+        auto coordinator = std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+            MoEOverlayInferenceTransactionCoordinator::Config{
+                .publishers = {publisher}, .graph_plan = coordinatorGraphPlan(2),
+                .continuation_participant_count = 2, .ticket_authority_participant_index = 0,
+                .participant_completion_boundaries = {MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous,
+                    MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command = 8, .max_mtp_draft_depth = 15,
+                .retired_decode_progress_sink = [&progress](std::uint64_t tokens, std::string *) {
+                    progress += tokens; return true;
+                }});
+        ASSERT_TRUE(coordinator->beginCommand(command()));
+        auto first = std::async(std::launch::async, [&] {
+            return coordinator->beginHostedContinuationGraphSequence(Transition::speculativeMTP(6)); });
+        auto sibling = std::async(std::launch::async, [&] {
+            return coordinator->beginHostedContinuationGraphSequence(Transition::speculativeMTP(6)); });
+        ASSERT_TRUE(first.get());
+        ASSERT_TRUE(sibling.get());
+        EXPECT_EQ(coordinator->activeMTPDraftDepth(), 6);
+        EXPECT_EQ(publisher->publishCount(), 0u);
+        EXPECT_EQ(publisher->retireCount(), 0u);
+        EXPECT_EQ(progress, 0u);
+        const MoEOverlayInferenceExecutionDescriptor sidecar{
+            .graph_role = MoEOverlayInferenceGraphRole::MTPDraft, .placement_epoch = 41,
+            .request_count = 1, .logical_rows_per_request = 1, .physical_rows_per_request = 1};
+        for (int depth = 0; depth < 6; ++depth)
+        {
+            auto a = coordinator->beginParticipantGraph(sidecar, 0);
+            auto b = coordinator->beginParticipantGraph(sidecar, 1);
+            ASSERT_TRUE(a.ok) << a.error;
+            ASSERT_TRUE(b.ok) << b.error;
+            ASSERT_TRUE(coordinator->armParticipantGraph(a));
+            ASSERT_TRUE(coordinator->finishParticipantGraph(a, true));
+            ASSERT_TRUE(coordinator->finishParticipantGraph(b, true));
+        }
+        const MoEOverlayInferenceExecutionDescriptor verifier{
+            .graph_role = MoEOverlayInferenceGraphRole::MTPGroupedVerifier, .placement_epoch = 41,
+            .request_count = 1, .logical_rows_per_request = 7, .physical_rows_per_request = 7, .draft_depth = 6};
+        auto a = coordinator->beginParticipantGraph(verifier, 0);
+        auto b = coordinator->beginParticipantGraph(verifier, 1);
+        ASSERT_TRUE(a.ok) << a.error;
+        ASSERT_TRUE(b.ok) << b.error;
+        ASSERT_TRUE(coordinator->armParticipantGraph(a));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(a, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(b, true));
+        ASSERT_TRUE(coordinator->advanceHostedGraphSequence(1, Transition::terminal(), 7));
+        ASSERT_TRUE(coordinator->advanceHostedGraphSequence(1, Transition::terminal(), 7));
+        EXPECT_EQ(progress, 7u);
+        EXPECT_EQ(publisher->publishCount(), 7u);
+        EXPECT_EQ(publisher->retireCount(), 7u);
+        ASSERT_TRUE(coordinator->completeCommand(41));
+    }
+
+    /** @brief Wrong role/depth, overlapping sequences and changed symmetric choices fail closed. */
+    TEST(Test__MoEOverlayInferenceTransaction, HostedContinuationAdmissionRejectsDivergentOrExistingSequence)
+    {
+        using Transition = MoEOverlayInferenceTransactionCoordinator::HostedGraphSequenceTransition;
+        for (int fault = 0; fault < 6; ++fault)
+        {
+            SCOPED_TRACE(fault);
+            auto coordinator = std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {std::make_shared<RecordingPublisher>(1)}, .graph_plan = coordinatorGraphPlan(1),
+                    .continuation_participant_count = 1, .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                    .max_transactions_per_command = 8, .max_mtp_draft_depth = 15});
+            if (fault != 0) ASSERT_TRUE(coordinator->beginCommand(command()));
+            auto transition = Transition::speculativeMTP(6);
+            if (fault == 1) transition = Transition::ordinaryDecode();
+            if (fault == 2) transition = Transition::terminal();
+            if (fault == 3) transition = Transition::speculativeMTP(16);
+            if (fault == 4) ASSERT_TRUE(coordinator->beginGraphSequence(1));
+            if (fault == 5) ASSERT_TRUE(coordinator->beginHostedContinuationGraphSequence(Transition::speculativeMTP(7)));
+            std::string error;
+            EXPECT_FALSE(coordinator->beginHostedContinuationGraphSequence(transition, &error));
+            EXPECT_FALSE(error.empty());
+        }
+    }
+
 } // namespace llaminar2::test

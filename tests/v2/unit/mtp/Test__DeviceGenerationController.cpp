@@ -31,6 +31,21 @@ namespace
     using ControlRow = std::array<int, kDeviceGenerationControlCount>;
     using MetaRow = std::array<int, kSpeculativeBatchMetaCount>;
 
+    /** @brief Author explicit publisher counts for direct controller-only observations.
+     * @param control The fixture's sole row, whose append-owned delta is supplied.
+     * @param outputs Actual authored compact output extent. @param leading Already emitted rows.
+     * @param published Actual authored state-publication extent.
+     * @return A validated transient witness; no acceptance count supplies its geometry.
+     */
+    llaminar2::MTPPublicationWitness authoredPublication(ControlRow &control,
+        int outputs, int leading, int published)
+    {
+        llaminar2::MTPPublicationWitness witness;
+        EXPECT_TRUE(llaminar2::MTPPublicationWitness::fromCounts(outputs, leading, published, false, &witness));
+        control[kDeviceGenerationControlLastTransactionEmittedTokenCount] = static_cast<int>(witness.newlyEmittedTokens());
+        return witness;
+    }
+
     /**
      * @brief Prove the controller handoff admits only the complete transaction cycle.
      */
@@ -726,7 +741,7 @@ TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEver
             /*accepted_prefix=*/depth,
             /*rollback=*/false,
             /*budget_limited=*/false,
-            control.data()));
+            control.data(), authoredPublication(control, depth + 1, 0, depth + 1)));
         EXPECT_EQ(
             control[kDeviceGenerationControlCurrentDraftDepth],
             depth + 1);
@@ -751,7 +766,7 @@ TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEver
             /*accepted_prefix=*/0,
             /*rollback=*/true,
             /*budget_limited=*/false,
-            control.data()));
+            control.data(), authoredPublication(control, 2, 0, 1)));
         EXPECT_EQ(
             control[kDeviceGenerationControlCurrentDraftDepth],
             depth - 1);
@@ -788,7 +803,7 @@ TEST(Test__DeviceGenerationController, ObservePolicyCannotMutateActiveGeometry)
         /*accepted_prefix=*/4,
         /*rollback=*/false,
         /*budget_limited=*/false,
-        control.data()));
+        control.data(), authoredPublication(control, 5, 0, 5)));
 
     EXPECT_EQ(control[kDeviceGenerationControlCurrentDraftDepth], 4);
     EXPECT_EQ(control[kDeviceGenerationControlActiveVerifierRowCount], 5);
@@ -841,7 +856,9 @@ TEST(Test__DeviceGenerationController, StreamingPublicationWindowsPreserveAdapti
                 for (auto *control : {&streamed, &uninterrupted})
                     ASSERT_TRUE(record_device_generation_depth_observation(
                         full_accept ? (*control)[kDeviceGenerationControlCurrentDraftDepth] : 0,
-                        !full_accept, false, control->data()));
+                        !full_accept, false, control->data(), authoredPublication(*control,
+                            full_accept ? (*control)[kDeviceGenerationControlCurrentDraftDepth] + 1 : 2,
+                            0, full_accept ? (*control)[kDeviceGenerationControlCurrentDraftDepth] + 1 : 1)));
                 EXPECT_EQ(streamed[kDeviceGenerationControlCurrentDraftDepth],
                           uninterrupted[kDeviceGenerationControlCurrentDraftDepth]);
                 for (int word = kDeviceGenerationControlDepthStepsSinceChange;
@@ -2099,3 +2116,175 @@ TEST(Test__DeviceGenerationController, ForwardFailurePolicyKeepsLegacyAdmissionA
     EXPECT_EQ(control[kDeviceGenerationControlErrorCode],static_cast<int>(DeviceGenerationError::InvalidInitialization));
 }
 } // namespace
+
+namespace
+{
+    /** @brief Author the real admitted scope; no runtime/model process is initialized.
+     * @param mode Declared adaptive observation mode. @param measured Complete exact cost scope.
+     * @param depth Actual sole active selector. @return Canonical portable policy. */
+    DeviceGenerationPolicy priorWindowPolicy(DeviceGenerationPolicyMode mode,bool measured,int depth=5)
+    {
+        DeviceGenerationPolicy policy;
+        policy.mode=mode;policy.initial_depth=depth;policy.minimum_depth=1;policy.maximum_depth=15;
+        policy.window_size=16;policy.minimum_samples=4;policy.cooldown_steps=8;
+        if(measured)
+            policy.learned={.enabled=mode!=DeviceGenerationPolicyMode::Observe,
+                .backend=llaminar2::MTPDepthPolicyBackend::ROCm,
+                .model_class=llaminar2::MTPDepthPolicyModelClass::MoE,
+                .verify_mode=llaminar2::MTPVerifyMode::Greedy,
+                .scope={llaminar2::MTPVerifierPhysicalWidthPolicy::ExactLogicalRows,4,1,15,2560,48,512,10,90,6}};
+        return policy;
+    }
+
+    /** @brief Validate the fatal-only mutation boundary of the production observer.
+     * @param actual Failed control row. @param before Exact independently retained input. */
+    void expectPriorWindowFailureOnly(const ControlRow &actual,const ControlRow &before)
+    {
+        expectFatal(actual,DeviceGenerationError::InvalidDepthPolicy);
+        for(int word=0;word<kDeviceGenerationControlCount;++word)
+        {
+            if(word==kDeviceGenerationControlOk||word==kDeviceGenerationControlErrorCode||
+                word==kDeviceGenerationControlRequestComplete||word==kDeviceGenerationControlTransactionCommitBudget)continue;
+            EXPECT_EQ(actual[word],before[word])<<"word="<<word;
+        }
+    }
+}
+
+/** @test A poisoned negative A must not become a plausible unsigned V during a short window. */
+TEST(Test__DeviceGenerationController, PriorWindowNegativeAcceptedFailsBeforeMutation)
+{
+    const auto policy=priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,true);
+    ASSERT_TRUE(policy.valid());ControlRow row{};
+    ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+    const auto publication=authoredPublication(row,2,0,1);
+    row[kDeviceGenerationControlDepthWindowAcceptedTokens]=-2;
+    const auto before=row;
+    ASSERT_FALSE(record_device_generation_depth_observation(0,true,false,row.data(),publication));
+    expectPriorWindowFailureOnly(row,before);
+}
+
+/** @test Safe near-maximum corruption is rejected BEFORE the full counter increment.
+ * INT32_MAX-1 reproduces the missing validation without signed-overflow UB on
+ * the defective implementation. The next full observation would otherwise
+ * produce INT32_MAX in a bank whose actual prior R is0 and return success. */
+TEST(Test__DeviceGenerationController, PriorWindowNearMaxFullCounterFailsBeforeIncrement)
+{
+    const auto policy=priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,true);
+    ASSERT_TRUE(policy.valid());ControlRow row{};
+    ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+    const auto publication=authoredPublication(row,6,0,6);
+    row[kDeviceGenerationControlDepthWindowFullAccepts]=INT32_MAX-1;
+    const auto before=row;
+    ASSERT_FALSE(record_device_generation_depth_observation(5,false,false,row.data(),publication));
+    expectPriorWindowFailureOnly(row,before);
+}
+
+/** @test Every prior count and its joint prefix geometry fails before mutation on all adaptive lanes. */
+TEST(Test__DeviceGenerationController, PriorWindowMalformedCountsAreFatalAcrossAdaptivePolicies)
+{
+    const std::array<int,8> fields{
+        kDeviceGenerationControlDepthWindowVerifierRuns,kDeviceGenerationControlDepthWindowAttemptedTokens,
+        kDeviceGenerationControlDepthWindowAcceptedTokens,kDeviceGenerationControlDepthWindowRejectedTokens,
+        kDeviceGenerationControlDepthWindowRollbacks,kDeviceGenerationControlDepthWindowFullAccepts,
+        kDeviceGenerationControlDepthWindowZeroAccepts,kDeviceGenerationControlDepthWindowAcceptedPrefixSum};
+    for(auto mode:{DeviceGenerationPolicyMode::Dynamic,DeviceGenerationPolicyMode::Observe})
+    for(bool measured:{false,true})
+    for(int field:fields)for(int poison:{-1,INT32_MAX-1})
+    {
+        SCOPED_TRACE(field);
+        SCOPED_TRACE(poison);
+        SCOPED_TRACE(static_cast<int>(mode));
+        SCOPED_TRACE(measured);
+        const auto policy=priorWindowPolicy(mode,measured);ASSERT_TRUE(policy.valid());ControlRow row{};
+        ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        const auto publication=authoredPublication(row,2,0,1);row[field]=poison;const auto before=row;
+        ASSERT_FALSE(record_device_generation_depth_observation(0,true,false,row.data(),publication));
+        expectPriorWindowFailureOnly(row,before);
+    }
+    for(int defect=0;defect<5;++defect)
+    {
+        const auto policy=priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,true);ControlRow row{};
+        ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        row[kDeviceGenerationControlDepthWindowVerifierRuns]=2;
+        row[kDeviceGenerationControlDepthWindowAttemptedTokens]=10;
+        row[kDeviceGenerationControlDepthWindowAcceptedTokens]=4;
+        row[kDeviceGenerationControlDepthWindowRejectedTokens]=6;
+        row[kDeviceGenerationControlDepthWindowAcceptedPrefixSum]=4;
+        row[kDeviceGenerationControlDepthUtilityWindowEmitted]=6;
+        if(defect==0)row[kDeviceGenerationControlDepthWindowAttemptedTokens]=9;
+        if(defect==1)row[kDeviceGenerationControlDepthWindowRejectedTokens]=5;
+        if(defect==2)row[kDeviceGenerationControlDepthWindowAcceptedPrefixSum]=3;
+        if(defect==3){row[kDeviceGenerationControlDepthWindowFullAccepts]=1;row[kDeviceGenerationControlDepthWindowZeroAccepts]=2;}
+        if(defect==4){row[kDeviceGenerationControlDepthWindowAcceptedTokens]=9;
+            row[kDeviceGenerationControlDepthWindowAcceptedPrefixSum]=9;row[kDeviceGenerationControlDepthWindowRejectedTokens]=1;}
+        const auto publication=authoredPublication(row,2,0,1);const auto before=row;
+        ASSERT_FALSE(record_device_generation_depth_observation(0,true,false,row.data(),publication));
+        expectPriorWindowFailureOnly(row,before);
+    }
+}
+
+/** @test Valid empty/partial banks retain generic/Observe/measured semantics at every supported depth. */
+TEST(Test__DeviceGenerationController, PriorWindowValidPartialCountsRemainSupported)
+{
+    for(auto mode:{DeviceGenerationPolicyMode::Dynamic,DeviceGenerationPolicyMode::Observe})
+    for(bool measured:{false,true})for(int depth=1;depth<=15;++depth)
+    {
+        const auto policy=priorWindowPolicy(mode,measured,depth);ASSERT_TRUE(policy.valid());ControlRow row{};
+        ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        const int prefix=depth/2;
+        for(int sample=1;sample<=2;++sample)
+        {
+            ASSERT_TRUE(record_device_generation_depth_observation(prefix,true,false,row.data(),
+                authoredPublication(row,prefix+2,1,prefix+1)));
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowVerifierRuns],sample);
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowAttemptedTokens],sample*depth);
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowAcceptedTokens],sample*prefix);
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowRejectedTokens],sample*(depth-prefix));
+            EXPECT_EQ(row[kDeviceGenerationControlDepthWindowAcceptedPrefixSum],sample*prefix);
+            EXPECT_EQ(row[kDeviceGenerationControlCurrentDraftDepth],depth);
+            EXPECT_EQ(row[kDeviceGenerationControlDepthEvaluatedWindows],0);
+        }
+    }
+}
+
+/** @test Fixed, clipped and stopped skips do not inspect or repair an inactive adaptive bank. */
+TEST(Test__DeviceGenerationController, PriorWindowExcludedAndFixedSkipsRemainUnchanged)
+{
+    for(int kind=0;kind<3;++kind)
+    {
+        const auto policy=kind==0?DeviceGenerationPolicy::fixed(5):
+            priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,true);
+        ControlRow row{};ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        llaminar2::MTPPublicationWitness publication;
+        ASSERT_TRUE(llaminar2::MTPPublicationWitness::fromCounts(2,0,1,kind==2,&publication));
+        row[kDeviceGenerationControlLastTransactionEmittedTokenCount]=2;
+        row[kDeviceGenerationControlDepthWindowAcceptedTokens]=-2;
+        row[kDeviceGenerationControlDepthWindowFullAccepts]=INT32_MAX;
+        const auto before=row;
+        ASSERT_TRUE(record_device_generation_depth_observation(0,true,kind==1,row.data(),publication));
+        EXPECT_EQ(row,before);
+    }
+}
+
+/** @test A valid-bank next increment must have representable R/attempted/step capacity. */
+TEST(Test__DeviceGenerationController, PriorWindowCounterExhaustionRejectsBeforeIncrement)
+{
+    for(int kind=0;kind<3;++kind)
+    {
+        const int depth=kind==0?1:5;
+        const auto policy=priorWindowPolicy(DeviceGenerationPolicyMode::Dynamic,false,depth);ControlRow row{};
+        ASSERT_TRUE(initialize_device_generation_control(64,64,policy,row.data()));
+        if(kind<2)
+        {
+            const int runs=kind==0?INT32_MAX:INT32_MAX/5;
+            row[kDeviceGenerationControlDepthWindowVerifierRuns]=runs;
+            row[kDeviceGenerationControlDepthWindowAttemptedTokens]=runs*depth;
+            row[kDeviceGenerationControlDepthWindowRejectedTokens]=runs*depth;
+            row[kDeviceGenerationControlDepthWindowZeroAccepts]=runs;
+        }
+        else row[kDeviceGenerationControlDepthStepsSinceChange]=INT32_MAX;
+        const auto publication=authoredPublication(row,2,0,1);const auto before=row;
+        ASSERT_FALSE(record_device_generation_depth_observation(0,true,false,row.data(),publication));
+        expectPriorWindowFailureOnly(row,before);
+    }
+}

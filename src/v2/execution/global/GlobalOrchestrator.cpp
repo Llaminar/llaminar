@@ -1075,6 +1075,9 @@ namespace llaminar2
             sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_updates);
             sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_promotions);
             sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_demotions);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_utility_returns);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_utility_keeps);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_utility_probes);
             sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_observe_recommendations);
             sum(&PrefixRuntimeStateSnapshot::prefill_chunk_schedules);
             sum(&PrefixRuntimeStateSnapshot::prefill_chunk_successful_schedules);
@@ -2088,6 +2091,20 @@ namespace llaminar2
         const std::vector<int32_t> &stop_tokens)
     {
         return stage_runners_.configureMTPRequestStopTokensAll(stop_tokens);
+    }
+
+    bool GlobalOrchestrator::publishMTPDirectTokenHistory(int target_sample_slot,
+        MTPDirectTokenHistoryDisposition disposition)
+    {
+        if (target_sample_slot != 0 ||
+            (disposition != MTPDirectTokenHistoryDisposition::NewlyEmitted &&
+             disposition != MTPDirectTokenHistoryDisposition::AlreadyPublished))
+            return false;
+        // Only the declared vocabulary-tail owner samples and owns generated
+        // history. Other ranks must not manufacture a scalar source or shadow.
+        if (!is_pipeline_tail_) return true;
+        IInferenceRunner *tail = stage_runners_.pipelineTailRunner();
+        return tail && tail->publishMTPDirectTokenHistory(target_sample_slot, disposition);
     }
 
     bool GlobalOrchestrator::configureMTPRequestPenaltyPolicy(

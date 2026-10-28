@@ -219,6 +219,7 @@ namespace llaminar2
 
     namespace sampling_math
     {
+        struct MTPDepthTransactionTrace;
         struct DeviceGenerationPolicy;
         struct OrdinaryGenerationPublication;
         enum class DeviceGenerationLeadingRowDisposition : int32_t;
@@ -1442,6 +1443,43 @@ namespace llaminar2
             (void)stream;
             return false;
         }
+
+        /**
+         * @brief Commit one direct MTP output and its successor fresh-logits frontier.
+         *
+         * The same captured scalar launch increments the original target token's
+         * durable history and clears only the resident first-token history bit.
+         * A successful nonterminal direct output is then committed through the
+         * shifted/main model row before any successor sampler may execute; its
+         * successor first target is therefore new and not yet in durable history.
+         * Grouped carry publication and AlreadyPublished dispositions never call
+         * this interface. It does not rewrite admitted penalty magnitudes.
+         *
+         * @param token_device Original device scalar containing this direct output.
+         * @param vocab_size Exact admitted vocabulary extent.
+         * @param generated_token_counts_device Existing durable history owner.
+         * @param penalty_policy_device Original mutable MTPGreedyPenaltyPolicy owner.
+         * @param device_id Exact backend-local participant ordinal.
+         * @param stream Exact non-null original target producer stream.
+         * @return True only when the complete single-writer transition was queued.
+         */
+        virtual bool enqueueCommitMTPDirectTokenHistoryDevice(
+            const void *token_device,
+            int vocab_size,
+            void *generated_token_counts_device,
+            void *penalty_policy_device,
+            int device_id,
+            void *stream)
+        {
+            (void)token_device;
+            (void)vocab_size;
+            (void)generated_token_counts_device;
+            (void)penalty_policy_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
 
         /**
          * @brief GPU-side top-k selection over FP32 data
@@ -3229,6 +3267,8 @@ namespace llaminar2
          * The call is allocation-free, graph-capturable, and requires the exact
          * non-null producer stream.  A validation failure publishes `out_ok=0`
          * and terminally invalidates the controller row.
+         * @param depth_transaction_trace_device Optional typed transaction trace view of the
+         * existing exclusive diagnostic bank; only a scalar request may bind it.
          */
         virtual bool enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
             const void *output_tokens_device,
@@ -3256,7 +3296,8 @@ namespace llaminar2
             void *out_next_verifier_condition_tokens_device = nullptr,
             const void *verifier_input_tokens_device = nullptr,
             int verifier_input_token_stride = 0,
-            void *out_committed_verifier_identity_device = nullptr)
+            void *out_committed_verifier_identity_device = nullptr,
+            sampling_math::MTPDepthTransactionTrace *depth_transaction_trace_device = nullptr)
         {
             (void)output_tokens_device;
             (void)output_token_stride;
@@ -3284,6 +3325,7 @@ namespace llaminar2
             (void)verifier_input_tokens_device;
             (void)verifier_input_token_stride;
             (void)out_committed_verifier_identity_device;
+            (void)depth_transaction_trace_device;
             return false;
         }
 

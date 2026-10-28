@@ -7,6 +7,7 @@ depend on assert statements. Real tokenizer/parser replay is a separate native
 metadata diagnostic; these tests never load models or initialize accelerators.
 """
 from copy import deepcopy
+import hashlib
 import datetime
 import json
 from pathlib import Path
@@ -14,9 +15,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'tests/v2/e2e/server'))
+import opencode_native_audit as audit
 from opencode_native_audit import compare_decoded, join_responses, native_groups, thinking_override, wire_exchange
 
 START = datetime.datetime(2026, 10, 7, tzinfo=datetime.timezone.utc).timestamp()
@@ -64,6 +67,61 @@ class NativeAuditTests(unittest.TestCase):
 
     def joined(self):
         return join_responses(native_groups(trace(), START), [wire_exchange('app/0', exchange())])[0]
+
+    def test_split_utf8_piece_bytes_preserve_exact_metadata_and_terminal_ids(self):
+        """Individual token pieces need not form Unicode; ordered IDs remain exact."""
+        lines = [line.encode('ascii') for line in trace()]
+        lines[0] += b' text="\xf0\x9f\x99"'
+        lines[1] += b' text="\x82"'
+        expected = native_groups(trace(), START)
+        self.assertEqual(native_groups(lines, START), expected)
+        self.assertEqual(expected[0]['tokens'], [10])
+        self.assertEqual(expected[0]['all_ids'], [10, 20])
+
+    def test_non_ascii_or_truncated_native_metadata_is_never_repaired(self):
+        """Byte payload tolerance must not admit corrupted numerical/control metadata."""
+        for old, new in [(b'index=0', b'index=\xff'), (b'token=10', b'token=1\x80'),
+                         (b'forced=false', b'forced=fal\xffse'),
+                         (b'disposition=text', b'disposition=text\xff'),
+                         (b'00:00:01.100', b'00:00:01.\xff00')]:
+            lines = [line.encode('ascii') for line in trace()]
+            lines[0] = lines[0].replace(old, new)
+            with self.subTest(new=new), self.assertRaises(ValueError):
+                native_groups(lines, START)
+        with self.assertRaisesRegex(ValueError, 'Malformed'):
+            native_groups([b'[ChatCompletion/token] index=0 token=10\xff'], START)
+
+    def test_binary_log_main_hashes_original_bytes_and_decodes_exact_ids(self):
+        """The public audit joins all raw bytes and channels without token-text repair."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = root / 'app/session-0'
+            session.mkdir(parents=True)
+            (session / 'exchange-0.json').write_text(json.dumps(exchange()))
+            raw = (trace()[0].encode('ascii') + b' text="\xf0\x9f\x99"\n' +
+                   trace()[1].encode('ascii') + b' text="\x82"\n' +
+                   trace()[2].encode('ascii') + b'\n')
+            (root / 'server.log').write_bytes(raw)
+            observed = []
+            def decode(model, records, output, **kwargs):
+                """Stand in for metadata-only native replay while inspecting exact IDs."""
+                observed.extend(records)
+                (output / 'decoded.json').write_text(json.dumps([replay('session-0/exchange-0.json')]))
+            argv = ['opencode_native_audit.py', '--exchanges', str(root / 'app'),
+                '--server-log', str(root / 'server.log'), '--server-start-unix', str(START),
+                '--decoder', str(root / 'metadata-only'), '--model', str(root / 'fixture.gguf'),
+                '--output', str(root / 'result')]
+            with patch.object(sys, 'argv', argv), patch.object(audit, 'decode_records', side_effect=decode):
+                self.assertEqual(audit.main(), 0)
+            self.assertEqual([row['tokens'] for row in observed], [[10]])
+            self.assertEqual((root / 'server.log').read_bytes(), raw)
+            binding = json.loads((root / 'result/source-log-binding.json').read_text())
+            self.assertEqual(binding['bytes'], len(raw))
+            self.assertEqual(binding['sha256'], hashlib.sha256(raw).hexdigest())
+            result = json.loads((root / 'result/result.json').read_text())
+            self.assertTrue(result['passed'])
+            self.assertEqual(result['joined_responses'], 1)
+            self.assertEqual(result['verified_native_calls'], 1)
 
     def test_exact_emoji_channels_and_independent_arguments_pass(self):
         result = compare_decoded(self.joined(), [replay()])

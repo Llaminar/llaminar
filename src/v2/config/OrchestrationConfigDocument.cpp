@@ -67,6 +67,7 @@ namespace
     ENUM(MTPDepthPolicyMode, VALUE(Fixed), VALUE(Observe), VALUE(Dynamic))
     ENUM(MTPDepthPolicyBackend, VALUE(Any), VALUE(CPU), VALUE(CUDA), VALUE(ROCm))
     ENUM(MTPDepthPolicyModelClass, VALUE(Any), VALUE(Dense), VALUE(MoE))
+    ENUM(MTPVerifierPhysicalWidthPolicy, VALUE(BoundedLogicalBucket), VALUE(DynamicDeviceEnvelope), VALUE(ExactLogicalRows))
     ENUM(MTPDepthDefaultsProfile, VALUE(Portable), VALUE(CUDARTX3090), VALUE(ROCmMI50))
     ENUM(MTPSidecarDensePolicy, VALUE(TensorParallel), VALUE(ReplicatedPerParticipant))
     ENUM(MTPTerminalHeadPolicy, VALUE(VocabularySharded), VALUE(MirroredFullVocabulary), VALUE(Automatic))
@@ -147,7 +148,11 @@ namespace
 #define MEMBERS(X) X(window_bytes) X(window_count) X(host_adaptive) X(distribution) X(gpu_adaptive)
     RECORD(ImmutableRowTablePolicy, storage, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(backend) X(model_class) X(min_depth) X(max_depth) X(initial_depth) \
+#define MEMBERS(X) X(tp_width) X(pp_stages) X(retained_depth) X(hidden_dim) X(main_layers) \
+    X(expert_count) X(experts_per_token) X(compute_capability_major) X(compute_capability_minor)
+    RECORD(MTPDepthPolicyScope, verifier_width_policy, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(backend) X(model_class) X(scope) X(min_depth) X(max_depth) X(initial_depth) \
     X(window_size) X(min_samples) X(cooldown_steps) X(promote_consecutive_windows) \
     X(use_generated_policy) X(promote_full_accept_rate) X(demote_zero_accept_rate) X(demote_acceptance_rate)
     RECORD(MTPDepthPolicyConfig, mode, MEMBERS)
@@ -191,7 +196,7 @@ namespace
     X(max_seq_len) X(prefill_max_bucket_size) X(use_mmap) X(prompt) X(prompt_was_explicitly_provided) X(n_predict) X(batch_size) \
     X(n_threads) X(seed) X(temperature) X(top_k) X(top_p) X(deterministic) X(chat_mode) \
     X(single_shot_chat) X(system_prompt) X(chat_template_override) X(benchmark_mode) \
-    X(benchmark_json_output_path) X(benchmark_prompt_file_path) X(benchmark_prompt_file_was_provided) \
+    X(benchmark_campaign_path) X(benchmark_campaign_was_provided) X(benchmark_json_output_path) X(benchmark_prompt_file_path) X(benchmark_prompt_file_was_provided) \
     X(serve_mode) X(serve_port) X(serve_host) X(use_fused_attention) X(fused_attention_backend) \
     X(mpi_procs) X(hostfile) X(mpi_dry_run) X(mpi_verbose) X(mpi_no_bootstrap) X(mpi_oversubscribe) \
     X(mpi_profile) X(verbose_level) X(list_devices) X(show_help) X(max_gpu_memory_mb) \
@@ -289,6 +294,8 @@ namespace
             invalid(path, "recursive topology-tree execution is unimplemented");
         else
         {
+            if constexpr (std::same_as<T, MTPDepthPolicyScope>)
+                if (!value.valid()) invalid(path, "incomplete or invalid frozen learned-policy scope");
             Writer writer{.path = path};
             fields(value, writer);
             return std::move(writer.json);
@@ -391,6 +398,8 @@ namespace
             Reader reader{.json = json, .path = path};
             fields(result, reader);
             reader.finish();
+            if constexpr (std::same_as<T, MTPDepthPolicyScope>)
+                if (!result.valid()) invalid(path, "incomplete or invalid frozen learned-policy scope");
             return result;
         }
     }

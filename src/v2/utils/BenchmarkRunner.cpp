@@ -8,6 +8,10 @@
  * selections survive as setup metadata without retaining runtime placement work.
  * Profiling remains separate from clean
  * timing; hardware default selection belongs to execution planning, not here.
+ * Bounded transaction traces permit one fresh measured request per collector epoch,
+ * preserving exact controller inputs without cross-request aggregation.
+ * Opt-in terminal depth-window evidence describes measured eligible outcomes;
+ * reset removes warmup windows without expanding per-transaction MTP telemetry.
  * @author David Sanftenberg
  * @date 2025
  */
@@ -21,6 +25,7 @@
 #include "CUDAKernelProfiler.h"
 #include "ROCmKernelProfiler.h"
 #include "PerfStatsCollector.h"
+#include "MTPDepthTransactionTraceCPU.h"
 #include "Sha256.h"
 #include "WeightLoadingProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
@@ -130,6 +135,9 @@ namespace llaminar2
                snapshot.mtp_depth_policy_updates != 0 ||
                snapshot.mtp_depth_policy_promotions != 0 ||
                snapshot.mtp_depth_policy_demotions != 0 ||
+               snapshot.mtp_depth_policy_utility_returns != 0 ||
+               snapshot.mtp_depth_policy_utility_keeps != 0 ||
+               snapshot.mtp_depth_policy_utility_probes != 0 ||
                snapshot.mtp_depth_policy_observe_recommendations != 0 ||
                snapshot.mtp_request.enabled ||
                snapshot.mtp_request.bypassed ||
@@ -206,11 +214,19 @@ namespace llaminar2
         };
     }
 
-    static double mtpTokenAcceptanceRate(uint64_t accepted_tokens, uint64_t rejected_tokens)
+    /**
+     * @brief Fraction of attempted speculative draft tokens accepted by verification.
+     * @param accepted_tokens Actual accepted draft tokens in this measured window.
+     * @param draft_steps Actual attempted drafts, including rejected suffix work.
+     * @return Accepted drafts divided by attempted drafts, or zero without attempts.
+     *
+     * The legacy rejected_tokens field counts rejected transactions on the
+     * captured path. It cannot reconstruct token attempts at depth above one.
+     */
+    static double mtpTokenAcceptanceRate(uint64_t accepted_tokens, uint64_t draft_steps)
     {
-        const uint64_t attempted_tokens = accepted_tokens + rejected_tokens;
-        return attempted_tokens > 0
-                   ? static_cast<double>(accepted_tokens) / static_cast<double>(attempted_tokens)
+        return draft_steps > 0
+                   ? static_cast<double>(accepted_tokens) / static_cast<double>(draft_steps)
                    : 0.0;
     }
 
@@ -464,6 +480,8 @@ namespace llaminar2
      * @brief Select measured diagnostics and exact retained immutable setup families for JSON.
      * @return Existing runtime filters plus the original per-layer physical expert selections.
      *
+     * The exact terminal depth-policy family carries eligible window counts;
+     * unrelated per-transaction MTP counters remain outside this snapshot.
      * Selection records survive the measured reset as setup observations; their
      * submission counts never represent measured replays, tokens or movement.
      */
@@ -476,6 +494,12 @@ namespace llaminar2
             "moe_overlay_controller",
             "moe_placement.routed_expert_weight_selection",
             "moe_rebalance",
+            "mtp.device_generation_terminal_depth_policy_state",
+            "mtp.depth_transaction_trace.initial",
+            "mtp.depth_transaction_trace.record",
+            "mtp.depth_transaction_trace.final",
+            "mtp.output_tokens",
+            "mtp.grouped_outcome_host_state_publications",
             "tp_allreduce_bom",
             "tp_allreduce_runtime",
             "tp_allreduce_small_gpu",
@@ -600,7 +624,20 @@ namespace llaminar2
 
         nlohmann::json records_json = nlohmann::json::array();
         for (const auto &record : records)
+        {
+            if (record.domain == "mtp" && record.name.starts_with("grouped_outcome_host_state_publications") &&
+                record.name != "grouped_outcome_host_state_publications")
+                continue;
+            if (record.domain == "mtp" && record.name.starts_with("output_tokens."))
+                continue;
+            if (record.domain == "mtp" &&
+                record.name.starts_with("depth_transaction_trace.") &&
+                record.name != "depth_transaction_trace.initial" &&
+                record.name != "depth_transaction_trace.record" &&
+                record.name != "depth_transaction_trace.final")
+                continue;
             records_json.push_back(perfStatRecordToJson(record));
+        }
 
         return nlohmann::json{
             {"schema", "llaminar.perf_stats.v1"},
@@ -701,7 +738,7 @@ namespace llaminar2
               {"acceptance_rate",
                mtpTokenAcceptanceRate(
                    iteration.mtp_accepted_tokens,
-                   iteration.mtp_rejected_tokens)}}}};
+                   iteration.mtp_draft_steps)}}}};
         result["decode_windows"] = nlohmann::json::array();
         for (const auto &window : iteration.decode_windows)
         {
@@ -830,6 +867,9 @@ namespace llaminar2
             previous.mtp_depth_policy_promotions + sample.mtp_depth_policy_promotions;
         aggregate->mtp_depth_policy_demotions =
             previous.mtp_depth_policy_demotions + sample.mtp_depth_policy_demotions;
+        aggregate->mtp_depth_policy_utility_returns = previous.mtp_depth_policy_utility_returns + sample.mtp_depth_policy_utility_returns;
+        aggregate->mtp_depth_policy_utility_keeps = previous.mtp_depth_policy_utility_keeps + sample.mtp_depth_policy_utility_keeps;
+        aggregate->mtp_depth_policy_utility_probes = previous.mtp_depth_policy_utility_probes + sample.mtp_depth_policy_utility_probes;
         aggregate->mtp_depth_policy_observe_recommendations =
             previous.mtp_depth_policy_observe_recommendations +
             sample.mtp_depth_policy_observe_recommendations;
@@ -858,7 +898,7 @@ namespace llaminar2
             sample.mtp_request.stochastic_terminal_samples;
         aggregate->mtp_request.acceptance_rate =
             mtpTokenAcceptanceRate(aggregate->mtp_request.accepted_tokens,
-                                   aggregate->mtp_request.rejected_tokens);
+                                   aggregate->mtp_request.draft_steps);
         aggregate->mtp_request.stochastic_acceptance_rate =
             aggregate->mtp_request.stochastic_accept_tests > 0
                 ? static_cast<double>(aggregate->mtp_request.stochastic_accepts) /
@@ -970,13 +1010,16 @@ namespace llaminar2
                       {"depth_policy_updates", state.mtp_depth_policy_updates},
                       {"depth_policy_promotions", state.mtp_depth_policy_promotions},
                       {"depth_policy_demotions", state.mtp_depth_policy_demotions},
+                      {"depth_policy_utility_returns", state.mtp_depth_policy_utility_returns},
+                      {"depth_policy_utility_keeps", state.mtp_depth_policy_utility_keeps},
+                      {"depth_policy_utility_probes", state.mtp_depth_policy_utility_probes},
                       {"depth_policy_observe_recommendations", state.mtp_depth_policy_observe_recommendations},
                       {"current_depth", state.mtp_current_depth},
                       {"min_depth", state.mtp_min_depth},
                       {"max_depth", state.mtp_max_depth},
                       {"acceptance_rate", mtpTokenAcceptanceRate(
                                               state.mtp_accepted_tokens,
-                                              state.mtp_rejected_tokens)},
+                                              state.mtp_draft_steps)},
                       {"request", mtpRequestToJson(state.mtp_request)}}},
             {"prefill_chunks", {{"schedules", state.prefill_chunk_schedules},
                                  {"successful_schedules", state.prefill_chunk_successful_schedules},
@@ -993,6 +1036,8 @@ namespace llaminar2
             doc["iterations"].push_back(
                 benchmarkIterationToJson(iteration));
 
+        if (!result.prompt_token_ids.empty())
+            doc["prompt"]["token_ids"] = result.prompt_token_ids;
         if (!result.prompt_file_path.empty())
             doc["prompt"]["file_path"] = result.prompt_file_path;
 
@@ -1011,6 +1056,7 @@ namespace llaminar2
                 {"mtp_depth_policy", mtpDepthPolicyModeToString(config->mtp.depth_policy.mode)},
                 {"mtp_min_draft_tokens", config->mtp.depth_policy.min_depth},
                 {"mtp_max_draft_tokens", config->mtp.depth_policy.max_depth},
+                {"mtp_initial_draft_tokens", config->mtp.depth_policy.initial_depth},
                 {"mtp_depth_window", config->mtp.depth_policy.window_size},
                 {"mtp_depth_generated_policy", config->mtp.depth_policy.use_generated_policy},
                 {"mtp_depth_defaults_profile", mtpDepthDefaultsProfileToString(config->mtp.depth_defaults_profile)},
@@ -1805,7 +1851,31 @@ namespace llaminar2
         return result;
     }
 
+    PreparedBenchmarkInput BenchmarkRunner::prepareInput(const OrchestrationConfig &config) const
+    {
+        auto prompt = resolveBenchmarkPrompt(config);
+        auto tokens = tokenizer_->encode(prompt.text, /*add_bos=*/false, /*add_eos=*/false);
+        if (tokens.empty() || tokens.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::runtime_error("benchmark prompt tokenization is empty or exceeds supported geometry");
+        const int vocabulary = runner_->vocab_size();
+        if (vocabulary <= 0 || std::any_of(tokens.begin(), tokens.end(), [vocabulary](int token) {
+                return token < 0 || token >= vocabulary;
+            })) throw std::runtime_error("benchmark prompt tokenization contains an invalid native token ID");
+        return PreparedBenchmarkInput(std::move(prompt), std::move(tokens));
+    }
+
     BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
+    {
+        return runImpl(config, std::nullopt);
+    }
+
+    BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config, const PreparedBenchmarkInput &input)
+    {
+        return runImpl(config, std::cref(input));
+    }
+
+    BenchmarkResult BenchmarkRunner::runImpl(const OrchestrationConfig &config,
+        std::optional<std::reference_wrapper<const PreparedBenchmarkInput>> prepared_input)
     {
         BenchmarkResult result;
         const int benchmark_iterations =
@@ -1826,6 +1896,32 @@ namespace llaminar2
                     : (runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{});
             return result;
         };
+
+        if (debugEnv().runtime_debug.mtp_depth_transaction_trace)
+        {
+            const auto scope = config.benchmark_mode && !config.serve_mode
+                ? sampling_math::MTPDepthTransactionTraceScope::BoundedBenchmark
+                : sampling_math::MTPDepthTransactionTraceScope::Other;
+            // Validate raw declarations, not clamped loop counts: an invalid
+            // authored zero-measurement request must not become measure1.
+            if (!debugEnv().runtime_debug.benchmark_iteration_overrides_valid ||
+                !validMTPDepthTransactionTracePolicy(config.mtp) ||
+                !sampling_math::validMTPDepthTransactionTraceScope(scope,
+                    debugEnv().runtime_debug.benchmark_warmup_iterations,
+                    debugEnv().runtime_debug.benchmark_iterations) ||
+                !sampling_math::validMTPDepthTransactionTraceAdmission(
+                    sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                    config.batch_size, config.n_predict < 0 ? 128 : config.n_predict))
+            {
+                last_failure_reason_ = "MTP depth-transaction trace requires a fresh scalar bounded benchmark with enabled positive-depth MTP (CPU bypass unsupported), warmup0/measure1, tokens1..256";
+                return capture_and_return();
+            }
+            if (!PerfStatsCollector::isDomainEnabled("mtp"))
+            {
+                last_failure_reason_ = "MTP depth-transaction trace requires enabled PerfStats collection of the mtp domain";
+                return capture_and_return();
+            }
+        }
 
         /*
          * Application startup owns all model preparation through the same
@@ -1852,26 +1948,19 @@ namespace llaminar2
 
         try
         {
-            const ResolvedBenchmarkPrompt resolved = resolveBenchmarkPrompt(config);
+            const PreparedBenchmarkInput prepared = prepared_input
+                ? prepared_input->get() : prepareInput(config);
+            const auto &resolved = prepared.prompt();
             prompt = resolved.text;
             result.prompt_source = resolved.source;
             result.prompt_file_path = resolved.file_path;
             result.prompt_bytes = resolved.text.size();
             result.prompt_sha256 = resolved.sha256;
-
-            LOG_DEBUG("Benchmark prompt source="
-                      << benchmarkPromptSourceToString(resolved.source)
-                      << " bytes=" << resolved.text.size()
-                      << " sha256=" << resolved.sha256);
-
-            tokens = tokenizer_->encode(prompt, /*add_bos=*/false, /*add_eos=*/false);
+            tokens = prepared.tokenIds();
+            if (prepared_input) result.prompt_token_ids = tokens;
             token_count = static_cast<int>(tokens.size());
-            if (tokens.empty())
-            {
-                last_failure_reason_ = "benchmark prompt tokenization failed";
-                LOG_ERROR(last_failure_reason_);
-                token_count = -1;
-            }
+            LOG_DEBUG("Benchmark prompt source=" << benchmarkPromptSourceToString(resolved.source)
+                      << " bytes=" << resolved.text.size() << " sha256=" << resolved.sha256);
         }
         catch (const std::exception &error)
         {

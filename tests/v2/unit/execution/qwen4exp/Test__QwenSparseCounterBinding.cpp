@@ -21,13 +21,16 @@ TEST(QwenSparseCounterBinding, MissingForeignExternalAndCPUOwnersAreRejectedWith
     EXPECT_THROW(QwenSparseCounterBinding::admit(borrowed,DeviceId::cuda(0),0,48,16),std::invalid_argument);
     EXPECT_EQ(foreign.gpu_data_ptr(),nullptr);
 }
-/** @brief The actual canonical arena admits exactly90 INT32 words per request, without a second BOM. */
+/** @brief The canonical arena owns108 INT32 words: immutable scope and32B utility state/events share the existing BOM. */
 TEST(QwenSparseCounterBinding, CanonicalOwnedArenaAndTerminalGeometryHaveOneExactExtent){
+    static_assert(sampling_math::kDeviceGenerationControlDepthUtilityPhase==100);
+    static_assert(sampling_math::kDeviceGenerationControlDepthUtilityProbes-sampling_math::kDeviceGenerationControlDepthUtilityPhase==5);
+    static_assert(sampling_math::kDeviceGenerationControlCount-sampling_math::kDeviceGenerationControlDepthUtilityProbes==3);
     llaminar2::test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(ArenaConfig{.factory=&factory});
     ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_GENERATION_CONTROL,3,sampling_math::kDeviceGenerationControlCount,"INT32",DeviceId::cpu()));
     ASSERT_TRUE(arena.allocate());auto tensor=arena.getSharedTensor(BufferId::MTP_GENERATION_CONTROL);ASSERT_TRUE(tensor);
-    EXPECT_EQ(tensor->size_bytes(),3u*(208+32+48+72));EXPECT_EQ(arena.getRows(BufferId::MTP_GENERATION_CONTROL),3u);
-    EXPECT_EQ(arena.getCols(BufferId::MTP_GENERATION_CONTROL),90u);
+    EXPECT_EQ(tensor->size_bytes(),3u*(208+32+48+72+40+20+12));EXPECT_EQ(arena.getRows(BufferId::MTP_GENERATION_CONTROL),3u);
+    EXPECT_EQ(arena.getCols(BufferId::MTP_GENERATION_CONTROL),108u);
     EXPECT_EQ(tensor->gpu_data_ptr(),nullptr);
     EXPECT_THROW(QwenSparseCounterBinding::admit(arena,DeviceId::cpu(),0,48,16),std::invalid_argument);
     EXPECT_THROW(QwenSparseCounterBinding::admit(arena,DeviceId::cuda(0),0,48,16),std::invalid_argument);

@@ -1485,6 +1485,117 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     else:
                         self.assertIn("unauthenticated scheduler", result.error or "")
 
+    @classmethod
+    def continuation_mtp_records(cls, *, cuda: bool = False, rank: int | None = None) -> list[dict]:
+        """Append one complete native-admission witness triplet to each controller."""
+        records = cls.hybrid_hosted_mtp_records(rank=rank) if cuda else cls.hosted_mtp_records()
+        if not cuda and rank is not None:
+            for row in records:
+                row["rank"] = rank
+        devices = {row.get("device") for row in records if row["name"] == "device_generation_loop_graph_materializations"}
+        for device in devices:
+            existing = next(row for row in records if row.get("device") == device and
+                            row["name"] == "device_generation_dispatch_ticket_d2h_submissions")
+            existing["value"] += 1
+            scope = {"kind": "counter", "count": 1, "phase": "decode", "sequence_word_count": 3,
+                     "sequence_minimum_words": [0, 17, 41], "sequence_maximum_words": [0, 17, 41],
+                     "sequence_digest_lo": 1234, "sequence_digest_hi": 5678}
+            if rank is not None:
+                scope["rank"] = rank
+            common = {"family": "exact_rows", "physical_rows": "4",
+                      "entry_source": "native_continue_response_admission"}
+            for name, tags in (
+                ("device_generation_continuation_admission_tickets", {**common, "depth": "3"}),
+                ("device_generation_dispatch_tickets_observed", {**common, "next_depth": "3", "complete": "false", "maintenance_due": "false"}),
+                ("hosted_device_generation_transaction_submissions", {**common, "depth": "3", "fragments": "12", "dynamic_depth_source": "device_controller_ticket"}),
+            ):
+                records.append(counter(name, domain="mtp", device=device, tags=tags) | copy.deepcopy(scope))
+            admission = counter("device_generation_admissions", domain="mtp", device=device, tags={
+                "admission_boundary": "continue_response", "response_owner": "persistent_device_ledger",
+                "request_count": "1", "minimum_draft_depth": "3", "maximum_draft_depth": "3"}) | {"phase": "decode"}
+            if rank is not None:
+                admission["rank"] = rank
+            records.append(admission)
+        return records
+
+    def test_hosted_mtp_continuation_joins_bounded_native_identity_streams(self) -> None:
+        """Genuine ticket zero adds exactly one witnessed dispatch per continuation."""
+        for cuda in (False, True):
+            for multi_rank in (False, True):
+                with self.subTest(cuda=cuda, multi_rank=multi_rank):
+                    records = (self.continuation_mtp_records(cuda=cuda, rank=0) +
+                               self.continuation_mtp_records(cuda=cuda, rank=1)) if multi_rank else self.continuation_mtp_records(cuda=cuda)
+                    result = validate_host_scheduled_mtp_device_generation_policy(records,
+                        device_kinds=frozenset({"cuda", "rocm"}), expected_minimum_depth=3, expected_maximum_depth=3)
+                    self.assertIsNone(result.error)
+        # Ordinary first transaction one keeps its original strict schema/law.
+        self.assertIsNone(validate_host_scheduled_mtp_device_generation_policy(self.hosted_mtp_records(),
+            device_kinds=frozenset({"rocm"}), expected_minimum_depth=3, expected_maximum_depth=3).error)
+
+    def test_hosted_mtp_continuation_rejects_missing_malformed_and_foreign_witnesses(self) -> None:
+        """No rank/device/depth or plausible total repairs an absent native identity."""
+        faults = ("missing_admission", "missing_observation", "missing_branch", "missing_all", "duplicate",
+                  "session", "workspace", "zero_session", "zero_workspace", "digest", "digest_missing", "count",
+                  "words", "ordinal", "family", "depth", "physical", "source", "committed_source", "phase",
+                  "domain", "device", "rank", "session_tag", "complete", "maintenance", "native_admissions",
+                  "word_bool", "word_fraction", "word_string", "count_bool", "count_fraction", "count_string",
+                  "word_count_bool", "word_count_fraction", "word_count_string", "epoch_overflow", "range_reverse", "digest_bool")
+        for cuda in (False, True):
+            for fault in faults:
+                with self.subTest(cuda=cuda, fault=fault):
+                    records = self.continuation_mtp_records(cuda=cuda, rank=0) + self.continuation_mtp_records(cuda=cuda, rank=1)
+                    target = next(row for row in records if row.get("rank") == 0 and
+                                  row["name"] == "device_generation_continuation_admission_tickets")
+                    device = target["device"]
+                    zero = next(row for row in records if row.get("rank") == 0 and row.get("device") == device and
+                                row["name"] == "device_generation_dispatch_tickets_observed" and
+                                row.get("tags", {}).get("entry_source") == "native_continue_response_admission")
+                    branch = next(row for row in records if row.get("rank") == 0 and row.get("device") == device and
+                                  row["name"] == "hosted_device_generation_transaction_submissions" and
+                                  row.get("tags", {}).get("entry_source") == "native_continue_response_admission")
+                    if fault.startswith("missing_"):
+                        for row in {"missing_admission": [target], "missing_observation": [zero],
+                                    "missing_branch": [branch], "missing_all": [target, zero, branch]}[fault]:
+                            records.remove(row)
+                    elif fault == "duplicate": records.append(copy.deepcopy(target))
+                    elif fault in {"session", "workspace", "zero_session", "zero_workspace"}:
+                        word = 1 if "session" in fault else 2
+                        for key in ("sequence_minimum_words", "sequence_maximum_words"):
+                            zero[key][word] = 0 if fault.startswith("zero_") else zero[key][word] + 1
+                    elif fault == "digest": zero["sequence_digest_hi"] += 1
+                    elif fault == "digest_missing": del zero["sequence_digest_lo"]
+                    elif fault == "count": zero["count"] = zero["value"] = 2
+                    elif fault == "words": zero["sequence_word_count"] = 1
+                    elif fault == "ordinal": zero["sequence_maximum_words"][0] = 1
+                    elif fault == "family": zero["tags"]["family"] = "bounded_buckets"
+                    elif fault == "depth": zero["tags"]["next_depth"] = "4"
+                    elif fault == "physical": zero["tags"]["physical_rows"] = "16"
+                    elif fault == "source": zero["tags"]["entry_source"] = "committed_transaction_ticket"
+                    elif fault == "committed_source": branch["tags"]["entry_source"] = "committed_transaction_ticket"
+                    elif fault == "phase": zero["phase"] = "setup"
+                    elif fault == "domain": zero["domain"] = "forward_graph"
+                    elif fault == "device": zero["device"] = "ROCm:99"
+                    elif fault == "rank": zero["rank"] = 2
+                    elif fault == "session_tag": zero["tags"]["session_epoch"] = "17"
+                    elif fault == "complete": zero["tags"]["complete"] = "true"
+                    elif fault == "maintenance": zero["tags"]["maintenance_due"] = "true"
+                    elif fault in {"word_bool", "word_fraction", "word_string"}:
+                        zero["sequence_minimum_words"][1] = {"word_bool": True, "word_fraction": 17.5, "word_string": "17"}[fault]
+                    elif fault in {"count_bool", "count_fraction", "count_string"}:
+                        zero["count"] = {"count_bool": True, "count_fraction": 1.5, "count_string": "1"}[fault]
+                    elif fault in {"word_count_bool", "word_count_fraction", "word_count_string"}:
+                        zero["sequence_word_count"] = {"word_count_bool": True, "word_count_fraction": 3.0, "word_count_string": "3"}[fault]
+                    elif fault == "epoch_overflow": zero["sequence_maximum_words"][1] = 1 << 64
+                    elif fault == "range_reverse": zero["sequence_minimum_words"][2] = 42
+                    elif fault == "digest_bool": zero["sequence_digest_lo"] = True
+                    elif fault == "native_admissions":
+                        row = next(row for row in records if row.get("rank") == 0 and row.get("device") == device and
+                                   row["name"] == "device_generation_admissions")
+                        row["value"] = 2
+                    result = validate_host_scheduled_mtp_device_generation_policy(records,
+                        device_kinds=frozenset({"cuda", "rocm"}), expected_minimum_depth=3, expected_maximum_depth=3)
+                    self.assertIsNotNone(result.error)
+
     def test_hybrid_cuda_terminal_mtp_accepts_authenticated_boundary(self) -> None:
         """A CUDA PP tail needs captured ticket dispatch across the ROCm boundary."""
         records = self.hybrid_hosted_mtp_records()

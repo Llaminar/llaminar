@@ -8,7 +8,8 @@
  * codebook-specific live and shadow expert bytes are added only by
  * MoEOverlayCapacityResolver. Pipeline groups share one fixed-owner assembly:
  * process archive backing is counted once and parent transfer endpoints remain
- * explicit even after each child has its own expert topology.
+ * explicit even after each child has its own expert topology. Generation
+ * domains and parent roles remain admission inputs through child projection.
  *
  * Ordinary single-domain native QFN TP shares original consumer declarations
  * with weight construction; separately retained dense/overlay families keep
@@ -445,6 +446,38 @@ namespace llaminar2
                 MoEOverlayCapacityAdmission::boundParticipants(overlay_plan);
             const auto continuation_shards =
                 MoEOverlayLocalCapacityPlanner::continuationShards(rank_plan, input.rank_execution_kind);
+            DeviceGenerationDomainDeclaration actual_generation;
+            switch (input.generation_domain)
+            {
+            case DeviceGenerationExecutionDomain::HostedBoundary:
+                actual_generation.requireHostedBoundary();
+                break;
+            case DeviceGenerationExecutionDomain::NativeDomain:
+                break;
+            default:
+                throw std::invalid_argument("ExpertOverlay fixed memory has an unknown generation domain");
+            }
+            if (input.generation_parent_role != MTPGenerationParentRole::Controller &&
+                input.generation_parent_role != MTPGenerationParentRole::PipelineFollower)
+                throw std::invalid_argument("ExpertOverlay fixed memory has an unknown generation parent owner");
+            for (const auto &participant : bound) actual_generation.observe(participant.device.type);
+            for (const auto &shard : continuation_shards) actual_generation.observe(shard.device.type);
+            if (actual_generation.domain() != input.generation_domain)
+                throw std::invalid_argument("ExpertOverlay fixed memory underdeclares its mixed generation boundary");
+            // Every native consumer shares this input's captured graph plan.
+            // Check uniformity before a common inventory is converted to bytes.
+            std::optional<MTPVerifierGraphFamily> gpu_family;
+            const auto authenticateFamily = [&](DeviceId device)
+            {
+                if (!device.is_gpu()) return;
+                const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+                    declaredDeviceGenerationExecutionPolicy(device.type, input.generation_domain)));
+                if (gpu_family && *gpu_family != family)
+                    throw std::invalid_argument("ExpertOverlay fixed memory has nonuniform GPU verifier owners");
+                gpu_family = family;
+            };
+            for (const auto &participant : bound) authenticateFamily(participant.device);
+            for (const auto &shard : continuation_shards) authenticateFamily(shard.device);
             if (!continuation_shards.empty() &&
                 (rank_plan.first_layer != family.first_model_layer ||
                  rank_plan.last_layer != family.first_model_layer + family.main_layer_count - 1))
@@ -588,10 +621,13 @@ namespace llaminar2
                     if (config.graph_snapshot_memory.valid())
                     {
                         const auto &mtp = rank_plan.runtime.mtp;
-                        const MTPGraphOwnerPlan graph_owners(mtp);
+                        const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+                            declaredDeviceGenerationExecutionPolicy(device.type, input.generation_domain)));
+                        const auto query_programs = profile.sparseQueryProgramCount();
+                        const MTPGraphOwnerPlan graph_owners(mtp, family, input.generation_parent_role, query_programs);
                         const auto arenas = ServingSnapshotArenaInventory::ordinary(
                             true, graph_owners.retainsGraphCapacity(), graph_owners.sidecarGraphSlots(),
-                            graph_owners.retainsGraphCapacity() ? graph_owners.requestCapacity() : 0u);
+                            graph_owners.retainsGraphCapacity() ? graph_owners.requestCapacity() : 0u, query_programs);
                         // PreparedInactive retains both lean and diagnostic executables,
                         // but lean graphs contain no snapshot arena. One frozen
                         // diagnostic namespace owns the role populations above.
@@ -977,12 +1013,30 @@ namespace llaminar2
                 const std::size_t activation_staging_bytes =
                     result.activation_channel_plan.stagingBytesFor(
                         rank_plan.rank, device);
-                const std::size_t captured_graph_bytes =
-                    device.is_gpu()
-                        ? estimateCapturedGraphExecutableBytes(
-                              device,
-                              input.captured_graph_plan.resident_executables)
-                        : 0u;
+                auto captured_inventory = input.captured_graph_plan.resident_executables;
+                const auto continuation = std::find_if(result.device_inputs.begin(), result.device_inputs.end(),
+                    [&](const auto &config) { return config.device == device &&
+                        config.execution_role == DeviceExecutionMemoryRole::ContinuationGraph; });
+                if (device.is_gpu() && continuation != result.device_inputs.end())
+                {
+                    const auto query_programs = profile.sparseQueryProgramCount();
+                    // Routed-only resources own no response controller or dense
+                    // resident-input forward. Sampling children belong only to
+                    // an actual tail; shared MTP parent capacity is counted once.
+                    const auto ordinary = OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                        device,
+                        input.graph_family.max_mtp_draft_depth > 0,
+                        declaredDeviceGenerationExecutionPolicy(device.type, input.generation_domain),
+                        input.generation_parent_role,
+                        query_programs) +
+                        OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(query_programs,
+                            continuation->pipeline_forward_only_graph_owner);
+                    if (ordinary > std::numeric_limits<std::size_t>::max() - captured_inventory.auxiliary_executable_count)
+                        throw std::overflow_error("ExpertOverlay ordinary native owner inventory overflows");
+                    captured_inventory.auxiliary_executable_count += ordinary;
+                }
+                const std::size_t captured_graph_bytes = device.is_gpu()
+                    ? estimateCapturedGraphExecutableBytes(device, captured_inventory) : 0u;
                 PhysicalMemoryBOMBuilder additions(resource);
                 // Startup probes reuse one serial scratch family on each CPU
                 // resource. Price it before automatic expert capacity fills RAM;
@@ -1102,6 +1156,13 @@ namespace llaminar2
         {
             transfers.push_back(PipelineStageTransferMemory::forStage(parent, index));
             const auto &input = stages[index];
+            const auto parent_domain = declaredRankDeviceGenerationDomain(parent);
+            const auto expected_parent_role = index + 1u < count
+                ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller;
+            if ((parent_domain == DeviceGenerationExecutionDomain::HostedBoundary &&
+                 input.generation_domain != DeviceGenerationExecutionDomain::HostedBoundary) ||
+                input.generation_parent_role != expected_parent_role)
+                throw std::invalid_argument("ExpertOverlay fixed pipeline loses its parent generation domain or transaction owner");
             const auto *rank = input.rank_plan;
             if (!rank || rank->rank != parent.rank || rank->usesLocalPP() || rank->usesGlobalTP() || rank->usesPipelineParallel() ||
                 input.resident_graph_rows <= 0 || input.resident_graph_rows != stages.front().resident_graph_rows ||

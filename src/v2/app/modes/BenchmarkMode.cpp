@@ -21,6 +21,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/BenchmarkRunner.h"
+#include "utils/BenchmarkCampaign.h"
 
 #include <fstream>
 #include <memory>
@@ -174,6 +175,20 @@ namespace llaminar2
         auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
 
         BenchmarkRunner benchmark(adapter, tokenizer);
+
+        if (ctx.config.benchmark_campaign_was_provided || !ctx.config.benchmark_campaign_path.empty())
+        {
+            // Physical admission/readiness above occurs once. The immutable
+            // campaign validates every natural input and depth before any cell
+            // may reset/publish a request; all inference uses this same adapter.
+            auto resolved = runner->config();
+            resolved.benchmark_campaign_path = ctx.config.benchmark_campaign_path;
+            resolved.benchmark_mode = true;
+            const auto campaign = prepareBenchmarkCampaign(resolved, benchmark);
+            const auto outcome = runBenchmarkCampaign(campaign, *runner, benchmark);
+            if (!outcome.success) LOG_ERROR("Benchmark campaign failed: " << outcome.failure_reason);
+            return shutdownAndReturn(outcome.success, outcome.failure_reason);
+        }
 
         BenchmarkResult result = benchmark.run(ctx.config);
         benchmark.printResults(result);

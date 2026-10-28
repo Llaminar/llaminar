@@ -11,6 +11,7 @@
 #pragma once
 
 #include <stdexcept>
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 
 namespace llaminar2
 {
@@ -34,6 +35,9 @@ namespace llaminar2
         int last_layer = 0;         ///< Last layer index this stage executes (exclusive)
         bool has_embedding = false; ///< True if this stage owns the token embedding lookup
         bool has_lm_head = false;   ///< True if this stage owns output_norm and LM head projection
+        /** Complete parent boundary, authored before any child graph admission. */
+        DeviceGenerationExecutionDomain generation_domain =
+            DeviceGenerationExecutionDomain::NativeDomain;
 
         /**
          * @brief Validate the PP stage configuration
@@ -49,6 +53,9 @@ namespace llaminar2
         [[nodiscard]] bool isValid() const
         {
             // Basic range validation
+            if (generation_domain != DeviceGenerationExecutionDomain::NativeDomain &&
+                generation_domain != DeviceGenerationExecutionDomain::HostedBoundary)
+                return false;
             if (first_layer < 0)
                 return false;
             if (last_layer <= first_layer)

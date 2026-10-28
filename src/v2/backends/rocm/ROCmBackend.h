@@ -174,6 +174,14 @@ namespace llaminar2
             void *generated_token_counts_device,
             int device_id,
             void *stream) override;
+        /** @copydoc IBackend::enqueueCommitMTPDirectTokenHistoryDevice */
+        bool enqueueCommitMTPDirectTokenHistoryDevice(
+            const void *token_device,
+            int vocab_size,
+            void *generated_token_counts_device,
+            void *penalty_policy_device,
+            int device_id,
+            void *stream) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,
@@ -651,6 +659,7 @@ namespace llaminar2
             void *decode_boundary_advanced_device,
             int device_id,
             void *stream) override;
+        /** @copydoc IBackend::enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata */
         bool enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
             const void *output_tokens_device,
             int output_token_stride,
@@ -677,7 +686,8 @@ namespace llaminar2
             void *out_next_verifier_condition_tokens_device = nullptr,
             const void *verifier_input_tokens_device = nullptr,
             int verifier_input_token_stride = 0,
-            void *out_committed_verifier_identity_device = nullptr) override;
+            void *out_committed_verifier_identity_device = nullptr,
+            sampling_math::MTPDepthTransactionTrace *depth_transaction_trace_device = nullptr) override;
         bool enqueueDeriveSpeculativePublicationMetadata(
             const void *meta_device,
             int meta_stride,

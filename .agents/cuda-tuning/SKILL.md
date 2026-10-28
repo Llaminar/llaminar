@@ -19,6 +19,12 @@ The golden rule of this codebase: **isolated kernel speedups do not always trans
 to full-model speedups.** Always confirm a win on the real `benchmark` subcommand, and
 always re-run parity before trusting it.
 
+For isolated kernel work, follow the shared
+[production kernel replay procedure](../llaminar-testing/references/kernel-replay.md).
+It is the canonical correctness/timing method: retain the production graph and
+inputs, prove dirty reuse, then collect events and separate profiler evidence.
+The CUDA attachment and observer rules below remain authoritative.
+
 ## Production hot-path invariants
 
 CUDA kernel tuning must preserve the production execution architecture, not

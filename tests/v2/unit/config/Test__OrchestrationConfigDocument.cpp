@@ -12,6 +12,10 @@
  */
 #include "config/OrchestrationConfigDocument.h"
 #include "config/OrchestrationConfigParser.h"
+#include "config/ConfigValidator.h"
+#include "config/OrchestrationStartupPolicy.h"
+#include "execution/runner/OrchestrationRunner.h"
+#include <algorithm>
 #include "utils/DebugEnv.h"
 
 #include <gtest/gtest.h>
@@ -548,5 +552,122 @@ TEST(OrchestrationConfigDocument, GPUAdaptiveRequestIsLosslessWithoutEnteringAut
         EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
         bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["distribution"]="FixedHeadSharded";
         EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    }
+}
+
+namespace
+{
+    /** @return Complete synthetic internal metadata, never an authored startup policy. */
+    MTPDepthPolicyScope documentScope()
+    {
+        return {MTPVerifierPhysicalWidthPolicy::ExactLogicalRows,
+                4, 1, 15, 512, 7, 16, 2, 1, 0};
+    }
+}
+
+TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtSchemaEleven)
+{
+    static_assert(kOrchestrationConfigDocumentSchemaVersion == 11);
+    for (const auto width : {MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket,
+                             MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope,
+                             MTPVerifierPhysicalWidthPolicy::ExactLogicalRows})
+    {
+        OrchestrationConfig internal;
+        internal.mtp.depth_policy.backend = MTPDepthPolicyBackend::ROCm;
+        internal.mtp.depth_policy.model_class = MTPDepthPolicyModelClass::MoE;
+        internal.mtp.depth_policy.scope = documentScope();
+        internal.mtp.depth_policy.scope.verifier_width_policy = width;
+        const auto document = serializeOrchestrationConfig(internal);
+        const auto decoded = deserializeOrchestrationConfig(document);
+        EXPECT_EQ(decoded.mtp.depth_policy.scope, internal.mtp.depth_policy.scope);
+        EXPECT_EQ(serializeOrchestrationConfig(decoded), document);
+        const auto json = Json::parse(document);
+        EXPECT_EQ(json.at("schema_version"), 11);
+        const auto &scope = json.at("configuration").at("mtp").at("depth_policy").at("scope");
+        EXPECT_EQ(scope.size(), 10);
+        EXPECT_TRUE(scope.at("verifier_width_policy").is_string());
+    }
+    const auto generic = serializeOrchestrationConfig(OrchestrationConfig{});
+    EXPECT_EQ(deserializeOrchestrationConfig(generic).mtp.depth_policy.scope, MTPDepthPolicyScope{});
+}
+
+TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRejectsMalformedFieldsAndOldSchema)
+{
+    OrchestrationConfig internal;
+    internal.mtp.depth_policy.scope = documentScope();
+    const auto valid = Json::parse(serializeOrchestrationConfig(internal));
+    const Json::json_pointer location("/configuration/mtp/depth_policy/scope");
+    for (const auto *field : {"verifier_width_policy", "tp_width", "pp_stages", "retained_depth",
+                             "hidden_dim", "main_layers", "expert_count", "experts_per_token",
+                             "compute_capability_major", "compute_capability_minor"})
+    {
+        auto missing = valid;
+        missing[location].erase(field);
+        EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument) << field;
+    }
+    auto extra = valid;
+    extra[location]["invented_scope"] = 1;
+    EXPECT_THROW((void)deserializeOrchestrationConfig(extra.dump()), std::invalid_argument);
+    for (const auto &[field, replacement] : std::vector<std::pair<std::string, Json>>{
+            {"verifier_width_policy", "exact_logical_rows"}, {"verifier_width_policy", 2},
+            {"tp_width", 4.0}, {"tp_width", "4"}, {"tp_width", false},
+            {"tp_width", std::numeric_limits<std::uint64_t>::max()},
+            {"tp_width", 0}, {"hidden_dim", 0}, {"retained_depth", 16},
+            {"experts_per_token", 17}, {"compute_capability_major", 0},
+            {"compute_capability_minor", -1}})
+    {
+        auto malformed = valid;
+        malformed[location][field] = replacement;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(malformed.dump()), std::invalid_argument) << field;
+    }
+    for (const Json version : {Json(10), Json(12), Json(11.0)})
+    {
+        auto old = valid;
+        old["schema_version"] = version;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(old.dump()), std::invalid_argument);
+    }
+    internal.mtp.depth_policy.scope.tp_width = 0;
+    EXPECT_NE(internal.mtp.depth_policy.scope, MTPDepthPolicyScope{});
+    EXPECT_FALSE(internal.mtp.depth_policy.scope.valid());
+    EXPECT_THROW((void)serializeOrchestrationConfig(internal), std::invalid_argument);
+}
+
+TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeCannotAuthorStartupOrRequest)
+{
+    StartupEnvironment restore;
+    ASSERT_EQ(setenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,256", 1), 0);
+    ASSERT_EQ(setenv("LLAMINAR_DETERMINISTIC", "0", 1), 0);
+    mutableDebugEnv().reload();
+    OrchestrationConfig authored;
+    authored.prefill_max_bucket_size = 1024;
+    authored.deterministic = true;
+    authored.mtp.depth_policy.scope = documentScope();
+    const auto document = serializeOrchestrationConfig(authored); // Metadata codec is intentionally lossless.
+    EXPECT_EQ(deserializeOrchestrationConfig(document).mtp.depth_policy.scope, documentScope());
+    EXPECT_THROW((void)OrchestrationConfigParser{}.parseYamlString(document), std::invalid_argument);
+    EXPECT_STREQ(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), "64,256");
+    EXPECT_STREQ(std::getenv("LLAMINAR_DETERMINISTIC"), "0");
+    for (const bool partial : {false, true})
+    {
+        auto candidate = authored;
+        if (partial) candidate.mtp.depth_policy.scope.tp_width = 0;
+        const auto errors = ConfigValidator::createStandard().validate(candidate);
+        EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &error) {
+            return error.rule_id == "mtp-learned-scope-authority";
+        }));
+        EXPECT_THROW(publishOrchestrationStartupPolicy(candidate), std::invalid_argument);
+        EXPECT_STREQ(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), "64,256");
+        EXPECT_STREQ(std::getenv("LLAMINAR_DETERMINISTIC"), "0");
+        // Public direct runner APIs reject before MPI, plan or model work.
+        OrchestrationRunner inference(candidate, RankExecutionPlan{});
+        EXPECT_FALSE(inference.initialize());
+        EXPECT_NE(inference.lastError().find("runtime-derived"), std::string::npos);
+        OrchestrationRunner admission(candidate, RankExecutionPlan{});
+        EXPECT_FALSE(admission.initializeForDryRun());
+        EXPECT_NE(admission.lastError().find("runtime-derived"), std::string::npos);
+        auto request = makeMTPRequestPolicy(candidate.mtp);
+        EXPECT_EQ(request.depth_policy.scope, MTPDepthPolicyScope{});
+        request.depth_policy.scope = candidate.mtp.depth_policy.scope;
+        EXPECT_TRUE(validateMTPRequestPolicy(request, candidate.mtp).has_value());
     }
 }

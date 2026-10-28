@@ -59,14 +59,14 @@ TEST(QwenSparseFollowerCounters, MalformedOrFailedSubmissionCannotPublishStaleBy
     EXPECT_EQ(calls,1);EXPECT_EQ(observation.words,before);
 }
 
-/** @brief Appended native-send reporting words never enter the frozen QSA follower reset or terminal field. */
+/** @brief Appended native-send and utility words never enter the frozen QSA follower reset or terminal field. */
 TEST(QwenSparseFollowerCounters, AdditionalReportingPairsNeverExpandFollowerResetOrCopy){
     static_assert(QwenSparseFollowerCounterObservation::first_word==52);
     static_assert(QwenSparseFollowerCounterObservation::last_word==59);
     static_assert(QwenSparseFollowerCounterObservation::word_count==8);
     static_assert(QwenSparseFollowerCounterObservation::byte_count==32);
     static_assert(kDeviceGenerationControlFixedHeadCallsLow==60);
-    static_assert(kDeviceGenerationControlCount == 90);
+    static_assert(kDeviceGenerationControlCount == 108);
     alignas(8)std::array<std::int32_t,kDeviceGenerationControlCount+2> control{};
     for(std::size_t word=0;word<control.size();++word)control[word]=static_cast<std::int32_t>(0x12340000+word);
     const auto before=control;

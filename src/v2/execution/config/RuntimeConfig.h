@@ -19,7 +19,9 @@
 #include "OrdinaryTerminalProjectionCapacity.h"
 #include "MTPDepthDefaults.h"
 #include "MTPDepthPolicyTypes.h"
+#include "MTPDepthPolicyScope.h"
 #include "../mtp/MTPConditionForwardPurpose.h"
+#include "../mtp/MTPVerifierGraphFamily.h"
 #include "../moe/DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
 #include <bit>
@@ -551,6 +553,7 @@ namespace llaminar2
         MTPDepthPolicyMode mode = MTPDepthPolicyMode::Fixed;
         MTPDepthPolicyBackend backend = MTPDepthPolicyBackend::Any;
         MTPDepthPolicyModelClass model_class = MTPDepthPolicyModelClass::Any;
+        MTPDepthPolicyScope scope; ///< Frozen runtime projection; never request-authored.
         int min_depth = 1;
         int max_depth = 0;     ///< 0 selects the complete supported adaptive range.
         int initial_depth = 0; ///< 0 derives from a policy-specific default.
@@ -1145,13 +1148,15 @@ namespace llaminar2
     [[nodiscard]] inline MTPRequestPolicy makeMTPRequestPolicy(
         const MTPRuntimeConfig &config)
     {
+        auto depth_policy = config.depth_policy;
+        depth_policy.scope = {};
         return {
             .enabled = config.enabled,
             .draft_tokens = config.draft_tokens,
             .verify_mode = config.verify_mode,
             .require_terminal_hidden_for_full_hit =
                 config.require_terminal_hidden_for_full_hit,
-            .depth_policy = config.depth_policy,
+            .depth_policy = depth_policy,
         };
     }
 
@@ -1176,6 +1181,8 @@ namespace llaminar2
             return "MTP request verification mode is invalid";
 
         const MTPDepthPolicyConfig &depth = policy.depth_policy;
+        if (depth.scope != MTPDepthPolicyScope{})
+            return "MTP request cannot author frozen learned-policy scope";
         const bool known_depth_mode =
             depth.mode == MTPDepthPolicyMode::Fixed ||
             depth.mode == MTPDepthPolicyMode::Observe ||
@@ -1271,28 +1278,31 @@ namespace llaminar2
     }
 
     /**
-     * @brief Count the bounded scalar verifier widths in the retained family.
+     * @brief Count scalar verifier widths in the admitted immutable family.
      * @param config Immutable admitted capacity, independent of active depth.
-     * @return Power-of-two buckets plus a possibly clipped final bucket.
-     *
-     * Rows run from two through retained depth plus one. The number of those
-     * buckets is bit_width(depth); no signed depth-plus-one overflow is needed.
+     * @param family Required execution-owned family; never inferred from depth.
+     * @return Canonical grouped width count, excluding existing ordinary M1.
+     * @throws std::invalid_argument for an unknown family.
+     * @throws std::overflow_error when depth plus one is not representable.
      */
     [[nodiscard]] inline std::size_t resolveMTPRetainedVerifierWidthCount(
-        const MTPRuntimeConfig &config) noexcept
+        const MTPRuntimeConfig &config, MTPVerifierGraphFamily family)
     {
-        return retainsMTPGraphCapacity(config)
-            ? std::bit_width(static_cast<unsigned int>(resolveMTPRetainedDraftCapacity(config)))
-            : 0u;
+        const int depth = resolveMTPRetainedDraftCapacity(config);
+        if (depth == std::numeric_limits<int>::max())
+            throw std::overflow_error("MTP retained verifier row capacity overflows int");
+        const auto count = mtpVerifierGraphFamilyWidthCount(depth + 1, family);
+        return retainsMTPGraphCapacity(config) ? count : 0u;
     }
 
     /**
      * @brief Count complete model forwards retained by the MTP serving family.
      * @param config Frozen runtime and graph-capacity policy.
+     * @param family Required execution-owned family shared with materialization.
      * @return All condition purposes and both outcomes at every retained width.
      *
      * The MTP serving family owns speculative and committed condition forwards
-     * plus greedy and stochastic/disabled grouped verifiers at every bounded
+     * plus greedy and stochastic/disabled grouped verifiers at every admitted
      * width. Fixed request depth may be smaller than retained capacity without
      * discovering a new graph after admission. These are complete transformer graphs, not small
      * controller fragments, and must therefore pay the per-layer graph-memory
@@ -1302,11 +1312,11 @@ namespace llaminar2
      */
     [[nodiscard]] inline std::size_t
     resolveMTPRetainedServingForwardModelGraphIdentityCount(
-        const MTPRuntimeConfig &config) noexcept
+        const MTPRuntimeConfig &config, MTPVerifierGraphFamily family)
     {
+        const auto widths = resolveMTPRetainedVerifierWidthCount(config, family);
         return retainsMTPGraphCapacity(config)
-                   ? kMTPConditionForwardPurposes.size() +
-                         std::size_t{2} * resolveMTPRetainedVerifierWidthCount(config)
+                   ? kMTPConditionForwardPurposes.size() + std::size_t{2} * widths
                    : std::size_t{0};
     }
 

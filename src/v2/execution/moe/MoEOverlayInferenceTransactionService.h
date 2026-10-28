@@ -894,6 +894,16 @@ namespace llaminar2
          * @return True when this exact transition was applied or had already
          *         been applied by a symmetric participant.
          */
+        /**
+         * @brief Open the first retained sequence named by an authenticated ContinueResponse ticket zero.
+         * @param transition Exact nonterminal speculative depth from the device admission ticket.
+         * @param error Receives the first lifecycle or symmetric-decision disagreement.
+         * @return True once per command, or idempotently for matching symmetric participants.
+         * No predecessor is retired and no committed-token progress is reported.
+         */
+        bool beginHostedContinuationGraphSequence(HostedGraphSequenceTransition transition,
+            std::string *error = nullptr);
+
         bool advanceHostedGraphSequence(
             std::uint64_t transaction_id,
             HostedGraphSequenceTransition transition,

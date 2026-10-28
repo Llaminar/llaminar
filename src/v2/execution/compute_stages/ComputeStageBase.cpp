@@ -289,6 +289,8 @@ namespace llaminar2
             return "MTP_CONCAT";
         case ComputeStageType::MTP_DRAFT_TOKEN_PUBLICATION:
             return "MTP_DRAFT_TOKEN_PUBLICATION";
+        case ComputeStageType::MTP_DIRECT_TOKEN_HISTORY_PUBLICATION:
+            return "MTP_DIRECT_TOKEN_HISTORY_PUBLICATION";
         case ComputeStageType::MOE_OVERLAY_EPOCH_BOUNDARY:
             return "MOE_OVERLAY_EPOCH_BOUNDARY";
         case ComputeStageType::MOE_OVERLAY_DEVICE_CONTROLLER:

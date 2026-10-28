@@ -46,6 +46,7 @@
 #include "../../utils/Assertions.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/Tokenizer.h"
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -335,6 +336,10 @@ namespace llaminar2
         std::shared_ptr<ITokenizer> tokenizer() const override;
         const std::string &architecture() const override;
         const IModelContext *modelContextForDiagnostics() const override;
+        /** @return Actual immutable topology/model economics with current width strategy. */
+        [[nodiscard]] MTPDepthPolicyScope mtpDepthPolicyScope() const override;
+        /** @return Explicit reason for generic scope, without changing execution policy. */
+        [[nodiscard]] const char *mtpDepthPolicyScopeGenericReason() const override;
 
         /**
          * @brief Return the immutable live ExpertOverlay map for diagnostics.
@@ -1103,6 +1108,39 @@ namespace llaminar2
             int transaction_base_tokens,
             int committed_rows,
             const char *source);
+        /** @brief Authority which submitted the first transaction of a response window. */
+        enum class DeviceGenerationFirstTransaction
+        {
+            External, ///< Fresh request's externally scheduled captured transaction.
+            AdmissionTicket, ///< Continued response's native ticket-zero retained branch.
+        };
+
+        /**
+         * @brief Detect a hosted adaptive response continuation without observing depth.
+         * @param mtp Immutable active request policy.
+         * @return Whether the next admitted transaction must be selected by native ticket zero.
+         */
+        bool isHostedDynamicMTPContinuation(const MTPRuntimeConfig &mtp) const;
+
+        /**
+         * @brief Validate and publish one scalar controller's immutable terminal ledger.
+         * @param sampling_mode Exact captured sampling law.
+         * @param transaction_base_cached_tokens Scheduler position before admitted work.
+         * @param first_transaction Explicit owner of the first transaction's submission.
+         * @param requested_draft_depth External selected depth; zero for admission-ticket work.
+         * @param initial_transaction_draft_depth External geometry to retire from host draft
+         *        statistics; zero for retained work, whose geometry stays ticket-owned.
+         * @param result Current response object to receive terminal tokens and evidence.
+         * @return Complete response or a fatal controller/ownership/ledger error.
+         */
+        GenerationResult finishScalarDeviceResidentGeneration(
+            DeviceGenerationSamplingMode sampling_mode,
+            int transaction_base_cached_tokens,
+            DeviceGenerationFirstTransaction first_transaction,
+            int requested_draft_depth,
+            int initial_transaction_draft_depth,
+            GenerationResult result);
+
         /**
          * @brief Run and surface one complete native device-generation parent.
          *
@@ -1118,8 +1156,8 @@ namespace llaminar2
          * @param sampling_mode Greedy or stochastic parent topology.
          * @param transaction_base_cached_tokens Scheduler position at entry.
          * @param requested_draft_depth Device-selected first-transaction depth.
-         * @param capture_draft_depth Physical child-family capacity materialized
-         *        by the first transaction.
+         * @param initial_transaction_draft_depth Exact first transaction geometry;
+         *        retained parent capacity is resolved independently from admitted policy.
          * @param result Current decode result to complete with terminal tokens.
          * @return Completed result, or an error suitable for atomic rollback.
          */
@@ -1128,7 +1166,7 @@ namespace llaminar2
             DeviceGenerationSamplingMode sampling_mode,
             int transaction_base_cached_tokens,
             int requested_draft_depth,
-            int capture_draft_depth,
+            int initial_transaction_draft_depth,
             GenerationResult result);
         /**
          * @brief Complete a request batch from one native device-generation parent.
@@ -1182,12 +1220,22 @@ namespace llaminar2
             const char *context,
             std::string *error = nullptr) const;
         void recordMTPDepthZeroBypass();
+        /**
+         * @brief Publish one actual host transaction to its adaptive owner and optional trace.
+         * @param requested_depth Controller-requested draft count.
+         * @param effective_depth Actually attempted draft count after budget admission.
+         * @param accepted_speculative_prefix Actual verifier-accepted prefix.
+         * @param budget_limited Whether this observation is excluded from adaptive samples.
+         * @param rollback Actual host rollback signal.
+         * @param publication Exact committed source output/state/debt/stop witness.
+         */
         void recordMTPDepthObservation(
             int requested_depth,
             int effective_depth,
             int accepted_speculative_prefix,
             bool budget_limited,
-            bool rollback);
+            bool rollback,
+            const MTPPublicationWitness &publication);
         GenerationResult decodeStepMTP();
         void clearBatchedDecodeState();
         /**
@@ -1970,6 +2018,27 @@ namespace llaminar2
                 return true;
             }
 
+            /**
+             * @brief Open a fresh ordinary response after a completed sampler-free model row.
+             * @return True only at an already-open zero-budget admission boundary.
+             *
+             * A forced ordinary token first consumes its prior emitted condition.
+             * Pipeline ForwardOnly owns that no-response transaction and replaces
+             * the original ordinary controller row with its own policy. A later
+             * response must therefore initialize its ordinary policy freshly;
+             * ContinueResponse may preserve only an unchanged controller policy.
+             * This edge neither resets request/KV/history nor invents prefill,
+             * and it cannot reopen a stopped or active controller. The caller
+             * invokes it only after the actual model-only forward succeeds.
+             */
+            [[nodiscard]] bool reopenAfterOrdinaryForwardOnly() noexcept
+            {
+                if (!awaitsAdmission() || admitted_token_budget != 0)
+                    return false;
+                phase = Phase::AwaitingBudget;
+                return true;
+            }
+
             /** @return true when the next grouped decode must admit a controller. */
             [[nodiscard]] bool awaitsAdmission() const noexcept
             {
@@ -2091,6 +2160,9 @@ namespace llaminar2
             MPIWorkerCommandLifecycle::AcceptingCommands};
         std::shared_ptr<ITokenizer> tokenizer_;
         MTPStats mtp_stats_;
+        /** Frozen setup metadata; request reset does not change geometry or ownership. */
+        MTPDepthPolicyScope mtp_depth_policy_scope_geometry_;
+        const char *mtp_depth_policy_scope_generic_reason_ = "model_free";
         std::unique_ptr<MTPDepthController> mtp_depth_controller_;
         PrefillChunkStats prefill_chunk_stats_;
         PrefixCacheRequestSummary prefix_request_summary_;

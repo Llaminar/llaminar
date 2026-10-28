@@ -172,7 +172,8 @@ namespace
                     .prefill = {.bucket_rows = buckets, .minimum_sequence_rows = 1, .maximum_cached_buckets = 16},
                     .gpu_weight_load = {.maximum_source_bytes = 65536},
                     .pipeline_stage = FactoryPPStageConfig{.first_layer = rank.first_layer, .last_layer = rank.last_layer + 1,
-                        .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head}}, rows);
+                        .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head,
+                        .generation_domain = declaredRankDeviceGenerationDomain(parent)}}, rows);
                 result.push_back(std::move(projected.local_capacity));
             }
             return result;
@@ -504,4 +505,54 @@ TEST_P(MoEPipelineMultiDeviceMemory, RejectsForeignMiddleAndTerminalScope)
 
 INSTANTIATE_TEST_SUITE_P(DeviceCounts, MoEPipelineMultiDeviceMemory, ::testing::Values(4, 8),
     [](const auto &info) { return "Devices" + std::to_string(info.param); });
+/** @test The actual parent boundary and nonterminal owner survive stage admission. */
+TEST(MoEPipelineFixedMemory, RejectsLostGenerationBoundaryAndWrongParentOwner)
+{
+    Fixture fixture(false, 1);
+    auto inputs = fixture.inputs();
+    ASSERT_EQ(inputs.size(), 2u);
+    for (const auto &input : inputs)
+        EXPECT_EQ(input.generation_domain, DeviceGenerationExecutionDomain::HostedBoundary);
+    EXPECT_EQ(inputs[0].generation_parent_role, MTPGenerationParentRole::PipelineFollower);
+    EXPECT_EQ(inputs[1].generation_parent_role, MTPGenerationParentRole::Controller);
+    inputs[0].generation_domain = DeviceGenerationExecutionDomain::NativeDomain;
+    EXPECT_THROW(MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+    inputs = fixture.inputs();
+    inputs[0].generation_parent_role = MTPGenerationParentRole::Controller;
+    EXPECT_THROW(MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+    inputs = fixture.inputs();
+    inputs[1].generation_domain = static_cast<DeviceGenerationExecutionDomain>(255);
+    EXPECT_THROW(MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+}
+
+/** @test Per-device ordinary owners reach PMA without inventing tail children on followers. */
+TEST(MoEPipelineFixedMemory, OrdinaryAuxiliaryBOMFollowsActualContinuationRoleAndPolicy)
+{
+    for (const bool mixed : {false, true})
+    {
+        Fixture fixture(std::vector<StageGeometry>{{DeviceType::CUDA,1},
+            {mixed ? DeviceType::ROCm : DeviceType::CUDA,1}});
+        const auto inputs = fixture.inputs();
+        const auto fixed = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs);
+        ASSERT_EQ(fixed.size(), 2u);
+        for (size_t stage = 0; stage < fixed.size(); ++stage)
+        {
+            const auto device = fixture.ranks[stage].primary_device.toLocalDeviceId();
+            const auto *bill = fixed[stage].physical_memory_admission->plan().find({0,device});
+            const auto *base = fixed[stage].fixed_memory_plan.physicalPlan().find({0,device});
+            ASSERT_NE(bill,nullptr);
+            ASSERT_NE(base,nullptr);
+            auto inventory = inputs[stage].captured_graph_plan.resident_executables;
+            const auto policy = declaredDeviceGenerationExecutionPolicy(device.type, inputs[stage].generation_domain);
+            const auto role = stage == 0 ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller;
+            const auto ordinary = OrdinaryGenerationGraphPlan::additionalExecutableCount(device, false, policy, role);
+            EXPECT_EQ(ordinary, mixed && stage == 1 ? 4u : 2u);
+            inventory.auxiliary_executable_count += ordinary +
+                OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant);
+            EXPECT_EQ(bill->bytes(PhysicalMemoryOwner::NativeGraphExecutable),
+                base->bytes(PhysicalMemoryOwner::NativeGraphExecutable) + estimateCapturedGraphExecutableBytes(device,inventory));
+        }
+    }
+}
+
 } // namespace llaminar2

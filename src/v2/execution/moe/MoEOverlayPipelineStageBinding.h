@@ -61,7 +61,7 @@ namespace llaminar2
 
         /**
          * @brief Reject installing a sealed runtime into a different PP stage.
-         * @param stage Exact destination main-layer interval and edge roles.
+         * @param stage Exact destination main-layer interval, edge roles and complete generation boundary.
          * @param participants Destination devices in canonical TP order.
          * @param weights Exact admitted tensor-parallel workshare declaration.
          * @param backend Collective implementation bound to that declaration.

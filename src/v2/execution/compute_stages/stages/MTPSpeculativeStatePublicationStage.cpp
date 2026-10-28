@@ -248,6 +248,7 @@ namespace llaminar2
                 params_.next_sidecar_condition_tokens_device || params_.next_sidecar_position_ids_device ||
                 params_.generation_response_tokens_device || params_.generation_response_token_stride ||
                 params_.generation_control_device || params_.generation_control_stride ||
+                params_.depth_transaction_trace_device ||
                 params_.verifier_input_tokens_device || params_.verifier_input_token_stride ||
                 params_.committed_verifier_identity_device || params_.publish_shifted_kv ||
                 params_.dynamic_moe_commit_boundary ||
@@ -287,6 +288,12 @@ namespace llaminar2
                 }))
         {
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Main-KV checkpoint cardinality does not match request geometry");
+            return false;
+        }
+        if (params_.depth_transaction_trace_device &&
+            (params_.authority != Authority::BoundedGeneration || params_.request_count != 1))
+        {
+            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Depth transaction trace requires its sole scalar response owner");
             return false;
         }
         if (params_.authority == Authority::BoundedGeneration &&
@@ -631,7 +638,8 @@ namespace llaminar2
                           params_.next_verifier_condition_tokens_device,
                           params_.verifier_input_tokens_device,
                           params_.verifier_input_token_stride,
-                          params_.committed_verifier_identity_device)
+                          params_.committed_verifier_identity_device,
+                          params_.depth_transaction_trace_device)
                 : params_.backend
                       ->enqueueDeriveSpeculativePublicationMetadata(
                           params_.outcome_meta_device,
@@ -790,6 +798,8 @@ namespace llaminar2
             "INT32");
         if (params_.authority == Authority::BoundedGeneration)
         {
+            if (params_.depth_transaction_trace_device)
+                contract.addPreallocatedInOut(BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC, "INT32");
             contract.addPreallocatedInOut(
                 BufferId::MTP_GENERATION_RESPONSE_TOKENS,
                 "INT32");
@@ -862,6 +872,7 @@ namespace llaminar2
                    other.generation_control_device &&
                self.generation_control_stride ==
                    other.generation_control_stride &&
+               self.depth_transaction_trace_device == other.depth_transaction_trace_device &&
                self.verifier_input_tokens_device ==
                    other.verifier_input_tokens_device &&
                self.verifier_input_token_stride ==

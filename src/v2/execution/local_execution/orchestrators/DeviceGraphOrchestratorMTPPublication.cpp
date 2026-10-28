@@ -126,6 +126,7 @@ namespace llaminar2
             device_generation_storage_.control_device;
         params.generation_control_stride =
             device_generation_storage_.control_stride;
+        params.depth_transaction_trace_device = mtp_depth_transaction_trace_dev_;
         params.verifier_input_tokens_device =
             static_cast<const int32_t *>(
                 mtp_verifier_input_tokens_dev_);
@@ -480,9 +481,10 @@ namespace llaminar2
         MTPSpeculativeStatePublicationStage::Params params;
         try
         {
-            // A complete dynamic parent fixes one maximum physical width.
-            // Every cold reuse compares the latest original admission's full
-            // outcome/policy Params, even when the verifier key is unchanged.
+            // The original successful admission owns every outcome/policy
+            // binding. Hosted siblings must be original setup-produced exact
+            // keys; projection changes only their physical stride and rebuilds
+            // all target-local verifier state hooks below.
             params = mtpStatePublicationAuthority(signature, workspaceGeneration(state_.device_id));
         }
         catch (const std::exception &exception)

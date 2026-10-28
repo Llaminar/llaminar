@@ -476,6 +476,22 @@ namespace llaminar2
             routing_evidence_count_scratch_;
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
 
+        /**
+         * @brief Acquire the existing graph-owned kernel object without stream binding.
+         * @return Borrowed kernel, or null if construction fails.
+         *
+         * Accepted-state preparation calls this before native capture. Object
+         * ownership is independent of the verifier compute stream; no model
+         * arithmetic, workspace rebinding or stream substitution occurs here.
+         */
+        IMoEKernel *acquireMoEKernelObject() const;
+
+        /**
+         * @brief Resolve the ordinary compute kernel and its exact stage binding.
+         * @return Graph-owned kernel bound to this stage's compute stream/workspace.
+         * Histogram publication instead uses the prepared object and its explicit
+         * table-owned MoEKernelLaunchContext, never this compute-stream boundary.
+         */
         IMoEKernel *ensureMoEKernel() const;
         /** @brief Classify the production arithmetic route prepared for capture. */
         MoERouteLaunchKind routeLaunchKind() const noexcept;

@@ -555,6 +555,9 @@ namespace llaminar2
          */
         bool configureMTPRequestStopTokens(
             const std::vector<int32_t> &stop_tokens) override;
+        /** @copydoc IInferenceRunner::publishMTPDirectTokenHistory */
+        bool publishMTPDirectTokenHistory(int target_sample_slot,
+            MTPDirectTokenHistoryDisposition disposition) override;
         /**
          * @brief Forward request penalty admission to every graph owner.
          */

@@ -805,6 +805,7 @@ namespace llaminar2
         const int *token,
         int vocab_size,
         int *generated_token_counts,
+        MTPGreedyPenaltyPolicy *direct_output_policy,
         int device_idx,
         void *stream);
 
@@ -1294,6 +1295,32 @@ namespace llaminar2
             static_cast<const int *>(token_device),
             vocab_size,
             static_cast<int *>(generated_token_counts_device),
+            nullptr, // Ordinary publication does not own an MTP frontier transition.
+            device_id,
+            stream);
+    }
+
+    /** @brief One native scalar launch owns the direct history/frontier transition. */
+    bool ROCmBackend::enqueueCommitMTPDirectTokenHistoryDevice(
+        const void *token_device,
+        int vocab_size,
+        void *generated_token_counts_device,
+        void *penalty_policy_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !token_device || vocab_size <= 0 ||
+            !generated_token_counts_device || !penalty_policy_device || !stream)
+        {
+            return false;
+        }
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_commit_generation_token_history(
+            static_cast<const int *>(token_device),
+            vocab_size,
+            static_cast<int *>(generated_token_counts_device),
+            static_cast<MTPGreedyPenaltyPolicy *>(penalty_policy_device),
             device_id,
             stream);
     }
@@ -1763,6 +1790,7 @@ namespace llaminar2
         int verifier_input_token_stride,
         sampling_math::MTPCommittedVerifierIdentityRecord *
             out_committed_verifier_identity,
+        sampling_math::MTPDepthTransactionTrace *depth_transaction_trace,
         int device_idx,
         void *stream);
     extern "C" bool rocmOps_derive_speculative_publication_metadata(
@@ -3568,7 +3596,8 @@ namespace llaminar2
         void *out_next_verifier_condition_tokens_device,
         const void *verifier_input_tokens_device,
         int verifier_input_token_stride,
-        void *out_committed_verifier_identity_device)
+        void *out_committed_verifier_identity_device,
+        sampling_math::MTPDepthTransactionTrace *depth_transaction_trace_device)
     {
         const bool has_verifier_identity_binding =
             verifier_input_tokens_device != nullptr ||
@@ -3582,7 +3611,7 @@ namespace llaminar2
             !output_tokens_device || output_token_stride <= 0 ||
             !meta_device || !base_cached_tokens_device ||
             meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
-            request_count <= 0 || padded_state_rows_per_request <= 0 ||
+            request_count <= 0 || (depth_transaction_trace_device && request_count != 1) || padded_state_rows_per_request <= 0 ||
             !response_tokens_device ||
             response_token_stride <= 0 || !control_device ||
             control_stride < sampling_math::kDeviceGenerationControlCount ||
@@ -3629,6 +3658,7 @@ namespace llaminar2
             static_cast<
                 sampling_math::MTPCommittedVerifierIdentityRecord *>(
                 out_committed_verifier_identity_device),
+            depth_transaction_trace_device,
             device_id,
             stream);
     }

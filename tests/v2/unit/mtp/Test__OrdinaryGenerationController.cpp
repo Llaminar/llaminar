@@ -65,11 +65,32 @@ TEST(OrdinaryGenerationController, OrdinaryGraphOwnerInventoryMatchesNativeAndHo
 {
     using llaminar2::DeviceId;
     using llaminar2::OrdinaryGenerationGraphPlan;
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false), 2u);
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), true), 1u);
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::rocm(0), false), 4u);
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::rocm(0), true), 3u);
-    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cpu(), false), std::invalid_argument);
+    using llaminar2::MTPGenerationParentRole;
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::cuda(0),
+        false,
+        llaminar2::DeviceGenerationExecutionPolicy::NativeConditionalGraph,
+        MTPGenerationParentRole::Controller), 2u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::cuda(0),
+        true,
+        llaminar2::DeviceGenerationExecutionPolicy::NativeConditionalGraph,
+        MTPGenerationParentRole::Controller), 1u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::rocm(0),
+        false,
+        llaminar2::DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions,
+        MTPGenerationParentRole::Controller), 4u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::rocm(0),
+        true,
+        llaminar2::DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions,
+        MTPGenerationParentRole::Controller), 3u);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::cpu(),
+        false,
+        llaminar2::DeviceGenerationExecutionPolicy::Unsupported,
+        MTPGenerationParentRole::Controller), std::invalid_argument);
 }
 
 /** @test Admission owns resolved randomness; wrong row geometry fails before launch. */
@@ -435,13 +456,15 @@ TEST(OrdinaryGenerationController, HistoryAdmissionAndCommitAreExclusiveAndFailu
 
 TEST(OrdinaryGenerationController, PolicyIsExplicitAndSharesTheResidentStorageABI)
 {
-    // QSA four pairs and fixed-head six pairs append observations; execution ordinals stay fixed.
+    // Immutable measured-scope words append after existing observations; execution ordinals stay fixed.
     static_assert(kDeviceGenerationControlInitialDraftDepth == 51);
     static_assert(kDeviceGenerationControlQsaPriorHeaderBytesLow == 52);
     static_assert(kDeviceGenerationControlQsaAcceptedPayloadBytesHigh == 59);
     static_assert(kDeviceGenerationControlFixedHeadCallsLow == 60);
-    static_assert(kDeviceGenerationControlCount == 90);
-    static_assert(sizeof(DeviceGenerationPolicy) == 15 * sizeof(int));
+    static_assert(kDeviceGenerationControlLearnedScopeWidthPolicy == 90);
+    static_assert(kDeviceGenerationControlLearnedScopeComputeCapabilityMinor == 99);
+    static_assert(kDeviceGenerationControlCount == 108);
+    static_assert(sizeof(DeviceGenerationPolicy) == 25 * sizeof(int));
     EXPECT_FALSE(DeviceGenerationPolicy::fixed(0).valid());
     EXPECT_TRUE(DeviceGenerationPolicy::ordinary().valid());
     EXPECT_TRUE(DeviceGenerationPolicy::ordinary().isOrdinary());
@@ -745,16 +768,20 @@ TEST(OrdinaryGenerationController, TerminalContractAuthenticatesEverySpeculative
         Control control{};
         std::array<int32_t, 16> response{};
         std::array<int32_t, 16> tokens{};
+        std::array<int, 16> targets{}, accepted{};
         std::array<int, kSpeculativeBatchMetaCount> meta{};
-        for (int i = 0; i <= depth; ++i)
-            tokens[i] = 100 + i;
-        meta[kSpecBatchMetaOk] = 1;
-        meta[kSpecBatchMetaOutputCount] = depth + 1;
-        meta[kSpecBatchMetaAcceptedSpeculativePrefix] = depth;
-        meta[kSpecBatchMetaTargetVerifierStateCommitCount] = depth;
-        meta[kSpecBatchMetaAllSpeculativeAccepted] = 1;
-        meta[kSpecBatchMetaConsumedVerifierRows] = depth;
-        meta[kSpecBatchMetaSampledTerminal] = 1;
+        for (int i = 0; i < depth; ++i)
+        {
+            targets[i] = 100 + i;
+            accepted[i] = 1;
+        }
+        // The canonical producer includes the condition state in a full commit;
+        // hand-writing only `depth` states gives the learner inconsistent input.
+        summarize_speculative_verify_batch_at_commit_boundary(99, targets.data(),
+            accepted.data(), depth, nullptr, 0, 200, 1, depth + 1,
+            tokens.data(), tokens.size(), meta.data());
+        ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
+        ASSERT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], depth + 1);
         ASSERT_TRUE(initialize_device_generation_control(depth + 1, response.size(), policy, control.data()));
         ASSERT_EQ(prepare_device_generation_transaction_budget(depth + 1, depth + 1, control.data()), depth + 1);
         ASSERT_TRUE(append_speculative_outcome_to_device_generation(tokens.data(), depth + 1,
@@ -791,7 +818,7 @@ TEST(OrdinaryGenerationController, TerminalContractAuthenticatesEverySpeculative
 TEST(OrdinaryGenerationController, PipelineForwardOnlyAdmissionAndTerminalAreExact)
 {
     using namespace llaminar2;
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(), 1u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant), 1u);
     DeviceGenerationAdmissionRequest request{.request_count = 1, .max_new_tokens = 0,
         .depth_policy = DeviceGenerationPolicy::forwardOnly(),
         .initial_leading_row_disposition = DeviceGenerationLeadingRowDisposition::AlreadyEmitted};
@@ -954,4 +981,27 @@ TEST(Test__OrdinaryGenerationController, SparseQueryVisibilityProgramSlotsAreClo
                  std::invalid_argument);
     EXPECT_THROW(sparseQueryExecutionProgramIndex(static_cast<SparseQueryExecutionProgram>(2)),
                  std::invalid_argument);
+}
+
+/** @test Hosted CUDA and role-specific tail children are exact native owners. */
+TEST(OrdinaryGenerationController, DeclaredExecutionAndParentRoleOwnOrdinaryAuxiliaries)
+{
+    using namespace llaminar2;
+    using Policy = DeviceGenerationExecutionPolicy;
+    using Role = MTPGenerationParentRole;
+    for (const bool retained : {false, true})
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const std::size_t programs : {1u, 2u})
+    {
+        const auto base = retained ? 1u : 2u;
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(device, retained, Policy::HostScheduledCapturedTransactions, Role::Controller, programs), (base + 2u) * programs);
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(device, retained, Policy::HostScheduledCapturedTransactions, Role::PipelineFollower, programs), base * programs);
+        if (device.is_cuda())
+            EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(device, retained, Policy::NativeConditionalGraph, Role::PipelineFollower, programs), base * programs);
+        else
+            EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(device, retained, Policy::NativeConditionalGraph, Role::PipelineFollower, programs), std::invalid_argument);
+    }
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false, Policy::Unsupported, MTPGenerationParentRole::Controller), std::invalid_argument);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false, Policy::HostScheduledCapturedTransactions, static_cast<Role>(255)), std::invalid_argument);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false, Policy::HostScheduledCapturedTransactions, Role::Controller, 3u), std::invalid_argument);
 }

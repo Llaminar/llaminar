@@ -9,7 +9,10 @@
 # scripts/ci/run_model_parity_e2e.py. This file owns HTTP checks and server
 # lifecycle, not a second model/topology/feature matrix.
 # Canonical generation probes reuse this same lifecycle via an explicit
-# --generation-configuration file. They are not full HTTP/E2E certification;
+# --generation-configuration file. Explicit --local-unbounded-generation keeps
+# native generation and successful administrative persistence unbounded while
+# exceptional retirement stays30s; ordinary CI retains its finite policy.
+# Generation probes are not full HTTP/E2E certification;
 # their ordered requests and serial-control identity come from the typed matrix.
 # A diagnostic --http-lifecycle-hammer likewise changes only the workload:
 # one preserved public request sequence loops until its first failure, while
@@ -227,6 +230,7 @@ OVERRIDE_MODEL=""
 OVERRIDE_BACKENDS=""
 SERVER_ARGS_FILE=""
 GENERATION_CONFIG_FILE=""
+LOCAL_UNBOUNDED_GENERATION=0
 GENERATION_CONTROL_FILE=""
 GENERATION_EXPECTED_TOKENS_FILE=""
 HTTP_LIFECYCLE_HAMMER_FILE=""
@@ -249,6 +253,7 @@ Container options:
   --docker-arg                        Additional docker run argument; repeatable
 
 Canonical generation diagnostics (not the full E2E suite):
+  --local-unbounded-generation        Local generation only: no generation/normal-shutdown deadline
   --generation-configuration          Typed exported cell, with canonical requests
   --generation-control               Completed serial observations; required for MTP
   --generation-expected-tokens       Read-only reviewed serial-token projection (exclusive with control)
@@ -298,6 +303,7 @@ while [[ $# -gt 0 ]]; do
         --backends) OVERRIDE_BACKENDS="$2"; shift 2 ;;
         --suite)    SUITES+=("$2");         shift 2 ;;
         --server-args-file) SERVER_ARGS_FILE="$2"; shift 2 ;;
+        --local-unbounded-generation) LOCAL_UNBOUNDED_GENERATION=1; shift ;;
         --generation-configuration) GENERATION_CONFIG_FILE="$2"; shift 2 ;;
         --generation-control) GENERATION_CONTROL_FILE="$2"; shift 2 ;;
         --generation-expected-tokens) GENERATION_EXPECTED_TOKENS_FILE="$2"; shift 2 ;;
@@ -308,6 +314,13 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [[ "$LOCAL_UNBOUNDED_GENERATION" == "1" &&
+      ( -z "$GENERATION_CONFIG_FILE" || "$SERVER_MODE" != "local" ||
+        -n "$HTTP_LIFECYCLE_HAMMER_FILE" || -n "$CROSS_HOST_CONFIG_FILE" || -n "$CROSS_HOST_CASE" ) ]]; then
+    echo "Local unbounded generation requires the canonical generation workload and local native ownership" >&2
+    exit 2
+fi
 
 if [[ -n "$HTTP_LIFECYCLE_HAMMER_FILE" &&
       ( -n "$GENERATION_CONFIG_FILE" || -n "$CROSS_HOST_CONFIG_FILE" || -n "$CROSS_HOST_CASE" ) ]]; then
@@ -1231,6 +1244,22 @@ request_server_shutdown() {
     [[ "$code" == "202" ]]
 }
 
+# One local native lifetime boundary: true means the owned root actually exited.
+# A successful diagnostic admin request is unbounded; explicit failure retires
+# within30s. This helper neither signals a process nor substitutes exit success.
+wait_for_local_server_exit() {
+    local pid="$1" exceptional="$2"
+    if [[ "$LOCAL_UNBOUNDED_GENERATION" == "1" && "$exceptional" == "0" ]]; then
+        while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+        return 0
+    fi
+    local allowance="$SHUTDOWN_TIMEOUT"
+    if [[ "$LOCAL_UNBOUNDED_GENERATION" == "1" ]]; then allowance=30; fi
+    local deadline=$((SECONDS + allowance))
+    while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do sleep 0.2; done
+    ! kill -0 "$pid" 2>/dev/null
+}
+
 # Graceful shutdown with exit code, VRAM release, and crash validation.
 # Called at the end of each test case instead of bare cleanup_server.
 shutdown_and_validate() {
@@ -1303,24 +1332,24 @@ shutdown_and_validate() {
                 signalled=1
             fi
 
-            # Wait with timeout — poll until root process exits or deadline
-            local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
-            while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
-                sleep 0.2
-            done
-            if kill -0 "$pid" 2>/dev/null && [ "$signalled" -eq 0 ]; then
-                signal_local_llaminar_processes "$pid" TERM || kill "$pid" 2>/dev/null || true
-                deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
-                while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
-                    sleep 0.2
-                done
+            # The lifetime helper waits naturally only after an accepted local
+            # administrative shutdown. Failure enters exact-owned retirement;
+            # ordinary CI retains both original finite grace windows.
+            if ! wait_for_local_server_exit "$pid" "$signalled"; then
+                if [[ "$signalled" == "0" ]]; then
+                    signal_local_llaminar_processes "$pid" TERM || kill "$pid" 2>/dev/null || true
+                    signalled=1
+                    wait_for_local_server_exit "$pid" "$signalled" || true
+                fi
             fi
 
             if kill -0 "$pid" 2>/dev/null; then
                 # Process didn't exit gracefully — force kill entire tree
                 local tree_pids
                 tree_pids=$(collect_process_tree_pids "$pid" | xargs || echo "$pid")
-                fail "[${tag}] Shutdown: process did not exit within ${SHUTDOWN_TIMEOUT}s after SIGTERM, sending SIGKILL"
+                local retirement_allowance="$SHUTDOWN_TIMEOUT"
+                if [[ "$LOCAL_UNBOUNDED_GENERATION" == "1" ]]; then retirement_allowance=30; fi
+                fail "[${tag}] Shutdown: process did not exit within ${retirement_allowance}s after SIGTERM, sending SIGKILL"
                 kill -9 $tree_pids 2>/dev/null || true
                 wait "$pid" 2>/dev/null || true
                 return
@@ -3589,6 +3618,9 @@ run_backend_tests() {
             --base-url "$(server_base_url "$port")"
             --output "$LOG_DIR/generation"
         )
+        if [[ "$LOCAL_UNBOUNDED_GENERATION" == "1" ]]; then
+            generation_args+=(--local-unbounded-generation)
+        fi
         if [[ -n "$GENERATION_CONTROL_FILE" ]]; then
             generation_args+=(--control "$GENERATION_CONTROL_FILE")
         fi

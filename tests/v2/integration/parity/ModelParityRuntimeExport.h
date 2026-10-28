@@ -63,6 +63,8 @@ namespace llaminar2::test::parity
         case ModelParityMTP::Depth1: return "depth_1";
         case ModelParityMTP::Depth2: return "depth_2";
         case ModelParityMTP::Depth3: return "depth_3";
+        case ModelParityMTP::Depth5: return "depth_5";
+        case ModelParityMTP::Depth6: return "depth_6";
         case ModelParityMTP::Depth15: return "depth_15";
         case ModelParityMTP::DynamicDepth: return "dynamic";
         }

@@ -690,6 +690,12 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
      */
     for (const auto& cfg : device_configs)
     {
+        // Validate the topology-authored owner even when capture is disabled;
+        // CPU placement and unknown enum arms cannot acquire a GPU parent.
+        (void)OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+            1u, cfg.pipeline_forward_only_graph_owner);
+        if (cfg.pipeline_forward_only_graph_owner == PipelineForwardOnlyGraphOwner::Participant && !cfg.device.is_gpu())
+            throw std::invalid_argument("Pipeline ForwardOnly parent requires its declared GPU participant");
         const auto ngram_lookup = ngramLookup(profile, cfg);
         const bool gpu_adaptive=(cfg.ngram_table_placement && cfg.ngram_table_placement->isGPUAdaptive()) ||
             (cfg.ngram_execution_policy && cfg.ngram_execution_policy->isGPUAdaptive());
@@ -952,6 +958,13 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
 
         if (cfg.device.is_gpu() && cfg.captured_serving_graphs.enabled())
         {
+            if (!cfg.captured_serving_graphs.generation_domain)
+                throw std::invalid_argument("Captured serving inventory has no declared generation domain");
+            const auto generation_execution = declaredDeviceGenerationExecutionPolicy(
+                cfg.device.type, *cfg.captured_serving_graphs.generation_domain);
+            const auto expected_family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(generation_execution));
+            if (cfg.captured_serving_graphs.verifier_graph_family != expected_family)
+                throw std::invalid_argument("Captured serving verifier family contradicts this GPU's declared generation domain");
             const std::size_t prefill_executable_count =
                 prefillGraphBucketsAtOrBelowCapacity(
                     cfg.captured_serving_graphs.prefill_bucket_rows,
@@ -970,11 +983,14 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         .auxiliary_executable_count =
                             (cfg.captured_serving_graphs.ordinary_generation
                                 ? OrdinaryGenerationGraphPlan::additionalExecutableCount(
-                                    cfg.device, cfg.captured_serving_graphs.mtp_graph_owners.retainsGraphCapacity(),
+                                    cfg.device,
+                                    cfg.captured_serving_graphs.mtp_graph_owners.retainsGraphCapacity(),
+                                    generation_execution,
+                                    cfg.captured_serving_graphs.generation_parent_role,
                                     cfg.captured_serving_graphs.sparse_query_program_count) +
-                                    (cfg.local_pipeline_backend
-                                        ? OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
-                                            cfg.captured_serving_graphs.sparse_query_program_count) : 0u)
+                                    OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+                                        cfg.captured_serving_graphs.sparse_query_program_count,
+                                        cfg.pipeline_forward_only_graph_owner)
                                 : 0u) +
                             cfg.captured_serving_graphs
                                 .mtp_graph_owners

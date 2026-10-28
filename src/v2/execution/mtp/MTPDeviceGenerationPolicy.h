@@ -94,7 +94,7 @@ namespace llaminar2
         policy.learned = {
             .enabled = depth.use_generated_policy && depth.mode == MTPDepthPolicyMode::Dynamic,
             .backend = depth.backend, .model_class = depth.model_class,
-            .verify_mode = mtp.verify_mode};
+            .verify_mode = mtp.verify_mode, .scope = depth.scope};
         return policy;
     }
     /**

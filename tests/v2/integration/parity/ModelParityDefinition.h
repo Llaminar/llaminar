@@ -91,7 +91,7 @@ namespace llaminar2::test::parity
     /** Deepest fixed/adaptive MTP draft policy in the canonical matrix. */
     inline constexpr int kModelParityRequiredMaximumMTPDepth = 15;
 
-    /** MTP execution policy selected by one generated parity case. */
+    /** Typed MTP policy; explicit runtime qualification axes do not enlarge the canonical matrix. */
     enum class ModelParityMTP : std::uint8_t
     {
         Off,
@@ -100,6 +100,9 @@ namespace llaminar2::test::parity
         Depth3,
         Depth15,
         DynamicDepth,
+        // Runtime-only qualification axes; the canonical matrix below stays unchanged.
+        Depth5,
+        Depth6,
     };
 
     /**
@@ -876,6 +879,10 @@ namespace llaminar2::test::parity
                 return 2;
             case ModelParityMTP::Depth3:
                 return 3;
+            case ModelParityMTP::Depth5:
+                return 5;
+            case ModelParityMTP::Depth6:
+                return 6;
             case ModelParityMTP::Depth15:
             case ModelParityMTP::DynamicDepth:
                 return kModelParityRequiredMaximumMTPDepth;
@@ -1467,6 +1474,10 @@ namespace llaminar2::test::parity
                 return "MTPDepth2";
             case ModelParityMTP::Depth3:
                 return "MTPDepth3";
+            case ModelParityMTP::Depth5:
+                return "MTPDepth5";
+            case ModelParityMTP::Depth6:
+                return "MTPDepth6";
             case ModelParityMTP::Depth15:
                 return "MTPDepth15";
             case ModelParityMTP::DynamicDepth:

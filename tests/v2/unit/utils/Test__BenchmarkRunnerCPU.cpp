@@ -10,6 +10,7 @@
  * - Serial and speculative benchmarks deliver the same requested sampling law
  * - Result-owned setup arithmetic observations survive resets without entering measured counters
  * - Exact tagged physical expert selections survive as setup metadata without warmup movement
+ * - Opt-in terminal eligible-window counters serialize after the real measured reset
  */
 
 #include <gtest/gtest.h>
@@ -28,6 +29,13 @@
 #include <utility>
 
 #include "utils/BenchmarkRunner.h"
+#include "utils/MTPDepthTransactionTracePerfStats.h"
+#include "utils/MTPDepthTransactionTraceCPU.h"
+#include "execution/runner/OrchestrationRunner.h"
+#include "utils/BenchmarkCampaign.h"
+#include "config/ConfigValidator.h"
+#include "config/OrchestrationConfigParser.h"
+#include "config/OrchestrationConfigDocument.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "app/InferenceRunnerAdapter.h"
@@ -514,6 +522,89 @@ namespace
         std::vector<std::string> events_;
     };
 
+    /** @brief Restore environment-owned collection after every test scope has unwound. */
+    struct TerminalEvidencePolicyRestore
+    {
+        /** @brief Clear fixture counters and republish the restored caller environment. */
+        ~TerminalEvidencePolicyRestore()
+        {
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+    };
+
+    /** @brief Explicit passive opt-in with all stage clocks disabled and no output file. */
+    class ScopedTerminalEvidenceCollection
+    {
+    public:
+        /** @param enabled Whether terminal counters may be collected in this fixture. */
+        explicit ScopedTerminalEvidenceCollection(bool enabled)
+            : summary_("LLAMINAR_PERF_STATS_SUMMARY", enabled ? "1" : "0")
+        {
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+    private:
+        TerminalEvidencePolicyRestore restore_;
+        ScopedEnv json_{"LLAMINAR_PERF_STATS_JSON", "0"};
+        ScopedEnv csv_{"LLAMINAR_PERF_STATS_CSV", "0"};
+        ScopedEnv table_{"LLAMINAR_PERF_STATS_TABLE", "0"};
+        ScopedEnv summary_;
+        ScopedEnv filter_{"LLAMINAR_PERF_STATS_FILTER", ""};
+        ScopedEnv legacy_{"LLAMINAR_PROFILING", "0"};
+        ScopedEnv kernels_{"LLAMINAR_PROFILE_KERNELS", "0"};
+        ScopedEnv cpu_{"LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", "0"};
+        ScopedEnv gpu_{"LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", "0"};
+        ScopedEnv stage_{"LLAMINAR_GPU_STAGE_TIMING", "0"};
+        ScopedEnv detail_{"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"};
+    };
+
+    /** @return Distinct eligible terminal counts, not physical draft/rejection work. */
+    PerfStatsCollector::Tags terminalWindowFixtureTags(const char *observation)
+    {
+        return {{"observation", observation}, {"request", "0"}, {"mode", "1"},
+                {"minimum_depth", "1"}, {"maximum_depth", "15"}, {"final_depth", "5"},
+                {"window_size", "1024"}, {"minimum_samples", "1024"},
+                {"pending_window_runs", "3"}, {"pending_window_tokens", "15"},
+                {"pending_window_accepted_tokens", "7"}, {"pending_window_rejected_tokens", "8"},
+                {"pending_window_full_accepts", "1"}, {"pending_window_zero_accepts", "1"},
+                {"pending_window_rollbacks", "2"}, {"evaluated_windows", "0"},
+                {"learned_matched_windows", "0"}};
+    }
+
+    /** @brief Emit passive terminal observations from the existing device-free decode owner. */
+    class MockTerminalWindowEvidenceRunner final : public MockOrchestratedDecodeRunner
+    {
+    public:
+        /** @brief Mark the real post-warmup boundary without bypassing its subsequent reset. */
+        void beginMeasuredObservations() { measured_ = true; }
+        /** @param max_tokens Remaining request budget owned by the benchmark loop. */
+        void setDecodeStepTokenBudget(int max_tokens) override
+        {
+            MockOrchestratedDecodeRunner::setDecodeStepTokenBudget(max_tokens);
+            remaining_request_tokens_ = max_tokens;
+        }
+        /** @return The ordinary mock tokens with one immutable terminal observation attached. */
+        DecodeStepOutput decodeStepForBenchmark() override
+        {
+            auto output = MockOrchestratedDecodeRunner::decodeStepForBenchmark();
+            // The mock returns at most two tokens per transaction. Publication
+            // belongs to request completion even when several transactions run.
+            if (remaining_request_tokens_ > 0 &&
+                output.tokens.size() == static_cast<size_t>(remaining_request_tokens_))
+            {
+                PerfStatsCollector::addCounter("mtp", "device_generation_terminal_depth_policy_state", 1.0,
+                    "decode", "ROCm:0", terminalWindowFixtureTags(measured_ ? "measured" : "warmup"));
+            }
+            PerfStatsCollector::addCounter("mtp", "unrelated_transaction_submission", 1.0,
+                "decode", "ROCm:0");
+            return output;
+        }
+    private:
+        bool measured_ = false;
+        int remaining_request_tokens_ = 0;
+    };
+
     class MockPerfStatsMaintenanceRunner : public MockOrchestratedDecodeRunner
     {
     public:
@@ -765,7 +856,7 @@ namespace
              * benchmark reporting is an aggregate over the measured iterations,
              * not a final live snapshot.
              */
-            snapshot.mtp_draft_steps = probe_count_;
+            snapshot.mtp_draft_steps = probe_count_ * 20;
             snapshot.mtp_accepted_tokens = probe_count_ * 10;
             snapshot.mtp_rejected_tokens = probe_count_;
             snapshot.mtp_rollbacks = probe_count_ * 2;
@@ -803,8 +894,7 @@ namespace
             snapshot.mtp_request.rollbacks = snapshot.mtp_rollbacks;
             snapshot.mtp_request.acceptance_rate =
                 static_cast<double>(snapshot.mtp_accepted_tokens) /
-                static_cast<double>(snapshot.mtp_accepted_tokens +
-                                    snapshot.mtp_rejected_tokens);
+                static_cast<double>(snapshot.mtp_draft_steps);
             snapshot.mtp_request.stochastic_accept_tests =
                 snapshot.mtp_stochastic_accept_tests;
             snapshot.mtp_request.stochastic_accepts = snapshot.mtp_stochastic_accepts;
@@ -1720,6 +1810,75 @@ TEST(Test__BenchmarkRunnerCPU, PostWarmupCallbackSeesDecodeHistogramBeforePrefil
         << ::testing::PrintToString(events);
 }
 
+/** @test Actual benchmark JSON retains only measured terminal windows, with collection still passive. */
+TEST(Test__BenchmarkRunnerCPU, TerminalDepthWindowEvidenceSurvivesMeasuredSerializationAndDropsWarmup)
+{
+    ScopedTerminalEvidenceCollection collection(true);
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    ASSERT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_FALSE(PerfStatsCollector::cpuStageTimingEnabled());
+    EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
+    auto runner = std::make_shared<MockTerminalWindowEvidenceRunner>();
+    BenchmarkRunner benchmark(runner, createMockTokenizer());
+    benchmark.setPostWarmupCallback([&]()
+    {
+        // This genuine warmup/setup record must be removed by BenchmarkRunner's
+        // existing measured reset, not hidden by an artificial test reset.
+        PerfStatsCollector::addCounter("mtp", "device_generation_terminal_depth_policy_state", 1.0,
+            "decode", "ROCm:0", terminalWindowFixtureTags("post_warmup"));
+        runner->beginMeasuredObservations();
+    });
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+    const auto result = benchmark.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    const auto document = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+    const auto &stats = document.at("perf_stats");
+    EXPECT_TRUE(stats.at("enabled").get<bool>());
+    const auto &filters = stats.at("filters");
+    EXPECT_NE(std::find(filters.begin(), filters.end(), "mtp.device_generation_terminal_depth_policy_state"), filters.end());
+    EXPECT_EQ(std::find(filters.begin(), filters.end(), "mtp"), filters.end());
+    std::size_t terminals = 0;
+    for (const auto &row : stats.at("records"))
+    {
+        if (row.at("domain") != "mtp") continue;
+        ++terminals;
+        EXPECT_EQ(row.at("name"), "device_generation_terminal_depth_policy_state");
+        EXPECT_EQ(row.at("kind"), "counter");
+        EXPECT_EQ(row.at("phase"), "decode");
+        EXPECT_EQ(row.at("device"), "ROCm:0");
+        EXPECT_EQ(row.at("tags").get<PerfStatsCollector::Tags>(), terminalWindowFixtureTags("measured"));
+        EXPECT_EQ(row.at("count").get<uint64_t>(), static_cast<uint64_t>(result.measurement_iterations));
+        EXPECT_EQ(row.at("value").get<double>(), static_cast<double>(result.measurement_iterations));
+    }
+    EXPECT_EQ(terminals, 1u);
+    const auto collected = PerfStatsCollector::snapshot({"mtp"});
+    EXPECT_TRUE(std::any_of(collected.begin(), collected.end(), [](const auto &row)
+    { return row.name == "unrelated_transaction_submission"; }))
+        << "The unrelated record must be filtered by the real serializer, not absent from the fixture";
+    for (const auto &row : collected)
+        if (row.name == "device_generation_terminal_depth_policy_state")
+            EXPECT_EQ(row.tags.at("observation"), "measured");
+}
+
+/** @test Adding an export family cannot turn disabled collection into inference instrumentation. */
+TEST(Test__BenchmarkRunnerCPU, TerminalDepthWindowEvidenceRemainsOptIn)
+{
+    ScopedTerminalEvidenceCollection collection(false);
+    ASSERT_FALSE(PerfStatsCollector::isEnabled());
+    PerfStatsCollector::addCounter("mtp", "device_generation_terminal_depth_policy_state", 1.0,
+        "decode", "ROCm:0", terminalWindowFixtureTags("disabled"));
+    BenchmarkResult result;
+    const auto document = nlohmann::json::parse(benchmarkResultToJsonString(result));
+    EXPECT_FALSE(document.at("perf_stats").at("enabled").get<bool>());
+    EXPECT_TRUE(document.at("perf_stats").at("records").empty());
+    EXPECT_TRUE(PerfStatsCollector::snapshot().empty());
+    EXPECT_FALSE(PerfStatsCollector::cpuStageTimingEnabled());
+    EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
+}
+
 TEST(Test__BenchmarkRunnerCPU, PerfStatsResetDropsPostWarmupMoEStatsBeforeMeasuredIterations)
 {
     ScopedEnv perf_stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
@@ -2243,7 +2402,7 @@ TEST(Test__BenchmarkRunnerCPU, AggregatesMeasuredIterationMTPStats)
     EXPECT_EQ(runner->probeCount(), 3)
         << "Only measured iterations should be probed for aggregate reporting";
 
-    EXPECT_EQ(result.prefix_state.mtp_draft_steps, 6u);
+    EXPECT_EQ(result.prefix_state.mtp_draft_steps, 120u);
     EXPECT_EQ(result.prefix_state.mtp_accepted_tokens, 60u);
     EXPECT_EQ(result.prefix_state.mtp_rejected_tokens, 6u);
     EXPECT_EQ(result.prefix_state.mtp_rollbacks, 12u);
@@ -2270,7 +2429,7 @@ TEST(Test__BenchmarkRunnerCPU, AggregatesMeasuredIterationMTPStats)
     EXPECT_EQ(result.prefix_state.mtp_request.last_depth_policy_reason, "probe_3");
     EXPECT_EQ(result.prefix_state.mtp_request.accepted_tokens, 60u);
     EXPECT_EQ(result.prefix_state.mtp_request.rejected_tokens, 6u);
-    EXPECT_DOUBLE_EQ(result.prefix_state.mtp_request.acceptance_rate, 60.0 / 66.0);
+    EXPECT_DOUBLE_EQ(result.prefix_state.mtp_request.acceptance_rate, 0.5);
     EXPECT_EQ(result.prefix_state.mtp_request.stochastic_accept_tests, 30u);
     EXPECT_EQ(result.prefix_state.mtp_request.stochastic_accepts, 24u);
     EXPECT_DOUBLE_EQ(result.prefix_state.mtp_request.stochastic_acceptance_rate, 0.8);
@@ -2278,7 +2437,7 @@ TEST(Test__BenchmarkRunnerCPU, AggregatesMeasuredIterationMTPStats)
     const auto doc = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
     EXPECT_EQ(doc.at("mtp").at("accepted_tokens"), 60);
     EXPECT_EQ(doc.at("mtp").at("rejected_tokens"), 6);
-    EXPECT_DOUBLE_EQ(doc.at("mtp").at("acceptance_rate").get<double>(), 60.0 / 66.0);
+    EXPECT_DOUBLE_EQ(doc.at("mtp").at("acceptance_rate").get<double>(), 0.5);
     EXPECT_EQ(doc.at("mtp").at("request").at("stochastic_accepts"), 24);
     EXPECT_DOUBLE_EQ(doc.at("mtp").at("request").at("stochastic_acceptance_rate").get<double>(),
                      0.8);
@@ -3318,4 +3477,713 @@ TEST(Test__BenchmarkRunnerCPU, RetainsExactTaggedPhysicalPlacementSetupAcrossMea
             << "Placement metadata must not broaden the arithmetic snapshot";
     }
     PerfStatsCollector::reset();
+}
+
+namespace
+{
+/** @brief Command-only policy mock; benchmark inference remains the existing CPU fixture. */
+class CampaignPolicyAuthority final : public MockOrchestrationRunner
+{
+public:
+    OrchestrationConfig retained;
+    MTPRequestPolicy installed;
+    int resets = 0;
+    int publications = 0;
+    int fail_publication = -1;
+    bool idle = false;
+    bool generic_scope = false;
+    std::string error = "authored policy rejection";
+    std::string arch = "mock_cpu";
+    /** @brief Model a real reset-before-publication lifecycle without devices. */
+    void clearCache() override { ++resets; idle = true; }
+    /** @brief Publish exactly one request policy after an explicit reset. */
+    bool configureMTPRequestPolicy(const MTPRequestPolicy &policy) override
+    {
+        if (!idle) return false;
+        idle = false;
+        ++publications;
+        if (publications == fail_publication) return false;
+        installed = policy;
+        return true;
+    }
+    /** @return The actual installed mock request policy. */
+    MTPRequestPolicy mtpRequestPolicy() const override { return installed; }
+    /** @return One immutable startup physical envelope. */
+    const OrchestrationConfig &config() const override { return retained; }
+    /** @return Precise authored failure without a fallback request. */
+    const std::string &lastError() const override { return error; }
+    /** @return Explicit model-free mock architecture. */
+    const std::string &architecture() const override { return arch; }
+    /** @return Complete mock geometry solely for device-free interface coverage. */
+    MTPDepthPolicyScope mtpDepthPolicyScope() const override
+    {
+        MTPDepthPolicyScope result;
+        if (generic_scope) return result;
+        result.verifier_width_policy = MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
+        result.tp_width = 1; result.pp_stages = 1; result.retained_depth = 15;
+        result.hidden_dim = 64; result.main_layers = 1;
+        result.compute_capability_major = 90; result.compute_capability_minor = 6;
+        return result;
+    }
+};
+/** @brief Isolate temporary campaign metadata and remove it after its assertions. */
+class CampaignFiles final
+{
+public:
+    std::filesystem::path directory = uniqueBenchmarkPromptPath().string() + ".campaign." +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    CampaignFiles() { std::filesystem::create_directory(directory); }
+    ~CampaignFiles() { std::error_code error; std::filesystem::remove_all(directory, error); }
+    /** @return A tiny, explicit complete fixed-depth sweep over one natural prompt. */
+    nlohmann::json document() const
+    {
+        using Json = nlohmann::json;
+        Json result{{"schema", "llaminar.benchmark-campaign.v1"}, {"output_directory", (directory / "results").string()},
+            {"sampling", {{"temperature", 0}, {"top_k", 1}, {"top_p", 1}, {"seed", 42}}},
+            {"prompts", Json::array({{{"id", "natural"}, {"partition", "train"}, {"text", "Natural input stays intact.\n"}}})},
+            {"cells", Json::array({{{"id", "off"}, {"prompt_id", "natural"}, {"mtp", {{"mode", "off"}}}}})}};
+        for (int depth = 1; depth <= 15; ++depth)
+            result["cells"].push_back({{"id", "fixed" + std::to_string(depth)}, {"prompt_id", "natural"},
+                {"mtp", {{"mode", "fixed"}, {"depth", depth}}}});
+        result["cells"].push_back({{"id", "dynamic"}, {"prompt_id", "natural"}, {"mtp", {
+            {"mode", "dynamic"}, {"minimum_depth", 1}, {"maximum_depth", 15}, {"initial_depth", 3}}}});
+        return result;
+    }
+    /** @brief Persist only the tiny authored input document used by the parser. */
+    OrchestrationConfig write(const nlohmann::json &document) const
+    {
+        OrchestrationConfig config;
+        config.benchmark_mode = true;
+        config.benchmark_campaign_path = (directory / "campaign.json").string();
+        config.max_seq_len = 64; config.n_predict = 3;
+        config.temperature = 0; config.top_k = 1; config.top_p = 1; config.seed = 42;
+        config.mtp.enabled = true; config.mtp.draft_tokens = 15;
+        config.mtp.graph_capacity_draft_tokens = 15;
+        config.mtp.verify_mode = MTPVerifyMode::Greedy;
+        config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        std::ofstream out(config.benchmark_campaign_path);
+        out << document.dump();
+        return config;
+    }
+};
+}
+
+/** @brief Every policy uses the existing timing implementation, with one tokenization. */
+TEST(Test__BenchmarkRunnerCPU, CampaignReusesOneTokenizedPromptAcrossOffFixedSweepAndDynamic)
+{
+    ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+    ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+    auto inference = std::make_shared<MockOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    EXPECT_CALL(*tokenizer, encode("Natural input stays intact.\n", false, false))
+        .Times(1).WillOnce(Return(std::vector<int>{1, 2, 3, 4, 5}));
+    BenchmarkRunner benchmark(inference, tokenizer);
+    CampaignFiles files;
+    const auto config = files.write(files.document());
+    const auto campaign = prepareBenchmarkCampaign(config, benchmark);
+    CampaignPolicyAuthority authority;
+    authority.retained = config;
+    const auto result = runBenchmarkCampaign(campaign, authority, benchmark);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    EXPECT_EQ(result.completed_cells, 17u);
+    EXPECT_EQ(authority.resets, 17);
+    EXPECT_EQ(authority.publications, 17);
+    EXPECT_GT(inference->forwardCount(), 0);
+    for (const auto &cell : campaign.cells())
+    {
+        std::ifstream input(campaign.outputDirectory() / (cell.id + ".json"));
+        nlohmann::json record; input >> record;
+        EXPECT_TRUE(record.at("success").get<bool>());
+        EXPECT_EQ(record.at("prompt").at("token_ids"), nlohmann::json::array({1, 2, 3, 4, 5}));
+        EXPECT_EQ(record.at("config").at("mtp_graph_capacity_draft_tokens"), 15);
+        EXPECT_EQ(record.at("campaign").at("prompt_id"), "natural");
+        if (cell.id == "off") EXPECT_EQ(record.at("request_policy").at("mode"), "off");
+        else if (cell.id == "dynamic") EXPECT_EQ(record.at("request_policy").at("resolved_initial_depth"), 3);
+        else EXPECT_EQ(record.at("config").at("mtp_draft_tokens"), cell.policy.draft_tokens);
+    }
+    std::ifstream terminal(campaign.outputDirectory() / "summary.json");
+    nlohmann::json summary; terminal >> summary;
+    EXPECT_TRUE(summary.at("complete").get<bool>()); EXPECT_TRUE(summary.at("success").get<bool>());
+    EXPECT_EQ(summary.at("completed_cells"), 17);
+}
+
+/** @brief A bad later cell never executes or creates partial campaign output. */
+TEST(Test__BenchmarkRunnerCPU, CampaignValidatesAllInputsBeforeFirstRequest)
+{
+    const std::vector<std::string> faults{"unknown", "fixed0", "fixed16", "capacity", "cohort", "context", "partition", "path"};
+    for (const auto &fault : faults)
+    {
+        SCOPED_TRACE(fault);
+        CampaignFiles files;
+        auto document = files.document();
+        if (fault == "unknown") document["cells"].back()["mtp"]["surprise"] = true;
+        if (fault == "fixed0") document["cells"][1]["mtp"]["depth"] = 0;
+        if (fault == "fixed16") document["cells"][1]["mtp"]["depth"] = 16;
+        if (fault == "cohort") document["sampling"]["temperature"] = 0.7;
+        if (fault == "partition") document["prompts"].push_back({{"id", "alias"}, {"partition", "holdout"}, {"text", "same native tokens"}});
+        if (fault == "path") document["cells"].back()["id"] = "../escape";
+        auto config = files.write(document);
+        if (fault == "capacity") config.mtp.graph_capacity_draft_tokens = 3, config.mtp.draft_tokens = 3, config.mtp.depth_policy.max_depth = 3;
+        if (fault == "context") config.max_seq_len = 7;
+        auto inference = std::make_shared<MockOrchestratedDecodeRunner>();
+        BenchmarkRunner benchmark(inference, createMockTokenizer());
+        EXPECT_THROW((void)prepareBenchmarkCampaign(config, benchmark), std::invalid_argument);
+        EXPECT_EQ(inference->forwardCount(), 0);
+        EXPECT_FALSE(std::filesystem::exists(files.directory / "results"));
+    }
+}
+
+/** @brief A rejected policy stops the campaign and preserves its successful prefix. */
+TEST(Test__BenchmarkRunnerCPU, CampaignPreservesCompletedFilesAndConcreteTerminalFailure)
+{
+    ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+    ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+    CampaignFiles files;
+    const auto config = files.write(files.document());
+    BenchmarkRunner benchmark(std::make_shared<MockOrchestratedDecodeRunner>(), createMockTokenizer());
+    const auto campaign = prepareBenchmarkCampaign(config, benchmark);
+    CampaignPolicyAuthority authority;
+    authority.retained = config; authority.fail_publication = 2;
+    const auto result = runBenchmarkCampaign(campaign, authority, benchmark);
+    EXPECT_FALSE(result.success); EXPECT_EQ(result.completed_cells, 1u);
+    EXPECT_EQ(authority.publications, 2);
+    EXPECT_EQ(authority.resets, 2);
+    EXPECT_NE(result.failure_reason.find("fixed1"), std::string::npos);
+    EXPECT_NE(result.failure_reason.find("authored policy rejection"), std::string::npos);
+    EXPECT_TRUE(std::filesystem::is_regular_file(campaign.outputDirectory() / "off.json"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(campaign.outputDirectory() / "fixed1.json"));
+    EXPECT_FALSE(std::filesystem::exists(campaign.outputDirectory() / "fixed2.json"));
+    std::ifstream terminal(campaign.outputDirectory() / "summary.json");
+    nlohmann::json summary; terminal >> summary;
+    EXPECT_TRUE(summary.at("complete").get<bool>()); EXPECT_FALSE(summary.at("success").get<bool>());
+    EXPECT_EQ(summary.at("cells").size(), 2u); EXPECT_EQ(summary.at("completed_cells"), 1);
+}
+
+/** @brief CLI scope and lossless public configuration keep campaign authoring explicit. */
+TEST(Test__BenchmarkRunnerCPU, CampaignCLIRejectsSingularInputConflictsAndPreservesDocument)
+{
+    OrchestrationConfigParser parser;
+    // SubcommandRouter removes the subcommand before BenchmarkCommand parses
+    // flags; the command then selects benchmark mode before validation.
+    std::string program = "llaminar2", flag = "--benchmark-campaign", path = "/tmp/authored.json";
+    char *argv[]{program.data(), flag.data(), path.data()};
+    auto config = parser.parseArgs(3, argv);
+    config.benchmark_mode = true;
+    EXPECT_EQ(config.benchmark_campaign_path, path);
+    EXPECT_NE(OrchestrationConfigParser::getHelpText().find("--benchmark-campaign"), std::string::npos);
+    EXPECT_TRUE(config.benchmark_campaign_was_provided);
+    const auto document = serializeOrchestrationConfig(config);
+    EXPECT_EQ(serializeOrchestrationConfig(deserializeOrchestrationConfig(document)), document);
+    auto older = nlohmann::json::parse(document);
+    older["schema_version"] = kOrchestrationConfigDocumentSchemaVersion - 1;
+    EXPECT_THROW((void)deserializeOrchestrationConfig(older.dump()), std::invalid_argument);
+    const auto validator = ConfigValidator::createStandard();
+    const auto invalid = [&](const OrchestrationConfig &candidate) {
+        const auto errors = validator.validate(candidate);
+        return std::any_of(errors.begin(), errors.end(), [](const auto &error) { return error.rule_id == "benchmark-campaign-scope"; });
+    };
+    EXPECT_FALSE(invalid(config));
+    auto conflict = config; conflict.prompt = "singular"; EXPECT_TRUE(invalid(conflict));
+    conflict = config; conflict.benchmark_json_output_path = "/tmp/singular.json"; EXPECT_TRUE(invalid(conflict));
+    conflict = config; conflict.benchmark_mode = false; EXPECT_TRUE(invalid(conflict));
+    conflict = config; conflict.benchmark_campaign_path.clear(); EXPECT_TRUE(invalid(conflict));
+}
+
+/** @brief Observe requests retain authored bounds and serialize their actual mode across resets. */
+TEST(Test__BenchmarkRunnerCPU, CampaignObserveReusesResetPolicyAndSerializesItsOwnMode)
+{
+    ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+    ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+    CampaignFiles files;
+    auto document = files.document();
+    const auto observe = [](const char *id, int initial) {
+        return nlohmann::json{{"id", id}, {"prompt_id", "natural"}, {"mtp", {
+            {"mode", "observe"}, {"minimum_depth", 1}, {"maximum_depth", 15}, {"initial_depth", initial}}}};
+    };
+    auto dynamic = document["cells"].back();
+    dynamic["mtp"]["initial_depth"] = 7;
+    document["cells"] = nlohmann::json::array({document["cells"][0], observe("observe3", 3),
+        dynamic, observe("observe5", 5), observe("observe-auto", 0), document["cells"][2]});
+    auto config = files.write(document);
+    // Controller geometry is inherited from startup, not a new per-cell override.
+    config.mtp.depth_policy.window_size = 1024;
+    config.mtp.depth_policy.min_samples = 1024;
+    auto inference = std::make_shared<MockOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    EXPECT_CALL(*tokenizer, encode("Natural input stays intact.\n", false, false))
+        .Times(1).WillOnce(Return(std::vector<int>{1, 2, 3, 4, 5}));
+    BenchmarkRunner benchmark(inference, tokenizer);
+    const auto campaign = prepareBenchmarkCampaign(config, benchmark);
+    ASSERT_EQ(campaign.cells().size(), 6u);
+    for (const auto index : {1u, 3u, 4u})
+    {
+        const auto &policy = campaign.cells()[index].policy;
+        EXPECT_EQ(policy.depth_policy.mode, MTPDepthPolicyMode::Observe);
+        EXPECT_EQ(policy.depth_policy.window_size, 1024);
+        EXPECT_EQ(policy.depth_policy.min_samples, 1024);
+        EXPECT_EQ(policy.depth_policy.min_depth, 1);
+        EXPECT_EQ(policy.depth_policy.max_depth, 15);
+        EXPECT_EQ(policy.draft_tokens, 15);
+    }
+    CampaignPolicyAuthority authority;
+    authority.retained = config;
+    const auto result = runBenchmarkCampaign(campaign, authority, benchmark);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    EXPECT_EQ(result.completed_cells, 6u);
+    EXPECT_EQ(authority.resets, 6);
+    EXPECT_EQ(authority.publications, 6);
+    EXPECT_EQ(authority.installed.depth_policy.mode, MTPDepthPolicyMode::Fixed);
+    EXPECT_EQ(authority.installed.draft_tokens, 2);
+    for (const auto index : {1u, 3u, 4u})
+    {
+        const auto &cell = campaign.cells()[index];
+        std::ifstream input(campaign.outputDirectory() / (cell.id + ".json"));
+        nlohmann::json record; input >> record;
+        const auto &policy = record.at("request_policy");
+        EXPECT_EQ(policy.at("mode"), "observe");
+        EXPECT_TRUE(policy.at("enabled").get<bool>());
+        EXPECT_EQ(policy.at("draft_tokens"), 15);
+        EXPECT_EQ(policy.at("minimum_depth"), 1);
+        EXPECT_EQ(policy.at("maximum_depth"), 15);
+        EXPECT_EQ(policy.at("initial_depth"), cell.policy.depth_policy.initial_depth);
+        EXPECT_EQ(policy.at("resolved_initial_depth"), index == 4u ? 2 : cell.policy.depth_policy.initial_depth);
+        EXPECT_EQ(record.at("config").at("mtp_depth_policy"), "observe");
+        EXPECT_EQ(record.at("config").at("mtp_initial_draft_tokens"), cell.policy.depth_policy.initial_depth);
+        EXPECT_EQ(record.at("config").at("mtp_graph_capacity_draft_tokens"), 15);
+        EXPECT_EQ(record.at("prompt").at("token_ids"), nlohmann::json::array({1, 2, 3, 4, 5}));
+    }
+    std::ifstream dynamic_input(campaign.outputDirectory() / "dynamic.json");
+    nlohmann::json dynamic_record; dynamic_input >> dynamic_record;
+    EXPECT_EQ(dynamic_record.at("request_policy").at("mode"), "dynamic");
+    EXPECT_EQ(dynamic_record.at("request_policy").at("resolved_initial_depth"), 7);
+    EXPECT_NE(OrchestrationConfigParser::getHelpText().find("off/fixed/observe/dynamic"), std::string::npos);
+}
+
+/** @brief Malformed Observe geometry fails canonical admission before any request/reset. */
+TEST(Test__BenchmarkRunnerCPU, CampaignObserveRejectsMalformedOrUnadmittedBoundsBeforeRequest)
+{
+    for (const std::string fault : {"unknown", "missing", "zero-min", "reversed", "max16", "initial16",
+                                   "below-min", "bool", "fraction", "string", "capacity", "window"})
+    {
+        SCOPED_TRACE(fault);
+        CampaignFiles files;
+        auto document = files.document();
+        document["cells"].back()["mtp"] = {{"mode", "observe"}, {"minimum_depth", 1},
+            {"maximum_depth", 15}, {"initial_depth", 3}};
+        auto &mtp = document["cells"].back()["mtp"];
+        if (fault == "unknown") mtp["depth"] = 3;
+        if (fault == "missing") mtp.erase("initial_depth");
+        if (fault == "zero-min") mtp["minimum_depth"] = 0;
+        if (fault == "reversed") mtp["minimum_depth"] = 15, mtp["maximum_depth"] = 3;
+        if (fault == "max16") mtp["maximum_depth"] = 16;
+        if (fault == "initial16") mtp["initial_depth"] = 16;
+        if (fault == "below-min") mtp["minimum_depth"] = 4;
+        if (fault == "bool") mtp["initial_depth"] = true;
+        if (fault == "fraction") mtp["initial_depth"] = 3.5;
+        if (fault == "string") mtp["initial_depth"] = "3";
+        auto config = files.write(document);
+        if (fault == "capacity")
+        {
+            // Earlier cells are valid; only the later Observe ceiling exceeds admission.
+            document["cells"] = nlohmann::json::array({document["cells"][0], document["cells"].back()});
+            config = files.write(document);
+            config.mtp.graph_capacity_draft_tokens = 3;
+            config.mtp.draft_tokens = 3;
+            config.mtp.depth_policy.max_depth = 3;
+        }
+        if (fault == "window") config.mtp.depth_policy.window_size = 0;
+        auto inference = std::make_shared<MockOrchestratedDecodeRunner>();
+        BenchmarkRunner benchmark(inference, createMockTokenizer());
+        CampaignPolicyAuthority authority;
+        EXPECT_THROW((void)prepareBenchmarkCampaign(config, benchmark), std::invalid_argument);
+        EXPECT_EQ(authority.resets, 0);
+        EXPECT_EQ(authority.publications, 0);
+        EXPECT_EQ(inference->forwardCount(), 0);
+        EXPECT_FALSE(std::filesystem::exists(files.directory / "results"));
+    }
+}
+
+/** @brief Default stochastic capability specializes greedy law; real conflicts remain fatal. */
+TEST(Test__BenchmarkRunnerCPU, CampaignUsesCanonicalSamplingSpecializationAndAllowsGenericScope)
+{
+    ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+    ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+    CampaignFiles files;
+    auto document = files.document();
+    document["cells"] = nlohmann::json::array({document["cells"][0], document["cells"][1]});
+    auto config = files.write(document);
+    config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+    BenchmarkRunner benchmark(std::make_shared<MockOrchestratedDecodeRunner>(), createMockTokenizer());
+    const auto campaign = prepareBenchmarkCampaign(config, benchmark);
+    CampaignPolicyAuthority authority;
+    authority.retained = config; authority.generic_scope = true;
+    const auto result = runBenchmarkCampaign(campaign, authority, benchmark);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    std::ifstream input(campaign.outputDirectory() / "off.json");
+    nlohmann::json observed; input >> observed;
+    EXPECT_EQ(observed.at("request_policy").at("verify_mode"), "greedy");
+    EXPECT_EQ(observed.at("training_scope").at("tp_width"), 0);
+    EXPECT_EQ(observed.at("training_scope_generic_reason"), "model_free");
+    // A greedy-only capability may not be silently upgraded for stochastic MTP.
+    CampaignFiles conflict;
+    auto invalid = conflict.document();
+    invalid["sampling"]["temperature"] = 0.7;
+    invalid["sampling"]["top_k"] = 40;
+    auto incompatible = conflict.write(invalid);
+    incompatible.temperature = 0.7f; incompatible.top_k = 40;
+    EXPECT_THROW((void)prepareBenchmarkCampaign(incompatible, benchmark), std::invalid_argument);
+}
+
+/** @brief Nested duplicate keys and typed scalar errors never launch a request. */
+TEST(Test__BenchmarkRunnerCPU, CampaignRejectsDuplicateAndMalformedDocumentsBeforeRequest)
+{
+    CampaignFiles files;
+    auto config = files.write(files.document());
+    BenchmarkRunner benchmark(std::make_shared<MockOrchestratedDecodeRunner>(), createMockTokenizer());
+    for (const std::string bytes : {std::string("{\"schema\":1,\"schema\":2}"), std::string("{")})
+    {
+        std::ofstream output(config.benchmark_campaign_path); output << bytes; output.close();
+        EXPECT_THROW((void)prepareBenchmarkCampaign(config, benchmark), std::invalid_argument);
+    }
+    for (const auto &bad : {nlohmann::json(true), nlohmann::json(1.5), nlohmann::json("1")})
+    {
+        auto document = files.document(); document["cells"][1]["mtp"]["depth"] = bad;
+        config = files.write(document);
+        EXPECT_THROW((void)prepareBenchmarkCampaign(config, benchmark), std::invalid_argument);
+    }
+    EXPECT_FALSE(std::filesystem::exists(files.directory / "results"));
+}
+
+/** @test A rejected transaction cannot stand for its entire unaccepted draft suffix. */
+TEST(Test__BenchmarkRunnerCPU, DraftAcceptanceUsesAttemptedTokensAcrossMeasuredJSON)
+{
+    auto runner = std::make_shared<MockStatsInferenceRunner>();
+    // Four depth-five verifications accept5,5,1,1 drafts: twelve of twenty
+    // attempts are accepted, while only two transactions reject a suffix.
+    runner->snapshot.mtp_config_enabled = true;
+    runner->snapshot.mtp_draft_steps = 20;
+    runner->snapshot.mtp_accepted_tokens = 12;
+    runner->snapshot.mtp_rejected_tokens = 2;
+    runner->snapshot.mtp_verifier_runs = 4;
+    runner->snapshot.mtp_verifier_token_count = 24;
+    auto &request = runner->snapshot.mtp_request;
+    request.enabled = true;
+    request.draft_steps = 20;
+    request.accepted_tokens = 12;
+    request.rejected_tokens = 2;
+    request.acceptance_rate = 0.6;
+    BenchmarkRunner benchmark(runner, createMockTokenizer());
+    OrchestrationConfig config;
+    config.prompt = "Natural arithmetic evidence";
+    config.n_predict = 1;
+    config.temperature = 0;
+    const auto result = benchmark.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    const auto document = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+    EXPECT_DOUBLE_EQ(document.at("mtp").at("acceptance_rate").get<double>(), 0.6);
+    EXPECT_DOUBLE_EQ(document.at("mtp").at("request").at("acceptance_rate").get<double>(), 0.6);
+    for (const auto &iteration : document.at("iterations"))
+    {
+        EXPECT_EQ(iteration.at("mtp").at("draft_steps"), 20);
+        EXPECT_EQ(iteration.at("mtp").at("accepted_tokens"), 12);
+        EXPECT_EQ(iteration.at("mtp").at("rejected_tokens"), 2);
+        EXPECT_DOUBLE_EQ(iteration.at("mtp").at("acceptance_rate").get<double>(), 0.6);
+    }
+    BenchmarkResult ordinary;
+    const auto zero = nlohmann::json::parse(benchmarkResultToJsonString(ordinary));
+    EXPECT_DOUBLE_EQ(zero.at("mtp").at("acceptance_rate").get<double>(), 0.0);
+}
+
+namespace
+{
+    /** @return One legitimate finite scalar diagnostic request, with no model payload. */
+    OrchestrationConfig traceBenchmarkConfig()
+    {
+        OrchestrationConfig config;
+        config.benchmark_mode = true; config.prompt = "Hello world"; config.n_predict = 3;
+        config.batch_size = 1; config.mtp.enabled = true; config.mtp.max_request_batch = 1;
+        config.mtp.depth_policy.min_samples = 4;
+        return config;
+    }
+
+    /** @return A complete immutable serializer fixture, distinct from live controller proof. */
+    sampling_math::MTPDepthTransactionTraceRecord traceSerializationFixture()
+    {
+        // Authored O3/L0/P2/Y3 at d3,A1: raw outgoing debt1, no stop.
+        return {3u|(1u<<4)|(3u<<8)|(3u<<14)|(3u<<19)|(1u<<24)|(3u<<25)|(1u<<30),3,0};
+    }
+
+    /** @brief Reuse ordinary mock decode and publish exactly once at its terminal boundary. */
+    class MockDepthTransactionTraceRunner final : public MockOrchestratedDecodeRunner
+    {
+    public:
+        /** @param tokens Actual remaining request budget supplied by BenchmarkRunner. */
+        void setDecodeStepTokenBudget(int tokens) override
+        {
+            MockOrchestratedDecodeRunner::setDecodeStepTokenBudget(tokens);
+            remaining_ = tokens;
+        }
+        /** @return Ordinary mock output; journal is immutable terminal evidence only. */
+        DecodeStepOutput decodeStepForBenchmark() override
+        {
+            auto result = MockOrchestratedDecodeRunner::decodeStepForBenchmark();
+            if (remaining_ > 0 && result.tokens.size() == static_cast<std::size_t>(remaining_))
+            {
+                MTPDepthPolicyConfig policy;
+                policy.mode = MTPDepthPolicyMode::Dynamic; policy.min_depth = 1; policy.max_depth = 5;
+                policy.initial_depth = 3; policy.window_size = 4; policy.min_samples = 4;
+                policy.cooldown_steps = 0; policy.promote_consecutive_windows = 1; policy.use_generated_policy = false;
+                MTPDepthController owner(policy, 3);
+                MTPPublicationWitness publication;
+                if(!MTPPublicationWitness::fromCounts(3,0,2,false,&publication))
+                    throw std::logic_error("Invalid authored serializer publication");
+                publishCPUDepthTransactionTraceInitial(owner,3,publication,"CPU","measured");
+                publishMTPDepthTransactionRecord(traceSerializationFixture(), 1, "CPU", "measured", "cpu_host");
+                PerfStatsCollector::addCounter("mtp","grouped_outcome_host_state_publications",1.0,"decode",{},
+                    {{"request_count","1"},{"accepted_state_count","2"},{"stopped_on_output","false"}});
+                terminal_published_=true;
+                PerfStatsCollector::addCounter("mtp", "output_tokens", 3.0, "decode", {},
+                    {{"source", "committed_host_mtp_transaction"}});
+                // A distinct direct-emission event belongs to general output
+                // totals but has no verifier transaction/trace record.
+                PerfStatsCollector::addCounter("mtp", "output_tokens", 2.0, "decode");
+            }
+            PerfStatsCollector::addCounter("mtp","grouped_outcome_host_state_publications.neighbor",99.0,"decode");
+            PerfStatsCollector::addCounter("mtp","grouped_outcome_host_state_publications_neighbor",99.0,"decode");
+            PerfStatsCollector::addCounter("mtp", "output_tokens.neighbor", 99.0, "decode");
+            PerfStatsCollector::addCounter("mtp", "unrelated_journal_transaction", 1.0, "decode", "CPU");
+            PerfStatsCollector::addCounter("mtp", "depth_transaction_trace.record.neighbor", 1.0, "decode", "CPU");
+            return result;
+        }
+        /** @return Independently authored terminal snapshot, never summed from trace rows. */
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy & = PrefixProbeCapturePolicy::fromEnvironment()) const override
+        {
+            PrefixRuntimeStateSnapshot value;value.initialized=true;value.primary_device=DeviceId::cpu();
+            value.mtp_config_enabled=true;value.mtp_current_depth=3;value.mtp_min_depth=1;value.mtp_max_depth=5;
+            value.mtp_verifier_runs=terminal_published_?1:0;value.mtp_draft_steps=terminal_published_?3:0;
+            value.mtp_accepted_tokens=terminal_published_?1:0;value.mtp_rejected_tokens=terminal_published_?1:0;
+            value.mtp_verifier_token_count=terminal_published_?4:0;return value;
+        }
+        /** @brief Reset mock request state while the real benchmark owns collector reset. */
+        void clear_cache() override
+        { MockOrchestratedDecodeRunner::clear_cache();terminal_published_=false; }
+    private:
+        int remaining_ = 0;
+        bool terminal_published_ = false;
+    };
+}
+
+/** @test Raw scope declarations fail before any prefill or decode request can execute. */
+TEST(Test__BenchmarkRunnerCPU, DepthTransactionTraceRejectsNonFiniteOrBatchedRequestsBeforeExecution)
+{
+    for (int invalid_case = 0; invalid_case < 16; ++invalid_case)
+    {
+        SCOPED_TRACE(invalid_case);
+        TerminalEvidencePolicyRestore restore;
+        ScopedEnv journal("LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE", "1");
+        ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", invalid_case == 0 ? "2" : invalid_case == 1 ? "0" : "1");
+        ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", invalid_case == 2 ? "1" : invalid_case == 3 ? "-1" : "0");
+        ScopedTerminalEvidenceCollection collection(true);
+        auto config = traceBenchmarkConfig();
+        if (invalid_case == 4) config.benchmark_mode = false;
+        if (invalid_case == 5) config.serve_mode = true;
+        if (invalid_case == 6) config.batch_size = 2;
+        if (invalid_case == 7) config.mtp.max_request_batch = 2;
+        if (invalid_case == 8) config.n_predict = 0;
+        if (invalid_case == 9) config.n_predict = 257;
+        if (invalid_case == 10) config.mtp.enabled = false;
+        if (invalid_case == 11) config.mtp.depth_policy.min_depth = 0;
+        if (invalid_case == 12) config.mtp.draft_tokens = 16;
+        if (invalid_case == 13) config.mtp.verify_mode = static_cast<MTPVerifyMode>(99);
+        if (invalid_case == 14) config.mtp.depth_policy.mode = static_cast<MTPDepthPolicyMode>(99);
+        if (invalid_case == 15) config.mtp.depth_policy.min_samples = 0;
+        auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
+        BenchmarkRunner benchmark(runner, createMockTokenizer());
+        const auto result = benchmark.run(config);
+        EXPECT_FALSE(result.success);
+        EXPECT_NE(result.failure_reason.find("fresh scalar bounded benchmark"), std::string::npos);
+        EXPECT_EQ(runner->forwardCount(), 0); EXPECT_EQ(runner->decodeStepCalls(), 0);
+    }
+}
+
+/** @test A journal cannot silently run without its required passive collector domain. */
+TEST(Test__BenchmarkRunnerCPU, DepthTransactionTraceRequiresEnabledMTPCollectionBeforeExecution)
+{
+    for (const bool enabled : {false, true})
+    {
+        TerminalEvidencePolicyRestore restore;
+        ScopedEnv journal("LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE", "1");
+        ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+        ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+        ScopedTerminalEvidenceCollection collection(enabled);
+        ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", enabled ? "kernel" : "");
+        mutableDebugEnv().reload();
+        PerfStatsCollector::reloadConfigurationFromEnvironment(); // Environment mutation must republish the immutable collector policy.
+        ASSERT_FALSE(PerfStatsCollector::isDomainEnabled("mtp"));
+        auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
+        BenchmarkRunner benchmark(runner, createMockTokenizer());
+        const auto result = benchmark.run(traceBenchmarkConfig());
+        EXPECT_FALSE(result.success);
+        EXPECT_NE(result.failure_reason.find("MTP depth-transaction trace"), std::string::npos);
+        EXPECT_EQ(runner->forwardCount(), 0); EXPECT_EQ(runner->decodeStepCalls(), 0);
+    }
+}
+
+/** @test The real measured reset and exact serializer own one journal request and no neighbors. */
+TEST(Test__BenchmarkRunnerCPU, DepthTransactionTraceKeepsExactMeasuredRecordsAndDropsStaleNeighbors)
+{
+    TerminalEvidencePolicyRestore restore;
+    ScopedEnv journal("LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE", "1");
+    ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+    ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+    ScopedTerminalEvidenceCollection collection(true);
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    publishMTPDepthTransactionRecord(traceSerializationFixture(), 1, "CPU", "stale_before_measured_reset", "cpu_host");
+    PerfStatsCollector::addCounter("mtp", "output_tokens", 99.0, "decode");
+    PerfStatsCollector::addCounter("mtp","grouped_outcome_host_state_publications",99.0,"decode",{},
+        {{"request_count","1"},{"accepted_state_count","15"},{"stopped_on_output","true"}});
+    auto runner = std::make_shared<MockDepthTransactionTraceRunner>();
+    BenchmarkRunner benchmark(runner, createMockTokenizer());
+    auto config = traceBenchmarkConfig();config.n_predict=3;
+    const auto result = benchmark.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    ASSERT_EQ(result.measurement_iterations, 1); ASSERT_EQ(result.warmup_iterations, 0);
+    const auto document = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+    const auto &stats = document.at("perf_stats");
+    EXPECT_NE(std::find(stats.at("filters").begin(), stats.at("filters").end(),
+        "mtp.depth_transaction_trace.record"), stats.at("filters").end());
+    EXPECT_EQ(std::find(stats.at("filters").begin(), stats.at("filters").end(), "mtp"), stats.at("filters").end());
+    int records = 0;
+    for (const auto &row : stats.at("records"))
+    {
+        if (row.at("domain") != "mtp") continue;
+        ++records;
+        if(row.at("name")=="grouped_outcome_host_state_publications")
+        {
+            EXPECT_EQ(row.at("count"),1);EXPECT_EQ(row.at("value"),1.0);
+            EXPECT_EQ(row.at("tags").at("request_count"),"1");
+            EXPECT_EQ(row.at("tags").at("accepted_state_count"),"2");
+            EXPECT_EQ(row.at("tags").at("stopped_on_output"),"false");
+            continue; // Independent publisher ledger, never inferred from the trace.
+        }
+        if (row.at("name") == "output_tokens")
+        {
+            EXPECT_EQ(row.at("count"), 1);
+            const auto tags=row.at("tags").get<PerfStatsCollector::Tags>();
+            EXPECT_EQ(row.at("value"), tags.empty() ? 2.0 : 3.0);
+            if (!tags.empty()) EXPECT_EQ(tags.at("source"), "committed_host_mtp_transaction");
+            continue; // Both real metric groups survive; only tagged work is a trace witness.
+        }
+        EXPECT_EQ(row.at("count"), 1); EXPECT_EQ(row.at("value"), 1.0);
+        const auto &tags = row.at("tags");
+        EXPECT_EQ(tags.at("observation_identity"), "measured");
+        EXPECT_EQ(tags.at("authority"), "cpu_host");
+        if (row.at("name") == "depth_transaction_trace.initial")
+        {
+            const auto policy = nlohmann::json::parse(tags.at("policy_json").get<std::string>());
+            EXPECT_EQ(policy.at("schema"), "llaminar.mtp.cpu_depth_transaction_trace_initial.v3");
+            EXPECT_FALSE(policy.at("initial_incoming_debt").get<bool>());
+            EXPECT_EQ(policy.at("initial_depth"), 3);
+        }
+        else
+        {
+            EXPECT_EQ(row.at("name"), "depth_transaction_trace.record");
+            EXPECT_EQ(tags.at("transaction_count"), "1");
+            EXPECT_EQ(tags.at("accepted_prefix"), "1"); EXPECT_EQ(tags.at("post_depth"), "3");
+            EXPECT_EQ(tags.at("incoming_debt"),"false");EXPECT_EQ(tags.at("outgoing_debt"),"true");
+            EXPECT_EQ(tags.at("model_stopped"),"false");
+            EXPECT_EQ(tags.at("response_token_count"), "-1");
+            EXPECT_EQ(tags.at("response_token_count_valid"), "false");
+            EXPECT_EQ(tags.at("token_witness"), "3");
+            EXPECT_EQ(tags.at("token_witness_scope"), "cpu_transaction_emitted");
+        }
+    }
+    EXPECT_EQ(records,5);
+    EXPECT_NE(std::find(stats.at("filters").begin(),stats.at("filters").end(),
+        "mtp.grouped_outcome_host_state_publications"),stats.at("filters").end());
+    for(const auto &entry:stats.at("records"))
+        EXPECT_TRUE(entry.at("name").get<std::string>().find("neighbor")==std::string::npos);
+    const auto raw = PerfStatsCollector::snapshot({"mtp"});
+    EXPECT_TRUE(std::any_of(raw.begin(), raw.end(), [](const auto &row)
+        { return row.name == "depth_transaction_trace.record.neighbor"; }));
+    EXPECT_TRUE(std::any_of(raw.begin(), raw.end(), [](const auto &row)
+        { return row.name == "unrelated_journal_transaction"; }));
+}
+
+/** @test Direct decode refuses an unbounded journal before initialization or model work. */
+TEST(Test__BenchmarkRunnerCPU, DepthTransactionTraceDirectDecodeRequiresActualRemainingBudget)
+{
+    TerminalEvidencePolicyRestore restore;
+    ScopedEnv journal("LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE", "1");
+    mutableDebugEnv().reload();
+    OrchestrationRunner runner(traceBenchmarkConfig(), nullptr);
+    for (int budget : {-1, 0, 257})
+    {
+        runner.setDecodeStepTokenBudget(budget);
+        const auto result = runner.decodeStep();
+        EXPECT_NE(result.error.find("explicit remaining token budget1..256"), std::string::npos);
+    }
+    for (int budget : {1, 256})
+    {
+        runner.setDecodeStepTokenBudget(budget);
+        EXPECT_EQ(runner.decodeStep().error, "Runner not initialized");
+    }
+}
+
+/** @test Actual canonical benchmark JSON preserves independent utility event totals. */
+TEST(Test__BenchmarkRunnerCPU, UtilityProbeCountersSurviveCanonicalJSON)
+{
+    BenchmarkResult result;
+    result.prefix_state.mtp_depth_policy_utility_probes=7;
+    result.prefix_state.mtp_depth_policy_utility_keeps=3;
+    result.prefix_state.mtp_depth_policy_utility_returns=2;
+    const auto doc=nlohmann::json::parse(benchmarkResultToJsonString(result));
+    EXPECT_EQ(doc.at("mtp").at("depth_policy_utility_probes"),7);
+    EXPECT_EQ(doc.at("mtp").at("depth_policy_utility_keeps"),3);
+    EXPECT_EQ(doc.at("mtp").at("depth_policy_utility_returns"),2);
+}
+
+/** @test A committed verifier witness cannot absorb untraced direct output. */
+TEST(Test__BenchmarkRunnerCPU, PublicationV3CPUWitnessSeparatesVerifierProgressAndDirectOutputs)
+{
+    TerminalEvidencePolicyRestore restore;
+    ScopedEnv trace("LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE", "1");
+    ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+    ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+    ScopedTerminalEvidenceCollection collection(true);
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    auto runner=std::make_shared<MockDepthTransactionTraceRunner>();
+    BenchmarkRunner benchmark(runner,createMockTokenizer());
+    auto config=traceBenchmarkConfig();config.n_predict=3;
+    const auto result=benchmark.run(config);ASSERT_TRUE(result.success)<<result.failure_reason;
+    const auto doc=nlohmann::json::parse(benchmarkResultToJsonString(result,&config));
+    double general_output=0,verifier_output=0;std::uint64_t verifier_events=0,published_states=0,publication_events=0;
+    for(const auto &row:doc.at("perf_stats").at("records"))
+    {
+        if(row.at("domain")!="mtp")continue;
+        if(row.at("name")=="grouped_outcome_host_state_publications")
+        {
+            EXPECT_EQ(row.at("value"),row.at("count"));
+            EXPECT_EQ(row.at("tags").at("request_count"),"1");
+            EXPECT_EQ(row.at("tags").at("stopped_on_output"),"false");
+            const auto count=row.at("count").get<std::uint64_t>();
+            publication_events+=count;
+            published_states+=count*std::stoull(row.at("tags").at("accepted_state_count").get<std::string>());
+            continue;
+        }
+        if(row.at("name")!="output_tokens")continue;
+        general_output+=row.at("value").get<double>();
+        if(row.at("tags").value("source",std::string{})=="committed_host_mtp_transaction")
+        {
+            verifier_output+=row.at("value").get<double>();
+            verifier_events+=row.at("count").get<std::uint64_t>();
+        }
+    }
+    EXPECT_EQ(general_output,5); // General physical metric is unchanged.
+    EXPECT_EQ(verifier_output,3);EXPECT_EQ(verifier_events,1u);
+    EXPECT_EQ(published_states,2u);EXPECT_EQ(publication_events,1u);
+    EXPECT_EQ(doc.at("mtp").at("verifier_runs"),publication_events);
+    EXPECT_EQ(publication_events,verifier_events);EXPECT_NE(verifier_output,published_states);
+    EXPECT_NE(general_output,verifier_output); // Only this tagged value can author CPU terminal.emitted_tokens.
 }

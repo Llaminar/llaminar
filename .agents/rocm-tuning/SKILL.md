@@ -26,6 +26,12 @@ cannot isolate an asynchronous kernel, while profiler overhead and overlapping
 kernel intervals cannot be substituted for end-to-end throughput. Measure
 communication and overlap instead of assuming a fixed fraction of either.
 
+For isolated kernel work, follow the shared
+[production kernel replay procedure](../llaminar-testing/references/kernel-replay.md).
+It is the canonical correctness/timing method: retain the production graph and
+inputs, prove dirty reuse, then collect events and separate profiler evidence.
+Use the ROCm procedures below for exact-dispatch counters and ISA inspection.
+
 ## Production hot-path invariants
 
 ROCm kernel tuning must preserve the production execution architecture, not

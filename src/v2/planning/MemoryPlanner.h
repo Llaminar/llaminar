@@ -151,8 +151,13 @@ struct CapturedServingGraphMemoryInventory
     std::size_t fixed_executable_count = 0u;
     /** Closed main-query programs; numeric request visibility never changes this inventory. */
     std::size_t sparse_query_program_count = 1u;
+    /** Required family provenance is checked against each GPU's declared policy. */
+    MTPVerifierGraphFamily verifier_graph_family = MTPVerifierGraphFamily::BoundedBuckets;
+    /** Frozen complete generation boundary and actual parent ownership. */
+    std::optional<DeviceGenerationExecutionDomain> generation_domain;
+    MTPGenerationParentRole generation_parent_role = MTPGenerationParentRole::Controller;
     /** Canonical MTP helper/controller cache geometry and graph owners. */
-    MTPGraphOwnerPlan mtp_graph_owners{MTPRuntimeConfig{}};
+    MTPGraphOwnerPlan mtp_graph_owners{MTPRuntimeConfig{}, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller};
     /** Present only when the complete ordinary request program is retained. */
     std::optional<OrdinaryGenerationGraphPlan> ordinary_generation;
 
@@ -170,7 +175,13 @@ struct CapturedServingGraphMemoryInventory
  * @brief Resolve the exact ordinary serving-graph inventory retained at setup.
  * @param prefill_bucket_rows Configured captured-prefill bucket boundaries.
  * @param mtp Runtime execution and retained-capacity policy.
+ * @param family Required execution-owned verifier identities, shared with capture.
+ * @param parent_role Controller or pipeline follower owning the complete transactions.
+ * @param generation_domain Frozen boundary used by per-device ordinary auxiliary projection.
+ * @param query_programs Whole-main-model retained query execution programs.
  * @return Inventory consumed by @ref MemoryPlanner before graph construction.
+ * @throws std::invalid_argument For an unknown execution domain, retained family, parent role or query count.
+ * @throws std::overflow_error When retained model or auxiliary owner counts are not representable.
  *
  * The first request in a reusable model context may execute with MTP disabled
  * while reserving a wider graph family for later requests. Admission must
@@ -183,13 +194,19 @@ struct CapturedServingGraphMemoryInventory
 resolveCapturedServingGraphMemoryInventory(
     std::vector<int> prefill_bucket_rows,
     const MTPRuntimeConfig &mtp,
+    MTPVerifierGraphFamily family,
+    MTPGenerationParentRole parent_role,
+    DeviceGenerationExecutionDomain generation_domain,
     std::size_t query_programs = 1u)
 {
+    if (generation_domain != DeviceGenerationExecutionDomain::NativeDomain &&
+        generation_domain != DeviceGenerationExecutionDomain::HostedBoundary)
+        throw std::invalid_argument("Serving graph inventory has an unknown generation domain");
     if (query_programs == 0 || query_programs > kSparseQueryExecutionProgramCount)
         throw std::invalid_argument("Serving graph inventory has an unknown query-program family");
     const bool retains_mtp = retainsMTPGraphCapacity(mtp);
     const auto fixed = 1u + (retains_mtp ? 1u : 0u) +
-        resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp);
+        resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, family);
     if (fixed > std::numeric_limits<std::size_t>::max() / query_programs)
         throw std::overflow_error("Serving sparse-query native-owner inventory overflows");
     return CapturedServingGraphMemoryInventory{
@@ -197,7 +214,10 @@ resolveCapturedServingGraphMemoryInventory(
         .fixed_executable_count =
             query_programs * fixed,
         .sparse_query_program_count = query_programs,
-        .mtp_graph_owners = MTPGraphOwnerPlan(mtp, query_programs),
+        .verifier_graph_family = family,
+        .generation_domain = generation_domain,
+        .generation_parent_role = parent_role,
+        .mtp_graph_owners = MTPGraphOwnerPlan(mtp, family, parent_role, query_programs),
         .ordinary_generation = OrdinaryGenerationGraphPlan{},
     };
 }
@@ -306,6 +326,9 @@ struct DevicePlanConfig
      * installed by LocalTP; AUTO is invalid, not an alias for absence.
      */
     std::optional<CollectiveBackendType> local_tp_backend;
+
+    /** Exact PP parent ownership, independent of transport leadership and TP sharding. */
+    PipelineForwardOnlyGraphOwner pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::None;
 
     /** Native local PP lifecycle resources, independent of TP weight sharding. */
     std::optional<CollectiveBackendType> local_pipeline_backend;

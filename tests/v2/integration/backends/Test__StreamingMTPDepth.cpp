@@ -4,7 +4,8 @@
  *
  * CUDA and ROCm execute consecutive short response windows in one retained
  * graph, with no intermediate host observation or upload of learner state.
- * Immutable compact verifier outcomes are test inputs. Every terminal word and
+ * The canonical compact producer prepares immutable verifier outcomes before
+ * capture, including full-state publication and carried commit boundaries. Every terminal word and
  * emitted token is compared with the shared serial arithmetic oracle; separate
  * assertions prove windows actually accumulate and request reset is repeatable.
  */
@@ -97,6 +98,7 @@ TEST_P(StreamingMTPDepth, CapturedShortWindowsRetainDeviceLearning)
             ASSERT_TRUE(initialize_device_generation_dispatch_ticket(epoch, generation, &reference_ticket));
             int base = 23, transaction = 0, eligible_observations = 0;
             int next_token = 100, previous_condition = -1;
+            bool injected_boundary_rejection = false;
             for (int window = 0; window < windows; ++window) {
                 leading_rows[window] = window == 0 ? DeviceGenerationLeadingRowDisposition::PendingResponse
                     : static_cast<DeviceGenerationLeadingRowDisposition>(
@@ -115,32 +117,68 @@ TEST_P(StreamingMTPDepth, CapturedShortWindowsRetainDeviceLearning)
                         reference.data());
                     ASSERT_GT(budget, 0);
                     eligible_observations += budget == depth + 1 ? 1 : 0;
-                    const int output_count = std::min(depth + 1, remaining + leading);
                     const int row_index = transaction++;
                     ASSERT_LE(transaction, windows * capacity);
                     transaction_rows[window].push_back(row_index);
                     int *tokens = input.data() + row_index * input_stride;
-                    for (int row = 0; row < output_count; ++row)
-                        tokens[row] = row == 0 && leading ? previous_condition : next_token++;
                     int *meta = tokens + capacity;
-                    meta[kSpecBatchMetaOk] = 1;
-                    meta[kSpecBatchMetaOutputCount] = output_count;
-                    meta[kSpecBatchMetaLeadingCommittedOutputCount] = leading;
-                    meta[kSpecBatchMetaAcceptedSpeculativePrefix] = output_count - 1;
-                    meta[kSpecBatchMetaTargetVerifierStateCommitCount] =
-                        output_count == depth + 1 ? depth : output_count;
-                    meta[kSpecBatchMetaConsumedVerifierRows] = output_count - 1;
-                    meta[kSpecBatchMetaAllSpeculativeAccepted] = output_count == depth + 1 ? 1 : 0;
-                    meta[kSpecBatchMetaSampledTerminal] = output_count == depth + 1 ? 1 : 0;
-                    meta[kSpecBatchMetaCommitBoundaryClipped] = budget < depth + 1 ? 1 : 0;
-                    meta[kSpecBatchMetaReadyToken] = -1;
+                    std::array<int, capacity> target_tokens{}, acceptance{};
+                    acceptance.fill(1);
+                    // One real rejection at the first response's final full
+                    // transaction leaves a genuine already-emitted condition.
+                    // The next response consumes it without returning it twice;
+                    // subsequent all-full inputs retain healthy learned coverage.
+                    const bool inject_rejection = window == 0 && !injected_boundary_rejection &&
+                        remaining <= depth + 1;
+                    if (inject_rejection)
+                    {
+                        acceptance[0] = 0;
+                        injected_boundary_rejection = true;
+                    }
+                    const int first_token = previous_condition >= 0 ? previous_condition : next_token++;
+                    for (int row = 0; row < capacity; ++row)
+                        target_tokens[row] = next_token++;
+                    const int bonus_token = next_token++;
+                    // Full d acceptance publishes d+1 actual states. At the
+                    // response boundary the canonical producer shortens the
+                    // visible prefix and retains the exact sampled condition;
+                    // allocation capacity is never fabricated as live progress.
+                    summarize_speculative_verify_batch_at_commit_boundary(first_token,
+                        target_tokens.data(), acceptance.data(), depth, nullptr, 0,
+                        bonus_token, 1, budget, tokens, capacity, meta, nullptr, leading);
+                    ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
+                    if (budget == depth + 1)
+                    {
+                        EXPECT_EQ(meta[kSpecBatchMetaAcceptedSpeculativePrefix], inject_rejection ? 0 : depth);
+                        EXPECT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], inject_rejection ? 1 : depth + 1);
+                    }
                     tokens[input_stride - 1] = base;
                     const int prior_commits = reference[kDeviceGenerationControlPublishedStateCommitCount];
-                    ASSERT_TRUE(append_speculative_outcome_to_device_generation(tokens, capacity, meta,
-                        kSpeculativeBatchMetaCount, reference_response.data(), capacity, reference.data()));
-                    base += reference[kDeviceGenerationControlPublishedStateCommitCount] - prior_commits;
-                    previous_condition = tokens[output_count - 1];
+                    std::array<int, 7> reference_publication{};
+                    ASSERT_TRUE(commit_device_generation_and_derive_speculative_publication_metadata(
+                        tokens, capacity, meta, kSpeculativeBatchMetaCount, 0, capacity, base,
+                        reference_response.data(), capacity, reference.data(),
+                        reference_publication.data(), reference_publication.data() + 1,
+                        reference_publication.data() + 2, reference_publication.data() + 3,
+                        reference_publication.data() + 4, reference_publication.data() + 5,
+                        reference_publication.data() + 6));
+                    const int published = reference[kDeviceGenerationControlPublishedStateCommitCount] - prior_commits;
+                    EXPECT_EQ(reference[kDeviceGenerationControlLastTransactionEmittedTokenCount] + leading -
+                        reference[kDeviceGenerationControlNextLeadingCommittedOutputCount], published);
+                    if (budget == depth + 1)
+                        EXPECT_EQ(published, meta[kSpecBatchMetaAcceptedSpeculativePrefix] + 1);
+                    // Follow the real producer's next frontier, not the last
+                    // returned token: a full batch has an unreturned ready token.
+                    base = reference_publication[1];
+                    previous_condition = reference_publication[4];
                 }
+                if (window == 0)
+                {
+                    EXPECT_TRUE(injected_boundary_rejection);
+                    EXPECT_EQ(reference[kDeviceGenerationControlNextLeadingCommittedOutputCount], 1);
+                }
+                if (window == 1)
+                    EXPECT_EQ(leading_rows[window], DeviceGenerationLeadingRowDisposition::AlreadyEmitted);
                 EXPECT_EQ(validateDeviceGenerationTerminal(reference,
                     {.request_count = 1, .max_new_tokens = capacity, .depth_policy = policy,
                      .initial_leading_row_disposition = leading_rows[window]},

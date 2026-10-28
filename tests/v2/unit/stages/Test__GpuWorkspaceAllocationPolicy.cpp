@@ -1902,9 +1902,25 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         ++call_count;
         cursor += policy_call.size();
     }
-    EXPECT_EQ(call_count, 3u)
+    EXPECT_EQ(call_count, 4u)
         << "The graph-aware policy must have one definition plus exact calls "
-           "from initial sidecar capture and hosted replay.";
+           "from initial execution, cold chained materialization and hosted replay.";
+
+    const auto sidecar = sliceBetween(source,
+        "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
+        "bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
+    const auto cold = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        sidecar, "        if (materialize_only)\n        {",
+        "        if (mtpGraphReuseDiagnosticsEnabledForContext(sidecar_context))")));
+    EXPECT_NE(cold.find("buildDecodeCapturePolicyForGraph(*sidecar_cache.graph,"), std::string::npos)
+        << "Cold siblings must use the same graph-owned native envelope as live execution.";
+    EXPECT_NE(cold.find("*policy,&replay,submission)"), std::string::npos)
+        << "The native executor must receive the authenticated no-launch policy.";
+    EXPECT_NE(cold.find("returnsidecar_cache.segment_cache.initialized&&"), std::string::npos)
+        << "Cold preparation must return before execution diagnostics, leases and state publication.";
+    for (const char *operation : {"acquireReadLease", "recordShiftedMTPKVReady",
+             "recordDeviceResidentMTPTransactionMutation", "stageStochasticTargetToken"})
+        EXPECT_EQ(cold.find(operation), std::string::npos) << operation;
 
     const auto helper = sliceBetween(
         source,
@@ -3119,13 +3135,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
             "recordStochasticTargetSampleReady("),
         std::string::npos)
         << "The target slot must publish the exact scalar-kernel producer stream.";
+    // Cold capture records but does not execute model reads. Its explicit
+    // early return is guarded above; the live submission retains the original
+    // publication lease and producer/consumer event ordering.
+    const auto cold_begin = sidecar_executable.find("if (materialize_only)");
+    ASSERT_NE(cold_begin, std::string::npos);
+    const auto live_begin = sidecar_executable.find(
+        "if (mtpGraphReuseDiagnosticsEnabledForContext(sidecar_context))", cold_begin);
+    ASSERT_NE(live_begin, std::string::npos);
+    const auto live_sidecar_submission = sidecar_executable.substr(live_begin);
     expectNeedleBefore(
-        sidecar_executable,
+        live_sidecar_submission,
         "acquireReadLease",
         "sidecar_cache.graph->reset()",
-        "Every terminal-hidden sidecar must acquire the exact publication lease immediately before graph submission.");
+        "Every executing terminal-hidden sidecar must acquire the exact publication lease immediately before graph submission.");
     expectNeedleBefore(
-        sidecar_executable,
+        live_sidecar_submission,
         "sidecar_cache.graph->reset()",
         "stillOwns",
         "The common sidecar boundary must verify terminal-hidden ownership after submitting the graph read.");
@@ -4451,6 +4476,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTargetDistributionBuildPreservesDefe
         << "Draft distribution builds overwrite the sampled-token slot, so the clear must not preserve verifier-owned state.";
 }
 
+/** @test Sidecar event restamping preserves the original target's one history right. */
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarRestampsDeferredTargetTokenForVerifierConsumer)
 {
     const auto source =
@@ -4471,11 +4497,19 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarRestampsDeferredTargetTokenFo
      */
     EXPECT_NE(compact_sidecar.find("draft_condition_ready_is_target"),
               std::string::npos);
-    EXPECT_NE(
-        compact_sidecar.find(
-            "recordStochasticTargetSampleReady(draft_condition_ready_slot,sidecar_dynamic_stream)"),
+    const auto producer_wait = compact_sidecar.find(
+        "waitForRequiredStochasticTargetSampleReady(draft_condition_ready_slot,sidecar_dynamic_stream,");
+    const auto preserved_ready = compact_sidecar.find(
+        "recordStochasticTargetSampleReady(draft_condition_ready_slot,sidecar_dynamic_stream,false,StochasticTargetPublication::PreserveHistoryRight)");
+    ASSERT_NE(producer_wait, std::string::npos);
+    ASSERT_NE(preserved_ready, std::string::npos)
+        << "Sidecar restamping must retain the exact stream and existing history-consumer right.";
+    EXPECT_LT(producer_wait, preserved_ready)
+        << "Restamping follows the wait for the original sampler publication.";
+    EXPECT_EQ(compact_sidecar.find(
+        "recordStochasticTargetSampleReady(draft_condition_ready_slot,sidecar_dynamic_stream,false,StochasticTargetPublication::NewValue)"),
         std::string::npos)
-        << "Device-target sidecar staging must restamp the deferred first-token ready event for the verifier.";
+        << "Event-only sidecar staging cannot grant a second history write right.";
     EXPECT_EQ(
         compact_sidecar.find(
             "recordStochasticDraftSampleReady(draft_condition_ready_slot,sidecar_dynamic_stream)"),
@@ -4535,6 +4569,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
            "coordinated root.";
 }
 
+/** @test Exact target events grant new-value rights once while preserving verifier borrows. */
 TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifierOwnedSlots)
 {
     const auto header =
@@ -4557,6 +4592,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifie
         source,
         "void DeviceGraphOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled)",
         "void DeviceGraphOrchestrator::setMTPMainDecodeSyncDeferralEnabled(bool enabled)")));
+    const auto target_ready_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::recordStochasticTargetSampleReady(",
+        "bool DeviceGraphOrchestrator::beginPendingGpuTimingMeasurement(")));
     const auto greedy_first_token_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::sampleGreedyFromMainLogitsToDeviceTargetSlot(",
@@ -4596,9 +4635,32 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifie
               std::string::npos)
         << "All-position sync deferral cleanup should use preserving draft-slot cleanup.";
     EXPECT_NE(greedy_first_token_body.find(
-                  "recordStochasticTargetSampleReady(target_sample_slot,stream,out_token==nullptr)"),
+                  "recordStochasticTargetSampleReady(target_sample_slot,stream,out_token==nullptr,StochasticTargetPublication::NewValue)"),
               std::string::npos)
         << "Deferred greedy first-token sampling must mark the target slot as verifier-owned.";
+    EXPECT_NE(target_ready_body.find(
+        "publication==StochasticTargetPublication::NewValue?StochasticTargetHistoryRight::Available:ready.history_right"),
+        std::string::npos)
+        << "Only a real value producer grants a new right; event restamps retain Available or Consumed.";
+    EXPECT_NE(target_ready_body.find(
+        "publication==StochasticTargetPublication::PreserveHistoryRight&&(!ready.valid||ready.history_right==StochasticTargetHistoryRight::Absent)"),
+        std::string::npos)
+        << "Restamping must reject absent event/history authority.";
+    const auto exact_event = target_ready_body.find(
+        "backend->recordEvent(ready.event.get(),state_.device_id.gpu_ordinal(),producer_stream)");
+    const auto arena_publication = target_ready_body.find(
+        "publishPreparedArenaGraphInput(BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS,stochastic_target_sample_tokens_dev_,producer_stream,state_.device_id,");
+    const auto right_commit = target_ready_body.find("ready.history_right=history_right;");
+    ASSERT_NE(exact_event, std::string::npos);
+    ASSERT_NE(arena_publication, std::string::npos);
+    ASSERT_NE(right_commit, std::string::npos);
+    EXPECT_LT(exact_event, arena_publication);
+    EXPECT_LT(arena_publication, right_commit)
+        << "History rights become visible only after exact event and arena publication succeed.";
+    EXPECT_NE(target_ready_body.find(
+        "ready.producer_stream=producer_stream;ready.verifier_consumer_pending=ready.verifier_consumer_pending||verifier_consumer_pending;"),
+        std::string::npos)
+        << "The target event keeps its original stream and independent verifier borrow.";
     EXPECT_NE(set_verifier_plan_body.find("pending_mtp_verifier_device_token_plan_.reset()"),
               std::string::npos)
         << "Installing a verifier row plan must drop any stale token-row copy plan.";
@@ -6446,8 +6508,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         countOccurrences(
             arena_publication,
             "publishPreparedArenaGraphInput("),
-        3u)
-        << "The response ledger, controller, and dispatch ticket are one arena publication transaction.";
+        4u)
+        << "The three generation owners and the explicitly enabled diagnostic bank share the producer event.";
+    const auto compact_publication = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(arena_publication));
+    EXPECT_NE(compact_publication.find(
+        "if(mtp_depth_transaction_trace_dev_&&!publishPreparedArenaGraphInput("
+        "BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC,mtp_depth_transaction_trace_dev_,"
+        "producer_stream,state_.device_id,producer))returnfalse;"), std::string::npos)
+        << "The fourth publication is only the typed diagnostic bank on its exact producer stream.";
     EXPECT_NE(
         arena_publication.find("BufferId::MTP_GENERATION_RESPONSE_TOKENS"),
         std::string::npos);
@@ -6527,6 +6596,47 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "void *producer_stream) unrelated_token { return true; }", signature).empty());
     EXPECT_TRUE(generationPublicationDefinition(signature +
         "void *producer_stream; bool adjacent() {}", signature).empty());
+}
+
+/**
+ * @brief Bound diagnostic readback to one authenticated terminal caller.
+ *
+ * The ordinary result retains its two copies and one wait. An explicitly
+ * enabled finite trace needs a subsequent copy because the authenticated
+ * terminal transaction count determines its live extent. The diagnostic bank
+ * never becomes a host execution-state mirror or an inference synchronization.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPDepthTraceTerminalReadbackHasSingleOwner)
+{
+    const auto source = readFile(repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const std::string name = "observeMTPDepthTransactionTraceTerminal(";
+    const auto helper = generationPublicationDefinition(source,
+        "bool DeviceGraphOrchestrator::" + name);
+    const auto terminal = generationPublicationDefinition(source,
+        "bool DeviceGraphOrchestrator::finishDeviceResidentGeneration(");
+    ASSERT_FALSE(helper.empty());
+    ASSERT_FALSE(terminal.empty());
+    EXPECT_EQ(countOccurrences(source, name), 2u)
+        << "Only the definition and one terminal call may reference the diagnostic bridge.";
+    EXPECT_EQ(countOccurrences(terminal, name), 1u);
+    const auto authentication = terminal.find("validateDeviceGenerationTerminal(");
+    const auto observation = terminal.find(name);
+    ASSERT_NE(authentication, std::string::npos);
+    ASSERT_NE(observation, std::string::npos);
+    EXPECT_LT(authentication, observation);
+    const auto body = removeAsciiWhitespace(stripCommentsAndStringLiterals(helper));
+    EXPECT_NE(body.find("if(!mtp_depth_transaction_trace_dev_)returntrue;"), std::string::npos);
+    EXPECT_NE(body.find("!result_stream"), std::string::npos);
+    EXPECT_NE(body.find("validMTPDepthTransactionTraceAdmission("), std::string::npos);
+    EXPECT_NE(body.find("mtpDepthTransactionTraceBytes(records)"), std::string::npos);
+    EXPECT_NE(body.find("mtp_depth_transaction_trace_dev_,bytes,state_.device_id.gpu_ordinal(),result_stream)"),
+        std::string::npos);
+    EXPECT_EQ(countOccurrences(body, "deviceToHostOnStream("), 1u);
+    EXPECT_EQ(countOccurrences(body, "recordEvent("), 1u);
+    EXPECT_EQ(countOccurrences(body, "waitForEvent("), 1u);
+    for (const auto *forbidden : {"hostToDevice", "createStream(", "synchronizeStream(", "backend->allocate("})
+        EXPECT_EQ(body.find(forbidden), std::string::npos) << forbidden;
 }
 
 /**
@@ -6655,10 +6765,34 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         std::string::npos);
 
     EXPECT_EQ(countOccurrences(ticket_observation, "waitForEvent("), 1u);
-    EXPECT_NE(ticket_observation.find("matchesLifecycle("), std::string::npos);
-    EXPECT_NE(
-        ticket_observation.find(
-            "ticket.transaction_count==expected_transaction_count"),
+    // Authentication belongs to the typed cursor. Verify the observer delegates
+    // before accepting a ticket, then inspect that canonical method rather than
+    // requiring a second handwritten expression in the GPU orchestration layer.
+    const auto hosted_cursor_source = readFile(root /
+        "src/v2/execution/mtp/HostedDeviceGenerationLifecycle.h");
+    const auto typed_ticket_authentication = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(hosted_cursor_source,
+            "        [[nodiscard]] bool acceptsTicket(",
+            "        /** @return Whether a new ticket observation may be submitted. */")));
+    const auto typed_ticket_ordinal = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(hosted_cursor_source,
+            "        [[nodiscard]] bool acceptsTicketOrdinal(",
+            "        [[nodiscard]] bool acceptsTicket(")));
+    const auto typed_continuation_admission = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(hosted_cursor_source,
+            "        [[nodiscard]] bool armContinuationAdmission(",
+            "        /** @return Whether the next observation must read the native admission ticket directly. */")));
+    EXPECT_NE(ticket_observation.find("hosted_device_generation_cursor_.acceptsTicket(ticket,"),
+        std::string::npos);
+    EXPECT_NE(typed_ticket_authentication.find("ticket.matchesLifecycle(session_epoch,workspace_generation)"),
+        std::string::npos);
+    EXPECT_NE(typed_ticket_authentication.find("acceptsTicketOrdinal(ticket.transaction_count)"),
+        std::string::npos);
+    EXPECT_NE(typed_ticket_ordinal.find("admission_ticket_pending_?ordinal==0:"), std::string::npos);
+    EXPECT_NE(typed_ticket_ordinal.find("ordinal==last_transaction_count_+1"), std::string::npos);
+    EXPECT_NE(typed_continuation_admission.find("kind!=sampling_math::DeviceGenerationAdmissionKind::ContinueResponse"),
+        std::string::npos);
+    EXPECT_NE(typed_ticket_authentication.find("ticket.complete==0&&ticket.maintenance_due==0&&ticket.committed_output_tokens==0"),
         std::string::npos);
     EXPECT_NE(
         branch_submission.find("ticket.hasSameDispatchDecision("),
@@ -8151,6 +8285,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchedPrefillTerminalRowsStayDe
         << "The stage must dispatch the prompt-width-total device-geometry row-packing kernel.";
 }
 
+/** @test Fused outcome writes publish new target rights before the logical mailbox is consumable. */
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationMetadataStaysOnVerifierStream)
 {
     const auto source =
@@ -8280,12 +8415,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationMetadataSta
     EXPECT_EQ(compact_stage.find("hostToDevice"), std::string::npos);
 
     const auto canonical_ready = lifecycle_body.find(
-        "recordStochasticTargetSampleReady(request_index,request.outcome.stream,true)");
+        "recordStochasticTargetSampleReady(request_index,request.outcome.stream,true,StochasticTargetPublication::NewValue)");
+    const auto old_target_retired = lifecycle_body.find(
+        "clearStochasticTargetSampleReadySlot(request_index,StochasticSampleReadyClearMode::Force)");
     const auto logical_mailbox = lifecycle_body.find(
         "recordDeviceResidentLogicalSequenceStateMailbox(");
     ASSERT_NE(canonical_ready, std::string::npos)
         << "Finalization must publish the exact producer event for every refreshed target slot.";
+    ASSERT_NE(old_target_retired, std::string::npos);
     ASSERT_NE(logical_mailbox, std::string::npos);
+    EXPECT_LT(old_target_retired, canonical_ready)
+        << "A fused new target value retires its prior slot right before granting a new one.";
     EXPECT_LT(canonical_ready, logical_mailbox)
         << "The canonical verifier condition must be visible before the accepted "
            "logical-state mailbox becomes consumable.";
@@ -16947,6 +17087,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             decode_step_source,
             "const bool materialize_dynamic_generation_loop_this_step =",
             "if (!admitScalarDeviceResidentGeneration(")));
+    const auto pipeline_speculative = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            readFile(root / "src/v2/execution/local_execution/orchestrators/PipelineMTPDeviceGeneration.cpp"),
+            "bool PipelineDeviceGeneration::prepareSpeculativeParticipants(",
+            "bool PipelineDeviceGeneration::composeSpeculativeParticipants()")));
+    const auto pipeline_admission = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            readFile(root / "src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp"),
+            "bool PipelineDeviceGeneration::begin(",
+            "bool PipelineDeviceGeneration::prepareParticipants(")));
+    const auto declared_execution_policy = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "DeviceGraphOrchestrator::declaredDeviceGenerationExecutionPolicy()",
+            "DeviceGraphOrchestrator::deviceGenerationExecutionPolicy(")));
     const auto execution_policy = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             source,
@@ -16959,15 +17114,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "DeviceGraphOrchestrator::mtpAcceptedTerminalHiddenDeviceLoopGraphTemplate(")));
 
     EXPECT_NE(
-        execution_policy.find("hasHeterogeneousCollectiveExecutionDomain()"),
+        declared_execution_policy.find("hasHeterogeneousCollectiveExecutionDomain()"),
         std::string::npos)
-        << "Process-local CPU/GPU and cross-vendor overlays must select the "
-           "same hosted policy as their segmented decode graph.";
+        << "Process-local CPU/GPU and cross-vendor overlays must declare the "
+           "same hosted policy before graph admission and execution.";
     EXPECT_NE(
-        execution_policy.find("moe_overlay_inference_transaction_coordinator_"),
+        declared_execution_policy.find("generationExecutionDomain()"),
         std::string::npos)
-        << "A remote sparse participant is independently sufficient to require "
-           "hosted retained-transaction submission.";
+        << "Remote sparse participants must enter the immutable declaration "
+           "before the later coordinator object is installed.";
+    EXPECT_NE(execution_policy.find("declaredDeviceGenerationExecutionPolicy()"),
+        std::string::npos);
+    EXPECT_EQ(execution_policy.find("moe_overlay_inference_transaction_coordinator_"),
+        std::string::npos)
+        << "Late mutable coordinator availability cannot change the admitted graph family.";
     EXPECT_NE(
         verifier_pairing.find("deviceGenerationExecutionPolicy(topology)"),
         std::string::npos)
@@ -17101,17 +17261,38 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_NE(
         composer.find("loop.sampling_mode=sampling_mode"),
         std::string::npos);
+    const size_t branch_width = composer.find(
+        "branch_physical_rows=hosted_execution?transaction_depth+1:physical_verifier_rows_per_request;");
+    ASSERT_NE(branch_width, std::string::npos)
+        << "Hosted tickets select an exact retained row identity; native "
+           "conditional branches retain their admitted physical envelope.";
+    EXPECT_LT(branch_width, verifier_preparation);
+    EXPECT_NE(composer.find(
+        "mtpVerifierPreparationDeviceLoopGraphTemplate(request_count,branch_physical_rows"), std::string::npos);
     EXPECT_NE(
         composer.find(
-            "mtpAllPositionVerifierDeviceLoopGraphTemplate(request_count,physical_verifier_rows_per_request,sampling_mode"),
+            "mtpAllPositionVerifierDeviceLoopGraphTemplate(request_count,branch_physical_rows,sampling_mode"),
         std::string::npos)
-        << "The retained forward must authenticate the same sampling topology as its parent.";
+        << "The retained native forward must authenticate the parent's exact sampling topology and branch width.";
+    EXPECT_NE(composer.find("signature.seq_len!=branch_physical_rows"), std::string::npos);
+    EXPECT_NE(composer.find(
+        "signature.all_position_logit_rows!=request_count*branch_physical_rows"), std::string::npos);
+    EXPECT_NE(composer.find(
+        "expected_outcome_mode=sampling_mode==DeviceGenerationSamplingMode::Greedy?MTPVerifierOutcomeGraphMode::Greedy:MTPVerifierOutcomeGraphMode::Disabled;"),
+        std::string::npos);
+    EXPECT_NE(composer.find("signature.mtp_verifier_outcome_graph_mode!=expected_outcome_mode"), std::string::npos)
+        << "Hosted forwards must authenticate the same greedy/stochastic law as their parent.";
+    EXPECT_NE(composer.find(
+        "mtpStochasticTargetDistributionDeviceLoopGraphTemplate(branch_physical_rows"), std::string::npos);
+    EXPECT_NE(composer.find(
+        "mtpStochasticOutcomeDeviceLoopGraphTemplate(request_count,hosted_execution?branch_physical_rows-1:draft_depth"),
+        std::string::npos);
     EXPECT_NE(
         composer.find(
-            "mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(request_count,physical_verifier_rows_per_request"),
+            "mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(request_count,branch_physical_rows"),
         std::string::npos)
-        << "Accepted-state publication must consume the verifier graph's "
-           "physical padded width, not the smaller logical draft width.";
+        << "Preparation, model, stochastic outcome and accepted-state publication "
+           "must consume the same physical branch width.";
 
     const std::array<const char *, 18> forbidden = {
         "cudaMalloc",
@@ -17237,12 +17418,70 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         dynamic_parent_admission.find(
             "use_grouped_outcome_device_resident_publication_verifier"),
         std::string::npos);
-    EXPECT_EQ(
+    EXPECT_NE(dynamic_parent_admission.find(
+        "hosted_dynamic_continuation=isHostedDynamicMTPContinuation(mtp);"), std::string::npos);
+    EXPECT_NE(dynamic_parent_admission.find(
+        "requested_speculative_draft_count=hosted_dynamic_continuation?0:currentMTPDraftDepth(mtp);"), std::string::npos)
+        << "A retained hosted continuation takes its first exact width from "
+           "the device admission ticket, never from the dormant host learner.";
+    EXPECT_NE(
         dynamic_parent_admission.find(
-            "generation_execution_policy==DeviceGenerationExecutionPolicy::NativeConditionalGraph"),
+            "transaction_draft_capacity=hosted_dynamic_continuation?effectiveMTPMaxDraftDepth(mtp):materialize_dynamic_generation_loop_this_step&&generation_execution_policy==DeviceGenerationExecutionPolicy::NativeConditionalGraph?effectiveMTPMaxDraftDepth(mtp):requested_speculative_draft_count;"),
         std::string::npos)
-        << "Dynamic graph-family capture applies equally to native CUDA and "
-           "ticket-scheduled HIP execution.";
+        << "Native conditional capture admits its maximum envelope, while a "
+           "hosted continuation uses that capacity only for response admission. "
+           "Its model work must enter the retained family through ticket zero.";
+    const auto continuation_prepare = decode_step_text.find(
+        "runner_->prepareDeviceResidentGenerationContinuation(mode)");
+    const auto continuation_finish = decode_step_text.find(
+        "DeviceGenerationFirstTransaction::AdmissionTicket");
+    ASSERT_NE(continuation_prepare, std::string::npos);
+    ASSERT_NE(continuation_finish, std::string::npos);
+    EXPECT_LT(continuation_prepare, continuation_finish);
+    EXPECT_NE(dynamic_parent_admission.find(
+        "transaction_draft_capacity<requested_speculative_draft_count"), std::string::npos)
+        << "Neither initial-width policy may narrow below the admitted request depth.";
+    // A continued response may carry a pending correction whose host token is
+    // diagnostic only. Require an authenticated resident scalar when the ready
+    // or newly sampled target slot was not already staged by the common setup.
+    const auto continuation_entry = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            decode_step_source,
+            "        if (hosted_dynamic_continuation)\n        {\n            const auto mode",
+            "        std::optional<PrefixStateSnapshot> verifier_replay_base_checkpoint;")));
+    const auto continuation_target_guard = continuation_entry.find(
+        "if(!first_token_device_target_slot_available)");
+    const auto continuation_resident_stage = continuation_entry.find(
+        "publishDeviceResidentConditionTokenToTargetSampleSlot(*first_token_resident_state,");
+    const auto continuation_target_prepare = continuation_entry.find(
+        "prepareDeviceResidentGenerationContinuation(mode)");
+    ASSERT_NE(continuation_target_guard, std::string::npos);
+    ASSERT_NE(continuation_resident_stage, std::string::npos);
+    ASSERT_NE(continuation_target_prepare, std::string::npos);
+    EXPECT_LT(continuation_target_guard, continuation_resident_stage);
+    EXPECT_LT(continuation_resident_stage, continuation_target_prepare);
+    EXPECT_NE(continuation_entry.find("!first_token_resident_state.has_value()"), std::string::npos);
+    EXPECT_NE(continuation_entry.find("!first_token_resident_state->coversRequest(0)"), std::string::npos);
+    EXPECT_NE(continuation_entry.find("returnfail_after_checkpoint("), std::string::npos);
+    EXPECT_EQ(continuation_entry.find("publishForcedDeviceResidentConditionToken("), std::string::npos);
+    EXPECT_EQ(continuation_entry.find("materializeDeviceResidentGeneration("), std::string::npos);
+
+    EXPECT_NE(pipeline_speculative.find(
+        "constauto&tail_admission=stages_[terminalIndex()]->active_device_generation_admission_;"), std::string::npos);
+    EXPECT_NE(pipeline_speculative.find("if(!tail_admission)"), std::string::npos);
+    EXPECT_NE(pipeline_speculative.find("constauto&policy=tail_admission->depth_policy;"), std::string::npos)
+        << "Follower bounds borrow the terminal's immutable policy; they never own a second sampler/controller admission.";
+    EXPECT_EQ(pipeline_speculative.find("stage.active_device_generation_admission_"), std::string::npos);
+    EXPECT_NE(pipeline_speculative.find(
+        "loop.minimum_draft_depth=policy.mode==sampling_math::DeviceGenerationPolicyMode::Dynamic?policy.minimum_depth:policy.initial_depth;"),
+        std::string::npos);
+    EXPECT_NE(pipeline_speculative.find(
+        "loop.maximum_draft_depth=policy.mode==sampling_math::DeviceGenerationPolicyMode::Dynamic?policy.maximum_depth:policy.initial_depth;"),
+        std::string::npos);
+    EXPECT_NE(pipeline_admission.find("domains_.back().runner->beginDeviceResidentGeneration(request)"), std::string::npos);
+    EXPECT_NE(pipeline_admission.find("stage.active_device_generation_admission_||"), std::string::npos)
+        << "Follower admission must continue rejecting a controller shadow.";
+    EXPECT_EQ(pipeline_admission.find("stage.active_device_generation_admission_="), std::string::npos);
     EXPECT_EQ(
         dynamic_parent_admission.find("primaryDeviceId().is_cuda()"),
         std::string::npos)

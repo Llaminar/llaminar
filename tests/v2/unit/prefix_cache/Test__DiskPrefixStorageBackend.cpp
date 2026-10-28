@@ -24,6 +24,7 @@
 #include <cmath>
 #include <bit>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 
@@ -344,6 +345,76 @@ namespace
             std::move(admission), 0);
     }
 } // namespace
+
+/**
+ * @test Produce a retired archive through the actual current writer for the independent audit.
+ *
+ * With no export option this remains an ordinary small device-free native case.
+ * The explicit preflight qualifier supplies an empty owned directory, runs only
+ * this case, then observes journal metadata and payload inode extents in Python.
+ * No fixture payload is read back or hashed by that audit. The native writer's
+ * real put/touch/capacity-eviction path, including nonempty runtime state, prevents
+ * an authored old-format fixture from silently certifying a changed writer.
+ */
+TEST(Test__DiskPrefixStorageBackend, MetadataAuditCurrentWriterProducesRetiredArchive)
+{
+    const char *const export_directory = std::getenv("LLAMINAR_TEST_PREFIX_METADATA_AUDIT_DIRECTORY");
+    const bool exported = export_directory && export_directory[0] != '\0';
+    const auto directory = exported ? std::filesystem::path(export_directory) : tempDir();
+    if (exported)
+    {
+        ASSERT_TRUE(directory.is_absolute());
+        ASSERT_FALSE(std::filesystem::is_symlink(directory));
+        ASSERT_TRUE(std::filesystem::is_directory(directory));
+        ASSERT_TRUE(std::filesystem::is_empty(directory));
+    }
+    struct Cleanup
+    {
+        std::filesystem::path directory;
+        bool retained;
+        /** @brief Qualifier owns exported evidence; ordinary Unit owns temporary cleanup. */
+        ~Cleanup()
+        {
+            if (!retained) { std::error_code ignored; std::filesystem::remove_all(directory, ignored); }
+        }
+    } cleanup{directory, exported};
+    const auto layout = makeLayout();
+    RamPrefixStorageBackend ram(256u);
+    auto a = ram.allocate(testKey(), layout);
+    auto b = ram.allocate(makePrefixCacheKey(0x12345678, 0, 1, 2, {3, 4}), layout);
+    ASSERT_TRUE(a.valid());
+    ASSERT_TRUE(b.valid());
+    ASSERT_TRUE(ram.attachModelRuntimeState(&a, std::make_shared<std::vector<uint8_t>>(8u, 0x18)));
+    ASSERT_TRUE(ram.attachModelRuntimeState(&b, std::make_shared<std::vector<uint8_t>>(8u, 0x29)));
+    ASSERT_EQ(a.total_bytes, b.total_bytes);
+    for (const auto *handle : {&a, &b})
+    {
+        std::fill_n(static_cast<uint8_t *>(handle->kv_payload), handle->kvBytes(), uint8_t{0x31});
+        std::fill_n(static_cast<uint8_t *>(handle->terminal_logits), handle->terminalLogitsBytes(), uint8_t{0x42});
+    }
+    const auto budget = a.total_bytes;
+    {
+        DiskPrefixStorageBackend disk(archivePath(directory), budget, kModelArtifactIdentity);
+        ASSERT_TRUE(disk.ready()) << disk.initializationError();
+        PrefixBlockHandle stored;
+        std::string error;
+        ASSERT_TRUE(disk.writeBlock(a, &stored, nullptr, &error)) << error;
+        ASSERT_TRUE(disk.writeBlock(a, &stored, nullptr, &error)) << error; // Actual metadata-only touch.
+        ASSERT_TRUE(disk.writeBlock(b, &stored, nullptr, &error)) << error; // Actual capacity retirement of a.
+        ASSERT_TRUE(disk.writeBlock(b, &stored, nullptr, &error)) << error;
+        ASSERT_TRUE(disk.waitForCompaction(&error)) << error;
+        const auto usage = disk.telemetry()->snapshot();
+        EXPECT_EQ(usage.entries, 1u);
+        EXPECT_EQ(usage.used_bytes, budget);
+    } // Join native writer/maintenance before the independent auditor may open metadata.
+    std::ofstream metadata(directory / "native-writer-fixture.json");
+    ASSERT_TRUE(metadata);
+    metadata << nlohmann::json{{"schema", "llaminar.test.prefix_archive_native_fixture.v1"},
+        {"budget_bytes", budget}, {"expected_entries", 1u}, {"expected_payload_bytes", budget},
+        {"model_artifact_identity", kModelArtifactIdentity}}.dump() << '\n';
+    metadata.flush();
+    ASSERT_TRUE(metadata);
+}
 
 /** @brief Archive-owned gauges survive restart; counters distinguish writes, touches, selected reads and evictions. */
 TEST(Test__DiskPrefixStorageBackend, TelemetryOccupancyTrafficAndRestart)

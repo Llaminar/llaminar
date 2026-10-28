@@ -31,12 +31,40 @@ from generation_movement_ledger import MovementLedgerObserver, MovementRequireme
 from production_artifacts import write_json
 
 
+class GenerationWaitPolicy(str, Enum):
+    """Explicit lifetime authority; canonical CI remains a bounded sequence.
+
+    Local diagnostics may wait for natural completion without a generation
+    deadline. Readiness, operator cancellation and owned exceptional retirement
+    remain the outer lifecycle owner's responsibility.
+    """
+
+    CI_BOUNDED = "ci_bounded"
+    LOCAL_UNBOUNDED = "local_unbounded"
+
+    def deadline(self, started: float) -> float | None:
+        """Keep the existing 600-second CI allowance or declare no deadline."""
+        return started + 600 if self is GenerationWaitPolicy.CI_BOUNDED else None
+
+
+def generation_wait_remaining(deadline: float | None) -> float | None:
+    """Return an HTTP socket allowance, rejecting an expired finite sequence."""
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("generation request sequence exceeded the exact-cell watchdog")
+    return remaining
+
+
 class MTPPolicy(str, Enum):
     """Exact producer-owned policy; names and CLI strings are never parsed."""
     OFF = "off"
     DEPTH1 = "depth_1"
     DEPTH2 = "depth_2"
     DEPTH3 = "depth_3"
+    DEPTH5 = "depth_5"
+    DEPTH6 = "depth_6"
     DEPTH15 = "depth_15"
     DYNAMIC = "dynamic"
 
@@ -328,7 +356,7 @@ def validate_prefix_outcome(profile: dict, request: dict, response: dict, trace:
             raise ValueError("MTP full prefix request did not restore terminal hidden state")
 
 
-def post_completion(base_url: str, body: dict, timeout: float) -> dict:
+def post_completion(base_url: str, body: dict, timeout: float | None) -> dict:
     """Send exactly one public request; never retry or extend a short completion."""
     request = urllib.request.Request(base_url.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
@@ -372,19 +400,23 @@ def validate_mtp_outcome(profile: dict, response: dict) -> None:
         raise ValueError("terminal MTP depth policy differs from the canonical cell")
     if dynamic and mtp["depth_policy_updates"] == 0:
         raise ValueError("dynamic MTP request did not observe a completed depth-policy update")
-    fixed_depths = {MTPPolicy.DEPTH1: 1, MTPPolicy.DEPTH2: 2, MTPPolicy.DEPTH3: 3, MTPPolicy.DEPTH15: 15}
+    fixed_depths = {MTPPolicy.DEPTH1: 1, MTPPolicy.DEPTH2: 2, MTPPolicy.DEPTH3: 3,
+                    MTPPolicy.DEPTH5: 5, MTPPolicy.DEPTH6: 6, MTPPolicy.DEPTH15: 15}
     if not dynamic and any(mtp[name] != fixed_depths[policy] for name in ("min_depth", "current_depth", "max_depth")):
         raise ValueError("fixed MTP request did not execute its named draft depth")
 
 
 def run_probes(record: dict, base_url: str, output: Path, expected: dict | None = None,
-               *, expected_tokens: dict | None = None) -> dict:
-    """Collect or compare an entire ordered workload within one bounded session.
+               *, expected_tokens: dict | None = None,
+               wait_policy: GenerationWaitPolicy = GenerationWaitPolicy.CI_BOUNDED) -> dict:
+    """Collect or compare one ordered workload under its explicit lifetime policy.
 
     All observations remain diagnostic until the outer campaign authenticates
     independent numerical provenance and full path/ledger evidence. Even a
     successful serial comparison cannot issue an image certificate here.
     """
+    if not isinstance(wait_policy, GenerationWaitPolicy):
+        raise ValueError("An explicit typed generation wait policy is required")
     profile = generation_profile(record)
     if expected is not None and expected_tokens is not None:
         raise ValueError("generation requires exactly one expected-token authority")
@@ -399,14 +431,12 @@ def run_probes(record: dict, base_url: str, output: Path, expected: dict | None 
               "certification_eligible": False, "repeatability_passed": False,
               "serial_comparison_passed": False if controls else None, "requests": []}
     started = time.monotonic()
-    deadline = started + 600
+    deadline = wait_policy.deadline(started)
     repeated = {}
     traces = []
     try:
         for request in profile["requests"]:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("generation request sequence exceeded the exact-cell watchdog")
+            remaining = generation_wait_remaining(deadline)
             before = time.monotonic()
             response = post_completion(base_url, request["body"], remaining)
             row = {"id": request["id"], "body": request["body"], "response": response,
@@ -452,13 +482,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--configuration", type=Path, required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--local-unbounded-generation", action="store_true",
+                        help="Local diagnostic only: natural generation has no deadline; CI default remains600s")
     expected = parser.add_mutually_exclusive_group()
     expected.add_argument("--control", type=Path)
     expected.add_argument("--expected-tokens", type=Path)
     args = parser.parse_args(argv)
     run_probes(json.loads(args.configuration.read_text()), args.base_url, args.output,
                json.loads(args.control.read_text()) if args.control else None,
-               expected_tokens=json.loads(args.expected_tokens.read_text()) if args.expected_tokens else None)
+               expected_tokens=json.loads(args.expected_tokens.read_text()) if args.expected_tokens else None,
+               wait_policy=(GenerationWaitPolicy.LOCAL_UNBOUNDED if args.local_unbounded_generation
+                            else GenerationWaitPolicy.CI_BOUNDED))
     return 0
 
 

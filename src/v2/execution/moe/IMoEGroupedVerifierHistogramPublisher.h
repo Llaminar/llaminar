@@ -103,9 +103,12 @@ namespace llaminar2
          * @brief Admit the exact accepted-state producer before graph capture.
          *
          * The stream must equal @ref groupedVerifierHistogramPublicationStream.
-         * Model setup has already allocated its reusable events and installed
-         * the initialization edge, so this call is an allocation-free identity
-         * certification at the enclosing graph's `prepareGraphLaunch()` edge.
+         * Model setup has already allocated reusable events and installed the
+         * initialization edge. The enclosing graph's `prepareGraphLaunch()`
+         * resolves its graph-owned kernel object before capture; it must not
+         * execute the verifier or bind the verifier's separate compute stream.
+         * Enqueue consumes that prepared object through an explicit publication
+         * launch context and may neither allocate nor acquire a compute binding.
          *
          * @param producer_stream Exact non-null CUDA/HIP capture/replay stream.
          * @return true when the producer identity is permanently admitted.

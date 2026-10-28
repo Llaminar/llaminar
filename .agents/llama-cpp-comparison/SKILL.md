@@ -54,6 +54,11 @@ For GEMM dispatch work also use
 [MTP tuning](../mtp-tuning/SKILL.md). Never adopt a baseline's precision or
 non-invariant reduction merely to match its timing.
 
+Use the canonical [production kernel replay procedure](../llaminar-testing/references/kernel-replay.md)
+to isolate a paired deficit with fixed inputs/routes and complete operation
+boundaries. Its captured timings and byte checks guide tuning; the matched
+cross-engine model comparison remains the acceptance evidence.
+
 Profile one exact candidate/shape per launch, outside canonical timing. Then
 repeat the fixed Release benchmark, preferably A/B/A or interleaved repetitions,
 and compare token identities and memory BOM as well as throughput. Retain a

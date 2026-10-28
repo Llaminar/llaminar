@@ -16,6 +16,9 @@
  * Request regressions additionally enter real sparse generation after setup,
  * reset and prefix reuse. Every stage must receive the root's request identity;
  * successful weight preparation alone cannot prove that lifecycle publication.
+ * Cold one-token responses must leave no hidden stream-binding prerequisite.
+ * Exact-width follower families are authenticated by width and may materialize
+ * once only; cache reset and prefix restore must reuse that same topology.
  */
 #include "../../../utils/PlanningGGUFFixture.h"
 #include "../../../utils/ServingGGUFFixturePayload.h"
@@ -27,6 +30,7 @@
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
 #include "execution/runner/OrchestrationRunner.h"
+#include "execution/mtp/MTPGraphOwnerPlan.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "planning/PhysicalMemoryAuthority.h"
@@ -35,6 +39,7 @@
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayNoPeerResidency.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <charconv>
 #include <map>
 #include <set>
@@ -552,6 +557,51 @@ namespace
         sampling.seed = 123;
         runner.setSamplingParams(sampling);
         runner.setStopTokens({});
+        // This fixture has one full-attention query program. Resolve the active
+        // model-selected policy while retaining the authored physical capacity;
+        // the automatic CLI activation sentinel is not the admitted MTP policy.
+        const auto admitted_mtp = composeMTPRequestConfig(config.mtp, runner.mtpRequestPolicy());
+        using FollowerMaterializationKey = std::tuple<std::string, std::string, std::string, std::string>;
+        std::map<FollowerMaterializationKey, double> expected_follower_materializations;
+        if (test.lane != MTPLane::Disabled)
+        {
+            const auto policy = test.first_cuda && test.last_cuda && test.width == 1
+                ? DeviceGenerationExecutionPolicy::NativeConditionalGraph
+                : DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions;
+            const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(policy));
+            const MTPGraphOwnerPlan owners(admitted_mtp, family, MTPGenerationParentRole::PipelineFollower);
+            for (int member = 0; member < test.width; ++member)
+            {
+                const auto device = (test.first_cuda ? DeviceId::cuda(member) : DeviceId::rocm(member)).toString();
+                if (policy == DeviceGenerationExecutionPolicy::NativeConditionalGraph)
+                    expected_follower_materializations[{device, deviceGenerationExecutionPolicyName(policy), "", ""}] = 1;
+                else
+                    for (size_t width = 0; width < owners.generationParentWidthCount(); ++width)
+                    {
+                        const int rows = mtpVerifierGraphFamilyWidthAt(width,
+                            owners.verifierRowsPerRequest(), family);
+                        expected_follower_materializations[{device, deviceGenerationExecutionPolicyName(policy),
+                            "exact_rows", std::to_string(rows)}] = 1;
+                    }
+            }
+        }
+        const auto follower_materializations = [](const char *name = "pipeline_mtp_follower_graph_materializations")
+        {
+            std::map<FollowerMaterializationKey, double> result;
+            for (const auto &record : PerfStatsCollector::snapshot())
+                if (record.domain == "generation" && record.name == name)
+                {
+                    EXPECT_EQ(record.kind, PerfStatRecord::Kind::Counter);
+                    EXPECT_EQ(record.phase, "graph_setup");
+                    const auto tag = [&](const char *name)
+                    {
+                        const auto value = record.tags.find(name);
+                        return value == record.tags.end() ? std::string{} : value->second;
+                    };
+                    result[{record.device, tag("execution"), tag("family"), tag("physical_rows")}] += record.value;
+                }
+            return result;
+        };
         std::vector<int32_t> prompt(96);
         for (size_t i = 0; i < prompt.size(); ++i)
             prompt[i] = 11 + static_cast<int32_t>(i);
@@ -560,9 +610,12 @@ namespace
             SCOPED_TRACE(::testing::Message() << "request=" << request);
             if (request != 0)
             {
+                EXPECT_EQ(follower_materializations(), expected_follower_materializations);
                 const double before = publications();
                 runner.clearCache();
                 ASSERT_EQ(publications(), before + 1);
+                EXPECT_EQ(follower_materializations(), expected_follower_materializations)
+                    << "Reset must publish new data without rebuilding any follower width";
             }
             if (request == 2) prompt.push_back(137);
             ASSERT_TRUE(runner.prefill(prompt)) << runner.lastError();
@@ -579,6 +632,10 @@ namespace
                 // maintenance policy before admitting the next outer step.
                 ASSERT_TRUE(runner.maybeApplyMoERebalance(result.tokens.size())) << runner.lastError();
             }
+            // The first budget deliberately remains one: no eager verifier
+            // warmup may supply a stream to a later cold exact-width child.
+            EXPECT_EQ(follower_materializations(), expected_follower_materializations)
+                << "Every admitted follower width must materialize exactly once across reset/prefix reuse";
             const auto summary = runner.requestRuntimeSummary();
             ASSERT_TRUE(summary.prefix_request.enabled);
             ASSERT_FALSE(summary.prefix_request.bypassed) << summary.prefix_request.bypass_reason;
@@ -594,6 +651,7 @@ namespace
                     test.lane == MTPLane::Fixed ? "fixed" : "dynamic");
             }
         }
+        const auto follower_reuses = follower_materializations("pipeline_mtp_follower_graph_reuses");
         const auto records = PerfStatsCollector::snapshot();
         double bridges = 0;
         for (const auto &record : records)
@@ -656,8 +714,26 @@ namespace
                     EXPECT_EQ(native_launches,0) << device;
                 }
                 EXPECT_GE(count("pipeline_mtp_follower_graph_reuses"), 2) << device;
-                EXPECT_EQ(count("pipeline_mtp_follower_graph_materializations"), 1) << device;
-                EXPECT_EQ(materializations_for_policy,1) << device;
+                const auto expected_count = std::count_if(expected_follower_materializations.begin(),
+                    expected_follower_materializations.end(), [&](const auto &entry)
+                    { return std::get<0>(entry.first) == device; });
+                EXPECT_EQ(count("pipeline_mtp_follower_graph_materializations"), expected_count) << device;
+                EXPECT_EQ(materializations_for_policy, expected_count) << device;
+                if (policy == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions)
+                {
+                    size_t reused_widths = 0;
+                    for (const auto &[key, value] : follower_reuses)
+                        if (std::get<0>(key) == device)
+                        {
+                            ++reused_widths;
+                            EXPECT_TRUE(expected_follower_materializations.contains(key))
+                                << "Reuse must name an admitted exact-width complete parent on " << device;
+                            EXPECT_GE(value, 2)
+                                << "Each retained width must reuse across both request resets on " << device
+                                << " rows=" << std::get<3>(key);
+                        }
+                    EXPECT_EQ(reused_widths, expected_count) << device;
+                }
             }
         }
         runner.shutdown();

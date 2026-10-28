@@ -10,6 +10,11 @@ kernel and geometry, collect counters without contaminating canonical timing,
 inspect the hot instructions, change one hypothesis, then repeat the focused
 and end-to-end correctness/economy gates.
 
+Use the shared [production kernel replay procedure](../llaminar-testing/references/kernel-replay.md)
+for fixed inputs/routes, dirty-buffer correctness and paired timing. On CPU,
+replay the production call with retained storage and explicit ISA/team/NUMA
+placement; GPU capture and native-event requirements do not apply.
+
 ## Preserve the execution contract
 
 - Keep hot-path state host-owned and persistent. Do not add allocation,

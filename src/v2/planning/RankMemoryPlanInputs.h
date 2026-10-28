@@ -10,6 +10,7 @@
 #pragma once
 
 #include "planning/MemoryPlanner.h"
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "loaders/GPUVramPreflight.h"
@@ -63,6 +64,17 @@ namespace llaminar2
      */
     [[nodiscard]] ImmutableRowTableTPTopology immutableRowTableTPTopology(
         const ModelMemoryProfile &profile,const RankExecutionPlan &plan);
+
+    /**
+     * @brief Project actual rank TP/PP/domain membership into one immutable boundary.
+     * @param plan Authored rank and complete local pipeline/domain participants.
+     * @return Native domain for one backend, hosted boundary for mixed members.
+     *
+     * Inventory-only devices are excluded. Remote GlobalPP MTP has no complete
+     * captured generation implementation and is not introduced by this projection.
+     */
+    [[nodiscard]] DeviceGenerationExecutionDomain declaredRankDeviceGenerationDomain(
+        const RankExecutionPlan &plan);
 
     /** @brief Immutable observations and execution policies for one rank BOM. */
     struct RankMemoryPlanInputRequest

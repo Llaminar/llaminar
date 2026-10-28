@@ -9,6 +9,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstdint>
+#include <utility>
 #include <array>
 #include <optional>
 #include <stdexcept>
@@ -26,6 +28,10 @@
 #include "execution/mtp/MTPDeviceGenerationPolicy.h"
 #include "execution/mtp/MTPDepthController.h"
 #include "execution/mtp/MTPRequestSamplingPolicy.h"
+#include "execution/mtp/MTPModelClassPolicy.h"
+#include "../../mocks/MockModelContext.h"
+#include "../models/qwen4exp/Qwen4ExpMetadataFixture.h"
+#include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "models/GraphTypes.h"
 #include "utils/DebugEnv.h"
@@ -130,6 +136,8 @@ TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
     EXPECT_EQ(config.mtp.depth_policy.max_depth, 0);
     EXPECT_EQ(config.mtp.depth_policy.initial_depth, 0);
+    EXPECT_TRUE(config.mtp.depth_policy.use_generated_policy)
+        << "Public Dynamic defaults must select the installed scope-owned controller without a debug override";
     EXPECT_EQ(config.mtp.depth_policy.window_size, 16);
     EXPECT_EQ(config.mtp.depth_policy.min_samples, 4);
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 8);
@@ -320,9 +328,16 @@ TEST(Test__PrefixMTPConfig, LearnedMTPWindowsAgreeAcrossExecutionOwners)
         ASSERT_TRUE(initialize_device_generation_control(1024, 1024, device_policy, device.data()));
         for (int step = 0; step < 16; ++step)
         {
+            MTPPublicationWitness publication;
+            ASSERT_TRUE(MTPPublicationWitness::fromCounts(
+                accepted + 1 + (accepted < depth ? 1 : 0), 0, accepted + 1, false, &publication));
             host.recordStep({.requested_depth = depth, .effective_depth = depth,
-                .accepted_speculative_prefix = accepted, .rollback = accepted < depth});
-            ASSERT_TRUE(record_device_generation_depth_observation(accepted, accepted < depth, false, device.data()));
+                .accepted_speculative_prefix = accepted, .rollback = accepted < depth,
+                .newly_emitted_tokens = publication.newlyEmittedTokens(), .publication = publication});
+            device[kDeviceGenerationControlLastTransactionEmittedTokenCount] =
+                static_cast<int>(publication.newlyEmittedTokens());
+            ASSERT_TRUE(record_device_generation_depth_observation(
+                accepted, accepted < depth, false, device.data(), publication));
         }
         const auto reason = host.lastDecision().reason;
         if (reason == MTPDepthDecisionReason::GeneratedPolicyHold ||
@@ -363,7 +378,11 @@ TEST(Test__PrefixMTPConfig, LearnedMTPHoldsAreNotMissingRecommendations)
         std::array<int, kDeviceGenerationControlCount> device{};
         ASSERT_TRUE(initialize_device_generation_control(1024, 1024,
             resolveMTPDeviceGenerationDepthPolicy(config), device.data()));
-        ASSERT_TRUE(record_device_generation_depth_observation(policy.initial_depth, false, false, device.data()));
+        MTPPublicationWitness publication;
+        ASSERT_TRUE(MTPPublicationWitness::fromCounts(4, 0, 4, false, &publication));
+        device[kDeviceGenerationControlLastTransactionEmittedTokenCount] = 4;
+        ASSERT_TRUE(record_device_generation_depth_observation(
+            policy.initial_depth, false, false, device.data(), publication));
         EXPECT_EQ(device[kDeviceGenerationControlCurrentDraftDepth], policy.initial_depth + (generated ? 0 : 1));
         EXPECT_EQ(device[kDeviceGenerationControlLearnedDepthMatchedWindows], generated ? 1 : 0);
     }
@@ -710,7 +729,7 @@ TEST(Test__PrefixMTPConfig, DisabledExecutionMayRetainMTPGraphCapacity)
     EXPECT_FALSE(mtp.enabled)
         << "retained setup capacity must never select an execution policy";
 
-    const MTPGraphOwnerPlan owner_plan(mtp);
+    const MTPGraphOwnerPlan owner_plan(mtp, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
     EXPECT_TRUE(owner_plan.retainsGraphCapacity());
     EXPECT_EQ(owner_plan.draftDepth(), 15);
     EXPECT_EQ(owner_plan.requestCapacity(), 1);
@@ -720,9 +739,10 @@ TEST(Test__PrefixMTPConfig, DisabledExecutionMayRetainMTPGraphCapacity)
     EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 35u);
     EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 15u);
     EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 32u);
-    EXPECT_EQ(owner_plan.controllerGraphSlots(), 4u);
-    EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 107u);
-    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
+    EXPECT_EQ(owner_plan.directTokenHistoryGraphSlots(), 1u);
+    EXPECT_EQ(owner_plan.controllerGraphSlots(), 5u);
+    EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 108u);
+    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 83u);
     EXPECT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
 }
 
@@ -736,9 +756,10 @@ TEST(Test__PrefixMTPConfig, HelperGraphAdmissionTracksRequestScaledVerifierShape
             MTPRuntimeConfig config;
             config.graph_capacity_draft_tokens = depth;
             config.max_request_batch = requests;
-            const MTPGraphOwnerPlan plan(config);
+            const MTPGraphOwnerPlan plan(config, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
             size_t expected_helpers = plan.terminalHiddenGraphSlots() +
-                                      plan.draftPublicationGraphSlots();
+                                      plan.draftPublicationGraphSlots() +
+                                      plan.directTokenHistoryGraphSlots();
             for (int shape_requests = 1; shape_requests <= requests; ++shape_requests)
             {
                 const auto executable_class =
@@ -757,7 +778,7 @@ TEST(Test__PrefixMTPConfig, HelperGraphAdmissionTracksRequestScaledVerifierShape
     }
     EXPECT_THROW((void)MTPGraphOwnerPlan::verifierPreparationExecutableClass(0),
                  std::invalid_argument);
-    EXPECT_EQ(MTPGraphOwnerPlan(MTPRuntimeConfig{}).boundedHelperExecutableSlotCount(), 0u);
+    EXPECT_EQ(MTPGraphOwnerPlan(MTPRuntimeConfig{}, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller).boundedHelperExecutableSlotCount(), 0u);
 }
 
 TEST(Test__PrefixMTPConfig,
@@ -918,7 +939,7 @@ TEST(Test__PrefixMTPConfig,
     mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
     mtp.max_request_batch = 2;
 
-    const MTPGraphOwnerPlan owner_plan(mtp);
+    const MTPGraphOwnerPlan owner_plan(mtp, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
     EXPECT_EQ(owner_plan.draftDepth(), 3);
     EXPECT_EQ(owner_plan.requestCapacity(), 2);
     EXPECT_EQ(owner_plan.verifierRowsPerRequest(), 4);
@@ -935,7 +956,7 @@ TEST(Test__PrefixMTPConfig,
     EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 29u);
     EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 6u);
     EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 16u);
-    EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 68u);
+    EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 69u);
 }
 
 TEST(Test__PrefixMTPConfig,
@@ -944,8 +965,9 @@ TEST(Test__PrefixMTPConfig,
     MTPRuntimeConfig mtp;
     mtp.enabled = false;
 
-    const MTPGraphOwnerPlan owner_plan(mtp);
+    const MTPGraphOwnerPlan owner_plan(mtp, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
     EXPECT_FALSE(owner_plan.retainsGraphCapacity());
+    EXPECT_EQ(owner_plan.directTokenHistoryGraphSlots(), 0u);
     EXPECT_EQ(owner_plan.stochasticTargetRows(), 4);
     EXPECT_EQ(owner_plan.stochasticDraftRows(), 3);
     EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 0u);
@@ -1309,4 +1331,220 @@ TEST(Test__PrefixMTPConfig, ShapeDependentForwardPoliciesRequireEagerFamilyManif
         RoutedExpertPlacementTopology::TieredOverlay;
     EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest())
         << "Tiered overlay startup must resolve every participant's initial prepared bank";
+}
+
+
+namespace
+{
+    /** @brief Borrow a synthetic loaded directory without files, weights, or hardware. */
+    class MTPMetadataContext final : public llaminar2::test::MockModelContext
+    {
+    public:
+        /** @brief Keep the caller-owned immutable directory alive for this test scope. */
+        explicit MTPMetadataContext(const GGUFModel *directory) : directory_(directory)
+        {
+            if (directory_) setArchitecture(directory_->architecture);
+        }
+        /** @return The same original metadata borrow exposed by production ModelContext. */
+        const GGUFModel *ggufDirectory() const noexcept override { return directory_; }
+    private:
+        const GGUFModel *directory_;
+    };
+}
+
+/** @test Model capabilities, including names with misleading substrings, select the trained class. */
+TEST(Test__PrefixMTPConfig, MTPModelClassUsesLoadedExpertGeometry)
+{
+    auto qfn = llaminar2::test::qwen4MetadataFixture();
+    MTPMetadataContext context(&qfn);
+    GraphConfig canonical;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qfn, canonical);
+    ASSERT_TRUE(canonical.isMoE());
+    ASSERT_EQ(canonical.moe.num_experts, 512);
+    ASSERT_EQ(canonical.moe.top_k, 10);
+    EXPECT_EQ(resolveMTPDepthPolicyModelClass(&context), MTPDepthPolicyModelClass::MoE);
+
+    GGUFModel misleading;
+    misleading.architecture = "looks_like_moe_but_is_dense";
+    MTPMetadataContext dense(&misleading);
+    EXPECT_EQ(resolveMTPDepthPolicyModelClass(&dense), MTPDepthPolicyModelClass::Dense);
+    misleading.architecture = "ordinary_dense_transformer";
+    EXPECT_EQ(resolveMTPDepthPolicyModelClass(&dense), MTPDepthPolicyModelClass::Dense);
+    for (const auto suffix : {"expert_count", "expert_used_count"})
+        misleading.metadata[misleading.architecture + "." + suffix] =
+            llaminar2::test::qwen4Scalar(GGUFValueType::UINT64, uint64_t{0});
+    EXPECT_EQ(resolveMTPDepthPolicyModelClass(&dense), MTPDepthPolicyModelClass::Dense);
+
+    GGUFModel unnamed_moe;
+    unnamed_moe.architecture = "plain_transformer";
+    unnamed_moe.metadata["plain_transformer.expert_count"] =
+        llaminar2::test::qwen4Scalar(GGUFValueType::UINT64, uint64_t{512});
+    unnamed_moe.metadata["plain_transformer.expert_used_count"] =
+        llaminar2::test::qwen4Scalar(GGUFValueType::UINT32, uint32_t{10});
+    MTPMetadataContext routed(&unnamed_moe);
+    EXPECT_EQ(resolveMTPDepthPolicyModelClass(&routed), MTPDepthPolicyModelClass::MoE);
+}
+
+/** @test An explicitly absent model is untrained; present malformed source metadata never becomes Dense. */
+TEST(Test__PrefixMTPConfig, MTPModelClassRejectsIncompleteAndInvalidContext)
+{
+    EXPECT_EQ(resolveMTPDepthPolicyModelClass(nullptr), MTPDepthPolicyModelClass::Any);
+    MTPMetadataContext absent_directory(nullptr);
+    EXPECT_THROW((void)resolveMTPDepthPolicyModelClass(&absent_directory), std::invalid_argument);
+    GGUFModel empty;
+    MTPMetadataContext empty_context(&empty);
+    EXPECT_THROW((void)resolveMTPDepthPolicyModelClass(&empty_context), std::invalid_argument);
+
+    const auto original = llaminar2::test::qwen4MetadataFixture();
+    for (const auto suffix : {"expert_count", "expert_used_count"})
+    {
+        auto partial = original;
+        partial.metadata.erase(std::string("qwen4exp.") + suffix);
+        MTPMetadataContext context(&partial);
+        EXPECT_THROW((void)resolveMTPDepthPolicyModelClass(&context), std::invalid_argument);
+    }
+    for (const auto counts : {std::pair{0u, 10u}, std::pair{512u, 0u}, std::pair{512u, 513u}})
+    {
+        auto invalid = original;
+        invalid.metadata["qwen4exp.expert_count"] = llaminar2::test::qwen4Scalar(GGUFValueType::UINT32, counts.first);
+        invalid.metadata["qwen4exp.expert_used_count"] = llaminar2::test::qwen4Scalar(GGUFValueType::UINT32, counts.second);
+        MTPMetadataContext context(&invalid);
+        EXPECT_THROW((void)resolveMTPDepthPolicyModelClass(&context), std::invalid_argument);
+    }
+    for (const auto value : {
+             llaminar2::test::qwen4Scalar(GGUFValueType::INT32, int32_t{-1}),
+             llaminar2::test::qwen4Scalar(GGUFValueType::FLOAT32, 512.0f),
+             GGUFValue{.type = GGUFValueType::UINT32, .data = {1, 2}}})
+    {
+        auto invalid = original;
+        invalid.metadata["qwen4exp.expert_count"] = value;
+        MTPMetadataContext context(&invalid);
+        EXPECT_THROW((void)resolveMTPDepthPolicyModelClass(&context), std::invalid_argument);
+    }
+}
+
+/** @test Real metadata admission preserves authored policy and feeds identical host/device startup decisions. */
+TEST(Test__PrefixMTPConfig, MTPModelClassAdmissionPreservesPolicyAndSharesHostDeviceResolver)
+{
+    const auto qfn = llaminar2::test::qwen4MetadataFixture();
+    MTPMetadataContext context(&qfn);
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto sampling : {SamplingParams{.temperature = 0.0f},
+                               SamplingParams{.temperature = 0.7f, .top_k = 40, .top_p = 0.9f}})
+    for (const int ceiling : {3, 15})
+    for (const int initial : {0, 1, 3})
+    for (const bool generated : {false, true})
+    {
+        MTPRuntimeConfig retained;
+        retained.enabled = true;
+        retained.draft_tokens = 3;
+        retained.graph_capacity_draft_tokens = ceiling;
+        retained.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        retained.depth_policy.min_depth = 1;
+        retained.depth_policy.max_depth = ceiling;
+        retained.depth_policy.initial_depth = initial;
+        retained.depth_policy.use_generated_policy = generated;
+        retained.depth_policy.window_size = 19;
+        retained.depth_policy.min_samples = 5;
+        retained.depth_policy.cooldown_steps = 2;
+        retained.depth_policy.promote_consecutive_windows = 4;
+        retained.depth_policy.demote_zero_accept_rate = 0.31;
+        retained.depth_policy.demote_acceptance_rate = 0.57;
+        const auto requested = makeMTPRequestPolicy(retained);
+        const auto unbound = resolveMTPSamplingRequestConfig(retained, requested, sampling);
+        const auto active = resolveMTPRequestDepthPolicyContext(unbound, device, &context);
+        auto expected = unbound;
+        expected.depth_policy.backend = device.is_cuda() ? MTPDepthPolicyBackend::CUDA
+            : device.is_rocm() ? MTPDepthPolicyBackend::ROCm : MTPDepthPolicyBackend::CPU;
+        expected.depth_policy.model_class = MTPDepthPolicyModelClass::MoE;
+        OrchestrationConfig actual_document, expected_document;
+        actual_document.mtp = active;
+        expected_document.mtp = expected;
+        EXPECT_EQ(serializeOrchestrationConfig(actual_document), serializeOrchestrationConfig(expected_document));
+        EXPECT_EQ(retained.depth_policy.initial_depth, initial);
+        EXPECT_EQ(requested.depth_policy.initial_depth, initial);
+
+        MTPDepthController host(resolveMTPDepthPolicyConfig(active), active.draft_tokens, active.verify_mode);
+        const auto device_policy = resolveMTPDeviceGenerationDepthPolicy(active);
+        ASSERT_TRUE(device_policy.valid());
+        EXPECT_EQ(device_policy.learned.model_class, MTPDepthPolicyModelClass::MoE);
+        EXPECT_EQ(device_policy.initial_depth, host.currentDepth());
+        EXPECT_EQ(device_policy.minimum_depth, host.minDepth());
+        EXPECT_EQ(device_policy.maximum_depth, host.maxDepth());
+        EXPECT_EQ(device_policy.maximum_depth, ceiling);
+        if (initial > 0)
+            EXPECT_EQ(device_policy.initial_depth, initial);
+        else if (generated && device.is_rocm())
+            EXPECT_EQ(device_policy.initial_depth, 3) << "Both greedy and stochastic QFN requests use their MoE startup";
+    }
+}
+
+
+/** @test QFN geometry selects the MoE acceptance threshold while greedy automatic startup stays at three. */
+TEST(Test__PrefixMTPConfig, MTPModelClassAdmissionSelectsMoEThresholds)
+{
+    const auto qfn = llaminar2::test::qwen4MetadataFixture();
+    MTPMetadataContext context(&qfn);
+    MTPRuntimeConfig authored;
+    authored.enabled = true;
+    authored.verify_mode = MTPVerifyMode::Greedy;
+    authored.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    authored.depth_policy.max_depth = 3;
+    authored.graph_capacity_draft_tokens = 3;
+    const auto active = resolveMTPRequestDepthPolicyContext(authored, DeviceId::rocm(0), &context);
+    const auto device = resolveMTPDeviceGenerationDepthPolicy(active);
+    ASSERT_EQ(device.initial_depth, 3);
+    const MTPLearnedDepthWindow window{.attempted = 100, .accepted = 85, .runs = 50,
+                                      .zero_accepts = 0, .full_accepts = 35};
+    const auto moe = matchMTPLearnedDepthPolicy(device.learned, 2, window);
+    EXPECT_TRUE(moe.matched);
+    EXPECT_EQ(moe.depth_delta, 1);
+    auto dense_context = device.learned;
+    dense_context.model_class = MTPDepthPolicyModelClass::Dense;
+    EXPECT_FALSE(matchMTPLearnedDepthPolicy(dense_context, 2, window).matched);
+}
+
+TEST(Test__PrefixMTPConfig, LearnedScopeAdmissionAuthenticatesEveryFrozenScalar)
+{
+    using namespace sampling_math;
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 3;
+    mtp.graph_capacity_draft_tokens = 15;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    mtp.depth_policy.backend = MTPDepthPolicyBackend::ROCm;
+    mtp.depth_policy.model_class = MTPDepthPolicyModelClass::MoE;
+    mtp.depth_policy.initial_depth = 3;
+    mtp.depth_policy.min_depth = 1;
+    mtp.depth_policy.max_depth = 15;
+    mtp.depth_policy.scope = {MTPVerifierPhysicalWidthPolicy::ExactLogicalRows,
+                             4, 1, 15, 2048, 40, 256, 8, 90, 6};
+    const auto policy = resolveMTPDeviceGenerationDepthPolicy(mtp);
+    EXPECT_EQ(policy.learned.scope, mtp.depth_policy.scope);
+    EXPECT_TRUE(policy.valid());
+    std::array<int, kDeviceGenerationControlCount> control{};
+    ASSERT_TRUE(initialize_device_generation_control(128, 128, policy, control.data()));
+    ASSERT_TRUE(device_generation_policy_matches(control.data(), policy));
+    const std::array scope_words{
+        kDeviceGenerationControlLearnedScopeWidthPolicy,
+        kDeviceGenerationControlLearnedScopeTPWidth,
+        kDeviceGenerationControlLearnedScopePPStages,
+        kDeviceGenerationControlLearnedScopeRetainedDepth,
+        kDeviceGenerationControlLearnedScopeHiddenDim,
+        kDeviceGenerationControlLearnedScopeMainLayers,
+        kDeviceGenerationControlLearnedScopeExpertCount,
+        kDeviceGenerationControlLearnedScopeExpertsPerToken,
+        kDeviceGenerationControlLearnedScopeComputeCapabilityMajor,
+        kDeviceGenerationControlLearnedScopeComputeCapabilityMinor};
+    for (const auto word : scope_words)
+    {
+        auto stale = control;
+        ++stale[word];
+        EXPECT_FALSE(device_generation_policy_matches(stale.data(), policy));
+    }
+    // Request selectors cannot author or smuggle immutable scope over the MPI wire.
+    auto request = makeMTPRequestPolicy(mtp);
+    EXPECT_EQ(request.depth_policy.scope, MTPDepthPolicyScope{});
+    request.depth_policy.scope = mtp.depth_policy.scope;
+    EXPECT_TRUE(validateMTPRequestPolicy(request, mtp).has_value());
 }

@@ -54,7 +54,16 @@ TEST_P(PipelineMTPStateOwnership, RankMTPConditionAdvancesEveryCapturedParticipa
             input.max_seq_len = input.activation_seq_len = 64;
             input.mtp_enabled = true;
             input.mtp_target_query_rows = 16;
-            input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory({32}, mtp);
+            const auto execution = declaredDeviceGenerationExecutionPolicy(
+                input.device.type, DeviceGenerationExecutionDomain::NativeDomain);
+            const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(execution));
+            input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+                {32},
+                mtp,
+                family,
+                input.first_layer + 1 == participants
+                    ? MTPGenerationParentRole::Controller : MTPGenerationParentRole::PipelineFollower,
+                DeviceGenerationExecutionDomain::NativeDomain);
             input.local_pipeline_backend = cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
             memory_inputs.push_back(input);
         }
@@ -256,7 +265,16 @@ void PipelineMTPStateOwnership::runPublicMTPStreamingProof(MTPDepthPolicyMode mo
         input.max_seq_len = input.activation_seq_len = 512;
         input.mtp_enabled = true;
         input.mtp_target_query_rows = 16;
-        input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory({256}, mtp);
+        const auto execution = declaredDeviceGenerationExecutionPolicy(
+            input.device.type, DeviceGenerationExecutionDomain::NativeDomain);
+        const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(execution));
+        input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+            {256},
+            mtp,
+            family,
+            input.first_layer == 1
+                ? MTPGenerationParentRole::Controller : MTPGenerationParentRole::PipelineFollower,
+            DeviceGenerationExecutionDomain::NativeDomain);
         input.local_pipeline_backend = cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
         memory_inputs.push_back(input);
     }

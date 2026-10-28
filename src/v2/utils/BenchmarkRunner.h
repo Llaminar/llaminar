@@ -30,6 +30,8 @@
 #include <vector>
 #include <chrono>
 #include <functional>
+#include <optional>
+#include <utility>
 
 namespace llaminar2
 {
@@ -84,6 +86,28 @@ namespace llaminar2
      * @throws std::runtime_error for file I/O or SHA-256 failures.
      */
     ResolvedBenchmarkPrompt resolveBenchmarkPrompt(const OrchestrationConfig &config);
+
+    /**
+     * @brief Immutable prompt bytes and their one canonical tokenizer result.
+     * Benchmark campaigns prepare each natural prompt once before their first
+     * request. Only BenchmarkRunner may construct this value; replay never
+     * rereads an input file or substitutes another tokenization.
+     */
+    class PreparedBenchmarkInput final
+    {
+    public:
+        /** @return Exact immutable prompt origin, bytes and SHA-256. */
+        const ResolvedBenchmarkPrompt &prompt() const noexcept { return prompt_; }
+        /** @return Exact natural token IDs, including their original order. */
+        const std::vector<int> &tokenIds() const noexcept { return tokens_; }
+    private:
+        friend class BenchmarkRunner;
+        /** @brief Seal an already validated tokenizer result with its source. */
+        PreparedBenchmarkInput(ResolvedBenchmarkPrompt prompt, std::vector<int> tokens)
+            : prompt_(std::move(prompt)), tokens_(std::move(tokens)) {}
+        ResolvedBenchmarkPrompt prompt_;
+        std::vector<int> tokens_;
+    };
 
     /**
      * @brief Inter-step overhead profiling data from the decode loop.
@@ -220,6 +244,7 @@ namespace llaminar2
         std::string prompt_file_path; ///< Source path when `prompt_source == File`.
         size_t prompt_bytes = 0;      ///< Exact byte count before tokenization.
         std::string prompt_sha256;    ///< SHA-256 of the exact pre-tokenization bytes.
+        std::vector<int> prompt_token_ids; ///< Exact once-tokenized natural input; never inferred from output tokens.
 
         // Prefill phase
         int prefill_tokens = 0;              ///< Number of tokens in prefill
@@ -322,6 +347,22 @@ namespace llaminar2
         BenchmarkResult run(const OrchestrationConfig &config);
 
         /**
+         * @brief Resolve/tokenize an immutable input without executing inference.
+         * @param config Exact prompt source; all bytes remain significant.
+         * @return Sealed prompt and nonempty natural token sequence.
+         * @throws std::runtime_error For unreadable/empty/failed tokenizer input.
+         */
+        PreparedBenchmarkInput prepareInput(const OrchestrationConfig &config) const;
+
+        /**
+         * @brief Run the same production timing path with a previously sealed input.
+         * @param config Exact request sampling/MTP/decode policy.
+         * @param input Once-tokenized immutable natural prompt.
+         * @return Ordinary BenchmarkResult with the exact input token IDs.
+         */
+        BenchmarkResult run(const OrchestrationConfig &config, const PreparedBenchmarkInput &input);
+
+        /**
          * @brief Print benchmark results in a formatted table
          * @param result Benchmark results to print
          */
@@ -340,6 +381,9 @@ namespace llaminar2
         void setDecodeStepCallback(std::function<void()> cb) { decode_step_cb_ = std::move(cb); }
 
     private:
+        /** @brief Shared timing implementation; preparation never changes the inference path. */
+        BenchmarkResult runImpl(const OrchestrationConfig &config,
+            std::optional<std::reference_wrapper<const PreparedBenchmarkInput>> input);
         std::shared_ptr<IInferenceRunner> runner_;
         std::shared_ptr<ITokenizer> tokenizer_;
         std::function<void()> post_warmup_cb_;

@@ -74,7 +74,14 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryPipelineHasOneTailResponseOwner)
                 input.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
                 input.prefix_cache.ram_budget_bytes = 4u << 20;
                 input.prefix_cache.device_budget_bytes = input.prefix_cache.disk_budget_bytes = 0;
-                input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory({256, 512}, {});
+                input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+                    {256, 512},
+                    {},
+                    resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(declaredDeviceGenerationExecutionPolicy(
+                    input.device.type, DeviceGenerationExecutionDomain::NativeDomain))),
+                    input.first_layer + 1 == participant_count
+                        ? MTPGenerationParentRole::Controller : MTPGenerationParentRole::PipelineFollower,
+                    DeviceGenerationExecutionDomain::NativeDomain);
                 memory_inputs.push_back(input);
             }
             auto memory = std::make_shared<PhysicalMemoryAuthority>(
@@ -642,7 +649,14 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryPipelineForwardOnlyPreservesPendingTea
                 input.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
                 input.prefix_cache.ram_budget_bytes = 4u << 20;
                 input.prefix_cache.device_budget_bytes = input.prefix_cache.disk_budget_bytes = 0;
-                input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory({256, 512}, {});
+                input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+                    {256, 512},
+                    {},
+                    resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(declaredDeviceGenerationExecutionPolicy(
+                    input.device.type, DeviceGenerationExecutionDomain::NativeDomain))),
+                    input.first_layer + 1 == participant_count
+                        ? MTPGenerationParentRole::Controller : MTPGenerationParentRole::PipelineFollower,
+                    DeviceGenerationExecutionDomain::NativeDomain);
                 memory_inputs.push_back(input);
             }
             auto memory = std::make_shared<PhysicalMemoryAuthority>(

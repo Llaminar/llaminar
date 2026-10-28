@@ -3524,17 +3524,36 @@ def _preflight_name_regex(names: tuple[str, ...]) -> str:
     return "^(" + "|".join(re.escape(name) for name in names) + ")$"
 
 
+def _preflight_test_phase_completed(return_code: int) -> bool:
+    """Distinguish completed CTest failures from unsafe infrastructure exits.
+
+    CTest's dedicated test-failure exit8 still represents a completed test
+    command. It must not hide later independent failures. Timeout/cancellation,
+    signals, launch exceptions and other error codes stop ownership admission.
+    This helper is never used to forgive a prerequisite build failure.
+    """
+    return return_code in (0, 8)
+
+
+def _preflight_merge_test_phase_return_codes(prior: int, observed: int) -> int:
+    """Keep the first observed fatal; later cancellation cannot hide its cause."""
+    if not _preflight_test_phase_completed(prior):
+        return prior
+    if not _preflight_test_phase_completed(observed):
+        return observed
+    return prior if prior != 0 else observed
+
+
 def _run_preflight_parallel_processes(
     commands: dict[PreflightExecutionLane, list[str]],
     timeout_seconds: float | None,
 ) -> dict[PreflightExecutionLane, int]:
-    """Run disjoint preflight lanes and retire sibling MPI trees on failure.
+    """Collect both completed test lanes; retire siblings on infrastructure failure.
 
-    This is intentionally narrower than the campaign scheduler: it admits only
-    the two single-rank accelerator lanes after their typed planner assigned
-    disjoint CPU packages. A red or transaction deadline tears down both exact
-    process groups immediately, so a failed CUDA test cannot leave ROCm work
-    running past the gate's terminal transition.
+    Only the two typed single-rank lanes may overlap on disjoint CPU packages.
+    Ordinary CTest8 retains the peer's independent failure evidence. Launch or
+    ownership exceptions, abnormal exits and transaction deadlines still retire
+    the exact process groups before another ownership lane can start.
     """
 
     if set(commands) != {
@@ -3544,14 +3563,15 @@ def _run_preflight_parallel_processes(
         raise ValueError("parallel preflight requires exactly CUDA and ROCm socket lanes")
     if timeout_seconds is not None and timeout_seconds <= 0.0:
         return {lane: 124 for lane in commands}
-    processes = {
-        lane: subprocess.Popen(command, start_new_session=True)
-        for lane, command in commands.items()
-    }
+    # Publish each owner inside the retirement scope: a second launch failure
+    # must not strand the already started first process group.
+    processes = {}
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     results: dict[PreflightExecutionLane, int] = {}
     failed = False
     try:
+        for lane, command in commands.items():
+            processes[lane] = subprocess.Popen(command, start_new_session=True)
         while len(results) != len(processes):
             for lane, process in processes.items():
                 if lane in results:
@@ -3560,7 +3580,7 @@ def _run_preflight_parallel_processes(
                 if return_code is None:
                     continue
                 results[lane] = return_code
-                failed = failed or return_code != 0
+                failed = failed or not _preflight_test_phase_completed(return_code)
             if failed:
                 for lane, process in processes.items():
                     if lane not in results and process.poll() is None:
@@ -3748,7 +3768,7 @@ def run_production_test_preflight(
         f"test_count={len(unit_tests)} elapsed_seconds={unit_elapsed:.3f}",
         flush=True,
     )
-    if return_code != 0:
+    if not _preflight_test_phase_completed(return_code):
         elapsed = time.monotonic() - started
         print(
             "[production-parity] preflight_status=FAIL "
@@ -3757,6 +3777,8 @@ def run_production_test_preflight(
             flush=True,
         )
         return complete(return_code, elapsed)
+
+    unit_return_code = return_code
 
     execution_plan = preflight_execution_plan(integration_registrations)
     planned_names = tuple(
@@ -3835,7 +3857,7 @@ def run_production_test_preflight(
         PreflightExecutionLane.HOST,
         execution_plan[PreflightExecutionLane.HOST],
     )
-    if return_code == 0:
+    if _preflight_test_phase_completed(return_code):
         cuda_names = execution_plan[PreflightExecutionLane.CUDA_SOCKET]
         rocm_names = execution_plan[PreflightExecutionLane.ROCM_SOCKET]
         cpu_sets = preflight_accelerator_cpu_sets()
@@ -3883,10 +3905,8 @@ def run_production_test_preflight(
                     f"elapsed_seconds={parallel_elapsed:.3f}",
                     flush=True,
                 )
-            return_code = next(
-                (code for code in parallel_results.values() if code != 0),
-                0,
-            )
+            for lane_code in parallel_results.values():
+                return_code = _preflight_merge_test_phase_return_codes(return_code, lane_code)
         else:
             # A one-package host cannot safely give two MPI launchers
             # disjoint worker capacity. The complete typed plan is still
@@ -3895,14 +3915,16 @@ def run_production_test_preflight(
                 PreflightExecutionLane.CUDA_SOCKET,
                 PreflightExecutionLane.ROCM_SOCKET,
             ):
-                return_code, _ = run_integration_lane(lane, execution_plan[lane])
-                if return_code != 0:
+                lane_code, _ = run_integration_lane(lane, execution_plan[lane])
+                return_code = _preflight_merge_test_phase_return_codes(return_code, lane_code)
+                if not _preflight_test_phase_completed(lane_code):
                     break
-    if return_code == 0:
-        return_code, _ = run_integration_lane(
+    if _preflight_test_phase_completed(return_code):
+        exclusive_code, _ = run_integration_lane(
             PreflightExecutionLane.EXCLUSIVE,
             execution_plan[PreflightExecutionLane.EXCLUSIVE],
         )
+        return_code = _preflight_merge_test_phase_return_codes(return_code, exclusive_code)
     integration_elapsed = time.monotonic() - integration_started
     elapsed = time.monotonic() - started
     print(
@@ -3911,6 +3933,7 @@ def run_production_test_preflight(
         f"test_count={len(integration_tests)} elapsed_seconds={integration_elapsed:.3f}",
         flush=True,
     )
+    return_code = _preflight_merge_test_phase_return_codes(unit_return_code, return_code)
     print(
         "[production-parity] preflight_status="
         f"{'PASS' if return_code == 0 else 'FAIL'} "

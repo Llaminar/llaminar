@@ -415,6 +415,8 @@ namespace llaminar2
         // =========================================================================
 
         bool benchmark_mode = false;            ///< Run benchmark.
+        std::string benchmark_campaign_path; ///< Strict ordered request campaign over one admitted runtime.
+        bool benchmark_campaign_was_provided = false; ///< Rejects an explicitly empty campaign path.
         std::string benchmark_json_output_path; ///< Optional machine-readable benchmark JSON output path.
         std::string benchmark_prompt_file_path; ///< Exact benchmark prompt bytes loaded from this text file.
         bool benchmark_prompt_file_was_provided = false; ///< Distinguishes omission from `--prompt-file ""`.

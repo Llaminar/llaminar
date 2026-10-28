@@ -275,9 +275,14 @@ namespace llaminar2
         child.devices = stage.stage_devices;
         child.weights = stage.tp_weights;
         child.backend = stage.tp_backend;
+        DeviceGenerationDomainDeclaration generation_domain;
+        for (const auto &participant_stage : pp_stages)
+            for (const auto &member : participant_stage.stage_devices)
+                generation_domain.observe(member.device_type);
         child.nested_pp_stage_config = FactoryPPStageConfig{
             .first_layer = stage.first_layer, .last_layer = stage.last_layer,
-            .has_embedding = stage.has_embedding, .has_lm_head = stage.has_lm_head};
+            .has_embedding = stage.has_embedding, .has_lm_head = stage.has_lm_head,
+            .generation_domain = generation_domain.domain()};
         if (stage.moe_runtime)
         {
             stage.moe_runtime->requireDestination(*child.nested_pp_stage_config,

@@ -176,6 +176,15 @@ namespace
     class MockInferenceRunner : public IInferenceRunner
     {
     public:
+        /** @brief Device-source operations observed by forced-boundary regressions. */
+        enum class MTPForceDeviceOperation
+        {
+            ResidentToTarget, HistoryAlreadyPublished, ResidentShiftedCommit,
+            TargetMainAdvance, ForcedTargetStage, HistoryNewlyEmitted, TargetShiftedCommit,
+        };
+        /** @return Ordered original token observations; no production execution state. */
+        const auto &mtpForceDeviceOperations() const { return mtp_force_device_operations_; }
+
         static constexpr int VOCAB_SIZE = 10;
         static constexpr int PREFILL_ARGMAX_TOKEN = 7; // Token with highest logit after prefill
         static constexpr int DECODE_ARGMAX_TOKEN = 3;  // Token with highest logit after decode forward
@@ -438,6 +447,7 @@ namespace
             return forward(&token_shadow, 1);
         }
 
+        /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceTargetSample */
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
             int target_sample_slot,
@@ -466,7 +476,12 @@ namespace
             resident_publication_ok_flags_[0] = 1;
             resident_logical_state_request_count_ = 1;
             resident_logical_state_valid_ = true;
-            return forward(&token_shadow, 1);
+            const int32_t device_input = device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)];
+            mtp_force_device_operations_.emplace_back(MTPForceDeviceOperation::TargetMainAdvance, device_input);
+            // A response shadow cannot supply execution input, even in this
+            // CPU-only emulator of the device-authoritative target interface.
+            (void)token_shadow;
+            return forward(&device_input, 1);
         }
 
         bool forwardBatchWithDeviceTokenIds(
@@ -867,6 +882,7 @@ namespace
                 checkpoint_position);
         }
 
+        /** @copydoc IInferenceRunner::commitMTPShiftedRowFromDeviceTargetSample */
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
@@ -883,6 +899,7 @@ namespace
                 device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)];
             if (token < 0)
                 return false;
+            mtp_force_device_operations_.emplace_back(MTPForceDeviceOperation::TargetShiftedCommit, token);
             last_device_target_shifted_commit_token_ = token;
             return commitMTPShiftedRowFromCurrentTerminalHidden(
                 token,
@@ -1478,6 +1495,7 @@ namespace
             return true;
         }
 
+        /** @copydoc IInferenceRunner::commitMTPShiftedRowFromDeviceResidentLogicalState */
         bool commitMTPShiftedRowFromDeviceResidentLogicalState(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
@@ -1502,6 +1520,7 @@ namespace
             if (token < 0)
                 return false;
 
+            mtp_force_device_operations_.emplace_back(MTPForceDeviceOperation::ResidentShiftedCommit, token);
             ++commit_mtp_shifted_count_;
             last_commit_mtp_already_appended_ = already_appended_tokens;
             last_commit_mtp_main_forward_token_count_ = 0;
@@ -2116,6 +2135,7 @@ namespace
             return greedyArgmax(mtp_logits_.data(), VOCAB_SIZE);
         }
 
+        /** @copydoc IInferenceRunner::sampleGreedyFromMTPLogitsToDeviceDraftSlot */
         bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(
             int draft_sample_slot,
             int32_t *out_token) override
@@ -2131,6 +2151,16 @@ namespace
                     static_cast<int>(device_draft_sample_tokens_.size()))
             {
                 return false;
+            }
+            if (request_penalty_policy_.enabled())
+            {
+                // The production retained proposal publisher owns this
+                // transform; the orchestration caller must not apply it too.
+                if (!applyDeviceOwnedMTPBranchPenaltyMath(draft_sample_slot, request_penalty_policy_))
+                    return false;
+                captured_greedy_draft_prior_counts_.push_back(draft_sample_slot);
+                captured_greedy_draft_policies_.push_back(request_penalty_policy_);
+                captured_greedy_draft_logits_.push_back(mtp_logits_);
             }
             const int token = greedyArgmax(mtp_logits_.data(), VOCAB_SIZE);
             if (token < 0)
@@ -3001,57 +3031,15 @@ namespace
                 penalty_policy);
         }
 
+        /** @copydoc IInferenceRunner::applyDeviceOwnedMTPBranchPenaltiesToLogits */
         bool applyDeviceOwnedMTPBranchPenaltiesToLogits(
             int prior_draft_count,
             const MTPRequestPenaltyPolicy &penalty_policy) override
         {
             ++apply_device_owned_mtp_branch_penalties_count_;
-            if (prior_draft_count < 0 ||
-                prior_draft_count >
-                    static_cast<int>(device_draft_sample_tokens_.size()) ||
-                !penalty_policy.enabled() ||
-                last_mtp_condition_token_ < 0 ||
-                mtp_logits_.size() != VOCAB_SIZE)
-            {
+            if (!applyDeviceOwnedMTPBranchPenaltyMath(prior_draft_count, penalty_policy))
                 return false;
-            }
-
-            std::array<int, VOCAB_SIZE> branch_counts =
-                mock_device_generated_token_counts_;
-            if (mock_device_penalty_policy_
-                    .first_token_already_in_history == 0)
-            {
-                ++branch_counts[static_cast<size_t>(
-                    last_mtp_condition_token_)];
-            }
-            for (int draft = 0; draft < prior_draft_count; ++draft)
-            {
-                if (!device_draft_sample_ready_[static_cast<size_t>(draft)])
-                    return false;
-                const int token =
-                    device_draft_sample_tokens_[static_cast<size_t>(draft)];
-                if (token < 0 || token >= VOCAB_SIZE)
-                    return false;
-                ++branch_counts[static_cast<size_t>(token)];
-            }
-
-            for (int token = 0; token < VOCAB_SIZE; ++token)
-            {
-                const int count = branch_counts[static_cast<size_t>(token)];
-                if (count <= 0)
-                    continue;
-                float penalty = 0.0f;
-                if (penalty_policy.presence_penalty != 0.0f)
-                    penalty += penalty_policy.presence_penalty;
-                if (penalty_policy.frequency_penalty != 0.0f)
-                {
-                    penalty += penalty_policy.frequency_penalty *
-                               static_cast<float>(count);
-                }
-                mtp_logits_[static_cast<size_t>(token)] -= penalty;
-            }
-            last_device_owned_mtp_branch_prior_draft_count_ =
-                prior_draft_count;
+            last_device_owned_mtp_branch_prior_draft_count_ = prior_draft_count;
             return true;
         }
 
@@ -3378,6 +3366,7 @@ namespace
             return true;
         }
 
+        /** @copydoc IInferenceRunner::stageStochasticTargetTokenForDeviceSampling */
         bool stageStochasticTargetTokenForDeviceSampling(
             int32_t target_token,
             int target_sample_slot = 0) override
@@ -3394,6 +3383,7 @@ namespace
                 return false;
             }
 
+            mtp_force_device_operations_.emplace_back(MTPForceDeviceOperation::ForcedTargetStage, target_token);
             device_target_sample_tokens_[static_cast<size_t>(
                 target_sample_slot)] = target_token;
             device_target_sample_ready_[static_cast<size_t>(
@@ -3423,6 +3413,7 @@ namespace
             return true;
         }
 
+        /** @copydoc IInferenceRunner::publishDeviceResidentConditionTokenToTargetSampleSlot */
         bool publishDeviceResidentConditionTokenToTargetSampleSlot(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
@@ -3445,6 +3436,7 @@ namespace
                 logical_state.next_condition_tokens_device[request_index];
             if (token < 0)
                 return false;
+            mtp_force_device_operations_.emplace_back(MTPForceDeviceOperation::ResidentToTarget, token);
             device_target_sample_tokens_[static_cast<size_t>(
                 target_sample_slot)] = token;
             device_target_sample_ready_[static_cast<size_t>(
@@ -4852,6 +4844,45 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Model publication from the persistent target slot without a GPU.
+         * @param target_sample_slot Original sampled/control-token slot.
+         * @param disposition Whether this output already belongs to history.
+         * @return False for injected failure, invalid slots or invalid policy.
+         *
+         * The vector is a test observation of successful publications, never a
+         * production history authority. Failed publication cannot append data.
+         */
+        bool publishMTPDirectTokenHistory(
+            int target_sample_slot,
+            MTPDirectTokenHistoryDisposition disposition) override
+        {
+            direct_history_dispositions_.push_back(disposition);
+            if (fail_direct_history_publication_ || target_sample_slot < 0 ||
+                target_sample_slot >= static_cast<int>(device_target_sample_tokens_.size()))
+                return false;
+            if (disposition == MTPDirectTokenHistoryDisposition::AlreadyPublished)
+            {
+                mtp_force_device_operations_.emplace_back(MTPForceDeviceOperation::HistoryAlreadyPublished,
+                    device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)]);
+                return true;
+            }
+            if (disposition != MTPDirectTokenHistoryDisposition::NewlyEmitted)
+                return false;
+            mtp_force_device_operations_.emplace_back(MTPForceDeviceOperation::HistoryNewlyEmitted,
+                device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)]);
+            direct_history_tokens_.push_back(
+                device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)]);
+            return true;
+        }
+
+        /** @return Tokens consumed from successful direct target publications. */
+        const auto &directHistoryTokens() const { return direct_history_tokens_; }
+        /** @return Every attempted publication's explicit ownership policy. */
+        const auto &directHistoryDispositions() const { return direct_history_dispositions_; }
+        /** @brief Inject a fatal publication failure before any history write. */
+        void failDirectHistoryPublication() { fail_direct_history_publication_ = true; }
+
         /** @brief Observe exact prompt membership admitted before any sampling. */
         bool initializePromptRepetitionHistory(std::span<const int32_t> tokens, int request_index = 0) override
         {
@@ -5562,6 +5593,12 @@ namespace
             return last_main_logits_batch_resident_positions_;
         }
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
+        /** @return Branch widths transformed inside the retained-slot mock. */
+        const auto &capturedGreedyDraftPriorCounts() const { return captured_greedy_draft_prior_counts_; }
+        /** @return Original immutable request policies consumed by those transforms. */
+        const auto &capturedGreedyDraftPolicies() const { return captured_greedy_draft_policies_; }
+        /** @return Post-transform logits observed immediately before slot argmax. */
+        const auto &capturedGreedyDraftLogits() const { return captured_greedy_draft_logits_; }
         int sampleMTPLogitsToDeviceDraftSlotCount() const
         {
             return sample_mtp_logits_to_device_draft_slot_count_;
@@ -6435,6 +6472,63 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Apply the mock's additive branch-policy oracle to current sidecar logits.
+         * @param prior_draft_count Exact ready draft prefix preceding this proposal.
+         * @param penalty_policy Immutable request policy bound to its captured publisher.
+         * @return False for incomplete history, source slots or vocabulary geometry.
+         */
+        bool applyDeviceOwnedMTPBranchPenaltyMath(
+            int prior_draft_count,
+            const MTPRequestPenaltyPolicy &penalty_policy)
+        {
+            if (prior_draft_count < 0 ||
+                prior_draft_count >
+                    static_cast<int>(device_draft_sample_tokens_.size()) ||
+                !penalty_policy.enabled() ||
+                last_mtp_condition_token_ < 0 ||
+                mtp_logits_.size() != VOCAB_SIZE)
+            {
+                return false;
+            }
+
+            std::array<int, VOCAB_SIZE> branch_counts =
+                mock_device_generated_token_counts_;
+            if (mock_device_penalty_policy_
+                    .first_token_already_in_history == 0)
+            {
+                ++branch_counts[static_cast<size_t>(
+                    last_mtp_condition_token_)];
+            }
+            for (int draft = 0; draft < prior_draft_count; ++draft)
+            {
+                if (!device_draft_sample_ready_[static_cast<size_t>(draft)])
+                    return false;
+                const int token =
+                    device_draft_sample_tokens_[static_cast<size_t>(draft)];
+                if (token < 0 || token >= VOCAB_SIZE)
+                    return false;
+                ++branch_counts[static_cast<size_t>(token)];
+            }
+
+            for (int token = 0; token < VOCAB_SIZE; ++token)
+            {
+                const int count = branch_counts[static_cast<size_t>(token)];
+                if (count <= 0)
+                    continue;
+                float penalty = 0.0f;
+                if (penalty_policy.presence_penalty != 0.0f)
+                    penalty += penalty_policy.presence_penalty;
+                if (penalty_policy.frequency_penalty != 0.0f)
+                {
+                    penalty += penalty_policy.frequency_penalty *
+                               static_cast<float>(count);
+                }
+                mtp_logits_[static_cast<size_t>(token)] -= penalty;
+            }
+            return true;
+        }
+
         static int greedyArgmax(const float *logits, int vocab)
         {
             if (!logits || vocab <= 0)
@@ -7021,6 +7115,13 @@ namespace
             device_generation_admission_dispositions_;
         std::vector<sampling_math::DeviceGenerationAdmissionKind> device_generation_admission_kinds_;
         std::vector<std::optional<GenerationRequestSeeds>> device_generation_seed_admissions_;
+        std::vector<std::pair<MTPForceDeviceOperation, int32_t>> mtp_force_device_operations_;
+        std::vector<int> captured_greedy_draft_prior_counts_;
+        std::vector<MTPRequestPenaltyPolicy> captured_greedy_draft_policies_;
+        std::vector<std::vector<float>> captured_greedy_draft_logits_;
+        std::vector<int32_t> direct_history_tokens_;
+        std::vector<MTPDirectTokenHistoryDisposition> direct_history_dispositions_;
+        bool fail_direct_history_publication_ = false;
         std::vector<std::pair<int, std::vector<int32_t>>> prompt_history_admissions_;
         int device_generation_materialization_count_{0};
         int last_device_generation_draft_depth_{0};
@@ -9342,8 +9443,11 @@ namespace
      * A bounded-thinking close sequence can begin immediately after a captured
      * ordinary window. Each forced token must commit the prior already-emitted
      * mailbox row through the retained device graph, publish itself as the next
-     * mailbox condition, and let the following ordinary controller resume with
-     * `AlreadyEmitted` ownership. No host-token forward may bridge the windows.
+     * mailbox condition, and let a new ordinary controller admission preserve
+     * `AlreadyEmitted` ownership. Completed ForwardOnly replaces the controller
+     * policy, so the first later ordinary window must be NewRequest; only an
+     * undisturbed ordinary successor may ContinueResponse. No host-token forward
+     * may bridge the windows.
      */
     TEST_F(Test__PrefillDecodeTransition,
            OrdinaryGPUForcedSequencePreservesDeviceResidentContinuation)
@@ -9367,6 +9471,10 @@ namespace
                  .transaction_count = 1,
                  .published_state_commit_count = 0},
                 {.tokens = {8},
+                 .next_leading_row_disposition = Leading::AlreadyEmitted,
+                 .transaction_count = 1,
+                 .published_state_commit_count = 1},
+                {.tokens = {9},
                  .next_leading_row_disposition = Leading::AlreadyEmitted,
                  .transaction_count = 1,
                  .published_state_commit_count = 1},
@@ -9394,9 +9502,23 @@ namespace
             const GenerationResult after_force = decodeWithBudget(runner, 1);
             ASSERT_TRUE(after_force.success()) << after_force.error;
             EXPECT_THAT(after_force.tokens, ElementsAre(8));
+            EXPECT_THAT(mock->deviceGenerationAdmissionKinds(), ElementsAre(
+                sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                sampling_math::DeviceGenerationAdmissionKind::NewRequest))
+                << "Completed ForwardOnly replaced the device controller policy.";
+
+            const GenerationResult ordinary_continuation = decodeWithBudget(runner, 1);
+            ASSERT_TRUE(ordinary_continuation.success()) << ordinary_continuation.error;
+            EXPECT_THAT(ordinary_continuation.tokens, ElementsAre(9));
+            EXPECT_THAT(mock->deviceGenerationAdmissionKinds(), ElementsAre(
+                sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                sampling_math::DeviceGenerationAdmissionKind::ContinueResponse))
+                << "An undisturbed ordinary successor must retain its controller.";
             EXPECT_THAT(
                 mock->deviceGenerationAdmissionDispositions(),
-                ElementsAre(Leading::PendingResponse, Leading::AlreadyEmitted));
+                ElementsAre(Leading::PendingResponse, Leading::AlreadyEmitted,
+                            Leading::AlreadyEmitted));
             EXPECT_EQ(mock->residentOrdinaryConditionAdvanceCount(), 2);
             EXPECT_EQ(mock->forcedResidentConditionPublicationCount(), 2);
             EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 2);
@@ -9655,6 +9777,10 @@ namespace
         EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 2);
         EXPECT_THAT(mock->lastStagedStochasticTargetTokens(), ElementsAre(2, 4));
         EXPECT_THAT(mock->lastStagedStochasticTargetSlots(), ElementsAre(0, 0));
+        EXPECT_THAT(mock->directHistoryTokens(), ElementsAre(2, 4));
+        EXPECT_THAT(mock->directHistoryDispositions(), ElementsAre(
+            MTPDirectTokenHistoryDisposition::NewlyEmitted,
+            MTPDirectTokenHistoryDisposition::NewlyEmitted));
         EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 2);
         EXPECT_EQ(mock->lastDeviceTargetShiftedCommitToken(), 4);
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
@@ -9665,6 +9791,122 @@ namespace
         EXPECT_THAT(mock->conditionForwardPurposes(), ElementsAre(
             MTPConditionForwardPurpose::CommittedSerialToken,
             MTPConditionForwardPurpose::CommittedSerialToken));
+    }
+
+    /**
+     * @brief Forced output consumes an emitted grouped carry before replacing its slot.
+     *
+     * The existing compact outcome fixture produces either an emitted correction
+     * or an unemitted bonus. Only the former is a pending model row. Ordered
+     * device-source receipts prove the old resident token reaches shifted/main
+     * state before forced publication, and that already-counted history is not
+     * incremented twice. Each actual row also needs its own ForwardOnly sparse
+     * admission at P then P+1; an unemitted bonus needs only P. Terminal forced
+     * stops admit no row and retain their no-row contract.
+     */
+    TEST_F(Test__PrefillDecodeTransition, MTPGroupedForcePreservesEmittedCarryAndReplacesPendingBonus)
+    {
+        using Op = MockInferenceRunner::MTPForceDeviceOperation;
+        using Observation = std::pair<Op, int32_t>;
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const bool carried : {false, true})
+        for (const bool forced_stop : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << device.toString() << " carried=" << carried
+                << " forced_stop=" << forced_stop);
+            auto [runner, mock] = createRunner(true, !carried, {}, nullptr, true, false, device,
+                1, false, false);
+            mock->enableGroupedOutcomeDeviceResidentPublication(4);
+            mock->enableStochasticDeviceSampling();
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            mock->hideMTPSpecStatePublicationFromPolicy();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->setVerifierAcceptedPrefixScript({carried ? 0 : 1});
+            if (forced_stop) runner->setStopTokens({2});
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const auto grouped = decodeWithBudget(runner, 2);
+            ASSERT_TRUE(grouped.success()) << grouped.error;
+            ASSERT_EQ(grouped.tokens.size(), 2u);
+            const auto &publication = mock->lastDeviceResidentPublicationRequest();
+            ASSERT_TRUE(publication.valid());
+            const int *meta = publication.outcome.meta_device;
+            ASSERT_EQ(meta[sampling_math::kSpecBatchMetaOutputCount] >
+                meta[sampling_math::kSpecBatchMetaTargetVerifierStateCommitCount], carried);
+            const auto resident = mock->deviceResidentLogicalSequenceState();
+            ASSERT_TRUE(resident.coversRequest(0));
+            const int original_position = resident.target_positions_device[0];
+            const size_t sparse_admissions_before = mock->sparseQueryAdmissions().size();
+            const int32_t original_token = resident.next_condition_tokens_device[0];
+            ASSERT_NE(original_token, 2);
+            if (carried) EXPECT_EQ(original_token, grouped.tokens.back());
+            const size_t operations_before = mock->mtpForceDeviceOperations().size();
+            const int forwards_before = mock->forwardCallCount();
+            const int shifted_before = mock->commitMTPShiftedCount();
+            const int target_advances_before = mock->targetSampleMainConditionAdvanceCount();
+            const int staged_before = mock->stageStochasticTargetTokenCount();
+            const int host_replay_before = mock->forwardGroupedMTPVerifierWithHostTokenIdsCount();
+
+            const auto forced = runner->forceDecodeToken(2);
+            ASSERT_TRUE(forced.success()) << forced.error;
+            EXPECT_THAT(forced.tokens, ElementsAre(2));
+            std::vector<Observation> expected;
+            if (!forced_stop)
+            {
+                if (carried)
+                    expected = {{Op::ResidentToTarget, original_token},
+                        {Op::HistoryAlreadyPublished, original_token},
+                        {Op::ResidentShiftedCommit, original_token},
+                        {Op::TargetMainAdvance, original_token}};
+                const std::vector<Observation> forced_operations{{Op::ForcedTargetStage, 2},
+                    {Op::HistoryNewlyEmitted, 2}, {Op::TargetShiftedCommit, 2}, {Op::TargetMainAdvance, 2}};
+                expected.insert(expected.end(), forced_operations.begin(), forced_operations.end());
+                EXPECT_THAT(mock->directHistoryTokens(), ElementsAre(2));
+                EXPECT_EQ(forced.returned_token_commit, ReturnedTokenCommitState::Committed);
+            }
+            else
+            {
+                EXPECT_TRUE(mock->directHistoryTokens().empty());
+                EXPECT_EQ(forced.returned_token_commit, ReturnedTokenCommitState::NoModelRow);
+                EXPECT_TRUE(forced.is_complete);
+            }
+            const auto &all_operations = mock->mtpForceDeviceOperations();
+            EXPECT_EQ(std::vector<Observation>(all_operations.begin() + operations_before,
+                all_operations.end()), expected);
+            const int rows = forced_stop ? 0 : (carried ? 2 : 1);
+            const auto &sparse_admissions = mock->sparseQueryAdmissions();
+            ASSERT_EQ(sparse_admissions.size() - sparse_admissions_before,
+                static_cast<size_t>(rows))
+                << "Every actual model row requires a fresh visibility envelope.";
+            for (int row = 0; row < rows; ++row)
+            {
+                const auto &admission = sparse_admissions[sparse_admissions_before + static_cast<size_t>(row)];
+                EXPECT_TRUE(admission.depth_policy.isForwardOnly());
+                EXPECT_EQ(admission.request_count, 1);
+                EXPECT_EQ(admission.max_new_tokens, 0);
+                EXPECT_EQ(admission.initial_leading_row_disposition,
+                    sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted);
+                ASSERT_TRUE(admission.initial_target_counts.has_value());
+                EXPECT_THAT(admission.initial_target_counts->values(),
+                    ElementsAre(original_position + row));
+            }
+            EXPECT_EQ(mock->forwardCallCount() - forwards_before, rows);
+            EXPECT_EQ(mock->commitMTPShiftedCount() - shifted_before, rows);
+            EXPECT_EQ(mock->targetSampleMainConditionAdvanceCount() - target_advances_before, rows);
+            EXPECT_EQ(mock->stageStochasticTargetTokenCount() - staged_before, forced_stop ? 0 : 1);
+            EXPECT_EQ(mock->forwardGroupedMTPVerifierWithHostTokenIdsCount(), host_replay_before);
+            if (!forced_stop)
+            {
+                std::vector<std::vector<int>> expected_forwards;
+                if (carried) expected_forwards.push_back({original_token});
+                expected_forwards.push_back({2});
+                const auto &forwards = mock->forwardHistory();
+                EXPECT_EQ(std::vector<std::vector<int>>(forwards.begin() + forwards_before,
+                    forwards.end()), expected_forwards);
+            }
+        }
     }
 
     /**
@@ -10282,6 +10524,28 @@ namespace
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
+    }
+
+    /** @test Request diagnostics use actual token attempts after a partial multi-draft verification. */
+    TEST_F(Test__PrefillDecodeTransition, MTPRequestAcceptanceUsesDraftAttemptsAfterPartialVerification)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true, /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{}, /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false, /*hide_local_logits=*/false,
+            DeviceId::cpu(), /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true);
+        mock->setVerifierAcceptedPrefixScript({1});
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const auto step = decodeWithBudget(runner, 8);
+        ASSERT_TRUE(step.success()) << step.error;
+        const auto state = runner->prefixStateProbe();
+        ASSERT_EQ(state.mtp_draft_steps, 3u);
+        ASSERT_EQ(state.mtp_accepted_tokens, 1u);
+        ASSERT_EQ(state.mtp_rejected_tokens, 1u);
+        EXPECT_DOUBLE_EQ(state.mtp_request.acceptance_rate, 1.0 / 3.0);
+        runner->clearCache();
+        EXPECT_DOUBLE_EQ(runner->prefixStateProbe().mtp_request.acceptance_rate, 0.0);
     }
 
     TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthDemotesAfterZeroAcceptWindow)
@@ -11113,6 +11377,7 @@ namespace
         EXPECT_THAT(mock->publicationEvents(), IsEmpty());
     }
 
+    /** @brief Proposal penalties run exactly once inside each retained slot publisher. */
     TEST_F(Test__PrefillDecodeTransition,
            PenaltyGreedyGPUUsesCapturedVerifierTransform)
     {
@@ -11160,11 +11425,22 @@ namespace
                 << "GPU proposal penalties must not upload a host-authored sparse map";
             EXPECT_EQ(mock->applyDeviceOwnedMTPPenaltyRowsCount(), 1)
                 << "the first target row consumes the durable device histogram";
-            EXPECT_EQ(mock->applyDeviceOwnedMTPBranchPenaltiesCount(), 2)
-                << "every draft proposal consumes the condition token and prior "
-                   "draft slots directly from device-owned history";
-            EXPECT_EQ(mock->lastDeviceOwnedMTPBranchPriorDraftCount(), 1)
-                << "the second proposal must include exactly the first draft slot";
+            EXPECT_EQ(mock->applyDeviceOwnedMTPBranchPenaltiesCount(), 0)
+                << "The retained proposal publisher owns the transform; an external mutation doubles it.";
+            EXPECT_EQ(mock->lastDeviceOwnedMTPBranchPriorDraftCount(), -1);
+            EXPECT_THAT(mock->capturedGreedyDraftPriorCounts(), ElementsAre(0, 1));
+            ASSERT_EQ(mock->capturedGreedyDraftPolicies().size(), 2u);
+            for (const auto &policy : mock->capturedGreedyDraftPolicies())
+            {
+                EXPECT_FLOAT_EQ(policy.presence_penalty, sampling.presence_penalty);
+                EXPECT_FLOAT_EQ(policy.frequency_penalty, sampling.frequency_penalty);
+                EXPECT_FLOAT_EQ(policy.repetition_penalty, sampling.repetition_penalty);
+            }
+            ASSERT_EQ(mock->capturedGreedyDraftLogits().size(), 2u);
+            EXPECT_FLOAT_EQ(mock->capturedGreedyDraftLogits()[0][MockInferenceRunner::MTP_ARGMAX_TOKEN], 10.0f);
+            EXPECT_FLOAT_EQ(mock->capturedGreedyDraftLogits()[1][MockInferenceRunner::MTP_ARGMAX_TOKEN],
+                10.0f - sampling.presence_penalty)
+                << "Exactly one prior draft contributes once inside the second retained publisher.";
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0)
                 << "greedy verifier penalties belong to the captured outcome "
                    "kernel, never to a host-scheduled row mutation";
@@ -14531,6 +14807,9 @@ namespace
 
         ASSERT_TRUE(step.success()) << step.error;
         EXPECT_EQ(step.tokens, terminal_tokens);
+        EXPECT_EQ(mock->lastForwardDeviceTokenSeqLen(), 4)
+            << "Native conditional transaction zero preserves its maximum-width envelope.";
+        EXPECT_EQ(mock->sampleMTPLogitsToDeviceDraftSlotCount(), 3);
         EXPECT_EQ(mock->deviceGenerationMaterializationCount(), 1);
         const auto &admitted_policy =
             mock->lastDeviceGenerationDepthPolicy();
@@ -14608,8 +14887,8 @@ namespace
      *
      * HIP hosts only the graph-submission decision because conditional graph
      * nodes are unavailable. It must still materialize every configured depth
-     * branch at the maximum verifier width and identify the topology as
-     * dynamic. This regression prevents the hosted scheduler from substituting
+     * branch while transaction zero executes the admitted initial width. The
+     * parent remains dynamic. This regression prevents the hosted scheduler from substituting
      * one host-selected fixed depth while retaining the same terminal ledger.
      */
     TEST_F(
@@ -14690,6 +14969,9 @@ namespace
         ASSERT_TRUE(step.success()) << step.error;
         EXPECT_EQ(step.tokens, terminal_tokens);
 
+        EXPECT_EQ(mock->lastForwardDeviceTokenSeqLen(), 3)
+            << "Hosted transaction zero executes initial_depth+1 rows, independently of max-depth parent capacity.";
+        EXPECT_EQ(mock->sampleMTPLogitsToDeviceDraftSlotCount(), 2);
         EXPECT_EQ(mock->deviceGenerationMaterializationCount(), 1);
         EXPECT_EQ(mock->lastDeviceGenerationDraftDepth(), 3);
         EXPECT_EQ(
@@ -14724,6 +15006,103 @@ namespace
                   "host_scheduled_captured_transactions"}}),
             nullptr);
 
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Transaction-zero width and retained dynamic capacity have independent authorities.
+     *
+     * The mock observes real runner forward and sampling calls, then returns a
+     * separately authored multi-transaction terminal ledger. CUDA keeps its
+     * maximum envelope; hosted execution proposes only the initial depth. Both
+     * must retain max-depth parent capacity and report identical terminal work.
+     * This is a runner protocol test, not native graph or sampling certification.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           DynamicInitialVerifierWidthPreservesRetainedCapacityAcrossSamplingModes)
+    {
+        const auto export_path = std::filesystem::temp_directory_path() /
+            "llaminar_mtp_initial_width_capacity_unit.json";
+        ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const bool stochastic : {false, true})
+        {
+            SCOPED_TRACE(device.toString());
+            SCOPED_TRACE(stochastic);
+            PerfStatsCollector::reset();
+            MTPDepthPolicyConfig policy;
+            policy.mode = MTPDepthPolicyMode::Dynamic;
+            policy.min_depth = 1;
+            policy.max_depth = 3;
+            policy.initial_depth = 2;
+            policy.window_size = policy.min_samples = policy.promote_consecutive_windows = 1;
+            policy.cooldown_steps = 0;
+            policy.use_generated_policy = false;
+            auto [runner, mock] = createRunner(true, true, {}, nullptr, true, false,
+                device, 3, true, false, policy,
+                stochastic ? MTPVerifyMode::SpeculativeSampling : MTPVerifyMode::Greedy);
+            mock->enableGroupedOutcomeDeviceResidentPublication(4);
+            mock->enableStochasticDeviceSampling();
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            mock->hideMTPSpecStatePublicationFromPolicy();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->enableMTPSidecarLogitsStreamHandoff();
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->setVerifierAcceptedPrefixScript({3});
+            if (stochastic)
+            {
+                SamplingParams sampling;
+                sampling.temperature = 0.8f;
+                sampling.top_k = 2;
+                sampling.top_p = 0.95f;
+                sampling.seed = 123;
+                runner->setSamplingParams(sampling);
+            }
+            // Three controller transactions attempt2+3+3 drafts. Seven drafts
+            // enter this bounded eight-token response; the terminal observation
+            // is independent of the mock's one external verifier transaction.
+            const std::vector<int32_t> terminal_tokens{
+                MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN, MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN, MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN, MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN};
+            mock->enableDeviceResidentGeneration(DeviceGenerationTerminalRequestResult{
+                .tokens = terminal_tokens, .remaining_token_count = 0, .model_stopped = false,
+                .transaction_count = 3, .accepted_speculative_token_count = 7,
+                .rejected_transaction_count = 0, .consumed_verifier_row_count = 11,
+                .published_state_commit_count = 8, .attempted_draft_token_count = 8,
+                .verifier_token_count = 11, .final_draft_depth = 3,
+                .depth_evaluated_window_count = 2, .depth_update_count = 1,
+                .depth_promotion_count = 1, .depth_demotion_count = 0});
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const auto result = decodeWithBudget(runner, 8);
+            ASSERT_TRUE(result.success()) << result.error;
+            EXPECT_EQ(result.tokens, terminal_tokens);
+            const int initial_drafts = device.is_rocm() ? 2 : 3;
+            EXPECT_EQ(mock->lastForwardDeviceTokenSeqLen(), initial_drafts + 1);
+            EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().logicalVerifierRowsPerRequest(), initial_drafts + 1);
+            EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().physicalVerifierRowsPerRequest(), initial_drafts + 1);
+            if (stochastic)
+                EXPECT_EQ(mock->deviceDraftTemperatureProposalCount(), initial_drafts);
+            else
+                EXPECT_EQ(mock->sampleMTPLogitsToDeviceDraftSlotCount(), initial_drafts);
+            EXPECT_EQ(mock->deviceGenerationMaterializationCount(), 1);
+            EXPECT_EQ(mock->lastDeviceGenerationDraftDepth(), 3);
+            EXPECT_EQ(mock->lastDeviceGenerationDepthPolicy().initial_depth, 2);
+            EXPECT_EQ(mock->lastDeviceGenerationDepthPolicy().maximum_depth, 3);
+            EXPECT_EQ(mock->lastDeviceGenerationMaxNewTokens(), 8);
+            EXPECT_EQ(mock->lastDeviceGenerationSamplingMode(), stochastic
+                ? DeviceGenerationSamplingMode::Stochastic : DeviceGenerationSamplingMode::Greedy);
+            EXPECT_THAT(mock->publicationEvents(), ElementsAre("device_outcome_publish"));
+            const auto probe = runner->prefixStateProbe();
+            EXPECT_EQ(probe.mtp_draft_steps, 8u);
+            EXPECT_EQ(probe.mtp_verifier_runs, 3u);
+            EXPECT_EQ(probe.mtp_verifier_token_count, 11u);
+            EXPECT_EQ(probe.mtp_current_depth, 3);
+        }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
     }
@@ -17777,8 +18156,8 @@ namespace
      * the effective speculative depth to zero after the normal MTP policy has
      * selected a grouped, device-resident verifier. The emitted token must
      * remain in its persistent target slot for both shifted-MTP publication and
-     * the main-model state advance; the host scalar exists only as the response
-     * and sampler-history shadow.
+     * the main-model state advance and generated-history publication; the host
+     * scalar exists only as the response observation.
      */
     TEST_F(Test__PrefillDecodeTransition,
            MTPGpuBudgetClampDirectEmitUsesOneDeviceTargetSlotEndToEnd)
@@ -17800,6 +18179,10 @@ namespace
         ASSERT_TRUE(step.success()) << step.error;
         EXPECT_THAT(step.tokens,
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+        EXPECT_THAT(mock->directHistoryTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+        EXPECT_THAT(mock->directHistoryDispositions(),
+                    ElementsAre(MTPDirectTokenHistoryDisposition::NewlyEmitted));
         EXPECT_EQ(mock->sampleMainLogitsToDeviceTargetSlotCount(), 1)
             << "GPU direct emit must persist the sampled output token before "
                "shifted-state publication.";
@@ -17819,6 +18202,82 @@ namespace
             MTPConditionForwardPurpose::CommittedSerialToken));
     }
 
+    /** @brief Sampled stop outputs publish history even without a model row. */
+    TEST_F(Test__PrefillDecodeTransition, MTPDirectSampledStopPublishesHistoryOnBothBackends)
+    {
+        for (const int budget : {0, 1})
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            SCOPED_TRACE(device.toString());
+            SCOPED_TRACE(budget);
+            auto [runner, mock] = createRunner(true, true);
+            mock->setPrimaryDevice(device);
+            mock->enableMTPTokenCoordination(false);
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            // An unclipped GPU transaction defers the first sample to its
+            // compact outcome; enable history policy to observe that owner.
+            if (budget == 0)
+            {
+                SamplingParams sampling;
+                sampling.temperature = 0.0f;
+                sampling.presence_penalty = 0.25f;
+                runner->setSamplingParams(sampling);
+            }
+            runner->setStopTokens({MockInferenceRunner::PREFILL_ARGMAX_TOKEN});
+            ASSERT_TRUE(runner->prefill({1, 2, 3}));
+            runner->setDecodeStepTokenBudget(budget);
+            const auto step = runner->decodeStep();
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_TRUE(step.is_complete);
+            EXPECT_THAT(step.tokens, ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+            if (budget == 0)
+            {
+                // Deferred EOS belongs to the grouped publisher. A second
+                // direct publication would count the same response twice.
+                EXPECT_TRUE(mock->directHistoryTokens().empty());
+                EXPECT_TRUE(mock->directHistoryDispositions().empty());
+                EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+                EXPECT_EQ(mock->deviceGeneratedTokenCount(
+                    MockInferenceRunner::PREFILL_ARGMAX_TOKEN), 1);
+            }
+            else
+            {
+                EXPECT_THAT(mock->directHistoryTokens(), ElementsAre(
+                    MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+                EXPECT_THAT(mock->directHistoryDispositions(), ElementsAre(
+                    MTPDirectTokenHistoryDisposition::NewlyEmitted));
+                EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
+            }
+            EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 0);
+            EXPECT_EQ(mock->targetSampleMainConditionAdvanceCount(), 0);
+        }
+    }
+
+    /** @brief Failed publication cannot advance KV or return a successful output. */
+    TEST_F(Test__PrefillDecodeTransition, MTPDirectHistoryFailurePropagatesBeforeStateAdvance)
+    {
+        for (const bool forced : {false, true})
+        {
+            SCOPED_TRACE(forced);
+            auto [runner, mock] = createRunner(true, true);
+            mock->setPrimaryDevice(DeviceId::cuda(0));
+            mock->enableMTPTokenCoordination(false);
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            ASSERT_TRUE(runner->prefill({1, 2, 3}));
+            mock->failDirectHistoryPublication();
+            runner->setDecodeStepTokenBudget(1);
+            const auto step = forced ? runner->forceDecodeToken(2) : runner->decodeStep();
+            EXPECT_FALSE(step.success());
+            EXPECT_THAT(step.error, HasSubstr("device-token history"));
+            EXPECT_TRUE(mock->directHistoryTokens().empty());
+            ASSERT_EQ(mock->directHistoryDispositions().size(), 1u);
+            EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 0);
+            EXPECT_EQ(mock->targetSampleMainConditionAdvanceCount(), 0);
+        }
+    }
+
     /** @brief Budget-one requests on either GPU backend own every new commit. */
     TEST_F(Test__PrefillDecodeTransition,
            MTPBudgetOneContinuationPreservesSerialCommitOwnershipOnBothBackends)
@@ -17833,11 +18292,15 @@ namespace
             mock->enableDeviceResidentMTPSpecStatePublication();
             ASSERT_TRUE(runner->prefill({1, 2, 3}));
             runner->setDecodeStepTokenBudget(1);
+            std::vector<int32_t> emitted;
             for (int row = 0; row != 3; ++row)
             {
                 const auto step = runner->decodeStep();
                 ASSERT_TRUE(step.success()) << step.error;
                 ASSERT_EQ(step.tokens.size(), 1u);
+                emitted.push_back(step.tokens.front());
+                EXPECT_EQ(mock->directHistoryTokens(), emitted)
+                    << "Each bounded response must publish before the next call.";
             }
             EXPECT_THAT(mock->conditionForwardPurposes(), ElementsAre(
                 MTPConditionForwardPurpose::CommittedSerialToken,
@@ -18007,8 +18470,9 @@ namespace
      * A later one-token call returns the preceding terminal condition itself,
      * because that token is already the next serial output but has not yet been
      * consumed by the main graph. The logical-state mailbox supplies token and
-     * position to shifted publication, while a D2D target-slot copy supplies the
-     * same token to one main-state advance. Only the terminal result crosses D2H.
+     * position to shifted publication; the grouped publisher's original target
+     * slot supplies the same token to one main-state advance without a duplicate
+     * copy. Only the terminal result crosses D2H.
      */
     TEST_F(Test__PrefillDecodeTransition,
            MTPGpuBudgetClampAfterResidentTerminalUsesDeviceTransactionsOnly)
@@ -18047,6 +18511,7 @@ namespace
             mock->deviceTargetShiftedCommitCount();
         const int target_condition_advances_before =
             mock->targetSampleMainConditionAdvanceCount();
+        const size_t operations_before = mock->mtpForceDeviceOperations().size();
         const int observations_before =
             mock->residentNextConditionTokenObservationCount();
 
@@ -18057,7 +18522,8 @@ namespace
         ASSERT_TRUE(direct.success()) << direct.error;
         ASSERT_THAT(direct.tokens, SizeIs(1));
         EXPECT_EQ(mock->residentConditionTokenTargetPublicationCount(),
-                  resident_publications_before + 1);
+                  resident_publications_before)
+            << "Grouped publication already owns canonical target slot zero; do not copy it again.";
         EXPECT_EQ(mock->residentLogicalStateShiftedCommitCount(),
                   resident_commits_before + 1)
             << "Shifted publication must consume the mailbox-owned token and position.";
@@ -18074,6 +18540,13 @@ namespace
             << "Only the compact terminal result may cross to the host.";
         EXPECT_EQ(direct.tokens.front(),
                   mock->lastResidentLogicalStateShiftedCommitToken());
+        using Op = MockInferenceRunner::MTPForceDeviceOperation;
+        using Observation = std::pair<Op, int32_t>;
+        const int32_t token = direct.tokens.front();
+        const std::vector<Observation> expected{{Op::HistoryNewlyEmitted, token},
+            {Op::ResidentShiftedCommit, token}, {Op::TargetMainAdvance, token}};
+        const auto &operations = mock->mtpForceDeviceOperations();
+        EXPECT_EQ(std::vector<Observation>(operations.begin() + operations_before, operations.end()), expected);
     }
 
     /**
@@ -18116,6 +18589,7 @@ namespace
         std::array<int, 2> device_target_commits_before{};
         std::array<int, 2> target_advances_before{};
         std::array<int, 2> observations_before{};
+        std::array<size_t, 2> operations_before{};
         const std::array<MockInferenceRunner *, 2> children{
             harness.child0,
             harness.child1,
@@ -18131,6 +18605,7 @@ namespace
                 child->deviceTargetShiftedCommitCount();
             target_advances_before[child_index] =
                 child->targetSampleMainConditionAdvanceCount();
+            operations_before[child_index] = child->mtpForceDeviceOperations().size();
             observations_before[child_index] =
                 child->residentNextConditionTokenObservationCount();
         }
@@ -18146,7 +18621,16 @@ namespace
             MockInferenceRunner *const child = children[child_index];
             EXPECT_EQ(
                 child->residentConditionTokenTargetPublicationCount(),
-                resident_target_publications_before[child_index] + 1);
+                resident_target_publications_before[child_index])
+                << "Each participant already owns its published canonical target; no duplicate D2D copy.";
+            using Op = MockInferenceRunner::MTPForceDeviceOperation;
+            using Observation = std::pair<Op, int32_t>;
+            const int32_t token = direct.tokens.front();
+            const std::vector<Observation> expected{{Op::HistoryNewlyEmitted, token},
+                {Op::ResidentShiftedCommit, token}, {Op::TargetMainAdvance, token}};
+            const auto &operations = child->mtpForceDeviceOperations();
+            EXPECT_EQ(std::vector<Observation>(operations.begin() + operations_before[child_index],
+                operations.end()), expected);
             EXPECT_EQ(
                 child->residentLogicalStateShiftedCommitCount(),
                 resident_commits_before[child_index] + 1);

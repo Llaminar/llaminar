@@ -89,6 +89,60 @@ namespace llaminar2
         {
             return DeviceGraphOrchestrator::groupedVerifierWorkspaceInput(ordinary, owner);
         }
+        /** @brief Existing graph owners that close model-weight publication without device work. */
+        enum class WeightGraphOwner { FullHost, FullDevice, ChainedHost, ChainedDevice, KVHost, KVDevice,
+                                      KVBatch, Attention, FFN, ServingPlan, ServingSealed };
+
+        /** @brief Select an actual owned graph slot; never fabricate capture/executable support. */
+        static std::unique_ptr<ComputeGraph> *weightGraphSlot(DeviceGraphOrchestrator &owner, WeightGraphOwner kind)
+        {
+            switch (kind)
+            {
+            case WeightGraphOwner::FullHost: return &owner.mtp_sidecar_depth0_cache_.graph;
+            case WeightGraphOwner::FullDevice: return &owner.mtp_sidecar_depth0_device_token_cache_.graph;
+            case WeightGraphOwner::ChainedHost: return &owner.mtp_sidecar_depth0_chained_cache_.graph;
+            case WeightGraphOwner::ChainedDevice: return &owner.mtp_sidecar_depth0_chained_device_token_cache_.graph;
+            case WeightGraphOwner::KVHost: return &owner.mtp_sidecar_depth0_kv_only_cache_.graph;
+            case WeightGraphOwner::KVDevice: return &owner.mtp_sidecar_depth0_kv_only_device_token_cache_.graph;
+            case WeightGraphOwner::KVBatch:
+                if (owner.mtp_sidecar_depth0_kv_only_batch_caches_.empty())
+                    owner.mtp_sidecar_depth0_kv_only_batch_caches_.push_back(
+                        std::make_unique<DeviceGraphOrchestrator::MTPSidecarGraphCache>());
+                return &owner.mtp_sidecar_depth0_kv_only_batch_caches_.front()->graph;
+            case WeightGraphOwner::Attention:
+            case WeightGraphOwner::FFN:
+                if (owner.layer_graph_cache_.empty()) owner.layer_graph_cache_.resize(1);
+                return kind == WeightGraphOwner::Attention ? &owner.layer_graph_cache_.front().attention_decode
+                                                          : &owner.layer_graph_cache_.front().ffn_decode;
+            case WeightGraphOwner::ServingPlan:
+            case WeightGraphOwner::ServingSealed: return nullptr;
+            }
+            throw std::invalid_argument("Unknown test weight graph owner");
+        }
+
+        /** @brief Cross the real ownership boundary with tiny graph metadata only. */
+        static void closeWeightPublication(DeviceGraphOrchestrator &owner, WeightGraphOwner kind, DeviceId device)
+        {
+            if (kind == WeightGraphOwner::ServingPlan) owner.serving_graph_family_plan_.emplace();
+            else if (kind == WeightGraphOwner::ServingSealed)
+                owner.serving_graph_family_lifecycle_ = DeviceGraphOrchestrator::ServingGraphFamilyLifecycle::Sealed;
+            else
+            {
+                auto graph = std::make_unique<ComputeGraph>();
+                graph->addNode("weight_binding_owner", std::make_unique<testing::MockComputeStage>(
+                    ComputeStageType::GEMM, "weight_binding_owner", device), device);
+                *weightGraphSlot(owner, kind) = std::move(graph);
+            }
+        }
+
+        /** @return Original alternate source, without lending mutation authority. */
+        static const FrozenModelWeightSet *decodeWeightSource(const DeviceGraphOrchestrator &owner)
+        { return owner.decode_replicated_dense_weight_set_.get(); }
+
+        /** @brief Exercise the private legacy materializer's defensive boundary directly. */
+        static void rebuildFrozenWeights(DeviceGraphOrchestrator &owner, const ModelWeights &weights)
+        { owner.buildFrozenWeightSet(weights, {}, 0, 0); }
+
         /** @brief Bind small CPU-owned producer/destination tensors and request identity. */
         static void seed(DeviceGraphOrchestrator &runner,
                          std::shared_ptr<TensorBase> producer,
@@ -233,6 +287,72 @@ struct DeviceGraphOrchestratorServingBuffersTestAccess
  */
 struct DeviceGraphOrchestratorPublicationProgramsTestAccess
 {
+    /** @brief Prove exact-width metadata owners survive arbitrary selection and retire before hooks. */
+    static void proveExactWidths(DeviceGraphOrchestrator &owner)
+    {
+        using Program = SparseQueryExecutionProgram;
+        MTPRuntimeConfig config;
+        config.enabled = true;
+        config.draft_tokens = 15;
+        config.graph_capacity_draft_tokens = 15;
+        owner.mtp_verifier_graph_family_ = MTPVerifierGraphFamily::ExactRows;
+        owner.mtp_graph_owner_plan_ = MTPGraphOwnerPlan(config, MTPVerifierGraphFamily::ExactRows,
+            MTPGenerationParentRole::Controller, 2u);
+        owner.mtp_max_verifier_rows_ = 16;
+        owner.mtp_speculative_state_publication_graphs_.clear();
+        owner.mtp_speculative_state_publication_graphs_.resize(owner.mtp_graph_owner_plan_.speculativePublicationGraphSlots());
+        std::array<std::array<const ComputeGraph *, 17>, 2> original{};
+        const auto key = [&](Program program, int rows) {
+            ForwardGraphSignature signature;
+            signature.device = owner.state_.device_id;
+            signature.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+            signature.seq_len = signature.all_position_logit_rows = rows;
+            signature.batch_size = 1;
+            signature.decode = signature.all_position_logits = true;
+            signature.sparse_query_execution_program = program;
+            return signature;
+        };
+        for (const auto program : {Program::RankingPossible, Program::ProvenNoRanking})
+        {
+            DeviceGraphOrchestrator::SparseQueryProgramCompilationScope scope(owner, program);
+            for (int rows = 16; rows >= 2; --rows)
+            {
+                auto &cache = owner.mtpStatePublicationCache(key(program, rows));
+                EXPECT_FALSE(cache.graph);
+                cache.graph = std::make_unique<ComputeGraph>();
+                cache.verifier_signature = key(program, rows);
+                cache.valid = true;
+                original[sparseQueryExecutionProgramIndex(program)][rows] = cache.graph.get();
+            }
+        }
+        // Physical16 storage remains admitted while each exact native owner is
+        // selected independently. No width may replace an earlier sibling.
+        for (const auto program : {Program::ProvenNoRanking, Program::RankingPossible})
+        {
+            DeviceGraphOrchestrator::SparseQueryProgramCompilationScope scope(owner, program);
+            for (const int rows : {16, 4, 8, 3, 15, 2, 16})
+            {
+                auto &cache = owner.mtpStatePublicationCache(key(program, rows));
+                EXPECT_EQ(cache.graph.get(), original[sparseQueryExecutionProgramIndex(program)][rows]);
+                cache.resetSessionState();
+                EXPECT_EQ(cache.verifier_signature, key(program, rows));
+                auto malformed = key(program, rows);
+                malformed.device = DeviceId::rocm(0);
+                EXPECT_THROW((void)owner.mtpStatePublicationCache(malformed), std::invalid_argument);
+                EXPECT_THROW((void)owner.mtpStatePublicationCache(key(program, 1)), std::invalid_argument);
+                EXPECT_THROW((void)owner.mtpStatePublicationCache(key(program, 17)), std::invalid_argument);
+                EXPECT_EQ(owner.mtpStatePublicationCache().graph.get(), original[sparseQueryExecutionProgramIndex(program)][rows]);
+            }
+        }
+        owner.retireMTPPublicationVerifierBorrows();
+        for (const auto &cache : owner.mtp_speculative_state_publication_graphs_)
+        {
+            EXPECT_FALSE(cache.graph);
+            EXPECT_FALSE(cache.verifier_signature);
+            EXPECT_FALSE(cache.valid);
+        }
+    }
+
     /** @brief Retain sibling hook identities and exercise exact selection/reset/retirement. */
     static void prove(DeviceGraphOrchestrator &owner, IComputeStage *short_hook, IComputeStage *full_hook)
     {
@@ -1377,6 +1497,84 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeL
     EXPECT_EQ(graph_ref->binding_id, gdn_binding->binding_id);
 }
 
+/** @brief Build a tiny immutable CPU source; no model, prepared payload or device is loaded. */
+static std::unique_ptr<FrozenModelWeightSet> lifecycleWeightSource(TensorBase *embedding)
+{
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{42};
+    strategy.devices = {DeviceId::cpu()};
+    ModelWeightSetBuilder builder(strategy);
+    WeightBinding binding;
+    binding.identity = makeSourceWeightIdentity("token_embd.weight", strategy.model_id);
+    binding.identity.role = WeightRole::Embedding;
+    binding.tensor = embedding;
+    binding.residency.home_device = DeviceId::cpu();
+    binding.residency.resident_device = DeviceId::cpu();
+    builder.addBinding(std::move(binding));
+    return std::make_unique<FrozenModelWeightSet>(strategy, builder.freezeBindings());
+}
+
+/** @test Real startup publication order stays open until graph binding begins. */
+TEST_F(Test__DeviceGraphOrchestrator, WeightPublicationAllowsStartupBeforeGraphBinding)
+{
+    config_.n_layers = 1;
+    FP32Tensor first(std::vector<size_t>{16, 8}), second(std::vector<size_t>{16, 8});
+    auto builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator owner(builder, nullptr);
+    EXPECT_NO_THROW(owner.setWeights(ModelWeights{}));
+    EXPECT_NO_THROW(owner.setFrozenWeightSet(lifecycleWeightSource(&first)));
+    EXPECT_NO_THROW(owner.setDecodeReplicatedDenseWeightSet(lifecycleWeightSource(&first)));
+    EXPECT_NO_THROW(owner.setFrozenWeightSet(lifecycleWeightSource(&second)));
+    EXPECT_NO_THROW(owner.setDecodeReplicatedDenseWeightSet(lifecycleWeightSource(&second)));
+    EXPECT_NO_THROW(owner.setDecodeReplicatedDenseWeightSet(nullptr));
+    EXPECT_EQ(builder->captured_weights.embedding_table, &second);
+    EXPECT_EQ(owner.frozenWeightSet()->global("token_embd.weight").tensor, &second);
+}
+
+/** @test Full(A) and every other weight-bound graph prevent source B publication before any mutation. */
+TEST_F(Test__DeviceGraphOrchestrator, WeightPublicationRejectsEveryBoundGraphOwnerBeforeMutation)
+{
+    using Access = DeviceGraphOrchestratorLiveStateTestAccess;
+    using Kind = Access::WeightGraphOwner;
+    for (auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (auto kind : {Kind::FullHost, Kind::FullDevice, Kind::ChainedHost, Kind::ChainedDevice,
+                     Kind::KVHost, Kind::KVDevice, Kind::KVBatch, Kind::Attention, Kind::FFN,
+                     Kind::ServingPlan, Kind::ServingSealed})
+    {
+        SCOPED_TRACE(::testing::Message() << device.toString() << '/' << static_cast<int>(kind));
+        config_.n_layers = 1;
+        FP32Tensor first(std::vector<size_t>{16, 8}), second(std::vector<size_t>{16, 8});
+        auto builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+        DeviceGraphOrchestrator owner(builder, nullptr);
+        owner.setFrozenWeightSet(lifecycleWeightSource(&first));
+        owner.setDecodeReplicatedDenseWeightSet(lifecycleWeightSource(&first));
+        const auto *primary = owner.frozenWeightSet();
+        const auto *alternate = Access::decodeWeightSource(owner);
+        const auto binding_publications = builder->binding_set_count;
+        Access::closeWeightPublication(owner, kind, device);
+        auto *slot = Access::weightGraphSlot(owner, kind);
+        const auto *original_graph = slot ? slot->get() : nullptr;
+        int callbacks = 0;
+        ModelWeights replacement;
+        replacement.embedding_table = &second;
+        replacement.get_layer_weights = [&](int) { ++callbacks; return LayerWeights{}; };
+        EXPECT_THROW(owner.setWeights(replacement), std::logic_error);
+        EXPECT_THROW(owner.setFrozenWeightSet(lifecycleWeightSource(&second)), std::logic_error);
+        EXPECT_THROW(owner.setDecodeReplicatedDenseWeightSet(lifecycleWeightSource(&second)), std::logic_error);
+        EXPECT_THROW(owner.setDecodeReplicatedDenseWeightSet(nullptr), std::logic_error);
+        EXPECT_THROW(Access::rebuildFrozenWeights(owner, replacement), std::logic_error);
+        EXPECT_EQ(callbacks, 0);
+        ASSERT_EQ(owner.frozenWeightSet(), primary);
+        ASSERT_EQ(Access::decodeWeightSource(owner), alternate);
+        EXPECT_EQ(primary->global("token_embd.weight").tensor, &first);
+        EXPECT_EQ(alternate->global("token_embd.weight").tensor, &first);
+        EXPECT_EQ(builder->binding_set_count, binding_publications);
+        EXPECT_EQ(builder->captured_weights.embedding_table, &first);
+        EXPECT_EQ(slot ? slot->get() : nullptr, original_graph);
+    }
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, SetFrozenWeightSetConfiguresBindingsDirectly)
 {
     config_.n_layers = 1;
@@ -2258,6 +2456,17 @@ TEST_F(Test__DeviceGraphOrchestrator, SparseQueryPublicationChildrenRetainExactV
     auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
     DeviceGraphOrchestrator owner(builder, nullptr);
     DeviceGraphOrchestratorPublicationProgramsTestAccess::prove(owner, &short_hook, &full_hook);
+}
+
+/** @test Every admitted hosted row/program has an independent metadata owner through dirty selection and reset. */
+TEST_F(Test__DeviceGraphOrchestrator, HostedExactVerifierPublicationOwnersRetainEveryWidth)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(test::qwen4MetadataFixture(false), config);
+    config.default_device = DeviceId::cpu();
+    auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator owner(builder, nullptr);
+    DeviceGraphOrchestratorPublicationProgramsTestAccess::proveExactWidths(owner);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
@@ -3720,8 +3929,8 @@ TEST_F(
              "mtp_speculative_state_publication_graphs_.rbegin()",
              "mtp_draft_token_publication_graphs_",
              "mtp_verifier_preparation_graphs_",
-             "mtp_stochastic_outcome_graph_.invalidate();",
-             "mtp_stochastic_target_distribution_graph_.invalidate();",
+             "for (auto &cache : mtp_stochastic_outcome_graphs_) cache.invalidate();",
+             "for (auto &cache : mtp_stochastic_target_distribution_graphs_) cache.invalidate();",
              "moe_overlay_epoch_acquire_graph_.invalidate();",
              "moe_overlay_epoch_release_graph_.invalidate();",
              "device_moe_rebalance_maintenance_graph_.invalidate();"})
@@ -6289,7 +6498,7 @@ TEST(DeviceGraphOrchestratorWorkspaceInput, GroupedVerifierUsesGenerationRequest
     config.enabled = true;
     config.draft_tokens = 15;
     config.max_request_batch = 3;
-    const MTPGraphOwnerPlan owner(config);
+    const MTPGraphOwnerPlan owner(config, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
     int token = 4, position = 0;
     std::vector<int> ordinary_lengths(7, 9);
     ForwardInput ordinary;
@@ -6387,5 +6596,5 @@ TEST(DeviceGraphOrchestratorWorkspaceInput, GroupedVerifierUsesGenerationRequest
     EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(malformed, owner),
         std::invalid_argument);
     EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(
-        ordinary, MTPGraphOwnerPlan(MTPRuntimeConfig{})), std::logic_error);
+        ordinary, MTPGraphOwnerPlan(MTPRuntimeConfig{}, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller)), std::logic_error);
 }

@@ -46,6 +46,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/LocalTPContext.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -1707,6 +1708,178 @@ TEST(Test__ROCmMoEKernel,
             RuntimeExpertHistogramSourceMask{true, true, false}),
         std::invalid_argument)
         << "A host drain may not silently discard the table's accepted-row source";
+#endif
+}
+
+
+/**
+ * @brief Capture accepted-row publication from a genuinely cold verifier owner.
+ *
+ * Neither real stage executes nor receives a compute stream before publication.
+ * The model-lifetime table stream prepares its kernel before capture; the native
+ * graph must contain only the commit kernel, with no allocation, copy, callback
+ * or preparation nodes. Dirty full/small/empty/disabled replays use the original
+ * graph and compare every runtime-table byte against independent route counts.
+ */
+TEST(Test__ROCmMoEKernel, ColdGroupedVerifierPublisherCapturesWithoutComputeStream)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    SKIP_IF_NO_ROCM();
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    ScopedHipDeviceStream foreign_stream(0);
+    ASSERT_EQ(foreign_stream.status(), hipSuccess);
+    using namespace llaminar2;
+    constexpr int rows = 16, num_experts = 4, top_k = 2;
+    constexpr int slots = rows * top_k;
+    const auto device = DeviceId::rocm(0);
+    for (const bool routing_owner : {false, true})
+    {
+        SCOPED_TRACE(routing_owner ? "overlay router publisher" : "expert publisher");
+        DeviceMoERuntimeTable::Config config;
+        config.device_id = device;
+        config.num_layers = 1;
+        config.num_experts = num_experts;
+        config.top_k = top_k;
+        config.mirror_to_device = true;
+        config.deferred_verifier_token_capacity = rows;
+        config.grouped_verifier_histogram_publication =
+            GroupedVerifierHistogramPublicationMode::AcceptedRows;
+        DeviceMoERuntimeTable table(config); // Deliberately no host histogram drain.
+        ScopedRuntimeHistogramProducerRetirement retirement(table);
+        auto *const publication_stream = table.groupedVerifierHistogramPublicationStream();
+        ASSERT_NE(publication_stream, nullptr);
+        ASSERT_NE(publication_stream, foreign_stream.get());
+        const auto native_stream = static_cast<hipStream_t>(publication_stream);
+        HipAllocation accepted(sizeof(int32_t)), publication_ok(sizeof(int32_t));
+        const auto *accepted_device = static_cast<const int32_t *>(accepted.get());
+        const auto *ok_device = static_cast<const int32_t *>(publication_ok.get());
+
+        std::unique_ptr<IComputeStage> stage;
+        if (routing_owner)
+        {
+            MoERoutingStage::Params params;
+            params.device_id = device;
+            params.seq_len = rows;
+            params.d_model = 16;
+            params.num_experts = num_experts;
+            params.top_k = top_k;
+            params.layer_idx = 0;
+            params.moe_runtime_table = &table;
+            params.force_decode_equivalent_verifier_prefill = true;
+            params.grouped_verifier_histogram_role = MoEGroupedVerifierHistogramRole::DeferredAcceptedRows;
+            stage = std::make_unique<MoERoutingStage>(std::move(params));
+        }
+        else
+        {
+            MoEExpertComputeStage::Params params;
+            params.device_id = device;
+            params.seq_len = rows;
+            params.d_model = 16;
+            params.num_experts = num_experts;
+            params.top_k = top_k;
+            params.expert_intermediate = 32;
+            params.layer_idx = 0;
+            params.moe_runtime_table = &table;
+            params.force_grouped_verifier_prefill_for_decode = true;
+            params.grouped_verifier_histogram_role = MoEGroupedVerifierHistogramRole::DeferredAcceptedRows;
+            stage = std::make_unique<MoEExpertComputeStage>(std::move(params));
+        }
+        auto *const publisher = dynamic_cast<IMoEGroupedVerifierHistogramPublisher *>(stage.get());
+        ASSERT_NE(publisher, nullptr);
+        ASSERT_FALSE(stage->hasGPUStream());
+        EXPECT_FALSE(publisher->prepareGroupedVerifierHistogramProducer(nullptr));
+        EXPECT_FALSE(publisher->prepareGroupedVerifierHistogramProducer(foreign_stream.get()));
+        EXPECT_EQ(table.decodeHistogramProducerStream(), nullptr);
+        EXPECT_FALSE(publisher->enqueueCommittedGroupedVerifierHistograms(
+            accepted_device, ok_device, 1, rows, publication_stream));
+        EXPECT_EQ(table.decodeHistogramProducerStream(), nullptr)
+            << "Missing preparation must reject before publishing even the diagnostic producer alias";
+        ASSERT_TRUE(publisher->prepareGroupedVerifierHistogramProducer(publication_stream));
+        ASSERT_FALSE(stage->hasGPUStream()) << "Publication must not borrow or manufacture a verifier compute stream";
+        EXPECT_FALSE(publisher->enqueueCommittedGroupedVerifierHistograms(
+            accepted_device, ok_device, 1, rows, nullptr));
+        EXPECT_FALSE(publisher->enqueueCommittedGroupedVerifierHistograms(
+            accepted_device, ok_device, 1, rows, foreign_stream.get()));
+        EXPECT_EQ(table.decodeHistogramProducerStream(), publication_stream);
+
+        ASSERT_TRUE(publisher->transitionGroupedVerifierHistogramProducerCapture(
+            publication_stream, RuntimeHistogramProducerCaptureTransition::Entering));
+        ScopedHipTestGraph graph(0, native_stream, "cold accepted-row publisher");
+        EXPECT_FALSE(publisher->prepareGroupedVerifierHistogramProducer(publication_stream))
+            << "Object preparation is forbidden inside native capture";
+        ASSERT_TRUE(publisher->enqueueCommittedGroupedVerifierHistograms(
+            accepted_device, ok_device, 1, rows, publication_stream));
+        ASSERT_TRUE(graph.finishAndInstantiate());
+        ASSERT_TRUE(publisher->transitionGroupedVerifierHistogramProducerCapture(
+            publication_stream, RuntimeHistogramProducerCaptureTransition::Completed));
+        ASSERT_FALSE(stage->hasGPUStream());
+        std::size_t node_count = 0;
+        ASSERT_EQ(hipGraphGetNodes(graph.nativeGraphForInspection(), nullptr, &node_count), hipSuccess);
+        ASSERT_EQ(node_count, 1u) << "Cold publisher must capture only the existing histogram kernel";
+        hipGraphNode_t node{};
+        ASSERT_EQ(hipGraphGetNodes(graph.nativeGraphForInspection(), &node, &node_count), hipSuccess);
+        hipGraphNodeType node_type{};
+        ASSERT_EQ(hipGraphNodeGetType(node, &node_type), hipSuccess);
+        EXPECT_EQ(node_type, hipGraphNodeTypeKernel);
+
+        // Copy object representations explicitly: aggregate copy is not a
+        // contract for padding bytes, while this oracle compares the complete
+        // device image, including bytes outside the committed histograms.
+        DeviceMoELayerRuntime baseline{};
+        std::memcpy(&baseline, &table.hostLayerState(0), sizeof(baseline));
+        baseline.participant_id = 1;
+        baseline.participant_count = 2;
+        ASSERT_NE(baseline.deferred_verifier_route_expert_ids, nullptr);
+        ASSERT_NE(baseline.deferred_verifier_route_participant_ids, nullptr);
+        ASSERT_GE(baseline.deferred_verifier_route_capacity, static_cast<uint32_t>(slots));
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            SCOPED_TRACE(replay);
+            if (replay != 0)
+                stage->resetSessionStatePreservingCapturedReplay();
+            ASSERT_FALSE(stage->hasGPUStream());
+            std::array<int32_t, slots> experts{}, participants{};
+            for (int slot = 0; slot < slots; ++slot)
+            {
+                experts[slot] = (slot + replay) % num_experts;
+                participants[slot] = (slot / top_k + slot + replay) % 2;
+            }
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                baseline.decode_histogram[expert] = 101 + replay + expert;
+                baseline.decode_local_histogram[expert] = 201 + replay + expert;
+                baseline.prefill_histogram[expert] = 301 + replay + expert;
+                baseline.prefill_local_histogram[expert] = 401 + replay + expert;
+                baseline.grouped_verifier_histogram[expert] = 501 + replay + expert;
+                baseline.grouped_verifier_local_histogram[expert] = 601 + replay + expert;
+            }
+            const int32_t accepted_rows = std::array<int32_t, 5>{rows, 1, 7, 0, rows}[replay % 5];
+            const int32_t enabled = replay % 5 == 4 ? 0 : 1;
+            DeviceMoELayerRuntime expected{};
+            std::memcpy(&expected, &baseline, sizeof(expected));
+            if (enabled)
+                for (int slot = 0; slot < accepted_rows * top_k; ++slot)
+                {
+                    ++expected.grouped_verifier_histogram[experts[slot]];
+                    if (participants[slot] == static_cast<int32_t>(baseline.participant_id))
+                        ++expected.grouped_verifier_local_histogram[experts[slot]];
+                }
+            ASSERT_EQ(hipMemcpyAsync(table.deviceLayerState(0), &baseline, sizeof(baseline), hipMemcpyHostToDevice, native_stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(baseline.deferred_verifier_route_expert_ids, experts.data(), sizeof(experts), hipMemcpyHostToDevice, native_stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(baseline.deferred_verifier_route_participant_ids, participants.data(), sizeof(participants), hipMemcpyHostToDevice, native_stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(accepted.get(), &accepted_rows, sizeof(accepted_rows), hipMemcpyHostToDevice, native_stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(publication_ok.get(), &enabled, sizeof(enabled), hipMemcpyHostToDevice, native_stream), hipSuccess);
+            ASSERT_TRUE(graph.launch());
+            DeviceMoELayerRuntime actual{};
+            ASSERT_EQ(hipMemcpyAsync(&actual, table.deviceLayerState(0), sizeof(actual), hipMemcpyDeviceToHost, native_stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(native_stream), hipSuccess);
+            EXPECT_EQ(std::memcmp(&actual, &expected, sizeof(expected)), 0)
+                << "Only accepted rows may update selected/local grouped history; dirty ordinary/prefill history and pointers must survive";
+            EXPECT_EQ(table.decodeHistogramProducerStream(), publication_stream);
+        }
+    }
 #endif
 }
 

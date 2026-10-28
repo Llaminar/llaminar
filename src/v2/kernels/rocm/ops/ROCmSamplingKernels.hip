@@ -4695,7 +4695,8 @@ rocm_commit_device_generation_and_derive_speculative_publication_metadata_kernel
     const int32_t *__restrict__ verifier_input_tokens,
     int verifier_input_token_stride,
     llaminar2::sampling_math::MTPCommittedVerifierIdentityRecord *
-        __restrict__ out_committed_verifier_identity)
+        __restrict__ out_committed_verifier_identity,
+    llaminar2::sampling_math::MTPDepthTransactionTrace *depth_transaction_trace)
 {
     const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (request_index >= request_count)
@@ -4773,7 +4774,8 @@ rocm_commit_device_generation_and_derive_speculative_publication_metadata_kernel
         out_all_drafts_accepted_flags
             ? out_all_drafts_accepted_flags + request_index
             : nullptr,
-        out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+        out_stopped_flags ? out_stopped_flags + request_index : nullptr,
+        depth_transaction_trace);
 
     if (committed && out_ok && out_ok[request_index] != 0 &&
         has_complete_verifier_identity_binding &&
@@ -7688,12 +7690,13 @@ rocmOps_commit_device_generation_and_derive_speculative_publication_metadata(
     int verifier_input_token_stride,
     llaminar2::sampling_math::MTPCommittedVerifierIdentityRecord *
         out_committed_verifier_identity,
+        llaminar2::sampling_math::MTPDepthTransactionTrace *depth_transaction_trace,
     int device_idx,
     void *stream)
 {
     if (!compact_tokens || output_token_stride <= 0 || !compact_meta ||
         meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
-        !base_cached_tokens || request_count <= 0 ||
+        !base_cached_tokens || request_count <= 0 || (depth_transaction_trace && request_count != 1) ||
         padded_state_rows_per_request <= 0 ||
         !response_tokens || response_token_stride <= 0 ||
         !control ||
@@ -7755,7 +7758,7 @@ rocmOps_commit_device_generation_and_derive_speculative_publication_metadata(
             out_next_verifier_condition_tokens),
         verifier_input_tokens,
         verifier_input_token_stride,
-        out_committed_verifier_identity);
+        out_committed_verifier_identity, depth_transaction_trace);
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {

@@ -37,7 +37,12 @@ namespace llaminar2
             const auto &p = summary.prefix_request;
             return prompt - (p.enabled && !p.bypassed ? p.matched_tokens : 0);
         }
-        /** @brief Serialize one actual terminal MTP observation with token-weighted acceptance. */
+        /**
+         * @brief Serialize accepted draft tokens over actual attempted draft tokens.
+         * Rejected transactions cannot reconstruct discarded multi-token suffixes.
+         * @param summary Immutable terminal request counters published after cleanup.
+         * @return MTP diagnostics with nullable rates when disabled, bypassed or unattempted.
+         */
         json mtpJson(const RequestRuntimeSummary &summary)
         {
             const auto &m = summary.mtp_request;
@@ -48,8 +53,7 @@ namespace llaminar2
                 {"depth_updates", m.depth_policy_updates}, {"draft_tokens", m.draft_steps},
                 {"accepted_tokens", m.accepted_tokens}, {"rejected_tokens", m.rejected_tokens},
                 {"verifier_runs", summary.mtp_verifier_runs},
-                {"acceptance_rate", measured ? ratio(m.accepted_tokens,
-                    static_cast<double>(m.accepted_tokens) + m.rejected_tokens) : json(nullptr)},
+                {"acceptance_rate", measured ? ratio(m.accepted_tokens, m.draft_steps) : json(nullptr)},
                 {"stochastic_acceptance_rate", measured ?
                     ratio(m.stochastic_accepts, m.stochastic_accept_tests) : json(nullptr)}};
         }
@@ -352,7 +356,7 @@ namespace llaminar2
             {"mtp", {{"requests", c.mtp_requests}, {"draft_tokens", c.mtp_drafts},
                 {"accepted_tokens", c.mtp_accepted}, {"rejected_tokens", c.mtp_rejected},
                 {"depth_updates", c.mtp_depth_updates}, {"verifier_runs", c.mtp_verifier_runs},
-                {"acceptance_rate", ratio(c.mtp_accepted, static_cast<double>(c.mtp_accepted) + c.mtp_rejected)},
+                {"acceptance_rate", ratio(c.mtp_accepted, c.mtp_drafts)},
                 {"stochastic_accept_tests", c.mtp_stochastic_tests}, {"stochastic_accepts", c.mtp_stochastic_accepts},
                 {"stochastic_acceptance_rate", ratio(c.mtp_stochastic_accepts, c.mtp_stochastic_tests)}}},
             {"last_request", nullptr}};

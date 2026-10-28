@@ -2875,7 +2875,10 @@ namespace llaminar2
              {"composed_parent",
               retained->composed_parent ? "true" : "false"},
              {"role", std::to_string(static_cast<int>(
-                          signature.execution_role))}});
+                          signature.execution_role))},
+             {"physical_rows", std::to_string(signature.seq_len)},
+             {"sparse_query_program", std::to_string(sparseQueryExecutionProgramIndex(signature.sparse_query_execution_program))},
+             {"capture_family", std::to_string(cache.segment_cache.evidence_family)}});
         return true;
     }
 

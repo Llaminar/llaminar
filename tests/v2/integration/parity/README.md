@@ -161,6 +161,16 @@ partial hits; MTP independently adds shifted sidecar and full-hit hidden-state
 obligations. This contract is part of serial-control identity, not inferred
 from model filenames, response flags or optional profiling.
 
+Explicit local diagnostics may pass `--local-unbounded-generation` to the
+native HTTP harness with `--generation-configuration`. Docker and cross-host
+workloads are rejected. Generation requests and successful administrative
+persistence then wait without a deadline; startup stays bounded and failed
+shutdown uses 30s exceptional retirement. The client defaults to one 600s sequence,
+and the outer canonical CI cell watchdog is unchanged. A local caller must own
+process/signal cleanup and use an unbounded ordinary wait; the option alone does
+not disable an enclosing watchdog. All token, prefix, movement, graph and native
+retirement checks remain mandatory. This diagnostic does not certify an image.
+
 The routine generation runner reuses the mature HTTP harness's local or
 Docker server lifecycle. Its default `regression` mode selects only MTP-off
 and dynamic-depth cells and compares them with reviewed, versioned serial
@@ -379,7 +389,7 @@ passed flag alone is insufficient. Runtime startup evidence joins selected
 participants to canonical physical-node and GPU UUID/CPU NUMA identity, then
 checks the declared strategy and counts. Repeated visibility of one GPU on two
 MPI ranks cannot satisfy a two-GPU obligation. There is no model-size skip for
-a tagged cell. Each HTTP
+a tagged cell. Each canonical CI HTTP
 cell has one profile-owned `cell_timeout_seconds` watchdog (default fifteen
 minutes), including startup and shutdown. The profile exports budgets for both
 ISAs; the runner selects the tested image's OCI ISA label or the local Release

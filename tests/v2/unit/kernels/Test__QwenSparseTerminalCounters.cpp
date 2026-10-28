@@ -52,14 +52,17 @@ TEST(QwenSparseTerminalCounters, ExactPairsCarryAndOverflowPreserveAllEarlierWor
     EXPECT_FALSE(addQwenSparseHostCounters(row.words.data(),kDeviceGenerationControlCount,{16,0,8,3}));EXPECT_EQ(row.words,limit);
     EXPECT_FALSE((QwenSparseWorkCounterRow{row.words.data(),52}).valid());
 }
-/** @brief QSA retains its exact32B; fixed-head48B and adaptive72B extend the same canonical row. */
+/** @brief QSA retains its exact32B; fixed-head48B, adaptive72B and immutable scope40B and utility state/events32B extend the same canonical row. */
 TEST(QwenSparseTerminalCounters, TerminalAndCanonicalRowExtentsAddExactlyFourPairs){
     static_assert(kDeviceGenerationControlQsaPriorHeaderBytesLow==kDeviceGenerationControlInitialDraftDepth+1);
-    static_assert(kDeviceGenerationControlCount*sizeof(std::int32_t)==360);
+    static_assert(kDeviceGenerationControlCount*sizeof(std::int32_t)==432);
+    static_assert(kDeviceGenerationControlDepthUtilityPhase==100);
+    static_assert(kDeviceGenerationControlDepthUtilityProbes-kDeviceGenerationControlDepthUtilityPhase==5);
+    static_assert(kDeviceGenerationControlCount-kDeviceGenerationControlDepthUtilityProbes==3);
     EXPECT_EQ((kDeviceGenerationControlQsaAcceptedPayloadBytesHigh+1-kDeviceGenerationControlQsaPriorHeaderBytesLow)*sizeof(std::int32_t),4*sizeof(std::uint64_t));
     for(int requests:{1,3,8}){
         const auto bytes=std::size_t(requests)*kDeviceGenerationControlCount*sizeof(std::int32_t);
-        EXPECT_EQ(bytes,std::size_t(requests)*(208+32+48+72));
+        EXPECT_EQ(bytes,std::size_t(requests)*(208+32+48+72+40+20+12));
         EXPECT_EQ((kDeviceGenerationControlCount*sizeof(std::int32_t))%alignof(std::uint64_t),0u);
     }
 }

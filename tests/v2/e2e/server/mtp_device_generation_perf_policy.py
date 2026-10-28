@@ -89,6 +89,95 @@ def _positive_transaction_sequence(record: Mapping[str, Any]) -> bool:
     )
 
 
+_ADMISSION_SOURCE = "native_continue_response_admission"
+_ADMISSION_NAMES = (
+    "device_generation_continuation_admission_tickets",
+    "device_generation_dispatch_tickets_observed",
+    "hosted_device_generation_transaction_submissions",
+)
+
+
+def _admission_witness(record: Mapping[str, Any]) -> tuple | None:
+    """Authenticate one bounded [ordinal0, session, workspace] counter stream.
+
+    The collector's digest fold depends only on ordered witness words, so the
+    independently appended admission/observation/submission streams must match
+    exactly. Session/workspace IDs never become cumulative counter-map keys.
+    """
+    count = record.get("count")
+    minimum, maximum = record.get("sequence_minimum_words"), record.get("sequence_maximum_words")
+    unsigned = lambda value: type(value) is int and 0 <= value < 1 << 64
+    if (record.get("kind") != "counter" or record.get("domain") != "mtp"
+            or record.get("phase") != "decode" or not unsigned(count) or count == 0
+            or type(record.get("value")) not in (int, float) or record["value"] != count
+            or type(record.get("sequence_word_count")) is not int
+            or record["sequence_word_count"] != count * 3
+            or not isinstance(minimum, list) or not isinstance(maximum, list)
+            or len(minimum) != 3 or len(maximum) != 3
+            or not all(unsigned(value) for value in [*minimum, *maximum])
+            or minimum[0] != 0 or maximum[0] != 0
+            or any(not 0 < minimum[word] <= maximum[word] for word in (1, 2))
+            or not unsigned(record.get("sequence_digest_lo"))
+            or not unsigned(record.get("sequence_digest_hi"))):
+        return None
+    return (count, record["sequence_word_count"], tuple(minimum), tuple(maximum),
+            record["sequence_digest_lo"], record["sequence_digest_hi"])
+
+
+def _continuation_admission_error(records: Iterable[Mapping[str, Any]], device: str,
+                                  minimum_depth: int, maximum_depth: int) -> tuple[str | None, int]:
+    """Join every zero-ticket admission to its actual observation and branch.
+
+    A separate ContinueResponse admission count proves the number of response
+    windows. A zero-valued or duplicated stream, another device/rank, a foreign
+    lifecycle, or another entry role cannot repair a missing witness.
+    """
+    streams: list[dict[tuple, tuple]] = []
+    for name in _ADMISSION_NAMES:
+        stream: dict[tuple, tuple] = {}
+        for record in records:
+            tags = record.get("tags") or {}
+            if (record.get("device") != device or record.get("name") != name
+                    or (name != _ADMISSION_NAMES[0] and tags.get("entry_source") != _ADMISSION_SOURCE)):
+                continue
+            depth = _integer(tags.get("next_depth") if name == _ADMISSION_NAMES[1] else tags.get("depth"))
+            witness = _admission_witness(record)
+            depth_field = tags.get("next_depth") if name == _ADMISSION_NAMES[1] else tags.get("depth")
+            if (witness is None or type(depth_field) is not str or depth_field != str(depth)
+                    or type(tags.get("physical_rows")) is not str or tags["physical_rows"] != str(depth + 1)
+                    or tags.get("entry_source") != _ADMISSION_SOURCE
+                    or tags.get("family") != "exact_rows"
+                    or not minimum_depth <= depth <= maximum_depth
+                    or _integer(tags.get("physical_rows")) != depth + 1
+                    or any(key in tags for key in ("transaction", "session_epoch", "workspace_generation"))
+                    or (name == _ADMISSION_NAMES[1] and
+                        (tags.get("complete") != "false" or tags.get("maintenance_due") != "false"))
+                    or (name == _ADMISSION_NAMES[2] and
+                        (tags.get("dynamic_depth_source") != "device_controller_ticket" or
+                         _integer(tags.get("fragments")) <= 0))):
+                return f"Hosted MTP continuation admission witness is malformed on {device}", 0
+            key = (depth, depth + 1, "exact_rows", _ADMISSION_SOURCE)
+            if key in stream:
+                return f"Hosted MTP continuation admission witness is duplicated on {device}", 0
+            stream[key] = witness
+        streams.append(stream)
+    if streams[0] != streams[1] or streams[0] != streams[2]:
+        return f"Hosted MTP continuation admission/observation/branch witnesses disagree on {device}", 0
+    count = sum(witness[0] for witness in streams[0].values())
+    admissions = [record for record in records if record.get("device") == device
+                      and record.get("name") == "device_generation_admissions"
+                      and (record.get("tags") or {}).get("admission_boundary") == "continue_response"]
+    if count or admissions:
+        if (not admissions or any(record.get("domain") != "mtp" or record.get("phase") != "decode"
+                or (record.get("tags") or {}).get("response_owner") != "persistent_device_ledger"
+                or _integer((record.get("tags") or {}).get("request_count")) != 1
+                or _integer((record.get("tags") or {}).get("minimum_draft_depth")) != minimum_depth
+                or _integer((record.get("tags") or {}).get("maximum_draft_depth")) != maximum_depth
+                for record in admissions) or sum(_value(record) for record in admissions) != count):
+            return f"Hosted MTP continuation admission count disagrees with native ticket-zero work on {device}", 0
+    return None, count
+
+
 def _records_by_device(
     records: Iterable[Mapping[str, Any]],
     name: str,
@@ -494,6 +583,10 @@ def validate_host_scheduled_mtp_device_generation_policy(
                   == "hosted_captured_transactions_with_ticket_only_dispatch")}
     if not ranks:
         return MTPDeviceGenerationValidation("Hosted MTP emitted no controller materialization", ())
+    if any(row.get("rank") not in ranks and row.get("name") in _ADMISSION_NAMES
+           and (row.get("name") == _ADMISSION_NAMES[0] or
+                (row.get("tags") or {}).get("entry_source") == _ADMISSION_SOURCE) for row in records):
+        return MTPDeviceGenerationValidation("Hosted MTP continuation witness has a foreign rank", ())
     devices: list[str] = []
     for rank in sorted(ranks, key=str):
         rows = tuple(row for row in records if row.get("rank") == rank)
@@ -566,7 +659,19 @@ def _validate_host_scheduled_rank(
         records, "hosted_device_generation_transaction_submissions"
     )
 
+    continuation_counts: dict[str, int] = {}
+    for record in records:
+        tags = record.get("tags") or {}
+        if (record.get("name") in _ADMISSION_NAMES and
+                (record.get("name") == _ADMISSION_NAMES[0] or tags.get("entry_source") == _ADMISSION_SOURCE)
+                and record.get("device") not in devices):
+            return MTPDeviceGenerationValidation("Hosted MTP continuation witness has a foreign participant", devices)
     for device in devices:
+        continuation_error, continuation_count = _continuation_admission_error(
+            records, device, expected_minimum_depth, expected_maximum_depth)
+        if continuation_error:
+            return MTPDeviceGenerationValidation(continuation_error, devices)
+        continuation_counts[device] = continuation_count
         kind = device.partition(":")[0].lower()
         if kind not in device_kinds:
             return MTPDeviceGenerationValidation(
@@ -677,7 +782,9 @@ def _validate_host_scheduled_rank(
             )
 
         if not ticket_observations.get(device) or any(
-            not _positive_transaction_sequence(record)
+            ((record.get("tags") or {}).get("entry_source") != _ADMISSION_SOURCE and
+             (not _positive_transaction_sequence(record) or
+              (record.get("tags") or {}).get("entry_source") not in {None, "committed_transaction_ticket"}))
             or not (
                 expected_minimum_depth
                 <= _integer((record.get("tags") or {}).get("next_depth"))
@@ -703,6 +810,10 @@ def _validate_host_scheduled_rank(
                 <= _integer((record.get("tags") or {}).get("depth"))
                 <= expected_maximum_depth
             )
+            or (record.get("tags") or {}).get("entry_source") not in {
+                None, "committed_transaction_ticket", _ADMISSION_SOURCE}
+            or ((record.get("tags") or {}).get("entry_source") != _ADMISSION_SOURCE
+                and record.get("sequence_word_count", 0) != 0)
             or (record.get("tags") or {}).get("dynamic_depth_source")
             != "device_controller_ticket"
             or _integer((record.get("tags") or {}).get("fragments")) <= 0
@@ -768,11 +879,11 @@ def _validate_host_scheduled_rank(
         if (
             transaction_count <= 0.0
             or compact_reductions.get(device, 0.0) != transaction_count
-            or ticket_submission_totals.get(device, 0.0) != transaction_count
-            or ticket_observation_totals.get(device, 0.0) != transaction_count
+            or ticket_submission_totals.get(device, 0.0) != transaction_count + continuation_counts[device]
+            or ticket_observation_totals.get(device, 0.0) != transaction_count + continuation_counts[device]
             or hosted_transaction_totals.get(device, 0.0)
             + hosted_terminal_totals.get(device, 0.0)
-            != transaction_count
+            != transaction_count + continuation_counts[device]
             or hosted_terminal_totals.get(device, 0.0) <= 0.0
             or attempted_drafts
             < transaction_count * expected_minimum_depth
@@ -840,6 +951,7 @@ def _validate_host_scheduled_rank(
             )
 
     mirrored_totals = (
+        continuation_counts,
         transactions,
         compact_reductions,
         drafts,

@@ -1,13 +1,14 @@
 # QFN MTP on ROCm TP4
 
-Updated 2026-10-27. Active objective: exceed Castagna's measured QFN MTP decode
+Updated 2026-10-28. Limit: 15,000 UTF-8 bytes. Active objective: exceed Castagna's measured QFN MTP decode
 throughput on the same four MI50s, then complete a full OpenCode coding session
 with the accepted configuration. This plan and status table remain below 15 KB;
 raw runs, profiles and failed experiments stay in ignored result directories.
 
 ## Baseline contract
 
-- Llaminar starts at `e2c971301`; Castagna is pinned to
+- Llaminar qualification is checkpointed at `3d46cf4a9` (base `e2c971301`);
+  Castagna is pinned to
   `3483d462715d61f21ed5877836be35a724446359`, matching its checked remote main.
 - Both engines use the original four-shard Qwen3.8-Flash-Next UD-Q4_K_XL and
   `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, with metadata-only source identity.
@@ -28,105 +29,158 @@ Qualification and acceptance of fixed/dynamic MTP, stochastic sampling and
 prefix request reuse precede further performance tuning. The table records
 diagnostic timings; it does not certify the remaining production cases.
 
-## Current qualification
+## Current status
 
-**Accepted for checkpointing:** fresh complete prerequisites and all six real
-QFN TP4 HTTP modes pass. Performance tuning against Castagna is next; no MTP
-throughput win or full OpenCode completion is claimed yet.
+**Accepted dynamic default: 101.05 decode tok/s versus fresh Off 43.40.**
+On the original 512/256 repetition workload, all token IDs match across one
+warmup and three measured requests per arm. Dynamic is 2.94% above the dated
+Castagna 98.16 control; no new Castagna run or general-policy win is claimed.
+[Current evidence](QFN_MTP_DIRECT_OUTPUT_HISTORY_20261028.md).
 
-- Complete prerequisite R3: **783 Unit + 2,065 integration tests pass**, with
-  29 unavailable-hardware skips and no failures. Every terminal XML and the
-  unchanged build/inventory identity were verified. Receipt:
-  `/tmp/qfn-mtp-qualified-prerequisites-r3/prerequisites.json`.
-- Release/Integration rebuilds, ten focused registrations and six actual source
-  runtime exports pass. The accepted implementation retains native allocation
-  borrows across replay, declares independent FA/QSA participant obligations,
-  publishes completed native capture evidence and fixes main/predictor bounds.
-  Each defect has an explicit production-preflight regression.
-- Runtime exports separate admission diagnostics, HTTP qualification and
-  production serving. Runtime uses production prefix/maintenance defaults;
-  diagnostic short-prompt block geometry cannot leak into serving. Qualification
-  retains capacity 15 and starts dynamic depth at 15; serving delegates initial
-  depth to the native policy. Cold startup remains within its source-owned 300s
-  readiness allowance.
+**Chosen default (user decision 2026-10-28):** retain the new controller for the
+measured QFN ROCm TP4 scope despite imperfect economics. The 95%-of-best-fixed
+comparison passes only6/10 and is now diagnostic, not a promotion blocker.
+Every measured miss remains visible. Correctness, HTTP and full-session gates
+still apply; no unmeasured cost domain is added.
 
-| HTTP policy | Committed tokens | Recorded rejections | Result |
-|---|---:|---:|---|
-| Off | 1,536 | 0 | Green control and exact repeats |
-| Fixed1 | 1,536 | 306 | Green; exact serial agreement |
-| Fixed2 | 1,536 | 472 | Green; exact serial agreement |
-| Fixed3 | 1,536 | 568 | Green; exact serial agreement |
-| Fixed15 | 1,536 | 664 | Green; exact serial agreement |
-| Dynamic, initial15 | 1,536 | 664 | Green; 38 updates, terminal depth 5/6 |
+R13 Unit/preflight: 2,978 pass, zero fail, 29 skips. Post-audit Unit: 786/786.
+Release replay/resources pass. Native-event medians CUDA 1.136µs and ROCm
+1.9475µs are amortized operations, not speedup claims. All nine HTTP arms pass:
+Off is the serial control; eight arms prove widths/comparison. Serving starts
+at depth 5 and uses depths 1/2/3/5. Ten app phases pass: 128 tool calls, two
+errors, 65 tests and independent acceptance. Archive/native-token audit repairs
+pass. The strict driver gate remains red; complete certification is open.
+[Diagnosis and receipts](QFN_MTP_DIRECT_OUTPUT_HISTORY_20261028.md).
 
-Each mode runs the same four 384-token stochastic requests, T0.7/k40/p0.9/seed4242:
-fresh harbor, full repeat, partial mountain continuation, full repeat. All active
-responses match the fresh Off control exactly. Full hits restore 214/214 or 289/289
-prompt tokens; the partial hit restores 214/289. Active cases restore both MTP
-and hybrid recurrent state. All four GPUs publish prefill/decode QSA capture
-proof, with separate FA predictor obligations when enabled. Dynamic also passes
-the native stochastic-controller/retained-transaction ticket validator.
+Historical HTTP:24 requests/9,216 tokens, exact serial equality at
+T0.7/k40/p0.9/seed4242, full/partial prefix restoration:
+`/tmp/qfn-a1-http-qualification-setup-r5/acceptance.json`.
+This does not certify current source.
 
-Total: **24 requests / 9,216 tokens**. PMA, captured replay, transfer/movement
-policy, driver observations and normal retirement pass. VRAM returns to the 40 MiB
-host baseline after each run. Passive peak process-tree RSS sums are 39.66 GB Off
-and 40.91–41.07 GB active; these sums are not deduplicated physical memory.
-All observed owners retire. Exact owned cache cleanup removes 14.49 GB, leaving
-about 506 GB free. No model/cache payloads are read or hashed for this accounting.
+Scoped training, exact transaction capture and canonical controller replay are
+implemented. Global fitting, longer sample cadence and capped upward steps have
+not passed the complete economic gate. See the
+[training investigation](QFN_MTP_DEPTH_RETRAINING_20261027.md) for retained failures.
 
-Evidence: `/tmp/qfn-a1-http-qualification-setup-r5/acceptance.json`, its invocation,
-execution and resource receipts, and `qualification-progress.json`. Canonical
-logs, observations, PerfStats, driver reports and cleanup receipts remain in
-`parity-results/qwen-flash-next/a1-cap15-http-{off,fixed1,fixed2,fixed3,fixed15,dynamic}-r2/`.
-Actual exports are in `/tmp/qfn-a1-runtime-exports-r5/`.
+Earlier reversible-utility and provenance trials failed economics. Their full
+evidence remains in the [utility investigation](QFN_MTP_UTILITY_PROBE_PLAN_20261027.md).
 
-The earlier Off r1 remains red: generation passed but its FA-only observer
-rejected QSA. Fresh r2 proves the fix; failed receipts were not restamped.
-This is local runtime qualification, not corpus/image/release certification.
-**Full OpenCode has not run.** The prepared client 1.18.34 adapter has 32 passing
-pure tests and uses the separate production-serving export; refresh its plan
-if source/binary identity changes before execution.
+The previous downward-only candidate passed TRAIN10/10 but failed frozen HOLDOUT3/4;
+it remains rejected. Its exact results are retained in
+`/tmp/qfn-mtp-directional-downward-final-economic-report-r1/final-evaluation.json`.
 
-The historical 42.959 tok/s Castagna and 43.453 tok/s Llaminar results are
-**MTP-off**. Castagna's published 119 tok/s profile uses TP2×PP2 and restricted
-draft vocabulary. Neither number establishes this goal's TP4 MTP target.
+The previous verified-progress candidate passed correctness but only6/10 speed
+rows; its evidence remains in the [investigation](QFN_MTP_VERIFIED_PROGRESS_20261028.md).
+The [confirmation successor](QFN_MTP_TARGET_CONFIRMATION_20261028.md) requires the
+same target across three disjoint windows using admitted hysteresis. Complete786
+Unit and75 focused registrations pass without skips, including native CUDA/ROCm,
+terminal validation and genuine recorded preflight replay. Release,10 captures
+and40 strict replays pass. All90 timed outputs match serial controls. However,
+speed reaches95% in only6/10 rows. The user accepted this trade-off for the
+default. Current-source correctness preflight and HTTP/app qualification remain
+required; the failed economic results are retained as diagnostics.
 
-| TP4 policy | Castagna prefill/decode | Llaminar prefill/decode | Accuracy / state |
-|---|---|---|---|
-| Off control | 466.22 / 42.67 tok/s | 819.46 / 43.36 tok/s | Fresh lease-fix control; unchanged IDs and speed; prior main-model panel green |
-| Fixed 1 | 437.88 / 64.55 tok/s | 789.27 / 59.11 tok/s | Lease fix: 4.12× faster; exact original/own-Off IDs, 100% acceptance; still below fork |
-| Fixed 2 | 435.81 / 78.45 tok/s | Pending | Fork: 100% draft acceptance; exact own-Off IDs |
-| Fixed 3 | 433.91 / 91.38 tok/s | 788.79 / 89.91 tok/s | Lease fix: 2.85× faster; exact original/own-Off IDs, 100% acceptance; 1.61% below fork |
-| Native adaptive, cap 3 | 435.80 / 90.86 tok/s | Pending | Fork: depth-3 work; exact own-Off IDs |
+| TRAIN prompt | Greedy dynamic/fixed tok/s | Difference | Stochastic dynamic/fixed tok/s | Difference |
+|---|---:|---:|---:|---:|
+| Python | 79.78 / 79.74 | +0.04% | 81.15 / 80.80 | +0.43% |
+| Repetition | 101.19 / 108.13 | −6.41% | 100.48 / 107.79 | −6.78% |
+| Builtin | 76.80 / 89.26 | −13.96% | 79.23 / 79.28 | −0.07% |
+| Long Python | 66.28 / 70.27 | −5.68% | 60.38 / 62.49 | −3.38% |
+| Prose | 62.28 / 64.76 | −3.83% | 75.78 / 74.77 | +1.35% |
 
-All completed timing arms retain native/quiet/driver/retirement passes and exact
-own-Off output IDs. These are the earlier frozen lease-fix cohort; prepare a
-fresh packet after checkpointing. The synthetic repeated-token prompt has 100%
-draft acceptance and isolates execution cost. Use the prepared natural Python/
-prose pair as a separate newly authenticated comparison, not a mixed series.
+Medians of three: refreshed greedy, original stochastic. Report the95% comparison
+against each fresh frozen-best-fixed control as a diagnostic.
+No normalization or dropped rows. Evidence:
+`/tmp/qfn-mtp-confirmation-comparison-r1/comparison.json` and
+`/tmp/qfn-mtp-confirmation-focused-r3/result.json`.
+Fewer probes (72→15) did not establish a general speed win. Builtin spends32
+transactions at depth2 versus8 previously. Repetition's locally supported depth6
+changes future transaction boundaries and finishes slower than fixed5; its cost
+profile agrees with measurement. Long-context repricing preserves all ten fixed
+winners. Neither richer histograms nor a cost-table correction fixes these choices.
+Next: investigate the strict driver failure; checkpoint the scoped green work.
+Diagnosis: `/tmp/qfn-mtp-confirmation-repetition-diagnosis-r1-private/NOTE.md`;
+baseline plan: `/tmp/qfn-mtp-castagna-train-coverage-review-r1-private/NOTE.md`.
 
-Raw timings live under `parity-results/qwen-flash-next/mtp-tp4-castagna-*` and
-`mtp-tp4-llaminar-{off,fixed1,fixed3}-lease-r1`. Fixed3 samples span 89.8980–90.1235
-for Llaminar and 90.9197–91.4698 for Castagna. The 1.61% median gap needs repeat or
-interleaved observations before statistical claims. Native MPI uses
-`OMP_PROC_BIND=close,OMP_PLACES=cores`; Castagna retains its own `false` policy.
+Scoped control preserves original counter ordinals. Guarded CUDA80/86/89/90 and
+gfx906 builds pass after eliminating an outlined-helper callee-save spill;
+metadata serialization and startup authority have regressions.
 
-The original fixed1 CPU profile found 41.14% sampled cycles in repeated
-`ROCmBackend::retainNativeAllocation` scans during graph identity validation.
-The accepted fix borrows once and checks frozen owner/backend/span identity on
-replay. Existing borrower guards still forbid physical free/reuse; there is no
-new allocation owner or PMA ledger. The fixed1 diagnostic improved 4.12× and
-fixed3 improved 2.85×, with unchanged output IDs and verifier work. These rates
-are not a new post-qualification benchmark.
+## Current performance
 
-Original captured traces showed 39.26 ms median spread between participant main
-launches, while the final-arrival AllGather tail was about 0.081 ms. This exposed
-host submission as the original deficit; it did not establish poor collective
-bandwidth. Sampled-cycle percentages and profiled spans are not wall fractions.
-Evidence: `mtp-tp4-fixed1-host-cycles-r1`, `/tmp/qfn-a1-fixed1-host-cycles-r1`,
-`mtp-tp4-fixed1-captured-trace-r3`, and the clean Off diagnostic
-`mtp-tp4-off-captured-trace-r5`. Earlier observer/profiler failures remain failed.
-Profile the remaining post-fix deficit before choosing another optimization.
+Rates are prefill/decode **tok/s**, medians of three requests after one warmup.
+The table below retains historical R9/R11 rates; the fresh natural-EOS control
+is above. Llaminar retains capacity15. Castagna's native baseline uses capacity
+equal to depth; capacity15 controls are also shown because its larger reservation
+measurably costs throughput. The newest exact-row results are R9/R11.
+
+| Policy | Castagna native capacity | Castagna capacity15 | Llaminar capacity15 | Scope |
+|---|---:|---:|---:|---|
+| Off |466.22 /42.67|—|819.75 /43.43|Serial controls; L R6 |
+| Fixed1 |437.88 /64.55|—|789.27 /59.11|Earlier lease-fix control |
+| Fixed2 |435.81 /78.45|—|789.10 /73.59|Qualified checkpoint control |
+| Fixed3 |434.57 /91.04|—|789.22 /90.11|L R9 exact rows4 |
+| Fixed4 |432.68 /92.22|409.21 /85.73|789.05 /96.82|R10/R11; L exact rows5 |
+| Fixed5 |431.60 /93.76|414.94 /88.08|788.99 /**108.43**|R10/R11; L exact rows6 |
+| Fixed6 |424.11 /**100.21**|408.86 /92.82|788.54 /86.01|R10/R11; L exact rows7 |
+| Default dynamic, cap15 |—|410.76 /65.49|789.16 /89.16|Different controllers; L R9 holds3 |
+
+L fixed4/5/6 request work respectively:208/215/300 drafts,
+204/213/206 accepted,0/1/42 rejections,52/43/50 verifier calls and260/258/350
+logical rows. Post-rejection and terminal-budget unused drafts are not accepted;
+training uses accepted/drafted, matching controller economics. Fixed5 samples
+108.19–108.65; fixed6 samples85.92–86.20. Each stream equals own-Off IDs.
+Historical rate differences are15.64% at depth5 and8.20% versus fork-best6;
+those historical fork requests suppressed EOS; use the fresh matched control above.
+
+Completed arms retain native, quiet-window, driver and normal-retirement passes.
+L uses `OMP_PROC_BIND=close,OMP_PLACES=cores`; Castagna uses explicit `false`.
+Results under `parity-results/qwen-flash-next/`:
+`mtp-tp4-llaminar-{default-dynamic,fixed3}-exact-r9-r1`,
+`mtp-tp4-llaminar-fixed{4,5,6}-exact-r11-r1`,
+`mtp-tp4-castagna-fixed{4,5,6}-cap15-r10-*`, and
+`mtp-tp4-castagna-fixed{4,5,6}-cap{4,5,6}-r11-r1`, with quiet siblings.
+Fork token proof: `/tmp/qfn-fixed456-castagna-baselines-r1.json`.
+
+Hosted execution retains exact rows2–16, ordinary M1 separately, with one
+admission inventory for prep/outcome/publication and pipeline followers. Native
+CUDA conditional parents retain their envelope. Continuation uses the genuine
+device-authored admission ticket and preserves learned depth, without host state
+mirrors or serial row replay. Exact-row tags are absent from timing's disabled/
+reset PerfStats; HTTP must prove actual retained replays separately.
+
+R9 versus R6 Dynamic: four-GPU sampled VRAM rises0.372GiB; summed process RSS
+rises4.04GiB, not deduplicated physical RAM. Maximum overlapping worker family
+setup rises44.683→105.945s, not total launch readiness. Later idle VRAM returns
+to the approximately40MiB baseline. The ordered-view candidate was removed:
+90.271 D overlaps90.164/90.369 control/repeat. The fixed3 CPU profile attributes
+94.64% sampled cycles to ticket waits and0.97% to identity checks; these are not
+wall-time fractions. [Details](QFN_MTP_TP4_HOST_PROFILE_20261027.md).
+
+## Dynamic-depth retraining
+
+Use the existing generated-table trainer and production BenchmarkRunner. Reuse
+one admitted runtime across validated, reset requests through the typed
+`configureMTPRequestPolicy` API. Keep canonical timing and output evidence.
+
+1. Freeze short/repetitive, Python generation, prose and long-context prompts
+   before collection; separate train and holdout prompts. Measure fixed1–15,
+   Off and old dynamic with greedy and seeded stochastic sampling, common
+   retained capacity and request budgets.
+2. Authenticate prompt IDs, real model class, topology, execution family,
+   sampling, source/runtime and work counts. Scope policy updates to measured
+   domains; preserve unmeasured models/backends/topologies.
+3. Derive labels from useful after-prefill throughput and accepted/attempted
+   drafts. Select startup from equal-weight training requests only. Holdouts
+   cannot select startup, thresholds or the near-best band.
+4. Test emitted first-match behavior and unchanged domains. Measure held-out
+   dynamic against old dynamic and fixed controls, including rejection, low
+   acceptance, longer context and retained graph reuse. Report throughput regret
+   as well as rule classification; aim within5% of best fixed without baseline
+   regressions. The repetitive512-token control alone cannot qualify defaults.
+5. Promote the measured winner, run fresh complete prerequisites, then refresh
+   stochastic/prefix HTTP and OpenCode. Fixed5/6 exports preserve existing
+   six-mode qualification; the automatic serving startup is a separate check.
 
 The refreshed main-model panel is
 `parity-results/qwen-flash-next/mtp-tp4-baseline-accuracy-r1/report.json`.

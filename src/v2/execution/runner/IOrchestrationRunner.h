@@ -753,6 +753,16 @@ namespace llaminar2
         virtual const RankExecutionPlan &executionPlan() const = 0;
 
         /**
+         * @brief Project frozen model/topology keys and the current physical width strategy.
+         * @return Complete actual economics scope, or explicit generic metadata.
+         * Request selection changes only the actual strategy key; retained capacity
+         * and loaded geometry remain immutable. No mutable device values are read.
+         */
+        [[nodiscard]] virtual MTPDepthPolicyScope mtpDepthPolicyScope() const { return {}; }
+        /** @return Why a scalar measured scope is unavailable; generic policy remains unchanged. */
+        [[nodiscard]] virtual const char *mtpDepthPolicyScopeGenericReason() const { return "model_free"; }
+
+        /**
          * @brief Get orchestration configuration
          *
          * Returns the OrchestrationConfig used to create this runner.

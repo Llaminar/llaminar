@@ -36,6 +36,7 @@ namespace llaminar2
     namespace sampling_math
     {
         struct MTPCommittedVerifierIdentityRecord;
+        struct MTPDepthTransactionTrace;
     }
 
     /**
@@ -164,6 +165,8 @@ namespace llaminar2
             int generation_response_token_stride = 0;
             int *generation_control_device = nullptr;
             int generation_control_stride = 0;
+            /** Optional exclusive diagnostic bank; no value supplies inference state. */
+            sampling_math::MTPDepthTransactionTrace *depth_transaction_trace_device = nullptr;
 
             /** Reusable verifier row consumed by the transaction being committed. */
             const int32_t *verifier_input_tokens_device = nullptr;

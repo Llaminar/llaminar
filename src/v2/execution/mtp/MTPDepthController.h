@@ -5,15 +5,23 @@
  * Request admission selects a measured startup independently of the learned
  * acceptance-window transitions. The controller owns only CPU request state;
  * GPU admission seals the same policy into the device-owned generation ABI.
+ * Measured adaptation confirms targets using one mode-exclusive CPU history;
+ * partial observations cannot overwrite or duplicate that target authority.
  * Neither startup selection nor adaptation changes the retained graph capacity.
  */
 #pragma once
 
 #include "../config/RuntimeConfig.h"
+#include "MTPDepthCostProfile.h"
+#include "MTPPublicationWitness.h"
+#include "MTPReversibleProposalGate.h"
+#include "MTPSurvivalDepthSelector.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
+#include <variant>
 
 namespace llaminar2
 {
@@ -30,6 +38,11 @@ namespace llaminar2
         FixedMode,
         WindowNotReady,
         BudgetLimited,
+        ModelStopped,
+        SurvivalSupportedProbe,
+        SurvivalUnresolvedProbe,
+        SurvivalHold,
+        SurvivalAwaitingConfirmation,
         CooldownActive,
         PromotionHysteresisActive,
         PromoteFullAcceptRate,
@@ -42,6 +55,10 @@ namespace llaminar2
         ProbeHigherBeforeDemote,
         DepthZeroBypass,
         Hold,
+        UtilityProbeStarted,
+        UtilityProbeKept,
+        UtilityProbeReturned,
+        UtilityRejectedComparisonHold,
     };
 
     /** @return Stable diagnostic spelling of a depth decision reason. */
@@ -81,6 +98,16 @@ namespace llaminar2
         int accepted_speculative_prefix = 0;
         bool budget_limited = false;
         bool rollback = false;
+        /** Actual response publication delta. Required by utility comparison and
+         * trace export; an absent synthetic legacy observation is not inferred
+         * from accepted drafts or from the verifier's leading condition row.
+         */
+        std::optional<uint32_t> newly_emitted_tokens;
+        /** Actual publisher-owned progress and debt. Production always supplies
+         * this value; absence is retained only for synthetic generic fixtures.
+         * Measured progress policy and v3 trace export reject missing evidence.
+         */
+        std::optional<MTPPublicationWitness> publication;
     };
 
     /**
@@ -115,6 +142,9 @@ namespace llaminar2
         uint64_t promotions = 0;
         uint64_t demotions = 0;
         uint64_t observe_recommendations = 0;
+        uint64_t utility_probes = 0;
+        uint64_t utility_keeps = 0;
+        uint64_t utility_returns = 0;
     };
 
     /**
@@ -169,6 +199,23 @@ namespace llaminar2
         MTPDepthPolicyMode mode() const { return config_.mode; }
         /** @return Request-owned aggregate observation and transition counts. */
         const MTPDepthControllerStats &stats() const { return stats_; }
+        /** @return Actual resolved host policy for a bounded replay diagnostic.
+         * Automatic thresholds/startup and frozen scope are already resolved by
+         * this controller; observers must not re-resolve them through GPU rules.
+         */
+        const MTPDepthPolicyConfig &resolvedConfig() const noexcept { return config_; }
+        /** @return Actual admitted host verification law for exact replay. */
+        MTPVerifyMode verifyMode() const noexcept { return verify_mode_; }
+        /** @return Actual host-owned reversible comparison, never a GPU mirror. */
+        const MTPReversibleProposalState &utilityState() const noexcept { return utility_state_; }
+        /** @return Borrowed actual measured confirmation, or null for legacy mode.
+         * The pointer is an observation of the sole mode-exclusive host owner;
+         * configure/reset may replace that owner, so callers must not retain it.
+         */
+        const MTPProposalConfirmation *proposalConfirmation() const noexcept
+        { return std::get_if<MTPProposalConfirmation>(&proposal_history_); }
+        /** @return Immutable measured profile selected from the admitted context. */
+        MTPDepthCostProfile costProfile() const noexcept { return cost_profile_; }
         /** @return Last evaluated or deferred transition, for diagnostics. */
         const MTPDepthDecision &lastDecision() const { return last_decision_; }
 
@@ -206,6 +253,8 @@ namespace llaminar2
          */
         int nextUnrejectedDepthAbove(int depth) const;
 
+        /** @return Actual window/rates without evaluating a second parent proposal. */
+        MTPDepthDecision windowDecision() const;
         /** @return Learned or portable recommendation for the accumulated window. */
         MTPDepthDecision evaluateWindow() const;
         /** @return Whether sufficient unbiased observations permit evaluation. */
@@ -214,22 +263,28 @@ namespace llaminar2
         bool depthZeroProbeReady() const;
 
         MTPDepthPolicyConfig config_;
+        /** Immutable cost authority; no table storage or live timing state. */
+        MTPDepthCostProfile cost_profile_;
+        /** Sole actual host comparison; current depth and R remain existing owners. */
+        MTPReversibleProposalState utility_state_;
         /** @brief Active verifier mode used to select generated policy rows. */
         MTPVerifyMode verify_mode_ = MTPVerifyMode::Greedy;
         int current_depth_ = 1;
         int steps_since_change_ = 0;
-        int promotion_streak_ = 0;
+        /** @brief Legacy history is inactive while measured confirmation owns this storage. */
+        struct LegacyProposalHistory
+        {
+            int promotion_streak = 0;
+            int generated_best_bad_streak = 0;
+        };
         /**
-         * @brief Consecutive non-catastrophic bad windows at the learned best
-         * fixed-depth lane.
+         * @brief Mode-exclusive CPU history, selected at configure/reset.
          *
-         * The benchmark-trained startup identifies a depth that wins across
-         * requests even though individual 16-step windows are noisy. One
-         * bad window gets grace; a second consecutive bad window is treated as
-         * request-local evidence that this prompt differs from the trained
-         * fixed-depth lane.
+         * Measured mode owns a persistent confirmation target independent of
+         * last_decision_, which is overwritten on every partial observation.
+         * The unmeasured mode retains its original two legacy history values.
          */
-        int generated_best_bad_streak_ = 0;
+        std::variant<LegacyProposalHistory,MTPProposalConfirmation> proposal_history_{LegacyProposalHistory{}};
         MTPDepthWindow window_;
         MTPDepthDecision last_decision_;
         MTPDepthControllerStats stats_;

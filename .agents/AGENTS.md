@@ -142,6 +142,18 @@ replays; correct output alone does not prove economical communication.
     focused regression registered explicitly in the `ProductionTestPreflight`
     suite; broad Unit or backend coverage does not replace that preflight entry.
 
+**Replay tests are standard for controllers and GPU kernels.** New or changed
+controllers and GPU kernels must include replay regressions explicitly
+registered in `ProductionTestPreflight`. Replay recorded inputs and initial
+state through the actual production implementation, preserving the relevant
+policy/version, geometry, precision, ordering and execution configuration.
+Check decisions, state transitions and outputs against the applicable numerical
+contract; cover reset, partial work and repeated replay. Keep controller replay
+fast and device-free where possible, and exercise GPU kernels in the explicit
+CUDA/ROCm integration suites. Reject incomplete or incompatible traces and
+report unsupported candidate paths instead of inventing missing observations.
+Replay complements native capture and end-to-end gates; it does not replace them.
+
 ### Performance and Observability
 
 23. **Measure production binaries and production workloads.** Canonical server

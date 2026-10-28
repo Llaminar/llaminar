@@ -279,7 +279,11 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
     }
     else
     {
-        const auto &publication=mtpStatePublicationCache();
+        std::size_t publication_count=0;
+        for (const auto &publication:mtp_speculative_state_publication_graphs_)
+        {
+            if(!publication.valid || !publication.verifier_signature ||
+                publication.verifier_signature->sparse_query_execution_program!=sparseQueryGraphProgram())continue;
         if(!publication.valid || !publication.stage || publication.workspace_generation!=loop.workspace_generation)fail();
         const auto &p=publication.stage->getParams();const auto &logical=device_resident_logical_sequence_state_storage_;
         if(p.authority!=MTPSpeculativeStatePublicationStage::Authority::BoundedGeneration || p.request_count!=1 ||
@@ -289,7 +293,13 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
             p.target_cached_tokens_device!=logical.target_cached_tokens_device ||
             p.main_kv_bindings.size()!=1 || p.main_kv_bindings.front().cache!=state_.kv_cache.get())fail();
         const auto pc=publication.segment_cache.deviceLoopGraphTemplate(*publication.graph);
-        if(!pc || !embedded(pc->capture,publication.graph.get()))fail();
+        if(!pc || !embedded(pc->capture,publication.graph.get()))continue;
+        ++publication_count;
+        }
+        const auto expected_publications = loop.execution_kind ==
+            MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher
+            ? static_cast<std::size_t>(loop.maximum_draft_depth-loop.minimum_draft_depth+1) : 1u;
+        if(publication_count!=expected_publications)fail();
         bool verifier=false;
         for(const auto &preparation:mtp_verifier_preparation_graphs_)
         {
@@ -362,16 +372,29 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         sidecars(*this,heads);sidecars(canonical,referenceHeads);
         if(loop.sampling_mode==DeviceGenerationSamplingMode::Stochastic)
         {
-            const auto &target=mtp_stochastic_target_distribution_graph_;
-            const auto &outcome=mtp_stochastic_outcome_graph_;
-            const auto &peerTarget=canonical.mtp_stochastic_target_distribution_graph_;
-            const auto &peerOutcome=canonical.mtp_stochastic_outcome_graph_;
+            std::size_t selected_helpers=0;
+            if(mtp_graph_owner_plan_.samplerHelperWidthCount()!=canonical.mtp_graph_owner_plan_.samplerHelperWidthCount())fail();
+            for(std::size_t width=0;width<mtp_graph_owner_plan_.samplerHelperWidthCount();++width)
+            {
+            const auto &target=mtp_stochastic_target_distribution_graphs_.at(width);
+            const auto &outcome=mtp_stochastic_outcome_graphs_.at(width);
+            const auto &peerTarget=canonical.mtp_stochastic_target_distribution_graphs_.at(width);
+            const auto &peerOutcome=canonical.mtp_stochastic_outcome_graphs_.at(width);
             if(!target.valid || !target.stage || !target.graph || !outcome.valid || !outcome.stage || !outcome.graph ||
                 !peerTarget.valid || !peerTarget.stage || !peerOutcome.valid || !peerOutcome.stage ||
                 target.workspace_generation!=loop.workspace_generation || outcome.workspace_generation!=loop.workspace_generation)fail();
             const auto tc=target.segment_cache.deviceLoopGraphTemplate(*target.graph);
             const auto oc=outcome.segment_cache.deviceLoopGraphTemplate(*outcome.graph);
-            if(!tc || !oc || !embedded(tc->capture,target.graph.get()) || !embedded(oc->capture,outcome.graph.get()))fail();
+            if(!tc || !oc)fail();
+            const bool target_selected=embedded(tc->capture,target.graph.get());
+            const bool outcome_selected=embedded(oc->capture,outcome.graph.get());
+            if(target_selected!=outcome_selected)fail();
+            if(!target_selected)continue;
+            const auto ptc=peerTarget.segment_cache.deviceLoopGraphTemplate(*peerTarget.graph);
+            const auto poc=peerOutcome.segment_cache.deviceLoopGraphTemplate(*peerOutcome.graph);
+            if(!ptc || !poc || !canonicalEmbedded(ptc->capture,peerTarget.graph.get()) ||
+                !canonicalEmbedded(poc->capture,peerOutcome.graph.get()))fail();
+            ++selected_helpers;
             const auto &t=target.stage->getParams();const auto &pt=peerTarget.stage->getParams();
             const auto &o=outcome.stage->getParams();const auto &po=peerOutcome.stage->getParams();
             const auto seeds=arena_->getSharedTensor(BufferId::SAMPLING_REQUEST_SEEDS);
@@ -388,6 +411,10 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
                     o.threshold_position_offset,o.target_distribution_row_stride)!=
                     std::tuple(po.verification,po.top_k,po.request_count,po.comparison_rows_per_request,po.verifier_row_capacity,
                         po.threshold_position_offset,po.target_distribution_row_stride))fail();
+            }
+            const auto expected_helpers=mtpVerifierGraphFamily()==MTPVerifierGraphFamily::ExactRows
+                ? static_cast<std::size_t>(loop.maximum_draft_depth-loop.minimum_draft_depth+1) : 1u;
+            if(selected_helpers!=expected_helpers)fail();
         }
     }
     std::ranges::sort(heads);std::ranges::sort(referenceHeads);

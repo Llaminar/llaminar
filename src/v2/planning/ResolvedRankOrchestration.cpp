@@ -10,6 +10,7 @@
  */
 #include "planning/ResolvedRankOrchestration.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/RankMemoryPlanInputs.h"
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 #include "config/OrchestrationConfigParser.h"
 #include "config/OrchestrationStartupPolicy.h"
@@ -261,7 +262,8 @@ namespace llaminar2
                     .first_layer = rank_plan.local_pp_layer_boundaries[index],
                     .last_layer = rank_plan.local_pp_layer_boundaries[index + 1],
                     .has_embedding = rank_plan.has_embedding && index == 0,
-                    .has_lm_head = rank_plan.has_lm_head && index + 1 == rank_plan.local_pp_devices.size()};
+                    .has_lm_head = rank_plan.has_lm_head && index + 1 == rank_plan.local_pp_devices.size(),
+                    .generation_domain = declaredRankDeviceGenerationDomain(rank_plan)};
                 const auto child = rank_plan.local_pp_stage_tp_info.empty()
                     ? RankExecutionPlan::LocalPPStageTPInfo{} : rank_plan.local_pp_stage_tp_info[index];
                 const auto participants = child.devices.empty()

@@ -2589,6 +2589,28 @@ namespace llaminar2
         return retireCompletedGraphSequenceLocked(error);
     }
 
+    bool MoEOverlayInferenceTransactionCoordinator::beginHostedContinuationGraphSequence(
+        HostedGraphSequenceTransition transition, std::string *error)
+    {
+        std::lock_guard lock(mutex_);
+        if (error) error->clear();
+        if (transition.kind() != HostedGraphSequenceTransition::Kind::SpeculativeMTP ||
+            transition.draftDepth() <= 0 || transition.draftDepth() > config_.max_mtp_draft_depth ||
+            last_hosted_sequence_transition_id_ != 0 || last_hosted_sequence_committed_output_tokens_ != 0)
+            return failLocked("ExpertOverlay continuation admission requires one fresh speculative ticket-zero decision", error);
+        if (last_hosted_sequence_transition_)
+        {
+            if (transition != *last_hosted_sequence_transition_)
+                return failLocked("ExpertOverlay symmetric continuation admission decisions diverged", error);
+            return true;
+        }
+        if (execution_sequence_.active() || transaction_count_ != 0 ||
+            !beginGraphSequenceLocked(transition.draftDepth(), error))
+            return failLocked("ExpertOverlay continuation admission cannot retire or replace an existing sequence", error);
+        last_hosted_sequence_transition_ = transition;
+        return true;
+    }
+
     bool MoEOverlayInferenceTransactionCoordinator::
         advanceHostedGraphSequence(
             std::uint64_t transaction_id,

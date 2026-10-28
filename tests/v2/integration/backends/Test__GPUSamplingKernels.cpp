@@ -13,6 +13,8 @@
  * - Edge cases: single element, uniform distribution, all-negative, all-same
  * - Real-world: Qwen2 vocab size (151936), realistic logit distributions
  * - Device-resident MTP request-batch input composition and first publication
+ * - Direct MTP history/frontier dirty replay with exact policy/prompt-bit preservation
+ *   and opt-in retained native-event measurement, separate from functional CI
  *
  * **GPU API Model**:
  * - allocate() → hostToDevice() → argmaxF32/topKF32 → free()
@@ -42,6 +44,8 @@
 #include "execution/mtp/MTPRejectionSampler.h"
 #include "execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "execution/compute_stages/stages/MTPDraftTokenPublicationStage.h"
+#include "execution/compute_stages/stages/MTPDirectTokenHistoryPublicationStage.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/compute_stages/stages/MTPStochasticOutcomeStage.h"
 #include "execution/compute_stages/stages/MTPStochasticTargetDistributionStage.h"
 #include "execution/compute_stages/stages/MTPVerifierPreparationStage.h"
@@ -65,6 +69,10 @@
 #include <limits>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 
 using namespace llaminar2;
 
@@ -6008,6 +6016,227 @@ namespace
             backend_->free(*it, device_id_);
         backend_->free(d_probabilities, device_id_);
         backend_->free(d_token_ids, device_id_);
+    }
+
+    /**
+     * @test The retained direct-history operation normalizes only its successor frontier.
+     *
+     * One production stage records the existing scalar kernel. Dirty inputs at
+     * the same addresses prove prompt/count bits and every immutable policy
+     * field survive while the new output increments once and clears the prior
+     * carried-frontier bit. The ordinary backend entrypoint remains an actual
+     * unchanged control. Functional CI has no timing threshold. Explicit timing
+     * mode records64 serial complete operations in the same retained graph,
+     * restores fixed inputs outside every interval, and reports raw native-event
+     * samples plus a final byte check; this is isolated replay, not request TPS.
+     */
+    TEST_P(GPUSamplingTest, DirectMTPHistoryFrontierCapturedReplayPreservesPolicyAndPromptBits)
+    {
+        constexpr int vocab = 257;
+        constexpr int warmups = 5, samples = 20;
+        const char *timing_flag = std::getenv("LLAMINAR_TEST_MTP_DIRECT_HISTORY_EVENT_TIMING");
+        if (timing_flag) ASSERT_STREQ(timing_flag, "1");
+        const bool timing = timing_flag != nullptr;
+        const int operations = timing ? 64 : 1;
+        auto run = [&](IWorkerGPUContext &worker)
+        {
+            const auto release = [&](void *pointer) { if (pointer) backend_->free(pointer, device_id_); };
+            const auto allocate = [&](size_t bytes) {
+                return std::unique_ptr<void, decltype(release)>(backend_->allocate(bytes, device_id_), release);
+            };
+            auto token_device = allocate(sizeof(int32_t));
+            auto counts_device = allocate(vocab * sizeof(int32_t));
+            auto policy_device = allocate(sizeof(MTPGreedyPenaltyPolicy));
+            ASSERT_TRUE(token_device && counts_device && policy_device);
+            worker.submitAndWait([&]
+            {
+                const auto device = GetParam() == "CUDA" ? DeviceId::cuda(device_id_) : DeviceId::rocm(device_id_);
+                auto execution = IDeviceContext::create(device);
+                ASSERT_NE(execution, nullptr);
+                void *const stream = worker.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                std::array<int32_t, vocab> initial{}, expected{}, actual{};
+                MTPGreedyPenaltyPolicy input{.presence_penalty = 1.5F, .frequency_penalty = 0.125F,
+                    .repetition_penalty = 1.125F, .first_token_already_in_history = 1, .enabled = 1};
+                int32_t token = 17;
+                const auto restore = [&]
+                {
+                    ASSERT_TRUE(copyHostToDevice(token_device.get(), &token, sizeof(token), device_id_, stream));
+                    ASSERT_TRUE(copyHostToDevice(counts_device.get(), initial.data(), sizeof(initial), device_id_, stream));
+                    ASSERT_TRUE(copyHostToDevice(policy_device.get(), &input, sizeof(input), device_id_, stream));
+                };
+                const auto check = [&](int increments, bool clears_frontier)
+                {
+                    expected = initial;
+                    expected[size_t(token)] += increments;
+                    MTPGreedyPenaltyPolicy expected_policy, actual_policy;
+                    std::memcpy(&expected_policy, &input, sizeof(input));
+                    if (clears_frontier) expected_policy.first_token_already_in_history = 0;
+                    int32_t observed_token = -1;
+                    ASSERT_TRUE(copyDeviceToHost(actual.data(), counts_device.get(), sizeof(actual), device_id_, stream));
+                    ASSERT_TRUE(copyDeviceToHost(&actual_policy, policy_device.get(), sizeof(actual_policy), device_id_, stream));
+                    ASSERT_TRUE(copyDeviceToHost(&observed_token, token_device.get(), sizeof(observed_token), device_id_, stream));
+                    EXPECT_EQ(actual, expected);
+                    EXPECT_EQ(std::memcmp(&actual_policy, &expected_policy, sizeof(expected_policy)), 0);
+                    EXPECT_EQ(observed_token, token);
+                };
+                restore();
+                ASSERT_FALSE(HasFailure());
+                // Every incomplete host binding rejects before enqueue. No
+                // device token/count observation is used to select a path.
+                EXPECT_FALSE(backend_->enqueueCommitMTPDirectTokenHistoryDevice(nullptr, vocab,
+                    counts_device.get(), policy_device.get(), device_id_, stream));
+                EXPECT_FALSE(backend_->enqueueCommitMTPDirectTokenHistoryDevice(token_device.get(), 0,
+                    counts_device.get(), policy_device.get(), device_id_, stream));
+                EXPECT_FALSE(backend_->enqueueCommitMTPDirectTokenHistoryDevice(token_device.get(), -1,
+                    counts_device.get(), policy_device.get(), device_id_, stream));
+                EXPECT_FALSE(backend_->enqueueCommitMTPDirectTokenHistoryDevice(token_device.get(), vocab,
+                    nullptr, policy_device.get(), device_id_, stream));
+                EXPECT_FALSE(backend_->enqueueCommitMTPDirectTokenHistoryDevice(token_device.get(), vocab,
+                    counts_device.get(), nullptr, device_id_, stream));
+                EXPECT_FALSE(backend_->enqueueCommitMTPDirectTokenHistoryDevice(token_device.get(), vocab,
+                    counts_device.get(), policy_device.get(), device_id_, nullptr));
+                MTPDirectTokenHistoryPublicationStage::Params params;
+                params.device_id = device;
+                params.backend = backend_;
+                params.token_device = static_cast<const int32_t *>(token_device.get());
+                params.counts_device = static_cast<int32_t *>(counts_device.get());
+                params.policy_device = static_cast<MTPGreedyPenaltyPolicy *>(policy_device.get());
+                params.vocab_size = vocab;
+                MTPDirectTokenHistoryPublicationStage stage(params);
+                EXPECT_THROW(stage.execute(execution.get()), std::logic_error);
+                stage.setGPUStream(stream);
+                auto incomplete = params;
+                incomplete.policy_device = nullptr;
+                MTPDirectTokenHistoryPublicationStage incomplete_stage(incomplete);
+                incomplete_stage.setGPUStream(stream);
+                EXPECT_FALSE(incomplete_stage.execute(execution.get()));
+                check(0, false);
+                ASSERT_FALSE(HasFailure());
+                auto graph = worker.createGraphCapture(stream);
+                ASSERT_NE(graph, nullptr);
+                {
+                    ScopedBackendGraphCapture capture(worker, *graph, "direct_mtp_history_frontier_replay");
+                    ASSERT_TRUE(capture.begin());
+                    bool queued = true;
+                    for (int operation = 0; operation < operations; ++operation)
+                        queued = stage.execute(execution.get()) && queued;
+                    capture.finish();
+                    ASSERT_TRUE(queued);
+                }
+                ASSERT_EQ(graph->nodeCount(), size_t(operations));
+                std::vector<GPUGraphKernelNodeInfo> nodes;
+                std::string inspection_error;
+                ASSERT_TRUE(graph->inspectKernelNodes(nodes, &inspection_error)) << inspection_error;
+                ASSERT_EQ(nodes.size(), size_t(operations));
+                for (const auto &node : nodes)
+                {
+                    EXPECT_NE(node.function_identity, uintptr_t{0});
+                    EXPECT_EQ(node.function_identity, nodes.front().function_identity);
+                    EXPECT_EQ(node.grid_x, 1u); EXPECT_EQ(node.grid_y, 1u); EXPECT_EQ(node.grid_z, 1u);
+                    EXPECT_EQ(node.block_x, 1u); EXPECT_EQ(node.block_y, 1u); EXPECT_EQ(node.block_z, 1u);
+                    EXPECT_EQ(node.dynamic_shared_memory_bytes, 0u);
+                    if (node.name_resolved)
+                        EXPECT_NE(node.name.find("commit_generation_token_history_kernel"), std::string::npos);
+                }
+                ASSERT_TRUE(graph->instantiate());
+                if (timing)
+                {
+                    // One fixed cache-hot state trajectory, restored before
+                    // every warmup/sample. Transfers and byte checks are never
+                    // enclosed by the native measurement events.
+                    for (size_t index = 0; index < initial.size(); ++index)
+                        initial[index] = int32_t(index % 7) |
+                            (index % 3 == 0 ? sampling_math::TokenPenaltyHistory::prompt_bit : 0);
+                    for (int warm = 0; warm < warmups; ++warm)
+                    {
+                        restore();
+                        ASSERT_FALSE(HasFailure());
+                        ASSERT_TRUE(graph->launch());
+                    }
+                    check(operations, true);
+                    ASSERT_FALSE(HasFailure());
+                    const auto release_event = [&](void *event) { if (event) backend_->destroyEvent(event, device_id_); };
+                    std::unique_ptr<void, decltype(release_event)> start(backend_->createTimingEvent(device_id_), release_event);
+                    std::unique_ptr<void, decltype(release_event)> stop(backend_->createTimingEvent(device_id_), release_event);
+                    ASSERT_TRUE(start && stop);
+                    std::array<float, samples> elapsed{};
+                    for (int sample = 0; sample < samples; ++sample)
+                    {
+                        restore();
+                        ASSERT_FALSE(HasFailure());
+                        ASSERT_TRUE(backend_->recordEvent(start.get(), device_id_, stream));
+                        ASSERT_TRUE(graph->launch());
+                        ASSERT_TRUE(backend_->recordEvent(stop.get(), device_id_, stream));
+                        ASSERT_TRUE(backend_->waitForEvent(stop.get(), device_id_));
+                        ASSERT_TRUE(backend_->eventElapsedTimeMs(start.get(), stop.get(), device_id_, &elapsed[size_t(sample)]));
+                        ASSERT_TRUE(std::isfinite(elapsed[size_t(sample)]));
+                        ASSERT_GE(elapsed[size_t(sample)], 0.0F);
+                    }
+                    check(operations, true);
+                    ASSERT_FALSE(HasFailure());
+                    std::ostringstream record;
+                    record << std::setprecision(std::numeric_limits<float>::max_digits10)
+                        << "{\"schema\":\"llaminar.test.mtp_direct_history_native_events.v1\",\"backend\":\"" << GetParam()
+                        << "\",\"vocab\":" << vocab << ",\"count_bytes\":" << sizeof(initial)
+                        << ",\"policy_bytes\":" << sizeof(input) << ",\"token\":" << token
+                        << ",\"operations_per_graph\":" << operations << ",\"warmups\":" << warmups
+                        << ",\"cache\":\"fixed_cache_hot_trajectory\",\"scope\":\"amortized_captured_operation_including_native_scheduling\""
+                        << ",\"final_byte_check\":true,\"graph_elapsed_ms\":[";
+                    for (size_t sample = 0; sample < elapsed.size(); ++sample)
+                        record << (sample ? "," : "") << elapsed[sample];
+                    record << "],\"operation_elapsed_ms\":[";
+                    for (size_t sample = 0; sample < elapsed.size(); ++sample)
+                        record << (sample ? "," : "") << elapsed[sample] / float(operations);
+                    record << "]}";
+                    std::cout << "[MTPDirectHistoryNativeEvents] " << record.str() << '\n';
+                    RecordProperty("mtp_direct_history_native_events", record.str());
+                    return;
+                }
+                for (int replay = 0; replay < 20; ++replay)
+                {
+                    SCOPED_TRACE(::testing::Message() << "dirty replay=" << replay);
+                    token = std::array<int32_t, 3>{0, 17, vocab - 1}[size_t(replay % 3)];
+                    for (size_t index = 0; index < initial.size(); ++index)
+                        initial[index] = int32_t((index + size_t(replay)) % 11) |
+                            (index % 3 == 0 ? sampling_math::TokenPenaltyHistory::prompt_bit : 0);
+                    input.presence_penalty = 1.5F + float(replay) / 64.0F;
+                    input.frequency_penalty = 0.125F;
+                    input.repetition_penalty = 1.125F;
+                    input.first_token_already_in_history = 1; // Poison prior carried frontier.
+                    input.enabled = replay % 2;
+                    restore();
+                    ASSERT_FALSE(HasFailure());
+                    for (int publication = 1; publication <= 3; ++publication)
+                    {
+                        // A real new write at the same scalar address, even
+                        // when its value is unchanged, precedes each replay.
+                        ASSERT_TRUE(copyHostToDevice(token_device.get(), &token, sizeof(token), device_id_, stream));
+                        ASSERT_TRUE(graph->launch());
+                        check(publication, true);
+                        ASSERT_FALSE(HasFailure());
+                    }
+                }
+                // Request reset restores the same bank, including prompt flags.
+                initial.fill(0);
+                initial[17] = sampling_math::TokenPenaltyHistory::prompt_bit | 3;
+                token = 17;
+                input.first_token_already_in_history = 1;
+                input.enabled = 1;
+                restore();
+                ASSERT_TRUE(graph->launch());
+                check(1, true);
+                ASSERT_FALSE(HasFailure());
+                // Ordinary forced output still uses the existing null-policy
+                // internal kernel arm and cannot normalize an MTP frontier.
+                restore();
+                ASSERT_TRUE(backend_->enqueueCommitGenerationTokenHistoryDevice(token_device.get(), vocab,
+                    counts_device.get(), device_id_, stream));
+                check(1, false);
+            });
+        };
+        if (GetParam() == "CUDA") run(GPUDeviceContextPool::instance().getNvidiaContext(device_id_));
+        else run(GPUDeviceContextPool::instance().getAMDContext(device_id_));
     }
 
     /**

@@ -217,6 +217,7 @@ namespace llaminar2
             const auto identity = routedWeightAuthorityRequestIdentity(config.moe_routed_expert_plan, config);
             const auto &cache = config.prefix_cache;
             out << scope.first_layer << ',' << scope.last_layer << ',' << scope.has_embedding << ',' << scope.has_lm_head
+                << ',' << static_cast<int>(scope.generation_domain)
                 << '/' << identity.size() << ':' << identity << '/'
                 << cache.enabled << ',' << static_cast<int>(cache.storage_mode) << ',' << cache.block_size << ','
                 << cache.ram_budget_bytes << ',' << cache.device_budget_bytes << ',' << cache.disk_budget_bytes << ','

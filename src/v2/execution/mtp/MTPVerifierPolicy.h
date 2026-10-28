@@ -1,11 +1,11 @@
-#pragma once
-
-#include <bit>
-#include <algorithm>
-
 /**
  * @file MTPVerifierPolicy.h
- * @brief Production policy for choosing an MTP verifier execution lane.
+ * @brief MTP transaction budgets, physical verifier width and execution contracts.
+ *
+ * Physical width follows immutable execution ownership: hosted tickets select
+ * exact retained row identities, native dynamic parents share one maximum
+ * envelope, and standalone verification uses bounded buckets. Device-owned
+ * live counts still clip useful rows and publication within the selected graph.
  *
  * The policy is intentionally fail-closed. Every production MTP verifier uses
  * the grouped decode-equivalent outcome contract; backend-specific publication
@@ -13,6 +13,12 @@
  * Serial row replay remains a diagnostic/oracle concept owned by focused tests
  * and helper utilities; it is not a production fallback selected here.
  */
+#pragma once
+
+#include "MTPVerifierGraphFamily.h"
+#include "MTPVerifierPhysicalWidthPolicy.h"
+#include <bit>
+#include <algorithm>
 
 namespace llaminar2
 {
@@ -56,28 +62,11 @@ namespace llaminar2
     }
 
     /**
-     * @brief Immutable policy for mapping logical verifier rows to graph width.
-     *
-     * Standalone, fixed-depth, and observe-only transactions retain the bounded
-     * bucket family because their logical width cannot change behind a captured
-     * graph. A scalar dynamic device controller instead owns one maximum-width
-     * envelope: active rows are replay data and may change after every accepted
-     * transaction without changing graph identity.
-     */
-    enum class MTPVerifierPhysicalWidthPolicy
-    {
-        BoundedLogicalBucket,
-        DynamicDeviceEnvelope,
-    };
-
-    /**
      * @brief Select the bounded physical row width for a logical verifier step.
      *
-     * GPU verifier graphs are expensive, immutable executables. Capturing one
-     * complete graph for every observed MTP depth retains an unbounded family
-     * of nearly identical graphs and can exhaust device memory. This helper
-     * defines the one canonical graph-family policy: use power-of-two physical
-     * widths and clamp the final family member to the configured maximum.
+     * This is the bounded family's mapping: power-of-two physical widths,
+     * clamped at admitted capacity. Hosted exact families use ExactLogicalRows
+     * instead and pay for every retained identity during physical admission.
      *
      * The returned width is a launch/capture property only. Kernels must still
      * consume the exact logical row count from device-resident request state so
@@ -130,17 +119,18 @@ namespace llaminar2
         {
             return 0;
         }
-        if (policy ==
-                MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope &&
-            request_count == 1)
+        switch (policy)
         {
-            return max_rows;
+        case MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope:
+            return request_count == 1 ? max_rows : logical_padded_seq_len;
+        case MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket:
+            return request_count == 1
+                ? mtpVerifierPhysicalRowBucket(logical_padded_seq_len, max_rows)
+                : logical_padded_seq_len;
+        case MTPVerifierPhysicalWidthPolicy::ExactLogicalRows:
+            return logical_padded_seq_len;
         }
-        return request_count == 1
-                   ? mtpVerifierPhysicalRowBucket(
-                         logical_padded_seq_len,
-                         max_rows)
-                   : logical_padded_seq_len;
+        return 0; // Unknown ownership must never select an executable.
     }
 
     enum class MTPVerifierExecutionPath

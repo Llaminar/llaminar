@@ -914,6 +914,8 @@ TEST(Test__MemoryPlanner,
     cfg.captured_serving_graphs = {
         .prefill_bucket_rows = {32, 64, 128},
         .fixed_executable_count = 2u,
+        .verifier_graph_family = MTPVerifierGraphFamily::BoundedBuckets,
+        .generation_domain = DeviceGenerationExecutionDomain::NativeDomain,
     };
 
     const auto plan_64 = MemoryPlanner::plan(profile, {cfg});
@@ -971,20 +973,23 @@ TEST(Test__MemoryPlanner,
     cfg.captured_serving_graphs =
         resolveCapturedServingGraphMemoryInventory(
             {32, 64, 128},
-            retained_mtp);
+            retained_mtp,
+            MTPVerifierGraphFamily::BoundedBuckets,
+            MTPGenerationParentRole::Controller,
+            DeviceGenerationExecutionDomain::NativeDomain);
     EXPECT_EQ(cfg.captured_serving_graphs.fixed_executable_count, 12u);
-    const MTPGraphOwnerPlan owner_plan(retained_mtp);
+    const MTPGraphOwnerPlan owner_plan(retained_mtp, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller);
     EXPECT_EQ(owner_plan.sidecarGraphSlots(), 21u);
     EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 35u);
     EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 15u);
     EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 32u);
-    EXPECT_EQ(owner_plan.controllerGraphSlots(), 4u);
-    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
+    EXPECT_EQ(owner_plan.controllerGraphSlots(), 5u);
+    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 83u);
     EXPECT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
     EXPECT_EQ(
         cfg.captured_serving_graphs.mtp_graph_owners
             .auxiliaryExecutableSlotCount(),
-        107u);
+        108u);
     EXPECT_EQ(
         resolveMTPRetainedDeviceGenerationFragmentCapacity(15),
         375u)
@@ -1002,7 +1007,11 @@ TEST(Test__MemoryPlanner,
                 .model_graph_topology_variant_count = 1u,
                 .auxiliary_executable_count =
                     owner_plan.generalAuxiliaryExecutableSlotCount() +
-                    OrdinaryGenerationGraphPlan::additionalExecutableCount(cfg.device, true),
+                    OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                        cfg.device,
+                        true,
+                        declaredDeviceGenerationExecutionPolicy(cfg.device.type, *cfg.captured_serving_graphs.generation_domain),
+                        cfg.captured_serving_graphs.generation_parent_role),
                 .bounded_helper_executable_count =
                     owner_plan.boundedHelperExecutableSlotCount(),
             }));
@@ -1011,6 +1020,163 @@ TEST(Test__MemoryPlanner,
         estimateCapturedGraphExecutableBytes(
             cfg.device,
             /*two prefill + decode + prefix bridge + ten MTP forwards=*/14u));
+}
+
+/** @test Exact hosted width owners are admitted before any request, with ordinary M1 charged once. */
+TEST(Test__MemoryPlanner, ExactHostedVerifierFamilyPricesEveryModelAndPublicationOwner)
+{
+    constexpr std::size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    const auto profile = createTestProfile();
+    for (bool initially_enabled : {false, true})
+    for (auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (auto parent_role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        MTPRuntimeConfig retained;
+        retained.enabled = initially_enabled;
+        retained.draft_tokens = 3;
+        retained.graph_capacity_draft_tokens = 15;
+        const auto exact_family = resolveMTPVerifierGraphFamily(MTPVerifierExecutionRole::HostedCapturedTransactions);
+        const bool follower = parent_role == MTPGenerationParentRole::PipelineFollower;
+        const auto exact = resolveCapturedServingGraphMemoryInventory(
+            {32, 64, 128},
+            retained,
+            exact_family,
+            parent_role,
+            DeviceGenerationExecutionDomain::HostedBoundary,
+            1u);
+        const auto bounded = resolveCapturedServingGraphMemoryInventory(
+            {32, 64, 128},
+            retained,
+            MTPVerifierGraphFamily::BoundedBuckets,
+            parent_role,
+            DeviceGenerationExecutionDomain::NativeDomain);
+        EXPECT_EQ(exact.fixed_executable_count, 34u); // Ordinary M1 + prefix bridge + 32 MTP forwards.
+        EXPECT_EQ(bounded.fixed_executable_count, 12u);
+        const auto &owners = exact.mtp_graph_owners;
+        EXPECT_EQ(owners.speculativePublicationWidthCount(), 15u);
+        EXPECT_EQ(owners.speculativePublicationGraphSlots(), 15u);
+        EXPECT_EQ(owners.generationParentWidthCount(), follower ? 15u : 1u);
+        EXPECT_EQ(owners.generationParentGraphSlots(), follower ? 15u : 1u);
+        EXPECT_EQ(owners.samplerHelperWidthCount(), 15u);
+        EXPECT_EQ(owners.samplerHelperGraphSlots(), 30u);
+        EXPECT_EQ(owners.controllerGraphSlots(), follower ? 60u : 47u);
+        EXPECT_EQ(owners.auxiliaryExecutableSlotCount(), follower ? 163u : 150u);
+        EXPECT_EQ(owners.generalAuxiliaryExecutableSlotCount(), follower ? 81u : 67u);
+        EXPECT_EQ(owners.boundedHelperExecutableSlotCount(), follower ? 82u : 83u);
+        EXPECT_EQ(owners.sidecarGraphSlots(), bounded.mtp_graph_owners.sidecarGraphSlots());
+        EXPECT_EQ(owners.verifierPreparationGraphSlots(), bounded.mtp_graph_owners.verifierPreparationGraphSlots());
+        EXPECT_EQ(owners.terminalHiddenGraphSlots(), bounded.mtp_graph_owners.terminalHiddenGraphSlots());
+        const auto two_programs = resolveCapturedServingGraphMemoryInventory(
+            {32, 64, 128},
+            retained,
+            exact_family,
+            parent_role,
+            DeviceGenerationExecutionDomain::HostedBoundary,
+            2u);
+        EXPECT_EQ(two_programs.fixed_executable_count, 68u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.speculativePublicationGraphSlots(), 30u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.generationParentGraphSlots(), follower ? 30u : 2u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.samplerHelperWidthCount(), 15u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.samplerHelperGraphSlots(), 30u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.controllerGraphSlots(), follower ? 90u : 63u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.boundedHelperExecutableSlotCount(), follower ? 82u : 83u);
+
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.device_compute_units = 82;
+        cfg.device_total_bytes = 64u * GiB;
+        cfg.device_free_bytes = cfg.device_total_bytes;
+        cfg.batch_size = 1;
+        cfg.max_seq_len = 4096;
+        cfg.activation_seq_len = 64;
+        cfg.kv_precision = "fp16";
+        cfg.captured_serving_graphs = exact;
+        const auto plan = MemoryPlanner::plan(profile, {cfg});
+        ASSERT_EQ(plan.devices.size(), 1u);
+        EXPECT_EQ(plan.devices.front().captured_graph_bytes(), estimateCapturedGraphExecutableBytes(
+            device, CapturedGraphExecutableInventory{
+                .model_graph_identity_count = 36u, // Two admitted prefills plus the 34 fixed owners.
+                .model_graph_topology_variant_count = 1u,
+                .auxiliary_executable_count = owners.generalAuxiliaryExecutableSlotCount() +
+                    OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                        device,
+                        true,
+                        declaredDeviceGenerationExecutionPolicy(device.type, *exact.generation_domain),
+                        parent_role),
+                .bounded_helper_executable_count = owners.boundedHelperExecutableSlotCount(),
+            }));
+    }
+    const auto empty = resolveCapturedServingGraphMemoryInventory(
+        {},
+        {},
+        MTPVerifierGraphFamily::ExactRows,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::HostedBoundary);
+    EXPECT_EQ(empty.fixed_executable_count, 1u); // Existing ordinary M1 alone.
+    EXPECT_EQ(empty.mtp_graph_owners.speculativePublicationWidthCount(), 0u);
+    EXPECT_EQ(empty.mtp_graph_owners.samplerHelperWidthCount(), 0u);
+    EXPECT_EQ(empty.mtp_graph_owners.samplerHelperGraphSlots(), 0u);
+    EXPECT_EQ(empty.mtp_graph_owners.auxiliaryExecutableSlotCount(), 0u);
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory(
+        {},
+        {},
+        static_cast<MTPVerifierGraphFamily>(99),
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain), std::invalid_argument);
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory(
+        {},
+        {},
+        MTPVerifierGraphFamily::ExactRows,
+        static_cast<MTPGenerationParentRole>(99),
+        DeviceGenerationExecutionDomain::HostedBoundary), std::invalid_argument);
+}
+
+/** @test Every exact sampler geometry is admitted once and shared across immutable query programs. */
+TEST(Test__MemoryPlanner, ExactHostedSamplerHelpersRemainSharedAcrossQueryPrograms)
+{
+    for (int capacity = 1; capacity <= kMaximumSupportedMTPDraftDepth; ++capacity)
+    for (int initial_depth = 1; initial_depth <= capacity; ++initial_depth)
+    for (auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+    for (bool initially_enabled : {false, true})
+    for (auto family : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+    for (auto role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        MTPRuntimeConfig config;
+        config.enabled = initially_enabled;
+        config.draft_tokens = initial_depth;
+        config.graph_capacity_draft_tokens = capacity;
+        config.depth_policy.mode = mode;
+        config.depth_policy.min_depth = 1;
+        config.depth_policy.initial_depth = initial_depth;
+        config.depth_policy.max_depth = initial_depth;
+        const MTPGraphOwnerPlan one(config, family, role);
+        const MTPGraphOwnerPlan two(config, family, role, 2u);
+        const std::size_t expected_widths = family == MTPVerifierGraphFamily::ExactRows
+            ? mtpVerifierGraphFamilyWidthCount(capacity + 1, family) : 1u;
+        EXPECT_EQ(one.samplerHelperWidthCount(), expected_widths);
+        EXPECT_EQ(two.samplerHelperWidthCount(), expected_widths);
+        EXPECT_EQ(one.samplerHelperGraphSlots(), 2u * expected_widths);
+        EXPECT_EQ(two.samplerHelperGraphSlots(), one.samplerHelperGraphSlots());
+        EXPECT_EQ(one.controllerGraphSlots(), one.samplerHelperGraphSlots() +
+            one.generationParentGraphSlots() + one.speculativePublicationGraphSlots() + one.directTokenHistoryGraphSlots());
+        EXPECT_EQ(two.controllerGraphSlots(), two.samplerHelperGraphSlots() +
+            two.generationParentGraphSlots() + two.speculativePublicationGraphSlots() + two.directTokenHistoryGraphSlots());
+        EXPECT_EQ(two.controllerGraphSlots() - one.controllerGraphSlots(),
+            one.generationParentGraphSlots() + one.speculativePublicationGraphSlots());
+        EXPECT_EQ(two.boundedHelperExecutableSlotCount(), one.boundedHelperExecutableSlotCount());
+    }
+    // Capacity belongs to setup even if the first request only selects rows4.
+    MTPRuntimeConfig shallow;
+    shallow.enabled = true;
+    shallow.draft_tokens = 3;
+    shallow.graph_capacity_draft_tokens = 15;
+    const MTPGraphOwnerPlan admitted(shallow, MTPVerifierGraphFamily::ExactRows, MTPGenerationParentRole::Controller);
+    EXPECT_EQ(admitted.samplerHelperWidthCount(), 15u);
+    EXPECT_EQ(admitted.samplerHelperGraphSlots(), 30u);
+    EXPECT_EQ(admitted.controllerGraphSlots(), 47u);
+    shallow.graph_capacity_draft_tokens = 0;
+    EXPECT_EQ(MTPGraphOwnerPlan(shallow, MTPVerifierGraphFamily::ExactRows,
+        MTPGenerationParentRole::Controller).samplerHelperWidthCount(), 3u);
 }
 
 TEST(Test__MemoryPlanner,
@@ -3680,11 +3846,13 @@ TEST(Test__MemoryPlanner, NgramVRAMEligibilityUsesEachOriginalUploadGeometry)
     EXPECT_THROW(MemoryPlanner::immutableRowTableModeContributions(profile,groups,foreign),std::invalid_argument);
 }
 
-/** @test Each original native PP participant prices one additional complete no-sampling parent. */
+/** @test Native and hosted PP participants price one sampler-free parent per admitted query program. */
 TEST(Test__MemoryPlanner, NativePipelineForwardOnlyParentHasNamedPhysicalBOM)
 {
     constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
     for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto domain : {DeviceGenerationExecutionDomain::NativeDomain, DeviceGenerationExecutionDomain::HostedBoundary})
+    for (const size_t programs : {1u, 2u})
     {
         auto profile = createTestProfile();
         DevicePlanConfig cfg;
@@ -3693,9 +3861,15 @@ TEST(Test__MemoryPlanner, NativePipelineForwardOnlyParentHasNamedPhysicalBOM)
         cfg.device_total_bytes = cfg.device_free_bytes = 64ULL * GiB;
         cfg.max_seq_len = 4096;
         cfg.activation_seq_len = 64;
-        cfg.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory({64}, {});
+        cfg.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+            {64},
+            {},
+            resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(declaredDeviceGenerationExecutionPolicy(
+                device.type, domain))),
+            MTPGenerationParentRole::Controller,
+            domain, programs);
         const auto ordinary = MemoryPlanner::plan(profile, {cfg});
-        cfg.local_pipeline_backend = device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        cfg.pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::Participant;
         const auto pipeline = MemoryPlanner::plan(profile, {cfg});
         ASSERT_EQ(ordinary.devices.size(), 1u);
         ASSERT_EQ(pipeline.devices.size(), 1u);
@@ -3703,11 +3877,11 @@ TEST(Test__MemoryPlanner, NativePipelineForwardOnlyParentHasNamedPhysicalBOM)
             estimateCapturedGraphExecutableBytes(device, CapturedGraphExecutableInventory{
                 .model_graph_identity_count = 0u,
                 .model_graph_topology_variant_count = 0u,
-                .auxiliary_executable_count = OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount()}));
+                .auxiliary_executable_count = OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(programs, PipelineForwardOnlyGraphOwner::Participant)}));
     }
 }
 
-/** @test The production closed PP projection prices the parent only on actual singleton native domains. */
+/** @test Native and captured-domain PP declarations own parents independently of transport. */
 TEST(Test__MemoryPlanner, ForwardOnlyBOMFollowsOriginalNativePipelineProjection)
 {
     for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
@@ -3733,12 +3907,70 @@ TEST(Test__MemoryPlanner, ForwardOnlyBOMFollowsOriginalNativePipelineProjection)
         cfg.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
             .device = DeviceId::cpu(), .total_bytes = 4096, .admission_available_bytes = 4096};
         PipelineStageTransferMemory::forStage(parent, 0).bind(cfg);
+        EXPECT_EQ(cfg.pipeline_forward_only_graph_owner, PipelineForwardOnlyGraphOwner::Participant);
+        EXPECT_THROW(PipelineStageTransferMemory::forStage(parent, 0).bind(cfg), std::invalid_argument);
         EXPECT_EQ(cfg.local_pipeline_backend.has_value(), topology == 0);
         if (topology == 0)
         {
             EXPECT_EQ(*cfg.local_pipeline_backend, type == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
         }
     }
+}
+
+/** @test Frozen domains assign exactly one parent/program to every actual GPU, including TP siblings. */
+TEST(Test__MemoryPlanner, CapturedDomainForwardOnlyOwnersIncludeEveryPhysicalParticipant)
+{
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
+    for (int members = 1; members <= 8; ++members)
+    {
+        RankExecutionPlan parent;
+        parent.rank = 0;
+        const auto other = type == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA;
+        const auto first = GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, 0));
+        const auto tail = GlobalDeviceAddress::fromLocalDeviceId(DeviceId(other, 0));
+        parent.local_pp_devices = {first, tail};
+        parent.local_pp_layer_boundaries = {0, 2, 4};
+        parent.local_pp_stage_tp_info.resize(2);
+        for (int member = 0; member < members; ++member)
+        {
+            parent.local_pp_stage_tp_info[0].devices.push_back(
+                GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, member)));
+            parent.local_pp_stage_tp_info[1].devices.push_back(
+                GlobalDeviceAddress::fromLocalDeviceId(DeviceId(other, member)));
+        }
+        for (size_t stage = 0; stage != 2; ++stage)
+        {
+            const auto transfer = PipelineStageTransferMemory::forStage(parent, stage);
+            for (const auto &member : parent.local_pp_stage_tp_info[stage].devices)
+            {
+                DevicePlanConfig cfg;
+                cfg.world_rank = 0;
+                cfg.device = member.toLocalDeviceId();
+                cfg.first_layer = static_cast<int>(stage) * 2;
+                cfg.last_layer = cfg.first_layer + 1;
+                cfg.execution_role = DeviceExecutionMemoryRole::ContinuationGraph;
+                cfg.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
+                    .device = DeviceId::cpu(), .total_bytes = 4096, .admission_available_bytes = 4096};
+                transfer.bind(cfg);
+                EXPECT_FALSE(cfg.local_pipeline_backend);
+                EXPECT_EQ(cfg.pipeline_forward_only_graph_owner, PipelineForwardOnlyGraphOwner::Participant);
+                for (const size_t programs : {1u, 2u})
+                    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+                        programs, cfg.pipeline_forward_only_graph_owner), programs);
+                EXPECT_THROW(transfer.bind(cfg), std::invalid_argument);
+            }
+        }
+    }
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+        2u, PipelineForwardOnlyGraphOwner::None), 0u);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
+        1u, static_cast<PipelineForwardOnlyGraphOwner>(255)), std::invalid_argument);
+    DevicePlanConfig invalid;
+    invalid.device = DeviceId::cpu();
+    invalid.pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::Participant;
+    EXPECT_THROW(MemoryPlanner::plan(createTestProfile(), {invalid}), std::invalid_argument);
+    invalid.pipeline_forward_only_graph_owner = static_cast<PipelineForwardOnlyGraphOwner>(255);
+    EXPECT_THROW(MemoryPlanner::plan(createTestProfile(), {invalid}), std::invalid_argument);
 }
 
 /**
@@ -4011,8 +4243,19 @@ TEST(Test__MemoryPlanner, SparseQueryProgramInventoryPricesOnlyAdditionalMainOwn
         MTPRuntimeConfig policy;
         policy.enabled=false;
         policy.graph_capacity_draft_tokens=retains?15:0;
-        const auto one=resolveCapturedServingGraphMemoryInventory({32,64},policy);
-        const auto two=resolveCapturedServingGraphMemoryInventory({32,64},policy,2u);
+        const auto one=resolveCapturedServingGraphMemoryInventory(
+            {32,64},
+            policy,
+            MTPVerifierGraphFamily::BoundedBuckets,
+            MTPGenerationParentRole::Controller,
+            DeviceGenerationExecutionDomain::NativeDomain);
+        const auto two=resolveCapturedServingGraphMemoryInventory(
+            {32,64},
+            policy,
+            MTPVerifierGraphFamily::BoundedBuckets,
+            MTPGenerationParentRole::Controller,
+            DeviceGenerationExecutionDomain::NativeDomain,
+            2u);
         EXPECT_EQ(one.sparse_query_program_count,1u);
         EXPECT_EQ(two.sparse_query_program_count,2u);
         EXPECT_EQ(two.prefill_bucket_rows,one.prefill_bucket_rows);
@@ -4024,17 +4267,43 @@ TEST(Test__MemoryPlanner, SparseQueryProgramInventoryPricesOnlyAdditionalMainOwn
         EXPECT_EQ(two.mtp_graph_owners.speculativePublicationGraphSlots(), retains ? 2u : 0u);
         EXPECT_EQ(two.mtp_graph_owners.generalAuxiliaryExecutableSlotCount(),
             one.mtp_graph_owners.generalAuxiliaryExecutableSlotCount() + (retains ? 2u : 0u));
-        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(),1u);
-        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(2u),2u);
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant),1u);
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(2u, PipelineForwardOnlyGraphOwner::Participant),2u);
         for(auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
-            EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(device,retains,2u),
-                2u*OrdinaryGenerationGraphPlan::additionalExecutableCount(device,retains));
+            EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                device,
+                retains,
+                declaredDeviceGenerationExecutionPolicy(device.type,DeviceGenerationExecutionDomain::NativeDomain),
+                MTPGenerationParentRole::Controller,
+                2u),
+                2u*OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                    device,
+                    retains,
+                    declaredDeviceGenerationExecutionPolicy(device.type,DeviceGenerationExecutionDomain::NativeDomain),
+                    MTPGenerationParentRole::Controller));
     }
-    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory({32},MTPRuntimeConfig{},0u),std::invalid_argument);
-    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory({32},MTPRuntimeConfig{},3u),std::invalid_argument);
-    EXPECT_THROW((void)MTPGraphOwnerPlan(MTPRuntimeConfig{},3u),std::invalid_argument);
-    EXPECT_THROW((void)OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::rocm(0),false,3u),std::invalid_argument);
-    EXPECT_THROW((void)OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(3u),std::invalid_argument);
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory(
+        {32},
+        MTPRuntimeConfig{},
+        MTPVerifierGraphFamily::BoundedBuckets,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain,
+        0u),std::invalid_argument);
+    EXPECT_THROW((void)resolveCapturedServingGraphMemoryInventory(
+        {32},
+        MTPRuntimeConfig{},
+        MTPVerifierGraphFamily::BoundedBuckets,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain,
+        3u),std::invalid_argument);
+    EXPECT_THROW((void)MTPGraphOwnerPlan(MTPRuntimeConfig{},MTPVerifierGraphFamily::BoundedBuckets,MTPGenerationParentRole::Controller,3u),std::invalid_argument);
+    EXPECT_THROW((void)OrdinaryGenerationGraphPlan::additionalExecutableCount(
+        DeviceId::rocm(0),
+        false,
+        DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions,
+        MTPGenerationParentRole::Controller,
+        3u),std::invalid_argument);
+    EXPECT_THROW((void)OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(3u, PipelineForwardOnlyGraphOwner::Participant),std::invalid_argument);
 }
 
 /** @test Dedicated scalar diagnostic arenas multiply; proven wide/condition lanes and Dense0 stay shared. */
@@ -4051,4 +4320,140 @@ TEST(Test__MemoryPlanner, SparseQueryProgramSnapshotOwnersMatchPhysicalSharing)
     EXPECT_EQ(payload.bytesFor(two)-payload.bytesFor(one),2u*128u);
     EXPECT_THROW((void)ServingSnapshotArenaInventory::ordinary(true,false,0u,0u,0u),std::invalid_argument);
     EXPECT_THROW((void)ServingSnapshotArenaInventory::ordinary(true,false,0u,0u,3u),std::invalid_argument);
+}
+
+/** @test Complete-main sparse topology determines immutable programs, independent of stage scope. */
+TEST(Test__MemoryPlanner, SparseQueryProfileProjectionExcludesPredictorOnlyLayers)
+{
+    ModelMemoryProfile profile;
+    profile.n_layers = 4;
+    profile.mtp_layer_count = 1;
+    EXPECT_EQ(profile.sparseQueryProgramCount(), 1u);
+    profile.flash_next.emplace();
+    profile.flash_next->sparse_decoder_layers = {4};
+    EXPECT_EQ(profile.sparseQueryProgramCount(), 1u); // Predictor-only sparse geometry is not a main program.
+    profile.flash_next->sparse_decoder_layers = {3, 4};
+    EXPECT_EQ(profile.sparseQueryProgramCount(), 2u);
+    profile.n_layers = -1;
+    EXPECT_THROW(profile.sparseQueryProgramCount(), std::invalid_argument);
+}
+
+/** @test Two decode programs never create a second RankingPossible-only prefill family. */
+TEST(Test__MemoryPlanner, SparseQueryProgramBOMKeepsPrefillSingleAndPricesHostedCudaTail)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig config;
+    config.device = DeviceId::cuda(0);
+    config.device_total_bytes = config.device_free_bytes = 64ull << 30;
+    config.device_compute_units = 60;
+    config.max_seq_len = 4096;
+    config.activation_seq_len = 64;
+    MTPRuntimeConfig retained;
+    retained.graph_capacity_draft_tokens = 15;
+    for (const auto role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        config.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+            {32, 64},
+            retained,
+            MTPVerifierGraphFamily::ExactRows,
+            role,
+            DeviceGenerationExecutionDomain::HostedBoundary,
+            2u);
+        const auto plan = MemoryPlanner::plan(profile, {config});
+        ASSERT_EQ(plan.devices.size(), 1u);
+        const auto &serving = config.captured_serving_graphs;
+        const auto ordinary = OrdinaryGenerationGraphPlan::additionalExecutableCount(config.device, true, DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions, role, 2u);
+        const CapturedGraphExecutableInventory expected{
+            .model_graph_identity_count = 2u + serving.fixed_executable_count,
+            .model_graph_topology_variant_count = 1u,
+            .auxiliary_executable_count = serving.mtp_graph_owners.generalAuxiliaryExecutableSlotCount() + ordinary,
+            .bounded_helper_executable_count = serving.mtp_graph_owners.boundedHelperExecutableSlotCount()};
+        EXPECT_EQ(plan.devices.front().captured_graph_bytes(), estimateCapturedGraphExecutableBytes(config.device, expected));
+        auto wrong_prefill = expected;
+        wrong_prefill.model_graph_identity_count += 2u; // Blanket program multiplication invents two prefills.
+        EXPECT_NE(plan.devices.front().captured_graph_bytes(), estimateCapturedGraphExecutableBytes(config.device, wrong_prefill));
+    }
+}
+
+/** @test A per-GPU BOM rejects missing or contradictory execution declarations before pricing. */
+TEST(Test__MemoryPlanner, CapturedServingFamilyMustMatchDeclaredGpuDomain)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig config;
+    config.device = DeviceId::cuda(0);
+    config.device_total_bytes = config.device_free_bytes = 64ull << 30;
+    config.device_compute_units = 60;
+    config.max_seq_len = 4096;
+    config.activation_seq_len = 64;
+    MTPRuntimeConfig retained;
+    retained.graph_capacity_draft_tokens = 15;
+    config.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+        {32},
+        retained,
+        MTPVerifierGraphFamily::ExactRows,
+        MTPGenerationParentRole::Controller,
+        DeviceGenerationExecutionDomain::NativeDomain);
+    EXPECT_THROW(MemoryPlanner::plan(profile,{config}), std::invalid_argument); // CUDA native requires bounded.
+    config.device = DeviceId::rocm(0);
+    EXPECT_NO_THROW(MemoryPlanner::plan(profile,{config})); // ROCm native domain declares hosted exact.
+    config.device = DeviceId::cuda(0);
+    config.captured_serving_graphs.generation_domain = DeviceGenerationExecutionDomain::HostedBoundary;
+    EXPECT_NO_THROW(MemoryPlanner::plan(profile,{config}));
+    config.captured_serving_graphs.verifier_graph_family = MTPVerifierGraphFamily::BoundedBuckets;
+    EXPECT_THROW(MemoryPlanner::plan(profile,{config}), std::invalid_argument);
+    config.captured_serving_graphs.generation_domain.reset();
+    EXPECT_THROW(MemoryPlanner::plan(profile,{config}), std::invalid_argument);
+}
+
+/**
+ * @test One flat scalar history owner is admitted for each MTP controller.
+ * @details Depth, request capacity, query programs and initial request enablement
+ * do not multiply this owner. Its one bounded-helper charge reaches the actual
+ * backend byte estimator; followers and absent retained capacity own none.
+ */
+TEST(Test__MemoryPlanner, MTPDirectTokenHistoryOwnerIsSingleBoundedControllerHelper)
+{
+    for (int requests = 1; requests <= 8; ++requests)
+    for (int depth : {1, 3, 15})
+    for (std::size_t programs : {1u, 2u})
+    for (bool enabled : {false, true})
+    for (auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+    for (auto family : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+    for (auto role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        MTPRuntimeConfig policy;
+        policy.enabled = enabled;
+        policy.draft_tokens = 1;
+        policy.graph_capacity_draft_tokens = depth;
+        policy.max_request_batch = requests;
+        policy.depth_policy.mode = mode;
+        const MTPGraphOwnerPlan owners(policy, family, role, programs);
+        const std::size_t direct = role == MTPGenerationParentRole::Controller ? 1u : 0u;
+        EXPECT_EQ(owners.directTokenHistoryGraphSlots(), direct);
+        EXPECT_EQ(owners.controllerGraphSlots(), owners.samplerHelperGraphSlots() +
+            owners.generationParentGraphSlots() + owners.speculativePublicationGraphSlots() + direct);
+        const auto bounded_without_direct = owners.boundedHelperExecutableSlotCount() - direct;
+        const auto total_without_direct = owners.auxiliaryExecutableSlotCount() - direct;
+        EXPECT_EQ(owners.generalAuxiliaryExecutableSlotCount() + bounded_without_direct,
+                  total_without_direct);
+        for (auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            CapturedGraphExecutableInventory inventory{
+                .model_graph_identity_count = 1u,
+                .model_graph_topology_variant_count = 1u,
+                .auxiliary_executable_count = owners.generalAuxiliaryExecutableSlotCount(),
+                .bounded_helper_executable_count = bounded_without_direct,
+            };
+            const auto without_direct = estimateCapturedGraphExecutableBytes(device, inventory);
+            inventory.bounded_helper_executable_count += direct;
+            EXPECT_EQ(estimateCapturedGraphExecutableBytes(device, inventory), without_direct + direct *
+                GPUGraphMemoryContract::reservationBytesPerExecutable(device, GPUGraphExecutableClass::BoundedFlatHelper));
+        }
+    }
+    for (auto role : {MTPGenerationParentRole::Controller, MTPGenerationParentRole::PipelineFollower})
+    {
+        const MTPGraphOwnerPlan absent(MTPRuntimeConfig{}, MTPVerifierGraphFamily::ExactRows, role);
+        EXPECT_EQ(absent.directTokenHistoryGraphSlots(), 0u);
+        EXPECT_EQ(absent.auxiliaryExecutableSlotCount(), 0u);
+    }
 }

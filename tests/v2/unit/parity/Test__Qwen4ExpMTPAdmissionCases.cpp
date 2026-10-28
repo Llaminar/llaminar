@@ -9,6 +9,8 @@
 #include "integration/parity/qwen4exp/Qwen4ExpMTPAdmissionCases.h"
 #include <gtest/gtest.h>
 #include <array>
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
+#include "execution/mtp/MTPServingForwardCaptureGeometry.h"
 #include "config/OrchestrationConfigDocument.h"
 #include <set>
 namespace llaminar2::test::parity::qwen4exp
@@ -88,7 +90,7 @@ TEST(Qwen4ExpMTPAdmissionCases, HybridKeepsOriginalExplicitPipelineAndRejectsFor
 TEST(Qwen4ExpMTPAdmissionCases, FullROCmTP4RuntimePoliciesKeepNumericalOffSeparate)
 {
     const auto &cases = qwen4ExpFullROCmTP4MTPAdmissionCases();
-    ASSERT_EQ(cases.size(), 5u);
+    ASSERT_EQ(cases.size(), 7u);
     EXPECT_EQ(std::string_view(qwen4ExpMTPRuntimePurposeName(Qwen4ExpMTPAdmissionPurpose::RuntimeQualification)),
               "runtime_qualification");
     EXPECT_EQ(std::string_view(qwen4ExpMTPRuntimePurposeName(Qwen4ExpMTPAdmissionPurpose::ProductionServing)),
@@ -215,6 +217,56 @@ TEST(Qwen4ExpMTPAdmissionCases, FullROCmTP4RuntimePoliciesKeepNumericalOffSepara
         invalid = cell;
         invalid.policy = static_cast<ModelParityMTP>(255);
         EXPECT_THROW(invalid.config(Qwen4ExpMTPAdmissionExecution::Active), std::invalid_argument);
+    }
+}
+/** @test Non-power verifier rows6/7 remain exact runtime axes without expanding numerical certification. */
+TEST(Qwen4ExpMTPAdmissionCases, FixedFiveSixRuntimeExportsKeepExactRowsAndOriginalInventory)
+{
+    const auto &cases = qwen4ExpFullROCmTP4MTPAdmissionCases();
+    ASSERT_EQ(cases.size(), 7u);
+    constexpr std::array original{ModelParityMTP::Depth1, ModelParityMTP::Depth2,
+        ModelParityMTP::Depth3, ModelParityMTP::Depth15, ModelParityMTP::DynamicDepth};
+    for (std::size_t index = 0; index < original.size(); ++index)
+        EXPECT_EQ(cases[index].policy, original[index]);
+    EXPECT_EQ(qwen4ExpProductionCases().size(), 20u);
+    EXPECT_EQ(qwen4ExpFullROCmTP4ProductionCases().size(), 1u);
+    EXPECT_EQ(kCanonicalModelParityMTPPolicies,
+        (std::array<ModelParityMTP, 6>{ModelParityMTP::Off, ModelParityMTP::Depth1,
+         ModelParityMTP::Depth2, ModelParityMTP::Depth3, ModelParityMTP::Depth15,
+         ModelParityMTP::DynamicDepth}));
+    for (const int depth : {5, 6})
+    {
+        const auto &cell = cases[depth];
+        EXPECT_EQ(cell.policy, depth == 5 ? ModelParityMTP::Depth5 : ModelParityMTP::Depth6);
+        EXPECT_EQ(cell.requestedDepth(), depth);
+        EXPECT_TRUE(cell.testName().ends_with("MTPR1Fixed" + std::to_string(depth) + "Retained15"));
+        EXPECT_EQ(modelParityMTPPolicyName(cell.policy), std::string("depth_") + std::to_string(depth));
+        EXPECT_EQ(cell.main.mtp, ModelParityMTP::Off);
+        EXPECT_EQ(cell.main.model.maximum_mtp_draft_depth, 0);
+        EXPECT_EQ(cell.main.generation_workload, cases[2].main.generation_workload);
+        for (const auto purpose : {Qwen4ExpMTPAdmissionPurpose::RuntimeQualification,
+                                  Qwen4ExpMTPAdmissionPurpose::ProductionServing})
+        {
+            const auto config = cell.config(Qwen4ExpMTPAdmissionExecution::Active, purpose);
+            auto expected = cases[2].config(Qwen4ExpMTPAdmissionExecution::Active, purpose);
+            expected.mtp.draft_tokens = depth;
+            // Full equality guards sources/topology/precision/ownership/prefix/
+            // resources/sampler law; only the authored fixed draft depth differs.
+            EXPECT_EQ(serializeOrchestrationConfig(config), serializeOrchestrationConfig(expected));
+            EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
+            EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(config.mtp), depth);
+            EXPECT_EQ(resolveMTPRetainedDraftCapacity(config.mtp), 15);
+            const auto execution = declaredDeviceGenerationExecutionPolicy(
+                DeviceType::ROCm, DeviceGenerationExecutionDomain::NativeDomain);
+            const auto role = mtpVerifierExecutionRole(execution);
+            const auto family = resolveMTPVerifierGraphFamily(role);
+            EXPECT_EQ(family, MTPVerifierGraphFamily::ExactRows);
+            const auto geometry = resolveMTPServingForwardCaptureGeometry(config.mtp, 16, family);
+            EXPECT_EQ(geometry.verifier_rows, 16);
+            const auto width_policy = resolveMTPVerifierPhysicalWidthPolicy(role, config.mtp.depth_policy.mode);
+            EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, depth + 1, geometry.verifier_rows, width_policy), depth + 1);
+            EXPECT_NE(depth + 1, mtpVerifierPhysicalRowBucket(depth + 1, geometry.verifier_rows));
+        }
     }
 }
 } // namespace llaminar2::test::parity::qwen4exp

@@ -379,6 +379,7 @@ class GenerationHTTPTests(unittest.TestCase):
         dynamic = policy is generation_http.MTPPolicy.DYNAMIC
         depth = {generation_http.MTPPolicy.OFF: 1, generation_http.MTPPolicy.DEPTH1: 1,
                  generation_http.MTPPolicy.DEPTH2: 2, generation_http.MTPPolicy.DEPTH3: 3,
+                 generation_http.MTPPolicy.DEPTH5: 5, generation_http.MTPPolicy.DEPTH6: 6,
                  generation_http.MTPPolicy.DEPTH15: 15, generation_http.MTPPolicy.DYNAMIC: 2}[policy]
         return {"object": "chat.completion", "token_ids": {"prompt": prompt,
                 "completion": [variant * 1000 + index for index in range(384)]},
@@ -846,6 +847,31 @@ class GenerationHTTPTests(unittest.TestCase):
         changed["runtime_summary"]["mtp"].pop("depth_policy_updates")
         with self.assertRaises(ValueError):
             generation_http.validate_mtp_outcome(record["runtime"]["generation"], changed)
+
+    def test_fixed_five_six_preserve_stochastic_prefix_and_exact_terminal_depth(self):
+        """Named non-power verifier axes retain all four384-token/prefix/serial obligations."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            control = self.collect(root / "serial")
+            for policy, depth in ((generation_http.MTPPolicy.DEPTH5, 5), (generation_http.MTPPolicy.DEPTH6, 6)):
+                self.mtp_policy = policy
+                record = self.record(True)
+                record["runtime"]["generation"]["mtp_policy"] = policy.value
+                with patch.object(generation_http, "post_completion", side_effect=self.response) as post:
+                    observed = generation_http.run_probes(record, "http://unused", root / policy.value, control)
+                self.assertEqual(post.call_count, 4)
+                self.assertTrue(observed["complete"])
+                self.assertTrue(observed["repeatability_passed"])
+                self.assertTrue(observed["serial_comparison_passed"])
+                self.assertFalse(observed["certification_eligible"])
+                for request in observed["requests"]:
+                    self.assertEqual(len(request["response"]["token_ids"]["completion"]), 384)
+                response = observed["requests"][0]["response"]
+                for field in ("min_depth", "current_depth", "max_depth"):
+                    changed = copy.deepcopy(response)
+                    changed["runtime_summary"]["mtp"][field] = 3
+                    with self.subTest(policy=policy, field=field), self.assertRaisesRegex(ValueError, "fixed|admitted bounds"):
+                        generation_http.validate_mtp_outcome(record["runtime"]["generation"], changed)
 
     def test_terminal_mtp_evidence_rejects_bypass_wrong_policy_and_inactive_drafts(self):
         """A requested MTP mode is not proof that its stochastic work happened."""
@@ -1483,7 +1509,7 @@ class RoutineGenerationPolicyTests(unittest.TestCase):
         helper = GenerationHTTPTests()
         campaign = parity.CampaignCell("campaign", parity.CampaignGroup("CUDA", "ALL"))
         records = [helper.record()]
-        for policy in ("depth_1", "depth_2", "depth_3", "depth_15", "dynamic"):
+        for policy in ("depth_1", "depth_2", "depth_3", "depth_5", "depth_6", "depth_15", "dynamic"):
             record = helper.record(True)
             record["id"] = policy
             record["runtime"]["generation"]["mtp_policy"] = policy
@@ -1493,7 +1519,7 @@ class RoutineGenerationPolicyTests(unittest.TestCase):
         with patch.object(generation_runner, "discover", return_value=inventory):
             self.assertEqual([cell.configuration["id"] for cell in generation_runner.select_cells(args)],
                              ["serial", "dynamic"])
-            self.assertEqual(len(generation_runner.select_cells(args, generation_corpus.InventoryScope.ALL)), 6)
+            self.assertEqual(len(generation_runner.select_cells(args, generation_corpus.InventoryScope.ALL)), 8)
 
     def test_full_inventory_excludes_only_declared_numerical_controls(self):
         """Three real discovery roles preserve both QFN tests and unrelated Qwen36 selection."""

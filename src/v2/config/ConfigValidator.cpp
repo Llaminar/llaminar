@@ -227,6 +227,19 @@ namespace llaminar2
         ConfigValidator v;
 
         v.addRule({
+            .id = "mtp-learned-scope-authority",
+            .description = "Learned economics scope is derived from frozen loaded runtime metadata",
+            .fix_hint = "Remove authored mtp.depth_policy.scope; the admitted runner derives this identity",
+            .applies = [](const OrchestrationConfig &) { return true; },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
+            {
+                if (c.mtp.depth_policy.scope != MTPDepthPolicyScope{})
+                    return "MTP learned-policy scope is runtime-derived and cannot be authored in startup configuration.";
+                return std::nullopt;
+            },
+        });
+
+        v.addRule({
             .id = "shared-predictor-target-required",
             .description = "A separate shared predictor requires an explicit target artifact",
             .fix_hint = "Pair --mtp-model <GGUF> with --model <target GGUF>",
@@ -453,6 +466,22 @@ namespace llaminar2
         // rules in the declarative validator means every CLI entry point sees
         // the same contract before model loading or MPI work begins.
         // =====================================================================
+
+        v.addRule({
+            .id = "benchmark-campaign-scope",
+            .description = "Campaigns own all prompt sources and incremental JSON artifacts",
+            .fix_hint = "Use benchmark --benchmark-campaign PATH without --prompt, --prompt-file or --benchmark-json-output",
+            .applies = [](const OrchestrationConfig &c)
+            { return c.benchmark_campaign_was_provided || !c.benchmark_campaign_path.empty(); },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
+            {
+                if (!c.benchmark_mode) return "--benchmark-campaign requires benchmark mode.";
+                if (c.benchmark_campaign_path.empty()) return "--benchmark-campaign requires a nonempty JSON path.";
+                if (hasExplicitPrompt(c) || hasBenchmarkPromptFile(c) || !c.benchmark_json_output_path.empty())
+                    return "Benchmark campaign conflicts with singular prompt/JSON-output options.";
+                return std::nullopt;
+            },
+        });
 
         v.addRule({
             .id = "benchmark-prompt-source-mutex",

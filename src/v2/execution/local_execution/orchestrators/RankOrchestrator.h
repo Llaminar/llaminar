@@ -1095,6 +1095,9 @@ namespace llaminar2
         bool stageStochasticTargetTokenForDeviceSampling(
             int32_t target_token,
             int target_sample_slot = 0) override;
+        /** @copydoc IInferenceRunner::publishMTPDirectTokenHistory */
+        bool publishMTPDirectTokenHistory(int target_sample_slot,
+            MTPDirectTokenHistoryDisposition disposition) override;
         /** @copydoc IInferenceRunner::publishForcedDeviceResidentConditionToken */
         bool publishForcedDeviceResidentConditionToken(
             int32_t token,
@@ -1194,6 +1197,7 @@ namespace llaminar2
             int draft_depth,
             DeviceGenerationLoopTopology topology,
             DeviceGenerationSamplingMode sampling_mode) override;
+        bool prepareDeviceResidentGenerationContinuation(DeviceGenerationSamplingMode sampling_mode) override;
         bool launchDeviceResidentGeneration() override;
         bool observeDeviceGenerationDispatchTicket(
             sampling_math::DeviceGenerationDispatchTicket *out_ticket)
@@ -2606,6 +2610,16 @@ namespace llaminar2
         bool validateMirroredLocalTPChildOutcomesComplete(
             const std::vector<DeviceSpeculativeOutcomeHandle> &child_outcomes,
             const char *context_name);
+
+        /** @brief The owning pipeline retires borrowed complete one-shot domain forwards. */
+        friend class PipelineDeviceGeneration;
+        /**
+         * @brief Retire rank-local bookkeeping after all original domain children completed one row.
+         * @details Called only by the enclosing pipeline after independent device
+         * terminal validation and mailbox retirement. The increment describes
+         * scheduler/logits geometry; device KV remains the execution authority.
+         */
+        void retirePipelineForwardOnlyDomain();
 
         /**
          * @brief Invalidate the rank token that aggregates child logical mailboxes.

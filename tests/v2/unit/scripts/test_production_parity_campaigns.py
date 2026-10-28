@@ -1007,6 +1007,181 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 "invalid-cuda", frozenset(("Integration", "CUDA")), mpi_one, ["rocm_gpu_0"]
             )
 
+    def test_preflight_completed_ctest_failure_is_distinct_from_infrastructure_exit(self) -> None:
+        """Only normal CTest success/test-failure outcomes allow the next owner."""
+        self.assertTrue(campaigns._preflight_test_phase_completed(0))
+        self.assertTrue(campaigns._preflight_test_phase_completed(8))
+        for code in (1, 2, 7, 124, 130, -9, -15):
+            self.assertFalse(campaigns._preflight_test_phase_completed(code))
+        self.assertEqual(campaigns._preflight_merge_test_phase_return_codes(8, 0), 8)
+        self.assertEqual(campaigns._preflight_merge_test_phase_return_codes(8, 124), 124)
+        self.assertEqual(campaigns._preflight_merge_test_phase_return_codes(7, 130), 7)
+        self.assertEqual(campaigns._preflight_merge_test_phase_return_codes(124, -9), 124)
+
+    def test_preflight_completed_test_failures_collect_all_serial_lanes_and_stay_red(self) -> None:
+        """Unit/host/backend failures cannot hide later safe tests or publish green."""
+        lanes = campaigns.PreflightExecutionLane
+        registrations = tuple(
+            campaigns.PreflightRegistration(
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), None, lane
+            )
+            for lane in lanes
+        )
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            mock.patch.object(
+                campaigns, "discover_production_parity_unit_tests",
+                return_value=("V2_Unit_Example",),
+            ),
+            mock.patch.object(
+                campaigns, "discover_production_test_preflight_registrations",
+                return_value=registrations,
+            ),
+            mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None),
+            mock.patch.object(campaigns, "_run_process", side_effect=[0, 8, 8, 0, 8, 0]) as execute,
+        ):
+            artifact = Path(folder) / "evidence"
+            code, _, inventory = campaigns.run_production_test_preflight(
+                Path(folder), None, artifact_directory=artifact
+            )
+            self.assertEqual(code, 8)
+            self.assertEqual(execute.call_count, 6)
+            selectors = [
+                call.args[0][call.args[0].index("-R") + 1]
+                for call in execute.call_args_list[1:]
+            ]
+            self.assertEqual(len(selectors), 5)
+            for lane in lanes:
+                self.assertTrue(any(
+                    re.search(selector, "V2_Integration_" + lane.value)
+                    for selector in selectors
+                ))
+            report = json.loads((artifact / "prerequisites.json").read_text())
+            self.assertEqual(report["preflight_return_code"], 8)
+            self.assertEqual(report["preflight_tests"], list(inventory))
+            self.assertFalse(report["certification_eligible"])
+
+    def test_preflight_backend_test_failure_still_collects_exclusive_lane(self) -> None:
+        """The exact present defect: backend8 preserves EXCLUSIVE and final red."""
+        lanes = campaigns.PreflightExecutionLane
+        registrations = tuple(
+            campaigns.PreflightRegistration(
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), 1, lane
+            )
+            for lane in lanes
+        )
+        with (
+            mock.patch.object(
+                campaigns, "discover_production_parity_unit_tests",
+                return_value=("V2_Unit_Example",),
+            ),
+            mock.patch.object(
+                campaigns, "discover_production_test_preflight_registrations",
+                return_value=registrations,
+            ),
+            mock.patch.object(
+                campaigns, "preflight_accelerator_cpu_sets", return_value=("0-27", "28-55")
+            ),
+            mock.patch.object(
+                campaigns, "_run_preflight_parallel_processes",
+                return_value={lanes.CUDA_SOCKET: 0, lanes.ROCM_SOCKET: 8},
+            ),
+            mock.patch.object(campaigns, "_run_process", return_value=0) as execute,
+        ):
+            code, _, _ = campaigns.run_production_test_preflight(Path("build"), None)
+            self.assertEqual(code, 8)
+            self.assertEqual(execute.call_count, 4)
+            self.assertIn("V2_Integration_exclusive", execute.call_args_list[-1].args[0][-1])
+
+    def test_preflight_build_and_infrastructure_failures_do_not_admit_later_lanes(self) -> None:
+        """An8 build failure is never reinterpreted as completed CTest work."""
+        for outcomes, expected_calls in (([8], 1), ([0, 124], 2), ([0, 0, 2], 3)):
+            with (
+                self.subTest(outcomes=outcomes),
+                mock.patch.object(
+                    campaigns, "discover_production_parity_unit_tests",
+                    return_value=("V2_Unit_Example",),
+                ),
+                mock.patch.object(
+                    campaigns, "discover_production_test_preflight_registrations",
+                    return_value=preflight_registrations("V2_Integration_Host"),
+                ),
+                mock.patch.object(campaigns, "_run_process", side_effect=outcomes) as execute,
+            ):
+                code, _, _ = campaigns.run_production_test_preflight(Path("build"), None)
+                self.assertEqual(code, outcomes[-1])
+                self.assertEqual(execute.call_count, expected_calls)
+
+    def test_preflight_first_backend_fatal_is_not_replaced_by_peer_cancellation(self) -> None:
+        """Keep the observed fatal result when retirement adds a cancelled sibling."""
+        lanes = campaigns.PreflightExecutionLane
+        registrations = tuple(
+            campaigns.PreflightRegistration(
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), 1, lane
+            )
+            for lane in lanes
+        )
+        with (
+            mock.patch.object(
+                campaigns, "discover_production_parity_unit_tests",
+                return_value=("V2_Unit_Example",),
+            ),
+            mock.patch.object(
+                campaigns, "discover_production_test_preflight_registrations",
+                return_value=registrations,
+            ),
+            mock.patch.object(
+                campaigns, "preflight_accelerator_cpu_sets", return_value=("0-27", "28-55")
+            ),
+            mock.patch.object(
+                campaigns, "_run_preflight_parallel_processes",
+                return_value={lanes.ROCM_SOCKET: 7, lanes.CUDA_SOCKET: 130},
+            ),
+            mock.patch.object(campaigns, "_run_process", return_value=0) as execute,
+        ):
+            code, _, _ = campaigns.run_production_test_preflight(Path("build"), None)
+            self.assertEqual(code, 7)
+            self.assertEqual(execute.call_count, 3)  # Build, Unit, host; no EXCLUSIVE.
+
+    def test_preflight_parallel_test_failure_does_not_cancel_peer(self) -> None:
+        """A completed CTest8 lets the independently owned sibling finish."""
+        lanes = campaigns.PreflightExecutionLane
+        commands = {
+            lanes.CUDA_SOCKET: ["ctest", "cuda"],
+            lanes.ROCM_SOCKET: ["ctest", "rocm"],
+        }
+        first = mock.Mock()
+        first.poll.return_value = 8
+        second = mock.Mock()
+        second.poll.side_effect = [None, 0]
+        with (
+            mock.patch.object(campaigns.subprocess, "Popen", side_effect=[first, second]),
+            mock.patch.object(campaigns, "_terminate_process_group") as retire,
+            mock.patch.object(campaigns.time, "sleep"),
+        ):
+            result = campaigns._run_preflight_parallel_processes(commands, None)
+        self.assertEqual(result, {lanes.CUDA_SOCKET: 8, lanes.ROCM_SOCKET: 0})
+        retire.assert_not_called()
+
+    def test_preflight_parallel_launch_failure_retires_started_peer(self) -> None:
+        """Ownership exceptions stay fatal and close a partially launched pair."""
+        lanes = campaigns.PreflightExecutionLane
+        commands = {
+            lanes.CUDA_SOCKET: ["ctest", "cuda"],
+            lanes.ROCM_SOCKET: ["ctest", "rocm"],
+        }
+        first = mock.Mock()
+        first.poll.return_value = None
+        with (
+            mock.patch.object(
+                campaigns.subprocess, "Popen", side_effect=[first, OSError("authored launch failure")]
+            ),
+            mock.patch.object(campaigns, "_terminate_process_group") as retire,
+        ):
+            with self.assertRaisesRegex(OSError, "authored launch failure"):
+                campaigns._run_preflight_parallel_processes(commands, None)
+        retire.assert_called_once_with(first)
+
     def test_preflight_parallel_lanes_terminate_the_sibling_process_group_on_failure(self) -> None:
         """A red accelerator lane cannot leave its opposite MPI family running."""
 

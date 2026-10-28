@@ -3482,6 +3482,18 @@ namespace llaminar2
         return true;
     }
 
+    void RankOrchestrator::retirePipelineForwardOnlyDomain()
+    {
+        if (device_runners_.empty() || !pp_stage_runners_.empty())
+            throw std::logic_error("Pipeline forward-only completion requires its original local TP domain");
+        invalidateRankResidentLogicalStateAggregate("pipeline_forward_only_domain", "original_children_consumed");
+        ++current_position_;
+        for (int &length : current_sequence_lengths_) ++length;
+        current_padded_seq_len_ = 1;
+        last_logits_forward_phase_ = LogitsForwardPhase::Decode;
+        stats_dirty_ = true;
+    }
+
     bool RankOrchestrator::
         advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
             int32_t token_shadow,
@@ -11834,6 +11846,29 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::publishMTPDirectTokenHistory(int target_sample_slot,
+        MTPDirectTokenHistoryDisposition disposition)
+    {
+        if (target_sample_slot != 0 ||
+            (disposition != MTPDirectTokenHistoryDisposition::NewlyEmitted &&
+             disposition != MTPDirectTokenHistoryDisposition::AlreadyPublished))
+            return false;
+        if (IInferenceRunner *tail = finalPPSidecarRunner())
+            return tail->publishMTPDirectTokenHistory(target_sample_slot, disposition);
+        if (device_runners_.size() == 1 && device_runners_[0])
+            return device_runners_[0]->publishMTPDirectTokenHistory(target_sample_slot, disposition);
+        if (device_runners_.size() < 2 || !primaryDeviceId().is_gpu())
+            return false;
+        // Sampling history is a participant-local graph input, not a model row
+        // or a new distributed controller. The existing dispatch owns each exact
+        // device worker and leaves the prior main-logit publication untouched.
+        return dispatchLocalTPMTPMainCondition("publishMTPDirectTokenHistory",
+            LocalTPConditionEffect::PublishInput,
+            [target_sample_slot, disposition](IInferenceRunner &child, size_t) {
+                return child.publishMTPDirectTokenHistory(target_sample_slot, disposition);
+            });
+    }
+
     bool RankOrchestrator::publishForcedDeviceResidentConditionToken(
         int32_t token,
         int target_sample_slot)
@@ -13119,6 +13154,62 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::prepareDeviceResidentGenerationContinuation(DeviceGenerationSamplingMode sampling_mode)
+    {
+        if (pp_device_generation_ && pp_device_generation_->active())
+            return pp_device_generation_->prepareContinuation(sampling_mode);
+        const auto &participants = !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
+        if (participants.empty() || !isValidDeviceGenerationSamplingMode(sampling_mode) ||
+            admitted_device_generation_max_new_tokens_ <= 0 ||
+            deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::DynamicDepth) !=
+                DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions)
+        {
+            LOG_ERROR("[RankOrchestrator] ContinueResponse lacks its complete retained hosted rank family");
+            return false;
+        }
+        const auto publish_retained_policy = [&]() {
+            materialized_device_generation_execution_policy_ = DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions;
+            materialized_device_generation_loop_topology_ = DeviceGenerationLoopTopology::DynamicDepth;
+            rank_hosted_device_generation_tickets_.resize(participants.size());
+        };
+        if (participants.size() == 1)
+        {
+            if (!participants.front() || !participants.front()->prepareDeviceResidentGenerationContinuation(sampling_mode))
+            {
+                LOG_ERROR("[RankOrchestrator] ContinueResponse retained-family preparation failed on the sole participant");
+                return false;
+            }
+            publish_retained_policy();
+            return true;
+        }
+        if (!tp_worker_pool_ || tp_worker_pool_->numWorkers() != participants.size())
+        {
+            LOG_ERROR("[RankOrchestrator] ContinueResponse has no exact persistent worker cohort"
+                << " participants=" << participants.size() << " workers=" << (tp_worker_pool_ ? tp_worker_pool_->numWorkers() : 0));
+            return false;
+        }
+        tp_worker_pool_->dispatch([&participants, sampling_mode](size_t index) {
+            return index < participants.size() && participants[index] &&
+                participants[index]->prepareDeviceResidentGenerationContinuation(sampling_mode);
+        });
+        const int timeout_ms = effectiveTPWorkerJoinTimeoutMs();
+        auto results = tp_worker_pool_->collectAll(timeout_ms);
+        bool success = results.size() == participants.size();
+        for (const auto &result : results)
+        {
+            if (!result.completed && timeout_ms > 0)
+                abortAfterTPWorkerTimeout("prepareDeviceResidentGenerationContinuation", timeout_ms, result.worker_index, participants.size());
+            if (result.exception) std::rethrow_exception(result.exception);
+            if (!result.completed || !result.success)
+                LOG_ERROR("[RankOrchestrator] ContinueResponse retained-family preparation failed"
+                    << " participant=" << result.worker_index << " completed=" << result.completed
+                    << " success=" << result.success);
+            success = success && result.completed && result.success;
+        }
+        if (success) publish_retained_policy();
+        return success;
+    }
+
     bool RankOrchestrator::launchDeviceResidentGeneration()
     {
         if (pp_device_generation_ && pp_device_generation_->active())
@@ -13146,8 +13237,8 @@ namespace llaminar2
                 LOG_ERROR("[RankOrchestrator] Hosted device-generation loop has no admitted transaction bound");
                 return false;
             }
-            for (int observation = 0;
-                 observation < admitted_device_generation_max_new_tokens_;
+            for (std::int64_t observation = 0;
+                 observation <= admitted_device_generation_max_new_tokens_;
                  ++observation)
             {
                 sampling_math::DeviceGenerationDispatchTicket ticket;
@@ -17707,6 +17798,9 @@ namespace llaminar2
             snapshot.mtp_depth_policy_updates += child.mtp_depth_policy_updates;
             snapshot.mtp_depth_policy_promotions += child.mtp_depth_policy_promotions;
             snapshot.mtp_depth_policy_demotions += child.mtp_depth_policy_demotions;
+            snapshot.mtp_depth_policy_utility_returns += child.mtp_depth_policy_utility_returns;
+            snapshot.mtp_depth_policy_utility_keeps += child.mtp_depth_policy_utility_keeps;
+            snapshot.mtp_depth_policy_utility_probes += child.mtp_depth_policy_utility_probes;
             snapshot.mtp_depth_policy_observe_recommendations +=
                 child.mtp_depth_policy_observe_recommendations;
             snapshot.mtp_current_depth =
@@ -19088,8 +19182,10 @@ namespace llaminar2
             const auto &binding = stage.moe_runtime;
             if (!child || !binding)
                 throw std::logic_error("MoE pipeline has a missing stage runtime owner");
-            binding->requireDestination({.first_layer = stage.first_layer, .last_layer = stage.last_layer,
-                    .has_embedding = stage.has_embedding, .has_lm_head = stage.has_lm_head},
+            // Reuse the complete construction-time scope, including the union
+            // of parent participant types that owns exact hosted graph capacity.
+            const auto projected = config_.forPipelineStage(index);
+            binding->requireDestination(projected.nested_pp_stage_config.value(),
                 stage.stage_devices, stage.tp_weights, stage.tp_backend, config_.moe_rebalance.mode);
             if (const auto *domain = dynamic_cast<const IRankOrchestrator *>(child.get()))
             {

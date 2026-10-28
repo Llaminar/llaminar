@@ -122,7 +122,11 @@ inline bool validQwenAdaptiveCounters(const QwenAdaptiveCounterTotals &v, std::s
            (probes <= v.completed_live_ids && v.source_rows == v.miss_rows && v.evictions <= v.promotions);
 }
 static_assert(sampling_math::kDeviceGenerationControlAdaptiveCallsLow == 72);
+// The nine reporting pairs stop before immutable admission metadata. The
+// canonical layout separately proves that the final scope word ends the ABI.
+static_assert(sampling_math::kDeviceGenerationControlAdaptiveFailedFramesHigh + 1 -
+              sampling_math::kDeviceGenerationControlAdaptiveCallsLow == 9 * 2);
 static_assert(sampling_math::kDeviceGenerationControlAdaptiveFailedFramesHigh + 1 ==
-              sampling_math::kDeviceGenerationControlCount);
+              sampling_math::kDeviceGenerationControlLearnedScopeWidthPolicy);
 } // namespace llaminar2::qwen4exp
 #undef LLAMINAR_ADAPTIVE_COUNTER_HD

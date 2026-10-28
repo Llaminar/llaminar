@@ -1953,6 +1953,22 @@ namespace llaminar2
         const DeviceMoEPlacementBank *activeRuntimePlacementBank() const;
         bool runtimeLocalComputeEnabled(const DeviceMoEPlacementBank *bank, int expert_id) const;
         void ensureScratchBuffers(int max_batch) const;
+        /**
+         * @brief Acquire the existing graph-owned kernel object without stream binding.
+         * @return Borrowed kernel, or null if construction fails.
+         *
+         * Accepted-state preparation calls this before native capture. Object
+         * ownership is independent of the verifier compute stream; no model
+         * arithmetic, workspace rebinding or stream substitution occurs here.
+         */
+        IMoEKernel *acquireMoEKernelObject() const;
+
+        /**
+         * @brief Resolve the ordinary compute kernel and its exact stage binding.
+         * @return Graph-owned kernel bound to this stage's compute stream/workspace.
+         * Histogram publication instead uses the prepared object and its explicit
+         * table-owned MoEKernelLaunchContext, never this compute-stream boundary.
+         */
         IMoEKernel *ensureMoEKernel() const;
 
         mutable int grouped_gateup_desc_table_id_ = -1;

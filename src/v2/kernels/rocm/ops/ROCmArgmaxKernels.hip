@@ -786,13 +786,22 @@ __global__ void rocm_commit_mtp_greedy_penalty_history_kernel(
 __global__ void rocm_commit_generation_token_history_kernel(
     const int *__restrict__ token,
     int vocab_size,
-    int *__restrict__ generated_token_counts)
+    int *__restrict__ generated_token_counts,
+    llaminar2::MTPGreedyPenaltyPolicy *__restrict__ direct_output_policy)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
     const int value = token[0];
     if (value >= 0 && value < vocab_size)
+    {
         ++generated_token_counts[value];
+        // Only the direct MTP API supplies this original policy owner. Its
+        // nonterminal token is consumed by the committed main row before the
+        // next fresh target sampler; a grouped carried condition never enters
+        // this transition. Preserve every admitted policy magnitude unchanged.
+        if (direct_output_policy)
+            direct_output_policy->first_token_already_in_history = 0;
+    }
 }
 
 template <bool PUBLISH_MTP_CHAIN, bool DEVICE_ACTIVE_ROWS = false>
@@ -1561,6 +1570,7 @@ bool rocmOps_commit_generation_token_history(
     const int *token,
     int vocab_size,
     int *generated_token_counts,
+    llaminar2::MTPGreedyPenaltyPolicy *direct_output_policy,
     int device_idx,
     void *stream)
 {
@@ -1570,7 +1580,7 @@ bool rocmOps_commit_generation_token_history(
     hipLaunchKernelGGL(
         rocm_commit_generation_token_history_kernel,
         dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
-        token, vocab_size, generated_token_counts);
+        token, vocab_size, generated_token_counts, direct_output_policy);
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {

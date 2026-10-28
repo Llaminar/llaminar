@@ -112,6 +112,7 @@ namespace llaminar2
             [&](const auto &candidate) { return candidate.name == plan_->effectiveBaseModelDomain(); });
         if (stage.first_layer != stage_.first_layer || stage.last_layer != stage_.last_layer ||
             stage.has_embedding != stage_.has_embedding || stage.has_lm_head != stage_.has_lm_head ||
+            stage.generation_domain != stage_.generation_domain ||
             !std::equal(participants.begin(), participants.end(), participants_.begin(), participants_.end()) ||
             !std::equal(weights.begin(), weights.end(), domain->weights.begin(), domain->weights.end()) ||
             backend != domain->backend ||

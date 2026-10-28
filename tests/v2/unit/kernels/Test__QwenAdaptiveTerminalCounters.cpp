@@ -33,7 +33,7 @@ struct Row
 TEST(QwenAdaptiveTerminalCounters, ExactTupleOverflowFailsBeforeAnyWordChanges)
 {
     static_assert(kDeviceGenerationControlAdaptiveCallsLow == 72);
-    static_assert(kDeviceGenerationControlCount == 90);
+    static_assert(kDeviceGenerationControlCount == 108);
     Row r;
     r.words.front() = 123;
     r.words.back() = 456;
@@ -151,4 +151,44 @@ TEST(QwenAdaptiveTerminalCounters, InitialPrefillPreservesOnceContinuationAndReq
     ASSERT_TRUE(
         initialize_device_generation_control(4, 4, DeviceGenerationPolicy::ordinary(), r.words.data()));
     EXPECT_EQ(r.read(), QwenAdaptiveCounterTotals{});
+}
+
+/** @test Reporting remains exactly nine pairs while the whole ABI includes immutable scope and disjoint utility state/events. */
+TEST(QwenAdaptiveTerminalCounters, ReportingExtentPreservesImmutableScopeAndRejectsLegacyTruncation)
+{
+    static_assert(kDeviceGenerationControlAdaptiveFailedFramesHigh + 1 ==
+                  kDeviceGenerationControlLearnedScopeWidthPolicy);
+    static_assert(kDeviceGenerationControlLearnedScopeComputeCapabilityMinor + 1 ==
+                  kDeviceGenerationControlDepthUtilityPhase);
+    static_assert(kDeviceGenerationControlDepthUtilityReturns + 1 == kDeviceGenerationControlCount);
+    static_assert(kDeviceGenerationControlCount == 108);
+    Row row;
+    for (std::size_t word = 0; word < row.words.size(); ++word)
+        if (word < kDeviceGenerationControlAdaptiveCallsLow || word > kDeviceGenerationControlAdaptiveFailedFramesHigh)
+            row.words[word] = static_cast<std::int32_t>(0x12340000u + word);
+    const auto original = row.words;
+    const QwenAdaptiveCounterTotals delta{2, 32, 1, 1, 1, 90, 1, 0, 0};
+    // The old reporting-end extent is no longer a complete controller. Both
+    // readers and writers must reject it without mutating output or storage.
+    auto unchanged = delta;
+    EXPECT_FALSE(readQwenAdaptiveCounters(row.words.data(),
+        kDeviceGenerationControlLearnedScopeWidthPolicy, unchanged));
+    EXPECT_EQ(unchanged, delta);
+    EXPECT_FALSE(accumulateQwenAdaptiveCounters(row.words.data(),
+        kDeviceGenerationControlLearnedScopeWidthPolicy, delta));
+    EXPECT_EQ(row.words, original);
+    // The former100-word ABI includes scope but omits the utility owner;
+    // reporting bindings still require the complete new controller extent.
+    EXPECT_FALSE(readQwenAdaptiveCounters(row.words.data(), kDeviceGenerationControlDepthUtilityPhase, unchanged));
+    EXPECT_EQ(unchanged, delta);
+    EXPECT_FALSE(accumulateQwenAdaptiveCounters(row.words.data(), kDeviceGenerationControlDepthUtilityPhase, delta));
+    EXPECT_EQ(row.words, original);
+    ASSERT_TRUE(accumulateQwenAdaptiveCounters(row.words.data(), kDeviceGenerationControlCount, delta));
+    EXPECT_EQ(row.read(), delta);
+    for (std::size_t word = 0; word < row.words.size(); ++word)
+        if (word < kDeviceGenerationControlAdaptiveCallsLow || word > kDeviceGenerationControlAdaptiveFailedFramesHigh)
+            EXPECT_EQ(row.words[word], original[word]) << word;
+    const auto complete = row.words;
+    EXPECT_FALSE(accumulateQwenAdaptiveCounters(row.words.data(), kDeviceGenerationControlCount + 1, delta));
+    EXPECT_EQ(row.words, complete);
 }

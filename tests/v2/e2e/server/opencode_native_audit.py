@@ -27,20 +27,32 @@ import uuid
 
 from opencode_tool_stress import authenticate_native_qwen_calls, requested_streaming_usage
 
-TOKEN = re.compile(r'^\[([^]]+)\].*\[ChatCompletion/token\] path=(\w+) index=(\d+) token=(-?\d+) forced=(\w+) disposition=(\w+)')
-PREFIX = re.compile(r'Prefix cache summary .*requested_tokens=(\d+) matched_tokens=(\d+)')
+TOKEN = re.compile(rb'^\[([^]]+)\].*\[ChatCompletion/token\] path=(\w+) index=(\d+) token=(-?\d+) forced=(\w+) disposition=(\w+)(?=[ \t\r\n]|$)')
+PREFIX = re.compile(rb'Prefix cache summary .*requested_tokens=(\d+) matched_tokens=(\d+)')
 
 
 def native_groups(lines, started: float) -> list[dict]:
-    """Validate one complete trace, including midnight rollover and terminal rows."""
+    """Validate exact ASCII metadata while preserving arbitrary logged token bytes.
+
+    A tokenizer piece may end inside a UTF-8 code point. Its diagnostic text is
+    not a Unicode channel or token authority: only the native decoder reconstructs
+    channels from the complete ordered IDs. Match raw bytes, decode matched
+    metadata strictly as ASCII, and never replacement-decode or drop log bytes.
+    Text lines remain accepted for device-free fixtures through strict encoding.
+    """
     if type(started) not in (int, float) or not math.isfinite(started) or started <= 0:
         raise ValueError('Native audit requires the recorded server start time')
     day = datetime.datetime.fromtimestamp(started, datetime.timezone.utc).date()
     previous_clock, current, groups = None, None, []
     for line in lines:
+        if isinstance(line, str):
+            line = line.encode('utf-8')
+        if not isinstance(line, bytes):
+            raise ValueError('Native trace lines must be raw bytes or strict Unicode text')
         token = TOKEN.search(line)
         if token:
-            clock, path, index, identity, forced, disposition = token.groups()
+            clock, path, index, identity, forced, disposition = (
+                value.decode('ascii') for value in token.groups())
             parsed = datetime.time.fromisoformat(clock)
             if previous_clock is not None and parsed < previous_clock:
                 if previous_clock.hour < 23 or parsed.hour > 0:
@@ -77,7 +89,7 @@ def native_groups(lines, started: float) -> list[dict]:
             current.update(prompt_tokens=prompt, matched_tokens=matched)
             groups.append(current)
             current = None
-        elif '[ChatCompletion/token]' in line:
+        elif b'[ChatCompletion/token]' in line:
             raise ValueError('Malformed native token trace line')
     if current is not None or not groups:
         raise ValueError('Native trace is empty or has an unfinished generation')
@@ -257,12 +269,12 @@ def main() -> int:
         fingerprint, size = hashlib.sha256(), 0
 
         def log_lines(stream):
-            """Fingerprint only retained log bytes while avoiding a full-log copy."""
+            """Fingerprint and forward every original byte without decoding token pieces."""
             nonlocal size
             for raw in stream:
                 fingerprint.update(raw)
                 size += len(raw)
-                yield raw.decode('utf-8')
+                yield raw
 
         with args.server_log.open('rb') as stream:
             groups = native_groups(log_lines(stream), args.server_start_unix)

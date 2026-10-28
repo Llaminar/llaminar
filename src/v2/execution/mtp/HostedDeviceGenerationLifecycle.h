@@ -18,6 +18,7 @@
 #pragma once
 
 #include "execution/local_execution/graph/DeviceExecutionTimeline.h"
+#include "kernels/common/SamplingMath.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -282,6 +283,7 @@ namespace llaminar2
     enum class HostedDeviceGenerationCursorState : std::uint8_t
     {
         Inactive = 0, ///< No hosted scheduler owns the current request.
+        ContinuationAdmissionReady, ///< Only a fresh ContinueResponse ticket zero may start this scheduler.
         SchedulerReady, ///< Scheduler initialized; no ticket copy is in flight.
         AwaitingTicket, ///< One immutable ticket D2H observation is pending.
         TicketObserved, ///< One authenticated ticket awaits branch submission.
@@ -293,7 +295,10 @@ namespace llaminar2
      * @brief Transaction cursor for one authenticated hosted MTP request.
      *
      * Exactly one transition owns each ticket observation and retained branch.
-     * Transaction numbers must be contiguous, start at one, and match the
+     * Transaction numbers are contiguous and normally start at one. A typed
+     * ContinueResponse entry alone admits the native admission ticket zero;
+     * after submitting that first retained body, positive ordinals remain strict.
+     * Every ordinal must match the
      * ticket currently being submitted.  `reset()` is reserved for model/request
      * teardown after the caller has joined device work; ordinary successful
      * completion must cross `retireCompleted()`.
@@ -321,7 +326,7 @@ namespace llaminar2
          */
         [[nodiscard]] bool mayObserveTicket() const noexcept
         {
-            return inactive() ||
+            return inactive() || continuationAdmissionReady() ||
                    state_ ==
                        HostedDeviceGenerationCursorState::AwaitingTicket;
         }
@@ -329,7 +334,61 @@ namespace llaminar2
         /** @return Whether the one-time hosted scheduler setup has run. */
         [[nodiscard]] bool schedulerStarted() const noexcept
         {
-            return !inactive();
+            return !inactive() && !continuationAdmissionReady();
+        }
+
+        /** @return Whether a typed continuation admission awaits scheduler entry. */
+        [[nodiscard]] bool continuationAdmissionReady() const noexcept
+        {
+            return state_ == HostedDeviceGenerationCursorState::ContinuationAdmissionReady;
+        }
+
+        /**
+         * @brief Authorize ticket zero for one authenticated ContinueResponse admission.
+         * @param kind Must be the immutable ContinueResponse admission kind.
+         * @return True only before scheduler entry; ordinary admission never calls this.
+         */
+        [[nodiscard]] bool armContinuationAdmission(sampling_math::DeviceGenerationAdmissionKind kind) noexcept
+        {
+            if (!inactive() || kind != sampling_math::DeviceGenerationAdmissionKind::ContinueResponse) return false;
+            state_ = HostedDeviceGenerationCursorState::ContinuationAdmissionReady;
+            admission_ticket_pending_ = true;
+            return true;
+        }
+
+        /** @return Whether the next observation must read the native admission ticket directly. */
+        [[nodiscard]] bool admissionTicketPending() const noexcept { return admission_ticket_pending_; }
+
+        /** @return Whether this ordinal is the sole legal next authenticated ticket. */
+        [[nodiscard]] bool acceptsTicketOrdinal(std::int32_t ordinal) const noexcept
+        {
+            return admission_ticket_pending_ ? ordinal == 0 :
+                last_transaction_count_ < std::numeric_limits<std::int32_t>::max() &&
+                ordinal == last_transaction_count_ + 1;
+        }
+
+        /**
+         * @brief Authenticate immutable ticket identity, bounds, and entry semantics without mutation.
+         * @param ticket Native device-published scheduling snapshot.
+         * @param session_epoch Current request session authority.
+         * @param workspace_generation Current physical workspace authority.
+         * @param minimum_depth Inclusive admitted selector lower bound.
+         * @param maximum_depth Inclusive admitted selector upper bound.
+         * @return Whether this ticket can enter the currently pending observation.
+         */
+        [[nodiscard]] bool acceptsTicket(const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            std::uint64_t session_epoch, std::uint64_t workspace_generation,
+            int minimum_depth, int maximum_depth) const noexcept
+        {
+            return ticketObservationPending() && minimum_depth >= 0 && maximum_depth >= minimum_depth &&
+                ticket.matchesLifecycle(session_epoch, workspace_generation) && ticket.healthy == 1 &&
+                ticket.error_code == static_cast<int>(sampling_math::DeviceGenerationError::None) &&
+                ticket.complete >= 0 && ticket.complete <= 1 && ticket.maintenance_due >= 0 &&
+                ticket.maintenance_due <= 1 && ticket.committed_output_tokens >= 0 &&
+                acceptsTicketOrdinal(ticket.transaction_count) && ticket.next_draft_depth >= minimum_depth &&
+                ticket.next_draft_depth <= maximum_depth &&
+                (!admission_ticket_pending_ || (ticket.complete == 0 && ticket.maintenance_due == 0 &&
+                                               ticket.committed_output_tokens == 0));
         }
 
         /** @return Whether a new ticket observation may be submitted. */
@@ -381,7 +440,7 @@ namespace llaminar2
          */
         [[nodiscard]] bool startScheduler() noexcept
         {
-            if (!inactive())
+            if (!inactive() && !continuationAdmissionReady())
                 return false;
             state_ = HostedDeviceGenerationCursorState::SchedulerReady;
             return true;
@@ -407,14 +466,12 @@ namespace llaminar2
         [[nodiscard]] bool acceptTicket(
             std::int32_t transaction_count) noexcept
         {
-            if (!ticketObservationPending() ||
-                last_transaction_count_ ==
-                    std::numeric_limits<std::int32_t>::max() ||
-                transaction_count != last_transaction_count_ + 1)
+            if (!ticketObservationPending() || !acceptsTicketOrdinal(transaction_count))
             {
                 return false;
             }
             last_transaction_count_ = transaction_count;
+            admission_ticket_pending_ = false;
             state_ = HostedDeviceGenerationCursorState::TicketObserved;
             return true;
         }
@@ -443,7 +500,7 @@ namespace llaminar2
             std::int32_t transaction_count,
             bool terminal) noexcept
         {
-            if (!submitting() ||
+            if (!submitting() || (terminal && transaction_count == 0) ||
                 transaction_count != last_transaction_count_)
             {
                 return false;
@@ -481,12 +538,14 @@ namespace llaminar2
         {
             state_ = HostedDeviceGenerationCursorState::Inactive;
             last_transaction_count_ = 0;
+            admission_ticket_pending_ = false;
         }
 
     private:
         HostedDeviceGenerationCursorState state_ =
             HostedDeviceGenerationCursorState::Inactive;
         std::int32_t last_transaction_count_ = 0;
+        bool admission_ticket_pending_ = false;
     };
 
     /** Lifecycle of the fragment cursor for one authenticated branch. */

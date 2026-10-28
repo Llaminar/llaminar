@@ -1691,6 +1691,107 @@ TEST(Test__MTPGraphConstruction,
     EXPECT_TRUE(cursor.retireCompleted());
 }
 
+/** @brief Only a typed continuation admission may submit native ticket zero, once. */
+TEST(Test__MTPGraphConstruction, HostedContinuationCursorUsesFreshNativeTicketZeroThenStrictOrdinals)
+{
+    using namespace sampling_math;
+    auto policy = DeviceGenerationPolicy::fixed(1);
+    policy.mode = DeviceGenerationPolicyMode::Dynamic;
+    policy.minimum_depth = 1;
+    policy.maximum_depth = 15;
+    std::array<int, kDeviceGenerationControlCount> control{};
+    ASSERT_TRUE(initialize_device_generation_control(65, 128, policy, control.data()));
+    // Authored terminal state preserves the device learner at depth six, despite
+    // immutable initial-depth one. ContinueResponse is the production initializer.
+    control[kDeviceGenerationControlCurrentDraftDepth] = 6;
+    control[kDeviceGenerationControlRequestComplete] = 1;
+    control[kDeviceGenerationControlRemainingTokenCount] = 0;
+    control[kDeviceGenerationControlResponseTokenCount] = 65;
+    control[kDeviceGenerationControlTransactionCount] = 17;
+    DeviceGenerationDispatchTicket ticket;
+    ASSERT_TRUE(initialize_device_generation_dispatch_ticket(17, 41, &ticket));
+    ASSERT_TRUE(publish_device_generation_dispatch_ticket(control.data(), nullptr, &ticket));
+    ASSERT_TRUE(initialize_device_generation_control(17, 128, policy, control.data(),
+        DeviceGenerationLeadingRowDisposition::PendingResponse,
+        {.kind = DeviceGenerationAdmissionKind::ContinueResponse, .session_epoch = 17,
+         .workspace_generation = 41, .prior_tickets = &ticket}));
+    ASSERT_TRUE(initialize_device_generation_dispatch_ticket(17, 41, &ticket));
+    ASSERT_TRUE(publish_device_generation_dispatch_ticket(control.data(), nullptr, &ticket));
+    ASSERT_EQ(ticket.transaction_count, 0);
+    ASSERT_EQ(ticket.next_draft_depth, 6);
+    ASSERT_EQ(ticket.complete, 0);
+    ASSERT_EQ(ticket.committed_output_tokens, 0);
+
+    HostedDeviceGenerationCursor cursor;
+    EXPECT_FALSE(cursor.armContinuationAdmission(DeviceGenerationAdmissionKind::NewRequest));
+    EXPECT_FALSE(cursor.armContinuationAdmission(static_cast<DeviceGenerationAdmissionKind>(255)));
+    ASSERT_TRUE(cursor.armContinuationAdmission(DeviceGenerationAdmissionKind::ContinueResponse));
+    EXPECT_FALSE(cursor.armContinuationAdmission(DeviceGenerationAdmissionKind::ContinueResponse));
+    EXPECT_TRUE(cursor.mayObserveTicket());
+    EXPECT_FALSE(cursor.schedulerStarted());
+    EXPECT_FALSE(cursor.acceptsTicket(ticket, 17, 41, 1, 15));
+    ASSERT_TRUE(cursor.startScheduler());
+    ASSERT_TRUE(cursor.markTicketObservationSubmitted());
+    ASSERT_TRUE(cursor.acceptsTicket(ticket, 17, 41, 1, 15));
+    for (int fault = 0; fault < 14; ++fault)
+    {
+        SCOPED_TRACE(fault);
+        auto malformed = ticket;
+        switch (fault)
+        {
+        case 0: malformed.magic = 0; break;
+        case 1: ++malformed.abi_version; break;
+        case 2: ++malformed.session_epoch_low; break;
+        case 3: ++malformed.workspace_generation_low; break;
+        case 4: malformed.healthy = 0; break;
+        case 5: malformed.complete = 1; break;
+        case 6: malformed.transaction_count = 1; break;
+        case 7: malformed.next_draft_depth = 0; break;
+        case 8: malformed.next_draft_depth = 16; break;
+        case 9: malformed.error_code = static_cast<int>(DeviceGenerationError::InvalidDepthSelector); break;
+        case 10: malformed.maintenance_due = 1; break;
+        case 11: malformed.committed_output_tokens = 1; break;
+        case 12: malformed.transaction_count = -1; break;
+        case 13: malformed.committed_output_tokens = -1; break;
+        }
+        EXPECT_FALSE(cursor.acceptsTicket(malformed, 17, 41, 1, 15));
+        EXPECT_TRUE(cursor.admissionTicketPending());
+    }
+    ASSERT_TRUE(cursor.acceptTicket(0));
+    EXPECT_FALSE(cursor.admissionTicketPending());
+    EXPECT_FALSE(cursor.acceptTicket(0));
+    ASSERT_TRUE(cursor.beginAdvance(0));
+    EXPECT_FALSE(cursor.finishAdvance(0, true));
+    EXPECT_FALSE(cursor.retireCompleted());
+    ASSERT_TRUE(cursor.finishAdvance(0, false));
+    ASSERT_TRUE(cursor.markTicketObservationSubmitted());
+    EXPECT_FALSE(cursor.acceptsTicket(ticket, 17, 41, 1, 15));
+    EXPECT_FALSE(cursor.acceptTicket(0));
+    EXPECT_FALSE(cursor.acceptTicket(2));
+    ticket.transaction_count = 1;
+    ticket.committed_output_tokens = 7;
+    ASSERT_TRUE(cursor.acceptsTicket(ticket, 17, 41, 1, 15));
+    ASSERT_TRUE(cursor.acceptTicket(1));
+    ASSERT_TRUE(cursor.beginAdvance(1));
+    ASSERT_TRUE(cursor.finishAdvance(1, true));
+    ASSERT_TRUE(cursor.retireCompleted());
+    ASSERT_TRUE(cursor.startScheduler());
+    ASSERT_TRUE(cursor.markTicketObservationSubmitted());
+    EXPECT_FALSE(cursor.acceptTicket(0));
+    EXPECT_TRUE(cursor.acceptTicket(1));
+}
+
+/** @brief Public continuation entry rejects absent admission before any device operation. */
+TEST(Test__MTPGraphConstruction, HostedContinuationEntryRequiresResidentContinuationAdmission)
+{
+    TinyQwen35MTPForwardFixture fixture;
+    auto builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(builder, fixture.mpi);
+    for (const auto mode : {DeviceGenerationSamplingMode::Greedy, DeviceGenerationSamplingMode::Stochastic,
+            DeviceGenerationSamplingMode::Unspecified, static_cast<DeviceGenerationSamplingMode>(255)})
+        EXPECT_FALSE(orchestrator.prepareDeviceResidentGenerationContinuation(mode));
+}
+
 TEST(Test__MTPGraphConstruction,
      HostedGenerationAdvanceCursorEnforcesEveryExactFragmentOrdinal)
 {

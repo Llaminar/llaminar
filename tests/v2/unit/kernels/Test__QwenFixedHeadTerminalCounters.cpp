@@ -40,10 +40,10 @@ TEST(QwenFixedHeadTerminalCounters, CanonicalExtentAddsExactlySixPairsAndRejects
     static_assert(kDeviceGenerationControlInitialDraftDepth==51);
     static_assert(kDeviceGenerationControlQsaPriorHeaderBytesLow==52);
     static_assert(kDeviceGenerationControlQsaAcceptedPayloadBytesHigh==59);
-    static_assert(kDeviceGenerationControlCount == 90);
+    static_assert(kDeviceGenerationControlCount == 108);
     static_assert(!std::is_constructible_v<DeviceGenerationCollectiveReceipt,void *>);
     for(const std::size_t requests:{1u,3u,8u}) {
-        EXPECT_EQ(requests * kDeviceGenerationControlCount * sizeof(int), requests * (240u + 48u + 72u));
+        EXPECT_EQ(requests * kDeviceGenerationControlCount * sizeof(int), requests * (240u + 48u + 72u + 40u + 20u + 12u));
         EXPECT_EQ((requests*kDeviceGenerationControlCount*sizeof(int))%alignof(std::uint64_t),0u);
     }
     Row row;QwenFixedHeadNativeSendTotals unchanged{1,2,3,4,5,6};const auto original=unchanged;

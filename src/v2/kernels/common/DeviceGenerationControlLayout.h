@@ -2,8 +2,11 @@
  * @file DeviceGenerationControlLayout.h
  * @brief Canonical fixed-width request controller and terminal observation word layout.
  *
- * Existing execution fields retain their ordinals. QSA work observations append
- * four explicit low/high UINT32 pairs; they never decide generation or cache state.
+ * Existing execution fields retain their ordinals. QSA work observations use
+ * explicit low/high UINT32 pairs; they never decide generation or cache state.
+ * The reversible depth comparison owns five learner words and three terminal
+ * counters. Only learner words survive an authenticated response continuation;
+ * counters restart so terminal consumers never add an earlier window twice.
  * Admission and response-window reset, arena BOM and the existing terminal copy
  * all use this one control-word count. No uint64 pointer/alignment is assumed.
  */
@@ -122,6 +125,38 @@ enum DeviceGenerationControlIndex : int
     kDeviceGenerationControlAdaptiveEvictionsHigh = 87,
     kDeviceGenerationControlAdaptiveFailedFramesLow = 88,
     kDeviceGenerationControlAdaptiveFailedFramesHigh = 89,
-    kDeviceGenerationControlCount = 90,
+    /** Immutable measured scope; not live device observations. */
+    kDeviceGenerationControlLearnedScopeWidthPolicy = 90,
+    kDeviceGenerationControlLearnedScopeTPWidth = 91,
+    kDeviceGenerationControlLearnedScopePPStages = 92,
+    kDeviceGenerationControlLearnedScopeRetainedDepth = 93,
+    kDeviceGenerationControlLearnedScopeHiddenDim = 94,
+    kDeviceGenerationControlLearnedScopeMainLayers = 95,
+    kDeviceGenerationControlLearnedScopeExpertCount = 96,
+    kDeviceGenerationControlLearnedScopeExpertsPerToken = 97,
+    kDeviceGenerationControlLearnedScopeComputeCapabilityMajor = 98,
+    kDeviceGenerationControlLearnedScopeComputeCapabilityMinor = 99,
+    /** Typed reversible comparison phase; zero is an empty comparison. */
+    kDeviceGenerationControlDepthUtilityPhase = 100,
+    /** Incumbent while probing, or failed target while retaining a rejection. */
+    kDeviceGenerationControlDepthUtilityReferenceDepth = 101,
+    /** Eligible physical transactions in the remembered comparison sample. */
+    kDeviceGenerationControlDepthUtilityReferenceRuns = 102,
+    /** Actual verified-state progress in the saved eligible sample, distinct from emitted outputs. */
+    kDeviceGenerationControlDepthUtilityReferenceVerifiedProgress = 103,
+    /** Actual emitted tokens in the current eligible controller window. */
+    kDeviceGenerationControlDepthUtilityWindowEmitted = 104,
+    /** Real depth trials begun in this response publication window. */
+    kDeviceGenerationControlDepthUtilityProbes = 105,
+    /** Trials retained after a strict estimated-utility improvement. */
+    kDeviceGenerationControlDepthUtilityKeeps = 106,
+    /** Trials returned to their incumbent, including estimated-utility ties. */
+    kDeviceGenerationControlDepthUtilityReturns = 107,
+    kDeviceGenerationControlCount = 108,
 };
+/** The mutable comparison and its response-local reporting have disjoint ranges. */
+static_assert(kDeviceGenerationControlDepthUtilityWindowEmitted + 1 ==
+              kDeviceGenerationControlDepthUtilityProbes);
+static_assert(kDeviceGenerationControlDepthUtilityReturns + 1 ==
+              kDeviceGenerationControlCount);
 } // namespace llaminar2::sampling_math

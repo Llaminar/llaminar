@@ -11,13 +11,18 @@ The incoming branch's 1,362 gates, 13 model cells and +1.9/+5.5/+5.9% depth-2/3/
 results compare against older develop, with changed work; they do not qualify this merge.
 Historical CPU scope and prefill cost: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
 
-## Active QFN frontier — 2026-10-27
+## Active QFN frontier — 2026-10-28
 
-QFN TP4 Off/fixed1/2/3/15/dynamic HTTP pass 24 requests/9,216 tokens with exact
-serial agreement; Unit 783 + preflight 2065 pass/29 hardware skips. Checkpoint, then
-matched MTP tuning against Castagna; full ten-phase OpenCode remains pending.
-[Live plan](../2026-10/QFN_MTP_TP4_TUNING.md). Historical hybrid results below
-do not qualify QFN or replace this new goal's complete coding session.
+The user accepted the confirmation controller as the QFN ROCm TP4 default;
+speed misses remain diagnostic. Current repetition benchmark: dynamic 101.05
+decode tok/s, fresh Off 43.40, dated Castagna 98.16; token IDs agree.
+R13 Unit/preflight passes 2,978 tests with 29 hardware skips. Post-audit Unit
+passes 786/786; nine HTTP modes pass. The ten-phase OpenCode app completes with
+128 tool calls, two errors, 65 app tests and independent acceptance passing.
+Native-token and archive-auditor repairs pass focused regressions. The original
+app aggregate remains red for an unresolved AMDGPU USERPTR workqueue warning
+and cannot retroactively certify its reclaimed archive. Full certification is open.
+[Live plan](../2026-10/QFN_MTP_TP4_TUNING.md). Historical hybrid results do not qualify QFN.
 
 ## Completed evidence
 

@@ -9,6 +9,7 @@
  * interpretation of a sampled token.
  */
 #pragma once
+#include "MTPDepthTransactionTrace.h"
 
 #include <cmath>
 #include <cstddef>
@@ -18,13 +19,18 @@
 #include "DeviceGenerationControlLayout.h"
 #include "execution/config/MTPDepthDefaults.h"
 #include "execution/mtp/MTPDepthLearnedPolicy.h"
+#include "execution/mtp/MTPDepthCostProfile.h"
+#include "execution/mtp/MTPReversibleProposalGate.h"
+#include "execution/mtp/MTPSurvivalDepthSelector.h"
 #include "execution/mtp/MTPShiftedCacheOrigin.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define LLAMINAR_SAMPLING_HD __host__ __device__ inline
+#define LLAMINAR_DEPTH_CONTROL_HD __host__ __device__ __forceinline__
 #else
 #define LLAMINAR_SAMPLING_HD inline
+#define LLAMINAR_DEPTH_CONTROL_HD inline
 #endif
 
 namespace llaminar2::sampling_math
@@ -286,6 +292,20 @@ namespace llaminar2::sampling_math
     static_assert(
         sizeof(MTPFirstTransactionDiagnosticRecord) % sizeof(int32_t) == 0,
         "The arena stores the first-transaction diagnostic as whole INT32 words");
+
+    /** @brief Mutually exclusive views of the SAME already admitted arena bank.
+     * No mode owns concurrent bytes; capture binds exactly one interpretation.
+     */
+    union alignas(MTPFirstTransactionDiagnosticRecord) MTPDiagnosticRecordStorage
+    {
+        MTPFirstTransactionDiagnosticRecord first_transaction;
+        MTPDepthTransactionTrace depth_transaction_trace;
+        /** @brief Host terminal destination starts the transaction trace view without allocating. */
+        MTPDiagnosticRecordStorage() : depth_transaction_trace{} {}
+    };
+    static_assert(sizeof(MTPDiagnosticRecordStorage) == sizeof(MTPFirstTransactionDiagnosticRecord));
+    static_assert(alignof(MTPDiagnosticRecordStorage) == alignof(MTPFirstTransactionDiagnosticRecord));
+    static_assert(std::is_trivially_copyable_v<MTPDiagnosticRecordStorage>);
 
     /**
      * @brief Return the exact IEEE-754 bit pattern used by sampling math.
@@ -705,6 +725,9 @@ namespace llaminar2::sampling_math
     // The lightweight layout is also consumed by native model-work counters.
 
 
+    static_assert(DeviceGenerationPolicy::kMaximumSupportedDraftDepth <= 15,
+        "Controller transaction trace requires explicit schema expansion beyond four-bit draft depths");
+
     /**
      * @brief Response ownership of verifier row zero at controller admission.
      *
@@ -793,6 +816,7 @@ namespace llaminar2::sampling_math
         InvalidContinuation = 16,
         InvalidRequestSeed = 17, ///< A captured verifier consumed an unadmitted zero seed.
         ImmutableStorageFailure = 18, ///< Captured immutable RAM/mmap row service failed authenticated native I/O.
+        InvalidDepthTransactionTrace = 19, ///< Diagnostic transaction trace binding/count is malformed or exceeded its bounded bank.
     };
 
     /**
@@ -864,10 +888,10 @@ namespace llaminar2::sampling_math
         /**
          * @brief Authenticate this snapshot against the active request owner.
          *
-         * A transaction count of zero is valid immediately after admission but
-         * is never sufficient to schedule a continuation.  Callers observing a
-         * completed first transaction additionally require a strictly positive
-         * count before choosing a graph branch.
+         * Transaction zero is the fresh native admission snapshot. Only an
+         * explicitly authenticated ContinueResponse start may select its first
+         * retained branch from that ticket. Ordinary completed-transaction
+         * observers require strictly positive contiguous ordinals.
          */
         LLAMINAR_SAMPLING_HD bool matchesLifecycle(
             uint64_t expected_session_epoch,
@@ -924,7 +948,17 @@ namespace llaminar2::sampling_math
             control[kDeviceGenerationControlLearnedDepthEnabled] == static_cast<int>(policy.learned.enabled) &&
             control[kDeviceGenerationControlLearnedDepthBackend] == static_cast<int>(policy.learned.backend) &&
             control[kDeviceGenerationControlLearnedDepthModelClass] == static_cast<int>(policy.learned.model_class) &&
-            control[kDeviceGenerationControlLearnedDepthVerifyMode] == static_cast<int>(policy.learned.verify_mode);
+            control[kDeviceGenerationControlLearnedDepthVerifyMode] == static_cast<int>(policy.learned.verify_mode) &&
+            control[kDeviceGenerationControlLearnedScopeWidthPolicy] == static_cast<int>(policy.learned.scope.verifier_width_policy) &&
+            control[kDeviceGenerationControlLearnedScopeTPWidth] == static_cast<int>(policy.learned.scope.tp_width) &&
+            control[kDeviceGenerationControlLearnedScopePPStages] == static_cast<int>(policy.learned.scope.pp_stages) &&
+            control[kDeviceGenerationControlLearnedScopeRetainedDepth] == static_cast<int>(policy.learned.scope.retained_depth) &&
+            control[kDeviceGenerationControlLearnedScopeHiddenDim] == static_cast<int>(policy.learned.scope.hidden_dim) &&
+            control[kDeviceGenerationControlLearnedScopeMainLayers] == static_cast<int>(policy.learned.scope.main_layers) &&
+            control[kDeviceGenerationControlLearnedScopeExpertCount] == static_cast<int>(policy.learned.scope.expert_count) &&
+            control[kDeviceGenerationControlLearnedScopeExpertsPerToken] == static_cast<int>(policy.learned.scope.experts_per_token) &&
+            control[kDeviceGenerationControlLearnedScopeComputeCapabilityMajor] == policy.learned.scope.compute_capability_major &&
+            control[kDeviceGenerationControlLearnedScopeComputeCapabilityMinor] == policy.learned.scope.compute_capability_minor;
     }
 
     /**
@@ -1116,6 +1150,18 @@ namespace llaminar2::sampling_math
     }
 
     /**
+     * @brief Validate measured confirmation/gate ownership before mutation.
+     * @param control Sole resident learner row, read-only.
+     * @param current Actual selector. @param minimum Admitted lower bound.
+     * @param maximum Admitted upper bound. @param required Confirmation threshold.
+     * @param minimum_samples Actual Pending comparison minimum.
+     * @return Whether existing words26/39 and independent gate state are coherent.
+     */
+    LLAMINAR_DEPTH_CONTROL_HD bool valid_device_generation_measured_confirmation(
+        const int *control, int current, int minimum, int maximum,
+        int required, int minimum_samples);
+
+    /**
      * @brief Initialize one persistent device generation controller row.
      *
      * This helper is called by a tiny explicit-stream backend kernel at request
@@ -1181,6 +1227,13 @@ namespace llaminar2::sampling_math
                 control[kDeviceGenerationControlCurrentDraftDepth] < depth_policy.minimum_depth ||
                 control[kDeviceGenerationControlCurrentDraftDepth] > depth_policy.maximum_depth)
                 return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            if (depth_policy.mode == DeviceGenerationPolicyMode::Dynamic &&
+                resolveMTPDepthCostProfile(depth_policy.learned).active() &&
+                !valid_device_generation_measured_confirmation(control,
+                    control[kDeviceGenerationControlCurrentDraftDepth], depth_policy.minimum_depth,
+                    depth_policy.maximum_depth, depth_policy.promote_consecutive_windows,
+                    depth_policy.minimum_samples))
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
         }
         for (int i = 0; i < kDeviceGenerationControlCount; ++i)
         {
@@ -1190,7 +1243,9 @@ namespace llaminar2::sampling_math
             const bool learner_word = i == kDeviceGenerationControlCurrentDraftDepth ||
                 i == kDeviceGenerationControlDepthLastRecommendedDepth ||
                 (i >= kDeviceGenerationControlDepthStepsSinceChange &&
-                 i <= kDeviceGenerationControlDepthWindowAcceptedPrefixSum);
+                 i <= kDeviceGenerationControlDepthWindowAcceptedPrefixSum) ||
+                (i >= kDeviceGenerationControlDepthUtilityPhase &&
+                 i <= kDeviceGenerationControlDepthUtilityWindowEmitted);
             // Fixed-head and adaptive PLE perform real native prefill before the first
             // response admission. Its request-reset owner already cleared these
             // observations. Keep that initial work once; continuation windows
@@ -1272,6 +1327,17 @@ namespace llaminar2::sampling_math
         control[kDeviceGenerationControlLearnedDepthBackend] = static_cast<int>(depth_policy.learned.backend);
         control[kDeviceGenerationControlLearnedDepthModelClass] = static_cast<int>(depth_policy.learned.model_class);
         control[kDeviceGenerationControlLearnedDepthVerifyMode] = static_cast<int>(depth_policy.learned.verify_mode);
+        control[kDeviceGenerationControlLearnedScopeWidthPolicy] = static_cast<int>(depth_policy.learned.scope.verifier_width_policy);
+        control[kDeviceGenerationControlLearnedScopeTPWidth] = static_cast<int>(depth_policy.learned.scope.tp_width);
+        control[kDeviceGenerationControlLearnedScopePPStages] = static_cast<int>(depth_policy.learned.scope.pp_stages);
+        control[kDeviceGenerationControlLearnedScopeRetainedDepth] = static_cast<int>(depth_policy.learned.scope.retained_depth);
+        control[kDeviceGenerationControlLearnedScopeHiddenDim] = static_cast<int>(depth_policy.learned.scope.hidden_dim);
+        control[kDeviceGenerationControlLearnedScopeMainLayers] = static_cast<int>(depth_policy.learned.scope.main_layers);
+        control[kDeviceGenerationControlLearnedScopeExpertCount] = static_cast<int>(depth_policy.learned.scope.expert_count);
+        control[kDeviceGenerationControlLearnedScopeExpertsPerToken] = static_cast<int>(depth_policy.learned.scope.experts_per_token);
+        control[kDeviceGenerationControlLearnedScopeComputeCapabilityMajor] = depth_policy.learned.scope.compute_capability_major;
+        control[kDeviceGenerationControlLearnedScopeComputeCapabilityMinor] = depth_policy.learned.scope.compute_capability_minor;
+
         return true;
     }
 
@@ -1723,21 +1789,210 @@ namespace llaminar2::sampling_math
                static_cast<int64_t>(denominator) * threshold_ppm;
     }
 
+    /** @brief Load the five actual device-owned comparison words.
+     * @param control Canonical resident row, whose signed words are validated by caller.
+     * @return A temporary arithmetic view, never a host model-state mirror.
+     */
+    LLAMINAR_DEPTH_CONTROL_HD MTPReversibleProposalState device_generation_utility_state(const int *control)
+    {
+        return {static_cast<MTPReversibleProposalPhase>(control[kDeviceGenerationControlDepthUtilityPhase]),
+            static_cast<uint32_t>(control[kDeviceGenerationControlDepthUtilityReferenceDepth]),
+            static_cast<uint32_t>(control[kDeviceGenerationControlDepthUtilityReferenceRuns]),
+            static_cast<uint32_t>(control[kDeviceGenerationControlDepthUtilityReferenceVerifiedProgress]),
+            static_cast<uint32_t>(control[kDeviceGenerationControlDepthUtilityWindowEmitted])};
+    }
+
+    /** @brief Publish one successful gate transition and its actual event exactly once.
+     * @param state Validated result, representable by signed controller words.
+     * @param action Actual typed gate event, not a proposed or inferred event.
+     * @param control Sole resident controller; no word changes on a failed bound.
+     * @return Whether the state and event fit the existing controller ABI.
+     */
+    LLAMINAR_DEPTH_CONTROL_HD bool publish_device_generation_utility_state(
+        const MTPReversibleProposalState &state, MTPReversibleProposalAction action, int *control)
+    {
+        if (state.reference_depth > INT32_MAX || state.reference_runs > INT32_MAX ||
+            state.reference_verified_progress > INT32_MAX || state.window_emitted > INT32_MAX)
+            return false;
+        const int counter = action == MTPReversibleProposalAction::ProbeStarted ? kDeviceGenerationControlDepthUtilityProbes
+            : action == MTPReversibleProposalAction::ProbeKept ? kDeviceGenerationControlDepthUtilityKeeps
+            : action == MTPReversibleProposalAction::ProbeReturned ? kDeviceGenerationControlDepthUtilityReturns : -1;
+        if (counter >= 0 && (control[counter] < 0 || control[counter] == INT32_MAX))
+            return false;
+        control[kDeviceGenerationControlDepthUtilityPhase] = static_cast<int>(state.phase);
+        control[kDeviceGenerationControlDepthUtilityReferenceDepth] = static_cast<int>(state.reference_depth);
+        control[kDeviceGenerationControlDepthUtilityReferenceRuns] = static_cast<int>(state.reference_runs);
+        control[kDeviceGenerationControlDepthUtilityReferenceVerifiedProgress] = static_cast<int>(state.reference_verified_progress);
+        control[kDeviceGenerationControlDepthUtilityWindowEmitted] = static_cast<int>(state.window_emitted);
+        if (counter >= 0) ++control[counter];
+        return true;
+    }
+
+    /**
+     * @brief Check the mode-exclusive existing history pair and gate before writes.
+     * @param control Authoritative resident row; no observation is appended here.
+     * @param current Actual selector. @param minimum Admitted lower bound.
+     * @param maximum Admitted upper bound. @param required Existing confirmation count.
+     * @param minimum_samples Actual gate comparison minimum.
+     * @return False for poison, unknown phase, Pending history or impossible prior Y.
+     *
+     * On measured Dynamic only, word39/LastRecommendedDepth owns confirmation
+     * target and word26/PromotionStreak owns completed disjoint windows. Legacy
+     * paths retain their original meanings. These are not a second controller
+     * bank and never borrow the failed-target reference's five words.
+     */
+    LLAMINAR_DEPTH_CONTROL_HD bool valid_device_generation_measured_confirmation(
+        const int *control, int current, int minimum, int maximum,
+        int required, int minimum_samples)
+    {
+        if (!control || required <= 0 || minimum_samples <= 0 ||
+            control[kDeviceGenerationControlDepthLastRecommendedDepth] < 0 ||
+            control[kDeviceGenerationControlDepthPromotionStreak] < 0 ||
+            control[kDeviceGenerationControlDepthWindowVerifierRuns] < 0)
+            return false;
+        for (int word = kDeviceGenerationControlDepthUtilityPhase;
+             word <= kDeviceGenerationControlDepthUtilityWindowEmitted; ++word)
+            if (control[word] < 0) return false;
+        const auto state = device_generation_utility_state(control);
+        const MTPProposalConfirmation confirmation{
+            static_cast<uint32_t>(control[kDeviceGenerationControlDepthLastRecommendedDepth]),
+            static_cast<uint32_t>(control[kDeviceGenerationControlDepthPromotionStreak])};
+        if (!validMTPProposalConfirmation(confirmation, static_cast<uint32_t>(current),
+                static_cast<uint32_t>(minimum), static_cast<uint32_t>(maximum),
+                static_cast<uint32_t>(required), state.phase == MTPReversibleProposalPhase::ProbePending))
+            return false;
+        const MTPReversibleProposalPolicy policy{.mode = MTPReversibleProposalMode::Dynamic,
+            .minimum_depth = static_cast<uint32_t>(minimum), .maximum_depth = static_cast<uint32_t>(maximum),
+            .minimum_samples = static_cast<uint32_t>(minimum_samples)};
+        const uint32_t runs = static_cast<uint32_t>(control[kDeviceGenerationControlDepthWindowVerifierRuns]);
+        return validMTPReversibleProposalState(state, policy, static_cast<uint32_t>(current)) &&
+            state.window_emitted >= runs && static_cast<uint64_t>(state.window_emitted) <=
+                static_cast<uint64_t>(runs) * (static_cast<uint32_t>(current) + 1);
+    }
+
+    /**
+     * @brief Publish only the validated measured-path confirmation projection.
+     * @param confirmation Typed next target/count, already checked against policy.
+     * @param control Sole resident row; existing ordinals and108-word ABI unchanged.
+     * @return False without writes if the typed projection cannot fit signed words.
+     */
+    LLAMINAR_DEPTH_CONTROL_HD bool publish_device_generation_measured_confirmation(
+        const MTPProposalConfirmation &confirmation, int *control)
+    {
+        if (!control || confirmation.target_depth > INT32_MAX || confirmation.completed_windows > INT32_MAX)
+            return false;
+        control[kDeviceGenerationControlDepthLastRecommendedDepth] = static_cast<int>(confirmation.target_depth);
+        control[kDeviceGenerationControlDepthPromotionStreak] = static_cast<int>(confirmation.completed_windows);
+        return true;
+    }
+
+    /** @brief Consume exactly the real controller's R/A/Z/F window.
+     * @param control Sole resident row; utility Y is consumed by the shared gate.
+     */
+    LLAMINAR_DEPTH_CONTROL_HD void consume_device_generation_depth_window(int *control)
+    {
+        for (int i = kDeviceGenerationControlDepthWindowVerifierRuns;
+             i <= kDeviceGenerationControlDepthWindowAcceptedPrefixSum; ++i) control[i] = 0;
+    }
+
+    /** @brief Apply one actual selector change without inventing a second parent.
+     * @param next Depth selected by the actual parent plus reversible gate.
+     * @param current Selector used for the just-committed transaction.
+     * @param control Sole resident selector and reporting bank.
+     */
+    LLAMINAR_DEPTH_CONTROL_HD void apply_device_generation_depth_change(int next, int current, int *control)
+    {
+        if (next == current) return;
+        control[kDeviceGenerationControlCurrentDraftDepth] = next;
+        control[kDeviceGenerationControlActiveVerifierRowCount] = next + 1;
+        control[kDeviceGenerationControlDepthStepsSinceChange] = 0;
+        ++control[kDeviceGenerationControlDepthUpdates];
+        if (next > current) ++control[kDeviceGenerationControlDepthPromotions];
+        else ++control[kDeviceGenerationControlDepthDemotions];
+    }
+
+    /**
+     * @brief Validate the existing eligible bank before any append can mutate it.
+     * @param current Positive current depth shared by all observations in this window.
+     * @param accepted_prefix Validated next eligible prefix, within the current depth.
+     * @param control Sole canonical row; this helper performs no writes.
+     * @return Whether prior counts are possible and every next increment fits.
+     *
+     * R/A/Z/F must describe one integer prefix population, not merely individually
+     * bounded words. Checked widened arithmetic proves attempted=R*depth,
+     * accepted+rejected=attempted, prefixSum=accepted, and the nonzero/nonfull
+     * interior bounds. A rollback cannot belong to a full prefix. Valid R below
+     * INT32_MAX also reserves one increment for rollback/full/zero counts. Keep
+     * these temporary scalar checks before learned-scope/gate temporaries become
+     * live; no array, model state, cost profile, allocation or transfer is used.
+     */
+    LLAMINAR_DEPTH_CONTROL_HD bool valid_device_generation_prior_depth_window(
+        int current, int accepted_prefix, const int *control)
+    {
+        if (!control || current <= 0 || current > DeviceGenerationPolicy::kMaximumSupportedDraftDepth ||
+            accepted_prefix < 0 || accepted_prefix > current)
+            return false;
+        for (int word = kDeviceGenerationControlDepthWindowVerifierRuns;
+             word <= kDeviceGenerationControlDepthWindowAcceptedPrefixSum; ++word)
+            if (control[word] < 0) return false;
+        if (control[kDeviceGenerationControlDepthStepsSinceChange] < 0 ||
+            control[kDeviceGenerationControlDepthStepsSinceChange] == INT32_MAX ||
+            control[kDeviceGenerationControlDepthWindowVerifierRuns] == INT32_MAX)
+            return false;
+        const int64_t runs = control[kDeviceGenerationControlDepthWindowVerifierRuns];
+        const int64_t accepted = control[kDeviceGenerationControlDepthWindowAcceptedTokens];
+        const int64_t full = control[kDeviceGenerationControlDepthWindowFullAccepts];
+        const int64_t zero = control[kDeviceGenerationControlDepthWindowZeroAccepts];
+        if (control[kDeviceGenerationControlDepthWindowAttemptedTokens] != runs * current ||
+            accepted + control[kDeviceGenerationControlDepthWindowRejectedTokens] !=
+                control[kDeviceGenerationControlDepthWindowAttemptedTokens] ||
+            control[kDeviceGenerationControlDepthWindowAcceptedPrefixSum] != accepted ||
+            full + zero > runs ||
+            control[kDeviceGenerationControlDepthWindowRollbacks] > runs - full)
+            return false;
+        const int64_t interior = runs - full - zero;
+        const int64_t interior_accepted = accepted - full * current;
+        if ((current == 1 && (interior != 0 || accepted != full)) ||
+            (current > 1 && (interior_accepted < interior ||
+                interior_accepted > (current - 1) * interior)))
+            return false;
+        return control[kDeviceGenerationControlDepthWindowAttemptedTokens] <= INT32_MAX - current &&
+            accepted <= INT32_MAX - accepted_prefix &&
+            control[kDeviceGenerationControlDepthWindowRejectedTokens] <= INT32_MAX - (current - accepted_prefix) &&
+            control[kDeviceGenerationControlDepthWindowAcceptedPrefixSum] <= INT32_MAX - accepted_prefix;
+    }
+
     /**
      * @brief Record one verifier outcome and publish the next device depth.
      *
      * The transition intentionally uses only integer counters. Fixed mode does
      * no adaptive bookkeeping. Observe mode evaluates the same windows and
      * records `LastRecommendedDepth` while retaining the active selector.
-     * Dynamic mode applies one-step promotion/demotion with cooldown and
-     * promotion hysteresis. The complete policy state remains in this row and
-     * is consumed by the next native SWITCH iteration without host polling.
+     * On a measured scope Dynamic ranks every admitted depth using exact
+     * same-exposure prefix bounds and runs actual reversible trials in either
+     * direction after admitted same-target confirmation across disjoint completed
+     * windows. Word39/26 project that target/streak only on this measured path;
+     * other scopes retain their declared learned/generic history meanings.
+     * Pending completion precedes the parent/cooldown and
+     * remains sole comparison owner until its minimum target sample completes.
+     * Complete policy state remains in this row and is consumed by the next
+     * native SWITCH iteration without host polling.
+     * @param accepted_prefix Actual accepted speculative prefix at the active depth.
+     * @param rollback Actual response transaction rollback observation.
+     * @param budget_limited Excludes clipped transactions from eligible evidence.
+     * @param control Sole mutable generation-controller row.
+     * @param publication Actual validated output/state publication at this commit.
+     * @return False after terminally invalidating a malformed controller.
      */
-    LLAMINAR_SAMPLING_HD bool record_device_generation_depth_observation(
+    // Keep the resident controller in its caller: an outlined GPU helper must
+    // preserve callee-saved registers, which can spill even when its arithmetic
+    // fits in registers. This changes no validation or integer reduction order.
+    LLAMINAR_DEPTH_CONTROL_HD bool record_device_generation_depth_observation(
         int accepted_prefix,
         bool rollback,
         bool budget_limited,
-        int *control)
+        int *control,
+        const MTPPublicationWitness &publication)
     {
         if (!control || control[kDeviceGenerationControlOk] == 0)
             return false;
@@ -1759,8 +2014,11 @@ namespace llaminar2::sampling_math
                 control,
                 DeviceGenerationError::InvalidDepthPolicy);
         }
+        if (!publication.valid() || publication.newlyEmittedTokens() !=
+                static_cast<uint32_t>(control[kDeviceGenerationControlLastTransactionEmittedTokenCount]))
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidCompactOutcome);
         if (mode == static_cast<int>(DeviceGenerationPolicyMode::Fixed) ||
-            budget_limited)
+            budget_limited || publication.modelStopped())
         {
             return true;
         }
@@ -1772,6 +2030,66 @@ namespace llaminar2::sampling_math
                 DeviceGenerationError::InvalidVerifierCounts);
         }
 
+        // This exact publication identity establishes the population to which
+        // prefix truncation bounds apply. Stops and clipped work were excluded
+        // above; physical output/cost accounting still includes those outcomes.
+        if (publication.publishedStateTokens() != static_cast<uint32_t>(accepted_prefix + 1))
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidVerifierCounts);
+
+        if (!valid_device_generation_prior_depth_window(current, accepted_prefix, control))
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+        // The complete scope and learned temporaries die before any five-word
+        // gate view is loaded, preventing overlapping large GPU live ranges.
+        MTPDepthCostProfileKind cost_kind = MTPDepthCostProfileKind::None;
+        bool learned_matched = false;
+        int learned_delta = 0;
+        {
+            const MTPLearnedDepthPolicyContext learned_context{
+                .enabled = control[kDeviceGenerationControlLearnedDepthEnabled] != 0,
+                .backend = static_cast<MTPDepthPolicyBackend>(control[kDeviceGenerationControlLearnedDepthBackend]),
+                .model_class = static_cast<MTPDepthPolicyModelClass>(control[kDeviceGenerationControlLearnedDepthModelClass]),
+                .verify_mode = static_cast<MTPVerifyMode>(control[kDeviceGenerationControlLearnedDepthVerifyMode]),
+                .scope = {
+                    .verifier_width_policy = static_cast<MTPVerifierPhysicalWidthPolicy>(control[kDeviceGenerationControlLearnedScopeWidthPolicy]),
+                    .tp_width = control[kDeviceGenerationControlLearnedScopeTPWidth],
+                    .pp_stages = control[kDeviceGenerationControlLearnedScopePPStages],
+                    .retained_depth = control[kDeviceGenerationControlLearnedScopeRetainedDepth],
+                    .hidden_dim = control[kDeviceGenerationControlLearnedScopeHiddenDim],
+                    .main_layers = control[kDeviceGenerationControlLearnedScopeMainLayers],
+                    .expert_count = control[kDeviceGenerationControlLearnedScopeExpertCount],
+                    .experts_per_token = control[kDeviceGenerationControlLearnedScopeExpertsPerToken],
+                    .compute_capability_major = control[kDeviceGenerationControlLearnedScopeComputeCapabilityMajor],
+                    .compute_capability_minor = control[kDeviceGenerationControlLearnedScopeComputeCapabilityMinor],
+                }};
+            if (mode == static_cast<int>(DeviceGenerationPolicyMode::Dynamic))
+                cost_kind = resolveMTPDepthCostProfile(learned_context).kind;
+            if (cost_kind != MTPDepthCostProfileKind::None)
+            {
+                if (!learned_context.valid())
+                    return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            }
+            else
+            {
+                const auto evaluated = evaluateMTPLearnedDepthPolicy(learned_context, current,
+                    {.attempted = static_cast<uint64_t>(control[kDeviceGenerationControlDepthWindowAttemptedTokens]) + static_cast<uint32_t>(current),
+                     .accepted = static_cast<uint64_t>(control[kDeviceGenerationControlDepthWindowAcceptedTokens]) + static_cast<uint32_t>(accepted_prefix),
+                     .runs = static_cast<uint64_t>(control[kDeviceGenerationControlDepthWindowVerifierRuns]) + 1,
+                     .zero_accepts = static_cast<uint64_t>(control[kDeviceGenerationControlDepthWindowZeroAccepts]) + (accepted_prefix == 0 ? 1 : 0),
+                     .full_accepts = static_cast<uint64_t>(control[kDeviceGenerationControlDepthWindowFullAccepts]) + (accepted_prefix == current ? 1 : 0)});
+                if (!evaluated.valid)
+                    return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+                learned_matched = evaluated.match.matched;
+                learned_delta = evaluated.match.depth_delta;
+            }
+        }
+        // Validate scoped history and Pending before any adaptive counter or
+        // confirmation mutation. Legacy evaluation above sees the exact proposed
+        // append, so its arithmetic/ordering is unchanged without early writes.
+        if (cost_kind != MTPDepthCostProfileKind::None &&
+            !valid_device_generation_measured_confirmation(control, current, minimum, maximum,
+                control[kDeviceGenerationControlDepthPromoteConsecutiveWindows],
+                control[kDeviceGenerationControlDepthMinimumSamples]))
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
         ++control[kDeviceGenerationControlDepthWindowVerifierRuns];
         control[kDeviceGenerationControlDepthWindowAttemptedTokens] += current;
         control[kDeviceGenerationControlDepthWindowAcceptedTokens] +=
@@ -1790,6 +2108,118 @@ namespace llaminar2::sampling_math
 
         const int verifier_runs =
             control[kDeviceGenerationControlDepthWindowVerifierRuns];
+        const MTPDepthCostProfile cost_profile{cost_kind};
+        if (cost_profile.active())
+        {
+            for (int i = kDeviceGenerationControlDepthUtilityPhase; i <= kDeviceGenerationControlDepthUtilityWindowEmitted; ++i)
+                if (control[i] < 0) return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            auto state = device_generation_utility_state(control);
+            const auto previous_runs = static_cast<uint32_t>(verifier_runs - 1);
+            if (state.window_emitted < previous_runs || static_cast<uint64_t>(state.window_emitted) >
+                static_cast<uint64_t>(previous_runs) * (current + 1))
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            const uint64_t verified = static_cast<uint64_t>(verifier_runs) +
+                static_cast<uint32_t>(control[kDeviceGenerationControlDepthWindowAcceptedTokens]);
+            if (verified > UINT32_MAX)
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            const MTPReversibleProposalPolicy policy{
+                .mode = MTPReversibleProposalMode::Dynamic, .minimum_depth = static_cast<uint32_t>(minimum),
+                .maximum_depth = static_cast<uint32_t>(maximum),
+                .minimum_samples = static_cast<uint32_t>(control[kDeviceGenerationControlDepthMinimumSamples])};
+            MTPReversibleProposalInput input{
+                .executed_depth = static_cast<uint32_t>(current), .window_runs = static_cast<uint32_t>(verifier_runs),
+                .newly_emitted_tokens = publication.newlyEmittedTokens(), .eligible = true,
+                .verified_progress = {.states = static_cast<uint32_t>(verified)}};
+            const auto appended = appendMTPReversibleProposalEmission(policy, state, input);
+            if (!appended.valid()) return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            MTPProposalConfirmation confirmation{
+                static_cast<uint32_t>(control[kDeviceGenerationControlDepthLastRecommendedDepth]),
+                static_cast<uint32_t>(control[kDeviceGenerationControlDepthPromotionStreak])};
+            bool awaiting_confirmation = false;
+            if (state.phase != MTPReversibleProposalPhase::ProbePending)
+            {
+                const int minimum_samples = control[kDeviceGenerationControlDepthMinimumSamples];
+                const int required_samples = control[kDeviceGenerationControlDepthWindowSize] > minimum_samples
+                    ? control[kDeviceGenerationControlDepthWindowSize] : minimum_samples;
+                const bool cooldown_complete = control[kDeviceGenerationControlDepthStepsSinceChange] >=
+                    control[kDeviceGenerationControlDepthCooldownSteps];
+                input.parent_target = static_cast<uint32_t>(current);
+                input.proposal_origin = MTPDepthProposalOrigin::Hold;
+                if (cooldown_complete && verifier_runs >= minimum_samples)
+                {
+                    MTPRejectedVerifiedComparison rejected;
+                    if (state.phase == MTPReversibleProposalPhase::RejectedComparison)
+                        rejected = {.kind = MTPRejectedVerifiedComparisonKind::RejectedTarget,
+                            .target_depth = state.reference_depth, .reference_runs = state.reference_runs,
+                            .reference_verified_progress = state.reference_verified_progress};
+                    const auto proposal = selectMTPSurvivalDepthProposal(
+                        {.scope = MTPPrefixEvidenceScope::NonStoppedUnclippedVerifiedState,
+                         .depth = static_cast<uint32_t>(current), .runs = static_cast<uint32_t>(verifier_runs),
+                         .accepted = static_cast<uint32_t>(control[kDeviceGenerationControlDepthWindowAcceptedTokens]),
+                         .zero = static_cast<uint32_t>(control[kDeviceGenerationControlDepthWindowZeroAccepts]),
+                         .full = static_cast<uint32_t>(control[kDeviceGenerationControlDepthWindowFullAccepts])},
+                        static_cast<uint32_t>(minimum), static_cast<uint32_t>(maximum), cost_profile, rejected);
+                    if (!proposal.valid())
+                        return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+                    input.parent_target = proposal.target_depth;
+                    input.proposal_origin = proposal.kind == MTPSurvivalProposalKind::SupportedProbe
+                        ? MTPDepthProposalOrigin::SupportedScore
+                        : proposal.kind == MTPSurvivalProposalKind::UnresolvedProbe
+                            ? MTPDepthProposalOrigin::UnresolvedScore : MTPDepthProposalOrigin::Hold;
+                }
+                if (verifier_runs < required_samples && input.parent_target == static_cast<uint32_t>(current))
+                {
+                    if (!publish_device_generation_utility_state(state, appended.action, control))
+                        return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+                    return true;
+                }
+                const auto confirmed = confirmMTPSurvivalProposal(confirmation,
+                    static_cast<uint32_t>(current), static_cast<uint32_t>(minimum),
+                    static_cast<uint32_t>(maximum),
+                    static_cast<uint32_t>(control[kDeviceGenerationControlDepthPromoteConsecutiveWindows]),
+                    input.parent_target);
+                if (!confirmed.valid())
+                    return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+                confirmation = confirmed.next;
+                awaiting_confirmation = confirmed.action == MTPProposalConfirmationAction::AwaitingConfirmation;
+                if (awaiting_confirmation)
+                {
+                    // The gate's Hold consumes this real Y/window exactly once
+                    // and preserves any failed-target sample; it does not own
+                    // the separate pending recommendation or reset cooldown.
+                    input.parent_target = static_cast<uint32_t>(current);
+                    input.proposal_origin = MTPDepthProposalOrigin::Hold;
+                }
+            }
+            // Pending owns its actual minimum-size comparison before any new
+            // action, even during cooldown. Both move directions are charged
+            // trials. A same-input bound never substitutes for the real trial.
+            const auto gate = decideMTPReversibleProposalGate(policy, state, input, cost_profile);
+            if (!gate.valid())
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            if (gate.consume_window)
+            {
+                if (!awaiting_confirmation) confirmation = {gate.next_depth, 0};
+                if (!validMTPProposalConfirmation(confirmation, gate.next_depth,
+                        static_cast<uint32_t>(minimum), static_cast<uint32_t>(maximum),
+                        static_cast<uint32_t>(control[kDeviceGenerationControlDepthPromoteConsecutiveWindows]),
+                        state.phase == MTPReversibleProposalPhase::ProbePending) ||
+                    control[kDeviceGenerationControlDepthEvaluatedWindows] < 0 ||
+                    control[kDeviceGenerationControlDepthEvaluatedWindows] == INT32_MAX)
+                    return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            }
+            if (!publish_device_generation_utility_state(state, gate.action, control))
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+            if (gate.consume_window)
+            {
+                if (!publish_device_generation_measured_confirmation(confirmation, control))
+                    return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+                ++control[kDeviceGenerationControlDepthEvaluatedWindows];
+                apply_device_generation_depth_change(static_cast<int>(gate.next_depth), current, control);
+                consume_device_generation_depth_window(control);
+            }
+            return true;
+        }
         const int required_samples =
             control[kDeviceGenerationControlDepthWindowSize] >
                     control[kDeviceGenerationControlDepthMinimumSamples]
@@ -1810,31 +2240,17 @@ namespace llaminar2::sampling_math
         const int full_accepts =
             control[kDeviceGenerationControlDepthWindowFullAccepts];
 
-        // The generated table is the same one used by the CPU owner. A learned
-        // hold must suppress generic promotion/demotion, not look like a miss.
-        const MTPLearnedDepthPolicyContext learned_context{
-            .enabled = control[kDeviceGenerationControlLearnedDepthEnabled] != 0,
-            .backend = static_cast<MTPDepthPolicyBackend>(control[kDeviceGenerationControlLearnedDepthBackend]),
-            .model_class = static_cast<MTPDepthPolicyModelClass>(control[kDeviceGenerationControlLearnedDepthModelClass]),
-            .verify_mode = static_cast<MTPVerifyMode>(control[kDeviceGenerationControlLearnedDepthVerifyMode])};
-        if (!learned_context.valid())
-            return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
-        const auto learned = matchMTPLearnedDepthPolicy(
-            learned_context, current,
-            {.attempted = static_cast<uint64_t>(attempted), .accepted = static_cast<uint64_t>(accepted),
-             .runs = static_cast<uint64_t>(verifier_runs), .zero_accepts = static_cast<uint64_t>(zero_accepts),
-             .full_accepts = static_cast<uint64_t>(full_accepts)});
-        const int learned_target = current + learned.depth_delta < minimum ? minimum
-            : current + learned.depth_delta > maximum ? maximum : current + learned.depth_delta;
+        const int learned_target = current + learned_delta < minimum ? minimum
+            : current + learned_delta > maximum ? maximum : current + learned_delta;
         // As on CPU, a learned move can use the minimum-sample window. Holds
         // retain evidence until the full window instead of resetting it early.
-        const bool learned_move_ready = cooldown_complete && learned.matched &&
+        const bool learned_move_ready = cooldown_complete && learned_matched &&
             learned_target != current &&
             verifier_runs >= control[kDeviceGenerationControlDepthMinimumSamples];
         if (verifier_runs < required_samples && !learned_move_ready)
             return true;
 
-        if (cooldown_complete && learned.matched)
+        if (cooldown_complete && learned_matched)
         {
             recommended = learned_target;
             promotion_streak = 0;
@@ -1882,34 +2298,16 @@ namespace llaminar2::sampling_math
             promotion_streak = 0;
         }
 
+
         control[kDeviceGenerationControlDepthPromotionStreak] =
             promotion_streak;
         control[kDeviceGenerationControlDepthLastRecommendedDepth] =
             recommended;
         ++control[kDeviceGenerationControlDepthEvaluatedWindows];
 
-        if (mode == static_cast<int>(DeviceGenerationPolicyMode::Dynamic) &&
-            recommended != current)
-        {
-            control[kDeviceGenerationControlCurrentDraftDepth] = recommended;
-            control[kDeviceGenerationControlActiveVerifierRowCount] =
-                recommended + 1;
-            control[kDeviceGenerationControlDepthStepsSinceChange] = 0;
-            ++control[kDeviceGenerationControlDepthUpdates];
-            if (recommended > current)
-                ++control[kDeviceGenerationControlDepthPromotions];
-            else
-                ++control[kDeviceGenerationControlDepthDemotions];
-        }
-
-        control[kDeviceGenerationControlDepthWindowVerifierRuns] = 0;
-        control[kDeviceGenerationControlDepthWindowAttemptedTokens] = 0;
-        control[kDeviceGenerationControlDepthWindowAcceptedTokens] = 0;
-        control[kDeviceGenerationControlDepthWindowRejectedTokens] = 0;
-        control[kDeviceGenerationControlDepthWindowRollbacks] = 0;
-        control[kDeviceGenerationControlDepthWindowFullAccepts] = 0;
-        control[kDeviceGenerationControlDepthWindowZeroAccepts] = 0;
-        control[kDeviceGenerationControlDepthWindowAcceptedPrefixSum] = 0;
+        if (mode == static_cast<int>(DeviceGenerationPolicyMode::Dynamic))
+            apply_device_generation_depth_change(recommended, current, control);
+        consume_device_generation_depth_window(control);
         return true;
     }
 
@@ -1929,6 +2327,7 @@ namespace llaminar2::sampling_math
      * @param response_tokens Persistent device response row.
      * @param response_capacity Capacity of @p response_tokens.
      * @param control Mutable controller row.
+     * @param trace Optional exclusive bounded transaction trace bank.
      * @return true when the transaction was appended, or when the request was
      *         already complete and therefore required no mutation.
      */
@@ -1939,7 +2338,8 @@ namespace llaminar2::sampling_math
         int meta_stride,
         int32_t *response_tokens,
         int response_capacity,
-        int *control)
+        int *control,
+        MTPDepthTransactionTrace *trace = nullptr)
     {
         if (!control || !compact_tokens || !compact_meta || !response_tokens ||
             output_token_stride <= 0 ||
@@ -2033,6 +2433,37 @@ namespace llaminar2::sampling_math
                 DeviceGenerationError::ResponseCapacityExceeded);
         }
 
+        const bool model_stopped = compact_meta[kSpecBatchMetaStoppedOnOutput] != 0;
+        const int transaction_budget = control[kDeviceGenerationControlTransactionCommitBudget];
+        const int published_state_count = verifier_state_count < transaction_budget
+            ? verifier_state_count : transaction_budget;
+        MTPPublicationWitness publication;
+        if (!MTPPublicationWitness::fromCounts(output_count, leading_count, published_state_count,
+                model_stopped, &publication))
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidCompactOutcome);
+
+        if (trace)
+        {
+            const int previous_transactions = control[kDeviceGenerationControlTransactionCount];
+            if (previous_transactions < 0 || previous_transactions >= kMTPDepthTransactionTraceCapacity ||
+                (previous_transactions != 0 && (trace->magic != kMTPDepthTransactionTraceMagic ||
+                 trace->version != kMTPDepthTransactionTraceVersion || trace->record_words != 3 ||
+                 trace->capacity != kMTPDepthTransactionTraceCapacity)))
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthTransactionTrace);
+            if (previous_transactions == 0)
+            {
+                trace->magic = kMTPDepthTransactionTraceMagic;
+                trace->version = kMTPDepthTransactionTraceVersion;
+                trace->record_words = 3;
+                trace->capacity = kMTPDepthTransactionTraceCapacity;
+                // Actual validated control before the first response/state
+                // append. External QSA/lookup words are retained evidence,
+                // never claimed reproducible by controller-input replay.
+                for (int word = 0; word < kDeviceGenerationControlCount; ++word)
+                    trace->initial_control[word] = control[word];
+            }
+        }
+
         for (int i = 0; i < newly_emitted_count; ++i)
         {
             response_tokens[response_count + i] =
@@ -2041,10 +2472,6 @@ namespace llaminar2::sampling_math
 
         const int next_response_count = response_count + newly_emitted_count;
         const int next_remaining_count = remaining_count - newly_emitted_count;
-        const bool model_stopped =
-            compact_meta[kSpecBatchMetaStoppedOnOutput] != 0;
-        const int transaction_budget =
-            control[kDeviceGenerationControlTransactionCommitBudget];
         /*
          * The compact outcome describes every physically evaluated verifier
          * row, while the transaction budget describes the serial-visible
@@ -2061,10 +2488,6 @@ namespace llaminar2::sampling_math
          * consumed by derive_speculative_publication_metadata() so response,
          * KV, and recurrent-state ownership advance as one transaction.
          */
-        const int published_state_count =
-            verifier_state_count < transaction_budget
-                ? verifier_state_count
-                : transaction_budget;
         const bool has_emitted_pending_condition =
             !model_stopped && output_count > published_state_count;
         const bool rejected_transaction =
@@ -2105,11 +2528,25 @@ namespace llaminar2::sampling_math
             newly_emitted_count;
         control[kDeviceGenerationControlErrorCode] =
             static_cast<int>(DeviceGenerationError::None);
-        return record_device_generation_depth_observation(
-            accepted_prefix,
-            rejected_transaction,
-            budget_limited,
-            control);
+        if (!record_device_generation_depth_observation(
+                accepted_prefix, rejected_transaction, budget_limited, control, publication)) return false;
+        if (trace)
+        {
+            MTPDepthTransactionTraceRecord encoded;
+            if (!packMTPDepthTransactionTraceRecord(
+                    {.pre_depth = active_depth, .accepted_prefix = accepted_prefix,
+                     .post_depth = control[kDeviceGenerationControlCurrentDraftDepth],
+                     .rollback = rejected_transaction, .budget_limited = budget_limited,
+                     .incoming_debt = publication.incomingDebt(), .outgoing_debt = publication.outgoingDebt(),
+                     .model_stopped = publication.modelStopped(),
+                     .recommended_depth = control[kDeviceGenerationControlDepthLastRecommendedDepth],
+                     .token_witness = next_response_count,
+                     .evaluated_windows = control[kDeviceGenerationControlDepthEvaluatedWindows]}, &encoded))
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthTransactionTrace);
+            // Exactly one lane owns TransactionCount and its matching trace row.
+            trace->records[control[kDeviceGenerationControlTransactionCount] - 1] = encoded;
+        }
+        return true;
     }
 
     /**
@@ -3157,6 +3594,7 @@ namespace llaminar2::sampling_math
      * @param response_capacity Persistent response-row capacity.
      * @param control Persistent generation-controller row.  Its current
      *        transaction budget is the sole publication limit.
+     * @param trace Optional exclusive bounded transaction trace bank; its append shares this commit.
      * @return true only when response and publication state were both committed.
      */
     LLAMINAR_SAMPLING_HD bool
@@ -3177,7 +3615,8 @@ namespace llaminar2::sampling_math
         int *out_ok,
         int32_t *out_next_condition_token = nullptr,
         int *out_all_drafts_accepted = nullptr,
-        int *out_stopped = nullptr)
+        int *out_stopped = nullptr,
+        MTPDepthTransactionTrace *trace = nullptr)
     {
         /*
          * Validate every required address and geometry before either helper can
@@ -3280,7 +3719,7 @@ namespace llaminar2::sampling_math
                 meta_stride,
                 response_tokens,
                 response_capacity,
-                control))
+                control, trace))
         {
             *out_ok = 0;
             request_meta[kSpecBatchMetaOk] = 0;
@@ -3576,3 +4015,4 @@ namespace llaminar2::sampling_math
 } // namespace llaminar2::sampling_math
 
 #undef LLAMINAR_SAMPLING_HD
+#undef LLAMINAR_DEPTH_CONTROL_HD

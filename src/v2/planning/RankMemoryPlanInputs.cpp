@@ -12,6 +12,7 @@
  *
  * Source-qualified query KV intervals come from the same canonical assignment
  * used for weights and graphs; PMA alone accounts their actual physical bytes.
+ * Retained graph owners follow declared participant domains and actual PP roles.
  */
 #include "planning/RankMemoryPlanInputs.h"
 #include "planning/TensorParallelSourceDeclaration.h"
@@ -19,6 +20,7 @@
 #include "planning/ActivationBufferSizing.h"
 #include "backends/DeviceAddressAdapter.h"
 #include "config/BackendSelector.h"
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 
 namespace llaminar2
 {
@@ -83,6 +85,7 @@ namespace llaminar2
     {
         if (config.world_rank != world_rank_ || config.first_layer != first_layer_ || config.last_layer != last_layer_ ||
             config.execution_role != DeviceExecutionMemoryRole::ContinuationGraph || config.local_pipeline_backend ||
+            config.pipeline_forward_only_graph_owner != PipelineForwardOnlyGraphOwner::None ||
             !config.captured_pipeline_boundaries.empty() ||
             std::find(participants_.begin(), participants_.end(), config.device) == participants_.end())
             throw std::invalid_argument("Pipeline transfer memory cannot bind a foreign or already bound device graph");
@@ -90,6 +93,10 @@ namespace llaminar2
             (!config.associated_host_memory || !config.associated_host_memory->valid() ||
              config.associated_host_memory->world_rank != world_rank_ || !config.associated_host_memory->device.is_cpu()))
             throw std::invalid_argument("Pipeline mapped channel owner requires its exact physical host authority");
+        // Every physical GPU imports its own resident model body. A TP sibling
+        // owns a parent even though only its leader owns boundary storage.
+        config.pipeline_forward_only_graph_owner = config.device.is_gpu()
+            ? PipelineForwardOnlyGraphOwner::Participant : PipelineForwardOnlyGraphOwner::None;
         if (config.device == participants_.front())
         {
             config.local_pipeline_backend = native_backend_;
@@ -118,6 +125,26 @@ namespace llaminar2
         }
         return ngram.isFixedHeadSharded()?ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal:
             ImmutableRowTableTPTopology::None;
+    }
+
+    DeviceGenerationExecutionDomain declaredRankDeviceGenerationDomain(const RankExecutionPlan &plan)
+    {
+        DeviceGenerationDomainDeclaration generation;
+        // A PP parent is a coordinator; its default primary slot is not an
+        // additional CPU participant. TP likewise declares its complete members.
+        if (!plan.usesLocalPP() && !plan.usesLocalTP())
+            generation.observe(plan.primary_device.device_type);
+        for (const auto &member : plan.local_tp_devices)
+            generation.observe(member.device_type);
+        for (const auto &member : plan.local_pp_devices)
+            generation.observe(member.device_type);
+        for (const auto &stage : plan.local_pp_stage_tp_info)
+            for (const auto &member : stage.devices)
+                generation.observe(member.device_type);
+        for (const auto &domain : plan.my_domains)
+            for (const auto &member : domain.devices)
+                generation.observe(member.device_type);
+        return generation.domain();
     }
 
     std::vector<DevicePlanConfig> buildRankMemoryPlanInputs(
@@ -459,18 +486,30 @@ namespace llaminar2
              * capacity has its own cross-rank executable inventory and must
              * not be charged a second time here.
              */
-            const CapturedServingGraphMemoryInventory graph_inventory =
-                resolveCapturedServingGraphMemoryInventory(
-                    configured_prefill_buckets,
-                    request.plan.runtime.mtp,
-                    profile.flash_next && std::any_of(profile.flash_next->sparse_decoder_layers.begin(),
-                        profile.flash_next->sparse_decoder_layers.end(), [&](auto layer) {
-                            return layer < static_cast<std::uint32_t>(profile.n_layers);
-                        }) ? kSparseQueryExecutionProgramCount : 1u);
+            // Observe authored members, including remote peers of this rank's
+            // domains. A mixed complete domain requires hosted transactions on
+            // every GPU; an inventory device outside that domain is irrelevant.
+            const auto generation_domain = declaredRankDeviceGenerationDomain(request.plan);
+            const auto query_programs = profile.sparseQueryProgramCount();
             for (auto &cfg : device_configs)
             {
                 if (!cfg.device.is_gpu())
                     continue;
+                const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+                    declaredDeviceGenerationExecutionPolicy(cfg.device.type, generation_domain)));
+                // Only actual local PP nonterminal stages own follower parents.
+                // A partial standalone graph is not a pipeline follower.
+                const auto parent_role = request.plan.usesLocalPP() &&
+                    cfg.last_layer < profile.mainLayerCount() - 1
+                    ? MTPGenerationParentRole::PipelineFollower
+                    : MTPGenerationParentRole::Controller;
+                const auto graph_inventory = resolveCapturedServingGraphMemoryInventory(
+                    configured_prefill_buckets,
+                    request.plan.runtime.mtp,
+                    family,
+                    parent_role,
+                    generation_domain,
+                    query_programs);
                 cfg.captured_serving_graphs = graph_inventory;
                 if (cfg.graph_snapshot_memory.valid())
                 {

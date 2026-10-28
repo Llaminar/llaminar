@@ -128,6 +128,7 @@ namespace llaminar2
         bool benchmark_memory_log = false;    ///< Emit benchmark GPU memory snapshots when LLAMINAR_BENCH_MEM_LOG is present.
         int benchmark_iterations = 3;         ///< Measured benchmark iterations (LLAMINAR_BENCHMARK_ITERATIONS, default 3).
         int benchmark_warmup_iterations = 1;  ///< Benchmark warmup iterations (LLAMINAR_BENCHMARK_WARMUP_ITERATIONS, default 1).
+        bool benchmark_iteration_overrides_valid = true; ///< Raw benchmark integer declarations passed parsing/range checks before legacy normalization.
         bool profiler_normal_exit = false;    ///< Permit profiler finalizers instead of `_exit(0)` when LLAMINAR_PROFILER_NORMAL_EXIT is truthy.
         bool rope_on_read = true;             ///< Enable RoPE-on-read unless LLAMINAR_ROPE_ON_READ parses to 0.
         bool sync_after_stage = false;        ///< Synchronize GPU after every stage when LLAMINAR_SYNC_AFTER_STAGE is present.
@@ -137,6 +138,7 @@ namespace llaminar2
         bool trace_generated_tokens = false;  ///< Trace streamed/generated token text when LLAMINAR_TRACE_GENERATED_TOKENS is truthy.
         bool moe_grouped_verifier_snapshot_diagnostic = false; ///< Emit grouped MoE verifier routing-row diagnostics.
         bool mtp_publication_diagnostics = false; ///< Emit opt-in device-owned MTP/KV publication diagnostics.
+        bool mtp_depth_transaction_trace = false; ///< Explicit finite untimed benchmark transaction trace; conflicts with first-transaction diagnostics.
         bool mtp_device_phase_snapshots = false; ///< Preserve device-only logical-state phase snapshots until a fatal diagnostic boundary.
         bool mtp_condition_graph_contract_trace = false; ///< Trace only the participant/cache/graph lifecycle of resident MTP condition advances.
         bool gpu_graph_kernel_inventory = false; ///< Export captured kernel names/geometries to PerfStats during graph setup.
@@ -158,8 +160,11 @@ namespace llaminar2
             no_color_output = isPresent("NO_COLOR") || isPresent("LLAMINAR_NO_COLOR");
             assert_thread_affinity = isExactlyOne("LLAMINAR_ASSERT_THREAD_AFFINITY");
             benchmark_memory_log = isPresent("LLAMINAR_BENCH_MEM_LOG");
-            benchmark_iterations = readIntClamped("LLAMINAR_BENCHMARK_ITERATIONS", 3, 1, 100);
-            benchmark_warmup_iterations = readIntClamped("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", 1, 0, 100);
+            bool measured_valid = true;
+            bool warmup_valid = true;
+            benchmark_iterations = readIntClamped("LLAMINAR_BENCHMARK_ITERATIONS", 3, 1, 100, measured_valid);
+            benchmark_warmup_iterations = readIntClamped("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", 1, 0, 100, warmup_valid);
+            benchmark_iteration_overrides_valid = measured_valid && warmup_valid;
             profiler_normal_exit = readTruthy("LLAMINAR_PROFILER_NORMAL_EXIT");
             rope_on_read = readBoolDefaultTrue("LLAMINAR_ROPE_ON_READ");
             sync_after_stage = isPresent("LLAMINAR_SYNC_AFTER_STAGE");
@@ -173,6 +178,9 @@ namespace llaminar2
                 readTruthy("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS");
             mtp_device_phase_snapshots =
                 readTruthy("LLAMINAR_MTP_DEVICE_PHASE_SNAPSHOTS");
+            if (readTruthy("LLAMINAR_MTP_DEPTH_WINDOW_JOURNAL"))
+                throw std::invalid_argument("LLAMINAR_MTP_DEPTH_WINDOW_JOURNAL was retired; use LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE");
+            mtp_depth_transaction_trace = readTruthy("LLAMINAR_MTP_DEPTH_TRANSACTION_TRACE");
             mtp_condition_graph_contract_trace =
                 readTruthy(
                     "LLAMINAR_MTP_CONDITION_GRAPH_CONTRACT_TRACE");
@@ -237,18 +245,35 @@ namespace llaminar2
             return std::string(value);
         }
 
-        /// @brief Read an integer environment override and clamp to a conservative range.
-        static int readIntClamped(const char *name, int default_value, int min_value, int max_value)
+        /** @brief Parse a count once and retain validity before legacy normalization.
+         * @param name Environment declaration. @param default_value Unset default.
+         * @param min_value Inclusive supported lower bound. @param max_value Upper bound.
+         * @param declaration_valid False for malformed, empty or out-of-range overrides.
+         * @return Existing normalized count; strict diagnostics additionally require validity.
+         */
+        static int readIntClamped(const char *name, int default_value, int min_value,
+            int max_value, bool &declaration_valid)
         {
             const char *value = std::getenv(name);
-            if (!value || value[0] == '\0')
+            declaration_valid = true;
+            if (!value)
                 return default_value;
+            if (value[0] == '\0')
+            {
+                declaration_valid = false;
+                return default_value;
+            }
             char *end = nullptr;
             const long parsed = std::strtol(value, &end, 10);
             if (end == value)
+            {
+                declaration_valid = false;
                 return default_value;
-            return std::clamp(static_cast<int>(parsed), min_value, max_value);
+            }
+            declaration_valid = *end == '\0' && parsed >= min_value && parsed <= max_value;
+            return static_cast<int>(std::clamp(parsed, static_cast<long>(min_value), static_cast<long>(max_value)));
         }
+
     };
 
     /**

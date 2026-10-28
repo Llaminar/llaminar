@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/mtp/MTPVerifierPolicy.h"
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "execution/mtp/MTPServingForwardCaptureGeometry.h"
 #include "execution/mtp/MTPMainForwardPolicy.h"
 #include "kernels/common/DeviceRowRange.h"
@@ -127,7 +128,7 @@ TEST(Test__MTPVerifierPolicy, RetainedVerifierFamilyCoversEveryRequestWidth)
         ASSERT_FALSE(family.empty());
         EXPECT_EQ(family.front().verifier_rows, depth + 1);
         EXPECT_EQ(family.back().verifier_rows, 2);
-        EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp),
+        EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, MTPVerifierGraphFamily::BoundedBuckets),
             kMTPConditionForwardPurposes.size() + 2 * family.size());
         int previous = depth + 2;
         for (const auto &geometry : family)
@@ -163,7 +164,7 @@ TEST(Test__MTPVerifierPolicy, FixedDepthOvercapacityRetainsExactVerifierMembers)
     std::vector<int> widths;
     for (const auto &geometry : family) widths.push_back(geometry.verifier_rows);
     EXPECT_EQ(widths, (std::vector<int>{16, 8, 4, 2}));
-    EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp), 10u);
+    EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, MTPVerifierGraphFamily::BoundedBuckets), 10u);
     EXPECT_EQ(resolveMTPDeviceGenerationDepthPolicy(mtp).maximum_depth, 7);
     for (const int invalid : {-1, 0, 1, 3, 5, 7, 9, 15, 17, std::numeric_limits<int>::max()})
         EXPECT_THROW((void)MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, invalid, family.front()), std::invalid_argument);
@@ -172,6 +173,181 @@ TEST(Test__MTPVerifierPolicy, FixedDepthOvercapacityRetainsExactVerifierMembers)
     for (const int mismatched : {0, 8, 32})
         EXPECT_THROW((void)resolveMTPServingForwardCaptureFamily(mtp, mismatched), std::invalid_argument);
     EXPECT_TRUE(resolveMTPServingForwardCaptureFamily({}, 0).empty());
+}
+
+/** @test Hosted tickets select exactly one retained child at every depth and request mode. */
+TEST(Test__MTPVerifierPolicy, ExactHostedFamilyCoversEveryDepthWithoutPadding)
+{
+    const auto family_kind = resolveMTPVerifierGraphFamily(MTPVerifierExecutionRole::HostedCapturedTransactions);
+    ASSERT_EQ(family_kind, MTPVerifierGraphFamily::ExactRows);
+    for (int depth = 1; depth <= kMaximumSupportedMTPDraftDepth; ++depth)
+    for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+    {
+        MTPRuntimeConfig mtp;
+        mtp.enabled = true;
+        mtp.draft_tokens = 1;
+        mtp.graph_capacity_draft_tokens = depth;
+        mtp.depth_policy.mode = mode;
+        mtp.depth_policy.min_depth = 1;
+        mtp.depth_policy.initial_depth = 1;
+        mtp.depth_policy.max_depth = depth;
+        const auto family = resolveMTPServingForwardCaptureFamily(mtp, depth + 1, family_kind);
+        ASSERT_EQ(family.size(), static_cast<std::size_t>(depth));
+        ASSERT_EQ(resolveMTPRetainedVerifierWidthCount(mtp, family_kind), family.size());
+        EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, family_kind),
+            kMTPConditionForwardPurposes.size() + 2 * family.size());
+        const auto physical_policy = resolveMTPVerifierPhysicalWidthPolicy(
+            MTPVerifierExecutionRole::HostedCapturedTransactions, mode);
+        ASSERT_EQ(physical_policy, MTPVerifierPhysicalWidthPolicy::ExactLogicalRows);
+        for (int selected_depth = depth; selected_depth >= 1; --selected_depth)
+        {
+            const auto index = static_cast<std::size_t>(depth - selected_depth);
+            const auto &geometry = family[index];
+            EXPECT_EQ(geometry.family, family_kind);
+            EXPECT_EQ(geometry.verifier_rows, selected_depth + 1);
+            EXPECT_EQ(geometry.draft_depth, selected_depth);
+            EXPECT_EQ(mtpVerifierGraphFamilyWidthAt(index, depth + 1, family_kind), geometry.verifier_rows);
+            EXPECT_TRUE(mtpVerifierGraphFamilyContains(geometry.verifier_rows, depth + 1, family_kind));
+            for (int requests : {1, 2, 4})
+                EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(requests, selected_depth + 1, depth + 1, physical_policy),
+                    selected_depth + 1);
+            for (auto outcome : {MTPVerifierOutcomeGraphMode::Greedy, MTPVerifierOutcomeGraphMode::Disabled})
+                EXPECT_EQ(MTPVerifierForwardPolicy(outcome, selected_depth + 1, family.front()).physicalRows(),
+                    selected_depth + 1);
+        }
+        EXPECT_EQ(mtpVerifierGraphFamilyWidthAt(family.size(), depth + 1, family_kind), 0);
+        EXPECT_FALSE(mtpVerifierGraphFamilyContains(1, depth + 1, family_kind));
+        EXPECT_FALSE(mtpVerifierGraphFamilyContains(depth + 2, depth + 1, family_kind));
+        EXPECT_THROW((void)MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, 1, family.front()), std::invalid_argument);
+    }
+}
+
+/** @test Native conditional dynamic parents keep their envelope and standalone roles keep buckets. */
+TEST(Test__MTPVerifierPolicy, VerifierExecutionRolesPreserveUnchangedFamilies)
+{
+    for (auto role : {MTPVerifierExecutionRole::Standalone, MTPVerifierExecutionRole::NativeConditionalParent})
+    for (auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+    {
+        EXPECT_EQ(resolveMTPVerifierGraphFamily(role), MTPVerifierGraphFamily::BoundedBuckets);
+        const auto policy = resolveMTPVerifierPhysicalWidthPolicy(role, mode);
+        const bool native_dynamic = role == MTPVerifierExecutionRole::NativeConditionalParent && mode == MTPDepthPolicyMode::Dynamic;
+        EXPECT_EQ(policy, native_dynamic ? MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope :
+            MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket);
+        for (int rows = 2; rows <= 16; ++rows)
+            EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, rows, 16, policy),
+                native_dynamic ? 16 : mtpVerifierPhysicalRowBucket(rows, 16));
+    }
+}
+
+/** @test Exact retention is setup-owned even when request one disables MTP; invalid policy cannot underprice it. */
+TEST(Test__MTPVerifierPolicy, ExactHostedFamilyAdmissionIsIndependentOfActiveDepth)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = false;
+    mtp.graph_capacity_draft_tokens = 15;
+    EXPECT_EQ(resolveMTPRetainedVerifierWidthCount(mtp, MTPVerifierGraphFamily::ExactRows), 15u);
+    EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, MTPVerifierGraphFamily::ExactRows), 32u);
+    EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, MTPVerifierGraphFamily::BoundedBuckets), 10u);
+    EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount({}, MTPVerifierGraphFamily::ExactRows), 0u);
+    // Disabled execution builds no live verifier; admission still reserves the complete family above.
+    EXPECT_TRUE(resolveMTPServingForwardCaptureFamily(mtp, 16, MTPVerifierGraphFamily::ExactRows).empty());
+    mtp.enabled = true;
+    const auto exact = resolveMTPServingForwardCaptureFamily(mtp, 16, MTPVerifierGraphFamily::ExactRows);
+    const auto bounded = resolveMTPServingForwardCaptureFamily(mtp, 16, MTPVerifierGraphFamily::BoundedBuckets);
+    EXPECT_NO_THROW((void)MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, 3, exact.front()));
+    EXPECT_THROW((void)MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, 3, bounded.front()), std::invalid_argument);
+    for (int wrong_capacity : {0, 8, 32})
+        EXPECT_THROW((void)resolveMTPServingForwardCaptureFamily(mtp, wrong_capacity, MTPVerifierGraphFamily::ExactRows), std::invalid_argument);
+    const auto unknown_family = static_cast<MTPVerifierGraphFamily>(99);
+    EXPECT_FALSE(mtpVerifierGraphFamilyContains(3, 16, unknown_family));
+    EXPECT_THROW((void)mtpVerifierGraphFamilyWidthCount(16, unknown_family), std::invalid_argument);
+    EXPECT_THROW((void)resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, unknown_family), std::invalid_argument);
+    EXPECT_THROW((void)resolveMTPVerifierGraphFamily(static_cast<MTPVerifierExecutionRole>(99)), std::invalid_argument);
+    EXPECT_THROW((void)resolveMTPVerifierPhysicalWidthPolicy(static_cast<MTPVerifierExecutionRole>(99), MTPDepthPolicyMode::Dynamic), std::invalid_argument);
+    EXPECT_THROW((void)resolveMTPVerifierPhysicalWidthPolicy(MTPVerifierExecutionRole::HostedCapturedTransactions, static_cast<MTPDepthPolicyMode>(99)), std::invalid_argument);
+    EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, 4, 16, static_cast<MTPVerifierPhysicalWidthPolicy>(99)), 0);
+    for (int bad_rows : {-1, 0, 17, std::numeric_limits<int>::max()})
+        EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, bad_rows, 16, MTPVerifierPhysicalWidthPolicy::ExactLogicalRows), 0);
+    for (auto family : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+        for (int invalid_max : {-1, 0, 1})
+        {
+            EXPECT_EQ(mtpVerifierGraphFamilyWidthCount(invalid_max, family), 0u);
+            EXPECT_EQ(mtpVerifierGraphFamilyWidthAt(0, invalid_max, family), 0);
+        }
+    mtp.graph_capacity_draft_tokens = std::numeric_limits<int>::max();
+    EXPECT_THROW((void)resolveMTPRetainedVerifierWidthCount(mtp, MTPVerifierGraphFamily::ExactRows), std::overflow_error);
+}
+
+/** @test Declared complete-parent ownership determines admission and width before capture exists. */
+TEST(Test__MTPVerifierPolicy, ExactHostedFamilyExecutionDeclaration)
+{
+    for (auto type : {DeviceType::CUDA, DeviceType::ROCm})
+    for (auto domain : {DeviceGenerationExecutionDomain::NativeDomain, DeviceGenerationExecutionDomain::HostedBoundary})
+    {
+        const bool native = type == DeviceType::CUDA && domain == DeviceGenerationExecutionDomain::NativeDomain;
+        const auto execution = declaredDeviceGenerationExecutionPolicy(type, domain);
+        EXPECT_EQ(execution, native ? DeviceGenerationExecutionPolicy::NativeConditionalGraph :
+            DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions);
+        const auto role = mtpVerifierExecutionRole(execution);
+        EXPECT_EQ(role, native ? MTPVerifierExecutionRole::NativeConditionalParent :
+            MTPVerifierExecutionRole::HostedCapturedTransactions);
+        const auto family = resolveMTPVerifierGraphFamily(role);
+        EXPECT_EQ(family, native ? MTPVerifierGraphFamily::BoundedBuckets : MTPVerifierGraphFamily::ExactRows);
+        MTPRuntimeConfig retained;
+        retained.enabled = false;
+        retained.graph_capacity_draft_tokens = 15;
+        EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(retained, family), native ? 10u : 32u);
+        for (auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+        {
+            const auto width_policy = resolveMTPVerifierPhysicalWidthPolicy(role, mode);
+            EXPECT_EQ(mtpVerifierPhysicalPaddedSeqLen(1, 3, 16, width_policy),
+                native ? (mode == MTPDepthPolicyMode::Dynamic ? 16 : 4) : 3);
+        }
+    }
+}
+
+/** @test Unknown declarations cannot become a supported policy or quietly underprice a family. */
+TEST(Test__MTPVerifierPolicy, ExactHostedFamilyExecutionDeclarationRejectsUnsupportedInputs)
+{
+    for (auto domain : {DeviceGenerationExecutionDomain::NativeDomain, DeviceGenerationExecutionDomain::HostedBoundary})
+        for (auto type : {DeviceType::CPU, DeviceType::Vulkan, DeviceType::Metal, static_cast<DeviceType>(99)})
+        {
+            const auto policy = declaredDeviceGenerationExecutionPolicy(type, domain);
+            EXPECT_EQ(policy, DeviceGenerationExecutionPolicy::Unsupported);
+            EXPECT_THROW((void)mtpVerifierExecutionRole(policy), std::invalid_argument);
+        }
+    for (auto type : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const auto policy = declaredDeviceGenerationExecutionPolicy(type, static_cast<DeviceGenerationExecutionDomain>(255));
+        EXPECT_EQ(policy, DeviceGenerationExecutionPolicy::Unsupported);
+        EXPECT_THROW((void)mtpVerifierExecutionRole(policy), std::invalid_argument);
+    }
+    EXPECT_THROW((void)mtpVerifierExecutionRole(static_cast<DeviceGenerationExecutionPolicy>(255)), std::invalid_argument);
+}
+
+/** @test Member-type union is order independent and an authored hosted boundary is sticky. */
+TEST(Test__MTPVerifierPolicy, ExactHostedFamilyExecutionDeclarationUnionsActualMembers)
+{
+    const auto native = DeviceGenerationExecutionDomain::NativeDomain;
+    const auto hosted = DeviceGenerationExecutionDomain::HostedBoundary;
+    EXPECT_EQ(DeviceGenerationDomainDeclaration{}.domain(), native);
+    for (auto first : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm, DeviceType::Vulkan, DeviceType::Metal})
+    for (auto second : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm, DeviceType::Vulkan, DeviceType::Metal})
+    for (auto third : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm, DeviceType::Vulkan, DeviceType::Metal})
+    {
+        const auto expected = first == second && second == third ? native : hosted;
+        DeviceGenerationDomainDeclaration forward, reverse, explicit_boundary;
+        forward.observe(first); forward.observe(second); forward.observe(third);
+        reverse.observe(third); reverse.observe(second); reverse.observe(first);
+        EXPECT_EQ(forward.domain(), expected);
+        EXPECT_EQ(reverse.domain(), expected);
+        explicit_boundary.requireHostedBoundary();
+        explicit_boundary.observe(first); explicit_boundary.observe(second); explicit_boundary.observe(third);
+        EXPECT_EQ(explicit_boundary.domain(), hosted);
+        forward.requireHostedBoundary();
+        forward.observe(first);
+        EXPECT_EQ(forward.domain(), hosted);
+    }
 }
 
 /** @brief Bounded grids cover every live row exactly once without consulting its owner. */

@@ -599,6 +599,39 @@ TEST(PreparedWeightAuthorityIdentity, Qwen4ExpHCUpWorkspaceSelectionSeparatesRet
     EXPECT_EQ(ordinary, routedWeightAuthorityRequestIdentity(plan, config));
 }
 
+/** @test A one-field generation-boundary change cannot reuse the original physical admission identity. */
+TEST(PreparedWeightAuthorityIdentity, PipelineGenerationDomainSeparatesRetainedAuthority)
+{
+    PlanningGGUFFixture file(true, true);
+    PlanningModelSource source(file.path());
+    auto input = proposal(source, 1, false);
+    input.config.mtp_activation_policy = MTPActivationPolicy::Disabled;
+    input.config.mtp.graph_capacity_draft_tokens = 15;
+    ExecutionPlanBuilder builder;
+    auto topology = ResolvedRankOrchestration::resolve(input.config, source.metadata(),
+        input.membership.inventory(), builder, 0);
+    const auto admitted = AdmittedOrchestrationCandidate::admit(input, source, policy());
+    ASSERT_TRUE(admitted.pipelineMemory());
+    const auto original = pipelineRoutedWeightAuthorityRequestIdentity(topology);
+    EXPECT_EQ(original, pipelineRoutedWeightAuthorityRequestIdentity(*admitted.pipelineMemory()));
+    for (std::size_t index = 0; index < topology.pipelineStages().size(); ++index)
+    {
+        auto changed_topology = topology;
+        auto changed_admission = *admitted.pipelineMemory();
+        // Deliberate mutation of non-const copied test values isolates one
+        // capacity field; production exposes no mutable scope accessor.
+        auto &scope = const_cast<FactoryPPStageConfig &>(changed_topology.pipelineStages().at(index).scope());
+        auto &admitted_scope = const_cast<FactoryPPStageConfig &>(changed_admission.stages().at(index).topology().scope());
+        ASSERT_EQ(scope.generation_domain, DeviceGenerationExecutionDomain::HostedBoundary);
+        scope.generation_domain = DeviceGenerationExecutionDomain::NativeDomain;
+        admitted_scope.generation_domain = scope.generation_domain;
+        const auto changed = pipelineRoutedWeightAuthorityRequestIdentity(changed_topology);
+        EXPECT_NE(changed, original);
+        EXPECT_EQ(changed, pipelineRoutedWeightAuthorityRequestIdentity(changed_admission));
+    }
+    EXPECT_EQ(original, pipelineRoutedWeightAuthorityRequestIdentity(topology));
+}
+
 /** @test Dense and MoE model reuse share the exact retained MTP weight-ownership gate. */
 TEST(PreparedWeightAuthorityIdentity, MTPReuseRequiresPredictorAndHeadPlacement)
 {

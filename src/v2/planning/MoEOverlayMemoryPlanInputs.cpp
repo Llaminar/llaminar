@@ -6,11 +6,13 @@
  * Native executable ownership is not compilation-stage count. Request prefill
  * segments do not truncate retained MTP capacity, and CPU histogram storage
  * follows the same distributed publication contract used by live maintenance.
+ * Frozen execution and parent boundaries authenticate one shared GPU family.
  */
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include <algorithm>
 #include <limits>
@@ -95,9 +97,51 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
         throw std::invalid_argument("ExpertOverlay capacity candidate has no cache-resident prefill graph ladder");
 
     const auto family_count = makeMoEOverlayActivationGraphFamilyManifests(family).size();
+    DeviceGenerationDomainDeclaration generation;
+    if (request.execution.generationExecutionDomain() == DeviceGenerationExecutionDomain::HostedBoundary)
+        generation.requireHostedBoundary();
+    if (request.pipeline_stage)
+    {
+        switch (request.pipeline_stage->generation_domain)
+        {
+        case DeviceGenerationExecutionDomain::HostedBoundary:
+            generation.requireHostedBoundary();
+            break;
+        case DeviceGenerationExecutionDomain::NativeDomain:
+            break;
+        default:
+            throw std::invalid_argument("ExpertOverlay pipeline memory has an unknown generation domain");
+        }
+    }
+    // One rank/stage inventory is shared by its GPUs. Authenticate that the
+    // complete frozen execution declaration gives every GPU the same family;
+    // authority residency alone cannot identify mixed or remote boundaries.
+    auto verifier_family = resolveMTPVerifierGraphFamily(MTPVerifierExecutionRole::Standalone);
+    bool has_gpu_family = false;
+    for (const auto &domain : request.execution.domains)
+        for (const auto &participant : domain.participants)
+        {
+            const auto device = participant.address.toLocalDeviceId();
+            if (!device.is_gpu()) continue;
+            const auto family_for_device = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(
+                declaredDeviceGenerationExecutionPolicy(device.type, generation.domain())));
+            if (has_gpu_family && verifier_family != family_for_device)
+                throw std::invalid_argument("ExpertOverlay shared captured graph inventory has nonuniform GPU verifier families");
+            verifier_family = family_for_device;
+            has_gpu_family = true;
+        }
+    // CPU-only plans have no native executable consumer; their diagnostic
+    // inventory keeps the standalone family without advertising GPU support.
+    const auto parent_role = request.pipeline_stage && !request.pipeline_stage->has_lm_head
+        ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller;
+    const auto query_programs = request.model.sparseQueryProgramCount();
+    const auto serving = resolveCapturedServingGraphMemoryInventory({}, mtp, verifier_family, parent_role, generation.domain(), query_programs);
+    // Prefill and its request/rehydration reserve have RankingPossible only.
+    // The canonical fixed inventory already prices each decode/condition/
+    // verifier identity per actual query program, including the prefix bridge.
     const auto graph_identities = retained_buckets.size() + kExpertOverlayPrefillGraphIdentityReserve +
-        resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp);
-    const MTPGraphOwnerPlan graph_owners(mtp);
+        serving.fixed_executable_count;
+    const auto &graph_owners = serving.mtp_graph_owners;
     const auto captured = resolveMoEOverlayCapturedGraphPlan(
         family.main_layer_count, overlay->authority_execution, graph_identities,
         request.model_graph_topology_variant_count,
@@ -140,6 +184,8 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
             .activation_channel_row_capacity = std::max(decode_rows, segment_rows),
             .activation_graph_family_count = family_count,
             .host_demand_memory = std::move(host_demand),
+            .generation_domain = generation.domain(),
+            .generation_parent_role = parent_role,
             .captured_graph_plan = captured,
             .graph_snapshot_memory = request.snapshot_capacity,
             .gpu_weight_load = request.gpu_weight_load,

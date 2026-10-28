@@ -6,6 +6,7 @@
  * stays in the canonical pipeline preflight target across translation units.
  */
 #include "PipelineGenerationTestSupport.h"
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "config/OrchestrationStartupPolicy.h"
 
 namespace llaminar2::test

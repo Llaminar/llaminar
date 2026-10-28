@@ -143,6 +143,16 @@ namespace llaminar2
         /** Source-authenticated predictor policy; presence is mandatory for a QFN learned block. */
         std::optional<Qwen4ExpPredictorMetadata> flash_next_predictor;
 
+        /**
+         * @brief Count immutable serving query programs over the complete main model.
+         * @return Two when any main layer uses QSA, otherwise one.
+         * @throws std::invalid_argument for invalid Flash Next main-layer counts.
+         *
+         * Owned PP intervals never narrow this family: runtime capture scans
+         * the complete model's main mixers. Predictor-only QSA is excluded.
+         */
+        [[nodiscard]] std::size_t sparseQueryProgramCount() const;
+
         /** @return Number of QSA layers in an inclusive interval; dense predictors contribute zero. */
         size_t flashNextSparseLayerCount(int first_layer, int last_layer) const;
 

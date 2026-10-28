@@ -452,6 +452,9 @@ namespace llaminar2
         uint64_t mtp_depth_policy_promotions = 0;
         uint64_t mtp_depth_policy_demotions = 0;
         uint64_t mtp_depth_policy_observe_recommendations = 0;
+        uint64_t mtp_depth_policy_utility_probes = 0; ///< Actual reversible comparison events in this observation.
+        uint64_t mtp_depth_policy_utility_keeps = 0; ///< Actual reversible comparison events in this observation.
+        uint64_t mtp_depth_policy_utility_returns = 0; ///< Actual reversible comparison events in this observation.
         int mtp_current_depth = 0;
         int mtp_min_depth = 0;
         int mtp_max_depth = 0;

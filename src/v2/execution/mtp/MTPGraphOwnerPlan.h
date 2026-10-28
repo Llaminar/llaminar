@@ -52,8 +52,8 @@ namespace llaminar2
         static constexpr std::size_t kFixedSidecarGraphSlots = 6u;
         /** Standalone and device-generation-controlled verifier preparations. */
         static constexpr std::size_t kVerifierControlPolicyCount = 2u;
-        /** Spec publication, generation parent, serial outcome, target distribution. */
-        static constexpr std::size_t kControllerGraphSlots = 4u;
+        /** Query-program-independent stochastic outcome and target-distribution families. */
+        static constexpr std::size_t kSamplerHelperFamilyCount = 2u;
         /** Four standalone preparation nodes/request plus two fixed nodes. */
         static constexpr std::size_t kMaximumBoundedVerifierRequests =
             (GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes - 2u) / 4u;
@@ -62,13 +62,17 @@ namespace llaminar2
             kGenericTerminalHiddenGraphSlots = 1u;
 
         /**
-         * @brief Compile the exact bounded owner plan from frozen MTP policy.
+         * @brief Compile retained native owner counts from frozen MTP execution ownership.
          * @param config Runtime execution and retained-capacity configuration.
+         * @param family Required execution-owned verifier identities shared with admission.
+         * @param parent_role Controller or pipeline follower owning complete native transactions.
          * @param query_programs Immutable model-geometry main-query programs; sidecars remain shared.
+         * @throws std::invalid_argument For an unknown family/parent role or invalid query/draft geometry.
          * @throws std::overflow_error when a configured geometry cannot be
          *         represented by the runtime's integer or size types.
          */
-        explicit MTPGraphOwnerPlan(const MTPRuntimeConfig &config, std::size_t query_programs = 1u)
+        explicit MTPGraphOwnerPlan(const MTPRuntimeConfig &config, MTPVerifierGraphFamily family,
+                                   MTPGenerationParentRole parent_role, std::size_t query_programs = 1u)
             : retains_graph_capacity_(retainsMTPGraphCapacity(config)),
               query_programs_(query_programs),
               draft_depth_(resolveMTPMaximumDraftDepth(config)),
@@ -100,8 +104,36 @@ namespace llaminar2
                     draft_depth_,
                     "MTP flattened draft rows"));
 
+            // A hosted transaction embeds one publication child per retained
+            // exact width. Replacing a single child's cache during setup would
+            // leave earlier complete transactions with duplicated ownership.
+            const auto family_widths = mtpVerifierGraphFamilyWidthCount(verifier_rows_per_request_, family);
+            if (parent_role != MTPGenerationParentRole::Controller &&
+                parent_role != MTPGenerationParentRole::PipelineFollower)
+                throw std::invalid_argument("MTP generation parent role is unknown");
             if (!retains_graph_capacity_)
                 return;
+            sampler_helper_widths_ = family == MTPVerifierGraphFamily::ExactRows ? family_widths : 1u;
+            sampler_helper_graph_slots_ = checkedSizeMultiply(kSamplerHelperFamilyCount,
+                sampler_helper_widths_, "MTP row-specific sampler helper graph slots");
+            generation_parent_widths_ = family == MTPVerifierGraphFamily::ExactRows &&
+                parent_role == MTPGenerationParentRole::PipelineFollower ? family_widths : 1u;
+            generation_parent_graph_slots_ = checkedSizeMultiply(
+                query_programs_, generation_parent_widths_, "MTP complete generation parent graph slots");
+            speculative_publication_widths_ = family == MTPVerifierGraphFamily::ExactRows
+                ? family_widths : 1u;
+            speculative_publication_graph_slots_ = checkedSizeMultiply(
+                query_programs_, speculative_publication_widths_, "MTP speculative publication graph slots");
+            // Direct output commits share scalar target slot zero. Only the
+            // terminal controller owns sampling history; followers own none.
+            // This flat helper is shared across widths and query programs.
+            direct_token_history_graph_slots_ =
+                parent_role == MTPGenerationParentRole::Controller ? 1u : 0u;
+            controller_graph_slots_ = checkedSizeAdd(direct_token_history_graph_slots_,
+                checkedSizeAdd(sampler_helper_graph_slots_,
+                    checkedSizeAdd(generation_parent_graph_slots_, speculative_publication_graph_slots_,
+                        "MTP parent and publication graph slots"), "MTP sampler and controller graph slots"),
+                "MTP direct output history and controller graph slots");
 
             /* Row one has a dedicated KV-only cache. Rows [2, N] own one
              * additional cache apiece, matching MTPSidecarCaptureLayout. */
@@ -272,18 +304,63 @@ namespace llaminar2
             return verifier_preparation_graph_slots_;
         }
 
-        /** @return Accepted-state publication owners, one per immutable main-query program. */
-        [[nodiscard]] std::size_t speculativePublicationGraphSlots() const noexcept
+        /** @return Immutable widths of each shared sampler helper family, independent of query programs. */
+        [[nodiscard]] std::size_t samplerHelperWidthCount() const noexcept
         {
-            return retains_graph_capacity_ ? query_programs_ : 0u;
+            return sampler_helper_widths_;
         }
 
-        /** @return Controller owners including distinct parent and publication programs. */
+        /** @return Outcome plus target-distribution owners across every admitted helper width. */
+        [[nodiscard]] std::size_t samplerHelperGraphSlots() const noexcept
+        {
+            return sampler_helper_graph_slots_;
+        }
+
+        /** @return Complete parent widths per query program; exact followers retain every member. */
+        [[nodiscard]] std::size_t generationParentWidthCount() const noexcept
+        {
+            return generation_parent_widths_;
+        }
+
+        /** @return Independently retained complete parent graph owners across query programs. */
+        [[nodiscard]] std::size_t generationParentGraphSlots() const noexcept
+        {
+            return generation_parent_graph_slots_;
+        }
+
+        /** @return Width identities per query program; bounded parents share one envelope. */
+        [[nodiscard]] std::size_t speculativePublicationWidthCount() const noexcept
+        {
+            return speculative_publication_widths_;
+        }
+
+        /** @return Accepted-state publication owners, indexed by admitted width and query program. */
+        [[nodiscard]] std::size_t speculativePublicationGraphSlots() const noexcept
+        {
+            return speculative_publication_graph_slots_;
+        }
+
+        /**
+         * @return One retained flat direct-token history publisher for an MTP
+         *         controller, zero for followers or absent graph capacity.
+         *
+         * The graph embeds only the existing scalar target/history pointers.
+         * It owns no tensor payload, has one kernel, and is reused across
+         * request/reset, query-program and verifier-width changes. Retained
+         * capacity requires its admission even when the first request is Off.
+         */
+        [[nodiscard]] std::size_t directTokenHistoryGraphSlots() const noexcept
+        {
+            return direct_token_history_graph_slots_;
+        }
+
+        /** @return Controller owners including shared direct history, parent and publication programs. */
         [[nodiscard]] std::size_t controllerGraphSlots() const noexcept
         {
-            // Dense0 sidecars and the outcome/distribution helpers stay shared.
-            // Both each main parent and its verifier-hook publication are owned.
-            return retains_graph_capacity_ ? kControllerGraphSlots + 2u * (query_programs_ - 1u) : 0u;
+            // Each outcome/distribution width remains shared across query
+            // programs; parent and publication directories retain their own owners.
+            // Direct scalar history publication is one controller-only owner.
+            return controller_graph_slots_;
         }
 
         /**
@@ -311,7 +388,8 @@ namespace llaminar2
         /**
          * @return Small native owners charged by the same contract as capture.
          *
-         * Terminal selectors and individual draft publications stay bounded.
+         * Terminal selectors, individual draft publications and the scalar
+         * direct-token history publisher stay bounded.
          * Verifier directories are indexed by request count: only the prefix
          * with a certified node bound receives the helper charge. Larger
          * request counts remain full first-class graphs, not an alternate path.
@@ -328,10 +406,12 @@ namespace llaminar2
                     static_cast<std::size_t>(verifier_rows_per_request_),
                     "MTP bounded verifier geometries"),
                 "MTP bounded verifier slots");
-            return checkedSizeAdd(
-                checkedSizeAdd(terminal_hidden_graph_slots_,
-                    draft_publication_graph_slots_, "MTP bounded publication slots"),
-                verifier_slots, "MTP bounded helper slots");
+            return checkedSizeAdd(direct_token_history_graph_slots_,
+                checkedSizeAdd(
+                    checkedSizeAdd(terminal_hidden_graph_slots_,
+                        draft_publication_graph_slots_, "MTP bounded publication slots"),
+                    verifier_slots, "MTP bounded verifier and publication helper slots"),
+                "MTP bounded helper slots");
         }
 
         /** @return General auxiliary owners, excluding every bounded helper. */
@@ -437,5 +517,13 @@ namespace llaminar2
         std::size_t terminal_hidden_shifted_prefill_graph_slots_ = 0u;
         std::size_t draft_publication_graph_slots_ = 0u;
         std::size_t verifier_preparation_graph_slots_ = 0u;
+        std::size_t speculative_publication_widths_ = 0u; ///< Immutable width directory per query program.
+        std::size_t speculative_publication_graph_slots_ = 0u;
+        std::size_t direct_token_history_graph_slots_ = 0u; ///< Shared scalar output-history publisher, controller only.
+        std::size_t controller_graph_slots_ = 0u;
+        std::size_t sampler_helper_widths_ = 0u; ///< Retained static row geometry per shared helper family.
+        std::size_t sampler_helper_graph_slots_ = 0u;
+        std::size_t generation_parent_widths_ = 0u; ///< Complete transaction family per query program.
+        std::size_t generation_parent_graph_slots_ = 0u;
     };
 } // namespace llaminar2

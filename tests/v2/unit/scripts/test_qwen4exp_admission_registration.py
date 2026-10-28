@@ -10,7 +10,8 @@ also preserves the main matrix's exact arithmetic counter families without
 broad-domain collection or changing execution policy.
 The full ROCm TP4 policies retain both the canonical Integration lock and all
 four participant locks; naming device locks must never replace shared lifecycle
-serialization against other integration fixtures.
+serialization against other integration fixtures. Explicit fixed5/6 runtime
+qualification extends that inventory without changing the numerical MTP matrix.
 """
 from pathlib import Path
 import argparse
@@ -110,7 +111,8 @@ endif()
                         f"V2_Integration_Qwen4ExpMTPAdmission_{topology}_{storage}"
                         for topology in topologies for storage in ("RAM", "Mmap")
                     } | {"V2_Integration_Qwen4ExpMTPAdmission_ExplicitNoMTP"}
-                    tp4_policies = ("Fixed1", "Fixed2", "Fixed3", "Fixed15", "Dynamic")
+                    tp4_policies = ("Fixed1", "Fixed2", "Fixed3", "Fixed15", "Dynamic",
+                                    "Fixed5", "Fixed6")
                     tp4_prefix = "V2_Integration_Qwen4ExpFullROCmTP4MTPAdmission_"
                     if rocm:
                         names.update(tp4_prefix + policy for policy in tp4_policies)

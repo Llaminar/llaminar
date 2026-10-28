@@ -502,6 +502,7 @@ namespace llaminar2
         QWEN4EXP_PLE_SNAPSHOT_PRIOR, ///< Ordered immutable transaction prestate capture.
         QWEN4EXP_PLE_RETAIN_CANDIDATES, ///< Live retention and accepted-prefix publication.
         QWEN4EXP_BRANCH_CONCAT, ///< Token-owned Dense0 four-branch concatenation.
+        MTP_DIRECT_TOKEN_HISTORY_PUBLICATION, ///< Append-only diagnostic identity for direct history commit.
     };
 
     /**

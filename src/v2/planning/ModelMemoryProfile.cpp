@@ -10,6 +10,7 @@
  * payload, so a stale or malformed directory cannot become an admitted model.
  */
 #include "planning/ModelMemoryProfile.h"
+#include "kernels/common/SparseQueryExecutionProgram.h"
 #include "../models/qwen4exp/Qwen4ExpConfig.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "../models/qwen4exp/Qwen4ExpPublishedGeometry.h"
@@ -27,6 +28,16 @@
 
 namespace llaminar2
 {
+    std::size_t ModelMemoryProfile::sparseQueryProgramCount() const
+    {
+        if (!flash_next) return 1u;
+        const int main_layers = mainLayerCount();
+        return std::any_of(flash_next->sparse_decoder_layers.begin(),
+            flash_next->sparse_decoder_layers.end(), [&](auto layer) {
+                return layer < static_cast<std::uint32_t>(main_layers);
+            }) ? kSparseQueryExecutionProgramCount : 1u;
+    }
+
     int ModelMemoryProfile::mainLayerCount() const
     {
         if (n_layers < 0 || mtp_layer_count < 0 || (!flash_next && mtp_layer_count > n_layers))

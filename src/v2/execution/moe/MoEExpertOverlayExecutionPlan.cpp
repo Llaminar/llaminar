@@ -807,6 +807,21 @@ namespace llaminar2
         return ranks;
     }
 
+    DeviceGenerationExecutionDomain
+    MoEExpertOverlayExecutionPlan::generationExecutionDomain() const noexcept
+    {
+        DeviceGenerationDomainDeclaration declaration;
+        for (const auto &domain : domains)
+            for (const auto &participant : domain.participants)
+                declaration.observe(participant.address.device_type);
+        if (current_rank.ownsTransactionAuthority() &&
+            std::any_of(rank_plans.begin(), rank_plans.end(), [](const auto &rank) {
+                return rank.usesExpertTransactionFollower();
+            }))
+            declaration.requireHostedBoundary();
+        return declaration.domain();
+    }
+
     MoEExpertOverlayExecutionPlan buildMoEExpertOverlayExecutionPlan(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
         int requested_world_size)

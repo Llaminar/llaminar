@@ -1887,6 +1887,7 @@ namespace llaminar2
             .resident_graph_rows = static_cast<int>(kRows),
             .activation_channel_row_capacity = static_cast<int>(kRows),
             .activation_graph_family_count = kFamilies,
+            .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
             .captured_graph_plan = resolveMoEOverlayCapturedGraphPlan(
                 profile.n_layers,
                 MoEOverlayAuthorityExecutionKind::HostResident,
@@ -2639,6 +2640,7 @@ namespace llaminar2
             .max_gpu_memory_bytes = 1024u * 1024u * 1024u,
             .max_cpu_memory_bytes = 512u * 1024u * 1024u,
             .resident_graph_rows = 8,
+            .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
             .gpu_weight_load = gpu_weight_load,
             .graph_family = testGraphFamily(profile),
         };
@@ -2856,6 +2858,7 @@ namespace llaminar2
                 .rank_execution_kind =
                     OverlayRankExecutionKind::ContinuationAuthority,
                 .resident_graph_rows = 8,
+                .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
                 .graph_family = testGraphFamily(profile),
             });
@@ -3102,6 +3105,7 @@ namespace llaminar2
                     OverlayRankExecutionKind::ContinuationAuthority,
                 .require_host_memory_authority = true,
                 .resident_graph_rows = rows,
+                .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
                 .graph_family = testGraphFamily(profile),
             });

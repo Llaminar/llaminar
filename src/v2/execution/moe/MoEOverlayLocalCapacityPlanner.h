@@ -13,6 +13,7 @@
 #pragma once
 
 #include "MoEOverlayActivationChannelPlan.h"
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "MoEOverlayCapacityAdmission.h"
 #include "MoEExpertOverlayExecutionPlan.h"
 #include "MoEOverlayHostDemandMemoryPlan.h"
@@ -129,6 +130,10 @@ namespace llaminar2
         std::size_t activation_graph_family_count = 0;
         /** Exact CPU evidence owners when the frozen Dynamic authority is host-resident. */
         std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;
+        /** Complete frozen execution boundary, including parent PP and remote experts. */
+        DeviceGenerationExecutionDomain generation_domain = DeviceGenerationExecutionDomain::NativeDomain;
+        /** Authored common stage ownership; standalone partial graphs remain controllers. */
+        MTPGenerationParentRole generation_parent_role = MTPGenerationParentRole::Controller;
         /** Exact compile/resident graph topology retained per GPU. */
         MoEOverlayCapturedGraphPlan captured_graph_plan;
         /** Graph-resident diagnostic checkpoint capacity per accelerator. */

@@ -91,11 +91,15 @@ public:
      * @param logical_state Current immutable tail-owned request-zero mailbox.
      * @param request_index Only the scalar request-zero lane is admitted.
      * @return Whether every original participant committed exactly one model row.
-     * Homogeneous singleton native PP only; unsupported domains fail before admission. */
+     * Native PP uses its command collective; captured domains reuse their
+     * existing scalar metadata/activation bodies and mirrored tail publishers.
+     * Both paths retire every physical model row without a sampler or response. */
     bool advanceOrdinaryCondition(const DeviceResidentLogicalSequenceStateHandle &logical_state, int request_index);
     /** @brief Admit the tail's policy and each follower's local event handoff. */
     bool begin(const DeviceGenerationAdmissionRequest &request);
     /** @brief Compile or reuse all complete parents before submitting any work. */
+    /** Authenticate an already retained hosted family for the tail-owned ContinueResponse admission. */
+    bool prepareContinuation(DeviceGenerationSamplingMode sampling);
     bool materialize(int requests, int depth, DeviceGenerationLoopTopology topology,
         DeviceGenerationSamplingMode sampling);
     /** @brief Enqueue every parent before any terminal observation. */
@@ -179,10 +183,19 @@ private:
      * Every follower is submitted before the next ticket is observed. The host
      * neither samples tokens nor inspects mutable model/cache state. */
     bool launchHostedTransactions();
-    /** @brief One separately priced complete parent per singleton participant. */
+    /** @brief One separately priced complete parent per original physical participant. */
     struct ForwardOnlyFamily;
     /** @brief Freeze source recordings, native edges and no-sampling publication at setup. */
     bool prepareForwardOnlyFamily();
+    /**
+     * @brief Retain one sampler-free transaction per captured-domain participant/program.
+     * @return Whether every exact local model/transport identity and terminal publisher is retained.
+     * Existing resident forwards already own scalar metadata and activation
+     * transfers. Only terminal TP participants publish complete frontiers;
+     * upstream participants retain their partial-row writer/event ownership.
+     * No tensor payload, transport channel or sampler recording is created.
+     */
+    bool prepareCapturedDomainForwardOnlyFamily();
     /** @brief Authenticate all original identities before request admission or submission. */
     bool forwardOnlyFamilyCurrent() const;
     /** @brief Observe only fixed terminal control/KV metadata and retire the actual admission. */

@@ -5172,13 +5172,22 @@ __global__ void cuda_commit_mtp_greedy_penalty_history_kernel(
 __global__ void cuda_commit_generation_token_history_kernel(
     const int *__restrict__ token,
     int vocab_size,
-    int *__restrict__ generated_token_counts)
+    int *__restrict__ generated_token_counts,
+    llaminar2::MTPGreedyPenaltyPolicy *__restrict__ direct_output_policy)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
     const int value = token[0];
     if (value >= 0 && value < vocab_size)
+    {
         ++generated_token_counts[value];
+        // Only the direct MTP API supplies this original policy owner. Its
+        // nonterminal token is consumed by the committed main row before the
+        // next fresh target sampler; a grouped carried condition never enters
+        // this transition. Preserve every admitted policy magnitude unchanged.
+        if (direct_output_policy)
+            direct_output_policy->first_token_already_in_history = 0;
+    }
 }
 
 /**
@@ -5388,7 +5397,8 @@ cuda_commit_device_generation_and_derive_speculative_publication_metadata_kernel
     const int32_t *__restrict__ verifier_input_tokens,
     int verifier_input_token_stride,
     llaminar2::sampling_math::MTPCommittedVerifierIdentityRecord *
-        __restrict__ out_committed_verifier_identity)
+        __restrict__ out_committed_verifier_identity,
+    llaminar2::sampling_math::MTPDepthTransactionTrace *depth_transaction_trace)
 {
     const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (request_index >= request_count)
@@ -5466,7 +5476,8 @@ cuda_commit_device_generation_and_derive_speculative_publication_metadata_kernel
         out_all_drafts_accepted_flags
             ? out_all_drafts_accepted_flags + request_index
             : nullptr,
-        out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+        out_stopped_flags ? out_stopped_flags + request_index : nullptr,
+        depth_transaction_trace);
 
     if (committed && out_ok && out_ok[request_index] != 0 &&
         has_complete_verifier_identity_binding &&
@@ -6562,6 +6573,7 @@ extern "C"
         const int *token,
         int vocab_size,
         int *generated_token_counts,
+        llaminar2::MTPGreedyPenaltyPolicy *direct_output_policy,
         int device_idx,
         void *stream)
     {
@@ -6570,7 +6582,7 @@ extern "C"
         cudaSetDevice(device_idx);
         cuda_commit_generation_token_history_kernel<<<
             1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
-            token, vocab_size, generated_token_counts);
+            token, vocab_size, generated_token_counts, direct_output_policy);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -9014,12 +9026,13 @@ extern "C"
         int verifier_input_token_stride,
         llaminar2::sampling_math::MTPCommittedVerifierIdentityRecord *
             out_committed_verifier_identity,
+        llaminar2::sampling_math::MTPDepthTransactionTrace *depth_transaction_trace,
         int device_idx,
         void *stream)
     {
         if (!compact_tokens || output_token_stride <= 0 || !compact_meta ||
             meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
-            !base_cached_tokens || request_count <= 0 ||
+            !base_cached_tokens || request_count <= 0 || (depth_transaction_trace && request_count != 1) ||
             padded_state_rows_per_request <= 0 ||
             !response_tokens || response_token_stride <= 0 ||
             !control ||
@@ -9082,7 +9095,7 @@ extern "C"
                 out_next_verifier_condition_tokens),
             verifier_input_tokens,
             verifier_input_token_stride,
-            out_committed_verifier_identity);
+            out_committed_verifier_identity, depth_transaction_trace);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

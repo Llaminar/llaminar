@@ -1029,6 +1029,11 @@ model, warms it up, and measures prompt processing and answer generation.
 It uses the same production runtime as the server. Stop other inference jobs
 on the same devices before running it.
 
+For an ordered prompt/MTP request sweep under one admitted runtime, use
+[`--benchmark-campaign`](docs/benchmark-campaigns.md). It retains one immutable
+sampling cohort, validates every input before the first request, and preserves
+completed cell JSON files if a later request fails.
+
 ### Run a benchmark and save the result
 
 Using your Quickstart settings, this command chooses a layout automatically
@@ -1100,6 +1105,9 @@ The examples use `--temperature 0 --seed 42` for greedy sampling. Avoid adding
 For sampled generation, set `--temperature`, `--top-k`, and `--top-p` explicitly;
 the same sampling settings apply with MTP on or off.
 Leave profiling and debug options off while measuring throughput.
+
+For offline diagnosis of adaptive MTP decisions, use the bounded
+[controller trace replay workflow](tests/v2/unit/mtp/README.md).
 
 For comparisons with other engines, the JSON field
 `throughput_tokens_per_sec.decode_after_prefill` excludes the first output
@@ -1197,7 +1205,7 @@ Uptime and request sequence numbers continue across resets.
 | `prefix_cache.token_reuse_rate` | Matched tokens divided by requested tokens, weighted across requests |
 | `prefix_cache.storage.tiers.ram`, `.disk` | Enabled/initialized state, payload `used_bytes`, `capacity_bytes`, and `utilization_percent`; RAM sums participant bytes, while shared disk archives count once |
 | `prefix_cache.storage.churn` | Completed RAM-to-disk demotions, disk-to-RAM hydrations, per-tier capacity evictions, actual disk payload writes and metadata-only backing reuse; each has `operations` and `bytes` |
-| `mtp.acceptance_rate` | Accepted speculative tokens divided by accepted plus rejected tokens |
+| `mtp.acceptance_rate` | Accepted speculative draft tokens divided by all attempted draft tokens; rejected transactions do not count discarded suffix tokens |
 | `last_request` | Atomically published terminal outcome, with sequence, age in seconds, usage and per-request rates; remains the previous outcome while the next request runs |
 | `http.status_codes` | Finished responses from all routes, including errors and stats calls; an SSE generation error can follow HTTP 200 headers |
 

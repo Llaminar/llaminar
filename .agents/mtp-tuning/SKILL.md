@@ -32,6 +32,11 @@ For backend kernel work, also use the relevant sibling skill:
 
 ### Captured GPU stage timing
 
+For isolated verifier/kernel experiments, use the canonical
+[production kernel replay procedure](../llaminar-testing/references/kernel-replay.md).
+Keep draft histories, routes and initial state fixed across candidates, and
+require serial/grouped byte equivalence through retained dirty replays.
+
 For CUDA stage attribution without CUPTI, follow the CUDA skill's
 `references/native-graph-events.md`. Its optional setup-only stage observer
 joins canonical model stage names to native GPU event intervals; enable

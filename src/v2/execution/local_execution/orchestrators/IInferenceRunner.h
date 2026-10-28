@@ -29,6 +29,7 @@
 #include "../../../snapshots/SnapshotRowPartition.h"
 #include "../../InferenceReadiness.h"
 #include "../../mtp/DeviceGenerationContract.h"
+#include "../../mtp/DeviceGenerationExecutionPolicy.h"
 #include "../../moe/DeviceMoERebalanceABI.h"
 #include "../../moe/MoEOverlayAuthorityExecution.h"
 #include "../../moe/MoEOverlayDeviceControllerRuntimeBinding.h"
@@ -57,6 +58,13 @@ namespace llaminar2
     class MoERebalanceController;
     class MoEOverlayInferenceInterferenceProbe;
     class MoEOverlayInferenceTransactionCoordinator;
+
+    /** @brief Whether a direct output still needs its one durable-history publication. */
+    enum class MTPDirectTokenHistoryDisposition : uint8_t
+    {
+        NewlyEmitted, ///< Commit the original sampled/policy token exactly once.
+        AlreadyPublished, ///< A carried response token; do not increment again.
+    };
 
     /**
      * @brief Decode member required in a frozen serving-graph inventory.
@@ -526,6 +534,10 @@ namespace llaminar2
         int depth_update_count = 0; ///< Applied dynamic selector transitions.
         int depth_promotion_count = 0; ///< Applied one-step promotions.
         int depth_demotion_count = 0; ///< Applied one-step demotions.
+        int depth_utility_probe_count = 0; ///< Actual per-response reversible comparison events.
+        int depth_utility_keep_count = 0; ///< Actual per-response reversible comparison events.
+        int depth_utility_return_count = 0; ///< Actual per-response reversible comparison events.
+
 
         bool operator==(
             const DeviceGenerationTerminalRequestResult &) const = default;
@@ -548,44 +560,6 @@ namespace llaminar2
         {
             return device.is_gpu() && !requests.empty();
         }
-    };
-
-    /**
-     * @brief Control topology required by one complete MTP generation loop.
-     *
-     * Fixed-depth generation needs one device-controlled WHILE body. Dynamic
-     * generation additionally needs a device-selected branch for every legal
-     * draft depth. Keeping this distinction typed prevents callers from
-     * assuming that support for a fixed conditional body also proves support
-     * for a selector-gated WHILE graph.
-     */
-    enum class DeviceGenerationLoopTopology : uint8_t
-    {
-        FixedDepth = 0, ///< One immutable transaction body repeated to completion.
-        DynamicDepth,   ///< Device-selected transaction body repeated to completion.
-    };
-
-    /**
-     * @brief Backend execution policy for the complete MTP generation loop.
-     *
-     * `NativeConditionalGraph` is the target architecture: one asynchronous
-     * parent graph owns every transaction. HIP currently exposes neither graph
-     * conditional nodes nor device-side graph launch, so ROCm deliberately uses
-     * `HostScheduledCapturedTransactions`: each expensive transaction remains a
-     * captured GPU graph, while the host advances only the outer transaction
-     * loop from a narrow generation-tagged dispatch ticket. Compact outcomes,
-     * response ledgers, caches, samplers, and dynamic-depth state remain device
-     * authoritative. This is an explicit backend policy, not a retry after
-     * native graph construction fails.
-     *
-     * `Unsupported` is fatal. It distinguishes a known backend limitation from
-     * a missing capture owner or an unexpectedly incomplete native capability.
-     */
-    enum class DeviceGenerationExecutionPolicy : uint8_t
-    {
-        NativeConditionalGraph = 0,
-        HostScheduledCapturedTransactions,
-        Unsupported,
     };
 
     /**
@@ -2928,6 +2902,11 @@ namespace llaminar2
          * prepareMTPVerifierInputTokensOnDevice().  This prevents the compact
          * verifier from uploading a host shadow of a token that was just
          * produced on the GPU.
+         *
+         * The captured publication consumes the request's configured branch
+         * penalty policy exactly once before argmax. Callers provide a fresh
+         * sidecar row and must not pre-apply that policy; retained parent replay
+         * executes the same publication implementation as the first transaction.
          */
         virtual bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(
             int draft_sample_slot,
@@ -4120,6 +4099,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish a direct MTP output through its retained history helper.
+         * @param target_sample_slot Exact original resident scalar target slot (zero).
+         * @param disposition New output or explicitly already-published carry.
+         * @return Whether the exact native helper was submitted and history published.
+         *
+         * This operation consumes the authenticated sample event and existing
+         * arena pointers. It does not sample, forward, upload a host token or
+         * change logical/KV state. CPU output history remains owned by its host
+         * sampler and does not call this device-only boundary. Grouped outcome
+         * and ordinary forced publication already commit their own history.
+         */
+        virtual bool publishMTPDirectTokenHistory(int target_sample_slot,
+            MTPDirectTokenHistoryDisposition disposition)
+        {
+            (void)target_sample_slot;
+            (void)disposition;
+            return false;
+        }
+
+        /**
          * @brief Publish one host-selected policy token as the resident condition.
          *
          * The scalar crosses the request-policy boundary through a backend
@@ -4848,6 +4847,24 @@ namespace llaminar2
             (void)request_count;
             (void)draft_depth;
             (void)topology;
+            (void)sampling_mode;
+            return false;
+        }
+
+        /**
+         * @brief Admit an already retained hosted MTP family for ContinueResponse.
+         *
+         * The caller has prepared target sample slot zero from the current resident
+         * condition or current main logits. This method refreshes stable Full inputs,
+         * authenticates every retained child, and authorizes the native admission
+         * ticket zero. It must not execute an external first transaction, materialize
+         * a missing graph, close a phantom epoch, or inspect mutable controller state.
+         * Subsequent launch uses the ordinary symmetric ticket scheduler.
+         * @param sampling_mode Exact retained compact-outcome sampling topology.
+         * @return True only for a matching ContinueResponse admission and retained family.
+         */
+        virtual bool prepareDeviceResidentGenerationContinuation(DeviceGenerationSamplingMode sampling_mode)
+        {
             (void)sampling_mode;
             return false;
         }

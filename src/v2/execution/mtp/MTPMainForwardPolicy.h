@@ -19,7 +19,7 @@ class MTPVerifierForwardPolicy final
 {
 public:
     /**
-     * @brief Authenticate one outcome and physical bucket against retained capacity.
+     * @brief Authenticate one outcome and physical member against retained capacity.
      * @param outcome Immutable terminal reduction topology.
      * @param physical_rows Exact graph width selected by the request width policy.
      * @param retained Widest admitted setup geometry.
@@ -31,7 +31,7 @@ public:
     {
         if (!retained.enabled || !retained.valid() || physical_rows < 2 || physical_rows > retained.verifier_rows ||
             (outcome != MTPVerifierOutcomeGraphMode::Greedy && outcome != MTPVerifierOutcomeGraphMode::Disabled) ||
-            mtpVerifierPhysicalRowBucket(physical_rows, retained.verifier_rows) != physical_rows)
+            !mtpVerifierGraphFamilyContains(physical_rows, retained.verifier_rows, retained.family))
             throw std::invalid_argument("MTP main-forward policy is not a retained verifier graph member");
     }
     /** @return Immutable terminal reduction topology; followers retain Disabled. */

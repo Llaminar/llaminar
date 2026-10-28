@@ -9,6 +9,7 @@
  */
 
 #include "MoERoutingStage.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "MoEDeviceRebalanceStage.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
@@ -153,7 +154,7 @@ namespace llaminar2
         kernel->clearGPUStreamBinding();
     }
 
-    IMoEKernel *MoERoutingStage::ensureMoEKernel() const
+    IMoEKernel *MoERoutingStage::acquireMoEKernelObject() const
     {
         if (!moe_kernel_)
         {
@@ -172,6 +173,14 @@ namespace llaminar2
                 moe_kernel_ = owned_moe_kernel_.get();
             }
         }
+
+        return moe_kernel_;
+    }
+
+    IMoEKernel *MoERoutingStage::ensureMoEKernel() const
+    {
+        if (!acquireMoEKernelObject())
+            return nullptr;
 
         if (params_.device_id.is_gpu() &&
             params_.routed_pipeline_kernel_owner)
@@ -669,6 +678,20 @@ namespace llaminar2
                 << " expected=" << publication_stream);
             return false;
         }
+        // Accepted-state publication owns its table stream independently of
+        // the verifier's compute stream. Cold retained widths may never execute
+        // before this child is recorded. Acquire only object ownership here;
+        // native enqueue below receives its exact stream explicitly.
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[MoERoutingStage] Histogram kernel preparation must precede native capture");
+            return false;
+        }
+        if (!acquireMoEKernelObject())
+        {
+            LOG_ERROR("[MoERoutingStage] Histogram publication could not prepare its graph-owned kernel");
+            return false;
+        }
         try
         {
             params_.moe_runtime_table->prepareDecodeHistogramProducerStream(
@@ -740,7 +763,10 @@ namespace llaminar2
                 << " layer=" << params_.layer_idx);
             return false;
         }
-        if (!producer_stream ||
+        // The accepted-state graph borrows the table-owned publication stream,
+        // even when no asynchronous histogram drain is currently installed.
+        void *const publication_stream = groupedVerifierHistogramPublicationStream();
+        if (!producer_stream || !publication_stream || producer_stream != publication_stream ||
             !accepted_state_counts_device ||
             !publication_ok_flags_device ||
             request_count <= 0 ||
@@ -764,6 +790,19 @@ namespace llaminar2
                 << " layer=" << params_.layer_idx);
             return false;
         }
+        // Preparation established this immutable object before capture. Do not
+        // bind the verifier's compute stream or construct a kernel here: the
+        // accepted-state transaction supplies its table-owned launch stream.
+        IMoEKernel *const kernel = moe_kernel_;
+        if (!kernel)
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Committed overlay-verifier publication "
+                "requires its graph-owned kernel prepared before capture"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+
         try
         {
             params_.moe_runtime_table->recordDecodeHistogramProducerStream(
@@ -776,16 +815,6 @@ namespace llaminar2
                 "not prepared before enqueue"
                 << " layer=" << params_.layer_idx
                 << " reason=" << error.what());
-            return false;
-        }
-
-        IMoEKernel *kernel = ensureMoEKernel();
-        if (!kernel)
-        {
-            LOG_ERROR(
-                "[MoERoutingStage] Committed overlay-verifier publication "
-                "could not resolve its graph-owned kernel"
-                << " layer=" << params_.layer_idx);
             return false;
         }
 

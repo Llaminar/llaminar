@@ -15,6 +15,35 @@
 namespace llaminar2
 {
     /**
+     * @brief Resolve physical width ownership from the declared execution role.
+     * @param role Immutable standalone or complete-parent execution ownership.
+     * @param depth_mode Admitted request controller mode.
+     * @return Exact hosted rows, native dynamic envelope, or standalone buckets.
+     * @throws std::invalid_argument for an unknown role or depth mode.
+     */
+    [[nodiscard]] inline MTPVerifierPhysicalWidthPolicy
+    resolveMTPVerifierPhysicalWidthPolicy(
+        MTPVerifierExecutionRole role, MTPDepthPolicyMode depth_mode)
+    {
+        if (depth_mode != MTPDepthPolicyMode::Fixed &&
+            depth_mode != MTPDepthPolicyMode::Observe &&
+            depth_mode != MTPDepthPolicyMode::Dynamic)
+            throw std::invalid_argument("MTP verifier depth mode is unknown");
+        switch (role)
+        {
+        case MTPVerifierExecutionRole::HostedCapturedTransactions:
+            return MTPVerifierPhysicalWidthPolicy::ExactLogicalRows;
+        case MTPVerifierExecutionRole::NativeConditionalParent:
+            return depth_mode == MTPDepthPolicyMode::Dynamic
+                ? MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope
+                : MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
+        case MTPVerifierExecutionRole::Standalone:
+            return MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
+        }
+        throw std::invalid_argument("MTP verifier execution role is unknown");
+    }
+
+    /**
      * @brief Immutable row geometry for setup-owned MTP forward capture.
      *
      * The same value controls both graph construction and diagnostic-arena
@@ -27,12 +56,14 @@ namespace llaminar2
         bool enabled = false; ///< Whether this runner retains an MTP family.
         int draft_depth = 0; ///< Maximum draft rows represented by capture.
         int verifier_rows = 0; ///< Physical grouped-verifier row capacity.
+        MTPVerifierGraphFamily family = MTPVerifierGraphFamily::BoundedBuckets; ///< Admitted identity set.
 
         /** @return Whether the enabled/disabled geometry is complete. */
         [[nodiscard]] bool valid() const noexcept
         {
             return !enabled ||
-                   (draft_depth > 0 && verifier_rows > draft_depth);
+                   (draft_depth > 0 && verifier_rows > draft_depth &&
+                    mtpVerifierGraphFamilyContains(verifier_rows, verifier_rows, family));
         }
     };
 
@@ -40,13 +71,17 @@ namespace llaminar2
      * @brief Resolve setup geometry from the admitted retained MTP envelope.
      * @param mtp Frozen capacity and initial request policy.
      * @param maximum_verifier_rows Arena-owned physical row capacity.
+     * @param family Immutable graph identities selected from execution ownership.
      * @return Complete disabled or enabled capture geometry.
+     * @throws std::invalid_argument For an unknown retained family.
      */
     [[nodiscard]] inline MTPServingForwardCaptureGeometry
     resolveMTPServingForwardCaptureGeometry(
         const MTPRuntimeConfig &mtp,
-        int maximum_verifier_rows)
+        int maximum_verifier_rows,
+        MTPVerifierGraphFamily family = MTPVerifierGraphFamily::BoundedBuckets)
     {
+        (void)mtpVerifierGraphFamilyWidthCount(maximum_verifier_rows, family);
         if (!mtp.enabled)
             return {};
 
@@ -61,9 +96,11 @@ namespace llaminar2
         const int draft_depth = resolveMTPRetainedDraftCapacity(mtp);
         const int logical_verifier_rows = draft_depth + 1;
         const auto physical_policy =
-            dynamic_depth
-                ? MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope
-                : MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
+            family == MTPVerifierGraphFamily::ExactRows
+                ? MTPVerifierPhysicalWidthPolicy::ExactLogicalRows
+                : dynamic_depth
+                    ? MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope
+                    : MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
         const int verifier_rows =
             depth_policy.valid() && draft_depth > 0
                 ? mtpVerifierPhysicalPaddedSeqLen(
@@ -76,6 +113,7 @@ namespace llaminar2
             .enabled = true,
             .draft_depth = draft_depth,
             .verifier_rows = verifier_rows,
+            .family = family,
         };
     }
 
@@ -83,25 +121,35 @@ namespace llaminar2
      * @brief Enumerate the complete admitted scalar verifier family largest first.
      * @param mtp Immutable graph capacity and initial serving policy.
      * @param maximum_verifier_rows Exact arena-owned per-request row capacity.
-     * @return Every bounded physical width; empty when execution is disabled.
+     * @param family_kind Immutable graph identities selected before physical admission.
+     * @return Every admitted physical width; empty when execution is disabled.
      * @throws std::invalid_argument when arena and retained capacity disagree.
      *
      * The first graph fixes shared snapshot addresses at their largest extent.
-     * Smaller fixed/observe requests then use already retained bucket identities;
-     * dynamic requests retain the widest device-controlled envelope. No live
-     * request grows storage or records an additional graph.
+     * The canonical family count and member enumeration also price physical
+     * admission. Exact hosted transactions retain every row width; unchanged
+     * native/standalone roles retain bounded identities. No live request grows
+     * storage, records another graph, or changes the admitted family.
      */
     [[nodiscard]] inline std::vector<MTPServingForwardCaptureGeometry>
-    resolveMTPServingForwardCaptureFamily(const MTPRuntimeConfig &mtp, int maximum_verifier_rows)
+    resolveMTPServingForwardCaptureFamily(
+        const MTPRuntimeConfig &mtp, int maximum_verifier_rows,
+        MTPVerifierGraphFamily family_kind = MTPVerifierGraphFamily::BoundedBuckets)
     {
-        const auto widest = resolveMTPServingForwardCaptureGeometry(mtp, maximum_verifier_rows);
+        const auto widest = resolveMTPServingForwardCaptureGeometry(mtp, maximum_verifier_rows, family_kind);
         if (!widest.enabled) return {};
         if (!widest.valid() || widest.draft_depth != maximum_verifier_rows - 1 ||
             widest.verifier_rows != maximum_verifier_rows)
             throw std::invalid_argument("MTP serving verifier family differs from admitted arena capacity");
-        std::vector<MTPServingForwardCaptureGeometry> family{widest};
-        for (unsigned width = std::bit_floor(static_cast<unsigned>(widest.verifier_rows - 1)); width >= 2; width /= 2)
-            family.push_back({.enabled = true, .draft_depth = int(width) - 1, .verifier_rows = int(width)});
+        std::vector<MTPServingForwardCaptureGeometry> family;
+        const auto count = mtpVerifierGraphFamilyWidthCount(maximum_verifier_rows, family_kind);
+        family.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            const int width = mtpVerifierGraphFamilyWidthAt(index, maximum_verifier_rows, family_kind);
+            family.push_back({.enabled = true, .draft_depth = width - 1,
+                              .verifier_rows = width, .family = family_kind});
+        }
         return family;
     }
 

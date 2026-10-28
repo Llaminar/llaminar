@@ -1542,6 +1542,17 @@ namespace llaminar2
             .setter = setters::assignBoolTrue(&OrchestrationConfig::benchmark_mode),
         });
         spec.add({
+            .long_name = "--benchmark-campaign",
+            .category = "Benchmark Configuration",
+            .value_label = "<json-path>",
+            .description = "Run validated off/fixed/observe/dynamic MTP cells under one admitted runtime and immutable sampling cohort",
+            .setter = [](OrchestrationConfig &config, const std::string &value)
+            {
+                config.benchmark_campaign_path = value;
+                config.benchmark_campaign_was_provided = true;
+            },
+        });
+        spec.add({
             .long_name = "--benchmark-json-output",
             .category = "Benchmark Configuration",
             .value_label = "<path>",

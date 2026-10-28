@@ -1016,12 +1016,14 @@ TEST_F(MoERoutingPrefillGraphCapture,
  * @brief Lock down the heterogeneous overlay verifier publication protocol.
  *
  * The continuation GPU router must retain selected expert IDs in its own
- * per-layer ledger while routing, then expose that exact ledger to the later
- * accepted-state transaction.  The unit uses pointer sentinels only: no device
- * allocation or GPU work is permitted in this protocol-level suite.
+ * per-layer ledger while routing. A CPU-backed runtime table has no GPU
+ * publication-stream authority, so it must not authorize a later accepted-state
+ * enqueue merely because a non-null pointer is supplied. Native CUDA/ROCm
+ * publisher tests separately prove the successful table-owned stream path.
+ * This unit uses pointer sentinels only, with no GPU allocation or work.
  */
 TEST_F(MoERoutingPrefillGraphCapture,
-       OverlayTicketVerifierRetainsThenCommitsOneTypedLedger)
+       OverlayTicketVerifierRetainsLedgerButRejectsMissingPublicationAuthority)
 {
 #if defined(HAVE_ROCM)
     const DeviceId device = DeviceId::rocm(0);
@@ -1080,19 +1082,18 @@ TEST_F(MoERoutingPrefillGraphCapture,
 
     int32_t accepted_rows = SEQ_LEN - 1;
     int32_t publication_ok = 1;
-    ASSERT_TRUE(stage.enqueueCommittedGroupedVerifierHistograms(
+    EXPECT_FALSE(stage.enqueueCommittedGroupedVerifierHistograms(
         &accepted_rows,
         &publication_ok,
         /*request_count=*/1,
         /*rows_per_request=*/SEQ_LEN,
         publication_stream));
-    EXPECT_EQ(stub_kernel_.verifier_histogram_commit_calls, 1);
-    EXPECT_EQ(
-        stub_kernel_.last_committed_route_ledger,
-        runtime_table.deviceLayerState(0));
-    EXPECT_EQ(
-        stub_kernel_.last_histogram_commit_stream,
-        publication_stream);
+    EXPECT_EQ(stub_kernel_.verifier_histogram_commit_calls, 0);
+    EXPECT_EQ(stub_kernel_.last_committed_route_ledger, nullptr);
+    EXPECT_EQ(stub_kernel_.last_histogram_commit_stream, nullptr);
+    EXPECT_TRUE(stage.hasGPUStream());
+    EXPECT_EQ(stage.gpuStream(), route_stream)
+        << "Rejected publication must not replace the verifier compute stream";
 #else
     GTEST_SKIP() << "ROCm graph-capture path is not compiled in this build";
 #endif

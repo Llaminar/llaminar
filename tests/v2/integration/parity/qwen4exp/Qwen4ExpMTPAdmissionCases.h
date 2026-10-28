@@ -62,6 +62,8 @@ struct Qwen4ExpMTPAdmissionCase
         case ModelParityMTP::Depth1: return 1;
         case ModelParityMTP::Depth2: return 2;
         case ModelParityMTP::Depth3: return 3;
+        case ModelParityMTP::Depth5: return 5;
+        case ModelParityMTP::Depth6: return 6;
         case ModelParityMTP::Depth15:
         case ModelParityMTP::DynamicDepth: return kModelParityRequiredMaximumMTPDepth;
         default: throw std::invalid_argument("Unknown active QFN admission policy");
@@ -169,7 +171,7 @@ inline const std::vector<Qwen4ExpMTPAdmissionCase> &qwen4ExpMTPAdmissionCases()
     return cases;
 }
 /**
- * @return Original A1 topology/source with fixed1/2/3/15 and dynamic R1 admission.
+ * @return Original A1 topology/source with fixed1/2/3/15 and dynamic plus named fixed5/6 R1 runtime admission.
  * @note These runtime declarations do not enter mathematical parity discovery:
  *       the main reference has no sidecar gold. Model admission is still PMA-owned.
  */
@@ -183,7 +185,8 @@ inline const std::vector<Qwen4ExpMTPAdmissionCase> &qwen4ExpFullROCmTP4MTPAdmiss
         auto runtime_main = qwen4ExpFullROCmTP4ProductionCases().front();
         runtime_main.generation_workload = runtime_main.generation_workload.withReadiness(300);
         for (const auto policy : {ModelParityMTP::Depth1, ModelParityMTP::Depth2, ModelParityMTP::Depth3,
-                                  ModelParityMTP::Depth15, ModelParityMTP::DynamicDepth})
+                                  ModelParityMTP::Depth15, ModelParityMTP::DynamicDepth,
+                                  ModelParityMTP::Depth5, ModelParityMTP::Depth6})
             result.push_back({.main = runtime_main,
                               .policy = policy,
                               .retained_depth = kModelParityRequiredMaximumMTPDepth,

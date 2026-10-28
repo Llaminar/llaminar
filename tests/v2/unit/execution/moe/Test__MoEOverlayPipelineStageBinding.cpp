@@ -144,6 +144,20 @@ namespace llaminar2::test
             }
         };
 
+        /**
+         * @brief Author the complete parent boundary before sealing either fixture.
+         * @param first Initial stage's immutable participants and scope.
+         * @param last Terminal stage's immutable participants and scope.
+         */
+        void declarePipelineGenerationDomain(StageFixture &first, StageFixture &last)
+        {
+            DeviceGenerationDomainDeclaration declaration;
+            for (const auto &member : first.devices) declaration.observe(member.device_type);
+            for (const auto &member : last.devices) declaration.observe(member.device_type);
+            first.scope.generation_domain = declaration.domain();
+            last.scope.generation_domain = declaration.domain();
+        }
+
         /** @return Dense two-stage policy used to detect accidental inheritance. */
         Config densePipeline()
         {
@@ -331,6 +345,7 @@ namespace llaminar2::test
     {
         StageFixture first(0, false, 0, DeviceType::CUDA, 1, MoERebalanceRuntimeMode::Dynamic);
         StageFixture last(2, true, 1, DeviceType::CPU, 1, MoERebalanceRuntimeMode::Dynamic);
+        declarePipelineGenerationDomain(first, last);
         auto config = densePipeline();
         config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
         config.pp_stages = {first.stage(), last.stage()};
@@ -363,6 +378,7 @@ namespace llaminar2::test
     {
         StageFixture first(0, false, 0, DeviceType::CUDA, 2, MoERebalanceRuntimeMode::Dynamic);
         StageFixture last(2, true, 1, DeviceType::CPU, 1, MoERebalanceRuntimeMode::Dynamic);
+        declarePipelineGenerationDomain(first, last);
         auto config = densePipeline();
         config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
         config.pp_stages = {first.stage(), last.stage()};
@@ -504,6 +520,7 @@ namespace llaminar2::test
             const auto weights = explicit_weights ? std::vector<float>(width, 1.0f / width) : std::vector<float>{};
             StageFixture early(0, false, 0, types[0], width, mode, 0, weights);
             StageFixture terminal(2, true, 0, types[1], width, mode, width, weights);
+            declarePipelineGenerationDomain(early, terminal);
             RankExecutionPlan plan;
             plan.runtime.moe_rebalance.mode = mode;
             plan.local_pp_devices = {early.devices.front(), terminal.devices.front()};
@@ -545,6 +562,7 @@ namespace llaminar2::test
         {
             StageFixture early(0, false, 0, type, 1, MoERebalanceRuntimeMode::Off);
             StageFixture terminal(2, true, 0, type, 1, MoERebalanceRuntimeMode::Off, 1);
+            declarePipelineGenerationDomain(early, terminal);
             RankExecutionPlan plan;
             plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
             plan.local_pp_devices = {early.devices.front(), terminal.devices.front()};
@@ -626,6 +644,7 @@ namespace llaminar2::test
         {
             StageFixture early(0, false, 0, DeviceType::ROCm, width, mode);
             StageFixture terminal(2, true, 1, DeviceType::CUDA, width, mode);
+            declarePipelineGenerationDomain(early, terminal);
             auto parent = densePipeline();
             parent.moe_rebalance.mode = mode;
             parent.pp_stages = {early.stage(), terminal.stage()};
@@ -644,6 +663,65 @@ namespace llaminar2::test
             first.moe_routed_expert_plan->first_model_layer = 99;
             EXPECT_EQ(early.owners.authority->snapshot()->placement_plan->first_model_layer, 0);
             EXPECT_EQ(parent.forPipelineStage(0).moe_routed_expert_plan->first_model_layer, 0);
+        }
+    }
+
+    /** @test Changing only the complete generation boundary cannot borrow an existing stage authority. */
+    TEST(Test__MoEOverlayPipelineStageBinding, GenerationDomainIsAuthenticatedWithExactScope)
+    {
+        for (auto type : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        for (auto admitted_domain : {DeviceGenerationExecutionDomain::NativeDomain,
+                                     DeviceGenerationExecutionDomain::HostedBoundary})
+        {
+            StageFixture fixture(2, true, 1, type, 1, MoERebalanceRuntimeMode::Dynamic);
+            fixture.scope.generation_domain = admitted_domain;
+            const auto binding = fixture.seal();
+            EXPECT_NO_THROW(binding->requireDestination(fixture.scope, fixture.devices, {}, fixture.backend,
+                MoERebalanceRuntimeMode::Dynamic));
+            auto changed = fixture.scope;
+            changed.generation_domain = admitted_domain == DeviceGenerationExecutionDomain::NativeDomain
+                ? DeviceGenerationExecutionDomain::HostedBoundary : DeviceGenerationExecutionDomain::NativeDomain;
+            EXPECT_THROW(binding->requireDestination(changed, fixture.devices, {}, fixture.backend,
+                MoERebalanceRuntimeMode::Dynamic), std::invalid_argument);
+            changed.generation_domain = static_cast<DeviceGenerationExecutionDomain>(255);
+            EXPECT_THROW(binding->requireDestination(changed, fixture.devices, {}, fixture.backend,
+                MoERebalanceRuntimeMode::Dynamic), std::invalid_argument);
+        }
+    }
+
+    /** @test Ownership revalidation consumes the same complete scope used before child construction. */
+    TEST(Test__MoEOverlayPipelineStageBinding, RankReauthenticationPreservesGenerationDomain)
+    {
+        for (auto types : {std::array{DeviceType::CUDA, DeviceType::CUDA},
+                           std::array{DeviceType::ROCm, DeviceType::ROCm},
+                           std::array{DeviceType::CUDA, DeviceType::ROCm},
+                           std::array{DeviceType::CUDA, DeviceType::CPU}})
+        {
+            StageFixture first(0, false, 0, types[0], 1, MoERebalanceRuntimeMode::Dynamic);
+            StageFixture last(2, true, 1, types[1], 1, MoERebalanceRuntimeMode::Dynamic,
+                types[0] == types[1] ? 1 : 0);
+            declarePipelineGenerationDomain(first, last);
+            auto config = densePipeline();
+            config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+            config.pp_stages = {first.stage(), last.stage()};
+            ASSERT_TRUE(config.validate());
+            const auto projected = config.forPipelineStage(0);
+            ASSERT_TRUE(projected.nested_pp_stage_config);
+            EXPECT_EQ(projected.nested_pp_stage_config->generation_domain, first.scope.generation_domain);
+            std::vector<std::unique_ptr<IInferenceRunner>> children;
+            for (const auto &device : {first.devices.front().toLocalDeviceId(), last.devices.front().toLocalDeviceId()})
+                children.push_back(std::make_unique<AuthorityWitness>(device, device.is_gpu()
+                    ? MoEOverlayAuthorityExecutionKind::DeviceResident : MoEOverlayAuthorityExecutionKind::HostResident));
+            auto rank = RankOrchestrator::createForTestWithPipelineStages(MockModelContext::createMinimal(),
+                std::move(children), config);
+            EXPECT_NO_THROW(rank->requireMoEPipelineRuntimeOwnership(IInferenceRunner::MoEPipelineOwnershipValidation::OwnersBound));
+            // Preserve every endpoint/owner and change only the sealed boundary.
+            first.scope.generation_domain = first.scope.generation_domain == DeviceGenerationExecutionDomain::NativeDomain
+                ? DeviceGenerationExecutionDomain::HostedBoundary : DeviceGenerationExecutionDomain::NativeDomain;
+            auto foreign = config;
+            foreign.pp_stages.front().moe_runtime = first.seal();
+            EXPECT_FALSE(foreign.validate());
+            EXPECT_THROW((void)foreign.forPipelineStage(0), std::invalid_argument);
         }
     }
 
@@ -674,6 +752,7 @@ namespace llaminar2::test
     {
         StageFixture early(0, false, 0, DeviceType::ROCm, 2, MoERebalanceRuntimeMode::Dynamic);
         StageFixture terminal(2, true, 1, DeviceType::CUDA, 2, MoERebalanceRuntimeMode::Dynamic);
+        declarePipelineGenerationDomain(early, terminal);
         auto parent = densePipeline();
         parent.pp_stages = {early.stage(), terminal.stage(false)};
         EXPECT_FALSE(parent.validate());

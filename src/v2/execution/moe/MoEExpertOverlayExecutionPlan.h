@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 
 #include "MoEExpertOverlayRuntimePlan.h"
 
@@ -131,6 +132,15 @@ namespace llaminar2
         {
             return current_rank.ownsContinuationGraph();
         }
+        /**
+         * @brief Project complete immutable generation ownership before graph admission.
+         * @return Hosted for mixed backends or a continuation authority with
+         *         expert-only transaction followers; native-domain otherwise.
+         *
+         * Dense NodeTP peers retain their coordinated dense lifecycle. This
+         * projection does not create a remote coordinator or inspect live state.
+         */
+        [[nodiscard]] DeviceGenerationExecutionDomain generationExecutionDomain() const noexcept;
         std::string diagnostics() const;
     };
 
