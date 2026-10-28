@@ -6,35 +6,42 @@ analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
-**Active goal:** beat fresh Castagna **MTP** throughput on ROCm TP4, then complete
-the full OpenCode coding session. [Contract and live MTP table](QFN_MTP_TP4_TUNING.md).
+**Checkpoint:** fresh finite-trajectory MTP comparison and full OpenCode
+session complete on accepted ROCm TP4. [Contract and live MTP table](QFN_MTP_TP4_TUNING.md).
 The A1 rates below are historical **MTP-off** results.
 
-**QFN ROCm TP4: accepted dynamic controller installed.**
-512/256 repetition: dynamic 101.05 D vs fresh Off 43.40; exact tokens.
-+2.94% vs dated Castagna 98.16. Speed 6/10 remains diagnostic.
-R13 Unit/preflight: 2,978 pass, 29 skips. Post-audit Unit: 786/786.
-Release replay/resources and nine HTTP arms pass; serving starts at depth 5.
-Ten app phases pass: 128 tool calls, two errors, 65 tests and acceptance.
-Audit repairs pass. Driver gate remains RED; full certification is open.
-[Diagnosis](QFN_MTP_DIRECT_OUTPUT_HISTORY_20261028.md);
+**QFN ROCm TP4: accepted Dynamic; fresh finite-trajectory timing complete.**
+512/256 repetition: Dynamic **101.367 D**, Off **43.512**, fresh Castagna fixed6
+**100.098**: **+1.267%** Dynamic/fork. All nine measured streams match using the
+same 255-token decode denominator. Native ignores stop termination; the fork
+permits EOS. This qualifies the observed finite trajectory, not identical EOS
+semantics or general performance superiority. Speed 6/10 remains diagnostic.
+
+Current-source gates: **2,981 pass / 29 hardware skips / zero failures**,
+including 786 Unit; Release green. Subsequent local validation accounts for one
+unrelated exporter link; the original gate receipt is unchanged and canonical
+reuse remains rejected. Fresh Off/Serving-Dynamic HTTP pass with exact serial
+IDs, prefix restoration, ticket/branch proof and clean retirement. This is local
+qualification; the host note retains the complete evidence and limitations.
+
+Full OpenCode **passes**: ten phases, 110 tools, zero errors, 85 requests,
+one client context compaction, 1,950.81 seconds; independent acceptance and
+45 application tests. Native audit joins 85 responses/110 calls unchanged.
+Runtime/resources/archive/driver and normal unforced retirement pass. Prefix
+token reuse is **95.1%**; all owned disk-cache payloads are reclaimed after a
+metadata-only audit. Earlier failed receipts remain unchanged.
+[Host diagnosis and receipts](QFN_HOST_REGISTRATION_INVALIDATION_20261028.md);
 [controller plan](QFN_MTP_TARGET_CONFIRMATION_20261028.md).
 
-Retained QFN query-omission evidence:185 exact logit rows, TP4/PP4 short MTP
-lifecycles and matching ordinary/MTP tokens. Serial timing819.673 P/43.453 D
-vs820.881/43.268 control overlaps in decode; all nine256-token streams match.
-[Evidence](QFN_SHORT_CONTEXT_QUERY_OMISSION.md); [prior grid slice][column-grid].
-
-Earlier component gains are retained in [norm/preparation evidence][qsa] and
-[rescale evidence][online-rescale]; matched model timing was neutral.
+Other component work retains 185 exact logit rows and neutral model timing:
+[query omission](QFN_SHORT_CONTEXT_QUERY_OMISSION.md), [QSA][qsa], [GDN][gdn]
+and [online rescale][online-rescale]. Component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Elide online rescale exponentials | Native/accuracy green; ≈0.75% prefill and ≈0.6% short-decode component savings. Model 820.812 P / 42.211 D vs 820.343 / 42.416: no overall gain. [Evidence][online-rescale]. |
-| Fuse GDN output normalization with SingleQ8 preparation | Focused gates, model panel, profiles and matched run green; 185 exact rows. Component 6.9% faster; cumulative model timing neutral. |
-| Omit unnecessary indexer launches | Accuracy, Unit, TP4/PP4 lifecycles and matched timing green; two retained programs omit provably unused query work. [Evidence](QFN_SHORT_CONTEXT_QUERY_OMISSION.md). |
-| Complete CUDA QSA component timings | First M1/512 cell saves 22.685%; remaining shapes pending. No CUDA model-speed claim. |
-| Broader topology tuning | Tune admitted A rows first, then admit and qualify B–D. Obtain applicable reference baselines before tuning. |
+| Host-fix checkpoint | Full app and independent/driver/retirement review complete locally. |
+| CUDA QSA timing | First M1/512 component saves 22.685%; remaining shapes pending, no model claim. |
+| Broader topologies | Tune admitted A rows, then qualify B–D with matched references. |
 
 QSA temporal/page certificates did not repay their costs through **64K/128K**;
 no pruning policy is installed. [Study][certificates]. CUDA hardware profiling
@@ -51,7 +58,7 @@ speed or an image. G60 is the last complete topology gate; later A1 gates are sc
 
 | ID | Topology and ngrams | Accuracy | Llaminar P | Reference P | Strata P | Llaminar D | Reference D | Strata D | Next / limitation |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 serial panel + MTP HTTP | 821.373 | 466.222 C | — | 43.360 | 42.668 C | — | Current dynamic101.05 D; fresh Off43.40; dated C98.16. |
+| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 serial panel + MTP HTTP | 821.373 | 466.222 C | — | 43.360 | 42.668 C | — | Fresh Dynamic101.367 D / C100.098; EOS caveat above. |
 | A2 | ROCm1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a2] | 156.707 | 159.177 C | 45.270≈ | 15.164 | 11.600 C | 24.024≈ | Prefill trails Castagna; decode trails Strata. |
 | A3 | CUDA1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a3] | 180.920 | 129.020 U⚠ | 74.301≈ | 18.231 | 13.059 U⚠ | 31.253≈ | Resolve upstream variance; decode trails Strata. |
 | A4 | CPU1, 28 physical workers; SSD mmap ngrams | [🟢 G60][a4] | 98.466 | 48.408 C | n/a | 5.797 | 4.611 C | n/a | Both recorded phases lead Castagna. |

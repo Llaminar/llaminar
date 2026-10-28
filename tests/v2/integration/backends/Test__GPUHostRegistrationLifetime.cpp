@@ -8,6 +8,8 @@
  * Small odd tails and cache-exceeding regions cover page and bulk lifetimes;
  * no model, weight format, pageable-copy substitution or serial compute oracle
  * is involved. CPU waits occur only at the test's terminal result boundary.
+ * Full-span VMA assertions include interior PMDs, so khugepaged eligibility is
+ * tested deterministically before captured DMA rather than through printk.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -167,7 +169,7 @@ TEST(GPUHostRegistrationLifetime, ExternalChannelCapturedReplayAcrossAllDevices)
     proveRegistrationLifetime(SourceOwner::ExternalChannel);
 }
 
-TEST(GPUHostRegistrationLifetime, NeighbourReclaimPreservesCapturedRegisteredPayload)
+TEST(GPUHostRegistrationLifetime, FullSpanPolicyAndNeighbourReclaimPreserveCapturedPayload)
 {
     const auto first = deviceAt(0);
     auto *backend = getBackendFor(first);
@@ -183,8 +185,9 @@ TEST(GPUHostRegistrationLifetime, NeighbourReclaimPreservesCapturedRegisteredPay
             const auto lanes = transfers.allocatePersistentTransferExecutionLanes(
                 1u, device, "host_registration_neighbour_reclaim");
             worker.submitAndWait([&] {
-                // The unrelated tail shares an initial huge-page VMA. Reclaim
-                // is legal there even while this live prefix is GPU-registered.
+                // Interior PMDs and the unrelated tail initially share one
+                // huge-page-eligible VMA. The registered prefix must exclude
+                // all its pages while leaving tail reclamation legal.
                 auto host = std::make_shared<test::HostPageMapping>();
                 const auto page = test::HostPageMapping::pageBytes();
                 const auto bytes = test::HostPageMapping::live_bytes;
@@ -203,10 +206,13 @@ TEST(GPUHostRegistrationLifetime, NeighbourReclaimPreservesCapturedRegisteredPay
                 EXPECT_TRUE(test::HostPageMapping::hasFlag(host->data(), "nh"));
                 EXPECT_TRUE(test::HostPageMapping::hasFlag(host->data() + bytes - 1u, "nh"));
                 EXPECT_TRUE(test::HostPageMapping::hasFlag(
+                    host->data() + 2u * test::HostPageMapping::huge_bytes, "nh"));
+                EXPECT_FALSE(test::HostPageMapping::hasFlag(
                     host->data() + 2u * test::HostPageMapping::huge_bytes, "hg"));
+                EXPECT_TRUE(test::HostPageMapping::hasFlag(host->data() + bytes, "hg"));
 #endif
-                FP32Tensor output({1u, page / sizeof(float)});
-                auto download = transfers.allocatePinnedHostBuffer(page, device);
+                FP32Tensor output({1u, bytes / sizeof(float)});
+                auto download = transfers.allocatePinnedHostBuffer(bytes, device);
                 const auto stream = lanes.front().stream();
                 TransferEngine::prepareDeviceOutput(&output, device, stream);
                 auto graph = worker.createGraphCapture(stream);
@@ -224,13 +230,13 @@ TEST(GPUHostRegistrationLifetime, NeighbourReclaimPreservesCapturedRegisteredPay
                     ASSERT_TRUE(capture.begin());
                     ScopedGraphCaptureStage stage(&output);
                     if (mapped)
-                        transfers.enqueueMappedHostToDevice(*mapped, bytes - page,
-                            &output, 0u, page, device, stream);
+                        transfers.enqueueMappedHostToDevice(*mapped, 0u,
+                            &output, 0u, bytes, device, stream);
                     else
-                        transfers.enqueuePinnedHostToDevice(*pinned, bytes - page,
-                            &output, 0u, page, device, stream);
+                        transfers.enqueuePinnedHostToDevice(*pinned, 0u,
+                            &output, 0u, bytes, device, stream);
                     transfers.enqueueDeviceToPinnedHost(&output, 0u, *download,
-                        0u, page, device, stream);
+                        0u, bytes, device, stream);
                     stage.complete();
                     capture.finish();
                 }
@@ -241,15 +247,32 @@ TEST(GPUHostRegistrationLifetime, NeighbourReclaimPreservesCapturedRegisteredPay
                 ASSERT_NE(terminal, nullptr);
                 for (int replay = 0; replay < 3; ++replay)
                 {
+                    // Change actual source bytes only after prior completion.
+                    // Include interior PMDs so replay cannot certify an edge-
+                    // only copy or a capture-time host snapshot.
+                    host->data()[page + 17u] = static_cast<unsigned char>(0x71u + replay);
+                    host->data()[2u * test::HostPageMapping::huge_bytes + 13u] =
+                        static_cast<unsigned char>(0x81u + replay);
+                    host->data()[bytes - 1u] = static_cast<unsigned char>(0x91u + replay);
                     host->reclaimNeighbour();
+                    std::memset(download->mutableData(), 0, bytes);
                     ASSERT_TRUE(graph->launch());
                     ASSERT_TRUE(worker.recordEventChecked(terminal.get(), stream));
                     ASSERT_TRUE(worker.synchronizeEventChecked(terminal.get()));
-                    EXPECT_EQ(std::memcmp(download->data(), host->data() + bytes - page, page), 0);
+                    EXPECT_EQ(std::memcmp(download->data(), host->data(), bytes), 0);
                 }
                 // Graph and terminal event retire before their registered host
                 // owner; no runtime free or registration occurs inside capture.
                 graph.reset();
+                mapped.reset();
+                pinned.reset();
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+                // Unpin must not restore THP eligibility: another registration
+                // or later capture may still share/reuse these exact pages.
+                EXPECT_TRUE(test::HostPageMapping::hasFlag(
+                    host->data() + 2u * test::HostPageMapping::huge_bytes, "nh"));
+                EXPECT_TRUE(test::HostPageMapping::hasFlag(host->data() + bytes, "hg"));
+#endif
             });
         }
 }

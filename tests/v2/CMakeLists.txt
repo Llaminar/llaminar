@@ -12953,18 +12953,18 @@ add_v2_test(V2_Integration_BackendManagerStartupPolicy
     LABELS "V2;Integration;ProductionTestPreflight;Backends;StartupPolicy;DeviceFree;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
-add_executable(v2_unit_host_registration_page_boundary
-    unit/memory/Test__HostRegistrationPageBoundary.cpp)
-target_link_libraries(v2_unit_host_registration_page_boundary llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_HostRegistrationPageBoundary
-    COMMAND $<TARGET_FILE:v2_unit_host_registration_page_boundary>
+add_executable(v2_unit_host_registration_page_range
+    unit/memory/Test__HostRegistrationPageRange.cpp)
+target_link_libraries(v2_unit_host_registration_page_range llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_HostRegistrationPageRange
+    COMMAND $<TARGET_FILE:v2_unit_host_registration_page_range>
     LABELS "V2;Unit;Memory;Transfer;Regression"
     MPI_PROCS 1
     NO_MPI NO_MODELS
 )
-add_v2_test(V2_Integration_HostRegistrationPageBoundary
-    COMMAND $<TARGET_FILE:v2_unit_host_registration_page_boundary>
-    LABELS "V2;Integration;ProductionTestPreflight;Memory;Transfer;Regression"
+add_v2_test(V2_Integration_HostRegistrationPageRange
+    COMMAND $<TARGET_FILE:v2_unit_host_registration_page_range>
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;Transfer;DeviceFree;Regression"
     MPI_PROCS 1
     TIMEOUT 30
     NO_MPI NO_MODELS
@@ -13014,10 +13014,25 @@ add_v2_gpu_backend_test(
     V2 Integration ProductionTestPreflight Backends Transfer Memory Regression
 )
 foreach(backend IN ITEMS CUDA ROCm)
+    string(TOLOWER "${backend}" backend_lower)
+    if(TARGET v2_integration_gpu_host_registration_lifetime_${backend_lower})
+        # Pin the interior-page defect to a named retained-capture regression.
+        # CUDA proves payload/replay symmetry; ROCm also proves the VMA policy
+        # required to keep khugepaged out of every live USERPTR page.
+        add_v2_test(V2_Integration_RegisteredHostFullSpan_${backend}
+            COMMAND $<TARGET_FILE:v2_integration_gpu_host_registration_lifetime_${backend_lower}>
+                --gtest_filter=GPUHostRegistrationLifetime.FullSpanPolicyAndNeighbourReclaimPreserveCapturedPayload
+            LABELS "V2;Integration;ProductionTestPreflight;${backend};Transfer;Memory;GraphCapture;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    endif()
     if(TEST V2_Integration_GPUHostRegistrationLifetime_${backend})
         set_tests_properties(V2_Integration_GPUHostRegistrationLifetime_${backend}
             PROPERTIES TIMEOUT 30)
         set_property(TEST V2_Integration_GPUHostRegistrationLifetime_${backend} APPEND PROPERTY
+            ENVIRONMENT_MODIFICATION "HSA_USERPTR_FOR_PAGED_MEM=unset:" "HSA_USE_SVM=unset:")
+    endif()
+    if(TEST V2_Integration_RegisteredHostFullSpan_${backend})
+        set_property(TEST V2_Integration_RegisteredHostFullSpan_${backend} APPEND PROPERTY
             ENVIRONMENT_MODIFICATION "HSA_USERPTR_FOR_PAGED_MEM=unset:" "HSA_USE_SVM=unset:")
     endif()
 endforeach()
@@ -26812,7 +26827,9 @@ if(HAVE_ROCM)
     V2_Integration_ROCm_MoEAsyncHistogramBorrowedStreamRetirement
     V2_Integration_ROCmFloatingExpertRetirement
     V2_Integration_ROCmHostMemoryBacking
-    V2_Integration_HostRegistrationPageBoundary
+    V2_Integration_HostRegistrationPageRange
+    V2_Integration_RegisteredHostFullSpan_CUDA
+    V2_Integration_RegisteredHostFullSpan_ROCm
     V2_Integration_GPUHostRegistrationLifetime_CUDA
     V2_Integration_GPUHostRegistrationLifetime_ROCm
     ${V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}

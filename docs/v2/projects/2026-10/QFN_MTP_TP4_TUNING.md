@@ -1,8 +1,8 @@
 # QFN MTP on ROCm TP4
 
-Updated 2026-10-28. Limit: 15,000 UTF-8 bytes. Active objective: exceed Castagna's measured QFN MTP decode
-throughput on the same four MI50s, then complete a full OpenCode coding session
-with the accepted configuration. This plan and status table remain below 15 KB;
+Updated 2026-10-28. Limit: 15,000 UTF-8 bytes. Checkpoint: fresh finite-trajectory
+QFN MTP comparison and full OpenCode session complete on the same four MI50s
+with the accepted configuration; EOS and scope limits remain explicit below. This plan and status table remain below 15 KB;
 raw runs, profiles and failed experiments stay in ignored result directories.
 
 ## Baseline contract
@@ -31,54 +31,50 @@ diagnostic timings; it does not certify the remaining production cases.
 
 ## Current status
 
-**Accepted dynamic default: 101.05 decode tok/s versus fresh Off 43.40.**
-On the original 512/256 repetition workload, all token IDs match across one
-warmup and three measured requests per arm. Dynamic is 2.94% above the dated
-Castagna 98.16 control; no new Castagna run or general-policy win is claimed.
-[Current evidence](QFN_MTP_DIRECT_OUTPUT_HISTORY_20261028.md).
+**Accepted Dynamic: 101.367 decode tok/s; fresh Castagna fixed6: 100.098.**
+Fresh Off is 43.512. On the exact 512/256 repetition trajectory, Dynamic leads
+the fresh fork median by **1.267%** and its own Off by **2.330×**. Decode ranges
+are 101.272–101.398, 98.183–100.989 and 43.471–43.572 respectively. Prefill
+medians are 788.986, 435.514 and 788.898 tok/s. All nine measured token streams
+match; native warmup count is retained, but its output IDs are not.
 
-**Chosen default (user decision 2026-10-28):** retain the new controller for the
-measured QFN ROCm TP4 scope despite imperfect economics. The 95%-of-best-fixed
-comparison passes only6/10 and is now diagnostic, not a promotion blocker.
-Every measured miss remains visible. Correctness, HTTP and full-session gates
-still apply; no unmeasured cost domain is added.
+**EOS caveat:** native benchmarking ignores stop-token termination; fork raw
+responses permit EOS and end at the token limit. This is a matched observed
+finite trajectory/budget with a common 255-token decode denominator, not
+identical EOS semantics or natural-EOS parity. Frozen packet labels overclaimed
+that contract. No general-policy/noise-superiority claim follows; the dated
+98.164 Castagna series stays dated. Fresh evidence:
+`/tmp/qfn-fresh-head-to-head-fullspan-r1-private/report.json`.
 
-R13 Unit/preflight: 2,978 pass, zero fail, 29 skips. Post-audit Unit: 786/786.
-Release replay/resources pass. Native-event medians CUDA 1.136µs and ROCm
-1.9475µs are amortized operations, not speedup claims. All nine HTTP arms pass:
-Off is the serial control; eight arms prove widths/comparison. Serving starts
-at depth 5 and uses depths 1/2/3/5. Ten app phases pass: 128 tool calls, two
-errors, 65 tests and independent acceptance. Archive/native-token audit repairs
-pass. The strict driver gate remains red; complete certification is open.
-[Diagnosis and receipts](QFN_MTP_DIRECT_OUTPUT_HISTORY_20261028.md).
+**Chosen default (user decision 2026-10-28):** retain the controller for this
+measured QFN ROCm TP4 scope. The 95%-of-best-fixed comparison remains 6/10 and
+diagnostic; every miss is retained. Correctness, HTTP and full-app gates pass.
 
-Historical HTTP:24 requests/9,216 tokens, exact serial equality at
-T0.7/k40/p0.9/seed4242, full/partial prefix restoration:
-`/tmp/qfn-a1-http-qualification-setup-r5/acceptance.json`.
-This does not certify current source.
+Current full-span source: complete gates **2,981 pass / 29 hardware skips / zero
+failures**, including 786 Unit tests; coherent Release green. Canonical reuse
+remains rejected after one unrelated exporter link. Reviewed local-only delta
+admission preserves the original 3,010-test receipt/time and authenticates its
+unchanged tested dependency/runtime/source/inventory closure. No CI/release
+certificate or refreshed gate is claimed. Fresh Off and Serving-Dynamic HTTP
+384-token fresh/full/partial/full lifetimes pass, including exact serial IDs,
+retained ticket/branch evidence, prefix/resources/strict driver and retirement.
 
-Scoped training, exact transaction capture and canonical controller replay are
-implemented. Global fitting, longer sample cadence and capped upward steps have
-not passed the complete economic gate. See the
-[training investigation](QFN_MTP_DEPTH_RETRAINING_20261027.md) for retained failures.
+Fresh ten-phase OpenCode **passes**: 110 tool attempts, zero errors, 85 requests,
+one client context compaction, 1,950.81 seconds; independent webapp acceptance
+and 45 application tests pass. Native audit joins all 85 responses/110 calls
+unchanged. Runtime/resources/archive/strict driver and normal unforced retirement
+pass; owner cleanup reads zero payload bytes. Local after-admission passes.
+Normal serving EOS semantics apply. The host fix is qualified for this workload,
+not universal page immovability or general performance superiority. Earlier R14
+aggregate red remains preserved; its old app counts are not current metrics.
+[Host fix and evidence](QFN_HOST_REGISTRATION_INVALIDATION_20261028.md).
 
-Earlier reversible-utility and provenance trials failed economics. Their full
-evidence remains in the [utility investigation](QFN_MTP_UTILITY_PROBE_PLAN_20261027.md).
-
-The previous downward-only candidate passed TRAIN10/10 but failed frozen HOLDOUT3/4;
-it remains rejected. Its exact results are retained in
-`/tmp/qfn-mtp-directional-downward-final-economic-report-r1/final-evaluation.json`.
-
-The previous verified-progress candidate passed correctness but only6/10 speed
-rows; its evidence remains in the [investigation](QFN_MTP_VERIFIED_PROGRESS_20261028.md).
-The [confirmation successor](QFN_MTP_TARGET_CONFIRMATION_20261028.md) requires the
-same target across three disjoint windows using admitted hysteresis. Complete786
-Unit and75 focused registrations pass without skips, including native CUDA/ROCm,
-terminal validation and genuine recorded preflight replay. Release,10 captures
-and40 strict replays pass. All90 timed outputs match serial controls. However,
-speed reaches95% in only6/10 rows. The user accepted this trade-off for the
-default. Current-source correctness preflight and HTTP/app qualification remain
-required; the failed economic results are retained as diagnostics.
+Historical HTTP and rejected controller economics remain in the
+[retained history](QFN_MTP_DIRECT_OUTPUT_HISTORY_20261028.md),
+[utility investigation](QFN_MTP_UTILITY_PROBE_PLAN_20261027.md) and
+[confirmation study](QFN_MTP_TARGET_CONFIRMATION_20261028.md).
+The preserved 6/10 speed result is unchanged; no prior focused/replay pass
+substitutes for current full-app evidence.
 
 | TRAIN prompt | Greedy dynamic/fixed tok/s | Difference | Stochastic dynamic/fixed tok/s | Difference |
 |---|---:|---:|---:|---:|
@@ -98,7 +94,7 @@ transactions at depth2 versus8 previously. Repetition's locally supported depth6
 changes future transaction boundaries and finishes slower than fixed5; its cost
 profile agrees with measurement. Long-context repricing preserves all ten fixed
 winners. Neither richer histograms nor a cost-table correction fixes these choices.
-Next: investigate the strict driver failure; checkpoint the scoped green work.
+Controller checkpoint: `078f14c88`; the [host-page fix](QFN_HOST_REGISTRATION_INVALIDATION_20261028.md) is now qualified locally.
 Diagnosis: `/tmp/qfn-mtp-confirmation-repetition-diagnosis-r1-private/NOTE.md`;
 baseline plan: `/tmp/qfn-mtp-castagna-train-coverage-review-r1-private/NOTE.md`.
 

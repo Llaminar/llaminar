@@ -19,7 +19,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../utils/VramBillOfMaterials.h"
-#include "../../memory/HostRegistrationPageBoundary.h"
+#include "../../memory/HostRegistrationPageRange.h"
 #include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
@@ -582,9 +582,10 @@ namespace llaminar2
                      << device_id << " ptr=" << ptr << " bytes=" << bytes);
             return false;
         }
-        // Fence shared huge-PMD edges before HIP owns the pages. Otherwise a
-        // neighbouring heap trim can evict all queues for this live process.
-        HostRegistrationPageBoundary::prepare(ptr, bytes);
+        // Exclude every registered page before HIP owns the range. Edge-only
+        // protection still permits khugepaged to invalidate interior USERPTR
+        // pages and evict all live process queues. This does not alter payload.
+        HostRegistrationPageRange::prepare(ptr, bytes);
         hipError_t err = hipHostRegister(ptr, bytes, hipHostRegisterDefault);
         if (err != hipSuccess)
         {
@@ -655,9 +656,10 @@ namespace llaminar2
                                    (scope == MappedHostRegistrationScope::BackendPortable
                                         ? hipHostRegisterPortable
                                         : 0u);
-        // External shared channels need the same edge ownership as tensor
-        // uploads; portable registration must not retain a neighbour's PMD.
-        HostRegistrationPageBoundary::prepare(ptr, bytes);
+        // External channels require the same complete-page policy as tensor
+        // uploads, including interior PMDs shared by portable GPU aliases.
+        // Unregister retains this advice while any storage owner may reuse it.
+        HostRegistrationPageRange::prepare(ptr, bytes);
         const hipError_t error = hipHostRegister(ptr, bytes, flags);
         if (error != hipSuccess)
         {
