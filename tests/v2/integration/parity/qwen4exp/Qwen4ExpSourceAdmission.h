@@ -15,6 +15,7 @@
 #include "Qwen4ExpProductionParityCases.h"
 #include "Qwen4ExpSourceAdmissionCases.h"
 #include "Qwen4ExpSourceAdmissionEvidence.h"
+#include "Qwen4ExpSourceAdmissionObservation.h"
 #include "execution/runner/ModelContextRetirement.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
@@ -611,9 +612,9 @@ inline void expectQwen4ExpSourceMTPMaterialization(const ModelParityCase &cell,
  * @param observe Void observer selecting successful admission or precise rejection.
  * @param gpu_memory_cap_mb Optional explicitly authored public binary-MiB ceiling.
  *
- * Observer-local aliases expire before finish(). Fatal assertions still unwind
- * the same lifetime owner; successful callbacks additionally emit genuine final
- * retirement and disposable-cache removal evidence in the retained parent.
+ * Observer-local aliases expire before finish(). Fatal assertions and exceptions
+ * retain their failed outcome while explicit final retirement and disposable-cache
+ * removal publish independent evidence. No receipt is emitted if retirement fails.
  */
 template<class Observe>
 void withQwen4ExpSourceAdmission(const ModelParityCase &cell, Observe &&observe,
@@ -657,14 +658,17 @@ void withQwen4ExpSourceAdmission(const ModelParityCase &cell, Observe &&observe,
     if (config.moe_routed_expert_plan)
         authored.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*config.moe_routed_expert_plan);
     Qwen4ExpSourceAdmissionLifetime lifetime(config, output / "prefix-cache");
-    ASSERT_NO_FATAL_FAILURE(observe(rank, config, authored, lifetime, output));
-    ASSERT_NO_THROW(lifetime.finish());
-    std::ofstream cleanup(output / "retirement.csv");
-    ASSERT_TRUE(cleanup.is_open());
-    cleanup << "cell,runner_retired,model_retired,prefix_removed,retired_gpu_generations\n"
-        << cell.testName() << ",1,1,1," << lifetime.retiredDeviceCount() << '\n';
-    cleanup.flush();
-    ASSERT_TRUE(cleanup.good());
+    observeQwen4ExpAdmissionThenRetire(
+        [&] { observe(rank, config, authored, lifetime, output); },
+        [&] {
+            ASSERT_NO_THROW(lifetime.finish());
+            std::ofstream cleanup(output / "retirement.csv");
+            ASSERT_TRUE(cleanup.is_open());
+            cleanup << "cell,runner_retired,model_retired,prefix_removed,retired_gpu_generations\n"
+                << cell.testName() << ",1,1,1," << lifetime.retiredDeviceCount() << '\n';
+            cleanup.flush();
+            ASSERT_TRUE(cleanup.good());
+        });
 }
 
 /**

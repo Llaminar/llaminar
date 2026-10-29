@@ -29198,6 +29198,7 @@ endforeach()
 target_sources(v2_test_model_parity_definition PRIVATE
     unit/parity/Test__Qwen4ExpNgramAdmissionCases.cpp
     unit/parity/Test__Qwen4ExpSourceAdmissionCases.cpp
+    unit/parity/Test__Qwen4ExpSourceAdmissionRetirement.cpp
     unit/planning/Test__Qwen4ExpSourceAdmissionMTPEvidence.cpp
     unit/parity/Test__Qwen4ExpSourceAdmissionCI.cpp)
 add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionCIMetadata
@@ -29207,6 +29208,13 @@ add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionCIMetadata
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpSourceAdmissionCIMetadata)
+add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionFailureRetirement
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionRetirement.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Admission;Retirement;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpSourceAdmissionFailureRetirement)
 add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionDeclarations
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=Qwen4ExpSourceAdmissionCases.*

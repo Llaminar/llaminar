@@ -82,7 +82,8 @@ Sources: [typed extensions](../../../../tests/v2/integration/parity/qwen4exp/Qwe
 
 ## Current qualification
 
-The CPU admission and physical-owner repair is integrated. The complete r5
+CPU admission and physical-owner repairs are checkpointed at `856493506`.
+The complete r5
 collection covered 790 Unit and 2,278 preflight registrations: native lanes
 passed 1,030 checks with 29 hardware skips and clean driver observations. The
 only failure was one CI tools-builder defect exposed by two registrations.
@@ -91,7 +92,13 @@ real tools-only Docker build also passes. Only CI/tests/docs changed afterward,
 so the native sweep was not repeated. Original evidence remains
 `/tmp/qfn-admission-r5-prerequisites/`; it retains its red aggregate receipt.
 Focused closure is `/tmp/qfn-admission-r5-focused-closure/`, not a replacement
-canonical receipt. No full-model accuracy or performance certificate follows.
+canonical receipt; it does not certify inference.
+
+Failure-retirement repair: **790/790 Unit**, four focused registrations and
+the original-code negative control pass. Native r7 proves cleanup for all
+18 attempts: two CUDA controls pass; all 16 composed admissions remain red.
+Evidence: `source-admission-retirement-r7/` and `/tmp/qfn-source-retirement-r7-*`.
+The observer now publishes retirement even after failed admission assertions.
 
 **Focused repairs now pass on CPU, ROCm and mixed PP.** These are separate,
 source-admission receipts; no complete current matrix or inference certificate
@@ -198,16 +205,14 @@ Temporary prefix directories must be absent after final retirement.
 
 1. Refresh the four-policy native batch without relabelling the full15 capacity
    failure; the bounded CUDA positive and explicit-cap controls already pass.
-2. Validate installed CI discovery/evidence and obtain a fresh complete
-   Unit/preflight receipt before checkpointing.
+2. Obtain a fresh complete preflight receipt after implementation settles;
+   preserve the earlier aggregate failure and its scoped closure.
 3. Run remaining locally available placement/ownership/MTP cases without
    equating a sampled batch with the full matrix.
-4. Implement native composed graph/maintenance ownership before qualifying the
-   16 composed candidates: homogeneous ROCm PP(TP2, TP2) needs native domain
-   composition; GPU-to-CPU TP tails need admitted host maintenance ownership.
-   CUDA4/8 and ROCm8 also require additional hardware.
-   This host has CUDA2, ROCm4 and
-   two CPU NUMA domains; unavailable configurations remain unqualified.
+4. Resolve the 16 native composed failures: ROCm PP(TP2, TP2) needs native
+   domain composition and an active-MTP capacity audit; GPU-to-CPU TP tails
+   need admitted host maintenance. CUDA4/8 and ROCm8 remain unqualified on
+   this CUDA2/ROCm4/two-NUMA host.
 5. Qualify the active MTP product across table sharding/adaptive tiers and
    composed graphs. Numerical/controller execution remains separate; existing
    paired-source MTP execution admissions remain intact.
