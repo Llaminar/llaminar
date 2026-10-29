@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2
@@ -39,6 +40,44 @@ namespace llaminar2
         Intermediate,
         LayersOnly,
     };
+
+    /**
+     * @brief Query the canonical global component scope shared by weight and workspace BOMs.
+     * @param scope Exact graph-owned global source uses, independent of retained verifier rows.
+     * @return Whether this component set owns an embedding lookup representation.
+     * @throws std::invalid_argument For an invalid scope.
+     */
+    [[nodiscard]] inline bool weightScopeOwnsEmbedding(WeightComponentScope scope)
+    {
+        switch (scope)
+        {
+        case WeightComponentScope::EmbeddingAndTerminal:
+        case WeightComponentScope::Embedding: return true;
+        case WeightComponentScope::Terminal:
+        case WeightComponentScope::Intermediate:
+        case WeightComponentScope::LayersOnly: return false;
+        }
+        throw std::invalid_argument("Weight component scope is invalid");
+    }
+
+    /**
+     * @brief Query whether the declared component set owns terminal model operands.
+     * @param scope Exact graph-owned global source uses, shared with weight materialization.
+     * @return Whether the terminal transformation and vocabulary projection execute locally.
+     * @throws std::invalid_argument For an invalid scope.
+     */
+    [[nodiscard]] inline bool weightScopeOwnsTerminal(WeightComponentScope scope)
+    {
+        switch (scope)
+        {
+        case WeightComponentScope::EmbeddingAndTerminal:
+        case WeightComponentScope::Terminal: return true;
+        case WeightComponentScope::Embedding:
+        case WeightComponentScope::Intermediate:
+        case WeightComponentScope::LayersOnly: return false;
+        }
+        throw std::invalid_argument("Weight component scope is invalid");
+    }
 
     /**
      * @brief Typed device-residency contract used by preflight weight sizing.

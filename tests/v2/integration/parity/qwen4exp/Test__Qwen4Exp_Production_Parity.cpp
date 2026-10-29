@@ -279,6 +279,13 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpComposedCandidateSourceAdmission, Qwen4ExpCandi
     ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpComposedCandidateSourceAdmissionCases()))),
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
 
+// A distinct authored split retains full15 and all expert policies; original
+// 16/32 candidates remain independent positive admission obligations.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCUDA2CPU2FifteenLayerSourceAdmission, Qwen4ExpCandidateSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(
+        qwen4ExpCUDA2CPU2FifteenLayerSourceAdmissionCases()))),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
+
 /** @brief Unsupported cross-tier expert slices retain an explicit rejection contract. */
 class Qwen4ExpRejectedSourceAdmissionTest : public ::testing::Test, public Qwen4ExpSourceAdmissionParameter {};
 

@@ -1806,6 +1806,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     .qfn_gdn_output_activation = cfg.qfn_gdn_output_activation,
                     .qfn_fa_output_activation = cfg.qfn_fa_output_activation,
                     .qfn_gdn_qkv_activation = cfg.qfn_gdn_qkv_activation,
+                    .weight_components = weight_components,
                 });
         }
         else

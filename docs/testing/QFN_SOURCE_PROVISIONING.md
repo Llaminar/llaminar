@@ -26,3 +26,9 @@ control remain mandatory when their device membership is available. The public
 13GiB-cap negative remains a distinct capacity-rejection obligation. Numerical
 model/reference policy, CTest identities, production placement, and all retained
 MTP defaults remain unchanged. PMA remains the sole physical allocation ledger.
+
+The separate CUDA2→CPU2 pipeline family with 15 GPU layers and 33 CPU layers
+retains the original full15 MTP capacity and every expert/storage policy. It
+has its own identities and does not replace the original 16/32-layer positives.
+These pipeline families have no inferred larger-card prerequisite: selected
+cases must prove actual fit through PMA, and a capacity failure remains red.

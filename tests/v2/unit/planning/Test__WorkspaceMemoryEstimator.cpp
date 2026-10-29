@@ -2243,3 +2243,147 @@ TEST(Test__WorkspaceMemoryEstimator, GPURetainedGDNWorkspaceAdmissionMatchesOrig
         EXPECT_THROW((void)WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile, geometry), std::invalid_argument);
     }
 }
+
+/** @test Replay exact source roles through the production selector on every backend. */
+TEST(Test__WorkspaceMemoryEstimator, PipelineWorkspaceSourceOwnershipReplaysAllComponentScopes)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen4exp";
+    profile.n_layers = 4;
+    profile.mtp_layer_count = 1;
+    profile.tensors.push_back({.name = "output.weight", .layer_index = -1});
+    struct RecordedSource { const char *name; int layer; };
+    const std::array<RecordedSource, 14> sources{{
+        RecordedSource{"token_embd.weight", -1}, {"output.weight", -1}, {"output_norm.weight", -1},
+        {"output_hc_norm.weight", -1}, {"output_hc_down.weight", -1}, {"output_hc_up.weight", -1},
+        {"blk.0.attn_q.weight", 0}, {"blk.1.ffn_gate_inp.weight", 1}, {"blk.1.ffn_gate_shexp.weight", 1},
+        {"blk.1.ffn_gate_exps.weight", 1}, {"blk.2.attn_output.weight", 2},
+        {"blk.3.nextn.eh_proj.weight", 3}, {"blk.3.ffn_gate_shexp.weight", 3},
+        {"blk.3.ffn_gate_exps.weight", 3}}};
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const int retained_rows : {16, 4, 2, 0, 16})
+            for (const auto scope : {WeightComponentScope::Embedding, WeightComponentScope::Intermediate,
+                WeightComponentScope::Terminal, WeightComponentScope::EmbeddingAndTerminal, WeightComponentScope::LayersOnly})
+            {
+                WorkspaceMemoryGeometry geometry;
+                geometry.device = device;
+                geometry.mtp_target_query_rows = retained_rows;
+                geometry.weight_components = scope;
+                geometry.first_layer = scope == WeightComponentScope::Embedding ? 0 :
+                    scope == WeightComponentScope::Intermediate ? 1 :
+                    scope == WeightComponentScope::Terminal ? 2 :
+                    scope == WeightComponentScope::LayersOnly ? 3 : 0;
+                geometry.last_layer = scope == WeightComponentScope::EmbeddingAndTerminal ? 2 : geometry.first_layer;
+                for (const auto &source : sources)
+                {
+                    TensorSizeInfo tensor{.name = source.name, .quant_type = "Q8_0", .elements = 128u * 128u,
+                        .K = 128, .layer_index = source.layer};
+                    // Norms/immutable scalar roles never construct GEMM workspace.
+                    const auto role = inferWeightRole(tensor.name);
+                    const bool immutable = isImmutableFP32WeightRole(role);
+                    const bool terminal = scope == WeightComponentScope::Terminal ||
+                        scope == WeightComponentScope::EmbeddingAndTerminal;
+                    const bool embedding = scope == WeightComponentScope::Embedding ||
+                        scope == WeightComponentScope::EmbeddingAndTerminal;
+                    bool expected = source.layer >= geometry.first_layer && source.layer <= geometry.last_layer;
+                    if (source.layer < 0)
+                        expected = tensor.name == "token_embd.weight" ? embedding : terminal;
+                    else if (source.layer == 3 && retained_rows > 0 && terminal)
+                        expected = true;
+                    if (immutable) expected = false;
+                    EXPECT_EQ(WorkspaceMemoryEstimator::ownsProjectionSource(tensor, profile, geometry), expected)
+                        << device.toString() << " source=" << source.name << " scope=" << static_cast<int>(scope)
+                        << " retained_rows=" << retained_rows;
+                }
+            }
+    // Removing the explicit head changes the semantic use of the embedding
+    // source: terminal-only PP owns the tied projection, intermediate PP does not.
+    profile.tensors.clear();
+    for (const auto scope : {WeightComponentScope::Embedding, WeightComponentScope::Intermediate,
+        WeightComponentScope::Terminal, WeightComponentScope::EmbeddingAndTerminal, WeightComponentScope::LayersOnly})
+    {
+        WorkspaceMemoryGeometry tied;
+        tied.weight_components = scope;
+        TensorSizeInfo embedding{.name = "token_embd.weight", .layer_index = -1};
+        const bool expected = scope == WeightComponentScope::Embedding ||
+            scope == WeightComponentScope::Terminal || scope == WeightComponentScope::EmbeddingAndTerminal;
+        EXPECT_EQ(WorkspaceMemoryEstimator::ownsProjectionSource(embedding, profile, tied), expected);
+    }
+    WorkspaceMemoryGeometry bad;
+    bad.weight_components = static_cast<WeightComponentScope>(99);
+    TensorSizeInfo local{.name = "blk.0.attn_q.weight", .layer_index = 0};
+    EXPECT_THROW((void)WorkspaceMemoryEstimator::ownsProjectionSource(local, profile, bad), std::invalid_argument);
+}
+
+/** @test Unowned terminal/predictor operands cannot inflate real retained verifier workspace. */
+TEST(Test__WorkspaceMemoryEstimator, PipelineVerifierWorkspaceIgnoresForeignPredictorAndHead)
+{
+    auto profile = qwen35MoEProfile(true);
+    profile.mtp_layer_count = 1;
+    auto foreign = profile;
+    foreign.tensors.push_back({.name = "blk.40.nextn.eh_proj.weight", .quant_type = "Q8_0",
+        .elements = size_t{32768} * 4096, .K = 4096, .layer_index = 40});
+    foreign.tensors.push_back({.name = "output.weight", .quant_type = "Q8_0",
+        .elements = size_t{248320} * 2048, .K = 2048, .layer_index = -1});
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        auto geometry = graphGeometry(device);
+        geometry.device_compute_units = device.is_cpu() ? 8 : 82;
+        geometry.cpu_execution = device.is_cpu() ? test::kSyntheticCPUExecutionGeometry : CPUExecutionGeometry{};
+        geometry.resident_graph_rows = 64;
+        geometry.first_layer = geometry.last_layer = 0;
+        geometry.local_query_heads = profile.n_heads;
+        geometry.local_kv_heads = profile.n_kv_heads;
+        geometry.weight_components = WeightComponentScope::Embedding;
+        for (const int rows : {16, 4, 16})
+        {
+            geometry.mtp_target_query_rows = rows;
+            const auto expected = WorkspaceMemoryEstimator::estimate(profile, geometry);
+            EXPECT_EQ(WorkspaceMemoryEstimator::estimate(foreign, geometry), expected)
+                << device.toString() << " retained_rows=" << rows;
+            // Retained main-model GDN rollback still consumes its real slots.
+            geometry.mtp_target_query_rows = 0;
+            EXPECT_GT(expected, WorkspaceMemoryEstimator::estimate(profile, geometry));
+        }
+    }
+}
+
+/** @test MemoryPlanner forwards its existing physical component scope to workspace selection. */
+TEST(Test__WorkspaceMemoryEstimator, PipelineMemoryPlannerPreservesGlobalOwnerAtWorkspaceBoundary)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen2";
+    profile.n_layers = 3; profile.mtp_layer_count = 1;
+    profile.d_model = 128; profile.d_ff = 256; profile.n_heads = 2;
+    profile.n_kv_heads = 1; profile.head_dim = 64; profile.vocab_size = 8192; profile.max_seq_len = 128;
+    const auto tensor = [](std::string name, std::size_t n, std::size_t k, int layer) {
+        return TensorSizeInfo{.name = std::move(name), .native_bytes = n*k*sizeof(float),
+            .quant_type = "F32", .elements = n*k, .K = k, .layer_index = layer};
+    };
+    profile.tensors = {tensor("token_embd.weight", 8192, 128, -1), tensor("output.weight", 8192, 128, -1),
+        tensor("blk.0.attn_q.weight", 128, 128, 0), tensor("blk.1.attn_q.weight", 128, 128, 1),
+        tensor("blk.2.nextn.eh_proj.weight", 128, 256, 2)};
+    auto changed_tail = profile;
+    for (auto &entry : changed_tail.tensors)
+        if (entry.name == "output.weight" || entry.layer_index == 2)
+        {
+            entry.quant_type = "Q8_0";
+            entry.native_bytes = entry.elements / 32 * 34;
+        }
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        DevicePlanConfig config;
+        config.device = device; config.device_compute_units = 8;
+        config.cpu_execution = device.is_cpu() ? test::kSyntheticCPUExecutionGeometry : CPUExecutionGeometry{};
+        config.device_total_bytes = config.device_free_bytes = std::size_t{64} << 30;
+        config.first_layer = config.last_layer = 0;
+        config.owns_embedding = true;
+        config.max_seq_len = 128; config.activation_seq_len = 64;
+        config.mtp_enabled = true; config.mtp_target_query_rows = 16;
+        const auto original = MemoryPlanner::plan(profile, {config}).devices.front();
+        const auto changed = MemoryPlanner::plan(changed_tail, {config}).devices.front();
+        EXPECT_EQ(changed.weight_bytes(), original.weight_bytes());
+        EXPECT_EQ(changed.workspace_bytes(), original.workspace_bytes()) << device.toString();
+        EXPECT_EQ(changed.checkpoint_state_bytes(), original.checkpoint_state_bytes());
+    }
+}

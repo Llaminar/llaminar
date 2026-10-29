@@ -415,20 +415,8 @@ namespace llaminar2
             }
         }
 
-        bool owns_embedding = false;
-        bool owns_terminal = false;
-        switch (components)
-        {
-        case WeightComponentScope::EmbeddingAndTerminal:
-            owns_embedding = owns_terminal = true;
-            break;
-        case WeightComponentScope::Embedding: owns_embedding = true; break;
-        case WeightComponentScope::Terminal: owns_terminal = true; break;
-        case WeightComponentScope::Intermediate:
-        case WeightComponentScope::LayersOnly: break;
-        default:
-            throw std::invalid_argument("Weight estimate has an invalid global component scope");
-        }
+        const bool owns_embedding = weightScopeOwnsEmbedding(components);
+        const bool owns_terminal = weightScopeOwnsTerminal(components);
 
         WeightEstimate est;
         const WeightShardGeometryResolver geometry_resolver(

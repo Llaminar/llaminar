@@ -1052,6 +1052,63 @@ TEST(Qwen4ExpSourceAdmissionCases, ExplicitRetainedThreeFamilyPreservesFullDefau
         static_cast<Qwen4ExpSourceMTPEnvelope>(255)), std::invalid_argument);
 }
 
+/** @test A separate layer split preserves original full15 inputs and every table/expert policy. */
+TEST(Qwen4ExpSourceAdmissionCases, ExplicitFifteenLayerCUDAHostFamilyPreservesOriginalFull15)
+{
+    const auto originals = expandModelParityDefinition(
+        qwen4ExpComposedSourceAdmissionDefinition(Qwen4ExpParityTopology::CUDA2CPU2TPPP));
+    const auto &fitting = qwen4ExpCUDA2CPU2FifteenLayerSourceAdmissionCases();
+    ASSERT_EQ(originals.size(), 4u);
+    ASSERT_EQ(fitting.size(), originals.size());
+    const auto full_original = qwen4ExpExpandSourceAdmissionMTP(originals);
+    const auto full_fitting = qwen4ExpExpandSourceAdmissionMTP(fitting);
+    std::set<std::string> names;
+    for (std::size_t i = 0; i < full_fitting.size(); ++i)
+    {
+        const auto &cell = full_fitting[i];
+        const auto &original = full_original[i];
+        SCOPED_TRACE(cell.testName());
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        EXPECT_TRUE(names.insert(original.testName()).second);
+        EXPECT_EQ(cell.model.model_path, original.model.model_path);
+        EXPECT_EQ(cell.model.shared_predictor, original.model.shared_predictor);
+        EXPECT_EQ(cell.retained_mtp_draft_capacity, original.retained_mtp_draft_capacity);
+        EXPECT_EQ(cell.mtp, original.mtp);
+        EXPECT_EQ(cell.ngram_table_policy, original.ngram_table_policy);
+        EXPECT_EQ(cell.expert_overlay, original.expert_overlay);
+        EXPECT_EQ(cell.topology.pipeline_stage_sizes, original.topology.pipeline_stage_sizes);
+        EXPECT_EQ(cell.topology.pipeline_tensor_parallel_collectives, original.topology.pipeline_tensor_parallel_collectives);
+        const auto request = qwen4ExpSourceAdmissionConfig(cell, cell.model.model_path, 0);
+        const auto original_request = qwen4ExpSourceAdmissionConfig(original, original.model.model_path, 0);
+        expectSourcePipeline(request, cell);
+        ASSERT_EQ(request.pp_stage_definitions.size(), 2u);
+        EXPECT_EQ(request.pp_stage_definitions[0].last_layer, 14);
+        EXPECT_EQ(request.pp_stage_definitions[1].first_layer, 15);
+        EXPECT_EQ(request.pp_stage_definitions[1].last_layer, 47);
+        EXPECT_EQ(original_request.pp_stage_definitions[0].last_layer, 15);
+        EXPECT_EQ(original_request.pp_stage_definitions[1].first_layer, 16);
+        EXPECT_EQ(request.ngram_table_policy, original_request.ngram_table_policy);
+        EXPECT_EQ(request.moe_rebalance.mode, original_request.moe_rebalance.mode);
+        EXPECT_EQ(request.mtp.graph_capacity_draft_tokens, cell.mtp == ModelParityMTP::Off ? 0 : 15);
+        if (cell.mtp != ModelParityMTP::Off)
+        {
+            EXPECT_EQ(resolveMTPRetainedTargetQueryRows(request.mtp), 16);
+            EXPECT_EQ(request.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
+            EXPECT_FALSE(request.deterministic);
+        }
+    }
+    // The public CLI projection owns the same explicit layer split before any
+    // backend initialization, source loading or physical-capacity selection.
+    for (const auto &cell : fitting)
+    {
+        const auto parsed = sourcePublicConfig(cell);
+        expectSourcePipeline(parsed, cell);
+        EXPECT_EQ(parsed.pp_stage_definitions[0].last_layer, 14);
+        EXPECT_EQ(parsed.pp_stage_definitions[1].first_layer, 15);
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(parsed).empty());
+    }
+}
+
 /** @test Bounded capacity controls preserve the original larger positive declaration. */
 TEST(Qwen4ExpSourceAdmissionCases, ExplicitFixedHeadCapacityControlsKeepOriginalPolicies)
 {
@@ -1116,7 +1173,8 @@ TEST(Qwen4ExpSourceAdmissionCases, FullSourceMatrixHasTotalFourPolicyMTPDimensio
         &qwen4ExpFixedHeadProductionCases(), &qwen4ExpGPUAdaptiveProductionCases(),
         &qwen4ExpFullROCmTP4ProductionCases(), &qwen4ExpROCm4OverlayPolicyProductionCases(),
         &qwen4ExpExtendedSourceAdmissionCases(), &qwen4ExpComposedCandidateSourceAdmissionCases(),
-        &qwen4ExpRejectedSourceAdmissionCases(), &qwen4ExpNgramAdmissionCases()};
+        &qwen4ExpRejectedSourceAdmissionCases(), &qwen4ExpNgramAdmissionCases(),
+        &qwen4ExpCUDA2CPU2FifteenLayerSourceAdmissionCases()};
     const std::set policies{ModelParityMTP::Off, ModelParityMTP::Depth1,
         ModelParityMTP::Depth3, ModelParityMTP::DynamicDepth};
     std::set<std::string> names;
@@ -1206,10 +1264,10 @@ TEST(Qwen4ExpSourceAdmissionCases, FullSourceMatrixHasTotalFourPolicyMTPDimensio
             EXPECT_EQ(observed, policies);
         }
     }
-    EXPECT_EQ(seeds, 151u);
-    EXPECT_EQ(off, 151u);
-    EXPECT_EQ(active, 453u);
-    EXPECT_EQ(names.size(), 604u);
+    EXPECT_EQ(seeds, 155u);
+    EXPECT_EQ(off, 155u);
+    EXPECT_EQ(active, 465u);
+    EXPECT_EQ(names.size(), 620u);
 }
 
 /** @test Missing paired sources and invalid dimension inputs fail without any source I/O. */

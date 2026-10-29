@@ -13,6 +13,7 @@
 #include "backends/CPUExecutionGeometry.h"
 #include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/WeightMemoryEstimator.h"
 #include "kernels/attention/AttentionExecutionPolicy.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include <cstddef>
@@ -132,11 +133,27 @@ struct WorkspaceMemoryGeometry
     QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
     /// Frozen original-main GDN QKV correction; independent of Z, alpha/beta and output projection.
     QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /** Actual graph-owned global source uses, projected from the same weight BOM.
+     * Retained verifier rows do not grant an earlier PP stage a predictor or head.
+     * Standalone callers retain the historical complete-model scope explicitly. */
+    WeightComponentScope weight_components = WeightComponentScope::EmbeddingAndTerminal;
+
 };
 
 class WorkspaceMemoryEstimator
 {
 public:
+    /**
+     * @brief Project a source operand onto the declared graph's workspace consumers.
+     * @param tensor Canonical tensor role and model-global source layer.
+     * @param profile Complete metadata, including dormant or other-stage sources.
+     * @param geometry Actual main interval, global component scope and retained row geometry.
+     * @return Whether this graph constructs a workspace consumer of the source.
+     * @throws std::invalid_argument For an invalid global component scope.
+     */
+    [[nodiscard]] static bool ownsProjectionSource(const TensorSizeInfo &tensor,
+        const ModelMemoryProfile &profile, const WorkspaceMemoryGeometry &geometry);
+
     /**
      * @brief Estimate dense kernel workspace from explicit dimensions.
      *

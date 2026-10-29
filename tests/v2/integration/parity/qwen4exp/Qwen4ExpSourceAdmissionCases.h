@@ -3,7 +3,8 @@
  * @brief Bounded gold-free setup coverage through canonical QFN case projection.
  *
  * Two CPU-NUMA blueprints and four unqualified composed TP/PP candidates add
- * four explicit host-table requests each. Twelve rejection cases retain unsupported internally sharded
+ * four explicit host-table requests each. An additive CUDA/CPU 15/33-layer family
+ * retains the same full15 MTP dimension. Twelve rejection cases retain unsupported internally sharded
  * expert requests across GPU-plus-CPU tiers, pairing RAM with fixed-head VRAM.
  * These are plain source-admission fixture inputs, never numerical campaign
  * registrations or claims that absent hardware or an unadmitted BOM is supported.
@@ -378,6 +379,29 @@ inline const std::vector<ModelParityCase> &qwen4ExpComposedCandidateSourceAdmiss
         if (result.size() != 16)
             throw std::logic_error("QFN composed candidate admission requires exactly 16 explicit cells");
         return result;
+    }();
+    return cases;
+}
+
+/**
+ * @return Four explicit 15-GPU/33-CPU layer requests, before the common MTP expansion.
+ * @note This separate topology preserves every expert and retained-depth policy.
+ *       The original 16/32 positive remains unchanged and is still mandatory.
+ *
+ * The smaller authored GPU interval exercises complete active admission on
+ * 24 GiB cards without removing experts or lowering retained verifier capacity.
+ * Actual physical fit is still proved by the source fixture, never by this name.
+ */
+inline const std::vector<ModelParityCase> &qwen4ExpCUDA2CPU2FifteenLayerSourceAdmissionCases()
+{
+    static const auto cases = [] {
+        auto definition = qwen4ExpComposedSourceAdmissionDefinition(Qwen4ExpParityTopology::CUDA2CPU2TPPP);
+        definition.topology.test_id = "CUDA01_CPU01_TP2_PP2_GPU15_CPU33";
+        definition.topology.pipeline_weights = {15.0f, 33.0f};
+        auto expanded = expandModelParityDefinition(definition);
+        if (expanded.size() != 4)
+            throw std::logic_error("Explicit CUDA/CPU layer split requires all four host-table policies");
+        return expanded;
     }();
     return cases;
 }

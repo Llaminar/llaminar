@@ -25689,6 +25689,11 @@ add_v2_test(V2_Integration_MoEOverlayResidencySetup
         --gtest_filter=MoEOverlayResidencySetup.*
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CPU;CUDA;ROCm;MTP;DeviceFree;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_PipelineWorkspaceSourceOwnership
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+        --gtest_filter=Test__WorkspaceMemoryEstimator.PipelineWorkspaceSourceOwnershipReplaysAllComponentScopes:Test__WorkspaceMemoryEstimator.PipelineVerifierWorkspaceIgnoresForeignPredictorAndHead:Test__WorkspaceMemoryEstimator.PipelineMemoryPlannerPreservesGlobalOwnerAtWorkspaceBoundary
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;CPU;CUDA;ROCm;PP;MTP;Workspace;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MTPReplicaRoutedWeightBOM
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.MTPReplicaRoutedAuthorityReplaysTerminalAndRetainedSetup:Test__MemoryPlanner.ReplicatedMTPSidecarPricesTrailingDenseAndSharedWeights
@@ -29255,6 +29260,13 @@ add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionDeclarations
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_Qwen4ExpSourceAdmissionDeclarations)
+add_v2_test(V2_Integration_Qwen4ExpCUDAHostLayerPartitionAdmission
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCases.ExplicitFifteenLayerCUDAHostFamilyPreservesOriginalFull15
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;CUDA;CPU;PP;MTP;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCUDAHostLayerPartitionAdmission)
 # The source-only matrix retains every fixed/dynamic policy and authenticates
 # actual setup ownership without claiming generation-controller execution.
 add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionMTPDimension
