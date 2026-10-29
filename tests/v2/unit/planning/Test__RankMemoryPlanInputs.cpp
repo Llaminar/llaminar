@@ -8,6 +8,8 @@
  *
  * Original QFN declarations and actual nonordinal endpoint fixtures cover every
  * supported head degree without loading model tensors or initializing GPUs.
+ * CPU NUMA pipeline domains preserve every logical shard while the actual PMA
+ * projection aggregates their storage into the single rank-local host allocator.
  */
 #include "planning/RankMemoryPlanInputs.h"
 #include "execution/mtp/DeviceGenerationExecutionPolicy.h"
@@ -90,6 +92,40 @@ namespace
             };
         }
     };
+
+    /**
+     * @brief Declare one GPU domain and one CPU NUMA domain without device work.
+     * @param backend Accelerator vendor for the peer domain.
+     * @param width Number of independently authored workers in each domain.
+     * @param cpu_first Whether CPU owns the earlier pipeline interval.
+     * @param reverse_members Whether communicator order runs opposite NUMA order.
+     * @return Complete rank fixture with distinct compute and storage identities.
+     */
+    Fixture cpuPipelineFixture(DeviceType backend, int width, bool cpu_first, bool reverse_members)
+    {
+        Fixture fixture(backend, width);
+        std::vector<GlobalDeviceAddress> cpu, gpu;
+        for (int ordinal = 0; ordinal < width; ++ordinal)
+        {
+            cpu.push_back(GlobalDeviceAddress::cpu(ordinal, "node"));
+            gpu.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId(backend, ordinal), "node", 0));
+        }
+        if (reverse_members)
+        {
+            std::reverse(cpu.begin(), cpu.end());
+            std::reverse(gpu.begin(), gpu.end());
+        }
+        fixture.plan.local_tp_devices.clear();
+        fixture.plan.local_pp_layer_boundaries = {0, 2, 4};
+        fixture.plan.local_pp_stage_tp_info = cpu_first
+            ? std::vector<RankExecutionPlan::LocalPPStageTPInfo>{{.devices = cpu}, {.devices = gpu}}
+            : std::vector<RankExecutionPlan::LocalPPStageTPInfo>{{.devices = gpu}, {.devices = cpu}};
+        fixture.plan.local_pp_devices = {
+            fixture.plan.local_pp_stage_tp_info[0].devices.front(),
+            fixture.plan.local_pp_stage_tp_info[1].devices.front()};
+        fixture.plan.primary_device = fixture.plan.local_pp_devices.front();
+        return fixture;
+    }
 }
 
 TEST(RankMemoryPlanInputs, CPUWorkspaceRequiresObservedWorkersNotPhysicalCoreFallback)
@@ -383,6 +419,90 @@ TEST(RankMemoryPlanInputs, PipelineTensorDomainsKeepTheirExactLayerIntervals)
         fixture.plan.local_pp_layer_boundaries.pop_back();
         EXPECT_THROW(buildRankMemoryPlanInputs(fixture.request()), std::invalid_argument);
     }
+}
+
+/** @test NUMA compute membership stays complete while physical host capacity is counted once. */
+TEST(RankMemoryPlanInputs, CPUNumaPipelineDomainsShareStorageWithoutLosingShards)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int width : {1, 2, 4, 8})
+    for (const bool cpu_first : {false, true})
+    for (const bool reversed : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << static_cast<int>(backend) << ":" << width
+            << " cpu_first=" << cpu_first << " reversed=" << reversed);
+        const auto fixture = cpuPipelineFixture(backend, width, cpu_first, reversed);
+        const auto configs = buildRankMemoryPlanInputs(fixture.request());
+        ASSERT_EQ(configs.size(), size_t(width * 2));
+        size_t host_kv_bytes = 0;
+        for (int stage = 0; stage < 2; ++stage)
+        for (int shard = 0; shard < width; ++shard)
+        {
+            const auto &cfg = configs[stage * width + shard];
+            const bool cpu = stage == (cpu_first ? 0 : 1);
+            EXPECT_EQ(cfg.device, fixture.plan.local_pp_stage_tp_info[stage].devices[shard].toLocalDeviceId());
+            EXPECT_EQ(cfg.device.is_cpu(), cpu);
+            EXPECT_EQ(cfg.shard_index, shard);
+            EXPECT_EQ(cfg.total_shards, width);
+            EXPECT_EQ(cfg.first_layer, stage * 2);
+            EXPECT_EQ(cfg.last_layer, stage * 2 + 1);
+            EXPECT_FALSE(cfg.local_pipeline_backend);
+            EXPECT_TRUE(cfg.captured_pipeline_boundaries.empty());
+            EXPECT_EQ(cfg.pipeline_forward_only_graph_owner, cpu
+                ? PipelineForwardOnlyGraphOwner::None : PipelineForwardOnlyGraphOwner::Participant);
+            if (width > 1)
+            {
+                ASSERT_TRUE(cfg.tensor_parallel_assignment);
+                EXPECT_EQ(cfg.tensor_parallel_assignment->local_rank, shard);
+            }
+            if (cpu)
+                host_kv_bytes += KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
+                    2, 1, cfg.max_seq_len, width == 1 ? fixture.model.n_kv_heads : cfg.local_kv_heads,
+                    fixture.model.head_dim, cfg.kv_precision, cfg.device);
+        }
+        const auto memory = MemoryPlanner::plan(fixture.model, configs);
+        ASSERT_TRUE(memory.fits());
+        EXPECT_NO_THROW((void)memory.admit());
+        const auto &resources = memory.physicalPlan().resources();
+        EXPECT_EQ(resources.size(), size_t(width + 1));
+        ASSERT_EQ(std::count_if(resources.begin(), resources.end(),
+            [](const auto &bom) { return bom.resource().device.is_cpu(); }), 1);
+        const auto host = std::find_if(resources.begin(), resources.end(),
+            [](const auto &bom) { return bom.resource().device.is_cpu(); });
+        EXPECT_EQ(host->bytes(PhysicalMemoryOwner::KVCache), host_kv_bytes);
+    }
+}
+
+/** @test The physical projection cannot conceal duplicate, foreign or invalid authored endpoints. */
+TEST(RankMemoryPlanInputs, CPUNumaPipelineRejectsInvalidAuthoredMembership)
+{
+    const auto valid = cpuPipelineFixture(DeviceType::CUDA, 2, false, false);
+    EXPECT_NO_THROW((void)PipelineStageTransferMemory::forStage(valid.plan, 1));
+    auto plan = valid.plan;
+    plan.local_pp_stage_tp_info[1].devices[1] = plan.local_pp_stage_tp_info[1].devices[0];
+    EXPECT_THROW((void)PipelineStageTransferMemory::forStage(plan, 1), std::invalid_argument);
+    // A meaningless CPU ordinal cannot turn the same NUMA worker into a new participant.
+    plan.local_pp_stage_tp_info[1].devices[1].device_ordinal = 7;
+    EXPECT_THROW((void)PipelineStageTransferMemory::forStage(plan, 1), std::invalid_argument);
+    plan = valid.plan;
+    std::reverse(plan.local_pp_stage_tp_info[1].devices.begin(), plan.local_pp_stage_tp_info[1].devices.end());
+    EXPECT_THROW((void)PipelineStageTransferMemory::forStage(plan, 1), std::invalid_argument);
+    plan = valid.plan;
+    plan.local_pp_stage_tp_info[1].devices[1].hostname = "other-host";
+    EXPECT_THROW((void)PipelineStageTransferMemory::forStage(plan, 1), std::invalid_argument);
+    plan = valid.plan;
+    plan.local_pp_stage_tp_info[1].devices[1].device_type = static_cast<DeviceType>(127);
+    EXPECT_THROW((void)PipelineStageTransferMemory::forStage(plan, 1), std::invalid_argument);
+    plan = valid.plan;
+    plan.local_pp_stage_tp_info[1].devices[1].device_ordinal = -1;
+    EXPECT_THROW((void)PipelineStageTransferMemory::forStage(plan, 1), std::invalid_argument);
+    plan = valid.plan;
+    plan.local_pp_devices[0].hostname = "other-host";
+    EXPECT_THROW((void)PipelineStageTransferMemory::forStage(plan, 1), std::invalid_argument);
+    plan = valid.plan;
+    plan.local_pp_stage_tp_info[0].devices[1] = plan.local_pp_stage_tp_info[0].devices[0];
+    plan.local_pp_stage_tp_info[0].devices[1].numa_node = 1;
+    EXPECT_THROW((void)PipelineStageTransferMemory::forStage(plan, 0), std::invalid_argument);
 }
 
 /** @test Only an installed native PP communicator contributes its fence BOM. */

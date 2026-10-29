@@ -801,6 +801,12 @@ namespace llaminar2
                                 config.projection_peer_access = localTPPeerAccessCoverage(inventory, devices);
                             }
                         }
+                    // Dense replicas borrow the prepared predictor experts from
+                    // this frozen overlay instead of owning raw expert parents.
+                    config.mtp_routed_expert_weight_authority =
+                        overlay_plan.usesExpertOverlayAuthority()
+                            ? MTPRoutedExpertWeightAuthority::ExpertOverlay
+                            : MTPRoutedExpertWeightAuthority::SidecarParticipant;
                     config.additional_weight_sets =
                         resolveAdditionalPersistentWeightSets(
                             overlay_plan.continuation_domain_spec

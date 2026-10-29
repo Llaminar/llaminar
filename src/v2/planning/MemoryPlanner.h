@@ -26,6 +26,7 @@
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
+#include "execution/mtp/MTPWeightManifest.h"
 #include "execution/mtp/OrdinaryGenerationGraphPlan.h"
 #include "loaders/PreparedWeightAdmission.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
@@ -69,7 +70,7 @@ enum class AdditionalPersistentWeightSet
     MirroredDecodeEmbedding,
     /** Full-vocabulary MTP terminal head retained beside the primary TP shard. */
     MirroredMTPTerminalHead,
-    /** Complete non-routed learned MTP predictor block per TP participant. */
+    /** Learned MTP predictor replica with explicit routed-parent authority. */
     ReplicatedMTPSidecarDense,
 };
 
@@ -525,6 +526,10 @@ struct DevicePlanConfig
     /** Runtime-state role; auxiliary experts never own dense-model caches. */
     DeviceExecutionMemoryRole execution_role =
         DeviceExecutionMemoryRole::ContinuationGraph;
+
+    /** Physical routed-parent owner copied from the same frozen graph authority as materialization. */
+    MTPRoutedExpertWeightAuthority mtp_routed_expert_weight_authority =
+        MTPRoutedExpertWeightAuthority::SidecarParticipant;
 
 };
 

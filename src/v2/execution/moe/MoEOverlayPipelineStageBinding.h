@@ -21,6 +21,7 @@ namespace llaminar2
 {
     struct CPUSerialExpertStorageAdmission;
     class MoEOverlayResidencyAuthority;
+    class MoEOverlayCPUHostMaintenance;
     class MoEOverlayParticipantResidencyRegistry;
     class IMPIContext;
     class MoEOverlayRankBatchTransportRegistry;
@@ -46,6 +47,8 @@ namespace llaminar2
             std::shared_ptr<IMPIContext> mpi;
             std::shared_ptr<MoEOverlayRankBatchTransportRegistry> rank_transport;
             std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> device_fabric;
+            /// Sole admitted mutable CPU-stage maintenance lifetime, absent for native GPU/no-peer stages.
+            std::shared_ptr<MoEOverlayCPUHostMaintenance> host_maintenance;
             /// Exact stage-owned declarations retained with its admitted capacity.
             std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         };

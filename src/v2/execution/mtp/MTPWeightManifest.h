@@ -11,6 +11,7 @@
 #pragma once
 
 #include "models/qwen4exp/Qwen4ExpPredictorPolicy.h"
+#include <stdexcept>
 #include <optional>
 #include <string>
 #include <vector>
@@ -32,6 +33,22 @@ namespace llaminar2
         /** ExpertOverlay owns per-expert prepared residency and publication. */
         ExpertOverlay,
     };
+
+    /**
+     * @brief Query the existing physical routed-parent owner without a naming heuristic.
+     * @param authority Exact owner installed by the frozen graph/placement authority.
+     * @return True only when the participant's auxiliary replica owns routed parents.
+     * @throws std::invalid_argument For an unknown authority value.
+     */
+    [[nodiscard]] inline bool mtpParticipantReplicaOwnsRoutedParents(MTPRoutedExpertWeightAuthority authority)
+    {
+        switch (authority)
+        {
+        case MTPRoutedExpertWeightAuthority::SidecarParticipant: return true;
+        case MTPRoutedExpertWeightAuthority::ExpertOverlay: return false;
+        }
+        throw std::invalid_argument("MTP replica has an unknown routed-parent authority");
+    }
 
     /** @brief Authenticated tensor roles for one learned predictor block. */
     struct MTPDepthWeightNames

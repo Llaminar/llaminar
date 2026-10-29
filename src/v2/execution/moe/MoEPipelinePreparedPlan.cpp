@@ -8,6 +8,8 @@
  * CPU root declarations remain stage-owned across child projection and reuse.
  */
 #include "MoEPipelinePreparedPlan.h"
+#include "MoEOverlayCPUHostMaintenance.h"
+#include "ExpertHistogramServingRegime.h"
 #include "MoEOverlayPipelineStageBinding.h"
 #include "MoEOverlayResidencySetup.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
@@ -83,9 +85,22 @@ namespace llaminar2
                 .plan = plan, .metadata = prepared.metadata, .loader = loader,
                 .rebalance = requested.config().moe_rebalance, .storage_policy = admitted.storagePolicy(),
                 .capacity = *admitted.capacity(), .memory = memory});
+            std::shared_ptr<MoEOverlayCPUHostMaintenance> host_maintenance;
+            if (requested.config().moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+                plan.authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
+                !setup.authority()->noPeerResidency())
+                host_maintenance = std::make_shared<MoEOverlayCPUHostMaintenance>(MoEOverlayCPUHostMaintenance::Config{
+                    .metadata = prepared.metadata, .storage = admitted.storagePolicy(),
+                    .rebalance = requested.config().moe_rebalance,
+                    .topology = ExpertHistogramProductionTopology::forRetainedExecution(prepared.metadata.num_layers,
+                        prepared.metadata.main_inference_layer_count, expertHistogramServingRegime(admitted.rankPlan().runtime.mtp),
+                        prepared.metadata.first_model_layer),
+                    .memory = memory, .admission = admitted.capacity()->physical_memory_admission,
+                    .authority = setup.authority(), .residency = setup.residency(), .histogram = setup.histogram(),
+                    .perf_device = "cpu_pipeline_stage_" + std::to_string(index)});
             auto binding = MoEOverlayPipelineStageBinding::seal(admitted.topology().scope(), prepared.metadata,
                 domain->participants, {.authority = setup.authority(), .residency = setup.residency(),
-                    .histogram = setup.histogram(), .mpi = context,
+                    .histogram = setup.histogram(), .mpi = context, .host_maintenance = std::move(host_maintenance),
                     .cpu_serial_expert_storage = admitted.capacity()->cpu_serial_expert_storage});
             const auto &requested_plan = *requested.config().moe_routed_expert_plan;
             const auto destination = std::find_if(requested_plan.domains.begin(), requested_plan.domains.end(),

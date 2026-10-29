@@ -51,6 +51,8 @@
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "loaders/ImmutableRowTable.h"
 #include "OrchestrationRunner.h"
+#include "execution/moe/MoEOverlayCPUHostMaintenance.h"
+#include "execution/moe/ExpertHistogramServingRegime.h"
 #include "planning/ResolvedRankOrchestration.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
 #include "IOrchestrationRunnerFactory.h"
@@ -1804,29 +1806,6 @@ namespace llaminar2
         }
 
 
-        /**
-         * @brief Resolve which retained routed phases belong to service economy.
-         *
-         * Positive-depth MTP retains serial decode only for terminal catch-up
-         * and short tails.  Those legal exceptional graphs remain reachable,
-         * but waiting for every sparse participant to execute one would make
-         * movement readiness traffic-dependent and potentially unbounded.
-         * Depth-zero adaptive policy makes serial decode recurring again and
-         * therefore requires its measured cost.
-         */
-        ExpertHistogramServingRegime expertHistogramServingRegime(
-            const MTPRuntimeConfig &mtp) noexcept
-        {
-            if (!mtp.enabled)
-                return ExpertHistogramServingRegime::Serial;
-            if (mtp.depth_policy.mode != MTPDepthPolicyMode::Fixed &&
-                mtp.depth_policy.min_depth == 0)
-            {
-                return ExpertHistogramServingRegime::AdaptiveSerialOrMTP;
-            }
-            return ExpertHistogramServingRegime::PositiveDepthMTP;
-        }
-
         /** @brief Append one unsigned scalar in a host-independent wire order. */
         template <typename UInt>
         void appendCapacityWireScalar(
@@ -3325,7 +3304,8 @@ namespace llaminar2
         moe_overlay_inference_transaction_follower_.reset();
         moe_overlay_inference_transaction_coordinator_.reset();
         runner_.reset();
-        if (preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::RetiredImmutableSources)
+        if (preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::RetiredImmutableSources ||
+            (moe_pipeline_prepared_plan_ && preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::LiveMutableResidency))
         {
             std::string error;
             if (!sealReusableModelContextPhysicalState(&error))
@@ -3337,6 +3317,7 @@ namespace llaminar2
             }
         }
         moe_pipeline_stage_bindings_.clear();
+        model_context_pipeline_host_restored_ = false;
         if (reusable_execution_workspaces_ &&
             !reusable_execution_workspaces_->valid())
         {
@@ -3577,6 +3558,10 @@ namespace llaminar2
         MoEOverlayInferenceProgressPhase phase,
         std::uint64_t completed_logical_tokens) noexcept
     {
+        if (completed_logical_tokens == 0u) return;
+        for (const auto &binding : moe_pipeline_stage_bindings_)
+            if (const auto &owner = binding->owners().host_maintenance; owner)
+                owner->notify({.phase = phase, .completed_logical_tokens = completed_logical_tokens});
         if (!moe_expert_overlay_maintenance_service_ ||
             completed_logical_tokens == 0u)
         {
@@ -3865,11 +3850,12 @@ namespace llaminar2
 
     bool OrchestrationRunner::activateMoEOverlayDemandAtRequestBoundary()
     {
-        if (!moe_expert_overlay_residency_authority_)
-            return true;
-
         try
         {
+            for (const auto &binding : moe_pipeline_stage_bindings_)
+                if (binding->owners().host_maintenance)
+                    (void)binding->owners().authority->activateOptimizationDemandAtRequestBoundary();
+            if (!moe_expert_overlay_residency_authority_) return true;
             /*
              * The authority transition is deliberately idempotent. A normal
              * remote rank reaches this helper from its typed command handler
@@ -16844,6 +16830,12 @@ namespace llaminar2
                 ? runner_->primaryDeviceId().toString()
                 : std::string{};
 
+        for (const auto &binding : moe_pipeline_stage_bindings_)
+            if (const auto &owner = binding->owners().host_maintenance; owner)
+            {
+                if (!owner->ready()) return setError("CPU pipeline host maintenance is not healthy/prepared");
+                owner->notify({.phase = MoEOverlayInferenceProgressPhase::Decode, .completed_logical_tokens = committed_tokens});
+            }
         if (device_generation_embedded_moe_maintenance_pending_ack_)
         {
             if (!runner_ ||
@@ -17687,7 +17679,13 @@ namespace llaminar2
                         *stage.config().moe_routed_expert_plan, config_.moe_rebalance.mode);
                     if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
                         storage != MoEOverlayMigrationStorageKind::NoPeer &&
-                        storage != MoEOverlayMigrationStorageKind::DeviceTransferDirectory)
+                        storage != MoEOverlayMigrationStorageKind::DeviceTransferDirectory &&
+                        !(storage == MoEOverlayMigrationStorageKind::PhysicalResidencyFabric &&
+                          std::all_of(stage.config().moe_routed_expert_plan->domains.begin(),
+                              stage.config().moe_routed_expert_plan->domains.end(), [](const auto &domain) {
+                                  return std::all_of(domain.participants.begin(), domain.participants.end(),
+                                      [](const auto &participant) { return participant.toLocalDeviceId().is_cpu(); });
+                              })))
                         return setError("Movable local MoE pipeline stages require an admitted native maintenance domain");
                 }
             }
@@ -19480,6 +19478,12 @@ namespace llaminar2
                     return true;
                 }))
                 return false;
+            if (!run_maintenance_phase("preparePipelineCPUHostMaintenance", [&] {
+                    for (const auto &binding : moe_pipeline_stage_bindings_)
+                        if (const auto &owner = binding->owners().host_maintenance; owner)
+                            owner->prepare();
+                    return true;
+                })) return false;
             // Nested TP-in-PP construction prepares weights and persistent
             // state, but deliberately leaves the graph family unmaterialized.
             // Finalized expert banks must precede capture; readiness can only
@@ -19499,7 +19503,9 @@ namespace llaminar2
                          {"migration_payload_bytes", "0"}, {"movement_collectives", "0"}});
             PerfStatsCollector::addCounter("moe_overlay_residency", "pipeline_maintenance_composed", 1.0,
                 "model_setup", {}, {{"stages", std::to_string(moe_pipeline_stage_bindings_.size())},
-                    {"authority_execution", "stage_owned"}, {"host_maintenance_service", "false"}});
+                    {"authority_execution", "stage_owned"}, {"host_maintenance_service",
+                        std::any_of(moe_pipeline_stage_bindings_.begin(), moe_pipeline_stage_bindings_.end(),
+                            [](const auto &binding) { return bool(binding->owners().host_maintenance); }) ? "true" : "false"}});
             return true;
         }
         if (!moe_expert_overlay_residency_authority_)
@@ -19596,9 +19602,16 @@ namespace llaminar2
             return true;
         }
 
+        const auto maintenance_world = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        const bool local_cpu_host_maintenance = maintenance_world && maintenance_world->world_size() == 1 &&
+            initial_snapshot->placement_plan->authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
+            config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+            std::all_of(initial_snapshot->owner_map.participants().begin(), initial_snapshot->owner_map.participants().end(),
+                [](const auto &participant) { return participant.device.is_cpu(); });
         std::vector<MoEOverlayParticipantLayerServiceTotals>
             prepared_cpu_service_measurements;
         if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+            !local_cpu_host_maintenance &&
             !run_maintenance_phase("measurePreparedCPUExpertService", [&]
             {
                 // This setup thread has the same MPI/NUMA/OpenMP placement as
@@ -19619,6 +19632,34 @@ namespace llaminar2
                 return true;
             }))
             return false;
+
+        if (local_cpu_host_maintenance)
+        {
+            if (!run_maintenance_phase("prepareCPUHostMaintenance", [&] {
+                    const auto metadata = resolveMoERoutedExpertModelMetadataForModel(*model_ctx_, retainedMTPConfig());
+                    const auto storage = resolveMoEOverlayCapacityAdmissionPolicy(*initial_snapshot->placement_plan,
+                        config_, 1, metadata.num_layers, metadata.num_experts);
+                    const auto profile_identity = expertOverlayMigrationProfileReuseIdentity(
+                        requested_routed_weight_authority_identity_, *moe_expert_overlay_residency_authority_->economyLayerCatalog());
+                    auto owner = std::make_shared<MoEOverlayCPUHostMaintenance>(MoEOverlayCPUHostMaintenance::Config{
+                        .metadata = metadata, .storage = storage, .rebalance = config_.moe_rebalance,
+                        .topology = ExpertHistogramProductionTopology::forRetainedExecution(metadata.num_layers,
+                            metadata.main_inference_layer_count, expertHistogramServingRegime(retainedMTPConfig()), metadata.first_model_layer),
+                        .memory = physical_memory_authority_, .admission = physical_memory_authority_->admission(),
+                        .authority = moe_expert_overlay_residency_authority_, .residency = moe_expert_overlay_participant_residency_,
+                        .histogram = moe_expert_overlay_decode_histogram_,
+                        .presealed_measurements = retained_expert_overlay_migration_profile_identity_ == profile_identity
+                            ? retained_expert_overlay_migration_profile_ : nullptr,
+                        .perf_device = perf_device});
+                    owner->prepare();
+                    moe_expert_overlay_economy_calibration_ = std::shared_ptr<MoEOverlayEconomyCalibrationController>(owner, owner->calibration());
+                    moe_expert_overlay_migration_profile_identity_ = profile_identity;
+                    moe_expert_overlay_maintenance_service_ = std::shared_ptr<MoEOverlayResidencyMaintenanceService>(owner, owner->service());
+                    moe_cpu_host_maintenance_ = std::move(owner);
+                    return bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily();
+                })) return false;
+            return true;
+        }
 
         const bool mapped_device_authority =
             initial_snapshot->placement_plan->authority_execution ==
@@ -20727,6 +20768,12 @@ namespace llaminar2
     bool OrchestrationRunner::
         startMoEExpertOverlayResidencyMaintenance()
     {
+        try
+        {
+            for (const auto &binding : moe_pipeline_stage_bindings_)
+                if (const auto &owner = binding->owners().host_maintenance; owner) owner->start();
+        }
+        catch (const std::exception &error) { return setError("CPU pipeline maintenance activation failed: " + std::string(error.what())); }
         if (moe_overlay_device_controller_graph_service_ &&
             moe_expert_overlay_maintenance_service_)
         {
@@ -20805,6 +20852,17 @@ namespace llaminar2
             terminal_moe_device_controller_drain_result_.reset();
         }
 
+        for (const auto &binding : moe_pipeline_stage_bindings_)
+            if (const auto &owner = binding->owners().host_maintenance; owner)
+            {
+                try { owner->stopAndDrain(); }
+                catch (const std::exception &error)
+                {
+                    model_context_reuse_seal_succeeded_ = false;
+                    model_context_reuse_seal_error_ = "CPU pipeline maintenance drain failed: " + std::string(error.what());
+                    LOG_ERROR(model_context_reuse_seal_error_);
+                }
+            }
         /*
          * The topology-wide device service owns the only thread that may touch
          * descriptor inboxes or the physical slot ledger. Stop and join it
@@ -20962,6 +21020,7 @@ namespace llaminar2
         moe_expert_overlay_wave_factory_.reset();
         moe_expert_overlay_device_bank_publisher_.reset();
         moe_expert_overlay_physical_residency_fabric_.reset();
+        moe_cpu_host_maintenance_.reset();
         moe_expert_overlay_remote_projection_transport_.reset();
         moe_expert_overlay_residency_consensus_.reset();
     }
@@ -21015,14 +21074,15 @@ namespace llaminar2
 
     bool OrchestrationRunner::rebindModelRegistryFromReusableContextSeal(
         const MoEOverlayReusableContextSeal &seal,
-        std::string *error) noexcept
+        std::string *error,
+        const std::shared_ptr<MoEOverlayParticipantResidencyRegistry> &residency) noexcept
     {
         if (error)
             error->clear();
         try
         {
             if (!seal.valid() || !model_ctx_ ||
-                !moe_expert_overlay_participant_residency_)
+                !residency)
             {
                 if (error)
                 {
@@ -21055,7 +21115,7 @@ namespace llaminar2
             std::vector<ExpertGemmRegistry::ParticipantExpertBinding>
                 bindings;
             const auto participant_ids =
-                moe_expert_overlay_participant_residency_
+                residency
                     ->localParticipantIds();
             if (seal.local_banks.size() != participant_ids.size())
             {
@@ -21071,7 +21131,7 @@ namespace llaminar2
                 const auto *participant =
                     canonical_owner_map.participantForId(participant_id);
                 const auto endpoint =
-                    moe_expert_overlay_participant_residency_->endpoint(
+                    residency->endpoint(
                         participant_id);
                 if (!participant || !endpoint)
                 {
@@ -21279,7 +21339,38 @@ namespace llaminar2
                 return true;
             }
             if (moe_pipeline_prepared_plan_)
-                throw std::logic_error("Pipeline prepared-context sealing requires immutable native source storage");
+            {
+                if (moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size())
+                    throw std::logic_error("Mutable pipeline sealing lost exact stage ownership");
+                if (!model_context_pipeline_host_restored_)
+                {
+                    for (const auto &binding : moe_pipeline_stage_bindings_)
+                        if (const auto &owner = binding->owners().host_maintenance; owner)
+                        {
+                            owner->stopAndDrain();
+                            const auto seal = owner->restorePreparedPlacement();
+                            if (!rebindModelRegistryFromReusableContextSeal(seal, error, binding->owners().residency)) return false;
+                        }
+                    model_context_pipeline_host_restored_ = true;
+                }
+                // Native directory sources remain immutable but may be bound by
+                // captured children. Their final proof follows child retirement.
+                if (runner_) return true;
+                const auto weights = model_ctx_->concreteWeightManager();
+                if (!weights) throw std::logic_error("Mutable pipeline seal lost its model weight registry");
+                for (const auto &binding : moe_pipeline_stage_bindings_)
+                {
+                    if (binding->owners().host_maintenance)
+                    {
+                        if (!binding->owners().authority->initialPreparedPlacementPublished() ||
+                            binding->owners().authority->activeTicketCount() != 0)
+                            throw std::logic_error("CPU pipeline prepared placement changed after terminal restoration");
+                    }
+                    else (void)binding->owners().residency->verifyImmutablePreparedSources(weights->expertGemmRegistry());
+                }
+                model_context_physical_state_sealed_ = true;
+                return true;
+            }
             if (!moe_expert_overlay_residency_authority_)
             {
                 const bool requires_dynamic_overlay_seal =
@@ -21297,6 +21388,14 @@ namespace llaminar2
                     }
                     return false;
                 }
+                model_context_physical_state_sealed_ = true;
+                return true;
+            }
+            if (moe_cpu_host_maintenance_)
+            {
+                moe_cpu_host_maintenance_->stopAndDrain();
+                const auto seal = moe_cpu_host_maintenance_->restorePreparedPlacement();
+                if (!rebindModelRegistryFromReusableContextSeal(seal, error, moe_expert_overlay_participant_residency_)) return false;
                 model_context_physical_state_sealed_ = true;
                 return true;
             }
@@ -21358,7 +21457,7 @@ namespace llaminar2
                             error);
                 if (!physical_seal ||
                     !rebindModelRegistryFromReusableContextSeal(
-                        *physical_seal, error))
+                        *physical_seal, error, moe_expert_overlay_participant_residency_))
                 {
                     return false;
                 }
@@ -21532,7 +21631,7 @@ namespace llaminar2
                         published->epoch, error);
             if (!physical_seal ||
                 !rebindModelRegistryFromReusableContextSeal(
-                    *physical_seal, error))
+                    *physical_seal, error, moe_expert_overlay_participant_residency_))
                 return false;
             model_context_physical_state_sealed_ = true;
             PerfStatsCollector::addCounter(
@@ -25310,6 +25409,18 @@ namespace llaminar2
     OrchestrationRunner::internalInferencePreparationReadiness() const
     {
         InferenceMeasurementReadiness overlay_readiness;
+        InferenceMeasurementReadiness stage_readiness;
+        for (const auto &binding : moe_pipeline_stage_bindings_)
+            if (const auto &owner = binding->owners().host_maintenance; owner)
+            {
+                if (!owner->service()) return {.state = InferenceMeasurementReadinessState::Failed,
+                    .owner = "cpu_pipeline_host_maintenance", .phase = "unprepared",
+                    .diagnostic = "CPU pipeline maintenance has no prepared service"};
+                const auto observed = owner->service()->measurementReadiness();
+                if (observed.failed()) return observed;
+                if (!observed.ready()) stage_readiness = observed;
+            }
+        if (!stage_readiness.ready()) return stage_readiness;
         if (moe_expert_overlay_maintenance_service_ &&
             moe_overlay_device_controller_graph_service_)
         {

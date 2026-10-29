@@ -6,6 +6,8 @@
  * ordered readiness exchange, immutable profile installation, and routing
  * evidence rebase. A cold-format price remains missing until a real
  * participant-local measurement supplies it.
+ * Stage service coordinates stay model-global; only compact vector offsets
+ * subtract the authenticated first model layer.
  */
 
 #include "MoEOverlayEconomyCertificationController.h"
@@ -140,6 +142,9 @@ namespace llaminar2
 
         const auto snapshot = config_.authority->snapshot();
         if (!snapshot || !snapshot->valid() ||
+            config_.model_metadata.first_model_layer != snapshot->layered_ownership.firstModelLayer() ||
+            config_.production_topology.firstModelLayer() != config_.model_metadata.first_model_layer ||
+            config_.layer_catalog->firstModelLayer() != config_.model_metadata.first_model_layer ||
             config_.model_metadata.num_layers !=
                 snapshot->layered_ownership.layerCount() ||
             config_.model_metadata.num_experts !=
@@ -821,10 +826,10 @@ namespace llaminar2
         }
         for (const auto &row : profile.participant_costs)
         {
-            if (row.participant_id < 0 || row.layer < 0 ||
+            if (row.participant_id < 0 || row.layer < config_.model_metadata.first_model_layer ||
                 static_cast<std::size_t>(row.participant_id) >=
                     participant_count ||
-                static_cast<std::size_t>(row.layer) >= layer_count)
+                static_cast<std::size_t>(row.layer - config_.model_metadata.first_model_layer) >= layer_count)
             {
                 throw std::invalid_argument(
                     "ExpertOverlay service diagnostics received an invalid participant coordinate");
@@ -861,16 +866,16 @@ namespace llaminar2
             profile.costs.size(), nullptr);
         for (const auto &row : profile.costs)
         {
-            if (row.tier_index < 0 || row.layer < 0 ||
+            if (row.tier_index < 0 || row.layer < config_.model_metadata.first_model_layer ||
                 static_cast<std::size_t>(row.tier_index) >= tier_count ||
-                static_cast<std::size_t>(row.layer) >= layer_count)
+                static_cast<std::size_t>(row.layer - config_.model_metadata.first_model_layer) >= layer_count)
             {
                 throw std::invalid_argument(
                     "ExpertOverlay crossover diagnostics received an invalid service coordinate");
             }
             const std::size_t offset =
                 static_cast<std::size_t>(row.tier_index) * layer_count +
-                static_cast<std::size_t>(row.layer);
+                static_cast<std::size_t>(row.layer - config_.model_metadata.first_model_layer);
             if (rows[offset] != nullptr)
             {
                 throw std::invalid_argument(
@@ -900,7 +905,7 @@ namespace llaminar2
                  ++phase)
             {
                 if (!profile.production_topology.requiresServiceEvidence(
-                        static_cast<int>(layer), phase))
+                        config_.model_metadata.first_model_layer + static_cast<int>(layer), phase))
                     continue;
                 for (std::size_t rank = 1;
                      rank < priority_order.size();
@@ -927,7 +932,7 @@ namespace llaminar2
                         1.0,
                         "maintenance",
                         config_.perf_device,
-                        {{"layer", std::to_string(layer)},
+                        {{"layer", std::to_string(config_.model_metadata.first_model_layer + static_cast<int>(layer))},
                          {"source", serviceSourceName(phase)},
                          {"preferred_tier", std::to_string(preferred)},
                          {"preferred_priority",
@@ -1018,8 +1023,8 @@ namespace llaminar2
     {
         std::uint64_t hash = kFNV1a64OffsetBasis;
         hashString(hash, config_.layer_catalog->identity());
-        for (int layer = 0;
-             layer < config_.model_metadata.num_layers;
+        for (int layer = config_.model_metadata.first_model_layer;
+             layer < config_.model_metadata.first_model_layer + config_.model_metadata.num_layers;
              ++layer)
         {
             for (const bool reachable :

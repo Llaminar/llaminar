@@ -7,6 +7,8 @@
  * CUDA/HIP runtime APIs before those dependencies can leak into compute stages.
  * Shared planning adapters, rather than runner-private formulas, own typed
  * admission inputs; live byte ownership remains in PhysicalMemoryAuthority.
+ * Lifecycle guards identify the actual resource owner so independently composed
+ * CPU and GPU services cannot satisfy or invalidate each other's wiring proof.
  */
 
 #include <gtest/gtest.h>
@@ -72,6 +74,25 @@ namespace llaminar2::test
                 if (!std::isspace(value))
                     result.push_back(static_cast<char>(value));
             return result;
+        }
+
+        /**
+         * @brief Authenticate the device controller's terminal evidence ordering.
+         * @param source Exact shutdown body, possibly containing other owners' drains.
+         * @return True when policy resolution precedes the device drain and its
+         *         movement snapshot survives until after that service is released.
+         */
+        bool hasRetainedDeviceDrainOrder(std::string_view source)
+        {
+            const auto compact = withoutWhitespace(source);
+            const auto disposition = compact.find("modelContextOverlayDrainIntent(");
+            const auto drain = compact.find(
+                "moe_overlay_device_controller_graph_service_->stopAndDrain(device_drain_intent)");
+            const auto retain = compact.find("terminal_moe_optimization_movement_ledger_=", drain);
+            const auto destroy = compact.find("moe_overlay_device_controller_graph_service_.reset()");
+            return disposition != std::string::npos && drain != std::string::npos &&
+                retain != std::string::npos && destroy != std::string::npos &&
+                disposition < drain && drain < retain && retain < destroy;
         }
 
         std::string readFile(const fs::path &path)
@@ -11442,6 +11463,27 @@ namespace llaminar2::test
             << "Device-owned teardown cannot reconstruct authority from a stale host snapshot";
     }
 
+    /** @test CPU drains cannot mask missing, reordered or prematurely destroyed GPU evidence. */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         TerminalDrainSourceGuardSelectsExactOwner)
+    {
+        const std::string policy = "auto device_drain_intent = modelContextOverlayDrainIntent(authority, mode);";
+        const std::string drain = "moe_overlay_device_controller_graph_service_ -> stopAndDrain(device_drain_intent);";
+        const std::string retain = "terminal_moe_optimization_movement_ledger_ = device_ledger;";
+        const std::string destroy = "moe_overlay_device_controller_graph_service_.reset();";
+        const std::string cpu = "owner->stopAndDrain();";
+        EXPECT_TRUE(hasRetainedDeviceDrainOrder(cpu + policy + drain + retain + destroy));
+        EXPECT_TRUE(hasRetainedDeviceDrainOrder(policy + cpu + drain + retain + cpu + destroy));
+        EXPECT_FALSE(hasRetainedDeviceDrainOrder(cpu + policy + retain + destroy));
+        EXPECT_FALSE(hasRetainedDeviceDrainOrder(cpu + drain + policy + retain + destroy));
+        EXPECT_FALSE(hasRetainedDeviceDrainOrder(cpu + policy + drain + destroy + retain));
+        EXPECT_FALSE(hasRetainedDeviceDrainOrder(cpu + policy + drain + destroy));
+        EXPECT_FALSE(hasRetainedDeviceDrainOrder(policy +
+            "moe_expert_overlay_maintenance_service_->stopAndDrain(device_drain_intent);" + retain + destroy));
+        EXPECT_FALSE(hasRetainedDeviceDrainOrder(policy +
+            "moe_overlay_device_controller_graph_service_->stopAndDrain(foreign_intent);" + retain + destroy));
+    }
+
     /**
      * @brief Keep typed movement evidence alive after terminal resource drain.
      *
@@ -11472,26 +11514,10 @@ namespace llaminar2::test
             runner,
             "void OrchestrationRunner::\n        shutdownMoEExpertOverlayResidencyMaintenance(");
         ASSERT_FALSE(shutdown.empty());
-        const size_t drain = shutdown.find("->stopAndDrain(");
-        const size_t retain = shutdown.find(
-            "terminal_moe_optimization_movement_ledger_",
-            drain);
-        const size_t destroy = shutdown.find(
-            "moe_overlay_device_controller_graph_service_.reset()");
-        ASSERT_NE(drain, std::string::npos);
         // Executable Unit/MPI tests own policy semantics. This wiring guard
-        // ensures the runner uses that authority-aware resolver instead of
-        // recreating an unconditional Dynamic => restore ternary here.
-        const size_t disposition = shutdown.find("modelContextOverlayDrainIntent(");
-        ASSERT_NE(disposition, std::string::npos);
-        EXPECT_LT(disposition, drain);
-        EXPECT_NE(shutdown.find("device_drain_intent", drain), std::string::npos)
-            << "Terminal drain must consume the model-retention policy result";
-        ASSERT_NE(retain, std::string::npos);
-        ASSERT_NE(destroy, std::string::npos);
-        EXPECT_LT(drain, retain);
-        EXPECT_LT(retain, destroy)
-            << "Runner destruction cannot erase terminal device movement evidence";
+        // authenticates the device owner, not the first independent CPU drain.
+        EXPECT_TRUE(hasRetainedDeviceDrainOrder(shutdown))
+            << "Device drain must consume its retention policy and preserve movement evidence before destruction";
 
         const std::string service_drain = braceBalancedDeclarationRegion(
             service,

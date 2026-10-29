@@ -31,6 +31,7 @@
  */
 
 #include "RankOrchestrator.h"
+#include "execution/moe/MoEOverlayCPUHostMaintenance.h"
 #include "snapshots/SnapshotAuthoredTokenRows.h"
 #include "PipelineResidualWidth.h"
 #include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
@@ -16795,6 +16796,10 @@ namespace llaminar2
                 if (i >= worker_participants.size() || !worker_participants[i])
                     return false;
 
+                if (use_pp_participants && config_.pp_stages.at(i).moe_runtime &&
+                    config_.pp_stages[i].moe_runtime->owners().host_maintenance)
+                    return config_.pp_stages[i].moe_runtime->owners().host_maintenance->ready();
+
                 const DeviceId device =
                     worker_participants[i]->primaryDeviceId();
                 ROCmKernelProfiler::setCurrentDevice(device.ordinal);
@@ -19255,9 +19260,15 @@ namespace llaminar2
             {
                 // A genuinely movable host stage needs its own admitted host
                 // maintenance composition. A no-peer identity cannot certify it.
-                if (binding->plan()->authority_execution != MoEOverlayAuthorityExecutionKind::DeviceResident)
-                    throw std::logic_error("Movable host MoE pipeline stage has no admitted maintenance owner");
-                if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized &&
+                if (binding->plan()->authority_execution == MoEOverlayAuthorityExecutionKind::HostResident)
+                {
+                    const auto &owner = binding->owners().host_maintenance;
+                    if (!owner) throw std::logic_error("Movable host MoE pipeline stage has no admitted maintenance owner");
+                    owner->requireScope(binding->owners().authority.get(), binding->owners().residency.get(), binding->metadata());
+                    if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized && !owner->ready())
+                        throw std::logic_error("Movable host MoE pipeline stage has no prepared maintenance family");
+                }
+                else if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized &&
                     !child->deviceResidentMoEOverlayMaintenanceReady())
                     throw std::logic_error("Movable MoE pipeline stage has no complete native maintenance family");
             }

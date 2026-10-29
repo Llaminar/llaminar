@@ -6,6 +6,8 @@
  * byte admission. This boundary only assembles their typed inputs, including
  * every retained MTP, prefix, snapshot and graph family. Frontends cannot omit
  * those families by maintaining another lightweight device-plan constructor.
+ * Compute membership retains CPU NUMA identity; only storage ownership projects
+ * those workers onto their shared host physical resource.
  */
 #pragma once
 
@@ -20,9 +22,10 @@ namespace llaminar2
     /**
      * @brief Immutable transfer ownership of one authored local pipeline stage.
      *
-     * Physical participant identity selects the domain leader. Dense replication
-     * may label every weight view shard zero and must not multiply channel owners.
-     * Ordinary and ExpertOverlay planning use this same projection.
+     * The authored domain selects the leader before physical storage projection.
+     * CPU NUMA workers retain independent compute shards and one host allocator;
+     * dense replication may label every weight view shard zero without multiplying
+     * channel owners. Ordinary and ExpertOverlay planning use this projection.
      */
     class PipelineStageTransferMemory final
     {

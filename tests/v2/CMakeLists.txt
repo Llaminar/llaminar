@@ -1324,6 +1324,11 @@ add_v2_test(V2_Unit_MoEForbiddenDependencyScan
     LABELS "V2;Unit;Execution;MoE;SourceHygiene;GraphNative"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_ComposedMoETerminalDrainSourceGuard
+    COMMAND $<TARGET_FILE:v2_unit_moe_forbidden_dependency_scan>
+        --gtest_filter=Test__MoEGraphNative_ForbiddenDependencyScan.TerminalDrainRetainsDeviceMovementLedgerForRunnerLifetime:Test__MoEGraphNative_ForbiddenDependencyScan.TerminalDrainSourceGuardSelectsExactOwner
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Pipeline;SourceHygiene;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Greedy Dynamic-MTP has a distinct accepted-state cadence edge. Keep the
 # source-graph ownership proof in preflight beside the CUDA/ROCm captured
@@ -1884,6 +1889,18 @@ add_v2_test(V2_Integration_MoEPipelineStagePhysicalResidency
         --gtest_filter=Test__MoEOverlayPhysicalResidencyFabric.PipelineStageTransfers*:Test__MoEOverlayPhysicalResidencyFabric.PipelineStageRejectsForeignFabricAdmission
     LABELS "V2;Integration;ProductionTestPreflight;MoE;Pipeline;Residency;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS
+)
+add_v2_test(V2_Integration_MoEPipelineCPUHostOwnerScope
+    COMMAND $<TARGET_FILE:v2_test_moe_pipeline_stage_binding>
+        --gtest_filter=Test__MoEOverlayPipelineStageBinding.CpuTPTailRejectsMissingStageHostMaintenance
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;Pipeline;Ownership;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+)
+add_v2_test(V2_Integration_MoEPipelineCPUHostMaintenance
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_physical_residency_fabric>
+        --gtest_filter=Test__MoEOverlayPhysicalResidencyFabric.CPUHostMaintenance*
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;Pipeline;Ownership;Lifecycle;Replay;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
 )
 add_v2_test(V2_Unit_MoEOverlayPhysicalResidencyFabric
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_physical_residency_fabric>
@@ -14316,6 +14333,11 @@ add_v2_test(V2_Unit_MTPWeightManifest
     LABELS "V2;Unit;MTP;Weights;PrefixCache"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_MTPDenseDecodeReplicaRoutedAuthority
+    COMMAND $<TARGET_FILE:v2_test_mtp_weight_manifest>
+        --gtest_filter=Test__MTPWeightManifest.DenseDecodeReplicaSelectionReplaysExactRoutedAuthority:Test__MTPWeightManifest.ParticipantReplicaNamesRespectTypedRoutedExpertAuthority
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;Weights;ExpertOverlay;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MTPLearnedWeightAdmission
     COMMAND $<TARGET_FILE:v2_test_mtp_weight_manifest>
         --gtest_filter=Test__MTPWeightManifest.PlainDenseAndMoEModelsRejectRequiredLearnedPredictor:Test__MTPWeightManifest.MetadataOnlyAndIncompletePredictorsFailRequiredAdmission:Test__MTPWeightManifest.RequiredAdmissionPreservesAuthenticatedNextNAndDedicatedLayouts
@@ -25667,6 +25689,11 @@ add_v2_test(V2_Integration_MoEOverlayResidencySetup
         --gtest_filter=MoEOverlayResidencySetup.*
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CPU;CUDA;ROCm;MTP;DeviceFree;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_MTPReplicaRoutedWeightBOM
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.MTPReplicaRoutedAuthorityReplaysTerminalAndRetainedSetup:Test__MemoryPlanner.ReplicatedMTPSidecarPricesTrailingDenseAndSharedWeights
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MTP;Weights;ExpertOverlay;Replay;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_RetainedMTPWeightAuthority
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=PreparedWeightAuthorityIdentity.MTPReuseRequiresPredictorAndHeadPlacement
@@ -25687,6 +25714,11 @@ add_v2_test(V2_Integration_CapturedPipelineMemoryAdmission
         --gtest_filter=Test__MemoryPlanner.CapturedPipelineChannelAccountingIsExactAndBackendSymmetric:RankMemoryPlanInputs.CapturedPipelineChannelsFollowDomainsNotDeviceOrdinals
     LABELS "V2;Integration;ProductionTestPreflight;Planning;Pipeline;Transfer;MemoryBudget;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_CPUNumaPipelineTransferAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=RankMemoryPlanInputs.CPUNumaPipeline*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;CPU;CUDA;ROCm;PP;TP;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_PhaseSplitDenseMemoryAdmission
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.PhaseSplitDenseDecodePricesFullKVAndCapturedActivationFamily

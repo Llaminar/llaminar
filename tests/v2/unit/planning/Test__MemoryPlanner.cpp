@@ -2246,6 +2246,8 @@ TEST(Test__MemoryPlanner,
     profile.mtp_layer_count = 1;
 
     DevicePlanConfig config = overlayDeviceConfig(DeviceId::rocm(0));
+    config.mtp_routed_expert_weight_authority =
+        MTPRoutedExpertWeightAuthority::ExpertOverlay;
     config.shard_index = 0;
     config.total_shards = 2;
     config.local_tp_backend = CollectiveBackendType::RCCL;
@@ -4784,4 +4786,95 @@ TEST(Test__MemoryPlanner, MTPFollowerExecutableOwnershipPreservesRegistryGeometr
         EXPECT_GT(follower.generationParentGraphSlots(), 0u);
         EXPECT_EQ(follower.speculativePublicationGraphSlots(), controller.speculativePublicationGraphSlots());
     }
+}
+
+/**
+ * @brief Replay the real weight BOM across retained policies and PP ownership.
+ *
+ * Only the terminal main stage owns the learned trailing predictor. Both
+ * phase-split decode and a separately replicated predictor obey the same
+ * physical routed-parent authority. Off with retained capacity reserves the
+ * same setup as enabled MTP, independent of request-time enablement.
+ */
+TEST(Test__MemoryPlanner, MTPReplicaRoutedAuthorityReplaysTerminalAndRetainedSetup)
+{
+    auto profile = createMoEOverlayProfile();
+    // Two main layers and one trailing learned predictor let the terminal
+    // stage begin at global layer one, catching local/global offset mistakes.
+    const auto original_tensors = profile.tensors;
+    for (const auto &tensor : original_tensors)
+    {
+        if (tensor.layer_index != 1)
+            continue;
+        auto predictor = tensor;
+        predictor.name.replace(0, 5, "blk.2");
+        predictor.layer_index = 2;
+        profile.total_native_bytes += predictor.native_bytes;
+        profile.tensors.push_back(std::move(predictor));
+    }
+    profile.n_layers = 3;
+    profile.mtp_layer_count = 1;
+    std::size_t predictor_parent_bytes = 0;
+    for (const auto &tensor : profile.tensors)
+        if (tensor.layer_index == 2 && isRoutedExpertRole(inferWeightRole(tensor.name)))
+            predictor_parent_bytes += tensor.native_bytes;
+    ASSERT_GT(predictor_parent_bytes, 0u);
+
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const auto dense_policy : {DenseParallelPolicy::TensorParallel,
+                                       DenseParallelPolicy::PrefillTensorParallelDecodeReplicated})
+            for (const int first_layer : {1, 0})
+                for (const bool enabled : {false, true, false})
+                {
+                    SCOPED_TRACE(device.toString() + " first=" + std::to_string(first_layer) +
+                        " enabled=" + std::to_string(enabled));
+                    auto config = overlayDeviceConfig(device);
+                    config.first_layer = first_layer;
+                    config.last_layer = first_layer;
+                    config.owns_embedding = first_layer == 0;
+                    config.total_shards = 2;
+                    if (device.is_gpu())
+                        config.local_tp_backend = device.is_cuda()
+                            ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+                    MTPRuntimeConfig mtp;
+                    mtp.enabled = enabled;
+                    mtp.draft_tokens = 3;
+                    mtp.graph_capacity_draft_tokens = 3;
+                    mtp.sidecar_dense_policy = MTPSidecarDensePolicy::ReplicatedPerParticipant;
+                    mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+                    config.mtp_enabled = retainsMTPGraphCapacity(mtp);
+                    ASSERT_TRUE(config.mtp_enabled);
+                    config.additional_weight_sets = resolveAdditionalPersistentWeightSets(
+                        dense_policy, config.total_shards, mtp);
+                    config.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+                        profile.expert_count, std::vector<int>(3, 0));
+                    config.mtp_routed_expert_weight_authority = MTPRoutedExpertWeightAuthority::ExpertOverlay;
+                    if (device.is_cpu()) declareCPUSerialFixture(config, profile);
+                    const auto overlay = MemoryPlanner::plan(profile, {config});
+                    config.mtp_routed_expert_weight_authority = MTPRoutedExpertWeightAuthority::SidecarParticipant;
+                    const auto ordinary = MemoryPlanner::plan(profile, {config});
+                    ASSERT_EQ(overlay.devices.size(), 1u);
+                    ASSERT_EQ(ordinary.devices.size(), 1u);
+                    const auto &overlay_device = overlay.devices.front();
+                    const auto &ordinary_device = ordinary.devices.front();
+                    EXPECT_EQ(ordinary_device.weight_bytes(), overlay_device.weight_bytes());
+                    EXPECT_EQ(ordinary_device.additional_weight_bytes(),
+                        overlay_device.additional_weight_bytes() +
+                            (first_layer == 1 ? predictor_parent_bytes : 0u));
+                    if (first_layer == 0 && dense_policy == DenseParallelPolicy::TensorParallel)
+                        EXPECT_EQ(overlay_device.additional_weight_bytes(), 0u);
+                    if (first_layer == 1)
+                        EXPECT_GT(overlay_device.additional_weight_bytes(), 0u)
+                            << "The predictor's non-routed operands remain admitted";
+                    // Exact replay must reproduce physical owner totals after
+                    // another authority/pipeline case has been planned.
+                    const auto replay = MemoryPlanner::plan(profile, {config});
+                    EXPECT_EQ(replay.devices.front().additional_weight_bytes(),
+                        ordinary_device.additional_weight_bytes());
+                }
+    EXPECT_EQ(DevicePlanConfig{}.mtp_routed_expert_weight_authority,
+        MTPRoutedExpertWeightAuthority::SidecarParticipant);
+    auto bad = overlayDeviceConfig(DeviceId::cuda(0));
+    bad.mtp_routed_expert_weight_authority = static_cast<MTPRoutedExpertWeightAuthority>(99);
+    EXPECT_THROW((void)MemoryPlanner::plan(profile, {bad}), std::invalid_argument);
 }

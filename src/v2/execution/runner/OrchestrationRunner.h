@@ -65,6 +65,7 @@ namespace llaminar2
     enum class ModelContextPhysicalSealBoundary;
 
     class MoEOverlayResidencyAuthority;
+    class MoEOverlayCPUHostMaintenance;
     class MoEOverlayParticipantResidencyRegistry;
     class MoEOverlayPhysicalResidencyFabric;
     class MoEOverlayPipelineStageBinding;
@@ -813,6 +814,7 @@ namespace llaminar2
          * @brief Rebind the model registry from a canonical physical seal.
          * @param seal Exact loader-allocation aliases produced after reader drain.
          * @param error Receives missing-bank or atomic replacement diagnostics.
+         * @param residency Exact stage or ordinary registry; null is a fatal scope error.
          * @return True only after every process-local scope is rebound.
          *
          * Published participant banks may still name temporary shadow slots even
@@ -821,7 +823,8 @@ namespace llaminar2
          */
         bool rebindModelRegistryFromReusableContextSeal(
             const MoEOverlayReusableContextSeal &seal,
-            std::string *error = nullptr) noexcept;
+            std::string *error,
+            const std::shared_ptr<MoEOverlayParticipantResidencyRegistry> &residency) noexcept;
 
         /**
          * @brief Validate TP/PP configuration against loaded model
@@ -1503,8 +1506,12 @@ namespace llaminar2
         std::shared_ptr<MoEOverlayMPIResidencyProposalPublisher>
             moe_expert_overlay_proposal_publisher_;
         /** Sole host background scheduler for durable overlay movement. */
-        std::unique_ptr<MoEOverlayResidencyMaintenanceService>
+        std::shared_ptr<MoEOverlayResidencyMaintenanceService>
             moe_expert_overlay_maintenance_service_;
+        /** Common CPU-only owner also used by exact mutable pipeline stages. */
+        std::shared_ptr<MoEOverlayCPUHostMaintenance> moe_cpu_host_maintenance_;
+        /** Mutable roots restore before child retirement; final proof follows retirement. */
+        bool model_context_pipeline_host_restored_ = false;
         /** Lock-free live inference interval boundary used only when armed. */
         std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
             moe_expert_overlay_interference_probe_;

@@ -2423,6 +2423,9 @@ namespace llaminar2
                  ++participant)
             {
                 const auto &input = result.device_inputs[participant];
+                EXPECT_EQ(input.mtp_routed_expert_weight_authority,
+                    MTPRoutedExpertWeightAuthority::ExpertOverlay)
+                    << "The capacity input must preserve the frozen overlay's sole expert authority";
                 EXPECT_EQ(input.device, device(static_cast<int>(participant)));
                 EXPECT_EQ(input.shard_index, 0);
                 EXPECT_EQ(input.total_shards, 1);

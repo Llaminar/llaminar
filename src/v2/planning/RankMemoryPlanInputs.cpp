@@ -8,7 +8,10 @@
  * sole ledger. Local TP uses the graph's exact proportional slice, not an
  * independent integer split reconstructed from the shard count. Ordinary and
  * ExpertOverlay pipelines share the same physical transfer-leader projection;
- * replicated weight views do not become extra channel owners.
+ * replicated weight views do not become extra channel owners. Authored CPU
+ * NUMA participants retain their compute shards while sharing the one physical
+ * host allocator; transfer ownership must not mistake that sharing for duplicate
+ * compute membership.
  *
  * Source-qualified query KV intervals come from the same canonical assignment
  * used for weights and graphs; PMA alone accounts their actual physical bytes.
@@ -21,6 +24,7 @@
 #include "backends/DeviceAddressAdapter.h"
 #include "config/BackendSelector.h"
 #include "execution/mtp/DeviceGenerationExecutionPolicy.h"
+#include <span>
 
 namespace llaminar2
 {
@@ -39,18 +43,44 @@ namespace llaminar2
         result.world_rank_ = parent.rank;
         result.first_layer_ = boundaries[stage];
         result.last_layer_ = boundaries[stage + 1] - 1;
-        if (stage_tp.empty() || stage_tp[stage].devices.empty())
-            result.participants_.push_back(devices[stage].toLocalDeviceId());
-        else
-            for (const auto &member : stage_tp[stage].devices)
-                result.participants_.push_back(member.toLocalDeviceId());
-        if (result.participants_.front() != devices[stage].toLocalDeviceId())
+        const std::span<const GlobalDeviceAddress> members =
+            stage_tp.empty() || stage_tp[stage].devices.empty()
+                ? std::span<const GlobalDeviceAddress>(&devices[stage], 1)
+                : std::span<const GlobalDeviceAddress>(stage_tp[stage].devices);
+        if (members.front() != devices[stage])
             throw std::invalid_argument("Pipeline transfer leader differs from its authored TP domain");
-        for (size_t index = 0; index < result.participants_.size(); ++index)
-            if (!result.participants_[index].is_valid() ||
-                std::find(result.participants_.begin(), result.participants_.begin() + index,
-                    result.participants_[index]) != result.participants_.begin() + index)
+
+        // Validate addresses before the lossy physical-allocator projection.
+        // CPU NUMA endpoints are different workers, but DeviceId::cpu() is their
+        // common storage authority. Conversely, changing a GPU's NUMA annotation
+        // cannot create another physical GPU or another channel owner.
+        const auto supported = [](const GlobalDeviceAddress &address) {
+            return address.device_ordinal >= 0 &&
+                (address.device_type == DeviceType::CPU || address.device_type == DeviceType::CUDA ||
+                 address.device_type == DeviceType::ROCm);
+        };
+        for (const auto &leader : devices)
+            if (!supported(leader) || leader.hostname != devices.front().hostname)
+                throw std::invalid_argument("Local pipeline transfer has an invalid or foreign stage leader");
+        for (size_t index = 0; index < members.size(); ++index)
+        {
+            const auto &member = members[index];
+            if (!supported(member) || member.hostname != devices[stage].hostname)
+                throw std::invalid_argument("Local pipeline transfer has an invalid or foreign TP participant");
+            if (std::any_of(members.begin(), members.begin() + index, [&](const auto &previous) {
+                    return previous == member ||
+                        (member.device_type == DeviceType::CPU && previous.device_type == DeviceType::CPU &&
+                         previous.numa_node == member.numa_node);
+                }))
+                throw std::invalid_argument("Pipeline transfer memory requires distinct authored TP participants");
+            const DeviceId physical = member.toLocalDeviceId();
+            const bool seen = std::find(result.participants_.begin(), result.participants_.end(), physical) !=
+                result.participants_.end();
+            if (!physical.is_valid() || (seen && !physical.is_cpu()))
                 throw std::invalid_argument("Pipeline transfer memory requires distinct valid physical participants");
+            if (!seen)
+                result.participants_.push_back(physical);
+        }
         // Only one homogeneous device per stage installs a native PP context.
         // Nested domains and mixed backends retain their explicit boundary path.
         const bool native = devices.front().toLocalDeviceId().is_gpu() &&

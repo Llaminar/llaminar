@@ -1603,6 +1603,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayHostAuthorityDeviceBankPublisher.cpp
     execution/moe/MoEOverlayDeviceControllerGraphService.cpp
     execution/moe/MoEOverlayResidencyAuthority.cpp
+    execution/moe/MoEOverlayCPUHostMaintenance.cpp
     execution/moe/MoEOverlayResidencySetup.cpp
     execution/moe/MoEPipelinePreparedPlan.cpp
     execution/runner/PreparedWeightAuthorityIdentity.cpp

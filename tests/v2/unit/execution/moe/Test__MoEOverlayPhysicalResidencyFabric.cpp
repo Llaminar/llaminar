@@ -9,6 +9,11 @@
  */
 
 #include "execution/moe/CpuExpertSlotPool.h"
+#include "backends/BackendManager.h"
+#include "execution/moe/MoEOverlayCPUHostMaintenance.h"
+#include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
+#include "execution/moe/MoEOverlayHostDemandMemoryPlan.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEOverlayDevicePhysicalSlotLedger.h"
@@ -317,7 +322,8 @@ namespace
     template <std::size_t ExpertCount>
     std::shared_ptr<MoEOverlayParticipantResidencyRegistry> makeRegistry(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &snapshot,
-        const std::array<MoEOverlayPreparedExpertPayload, ExpertCount> &experts)
+        const std::array<MoEOverlayPreparedExpertPayload, ExpertCount> &experts,
+        bool service_measurements = false)
     {
         static_assert(ExpertCount > 0);
         const int first = snapshot->layered_ownership.firstModelLayer();
@@ -330,6 +336,7 @@ namespace
                     .num_experts = static_cast<int>(ExpertCount),
                     .initial_epoch = snapshot->epoch,
                     .retained_epoch_capacity = 2,
+                    .collect_economy_service_measurements = service_measurements,
                     .first_model_layer = first,
                 });
 
@@ -579,6 +586,75 @@ namespace
             throw std::logic_error("device ledger test built an invalid swap");
         return result;
     }
+
+    /** @brief Exact production CPU host lifecycle with an offset and two logical local owners. */
+    struct CPUHostMaintenanceFixture
+    {
+        MoERoutedExpertModelMetadata metadata{.num_layers = 1, .num_experts = 2,
+            .d_model = 64, .routed_intermediate_size = 32, .main_inference_layer_count = 33, .first_model_layer = 32};
+        std::shared_ptr<PhysicalMemoryAuthority> memory;
+        std::shared_ptr<DecodeExpertHistogram> histogram;
+        std::shared_ptr<MoEOverlayResidencyAuthority> authority;
+        std::shared_ptr<MoEOverlayParticipantResidencyRegistry> residency;
+        MoEOverlayCPUHostMaintenance::Config config;
+
+        /** @brief Author exact scratch/demand/shadow BOM before constructing any runtime owner. */
+        explicit CPUHostMaintenanceFixture(bool admit_shadow = true)
+        {
+            if (!hasCPUBackend()) initCPUBackend(-1);
+            auto plan = twoCpuTierPlan({0, 1}, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+            plan.first_model_layer = metadata.first_model_layer;
+            plan.placements.front().layer = metadata.first_model_layer;
+            plan.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+            const auto owner_map = MoEExpertOwnerMap::build(plan);
+            const auto format = sourceProjectionSpecs().front().format;
+            const std::array experts{makeSourceExpertAtLayer(0, 32, 0, 11, format),
+                makeSourceExpertAtLayer(1, 32, 1, 93, format)};
+            MoEExpertComputeStage::Params sample;
+            sample.device_id = DeviceId::cpu(); sample.seq_len = MoEOverlayCPUServiceMeasurement::kMaximumRows;
+            sample.d_model = 64; sample.expert_intermediate = 32; sample.num_experts = 1; sample.top_k = 1;
+            sample.expert_mask = {true}; sample.prepared_gate_gemm = {experts[0].gate().get()};
+            sample.prepared_up_gemm = {experts[0].up().get()}; sample.prepared_down_gemm = {experts[0].down().get()};
+            const auto invocation = MoEExpertComputeStage(std::move(sample)).getWorkspaceRequirements(
+                MoEOverlayCPUServiceMeasurement::kMaximumRows).named_bytes_with_alignment();
+            const MoEOverlayHostDemandMemoryPlan demand({.num_layers = 1, .num_experts = 2, .top_k = 1,
+                .initial_window_rows = 4, .maximum_window_rows = 4, .maximum_invocation_rows = 8});
+            const auto shadows = admitCpuShadowPools(format, 2, 1);
+            const auto &resource = shadows.authority->admission()->plan().resources().front().resource();
+            PhysicalMemoryPlanBuilder builder;
+            builder.add(resource, PhysicalMemoryOwner::ExpertShadowSlots, admit_shadow ? shadows.bytes : 0);
+            builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, demand.allocationBytes() +
+                MoEOverlayCPUServiceMeasurement::allocationBytes({.d_model = 64, .intermediate = 32}, invocation));
+            auto admission = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build());
+            memory = std::make_shared<PhysicalMemoryAuthority>(admission, 0);
+            DecodeExpertHistogramConfig h;
+            h.num_layers = 1; h.num_experts = 2; h.top_k = 1; h.window_size = 4;
+            h.token_boundary_layer_idx = 32; h.sockets = {DeviceId::cpu(), DeviceId::cpu()};
+            h.ownership = owner_map.layeredOwnership(1, 2, 32); h.transaction_demand = demand.bind(h, memory);
+            histogram = std::make_shared<DecodeExpertHistogram>(h);
+            const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(oneLayerExpertModel(GGUFTensorType::Q4_0, 2, 32), 1, 2, 32);
+            auto catalog = std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(manifest);
+            authority = std::make_shared<MoEOverlayResidencyAuthority>(MoEOverlayResidencyAuthority::Config{
+                .initial_plan = plan, .model_metadata = metadata, .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                .histogram = histogram.get(), .histogram_max_window_tokens = 4, .economy_layer_catalog = catalog,
+                .shadow_slots_per_endpoint_layer = 1, .max_concurrent_cycles = 1});
+            residency = makeRegistry(authority->snapshot(), experts, true);
+            config.metadata = metadata; config.storage.migration_storage = MoEOverlayMigrationStorageKind::PhysicalResidencyFabric;
+            config.storage.overlay_world_size = 1; config.storage.shadow_slots_per_endpoint_layer = 1;
+            config.storage.staging_capacity_bytes = 64; config.storage.maximum_concurrent_cycles = 1;
+            config.storage.maximum_execution_streams = 1; config.rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+            config.rebalance.window_size = 4; config.rebalance.max_window_size = 4;
+            config.rebalance.migration_transfer_slots = 1;
+            config.topology = ExpertHistogramProductionTopology::forRetainedExecution(1, 33,
+                ExpertHistogramServingRegime::Serial, 32);
+            config.memory = memory; config.admission = admission; config.authority = authority;
+            config.residency = residency; config.histogram = histogram; config.perf_device = "cpu-host-stage32";
+        }
+        /** @return Actual retained shadow allocation, never an estimated live count. */
+        size_t liveShadows() const
+        { return memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExpertShadowSlots,
+            PhysicalMemoryMaterializationKind::NewAllocation); }
+    };
 } // namespace
 
 TEST(Test__MoEOverlayPhysicalResidencyFabric,
@@ -1706,4 +1782,87 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageRejectsForeignFabricA
     EXPECT_THROW((void)MoEOverlayPhysicalResidencyFabric::create(config), std::runtime_error);
     EXPECT_EQ(memory.authority->claimedBytes(DeviceId::cpu(),
         PhysicalMemoryOwner::ExpertShadowSlots, PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+
+/** @test Real CPU maintenance preserves offset, replay lifecycle and backing lifetime across aliases. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, CPUHostMaintenanceStageOffsetLifetimeAndReplay)
+{
+    for (int replay = 0; replay < 2; ++replay)
+    {
+        CPUHostMaintenanceFixture fixture;
+        const auto demand_live = fixture.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation);
+        auto owner = std::make_shared<MoEOverlayCPUHostMaintenance>(fixture.config);
+        EXPECT_FALSE(owner->ready());
+        EXPECT_THROW(owner->start(), std::logic_error);
+        owner->prepare();
+        ASSERT_TRUE(owner->ready());
+        EXPECT_EQ(fixture.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation), demand_live)
+            << "Prepared service scratch retires before the background owner publishes";
+        EXPECT_GT(fixture.liveShadows(), 0u);
+        EXPECT_NO_THROW(owner->requireScope(fixture.authority.get(), fixture.residency.get(), fixture.metadata));
+        auto alias = owner;
+        owner->start();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!fixture.authority->hasEconomyCertification() && owner->service()->healthy() &&
+            std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        ASSERT_TRUE(owner->service()->healthy()) << owner->service()->failureMessage();
+        ASSERT_TRUE(owner->service()->measurementReadiness().ready());
+        ASSERT_TRUE(fixture.authority->hasEconomyCertification());
+        (void)fixture.authority->activateOptimizationDemandAtRequestBoundary();
+        owner->notify({.phase = MoEOverlayInferenceProgressPhase::Decode, .completed_logical_tokens = 3});
+        owner->stopAndDrain();
+        EXPECT_FALSE(owner->ready());
+        const auto seal = owner->restorePreparedPlacement();
+        EXPECT_TRUE(seal.valid());
+        EXPECT_EQ(seal.canonical_owner_map.layeredOwnership(1, 2, 32).firstModelLayer(), 32);
+        EXPECT_THROW(owner->start(), std::logic_error);
+        EXPECT_NO_THROW(owner->stopAndDrain());
+        owner.reset();
+        EXPECT_GT(fixture.liveShadows(), 0u);
+        alias.reset();
+        EXPECT_EQ(fixture.liveShadows(), 0u);
+    }
+}
+
+/** @test A frozen permit without shadow capacity fails and retires every partial physical root. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, CPUHostMaintenanceFailureRetiresExactRoots)
+{
+    CPUHostMaintenanceFixture fixture(false);
+    const auto before = fixture.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation);
+    auto owner = std::make_shared<MoEOverlayCPUHostMaintenance>(fixture.config);
+    try
+    {
+        owner->prepare();
+        FAIL() << "Missing frozen shadow admission unexpectedly materialized maintenance";
+    }
+    catch (const std::exception &error)
+    {
+        EXPECT_NE(std::string(error.what()).find("Physical memory live claim exceeds admitted expert_shadow_slots"), std::string::npos)
+            << error.what();
+    }
+    EXPECT_FALSE(owner->ready());
+    EXPECT_EQ(fixture.liveShadows(), 0u);
+    EXPECT_EQ(fixture.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation), before);
+    EXPECT_NO_THROW(owner->stopAndDrain());
+}
+
+/** @test Stage global origin, histogram ownership and original PMA permit cannot be substituted. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, CPUHostMaintenanceRejectsForeignScopeAndAdmission)
+{
+    CPUHostMaintenanceFixture fixture;
+    auto owner = std::make_shared<MoEOverlayCPUHostMaintenance>(fixture.config);
+    auto changed = fixture.metadata; changed.first_model_layer = 0;
+    EXPECT_THROW(owner->requireScope(fixture.authority.get(), fixture.residency.get(), changed), std::invalid_argument);
+    EXPECT_THROW(owner->requireScope(nullptr, fixture.residency.get(), fixture.metadata), std::invalid_argument);
+    auto config = fixture.config; config.admission.reset();
+    EXPECT_THROW(MoEOverlayCPUHostMaintenance{config}, std::invalid_argument);
+    config = fixture.config; config.topology = ExpertHistogramProductionTopology::forRetainedExecution(1, 1,
+        ExpertHistogramServingRegime::Serial);
+    EXPECT_THROW(MoEOverlayCPUHostMaintenance{config}, std::invalid_argument);
+    EXPECT_EQ(fixture.liveShadows(), 0u);
 }

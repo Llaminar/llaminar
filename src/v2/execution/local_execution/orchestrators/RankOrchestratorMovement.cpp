@@ -8,6 +8,7 @@
  * Reading these completed snapshots never launches work or reads device state.
  */
 #include "RankOrchestrator.h"
+#include "execution/moe/MoEOverlayCPUHostMaintenance.h"
 #include "execution/moe/MoEOptimizationPipeline.h"
 #include "execution/moe/MoEOverlayPipelineStageBinding.h"
 
@@ -88,6 +89,15 @@ namespace llaminar2
                 throw std::logic_error("PP movement publication lost a stage runner");
             auto value = pp_stage_runners_[i]->moeOptimizationStatus();
             const auto &stage = config_.pp_stages[i];
+            if (stage.moe_runtime && stage.moe_runtime->owners().host_maintenance)
+            {
+                const auto &owner = stage.moe_runtime->owners().host_maintenance;
+                owner->requireScope(stage.moe_runtime->owners().authority.get(),
+                    stage.moe_runtime->owners().residency.get(), stage.moe_runtime->metadata());
+                if (value.authority != MoEOptimizationAuthority::None || !owner->service())
+                    throw std::logic_error("CPU pipeline maintenance has missing or competing publication ownership");
+                value = owner->service()->optimizationStatus();
+            }
             if (stage.moe_runtime && value.authority == MoEOptimizationAuthority::None)
             {
                 if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
@@ -116,7 +126,11 @@ namespace llaminar2
         std::vector<MoEOptimizationStages<MoEOptimizationMovementLedger>::Entry> stages;
         stages.reserve(pp_stage_runners_.size());
         for (std::size_t i = 0; i < pp_stage_runners_.size(); ++i)
-            stages.push_back({stageIdentity(i, config_.pp_stages[i]), pp_stage_runners_[i]->moeOptimizationMovementLedger()});
+        {
+            const auto &binding = config_.pp_stages[i].moe_runtime;
+            stages.push_back({stageIdentity(i, config_.pp_stages[i]), binding && binding->owners().host_maintenance
+                ? binding->owners().authority->movementLedger() : pp_stage_runners_[i]->moeOptimizationMovementLedger()});
+        }
         return composeMoEOptimizationMovementLedger(MoEOptimizationStages<MoEOptimizationMovementLedger>::seal(std::move(stages)));
     }
 }

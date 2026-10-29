@@ -844,6 +844,10 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
         std::size_t immutable_lookup_executable_bytes = 0u;
         std::size_t graph_snapshot_bytes = 0u;
         std::size_t primary_weight_bytes = 0u;
+        // Validate the descriptive authority even when no auxiliary set is used.
+        const bool mtp_replica_owns_routed_parents =
+            mtpParticipantReplicaOwnsRoutedParents(
+                cfg.mtp_routed_expert_weight_authority);
         std::size_t additional_weight_bytes = 0u;
         std::size_t retained_primary_weight_bytes = 0u;
         std::size_t retained_additional_weight_bytes = 0u;
@@ -1199,14 +1203,12 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 {
                     std::vector<int> selected_routed_experts(
                         static_cast<std::size_t>(profile.totalLayerCount()), 0);
-                    if (cfg.mtp_enabled && profile.mtp_layer_count > 0)
+                    if (cfg.mtp_enabled && profile.mtp_layer_count > 0 &&
+                        mtp_replica_owns_routed_parents)
                     {
-                        /*
-                         * Trailing MTP blocks are part of the replicated
-                         * verifier sidecar even when their GGUF names use the
-                         * routed-expert suffix. Ordinary base-model routed
-                         * experts remain owned exclusively by ExpertOverlay.
-                         */
+                        // Plain MTP replicas retain their predictor parents.
+                        // ExpertOverlay already prices those exact prepared
+                        // residents through RoutedExpertWeights, never twice.
                         for (int layer = main_layer_count;
                              layer < profile.totalLayerCount();
                              ++layer)
@@ -1297,16 +1299,14 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 }
 
                 DeviceWeightResidency sidecar_residency;
-                if (profile.expert_count > 0)
+                if (profile.expert_count > 0 &&
+                    !mtp_replica_owns_routed_parents)
                 {
                     sidecar_residency =
-                        DeviceWeightResidency::
-                            continuationWithSelectedRoutedExperts(
-                                profile.expert_count,
-                                std::vector<int>(
-                                    static_cast<std::size_t>(
-                                        profile.totalLayerCount()),
-                                    0));
+                        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+                            profile.expert_count,
+                            std::vector<int>(
+                                static_cast<std::size_t>(profile.totalLayerCount()), 0));
                 }
 
                 // Describe precisely the extra layer uses. No globals-only

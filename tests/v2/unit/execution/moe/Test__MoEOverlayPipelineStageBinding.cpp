@@ -810,3 +810,48 @@ namespace llaminar2::test
         EXPECT_THROW((void)parent.forPipelineStage(0),std::invalid_argument);
     }
 }
+
+
+namespace llaminar2::test
+{
+    /** @test A two-member CPU tail cannot borrow a GPU parent's maintenance capability. */
+    TEST(Test__MoEOverlayPipelineStageBinding, CpuTPTailRejectsMissingStageHostMaintenance)
+    {
+        StageFixture first(0, false, 0, DeviceType::CUDA, 2, MoERebalanceRuntimeMode::Dynamic);
+        StageFixture last(2, true, 1, DeviceType::CPU, 2, MoERebalanceRuntimeMode::Dynamic);
+        declarePipelineGenerationDomain(first, last);
+        auto config = densePipeline();
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+        config.pp_stages = {first.stage(), last.stage()};
+        MockLocalTPContext::Config context_config;
+        context_config.devices = first.devices; context_config.backend = CollectiveBackendType::NCCL;
+        auto first_context = std::make_unique<MockLocalTPContext>(context_config);
+        std::vector<std::unique_ptr<IInferenceRunner>> gpu;
+        gpu.push_back(std::make_unique<AuthorityWitness>(DeviceId::cuda(0), MoEOverlayAuthorityExecutionKind::DeviceResident));
+        gpu.push_back(std::make_unique<AuthorityWitness>(DeviceId::cuda(1), MoEOverlayAuthorityExecutionKind::DeviceResident));
+        auto first_child = RankOrchestrator::createForTest(MockModelContext::createMinimal(), std::move(gpu),
+            std::move(first_context), config.forPipelineStage(0));
+        context_config.devices = last.devices; context_config.backend = CollectiveBackendType::HOST;
+        auto last_context = std::make_unique<MockLocalTPContext>(context_config);
+        std::vector<std::unique_ptr<IInferenceRunner>> cpu;
+        // Execution DeviceId names the host backend. Exact NUMA membership stays
+        // in the authored context; inventing CPU:1 would reject before ownership.
+        for (const auto &participant : last.devices)
+            cpu.push_back(std::make_unique<AuthorityWitness>(participant.toLocalDeviceId(),
+                MoEOverlayAuthorityExecutionKind::HostResident));
+        auto last_child = RankOrchestrator::createForTest(MockModelContext::createMinimal(), std::move(cpu),
+            std::move(last_context), config.forPipelineStage(1));
+        std::vector<std::unique_ptr<IInferenceRunner>> children;
+        children.push_back(std::move(first_child)); children.push_back(std::move(last_child));
+        auto rank = RankOrchestrator::createForTestWithPipelineStages(MockModelContext::createMinimal(), std::move(children), config);
+        try
+        {
+            rank->requireMoEPipelineRuntimeOwnership(IInferenceRunner::MoEPipelineOwnershipValidation::OwnersBound);
+            FAIL() << "A movable CPU TP tail was admitted without its stage maintenance owner";
+        }
+        catch (const std::logic_error &error)
+        {
+            EXPECT_STREQ(error.what(), "Movable host MoE pipeline stage has no admitted maintenance owner");
+        }
+    }
+}

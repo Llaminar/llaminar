@@ -343,8 +343,7 @@ namespace llaminar2
         MTPRoutedExpertWeightAuthority routed_authority) const
     {
         std::vector<std::string> names = requiredNames();
-        if (routed_authority !=
-            MTPRoutedExpertWeightAuthority::ExpertOverlay)
+        if (mtpParticipantReplicaOwnsRoutedParents(routed_authority))
         {
             return names;
         }

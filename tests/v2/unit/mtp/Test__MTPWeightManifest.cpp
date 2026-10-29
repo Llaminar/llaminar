@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/mtp/MTPWeightManifest.h"
+#include "execution/factory/DenseDecodeWeightSelection.h"
 #include "execution/mtp/MTPLearnedBlockCount.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/WeightPlan.h"
@@ -628,4 +629,77 @@ TEST(Test__MTPWeightManifest, ModelWeightBindingsExposeNextNWeights)
     EXPECT_NE(legacy.mtp.depths[0].pre_fc_norm_hidden, nullptr);
     EXPECT_NE(legacy.mtp.depths[0].fa_block.wq, nullptr);
     EXPECT_NE(legacy.mtp.depths[0].fa_block.q_norm, nullptr);
+}
+
+/**
+ * @brief Replay actual replica selection with both physical authorities.
+ *
+ * The recorded names include the exact three routed QFN predictor parents,
+ * ordinary routed parents, all dense/shared/router roles, and dedicated MTP
+ * names. Large-to-small and empty replays must not retain prior selections.
+ */
+TEST(Test__MTPWeightManifest, DenseDecodeReplicaSelectionReplaysExactRoutedAuthority)
+{
+    struct Source
+    {
+        std::string name;
+        bool sidecar_owned;
+        bool overlay_owned;
+    };
+    const std::vector<Source> trace = {
+        {"blk.48.ffn_gate_exps.weight", true, false},
+        {"blk.48.ffn_up_exps.weight", true, false},
+        {"blk.48.ffn_down_exps.weight", true, false},
+        {"blk.47.ffn_gate_exps.weight", false, false},
+        {"blk.47.ffn_up_exps.weight", false, false},
+        {"blk.47.ffn_down_exps.weight", false, false},
+        {"blk.48.attn_q.weight", true, true},
+        {"blk.48.ffn_gate_inp.weight", true, true},
+        {"blk.48.ffn_gate_shexp.weight", true, true},
+        {"blk.48.ffn_up_shexp.weight", true, true},
+        {"blk.48.ffn_down_shexp.weight", true, true},
+        {"blk.48.ffn_gate_inp_shexp.weight", true, true},
+        {"blk.48.nextn.eh_proj.weight", true, true},
+        {"blk.48.nextn.hc_head_up.weight", true, true},
+        {"blk.48.nextn.hnorm.weight", true, true},
+        {"blk.48.attn_norm.weight", true, true},
+        {"token_embd.weight", true, true},
+        {"output.weight", true, true},
+        {"mtp.0.ffn_gate_exps.weight", true, false},
+        {"blk.61.nextn.ffn_down_exps.weight", true, false},
+    };
+    for (const auto authority : {MTPRoutedExpertWeightAuthority::SidecarParticipant,
+                                 MTPRoutedExpertWeightAuthority::ExpertOverlay})
+    {
+        for (const std::size_t live : {trace.size(), std::size_t{3}, std::size_t{0},
+                                      trace.size(), std::size_t{1}})
+        {
+            std::vector<std::string> actual;
+            std::vector<std::string> expected;
+            for (std::size_t index = 0; index < live; ++index)
+            {
+                const auto &source = trace[index];
+                if (includeWeightInDenseDecodeReplicatedPlan(source.name, {48}, authority))
+                    actual.push_back(source.name);
+                if (authority == MTPRoutedExpertWeightAuthority::ExpertOverlay
+                        ? source.overlay_owned : source.sidecar_owned)
+                    expected.push_back(source.name);
+            }
+            EXPECT_EQ(actual, expected) << "live=" << live;
+        }
+    }
+
+    // The generic selector must use the authenticated source layer, not a
+    // special QFN block number or a caller's pipeline-local layer offset.
+    EXPECT_TRUE(includeWeightInDenseDecodeReplicatedPlan("blk.7.ffn_gate_exps.weight", {7},
+        MTPRoutedExpertWeightAuthority::SidecarParticipant));
+    EXPECT_FALSE(includeWeightInDenseDecodeReplicatedPlan("blk.7.ffn_gate_exps.weight", {7},
+        MTPRoutedExpertWeightAuthority::ExpertOverlay));
+    EXPECT_FALSE(includeWeightInDenseDecodeReplicatedPlan("blk.7.ffn_gate_exps.weight", {0},
+        MTPRoutedExpertWeightAuthority::SidecarParticipant));
+    const auto invalid = static_cast<MTPRoutedExpertWeightAuthority>(99);
+    EXPECT_THROW((void)includeWeightInDenseDecodeReplicatedPlan("blk.48.attn_q.weight", {48}, invalid),
+        std::invalid_argument);
+    MTPWeightManifest manifest;
+    EXPECT_THROW((void)manifest.participantReplicaNames(invalid), std::invalid_argument);
 }

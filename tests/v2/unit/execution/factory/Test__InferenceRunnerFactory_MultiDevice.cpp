@@ -810,38 +810,6 @@ namespace
     }
 
     /**
-     * @brief Replicated dense decode plans must keep MTP verifier sidecar weights.
-     *
-     * Base-layer routed experts are excluded from the dense decode subset because
-     * ExpertOverlay owns their residency separately. Qwen3.6 MTP is different:
-     * its trailing nextn block is the verifier path itself, so even nextn tensors
-     * with ffn_*_exps names must remain in the replicated decode weight plan.
-     */
-    TEST(Test__InferenceRunnerFactory_SourceContract,
-         DecodeReplicatedDensePlansRetainNextNMTPSidecarWeights)
-    {
-        const std::string source =
-            readFactorySourceFile("src/v2/execution/factory/InferenceRunnerFactory.cpp");
-        ASSERT_FALSE(source.empty());
-
-        EXPECT_NE(source.find("weight_name.find(\".nextn.\")"),
-                  std::string::npos)
-            << "phase-split dense decode must keep Qwen3.6 nextn verifier weights";
-        EXPECT_NE(source.find("weight_name.rfind(\"mtp.\", 0)"),
-                  std::string::npos)
-            << "generic mtp.layers verifier weights must also remain in the dense decode plan";
-        EXPECT_NE(source.find("discoverDenseDecodeMTPSourceLayers"),
-                  std::string::npos)
-            << "Qwen3.6 nextn source-layer discovery must keep normal-named sidecar attention/expert weights";
-        EXPECT_NE(source.find("inferWeightLayer(weight_name)"),
-                  std::string::npos)
-            << "dense decode filtering must recognize the full trailing nextn layer, not only names containing nextn";
-        EXPECT_NE(source.find("grouped MTP rows remain mathematically identical to serial decode"),
-                  std::string::npos)
-            << "the source contract should document the parity reason for keeping MTP sidecar weights";
-    }
-
-    /**
      * @brief The MTP replica plan consumes typed manifest ownership directly.
      *
      * Source-layer substring filters cannot distinguish a locally replicated

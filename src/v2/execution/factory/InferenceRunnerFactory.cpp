@@ -19,6 +19,7 @@
  */
 
 #include "InferenceRunnerFactory.h"
+#include "DenseDecodeWeightSelection.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "backends/HostMemoryCapacity.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -1797,9 +1798,9 @@ namespace llaminar2
         bool replicate_routed_experts = false;
         bool dense_decode_replicated_subset = false;
         /**
-         * Materialize only the learned MTP predictor's dense/shared block.
-         * Routed experts are intentionally omitted because ExpertOverlay owns
-         * their complete per-expert residency independently of dense TP.
+         * Materialize only the learned MTP predictor replica. Its typed
+         * routed-parent authority determines whether the replica owns complete
+         * parents or borrows prepared expert residency from ExpertOverlay.
          */
         bool replicated_mtp_sidecar_subset = false;
         /** Typed physical owner of routed parents in an MTP replica. */
@@ -1852,8 +1853,9 @@ namespace llaminar2
      *
      * This decision is narrower than replicated dense decode and wider than
      * terminal-head mirroring. The resulting frozen plan owns the sidecar's
-     * attention, router, and shared-expert weights, while routed experts remain
-     * exclusively owned by the ExpertOverlay residency authority.
+     * attention, router, and shared-expert weights. The frozen routed-parent
+     * authority decides whether ExpertOverlay supplies prepared expert triplets
+     * or the replica owns complete local expert parents.
      */
     bool needsReplicatedMTPSidecarWeights(const GraphConfig &graph_config)
     {
@@ -1920,34 +1922,6 @@ namespace llaminar2
                 source_layers.insert(layer);
         }
         return source_layers;
-    }
-
-    static bool includeWeightInDenseDecodeReplicatedPlan(
-        const std::string &weight_name,
-        const std::unordered_set<int> &mtp_source_layers)
-    {
-        /*
-         * Qwen3.6 stores the MTP verifier sidecar as a trailing blk.N.nextn
-         * block.  That block can contain MoE expert tensors whose names look
-         * routed (ffn_*_exps), but they are not ordinary base-layer routed
-         * expert residency.  The verifier is dense decode work: every
-         * phase-split decode participant must own the complete nextn block so
-         * grouped MTP rows remain mathematically identical to serial decode.
-         */
-        const int layer = inferWeightLayer(weight_name);
-        if (layer >= 0 && mtp_source_layers.find(layer) != mtp_source_layers.end())
-            return true;
-
-        if (weight_name.find(".nextn.") != std::string::npos ||
-            weight_name.rfind("mtp.", 0) == 0)
-        {
-            return true;
-        }
-
-        const WeightRole role = inferWeightRole(weight_name);
-        // Shared experts are always-on dense FFN work; only routed experts are
-        // excluded from the dense/shared replicated subset.
-        return !isRoutedExpertRole(role);
     }
 
     static WeightSliceSpec vocabSliceSpecForAssignment(
@@ -2158,7 +2132,8 @@ namespace llaminar2
                 options.dense_decode_replicated_subset &&
                 !includeWeightInDenseDecodeReplicatedPlan(
                     weight_name,
-                    dense_decode_mtp_source_layers))
+                    dense_decode_mtp_source_layers,
+                    options.mtp_routed_expert_weight_authority))
             {
                 continue;
             }

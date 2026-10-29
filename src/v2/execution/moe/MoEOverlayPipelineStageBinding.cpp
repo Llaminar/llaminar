@@ -8,6 +8,7 @@
  * handoff authority; PP does not maintain a second ownership table.
  */
 #include "MoEOverlayPipelineStageBinding.h"
+#include "MoEOverlayCPUHostMaintenance.h"
 #include "MoEOverlayResidencyAuthority.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayNodeLocalDeviceControllerFabric.h"
@@ -96,6 +97,9 @@ namespace llaminar2
                 owners.device_fabric->localParticipantIds() != expected_local_ids)
                 throw std::invalid_argument("Pipeline expert binding has a foreign device-controller fabric");
         }
+
+        if (owners.host_maintenance)
+            owners.host_maintenance->requireScope(owners.authority.get(), owners.residency.get(), metadata);
 
         return std::shared_ptr<const MoEOverlayPipelineStageBinding>(
             new MoEOverlayPipelineStageBinding(stage, std::move(metadata),
