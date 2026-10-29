@@ -12,7 +12,9 @@
  * bytes, all-wave epilogues and twenty dirty retained histories. Disabled native
  * event tests retain paired timings and exact one-family profiler selection.
  * Real RAM/mmap service-worker affinity is observed by exact-inode libc delegation.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include <bit>
 #include <cmath>
@@ -608,7 +610,7 @@ void proveResidentOwnerStage(DeviceId device)
         EXPECT_EQ(model->residentImmutableRowTable(device),table);
 
         auto arenaClaim=memory->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,arenaBytes);
-        test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(ArenaConfig{.factory=&factory});
+        test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
         ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_GENERATION_CONTROL,1,
             sampling_math::kDeviceGenerationControlCount,"INT32",device));
         ASSERT_TRUE(arena.registerBuffer(BufferId::PREFILL_CHUNK_GEOMETRY,1,1,"INT32",device));
@@ -814,7 +816,7 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
                 .format=TensorType::IQ4_NL,.rowElements=width,.rowBytes=rowBytes,
                 .storage=ImmutableLookupStage::GPUStorage{boundary,Qwen4ExpIntBinding(stateTensor,BufferId::QFN_NGRAM_LOOKUP_STATE),Qwen4ExpIntBinding(nativeTensor,BufferId::QFN_NGRAM_NATIVE_ROWS)}});
             auto *stage=stageOwner.get();
-            test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena frontierArena(ArenaConfig{.factory=&factory});
+            test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena frontierArena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
             for(const auto &[role,tensor]:std::array<std::pair<BufferId,ITensor *>,5>{{
                 {BufferId::QFN_NGRAM_LOOKUP_STATE,&stateTensor},{BufferId::PREFILL_CHUNK_GEOMETRY,&liveTensor},
                 {BufferId::QFN_NGRAM_ROW_IDS,&idTensor},{BufferId::QFN_NGRAM_NATIVE_ROWS,&nativeTensor},

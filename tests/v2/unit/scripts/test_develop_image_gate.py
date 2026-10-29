@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Device-free contracts for model-free develop PR and image-publication gates.
+"""Device-free contracts for feature source admission and model-free publication.
 
 The PR workflow consumes the same image driver with one ISA and no publication.
-Its actual command is parsed and exercised here so adding a second ISA, model
-phase or registry write cannot silently expand the inexpensive pre-merge gate.
+Its actual command is parsed and exercised here so the explicit source stage
+cannot disappear, or accidentally add a second ISA or registry publication.
 """
 from __future__ import annotations
 
@@ -208,7 +208,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         self.assertIn("if: ${{ !cancelled() }}", workflow)
 
-    def test_develop_pr_builds_one_isa_and_runs_only_installed_prerequisites(self):
+    def test_develop_pr_builds_one_isa_and_runs_source_admission(self):
         """Exercise the real PR command, not a separately invented argument set."""
         workflow = yaml.load((ROOT / ".github/workflows/develop-pr.yml").read_text(),
                              Loader=yaml.BaseLoader)
@@ -246,6 +246,7 @@ class DevelopImageGateTests(unittest.TestCase):
         arguments = command[2:]
         policy = gate.parse_arguments(arguments)
         self.assertEqual(policy.cpu_isas, ["AVX512"])
+        self.assertTrue(policy.source_admission)
         self.assertFalse(policy.publish)
         self.assertIsNone(policy.image)
 
@@ -257,7 +258,7 @@ class DevelopImageGateTests(unittest.TestCase):
 
             def build(args, admitted, directory, *, test_inventory):
                 self.assertEqual(admitted, source)
-                self.assertEqual(test_inventory, gate.TestRunnerInventory.MODEL_FREE)
+                self.assertEqual(test_inventory, gate.TestRunnerInventory.FULL_MATRIX)
                 events.append(("build", args.cpu_isa))
                 return images(args.cpu_isa)
 
@@ -265,16 +266,23 @@ class DevelopImageGateTests(unittest.TestCase):
                 events.append(("prerequisites", built["test-runner"]["id"]))
                 return prerequisite_report()
 
+            def admission(built, admitted, isa, directory, models, runtime):
+                events.append(("source-admission", isa))
+                self.assertEqual(admitted, source)
+                return {"report_digest": "source-report"}
+
             with patch.object(gate, "source_identity", return_value=source), \
                  patch.object(gate, "device_lease", side_effect=lambda: nullcontext()), \
                  patch.object(gate, "build", side_effect=build), \
                  patch.object(gate, "require_image_pair"), \
                  patch.object(gate, "run_prerequisites", side_effect=prerequisites), \
+                 patch.object(gate, "run_admission", side_effect=admission), \
                  patch.object(gate, "publish_runtime") as publish:
                 self.assertEqual(gate.main(arguments), 0)
             publish.assert_not_called()
             self.assertEqual(events, [("build", "AVX512"),
-                                     ("prerequisites", "test-runner-avx512")])
+                                     ("prerequisites", "test-runner-avx512"),
+                                     ("source-admission", "AVX512")])
             receipt = json.loads((output / "develop-image-gate.json").read_text())
             self.assertTrue(receipt["complete"])
             self.assertFalse(receipt["published"])

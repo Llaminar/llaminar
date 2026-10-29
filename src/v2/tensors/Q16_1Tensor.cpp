@@ -5,6 +5,9 @@
  *
  * Like Q8_1 but with 256× more precision (int16 vs int8). Designed for residual stream
  * where quantization error accumulation is critical.
+ * Native CPU storage adoption moves the actual aligned backing, including its
+ * physical allocation lease, without initializing or copying a second payload.
+ * Exact CPU home identity and native extent are validated before publication.
  */
 
 // Suppress deprecation warnings for internal usage of mutable_q16_1_blocks()
@@ -36,6 +39,27 @@ namespace llaminar2
 {
 
     // ===== Constructors =====
+
+    Q16_1Tensor::Q16_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> storage,
+        DeviceId device, Q16BlockSize block_size)
+        : shape_(shape), is_view_(false), raw_data_(std::move(storage)), raw_data_ptr_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(device), device_blocks_(nullptr),
+          is_mutable_(true), cache_dirty_(false), block_size_(block_size)
+    {
+        if (!device.is_valid() || !device.is_cpu() || shape.size() != 2)
+            throw std::invalid_argument("Q16_1Tensor owned CPU storage requires a matrix and exact CPU home device");
+        size_t block_bytes = 0;
+        switch (block_size)
+        {
+        case Q16BlockSize::BLOCK_32: block_bytes = sizeof(Q16_1Block); break;
+        case Q16BlockSize::BLOCK_64: block_bytes = sizeof(Q16_1Block_64); break;
+        case Q16BlockSize::BLOCK_128: block_bytes = sizeof(Q16_1Block_128); break;
+        default: throw std::invalid_argument("Q16_1Tensor owned storage has unsupported block geometry");
+        }
+        const size_t expected = nativeMatrixExtent(shape[0], shape[1], static_cast<size_t>(block_size), block_bytes);
+        if (raw_data_.size() != expected)
+            throw std::invalid_argument("Q16_1Tensor owned storage does not match native matrix extent");
+    }
 
     Q16_1Tensor::Q16_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
         : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
@@ -106,18 +130,20 @@ namespace llaminar2
     Q16_1Tensor::Q16_1Tensor(const Q16_1Tensor &other)
         : shape_(other.shape_), is_view_(false), raw_data_(other.raw_data_), raw_data_ptr_(nullptr),
           view_byte_offset_(0), parent_(nullptr), device_(other.device_), device_blocks_(nullptr),
-          is_mutable_(other.is_mutable_), cache_dirty_(false)
+          is_mutable_(other.is_mutable_), cache_dirty_(false), block_size_(other.block_size_)
     {
         if (other.is_view_)
         {
             const size_t rows = shape_[0];
             const size_t cols = shape_[1];
-            const size_t blocks_per_row_ = (cols + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
-            const size_t n_blocks = rows * blocks_per_row_;
-            const size_t required_bytes = n_blocks * sizeof(Q16_1Block);
+            const size_t block_bytes = block_size_ == Q16BlockSize::BLOCK_32 ? sizeof(Q16_1Block)
+                : block_size_ == Q16BlockSize::BLOCK_64 ? sizeof(Q16_1Block_64) : sizeof(Q16_1Block_128);
+            const size_t required_bytes = nativeMatrixExtent(rows, cols, static_cast<size_t>(block_size_), block_bytes);
 
-            raw_data_.resize(required_bytes);
-            std::memcpy(raw_data_.data(), other.raw_data_ptr_ + other.view_byte_offset_, required_bytes);
+            const auto root = std::dynamic_pointer_cast<Q16_1Tensor>(other.parent_);
+            if (!root || root->is_view_)
+                throw std::logic_error("Q16_1 view copy requires its original physical backing owner");
+            raw_data_ = root->raw_data_.copySubrange(other.view_byte_offset_, required_bytes);
         }
 
         if (!other.dequant_cache_.empty())
@@ -203,12 +229,13 @@ namespace llaminar2
                              size_t byte_offset,
                              std::shared_ptr<TensorBase> parent)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(parent_raw_data),
-          view_byte_offset_(byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr),
+          view_byte_offset_(byte_offset), parent_(parent), device_(parent ? parent->home_device() : DeviceId::cpu()), device_blocks_(nullptr),
           is_mutable_(false), cache_dirty_(false)
     {
         if (auto parent_q16_1 = std::dynamic_pointer_cast<Q16_1Tensor>(parent))
         {
             is_mutable_ = parent_q16_1->is_mutable_;
+            block_size_ = parent_q16_1->block_size_;
         }
 
         LOG_TRACE("[Q16_1Tensor] Creating VIEW tensor shape=[" << shape[0] << "," << shape[1]
@@ -609,9 +636,9 @@ namespace llaminar2
         }
 
         // Calculate byte offset
-        size_t blocks_per_row_ = (K + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
-        size_t block_offset = start_row * blocks_per_row_;
-        size_t byte_offset = block_offset * sizeof(Q16_1Block);
+        const size_t block_bytes = block_size_ == Q16BlockSize::BLOCK_32 ? sizeof(Q16_1Block)
+            : block_size_ == Q16BlockSize::BLOCK_64 ? sizeof(Q16_1Block_64) : sizeof(Q16_1Block_128);
+        const size_t byte_offset = nativeMatrixExtent(start_row, K, static_cast<size_t>(block_size_), block_bytes);
 
         // Determine root parent
         const uint8_t *root_data_ptr;

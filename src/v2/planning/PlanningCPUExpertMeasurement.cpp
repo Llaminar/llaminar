@@ -3,8 +3,8 @@
  * @brief Real source weights, canonical preparation, and one complete CPU FFN.
  *
  * Source reads and packing are bounded by one requested payload. Every payload
- * is claimed before its allocation, and declaration order retires all engines
- * before their claims. Only immutable completed observations leave this scope.
+ * is claimed before its allocation; actual prepared backings retain their
+ * own claims. Only immutable completed observations leave this scope.
  * The existing startup service producer owns invocation workspace and timing,
  * so planning does not introduce a parallel expert execution implementation.
  */
@@ -118,25 +118,26 @@ namespace llaminar2
         if (workers <= 0 || omp_get_thread_limit() < workers)
             throw std::invalid_argument("CPU expert sampling worker budget exceeds the OpenMP team limit");
 
-        // Leases are declared before engines. The enclosing loaded sample owns
-        // all source bytes through preparation, execution and engine retirement.
-        std::vector<PhysicalMemoryAllocationLease> prepared_claims;
+        // The loaded sample owns source bytes. Final engine storage owns its
+        // admission lease, including any execution views retained from it.
         std::array<std::shared_ptr<ITensorGemm>, 3> engines;
         const auto inputs = request.projections();
         using llaminar::v2::kernels::KernelFactory;
         for (size_t i = 0; i < inputs.size(); ++i)
         {
-            prepared_claims.push_back(memory->claimNewAllocation(device,
-                PhysicalMemoryOwner::RoutedExpertWeights, description.preparation[i].persistent_bytes));
             std::optional<PhysicalMemoryAllocationLease> packing_claim;
             if (description.preparation[i].temporary_bytes)
                 packing_claim.emplace(memory->claimNewAllocation(device,
                     PhysicalMemoryOwner::WeightLoadStaging, description.preparation[i].temporary_bytes));
             // A const shared borrow is kept inside the source-sample scope;
             // it cannot escape its PMA owner through a returned tensor view.
-            engines[i] = KernelFactory::prepareExpertGemmLocal(sample.tensor(i).shared_from_this(), device);
+            // Every declared setup vector is constructor-local; synchronous
+            // preparation destroys them before packing_claim can retire.
+            engines[i] = KernelFactory::prepareExpertGemmLocal(sample.tensor(i).shared_from_this(),device,
+                KernelFactory::GemmPreparationKind::AUTO,CPUWeightStoragePlacement::accounted(
+                    memory,device,PhysicalMemoryOwner::RoutedExpertWeights,CPUWeightStoragePlacement::local()));
             if (!engines[i] || !engines[i]->hasWeights() ||
-                engines[i]->packedWeightBytes() != description.preparation[i].persistent_bytes)
+                engines[i]->packedWeightBytes() != description.preparation[i].persistent_payload_bytes)
                 throw std::runtime_error("CPU expert preparation disagrees with its admitted native payload");
         }
 

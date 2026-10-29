@@ -13,6 +13,9 @@
  *
  * @author David Sanftenberg
  * @date March 2026
+ * A complete transient CPU grouped-MoE declaration is carried beside named
+ * slab regions. Its owned roots share this allocator lifetime and sole PMA
+ * issuer; the serial-family envelope freezes before any consumer is bound.
  */
 
 #pragma once
@@ -477,7 +480,7 @@ namespace llaminar2
         /**
          * @brief Read sealed primary backing on one exact physical device.
          * @param device Allocation device, not the graph's continuation device.
-         * @return Retained block size, or zero when that device has no sealed block.
+         * @return Retained primary plus typed CPU backing bytes, or zero without a sealed owner.
          *
          * A heterogeneous graph family can bind several device managers. Its
          * host scratch must never enter a GPU retirement or reuse-capacity BOM.

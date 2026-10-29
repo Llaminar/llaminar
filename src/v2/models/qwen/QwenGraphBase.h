@@ -801,6 +801,14 @@ namespace llaminar2
         bool denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const;
         bool replicatedAttentionStateActiveForTokens(int total_tokens) const;
         bool attentionTPAllreduceEnabledForCurrentGraph() const;
+        /**
+         * @brief Require the real local-projection/full-cache phase handoff.
+         * @param total_tokens Positive actual rows, including one-row Prefill.
+         * @param kv_cache Canonical retained main or shifted cache authority.
+         * @param device Exact CPU/native-GPU graph participant.
+         * @return True only for sharded projections seeding an unsharded cache;
+         *         active full replicated projections never gather their rows.
+         */
         bool needsPhaseSplitPrefillKVCacheHandoff(
             int total_tokens,
             IKVCache *kv_cache,

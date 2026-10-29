@@ -17,6 +17,8 @@
  * arenas retain a bounded power-of-two ladder through one captured prefill
  * segment, keeping transfer and fixed-launch padding below two times the live
  * route count without sizing transient state from the full KV context.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
 #pragma once
@@ -33,6 +35,7 @@
 #include "../../../backends/CPUExecutionGeometry.h"
 #include "../../../tensors/TensorType.h"
 
+#include "memory/CPUSerialExpertStorageLayout.h"
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
@@ -142,6 +145,10 @@ namespace llaminar2
              */
             std::optional<int> logical_participant_id;
             std::string debug_name;
+            /// Exact immutable CPU root declaration used by admission and construction.
+            std::shared_ptr<const CPUSerialExpertStorageLayout> cpu_storage_layout;
+            /// Existing rank/model PMA issuer; backing storage owns every resulting claim.
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority;
         };
 
         /**
@@ -362,7 +369,12 @@ namespace llaminar2
             return cpu_grouped_workspace_;
         }
 
+        /** @return Canonical CPU issuer already retained by every serial backing root. */
+        const std::shared_ptr<PhysicalMemoryAuthority>& physicalMemoryAuthority() const noexcept
+        { return physical_memory_authority_; }
+
     private:
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_; ///< Dependency identity, not a byte ledger.
         DeviceId device_id_ = DeviceId::invalid();
         size_t row_capacity_ = 0;
         int d_model_ = 0;
@@ -607,6 +619,8 @@ namespace llaminar2
             std::shared_ptr<void> moe_packed_down_lifetime;
             /// Pointer to model-context-owned PreparedWeightStore.  Not owned here.
             PreparedWeightStore *prepared_store = nullptr;
+            /// Canonical issuer for this explicit CPU packet allocation dependency.
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority;
             /// Pointer to model-context-owned ExpertGemmRegistry.  Not owned here.
             ExpertGemmRegistry *expert_registry = nullptr;
             /**
@@ -834,7 +848,8 @@ namespace llaminar2
         /** @copydoc ICPUCurrentBatchLLEPExpertConsumer::cloneCPUCurrentBatchLLEPPreparedExpert */
         ExpertPackedWeights cloneCPUCurrentBatchLLEPPreparedExpert(
             int expert_id,
-            uint64_t durable_parent_epoch) const override;
+            uint64_t durable_parent_epoch,
+            CPUWeightStoragePlacement destination) const override;
 
         /** @copydoc ICPUCurrentBatchLLEPExpertConsumer::installCPUCurrentBatchLLEPTransientResidency */
         bool installCPUCurrentBatchLLEPTransientResidency(
@@ -946,7 +961,15 @@ namespace llaminar2
             Submitted, ///< GPU work and its exact producer event are in flight.
         };
 
-        /** @brief Bind a private or serial-family compact tensor set at fixed capacity. */
+        /**
+         * @brief Bind a retained family or validate immutable CPU packet capacity.
+         * @param rows Live/setup token rows requested by this packet.
+         * @param routing_top_k Fixed metadata route width.
+         * @return Whether the complete requested packet binding is valid.
+         * @throws std::logic_error For CPU private growth or missing setup backing.
+         * @details CPU private roots allocate only during construction from the
+         * frozen graph/packet capacity. Replay never replaces their storage.
+         */
         bool ensureCompactCapacity(size_t rows, int routing_top_k) const;
         /** @return Whether compute must retain raw per-expert rows until publication. */
         bool preservesCanonicalRouteRows() const noexcept
@@ -1077,6 +1100,8 @@ namespace llaminar2
         std::chrono::steady_clock::time_point pending_stage_setup_start_{};
         std::chrono::steady_clock::time_point pending_compute_start_{};
         std::chrono::steady_clock::time_point pending_compute_end_{};
+        /// Immutable setup declaration; absent on GPU and serial-family paths.
+        std::shared_ptr<const CPUCompactPacketStorageLayout> cpu_compact_packet_layout_;
         mutable size_t compact_capacity_ = 0;
         mutable std::shared_ptr<FP32Tensor> compact_hidden_;
         mutable std::shared_ptr<FP32Tensor> compact_routing_indices_;

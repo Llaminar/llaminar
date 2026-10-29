@@ -84,6 +84,9 @@
  * - Direct kernel creation (no operator layer)
  *
  * @author David Sanftenberg
+ * CPU native-storage adoption preserves the exact aligned physical owner and
+ * its allocation lease. Native views retain that owner, while view deep copies
+ * preclaim independent storage through the original backing's typed issuer.
  */
 
 #pragma once
@@ -2693,9 +2696,11 @@ namespace llaminar2
          * @brief Adopt fully initialized aligned FP16 storage without copying.
          * @param shape Tensor dimensions.
          * @param fp16_data Exact FP16 element storage; ownership is transferred.
+         * @param device Exact CPU home allocator identity.
          * @throws std::invalid_argument When storage size does not match @p shape.
          */
-        FP16Tensor(const std::vector<size_t> &shape, AlignedVector<uint16_t> fp16_data);
+        FP16Tensor(const std::vector<size_t> &shape, AlignedVector<uint16_t> fp16_data,
+                   DeviceId device = DeviceId::cpu());
         ~FP16Tensor() override;
 
         // TensorBase interface
@@ -2945,9 +2950,11 @@ namespace llaminar2
          * @brief Adopt fully initialized aligned BF16 storage without copying.
          * @param shape Tensor dimensions.
          * @param bf16_data Exact BF16 element storage; ownership is transferred.
+         * @param device Exact CPU home allocator identity.
          * @throws std::invalid_argument When storage size does not match @p shape.
          */
-        BF16Tensor(const std::vector<size_t> &shape, AlignedVector<uint16_t> bf16_data);
+        BF16Tensor(const std::vector<size_t> &shape, AlignedVector<uint16_t> bf16_data,
+                   DeviceId device = DeviceId::cpu());
         ~BF16Tensor() override;
 
         // TensorBase interface
@@ -3355,6 +3362,14 @@ namespace llaminar2
         int32_t *mutable_data_impl() { return host_int32_data_.data(); }
 
         explicit INT32Tensor(const std::vector<size_t> &shape);
+        /**
+         * @brief Adopt exact native CPU storage without a second allocation.
+         * @param shape Logical dimensions matching the owned element count.
+         * @param storage Fully initialized native values and their allocation lease.
+         * @param device Exact CPU home allocator identity.
+         */
+        INT32Tensor(const std::vector<size_t> &shape, AlignedVector<int32_t> storage,
+                    DeviceId device = DeviceId::cpu());
         INT32Tensor(const std::vector<size_t> &shape,
                     const std::vector<int32_t> &data);
         INT32Tensor(const std::vector<size_t> &shape,
@@ -4095,6 +4110,15 @@ namespace llaminar2
         /// @param device Device placement (default: CPU)
         explicit Q8_1Tensor(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
+        /**
+         * @brief Adopt native row-padded CPU block bytes without copying.
+         * @param shape Two-dimensional logical matrix shape.
+         * @param storage Exact native byte extent with backing-owned admission.
+         * @param device Exact CPU home allocator identity.
+         */
+        Q8_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> storage,
+                   DeviceId device = DeviceId::cpu());
+
         ~Q8_1Tensor() override;
 
         // TensorBase interface
@@ -4615,6 +4639,16 @@ namespace llaminar2
         /// @param block_size Block size for quantization (32, 64, 128, or 192)
         /// @param device Device placement (default: CPU)
         Q16_1Tensor(const std::vector<size_t> &shape, Q16BlockSize block_size, DeviceId device = DeviceId::cpu());
+
+        /**
+         * @brief Adopt native row-padded CPU bytes for the declared block geometry.
+         * @param shape Two-dimensional logical matrix shape.
+         * @param storage Exact native byte extent with backing-owned admission.
+         * @param device Exact CPU home allocator identity.
+         * @param block_size Original native block geometry, validated before publication.
+         */
+        Q16_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> storage,
+                    DeviceId device = DeviceId::cpu(), Q16BlockSize block_size = Q16BlockSize::BLOCK_32);
 
         ~Q16_1Tensor() override;
 

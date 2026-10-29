@@ -153,7 +153,11 @@ endif()
         def numerical_filter(target: str) -> tuple[str, ...]:
             """Read one exact literal from its actual numerical registration."""
             start = source.index(f"    discover_v2_parity_tests({target}\n")
-            end = source.index("MODEL_FILES", start)
+            # Additional source closures may end in MODEL_FILES too. Only the
+            # complete CMake argument names the numerical manifest boundary.
+            boundary = re.search(r"(?m)^[ \t]*MODEL_FILES(?:[ \t]|$)", source[start:])
+            self.assertIsNotNone(boundary, target)
+            end = start + boundary.start()
             filters = re.findall(r'PRODUCTION_PERF_STATS_FILTER "([^"\n]+)"', source[start:end])
             self.assertEqual(len(filters), 1, target)
             fields = tuple(filters[0].split(","))

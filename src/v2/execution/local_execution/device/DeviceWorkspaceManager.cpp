@@ -10,9 +10,15 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ * A complete transient CPU grouped-MoE declaration is carried beside named
+ * slab regions. Its owned roots share this allocator lifetime and sole PMA
+ * issuer; the serial-family envelope freezes before any consumer is bound.
  */
 
 #include "DeviceWorkspaceManager.h"
+#include "memory/CPUGroupedMoEStorageBacking.h"
+#include <optional>
+#include <cstring>
 #include "../../../backends/BackendManager.h"
 #include "../../../backends/IBackend.h"
 #include "../../../utils/Logger.h"
@@ -30,6 +36,37 @@
 
 namespace llaminar2
 {
+    size_t SerialWorkspaceFamilyPlan::totalPhysicalBytes() const
+    {
+        WorkspaceRequirements typed;
+        typed.cpu_grouped_moe_storage = cpu_grouped_moe_storage;
+        typed.cpu_router_q8_storage = cpu_router_q8_storage;
+        const auto extra = typed.cpu_grouped_bytes();
+        if(extra>std::numeric_limits<size_t>::max()-total_bytes)throw std::overflow_error("Workspace family root sum overflows");
+        return total_bytes+extra;
+    }
+    size_t DeviceWorkspaceManager::used() const
+    {return used_bytes_+typedCPUPhysicalBytes();}
+    size_t DeviceWorkspaceManager::retainedBackingBytes() const
+    {return block_size_+typedCPUPhysicalBytes();}
+    size_t DeviceWorkspaceManager::allocatedPhysicalBytes() const
+    {
+        size_t total=block_size_;
+        for(const auto &extension:extension_blocks_)total+=extension.size;
+        return total+typedCPUPhysicalBytes();
+    }
+
+    size_t DeviceWorkspaceManager::typedCPUPhysicalBytes() const
+    {
+        return cpu_grouped_moe_storage_ ? cpu_grouped_moe_storage_->physicalBytes()
+            : (cpu_router_q8_storage_ ? cpu_router_q8_storage_->allocationBytes() : 0);
+    }
+
+    std::shared_ptr<AlignedVector<Q8_1Block>> DeviceWorkspaceManager::cpuRouterQ8Storage() const noexcept
+    {
+        return cpu_grouped_moe_storage_ ? cpu_grouped_moe_storage_->kernel_router_q8 : cpu_router_q8_storage_;
+    }
+
     namespace detail
     {
         /** @brief Sole physical owner of a workspace block and its accounting claim. */
@@ -208,6 +245,39 @@ namespace llaminar2
         const WorkspaceRequirements &requirements,
         size_t minimum_primary_block_bytes)
     {
+        if (requirements.cpu_grouped_moe_storage || requirements.cpu_router_q8_storage)
+        {
+            if (allocated_)
+                throw std::logic_error("CPU typed roots must be declared before workspace publication");
+            // Validate the complete family before claiming any root, including
+            // router/grouped source identity and capacity compatibility.
+            const size_t named = std::max(requirements.named_bytes_with_alignment(), minimum_primary_block_bytes);
+            if (requirements.addCPUGrouped(named) > budget_bytes_)
+                throw std::logic_error("Complete CPU workspace exceeds admitted owner budget");
+            const auto allocator = requirements.cpu_grouped_moe_storage
+                ? requirements.cpu_grouped_moe_storage->batch.allocator()
+                : requirements.cpu_router_q8_storage->root.allocator();
+            if (device_ != allocator || physical_memory_owner_ != PhysicalMemoryOwner::ExecutionWorkspace ||
+                !physical_memory_authority_)
+                throw std::invalid_argument("CPU typed roots require their exact admitted workspace allocator");
+            std::shared_ptr<CPUGroupedMoEStorageBacking> grouped;
+            std::shared_ptr<AlignedVector<Q8_1Block>> router;
+            if (requirements.cpu_grouped_moe_storage)
+                grouped = std::make_shared<CPUGroupedMoEStorageBacking>(
+                    *requirements.cpu_grouped_moe_storage, physical_memory_authority_);
+            else
+                router = std::make_shared<AlignedVector<Q8_1Block>>(
+                    requirements.cpu_router_q8_storage->root.allocate(physical_memory_authority_));
+            auto named_requirements = requirements;
+            named_requirements.cpu_grouped_moe_storage.reset();
+            named_requirements.cpu_router_q8_storage.reset();
+            if (!allocate(named_requirements, minimum_primary_block_bytes))
+                return false;
+            cpu_grouped_moe_storage_ = std::move(grouped);
+            cpu_router_q8_storage_ = std::move(router);
+            cpu_router_q8_layout_ = cpu_grouped_moe_storage_ ? nullptr : requirements.cpu_router_q8_storage;
+            return true;
+        }
         if (allocated_)
         {
             LOG_WARN("[DeviceWorkspaceManager] Already allocated, call release() first");
@@ -330,6 +400,28 @@ namespace llaminar2
         const std::vector<WorkspaceRequirements> &participants)
     {
         SerialWorkspaceFamilyPlan plan;
+
+        try
+        {
+            for(const auto &participant:participants)
+                if(participant.cpu_grouped_moe_storage)
+                {
+                    participant.cpu_grouped_moe_storage->validate();
+                    plan.cpu_grouped_moe_storage=std::make_shared<const CPUGroupedMoEStorageLayout>(
+                        plan.cpu_grouped_moe_storage?plan.cpu_grouped_moe_storage->merge(*participant.cpu_grouped_moe_storage):*participant.cpu_grouped_moe_storage);
+                }
+            for (const auto &participant : participants)
+                if (participant.cpu_router_q8_storage)
+                {
+                    participant.cpu_router_q8_storage->validate();
+                    plan.cpu_router_q8_storage = std::make_shared<const CPURouterQ8StorageLayout>(
+                        plan.cpu_router_q8_storage
+                            ? plan.cpu_router_q8_storage->merge(*participant.cpu_router_q8_storage)
+                            : *participant.cpu_router_q8_storage);
+                }
+            (void)plan.totalPhysicalBytes();
+        }
+        catch(const std::exception &error){plan.error=error.what();return plan;}
 
         /*
          * A sorted map gives every workspace ABI name a deterministic index.
@@ -627,6 +719,38 @@ namespace llaminar2
     bool DeviceWorkspaceManager::allocateSerialFamily(
         const SerialWorkspaceFamilyPlan &plan)
     {
+        if (plan.cpu_grouped_moe_storage || plan.cpu_router_q8_storage)
+        {
+            if (allocated_)
+                throw std::logic_error("CPU serial envelope was already published");
+            if (!plan.valid())
+                return false;
+            if (plan.totalPhysicalBytes() > budget_bytes_)
+                throw std::logic_error("Complete CPU serial workspace exceeds admitted owner budget");
+            const auto allocator = plan.cpu_grouped_moe_storage
+                ? plan.cpu_grouped_moe_storage->batch.allocator()
+                : plan.cpu_router_q8_storage->root.allocator();
+            if (device_ != allocator || physical_memory_owner_ != PhysicalMemoryOwner::ExecutionWorkspace ||
+                !physical_memory_authority_)
+                throw std::invalid_argument("CPU serial roots require their admitted workspace allocator");
+            std::shared_ptr<CPUGroupedMoEStorageBacking> grouped;
+            std::shared_ptr<AlignedVector<Q8_1Block>> router;
+            if (plan.cpu_grouped_moe_storage)
+                grouped = std::make_shared<CPUGroupedMoEStorageBacking>(
+                    *plan.cpu_grouped_moe_storage, physical_memory_authority_);
+            else
+                router = std::make_shared<AlignedVector<Q8_1Block>>(
+                    plan.cpu_router_q8_storage->root.allocate(physical_memory_authority_));
+            auto named_plan = plan;
+            named_plan.cpu_grouped_moe_storage.reset();
+            named_plan.cpu_router_q8_storage.reset();
+            if (!allocateSerialFamily(named_plan))
+                return false;
+            cpu_grouped_moe_storage_ = std::move(grouped);
+            cpu_router_q8_storage_ = std::move(router);
+            cpu_router_q8_layout_ = cpu_grouped_moe_storage_ ? nullptr : plan.cpu_router_q8_storage;
+            return true;
+        }
         if (allocated_)
         {
             LOG_ERROR("[DeviceWorkspaceManager] Cannot allocate a serial family after workspace publication on "
@@ -720,6 +844,23 @@ namespace llaminar2
 
         try
         {
+            if(cpu_grouped_moe_storage_ && cpu_grouped_moe_storage_->physicalBytes()!=cpu_grouped_moe_storage_->layout().physicalBytes())
+            {
+                if(error)*error="CPU grouped-MoE backing was retired before reusable sealing";
+                return false;
+            }
+            if(cpu_grouped_moe_storage_ && (cpu_grouped_moe_storage_.use_count()!=1 || cpu_grouped_moe_storage_->hasExternalOwners()))
+            {
+                if(error)*error="CPU grouped-MoE workspace still has retained backing consumers";
+                return false;
+            }
+            if (cpu_router_q8_storage_ &&
+                (cpu_router_q8_storage_.use_count() != 1 || !cpu_router_q8_layout_ ||
+                 cpu_router_q8_storage_->allocationBytes() != cpu_router_q8_layout_->physicalBytes()))
+            {
+                if (error) *error = "CPU router workspace still has retained consumers or retired backing";
+                return false;
+            }
             // A consumer retaining even one word still owns its captured
             // meaning. Reject before clearing names/publications, so failure
             // leaves the current graph family completely unchanged.
@@ -749,7 +890,7 @@ namespace llaminar2
             buffers_.clear();
             used_bytes_ = 0;
 
-            if (!block_ || block_size_ == 0)
+            if ((!block_ || block_size_ == 0) && !cpu_grouped_moe_storage_ && !cpu_router_q8_storage_)
             {
                 allocated_ = false;
                 reusable_primary_block_ = false;
@@ -784,8 +925,10 @@ namespace llaminar2
     bool DeviceWorkspaceManager::reusePrimaryBlockForSerialFamily(
         const SerialWorkspaceFamilyPlan &plan)
     {
-        if (!reusable_primary_block_ || !allocated_ || !block_ ||
-            block_size_ == 0)
+        requireCPUGroupedMoEStorage(plan.cpu_grouped_moe_storage);
+        requireCPURouterQ8Storage(plan.cpu_router_q8_storage);
+        if (!reusable_primary_block_ || !allocated_ ||
+            (plan.total_bytes>0 && (!block_ || block_size_==0)))
         {
             LOG_ERROR(
                 "[DeviceWorkspaceManager] Serial-family reuse requires one sealed primary block on "
@@ -869,6 +1012,8 @@ namespace llaminar2
     bool DeviceWorkspaceManager::extend(
         const WorkspaceRequirements &requirements)
     {
+        requireCPUGroupedMoEStorage(requirements.cpu_grouped_moe_storage);
+        requireCPURouterQ8Storage(requirements.cpu_router_q8_storage);
         if (!allocated_)
         {
             LOG_ERROR("[DeviceWorkspaceManager] extend called before initial allocation on "
@@ -900,7 +1045,7 @@ namespace llaminar2
             const bool fits =
                 aligned_offset <= budget_bytes_ &&
                 buffer->size_bytes <= budget_bytes_ - aligned_offset &&
-                used_bytes_ <= budget_bytes_ -
+                used() <= budget_bytes_ -
                                    (aligned_offset + buffer->size_bytes);
             if (!fits)
             {
@@ -954,6 +1099,9 @@ namespace llaminar2
     bool DeviceWorkspaceManager::bindSerialParticipant(
         const WorkspaceRequirements &requirements)
     {
+        requireCPUGroupedMoEStorage(requirements.cpu_grouped_moe_storage);
+        requireCPURouterQ8Storage(requirements.cpu_router_q8_storage);
+        if(allocated_ && requirements.buffers.empty())return true;
         if (!allocated_ || !block_ || block_size_ == 0)
         {
             LOG_ERROR("[DeviceWorkspaceManager] Cannot bind a serial participant before the primary workspace allocation on "
@@ -1153,6 +1301,14 @@ namespace llaminar2
             return false;
         }
 
+        if (cpu_grouped_moe_storage_)
+            cpu_grouped_moe_storage_->zero();
+        else if (cpu_router_q8_storage_)
+        {
+            requireCPURouterQ8Storage(cpu_router_q8_layout_);
+            std::memset(static_cast<void *>(cpu_router_q8_storage_->data()), 0,
+                cpu_router_q8_storage_->size() * sizeof(Q8_1Block));
+        }
         IBackend *backend = getBackendFor(device_);
         if (!backend)
         {
@@ -1503,6 +1659,9 @@ namespace llaminar2
         persistent_slot_registry_ =
             std::make_shared<detail::PersistentWorkspaceSlotRegistry>();
 
+        cpu_grouped_moe_storage_.reset();
+        cpu_router_q8_storage_.reset();
+        cpu_router_q8_layout_.reset();
         if (!allocated_)
         {
             return;
@@ -1523,6 +1682,32 @@ namespace llaminar2
     // =========================================================================
     // Buffer Access
     // =========================================================================
+
+    void DeviceWorkspaceManager::requireCPURouterQ8Storage(
+        const std::shared_ptr<const CPURouterQ8StorageLayout> &requested) const
+    {
+        if (!requested)
+            return;
+        requested->validate();
+        const auto storage = cpuRouterQ8Storage();
+        const auto grouped_layout = cpu_grouped_moe_storage_
+            ? std::optional<CPURouterQ8StorageLayout>(cpu_grouped_moe_storage_->layout().routerLayout())
+            : std::nullopt;
+        const auto *layout = grouped_layout ? &*grouped_layout : cpu_router_q8_layout_.get();
+        if (!layout || !storage || !layout->contains(*requested) ||
+            storage->allocationBytes() != layout->physicalBytes())
+            throw std::logic_error("CPU router workspace cannot introduce, grow, rebind or use retired backing after publication");
+    }
+
+    void DeviceWorkspaceManager::requireCPUGroupedMoEStorage(
+        const std::shared_ptr<const CPUGroupedMoEStorageLayout> &requested) const
+    {
+        if(!requested)return;
+        requested->validate();
+        if(!cpu_grouped_moe_storage_ || !cpu_grouped_moe_storage_->layout().contains(*requested) ||
+            cpu_grouped_moe_storage_->physicalBytes()!=cpu_grouped_moe_storage_->layout().physicalBytes())
+            throw std::logic_error("CPU grouped-MoE workspace cannot introduce, grow, rebind or use retired backing after publication");
+    }
 
     std::shared_ptr<const WorkspaceBufferLease> DeviceWorkspaceManager::retainBuffer(
         const std::string &name, size_t offset, size_t bytes) const

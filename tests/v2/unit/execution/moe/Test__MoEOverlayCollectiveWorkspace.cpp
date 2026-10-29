@@ -18,6 +18,7 @@
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "collective/ITPContext.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../../utils/CPURouterKernelTestAdmission.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "mocks/MockMPIContext.h"
@@ -947,6 +948,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
         gate[index] = static_cast<float>(static_cast<int>(index % 17u) - 8) * 0.015625f;
 
     CPUMoEKernel transported_kernel;
+    llaminar2::test::admitCPURouterKernelForTest(transported_kernel,rows,d_model);
     ASSERT_TRUE(transported_kernel.publishTransportedRouterQ8Hidden(
         hidden.data(), rows, d_model));
     const Q8_1Block *const transported =
@@ -955,6 +957,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     ASSERT_NE(transported, nullptr);
 
     CPUMoEKernel routed_kernel;
+    llaminar2::test::admitCPURouterKernelForTest(routed_kernel,rows,d_model);
     MoERoutingResult routing;
     ASSERT_TRUE(routed_kernel.route(
         hidden.data(),
@@ -980,6 +983,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     std::vector<Q8_1Block> serial_rows(
         static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row));
     CPUMoEKernel serial_kernel;
+    llaminar2::test::admitCPURouterKernelForTest(serial_kernel,1,d_model);
     for (int row = 0; row < rows; ++row)
     {
         const float *const source =

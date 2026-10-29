@@ -49,6 +49,7 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_ExactShapes)
     config.local_n_kv_heads = 4;
     config.local_d_ff = 8960;
     config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
+    config.custom_formulas["terminal_logit_row_capacity"] = kVerifierRowCapacity;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -143,6 +144,7 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
     config.local_n_kv_heads = 4;
     config.local_d_ff = 8960;
     config.custom_formulas["mtp_target_query_rows"] = 8;
+    config.custom_formulas["terminal_logit_row_capacity"] = 8;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
     auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
@@ -241,6 +243,7 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_TP2)
     config.local_n_kv_heads = 2; // 4/2
     config.local_d_ff = 4480;    // 8960/2
     config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
+    config.custom_formulas["terminal_logit_row_capacity"] = kVerifierRowCapacity;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 

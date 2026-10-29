@@ -5,8 +5,10 @@
  * Only GGUF metadata and canonical planning functions execute. Sparse native
  * payload extents are never loaded; no device, graph, allocator or model runner
  * is started. The tests compare source-owned BOM lines, not duplicated sizing.
+ * Predictor storage ownership survives setup serialization independently of main TP.
  */
 #include "planning/MemoryPlanner.h"
+#include "execution/moe/MoEOverlayRowCandidateFinalization.h"
 #include "planning/ImmutableRowTableAdmissionWire.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "planning/RankMemoryPlanInputs.h"
@@ -543,7 +545,24 @@ TEST(NgramExecutionProvision, FixedHeadExactFitAndOneByteShortKeepFrozenRowsAndO
             ASSERT_TRUE(frozen.fits());
             if(short_by_one)
             {
-                EXPECT_THROW((void)ImmutableRowTablePlacementPlanner::select(q,frozen),PhysicalMemoryCapacityExhausted);
+                try
+                {
+                    (void)ImmutableRowTablePlacementPlanner::select(q, frozen);
+                    FAIL() << "One-byte-short fixed-head request unexpectedly admitted";
+                }
+                catch (const PhysicalMemoryCapacityExhausted &error)
+                {
+                    const std::string diagnostic = error.what();
+                    const auto owner = PhysicalMemoryAllocatorIdentity{0, c.front().device};
+                    const auto *expected = full.physical_plan.find(owner);
+                    ASSERT_NE(expected, nullptr);
+                    EXPECT_NE(diagnostic.find(c.front().device.toString()), std::string::npos);
+                    EXPECT_NE(diagnostic.find("immutable_table_storage=" +
+                        std::to_string(expected->bytes(PhysicalMemoryOwner::ImmutableTableStorage))), std::string::npos);
+                    EXPECT_NE(diagnostic.find("total=" + std::to_string(expected->totalBytes())), std::string::npos);
+                    EXPECT_NE(diagnostic.find("available=" + std::to_string(c.front().device_free_bytes)), std::string::npos);
+                    EXPECT_NE(diagnostic.find("deficit_bytes=1"), std::string::npos);
+                }
             }
             else EXPECT_TRUE(ImmutableRowTablePlacementPlanner::select(q,frozen).physical_plan.fits());
             for(std::size_t p=0;p<c.size();++p)
@@ -555,6 +574,99 @@ TEST(NgramExecutionProvision, FixedHeadExactFitAndOneByteShortKeepFrozenRowsAndO
         }
     }
 }
+/**
+ * @test Mandatory fixed-head ranges join row feasibility without changing grants.
+ *
+ * Metadata-only production planners retain the sixteen-row MTP ceiling. Exact
+ * smaller-envelope capacity rejects the larger envelope; one byte less rejects
+ * every legal candidate. No tensor allocation or backend context is created.
+ */
+TEST(NgramExecutionProvision, FixedHeadCompleteRowCandidatesPreserveGrantsAndMTPFloor)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &profile = source.metadata().memoryProfile();
+    const auto upload = resolveGPUWeightLoadMemoryGeometry(
+        maximumGGUFTensorPayloadBytes(source.loader().getModel()), {});
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto original = fixedHeadConsumers(profile, backend, 2, true, upload);
+        for (auto &config : original)
+        {
+            config.mtp_enabled = true;
+            config.mtp_target_query_rows = 16;
+            config.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+                profile.expert_count, std::vector<int>(profile.n_layers, 8));
+            config.activation_seq_len = 16;
+        }
+        // The production decision must not invoke lower-priority Automatic
+        // placement while rows/grants are still candidates.
+        ImmutableRowTablePolicy automatic{ImmutableRowStoragePreference::Automatic};
+        int calls = 0;
+        auto deferred = finalizeMoEOverlayRowCandidate(automatic, [&]() -> int
+        {
+            ++calls;
+            throw std::logic_error("Automatic placement ran before rows froze");
+        });
+        EXPECT_TRUE(std::holds_alternative<MoEOverlayRowDeferred>(deferred));
+        EXPECT_EQ(calls, 0);
+        EXPECT_THROW((void)finalizeMoEOverlayRowCandidate(*original.front().ngram_execution_policy,
+            []() -> int { throw std::invalid_argument("foreign head owner"); }), std::invalid_argument);
+        const auto small_base = MemoryPlanner::plan(profile, original).physicalPlan();
+        const auto small = ImmutableRowTablePlacementPlanner::select(request(profile, original), small_base);
+        for (const bool impossible : {false, true})
+        {
+            std::optional<ImmutableRowTablePlacementSelection> admitted;
+            int selected_rows = 0;
+            int capacity_rejections = 0;
+            for (const int rows : {64, 16})
+            {
+                auto configs = original;
+                for (std::size_t i = 0; i < configs.size(); ++i)
+                {
+                    configs[i].activation_seq_len = rows;
+                    const auto *bound = small.physical_plan.find({0, configs[i].device});
+                    ASSERT_NE(bound, nullptr);
+                    configs[i].device_free_bytes = bound->totalBytes() - (impossible && i == 0 ? 1u : 0u);
+                }
+                const auto frozen = MemoryPlanner::plan(profile, configs).physicalPlan();
+                ASSERT_TRUE(frozen.fits()); // Native table storage is the limiting owner.
+                auto finalized = finalizeMoEOverlayRowCandidate(*configs.front().ngram_execution_policy, [&]
+                {
+                    return ImmutableRowTablePlacementPlanner::select(request(profile, configs), frozen);
+                });
+                ASSERT_FALSE(std::holds_alternative<MoEOverlayRowDeferred>(finalized));
+                if (const auto *rejected = std::get_if<MoEOverlayRowCapacityRejected>(&finalized))
+                {
+                    EXPECT_FALSE(rejected->diagnostic.empty());
+                    ++capacity_rejections;
+                    continue;
+                }
+                auto *complete = std::get_if<MoEOverlayRowAdmitted<ImmutableRowTablePlacementSelection>>(&finalized);
+                ASSERT_NE(complete, nullptr);
+                admitted = std::move(complete->value);
+                selected_rows = rows;
+                for (const auto &config : configs)
+                {
+                    EXPECT_EQ(config.mtp_target_query_rows, 16);
+                    const PhysicalMemoryAllocatorIdentity owner{0, config.device};
+                    EXPECT_EQ(bytes(admitted->physical_plan, owner, PhysicalMemoryOwner::PrimaryModelWeights),
+                        bytes(small.physical_plan, owner, PhysicalMemoryOwner::PrimaryModelWeights));
+                    EXPECT_EQ(admitted->placement->fixedHeadSourceRangeFor(owner),
+                        small.placement->fixedHeadSourceRangeFor(owner));
+                    EXPECT_EQ(bytes(admitted->physical_plan, owner, PhysicalMemoryOwner::ImmutableTableStorage),
+                        bytes(small.physical_plan, owner, PhysicalMemoryOwner::ImmutableTableStorage));
+                }
+                EXPECT_EQ(*admitted->placement, *small.placement);
+                break;
+            }
+            EXPECT_EQ(capacity_rejections, impossible ? 2 : 1);
+            EXPECT_EQ(selected_rows, impossible ? 0 : 16);
+            EXPECT_EQ(admitted.has_value(), !impossible);
+        }
+    }
+}
+
 /** @test Missing original source/TP/upload authority and conflicting temporal coordinates fail closed. */
 TEST(NgramExecutionProvision, FixedHeadRejectsForeignTopologyCoordinatesSourceAndUpload)
 {
@@ -640,6 +752,39 @@ TEST(NgramExecutionProvision, AttentionPhaseScheduleIsPartOfConsumerAndRestoreId
     changed.front().activation.attention_phase_schedule=static_cast<Schedule>(255);
     EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,changed,
         q.execution_provision->executionPlan(),q.execution_provision->requiredBase()),std::invalid_argument);
+}
+
+/** @test Predictor ownership is preserved and authenticated by source provision and wire identity. */
+TEST(NgramExecutionProvision, PredictorStorageOwnershipSurvivesWireAndRejectsUnknownPolicies)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &profile=source.metadata().memoryProfile();
+    for (const auto policy : {MTPShiftedKVHeadLayout::PrimaryTensorParallelShard,
+                             MTPShiftedKVHeadLayout::FullModelPerParticipant})
+    {
+        auto c=consumer(DeviceType::CPU,ImmutableRowStoragePreference::RAM);
+        c.mtp_shifted_kv_head_layout=policy;
+        const auto q=request(profile,{c});
+        ASSERT_TRUE(q.execution_provision);
+        ASSERT_EQ(q.execution_provision->consumers().size(),1u);
+        const auto &original=q.execution_provision->consumers().front();
+        EXPECT_EQ(original.activation.mtp_shifted_kv_head_layout,policy);
+        const std::array requests{q};
+        const auto wire=serializeImmutableRowTableAdmissionRequests(requests);
+        const auto decoded=parseImmutableRowTableAdmissionRequests(wire,0,&profile);
+        ASSERT_EQ(decoded.size(),1u);
+        EXPECT_EQ(decoded.front().execution_provision->consumers(),q.execution_provision->consumers());
+        auto old=wire; old.at(4)=8;
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(old,0,&profile),std::invalid_argument);
+        auto changed=q.execution_provision->consumers();
+        changed.front().activation.mtp_shifted_kv_head_layout=policy==MTPShiftedKVHeadLayout::FullModelPerParticipant
+            ? MTPShiftedKVHeadLayout::PrimaryTensorParallelShard : MTPShiftedKVHeadLayout::FullModelPerParticipant;
+        EXPECT_NE(changed.front(),original);
+        changed.front().activation.mtp_shifted_kv_head_layout=static_cast<MTPShiftedKVHeadLayout>(255);
+        EXPECT_THROW(MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,changed,
+            q.execution_provision->executionPlan(),q.execution_provision->requiredBase()),std::invalid_argument);
+    }
 }
 
 /** @test Base arithmetic is a strict wire/cohort identity scalar, including values that would

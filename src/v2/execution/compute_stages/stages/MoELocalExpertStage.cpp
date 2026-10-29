@@ -14,6 +14,10 @@
  * builder has established a non-concurrent execution contract.
  * Host route publication partitions independent rows across the socket's team;
  * its joined count publication never changes the canonical numerical fold.
+ * CPU serial roots consume the same typed declarations as admission; the
+ * AlignedVector backing retains PMA claims through every tensor view lifetime.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
 #include "MoELocalExpertStage.h"
@@ -639,7 +643,7 @@ namespace llaminar2
 
     MoELocalExpertSerialBufferArena::MoELocalExpertSerialBufferArena(
         Config config)
-        : device_id_(config.device_id),
+        : physical_memory_authority_(config.physical_memory_authority), device_id_(config.device_id),
           row_capacity_(config.row_capacity),
           d_model_(config.d_model),
           routing_top_k_(config.routing_top_k),
@@ -703,6 +707,23 @@ namespace llaminar2
 
         const size_t d_model = static_cast<size_t>(d_model_);
         const size_t routing_top_k = static_cast<size_t>(routing_top_k_);
+        if(device_id_.is_cpu())
+        {
+            if(!config.cpu_storage_layout || !config.physical_memory_authority)
+                throw std::invalid_argument("CPU serial arena requires its frozen layout and existing PMA");
+            const auto &layout=*config.cpu_storage_layout;
+            std::vector<size_t> declared_rows;
+            for(const auto &family:layout.families()) declared_rows.push_back(family.rows);
+            if(layout.allocator()!=device_id_ || layout.maximumRows()!=row_capacity_ ||
+                layout.hiddenWidth()!=d_model_ || layout.routeWidth()!=routing_top_k_ ||
+                declared_rows!=config.row_capacity_buckets || bool(layout.canonical())!=
+                    (config.cpu_canonical_route_storage==CPUCanonicalRouteStoragePolicy::RetainSerialMaximum))
+                throw std::invalid_argument("CPU serial arena construction disagrees with its admitted root declarations");
+            if(bool(layout.grouped())!=(config.cpu_grouped_scratch_storage==CPUGroupedScratchStoragePolicy::RetainSerialMaximum) ||
+                bool(layout.mappedCanonical())!=bool(config.cpu_canonical_route_gpu_consumer) ||
+                (layout.mappedCanonical() && layout.mappedCanonical()->consumer()!=*config.cpu_canonical_route_gpu_consumer))
+                throw std::invalid_argument("CPU serial arena workspace/publication policy differs from its root declarations");
+        }
         families_.reserve(config.row_capacity_buckets.size());
         for (const size_t capacity : config.row_capacity_buckets)
         {
@@ -725,12 +746,14 @@ namespace llaminar2
                 checkedAdd(hidden_bytes, routing_bytes, "compact input bytes"),
                 checkedAdd(routing_bytes, hidden_bytes, "compact output bytes"),
                 "compact family bytes");
+            const auto owned_family_bytes=device_id_.is_cpu()
+                ? config.cpu_storage_layout->families().at(families_.size()).physicalBytes():family_bytes;
             allocation_bytes_ = checkedAdd(
-                allocation_bytes_, family_bytes, "compact arena bytes");
+                allocation_bytes_, owned_family_bytes, "compact arena bytes");
 
             TensorFamily family;
             family.row_capacity = capacity;
-            family.allocation_bytes = family_bytes;
+            family.allocation_bytes = owned_family_bytes;
             if (device_id_.is_gpu())
             {
                 /*
@@ -760,14 +783,26 @@ namespace llaminar2
                         family_bytes,
                         device_id_);
             }
-            family.hidden = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{capacity, d_model});
-            family.routing_indices = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{capacity, routing_top_k});
-            family.routing_weights = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{capacity, routing_top_k});
-            family.output = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{capacity, d_model});
+            if(device_id_.is_cpu())
+            {
+                const auto &roots=config.cpu_storage_layout->families().at(families_.size());
+                const auto adopt=[&](const CPUStorageRoot<float>& root,size_t columns)
+                {
+                    return std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,columns},
+                        root.allocate(config.physical_memory_authority),device_id_);
+                };
+                family.hidden=adopt(roots.hidden,d_model);
+                family.routing_indices=adopt(roots.indices,routing_top_k);
+                family.routing_weights=adopt(roots.weights,routing_top_k);
+                family.output=adopt(roots.output,d_model);
+            }
+            else
+            {
+                family.hidden = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,d_model});
+                family.routing_indices = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,routing_top_k});
+                family.routing_weights = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,routing_top_k});
+                family.output = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity,d_model});
+            }
 
             const std::string family_prefix =
                 prefix + ".rows" + std::to_string(capacity);
@@ -809,14 +844,14 @@ namespace llaminar2
              * pass or changing floating-point order.
              */
             cpu_canonical_routes_ = std::make_shared<FP32Tensor>(
-                canonical_shape);
+                std::vector<size_t>{route_rows,d_model},
+                config.cpu_storage_layout->canonical()->allocate(config.physical_memory_authority),device_id_);
+
             if (config.cpu_canonical_route_gpu_consumer)
             {
-                const std::array<DeviceId, 1> endpoints{
-                    *config.cpu_canonical_route_gpu_consumer};
                 mapped_cpu_canonical_routes_ =
                     TransferEngine::instance().allocateMappedHostRegion(
-                        canonical_route_bytes, endpoints);
+                        *config.cpu_storage_layout->mappedCanonical(),config.physical_memory_authority);
                 if (!mapped_cpu_canonical_routes_ ||
                     !mapped_cpu_canonical_routes_->isBound() ||
                     !mapped_cpu_canonical_routes_->hasDevice(
@@ -835,13 +870,13 @@ namespace llaminar2
                 prefix + ".cpu_canonical_route_rows");
             allocation_bytes_ = checkedAdd(
                 allocation_bytes_,
-                canonical_route_bytes,
+                config.cpu_storage_layout->canonical()->physicalBytes(),
                 "canonical route arena bytes");
             if (mapped_canonical_route_bytes > 0u)
             {
                 allocation_bytes_ = checkedAdd(
                     allocation_bytes_,
-                    mapped_canonical_route_bytes,
+                    config.cpu_storage_layout->mappedCanonical()->physicalBytes(),
                     "mapped canonical route publication bytes");
                 pinned_transfer_bytes_ = checkedAdd(
                     pinned_transfer_bytes_,
@@ -863,6 +898,10 @@ namespace llaminar2
                         .num_experts = config.num_experts,
                         .routing_top_k = routing_top_k_,
                         .debug_name = prefix + ".cpu_grouped_scratch",
+                        .device_id = device_id_,
+                        .physical_memory_authority = config.physical_memory_authority,
+                        .declared_storage = std::shared_ptr<const CPUGroupedMoESerialWorkspace::StorageLayout>(
+                            config.cpu_storage_layout,&*config.cpu_storage_layout->grouped()),
                     });
             cpu_grouped_scratch_bytes =
                 cpu_grouped_workspace_->allocationBytes();
@@ -980,6 +1019,9 @@ namespace llaminar2
                 .workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads(),
                 .execution = CPUExecutionGeometry::local()};
         }
+        if(params_.device_id.is_cpu() && params_.serial_compact_buffer_arena && params_.physical_memory_authority &&
+            params_.physical_memory_authority!=params_.serial_compact_buffer_arena->physicalMemoryAuthority())
+            throw std::invalid_argument("CPU serial packet and stage dependency name different physical authorities");
         if (!params_.input_rows && params_.input_rows_lifetime)
             params_.input_rows = params_.input_rows_lifetime.get();
         if (!params_.output_rows && params_.output_rows_lifetime)
@@ -1071,6 +1113,14 @@ namespace llaminar2
                     throw std::invalid_argument(
                         "MoELocalExpertStage canonical ticket return requires CPU execution, matching immutable route geometry, and distinct cached-compute/mapped-publication banks");
                 }
+            }
+            if(params_.device_id.is_cpu() && !params_.serial_compact_buffer_arena)
+            {
+                if(!params_.physical_memory_authority ||
+                    !params_.physical_memory_authority->contains(params_.device_id))
+                    throw std::invalid_argument("CPU per-layer packet requires its exact admitted allocator authority");
+                cpu_compact_packet_layout_=std::make_shared<const CPUCompactPacketStorageLayout>(
+                    CPUCompactPacketStorageLayout::declare(row_capacity,params_.d_model,params_.top_k,params_.device_id));
             }
             if (!ensureCompactCapacity(row_capacity, params_.top_k))
             {
@@ -1307,6 +1357,7 @@ namespace llaminar2
         compute_params.prepared_up_gemm = invocation_up_engines_;
         compute_params.prepared_down_gemm = invocation_down_engines_;
         compute_params.prepared_store = params_.prepared_store;
+        compute_params.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
         compute_params.expert_registry = params_.expert_registry;
         compute_params.moe_runtime_table =
             params_.overlay_participant_residency
@@ -1466,6 +1517,7 @@ namespace llaminar2
             compute_params.prepared_up_gemm = invocation_up_engines_;
             compute_params.prepared_down_gemm = invocation_down_engines_;
             compute_params.prepared_store = params_.prepared_store;
+        compute_params.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
             compute_params.expert_registry = params_.expert_registry;
             compute_params.overlay_service_telemetry =
                 params_.overlay_service_telemetry;
@@ -1652,7 +1704,8 @@ namespace llaminar2
     ExpertPackedWeights
     MoELocalExpertStage::cloneCPUCurrentBatchLLEPPreparedExpert(
         int expert_id,
-        uint64_t durable_parent_epoch) const
+        uint64_t durable_parent_epoch,
+        CPUWeightStoragePlacement destination) const
     {
         if (!params_.device_id.is_cpu() ||
             !params_.overlay_participant_residency ||
@@ -1684,9 +1737,9 @@ namespace llaminar2
 
         const auto &engines = layer.experts[expert_index];
         ExpertPackedWeights packed;
-        packed.gate = engines.gate()->cloneWeights();
-        packed.up = engines.up()->cloneWeights();
-        packed.down = engines.down()->cloneWeights();
+        packed.gate = engines.gate()->cloneWeightsTo(destination);
+        packed.up = engines.up()->cloneWeightsTo(destination);
+        packed.down = engines.down()->cloneWeightsTo(destination);
         if (!packed.complete())
         {
             throw std::runtime_error(
@@ -1968,6 +2021,9 @@ namespace llaminar2
             return false;
         }
 
+        if (params.device_id.is_cpu() &&
+            (!params.prepared_store || !params.prepared_store->physicalMemoryAuthority()))
+            throw std::logic_error("CPU local expert preparation requires physical-memory admission");
         MoEWeightContext context{
             params.device_id,
             params.num_experts,
@@ -1998,7 +2054,10 @@ namespace llaminar2
             params.down_slab_ref,
             true,
             nullptr,
-            CPUExpertNUMAPlacement::forDevice(params.device_id)};
+            CPUExpertNUMAPlacement::forDevice(params.device_id),
+            MoEExpertWeightResolutionPolicy::RawOrPrepared,
+            {},
+            PhysicalMemoryOwner::RoutedExpertWeights};
 
         if (!MoEExpertWeightService::extractExpertViews(context))
             return false;
@@ -2302,7 +2361,10 @@ namespace llaminar2
             params_.down_slab_ref,
             true,
             nullptr,
-            CPUExpertNUMAPlacement::forDevice(params_.device_id)};
+            CPUExpertNUMAPlacement::forDevice(params_.device_id),
+            MoEExpertWeightResolutionPolicy::RawOrPrepared,
+            {},
+            PhysicalMemoryOwner::RoutedExpertWeights};
     }
 
     void MoELocalExpertStage::bindPreparedExpertEnginesForExperts(
@@ -2509,6 +2571,33 @@ namespace llaminar2
                    compact_routing_weights_ && compact_output_ &&
                    (!preservesCanonicalRouteRows() ||
                     compact_canonical_routes_);
+        }
+
+        if(params_.device_id.is_cpu())
+        {
+            if(!cpu_compact_packet_layout_ || capacity>cpu_compact_packet_layout_->rows ||
+                routing_top_k!=params_.top_k)
+                throw std::logic_error("CPU per-layer packet request exceeds its immutable setup declaration");
+            const auto &layout=*cpu_compact_packet_layout_;
+            if(compact_capacity_)
+            {
+                if(!compact_hidden_ || !compact_routing_indices_ || !compact_routing_weights_ || !compact_output_ ||
+                    compact_capacity_!=layout.rows || compact_routing_top_k_!=params_.top_k)
+                    throw std::logic_error("CPU per-layer packet lost its immutable storage backing");
+                return true;
+            }
+            const auto adopt=[&](const CPUStorageRoot<float>& root,size_t columns) {
+                return std::make_shared<FP32Tensor>(std::vector<size_t>{layout.rows,columns},
+                    root.allocate(params_.physical_memory_authority),params_.device_id);
+            };
+            compact_hidden_=adopt(layout.hidden,static_cast<size_t>(params_.d_model));
+            compact_routing_indices_=adopt(layout.indices,static_cast<size_t>(params_.top_k));
+            compact_routing_weights_=adopt(layout.weights,static_cast<size_t>(params_.top_k));
+            compact_output_=adopt(layout.output,static_cast<size_t>(params_.d_model));
+            compact_canonical_routes_.reset();
+            compact_capacity_=layout.rows;
+            compact_routing_top_k_=params_.top_k;
+            return true;
         }
 
         if (compact_capacity_ >= capacity &&
@@ -3429,6 +3518,7 @@ namespace llaminar2
             compute_params.prepared_up_gemm = invocation_up_engines_;
             compute_params.prepared_down_gemm = invocation_down_engines_;
             compute_params.prepared_store = params_.prepared_store;
+        compute_params.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
             compute_params.expert_registry = params_.expert_registry;
             compute_params.moe_runtime_table = execution_layer_bank
                                                    ? nullptr
@@ -4595,6 +4685,26 @@ namespace llaminar2
             std::max(compact_rows_from_sparse_payload, compact_rows_from_graph_hint);
 
         WorkspaceRequirements reqs;
+        if (params_.device_id.is_cpu())
+        {
+            if (retained_cpu_compute_stage_)
+            {
+                // Project the actual frozen executor's root geometry, not the
+                // GPU route-flattening formula. Serial roots emit no new owner.
+                reqs.cpu_grouped_moe_storage = retained_cpu_compute_stage_->
+                    getWorkspaceRequirements(1, n, k).cpu_grouped_moe_storage;
+            }
+            else if (!params_.cpu_workspace_source)
+            {
+                throw std::logic_error(
+                    "CPU local expert workspace requires its retained executor or explicit source declaration");
+            }
+            // An explicit source-only query has no executor or physical grouped
+            // root to materialize. The canonical projection/SwiGLU factories
+            // below declare future named scratch from those source facts;
+            // execution still requires the independently retained executor.
+        }
+
         if (params_.device_id.is_cuda())
         {
             /*

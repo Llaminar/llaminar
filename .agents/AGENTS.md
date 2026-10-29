@@ -260,8 +260,10 @@ Conventional Commits: `<type>(<optional-scope>): <description>`, for example
 Push the feature branch and open a PR into `develop`. Same-repository,
 non-draft feature PRs enable native squash auto-merge, which must wait for every
 required gate and an up-to-date merge candidate. The canonical PR workflow
-builds the AVX512 test image and runs complete Unit and
-`ProductionTestPreflight` gates. A successful develop merge then builds,
+builds the AVX512 test image and runs complete Unit and model-free
+`ProductionTestPreflight`, followed by separate hardware-eligible real-model
+QFN source admission. Every selected cell must execute without skips; hardware
+that is absent remains explicitly unqualified. A successful develop merge then builds,
 tests and publishes both AVX512 and AVX2 develop images. These images are
 development artifacts; this gate does not certify a release.
 
@@ -271,7 +273,8 @@ for the current develop HEAD. If documentation/CI maintenance skipped that
 head's push CI, run `gh workflow run ci.yml --ref develop --repo Llaminar/llaminar`
 and wait for the published pair before opening the PR.
 The master workflow admits the exact develop source and published
-image pair, runs the full canonical E2E suite on both ISAs, then the published
+image pair, runs the separate QFN source-admission gate in source/ISA-bound
+test companions on both ISAs, then the full canonical E2E suite, the published
 benchmark gates and then complete OpenCode app sessions on every blessed E2E
 cell and both ISAs. Merge only after all required checks pass. The merge cuts a
 release through the canonical release workflow, promoting the same tested
@@ -1045,10 +1048,18 @@ add a second benchmark topology/model list or reintroduce this pipeline into
 pre-commit.
 
 Feature PRs targeting `develop` run `.github/workflows/develop-pr.yml`: build
-one AVX512 full-backend image pair and run only complete Unit and
-`ProductionTestPreflight` inside its test-runner image. This is the pre-commit
-test scope, not model or image certification. It reuses the existing image
-driver without publication; no AVX2, models, E2E or benchmarks run on this PR.
+one AVX512 full-backend image pair and run complete Unit and model-free
+`ProductionTestPreflight`, then a separate hardware-eligible real-model QFN
+source-admission stage in the full-matrix test companion. Typed CTest/GTest
+metadata and native hardware identities own selection; Candidates are positive
+obligations, and hardware-ineligible cells remain unqualified. This admits
+source setup without numerical references, generation or image certification.
+It reuses the image driver with explicit `--source-admission` and no publication;
+no AVX2, HTTP E2E or benchmarks run on this PR. The release model/E2E check runs
+source admission on both ISA companions before HTTP work and requires its
+image-bound receipts for benchmark/release admission. Gather ordinary failures
+across selected cells and both release ISAs; driver/infrastructure failure is
+terminal. Keep the develop push and production preflight model-free.
 
 The enabled `develop` push workflow is deliberately smaller than certification: it invokes
 `scripts/ci/run_develop_image_gate.py` to build AVX512 and AVX2 full-backend

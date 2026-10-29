@@ -7,6 +7,8 @@
  * CPU preparation establishes NUMA placement in exclusive final storage before
  * decoding or copying. Publication only borrows complete owned engines; it must
  * never migrate, replace, or discard already filled execution storage.
+ * Registry-only consumers drop references on departure without releasing shared
+ * weights or mutating the canonical registry and prepared-store ownership.
  */
 
 #include "MoEExpertWeightService.h"
@@ -997,9 +999,14 @@ namespace llaminar2
         }
         std::atomic<bool> error_flag{false};
 
-        const auto placement = enforce_numa_placement
-            ? CPUWeightStoragePlacement::onNode(target_numa_node)
-            : CPUWeightStoragePlacement::local();
+        auto placement = ctx.initial_cpu_storage_placement.value_or(
+            enforce_numa_placement
+                ? CPUWeightStoragePlacement::onNode(target_numa_node)
+                : CPUWeightStoragePlacement::local());
+        if (!ctx.initial_cpu_storage_placement && ctx.prepared_store)
+            placement = CPUWeightStoragePlacement::accounted(
+                ctx.prepared_store->physicalMemoryAuthority(),
+                ctx.device_id, ctx.persistent_weight_owner, placement);
 
         // Per-expert engine storage for parallel assignment (avoids push_back race)
         std::vector<std::shared_ptr<ITensorGemm>> local_gate_engines(prep_count);
@@ -1326,10 +1333,16 @@ namespace llaminar2
                 "Cannot clone an incomplete prepared CPU expert");
         }
 
+        if (!ctx.prepared_store)
+            throw std::logic_error("CPU expert clone requires physical-memory admission");
+        const auto staging = CPUWeightStoragePlacement::accounted(
+            ctx.prepared_store->physicalMemoryAuthority(), ctx.device_id,
+            PhysicalMemoryOwner::ExpertMigrationStaging,
+            CPUWeightStoragePlacement::local());
         ExpertPackedWeights weights;
-        weights.gate = engines[0]->cloneWeights();
-        weights.up = engines[1]->cloneWeights();
-        weights.down = engines[2]->cloneWeights();
+        weights.gate = engines[0]->cloneWeightsTo(staging);
+        weights.up = engines[1]->cloneWeightsTo(staging);
+        weights.down = engines[2]->cloneWeightsTo(staging);
         if (!weights.complete())
         {
             throw std::runtime_error(
@@ -1354,17 +1367,23 @@ namespace llaminar2
                 return {};
             }
 
-            auto packed = engine->cloneWeights();
+            const auto *packed = engine->exportCPUNativeVNNIPackedWeights();
             if (!packed)
             {
                 LOG_ERROR("[MoEWeightService] Cannot serialize packed expert weight: layer "
                           << ctx.layer_idx << " expert " << expert_id << " " << proj_name
-                          << " engine cannot clone packed weights");
+                          << " engine cannot export packed weights");
                 return {};
             }
 
+            if (!ctx.prepared_store)
+                throw std::logic_error("CPU expert serialization requires physical-memory admission");
+            const auto staging = CPUWeightStoragePlacement::accounted(
+                ctx.prepared_store->physicalMemoryAuthority(), ctx.device_id,
+                PhysicalMemoryOwner::ExpertMigrationStaging,
+                CPUWeightStoragePlacement::local());
             ExpertTransferBuffer buffer;
-            if (!packed_weights_serialization::serializeInto(*packed, buffer))
+            if (!packed_weights_serialization::serializeInto(*packed, buffer, staging))
                 return {};
             return buffer;
         };
@@ -1389,6 +1408,10 @@ namespace llaminar2
                 "MoEExpertWeightService::releaseDepartedExperts received a mask smaller than num_experts");
         }
 
+        // A registry-only graph is a consumer, never the canonical residency
+        // publisher. Dropping one graph's reference must leave sibling graphs
+        // and in-flight RCU readers' packed allocations and aliases untouched.
+        const bool owns_weights = ctx.ownsPreparedEngineWeights();
         std::vector<const TensorBase *> evict_tensors;
         std::vector<int> departed_ids;
         std::vector<ITensorGemm *> departed_engines;
@@ -1430,7 +1453,7 @@ namespace llaminar2
         }
 
         // Mirror departures to ExpertGemmRegistry (keeps registry in sync with stage state)
-        if (ctx.expert_registry && !departed_ids.empty())
+        if (owns_weights && ctx.expert_registry && !departed_ids.empty())
         {
             for (int e : departed_ids)
             {
@@ -1443,7 +1466,7 @@ namespace llaminar2
         }
 
         // Phase C: Notify PreparedWeightStore of departed experts
-        if (ctx.prepared_store && !departed_ids.empty())
+        if (owns_weights && ctx.prepared_store && !departed_ids.empty())
         {
             if (ctx.gate_slab_ref.has_value())
                 ctx.prepared_store->releaseDepartedExperts(*ctx.gate_slab_ref, departed_ids);
@@ -1468,7 +1491,8 @@ namespace llaminar2
                     continue;
                 if (std::find(released_owned_engines.begin(), released_owned_engines.end(), raw) != released_owned_engines.end())
                     continue;
-                owned->releaseWeights();
+                if (owns_weights)
+                    owned->releaseWeights();
                 released_owned_engines.push_back(raw);
             }
 
@@ -1534,6 +1558,11 @@ namespace llaminar2
         // The wire record contains eager CPU NativeVNNI data as well as the
         // original native blocks needed by accelerator destinations. CPU uses
         // the eager representation without another quantization pass.
+        // Terminal residency publication owns registry/store aliases for shared
+        // consumers. A graph may acquire its final prepared arrivals, but must
+        // neither borrow a coarse sibling alias nor create a retained alias that
+        // its non-destructive departure would intentionally leave untouched.
+        const bool owns_weights = ctx.ownsPreparedEngineWeights();
         auto t_start = std::chrono::high_resolution_clock::now();
         int transferred_count = 0;
         std::atomic<bool> error_flag{false};
@@ -1554,13 +1583,13 @@ namespace llaminar2
                       << ctx.layer_idx);
         }
 
-        const auto placement = enforce_numa_placement
+        const auto native_placement = enforce_numa_placement
             ? CPUWeightStoragePlacement::onNode(target_numa_node)
             : CPUWeightStoragePlacement::local();
 
         auto cached_engine_for = [&](const std::optional<ExpertSlabRef> &slab_ref, int expert_id) -> ITensorGemm *
         {
-            if (!ctx.prepared_store || !slab_ref.has_value())
+            if (!owns_weights || !ctx.prepared_store || !slab_ref.has_value())
                 return nullptr;
             return ctx.prepared_store->expertGemmKernel(*slab_ref, expert_id);
         };
@@ -1622,12 +1651,18 @@ namespace llaminar2
                         portable = &*provider_payload;
                 }
 
-                const auto build_projection = [placement](
+                const auto build_projection = [&ctx, native_placement](
                                                   const ExpertTransferBuffer &blob)
                     -> std::shared_ptr<ITensorGemm>
                 {
                     if (blob.empty())
                         return nullptr;
+                    // Borrowed prepared arrivals already retain their exact
+                    // physical owner. Only archive materialization creates new
+                    // durable bytes and consumes this destination's admission.
+                    const auto placement = CPUWeightStoragePlacement::accounted(
+                        requirePhysicalMemoryAuthority(ctx, "CPU expert archive arrival"),
+                        ctx.device_id, ctx.persistent_weight_owner, native_placement);
                     return KernelFactory::createExpertGemmFromTransferBlob(
                         blob.data(), blob.size(), placement);
                 };
@@ -1679,7 +1714,7 @@ namespace llaminar2
             return false;
 
         // Mark experts as prepared in the payload provider
-        if (ctx.payload_provider)
+        if (owns_weights && ctx.payload_provider)
         {
             for (int e : new_experts)
                 ctx.payload_provider->markExpertPrepared(ctx.layer_idx, e);
@@ -1699,7 +1734,7 @@ namespace llaminar2
         }
 
         // Phase C: Register new arrivals in PreparedWeightStore using cached slab refs
-        if (ctx.prepared_store && !new_experts.empty())
+        if (owns_weights && ctx.prepared_store && !new_experts.empty())
         {
             auto register_rebalance_arrivals = [&](const std::optional<ExpertSlabRef> &slab_ref,
                                                    const std::vector<ITensorGemm *> &engines,
@@ -1859,7 +1894,11 @@ namespace llaminar2
         {
             if (blob.empty())
                 return std::nullopt;
-            auto packed = packed_weights_serialization::deserialize(blob.data(), blob.size());
+            const auto staging = CPUWeightStoragePlacement::accounted(
+                requirePhysicalMemoryAuthority(ctx, "GPU expert archive decode"), DeviceId::cpu(),
+                PhysicalMemoryOwner::ExpertMigrationStaging,
+                CPUWeightStoragePlacement::local());
+            auto packed = packed_weights_serialization::deserialize(blob.data(), blob.size(), staging);
             if (!packed)
             {
                 LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to deserialize transferred packed weights for expert "

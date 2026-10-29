@@ -996,6 +996,45 @@ TEST(QwenSparseAttentionStage, AdmittedDefaultProjectionRejectsMissingDuplicateA
                  std::invalid_argument);
 }
 
+/** @test CPU TP shares only identical immutable programs; rank ownership remains outside this view. */
+TEST(QwenSparseAttentionStage, CPUSharedAddressSpaceProgramProjectionRetainsExactPolicyAndLayers)
+{
+    using namespace qwen4exp;
+    using A = QwenSparseAttentionArithmetic;
+    using S = QwenSparseAttentionPhaseSchedule;
+    const QwenSparseAttentionResolvedPolicy fp32{A::FixedFP32, S::Uniform};
+    // Replaying projection must not accumulate duplicate records. Each logical
+    // rank keeps its own admission/geometry elsewhere; this view owns no bytes.
+    for (int replay=0; replay<3; ++replay)
+    {
+        const auto projection=sealQwenSparseAttentionParticipants(
+            {{DeviceId::cpu(), fp32, 0, 23}, {DeviceId::cpu(), fp32, 0, 23},
+             {DeviceId::cpu(), fp32, 24, 47}, {DeviceId::cpu(), fp32, 24, 47}});
+        ASSERT_EQ(projection->size(),2u);
+        EXPECT_EQ(admittedQwenSparseAttentionPolicy(projection,DeviceId::cpu(),0,23),fp32);
+        EXPECT_EQ(admittedQwenSparseAttentionPolicy(projection,DeviceId::cpu(),24,47),fp32);
+        const auto resealed=sealQwenSparseAttentionParticipants(*projection);
+        EXPECT_EQ(resealed->size(),2u);
+        EXPECT_THROW(admittedQwenSparseAttentionPolicy(projection,DeviceId::cpu(),0,47),std::invalid_argument);
+        EXPECT_THROW(admittedQwenSparseAttentionPolicy(projection,DeviceId::cpu(),1,23),std::invalid_argument);
+        EXPECT_THROW(admittedQwenSparseAttentionPolicy(projection,DeviceId::cuda(0),0,23),std::invalid_argument);
+    }
+    EXPECT_THROW(sealQwenSparseAttentionParticipants(
+        {{DeviceId::cpu(),fp32,0,23},{DeviceId::cpu(),fp32,23,47}}),std::invalid_argument);
+    EXPECT_THROW(sealQwenSparseAttentionParticipants(
+        {{DeviceId::cpu(),fp32,0,23},{DeviceId::cpu(),fp32,0,47}}),std::invalid_argument);
+    const QwenSparseAttentionResolvedPolicy unsupported{A::TileFP16WithFP32Totals,S::Uniform};
+    EXPECT_THROW(sealQwenSparseAttentionParticipants(
+        {{DeviceId::cpu(),fp32,0,23},{DeviceId::cpu(),unsupported,0,23}}),std::invalid_argument);
+    for(const auto gpu:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        EXPECT_THROW(sealQwenSparseAttentionParticipants(
+            {{gpu,fp32,0,23},{gpu,fp32,0,23}}),std::invalid_argument);
+        EXPECT_THROW(sealQwenSparseAttentionParticipants(
+            {{gpu,fp32,0,23},{gpu,fp32,23,47}}),std::invalid_argument);
+    }
+}
+
 /** @test No-ranking retains required contracts while never publishing or observing query-only banks. */
 TEST(QwenSparseAttentionStage, ProvenNoRankingOmitsQueryContractsAndSnapshots)
 {

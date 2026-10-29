@@ -6,6 +6,7 @@
  * ordinary/overlay fixed plan pays it before graph-row and expert decisions.
  * Final admission authenticates the same source/consumer geometry and proves
  * its complete fixed footprint is covered before extending only table storage.
+ * Identity includes predictor storage ownership independently of main TP geometry.
  */
 #pragma once
 #include "planning/ModelMemoryProfile.h"
@@ -75,7 +76,8 @@ private:
                               g.generation_request_capacity,
                               g.ngram_fixed_head_participants,
                               g.attention_arithmetic,
-                              g.attention_phase_schedule};
+                              g.attention_phase_schedule,
+                              g.mtp_shifted_kv_head_layout};
         };
         return key(a)==key(b);
     }

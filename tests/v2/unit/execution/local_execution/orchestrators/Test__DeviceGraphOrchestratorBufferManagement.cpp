@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../../utils/CPUOrchestratorTestAdmission.h"
 #include "backends/DeviceId.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "models/qwen/QwenStandardGraph.h"
@@ -100,7 +101,9 @@ TEST_F(Test__DeviceGraphOrchestratorBufferManagement, InitializeBuffersSuccess)
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<QwenStandardGraph>(config, mpi_ctx_);
-    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphBuffersFixtureDependencies(graph_builder, mpi_ctx_, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     bool result = orchestrator.initializeBuffers(64);
@@ -114,7 +117,9 @@ TEST_F(Test__DeviceGraphOrchestratorBufferManagement, BufferStatsAvailable)
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<QwenStandardGraph>(config, mpi_ctx_);
-    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphBuffersFixtureDependencies(graph_builder, mpi_ctx_, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     EXPECT_EQ(orchestrator.bufferStats(), nullptr) << "No stats before init";
@@ -133,7 +138,9 @@ TEST_F(Test__DeviceGraphOrchestratorBufferManagement, ReleaseBuffers)
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<QwenStandardGraph>(config, mpi_ctx_);
-    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphBuffersFixtureDependencies(graph_builder, mpi_ctx_, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeBuffers(64));
@@ -150,7 +157,9 @@ TEST_F(Test__DeviceGraphOrchestratorBufferManagement, ReinitializeAfterRelease)
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<QwenStandardGraph>(config, mpi_ctx_);
-    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphBuffersFixtureDependencies(graph_builder, mpi_ctx_, 128));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     // First init
@@ -180,7 +189,9 @@ TEST_F(Test__DeviceGraphOrchestratorBufferManagement, AllocatesReasonableMemory)
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<QwenStandardGraph>(config, mpi_ctx_);
-    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphBuffersFixtureDependencies(graph_builder, mpi_ctx_, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeBuffers(64));
@@ -210,7 +221,9 @@ TEST_F(Test__DeviceGraphOrchestratorBufferManagement, LargerSeqLenUsesMoreMemory
     config.use_graph_buffer_management = true;
 
     auto graph_builder1 = std::make_shared<QwenStandardGraph>(config, mpi_ctx_);
-    DeviceGraphOrchestrator orchestrator1(graph_builder1, mpi_ctx_);
+    auto orchestrator1_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphBuffersFixtureDependencies(graph_builder1, mpi_ctx_, 64));
+    auto &orchestrator1 = *orchestrator1_owner;
     orchestrator1.setTensorFactory(tensor_factory_.get());
     ASSERT_TRUE(orchestrator1.initializeBuffers(64));
     size_t bytes_64 = orchestrator1.bufferStats()->total_bytes;
@@ -218,7 +231,9 @@ TEST_F(Test__DeviceGraphOrchestratorBufferManagement, LargerSeqLenUsesMoreMemory
     orchestrator1.releaseBuffers();
 
     auto graph_builder2 = std::make_shared<QwenStandardGraph>(config, mpi_ctx_);
-    DeviceGraphOrchestrator orchestrator2(graph_builder2, mpi_ctx_);
+    auto orchestrator2_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphBuffersFixtureDependencies(graph_builder2, mpi_ctx_, 256));
+    auto &orchestrator2 = *orchestrator2_owner;
     orchestrator2.setTensorFactory(tensor_factory_.get());
     ASSERT_TRUE(orchestrator2.initializeBuffers(256));
     size_t bytes_256 = orchestrator2.bufferStats()->total_bytes;
@@ -243,7 +258,9 @@ TEST_F(Test__DeviceGraphOrchestratorBufferManagement, VerySmallSeqLen)
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<QwenStandardGraph>(config, mpi_ctx_);
-    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphBuffersFixtureDependencies(graph_builder, mpi_ctx_, 1));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeBuffers(1));

@@ -5,7 +5,9 @@
  * Setup materializes only the original admitted arena allocation. Counter
  * writers remain outside per-stage tensor publication; reset and observation
  * retain the original complete generation-parent lifetime.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include "execution/qwen4exp/QwenSparseCounterBinding.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -22,7 +24,7 @@ void proveCounterAdmission(DeviceId device){
     auto& context=GPUDeviceContextPool::instance().getContext(device);
     context.submitAndWait([&]{
         void* stream=context.defaultStream();ASSERT_NE(stream,nullptr);MockMPIContext mpi;TensorFactory factory(mpi);
-        BufferArena arena(ArenaConfig{.factory=&factory});
+        BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
         ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_GENERATION_CONTROL,3,sampling_math::kDeviceGenerationControlCount,"INT32",device));
         ASSERT_TRUE(arena.allocate());auto owner=arena.getSharedTensor(BufferId::MTP_GENERATION_CONTROL);ASSERT_TRUE(owner);
         EXPECT_THROW(QwenSparseCounterBinding::admit(arena,device,0,48,16),std::invalid_argument);

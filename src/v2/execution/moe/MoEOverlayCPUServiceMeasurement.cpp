@@ -45,24 +45,50 @@ namespace llaminar2
 
         /** @return The exact CPU workspace constructor geometry used by a probe. */
         CPUGroupedMoESerialWorkspace::Config workspaceConfig(
-            MoEOverlayCPUServiceMeasurement::Geometry geometry, int rows)
+            MoEOverlayCPUServiceMeasurement::Geometry geometry, int rows,
+            DeviceId device, std::shared_ptr<PhysicalMemoryAuthority> memory = {})
         {
             return {.row_capacity = static_cast<size_t>(rows),
                     .d_model = geometry.d_model, .expert_intermediate = geometry.intermediate,
                     .num_experts = 1, .routing_top_k = 1,
-                    .debug_name = "overlay_prepared_service"};
+                    .debug_name = "overlay_prepared_service", .device_id = device,
+                    .physical_memory_authority = std::move(memory)};
         }
 
-        /** @return Exact input/output/route tensor and grouped-workspace payload bytes. */
+        /** @brief The calibration's final tensor roots, separately owned from grouped scratch. */
+        struct ServiceStorageLayout
+        {
+            CPUStorageRoot<float> input, indices, weights, output;
+            CPUGroupedMoESerialWorkspace::StorageLayout grouped;
+            /** @return Checked complete physical calibration bank. */
+            size_t physicalBytes() const
+            {
+                size_t total = grouped.physicalBytes();
+                for (size_t bytes : {input.physicalBytes(), indices.physicalBytes(), weights.physicalBytes(), output.physicalBytes()})
+                {
+                    if (bytes > std::numeric_limits<size_t>::max() - total)
+                        throw std::overflow_error("CPU prepared-service root extent overflows");
+                    total += bytes;
+                }
+                return total;
+            }
+        };
+
+        /** @return One allocation-free declaration used by admission and real calibration roots. */
+        ServiceStorageLayout serviceStorageLayout(
+            MoEOverlayCPUServiceMeasurement::Geometry geometry, int rows, DeviceId device)
+        {
+            const auto root = [&](size_t count) { return CPUStorageRoot<float>(
+                count, PhysicalMemoryOwner::ExecutionWorkspace, device); };
+            const auto grouped = CPUGroupedMoESerialWorkspace::storageLayout(workspaceConfig(geometry, rows, device));
+            return {root(grouped.batch.capacity()), root(static_cast<size_t>(rows)),
+                root(static_cast<size_t>(rows)), root(grouped.batch.capacity()), grouped};
+        }
+
+        /** @return Exact physical calibration geometry; CPU ordinal does not change rounding. */
         size_t payloadBytes(MoEOverlayCPUServiceMeasurement::Geometry geometry, int rows)
         {
-            const size_t workspace = CPUGroupedMoESerialWorkspace::plannedAllocationBytes(
-                workspaceConfig(geometry, rows));
-            const size_t tensor_elements = static_cast<size_t>(rows) *
-                (2u * static_cast<size_t>(geometry.d_model) + 2u);
-            if (tensor_elements > (std::numeric_limits<size_t>::max() - workspace) / sizeof(float))
-                throw std::overflow_error("CPU prepared-service tensor payload overflow");
-            return workspace + tensor_elements * sizeof(float);
+            return serviceStorageLayout(geometry, rows, DeviceId::cpu()).physicalBytes();
         }
 
         /**
@@ -102,13 +128,11 @@ namespace llaminar2
             requireProjection(source.gate(), device, geometry.intermediate, geometry.d_model);
             requireProjection(source.up(), device, geometry.intermediate, geometry.d_model);
             requireProjection(source.down(), device, geometry.d_model, geometry.intermediate);
-            // Declaration order retires stages/engines/tensors before the claim.
-            auto claim = memory->claimNewAllocation(device, PhysicalMemoryOwner::ExecutionWorkspace,
-                                                    payloadBytes(geometry, rows));
-            FP32Tensor input({static_cast<size_t>(rows), static_cast<size_t>(geometry.d_model)});
-            FP32Tensor indices({static_cast<size_t>(rows), 1});
-            FP32Tensor weights({static_cast<size_t>(rows), 1});
-            FP32Tensor output({static_cast<size_t>(rows), static_cast<size_t>(geometry.d_model)});
+            const auto layout = serviceStorageLayout(geometry, rows, device);
+            FP32Tensor input({static_cast<size_t>(rows), static_cast<size_t>(geometry.d_model)}, layout.input.allocate(memory), device);
+            FP32Tensor indices({static_cast<size_t>(rows), 1}, layout.indices.allocate(memory), device);
+            FP32Tensor weights({static_cast<size_t>(rows), 1}, layout.weights.allocate(memory), device);
+            FP32Tensor output({static_cast<size_t>(rows), static_cast<size_t>(geometry.d_model)}, layout.output.allocate(memory), device);
             for (int row = 0; row < rows; ++row)
             {
                 indices.mutable_typed_data()[row] = 0.0f;
@@ -121,7 +145,7 @@ namespace llaminar2
                 KernelFactory::createExpertServiceExecutionView(source.gate(), device),
                 KernelFactory::createExpertServiceExecutionView(source.up(), device),
                 KernelFactory::createExpertServiceExecutionView(source.down(), device)};
-            auto workspace = std::make_shared<CPUGroupedMoESerialWorkspace>(workspaceConfig(geometry, rows));
+            auto workspace = std::make_shared<CPUGroupedMoESerialWorkspace>(workspaceConfig(geometry, rows, device, memory));
             MoEExpertComputeStage::Params p;
             p.device_id = device;
             p.input = &input;

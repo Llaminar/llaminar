@@ -7,6 +7,12 @@
 # Production binaries identify their model/scope and matrix role, never one
 # placement, precision, or MTP cell. Discovery enforces that role before it
 # publishes campaign registrations; focused-only binaries remain independent.
+# FullSourceAdmission, CandidateSourceAdmission, RejectUnsupportedSourceAdmission
+# and RejectCapacitySourceAdmission
+# are setup-only contracts:
+# each retains exact model
+# dependencies and backend startup isolation without numerical-reference labels
+# or campaign admission. The real fixture still owns materialization/teardown.
 # Console parameter comments are opaque and may contain truncated JSON. Remove
 # them before converting lines to a CMake list: unmatched brackets in comments
 # otherwise absorb later test names. Structured parameters belong exclusively
@@ -21,12 +27,15 @@
 #   NUM_SOCKETS      - Detected CPU socket count
 #   CORES_PER_SOCKET - Cores per socket
 #   WORKING_DIR      - Working directory for tests
-#   TIMEOUT          - Optional per-test timeout in seconds
+#   TIMEOUT          - Optional ordinary focused-test timeout in seconds
+#   SOURCE_ADMISSION_TIMEOUT - Optional source-only setup deadline; takes precedence
 #   PRODUCTION_PERF_STATS_FILTER - Optional campaign PerfStats domains
 #   PRODUCTION_ISOLATED_TESTS_SERIALIZED - Pipe-separated literal GTest-name
 #                         fragments whose matching cells require a fresh MPI
 #                         application lifetime
 #   MODEL_FILES_SERIALIZED - Pipe-separated GGUF inputs owned by this binary
+#   SOURCE_ADMISSION_MTP_SOURCE_KIND - Embedded or Paired for active source cells
+#   SOURCE_ADMISSION_MTP_MODEL_FILES_SERIALIZED - External Paired predictor inputs only
 #   <BACKEND>_MODEL_FILES_SERIALIZED - Additional inputs for that backend
 # =============================================================================
 
@@ -75,7 +84,9 @@ foreach(_line IN LISTS _lines)
 
     # Check if this is a suite line (does not start with whitespace)
     string(REGEX MATCH "^[^ ]" _is_suite "${_line}")
-    if(_is_suite)
+    # Regex matches are strings, not booleans: a suite beginning with N
+    # matches "N", which CMake otherwise interprets as false.
+    if(NOT "${_is_suite}" STREQUAL "")
         # Suite line: strip trailing whitespace, keep the trailing dot
         string(STRIP "${_line}" _current_suite)
     else()
@@ -115,10 +126,22 @@ if(NOT PRODUCTION_PERF_STATS_FILTER)
         "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement,immutable_lookup,qsa")
 endif()
 
+# Only source-admission cells consume this explicit source intent. Embedded MTP
+# needs no external predictor; Paired MTP must name its own source closure.
+# Do not infer this from a model name or impose paired GGUFs on future embedded MTP.
+if(SOURCE_ADMISSION_MTP_SOURCE_KIND AND
+   NOT SOURCE_ADMISSION_MTP_SOURCE_KIND MATCHES "^(Embedded|Paired)$")
+    message(FATAL_ERROR "Invalid SOURCE_ADMISSION_MTP_SOURCE_KIND: ${SOURCE_ADMISSION_MTP_SOURCE_KIND}")
+endif()
+if(SOURCE_ADMISSION_MTP_MODEL_FILES_SERIALIZED AND
+   NOT SOURCE_ADMISSION_MTP_SOURCE_KIND STREQUAL "Paired")
+    message(FATAL_ERROR "External source-admission MTP inputs require Paired source kind")
+endif()
+
 # Normalize the binary-owned model manifest once. Production campaigns expose
 # the same list through REQUIRED_FILES for machine-readable aggregate discovery
 # and through an environment contract for runtime path-remap validation.
-foreach(_model_scope IN ITEMS COMMON CPU CUDA ROCM)
+foreach(_model_scope IN ITEMS COMMON CPU CUDA ROCM SOURCE_ADMISSION_MTP)
     if(_model_scope STREQUAL "COMMON")
         set(_serialized_scope_models "${MODEL_FILES_SERIALIZED}")
     else()
@@ -348,6 +371,57 @@ foreach(_full_name IN LISTS _all_tests)
     string(APPEND _output "add_test(\"${_ctest_name}\" ${_cmd_str})\n")
 
     set(_test_labels ${LABELS})
+    set(_focused_source_admission FALSE)
+    set(_focused_active_mtp FALSE)
+    set(_focused_model_files "")
+    set(_focused_backend_signature "")
+    if("${_full_name}" MATCHES "\\.(FullSourceAdmission|CandidateSourceAdmission|RejectUnsupportedSourceAdmission|RejectCapacitySourceAdmission)/")
+        set(_focused_source_admission TRUE)
+        # An admission fixture must not inherit every backend (or reference
+        # dependency) named by the binary's numerical matrix. Select only its
+        # actual participant signature, as for a numerical campaign above.
+        list(REMOVE_ITEM _test_labels CPU CUDA ROCm PyTorch GoldenReference Parity)
+        list(APPEND _test_labels Admission RealModel FullModel)
+        if("${_full_name}" MATCHES "\\.RejectCapacitySourceAdmission/")
+            list(APPEND _test_labels NegativeAdmission CapacityAdmission)
+        elseif("${_full_name}" MATCHES "\\.RejectUnsupportedSourceAdmission/")
+            list(APPEND _test_labels NegativeAdmission)
+        elseif("${_full_name}" MATCHES "\\.CandidateSourceAdmission/")
+            list(APPEND _test_labels UnqualifiedCandidate)
+        endif()
+        set(_focused_model_files ${_production_model_files_COMMON})
+        foreach(_backend IN ITEMS CPU CUDA ROCm)
+            if("${_full_name}" MATCHES "${_backend}")
+                list(APPEND _focused_backend_signature "${_backend}")
+                list(APPEND _test_labels "${_backend}")
+                string(TOUPPER "${_backend}" _backend_upper)
+                list(APPEND _focused_model_files ${_production_model_files_${_backend_upper}})
+            endif()
+        endforeach()
+        if(NOT _focused_backend_signature)
+            message(FATAL_ERROR "Source-admission case has no backend identity: ${_full_name}")
+        endif()
+        # These suffixes are the five active typed ModelParityMTP policies.
+        # Off and numerical methods retain their original manifests unchanged.
+        if("${_full_name}" MATCHES "MTP(Depth1|Depth2|Depth3|Depth15|DynamicDepth)$")
+            set(_focused_active_mtp TRUE)
+            if(NOT SOURCE_ADMISSION_MTP_SOURCE_KIND)
+                message(FATAL_ERROR "Active source-admission MTP case requires explicit Embedded or Paired source kind: ${_full_name}")
+            endif()
+            if(SOURCE_ADMISSION_MTP_SOURCE_KIND STREQUAL "Paired")
+                if(NOT _production_model_files_SOURCE_ADMISSION_MTP)
+                    message(FATAL_ERROR "Paired source-admission MTP case has no declared predictor inputs: ${_full_name}")
+                endif()
+                list(APPEND _focused_model_files ${_production_model_files_SOURCE_ADMISSION_MTP})
+            endif()
+        elseif("${_full_name}" MATCHES "_MTP[^/]*$" AND NOT "${_full_name}" MATCHES "_MTPOff$")
+            message(FATAL_ERROR "Unsupported source-admission MTP policy suffix: ${_full_name}")
+        endif()
+        list(REMOVE_DUPLICATES _focused_model_files)
+        if(NOT _focused_model_files)
+            message(FATAL_ERROR "Source-admission case has no declared MODEL_FILES: ${_full_name}")
+        endif()
+    endif()
     if("${_full_name}" MATCHES "Profiler")
         list(FIND _test_labels "Profiler" _profiler_label_index)
         if(_profiler_label_index EQUAL -1)
@@ -358,6 +432,34 @@ foreach(_full_name IN LISTS _all_tests)
     string(JOIN ";" _labels_joined ${_test_labels})
 
     set(_test_env_vars ${_env_vars})
+    if(_focused_source_admission)
+        list(FIND _focused_backend_signature ROCm _focused_rocm_index)
+        if(_focused_rocm_index EQUAL -1)
+            list(FILTER _test_env_vars EXCLUDE REGEX "^HSA_OVERRIDE_GFX_VERSION=")
+        endif()
+        if(_focused_backend_signature STREQUAL "CPU")
+            list(APPEND _test_env_vars "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+        else()
+            list(APPEND _test_env_vars "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0")
+        endif()
+        foreach(_backend IN ITEMS CUDA ROCm)
+            string(TOUPPER "${_backend}" _backend_upper)
+            list(FIND _focused_backend_signature "${_backend}" _focused_backend_index)
+            if(NOT _focused_backend_index EQUAL -1)
+                list(APPEND _test_env_vars "LLAMINAR_SKIP_${_backend_upper}_STARTUP=0")
+            else()
+                list(APPEND _test_env_vars "LLAMINAR_SKIP_${_backend_upper}_STARTUP=1")
+            endif()
+        endforeach()
+    endif()
+    if(_focused_active_mtp)
+        # Serving-plan evidence is observed from the production controller's
+        # forward-graph counters. Off cells keep their original environment.
+        list(FILTER _test_env_vars EXCLUDE REGEX "^LLAMINAR_PERF_STATS_(SUMMARY|FILTER)=")
+        list(APPEND _test_env_vars
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=forward_graph")
+    endif()
     if("${_full_name}" MATCHES "Profiler")
         list(APPEND _test_env_vars "LLAMINAR_PROFILE_KERNELS=1")
     endif()
@@ -365,12 +467,26 @@ foreach(_full_name IN LISTS _all_tests)
 
     string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n")
     string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
+    if(_focused_source_admission)
+        string(JOIN ";" _focused_model_files_joined ${_focused_model_files})
+        string(APPEND _output "    REQUIRED_FILES \"${_focused_model_files_joined}\"\n")
+    endif()
     string(APPEND _output "    LABELS \"${_labels_joined}\"\n")
     string(APPEND _output "    ENVIRONMENT \"${_env_joined}\"\n")
     string(APPEND _output "    WORKING_DIRECTORY \"${WORKING_DIR}\"\n")
     string(APPEND _output "    PROCESSORS 4\n")
-    if(DEFINED TIMEOUT AND NOT "${TIMEOUT}" STREQUAL "")
-        string(APPEND _output "    TIMEOUT \"${TIMEOUT}\"\n")
+    set(_focused_timeout "${TIMEOUT}")
+    if(_focused_source_admission)
+        if(DEFINED SOURCE_ADMISSION_TIMEOUT AND NOT "${SOURCE_ADMISSION_TIMEOUT}" STREQUAL "")
+            set(_focused_timeout "${SOURCE_ADMISSION_TIMEOUT}")
+        endif()
+        if(NOT "${_focused_timeout}" MATCHES "^[0-9]+([.][0-9]+)?$" OR
+           NOT _focused_timeout GREATER 0)
+            message(FATAL_ERROR "Source-admission case requires a positive TIMEOUT or SOURCE_ADMISSION_TIMEOUT: ${_full_name}")
+        endif()
+    endif()
+    if(NOT "${_focused_timeout}" STREQUAL "")
+        string(APPEND _output "    TIMEOUT \"${_focused_timeout}\"\n")
     endif()
     # Serialize with ALL integration tests (same lock as add_v2_mpi_test).
     # Parity tests load large models and consume significant memory/GPU resources.

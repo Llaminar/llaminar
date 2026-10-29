@@ -7,6 +7,7 @@
  * synthetic vocabulary is reduced to eight entries; this is binding proof,
  * not checkpoint numerical or native capture qualification.
  */
+#include "../../../utils/CPUPreparedStoreTestAdmission.h"
 #include "Qwen4ExpMetadataFixture.h"
 #include "models/qwen4exp/Qwen4ExpGraph.h"
 #include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
@@ -44,6 +45,7 @@ struct TerminalFixture
     static constexpr int hidden=2560, channels=4*hidden, rank=320, vocabulary=8;
     PreparedWeightStore store{ModelContextId{52917}};
     std::deque<WeightBinding> owned;
+    std::vector<WeightBinding *> pendingPreparation;
     ModelWeightBindings primary, replica;
     FP32Tensor trunk{{1,channels}}, normalized{{1,hidden}}, branchNormalized{{1,channels}},
         downRows{{1,rank}}, readLogits{{1,channels}}, logits{{1,vocabulary}};
@@ -60,6 +62,11 @@ struct TerminalFixture
             weights->lm_head=make("output.weight",vocabulary,hidden,false,true);
             weights->get_layer_weights=[](int) { return LayerWeightBindings{}; };
         }
+        std::vector<const TensorBase *> matrices;
+        for (const auto *binding : pendingPreparation) matrices.push_back(binding->tensor);
+        test::admitCPUPreparedStoreForTest(store, matrices);
+        for (auto *binding : pendingPreparation) binding->prepared=store.prepareGemm(*binding);
+        pendingPreparation.clear();
         // Replicas preserve original logical source identity but have distinct
         // frozen instances, backing tensors and actual prepared store entries.
         for (const auto pair : {std::pair{primary.hyper_connection_head.norm, replica.hyper_connection_head.norm},
@@ -87,8 +94,8 @@ struct TerminalFixture
             std::fill_n(tensor->mutable_data(),tensor->numel(),1.0f);
         auto binding=test::makePreparedWeightTestBinding(tensor.get(),DeviceId::cpu(),name,store.modelId());
         binding.tensor_owner=std::move(tensor);
-        if(quantized||prepare) binding.prepared=store.prepareGemm(binding);
         owned.push_back(std::move(binding));
+        if(quantized||prepare) pendingPreparation.push_back(&owned.back());
         return &owned.back();
     }
     /** @return Authenticated HC geometry plus a tiny synthetic terminal vocabulary. */

@@ -8,6 +8,8 @@
  * @author David Sanftenberg
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
+ * Explicit CPU clone destinations carry their own admitted allocation owner;
+ * source execution storage remains immutable throughout replication and transfer.
  */
 
 #pragma once
@@ -1738,6 +1740,18 @@ namespace llaminar2
         virtual std::unique_ptr<IPackedWeights> cloneWeights() const
         {
             return nullptr; // Default: not supported
+        }
+
+        /**
+         * @brief Clone weights into a caller-owned admitted CPU destination.
+         * @param destination Final allocation placement and accounting owner.
+         * @return Independent prepared storage with destination-bound leases.
+         * @throws std::logic_error If this backend lacks the CPU copy contract.
+         */
+        virtual std::unique_ptr<IPackedWeights> cloneWeightsTo(CPUWeightStoragePlacement destination) const
+        {
+            (void)destination;
+            throw std::logic_error("GEMM does not implement explicit CPU destination cloning");
         }
 
         /**

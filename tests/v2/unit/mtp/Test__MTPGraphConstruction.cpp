@@ -8,8 +8,10 @@
  * Bounded telemetry retains exact lifecycle coordinates in sequence words;
  * tests authenticate those words without rebuilding unbounded tag identities.
  */
+#include "../../utils/CPUPreparedStoreTestAdmission.h"
 
 #include <gtest/gtest.h>
+#include "utils/CPUOrchestratorTestAdmission.h"
 #include <gmock/gmock.h>
 
 #include "backends/ComputeBackend.h"
@@ -106,6 +108,37 @@ namespace
         mtp_graph_construction_cpu_backend_environment =
             ::testing::AddGlobalTestEnvironment(
                 new MTPGraphConstructionCPUBackendEnvironment());
+
+    /**
+     * @brief Admit the exact scratch roots of a direct single-row CPU sidecar.
+     * @param graph Fully prepared graph whose production consumers own sizing.
+     * @return Authority retained by the production workspace allocator.
+     *
+     * These fixtures bypass the orchestrator's admission boundary. Query the
+     * actual graph rather than providing an arbitrary test budget, then let
+     * WorkspaceAllocator perform its ordinary allocation and binding.
+     */
+    std::shared_ptr<PhysicalMemoryAuthority> admitCPUSidecarWorkspace(
+        const ComputeGraph &graph)
+    {
+        WorkspaceRequirements requirements;
+        for (const auto &name : graph.getExecutionOrder())
+        {
+            const auto *node = graph.getNode(name);
+            if (!node || !node->stage || !node->stage->device().is_cpu())
+                throw std::logic_error("Sidecar workspace fixture requires a complete CPU graph");
+            if (const auto *consumer =
+                    dynamic_cast<const IWorkspaceConsumer *>(node->stage.get()))
+                requirements.merge(consumer->getWorkspaceRequirements(1));
+        }
+        const size_t bytes = requirements.total_bytes_with_alignment();
+        PhysicalMemoryPlanBuilder builder;
+        builder.add({.world_rank = 0, .device = DeviceId::cpu(),
+                     .total_bytes = bytes, .admission_available_bytes = bytes},
+                    PhysicalMemoryOwner::ExecutionWorkspace, bytes);
+        return std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    }
 
     class ScopedDebugEnv
     {
@@ -528,8 +561,10 @@ namespace
             moe_expert_indices = TestTensorFactory::createFP32({row_capacity, moe_top_k});
             moe_expert_weights = TestTensorFactory::createFP32({row_capacity, moe_top_k});
             moe_combined_output = TestTensorFactory::createFP32({row_capacity, d});
+            // Match Qwen35MoESchema: CPU canonical publication includes route
+            // identities and a count trailer, carried by the extra slot.
             moe_canonical_route_contributions =
-                TestTensorFactory::createFP32({row_capacity, moe_top_k * d});
+                TestTensorFactory::createFP32({row_capacity, moe_top_k + 1, d});
             moe_shared_expert_output = TestTensorFactory::createFP32({row_capacity, d});
             moe_gate_scratch = TestTensorFactory::createFP32({row_capacity, moe_experts});
             moe_up_scratch = TestTensorFactory::createFP32({row_capacity, moe_experts});
@@ -1066,6 +1101,22 @@ namespace
         return plan;
     }
 
+    /** @brief Author both real CPU tier endpoints and their exact serial graph families. */
+    void declareMTPOverlayCPUStorage(GraphConfig &config)
+    {
+        const int rows = std::min(config.max_activation_rows>0?config.max_activation_rows:config.max_seq_len,
+            config.moe.routed_prefill_config.overlay_segment_rows);
+        auto admission = std::make_shared<CPUSerialExpertStorageAdmission>();
+        admission->allocator = {0, DeviceId::cpu()};
+        admission->participant_ids = {0,1};
+        admission->controller_devices = {config.default_device};
+        admission->envelope = std::make_shared<const CPUSerialExpertStorageEnvelope>(
+            DeviceId::cpu(), rows, std::max(1,resolveMTPRetainedTargetQueryRows(config.mtp)),
+            config.d_model,config.moe.top_k,std::vector<int>{1,2,4,8,16},1,8,true,
+            CPUSerialExpertFamilyPolicy::LocalPowerOfTwo,config.moe.intermediate_size,config.moe.num_experts);
+        config.cpu_serial_expert_storage = {std::move(admission)};
+    }
+
     /**
      * @brief Prepare and publish the tiny overlay's real CPU expert engines.
      *
@@ -1487,8 +1538,57 @@ namespace
     void prepareFrozenGemmWeightsForDevice(
         const FrozenModelWeightSet &frozen,
         PreparedWeightStore &store,
-        DeviceId device)
+        DeviceId device,
+        std::optional<PhysicalMemoryOwner> expert_owner = std::nullopt,
+        const GraphConfig *serial_config = nullptr)
     {
+        if (device.is_cpu())
+        {
+            std::vector<const TensorBase *> matrices;
+            for (const auto &binding : frozen.bindings())
+                if (binding.tensor && binding.tensor->shape().size() == 2 && binding.identity.role != WeightRole::Embedding)
+                    matrices.push_back(binding.tensor);
+            size_t dense_bytes = 0;
+            for (const auto *matrix : matrices)
+                dense_bytes += test::cpuPreparedStoreTestBytes(*matrix);
+            size_t expert_bytes = 0;
+            for (const auto &binding : frozen.bindings())
+            {
+                const bool expert_role = binding.identity.role == WeightRole::MoEExpertGate ||
+                    binding.identity.role == WeightRole::MoEExpertUp ||
+                    binding.identity.role == WeightRole::MoEExpertDown;
+                if (!expert_role || !binding.tensor || binding.tensor->shape().size() != 3)
+                    continue;
+                // This graph fixture's native FP32 expert constructor makes
+                // one final copy per expert, each with its own rounded extent.
+                const auto *native = IINT8Unpackable::fromTensor(binding.tensor);
+                if (native && native->vnniFormatInfo())
+                    throw std::invalid_argument("MTP native expert fixture requires floating source geometry");
+                const size_t experts = binding.tensor->shape().back();
+                if (!experts || binding.tensor->size_bytes() % experts)
+                    throw std::invalid_argument("MTP native expert fixture has invalid source geometry");
+                expert_bytes += experts * CPUWeightStoragePlacement::local().requiredAllocationBytes<uint8_t>(
+                    binding.tensor->size_bytes() / experts);
+            }
+            size_t serial_activation = 0, serial_workspace = 0;
+            if (serial_config)
+                for (const auto &entry : serial_config->cpu_serial_expert_storage)
+                {
+                    serial_activation = CPUSerialExpertStorageLayout::add(serial_activation,entry->physicalBytes());
+                    for (const auto controller : entry->controller_devices)
+                        serial_workspace = CPUSerialExpertStorageLayout::add(serial_workspace,
+                            entry->envelope->forController(controller)->workspaceBytes()*entry->participant_ids.size());
+                }
+            const size_t capacity = std::max(size_t{1},dense_bytes+expert_bytes+serial_activation+serial_workspace);
+            PhysicalMemoryPlanBuilder admission;
+            const PhysicalMemoryResource host{0, device, capacity, capacity};
+            admission.add(host, frozen.physicalMemoryOwner(), dense_bytes);
+            admission.add(host, expert_owner.value_or(frozen.physicalMemoryOwner()), expert_bytes);
+            admission.add(host,PhysicalMemoryOwner::ActivationArena,serial_activation);
+            admission.add(host,PhysicalMemoryOwner::ExecutionWorkspace,serial_workspace);
+            store.installPhysicalMemoryAuthority(std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(admission.build()), 0));
+        }
         for (const auto &source_binding : frozen.bindings())
         {
             if (!source_binding.tensor ||
@@ -1509,9 +1609,11 @@ namespace
 
     void prepareFrozenGemmWeightsForCPU(
         const FrozenModelWeightSet &frozen,
-        PreparedWeightStore &store)
+        PreparedWeightStore &store,
+        std::optional<PhysicalMemoryOwner> expert_owner = std::nullopt,
+        const GraphConfig *serial_config = nullptr)
     {
-        prepareFrozenGemmWeightsForDevice(frozen, store, DeviceId::cpu());
+        prepareFrozenGemmWeightsForDevice(frozen, store, DeviceId::cpu(), expert_owner, serial_config);
     }
 
     void expectSingleTokenKVPayloadNonZero(IKVCache &kv_cache)
@@ -3126,7 +3228,10 @@ TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesOneRowPerRequ
     TinyQwen35MTPForwardFixture fixture;
     fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -3197,7 +3302,10 @@ TEST(Test__MTPGraphConstruction,
     fixture.config.mtp.max_request_batch = 1;
     auto graph_builder =
         std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 4, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/4,
@@ -3258,7 +3366,10 @@ TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesVariableLengt
     TinyQwen35MTPForwardFixture fixture;
     fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -3328,7 +3439,10 @@ TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarRunsOneRowPerRequ
     TinyQwen35MTPForwardFixture fixture;
     fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -3438,7 +3552,10 @@ TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarPreservesPerReque
     TinyQwen35MTPForwardFixture fixture;
     fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -4161,7 +4278,10 @@ TEST(Test__MTPGraphConstruction, PhaseSplitColumnParallelLogitsReportsSemanticSh
     fixture.config.dense_tp_decode_replicated = true;
 
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -4192,7 +4312,10 @@ TEST(Test__MTPGraphConstruction, PhaseSplitDecodeDoesNotExposeStaleColumnParalle
     fixture.config.dense_tp_decode_replicated = true;
 
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -4240,7 +4363,10 @@ TEST(Test__MTPGraphConstruction,
 
     auto graph_builder =
         std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
         fixture.config.max_seq_len,
@@ -4735,6 +4861,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarFromRegistryWithoutRawEx
     fixture.config.moe.routed_expert_plan =
         makeMTPOverlayPlanForLayer(64);
 
+    declareMTPOverlayCPUStorage(fixture.config);
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
     auto frozen = makeMoEMTPFrozenWeightSet(fixture);
     auto bindings = makeModelWeightBindings(*frozen);
@@ -4742,7 +4869,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarFromRegistryWithoutRawEx
     graph_builder.setWeights(toLegacyModelWeights(bindings));
 
     PreparedWeightStore store;
-    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    prepareFrozenGemmWeightsForCPU(*frozen, store, PhysicalMemoryOwner::RoutedExpertWeights, &fixture.config);
     graph_builder.setPreparedWeightStore(&store);
     auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
     ASSERT_NE(model_ctx, nullptr);
@@ -4797,6 +4924,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     fixture.config.moe.has_shared_expert = false;
     fixture.config.moe.routed_expert_plan = makeMTPOverlayPlanForLayer(64);
 
+    declareMTPOverlayCPUStorage(fixture.config);
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
     auto frozen = makeMoEMTPFrozenWeightSet(fixture);
     auto bindings = makeModelWeightBindings(*frozen);
@@ -4804,7 +4932,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     graph_builder.setWeights(toLegacyModelWeights(bindings));
 
     PreparedWeightStore store;
-    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    prepareFrozenGemmWeightsForCPU(*frozen, store, PhysicalMemoryOwner::RoutedExpertWeights, &fixture.config);
     graph_builder.setPreparedWeightStore(&store);
     auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
     ASSERT_NE(model_ctx, nullptr);
@@ -4887,7 +5015,8 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
 
 TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)
 {
-    DenseMTPGraphFixture fixture;
+    // The bound tensor shape and admission describe this one-row invocation.
+    DenseMTPGraphFixture fixture(/*rows=*/1);
     Qwen35Graph graph_builder(fixture.config, fixture.mpi);
 
     auto frozen = makeDenseMTPFrozenWeightSet(fixture);
@@ -4907,6 +5036,7 @@ TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)
     WorkspaceAllocator workspace;
     ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
     ASSERT_GT(graph.size(), 0u);
+    workspace.installPhysicalMemoryAuthority(admitCPUSidecarWorkspace(graph));
     ASSERT_TRUE(workspace.allocateForGraph(graph, {.max_seq_len = 1}));
 
     CPUDeviceContext ctx(DeviceId::cpu());
@@ -4918,7 +5048,8 @@ TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)
 
 TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
 {
-    DenseMTPGraphFixture fixture;
+    // The bound tensor shape and admission describe this one-row invocation.
+    DenseMTPGraphFixture fixture(/*rows=*/1);
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
@@ -4941,6 +5072,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
     WorkspaceAllocator workspace;
     ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
     ASSERT_GT(graph.size(), 0u);
+    workspace.installPhysicalMemoryAuthority(admitCPUSidecarWorkspace(graph));
     ASSERT_TRUE(workspace.allocateForGraph(graph, {.max_seq_len = 1}));
 
     CPUDeviceContext ctx(DeviceId::cpu());
@@ -4952,7 +5084,8 @@ TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
 
 TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
 {
-    DenseMTPGraphFixture fixture;
+    // The bound tensor shape and admission describe this one-row invocation.
+    DenseMTPGraphFixture fixture(/*rows=*/1);
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
@@ -4960,6 +5093,7 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     fixture.config.moe.has_shared_expert = false;
     fixture.config.moe.routed_expert_plan = makeMTPOverlayPlanForLayer(64);
 
+    declareMTPOverlayCPUStorage(fixture.config);
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
     auto frozen = makeMoEMTPFrozenWeightSet(fixture);
     auto bindings = makeModelWeightBindings(*frozen);
@@ -4967,7 +5101,7 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     graph_builder.setWeights(toLegacyModelWeights(bindings));
 
     PreparedWeightStore store;
-    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    prepareFrozenGemmWeightsForCPU(*frozen, store, PhysicalMemoryOwner::RoutedExpertWeights, &fixture.config);
     graph_builder.setPreparedWeightStore(&store);
     auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
     ASSERT_NE(model_ctx, nullptr);
@@ -4979,6 +5113,7 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     WorkspaceAllocator workspace;
     ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
     ASSERT_GT(graph.size(), 0u);
+    workspace.installPhysicalMemoryAuthority(admitCPUSidecarWorkspace(graph));
     ASSERT_TRUE(workspace.allocateForGraph(graph, {.max_seq_len = 1}));
     ASSERT_NE(firstStageOfType<MoESparseDispatchStage>(graph), nullptr);
     ASSERT_NE(firstStageOfType<MoESparseReturnReduceStage>(graph), nullptr);
@@ -4996,7 +5131,10 @@ TEST(Test__MTPGraphConstruction, Qwen35PrefillPopulatesRealShiftedMTPKVPayload)
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -5058,7 +5196,10 @@ TEST(Test__MTPGraphConstruction,
     fixture.config.mtp.max_request_batch = 2;
     auto graph_builder =
         std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -5166,7 +5307,10 @@ TEST(Test__MTPGraphConstruction, WorkspaceFamilyDeclaresCompleteVerifierOutputs)
             fixture.config.mtp.max_request_batch = requests;
             auto builder = std::make_shared<WorkspaceManifestQwen35Graph>(
                 fixture.config, fixture.mpi);
-            DeviceGraphOrchestrator orchestrator(builder, fixture.mpi);
+            auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, requests, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
             ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
                 requests, fixture.config.max_seq_len, DeviceId::cpu()));
             orchestrator.setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
@@ -5208,7 +5352,10 @@ TEST(Test__MTPGraphConstruction, Qwen35RequestBatchedPrefillPublishesPerRequestS
     TinyQwen35MTPForwardFixture fixture;
     fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -5293,7 +5440,10 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainExecutionAcross
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -5403,7 +5553,10 @@ TEST(Test__MTPGraphConstruction, CPUSparseSidecarIdentitySurvivesReuseCorrection
     DeviceManager::instance().initialize(-1, false);
     TinyQwen35MTPForwardFixture fixture;
     auto builder = std::make_shared<SparseIdentityQwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator runner(builder, fixture.mpi);
+    auto runner_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &runner = *runner_owner;
     ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, fixture.config.max_seq_len, DeviceId::cpu()));
     runner.setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
     PreparedWeightStore store;
@@ -5450,7 +5603,10 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -5539,7 +5695,10 @@ TEST(Test__MTPGraphConstruction, DenseSidecarGraphCacheIgnoresMoEPlacementEpochC
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -5634,7 +5793,10 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
     fixture.config.moe.has_shared_expert = false;
 
     auto graph_builder = std::make_shared<Qwen35MoEGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeMoEMTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6042,7 +6204,10 @@ TEST(Test__MTPGraphConstruction, CPUShiftedPrefillChunksAtConfiguredRuntimeCapac
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6117,7 +6282,10 @@ TEST(Test__MTPGraphConstruction, CPUSeparatePrefillTransactionsPublishCrossSegme
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6188,7 +6356,10 @@ TEST(Test__MTPGraphConstruction, GlobalTPMTPSamplingAllgathersShardCandidates)
     fixture.config.vocab_local = fixture.config.tp_config->forRank(0).vocab_count;
 
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     auto global_tp = std::make_shared<ScriptedGlobalTPContext>();
     orchestrator.setGlobalTPContext(global_tp);
@@ -6258,7 +6429,10 @@ TEST(Test__MTPGraphConstruction, PrefixHarvestPersistsAndRestoresShiftedMTPKVPay
     fixture.config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull;
 
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6339,7 +6513,10 @@ TEST(Test__MTPGraphConstruction, PartialTerminalBlockRestoresShiftedMTPKVPayload
 
     auto graph_builder =
         std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
         fixture.config.max_seq_len,
@@ -6407,7 +6584,10 @@ TEST(Test__MTPGraphConstruction, CPUForwardUpdatesShiftedMTPCacheProbe)
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6462,7 +6642,10 @@ TEST(Test__MTPGraphConstruction, ChainedSidecarCommitDiscardsSpeculativeShiftedR
     fixture.config.mtp.draft_tokens = 2;
 
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6535,7 +6718,10 @@ TEST(Test__MTPGraphConstruction, DynamicDepthFullAcceptCommitDiscardsSpeculative
     fixture.config.mtp.draft_tokens = 1;
 
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6616,7 +6802,10 @@ TEST(Test__MTPGraphConstruction, CPUSpecStatePublicationIsRejectedBeforeMutation
         fixture.config.max_seq_len = 16;
 
         auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-        DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+        auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
         ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
             /*batch_size=*/1,
@@ -6734,7 +6923,10 @@ TEST(Test__MTPGraphConstruction, ChainedSidecarSuffixCommitAllowsCommittedVerifi
     fixture.config.max_seq_len = 16;
 
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6825,7 +7017,10 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -6962,7 +7157,10 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointAdmitsOnlyDeclaredAppendSpa
     DeviceManager::instance().initialize(-1, false);
     TinyQwen35MTPForwardFixture fixture;
     auto builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         1, fixture.config.max_seq_len, DeviceId::cpu()));
     orchestrator.setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
@@ -7009,7 +7207,10 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -7120,6 +7321,8 @@ TEST(Test__MTPGraphConstruction,
             "fp32",
             DeviceId::cpu());
 
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    const size_t arena_bytes = test::cpuFixtureGraphRoots(*graph_builder,1,fixture.config.max_seq_len).cpuPhysicalBytes();
     PhysicalMemoryBOMBuilder bom({
         .world_rank = 0,
         .device = DeviceId::cpu(),
@@ -7129,7 +7332,8 @@ TEST(Test__MTPGraphConstruction,
     bom.add(
         PhysicalMemoryOwner::RecurrentCheckpointState,
         expected_checkpoint_bytes)
-        .add(PhysicalMemoryOwner::KVCache, expected_kv_bytes);
+        .add(PhysicalMemoryOwner::KVCache, expected_kv_bytes)
+        .add(PhysicalMemoryOwner::ActivationArena, arena_bytes);
     PhysicalMemoryPlanBuilder plan_builder;
     plan_builder.add(bom.build());
     auto certificate = std::make_shared<
@@ -7140,8 +7344,6 @@ TEST(Test__MTPGraphConstruction,
         /*world_rank=*/0);
 
     {
-        auto graph_builder =
-            std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = test::MockModelContext::createMinimal();
         deps.graph_builder = graph_builder;
@@ -7188,7 +7390,10 @@ TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossR
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
     fixture.config.mtp.enabled = false;
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -7270,7 +7475,10 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEPlacementWi
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
     auto graph_builder = std::make_shared<Qwen35MoEGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeMoEMTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -7328,7 +7536,10 @@ TEST(Test__MTPGraphConstruction, LiveForwardExposesAllPositionLogitsOnCPU)
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
     fixture.config.mtp.enabled = false;
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -7366,8 +7577,15 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsMatchFullRowsOnCPU)
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
     fixture.config.mtp.enabled = false;
+    // Exercise verifier storage while keeping runtime MTP disabled. Capacity
+    // must be explicitly retained; disabled policy alone owns no verifier rows.
+    fixture.config.mtp.graph_capacity_draft_tokens =
+        resolveMTPMaximumExecutionDraftDepth(fixture.config.mtp);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1, fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -7434,8 +7652,16 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectExplicitVerif
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
     fixture.config.mtp.enabled = false;
+    // Exercise verifier storage while keeping runtime MTP disabled. Capacity
+    // must be explicitly retained; disabled policy alone owns no verifier rows.
+    fixture.config.mtp.graph_capacity_draft_tokens =
+        resolveMTPMaximumExecutionDraftDepth(fixture.config.mtp);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1,
+            fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -7521,8 +7747,16 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectPaddedVerifie
     fixture.config.mtp.enabled = false;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
+    // Exercise verifier storage while keeping runtime MTP disabled. Capacity
+    // must be explicitly retained; disabled policy alone owns no verifier rows.
+    fixture.config.mtp.graph_capacity_draft_tokens =
+        resolveMTPMaximumExecutionDraftDepth(fixture.config.mtp);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2,
+            fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -7666,8 +7900,16 @@ TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifier
     fixture.config.mtp.enabled = false;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
+    // Exercise verifier storage while keeping runtime MTP disabled. Capacity
+    // must be explicitly retained; disabled policy alone owns no verifier rows.
+    fixture.config.mtp.graph_capacity_draft_tokens =
+        resolveMTPMaximumExecutionDraftDepth(fixture.config.mtp);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2,
+            fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -7729,8 +7971,16 @@ TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationIsRejectedWhenMTPIsD
     fixture.config.mtp.enabled = false;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
+    // Exercise verifier storage while keeping runtime MTP disabled. Capacity
+    // must be explicitly retained; disabled policy alone owns no verifier rows.
+    fixture.config.mtp.graph_capacity_draft_tokens =
+        resolveMTPMaximumExecutionDraftDepth(fixture.config.mtp);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2,
+            fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -7831,8 +8081,16 @@ TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationRejectsBeforeMutatio
     fixture.config.mtp.enabled = false;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
+    // Exercise verifier storage while keeping runtime MTP disabled. Capacity
+    // must be explicitly retained; disabled policy alone owns no verifier rows.
+    fixture.config.mtp.graph_capacity_draft_tokens =
+        resolveMTPMaximumExecutionDraftDepth(fixture.config.mtp);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 2,
+            fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
@@ -7926,8 +8184,16 @@ TEST(Test__MTPGraphConstruction, RowIndexedVerifierRowsScaleWithMTPRequestBatchC
     fixture.config.mtp.enabled = false;
     fixture.config.mtp.draft_tokens = 2;
     fixture.config.mtp.max_request_batch = 2;
+    // Exercise verifier storage while keeping runtime MTP disabled. Capacity
+    // must be explicitly retained; disabled policy alone owns no verifier rows.
+    fixture.config.mtp.graph_capacity_draft_tokens =
+        resolveMTPMaximumExecutionDraftDepth(fixture.config.mtp);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(graph_builder, fixture.mpi, 1,
+            fixture.config.max_seq_len, fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+    auto &orchestrator = *orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -8320,7 +8586,10 @@ TEST(Test__MTPGraphConstruction, OrdinaryNativeVocabularyPublishesFullLogitsWith
         ASSERT_TRUE(fixture.config.mtpPublishesNativeGatheredVocabulary());
         auto builder = std::make_shared<MetadataArenaGraph>(fixture.config, fixture.mpi);
         builder->setWeights(fixture.modelWeights());
-        DeviceGraphOrchestrator orchestrator(builder, fixture.mpi);
+        auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+            test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 1, 16, 16,
+                test::cpuFixtureTensorInventory(fixture.modelWeights(),fixture.config.n_layers)));
+        auto &orchestrator = *orchestrator_owner;
         ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
         ASSERT_NE(orchestrator.inferenceState().logits_local, nullptr);
         EXPECT_FALSE(orchestrator.hasLogitsLocal());

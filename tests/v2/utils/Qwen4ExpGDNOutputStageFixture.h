@@ -8,6 +8,7 @@
  * query ownership only; native arithmetic/capture execution is a separate gate.
  */
 #pragma once
+#include "CPUPreparedStoreTestAdmission.h"
 #include "../unit/models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "PreparedWeightTestHarness.h"
 #include "GpuPreparedGemmHarness.h"
@@ -103,7 +104,13 @@ public:
                 if(!prepared.store->adoptPreparedGemmForBinding(prepared.binding,device))
                     throw std::runtime_error("Native Stage6 fixture lost its original prepared source binding");
             }
-            else prepared.ref = prepared.store->prepareGemm(prepared.binding);
+            else
+            {
+                // Admit this actual original matrix before its CPU native pack;
+                // the shared FA fixture inherits the same source-owned claim.
+                admitCPUPreparedStoreForTest(*prepared.store, {weight.get()}, device);
+                prepared.ref = prepared.store->prepareGemm(prepared.binding);
+            }
             prepared.binding.prepared = prepared.ref;
             Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), config);
             config.default_device = device;

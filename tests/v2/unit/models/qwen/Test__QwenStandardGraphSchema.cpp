@@ -914,6 +914,7 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolvesAllBuffers)
     config.local_d_ff = 4864;
     config.local_vocab = 151936;
     config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
+    config.custom_formulas["terminal_logit_row_capacity"] = kVerifierRowCapacity;
 
     // Resolve all buffers
     auto resolved = BufferAllocator::resolveAll(schema, config);
@@ -958,6 +959,7 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_EstimatesMemorySavings)
     config.local_d_ff = 4864;
     config.local_vocab = 151936;
     config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
+    config.custom_formulas["terminal_logit_row_capacity"] = kVerifierRowCapacity;
 
     auto [original, optimized] = BufferAllocator::estimateMemorySavings(schema, config);
 
@@ -1017,6 +1019,7 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveLayerBuffers)
     config.local_n_kv_heads = 2;
     config.local_d_ff = 4864;
     config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
+    config.custom_formulas["terminal_logit_row_capacity"] = kVerifierRowCapacity;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -1166,6 +1169,7 @@ TEST(Test__QwenStandardGraphSchema, LayerBuffers_MTPRequestBatchVerifierRowsScal
     config.local_d_ff = 4864;
     config.local_vocab = 151936;
     config.custom_formulas["mtp_target_query_rows"] = 8;
+    config.custom_formulas["terminal_logit_row_capacity"] = 8;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
     auto findBuf = [&](const std::string &name) -> const BufferDescriptor *

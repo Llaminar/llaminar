@@ -17,6 +17,7 @@
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
 #include "../../utils/PreparedWeightTestHarness.h"
+#include "../../utils/CPUPreparedStoreTestAdmission.h"
 #include "../../utils/CPUProjectionTestWorkspace.h"
 #include <algorithm>
 #include <array>
@@ -80,6 +81,9 @@ void provePreparedOutput(bool fa_output)
   PreparedWeightStore store{ModelContextId{801946}};
   auto binding=test::makePreparedWeightTestBinding(&source,DeviceId::cpu(),fa_output ? "blk.3.attn_output.weight" : "blk.0.ssm_out.weight",store.modelId());
   if(fa_output)binding.slice={.source_rows=n,.source_cols=k,.row_count=n,.col_count=k};
+  // The unchanged original Q8_0 source owns one final native pack for all
+  // ordinary/corrected and serial/grouped replays within this retained shape.
+  test::admitCPUPreparedStoreForTest(store, {&source});
   binding.prepared=store.prepareGemm(binding);auto *kernel=store.gemmKernel(*binding.prepared);ASSERT_NE(kernel,nullptr);
   const auto *packed=kernel->exportCPUNativeVNNIPackedWeights();ASSERT_NE(packed,nullptr);
   const auto *sourcePointer=packed->native_interleaved.data();

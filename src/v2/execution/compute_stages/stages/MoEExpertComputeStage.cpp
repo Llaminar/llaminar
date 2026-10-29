@@ -9,7 +9,11 @@
  * router stage, whereas graph-native heterogeneous ExpertOverlay participants
  * receive FP32 rows through a sparse transport boundary and must explicitly
  * publish the identical Q8_1 rows before either serial or grouped expert
- * execution begins.
+ * execution begins. Weight-service calls retain the graph's declared ownership
+ * mode so a departing shared consumer cannot invalidate sibling graph engines.
+ * Grouped CPU scratch uses one typed eight-root layout for both its admission
+ * BOM and final allocation. Each backing retains its own exact allocator and
+ * PMA lease, including the kernel's canonical router publication.
  */
 
 #include "MoEExpertComputeStage.h"
@@ -1172,180 +1176,49 @@ namespace llaminar2
         owner_ = nullptr;
     }
 
+    CPUGroupedMoESerialWorkspace::StorageLayout
+    CPUGroupedMoESerialWorkspace::storageLayout(const Config &config)
+    {
+        return StorageLayout::declare(config.row_capacity, config.d_model,
+            config.expert_intermediate, config.num_experts, config.routing_top_k, config.device_id);
+    }
+
     size_t CPUGroupedMoESerialWorkspace::plannedAllocationBytes(const Config &config)
     {
-        if (config.row_capacity == 0 || config.d_model <= 0 ||
-            config.expert_intermediate <= 0 || config.num_experts <= 0 ||
-            config.routing_top_k <= 0 || config.routing_top_k > config.num_experts)
-            throw std::invalid_argument("CPU grouped-MoE workspace requires positive geometry");
-        const auto multiply = [](size_t a, size_t b)
-        {
-            if (a && b > std::numeric_limits<size_t>::max() / a)
-                throw std::overflow_error("CPU grouped-MoE workspace byte product overflow");
-            return a * b;
-        };
-        const auto add = [](size_t a, size_t b)
-        {
-            if (b > std::numeric_limits<size_t>::max() - a)
-                throw std::overflow_error("CPU grouped-MoE workspace byte sum overflow");
-            return a + b;
-        };
-        const size_t rows = config.row_capacity;
-        const size_t routes = multiply(rows, static_cast<size_t>(config.routing_top_k));
-        if (routes > static_cast<size_t>(std::numeric_limits<int>::max()))
-            throw std::overflow_error("CPU grouped-MoE workspace route capacity exceeds int");
-        const size_t hidden = static_cast<size_t>(config.d_model);
-        const size_t intermediate = static_cast<size_t>(config.expert_intermediate);
-        const size_t hidden_blocks = (hidden + Q8_1Block::BLOCK_SIZE - 1u) / Q8_1Block::BLOCK_SIZE;
-        const size_t intermediate_blocks = (intermediate + Q8_1Block::BLOCK_SIZE - 1u) / Q8_1Block::BLOCK_SIZE;
-        // Batch input plus gate/up/out and the independent floating route output.
-        const size_t fp32_elements = add(multiply(rows, hidden),
-            multiply(routes, add(multiply(2u, hidden), multiply(2u, intermediate))));
-        // Transported router/SwiGLU rows and the kernel's own router publication.
-        const size_t q8_blocks = add(multiply(routes, add(hidden_blocks, intermediate_blocks)),
-                                    multiply(rows, hidden_blocks));
-        return add(multiply(fp32_elements, sizeof(float)), multiply(q8_blocks, sizeof(Q8_1Block)));
+        const auto authored = storageLayout(config);
+        if (config.declared_storage && *config.declared_storage != authored)
+            throw std::logic_error("CPU grouped-MoE declared storage differs from execution geometry");
+        return config.declared_storage ? config.declared_storage->physicalBytes() : authored.physicalBytes();
     }
 
     CPUGroupedMoESerialWorkspace::CPUGroupedMoESerialWorkspace(Config config)
-        : row_capacity_(config.row_capacity),
-          d_model_(config.d_model),
-          expert_intermediate_(config.expert_intermediate),
-          num_experts_(config.num_experts),
+        : row_capacity_(config.row_capacity), d_model_(config.d_model),
+          expert_intermediate_(config.expert_intermediate), num_experts_(config.num_experts),
           routing_top_k_(config.routing_top_k),
-          debug_name_(config.debug_name.empty()
-                          ? "cpu_grouped_moe_serial_workspace"
-                          : std::move(config.debug_name))
+          debug_name_(config.debug_name.empty() ? "cpu_grouped_moe_serial_workspace" : config.debug_name)
     {
-        // The allocation owner and preflight consume this same payload contract.
-        const size_t planned_bytes = plannedAllocationBytes(config);
-        if (row_capacity_ == 0 || d_model_ <= 0 ||
-            expert_intermediate_ <= 0 || num_experts_ <= 0 ||
-            routing_top_k_ <= 0 || routing_top_k_ > num_experts_)
-        {
-            throw std::invalid_argument(
-                "CPU grouped-MoE serial workspace requires complete positive geometry");
-        }
-        const auto checked_multiply = [](size_t left,
-                                         size_t right,
-                                         const char *what)
-        {
-            if (left != 0u &&
-                right > std::numeric_limits<size_t>::max() / left)
-            {
-                throw std::overflow_error(
-                    std::string("CPU grouped-MoE serial workspace overflow sizing ") +
-                    what);
-            }
-            return left * right;
-        };
-        const auto checked_add = [](size_t left,
-                                    size_t right,
-                                    const char *what)
-        {
-            if (right > std::numeric_limits<size_t>::max() - left)
-            {
-                throw std::overflow_error(
-                    std::string("CPU grouped-MoE serial workspace overflow summing ") +
-                    what);
-            }
-            return left + right;
-        };
-
-        route_capacity_ = checked_multiply(
-            row_capacity_,
-            static_cast<size_t>(routing_top_k_),
-            "route capacity");
-        if (route_capacity_ >
-            static_cast<size_t>(std::numeric_limits<int>::max()))
-        {
-            throw std::overflow_error(
-                "CPU grouped-MoE serial workspace route capacity exceeds int range");
-        }
-
-        scratch_batch_ = makeScratchFP32(
-            row_capacity_, static_cast<size_t>(d_model_), DeviceId::cpu());
-        scratch_gate_ = makeScratchFP32(
-            route_capacity_,
-            static_cast<size_t>(expert_intermediate_),
-            DeviceId::cpu());
-        scratch_up_ = makeScratchFP32(
-            route_capacity_,
-            static_cast<size_t>(expert_intermediate_),
-            DeviceId::cpu());
-        scratch_out_ = makeScratchFP32(
-            route_capacity_, static_cast<size_t>(d_model_), DeviceId::cpu());
-
-        const size_t router_blocks_per_row =
-            (static_cast<size_t>(d_model_) + Q8_1Block::BLOCK_SIZE - 1u) /
-            Q8_1Block::BLOCK_SIZE;
-        const size_t swiglu_blocks_per_row =
-            (static_cast<size_t>(expert_intermediate_) +
-             Q8_1Block::BLOCK_SIZE - 1u) /
-            Q8_1Block::BLOCK_SIZE;
-        router_q8_.resize(checked_multiply(
-            route_capacity_, router_blocks_per_row, "router Q8 blocks"));
-        swiglu_q8_.resize(checked_multiply(
-            route_capacity_, swiglu_blocks_per_row, "SwiGLU Q8 blocks"));
-        route_outputs_.resize(checked_multiply(
-            route_capacity_, static_cast<size_t>(d_model_),
-            "floating route outputs"));
-        const size_t kernel_router_publication_bytes = checked_multiply(
-            checked_multiply(
-                row_capacity_,
-                router_blocks_per_row,
-                "kernel router publication blocks"),
-            sizeof(Q8_1Block),
-            "kernel router publication bytes");
-
-        moe_kernel_ = KernelFactory::createMoEKernel(DeviceId::cpu());
-        auto *const cpu_kernel =
-            dynamic_cast<CPUMoEKernel *>(moe_kernel_.get());
-        if (!cpu_kernel ||
-            !cpu_kernel->reserveRouterQ8HiddenCapacity(
-                static_cast<int>(row_capacity_), d_model_))
-        {
-            throw std::runtime_error(
-                "CPU grouped-MoE serial workspace could not prepare its canonical router publication");
-        }
-
-        allocation_bytes_ = checked_add(
-            scratch_batch_->size_bytes(),
-            scratch_gate_->size_bytes(),
-            "FP32 scratch");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_, scratch_up_->size_bytes(), "FP32 scratch");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_, scratch_out_->size_bytes(), "FP32 scratch");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_,
-            checked_multiply(
-                router_q8_.size(), sizeof(Q8_1Block), "router Q8 bytes"),
-            "router Q8 bytes");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_,
-            checked_multiply(
-                swiglu_q8_.size(), sizeof(Q8_1Block), "SwiGLU Q8 bytes"),
-            "SwiGLU Q8 bytes");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_,
-            checked_multiply(
-                route_outputs_.size(), sizeof(float), "route output bytes"),
-            "route output bytes");
-        allocation_bytes_ = checked_add(
-            allocation_bytes_,
-            kernel_router_publication_bytes,
-            "kernel router publication bytes");
-
-        if (allocation_bytes_ != planned_bytes)
-            throw std::logic_error("CPU grouped-MoE workspace allocation disagrees with its BOM");
+        const auto authored = storageLayout(config);
+        if (config.declared_storage && *config.declared_storage != authored)
+            throw std::logic_error("CPU grouped-MoE declared storage differs from execution geometry");
+        const auto &layout = config.declared_storage ? *config.declared_storage : authored;
+        if (!config.physical_memory_authority)
+            throw std::logic_error("CPU grouped-MoE workspace requires physical-memory admission");
+        route_capacity_ = layout.route_capacity;
+        const auto &memory = config.physical_memory_authority;
+        backing_ = std::make_shared<CPUGroupedMoEStorageBacking>(layout, memory);
+        moe_kernel_ = KernelFactory::createMoEKernel(config.device_id);
+        auto *const cpu_kernel = dynamic_cast<CPUMoEKernel *>(moe_kernel_.get());
+        if (!cpu_kernel)
+            throw std::runtime_error("CPU grouped-MoE workspace requires the CPU router kernel");
+        cpu_kernel->bindRouterQ8HiddenStorage(backing_->kernel_router_q8);
+        allocation_bytes_ = layout.physicalBytes();
 
         PerfStatsCollector::addCounter(
             "memory",
             "cpu_grouped_moe_serial_workspace_bytes",
             static_cast<double>(allocation_bytes_),
             "model_setup",
-            "CPU",
+            config.device_id.toString(),
             {{"debug_name", debug_name_},
              {"row_capacity", std::to_string(row_capacity_)},
              {"route_capacity", std::to_string(route_capacity_)},
@@ -1416,6 +1289,7 @@ namespace llaminar2
          * both ownership regimes.
          */
         sparse_overlay_route_width_capacity_ = params_.top_k;
+        cpu_workspace_row_capacity_ = params_.seq_len;
         switch (params_.canonical_route_diagnostic_publication)
         {
         case MoECanonicalRouteDiagnosticPublication::CompleteBank:
@@ -1625,64 +1499,12 @@ namespace llaminar2
                       overlay_service_sample_ - params_.layer_idx))}});
         }
 
-        /*
-         * A grouped CPU verifier graph has one immutable runtime-M bucket, so
-         * its maximum routed-row count is known at construction as M * top-k.
-         * Materialize that bounded scratch now, before request execution. The
-         * old first-use allocation lived inside every routed-expert layer and
-         * made the first verifier transaction pay dozens of allocator and
-         * first-touch events. It also made an otherwise steady-state CPU graph
-         * mutate its memory topology after admission.
-         *
-         * Ordinary prefill is deliberately excluded. Its much larger buckets
-         * need graph-level lifetime sharing rather than eagerly reserving one
-         * worst-case arena per model layer. M=1 uses the dedicated decode
-         * implementation and therefore does not need grouped-row scratch.
-         */
-        if (params_.device_id.is_cpu() &&
-            !params_.cpu_grouped_serial_workspace &&
-            params_.force_decode_equivalent_verifier_prefill &&
-            params_.seq_len > 1 &&
-            params_.top_k > 0 && params_.top_k <= 16 &&
-            params_.d_model > 0 && params_.expert_intermediate > 0)
-        {
-            const size_t verifier_route_capacity =
-                static_cast<size_t>(params_.seq_len) *
-                static_cast<size_t>(params_.top_k);
-            if (verifier_route_capacity >
-                static_cast<size_t>(std::numeric_limits<int>::max()))
-            {
-                throw std::overflow_error(
-                    "CPU MoE verifier routed-row capacity exceeds int range");
-            }
+        // Ordinary payloads materialize in the finalized workspace domain.
+        // Explicit serial endpoints already own the same eight-root backing.
 
-            scratch_gate_ = makeScratchFP32(
-                verifier_route_capacity,
-                static_cast<size_t>(params_.expert_intermediate),
-                params_.device_id);
-            scratch_up_ = makeScratchFP32(
-                verifier_route_capacity,
-                static_cast<size_t>(params_.expert_intermediate),
-                params_.device_id);
-            scratch_out_ = makeScratchFP32(
-                verifier_route_capacity,
-                static_cast<size_t>(params_.d_model),
-                params_.device_id);
-            scratch_capacity_ = static_cast<int>(verifier_route_capacity);
+        if (params_.cpu_grouped_serial_workspace)
+            bindCPUGroupedStorage(params_.cpu_grouped_serial_workspace->backing_);
 
-            const size_t router_blocks_per_row =
-                (static_cast<size_t>(params_.d_model) +
-                 Q8_1Block::BLOCK_SIZE - 1u) /
-                Q8_1Block::BLOCK_SIZE;
-            const size_t swiglu_blocks_per_row =
-                (static_cast<size_t>(params_.expert_intermediate) +
-                 Q8_1Block::BLOCK_SIZE - 1u) /
-                Q8_1Block::BLOCK_SIZE;
-            cpu_grouped_router_q8_.resize(
-                verifier_route_capacity * router_blocks_per_row);
-            cpu_grouped_swiglu_q8_.resize(
-                verifier_route_capacity * swiglu_blocks_per_row);
-        }
     }
 
     bool MoEExpertComputeStage::usesGraphStableRuntimeDecodePlacement() const
@@ -2257,7 +2079,10 @@ namespace llaminar2
             params_.down_slab_ref,
             true,
             &params_.gpu_direct_slot_pool,
-            cpu_placement};
+            cpu_placement,
+            params_.expert_weight_resolution_policy,
+            {},
+            params_.persistent_weight_owner};
     }
 
     IMoEKernel *MoEExpertComputeStage::acquireMoEKernelObject() const
@@ -3693,20 +3518,29 @@ namespace llaminar2
          * through one of the fused workspace-native contracts above and can
          * never reach these allocations.
          */
-        if (static_cast<int>(scratch_gate_batch_.size()) < top_k)
+        if (params_.device_id.is_cpu())
         {
-            scratch_gate_batch_.resize(top_k);
-            scratch_up_batch_.resize(top_k);
-            for (int i = 0; i < top_k; ++i)
-            {
-                scratch_gate_batch_[i] =
-                    makeScratchFP32(1, intermediate, params_.device_id);
-                scratch_up_batch_[i] =
-                    makeScratchFP32(1, intermediate, params_.device_id);
-            }
+            if (!cpu_grouped_backing_ ||
+                static_cast<int>(scratch_gate_batch_.size()) < top_k || !scratch_out_)
+                throw std::logic_error("CPU MoE decode requires setup-bound declared storage");
         }
-        if (!scratch_out_)
-            scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
+        else
+        {
+            if (static_cast<int>(scratch_gate_batch_.size()) < top_k)
+            {
+                scratch_gate_batch_.resize(top_k);
+                scratch_up_batch_.resize(top_k);
+                for (int i = 0; i < top_k; ++i)
+                {
+                    scratch_gate_batch_[i] =
+                        makeScratchFP32(1, intermediate, params_.device_id);
+                    scratch_up_batch_[i] =
+                        makeScratchFP32(1, intermediate, params_.device_id);
+                }
+            }
+            if (!scratch_out_)
+                scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
+        }
 
         if (!params_.routing_indices || !params_.routing_weights)
         {
@@ -4208,17 +4042,7 @@ namespace llaminar2
             // implementation.
             {
                 if (static_cast<int>(scratch_down_batch_.size()) < num_active)
-                {
-                    scratch_down_batch_.resize(num_active);
-                    for (int i = 0; i < num_active; ++i)
-                    {
-                        if (!scratch_down_batch_[i])
-                        {
-                            scratch_down_batch_[i] = makeScratchFP32(
-                                1, d_model, params_.device_id);
-                        }
-                    }
-                }
+                    throw std::logic_error("CPU MoE decode exceeds its declared route capacity");
 
                 // Validate down GEMM engines
                 for (int i = 0; i < num_active; ++i)
@@ -4239,15 +4063,9 @@ namespace llaminar2
                         scratch_gate_batch_[info.batch_idx]->data();
                     const float *up_fp32 =
                         scratch_up_batch_[info.batch_idx]->data();
-                    swiglu_scratch_batch_.resize(
-                        std::max(
-                            swiglu_scratch_batch_.size(),
-                            static_cast<size_t>(num_active)));
-                    if (static_cast<int>(swiglu_scratch_batch_[i].size()) <
-                        intermediate)
-                    {
-                        swiglu_scratch_batch_[i].resize(intermediate);
-                    }
+                    if (static_cast<int>(swiglu_scratch_batch_.size()) <= i ||
+                        swiglu_scratch_batch_[i].size() < static_cast<size_t>(intermediate))
+                        throw std::logic_error("CPU MoE decode exceeds declared FP32 SwiGLU storage");
 
                     /*
                      * Every CPU expert uses the GPU-aligned SwiGLU program.
@@ -4431,34 +4249,15 @@ namespace llaminar2
                 params_.layer_idx);
         }
 
-        auto &grouped_scratch_batch =
-            serial_workspace
-                ? serial_workspace->scratch_batch_
-                : scratch_batch_;
-        auto &grouped_scratch_gate =
-            serial_workspace
-                ? serial_workspace->scratch_gate_
-                : scratch_gate_;
-        auto &grouped_scratch_up =
-            serial_workspace
-                ? serial_workspace->scratch_up_
-                : scratch_up_;
-        auto &grouped_scratch_out =
-            serial_workspace
-                ? serial_workspace->scratch_out_
-                : scratch_out_;
-        auto &grouped_router_q8 =
-            serial_workspace
-                ? serial_workspace->router_q8_
-                : cpu_grouped_router_q8_;
-        auto &grouped_swiglu_q8 =
-            serial_workspace
-                ? serial_workspace->swiglu_q8_
-                : cpu_grouped_swiglu_q8_;
-        auto &grouped_route_outputs =
-            serial_workspace
-                ? serial_workspace->route_outputs_
-                : cpu_grouped_route_outputs_;
+        if (!cpu_grouped_backing_)
+            throw std::logic_error("CPU MoE grouped execution requires setup-bound declared storage");
+        auto &grouped_scratch_batch = cpu_grouped_backing_->batch;
+        auto &grouped_scratch_gate = cpu_grouped_backing_->gate;
+        auto &grouped_scratch_up = cpu_grouped_backing_->up;
+        auto &grouped_scratch_out = cpu_grouped_backing_->output;
+        auto &grouped_router_q8 = cpu_grouped_backing_->router_q8;
+        auto &grouped_swiglu_q8 = cpu_grouped_backing_->swiglu_q8;
+        auto &grouped_route_outputs = cpu_grouped_backing_->route_outputs;
 
         IMoEKernel *kernel = ensureMoEKernel();
         if (!kernel)
@@ -5065,8 +4864,7 @@ namespace llaminar2
             if (grouped_route_outputs.size() <
                 required_route_output_elements)
             {
-                grouped_route_outputs.resize(
-                    required_route_output_elements);
+                throw std::logic_error("CPU MoE route outputs exceed declared storage");
             }
         }
 
@@ -5085,25 +4883,20 @@ namespace llaminar2
         if (!all_native_bundles &&
             !scratch_has_shape(grouped_scratch_batch, max_batch, d_model))
         {
-            grouped_scratch_batch = makeScratchFP32(
-                max_batch, d_model, params_.device_id);
+            throw std::logic_error("CPU MoE batch rows exceed declared storage");
         }
         if (!scratch_has_shape(grouped_scratch_gate, scratch_rows, intermediate))
         {
-            grouped_scratch_gate = makeScratchFP32(
-                scratch_rows, intermediate, params_.device_id);
+            throw std::logic_error("CPU MoE gate rows exceed declared storage");
         }
         if (!scratch_has_shape(grouped_scratch_up, scratch_rows, intermediate))
         {
-            grouped_scratch_up = makeScratchFP32(
-                scratch_rows, intermediate, params_.device_id);
+            throw std::logic_error("CPU MoE up rows exceed declared storage");
         }
         if (!scratch_has_shape(grouped_scratch_out, scratch_rows, d_model))
         {
-            grouped_scratch_out = makeScratchFP32(
-                scratch_rows, d_model, params_.device_id);
+            throw std::logic_error("CPU MoE out rows exceed declared storage");
         }
-        scratch_capacity_ = std::max(scratch_capacity_, scratch_rows);
         if ((!all_native_bundles && !grouped_scratch_batch) ||
             !grouped_scratch_gate || !grouped_scratch_up ||
             !grouped_scratch_out)
@@ -5118,7 +4911,7 @@ namespace llaminar2
                 static_cast<size_t>(local_route_rows) *
                 static_cast<size_t>(router_q8_blocks_per_row);
             if (grouped_router_q8.size() < required_router_q8_blocks)
-                grouped_router_q8.resize(required_router_q8_blocks);
+                throw std::logic_error("CPU MoE router rows exceed declared storage");
             const int swiglu_q8_blocks_per_row =
                 (intermediate + Q8_1Block::BLOCK_SIZE - 1) /
                 Q8_1Block::BLOCK_SIZE;
@@ -5126,7 +4919,7 @@ namespace llaminar2
                 static_cast<size_t>(local_route_rows) *
                 static_cast<size_t>(swiglu_q8_blocks_per_row);
             if (grouped_swiglu_q8.size() < required_swiglu_q8_blocks)
-                grouped_swiglu_q8.resize(required_swiglu_q8_blocks);
+                throw std::logic_error("CPU MoE SwiGLU rows exceed declared storage");
         }
         else
         {
@@ -8629,12 +8422,19 @@ namespace llaminar2
             {},
             true,
             nullptr,
-            CPUExpertNUMAPlacement::forDevice(params.device_id)};
+            CPUExpertNUMAPlacement::forDevice(params.device_id),
+            params.expert_weight_resolution_policy,
+            {},
+            params.persistent_weight_owner};
         return MoEExpertWeightService::extractExpertViews(ctx);
     }
 
     bool MoEExpertComputeStage::prepareExpertGemmEngines(Params &params)
     {
+        if (params.device_id.is_cpu() &&
+            params.expert_weight_resolution_policy == MoEExpertWeightResolutionPolicy::RawOrPrepared &&
+            (!params.prepared_store || !params.prepared_store->physicalMemoryAuthority()))
+            throw std::logic_error("CPU MoE preparation requires physical-memory admission");
         MoEWeightContext ctx{
             params.device_id,
             params.num_experts,
@@ -8665,7 +8465,10 @@ namespace llaminar2
             params.down_slab_ref,
             true,
             nullptr,
-            CPUExpertNUMAPlacement::forDevice(params.device_id)};
+            CPUExpertNUMAPlacement::forDevice(params.device_id),
+            params.expert_weight_resolution_policy,
+            {},
+            params.persistent_weight_owner};
         bool ok = MoEExpertWeightService::prepareGemmEngines(ctx);
         // Phase C: Copy slab refs back to params for rebalance reuse
         params.gate_slab_ref = ctx.gate_slab_ref;
@@ -9135,9 +8938,17 @@ namespace llaminar2
          * graph has already captured the published address.
          */
         const int workspace_rows =
-            std::max({1, m, params_.seq_len});
+            std::max({1, m, cpu_workspace_row_capacity_});
         const int workspace_experts = params_.num_experts;
         const int workspace_top_k = params_.top_k;
+        if (params_.device_id.is_cpu() && !params_.cpu_grouped_serial_workspace)
+        {
+            combined.cpu_grouped_moe_storage =
+                std::make_shared<const CPUGroupedMoEStorageLayout>(
+                    CPUGroupedMoEStorageLayout::declare(
+                        workspace_rows, params_.d_model, params_.expert_intermediate,
+                        params_.num_experts, sparse_overlay_route_width_capacity_, params_.device_id));
+        }
         if (params_.device_id.is_cuda())
         {
             combined.merge(MoEWorkspaceBuffers::cudaMoE(
@@ -9369,13 +9180,62 @@ namespace llaminar2
         return combined;
     }
 
+    void MoEExpertComputeStage::bindCPUGroupedStorage(
+        std::shared_ptr<CPUGroupedMoEStorageBacking> backing)
+    {
+        if (!backing || !backing->layout().contains(
+                CPUGroupedMoEStorageLayout::declare(
+                    std::max(1, cpu_workspace_row_capacity_), params_.d_model,
+                    params_.expert_intermediate, params_.num_experts,
+                    sparse_overlay_route_width_capacity_, params_.device_id)))
+            throw std::logic_error("CPU MoE stage requires compatible declared workspace roots");
+        if (backing != cpu_grouped_backing_)
+        {
+            cpu_grouped_backing_ = std::move(backing);
+            scratch_gate_batch_.clear();
+            scratch_up_batch_.clear();
+            scratch_down_batch_.clear();
+            swiglu_scratch_batch_.clear();
+            for (int route = 0; route < sparse_overlay_route_width_capacity_; ++route)
+            {
+                const size_t f = static_cast<size_t>(params_.expert_intermediate);
+                const size_t d = static_cast<size_t>(params_.d_model);
+                scratch_gate_batch_.push_back(std::dynamic_pointer_cast<FP32Tensor>(
+                    cpu_grouped_backing_->gate->create_view({1, f}, route * f)));
+                scratch_up_batch_.push_back(std::dynamic_pointer_cast<FP32Tensor>(
+                    cpu_grouped_backing_->up->create_view({1, f}, route * f)));
+                scratch_down_batch_.push_back(std::dynamic_pointer_cast<FP32Tensor>(
+                    cpu_grouped_backing_->output->create_view({1, d}, route * d)));
+                swiglu_scratch_batch_.emplace_back(
+                    cpu_grouped_backing_->route_outputs.data() + route * f, f);
+            }
+            scratch_out_ = scratch_down_batch_.front();
+        }
+        auto *kernel = dynamic_cast<CPUMoEKernel *>(acquireMoEKernelObject());
+        if (!kernel)
+            throw std::logic_error("CPU MoE stage has no CPU kernel");
+        kernel->bindRouterQ8HiddenStorage(cpu_grouped_backing_->kernel_router_q8);
+    }
+
     void MoEExpertComputeStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        // Allocator rebuilds revoke borrows through the public null binding.
+        // The graph-local kernel and its backing retain their own lifetimes.
+        if (!workspace)
+        {
+            unbindWorkspace();
+            return;
+        }
         if (workspace != bound_workspace_)
         {
             runtime_grouped_decode_launch_state_prepared_ = false;
             invalidateFixedTopologyMaskPublication();
         }
+
+        if (params_.device_id.is_cpu())
+            bindCPUGroupedStorage(params_.cpu_grouped_serial_workspace
+                ? params_.cpu_grouped_serial_workspace->backing_
+                : (workspace ? workspace->cpuGroupedMoEStorage() : nullptr));
 
         // Bind workspace to ALL expert GEMM engines (gate, up, down for each expert)
         auto bindAll = [workspace](const std::vector<ITensorGemm *> &engines)

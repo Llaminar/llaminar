@@ -7,6 +7,7 @@
  * inherit the parent's model-wide runtime. This setup-only value retains those
  * owners together and authenticates their layer and participant identities.
  * It allocates no model storage and owns no physical-memory accounting.
+ * CPU root declarations remain stage-owned across child projection and reuse.
  */
 #pragma once
 
@@ -18,6 +19,7 @@
 
 namespace llaminar2
 {
+    struct CPUSerialExpertStorageAdmission;
     class MoEOverlayResidencyAuthority;
     class MoEOverlayParticipantResidencyRegistry;
     class IMPIContext;
@@ -44,6 +46,8 @@ namespace llaminar2
             std::shared_ptr<IMPIContext> mpi;
             std::shared_ptr<MoEOverlayRankBatchTransportRegistry> rank_transport;
             std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> device_fabric;
+            /// Exact stage-owned declarations retained with its admitted capacity.
+            std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         };
 
         /**

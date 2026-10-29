@@ -9,6 +9,7 @@
  */
 
 #pragma once
+#include "memory/CPUMappedPublicationRoot.h"
 
 #include "MappedTransferProgressABI.h"
 #include "CapturedTransferEndpointScheduling.h"
@@ -34,6 +35,7 @@ namespace llaminar2
 {
     class TransferEngine;
     class PhysicalMemoryAuthority;
+    class PhysicalMemoryAllocationLease;
     class ReleasedWeightLoadStaging;
     class ImmutableNativeDeviceUpload;
     class ImmutableNativeUploadStaging;
@@ -878,6 +880,8 @@ namespace llaminar2
         std::vector<DeviceId> devices_; ///< Canonical exact endpoint set.
         std::vector<DeviceAlias> aliases_; ///< One alias per @ref devices_.
         std::vector<BackendRegistration> registrations_; ///< One per GPU family.
+        // Retire after native free/unregister; child slices retain this owner.
+        std::shared_ptr<PhysicalMemoryAllocationLease> allocation_claim_;
         std::shared_ptr<void> lifetime_; ///< Frees pages or retains the parent.
         BackingKind backing_kind_ = BackingKind::ExternalRegistration;
         bool bound_ = false; ///< True after every alias resolves successfully.
@@ -1509,6 +1513,17 @@ namespace llaminar2
         allocateMappedHostRegion(
             size_t bytes,
             std::span<const DeviceId> devices) const;
+
+        /**
+         * @brief Materialize one admitted CPU publication backing through native mapping.
+         * @param root Immutable exact CPU/GPU publication declaration used by its BOM.
+         * @param authority Sole rank-local physical-memory allocation issuer.
+         * @return Region whose backing retains its own claim through final native retirement.
+         * @throws std::logic_error If admission is absent or the owner line cannot fit.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferRegion> allocateMappedHostRegion(
+            const CPUMappedPublicationRoot &root,
+            const std::shared_ptr<PhysicalMemoryAuthority> &authority) const;
 
         /**
          * @brief Return the exact page-rounded backing extent used by mapped-host allocation.

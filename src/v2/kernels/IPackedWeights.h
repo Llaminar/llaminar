@@ -12,11 +12,14 @@
  * - CPU: CPUNativeVNNIPackedWeights (VNNI-interleaved layout)
  * - CUDA: CUDAPackedWeights (INT8 column-major, phase 2)
  * - ROCm: ROCmPackedWeights (INT8 column-major, phase 2)
+ * Explicit CPU clone destinations bind new physical bytes to a destination
+ * admission owner rather than silently borrowing the source capacity budget.
  */
 
 #pragma once
 
 #include "../backends/DeviceId.h"
+#include "memory/CPUWeightStoragePlacement.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -91,6 +94,18 @@ namespace llaminar2
          *         or nullptr on failure.
          */
         virtual std::unique_ptr<IPackedWeights> clone() const = 0;
+
+        /**
+         * @brief Copy into an explicitly admitted destination allocation owner.
+         * @param destination Final CPU placement and physical allocation issuer.
+         * @return Independently owned packed bytes charged to the destination.
+         * @throws std::logic_error If the implementation has no CPU copy contract.
+         */
+        virtual std::unique_ptr<IPackedWeights> cloneTo(CPUWeightStoragePlacement destination) const
+        {
+            (void)destination;
+            throw std::logic_error("Packed weights do not implement explicit CPU destination cloning");
+        }
 
         /**
          * @brief Convert packed weights to a different device format.

@@ -9,6 +9,7 @@
  * expectations independently count its1408-byte CPU unit and20-byte GPU block.
  */
 
+#include "memory/CPUSerialExpertStorageLayout.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
@@ -2720,14 +2721,17 @@ namespace llaminar2
         EXPECT_EQ(
             cuda->stagingBytes(),
             expected_load_geometry.staging_bytes);
-        /*
-         * One serial participant owns the complete immutable route-family
-         * ladder. Eight rows at top-k two retain capacities 1, 2, 4, 8, and
-         * the exact terminal capacity 16, shared across all model layers.
-         */
-        constexpr std::size_t kExpectedCpuSparsePacketBytes =
-            (1u + 2u + 4u + 8u + 16u) *
-            (2u * 64u + 2u) * sizeof(float);
+        // The immutable admission owns both separately rounded packet roots
+        // and the exact grouped workspace. Invocation scratch stays separate.
+        const auto cpu_config = std::find_if(result.device_inputs.begin(),result.device_inputs.end(),
+            [](const DevicePlanConfig &config) { return config.device.is_cpu(); });
+        ASSERT_NE(cpu_config,result.device_inputs.end());
+        ASSERT_TRUE(cpu_config->cpu_serial_expert_storage);
+        const auto &serial=*cpu_config->cpu_serial_expert_storage;
+        size_t grouped_bytes=0;
+        for(const auto controller:serial.controller_devices)
+            grouped_bytes+=serial.envelope->forController(controller)->workspaceBytes();
+        grouped_bytes*=serial.participant_ids.size();
         auto invocation_workspace = cpuSwiGLUWorkspaceRequirements(
             capacity_input.resident_graph_rows * profile.expert_used_count,
             profile.expert_feed_forward_length);
@@ -2740,8 +2744,8 @@ namespace llaminar2
                 .rows = capacity_input.resident_graph_rows * profile.expert_used_count,
                 .n = n, .k = k, .workers = inventory.cpu_cores, .execution = inventory.cpu_execution,
                 .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
-        EXPECT_EQ(cpu->fixedBytes(), kExpectedCpuSparsePacketBytes +
-            invocation_workspace.total_bytes_with_alignment());
+        EXPECT_EQ(cpu->fixedBytes(), serial.physicalBytes() + grouped_bytes +
+            invocation_workspace.total_bytes_with_alignment()*cpu_config->concurrent_workspace_owners);
         EXPECT_GT(cuda->fixedBytes(), 0u);
         EXPECT_EQ(
             cuda->resourceId(),
@@ -2874,6 +2878,11 @@ namespace llaminar2
             ASSERT_EQ(cpu_input->concurrent_workspace_owners, 2u);
             auto one_owner = *cpu_input;
             one_owner.concurrent_workspace_owners = 1u;
+            EXPECT_THROW((void)MemoryPlanner::plan(profile,{one_owner}),std::invalid_argument);
+            ASSERT_TRUE(one_owner.cpu_serial_expert_storage);
+            auto one_admission=std::make_shared<CPUSerialExpertStorageAdmission>(*one_owner.cpu_serial_expert_storage);
+            one_admission->controller_devices.resize(1);
+            one_owner.cpu_serial_expert_storage=std::move(one_admission);
             const auto one_plan = MemoryPlanner::plan(profile, {one_owner});
             ASSERT_EQ(one_plan.devices.size(), 1u);
             const auto cpu_plan = std::find_if(

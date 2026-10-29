@@ -8,6 +8,9 @@
  * device bytes through TransferEngine. Host access to that arm rejects.
  * @author David Sanftenberg
  * @date 2025-11-05
+ * Native CPU storage adoption moves the actual aligned backing, including its
+ * physical allocation lease, without initializing or copying a second payload.
+ * Exact CPU home identity and native extent are validated before publication.
  */
 
 #include "TensorClasses.h"
@@ -139,6 +142,15 @@ namespace llaminar2
             throw std::overflow_error("Device-only native root bytes overflow");
         // TransferEngine allocates only the admitted device storage later; no
         // host vector is resized, first-touched, copied or dequantized here.
+    }
+
+    INT32Tensor::INT32Tensor(const std::vector<size_t> &shape, AlignedVector<int32_t> storage, DeviceId device)
+        : shape_(shape), device_(device), host_int32_data_(std::move(storage)), scale_(1.0f), device_data_(nullptr)
+    {
+        if (!device.is_valid() || !device.is_cpu() || shape.empty())
+            throw std::invalid_argument("INT32Tensor owned CPU storage requires shape and exact CPU home device");
+        if (host_int32_data_.size() != nativeTensorExtent(shape, 1, 1))
+            throw std::invalid_argument("INT32Tensor owned storage does not match logical element count");
     }
 
     INT32Tensor::INT32Tensor(const std::vector<size_t> &shape)

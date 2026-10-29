@@ -5,9 +5,10 @@ This intentionally small gate is distinct from the full production
 certification pipeline.  It owns exactly the develop-branch promise: build the
 AVX512 and AVX2 full-backend image pairs, run the complete CMake-owned Unit and
 ProductionTestPreflight gates inside each installed test runner, then publish the
-two already-tested runtime siblings.  It never discovers models, stages a
-corpus, launches a server, runs mathematical parity, E2E, remote MPI, or a
-benchmark, and it never calls an image a certified release artifact.
+two already-tested runtime siblings. The default develop push remains model-free.
+Feature PRs explicitly add source-only admission in a full compiled inventory,
+separate from preflight. Neither route runs numerical parity, HTTP E2E, remote
+MPI or benchmarks, or calls the images certified release artifacts.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import sys
 import uuid
 
 import docker_paths
+from qfn_source_admission_image import run_admission
 from production_artifacts import digest, image_identity, validate_prerequisites, write_json
 from run_production_pipeline import (
     TestRunnerInventory, ImageRole, SHIPPING_ISAS, build, device_lease, logged_container_command,
@@ -121,6 +123,9 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True,
                         help="new ignored directory for build and prerequisite evidence")
     parser.add_argument("--image", help="AVX512 develop runtime tag; AVX2 appends -avx2")
+    parser.add_argument("--source-admission", action="store_true",
+                        help="feature PR: run separate real QFN source admission in the full test inventory")
+    parser.add_argument("--models", type=Path, default=Path("/opt/llaminar-models"))
     parser.add_argument("--publish", action="store_true",
                         help="push both tested runtime images after both ISA gates pass")
     parser.add_argument("--cpu-isa", choices=SHIPPING_ISAS, action="append", dest="cpu_isas",
@@ -146,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     receipt = {"schema": 1, "source": source, "complete": False, "published": False,
                "variants": {}, "image": args.image}
     write_json(args.output / "develop-image-gate.json", receipt)
+    inventory = TestRunnerInventory.FULL_MATRIX if args.source_admission else TestRunnerInventory.MODEL_FREE
     with device_lease():
         for isa in args.cpu_isas:
             if source_identity() != source:
@@ -154,14 +160,19 @@ def main(argv: list[str] | None = None) -> int:
             directory.mkdir()
             build_args = argparse.Namespace(cpu_isa=isa)
             images = build(build_args, source, directory,
-                           test_inventory=TestRunnerInventory.MODEL_FREE)
+                           test_inventory=inventory)
             require_image_pair(images, source, isa,
-                               test_inventory=TestRunnerInventory.MODEL_FREE)
+                               test_inventory=inventory)
             prerequisites = run_prerequisites(images, directory)
+            admission = None
+            if args.source_admission:
+                admission = run_admission(images, source, isa, directory / "source-admission",
+                                          args.models, images[ImageRole.RUNTIME.value])
             receipt["variants"][isa] = {
                 "test_runner_image": images[ImageRole.TEST_RUNNER.value]["id"],
                 "runtime_image": images[ImageRole.RUNTIME.value]["id"],
-                "test_runner_inventory": TestRunnerInventory.MODEL_FREE.value,
+                "test_runner_inventory": inventory.value,
+                "source_admission": admission,
                 "prerequisites_digest": digest(prerequisites),
                 "preflight_test_count": prerequisites["preflight_test_count"],
             }

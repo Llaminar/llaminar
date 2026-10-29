@@ -14,6 +14,8 @@
  * - Compute graphs (with PP Send/Recv stages)
  * - LOCAL TP context for intra-rank collectives
  * - KV cache state
+ * - Requested weight identity installed with its canonical resolved topology,
+ *   before later physical quotas and placements replace declarative intent.
  * - Per-stage expert runtime lifetimes for local PP composition; each stage
  *   shares its owners only among that stage's TP participants.
  *
@@ -138,6 +140,7 @@ namespace llaminar2
      */
     class OrchestrationRunner : public IOrchestrationRunner
     {
+        friend class OrchestrationRunnerResolvedAdmissionTestAccess;
     public:
         /**
          * @brief Construct from configuration
@@ -547,6 +550,17 @@ namespace llaminar2
          * @brief Build execution plan from config
          */
         bool buildExecutionPlan();
+
+        /**
+         * @brief Install one canonical resolved topology and its pre-freeze request identity.
+         * @param resolved Model-aware rank compiler result, before capacity freezing.
+         *
+         * Implicit TP may synthesize the first routed authority during resolution.
+         * The identity must be captured with that exact config/rank-plan install,
+         * then retained while model-aware quotas and placements are frozen later.
+         * Pipeline stages instead contribute their complete aggregate identity.
+         */
+        void installResolvedExecutionPlan(const ResolvedRankOrchestration &resolved);
 
         /**
          * @brief Gather cluster inventory for plan building
@@ -1432,7 +1446,7 @@ namespace llaminar2
          * Physical graph and weight identity never enters this value.
          */
         std::optional<MTPRequestPolicy> mtp_request_policy_;
-        /** Requested routed-weight identity captured before model-aware freezing. */
+        /** Requested identity installed with canonical topology, before capacity freezing. */
         std::string requested_routed_weight_authority_identity_;
         RankExecutionPlan plan_;
         /** Setup-only declaration consumed by the pure rank compiler before child projection. */

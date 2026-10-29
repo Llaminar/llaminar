@@ -8,6 +8,9 @@
  * Typed FP16 gates consume half-rounded hidden operands; native BF16 gates
  * retain FP32 hidden operands and widen weights in registers. Both use fixed
  * FP32 accumulation and preserve original hidden/Q8 authority for the experts.
+ * Serial workspace publication borrows no competing cache: setup moves its
+ * declared physical backing into the kernel, which keeps that address across
+ * partial and repeated publication until the final owner retires.
  */
 
 #pragma once
@@ -15,6 +18,7 @@
 #include "../../IMoEKernel.h"
 #include "../CPUKernelBase.h"
 #include "../../../tensors/BlockStructures.h"
+#include "../../../tensors/AlignedVector.h"
 
 #include <span>
 #include <vector>
@@ -244,10 +248,10 @@ namespace llaminar2
             std::span<Q8_1Block> destination);
 
         /**
-         * @brief Reserve and first-touch transported-router publication storage.
+         * @brief Validate capacity of the setup-bound router publication root.
          *
          * Serial ExpertOverlay graph families know their maximum compact row
-         * geometry during setup. Reserving here prevents the first production
+         * geometry during setup. Checking the frozen root prevents the first production
          * request from changing the CPU kernel's memory topology.
          *
          * @param rows Maximum positive compact row count.
@@ -255,6 +259,22 @@ namespace llaminar2
          * @return True when the complete Q8_1 publication fits the reservation.
          */
         bool reserveRouterQ8HiddenCapacity(int rows, int d_model);
+
+        /**
+         * @brief Install the setup-declared final router publication backing.
+         * @param storage Shared actual admitted backing; graph-local publication metadata stays here.
+         * @note Rebinding the same owner preserves publication; changing owner invalidates it.
+         * @throws std::invalid_argument If no publication capacity is supplied.
+         */
+        void bindRouterQ8HiddenStorage(std::shared_ptr<AlignedVector<Q8_1Block>> storage);
+
+        /** @brief Adopt an already-admitted root without copying its payload. */
+        void bindRouterQ8HiddenStorage(AlignedVector<Q8_1Block> storage)
+        {
+            bindRouterQ8HiddenStorage(
+                std::make_shared<AlignedVector<Q8_1Block>>(std::move(storage)));
+        }
+
 
         // =================================================================
         // ITensorKernel interface
@@ -322,7 +342,7 @@ namespace llaminar2
             Q8_1Block *destination,
             size_t destination_blocks);
 
-        std::vector<Q8_1Block> router_q8_hidden_; ///< Canonical contiguous verifier rows.
+        std::shared_ptr<AlignedVector<Q8_1Block>> router_q8_hidden_; ///< Actual declared backing; publication metadata remains graph-local.
         const float *router_q8_hidden_source_ = nullptr; ///< FP32 producer identity.
         int router_q8_hidden_rows_ = 0; ///< Number of published rows.
         int router_q8_hidden_d_model_ = 0; ///< Published row width.

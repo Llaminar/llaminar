@@ -13,6 +13,7 @@
  */
 #pragma once
 #include "GpuPreparedGemmHarness.h"
+#include "CPUPreparedStoreTestAdmission.h"
 #include "TestTensorFactory.h"
 #include "loaders/PreparedHalfWeights.h"
 #include "backends/IWorkerGPUContext.h"
@@ -100,6 +101,13 @@ public:
         weights_ = originals_;
         for (size_t i : {2u, 3u})
             weights_[i] = materializePreparedHalfWeights(*originals_[i]);
+        if (device_.is_cpu())
+        {
+            // The native QKV/Z and borrowed FP16 alpha/beta are the exact
+            // source inventory retained by the four production handles below.
+            admitCPUPreparedStoreForTest(store_,
+                {weights_[0].get(), weights_[1].get(), weights_[2].get(), weights_[3].get()}, device_);
+        }
         const std::array<std::string, 4> names{"blk.0.attn_qkv.weight",
             "blk.0.attn_gate.weight", "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight"};
         for (size_t i = 0; i < 4; ++i)

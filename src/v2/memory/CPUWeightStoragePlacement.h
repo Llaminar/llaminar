@@ -5,13 +5,14 @@
  * Exact-node weights receive dedicated pages, certified by the common NUMA
  * first-touch authority before any packing or native-byte copy. No live bytes
  * are migrated, discarded, or copied to repair placement after publication.
+ * All allocation and initialization mechanics delegate to CPUStorageRoot and
+ * CPUStoragePlacement, shared with tensor arenas and serial workspaces.
  * This policy owns no capacity ledger: the prepared-weight owner retains the
  * allocation and reports it through PhysicalMemoryAuthority as usual.
  */
 #pragma once
 
-#include "NUMAAllocator.h"
-#include "tensors/AlignedVector.h"
+#include "CPUStorageRoot.h"
 
 #include <stdexcept>
 #include <type_traits>
@@ -23,7 +24,7 @@ namespace llaminar2
     {
     public:
         /** @return Ordinary host storage with no single-node placement promise. */
-        static CPUWeightStoragePlacement local() noexcept { return CPUWeightStoragePlacement(-1); }
+        static CPUWeightStoragePlacement local() noexcept { return CPUWeightStoragePlacement(CPUStoragePlacement::local()); }
 
         /**
          * @brief Select exact-node placement for final CPU execution storage.
@@ -35,7 +36,45 @@ namespace llaminar2
         {
             if (node < 0)
                 throw std::invalid_argument("CPU weight placement requires a non-negative NUMA node");
-            return CPUWeightStoragePlacement(node);
+            return CPUWeightStoragePlacement(CPUStoragePlacement::onNode(node));
+        }
+
+        /**
+         * @brief Bind final storage allocations to the admitted CPU owner.
+         * @param authority Sole live physical-memory authority.
+         * @param allocator Exact admitted CPU allocator identity, independent of NUMA placement.
+         * @param owner Persistent, migration-staging or shadow owner charged before allocation.
+         * @param placement Native local or exact-node allocation policy.
+         * @return Placement carrying the allocation claim policy.
+         */
+        static CPUWeightStoragePlacement accounted(
+            std::shared_ptr<PhysicalMemoryAuthority> authority,
+            DeviceId allocator, PhysicalMemoryOwner owner,
+            CPUWeightStoragePlacement placement)
+        {
+            if (!authority || !allocator.is_valid() || !allocator.is_cpu() ||
+                !authority->contains(allocator) || (owner != PhysicalMemoryOwner::PrimaryModelWeights &&
+                owner != PhysicalMemoryOwner::AdditionalModelWeights &&
+                owner != PhysicalMemoryOwner::RoutedExpertWeights &&
+                owner != PhysicalMemoryOwner::ExpertMigrationStaging &&
+                owner != PhysicalMemoryOwner::ExpertShadowSlots) || placement.authority_)
+                throw std::invalid_argument("CPU weight accounting requires one admitted prepared-storage owner");
+            placement.authority_ = std::move(authority);
+            placement.owner_ = owner;
+            placement.allocator_ = allocator;
+            return placement;
+        }
+
+        /**
+         * @brief Resolve exactly the allocator-rounded final storage extent.
+         * @tparam T Native element type.
+         * @param count Required element capacity.
+         * @return Physical bytes, excluding unfaultable virtual mapping guards.
+         */
+        template <typename T>
+        [[nodiscard]] size_t requiredAllocationBytes(size_t count) const
+        {
+            return placement_.physicalBytes<T>(count);
         }
 
         /**
@@ -48,25 +87,18 @@ namespace llaminar2
         template <typename T>
         [[nodiscard]] AlignedVector<T> allocate(size_t count) const
         {
-            static_assert(std::is_trivially_copyable_v<T>);
-            if (node_ < 0)
-            {
-                AlignedVector<T> storage;
-                storage.resize_uninitialized(count);
-                return storage;
-            }
-            auto storage = AlignedVector<T>::pageMappedUninitialized(count);
-            // Fresh exclusive mappings cannot share recycled/pinned heap pages.
-            // Certification happens before the source decoder writes its bytes.
-            if (count && !NUMAAllocator::instance().prepareExternalReceiveRangeOnNode(
-                    storage.data(), storage.size() * sizeof(T), node_))
-                throw std::runtime_error("CPU prepared-weight first-touch placement failed");
-            return storage;
+            if (authority_)
+                return CPUStorageRoot<T>(count, owner_, allocator_, placement_,
+                    CPUStorageInitialization::Uninitialized).allocate(authority_);
+            return placement_.allocateUnadmitted<T>(count, CPUStorageInitialization::Uninitialized);
         }
 
     private:
         /** @brief Construct only through the explicit placement factories. */
-        explicit CPUWeightStoragePlacement(int node) noexcept : node_(node) {}
-        int node_; ///< Negative means no exact-node placement was requested.
+        explicit CPUWeightStoragePlacement(CPUStoragePlacement placement) noexcept : placement_(placement) {}
+        std::shared_ptr<PhysicalMemoryAuthority> authority_; ///< Sole admission issuer, never a parallel ledger.
+        DeviceId allocator_ = DeviceId::invalid(); ///< Exact admitted CPU allocator, never a NUMA node.
+        PhysicalMemoryOwner owner_ = PhysicalMemoryOwner::PrimaryModelWeights; ///< Typed accounting owner.
+        CPUStoragePlacement placement_; ///< Common immutable allocator/NUMA contract.
     };
 }

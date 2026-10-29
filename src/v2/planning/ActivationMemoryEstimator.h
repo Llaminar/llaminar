@@ -16,6 +16,7 @@
 
 namespace llaminar2
 {
+class GraphArenaStorageLayout;
 
 /**
  * @brief Complete runtime geometry that changes a captured activation arena.
@@ -54,12 +55,24 @@ struct ActivationGraphMemoryGeometry
         qwen4exp::QwenSparseAttentionArithmetic::FixedFP32; ///< Same admitted arithmetic consumed
                                                             ///< by execution.
     qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform; ///< Same frozen scalar as actual graph dimensions.
+    MTPShiftedKVHeadLayout mtp_shifted_kv_head_layout = MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
+        ///< Existing predictor ownership also determines its retained Q/K/V and FFN arena widths.
 };
 
 /** @brief Sizes stable activation owners used by captured inference graphs. */
 class ActivationMemoryEstimator
 {
 public:
+    /**
+     * @brief Declare the CPU arena from the production model schema.
+     * @param profile Exact source metadata, including hybrid projection geometry.
+     * @param geometry Admitted participant row and sharding envelope.
+     * @param device Exact CPU allocator identity.
+     * @return Resolved physical roots consumed by the same arena registration API.
+     */
+    static GraphArenaStorageLayout declareCPUStorage(const ModelMemoryProfile &profile,
+        const ActivationGraphMemoryGeometry &geometry, DeviceId device);
+
     /**
      * @brief Price only tier-specific PLE arena roles using the canonical declaration inventory.
      * @param profile Exact source metadata.
@@ -91,7 +104,7 @@ public:
     );
 
     /**
-     * @brief Estimate the logical BufferArena ownership for a model profile.
+     * @brief Price the physical BufferArena ownership for a model profile.
      *
      * This overload includes architecture-specific projection buffers inferred
      * from the GGUF tensor inventory, plus the declarative MTP and MoE owners
@@ -100,8 +113,9 @@ public:
      *
      * @param profile GGUF-derived model and tensor geometry.
      * @param geometry Complete participant-local captured graph geometry.
-     * @param device Device being admitted; activation ownership is symmetric
-     *        across backends, but retaining the device makes the API explicit.
+     * @param device Allocator being admitted. CPU roots use their exact native
+     *        AlignedVector allocation rounding individually; GPU roots retain
+     *        the native tensor byte extent.
      * @return Required bytes for the graph-owned BufferArena tensors.
      */
     static size_t estimate(

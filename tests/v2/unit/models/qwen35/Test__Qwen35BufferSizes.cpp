@@ -43,6 +43,8 @@ static void configureMTPBufferGeometry(GraphResolverConfig &config)
 {
     if (!config.custom_formulas.contains("mtp_target_query_rows"))
         config.custom_formulas["mtp_target_query_rows"] = 4;
+    config.custom_formulas["terminal_logit_row_capacity"] =
+        config.custom_formulas.at("mtp_target_query_rows");
     if (!config.custom_formulas.contains("mtp_kv_prefill_rows"))
     {
         config.custom_formulas["mtp_kv_prefill_rows"] = std::max(
@@ -121,6 +123,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     config.custom_formulas["fa_q_full_dim"] = 8192;
     config.custom_formulas["attn_output_dim"] = 4096;
     config.custom_formulas["mtp_target_query_rows"] = 4;
+    config.custom_formulas["terminal_logit_row_capacity"] = 4;
     configureMirroredMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
@@ -350,6 +353,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_SeparateVerifierAndIntegratedKVPrefil
     config.custom_formulas["attn_output_dim"] = 4096;
     constexpr size_t target_query_rows = 64;
     config.custom_formulas["mtp_target_query_rows"] = target_query_rows;
+    config.custom_formulas["terminal_logit_row_capacity"] = target_query_rows;
     configureMirroredMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
@@ -551,6 +555,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_CPUGlobalTP2)
     config.custom_formulas["fa_q_full_dim"] = 4096;
     config.custom_formulas["attn_output_dim"] = 2048;
     config.custom_formulas["mtp_target_query_rows"] = 4;
+    config.custom_formulas["terminal_logit_row_capacity"] = 4;
     config.custom_formulas["mtp_kv_prefill_rows"] = 4096;
     config.custom_formulas["mtp_gather_rows"] = 4;
     config.custom_formulas["mtp_gather_vocab"] = 248320;

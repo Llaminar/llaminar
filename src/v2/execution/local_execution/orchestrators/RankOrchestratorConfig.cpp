@@ -7,6 +7,8 @@
  * expert authority before any weight, collective or graph is materialized.
  * Keeping setup policy separate from native runner execution permits focused
  * ownership tests without loading a model or initializing a device backend.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * CPU root declarations remain stage-owned across child projection and reuse.
  */
 #include "RankOrchestrator.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
@@ -228,6 +230,7 @@ namespace llaminar2
         config.max_seq_len = runtime.max_seq_len;
         config.resident_graph_rows = runtime.resident_graph_rows;
         config.attention_participants = runtime.attention_participants;
+        config.cpu_serial_expert_storage = runtime.cpu_serial_expert_storage;
         config.ordinary_terminal_projection = runtime.ordinary_terminal_projection;
         config.batch_size = runtime.batch_size;
         config.activation_precision = runtime.activation_precision;
@@ -257,7 +260,7 @@ namespace llaminar2
         const auto &stage = pp_stages.at(stage_index);
         if (!stage.validate() || effectiveMode() == ParallelismMode::TP || nested_pp_stage_config)
             throw std::invalid_argument("Pipeline child requires one valid stage in a PP parent");
-        if (moe_routed_expert_plan || moe_expert_overlay_residency_authority ||
+        if (!cpu_serial_expert_storage.empty() || moe_routed_expert_plan || moe_expert_overlay_residency_authority ||
             moe_expert_overlay_participant_residency || moe_expert_overlay_decode_histogram ||
             moe_expert_overlay_mpi_ctx || moe_rank_batch_transport_registry ||
             moe_device_controller_fabric || moe_node_local_route_exchange ||
@@ -293,6 +296,7 @@ namespace llaminar2
             child.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(
                 *stage.moe_runtime->plan());
             const auto &owners = stage.moe_runtime->owners();
+            child.cpu_serial_expert_storage = owners.cpu_serial_expert_storage;
             child.moe_expert_overlay_residency_authority = owners.authority;
             child.moe_expert_overlay_participant_residency = owners.residency;
             child.moe_expert_overlay_decode_histogram = owners.histogram;

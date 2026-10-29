@@ -8,7 +8,9 @@
  * must materialize their exact borrowed owners, publish the initializing stream,
  * and let a different consumer stream observe reset bytes without host repair.
  * Protocol/replay roles are registered too, proving their distinct setup lifetime.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include "../../../unit/models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "../../../unit/models/qwen4exp/Qwen4ExpEmptyAuxiliaryFixture.h"
 #include "kernels/IHybridKVCache.h"
@@ -247,7 +249,7 @@ void proveAdmission(DeviceId device,bool proveArchive=false)
         Qwen4ExpGraph graph(config);
         const auto schema=graph.getSchema();
         const auto requirements=BufferAllocator::resolveLayerBuffers(schema,graph.getResolverConfig(1));
-        BufferArena arena(ArenaConfig{.factory=&factory});
+        BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
         constexpr std::array owners{BufferId::QFN_PLE_TOKEN_HISTORY,BufferId::QFN_PLE_CONV_HISTORY,
             BufferId::QFN_QSA_POOLED_KEYS,BufferId::QFN_QSA_PARTIAL_KEYS};
         constexpr std::array protocols{BufferId::QFN_NGRAM_LOOKUP_STATE,BufferId::QFN_QSA_REPLAY};

@@ -11,11 +11,15 @@
  * independently of model weights, accelerator availability, and generation.
  * Auxiliary terminal fixtures exercise registered model-owned requirements at
  * the actual installer, without model payloads, native graphs or GPU contexts.
+ * CPU state-only fixtures admit their schema and cache geometry before
+ * initialization without manufacturing model weights or prepared payloads.
  * Host-RCU fixtures seal the same topology-derived execution authority required
  * by production; unresolved or foreign authority cannot mint a no-peer proof.
  */
 
 #include "PrefixArchiveSourceContract.h"
+#include "../../../../utils/CPUOrchestratorTestAdmission.h"
+#include "../../../../utils/CPUPreparedStoreTestAdmission.h"
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/DeviceId.h"
@@ -1298,9 +1302,10 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndI
     moe_config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
     moe_config.moe.local_expert_start = 0;
     moe_config.moe.local_expert_count = -1;
-    DeviceGraphOrchestrator moe_orchestrator(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto moe_graph = std::make_shared<Qwen35MoEGraph>(moe_config, nullptr);
+    auto moe_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(moe_graph, nullptr, 1, 16, 16));
+    auto &moe_orchestrator = *moe_owner;
     ASSERT_TRUE(moe_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     EXPECT_TRUE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
@@ -1324,9 +1329,10 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndI
 
     auto dense_config = moe_config;
     dense_config.moe = {};
-    DeviceGraphOrchestrator dense_orchestrator(
-        std::make_shared<Qwen35Graph>(dense_config, nullptr),
-        nullptr);
+    auto dense_graph = std::make_shared<Qwen35Graph>(dense_config, nullptr);
+    auto dense_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(dense_graph, nullptr, 1, 16, 16));
+    auto &dense_orchestrator = *dense_owner;
     EXPECT_FALSE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
         << "The capability requires initialized KV/MTP cache state, not just config.";
     ASSERT_TRUE(dense_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
@@ -1359,9 +1365,10 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndI
 
     auto undeclared_config = config_;
     undeclared_config.mtp.enabled = true;
-    DeviceGraphOrchestrator undeclared_orchestrator(
-        std::make_shared<QwenStandardGraph>(undeclared_config, nullptr),
-        nullptr);
+    auto undeclared_orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(undeclared_config, nullptr),
+            nullptr, 1, 16, 16));
+    auto &undeclared_orchestrator = *undeclared_orchestrator_owner;
     ASSERT_TRUE(undeclared_orchestrator.initializeInferenceStateFromArena(
         1, 16, DeviceId::cpu()));
     EXPECT_FALSE(
@@ -1389,6 +1396,7 @@ TEST_F(
 {
     GraphConfig replicated = makeMaintenanceMoEGraphConfig();
     replicated.layer_types = {"gdn", "full_attention"};
+    replicated.gdn.full_attention_interval = 2; // Same authored two-layer map for state admission.
     replicated.head_start = 0;
     replicated.local_n_heads = replicated.n_heads;
     replicated.local_n_kv_heads = replicated.n_kv_heads;
@@ -1398,9 +1406,10 @@ TEST_F(
     replicated.local_rank = 1;
     replicated.tp_config.reset();
 
-    DeviceGraphOrchestrator participant_one(
-        std::make_shared<Qwen35MoEGraph>(replicated, nullptr),
-        nullptr);
+    auto participant_one_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(replicated, nullptr),
+            nullptr, 1, 16, 16));
+    auto &participant_one = *participant_one_owner;
 
     ASSERT_TRUE(participant_one.initializeInferenceStateFromArena(
         /*batch_size=*/1,
@@ -1700,6 +1709,8 @@ TEST_F(Test__DeviceGraphOrchestrator, PreparedStoreIncludesDecodeReplicatedDense
     orchestrator.setDecodeReplicatedDenseWeightSet(
         std::make_unique<FrozenModelWeightSet>(strategy, decode_builder.freezeBindings()));
 
+    test::admitCPUPreparedStoreForTest(*shared_store,
+        {lm_head.get(), primary_attn_q.get(), decode_down.get()});
     ASSERT_NO_THROW(orchestrator.initializePreparedWeightStore(DeviceId::cpu()));
 
     auto decode_ref = shared_store->preparedRefForBinding(decode_binding_id, DeviceId::cpu());
@@ -2534,7 +2545,8 @@ TEST_F(Test__DeviceGraphOrchestrator, InferenceStateNotInitializedByDefault)
 
 TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateSuccess)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 2, 64, 64));
 
     // Initialize state
     int batch_size = 2;
@@ -2548,7 +2560,8 @@ TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateSuccess)
 
 TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 2, 64, 64));
 
     int batch_size = 2;
     int max_seq_len = 64;
@@ -2563,7 +2576,8 @@ TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
 
 TEST_F(Test__DeviceGraphOrchestrator, RequestBoundaryResetResetsPositions)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 2, 64, 64));
 
     int batch_size = 2;
     int max_seq_len = 64;
@@ -2610,7 +2624,8 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutState)
 
 TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutWeights)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 1, 64, 64));
 
     // Initialize state but not weights
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 64, DeviceId::cpu()));
@@ -2624,7 +2639,8 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutWeights)
 
 TEST_F(Test__DeviceGraphOrchestrator, InferenceStateMultipleBatches)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph_builder_, nullptr, 4, 128, 128));
 
     int batch_size = 4;
     int max_seq_len = 128;
@@ -2642,9 +2658,8 @@ TEST_F(Test__DeviceGraphOrchestrator, DisabledPrefixCacheDoesNotRecordBypassStat
 {
     auto custom_config = config_;
     custom_config.prefix_cache.enabled = false;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<QwenStandardGraph>(custom_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr, 1, 16, 16));
 
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
@@ -2671,9 +2686,8 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixCacheBudgetBypassIsReportedInProbe)
     custom_config.prefix_cache.block_size = 2;
     custom_config.prefix_cache.ram_budget_bytes = 1;
     custom_config.mtp.enabled = false;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<QwenStandardGraph>(custom_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr, 1, 16, 16));
 
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
@@ -4153,12 +4167,10 @@ TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintNamesEachLogicalPayload
     auto rank0_config = make_participant_config(0);
     auto rank1_config = make_participant_config(1);
 
-    auto rank0 = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<QwenStandardGraph>(rank0_config, nullptr),
-        nullptr);
-    auto rank1 = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<QwenStandardGraph>(rank1_config, nullptr),
-        nullptr);
+    auto rank0 = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(rank0_config, nullptr), nullptr, 1, 16, 16));
+    auto rank1 = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(rank1_config, nullptr), nullptr, 1, 16, 16));
 
     ASSERT_TRUE(rank0->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
     ASSERT_TRUE(rank1->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
@@ -4205,6 +4217,7 @@ TEST_F(Test__DeviceGraphOrchestrator,
 
     auto cfg = makeMaintenanceMoEGraphConfig();
     cfg.layer_types = {"gdn", "full_attention"};
+    cfg.gdn.full_attention_interval = 2; // Same authored two-layer map for state admission.
     cfg.moe = {};
     constexpr int blocks = 24;
     std::vector<int32_t> tokens(blocks * cfg.prefix_cache.block_size);
@@ -4214,7 +4227,10 @@ TEST_F(Test__DeviceGraphOrchestrator,
     PrefixPayloadLayout layout;
     uint64_t fingerprint = 0;
     {
-        DeviceGraphOrchestrator probe(std::make_shared<Qwen35Graph>(cfg, nullptr), nullptr);
+        auto probe_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35Graph>(cfg, nullptr),
+            nullptr, 1, static_cast<int>(tokens.size()), static_cast<int>(tokens.size())));
+        auto &probe = *probe_owner;
         probe.retainModelContext(context);
         ASSERT_TRUE(probe.initializeInferenceStateFromArena(1, tokens.size(), DeviceId::cpu()));
         const auto admission = probe.lookupPrefix(tokens);
@@ -4274,10 +4290,15 @@ TEST_F(Test__DeviceGraphOrchestrator,
     kv.hybrid_config = &hybrid;
     const size_t recurrent_bytes = hybrid.gdnStateGeometry().localPayloadBytes(hybrid.countGDNLayers());
     const size_t archive_scratch = PrefixArchiveIOGeometry::scratchBytes();
-    const size_t capacity = kv.estimateBytes() + recurrent_bytes + archive_scratch + cfg.prefix_cache.ram_budget_bytes;
+    auto restore_graph = std::make_shared<Qwen35Graph>(cfg, nullptr);
+    const size_t arena_bytes = test::cpuFixtureGraphRoots(*restore_graph, 1,
+        static_cast<int>(tokens.size())).cpuPhysicalBytes();
+    const size_t capacity = kv.estimateBytes() + recurrent_bytes + archive_scratch +
+        cfg.prefix_cache.ram_budget_bytes + arena_bytes;
     const PhysicalMemoryResource resource{.world_rank = 0, .device = DeviceId::cpu(),
         .total_bytes = capacity, .admission_available_bytes = capacity};
     PhysicalMemoryPlanBuilder plan;
+    plan.add(resource, PhysicalMemoryOwner::ActivationArena, arena_bytes);
     plan.add(resource, PhysicalMemoryOwner::KVCache, kv.estimateBytes());
     plan.add(resource, PhysicalMemoryOwner::RecurrentLiveState, recurrent_bytes);
     plan.add(resource, PhysicalMemoryOwner::PrefixArchiveStaging, archive_scratch);
@@ -4285,7 +4306,7 @@ TEST_F(Test__DeviceGraphOrchestrator,
     auto authority = std::make_shared<PhysicalMemoryAuthority>(
         std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
     auto runner = DeviceGraphOrchestrator::createForTest({
-        .model_ctx = context, .graph_builder = std::make_shared<Qwen35Graph>(cfg, nullptr),
+        .model_ctx = context, .graph_builder = restore_graph,
         .physical_memory_authority = authority});
     ASSERT_TRUE(runner->initializeInferenceStateFromArena(1, tokens.size(), DeviceId::cpu()));
     const auto hit = runner->lookupPrefix(tokens);
@@ -4350,9 +4371,8 @@ TEST(InferenceStateResetRequest, ServingGraphSetupScrubsAllOwnersAndPreservesExe
 TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingPrefix)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(moe_config, nullptr), nullptr, 1, 16, 16));
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
@@ -4404,9 +4424,8 @@ TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingP
 TEST_F(Test__DeviceGraphOrchestrator, GraphStableMoERuntimeMovementIsTrackedWithoutRekeyingPrefix)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(moe_config, nullptr), nullptr, 1, 16, 16));
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     PrefixLookupResult before = orchestrator->lookupPrefix({1, 2});
@@ -4540,9 +4559,8 @@ TEST_F(Test__DeviceGraphOrchestrator, InvalidateOnRebalanceRekeysGraphStableRunt
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.prefix_cache.moe_policy =
         PrefixCacheMoEPolicy::InvalidateOnRebalance;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(moe_config, nullptr), nullptr, 1, 16, 16));
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(
         1, 16, DeviceId::cpu()));
 
@@ -4566,7 +4584,9 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixLookupRetainsEpochUsedToBuildFingerp
     auto config = makeMaintenanceMoEGraphConfig();
     config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
     auto graph = std::make_shared<PublishingPrefixMoEGraph>(config);
-    DeviceGraphOrchestrator runner(graph, nullptr);
+    auto runner_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(graph, nullptr, 1, 16, 16));
+    auto &runner = *runner_owner;
     ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     const std::vector<int32_t> prompt = {1, 2};
@@ -4609,9 +4629,8 @@ TEST_F(
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.prefix_cache.moe_policy =
         PrefixCacheMoEPolicy::InvalidateOnRebalance;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
-        nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<Qwen35MoEGraph>(moe_config, nullptr), nullptr, 1, 16, 16));
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(
         1, 16, DeviceId::cpu()));
 
@@ -5070,7 +5089,8 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_AutoDefaultsToQ16He
     // Create config with FP32 precision, AUTO KV cache (default)
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr, 1, 64, 64));
 
     // Initialize state
     int batch_size = 1;
@@ -5091,7 +5111,8 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32Activation_Defau
 {
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr, 1, 64, 64));
 
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 64, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
@@ -5109,7 +5130,8 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_AutoDefaultsToQ16He
     // Create config with BF16 precision, AUTO KV cache (default)
     auto bf16_config = config_;
     bf16_config.activation_precision = ActivationPrecision::BF16;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(bf16_config, nullptr), nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(bf16_config, nullptr), nullptr, 1, 64, 64));
 
     // Initialize state
     int batch_size = 1;
@@ -6120,7 +6142,8 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_AllConsumersG
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualBatchSizeFromInferenceState)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
+    auto orchestrator = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr, 8, 64, 64));
 
     // Initialize inference state with specific batch size
     const int batch_size = 8;

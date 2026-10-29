@@ -7,6 +7,8 @@
  * another program after failed admission. Defaults resolve once per admitted participant; explicit
  * FP32 remains the original control program. The separate immutable setup schedule resolves
  * to8/33 before capture; native arguments never carry an unresolved phase.
+ * Identical CPU TP programs share one policy projection for the host address
+ * space; logical participant ownership and geometry remain in admission.
  * No native headers, environment reads or live state are needed here.
  */
 #pragma once
@@ -264,32 +266,49 @@ struct QwenSparseAttentionParticipantProgram
     }
 };
 /**
- * @brief Publish checked policy copies directly from admitted device inputs.
+ * @brief Publish checked immutable programs directly from admitted device inputs.
  * @param participants Only actual attention graph owners, never expert-only endpoints.
  * @return Shared immutable setup metadata; it owns no allocation or byte ledger.
- * @throws std::invalid_argument For missing, duplicate, invalid or conflicting participants.
+ * @throws std::invalid_argument For missing, invalid, overlapping or conflicting programs.
+ * @details Exact CPU program copies coalesce because CPU TP ranks share a host
+ * address space. This view contains no shard geometry, ownership or accounting;
+ * those remain participant-local in admission. GPU duplicates always fail.
  */
 inline std::shared_ptr<const std::vector<QwenSparseAttentionParticipantProgram>>
 sealQwenSparseAttentionParticipants(std::vector<QwenSparseAttentionParticipantProgram> participants)
 {
     if (participants.empty())
         throw std::invalid_argument("QSA admission has no attention participants");
-    for (auto it = participants.begin(); it != participants.end(); ++it)
+    std::vector<QwenSparseAttentionParticipantProgram> programs;
+    programs.reserve(participants.size());
+    for (const auto &participant : participants)
     {
-        if (!it->device.is_valid())
+        if (!participant.device.is_valid())
             throw std::invalid_argument("QSA admission has an invalid device");
-        validateQwenSparseAttentionResolvedPolicy(it->policy, it->device.type);
-        if (std::any_of(participants.begin(),
-                        it,
-                        [&](const auto &old)
-                        {
-                            return old.device == it->device && old.first_layer <= it->last_layer &&
-                                   it->first_layer <= old.last_layer;
-                        }))
+        validateQwenSparseAttentionResolvedPolicy(participant.policy, participant.device.type);
+        const auto overlap = std::find_if(programs.begin(), programs.end(),
+            [&](const auto &old)
+            {
+                return old.device == participant.device &&
+                       old.first_layer <= participant.last_layer &&
+                       participant.first_layer <= old.last_layer;
+            });
+        if (overlap != programs.end())
+        {
+            // Sharing immutable arithmetic does not merge CPU shard ownership.
+            // Coalesce exact source intervals only; even equal policies cannot
+            // authorize a broader or partially overlapping layer projection.
+            if (participant.device.is_cpu() &&
+                overlap->first_layer == participant.first_layer &&
+                overlap->last_layer == participant.last_layer &&
+                overlap->policy == participant.policy)
+                continue;
             throw std::invalid_argument("QSA admission duplicates an attention participant");
+        }
+        programs.push_back(participant);
     }
     return std::make_shared<const std::vector<QwenSparseAttentionParticipantProgram>>(
-        std::move(participants));
+        std::move(programs));
 }
 /**
  * @brief Borrow the actual admitted program; factories never resolve defaults.

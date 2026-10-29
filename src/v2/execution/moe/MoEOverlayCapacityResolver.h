@@ -13,6 +13,7 @@
  * Production setup supplies the authenticated GGUF layer manifest, inventory
  * limits, and the already-resolved fixed graph/KV bytes.  Tests can therefore
  * exhaust every codebook, topology, and failure mode without occupying a GPU.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
@@ -35,6 +36,7 @@
 
 namespace llaminar2
 {
+    struct CPUSerialExpertStorageAdmission;
     /** @brief Whether a tier's live quota is setup-resolved or explicitly fixed. */
     enum class MoEOverlayLiveQuotaMode : std::uint8_t
     {
@@ -393,6 +395,8 @@ namespace llaminar2
     /** @brief Immutable capacity result consumed by placement and admission. */
     struct MoEOverlayResolvedCapacityPlan
     {
+        /// CPU declaration identities retained verbatim through setup and model reuse.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         int num_experts = 0;
         /** Concrete setup decisions for each rank that actually owns PLE. */
         std::vector<std::shared_ptr<const ResolvedImmutableRowTablePlacement>> ngram_table_placements;
@@ -421,8 +425,10 @@ namespace llaminar2
      * @brief Frozen higher-priority row/quota result, deliberately not allocatable.
      *
      * Row and replica searches retain this value. Only admit() creates the one
-     * final certificate after setup-only table selection has completed; table
-     * failures cannot be caught as another row/quota candidate rejection.
+     * final certificate after setup-only table selection has completed. Explicit
+     * fixed-head storage participates in complete-BOM row feasibility without
+     * changing that candidate's expert grants. Automatic table placement remains
+     * below frozen rows and quotas; its failure cannot reopen their search.
      */
     class MoEOverlayCapacityDraft final
     {

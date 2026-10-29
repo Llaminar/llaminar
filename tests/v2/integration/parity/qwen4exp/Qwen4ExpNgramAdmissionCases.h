@@ -5,9 +5,11 @@
  * These three cases reuse the canonical typed expander without appending to
  * the twenty mathematical cells. The explicit GPU/CPU pipeline is selected
  * before planning: table admission may not reduce its weights, rows or cache.
+ * Source-only MTP expansion shares the paired-source policy while preserving
+ * these explicit table-placement constraints and their original inactive forms.
  */
 #pragma once
-#include "Qwen4ExpProductionParityCases.h"
+#include "Qwen4ExpSourceAdmissionCases.h"
 
 namespace llaminar2::test::parity::qwen4exp
 {
@@ -68,7 +70,7 @@ inline const std::vector<ModelParityCase> &qwen4ExpNgramAdmissionCases()
 inline OrchestrationConfig qwen4ExpNgramAdmissionConfig(
     const ModelParityCase &cell, const std::string &model_path, int rank)
 {
-    auto config = cell.makeOrchestrationConfig(model_path, rank);
+    auto config = qwen4ExpSourceAdmissionConfig(cell, model_path, rank);
     if (cell.topology.kind == ModelParityTopologyKind::RankLocalMultiDomain)
         config.max_gpu_memory_mb = 24u * 1024u;
     return config;

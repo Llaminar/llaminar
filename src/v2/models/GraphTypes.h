@@ -18,6 +18,7 @@
  *
  * A source-derived TP declaration accompanies the exact retained assignment.
  * It names original consumer identity, never a second assignment or byte ledger.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
@@ -107,6 +108,8 @@ namespace llaminar2
      */
     struct GraphConfig
     {
+        /// Exact frozen CPU endpoint/worker root declarations retained with admission.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         // Model architecture
         int n_layers = 0;       ///< Number of transformer layers (local count for PP stages)
         int total_n_layers = 0; ///< Total model layers (for absolute-index validation in PP)
@@ -1396,6 +1399,9 @@ namespace llaminar2
         MTPWeightBindings mtp;
 
         std::function<LayerWeightBindings(int layer_idx)> get_layer_weights;
+
+        /** @brief Exact persistent allocation owner carried from the frozen source plan. */
+        PhysicalMemoryOwner physical_memory_owner = PhysicalMemoryOwner::Count;
     };
 
     /**
@@ -1569,6 +1575,7 @@ namespace llaminar2
         std::optional<DeviceId> preferred_device = std::nullopt)
     {
         ModelWeightBindings bindings;
+        bindings.physical_memory_owner = weight_set.physicalMemoryOwner();
         bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
         bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");
         bindings.lm_head = optionalGlobalBinding(weight_set, "output.weight");

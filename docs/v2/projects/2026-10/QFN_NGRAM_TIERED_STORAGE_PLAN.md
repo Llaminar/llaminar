@@ -64,11 +64,21 @@ component work does not qualify distributed storage, MTP serving or HTTP.
 
 ## Next distributed runtime slice
 
-The first complete pooled slice will use one homogeneous, rank-local full-main
-TP domain, including zero-capacity GPU members. Actual TP members own their
-physical slots; one coordinator owns policy and one existing CPU RAM/SSD service
-handles source misses. PP, EP and heterogeneous ownership remain later explicit
-slices, with their own functional and performance gates below.
+The target separates storage owners from continuation consumers across CPU,
+CUDA and ROCm, including cross-vendor, TP, PP, composed and cross-rank domains.
+The declaration, ownership protocol, PMA BOM and transport interfaces must model
+those relations from the start. Homogeneous rank-local TP is the first native
+qualification slice, rather than a restriction embedded in the storage model.
+Zero-capacity, storage-only and consumer-only participants are explicit roles.
+One authority owns policy, each storage owner controls its slots and grants,
+and the admitted CPU RAM/SSD service handles source misses.
+
+The [pooled continuation implementation contract](QFN_POOLED_NGRAM_CONTINUATIONS.md)
+binds the next work to this full target and its admission, replay, numerical,
+communication and performance matrix. Extend the existing pooled protocol;
+do not substitute a restricted head-local cache product or advertise an
+unimplemented transport. Existing single-tier and single-GPU policies retain
+their separate contracts.
 
 The implementation review identifies three production responsibilities still
 missing beyond the existing physical-owner components:

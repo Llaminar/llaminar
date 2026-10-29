@@ -2,6 +2,9 @@
  * @file FP16Tensor.cpp
  * @brief FP16 tensor implementation (16-bit IEEE 754 half-precision)
  * @author David Sanftenberg
+ * Native CPU storage adoption moves the actual aligned backing, including its
+ * physical allocation lease, without initializing or copying a second payload.
+ * Exact CPU home identity and native extent are validated before publication.
  */
 
 #include "TensorClasses.h"
@@ -67,11 +70,13 @@ namespace llaminar2
 
     FP16Tensor::FP16Tensor(
         const std::vector<size_t> &shape,
-        AlignedVector<uint16_t> fp16_data)
-        : shape_(shape), device_(DeviceId::cpu()), is_view_(false),
+        AlignedVector<uint16_t> fp16_data, DeviceId device)
+        : shape_(shape), device_(device), is_view_(false),
           host_fp16_data_(std::move(fp16_data)), parent_data_ptr_(nullptr),
           view_offset_(0), parent_(nullptr), device_data_(nullptr)
     {
+        if (!device.is_valid() || !device.is_cpu())
+            throw std::invalid_argument("FP16Tensor owned CPU storage requires an exact CPU home device");
         if (shape.empty())
             throw std::invalid_argument("FP16Tensor: shape cannot be empty");
 

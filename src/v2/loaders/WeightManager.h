@@ -13,6 +13,8 @@
  * Parallel participant setup retains immutable TP assignment snapshots. Atomic
  * publication prevents a reconfiguration from invalidating another builder's
  * weight-slicing declaration, without serializing participant construction.
+ * Typed cache identities distinguish CPU logical TP shards in one host address
+ * space while preserving ordinary unsharded and GPU device cache ownership.
  *
  * @see GraphSchema.h for WeightShardingConfig structure
  * @see models/qwen/Qwen2Schema.h for Qwen2-specific sharding patterns
@@ -206,6 +208,23 @@ namespace llaminar2
                 PreparedWeightAdmission::AllocateCompleteSet);
 
         /**
+         * @brief Prepare only the exact logical participants owned by one graph.
+         * @param runtime_plan Original retained overlay source.
+         * @param graph_scope Required source-bound selection used for source materialization.
+         * @param frozen_weights Exact immutable graph source bindings.
+         * @param execution_plan Optional rank authority applied before logical scope.
+         * @param admission Explicit allocate or certified-reuse lifecycle.
+         * @return True after every selected request is prepared; missing bindings fail.
+         * @throws std::invalid_argument For foreign source or endpoint scope.
+         */
+        bool prepareMoEExpertOverlayWeightsForGraph(
+            const MoEExpertOverlayRuntimePlan &runtime_plan,
+            const MoEExpertOverlayGraphScope &graph_scope,
+            const FrozenModelWeightSet *frozen_weights,
+            const MoEExpertOverlayExecutionPlan *execution_plan,
+            PreparedWeightAdmission admission);
+
+        /**
          * @brief Prepare weights for a single device, filtered to a layer range
          *
          * Same as prepareWeightsForDevice(device) but only processes weights
@@ -265,11 +284,12 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Pack all GEMM weights for a target device
+         * @brief Prepare cache-owned primary GEMM weights for a CPU device.
          *
-         * Creates GEMM kernels for all GEMM weights and calls prepareWeights()
-         * on each kernel. For GPU kernels, this uploads weights to device memory.
-         * For CPU kernels, this is typically a no-op (packing is lazy).
+         * The model's prepared store retains each admitted final pack before
+         * optional raw source retirement. Repeated preparation shares that
+         * allocation. Other persistent owners use the frozen-weight overload
+         * of prepareWeightsForDevice; GPU devices use the loading pipeline.
          *
          * @param target_device Target device for weight packing
          * @param progress_cb Optional callback for progress reporting
@@ -573,6 +593,16 @@ namespace llaminar2
          */
         bool hostDataRequired(const TensorBase *tensor, const std::string &key) const;
 
+        /**
+         * @brief Materialize exactly the immutable sources declared by a weight plan.
+         * @param plan Required identities, physical slices and participant ownership.
+         * @return Frozen bindings retaining the declared source and slice lifetimes.
+         * @throws std::runtime_error If a required source is absent or an explicit
+         *         expert selection cannot supply its exact compact tensor geometry.
+         *
+         * An explicit expert selection never substitutes the complete parent:
+         * its physical expert slots must match the binding's logical ownership.
+         */
         FrozenModelWeightSet materialize(const WeightPlan &plan);
 
         /**
@@ -963,14 +993,44 @@ namespace llaminar2
         }
 
     private:
-        /** @brief Execute one already-compiled role-specific preparation transaction. */
+        /**
+         * @brief Compile explicit bulk or graph-scoped preparation into the shared backend.
+         * @param runtime_plan Retained complete overlay source.
+         * @param target_device Physical execution device.
+         * @param frozen_weights Exact prepared-source lifetime authority.
+         * @param execution_plan Optional current-rank authority.
+         * @param admission Allocation or certified-reuse lifecycle.
+         * @param graph_scope Exact graph scope, or explicit existing device-wide operation.
+         * @return True after the shared preparation backend completes every request.
+         */
+        bool prepareMoEExpertOverlayWeightsWithScope(
+            const MoEExpertOverlayRuntimePlan &runtime_plan,
+            DeviceId target_device,
+            const FrozenModelWeightSet *frozen_weights,
+            const MoEExpertOverlayExecutionPlan *execution_plan,
+            PreparedWeightAdmission admission,
+            const std::optional<MoEExpertOverlayGraphScope> &graph_scope);
+
+        /**
+         * @brief Execute one already-compiled role-specific preparation transaction.
+         * @param runtime_plan Immutable source authenticated by graph scope.
+         * @param preparation_plan Complete source-authenticated role requests.
+         * @param target_device Actual graph or complete device-wide preparation endpoint.
+         * @param frozen_weights Immutable exact physical source bindings.
+         * @param execution_plan Optional rank ownership filter.
+         * @param admission Allocation or certified-reuse lifecycle.
+         * @param graph_scope Required for participant-local graph calls; absent for bulk calls.
+         * @return True only when all selected requests have prepared engines.
+         * @throws std::invalid_argument For stale source or device identity.
+         */
         bool prepareMoEExpertOverlayWeightsFromPlan(
             const MoEExpertOverlayRuntimePlan &runtime_plan,
             MoEExpertOverlayPreparationPlan preparation_plan,
             DeviceId target_device,
             const FrozenModelWeightSet *frozen_weights,
             const MoEExpertOverlayExecutionPlan *execution_plan,
-            PreparedWeightAdmission admission);
+            PreparedWeightAdmission admission,
+            const std::optional<MoEExpertOverlayGraphScope> &graph_scope);
 
         /**
          * @brief Load weight with replicated strategy
@@ -1309,9 +1369,68 @@ namespace llaminar2
         /// Progress tracker for weight loading (shared across devices)
         std::shared_ptr<WeightLoadProgress> weight_load_progress_;
 
-        /// Key: "device_type:ordinal:weight_name" e.g. "cuda:0:token_embd.weight"
-        /// Value: Device-specific tensor clone, uploaded to that device
-        std::unordered_map<std::string, std::shared_ptr<TensorBase>> per_device_cache_;
+        /**
+         * @brief One physical-device weight or a logical CPU TP participant's weight.
+         *
+         * CPU NUMA participants and host-staged GPU sources share DeviceId::cpu(),
+         * so their immutable TP assignment rank is required in addition to
+         * storage identity. GPU storage identities already distinguish their participants. Unsharded
+         * requests never alias a rank-qualified CPU shard.
+         */
+        struct DeviceWeightCacheKey
+        {
+            DeviceId device;
+            std::string name;
+            std::optional<int> cpu_tp_rank;
+
+            /** @return Exact equality of storage, canonical name and participant. */
+            bool operator==(const DeviceWeightCacheKey &) const = default;
+            /** @return Diagnostic spelling only; cache operations never parse it. */
+            std::string describe() const
+            {
+                return device.to_string() +
+                    (cpu_tp_rank ? "[tp_rank=" + std::to_string(*cpu_tp_rank) + "]" : "") +
+                    ":" + name;
+            }
+            /**
+             * @brief Construct ordinary device identity for unsharded/GPU access.
+             * @param device Actual storage endpoint.
+             * @param name Canonical requested weight name.
+             * @return Identity with no CPU TP participant.
+             */
+            static DeviceWeightCacheKey forDevice(DeviceId device, const std::string &name)
+            { return {device, name, std::nullopt}; }
+            /**
+             * @brief Preserve logical shard ownership in shared host storage.
+             * @param device Actual storage endpoint, which may be CPU during preparation.
+             * @param name Canonical requested weight name.
+             * @param assignment Retained canonical TP participant assignment.
+             * @return Device identity plus logical rank whenever actual storage is CPU.
+             * @details GPU participants can explicitly stage distinct sources on CPU.
+             * Their execution device cannot identify those shared host cache slots.
+             */
+            static DeviceWeightCacheKey forAssignment(DeviceId device, const std::string &name,
+                                                       const DeviceShardingAssignment &assignment)
+            {
+                return {device, name, device.is_cpu()
+                    ? std::optional<int>{assignment.local_rank} : std::nullopt};
+            }
+        };
+        /** @brief Hash every typed cache identity field without string encodings. */
+        struct DeviceWeightCacheKeyHash
+        {
+            /** @return Combined storage/name/participant hash; equality remains authoritative. */
+            size_t operator()(const DeviceWeightCacheKey &key) const noexcept
+            {
+                size_t hash=std::hash<DeviceId>{}(key.device);
+                for(const size_t value:{std::hash<std::string>{}(key.name),
+                                       std::hash<std::optional<int>>{}(key.cpu_tp_rank)})
+                    hash ^= value + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                return hash;
+            }
+        };
+        std::unordered_map<DeviceWeightCacheKey, std::shared_ptr<TensorBase>,
+                           DeviceWeightCacheKeyHash> per_device_cache_;
 
         /// First device that requested weights - original tensors are used for this device
         std::optional<DeviceId> first_device_;

@@ -6,8 +6,10 @@
  * no device or model payload is loaded. Tests call the same RankOrchestrator
  * projection used by both nested TP and single-device PP construction, including
  * foreign scopes, endpoint substitutions, mode changes and terminal MTP banks.
+ * CPU root declarations remain stage-owned across child projection and reuse.
  */
 #include "execution/moe/MoEOverlayPipelineStageBinding.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoEOverlayParticipantResidency.h"
@@ -760,5 +762,51 @@ namespace llaminar2::test
         std::swap(parent.pp_stages[0].moe_runtime, parent.pp_stages[1].moe_runtime);
         EXPECT_FALSE(parent.validate());
         EXPECT_THROW((void)parent.forPipelineStage(0), std::invalid_argument);
+    }
+
+    /** @test PP child projection and reuse retain each stage's exact CPU allocator/controller declaration. */
+    TEST(Test__MoEOverlayPipelineStageBinding, ProjectsDistinctCpuStorageDeclarationsAcrossStageReuse)
+    {
+        StageFixture first(0,false,0,DeviceType::CPU,1,MoERebalanceRuntimeMode::Off,0);
+        StageFixture last(2,true,0,DeviceType::CPU,1,MoERebalanceRuntimeMode::Off,1);
+        declarePipelineGenerationDomain(first,last);
+        const auto declaration=[](DeviceId device,int rows) {
+            auto result=std::make_shared<CPUSerialExpertStorageAdmission>();
+            result->allocator={0,device};
+            result->participant_ids={0};
+            result->controller_devices={device};
+            result->envelope=std::make_shared<const CPUSerialExpertStorageEnvelope>(device,rows,1,8,2,
+                std::vector<int>{1,2,4,8,16},1,8,true,CPUSerialExpertFamilyPolicy::LocalPowerOfTwo,16,4);
+            return result;
+        };
+        auto first_declaration=declaration(DeviceId(DeviceType::CPU,0),5);
+        auto last_declaration=declaration(DeviceId(DeviceType::CPU,1),9);
+        first.owners.cpu_serial_expert_storage={first_declaration};
+        last.owners.cpu_serial_expert_storage={last_declaration};
+        auto parent=densePipeline();
+        parent.pp_stages={first.stage(),last.stage()};
+        parent.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        for(int replay=0;replay<3;++replay)
+        {
+            const auto retained=parent;
+            const auto a=retained.forPipelineStage(0);
+            const auto b=retained.forPipelineStage(1);
+            ASSERT_EQ(a.cpu_serial_expert_storage.size(),1u);
+            ASSERT_EQ(b.cpu_serial_expert_storage.size(),1u);
+            EXPECT_TRUE(*a.cpu_serial_expert_storage.front()==*first_declaration);
+            EXPECT_TRUE(*b.cpu_serial_expert_storage.front()==*last_declaration);
+            EXPECT_FALSE(*a.cpu_serial_expert_storage.front()==*b.cpu_serial_expert_storage.front());
+            EXPECT_NO_THROW((void)requireCPUSerialExpertStorageAdmission(a.cpu_serial_expert_storage,
+                first_declaration->allocator,0,DeviceId(DeviceType::CPU,0)));
+            EXPECT_THROW((void)requireCPUSerialExpertStorageAdmission(a.cpu_serial_expert_storage,
+                last_declaration->allocator,0,DeviceId(DeviceType::CPU,1)),std::invalid_argument);
+        }
+        // Structural equality survives an independent metadata copy.
+        auto copy=std::make_shared<CPUSerialExpertStorageAdmission>(*first_declaration);
+        copy->envelope=std::make_shared<const CPUSerialExpertStorageEnvelope>(*first_declaration->envelope);
+        EXPECT_NE(copy->envelope.get(),first_declaration->envelope.get());
+        EXPECT_TRUE(*copy==*first_declaration);
+        parent.cpu_serial_expert_storage={first_declaration};
+        EXPECT_THROW((void)parent.forPipelineStage(0),std::invalid_argument);
     }
 }

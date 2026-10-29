@@ -10,6 +10,7 @@
  * original sources and adequate arenas, independently of floating-source policy.
  * No checkpoint or accelerator is required.
  */
+#include "../../../utils/CPUPreparedStoreTestAdmission.h"
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
@@ -47,8 +48,11 @@ struct BasicFixture
         activated{{rows,rank},DeviceId::cpu()},logits{{rows,channels},DeviceId::cpu()},mixed{{rows,hidden},DeviceId::cpu()},
         block{{rows,hidden},DeviceId::cpu()},injectionLogits{{rows,4},DeviceId::cpu()},output{{rows,channels},DeviceId::cpu()};
     WeightBinding downBinding,upBinding,injectBinding;
-    /** @brief Initialize finite fixtures and use production CPU weight preparation. */
-    BasicFixture()
+    /** @brief Initialize finite fixtures and use production CPU weight preparation.
+     * @param quantized_up Optional original source prepared by the derived row-authority fixture.
+     */
+    explicit BasicFixture(std::unique_ptr<TensorBase> quantized_up = {})
+        : originalUp(std::move(quantized_up))
     {
         for(int i=0;i<channels;++i)gain.mutable_data()[i]=0.5f+static_cast<float>(i/hidden)*0.25f;
         for(TensorBase *tensor:std::vector<TensorBase *>{&down,&up,&inject})
@@ -56,6 +60,9 @@ struct BasicFixture
                 tensor->mutable_data()[index]=static_cast<float>(static_cast<int>(index%11)-5)/37.0f;
         for(std::size_t index=0;index<embedding.numel();++index)
             embedding.mutable_data()[index]=static_cast<float>(static_cast<int>(index%13)-6)/11.0f;
+        std::vector<const TensorBase *> prepared_sources{&down, &up, &inject};
+        if (originalUp) prepared_sources.push_back(originalUp.get());
+        test::admitCPUPreparedStoreForTest(store, prepared_sources);
         downBinding=prepare(down,"mixer.down.weight");
         upBinding=prepare(up,"mixer.up.weight");
         injectBinding=prepare(inject,"mixer.inject.weight");
@@ -117,10 +124,10 @@ struct QuantizedRowFixture : BasicFixture<512,256>
      * @param source Optional all-format source; default is a legal original Q8_0 matrix.
      */
     explicit QuantizedRowFixture(std::unique_ptr<TensorBase> source={})
-    {
-        originalUp=source ? std::move(source) : std::make_unique<Q8_0Tensor>(
+        : BasicFixture<512,256>(source ? std::move(source) : std::make_unique<Q8_0Tensor>(
             std::vector<std::size_t>{channels,rank},
-            std::vector<std::uint8_t>(std::size_t(channels)*rank/32*sizeof(Q8_0Block)));
+            std::vector<std::uint8_t>(std::size_t(channels)*rank/32*sizeof(Q8_0Block))))
+    {
         upBinding=prepare(*originalUp,"blk.0.hc_ffn_up.weight");
     }
 };

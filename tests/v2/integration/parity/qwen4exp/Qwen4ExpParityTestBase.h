@@ -15,6 +15,7 @@
 #pragma once
 #include "config/OrchestrationConfigParser.h"
 #include "Qwen4ExpProductionParityCases.h"
+#include "Qwen4ExpSourceAdmission.h"
 #include "Qwen4ExpPrefillAcceptance.h"
 #include "Qwen4ExpMTPExpertReference.h"
 #include "Qwen4ExpLookupRecordEvidence.h"
@@ -451,99 +452,10 @@ protected:
      */
     void assertGPUAdaptiveNativeOwners()
     {
-        const auto &cell=static_cast<const Derived *>(this)->modelParityCase();
-        ASSERT_TRUE(cell.ngram_table_policy);ASSERT_TRUE(cell.ngram_table_policy->isGPUAdaptive());
-        const auto *context=Base::activeModelContextForDiagnostics();ASSERT_NE(context,nullptr);
-        const auto placement=context->resolvedImmutableRowTablePlacement();ASSERT_TRUE(placement);
-        ASSERT_TRUE(placement->isGPUAdaptive());placement->requireRequestedPolicy(*cell.ngram_table_policy);
-        const auto &layout=placement->gpuAdaptiveLayout();const auto &request=placement->gpuAdaptiveRequest();
-        ASSERT_EQ(layout.consumers().size(),1u);ASSERT_EQ(layout.sourceServices().size(),1u);
-        ASSERT_EQ(layout.owners().size(),2u);ASSERT_EQ(placement->allocators().size(),2u);
-        const auto gpu=layout.consumers().front(),host=layout.sourceServices().front().allocator;
-        ASSERT_TRUE(gpu.device.is_gpu());ASSERT_TRUE(host.device.is_cpu());EXPECT_EQ(gpu.world_rank,host.world_rank);
-        EXPECT_EQ(placement->lookupForConsumer(gpu),ImmutableRowLookupExecution::AdaptiveGPUCache);
-        const auto boundary=context->adaptiveImmutableLookupBoundary(gpu.device);ASSERT_TRUE(boundary);
-        ASSERT_TRUE(boundary->isAdaptive());EXPECT_EQ(boundary->device(),gpu.device);
-        EXPECT_EQ(context->adaptiveImmutableLookupBoundary(gpu.device).get(),boundary.get());
-        const auto provider=context->hostImmutableRowProvider();ASSERT_TRUE(provider);
-        EXPECT_EQ(provider->mode(),HostImmutableRowMode::AdaptiveRAMSSD);
-        EXPECT_EQ(provider->subordinateRequester(),std::optional{gpu});
-        EXPECT_EQ(provider->maximumLiveRows(),placement->gpuAdaptiveMaximumLiveRows());
-        // Authenticate source coordinates against the public original GGUF
-        // directory and ordered artifact set. Do not widen ModelContext's
-        // private materialization extractor merely for fixture convenience.
-        const auto &source=provider->source();
-        EXPECT_EQ(source.tensor_name,"per_layer_token_embd.weight");
-        const auto &directory=context->model();
-        const auto *native=directory.findTensor("per_layer_token_embd.weight");
-        ASSERT_NE(native,nullptr);ASSERT_EQ(native->dimensions.size(),2u);
-        const auto split=static_cast<std::size_t>(native->split_idx);
-        const auto artifacts=context->artifactPaths();ASSERT_LT(split,artifacts.size());
-        if(directory.split_count>1) { ASSERT_LT(split,directory.split_data_offsets.size()); }
-        const auto data_offset=directory.split_count>1?directory.split_data_offsets[split]:directory.data_offset;
-        ASSERT_LE(native->offset,std::numeric_limits<std::uint64_t>::max()-data_offset);
-        EXPECT_EQ(source.path,artifacts[split]);EXPECT_EQ(source.tensor_name,native->name);
-        EXPECT_EQ(source.file_offset,data_offset+native->offset);EXPECT_EQ(source.format,native->type);
-        EXPECT_EQ(source.rows,native->dimensions[0]);EXPECT_EQ(source.row_elements,native->dimensions[1]);
-        EXPECT_EQ(source.tensorBytes(),native->size_bytes);
-        EXPECT_EQ(provider->source().rowBytes(),placement->extent().rowBytes());
-        EXPECT_EQ(provider->source().rows,placement->extent().rows());
-        EXPECT_EQ(provider->source().row_elements,placement->gpuAdaptiveRowElements());
-        ASSERT_NO_THROW(provider->authenticateSource());
-        EXPECT_EQ(context->residentImmutableRowTable(gpu.device),nullptr);
-        EXPECT_EQ(context->residentImmutableRowTableBytes(gpu.device),0u);
-        const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),request);
-        const auto gpu_slots=geometry.gpu().slots();
-        const auto ram_slots=geometry.host().slots();
-        EXPECT_LE(gpu_slots,request.maximum_gpu_cache_rows);EXPECT_LE(ram_slots,request.host.maximum_cache_rows);
-        if(request.maximum_gpu_cache_rows && request.gpu_cache_physical_byte_limit)
-        {
-            EXPECT_GT(gpu_slots,0u) << "Positive GPU-cache cell cannot certify a zero optional grant";
-        }
-        else { EXPECT_EQ(gpu_slots,0u); }
-        if(request.host.maximum_cache_rows && request.host.cache_physical_byte_limit)
-        {
-            EXPECT_GT(ram_slots,0u) << "Positive RAM-cache cell cannot certify a zero optional grant";
-        }
-        else { EXPECT_EQ(ram_slots,0u); }
-        const auto roots=boundary->adaptiveRoots();ASSERT_TRUE(roots.frame);ASSERT_TRUE(roots.protocol);
-        EXPECT_EQ(bool(roots.cache),gpu_slots!=0);EXPECT_TRUE(roots.frame->is_raw_data_released());
-        EXPECT_TRUE(roots.protocol->is_raw_data_released());
-        if(roots.cache) { EXPECT_TRUE(roots.cache->is_raw_data_released()); }
-        EXPECT_EQ(roots.frame.get(),boundary->adaptiveRoots().frame.get());
-        EXPECT_EQ(roots.protocol.get(),boundary->adaptiveRoots().protocol.get());
-        const auto gpu_owner=boundary->rootStorage()->retainedOwnerObservation();
-        const auto source_owner=boundary->retainedSourceOwnerObservation();
-        const auto provider_owner=provider->retainedOwnerObservation();
-        const auto retained=Base::orch_runner_->modelContextReuseContract();ASSERT_TRUE(retained);
-        ASSERT_TRUE(retained->physical_memory_authority);
-        const auto &memory=retained->physical_memory_authority;
-        ASSERT_NO_THROW(boundary->rootStorage()->requireFor(geometry.gpu().nativePlan(),memory));
-        EXPECT_EQ(gpu_owner.authority().get(),memory.get());EXPECT_EQ(source_owner.authority().get(),memory.get());
-        EXPECT_EQ(provider_owner.authority().get(),memory.get());
-        EXPECT_EQ(gpu_owner.allocator(),gpu);EXPECT_EQ(source_owner.allocator(),host);
-        EXPECT_EQ(source_owner.hostPlacement(),placement->hostPlacement());
-        EXPECT_EQ(source_owner.tableStorageBytes(),provider_owner.tableStorageBytes());
-        EXPECT_GE(source_owner.lookupStagingBytes(),provider_owner.lookupStagingBytes());
-        EXPECT_EQ(source_owner.lookupStagingBytes()-provider_owner.lookupStagingBytes(),
-            ::llaminar2::qwen4exp::ImmutableLookupService::hostBytes(geometry.gpu().channelLayout()));
-        EXPECT_EQ(gpu_owner.tableStorageBytes(),geometry.gpu().cache().bytes);
-        EXPECT_EQ(gpu_owner.lookupStagingBytes(),geometry.gpu().mandatoryDeviceBytes());
-        EXPECT_LE(gpu_owner.tableStorageBytes(),request.gpu_cache_physical_byte_limit);
-        EXPECT_LE(geometry.host().storageBytes(),request.host.cache_physical_byte_limit);
-        const auto attestation=memory->rankAttestation();
-        const auto requireLedger=[&](PhysicalMemoryAllocatorIdentity allocator,PhysicalMemoryOwner owner,std::size_t live) {
-            const auto line=std::find_if(attestation.begin(),attestation.end(),[&](const auto &row) {
-                return row.identity==allocator && row.owner==owner;
-            });
-            ASSERT_NE(line,attestation.end());
-            ASSERT_LE(line->materialized_new_bytes,std::numeric_limits<std::size_t>::max()-line->adopted_resident_bytes);
-            EXPECT_EQ(line->materialized_new_bytes+line->adopted_resident_bytes,live);
-        };
-        ASSERT_NO_FATAL_FAILURE(requireLedger(gpu,PhysicalMemoryOwner::ImmutableTableStorage,gpu_owner.tableStorageBytes()));
-        ASSERT_NO_FATAL_FAILURE(requireLedger(gpu,PhysicalMemoryOwner::ImmutableLookupStaging,gpu_owner.lookupStagingBytes()));
-        ASSERT_NO_FATAL_FAILURE(requireLedger(host,PhysicalMemoryOwner::ImmutableTableStorage,source_owner.tableStorageBytes()));
-        ASSERT_NO_FATAL_FAILURE(requireLedger(host,PhysicalMemoryOwner::ImmutableLookupStaging,source_owner.lookupStagingBytes()));
+        // The setup-only and numerical fixtures consume the same retained
+        // native owners/PMA attestation; neither reconstructs a live ledger.
+        ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceGPUAdaptiveOwners(
+            static_cast<const Derived *>(this)->modelParityCase(), *Base::orch_runner_));
     }
 
     /**

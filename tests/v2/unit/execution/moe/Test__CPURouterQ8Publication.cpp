@@ -9,6 +9,7 @@
  * throughput threshold belongs in this functional Unit/preflight regression.
  */
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../../utils/CPURouterKernelTestAdmission.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
@@ -80,6 +81,7 @@ void provePublication(PublicationCase shape, int workers)
     // Each reference row uses the same public serial boundary as ordinary
     // decode. Independent block-arithmetic oracles live in the rounding gate.
     CPUMoEKernel serial;
+    admitCPURouterKernelForTest(serial,1,shape.width);
     std::vector<Q8_1Block> expected(size_t(source_rows) * blocks);
     for (int row = 0; row < source_rows; ++row)
     {

@@ -19,7 +19,7 @@
  * Weights are arranged in N-blocks of 64 columns for AVX-512 SIMD:
  *
  * ```
- * payload: [N_chunks][blocks_per_row][64][payload_bytes]
+ * setup-only source payload: [N_chunks][blocks_per_row][64][payload_bytes]
  *   - N_chunks = ceil(N/64)
  *   - blocks_per_row = ceil(K/32)
  *   - payload_bytes = format-specific (Q4_0=16, IQ4_NL=16, Q6_K=24, etc.)
@@ -30,6 +30,10 @@
  * mins: [N_chunks][blocks_per_row][64] × uint16_t (asymmetric/dual-scale)
  *   - FP16 minimum/second scale; Q6_K packs signed coefficients, IQ2_S/IQ4_XS raw source coefficients
  * ```
+ *
+ * Source payload and metadata are interleaved into the sole retained execution
+ * bank before publication. Legacy archive payload sections are accepted during
+ * import and retired by the engine publication boundary.
  *
  * This layout ensures:
  * - Sequential K-block streaming within an N-chunk → good prefetch/cache line use
@@ -153,12 +157,12 @@ namespace llaminar2::cpu::native_vnni
      *
      * ## Layout
      *
-     * Weights are stored in two complementary layouts:
+     * Newly prepared weights retain one execution representation. Source-order
+     * nibble bytes are temporary setup storage; scalar diagnostics reconstruct
+     * their bounded block from the same interleaved bytes as AVX2/AVX512.
+     * The optional payload member remains solely for archive compatibility.
      *
-     * 1. **payload**: Raw native bytes in [N_chunks][bpr][64][payload_bytes] layout
-     *    Used by the scalar reference path.
-     *
-     * 2. **native_interleaved**: VNNI-interleaved bytes with inline metadata:
+     * **native_interleaved**: VNNI-interleaved bytes with inline metadata:
      *    `[N_chunks][bpr][ groups×4 ZMMs×64B | 128B comp | 128B scales | 128B mins ]`
      *    Each 64-byte ZMM holds 16 columns × 4 consecutive native payload bytes.
      *    Metadata (comp, scales, mins) is embedded at the end of each K-block
@@ -202,8 +206,8 @@ namespace llaminar2::cpu::native_vnni
 
     struct CPUNativeVNNIPackedWeights
     {
-        /// Raw native payload bytes in [N_chunks][blocks_per_row][64][payload_bytes] layout
-        /// Only populated for the legacy scalar nibble-format oracle.
+        /// Optional source-order archive compatibility section. Newly prepared
+        /// engines leave it empty; publication retires imported legacy bytes.
         AlignedVector<uint8_t> payload;
 
         /// VNNI-interleaved weight data with inline metadata (64-byte aligned).
@@ -366,13 +370,6 @@ namespace llaminar2::cpu::native_vnni
         // Accessors for the kernel inner loop
         // -------------------------------------------------------------------
 
-        /// Payload pointer for N-chunk c, K-block kb, column n_local (within chunk)
-        inline const uint8_t *blockPayload(int c, int kb, int n_local) const
-        {
-            size_t offset = ((size_t)c * blocks_per_row * 64 + (size_t)kb * 64 + n_local) * payload_bytes;
-            return payload.data() + offset;
-        }
-
 #if defined(__AVX512F__)
         /** @brief Load sixteen effective scales without rounding source products to half.
          * @param primary Aligned inline primary words, within one64-column unit.
@@ -507,13 +504,6 @@ namespace llaminar2::cpu::native_vnni
             return reinterpret_cast<const uint32_t *>(interleavedBase() + offset + data_stride + 256);
         }
 
-        /// Payload pointer for N-chunk c, K-block kb (contiguous 64 × payload_bytes)
-        inline const uint8_t *chunkPayload(int c, int kb) const
-        {
-            size_t offset = ((size_t)c * blocks_per_row + kb) * 64 * payload_bytes;
-            return payload.data() + offset;
-        }
-
         /// Native-interleaved B data for N-chunk c, K-block kb, group g, ZMM z (0..3)
         /// Returns pointer to 64 bytes: 16 columns × 4 values each.
         /// For nibble-LUT: group ∈ [0,3], each holds 4 native payload bytes.
@@ -575,6 +565,19 @@ namespace llaminar2::cpu::native_vnni
         {
             size_t offset = ((size_t)c * blocks_per_row * 64 + (size_t)kb * 64 + n_local) * 32;
             return int8_flat.data() + offset;
+        }
+
+        /**
+         * @brief Retire optional legacy source-order bytes at execution publication.
+         *
+         * Archive readers retain the optional wire section until import has
+         * completed. CPU engines use only eager interleaved bytes, including
+         * scalar diagnostics, so publication must not retain this second matrix.
+         */
+        void releaseSourcePayload()
+        {
+            AlignedVector<uint8_t> empty;
+            payload.swap(empty);
         }
 
         /// Release the intermediate INT8 decode buffer to save memory.
@@ -1192,6 +1195,9 @@ namespace llaminar2::cpu::native_vnni
             return false;
         }
 
+        // Reusing an archive-imported container must not preserve its optional
+        // source-order matrix when constructing a new canonical execution bank.
+        out.releaseSourcePayload();
         int N = row_end - row_start;
         int N_padded = (N + 63) / 64 * 64;
         int blocks_per_row = (K + 31) / 32;
@@ -1583,14 +1589,15 @@ namespace llaminar2::cpu::native_vnni
             // =================================================================
             // NIBBLE-LUT PATH (Q4_0, IQ4_NL, Q4_1, IQ4_XS)
             //
-            // Store raw native payload bytes + VNNI-interleaved native bytes.
+            // Source-order payload is setup scratch, never retained weight
+            // storage. Every execution path consumes the final interleaved bytes.
             // The GEMV kernel decodes nibbles at runtime via vpshufb LUT.
             // Memory: 0.5 byte/element (half of INT8).
             // =================================================================
 
             temp_scales.assign(total_blocks, 0);
             temp_mins.assign(total_blocks, 0);
-            out.payload.resize(total_blocks * fmt->payload_bytes, 0);
+            std::vector<uint8_t> source_payload(total_blocks * fmt->payload_bytes, 0);
 
 // Pass 1: Extract scales/mins from superblocks
 #pragma omp parallel for schedule(static)
@@ -1672,7 +1679,7 @@ namespace llaminar2::cpu::native_vnni
                             temp_scales[cpu_idx] = temp_scales2[gpu_idx];
                             temp_mins[cpu_idx] = temp_mins2[gpu_idx];
                         }
-                        std::memcpy(out.payload.data() + cpu_idx * fmt->payload_bytes,
+                        std::memcpy(source_payload.data() + cpu_idx * fmt->payload_bytes,
                                     temp_payload.data() + gpu_idx * fmt->payload_bytes,
                                     fmt->payload_bytes);
                     }
@@ -1691,7 +1698,8 @@ namespace llaminar2::cpu::native_vnni
             {
                 for (int kb = 0; kb < blocks_per_row; ++kb)
                 {
-                    const uint8_t *chunk_payload = out.chunkPayload(chunk, kb);
+                    const uint8_t *chunk_payload = source_payload.data() +
+                        ((size_t)chunk * blocks_per_row + kb) * 64 * fmt->payload_bytes;
                     int n_cols = std::min(64, N - chunk * 64);
 
                     size_t block_offset = ((size_t)chunk * blocks_per_row + kb) * out.interleaved_block_stride;

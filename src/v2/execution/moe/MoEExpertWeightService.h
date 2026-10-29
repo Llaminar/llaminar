@@ -7,7 +7,8 @@
  * and during dynamic rebalancing — NOT during inference execution.
  *
  * All methods are static (stateless service). State lives in MoEWeightContext
- * which references MoEExpertComputeStage::Params fields.
+ * which references MoEExpertComputeStage::Params fields. Registry consumers
+ * retain shared engines and cannot destructively retire another consumer's bytes.
  */
 
 #pragma once
@@ -18,6 +19,7 @@
 #include "../../backends/BackendManager.h"
 #include "../../backends/DeviceId.h"
 #include "../../loaders/ExpertSlabTypes.h"
+#include "../../memory/CPUWeightStoragePlacement.h"
 
 #include <memory>
 #include <optional>
@@ -36,6 +38,20 @@ class PreparedWeightStore;
 class ExpertGemmRegistry;
 class GpuExpertSlotPool;
 class GpuExpertTransferStagingPool;
+
+/**
+ * @brief Select the preparation and retirement authority for expert weights.
+ *
+ * Standalone graphs may prepare their bound raw parents and retire those
+ * allocations. ExpertOverlay graphs receive participant-scoped engines from
+ * ExpertGemmRegistry. They release only their own references; the canonical
+ * owner retires the storage after every graph and residency reader has left.
+ */
+enum class MoEExpertWeightResolutionPolicy : uint8_t
+{
+    RawOrPrepared = 0,
+    PreparedRegistryOnly = 1,
+};
 
 /**
  * @brief Typed NUMA ownership policy for persistent CPU expert weights.
@@ -183,6 +199,40 @@ struct MoEWeightContext {
     // Required typed policy: omission at a new construction site is a compile
     // error instead of silently disabling strict arrival placement.
     CPUExpertNUMAPlacement cpu_numa_placement;
+
+    /** @brief Registry consumers retain shared weights; standalone stages own destructive retirement. */
+    MoEExpertWeightResolutionPolicy weight_resolution_policy =
+        MoEExpertWeightResolutionPolicy::RawOrPrepared;
+
+    /**
+     * @brief Initial routed preparation's exact physical allocation authority.
+     *
+     * WeightManager supplies an admitted placement only for newly packed
+     * canonical engines. The packed storage retains its own allocation lease;
+     * registry aliases and graph consumers do not acquire duplicate claims.
+     * Runtime migration continues to use its independently admitted slot pool.
+     */
+    std::optional<CPUWeightStoragePlacement> initial_cpu_storage_placement;
+
+    /** @brief Exact persistent owner authored by the frozen weight plan. */
+    PhysicalMemoryOwner persistent_weight_owner = PhysicalMemoryOwner::Count;
+
+    /**
+     * @brief Whether this context may retire canonical prepared allocations and aliases.
+     * @return True only for standalone graph-owned preparation.
+     * @throws std::invalid_argument For an unrecognized lifecycle policy.
+     */
+    [[nodiscard]] bool ownsPreparedEngineWeights() const
+    {
+        switch (weight_resolution_policy)
+        {
+        case MoEExpertWeightResolutionPolicy::RawOrPrepared:
+            return true;
+        case MoEExpertWeightResolutionPolicy::PreparedRegistryOnly:
+            return false;
+        }
+        throw std::invalid_argument("Unknown MoE expert weight resolution policy");
+    }
 
 };
 

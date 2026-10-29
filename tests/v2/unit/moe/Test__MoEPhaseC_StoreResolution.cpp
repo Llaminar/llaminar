@@ -18,6 +18,7 @@
 #include "loaders/ExpertSlabTypes.h"
 #include "tensors/TensorKernels.h"
 #include "backends/DeviceId.h"
+#include "../../utils/CPUPreparedStoreTestAdmission.h"
 
 using namespace llaminar2;
 
@@ -217,6 +218,9 @@ TEST(Test__MoEPhaseC_StoreResolution, PrepareGemmEngines_IncompleteExistingSlabs
     constexpr int layer_idx = 5;
 
     PreparedWeightStore store(ModelContextId{51});
+    // This negative case admits no new source allocation: incomplete fake
+    // slabs must fail resolution before any attempted physical repack.
+    test::admitCPUPreparedStoreForTest(store, {}, DeviceId::cpu(), PhysicalMemoryOwner::RoutedExpertWeights);
     auto gate_ref = store.registerExpertSlab(makeDesc(layer_idx, WeightRole::MoEExpertGate, num_experts));
     auto up_ref = store.registerExpertSlab(makeDesc(layer_idx, WeightRole::MoEExpertUp, num_experts));
     auto down_ref = store.registerExpertSlab(makeDesc(layer_idx, WeightRole::MoEExpertDown, num_experts));
@@ -268,6 +272,7 @@ TEST(Test__MoEPhaseC_StoreResolution, PrepareGemmEngines_IncompleteExistingSlabs
         nullptr,
         CPUExpertNUMAPlacement::aggregateDomain()};
 
+    ctx.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
     EXPECT_FALSE(MoEExpertWeightService::prepareGemmEngines(ctx));
     EXPECT_EQ(store.expertSlabCount(), 3u);
     EXPECT_TRUE(owned_kernels.empty());

@@ -6,7 +6,9 @@
  * and executor allocate the admitted arena first, then freeze snapshot sources.
  * One captured indexer replays full/partial/empty work without pointer changes,
  * storage growth, capacity downloads or removal of any requested output.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
@@ -38,7 +40,7 @@ void proveColdSnapshot(DeviceId device,bool noRanking=false){
         using Int=Qwen4ExpIntBinding;using Weight=Qwen4ExpImmutableWeightBinding;
         auto execution=IDeviceContext::create(device,1);ASSERT_TRUE(execution);
         void* stream=worker.defaultStream();ASSERT_NE(stream,nullptr);
-        llaminar2::test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(ArenaConfig{.factory=&factory});
+        llaminar2::test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
         const auto declare=[&](BufferId role,int n,int width,const char*type){ASSERT_TRUE(arena.registerBuffer(role,n,width,type,device));};
         declare(BufferId::QFN_QSA_QUERY,rows,512,"FP32");declare(BufferId::QFN_QSA_RAW_KEY,rows,128,"FP32");
         declare(BufferId::QFN_QSA_PARTIAL_KEYS,4,128,"FP32");declare(BufferId::QFN_QSA_POOLED_KEYS,blocks,128,"FP32");

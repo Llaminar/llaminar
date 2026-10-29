@@ -97,7 +97,11 @@ namespace llaminar2
         CPUWeightPreparationMemory cpuPreparation(const ProjectionGeometry &plan)
         {
             auto result = CPUWeightPreparationMemory::sourceNative(plan.format, plan.n, plan.k);
-            if (floating(plan)) result.persistent_bytes = 0;
+            if (floating(plan))
+            {
+                result.persistent_bytes = 0;
+                result.persistent_payload_bytes = 0;
+            }
             return result;
         }
 
@@ -281,7 +285,6 @@ namespace llaminar2
 
             // Floating CPU engines borrow the runtime source; quantized CPU
             // engines own a separately admitted pack.
-            std::optional<PhysicalMemoryAllocationLease> prepared_claim;
             std::shared_ptr<KernelFactory::PreparedGemmHandle> cpu_handle;
             std::shared_ptr<LoadOrchestrator> gpu_pool;
             std::shared_ptr<ITensorGemm> gpu_engine;
@@ -291,14 +294,16 @@ namespace llaminar2
             {
                 const auto packing = cpuPreparation(plan);
                 prepared_bytes = packing.persistent_bytes;
-                if (prepared_bytes) prepared_claim.emplace(memory->claimNewAllocation(device, kWeightOwner, prepared_bytes));
                 std::optional<PhysicalMemoryAllocationLease> staging;
                 if (packing.temporary_bytes) staging.emplace(memory->claimNewAllocation(device,
                     PhysicalMemoryOwner::WeightLoadStaging, packing.temporary_bytes));
-                cpu_handle = KernelFactory::prepareGemmHandleLocal(&execution, device,
-                    KernelFactory::GemmPreparationKind::AUTO, plan.operand_precision);
+                // Setup vectors retire inside this synchronous call. The
+                // retained pack claims its own exact final root before allocation.
+                cpu_handle = KernelFactory::prepareGemmHandleLocal(&execution,device,
+                    KernelFactory::GemmPreparationKind::AUTO,plan.operand_precision,
+                    CPUWeightStoragePlacement::accounted(memory,device,kWeightOwner,CPUWeightStoragePlacement::local()));
                 engine = KernelFactory::getOrCreateGemmEngine(cpu_handle.get());
-                require(engine && engine->hasWeights() && engine->packedWeightBytes() == prepared_bytes,
+                require(engine && engine->hasWeights() && engine->packedWeightBytes() == packing.persistent_payload_bytes,
                     "CPU prepared payload differs from its admitted native representation");
             }
             else

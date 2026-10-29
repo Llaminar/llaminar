@@ -95,7 +95,11 @@ TEST(Test__MTPGraphConstruction, SidecarWorkspaceUsesInvocationRowsNotContextCap
         fixture.config.mtp.max_request_batch = batch;
         auto graph = std::make_shared<SidecarWorkspaceQwenGraph>(fixture.config, fixture.mpi);
         PreparedWeightStore store; // All graph/kernel borrows retire before their immutable owner.
-        DeviceGraphOrchestrator runner(graph, fixture.mpi);
+        auto runner_owner = DeviceGraphOrchestrator::createForTest(
+            test::cpuInferenceFixtureDependencies(graph, fixture.mpi, batch,
+                fixture.config.max_seq_len, 512,
+                test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture),fixture.config.n_layers)));
+        auto &runner = *runner_owner;
         ASSERT_TRUE(runner.initializeInferenceStateFromArena(batch, fixture.config.max_seq_len,
             DeviceId::cpu(), {.activation_seq_len = 512}));
         runner.setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));

@@ -45,9 +45,11 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
+#include "../../factory/TestableInferenceRunnerOverrides.h"
 
 #include "IRankOrchestrator.h"
 #include "TPWorkerPool.h"
@@ -243,6 +245,8 @@ namespace llaminar2
 
             // =================================================================
             // Common Configuration
+            /// Exact frozen CPU endpoint/worker root declarations retained with admission.
+            std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
             // =================================================================
 
             /// Immutable admitted participant projection shared by LocalTP and pipeline children.
@@ -318,6 +322,9 @@ namespace llaminar2
             /// Optional stage-local prepared store shared by this RankOrchestrator
             /// and its per-device runners.
             std::shared_ptr<PreparedWeightStore> prepared_weight_store;
+
+            /// Explicit model-light child admission; concrete factories reject it.
+            TestableInferenceRunnerOverrides test_runner_overrides;
 
             /**
              * @brief Whether rank setup allocates or adopts its complete weight set.

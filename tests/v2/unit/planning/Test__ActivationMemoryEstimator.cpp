@@ -1,15 +1,22 @@
 /**
  * @file Test__ActivationMemoryEstimator.cpp
  * @brief Verifies generic and production model graph-arena byte accounting.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
 
+#include "../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include "planning/ActivationMemoryEstimator.h"
+#include "execution/config/RuntimeConfig.h"
 #include "backends/DeviceId.h"
 #include "config/TensorParallelAssignmentDeclaration.h"
 #include "kernels/gdn/GDNPreparedQK.h"
+#include "memory/BufferArena.h"
+#include "tensors/TensorFactory.h"
+#include "utils/MPIContext.h"
 
 #include <algorithm>
+#include <array>
 #include <string>
 
 using namespace llaminar2;
@@ -59,7 +66,7 @@ TEST(Test__ActivationMemoryEstimator, LargeVocabDoesNotReserveAllPositionLogits)
     EXPECT_GE(actual, hidden_state + terminal_logits);
 }
 
-TEST(Test__ActivationMemoryEstimator, CPUAndGPUSameEstimate)
+TEST(Test__ActivationMemoryEstimator, CPUPricesEachPhysicalRootSeparately)
 {
     // Activation estimate should be similar for CPU and GPU (same buffers needed)
     size_t gpu = ActivationMemoryEstimator::estimate(
@@ -67,7 +74,9 @@ TEST(Test__ActivationMemoryEstimator, CPUAndGPUSameEstimate)
     size_t cpu = ActivationMemoryEstimator::estimate(
         1, 4096, 896, 4864, 14, 2, 64, 151936, DeviceId::cpu());
 
-    EXPECT_EQ(gpu, cpu);
+    const auto logits_payload = size_t{151936} * sizeof(float);
+    EXPECT_EQ(cpu, gpu - logits_payload +
+        AlignedVector<float>::requiredAllocationBytes(151936));
 }
 
 TEST(Test__ActivationMemoryEstimator, LogicalArenaOwnership_MatchesManualComputation)
@@ -209,7 +218,10 @@ TEST(Test__ActivationMemoryEstimator,
         const auto mirrored = ActivationMemoryEstimator::estimate(profile, geometry, device);
         geometry.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
         const auto sharded = ActivationMemoryEstimator::estimate(profile, geometry, device);
-        EXPECT_EQ(sharded, mirrored + static_cast<size_t>(rows) * geometry.local_vocab * sizeof(float) - sizeof(float));
+        const auto root = [device](size_t words) {
+            return device.is_cpu() ? AlignedVector<float>::requiredAllocationBytes(words) : words * sizeof(float);
+        };
+        EXPECT_EQ(sharded, mirrored + root(static_cast<size_t>(rows) * geometry.local_vocab) - root(1));
     }
 }
 
@@ -224,12 +236,14 @@ TEST(Test__ActivationMemoryEstimator, GPUSeedBankUsesExactRequestCapacity)
         .batch_size = 1, .resident_graph_rows = 32, .local_d_ff = 64,
         .local_n_heads = 1, .local_n_kv_heads = 1};
     const auto cpu = ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cpu());
+    const auto gpu_without_seeds = ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cuda(0)) -
+        static_cast<size_t>(geometry.generation_request_capacity) * sizeof(uint64_t);
     for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
         for (const int requests : {1, 3, 8, 15})
         {
             geometry.generation_request_capacity = requests;
             EXPECT_EQ(ActivationMemoryEstimator::estimate(profile, geometry, device),
-                cpu + static_cast<size_t>(requests) * sizeof(uint64_t));
+                gpu_without_seeds + static_cast<size_t>(requests) * sizeof(uint64_t));
             EXPECT_EQ(ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cpu()), cpu);
         }
     geometry.generation_request_capacity = 0;
@@ -319,4 +333,101 @@ TEST(Test__ActivationMemoryEstimator, PreparedQKCapacityMatchesCanonicalUnevenHe
     EXPECT_FALSE(gdn::ScalarPreparedQKLayout::supportsNativeGeometry(128, 3));
     EXPECT_THROW((void)gdn::ScalarPreparedQKLayout::fromHeadPartition(
         16, 48, 128, 1, 24), std::invalid_argument);
+}
+
+/** @test The actual CPU full-row arena pair is priced independently from sharded projection capacity. */
+TEST(Test__ActivationMemoryEstimator, CPUPhaseSplitKVHandoffMatchesActualArenaOwners)
+{
+    ModelMemoryProfile profile;
+    profile.n_layers=1;profile.d_model=32;profile.d_ff=64;
+    profile.n_heads=4;profile.n_kv_heads=2;profile.head_dim=8;
+    profile.vocab_size=64;profile.max_seq_len=8;
+    MPIContext mpi(0,1,MPI_COMM_NULL);
+    TensorFactory factory(mpi);
+    for (const int rows : {1,3,8})
+    {
+        ActivationGraphMemoryGeometry geometry;
+        geometry.resident_graph_rows=rows;geometry.context_tokens=8;
+        geometry.local_d_ff=32;geometry.local_n_heads=2;geometry.local_n_kv_heads=1;
+        geometry.local_vocab=32;geometry.total_shards=2;geometry.first_layer=geometry.last_layer=0;
+        BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
+        ASSERT_TRUE(arena.registerBuffer(BufferId::K_FULL_PREFILL,rows,16,"FP32",DeviceId::cpu()));
+        ASSERT_TRUE(arena.registerBuffer(BufferId::V_FULL_PREFILL,rows,16,"FP32",DeviceId::cpu()));
+        ASSERT_TRUE(arena.allocate());
+        const size_t actual = arena.getTensor(BufferId::K_FULL_PREFILL)->size_bytes() +
+            arena.getTensor(BufferId::V_FULL_PREFILL)->size_bytes();
+        ASSERT_EQ(actual, size_t(2*rows*2*8)*sizeof(float));
+        for (const auto device : {DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+        {
+            geometry.replicated_dense_decode=false;
+            const auto sharded = ActivationMemoryEstimator::estimate(profile,geometry,device);
+            geometry.replicated_dense_decode=true;
+            EXPECT_EQ(ActivationMemoryEstimator::estimate(profile,geometry,device)-sharded,
+                device.is_cpu() ? 2 * AlignedVector<float>::requiredAllocationBytes(size_t(rows) * 16) : actual);
+        }
+    }
+}
+
+/** @test An admitted CPU BOM equals the physical claims of the declared common roots. */
+TEST(Test__ActivationMemoryEstimator, CpuTinyRootsMatchLivePhysicalArena)
+{
+    constexpr size_t rows = 3, width = 7, q = 5, kv = 2, ffn = 11, vocab = 13;
+    const auto estimated = ActivationMemoryEstimator::estimate(1, rows, width, ffn, q, kv, 1, vocab, DeviceId::cpu());
+    auto config = test::cpuArenaFixtureConfig(nullptr, estimated);
+    auto authority = config.physical_memory_authority;
+    BufferArena arena(config);
+    const std::array widths{width,width,width,width,width,q,q,kv,kv,ffn,ffn,rows};
+    const std::array ids{BufferId::HIDDEN_STATE,BufferId::NORMALIZED,BufferId::RESIDUAL,
+        BufferId::ATTN_PROJ,BufferId::FFN_OUTPUT,BufferId::Q_PROJ,BufferId::ATTN_OUTPUT,
+        BufferId::K_PROJ,BufferId::V_PROJ,BufferId::GATE_PROJ,BufferId::UP_PROJ,BufferId::GEMM_WORKSPACE};
+    for(size_t i=0;i<ids.size();++i)
+        ASSERT_TRUE(arena.registerBuffer(ids[i],rows,widths[i],"FP32",DeviceId::cpu()));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::LOGITS,1,vocab,"FP32",DeviceId::cpu()));
+    ASSERT_TRUE(arena.allocate());
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationArena,
+        PhysicalMemoryMaterializationKind::NewAllocation),estimated);
+}
+
+/** @test CPU retained MTP admission includes the exact independently owned terminal-hidden mailbox. */
+TEST(Test__ActivationMemoryEstimator, CpuRetainedMtpTerminalHiddenMatchesActualRoot)
+{
+    ModelMemoryProfile profile;
+    profile.d_model = 7; profile.head_dim = 1; profile.vocab_size = 13;
+    for (const bool enabled : {false, true})
+    for (const int requests : {1, 3})
+    for (const int configured_batch : {1, 17})
+    {
+        MTPRuntimeConfig mtp;
+        mtp.enabled = enabled;
+        mtp.graph_capacity_draft_tokens = 3;
+        mtp.max_request_batch = requests;
+        ActivationGraphMemoryGeometry geometry;
+        geometry.batch_size = resolveRuntimeBatchSizeForMTP(configured_batch, mtp);
+        geometry.resident_graph_rows = 1;
+        geometry.local_d_ff = 11;
+        geometry.local_n_heads = 5;
+        geometry.local_n_kv_heads = 2;
+        geometry.mtp_target_query_rows = resolveMTPRetainedTargetQueryRows(mtp);
+        geometry.retained_mtp_candidate_rows = geometry.mtp_target_query_rows;
+        const auto retained = ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cpu());
+        const auto gpu_retained = ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cuda(0));
+        geometry.retained_mtp_candidate_rows = 0;
+        const auto absent = ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cpu());
+        EXPECT_EQ(gpu_retained, ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cuda(0)));
+        const auto rows = static_cast<size_t>(resolveMTPTerminalHiddenRowCapacity(geometry.batch_size, mtp));
+        const auto bytes = AlignedVector<float>::requiredAllocationBytes(rows * profile.d_model);
+        EXPECT_EQ(retained - absent, bytes);
+        auto config = test::cpuArenaFixtureConfig(nullptr, bytes);
+        auto authority = config.physical_memory_authority;
+        {
+            BufferArena arena(config);
+            ASSERT_TRUE(arena.registerBuffer(BufferId::PREFIX_TERMINAL_HIDDEN, rows,
+                profile.d_model, "FP32", DeviceId::cpu()));
+            ASSERT_TRUE(arena.allocate());
+            EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,
+                PhysicalMemoryMaterializationKind::NewAllocation), retained - absent);
+        }
+        EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,
+            PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    }
 }

@@ -5,7 +5,9 @@
  * Independent backend spies make physical aliases and exact native submission
  * order observable without touching accelerators. These tests complement the
  * protocol state-machine sweep; they do not certify GPU memory visibility.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../utils/CPUActivationArenaFixture.h"
 #include "transfer/CapturedTransferChannel.h"
 #include "transfer/CapturedTransferKernelPlan.h"
 #include "transfer/CapturedTransferChannelBatch.h"
@@ -862,7 +864,7 @@ namespace
                 for (int member = 0; member < width; ++member)
                 {
                     const auto device = members[member].toLocalDeviceId();
-                    BufferArena arena({.factory = &factory});
+                    BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
                     ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 16, 32, "FP32", DeviceId::cpu()));
                     for (const auto id : {BufferId::REQUEST_TOKEN_IDS, BufferId::MTP_LOGICAL_SEQUENCE_STATE, BufferId::MTP_VERIFIER_INPUT_TOKENS,
                              BufferId::MTP_VERIFIER_POSITION_IDS, BufferId::MTP_VERIFIER_REQUEST_LENGTHS})
@@ -979,7 +981,7 @@ namespace
                 for(int member=0;member<width;++member) {
                     SCOPED_TRACE(::testing::Message()<<"reverse="<<reverse<<" width="<<width<<" domain="<<domain<<" member="<<member);
                     const auto device=members[member].toLocalDeviceId();
-                    BufferArena arena({.factory=&factory});
+                    BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
                     ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE,16,32,"FP32",DeviceId::cpu()));
                     constexpr std::array integers{BufferId::REQUEST_TOKEN_IDS,BufferId::REQUEST_POSITION_IDS,
                         BufferId::MTP_LOGICAL_SEQUENCE_STATE,BufferId::MTP_VERIFIER_INPUT_TOKENS,

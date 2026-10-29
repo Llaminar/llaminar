@@ -19,6 +19,7 @@
  * transformers 5.4.0 (torch_recurrent_gated_delta_rule,
  * torch_causal_conv1d_update).
  */
+#include "../../utils/CPUPreparedStoreTestAdmission.h"
 
 #include "../../fixtures/CPUGDNStateTestUtils.h"
 #include <gtest/gtest.h>
@@ -3558,6 +3559,7 @@ TEST(Test__GDNKernels, Projection_Qwen36NodeTPPrefillShapeResolvesPreparedMixedF
     auto b_binding = test::makePreparedWeightTestBinding(
         w_b.get(), DeviceId::cpu(), "blk.0.gdn_beta_proj.weight", model_id);
 
+    test::admitCPUPreparedStoreForTest(store, {w_qkv.get(), w_z.get(), w_a.get(), w_b.get()});
     auto qkv_ref = store.prepareGemm(qkv_binding);
     auto z_ref = store.prepareGemm(z_binding);
     auto a_ref = store.prepareGemm(a_binding);

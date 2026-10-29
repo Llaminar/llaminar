@@ -20,6 +20,7 @@
 #include "models/GraphTypes.h"
 #include "../../mocks/MockModelLoader.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
+#include "../../utils/CPUPreparedStoreTestAdmission.h"
 #include "tensors/Tensors.h"
 
 #include <cstring>
@@ -733,6 +734,11 @@ TEST(Test__WeightManagerPrepare, RegistersExactFrozenBindingRefs)
     plan.add(ffn_down);
 
     FrozenModelWeightSet frozen = manager.materialize(plan);
+    // These exact frozen FP32 sources remain borrowed by CPU preparation;
+    // their zero-new-byte owner still carries a mandatory admitted identity.
+    test::admitCPUPreparedStoreForTest(*store, {
+        frozen.global("output.weight").tensor,
+        frozen.layer(0, "ffn_down.weight").tensor});
     ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, DeviceId::cpu()));
 
     const auto &embedding_binding = frozen.global("token_embd.weight");
@@ -784,6 +790,7 @@ TEST(Test__WeightManagerPrepare, StagePreparedStoresRemainIndependentAcrossMater
     manager.setPreparedWeightStore(store_a);
     WeightPlan plan_a = make_plan(ModelContextId{1001}, 0, 0, 10);
     FrozenModelWeightSet frozen_a = manager.materialize(plan_a);
+    test::admitCPUPreparedStoreForTest(*store_a, {frozen_a.layer(0, "ffn_down.weight").tensor});
     ASSERT_TRUE(manager.prepareWeightsForDevice(frozen_a, DeviceId::cpu()));
 
     const auto &binding_a = frozen_a.layer(0, "ffn_down.weight");
@@ -796,6 +803,7 @@ TEST(Test__WeightManagerPrepare, StagePreparedStoresRemainIndependentAcrossMater
     manager.setPreparedWeightStore(store_b);
     WeightPlan plan_b = make_plan(ModelContextId{1002}, 1, 1, 20);
     FrozenModelWeightSet frozen_b = manager.materialize(plan_b);
+    test::admitCPUPreparedStoreForTest(*store_b, {frozen_b.layer(1, "ffn_down.weight").tensor});
     ASSERT_TRUE(manager.prepareWeightsForDevice(frozen_b, DeviceId::cpu()));
 
     const auto &binding_b = frozen_b.layer(1, "ffn_down.weight");

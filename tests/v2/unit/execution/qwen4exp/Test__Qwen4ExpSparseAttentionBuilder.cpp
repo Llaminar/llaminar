@@ -7,6 +7,7 @@
  * construction rejects missing producers, aliases and duplicate node identity
  * without publishing a partial graph. No accelerator or checkpoint is loaded.
  */
+#include "../../../utils/CPUPreparedStoreTestAdmission.h"
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpSparseAttentionBuilder.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
@@ -64,6 +65,7 @@ struct Fixture
             key[(token*2+head)*256+d]=0;
             value[(token*2+head)*256+d]=qwen4exp::detail::encodeHalf(float(token+head)/8);
         }
+        test::admitCPUPreparedStoreForTest(store, {&queryWeight, &keyWeight});
         queryBinding=prepare(queryWeight,"indexer.q_proj.weight");keyBinding=prepare(keyWeight,"indexer.k_proj.weight");
     }
     /** @brief Resolve immutable prepared authority through the production store. */
@@ -715,4 +717,25 @@ TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingStillRequiresExplicitGrouped
     policy.projectionArithmetic=Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
     EXPECT_NO_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()));
     EXPECT_EQ(graph.size(),5u);
+}
+
+/** @test A rejected shard identifies exact conflicting native fields without reading device state. */
+TEST(Qwen4ExpSparseAttentionBuilder, KVAuthorityDiagnosticNamesActualAndDeclaredGeometry)
+{
+    Fixture fixture;ComputeGraph graph;fixture.seed(graph);
+    auto consumer=fixture.consumer();consumer.kvHeads=1;consumer.kvHeadStart=1;
+    try
+    {
+        (void)Builder::append(graph,consumer,fixture.policy(),fixture.weights(),fixture.buffers());
+        FAIL() << "A sharded declaration cannot consume the full native cache";
+    }
+    catch (const std::invalid_argument &error)
+    {
+        const std::string message=error.what();
+        for(const auto field : {"declared_kv_heads=1","declared_kv_head_start=1",
+            "cache_local_kv_heads=2","cache_kv_head_start=0","cache_global_kv_heads=2",
+            "cache_sharded=0","cache_layout="})
+            EXPECT_NE(message.find(field),std::string::npos) << message;
+    }
+    EXPECT_EQ(graph.size(),1u);
 }

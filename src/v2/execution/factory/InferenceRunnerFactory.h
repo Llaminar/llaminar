@@ -54,9 +54,11 @@
  * config.tp_ctx = tp_ctx.get();
  * auto runner = createInferenceRunner(model_ctx, nullptr, DeviceId::cuda(0), config);
  * @endcode
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
+#include "TestableInferenceRunnerOverrides.h"
 
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../../loaders/ModelContext.h"
@@ -109,6 +111,8 @@ namespace llaminar2
     {
         int max_seq_len = 4096;
         int activation_seq_len = 0;
+        /// Exact frozen CPU endpoint/worker root declarations retained with admission.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         /// Immutable admitted participant programs, copied into both factory paths.
         std::shared_ptr<const std::vector<qwen4exp::QwenSparseAttentionParticipantProgram>>
             attention_participants;
@@ -329,6 +333,7 @@ namespace llaminar2
             config.max_seq_len = runtime.max_seq_len;
             config.activation_seq_len = runtime.resident_graph_rows;
             config.attention_participants = runtime.attention_participants;
+            config.cpu_serial_expert_storage = runtime.cpu_serial_expert_storage;
             config.ordinary_terminal_projection = runtime.ordinary_terminal_projection;
             config.batch_size = runtime.batch_size;
             config.activation_precision = runtime.activation_precision;
@@ -377,6 +382,8 @@ namespace llaminar2
      * @param model_ctx Model context interface (can be MockModelContext)
      * @param device Target device
      * @param config Runner configuration
+     * @param test_overrides Explicit model-light allocation admission after final graph resolution;
+     *        rejected for concrete ModelContext and required to return a non-null issuer.
      * @return Unique pointer to IInferenceRunner, or nullptr on failure
      *
      * @code
@@ -391,7 +398,8 @@ namespace llaminar2
     std::unique_ptr<IInferenceRunner> createTestableInferenceRunner(
         std::shared_ptr<IModelContext> model_ctx,
         DeviceId device,
-        const InferenceRunnerConfig &config = {});
+        const InferenceRunnerConfig &config = {},
+        const TestableInferenceRunnerOverrides &test_overrides = {});
 
     /**
      * @brief Freeze one tiered-overlay plan for the graph family that will run.

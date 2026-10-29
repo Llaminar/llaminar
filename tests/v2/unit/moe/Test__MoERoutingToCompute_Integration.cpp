@@ -11,6 +11,9 @@
  */
 
 #include <gtest/gtest.h>
+#include "utils/CPUExpertStageTestAdmission.h"
+#include "utils/CPUStandaloneRouterTestAdmission.h"
+#include "utils/CPUActualRoutedStageTestWorkspace.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "tensors/Tensors.h"
@@ -90,6 +93,8 @@ protected:
         return std::make_shared<Q4_KTensor>(shape, raw);
     }
 
+    CPUPreparedRouterTestSource setup_router_;
+
     /// Run the MoERoutingStage and return true on success
     bool runRouting(TensorBase *input, TensorBase *gate_weights,
                     TensorBase *output_indices, TensorBase *output_weights,
@@ -111,8 +116,17 @@ protected:
         params.routed_pipeline_kernel_owner =
             routed_pipeline_kernel_owner_;
 
+        admitCPUStandaloneRouterForTest(params);
         MoERoutingStage stage(params);
-        return stage.execute(cpu_ctx_.get());
+        if(!stage.execute(cpu_ctx_.get())) return false;
+        auto *indices=dynamic_cast<FP32Tensor *>(output_indices);
+        auto *weights=dynamic_cast<FP32Tensor *>(output_weights);
+        const size_t count=static_cast<size_t>(seq_len)*top_k;
+        setup_router_={routed_pipeline_kernel_owner_,params,
+            std::vector<float>(indices->data(),indices->data()+count),
+            std::vector<float>(weights->data(),weights->data()+count)};
+        setup_router_.source.routed_pipeline_kernel_owner.reset();
+        return true;
     }
 
     /// Run MoEExpertComputeStage with given routing results and expert weights
@@ -145,11 +159,13 @@ protected:
 
         if (!MoEExpertComputeStage::extractExpertViews(params))
             return false;
+        const auto params_admission = test::admitCPUExpertStageForTest(
+            params, PhysicalMemoryOwner::PrimaryModelWeights);
         if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             return false;
 
         MoEExpertComputeStage stage(params);
-        test::CPUStageTestWorkspace workspace(stage, seq_len);
+        CPUActualRoutedStageTestWorkspace workspace(stage,params,&setup_router_,cpu_ctx_.get());
         return stage.execute(cpu_ctx_.get());
     }
 

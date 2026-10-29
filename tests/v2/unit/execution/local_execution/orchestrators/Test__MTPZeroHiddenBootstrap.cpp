@@ -11,7 +11,9 @@
  * verifier, preserving finite/shape checks while admitting the valid zero seed.
  * Its compact M1 rows also reach the real prepared HC down GEMM stage and
  * serial-byte oracle through an exactly admitted CPU workspace.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../../utils/CPUActivationArenaFixture.h"
 #include "backends/BackendManager.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "execution/mtp/MTPStateTransaction.h"
@@ -59,7 +61,7 @@ struct DeviceGraphOrchestratorMTPZeroHiddenTestAccess
                         TensorFactory *factory = nullptr)
     {
         runner.state_.device_id = DeviceId::cpu();
-        runner.arena_ = std::make_unique<BufferArena>(ArenaConfig{.factory = factory});
+        runner.arena_ = std::make_unique<BufferArena>(::llaminar2::test::cpuArenaFixtureConfig(factory));
         if (!runner.arena_->registerBuffer(BufferId::PREFIX_TERMINAL_HIDDEN, rows, width, dtype, DeviceId::cpu()) ||
             !runner.arena_->allocate())
             return false;

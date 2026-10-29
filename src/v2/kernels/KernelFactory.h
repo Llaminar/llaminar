@@ -65,6 +65,8 @@
  * DeviceType dev = KernelFactory::getDeviceType(device_idx_);
  * return KernelFactory::createGemm<IQ4_NLTensor>(this, dev);
  * ```
+ * CPU prepared handles accept immutable final-storage placement and allocation
+ * authority so packing materializes exactly one admitted owner before publication.
  */
 
 #pragma once
@@ -1376,15 +1378,22 @@ namespace llaminar
                     llaminar2::DeviceId target_device,
                     GemmPreparationKind prep_kind = GemmPreparationKind::AUTO,
                     llaminar2::FloatingActivationOperandPrecision operand_precision =
-                        llaminar2::FloatingActivationOperandPrecision::Native);
+                        llaminar2::FloatingActivationOperandPrecision::Native,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
 
                 /**
-                 * @brief Create a sliced CPU GEMM kernel without using the global sliced cache.
+                 * @brief Create an independently owned CPU row slice without a global cache.
+                 * @param tensor Original CPU matrix with live native source bytes.
+                 * @param row_start Inclusive output-row offset.
+                 * @param row_end Exclusive output-row limit.
+                 * @param placement Exact final-storage allocator and admission owner.
+                 * @return Prepared slice retaining its own physical allocation lease.
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemmSlicedLocal(
                     const llaminar2::TensorBase *tensor,
                     size_t row_start,
-                    size_t row_end);
+                    size_t row_end,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
 
                 /**
                  * @brief Create a fused Gate/Up adapter from prepared handles without global cache insertion.

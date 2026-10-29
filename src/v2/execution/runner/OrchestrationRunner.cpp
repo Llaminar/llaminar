@@ -23,7 +23,9 @@
  * Admission-only completion remains distinct from inference readiness, so dry
  * runs neither enter inference shutdown collectives nor seal unprepared weights.
  * Model-aware topology is resolved by ResolvedRankOrchestration; this runner
- * installs that result without a second overlay-binding or role-selection path.
+ * installs that result and its requested weight identity together, before any
+ * capacity-frozen placement replaces the declarative request. There is no second
+ * overlay-binding or role-selection path.
  * Overlay candidates use the shared BOM adapter inside the common typed rank
  * initialization lifecycle. Capture-policy errors reach consensus before any
  * peer may enter the physical-budget collective.
@@ -39,8 +41,10 @@
  *
  * Physical TP validation borrows the already-resolved LocalTP endpoint order;
  * early structural validation never manufactures physical participant IDs.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
+#include "execution/moe/MoEOverlayRowCandidateFinalization.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "planning/ImmutableRowTableAdmissionWire.h"
@@ -2082,20 +2086,23 @@ namespace llaminar2
 
         /**
          * @brief Gather immutable final PLE requests after the higher-priority row/quota search.
-         * @param local Zero or one exact request owned by this communicator rank.
+         * @param frame Exact sender bytes validated before readiness consensus.
          * @param world Existing overlay startup communicator; no inference state is exchanged.
+         * @param profile Canonical source metadata authenticating received requests.
          * @return Rank-ordered source/consumer/mode BOM requests for one final certificate.
          * @throws std::exception For malformed framing, foreign identity or an oversized MPI extent.
          */
         std::vector<ImmutableRowTableAdmissionRequest> gatherOverlayImmutableTableRequests(
-            const std::vector<ImmutableRowTableAdmissionRequest> &local,
+            const ImmutableRowTableAdmissionSendFrame &frame,
             const std::shared_ptr<IMPIContext> &world,const ModelMemoryProfile &profile)
         {
-            if(!world||world->world_size()<=1)return local;
-            const auto send=serializeImmutableRowTableAdmissionRequests(local);
-            if(send.size()>static_cast<std::size_t>(INT_MAX))
-                throw std::overflow_error("Ngram admission sender metadata exceeds MPI extent");
-            const int n=world->world_size(),send_count=static_cast<int>(send.size());
+            if(!world||world->world_size()<=1)
+                return parseImmutableRowTableAdmissionRequests(frame.bytes(),frame.senderRank(),&profile);
+            // Sender validation and serialization already succeeded on every
+            // peer's input-readiness vote. No fallible local wire preparation
+            // remains between that agreement and the first collective.
+            const auto send=frame.bytes();
+            const int n=world->world_size(),send_count=frame.byteCount();
             std::vector<int> counts(n),offsets(n);
             world->allgather_bytes(&send_count,counts.data(),sizeof(send_count));
             std::size_t total=0;
@@ -17621,6 +17628,26 @@ namespace llaminar2
         return true;
     }
 
+    void OrchestrationRunner::installResolvedExecutionPlan(
+        const ResolvedRankOrchestration &resolved)
+    {
+        // Prepare all owning values before publishing any part of the result.
+        // Deriving this later from config_ would encode capacity-frozen placements
+        // rather than the user's exact requested reuse/migration authority.
+        auto config = resolved.config();
+        auto plan = resolved.rankPlan();
+        auto topology = resolved.pipelineStages().empty()
+            ? std::shared_ptr<const ResolvedRankOrchestration>{}
+            : std::make_shared<const ResolvedRankOrchestration>(resolved);
+        auto identity = topology
+            ? pipelineRoutedWeightAuthorityRequestIdentity(resolved)
+            : routedWeightAuthorityRequestIdentity(config.moe_routed_expert_plan, config);
+        config_ = std::move(config);
+        plan_ = std::move(plan);
+        moe_pipeline_topology_ = std::move(topology);
+        requested_routed_weight_authority_identity_ = std::move(identity);
+    }
+
     bool OrchestrationRunner::buildExecutionPlan()
     {
         if (plan_built_)
@@ -17663,11 +17690,8 @@ namespace llaminar2
                         storage != MoEOverlayMigrationStorageKind::DeviceTransferDirectory)
                         return setError("Movable local MoE pipeline stages require an admitted native maintenance domain");
                 }
-                moe_pipeline_topology_ = std::make_shared<const ResolvedRankOrchestration>(resolved);
-                requested_routed_weight_authority_identity_ = pipelineRoutedWeightAuthorityRequestIdentity(resolved);
             }
-            config_ = resolved.config();
-            plan_ = resolved.rankPlan();
+            installResolvedExecutionPlan(resolved);
             mpi_coordinated_root_rank_ = resolved.overlayExecution()
                 ? resolved.overlayExecution()->continuation_root_rank : 0;
             if (mpi_coordinated_root_rank_ < 0 || mpi_coordinated_root_rank_ >= mpi_ctx_->world_size())
@@ -18369,6 +18393,7 @@ namespace llaminar2
                     *retained_prepared_routed_weight_plan_);
             moe_expert_overlay_memory_admission_ =
                 retained_expert_overlay_memory_admission_;
+            plan_.runtime.cpu_serial_expert_storage = moe_expert_overlay_memory_admission_->cpu_serial_expert_storage;
             physical_memory_admission_ =
                 moe_expert_overlay_memory_admission_
                     ->physical_memory_admission;
@@ -18677,6 +18702,77 @@ namespace llaminar2
                         continue;
                     }
 
+                    // Explicit native head ranges are mandatory storage, so a
+                    // row candidate is complete only when those same ranges fit.
+                    // Automatic placement remains below frozen rows and quotas.
+                    if (plan_.runtime.ngram_table_policy.isFixedHeadSharded())
+                    {
+                        std::optional<ImmutableRowTableAdmissionSendFrame> local_frame;
+                        const auto inputs_result = capacity_phase(
+                            {static_cast<std::uint32_t>(candidate_rows), "overlay-candidate.fixed-head-inputs"}, [&]
+                        {
+                            const std::vector<std::vector<DevicePlanConfig>> groups{local_candidate->capacity.device_inputs};
+                            const auto upload = MemoryPlanner::immutableRowTableUploadBindings(profile, groups);
+                            const auto request = MemoryPlanner::immutableRowTableAdmissionRequest(profile,
+                                plan_.runtime.ngram_table_policy, groups, upload,
+                                ImmutableRowTableHostPlacement::fromObservedNUMANode(plan_.numa_node));
+                            std::vector<ImmutableRowTableAdmissionRequest> local_requests;
+                            if (request) local_requests.push_back(*request);
+                            local_frame.emplace(ImmutableRowTableAdmissionSendFrame::prepare(local_requests,
+                                overlay_world ? overlay_world->rank() : plan_.rank, &profile));
+                            return true;
+                        });
+                        if (!inputs_result.succeeded())
+                            throw std::runtime_error(inputs_result.diagnostic("Fixed-head row candidate metadata"));
+
+                        std::optional<MoEOverlayResolvedCapacityPlan> complete_candidate;
+                        std::string table_capacity_error;
+                        const auto table_result = capacity_phase(
+                            {static_cast<std::uint32_t>(candidate_rows), "overlay-candidate.fixed-head-complete-bom"}, [&]
+                        {
+                            const auto requests = gatherOverlayImmutableTableRequests(*local_frame, overlay_world, profile);
+                            auto finalized = finalizeMoEOverlayRowCandidate(
+                                plan_.runtime.ngram_table_policy, [&]
+                            {
+                                auto admitted = candidate_capacity->admit(requests);
+                                if (admitted.size() != 1u)
+                                    throw std::logic_error("Fixed-head row candidate lost its exact stage");
+                                return std::move(admitted.front());
+                            });
+                            if (auto *rejected = std::get_if<MoEOverlayRowCapacityRejected>(&finalized))
+                            {
+                                table_capacity_error = std::move(rejected->diagnostic);
+                                return false;
+                            }
+                            auto *admitted = std::get_if<MoEOverlayRowAdmitted<MoEOverlayResolvedCapacityPlan>>(&finalized);
+                            if (!admitted)
+                                throw std::logic_error("Mandatory fixed-head row finalization was deferred");
+                            complete_candidate = std::move(admitted->value);
+                            return true;
+                        });
+                        // Capacity rejection is a valid search outcome. Vote
+                        // separately on structural errors so every peer fails
+                        // fatally rather than advancing to another row epoch.
+                        const auto validity = capacity_phase(
+                            {static_cast<std::uint32_t>(candidate_rows), "overlay-candidate.fixed-head-validity"}, [&]
+                        {
+                            return table_result.status != RankInitializationPhaseStatus::LocalStepThrewException;
+                        });
+                        if (!validity.succeeded())
+                            throw std::runtime_error(table_result.diagnostic("Invalid fixed-head row candidate"));
+                        if (!table_result.succeeded())
+                        {
+                            last_capacity_error = table_result.diagnostic("Fixed-head complete row BOM");
+                            if (!table_capacity_error.empty()) last_capacity_error += ": " + table_capacity_error;
+                            LOG_DEBUG("[MoEOverlayCapacity] Rejected fixed-head resident graph candidate "
+                                << candidate_rows << " rows: " << last_capacity_error);
+                            continue;
+                        }
+                        // Reuse this one final certificate; no authority or
+                        // physical backing was created for rejected candidates.
+                        selected_capacity = std::move(complete_candidate);
+                    }
+
                     selected_local_capacity = std::move(local_candidate->capacity);
                     selected_capacity_draft = std::move(candidate_capacity);
                     selected_model_graph_identity_count =
@@ -18697,31 +18793,37 @@ namespace llaminar2
                              : ": " + last_capacity_error));
                 }
 
-                std::vector<ImmutableRowTableAdmissionRequest> local_table_requests;
-                const auto table_inputs=capacity_phase({0,"overlay.final-ngram-local-inputs"},[&] {
-                    const std::vector<std::vector<DevicePlanConfig>> groups{selected_local_capacity->device_inputs};
-                    const auto upload=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
-                    const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,
-                        plan_.runtime.ngram_table_policy,groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(plan_.numa_node));
-                    if(request)local_table_requests.push_back(*request);
-                    return true;
-                });
-                if(!table_inputs.succeeded())
-                    throw std::runtime_error(table_inputs.diagnostic("Final ngram local metadata admission"));
-                const auto table_result=capacity_phase({0,"overlay.final-ngram-admission"},[&] {
-                    const auto complete_requests=gatherOverlayImmutableTableRequests(local_table_requests,overlay_world,profile);
-                    auto admitted=selected_capacity_draft->admit(complete_requests);
-                    if(admitted.size()!=1u)throw std::logic_error("Standalone overlay finalization lost its exact stage");
-                    selected_capacity=std::move(admitted.front());
-                    plan_.runtime.attention_participants =
-                        projectAdmittedQwenSparseAttentionPrograms(
-                            profile, selected_local_capacity->device_inputs, plan_.rank);
-                    for(const auto &placement:selected_capacity->ngram_table_placements)
-                        if(placement->worldRank()==plan_.rank)plan_.runtime.ngram_table_placement=placement;
-                    return true;
-                });
-                if(!table_result.succeeded())
-                    throw std::runtime_error(table_result.diagnostic("Final ngram admission after frozen rows and quotas"));
+                if (!selected_capacity)
+                {
+                    std::optional<ImmutableRowTableAdmissionSendFrame> local_table_frame;
+                    const auto table_inputs=capacity_phase({0,"overlay.final-ngram-local-inputs"},[&] {
+                        const std::vector<std::vector<DevicePlanConfig>> groups{selected_local_capacity->device_inputs};
+                        const auto upload=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+                        const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,
+                            plan_.runtime.ngram_table_policy,groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(plan_.numa_node));
+                        std::vector<ImmutableRowTableAdmissionRequest> local_table_requests;
+                        if(request)local_table_requests.push_back(*request);
+                        local_table_frame.emplace(ImmutableRowTableAdmissionSendFrame::prepare(local_table_requests,
+                            overlay_world ? overlay_world->rank() : plan_.rank, &profile));
+                        return true;
+                    });
+                    if(!table_inputs.succeeded())
+                        throw std::runtime_error(table_inputs.diagnostic("Final ngram local metadata admission"));
+                    const auto table_result=capacity_phase({0,"overlay.final-ngram-admission"},[&] {
+                        const auto complete_requests=gatherOverlayImmutableTableRequests(*local_table_frame,overlay_world,profile);
+                        auto admitted=selected_capacity_draft->admit(complete_requests);
+                        if(admitted.size()!=1u)throw std::logic_error("Standalone overlay finalization lost its exact stage");
+                        selected_capacity=std::move(admitted.front());
+                        return true;
+                    });
+                    if(!table_result.succeeded())
+                        throw std::runtime_error(table_result.diagnostic("Final ngram admission after frozen rows and quotas"));
+                }
+                plan_.runtime.attention_participants = projectAdmittedQwenSparseAttentionPrograms(
+                    profile, selected_local_capacity->device_inputs, plan_.rank);
+                for (const auto &placement : selected_capacity->ngram_table_placements)
+                    if (placement->worldRank() == plan_.rank)
+                        plan_.runtime.ngram_table_placement = placement;
 
                 if (selected_prefill_segment_rows <= 0)
                 {
@@ -18741,6 +18843,9 @@ namespace llaminar2
                 // setup must not reconstruct a different host trace bound.
                 selected_capacity->host_demand_memory =
                     selected_local_capacity->host_demand_memory;
+                selected_capacity->cpu_serial_expert_storage =
+                    MemoryPlanner::cpuSerialExpertStorageAdmissions(selected_local_capacity->device_inputs);
+                plan_.runtime.cpu_serial_expert_storage = selected_capacity->cpu_serial_expert_storage;
                 const auto &capacity = *selected_capacity;
                 moe_expert_overlay_memory_admission_ =
                     std::make_shared<const MoEOverlayResolvedCapacityPlan>(
@@ -23043,6 +23148,7 @@ namespace llaminar2
                 runner_ = createMoEOverlayParticipantGraphRunner(
                     MoEOverlayParticipantGraphRunnerConfig{
                         .model_context = model_ctx_,
+                        .cpu_serial_expert_storage = plan_.runtime.cpu_serial_expert_storage,
                         .prepared_weight_admission =
                             retained_prepared_weight_plan_validated_
                                 ? PreparedWeightAdmission::
@@ -23082,6 +23188,7 @@ namespace llaminar2
                                     ? resolveMTPRetainedTargetQueryRows(
                                           active_mtp)
                                     : 1),
+                        .prefill_graph_row_capacity = plan_.runtime.overlay_prefill_schedule.graph_row_capacity,
                         .prefill_graph_row_shapes =
                             plan_.runtime.overlay_prefill_schedule.bucket_rows,
                         .max_decode_activation_rows =

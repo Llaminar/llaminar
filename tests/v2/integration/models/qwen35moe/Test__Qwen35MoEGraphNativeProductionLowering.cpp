@@ -43,6 +43,7 @@
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "mocks/MockLocalTPContext.h"
 #include "mocks/MockComputeStage.h"
@@ -1790,10 +1791,49 @@ namespace llaminar2::test
         registerCompleteDomainExpertLayer(
             registry, "remote_domain", DeviceId::cpu(), 0);
         registerOwnedParticipantExpertLayers(registry, owner_map, 1);
+        if (cpu_rank == 0)
+        {
+            // The rank-local ticket owns one CPU service endpoint beside its
+            // GPU producer. Freeze its complete serial packet/publication and
+            // grouped roots before lowering any serial/prefill/verifier graph.
+            auto declaration=std::make_shared<CPUSerialExpertStorageAdmission>();
+            declaration->allocator={0,DeviceId::cpu()};
+            declaration->controller_devices={device};
+            for(const auto &participant:owner_map.participants())
+                if(participant.device.is_cpu() && participant.world_rank_known && participant.world_rank==0)
+                    declaration->participant_ids.push_back(participant.participant_id);
+            if(declaration->participant_ids.empty())
+                throw std::invalid_argument("Rank-local canonical join fixture has no CPU service endpoint");
+            std::sort(declaration->participant_ids.begin(),declaration->participant_ids.end());
+            declaration->envelope=std::make_shared<const CPUSerialExpertStorageEnvelope>(
+                DeviceId::cpu(),config.max_activation_rows,1,kDModel,kTopK,
+                std::vector<int>{1,2,4,8,16},1,8,true,
+                CPUSerialExpertFamilyPolicy::LocalPowerOfTwo,kIntermediate,kNumExperts);
+            config.cpu_serial_expert_storage={declaration};
+            const size_t packet_bytes=declaration->physicalBytes();
+            const size_t grouped_bytes=declaration->envelope->forController(device)->workspaceBytes()*
+                declaration->participant_ids.size();
+            const size_t total=CPUSerialExpertStorageLayout::add(packet_bytes,grouped_bytes);
+            PhysicalMemoryPlanBuilder admission;
+            const PhysicalMemoryResource cpu{0,DeviceId::cpu(),total,total};
+            admission.add(cpu,PhysicalMemoryOwner::ActivationArena,packet_bytes);
+            admission.add(cpu,PhysicalMemoryOwner::ExecutionWorkspace,grouped_bytes);
+            model->concreteWeightManager()->preparedWeightStore()->installPhysicalMemoryAuthority(
+                std::make_shared<PhysicalMemoryAuthority>(
+                    std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(admission.build()),0));
+        }
         TensorArena weights;
         auto layer = makeLayerWeights(weights);
         ScopedDevicePublicationStream stream(device);
+        const auto prepared_store=model->concreteWeightManager()->preparedWeightStore();
         SealedFFNGraphBuilder builder(model, nullptr, config);
+        if (cpu_rank == 0)
+        {
+            // A standalone component builder receives its store explicitly;
+            // owning the model context does not bind this arena dependency.
+            ASSERT_NE(prepared_store->physicalMemoryAuthority(),nullptr);
+            builder.setPreparedWeightStore(prepared_store.get());
+        }
         for (const int rows : {1, kSeqLen, 16})
         {
             SCOPED_TRACE(rows);

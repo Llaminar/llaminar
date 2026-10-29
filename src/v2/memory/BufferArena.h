@@ -4,6 +4,7 @@
  *
  * BufferArena owns all activation/scratch/workspace buffers and provides:
  *   - Typed registration with BufferId keys
+ *   - Preclaimed CPU physical storage retained by each canonical root
  *   - External buffer registration (for weights)
  *   - Coherence tracking (host vs. device authoritative)
  *   - Borrow tracking with aliasing validation (debug builds)
@@ -36,6 +37,7 @@ namespace llaminar2
     class ITensor;
     class TensorBase;
     class TensorFactory;
+    class PhysicalMemoryAuthority;
 
     /**
      * @brief Configuration for BufferArena allocation behavior.
@@ -47,8 +49,11 @@ namespace llaminar2
      */
     struct ArenaConfig
     {
-        /// TensorFactory for NUMA-aware allocation (required for allocate())
+        /// Optional TensorFactory whose NUMA binding precedes CPU first touch.
         TensorFactory *factory = nullptr;
+
+        /// Existing admitted model authority; required for owned CPU roots.
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority;
 
     };
 
@@ -217,7 +222,14 @@ namespace llaminar2
          * Must be called after all registerBuffer() calls and before
          * any prepareForRead/Write calls.
          *
-         * @return true on success
+         * CPU roots preclaim their exact allocator-rounded extent using the
+         * configured admitted authority. Views and external tensors add no
+         * storage claims; retained shared roots preserve their own lease.
+         *
+         * @return true on success, false when already allocated or construction returns null.
+         * @throws std::logic_error for missing authority or exhausted owner admission.
+         * @throws std::overflow_error for an unrepresentable physical extent.
+         * @throws std::bad_alloc when native root construction fails; its preclaim retires.
          */
         bool allocate();
 
@@ -492,8 +504,14 @@ namespace llaminar2
         /// Check if any buffer in the same alias group has an active borrow
         bool aliasGroupHasAnyBorrow(int group, BufferId exclude) const;
 
-        /// Create a tensor for a registered buffer using TensorFactory
-        std::shared_ptr<TensorBase> createTensorForBuffer(const ManagedBuffer &b, BufferId id) const;
+        /**
+         * @brief Construct a unique root before publishing shared physical ownership.
+         * @param b Registered buffer geometry, dtype and home device.
+         * @param id Buffer identity used in allocation diagnostics.
+         * @return Unpublished tensor; CPU storage uses the common admitted native declaration.
+         * @throws std::bad_alloc when the underlying storage allocation fails.
+         */
+        std::unique_ptr<TensorBase> createTensorForBuffer(const ManagedBuffer &b, BufferId id) const;
     };
 
 } // namespace llaminar2

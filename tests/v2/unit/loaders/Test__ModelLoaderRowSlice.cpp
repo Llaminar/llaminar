@@ -25,6 +25,7 @@
 #include "tensors/TensorKernels.h"
 #include "../../utils/QuantizedVerifierFormats.h"
 #include "../../utils/CPUProjectionTestWorkspace.h"
+#include "../../utils/CPUPreparedStoreTestAdmission.h"
 #include "../../utils/PreparedWeightTestHarness.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
@@ -1005,6 +1006,13 @@ namespace llaminar2
             const auto matrices=parents.projectedExpertMatrices();
             EXPECT_THROW((void)matrices.projectedExpertMatrices(),std::invalid_argument);
             PreparedWeightStore store(plan.strategy().model_id);
+            // Projected matrices retain their real local native dimensions;
+            // charge each final pack to the same routed owner as preparation.
+            std::vector<const TensorBase *> prepared_sources;
+            for (const auto &binding : matrices.bindings())
+                prepared_sources.push_back(binding.tensor);
+            test::admitCPUPreparedStoreForTest(store, prepared_sources,
+                DeviceId::cpu(), matrices.physicalMemoryOwner());
             // A separate unsliced reader/preparation supplies the arithmetic
             // oracle. The observed production reader below must still read
             // only its exact compact rectangle. Native prepared codebooks can

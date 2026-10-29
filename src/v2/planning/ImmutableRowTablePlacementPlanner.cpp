@@ -238,7 +238,17 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
         const auto storage=placement->fixedHeadShardStorageBOM(request.input.consumers());
         for(const auto &bom:storage.resources())candidate.add(bom);
         auto complete=candidate.build();
-        if(!complete.fits())throw PhysicalMemoryCapacityExhausted("Explicit fixed head native ranges exceed complete frozen PMA capacity");
+        if (!complete.fits())
+        {
+            std::string diagnostic = "Explicit fixed head native ranges exceed complete frozen PMA capacity";
+            // Report the canonical rejected resource and every owner exactly;
+            // a generic table error cannot distinguish payload pressure from
+            // retained graph, workspace, or expert ownership defects.
+            for (const auto &bom : complete.resources())
+                if (!bom.fits())
+                    diagnostic += "; " + bom.summary() + " deficit_bytes=" + std::to_string(bom.deficitBytes());
+            throw PhysicalMemoryCapacityExhausted(diagnostic);
+        }
         return {std::move(placement),std::move(complete)};
     }
     if(request.requested.isGPUAdaptive())

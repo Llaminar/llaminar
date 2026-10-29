@@ -22,6 +22,7 @@
 #include "models/qwen35/Qwen35Graph.h"
 #include "planning/MemoryPlanner.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "../../../utils/CPUOrchestratorTestAdmission.h"
 #include "tensors/TensorKernels.h"
 #include "../../../mocks/MockModelContext.h"
 #include "../../../fixtures/CPUGDNStateTestUtils.h"
@@ -38,6 +39,37 @@
 
 namespace llaminar2::test
 {
+/**
+ * @brief Combine the authored cache/archive BOM with the actual CPU graph arena.
+ * @param profile Fixture's exact native cache and recurrent layer inventory.
+ * @param input Original participant-local cache/archive planning declaration.
+ * @param graph Actual arena schema; PP cache scope does not rewrite this graph.
+ * @return One complete immutable plan with no anonymous capacity contribution.
+ *
+ * These state fixtures intentionally construct the full model graph and then
+ * select a cache PP slice on DGO. Their cache/archive estimators remain exact,
+ * while arena ownership must follow the actual constructed graph schema.
+ */
+static PhysicalMemoryPlan prefixFixturePlan(const ModelMemoryProfile &profile,
+    const DevicePlanConfig &input, const Qwen35Graph &graph)
+{
+    const auto modeled = MemoryPlanner::plan(profile, {input});
+    if (!input.device.is_cpu())
+        return modeled.physicalPlan();
+    const size_t arena_bytes = cpuFixtureGraphRoots(graph, input.batch_size,
+        input.activation_seq_len).cpuPhysicalBytes();
+    PhysicalMemoryPlanBuilder admission;
+    for (const auto &resource : modeled.physicalPlan().resources())
+        for (size_t ordinal = 0; ordinal < static_cast<size_t>(PhysicalMemoryOwner::Count); ++ordinal)
+        {
+            const auto owner = static_cast<PhysicalMemoryOwner>(ordinal);
+            const bool arena = resource.resource().device == input.device &&
+                resource.resource().world_rank == input.world_rank && owner == PhysicalMemoryOwner::ActivationArena;
+            admission.add(resource.resource(), owner, arena ? arena_bytes : resource.bytes(owner));
+        }
+    return admission.build();
+}
+
 /** @brief Explicit backend selection keeps CPU-only preflight device-free. */
 class PipelinePrefixState : public ::testing::TestWithParam<std::string>
 {
@@ -158,10 +190,10 @@ TEST_P(PipelinePrefixState, FullVocabularyPublicationArchivesEveryTPShard)
             input.kv_precision = "fp16";
             input.prefix_cache = config.prefix_cache;
             input.mtp_terminal_logits_layout = config.mtpTerminalLogitsLayout();
+            auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
             auto memory = std::make_shared<PhysicalMemoryAuthority>(
                 std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
-                    MemoryPlanner::plan(profile, {input}).physicalPlan()), 0);
-            auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
+                    prefixFixturePlan(profile, input, *graph)), 0);
             auto owner = DeviceGraphOrchestrator::createForTest({
                 .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
                 .physical_memory_authority = memory});
@@ -286,10 +318,10 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                     input.mtp_enabled = true; // Price retained capacity, not request enablement.
                     input.mtp_target_query_rows = 16;
                     input.prefix_cache = config.prefix_cache;
+                    auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
                     auto memory = std::make_shared<PhysicalMemoryAuthority>(
                         std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
-                            MemoryPlanner::plan(profile, {input}).physicalPlan()), 0);
-                    auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
+                            prefixFixturePlan(profile, input, *graph)), 0);
                     auto owner = DeviceGraphOrchestrator::createForTest({
                         .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
                         .physical_memory_authority = memory});
@@ -517,10 +549,10 @@ TEST_P(PipelinePrefixState, OffsetHybridSlicesUseGlobalLayerIdentity)
                 input.max_seq_len = input.activation_seq_len = 64;
                 input.kv_precision = kvCachePrecisionToString(precision);
                 input.prefix_cache = config.prefix_cache;
+                auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
                 auto memory = std::make_shared<PhysicalMemoryAuthority>(
                     std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
-                        MemoryPlanner::plan(profile, {input}).physicalPlan()), 0);
-                auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
+                        prefixFixturePlan(profile, input, *graph)), 0);
                 auto owner = DeviceGraphOrchestrator::createForTest({
                     .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
                     .physical_memory_authority = memory});

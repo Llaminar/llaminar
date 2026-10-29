@@ -5,10 +5,12 @@
  * No model, file access, backend initialization, allocation authority or runtime
  * row directory is used. Tiny explicit intervals supply independent coverage
  * and native-byte equations; large extents prove source-size-independent metadata.
+ * Cross-vendor declarations prove geometry only, not native transport or runtime eligibility.
  */
 #include "loaders/ImmutableRowTableLayoutGeometry.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <algorithm>
 #include <limits>
 namespace llaminar2::test {
 namespace {
@@ -248,5 +250,68 @@ TEST(ImmutableRowTableLayoutGeometry, WholeTierAdapterPreservesWorkingStorageAnd
     }
     EXPECT_THROW(fixed().nativePayloadBytes(v0),std::invalid_argument);
     EXPECT_EQ(adaptive().maximumInflightRows(),3u);
+}
+
+/** @test Equal vendor-local ordinals remain distinct physical owners across independent consumers. */
+TEST(ImmutableRowTableLayoutGeometry, MixedVendorOwnersAndConsumersRemainIndependent) {
+    const Id cuda0{0,DeviceId::cuda(0)},rocm0{0,DeviceId::rocm(0)};
+    const Id storage_only{2,DeviceId::rocm(3)},consumer_only{3,DeviceId::cuda(1)};
+    const Id host_source{4,DeviceId::cpu()};
+    const Owner cuda{cuda0,Storage::VRAM},rocm{rocm0,Storage::VRAM};
+    const Owner empty{storage_only,Storage::VRAM},host{host_source,Storage::RAM};
+    ASSERT_NE(cuda0,rocm0);
+    const auto allowed=tiers({Storage::VRAM,Storage::RAM,Storage::MemoryMapped});
+    const std::vector<ImmutableRowTableLayoutOwner> owners{
+        {cuda,0,2,180},{rocm,0,5,450},{empty,0,0,0},{host,0,3,270}};
+    const std::vector<Id> consumers{cuda0,rocm0,cpu(1),consumer_only};
+    const auto result=Layout::checked(extent(),allowed,Residency::Adaptive,owners,consumers,
+        {},{service(host_source)}, {},storage_only,7);
+    EXPECT_EQ(result.owners().size(),4u);
+    EXPECT_EQ(result.consumers().size(),consumers.size());
+    EXPECT_TRUE(std::ranges::equal(result.consumers(),consumers));
+    EXPECT_EQ(result.gpuCoordinator(),storage_only);
+    EXPECT_EQ(result.sourceServices().front().allocator,host_source);
+    EXPECT_EQ(result.nativePayloadBytes(cuda),180u);
+    EXPECT_EQ(result.nativePayloadBytes(rocm),450u);
+    EXPECT_EQ(result.nativePayloadBytes(empty),0u);
+    EXPECT_EQ(result.nativePayloadBytes(host),270u);
+    EXPECT_EQ(result.gpuDirectoryRecordBound(),14u); // GPU slots (2+5+0) plus seven live rows; RAM slots are not GPU directory records.
+    EXPECT_EQ(result.maximumInflightRows(),7u);
+    EXPECT_TRUE(result.fixedRanges().empty());
+    EXPECT_EQ(result,Layout::checked(extent(),allowed,Residency::Adaptive,owners,consumers,
+        {},{service(host_source)}, {},storage_only,7));
+    EXPECT_NE(result,Layout::checked(extent(),allowed,Residency::Adaptive,owners,consumers,
+        {},{service(host_source)}, {},rocm0,7));
+    auto changed=owners;
+    changed[0].physical_byte_limit=181;
+    EXPECT_NE(result,Layout::checked(extent(),allowed,Residency::Adaptive,changed,consumers,
+        {},{service(host_source)}, {},storage_only,7));
+    EXPECT_NE(result,Layout::checked(extent(),allowed,Residency::Adaptive,owners,consumers,
+        {},{service(cpu(5))}, {},storage_only,7));
+    EXPECT_THROW(Layout::checked(extent(),allowed,Residency::Adaptive,owners,consumers,
+        {},{service(host_source)}, {},Id{8,DeviceId::rocm(3)},7),std::invalid_argument);
+}
+
+/** @test Native fixed ranges may span vendors/ranks without mirroring the table on consumers. */
+TEST(ImmutableRowTableLayoutGeometry, MixedVendorFixedRangesRetainExactNativeCoverage) {
+    const Owner cuda{{0,DeviceId::cuda(0)},Storage::VRAM};
+    const Owner rocm{{1,DeviceId::rocm(0)},Storage::VRAM};
+    const Owner host{{2,DeviceId::cpu()},Storage::RAM};
+    const std::vector<ImmutableRowTableLayoutOwner> owners{{cuda,2,0,180},{rocm,5,0,450},{host,3,0,270}};
+    const std::vector<ImmutableRowTableFixedRange> ranges{
+        {0,2,cuda,Role::Primary},{2,5,rocm,Role::Primary},{7,3,host,Role::Primary}};
+    const std::vector<Id> consumers{cpu(3),{4,DeviceId::cuda(1)},{5,DeviceId::rocm(2)}};
+    const auto result=Layout::checked(extent(),tiers({Storage::VRAM,Storage::RAM}),Residency::Fixed,
+        owners,consumers,ranges,{});
+    EXPECT_EQ(result.nativePayloadBytes(cuda)+result.nativePayloadBytes(rocm)+result.nativePayloadBytes(host),900u);
+    EXPECT_EQ(result.gpuDirectoryRecordBound(),0u);
+    EXPECT_EQ(result.fixedRanges().size(),ranges.size());
+    EXPECT_TRUE(std::ranges::equal(result.fixedRanges(),ranges));
+    EXPECT_EQ(result.consumers().size(),consumers.size());
+    EXPECT_TRUE(std::ranges::equal(result.consumers(),consumers));
+    auto collision=owners;
+    collision[1].key=cuda;
+    EXPECT_THROW(Layout::checked(extent(),tiers({Storage::VRAM,Storage::RAM}),Residency::Fixed,
+        collision,consumers,ranges,{}),std::invalid_argument);
 }
 } // namespace llaminar2::test

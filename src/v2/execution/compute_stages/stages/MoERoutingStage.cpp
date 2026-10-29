@@ -9,6 +9,8 @@
  */
 
 #include "MoERoutingStage.h"
+#include "../../../memory/CPURouterQ8StorageLayout.h"
+#include "../../../kernels/cpu/moe/CPUMoEKernel.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "MoEDeviceRebalanceStage.h"
 #include "../../../kernels/KernelFactory.h"
@@ -1690,6 +1692,14 @@ namespace llaminar2
         int,
         int) const
     {
+        if (params_.device_id.is_cpu())
+        {
+            WorkspaceRequirements reqs;
+            reqs.cpu_router_q8_storage = std::make_shared<const CPURouterQ8StorageLayout>(
+                CPURouterQ8StorageLayout::declare(
+                    std::max({1,m,params_.seq_len}),params_.d_model,params_.device_id));
+            return reqs;
+        }
         if (!params_.device_id.is_cuda() && !params_.device_id.is_rocm())
             return WorkspaceRequirements{};
 
@@ -1763,14 +1773,34 @@ namespace llaminar2
         /*
          * The view must never outlive the workspace address it describes.
          * Drop it before replacing either the workspace or the backend
-         * kernel's scratch binding.
+         * kernel's scratch binding. Null is the interface's explicit unbind:
+         * retain backing owners while revoking manager and device-view borrows.
          */
+        if (params_.device_id.is_cpu() && workspace)
+        {
+            const auto requested = std::make_shared<const CPURouterQ8StorageLayout>(
+                CPURouterQ8StorageLayout::declare(
+                    std::max(1,params_.seq_len),params_.d_model,params_.device_id));
+            workspace->requireCPURouterQ8Storage(requested);
+            const auto storage = workspace->cpuRouterQ8Storage();
+            if (!storage)
+                throw std::logic_error("CPU router requires declared publication storage");
+            auto *kernel = dynamic_cast<CPUMoEKernel *>(acquireMoEKernelObject());
+            if (!kernel)
+                throw std::logic_error("CPU router has no CPU kernel");
+            kernel->bindRouterQ8HiddenStorage(storage);
+        }
         router_logits_device_view_.reset();
         bound_workspace_ = workspace;
         if (moe_kernel_)
         {
             if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(moe_kernel_))
-                consumer->bindWorkspace(workspace);
+            {
+                if (workspace)
+                    consumer->bindWorkspace(workspace);
+                else
+                    consumer->unbindWorkspace();
+            }
         }
 
         if (!bindRouterLogitsDeviceView() && workspace && params_.device_id.is_gpu())

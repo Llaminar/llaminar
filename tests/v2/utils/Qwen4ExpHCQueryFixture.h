@@ -10,6 +10,7 @@
 #pragma once
 #include "../unit/models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "PreparedWeightTestHarness.h"
+#include "CPUPreparedStoreTestAdmission.h"
 #include "GpuPreparedGemmHarness.h"
 #include "models/qwen35/Qwen35Graph.h"
 #include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
@@ -113,6 +114,17 @@ public:
             down_=matrix(HCQueryActivations::R,HCQueryActivations::C);
             up_=matrix(HCQueryActivations::C,HCQueryActivations::R);
             inject_=matrix(4,HCQueryActivations::C);
+            if (device_.is_cpu())
+            {
+                // Each of the attention, FFN and head groups prepares its own
+                // three named handles. Their actual packer allocations are
+                // independent even though this fixture shares original tensors.
+                const std::array<const TensorBase *, 9> prepared_sources{
+                    down_.get(), up_.get(), inject_.get(),
+                    down_.get(), up_.get(), inject_.get(),
+                    down_.get(), up_.get(), inject_.get()};
+                admitCPUPreparedStoreForTest(store_, prepared_sources, device_);
+            }
             attention_=weights("blk.0.hc_attn_");
             ffn_=weights("blk.0.hc_ffn_");
             head_=weights("output_hc_");

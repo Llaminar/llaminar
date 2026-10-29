@@ -113,6 +113,8 @@ protected:
             const auto role = record.tags.find("role");
             if (role == record.tags.end() || role->second != "mtp_grouped_verifier") continue;
             EXPECT_EQ(record.phase, "setup");
+            EXPECT_EQ(record.tags.at("sparse_query_program"), std::to_string(
+                sparseQueryExecutionProgramIndex(SparseQueryExecutionProgram::RankingPossible)));
             EXPECT_EQ(record.tags.at("submission"), "materialized_unlaunched");
             actual[{record.device, record.tags.at("physical_rows"), record.tags.at("outcome_mode")}] += record.value;
         }

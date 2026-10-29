@@ -1,12 +1,12 @@
 # QFN tuning dashboard
 
-Updated 2026-10-28. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-10-29. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
-**Checkpoint:** fresh finite-trajectory MTP comparison and full OpenCode
+**Checkpoint `2cf99995d`:** fresh finite-trajectory MTP comparison and full OpenCode
 session complete on accepted ROCm TP4. [Contract and live MTP table](QFN_MTP_TP4_TUNING.md).
 The A1 rates below are historical **MTP-off** results.
 
@@ -17,12 +17,11 @@ same 255-token decode denominator. Native ignores stop termination; the fork
 permits EOS. This qualifies the observed finite trajectory, not identical EOS
 semantics or general performance superiority. Speed 6/10 remains diagnostic.
 
-Current-source gates: **2,981 pass / 29 hardware skips / zero failures**,
-including 786 Unit; Release green. Subsequent local validation accounts for one
-unrelated exporter link; the original gate receipt is unchanged and canonical
-reuse remains rejected. Fresh Off/Serving-Dynamic HTTP pass with exact serial
-IDs, prefix restoration, ticket/branch proof and clean retirement. This is local
-qualification; the host note retains the complete evidence and limitations.
+That checkpoint passed **2,981 checks / 29 hardware skips**, including 786
+Unit; Release passed. Its receipt does not certify subsequent changes.
+Off/Serving-Dynamic HTTP passed with exact serial IDs, prefix restoration,
+ticket/branch proof and clean retirement. The host note retains the evidence
+and limitations.
 
 Full OpenCode **passes**: ten phases, 110 tools, zero errors, 85 requests,
 one client context compaction, 1,950.81 seconds; independent acceptance and
@@ -39,7 +38,7 @@ and [online rescale][online-rescale]. Component savings do not establish model g
 
 | Next action | State / decision |
 |---|---|
-| Host-fix checkpoint | Full app and independent/driver/retirement review complete locally. |
+| Admission | [Matrix](QFN_SOURCE_ADMISSION_MATRIX.md): Unit 790/790; focused 8/8; native 1,030 pass; 468 source cells eligible. |
 | CUDA QSA timing | First M1/512 component saves 22.685%; remaining shapes pending, no model claim. |
 | Broader topologies | Tune admitted A rows, then qualify B–D with matched references. |
 

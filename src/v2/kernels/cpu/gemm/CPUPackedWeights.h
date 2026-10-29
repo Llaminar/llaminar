@@ -11,6 +11,8 @@
  * payload, int8_flat). The new buffers are allocated on the calling thread's
  * NUMA node via first-touch policy, ensuring NUMA locality for the destination
  * socket.
+ * Destination clones allocate each final section through its typed placement
+ * authority. Moves retain allocation leases through detach, transfer and attach.
  */
 
 #pragma once
@@ -73,6 +75,50 @@ namespace llaminar2::cpu::native_vnni
             return cloned;
         }
 
+        /**
+         * @brief Copy published packed bytes into the destination's exact allocations.
+         * @param destination Caller-admitted CPU staging or final-storage owner.
+         * @return Complete independent packed owner; no execution workspace is copied.
+         */
+        std::unique_ptr<IPackedWeights> cloneTo(CPUWeightStoragePlacement destination) const override
+        {
+            return copyTo(packed_, destination);
+        }
+
+        /**
+         * @brief Copy a borrowed packed descriptor through an explicit destination.
+         * @param source Published immutable packed storage.
+         * @param destination Admitted placement for each independently owned buffer.
+         * @return New independently owned packed storage.
+         */
+        static std::unique_ptr<IPackedWeights> copyTo(const CPUNativeVNNIPackedWeights &source,
+            CPUWeightStoragePlacement destination)
+        {
+            CPUNativeVNNIPackedWeights copy;
+            copy.N = source.N;
+            copy.K = source.K;
+            copy.N_padded = source.N_padded;
+            copy.blocks_per_row = source.blocks_per_row;
+            copy.payload_bytes = source.payload_bytes;
+            copy.codebook_id = source.codebook_id;
+            copy.is_asymmetric = source.is_asymmetric;
+            copy.is_superblock = source.is_superblock;
+            copy.encoding = source.encoding;
+            copy.numerical_policy = source.numerical_policy;
+            copy.data_stride = source.data_stride;
+            copy.interleaved_block_stride = source.interleaved_block_stride;
+            const auto clone_storage = [&]<typename T>(const AlignedVector<T> &section) {
+                auto storage = destination.allocate<T>(section.size());
+                if (!section.empty())
+                    std::memcpy(storage.data(), section.data(), section.size() * sizeof(T));
+                return storage;
+            };
+            copy.native_interleaved = clone_storage(source.native_interleaved);
+            copy.payload = clone_storage(source.payload);
+            copy.int8_flat = clone_storage(source.int8_flat);
+            return std::make_unique<CPUPackedWeights>(std::move(copy));
+        }
+
         std::unique_ptr<IPackedWeights> convertTo(DeviceType target) const override
         {
             if (target == DeviceType::CPU)
@@ -115,9 +161,32 @@ namespace llaminar2::cpu::native_vnni
             std::vector<uint8_t> &&native_blocks,
             size_t native_block_size)
             : CPUPackedWeights(std::move(packed)),
-              native_blocks_(std::move(native_blocks)),
+              native_blocks_(native_blocks),
               native_block_size_(native_block_size)
         {
+        }
+
+        /**
+         * @brief Adopt final admitted native source storage without copying it.
+         * @param packed Prepared metadata and interleaved storage.
+         * @param native_blocks Independently owned admitted source bytes.
+         * @param native_block_size Source format block extent.
+         */
+        CPUPackedWeightsWithNativeBlocks(CPUNativeVNNIPackedWeights &&packed,
+            AlignedVector<uint8_t> &&native_blocks, size_t native_block_size)
+            : CPUPackedWeights(std::move(packed)), native_blocks_(std::move(native_blocks)),
+              native_block_size_(native_block_size) {}
+
+        /** @copydoc CPUPackedWeights::cloneTo */
+        std::unique_ptr<IPackedWeights> cloneTo(CPUWeightStoragePlacement destination) const override
+        {
+            auto base = CPUPackedWeights::cloneTo(destination);
+            auto storage = destination.allocate<uint8_t>(native_blocks_.size());
+            if (!native_blocks_.empty())
+                std::memcpy(storage.data(), native_blocks_.data(), native_blocks_.size());
+            return std::make_unique<CPUPackedWeightsWithNativeBlocks>(
+                static_cast<CPUPackedWeights *>(base.get())->takePacked(),
+                std::move(storage), native_block_size_);
         }
 
         /// Deep copy including native blocks (NUMA-local).
@@ -125,7 +194,7 @@ namespace llaminar2::cpu::native_vnni
         {
             auto cloned = std::make_unique<CPUPackedWeightsWithNativeBlocks>(
                 CPUNativeVNNIPackedWeights(packed()), // copy packed
-                std::vector<uint8_t>(native_blocks_), // copy native blocks
+                AlignedVector<uint8_t>(native_blocks_), // copy native blocks
                 native_block_size_);
             return cloned;
         }
@@ -135,11 +204,11 @@ namespace llaminar2::cpu::native_vnni
             return CPUPackedWeights::sizeBytes() + native_blocks_.size();
         }
 
-        const std::vector<uint8_t> &nativeBlocks() const { return native_blocks_; }
+        const AlignedVector<uint8_t> &nativeBlocks() const { return native_blocks_; }
         size_t nativeBlockSize() const { return native_block_size_; }
 
     private:
-        std::vector<uint8_t> native_blocks_;
+        AlignedVector<uint8_t> native_blocks_;
         size_t native_block_size_ = 0;
     };
 

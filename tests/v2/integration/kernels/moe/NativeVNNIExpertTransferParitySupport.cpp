@@ -10,6 +10,7 @@
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "../../../utils/CPUProjectionTestWorkspace.h"
+#include "../../../utils/CPUSerialArenaTestAdmission.h"
 
 namespace llaminar2::test::native_vnni_transfer_parity_detail
 {
@@ -81,8 +82,10 @@ namespace llaminar2::test::native_vnni_transfer_parity_detail
                         d_model, physical.data() + (row * 2u + 1u) * d_model);
         }
 
+        // Preserve the authored coherent families and grouped/canonical roots;
+        // freeze their exact common layout before any backing is materialized.
         auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
-            MoELocalExpertSerialBufferArena::Config{
+            admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
                 .device_id = DeviceId::cpu(), .row_capacity = count,
                 .d_model = d_model, .routing_top_k = routes,
                 .cpu_canonical_route_storage = MoELocalExpertSerialBufferArena::
@@ -90,7 +93,7 @@ namespace llaminar2::test::native_vnni_transfer_parity_detail
                 .cpu_grouped_scratch_storage = MoELocalExpertSerialBufferArena::
                     CPUGroupedScratchStoragePolicy::RetainSerialMaximum,
                 .num_experts = routes, .expert_intermediate = intermediate,
-            });
+            }));
         MoELocalExpertStage::Params params;
         params.device_id = DeviceId::cpu();
         params.return_layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;

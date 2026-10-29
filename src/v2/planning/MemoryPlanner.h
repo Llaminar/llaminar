@@ -8,6 +8,7 @@
  * lifetime topology of graph-stable routed-expert buffers, allowing
  * captured serial graph families to share storage without under-admitting
  * concurrent graph families.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
@@ -494,11 +495,15 @@ struct DevicePlanConfig
      * Zero uses @ref activation_seq_len and @ref batch_size. ExpertOverlay
      * supplies its resolved captured-segment envelope here because dense graph
      * and KV capacities may be much larger. A positive value also selects the
-     * production power-of-two route-family ladder through the resulting
-     * `rows * top_k` maximum, so admission prices every stable address later
-     * retained by the participant graph.
+     * GPU production power-of-two route-family ladder through the resulting
+     * `rows * top_k` maximum. CPU participants instead require their immutable
+     * cpu_serial_expert_storage declaration, shared with materialization.
      */
     int serial_routed_expert_compact_rows = 0;
+
+    /// Exact immutable CPU serial declaration; absent on GPU and non-serial modes.
+    std::shared_ptr<const CPUSerialExpertStorageAdmission> cpu_serial_expert_storage;
+
 
     /** Exact model-weight authority installed on this device. */
     DeviceWeightResidency weight_residency;
@@ -632,6 +637,10 @@ struct ImmutableRowTableUploadBinding
 class MemoryPlanner
 {
 public:
+    /** @brief Retain the exact declarations from successful admitted device inputs. */
+    [[nodiscard]] static std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>>
+    cpuSerialExpertStorageAdmissions(std::span<const DevicePlanConfig> configs);
+
     /**
      * @brief Project original source and every actual PLE consumer after topology is fixed.
      * @param profile Original model metadata.

@@ -4,6 +4,8 @@
  *
  * Replicated KV retains the full original bank and global GQA mapping; local
  * query intervals stay integral without an artificial KV-count alignment.
+ * CPU participants share a host address space; canonical local ranks retain
+ * their distinct shards and ambiguous address-only lookups fail explicitly.
  * Model-specific GDN key-head boundary validation remains a separate guard.
  * Opt-in query coverage authenticates exact original intervals and their union;
  * logical totals count each original head once, never each physical replica.
@@ -109,6 +111,12 @@ namespace llaminar2
             throw std::out_of_range(
                 "Device not found in TensorParallelConfig: " + device.to_string());
         }
+        // A CPU DeviceId names host storage, not a NUMA participant. Selecting
+        // the first match would silently give later ranks the wrong shard.
+        if (std::any_of(it + 1, assignments_.end(),
+                        [device](const auto &a) { return a.device == device; }))
+            throw std::invalid_argument(
+                "Ambiguous device in TensorParallelConfig; use forRank: " + device.to_string());
         return *it;
     }
 
@@ -302,12 +310,19 @@ namespace llaminar2
             }
         }
 
-        // Check for duplicate devices
+        // CPU DeviceId is one shared host address space. Its shard identity is
+        // the canonical participant rank, while GPU devices remain exclusive.
+        // NUMA-domain membership is authenticated by the execution-domain owner.
+        for (size_t i = 0; i < assignments_.size(); ++i)
+            if (assignments_[i].device.is_cpu() && assignments_[i].local_rank != static_cast<int>(i))
+                return "CPU assignment local rank differs from canonical participant order";
+
+        // Check for duplicate GPU devices
         for (size_t i = 0; i < assignments_.size(); ++i)
         {
             for (size_t j = i + 1; j < assignments_.size(); ++j)
             {
-                if (assignments_[i].device == assignments_[j].device)
+                if (!assignments_[i].device.is_cpu() && assignments_[i].device == assignments_[j].device)
                 {
                     return "Duplicate device: " + assignments_[i].device.to_string();
                 }

@@ -19,6 +19,8 @@
  * cleanup by resetting dynamic kernel state while preserving long-lived packed
  * weights. Real kernel registration also authenticates the sealed floating
  * operand policy before publishing tensor state or an adoptable prepared ref.
+ * CPU packed preparation binds final allocator-rounded storage directly to the
+ * persistent owner; borrowed floating sources create no second storage claim.
  */
 
 namespace llaminar2
@@ -293,9 +295,18 @@ namespace llaminar2
         const PreparedWeightKind kind = inferPreparedKind(device);
         validateBindingForStore(binding, model_id_, kind);
 
+        auto placement = CPUWeightStoragePlacement::local();
+        if (device.is_cpu())
+        {
+            if (const auto authority = physicalMemoryAuthority())
+                placement = CPUWeightStoragePlacement::accounted(authority, device, memory_owner, placement);
+            else
+                throw std::logic_error("CPU GEMM preparation requires the admitted physical-memory authority");
+        }
+
         auto owned = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(
             binding.tensor, device, llaminar::v2::kernels::KernelFactory::GemmPreparationKind::AUTO,
-            binding.floating_operand_precision);
+            binding.floating_operand_precision, placement);
         if (!owned)
             throw std::runtime_error("PreparedWeightStore::prepareGemm failed for: " + binding.identity.canonical_name);
 
@@ -304,7 +315,7 @@ namespace llaminar2
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(owned)};
+        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(owned), memory_owner};
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -341,8 +352,11 @@ namespace llaminar2
         const WeightBinding &binding,
         PreparedWeightKind kind,
         DeviceId device,
-        std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle)
+        std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle,
+        std::optional<PhysicalMemoryOwner> memory_owner)
     {
+        if (memory_owner && !isPersistentWeightOwner(*memory_owner))
+            throw std::invalid_argument("Registered prepared GEMM requires an explicit persistent owner");
         validateBindingForStore(binding, model_id_, kind);
         // A real engine is the arithmetic authority. Reject a contradictory
         // advertised binding before publishing either tensor state or a ref.
@@ -361,7 +375,7 @@ namespace llaminar2
             stored.tensor->publishPreparedDeviceState();
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle)};
+        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle), memory_owner};
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -442,7 +456,7 @@ namespace llaminar2
             stored.prepared = ref;
             if (stored.tensor)
                 stored.tensor->publishPreparedDeviceState();
-            entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle)};
+            entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle), entry.memory_owner};
             return true;
         }
 
@@ -876,8 +890,13 @@ namespace llaminar2
         if (cache_it != sliced_cache_.end())
             return cache_it->second.get();
 
+        if (!ref.device.is_cpu() || !physical_memory_authority_ || !entry_it->second.memory_owner)
+            throw std::logic_error("Prepared CPU GEMM slice requires its original admitted allocation owner");
+        const auto placement = CPUWeightStoragePlacement::accounted(
+            physical_memory_authority_, ref.device, *entry_it->second.memory_owner,
+            CPUWeightStoragePlacement::local());
         auto kernel = llaminar::v2::kernels::KernelFactory::createGemmSlicedLocal(
-            tensor, row_start, row_end);
+            tensor, row_start, row_end, placement);
         if (kernel)
         {
             auto *raw = kernel.get();

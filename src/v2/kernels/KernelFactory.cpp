@@ -11,6 +11,8 @@
  * Bounded expert service measurements retain immutable prepared bytes while
  * giving GPU probes independent execution bindings, never borrowing the live
  * inference engine's stream, library handle, or scratch lifetime.
+ * CPU prepared dispatch preserves ordinary slicing and arithmetic identity while
+ * binding the final packed allocation to its caller-provided admission authority.
  */
 
 #include "KernelFactory.h"
@@ -3053,8 +3055,19 @@ namespace llaminar
                 static std::unique_ptr<llaminar2::ITensorGemm> createPreparedKernelForDevice(
                     const llaminar2::TensorBase *tensor,
                     llaminar2::DeviceId target_device,
-                    llaminar2::FloatingActivationOperandPrecision operand_precision)
+                    llaminar2::FloatingActivationOperandPrecision operand_precision,
+                    llaminar2::CPUWeightStoragePlacement placement)
                 {
+                    if (target_device.is_cpu() && isVnniPackableTensor(tensor) &&
+                        operand_precision == llaminar2::FloatingActivationOperandPrecision::Native)
+                    {
+                        const llaminar2::TensorBase *source = tensor;
+                        if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor);
+                            slice && slice->metadata().inner_is_presliced)
+                            source = slice->inner();
+                        return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+                            source, 0, -1, llaminar2::CPUProjectionNumericalPolicy::BackendNative, placement);
+                    }
                     const auto dev_type = KernelFactory::getDeviceType(target_device);
                     if (operand_precision != llaminar2::FloatingActivationOperandPrecision::Native)
                     {
@@ -3217,12 +3230,12 @@ namespace llaminar
                 const llaminar2::TensorBase *tensor,
                 llaminar2::DeviceId target_device,
                 GemmPreparationKind prep_kind,
-                llaminar2::FloatingActivationOperandPrecision operand_precision)
+                llaminar2::FloatingActivationOperandPrecision operand_precision,
+                llaminar2::CPUWeightStoragePlacement placement)
             {
                 if (!tensor)
                     throw std::runtime_error("KernelFactory::prepareGemmHandleLocal: null tensor");
 
-                const bool quantized = isVnniPackableTensor(tensor);
                 const GemmPreparationKind resolved_kind = resolveGemmPreparationKind(tensor, target_device, prep_kind);
 
                 if (!tensor->raw_data())
@@ -3238,10 +3251,7 @@ namespace llaminar
                         "KernelFactory::prepareGemmHandleLocal: GPU prepared GEMM handles must be registered by the PreparedWeightStore-backed load pipeline");
                 }
 
-                if (quantized && resolved_kind == GemmPreparationKind::CPU_PACKED)
-                    (void)ensurePackedWeightsInTensorCache(tensor);
-
-                auto bound_kernel = createPreparedKernelForDevice(tensor, target_device, operand_precision);
+                auto bound_kernel = createPreparedKernelForDevice(tensor, target_device, operand_precision, placement);
                 if (!bound_kernel)
                     throw std::runtime_error("KernelFactory::prepareGemmHandleLocal: failed to bind prepared kernel");
 
@@ -3260,7 +3270,8 @@ namespace llaminar
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemmSlicedLocal(
                 const llaminar2::TensorBase *tensor,
                 size_t row_start,
-                size_t row_end)
+                size_t row_end,
+                llaminar2::CPUWeightStoragePlacement placement)
             {
                 if (!tensor)
                 {
@@ -3283,7 +3294,8 @@ namespace llaminar
                     throw std::runtime_error("KernelFactory: sliced GEMM only supported on CPU");
 
                 return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
-                    tensor, static_cast<int>(row_start), static_cast<int>(row_end));
+                    tensor, static_cast<int>(row_start), static_cast<int>(row_end),
+                    llaminar2::CPUProjectionNumericalPolicy::BackendNative, placement);
             }
 
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
@@ -3346,9 +3358,6 @@ namespace llaminar
                 }
 
                 // Pack weights into tensor-local cache (same as global path)
-                if (quantized && resolved_kind == GemmPreparationKind::CPU_PACKED)
-                    (void)ensurePackedWeightsInTensorCache(tensor);
-
                 // ExpertOverlay may move this logical matrix between CPU and
                 // GPU after any residency epoch. Bind the cross-backend
                 // arithmetic policy at preparation rather than inferring it

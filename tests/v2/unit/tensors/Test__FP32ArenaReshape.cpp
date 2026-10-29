@@ -4,7 +4,9 @@
  *
  * GPU semantics use the existing host-memory MockBackend, never a native device.
  * Original host-only create_view is an explicit failing ownership control.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../utils/CPUActivationArenaFixture.h"
 #include "tensors/FP32ArenaReshape.h"
 #include "execution/compute_stages/stages/GEMMArenaReshapeStage.h"
 #include "memory/BufferArena.h"
@@ -24,7 +26,7 @@ struct Arena
 {
     MPIContext mpi{0, 1};
     TensorFactory factory{mpi};
-    BufferArena arena{ArenaConfig{.factory = &factory}};
+    BufferArena arena{::llaminar2::test::cpuArenaFixtureConfig(&factory)};
     /** @brief Allocate ordinary host storage only, including logical GPU participants. */
     explicit Arena(DeviceId device = DeviceId::cpu(), const char *type = "FP32")
     {

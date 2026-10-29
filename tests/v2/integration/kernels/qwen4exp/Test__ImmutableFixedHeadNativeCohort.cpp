@@ -9,7 +9,9 @@
  * query inputs do not certify Rank/DGO replicated token/history issuance, sampler,
  * MTP acceptance, prefix restore or complete model serving. Those require the
  * separately registered canonical full-model Rank qualification.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -283,7 +285,7 @@ void prove(DeviceId first,int degree,HostFailureInjection injection=HostFailureI
             for(const int capacity:{1,17}) {
                 auto hostClaim=memory->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ActivationArena,arenaBytes(capacity,degree));
                 auto deviceClaim=memory->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,arenaBytes(capacity,degree));
-                test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(ArenaConfig{.factory=&factory});
+                test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
                 for(const auto &r:roles(capacity,degree))require(arena.registerBuffer(r.id,r.rows,r.columns,r.type,device),"Register component role");require(arena.allocate(),"Allocate component arena");
                 SetupStreamRetirement setupRetirement(worker,*tp,stream,observations[participant]);
                 for(const auto &r:roles(capacity,degree)){auto *t=arena.getTensor(r.id);std::memset(t->raw_mutable_data(),0,t->size_bytes());

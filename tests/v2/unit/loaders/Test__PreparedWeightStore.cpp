@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/PreparedDeviceAllocationLedger.h"
@@ -698,8 +699,11 @@ TEST(Test__PreparedWeightStore, ResolvesSlicedGemmKernelByPreparedRef)
     auto binding = makeStoreBinding(13, "blk.0.ffn_down.weight", DeviceId::cpu());
     binding.tensor = tensor.get();
 
-    auto ref = store.registerPreparedForTest(
-        binding, PreparedWeightKind::CpuPackedGemm, DeviceId::cpu());
+    const std::array<const TensorBase *, 1> full{tensor.get()};
+    const std::array<test::CPUPreparedStoreTestSlice, 1> slices{{{tensor.get(), 0, 512}}};
+    test::admitCPUPreparedStoreForTest(store, full, DeviceId::cpu(),
+        PhysicalMemoryOwner::PrimaryModelWeights, slices);
+    auto ref = store.prepareGemm(binding);
 
     auto *first = store.slicedGemmKernel(ref, 0, 512);
     ASSERT_NE(first, nullptr);

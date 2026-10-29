@@ -25,6 +25,8 @@
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 #include "utils/CPUProjectionTestWorkspace.h"
+#include "utils/CPUExpertStageTestAdmission.h"
+#include "utils/CPUPerLayerPacketTestAdmission.h"
 
 #include <algorithm>
 #include <iterator>
@@ -137,9 +139,14 @@ namespace llaminar2::test
             params.routing_weights = routing_weights;
             params.output = output;
             params.output_registered_in_arena = false;
+            // The diagnostic oracle consumes the same explicit transported
+            // routing indices as the local endpoint; it has no router stage.
+            params.cpu_router_q8_input_publication=CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
 
-            if (!MoEExpertComputeStage::extractExpertViews(params) ||
-                !MoEExpertComputeStage::prepareExpertGemmEngines(params))
+            if (!MoEExpertComputeStage::extractExpertViews(params))
+                return false;
+            auto prepared_admission=test::admitCPUExpertStageForTest(params,PhysicalMemoryOwner::PrimaryModelWeights);
+            if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             {
                 return false;
             }
@@ -304,6 +311,7 @@ namespace llaminar2::test
 
         ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(prep))
             << "extractExpertViews failed";
+        auto prepared_admission=test::admitCPUExpertStageForTest(prep,PhysicalMemoryOwner::PrimaryModelWeights);
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(prep))
             << "prepareExpertGemmEngines failed";
 
@@ -343,7 +351,7 @@ namespace llaminar2::test
         // Validate prepared weights before execution.
         {
             std::string validate_err;
-            MoELocalExpertStage probe(local_params);
+            MoELocalExpertStage probe(test::admitCPUPerLayerPacketForTest(local_params));
             EXPECT_TRUE(probe.validatePreparedWeights(&validate_err))
                 << "validatePreparedWeights: " << validate_err;
         }
@@ -353,7 +361,7 @@ namespace llaminar2::test
 
         // Execute.
         {
-            MoELocalExpertStage local_stage(std::move(local_params));
+            MoELocalExpertStage local_stage(test::admitCPUPerLayerPacketForTest(std::move(local_params)));
             CPUStageTestWorkspace invocation_workspace(local_stage, kSeqLen);
             ASSERT_TRUE(local_stage.execute(cpu_ctx_.get()));
         }
@@ -467,6 +475,7 @@ namespace llaminar2::test
         prep.down_exps = weights.down.get();
         prep.expert_mask = local_mask;
         ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(prep));
+        auto prepared_admission=test::admitCPUExpertStageForTest(prep,PhysicalMemoryOwner::PrimaryModelWeights);
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(prep));
 
         auto local_output = workspace_.localExpertOutput(kLayer, 0);
@@ -486,7 +495,7 @@ namespace llaminar2::test
         local_params.output_rows = &local_output;
 
         {
-            MoELocalExpertStage local_stage(std::move(local_params));
+            MoELocalExpertStage local_stage(test::admitCPUPerLayerPacketForTest(std::move(local_params)));
             CPUStageTestWorkspace invocation_workspace(local_stage, kSeqLen);
             ASSERT_TRUE(local_stage.execute(cpu_ctx_.get()));
         }
@@ -599,6 +608,7 @@ namespace llaminar2::test
         prep.down_exps = weights.down.get();
         prep.expert_mask = {true, true, true, true};
         ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(prep));
+        auto prepared_admission=test::admitCPUExpertStageForTest(prep,PhysicalMemoryOwner::PrimaryModelWeights);
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(prep));
 
         auto local_output = workspace.localExpertOutput(kLayer, 0);
@@ -617,7 +627,7 @@ namespace llaminar2::test
         local_params.prepared_down_gemm = std::move(prep.prepared_down_gemm);
         local_params.moe_owned_kernels = std::move(prep.moe_owned_kernels);
         // This owner spans every logical-prefix replay of the retained stage.
-        MoELocalExpertStage local_stage(std::move(local_params));
+        MoELocalExpertStage local_stage(test::admitCPUPerLayerPacketForTest(std::move(local_params)));
         CPUStageTestWorkspace invocation_workspace(local_stage, bucket_rows);
 
         auto inbound_return = workspace.returnReceive(kLayer, 0);

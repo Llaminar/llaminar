@@ -723,11 +723,26 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Bind one retained layer to its canonical already-prepared payloads.
+         * @param registry Model-owned participant-scoped expert engine authority.
+         * @param layer_idx Exact global source layer within the frozen interval.
+         * @param error Optional missing membership/payload/publication diagnostic.
+         * @return True after every local participant's exact mask and engine
+         * lifetimes have been authenticated and idempotently registered.
+         * @note Constructs setup metadata without preparing, allocating, or
+         * replacing weight backing. Other layers
+         * may remain unpublished until complete setup finalization.
+         */
+        bool registerInitialLayerFromPreparedRegistry(
+            const ExpertGemmRegistry &registry, int layer_idx,
+            std::string *error = nullptr);
+
+        /**
          * @brief Complete the initial banks from the model-owned engine registry.
          *
          * This is the sole setup-time completion transition for process-local
          * physical residency. It walks the frozen owner map in deterministic
-         * participant/layer order, resolves exact shared engine lifetimes, and
+         * layer/participant order, resolves exact shared engine lifetimes, and
          * feeds them through @ref registerInitialLayer. Layers already supplied
          * by graph construction are identity-checked idempotently; dormant
          * retained graph-family layers are materialized without executing or

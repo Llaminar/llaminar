@@ -51,6 +51,8 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <set>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -12181,4 +12183,214 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_QueryKVRejectsForeignLayersAndKeepsAbs
     auto complete = fixture.rank->getTPSnapshot("layer999_K_PROJECTION");
     EXPECT_EQ(complete.mode, SnapshotShardingMode::REPLICATED);
     ASSERT_TRUE(complete.computeCombined()); EXPECT_EQ(complete.combined_data, expected);
+}
+
+namespace
+{
+/** @brief Passive setup owner; it records the real Rank call without running model arithmetic. */
+class HostServingMaterializationWitness final : public MockDeviceGraphOrchestrator
+{
+public:
+    /** @brief Retain a literal fixture participant and observable lifetime, not a hardware placement. */
+    HostServingMaterializationWitness(int participant,std::shared_ptr<std::atomic<int>> owners)
+        : logical_participant(participant),live_owners_(std::move(owners)) { ++*live_owners_; }
+    /** @brief Retire the injected owner after its real Rank and worker pool leave. */
+    ~HostServingMaterializationWitness() override { --*live_owners_; }
+    /** @return Actual CPU lifecycle unless a negative deliberately supplies a wrong declaration. */
+    ServingGraphPreparationKind servingGraphPreparationKind() const noexcept override
+    {
+        return declared_kind ? *declared_kind : MockDeviceGraphOrchestrator::servingGraphPreparationKind();
+    }
+    /** @brief Record every exact setup plan and the persistent worker that delivered it. */
+    bool materializeServingGraphFamilyWithoutLaunch(const ServingGraphFamilyMaterializationPlan &plan) override
+    {
+        plans.push_back(plan);
+        workers.push_back(std::this_thread::get_id());
+        if (throw_failure) throw std::runtime_error("literal CPU materialization failure");
+        if (fail || !plan.valid()) return false;
+        if (sealed && !sealed->sameCaptureIdentity(plan)) return false;
+        sealed=plan;
+        return true;
+    }
+    int logical_participant;
+    std::vector<ServingGraphFamilyMaterializationPlan> plans;
+    std::vector<std::thread::id> workers;
+    std::optional<ServingGraphPreparationKind> declared_kind;
+    bool fail=false,throw_failure=false;
+private:
+    std::shared_ptr<std::atomic<int>> live_owners_;
+    std::optional<ServingGraphFamilyMaterializationPlan> sealed;
+};
+/** @brief Distinct logical NUMA endpoints, with no native inventory or model allocation. */
+struct HostServingMaterializationFixture
+{
+    std::shared_ptr<std::atomic<int>> live=std::make_shared<std::atomic<int>>(0);
+    std::vector<std::unique_ptr<IInferenceRunner>> children;
+    std::vector<HostServingMaterializationWitness *> observed;
+    std::unique_ptr<MockLocalTPContext> context;
+    RankOrchestrator::Config config;
+    /** @brief Freeze the original declared order, including reversed physical-locality labels. */
+    explicit HostServingMaterializationFixture(int count,bool reverse=false)
+    {
+        MockLocalTPContext::Config local;
+        config.mode=RankOrchestrator::ParallelismMode::TP;
+        config.backend=CollectiveBackendType::HOST;
+        for(int index=0;index<count;++index)
+        {
+            const int endpoint=reverse ? count-index-1 : index;
+            local.devices.push_back(GlobalDeviceAddress::cpu(endpoint));
+            local.weights.push_back(1.0f/count);
+            auto child=std::make_unique<HostServingMaterializationWitness>(index,live);
+            observed.push_back(child.get());children.push_back(std::move(child));
+        }
+        config.devices=local.devices;config.weights=local.weights;
+        context=std::make_unique<MockLocalTPContext>(local);
+    }
+    /** @return The actual production Rank with passive children; no materialization is bypassed. */
+    std::unique_ptr<RankOrchestrator> build()
+    {
+        return RankOrchestrator::createForTest(llaminar2::test::MockModelContext::createMinimal(),
+            std::move(children),std::move(context),config);
+    }
+};
+/** @return An exact positive frozen setup plan; it contains no inference request or seed. */
+ServingGraphFamilyMaterializationPlan hostServingPlan(TensorBase *ingress=nullptr)
+{
+    return {.prefill_bucket_rows={1,4,16},.prefill_pad_token_id=3,
+        .main_decode_graph=ServingMainDecodeGraphKind::HistoryBearingSerial,.pipeline_hidden_input=ingress};
+}
+}
+/** @test Actual Rank forwards the exact CPU family to1/2/4/8 owners with stable worker binding. */
+TEST(RankServingHostMaterialization, ExactPlanRepeatAndLogicalParticipantWorkersWithoutInference)
+{
+    for(int count:{1,2,4,8})
+    for(bool reverse:{false,true})
+    {
+        SCOPED_TRACE(::testing::Message()<<"count="<<count<<" reverse="<<reverse);
+        HostServingMaterializationFixture fixture(count,reverse);
+        const auto members=fixture.config.devices;
+        FP32Tensor ingress({1,4});
+        const auto plan=hostServingPlan(&ingress);
+        auto rank=fixture.build();
+        ASSERT_EQ(rank->servingGraphPreparationKind(),ServingGraphPreparationKind::EagerHostGraph);
+        const auto caller=std::this_thread::get_id();
+        for(int repeat=0;repeat<3;++repeat)
+            ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch(plan));
+        ASSERT_NE(rank->localTPContext(),nullptr);
+        EXPECT_EQ(rank->localTPContext()->devices(),members);
+        std::set<std::thread::id> workers;
+        for(int index=0;index<count;++index)
+        {
+            const auto *child=fixture.observed[index];
+            EXPECT_EQ(child->logical_participant,index);
+            ASSERT_EQ(child->plans.size(),3u);
+            ASSERT_EQ(child->workers.size(),3u);
+            for(size_t call=0;call<3;++call)
+            {
+                EXPECT_TRUE(child->plans[call].sameCaptureIdentity(plan));
+                EXPECT_EQ(child->workers[call],child->workers.front());
+            }
+            workers.insert(child->workers.front());
+            EXPECT_EQ(child->forward_call_count(),0u);
+            EXPECT_EQ(child->clear_cache_call_count(),0u);
+            EXPECT_EQ(child->servingGraphPreparationKind(),ServingGraphPreparationKind::EagerHostGraph);
+            if(count==1)EXPECT_EQ(child->workers.front(),caller);
+            else EXPECT_NE(child->workers.front(),caller);
+        }
+        EXPECT_EQ(workers.size(),size_t(count));
+        rank.reset();
+        EXPECT_EQ(fixture.live->load(),0);
+    }
+}
+/** @test An invalid plan is rejected before any materializer or model operation. */
+TEST(RankServingHostMaterialization, InvalidFrozenPlanDoesNotReachChildren)
+{
+    HostServingMaterializationFixture fixture(2);auto rank=fixture.build();
+    for(int fault:{0,1,2})
+    {
+        auto invalid=hostServingPlan();
+        if(fault==0)invalid.prefill_bucket_rows.clear();
+        if(fault==1)invalid.prefill_bucket_rows={0};
+        if(fault==2)invalid.main_decode_graph=ServingMainDecodeGraphKind::Unspecified;
+        EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(invalid));
+    }
+    for(const auto *child:fixture.observed)
+    { EXPECT_TRUE(child->plans.empty());EXPECT_EQ(child->forward_call_count(),0u); }
+}
+/** @test Missing owner and context/cardinality faults cannot produce a successful group. */
+TEST(RankServingHostMaterialization, MissingOwnerOrLocalTPAuthorityDoesNotPartiallyMaterialize)
+{
+    for(int fault:{0,1,2})
+    {
+        HostServingMaterializationFixture fixture(2);
+        if(fault==0)
+        {
+            fixture.children[1].reset();fixture.observed[1]=nullptr;
+            // The existing authority query rejects an absent participant
+            // during construction. Failed construction retires every moved
+            // owner; the observation pointers must never be dereferenced.
+            EXPECT_THROW(fixture.build(),std::logic_error);
+            EXPECT_EQ(fixture.live->load(),0);
+            continue;
+        }
+        if(fault==1)fixture.context.reset();
+        if(fault==2)
+        {
+            MockLocalTPContext::Config single;single.devices={GlobalDeviceAddress::cpu(0)};single.weights={1.0f};
+            fixture.context=std::make_unique<MockLocalTPContext>(single);
+        }
+        auto rank=fixture.build();
+        EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(hostServingPlan()));
+        for(const auto *child:fixture.observed)if(child)EXPECT_TRUE(child->plans.empty());
+    }
+}
+/** @test CPU cannot claim a native-GPU lifecycle or silently join an unresolved/mixed family. */
+TEST(RankServingHostMaterialization, WrongOrUnresolvedPreparationLocusFailsBeforeDispatch)
+{
+    for(int fault:{0,1,2})
+    {
+        HostServingMaterializationFixture fixture(2);
+        if(fault==0)fixture.observed[1]->declared_kind=ServingGraphPreparationKind::Unresolved;
+        if(fault==1)
+            for(auto *child:fixture.observed)child->declared_kind=ServingGraphPreparationKind::NativeDeviceExecutableFamily;
+        if(fault==2)fixture.observed[1]->set_primary_device_id(DeviceId::cuda(7));
+        auto rank=fixture.build();
+        EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(hostServingPlan()));
+        for(const auto *child:fixture.observed)EXPECT_TRUE(child->plans.empty());
+    }
+}
+/** @test False and exceptional child setup are never converted to successful materialization. */
+TEST(RankServingHostMaterialization, ChildFailureAndExceptionRemainFatalAfterCompleteFanout)
+{
+    for(bool throwing:{false,true})
+    {
+        HostServingMaterializationFixture fixture(2);
+        fixture.observed[1]->fail=!throwing;fixture.observed[1]->throw_failure=throwing;
+        auto rank=fixture.build();const auto plan=hostServingPlan();
+        if(throwing)EXPECT_THROW(rank->materializeServingGraphFamilyWithoutLaunch(plan),std::runtime_error);
+        else EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(plan));
+        for(const auto *child:fixture.observed)
+        {
+            ASSERT_EQ(child->plans.size(),1u);
+            EXPECT_TRUE(child->plans.front().sameCaptureIdentity(plan));
+            EXPECT_EQ(child->forward_call_count(),0u);
+        }
+    }
+}
+/** @test A repeated child seals its own exact plan; Rank never rewrites a changed identity to make it pass. */
+TEST(RankServingHostMaterialization, ChangedSealedPlanIsForwardedExactlyAndRejectedByOwner)
+{
+    HostServingMaterializationFixture fixture(2);auto rank=fixture.build();
+    const auto original=hostServingPlan();
+    ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch(original));
+    auto changed=original;changed.prefill_pad_token_id=4;
+    EXPECT_FALSE(rank->materializeServingGraphFamilyWithoutLaunch(changed));
+    for(const auto *child:fixture.observed)
+    {
+        ASSERT_EQ(child->plans.size(),2u);
+        EXPECT_TRUE(child->plans[0].sameCaptureIdentity(original));
+        EXPECT_TRUE(child->plans[1].sameCaptureIdentity(changed));
+        EXPECT_EQ(child->workers[0],child->workers[1]);
+        EXPECT_EQ(child->forward_call_count(),0u);
+    }
 }

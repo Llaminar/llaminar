@@ -42,6 +42,8 @@
  * epilogues. Physical M and each original row address remain unchanged.
  * The scalar Q6 diagnostic also retains the production paths' explicit rounding
  * boundaries so it can check original source factors without introducing FMA drift.
+ * Scalar diagnostics reconstruct one native block from that same storage;
+ * they do not require a second persistent source-order payload matrix.
  */
 
 #pragma once
@@ -1586,7 +1588,18 @@ namespace llaminar2::cpu::native_vnni
                     int8_t b_vals[32];
                     if (packed.usesNibbleLUT())
                     {
-                        const uint8_t *payload = packed.blockPayload(chunk, kb, n_local);
+                        // Four groups contain the original sixteen native
+                        // bytes for this column. Reconstruct only this bounded
+                        // diagnostic block; retaining another matrix solely for
+                        // the scalar oracle would violate prepared-memory BOM.
+                        uint8_t payload[16];
+                        const int z = n_local / 16;
+                        const int lane = n_local % 16;
+                        for (int group = 0; group < 4; ++group)
+                        {
+                            const auto *source = packed.interleavedB(chunk, kb, group, z);
+                            std::memcpy(payload + group * 4, source + lane * 4, 4);
+                        }
                         decode_native_block(packed.codebook_id, payload, b_vals);
                     }
                     else

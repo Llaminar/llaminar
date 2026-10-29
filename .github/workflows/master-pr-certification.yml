@@ -91,14 +91,14 @@ jobs:
         run: |
           git submodule update --init -- corpora
           git -C corpora lfs pull --include 'model-kld/qwen-gdn-alpha-beta-v1/**' --exclude ''
-      - name: Run exact-ref HTTP E2E and GPU KL canaries on both published ISA images
+      - name: Run QFN source admission, exact-ref HTTP E2E and GPU KL on both ISAs
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          exec python3 scripts/ci/run_published_image_suite.py e2e --model-kld-canaries \
+          exec python3 scripts/ci/run_published_image_suite.py e2e --model-kld-canaries --qfn-source-admission \
             --repository "$REPOSITORY" --branch develop \
             --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
             --expected-source-revision "$HEAD_SHA" \
@@ -118,6 +118,8 @@ jobs:
             ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx2/e2e.json
             ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx512/kld/kld-canaries.json
             ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx2/kld/kld-canaries.json
+            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx512/source-admission/**
+            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx2/source-admission/**
           if-no-files-found: warn
           retention-days: 90
 
@@ -323,7 +325,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          exec python3 scripts/ci/run_published_image_suite.py benchmarks \
+          exec python3 scripts/ci/run_published_image_suite.py benchmarks --qfn-source-admission \
             --repository "$REPOSITORY" --branch develop \
             --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
             --expected-source-revision "$HEAD_SHA" \

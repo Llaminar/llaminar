@@ -20,6 +20,8 @@
  * participant sources; they never publish whole-expert or overlay aliases.
  * Each sharding operation retains an immutable TP assignment while parallel
  * participant construction may atomically republish the shared manager owner.
+ * CPU participant rank qualifies each cached shard independently of its shared
+ * host storage DeviceId; ordinary/GPU cache access retains device identity.
  *
  * @author David Sanftenberg
  */
@@ -724,18 +726,14 @@ namespace llaminar2
             safe_release(base_it->second.get(), name);
         }
 
-        const std::string suffix = ":" + name;
         for (const auto &[key, tensor] : per_device_cache_)
         {
             if (!tensor)
             {
                 continue;
             }
-            if (key.size() >= suffix.size() &&
-                key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0)
-            {
-                safe_release(tensor.get(), key);
-            }
+            if (key.name == name)
+                safe_release(tensor.get(), key.describe());
         }
 
         if (!found_any)
@@ -2168,16 +2166,12 @@ namespace llaminar2
                 visitor(name, tensor.get());
         }
         // Per-device cache (TP-sliced tensors, used in LOCAL TP mode)
-        // Keys are "device:name", extract the weight name after the first ':'
+        // Canonical names are typed fields, independent of device/rank spelling.
         for (const auto &[cache_key, tensor] : per_device_cache_)
         {
             if (!tensor)
                 continue;
-            auto colon_pos = cache_key.find(':');
-            if (colon_pos == std::string::npos)
-                continue;
-            std::string name = cache_key.substr(colon_pos + 1);
-            visitor(name, tensor.get());
+            visitor(cache_key.name, tensor.get());
         }
     }
 
@@ -2353,19 +2347,34 @@ namespace llaminar2
                     selected_experts,
                     lookup_device,
                     weight_precision_);
-                if (tensor)
+                if (!tensor)
                 {
-                    WeightSliceSpec selected_slice = requirement.slice;
-                    selected_slice.expert_start = selected_experts.front();
-                    selected_slice.expert_count = selected_experts.size();
-                    selected_slice.inner_is_presliced = true;
-                    registerDerivedMetadata(
-                        requirement.canonical_name,
-                        tensor,
-                        WeightDerivationKind::ExpertSlice,
-                        selected_slice,
-                        lookup_device);
+                    throw std::runtime_error(
+                        "[WeightManager] Explicit expert selection could not materialize its declared source: " +
+                        load_name);
                 }
+                // Expert-axis selection preserves the original K/N geometry.
+                // Reject a full parent or malformed selection before publishing
+                // logical subset metadata; neither may enter generic loading.
+                const auto source_shape = loader_.getTensorShape(load_name);
+                if (!source_shape || source_shape->size() != 3u ||
+                    tensor->shape() != std::vector<size_t>{
+                        (*source_shape)[0], (*source_shape)[1], selected_experts.size()})
+                {
+                    throw std::runtime_error(
+                        "[WeightManager] Explicit expert selection changed original matrix geometry or selected expert extent: " +
+                        load_name + " (selected experts=" + std::to_string(selected_experts.size()) + ")");
+                }
+                WeightSliceSpec selected_slice = requirement.slice;
+                selected_slice.expert_start = selected_experts.front();
+                selected_slice.expert_count = selected_experts.size();
+                selected_slice.inner_is_presliced = true;
+                registerDerivedMetadata(
+                    requirement.canonical_name,
+                    tensor,
+                    WeightDerivationKind::ExpertSlice,
+                    selected_slice,
+                    lookup_device);
             }
             else if (requirement.bypass_tensor_parallel)
             {
@@ -3509,7 +3518,7 @@ namespace llaminar2
         }
 
         // Check per-device cache for subsequent devices
-        std::string cache_key = device.to_string() + ":" + name;
+        const auto cache_key = DeviceWeightCacheKey::forDevice(device, name);
         auto it = per_device_cache_.find(cache_key);
         if (it != per_device_cache_.end())
         {
@@ -4166,13 +4175,12 @@ namespace llaminar2
         std::vector<std::pair<std::string, std::shared_ptr<TensorBase>>> gemm_weights;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
-            const std::string device_prefix = target_device.to_string() + ":";
             bool has_per_device_entries = false;
 
             // Check if we have device-specific entries in per_device_cache_
             for (const auto &[key, tensor] : per_device_cache_)
             {
-                if (key.compare(0, device_prefix.size(), device_prefix) == 0)
+                if (key.device == target_device)
                 {
                     has_per_device_entries = true;
                     break;
@@ -4184,10 +4192,10 @@ namespace llaminar2
                 // LOCAL TP: iterate per_device_cache_ entries for this device
                 for (const auto &[key, tensor] : per_device_cache_)
                 {
-                    if (key.compare(0, device_prefix.size(), device_prefix) != 0)
+                    if (key.device != target_device)
                         continue;
-                    // Extract original weight name from key (strip "rocm:0:" prefix)
-                    const std::string name = key.substr(device_prefix.size());
+                    // The typed key retains the canonical source name directly.
+                    const std::string &name = key.name;
                     if (isGemmWeight(name) && tensor)
                     {
                         if (layer_filter && !layer_filter(name))
@@ -4256,6 +4264,10 @@ namespace llaminar2
                                              << target_device.to_string());
 
         const size_t total = gemm_weights.size();
+        // This cache-owned public operation prepares the primary model. Other
+        // persistent owners enter through the frozen binding overload, which
+        // preserves their exact source-plan owner rather than this cache API.
+        auto store = preparedWeightStore();
 
         // CPU-only path: single producer, single consumer.
         // GPU devices use packGemmWeightsViaPipeline() instead.
@@ -4267,7 +4279,7 @@ namespace llaminar2
         {
             std::string name;
             std::shared_ptr<TensorBase> tensor;
-            std::shared_ptr<KernelFactory::PreparedGemmHandle> prepared;
+            std::optional<PreparedWeightRef> prepared;
             bool preparation_ok = false;
         };
 
@@ -4290,8 +4302,46 @@ namespace llaminar2
 
             try
             {
-                job.prepared = KernelFactory::prepareGemmHandleLocal(job.tensor.get(), target_device);
-                job.preparation_ok = (job.prepared != nullptr);
+                WeightBinding binding;
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    binding.binding_id = next_pipeline_prepared_binding_id_++;
+                    binding.identity = makeSourceWeightIdentity(
+                        job.name, store->modelId(), binding.binding_id);
+                    if (weight_metadata_)
+                    {
+                        if (const auto metadata = weight_metadata_->metadata(job.tensor.get()))
+                        {
+                            binding.identity.derivation = metadata->identity.derivation;
+                            binding.identity.role = metadata->identity.role == WeightRole::Other
+                                ? inferWeightRole(job.name) : metadata->identity.role;
+                            binding.identity.layer = metadata->identity.layer;
+                            binding.identity.expert = metadata->identity.expert;
+                            binding.slice = metadata->slice;
+                            binding.residency = metadata->residency;
+                        }
+                    }
+                }
+                binding.tensor = job.tensor.get();
+                binding.tensor_owner = job.tensor;
+                if (binding.slice.source_rows == 0 && binding.slice.source_cols == 0 &&
+                    binding.slice.row_count == 0 && binding.slice.col_count == 0)
+                    binding.slice = fullSliceSpec(*job.tensor);
+                binding.residency.home_device = target_device;
+                binding.residency.resident_device = target_device;
+                binding.immutable = true;
+                binding.prepared = PreparedWeightRef{
+                    store->modelId(), binding.binding_id,
+                    PreparedWeightKind::CpuPackedGemm, target_device};
+                if (store->adoptPreparedGemmForBinding(binding, target_device))
+                    job.prepared = store->preparedRefForBinding(
+                        binding.binding_id, target_device, PreparedWeightKind::CpuPackedGemm);
+                else
+                    job.prepared = store->prepareGemm(
+                        binding, PhysicalMemoryOwner::PrimaryModelWeights);
+                // The model store retains the same final pack before raw source
+                // release. Temporary preparation jobs never own its lifetime.
+                job.preparation_ok = job.prepared.has_value();
             }
             catch (const std::exception &e)
             {
@@ -4311,7 +4361,7 @@ namespace llaminar2
 
             try
             {
-                auto *kernel = KernelFactory::getOrCreateGemmEngine(job.prepared.get());
+                auto *kernel = store->gemmKernel(*job.prepared);
                 if (!kernel)
                 {
                     return false;
@@ -4773,6 +4823,30 @@ namespace llaminar2
         const MoEExpertOverlayExecutionPlan *execution_plan,
         PreparedWeightAdmission admission)
     {
+        return prepareMoEExpertOverlayWeightsWithScope(runtime_plan, target_device,
+            frozen_weights, execution_plan, admission, std::nullopt);
+    }
+
+    bool WeightManager::prepareMoEExpertOverlayWeightsForGraph(
+        const MoEExpertOverlayRuntimePlan &runtime_plan,
+        const MoEExpertOverlayGraphScope &graph_scope,
+        const FrozenModelWeightSet *frozen_weights,
+        const MoEExpertOverlayExecutionPlan *execution_plan,
+        PreparedWeightAdmission admission)
+    {
+        graph_scope.validate(runtime_plan, graph_scope.device());
+        return prepareMoEExpertOverlayWeightsWithScope(runtime_plan, graph_scope.device(),
+            frozen_weights, execution_plan, admission, graph_scope);
+    }
+
+    bool WeightManager::prepareMoEExpertOverlayWeightsWithScope(
+        const MoEExpertOverlayRuntimePlan &runtime_plan,
+        DeviceId target_device,
+        const FrozenModelWeightSet *frozen_weights,
+        const MoEExpertOverlayExecutionPlan *execution_plan,
+        PreparedWeightAdmission admission,
+        const std::optional<MoEExpertOverlayGraphScope> &graph_scope)
+    {
         if (!runtime_plan.sourcePlan().usesExpertOverlayAuthority())
             return true;
         if (!target_device.is_valid())
@@ -4792,7 +4866,7 @@ namespace llaminar2
             loader_,
             routed_expert_bytes_per_expert);
         return prepareMoEExpertOverlayWeightsFromPlan(runtime_plan, std::move(preparation_plan),
-            target_device, frozen_weights, execution_plan, admission);
+            target_device, frozen_weights, execution_plan, admission, graph_scope);
     }
 
     bool WeightManager::prepareMoEExpertOverlayWeightsFromPlan(
@@ -4801,28 +4875,29 @@ namespace llaminar2
         DeviceId target_device,
         const FrozenModelWeightSet *frozen_weights,
         const MoEExpertOverlayExecutionPlan *execution_plan,
-        PreparedWeightAdmission admission)
+        PreparedWeightAdmission admission,
+        const std::optional<MoEExpertOverlayGraphScope> &graph_scope)
     {
         if (execution_plan)
             preparation_plan = preparation_plan.filteredForRank(execution_plan->currentRankPlan());
-        std::vector<DeviceId> graph_execution_devices{target_device};
-        if (execution_plan && target_device.is_gpu() &&
-            execution_plan->currentRankPlan().hasRole(
-                OverlayRankRole::ContinuationRoot) &&
-            target_device == runtime_plan.continuationDevice())
+        const bool owns_colocated_cpu = execution_plan && target_device.is_gpu() &&
+            execution_plan->currentRankPlan().hasRole(OverlayRankRole::ContinuationRoot) &&
+            target_device == runtime_plan.continuationDevice();
+        if (graph_scope)
         {
-            /*
-             * The logical continuation-root graph may contain explicit CPU
-             * sparse endpoints owned by the same rank.  Their engines belong
-             * to this graph transaction even though dense weights and capture
-             * remain on the primary GPU. Sibling LocalTP GPU callers retain
-             * exact-device preparation because only the declared root device
-             * matches continuationDevice().
-             */
-            graph_execution_devices.push_back(DeviceId::cpu());
+            graph_scope->validate(runtime_plan, target_device);
+            preparation_plan = preparation_plan.filteredForGraphScope(runtime_plan, *graph_scope);
         }
-        preparation_plan = preparation_plan.filteredForDevices(
-            graph_execution_devices);
+        else
+        {
+            // The existing device-wide preparation API intentionally owns every
+            // matching bank in its complete frozen authority. Graph factories
+            // always supply exact logical scope before entering this method.
+            std::vector<DeviceId> graph_execution_devices{target_device};
+            if (owns_colocated_cpu)
+                graph_execution_devices.push_back(DeviceId::cpu());
+            preparation_plan = preparation_plan.filteredForDevices(graph_execution_devices);
+        }
 
         if (admission ==
             PreparedWeightAdmission::ReuseCertifiedCompleteSet)
@@ -5345,6 +5420,20 @@ namespace llaminar2
                     true,
                     nullptr,
                     CPUExpertNUMAPlacement::forDevice(group.device)};
+                // Bind admission before any expert pack allocates. Each final
+                // storage allocation retains its lease, so participant/domain
+                // aliases and later graph families share one physical claim.
+                const auto memory_authority = physicalMemoryAuthority();
+                if (!memory_authority)
+                    throw std::logic_error(
+                        "WeightManager CPU routed-expert preparation reached allocation before physical-memory admission");
+                const auto cpu_placement = ctx.cpu_numa_placement.requiresNodeBinding()
+                    ? CPUWeightStoragePlacement::onNode(ctx.cpu_numa_placement.node())
+                    : CPUWeightStoragePlacement::local();
+                ctx.initial_cpu_storage_placement = CPUWeightStoragePlacement::accounted(
+                    memory_authority, group.device,
+                    PhysicalMemoryOwner::RoutedExpertWeights, cpu_placement);
+                ctx.persistent_weight_owner = PhysicalMemoryOwner::RoutedExpertWeights;
                 ctx.advise_raw_pages_after_prepare = !preparation_plan.hasAcceleratorRequests();
 
                 if (!MoEExpertWeightService::extractExpertViews(ctx) ||
@@ -5499,13 +5588,12 @@ namespace llaminar2
             }
             else
             {
-                const std::string device_prefix = target_device.to_string() + ":";
                 bool has_per_device_entries = false;
                 std::unordered_set<std::string> collected_names;
 
                 for (const auto &[key, tensor] : per_device_cache_)
                 {
-                    if (key.compare(0, device_prefix.size(), device_prefix) == 0)
+                    if (key.device == target_device)
                     {
                         has_per_device_entries = true;
                         break;
@@ -5516,9 +5604,9 @@ namespace llaminar2
                 {
                     for (const auto &[key, tensor] : per_device_cache_)
                     {
-                        if (key.compare(0, device_prefix.size(), device_prefix) != 0)
+                        if (key.device != target_device)
                             continue;
-                        const std::string name = key.substr(device_prefix.size());
+                        const std::string &name = key.name;
                         if (isGemmWeight(name) && tensor)
                         {
                             if (layer_filter && !layer_filter(name))
@@ -5567,7 +5655,7 @@ namespace llaminar2
                     if (!has_output_weight)
                     {
                         std::shared_ptr<TensorBase> embed_tensor;
-                        const std::string device_key = target_device.to_string() + ":token_embd.weight";
+                        const auto device_key = DeviceWeightCacheKey::forDevice(target_device, "token_embd.weight");
                         auto pdit = per_device_cache_.find(device_key);
                         if (pdit != per_device_cache_.end() && pdit->second)
                             embed_tensor = pdit->second;
@@ -7254,7 +7342,7 @@ namespace llaminar2
                 else if (first_device_.has_value())
                 {
                     // Subsequent devices need clones - check per-device cache
-                    std::string cache_key = target_device.to_string() + ":" + name;
+                    const auto cache_key = DeviceWeightCacheKey::forDevice(target_device, name);
                     auto it = per_device_cache_.find(cache_key);
                     if (it != per_device_cache_.end())
                     {
@@ -7465,7 +7553,7 @@ namespace llaminar2
         // Sweep per-device cache (clones for multi-GPU)
         for (auto &[key, tensor] : per_device_cache_)
         {
-            try_release(tensor.get(), key);
+            try_release(tensor.get(), key.name);
         }
 
         LOG_DEBUG("[WeightManager] Released host weight data: " << released_count
@@ -7522,7 +7610,7 @@ namespace llaminar2
 
         for (auto &[key, tensor] : per_device_cache_)
         {
-            try_release(tensor.get(), key);
+            try_release(tensor.get(), key.name);
         }
 
         if (released_count > 0)
@@ -7686,8 +7774,8 @@ namespace llaminar2
 
         for (const auto &[name, tensor] : cache_)
             try_release(name, tensor);
-        for (const auto &[name, tensor] : per_device_cache_)
-            try_release(name, tensor);
+        for (const auto &[key, tensor] : per_device_cache_)
+            try_release(key.name, tensor);
 
         LOG_DEBUG("[WeightManager] Released cached MoE expert raw data: "
                   << released_count << " tensors (" << (released_bytes >> 20) << " MB) released, "
@@ -8810,10 +8898,10 @@ namespace llaminar2
                 layer_idx);
         }
 
-        // Check per-device cache first.
-        // WeightManager is rank-local, so device string uniquely identifies the
-        // cache entry. LOCAL TP devices have distinct DeviceIds (e.g. cuda:0, cuda:1).
-        std::string cache_key = device.to_string() + ":" + name;
+        // The retained assignment owns host-staged shard identity. CPU NUMA
+        // participants and GPU sources explicitly staged onto CPU share a host
+        // address space; actual GPU storage remains device-keyed.
+        const auto cache_key = DeviceWeightCacheKey::forAssignment(device, name, assignment);
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             auto it = per_device_cache_.find(cache_key);
@@ -8834,7 +8922,7 @@ namespace llaminar2
                     else
                     {
                         validateCachedRoutedExpertSlice(
-                            name, it->second, *expected_expert_ids, cache_key);
+                            name, it->second, *expected_expert_ids, cache_key.describe());
                         return it->second;
                     }
                 }
@@ -8862,7 +8950,7 @@ namespace llaminar2
 
                     throw std::runtime_error(
                         "[WeightManager] Fatal per-device weight cache mode mismatch for " +
-                        cache_key + ": requested_mode=" +
+                        cache_key.describe() + ": requested_mode=" +
                         std::to_string(static_cast<int>(mode)) +
                         " requested_rank=" + std::to_string(assignment.local_rank) +
                         " requested_world_size=" +

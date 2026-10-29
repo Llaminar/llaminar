@@ -11,6 +11,10 @@
  * coordinates through rotation, quantization and fixed-order products.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
+ * Imported optional source-order archive payloads are retired at engine
+ * publication; scalar and SIMD execution share the canonical interleaved bank.
+ * Packed ownership handoffs retain physical-allocation leases; explicit clone
+ * destinations allocate new bytes through their own admitted storage authority.
  */
 
 #pragma once
@@ -158,6 +162,7 @@ namespace llaminar2::cpu::native_vnni
               numerical_policy_(numerical_policy)
         {
             packed_.numerical_policy = numerical_policy_;
+            packed_.releaseSourcePayload();
             if (!valid_)
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] Pre-packed CPU_NATIVE_VNNI weights are missing eager interleaved data");
         }
@@ -429,6 +434,20 @@ namespace llaminar2::cpu::native_vnni
             return std::make_unique<CPUPackedWeights>(packed_);
         }
 
+        /**
+         * @brief Clone published bytes through the explicit destination authority.
+         * @param destination Admitted final CPU placement for the new owner.
+         * @return Independent packed weights, or empty when this engine is retired.
+         */
+        std::unique_ptr<IPackedWeights> cloneWeightsTo(CPUWeightStoragePlacement destination) const override
+        {
+            if (!valid_)
+                return nullptr;
+            // Read-only wrapper is unnecessary: destination copying operates
+            // on a metadata view and never transfers this engine's storage.
+            return CPUPackedWeights::copyTo(packed_, destination);
+        }
+
         bool attachWeights(std::unique_ptr<IPackedWeights> weights) override
         {
             if (!weights || weights->format() != PackedWeightsFormat::CPU_NATIVE_VNNI)
@@ -444,6 +463,7 @@ namespace llaminar2::cpu::native_vnni
             // unneeded cross-backend section after this move.
             packed_ = cpu_packed->takePacked();
             packed_.numerical_policy = numerical_policy_;
+            packed_.releaseSourcePayload();
             if (!packed_.hasInterleavedData())
             {
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] Attached CPU_NATIVE_VNNI weights have no eager interleaved data");

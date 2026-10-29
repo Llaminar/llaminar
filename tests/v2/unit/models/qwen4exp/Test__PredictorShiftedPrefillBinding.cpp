@@ -7,7 +7,10 @@
  * the HC isolation case prepares its real native HC engines without executing
  * them. Neither is advertised as native capture evidence. A coherent rebuilt core
  * owns the real source/layout and public body-entry validators under test.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUPreparedStoreTestAdmission.h"
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorResidualBinding.h"
 #include <gtest/gtest.h>
 #include <array>
@@ -94,6 +97,11 @@ struct FrozenResidualFixture
     /** @brief Prepare only original native HC projections for the actual isolation composer, never fake executable refs. */
     void prepareHCMixers()
     {
+        std::vector<const TensorBase *> matrices;
+        for (const auto &binding : bindings)
+            if (binding.identity.canonical_name.find(".hc_") != std::string::npos && binding.tensor->native_type() == TensorType::Q8_0)
+                matrices.push_back(binding.tensor);
+        test::admitCPUPreparedStoreForTest(store, matrices);
         for(auto &binding:bindings)
             if(binding.identity.canonical_name.find(".hc_")!=std::string::npos &&
                binding.tensor->native_type()==TensorType::Q8_0)
@@ -115,6 +123,7 @@ struct FrozenResidualFixture
         resolver.n_kv_heads=resolver.local_n_kv_heads=2;resolver.head_dim=256;resolver.default_device=DeviceId::cpu();
         resolver.custom_formulas["mtp_kv_prefill_rows"]=512;
         resolver.custom_formulas["mtp_target_query_rows"]=2;
+        resolver.custom_formulas["terminal_logit_row_capacity"] = 2;
         resolver.custom_formulas["mtp_kv_dim"]=512;
         resolver.custom_formulas["mtp_q_dim"]=6144;
         applyQwen4ExpBufferGeometry(resolver,config);
@@ -167,7 +176,7 @@ TEST(PredictorShiftedPrefillBinding, BucketArenaHasReadOwnershipWithoutDraftWrit
     const auto projected=f.shape("mtp_projected"),terminal=f.shape("mtp_hidden");
     ASSERT_EQ(projected,(std::vector<size_t>{512,10240}));
     ASSERT_EQ(terminal,(std::vector<size_t>{2,10240}));
-    BufferArena arena;
+    BufferArena arena{::llaminar2::test::cpuArenaFixtureConfig()};
     ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_PROJECTED,projected[0],projected[1],"FP32",DeviceId::cpu()));
     ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_HIDDEN,terminal[0],terminal[1],"FP32",DeviceId::cpu()));
     ASSERT_TRUE(arena.allocate());

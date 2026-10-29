@@ -263,7 +263,8 @@ namespace llaminar2
             int my_rank,
             int target_numa_node,
             MPI_Comm comm,
-            ExpertTransferEvidence *evidence = nullptr)
+            ExpertTransferEvidence *evidence = nullptr,
+            std::optional<CPUWeightStoragePlacement> destination = std::nullopt)
         {
             if (evidence)
                 *evidence = ExpertTransferEvidence{};
@@ -507,7 +508,7 @@ namespace llaminar2
                     }
                     entry.targets[projection] =
                         packed_weights_serialization::allocateTransferTarget(
-                            entry.descriptors[projection]);
+                            entry.descriptors[projection], destination);
                     for (size_t section = 0; section < section_count; ++section)
                     {
                         const size_t bytes =
@@ -691,7 +692,8 @@ namespace llaminar2
             std::function<ExpertWeightBlobs(int layer_idx, int expert_id)> get_blobs,
             int my_rank,
             MPI_Comm comm,
-            ExpertTransferEvidence *evidence = nullptr)
+            ExpertTransferEvidence *evidence = nullptr,
+            std::optional<CPUWeightStoragePlacement> destination = std::nullopt)
         {
             if (evidence)
                 *evidence = ExpertTransferEvidence{};
@@ -856,9 +858,18 @@ namespace llaminar2
                 RecvBufEntry buf;
                 buf.expert_id = entry.expert_id;
                 buf.layer = entry.layer;
-                buf.gate.resize_uninitialized(entry.sizes[0]);
-                buf.up.resize_uninitialized(entry.sizes[1]);
-                buf.down.resize_uninitialized(entry.sizes[2]);
+                if (destination)
+                {
+                    buf.gate = destination->allocate<uint8_t>(entry.sizes[0]);
+                    buf.up = destination->allocate<uint8_t>(entry.sizes[1]);
+                    buf.down = destination->allocate<uint8_t>(entry.sizes[2]);
+                }
+                else
+                {
+                    buf.gate.resize_uninitialized(entry.sizes[0]);
+                    buf.up.resize_uninitialized(entry.sizes[1]);
+                    buf.down.resize_uninitialized(entry.sizes[2]);
+                }
 
                 const ExpertTransferBuffer *projection_buffers[3] = {
                     &buf.gate, &buf.up, &buf.down};

@@ -15,7 +15,8 @@
  *
  * Uses MockGraphBuilder (IGraphBuilder interface mock) with configurable
  * schema/resolver to prove end-to-end wiring without depending on any
- * real model (Qwen2, Qwen3.5, etc.).
+ * real model (Qwen2, Qwen3.5, etc.). CPU state fixtures admit their actual
+ * schema and canonical cache geometry before materializing arena roots.
  */
 
 #include <gtest/gtest.h>
@@ -29,6 +30,7 @@
 #include "models/GraphTypes.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
+#include "../../../../utils/CPUOrchestratorTestAdmission.h"
 
 using namespace llaminar2;
 
@@ -321,7 +323,9 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator, ToModelBuffers_EmptyExtension
 {
     // Orchestrator with no extension buffers
     auto mock = createMockGraphBuilder();
-    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(mock, mpi_ctx_, 1, 64, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
@@ -343,7 +347,9 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator, ToModelBuffers_EmptyExtension
 TEST_F(Test__DynamicBufferExtensions_Orchestrator, InitializeInferenceState_UsesActivationSeqLenForArena)
 {
     auto mock = createMockGraphBuilder();
-    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(mock, mpi_ctx_, 1, 64, 8));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     InferenceStateInitConfig init_config;
@@ -424,7 +430,9 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator, EndToEnd_CoreIdsFilterCorrect
     // Use a mock model with no extensions — verify all core buffers go
     // into named fields, NOT extension_buffers
     auto mock = createMockGraphBuilder();
-    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(mock, mpi_ctx_, 1, 64, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
@@ -463,7 +471,9 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator,
     };
 
     auto mock = createMockGraphBuilder(extensions);
-    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(mock, mpi_ctx_, 1, 64, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
@@ -507,7 +517,9 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator,
     };
 
     auto mock = createMockGraphBuilder(extensions);
-    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(mock, mpi_ctx_, 1, 64, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
@@ -560,7 +572,9 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator,
     };
 
     auto mock = createMockGraphBuilder(mock_extensions);
-    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(mock, mpi_ctx_, 1, 64, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
@@ -636,7 +650,9 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator,
     };
 
     auto mock = createMockGraphBuilder(extensions);
-    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(mock, mpi_ctx_, 1, 64, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
@@ -715,7 +731,9 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator,
             return buildMinimalResolverConfig(seq_len);
         });
 
-    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    auto orchestrator_owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuGraphStateFixtureDependencies(mock, mpi_ctx_, 1, 64, 64));
+    auto &orchestrator = *orchestrator_owner;
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(

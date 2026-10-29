@@ -100,11 +100,21 @@ namespace llaminar2
             const WeightBinding &binding,
             PreparedWeightKind kind,
             DeviceId device);
+        /**
+         * @brief Register an existing physical handle without allocating another copy.
+         * @param binding Immutable source identity retained by the handle.
+         * @param kind Backend storage representation.
+         * @param device Exact admitted physical allocator identity.
+         * @param handle Existing independently owned prepared handle.
+         * @param memory_owner Explicit persistent owner for any later derived CPU slices.
+         * @return Stable store reference sharing the original physical storage.
+         */
         PreparedWeightRef registerPreparedGemmHandle(
             const WeightBinding &binding,
             PreparedWeightKind kind,
             DeviceId device,
-            std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle);
+            std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle,
+            std::optional<PhysicalMemoryOwner> memory_owner = std::nullopt);
         /**
          * @brief Attach an existing prepared GEMM to a materialized binding.
          *
@@ -428,6 +438,7 @@ namespace llaminar2
             PreparedWeightRef ref;
             // Phase 8: Store owns the prepared handle directly (not borrowed from KernelFactory).
             std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> owned_handle;
+            std::optional<PhysicalMemoryOwner> memory_owner; ///< Explicit allocator owner retained for derived physical slices.
 
             /// Resolve the active handle (owned or legacy).
             const llaminar::v2::kernels::KernelFactory::PreparedGemmHandle *activeHandle() const

@@ -7,6 +7,8 @@
  * expert capacity. The mixed-vendor case is an explicit CUDA/ROCm/CPU pipeline:
  * each device owns its graph and complete local expert work. RAM and bounded
  * mmap are independent cells; only overlay cases expand movement/owner axes.
+ * Additional CPU-NUMA and composed TP/PP blueprints are consumed by the plain
+ * source-admission fixture only; they do not extend the numerical main20 list.
  */
 #pragma once
 #include "Qwen4ExpModelParityDefinitions.h"
@@ -17,7 +19,12 @@
 namespace llaminar2::test::parity::qwen4exp
 {
 /** @brief Requested physical backend composition, independent of storage choice. */
-enum class Qwen4ExpParityTopology { CPU, CUDACPU, ROCmCPU, CUDAROCmCPU };
+enum class Qwen4ExpParityTopology
+{
+    CPU, CUDACPU, ROCmCPU, CUDAROCmCPU,
+    CPU2TP, CPU2PP, ROCm4TP2PP2, CUDA2CPU2TPPP, ROCm2CPU2TPPP,
+    CUDA2ROCm2CPU2TPPP,
+};
 /** @brief One exact participant domain; quotas remain the production memory planner's responsibility. */
 inline RoutedExpertDomain qwen4ExpParityDomain(const char *name, GlobalDeviceAddress device,
                                               CollectiveBackendType backend)
@@ -34,12 +41,68 @@ inline RoutedExpertDomain qwen4ExpParityDomain(const char *name, GlobalDeviceAdd
     domain.routed_prefill_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
     return domain;
 }
-/** @brief Express actual GPU continuation and expert-capacity ownership through the canonical plan. */
+/**
+ * @brief Declare actual participant ownership through canonical topology/domain policies.
+ * @param mode Exact CPU, GPU-overlay or explicitly composed pipeline request.
+ * @return Immutable physical topology; source admission and PMA still prove materialization.
+ * @throws std::invalid_argument For an unknown mode or invalid expert-domain plan.
+ */
 inline ModelParityTopologyDefinition qwen4ExpProductionTopology(Qwen4ExpParityTopology mode)
 {
     if (mode == Qwen4ExpParityTopology::CPU)
         return {.test_id = "CPU0", .kind = ModelParityTopologyKind::SingleDevice,
                 .participants = {{GlobalDeviceAddress::cpu(0), 0}}};
+    if (mode == Qwen4ExpParityTopology::CPU2TP)
+        return {.test_id = "CPU01_TP2", .kind = ModelParityTopologyKind::RankLocalTensorParallel,
+                .participants = {{GlobalDeviceAddress::cpu(0), 0},
+                                 {GlobalDeviceAddress::cpu(1), 0}},
+                .collective = Collective::HOST};
+    if (mode == Qwen4ExpParityTopology::CPU2PP)
+        return {.test_id = "CPU0_CPU1_PP2", .kind = ModelParityTopologyKind::RankLocalPipelineParallel,
+                .participants = {{GlobalDeviceAddress::cpu(0), 0},
+                                 {GlobalDeviceAddress::cpu(1), 0}},
+                .collective = Collective::HOST, .pipeline_stage_sizes = {1, 1},
+                .pipeline_weights = {1.0f, 1.0f},
+                .pipeline_tensor_parallel_collectives = {Collective::HOST, Collective::HOST}};
+    if (mode == Qwen4ExpParityTopology::ROCm4TP2PP2)
+        return {.test_id = "ROCm0123_TP2_PP2", .kind = ModelParityTopologyKind::RankLocalPipelineParallel,
+                .participants = {{GlobalDeviceAddress::rocm(0), 0},
+                                 {GlobalDeviceAddress::rocm(1), 0},
+                                 {GlobalDeviceAddress::rocm(2), 0},
+                                 {GlobalDeviceAddress::rocm(3), 0}},
+                .collective = Collective::RCCL, .pipeline_stage_sizes = {2, 2},
+                .pipeline_weights = {1.0f, 1.0f},
+                .pipeline_tensor_parallel_collectives = {Collective::RCCL, Collective::RCCL}};
+    if (mode == Qwen4ExpParityTopology::CUDA2CPU2TPPP ||
+        mode == Qwen4ExpParityTopology::ROCm2CPU2TPPP)
+    {
+        const bool cuda = mode == Qwen4ExpParityTopology::CUDA2CPU2TPPP;
+        // Sixteen GPU layers are an authored partition shared by both vendors,
+        // not a capacity-driven substitution. Native PMA still admits the BOM.
+        return {.test_id = cuda ? "CUDA01_CPU01_TP2_PP2" : "ROCm01_CPU01_TP2_PP2",
+                .kind = ModelParityTopologyKind::RankLocalPipelineParallel,
+                .participants = {{cuda ? GlobalDeviceAddress::cuda(0) : GlobalDeviceAddress::rocm(0), 0},
+                                 {cuda ? GlobalDeviceAddress::cuda(1) : GlobalDeviceAddress::rocm(1), 0},
+                                 {GlobalDeviceAddress::cpu(0), 0},
+                                 {GlobalDeviceAddress::cpu(1), 0}},
+                .collective = Collective::HETEROGENEOUS, .pipeline_stage_sizes = {2, 2},
+                .pipeline_weights = {1.0f, 2.0f},
+                .pipeline_tensor_parallel_collectives = {
+                    cuda ? Collective::NCCL : Collective::RCCL, Collective::HOST}};
+    }
+    if (mode == Qwen4ExpParityTopology::CUDA2ROCm2CPU2TPPP)
+        return {.test_id = "CUDA01_ROCm01_CPU01_TP2_PP3",
+                .kind = ModelParityTopologyKind::RankLocalPipelineParallel,
+                .participants = {{GlobalDeviceAddress::cuda(0), 0},
+                                 {GlobalDeviceAddress::cuda(1), 0},
+                                 {GlobalDeviceAddress::rocm(0), 0},
+                                 {GlobalDeviceAddress::rocm(1), 0},
+                                 {GlobalDeviceAddress::cpu(0), 0},
+                                 {GlobalDeviceAddress::cpu(1), 0}},
+                .collective = Collective::HETEROGENEOUS, .pipeline_stage_sizes = {2, 2, 2},
+                .pipeline_weights = {2.0f, 3.0f, 7.0f},
+                .pipeline_tensor_parallel_collectives = {
+                    Collective::NCCL, Collective::RCCL, Collective::HOST}};
     if (mode == Qwen4ExpParityTopology::CUDAROCmCPU)
     {
         // The mixed-vendor boundary belongs to the public pipeline executor.

@@ -22,6 +22,7 @@ enum class Qwen4ExpMTPAdmissionExecution { Active, Inactive };
 enum class Qwen4ExpMTPAdmissionPurpose
 {
     AdmissionDiagnostic,
+    SourceAdmission, ///< Full storage/topology source matrix; production-resolved initial depth.
     RuntimeQualification,
     ProductionServing,
 };
@@ -64,8 +65,10 @@ struct Qwen4ExpMTPAdmissionCase
         case ModelParityMTP::Depth3: return 3;
         case ModelParityMTP::Depth5: return 5;
         case ModelParityMTP::Depth6: return 6;
-        case ModelParityMTP::Depth15:
-        case ModelParityMTP::DynamicDepth: return kModelParityRequiredMaximumMTPDepth;
+        case ModelParityMTP::Depth15: return kModelParityRequiredMaximumMTPDepth;
+        // Dynamic's selected bound comes from this explicit physical family;
+        // the main model's numerical reference capability remains unchanged.
+        case ModelParityMTP::DynamicDepth: return retained_depth;
         default: throw std::invalid_argument("Unknown active QFN admission policy");
         }
     }
@@ -93,22 +96,55 @@ struct Qwen4ExpMTPAdmissionCase
     OrchestrationConfig config(Qwen4ExpMTPAdmissionExecution execution,
         Qwen4ExpMTPAdmissionPurpose purpose = Qwen4ExpMTPAdmissionPurpose::AdmissionDiagnostic) const
     {
+        return project(execution, purpose, main.model.model_path, 0);
+    }
+
+    /**
+     * @brief Project the complete source matrix without numerical/runtime policy substitutions.
+     * @param execution Explicit active or separately declared inactive source control.
+     * @param resolved_main_path Exact main source selected by the harness.
+     * @param rank Owning runtime MPI rank.
+     * @return Original storage/topology policies with explicit paired MTP capacity.
+     * @throws std::invalid_argument For an invalid paired declaration.
+     */
+    OrchestrationConfig sourceAdmissionConfig(Qwen4ExpMTPAdmissionExecution execution,
+        const std::string &resolved_main_path, int rank) const
+    {
+        return project(execution, Qwen4ExpMTPAdmissionPurpose::SourceAdmission, resolved_main_path, rank);
+    }
+
+private:
+    /**
+     * @brief Single source/depth projection for diagnostic, runtime and source-only purposes.
+     * @param execution Active or explicit inactive paired source.
+     * @param purpose Exact policy projection, preserving legacy diagnostic/runtime semantics.
+     * @param resolved_main_path Exact authored main source path.
+     * @param rank Owning runtime MPI rank.
+     * @return Complete paired runtime configuration; no storage is materialized.
+     * @throws std::invalid_argument For an incomplete or incompatible declaration.
+     */
+    OrchestrationConfig project(Qwen4ExpMTPAdmissionExecution execution,
+        Qwen4ExpMTPAdmissionPurpose purpose, const std::string &resolved_main_path, int rank) const
+    {
         if (execution != Qwen4ExpMTPAdmissionExecution::Active &&
             execution != Qwen4ExpMTPAdmissionExecution::Inactive)
             throw std::invalid_argument("Unknown QFN MTP admission execution intent");
         if (!main.ngram_table_policy ||
-            (main.ngram_table_policy->storage != ImmutableRowStoragePreference::RAM &&
+            (purpose != Qwen4ExpMTPAdmissionPurpose::SourceAdmission &&
+             main.ngram_table_policy->storage != ImmutableRowStoragePreference::RAM &&
              main.ngram_table_policy->storage != ImmutableRowStoragePreference::MemoryMapped))
             throw std::invalid_argument("QFN MTP admission requires its exact RAM/mmap source policy");
         if (purpose != Qwen4ExpMTPAdmissionPurpose::AdmissionDiagnostic &&
+            purpose != Qwen4ExpMTPAdmissionPurpose::SourceAdmission &&
             purpose != Qwen4ExpMTPAdmissionPurpose::RuntimeQualification &&
             purpose != Qwen4ExpMTPAdmissionPurpose::ProductionServing)
             throw std::invalid_argument("Unknown QFN runtime projection purpose");
         const int depth = requestedDepth();
-        if (retained_depth < depth || retained_depth > kModelParityRequiredMaximumMTPDepth)
+        if (retained_depth < 1 || retained_depth < depth || retained_depth > kModelParityRequiredMaximumMTPDepth)
             throw std::invalid_argument("QFN admission depth exceeds its explicit retained envelope");
-        auto result = main.makeOrchestrationConfig(main.model.model_path, 0);
-        if (purpose != Qwen4ExpMTPAdmissionPurpose::AdmissionDiagnostic)
+        auto result = main.makeOrchestrationConfig(resolved_main_path, rank);
+        if (purpose == Qwen4ExpMTPAdmissionPurpose::RuntimeQualification ||
+            purpose == Qwen4ExpMTPAdmissionPurpose::ProductionServing)
         {
             // Production retains declared residency semantics while retiring
             // short numerical-parity cache geometry and forced maintenance
@@ -127,10 +163,13 @@ struct Qwen4ExpMTPAdmissionCase
         result.mtp.enabled = execution == Qwen4ExpMTPAdmissionExecution::Active;
         result.mtp.draft_tokens = depth;
         result.mtp.graph_capacity_draft_tokens = result.mtp.enabled ? retained_depth : 0;
-        // Production HTTP sampling owns the public stochastic-capable verifier,
-        // including its greedy specialization; admission-only diagnostics stay greedy.
-        if (purpose != Qwen4ExpMTPAdmissionPurpose::AdmissionDiagnostic)
+        // Source setup admits the production stochastic-capable family;
+        // AdmissionDiagnostic alone retains its historical greedy verifier.
+        if (purpose == Qwen4ExpMTPAdmissionPurpose::RuntimeQualification ||
+            purpose == Qwen4ExpMTPAdmissionPurpose::ProductionServing)
             result.mtp.verify_mode = modelParityHttpMTPVerifyMode();
+        if (purpose == Qwen4ExpMTPAdmissionPurpose::SourceAdmission)
+            result.mtp.verify_mode = OrchestrationConfig::defaults().mtp.verify_mode;
         result.mtp.max_request_batch = 1;
         result.mtp.terminal_head_policy = terminal_head_policy;
         result.mtp.depth_policy = MTPDepthPolicyConfig{};
@@ -143,13 +182,16 @@ struct Qwen4ExpMTPAdmissionCase
             // HTTP qualification explicitly starts deep to exercise retained
             // execution. The full workload delegates initial depth to the
             // native trained backend/model resolver with the same bounds.
-            if (purpose != Qwen4ExpMTPAdmissionPurpose::ProductionServing)
+            if (purpose == Qwen4ExpMTPAdmissionPurpose::AdmissionDiagnostic ||
+                purpose == Qwen4ExpMTPAdmissionPurpose::RuntimeQualification)
                 result.mtp.depth_policy.initial_depth = depth;
         }
         // The short admission proof alone inherits numerical-prompt geometry.
         if (purpose == Qwen4ExpMTPAdmissionPurpose::AdmissionDiagnostic)
             result.prefix_cache.block_size = productionParityPrefixRestoreProofBlockSize(main.model.token_ids.size());
-        result.deterministic = purpose == Qwen4ExpMTPAdmissionPurpose::AdmissionDiagnostic;
+        result.deterministic = purpose == Qwen4ExpMTPAdmissionPurpose::SourceAdmission
+            ? OrchestrationConfig::defaults().deterministic
+            : purpose == Qwen4ExpMTPAdmissionPurpose::AdmissionDiagnostic;
         return result;
     }
 };

@@ -6,7 +6,9 @@
  * factory for native banks. Every representation records indexer, selected
  * attention and accepted-tail publication once, then replays changing canonical
  * row parameters and live/accepted counts without replacing any pointer.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/ExplicitGPUStream.h"
@@ -348,7 +350,7 @@ void proveStageSelectorForwarding(DeviceId device,
             QwenSparsePoolSelection::Bounded512_512,QwenSparsePoolSelection::Bounded1024_1024};
         for(int rows:{1,16,17,33}){
             SCOPED_TRACE(rows);
-            llaminar2::test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(ArenaConfig{.factory=&factory});
+            llaminar2::test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
             const auto declare=[&](BufferId id,int n,int width,const char* type){require(arena.registerBuffer(id,n,width,type,device),"Selector arena role admission failed");};
             declare(BufferId::QFN_QSA_QUERY,rows,512,"FP32");declare(BufferId::QFN_QSA_RAW_KEY,rows,128,"FP32");
             declare(BufferId::QFN_QSA_PARTIAL_KEYS,4,128,"FP32");declare(BufferId::QFN_QSA_POOLED_KEYS,blocks,128,"FP32");

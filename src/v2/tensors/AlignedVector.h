@@ -8,6 +8,11 @@
  * - Aligned loads (_mm512_load_ps) - faster than unaligned loads
  * - Cache line optimization - avoid cache line splits
  *
+ * Final prepared storage retains a typed preallocation lease with its physical
+ * owner. Moves preserve that lease; independent copies preclaim their own bytes.
+ * Rebinding claimed capacity is rejected, while empty shrink retires both bytes
+ * and claim through the same temporary owner.
+ *
  * Dedicated NUMA mappings retain inaccessible virtual guards on both sides.
  * Guards prevent huge-page sharing across independent first-touch owners while
  * large payloads remain huge-page aligned and eligible. Physical accounting is
@@ -22,6 +27,7 @@
 
 #pragma once
 
+#include "planning/PhysicalMemoryAuthority.h"
 #include <cstdlib> // aligned_alloc, free
 #include <cstdint> // uintptr_t
 #include <cstring> // memcpy
@@ -40,6 +46,7 @@
 
 namespace llaminar2
 {
+    class CPUStoragePlacement;
 
     /**
      * @brief Vector with 64-byte aligned memory allocation
@@ -141,6 +148,12 @@ namespace llaminar2
         AlignedVector(const AlignedVector &other)
             : data_(nullptr), size_(other.size_), capacity_(other.size_)
         {
+            allocation_authority_ = other.allocation_authority_;
+            allocation_owner_ = other.allocation_owner_;
+            allocation_device_ = other.allocation_device_;
+            if (allocation_authority_ && size_)
+                allocation_lifetime_ = std::make_shared<PhysicalMemoryAllocationLease>(
+                    allocation_authority_->claimNewAllocation(allocation_device_, allocation_owner_, requiredAllocationBytes(size_)));
             if (size_ > 0)
             {
                 allocate(size_);
@@ -148,12 +161,47 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Copy a logical subrange through this backing's exact typed issuer.
+         * @param offset First initialized source element.
+         * @param count Number of initialized elements to copy.
+         * @return Independent local backing, preclaimed before allocation when admitted.
+         *
+         * Native tensor views use this instead of growing an unaccounted empty
+         * vector. The original root remains unchanged and owns its full lease.
+         */
+        [[nodiscard]] AlignedVector copySubrange(size_t offset, size_t count) const
+        {
+            if (offset > size_ || count > size_ - offset)
+                throw std::out_of_range("AlignedVector copy range exceeds live elements");
+            AlignedVector result;
+            result.allocation_authority_ = allocation_authority_;
+            result.allocation_owner_ = allocation_owner_;
+            result.allocation_device_ = allocation_device_;
+            if (result.allocation_authority_ && count)
+                result.allocation_lifetime_ = std::make_shared<PhysicalMemoryAllocationLease>(
+                    result.allocation_authority_->claimNewAllocation(result.allocation_device_,
+                        result.allocation_owner_, requiredAllocationBytes(count)));
+            if (count)
+            {
+                result.allocate(count);
+                std::uninitialized_copy_n(data_ + offset, count, result.data_);
+            }
+            result.size_ = count;
+            result.capacity_ = count;
+            return result;
+        }
+
         /// Move constructor
         AlignedVector(AlignedVector &&other) noexcept
             : data_(other.data_), size_(other.size_), capacity_(other.capacity_),
               allocation_bytes_(other.allocation_bytes_),
               allocation_alignment_(other.allocation_alignment_),
-              storage_kind_(other.storage_kind_)
+              storage_kind_(other.storage_kind_),
+              allocation_authority_(std::move(other.allocation_authority_)),
+              allocation_owner_(other.allocation_owner_),
+              allocation_device_(other.allocation_device_),
+              allocation_lifetime_(std::move(other.allocation_lifetime_))
         {
             other.data_ = nullptr;
             other.size_ = 0;
@@ -213,6 +261,8 @@ namespace llaminar2
             if (new_capacity <= capacity_)
                 return;
 
+            if (allocation_authority_)
+                throw std::logic_error("Accounted AlignedVector storage cannot be rebound");
             size_t new_allocation_bytes = 0;
             T *new_data = allocate_raw(
                 new_capacity,
@@ -269,6 +319,8 @@ namespace llaminar2
 
             const size_t target_capacity =
                 std::max(new_capacity, capacity_);
+            if (allocation_authority_)
+                throw std::logic_error("Accounted AlignedVector storage cannot be rebound");
             size_t new_allocation_bytes = 0;
             T *new_data = allocate_raw(
                 target_capacity,
@@ -434,10 +486,17 @@ namespace llaminar2
             if (size_ == 0)
             {
                 AlignedVector empty;
+                // Capacity retirement preserves the immutable allocation
+                // policy so later growth cannot escape admission accounting.
+                empty.allocation_authority_ = allocation_authority_;
+                empty.allocation_owner_ = allocation_owner_;
+                empty.allocation_device_ = allocation_device_;
                 swap(empty);
                 return;
             }
 
+            if (allocation_authority_)
+                throw std::logic_error("Accounted AlignedVector storage cannot be compacted");
             AlignedVector compact;
             compact.resize_uninitialized(size_);
             std::uninitialized_copy_n(data_, size_, compact.data_);
@@ -521,8 +580,39 @@ namespace llaminar2
             std::swap(allocation_bytes_, other.allocation_bytes_);
             std::swap(allocation_alignment_, other.allocation_alignment_);
             std::swap(storage_kind_, other.storage_kind_);
+            allocation_lifetime_.swap(other.allocation_lifetime_);
+            allocation_authority_.swap(other.allocation_authority_);
+            std::swap(allocation_owner_, other.allocation_owner_);
+            std::swap(allocation_device_, other.allocation_device_);
         }
 
+    private:
+        friend class CPUStoragePlacement;
+        /**
+         * @brief Bind admission lifetime to this exact immutable allocation.
+         * @param lifetime RAII physical-memory claim issued before allocation.
+         * @param bytes Exact allocator-rounded capacity represented by the claim.
+         * @param authority Admission issuer for independent physical copies.
+         * @param allocator Exact admitted CPU allocator used for independent copies.
+         * @param owner Owner used for independent physical copies.
+         * @throws std::logic_error For a duplicate, absent, or mismatched claim.
+         */
+        void retainAllocationLifetime(std::shared_ptr<PhysicalMemoryAllocationLease> lifetime, size_t bytes,
+            std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId allocator, PhysicalMemoryOwner owner)
+        {
+            const bool lease_matches = bytes == 0
+                ? !lifetime
+                : lifetime && lifetime->valid() && lifetime->owner() == owner && lifetime->bytes() == bytes;
+            if (!lease_matches || !authority || !allocator.is_valid() || !allocator.is_cpu() ||
+                allocation_authority_ || bytes != allocation_bytes_)
+                throw std::logic_error("AlignedVector allocation claim does not match physical storage");
+            allocation_lifetime_ = std::move(lifetime);
+            allocation_authority_ = std::move(authority);
+            allocation_owner_ = owner;
+            allocation_device_ = allocator;
+        }
+
+    public:
         // ========== Alignment Query ==========
 
         /// Check if data pointer is properly aligned
@@ -604,6 +694,10 @@ namespace llaminar2
         size_t allocation_bytes_ = 0;
         size_t allocation_alignment_ = ALIGNMENT;
         StorageKind storage_kind_ = StorageKind::Heap;
+        std::shared_ptr<PhysicalMemoryAuthority> allocation_authority_; ///< Typed issuer for independent copies.
+        PhysicalMemoryOwner allocation_owner_ = PhysicalMemoryOwner::Count; ///< Immutable allocation owner.
+        DeviceId allocation_device_ = DeviceId::invalid(); ///< Exact admitted CPU allocator.
+        std::shared_ptr<PhysicalMemoryAllocationLease> allocation_lifetime_; ///< Released after destructor frees the physical allocation.
 
         /** @return The platform page size required by anonymous mappings. */
         static size_t runtimePageSize()

@@ -5,7 +5,9 @@
  * No model weights are loaded. Exact metadata, small native cache frontiers and
  * arena-backed state prove initialization before the first ModelBuffers forward
  * publication, including physical rank-three-to-matrix flattening and PP offsets.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include "Qwen4ExpMetadataFixture.h"
 #include "models/qwen4exp/Qwen4ExpGraph.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
@@ -78,7 +80,7 @@ TEST(Qwen4ExpGraphStateBindings, DeclaredArenaRetainsIntegerHistoriesAndAllSpars
     const auto schema=graph.getSchema();
     const auto resolver=graph.getResolverConfig(128);
     const auto requirements=BufferAllocator::resolveLayerBuffers(schema,resolver);
-    BufferArena arena(ArenaConfig{.factory=&factory});
+    BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
     // Allocate only persistent model state while preserving the actual schema,
     // resolver and typed arena path. No expert weights or GPU work are needed.
     for(const auto role:{BufferId::QFN_PLE_TOKEN_HISTORY,BufferId::QFN_PLE_CONV_HISTORY,
@@ -121,7 +123,7 @@ TEST(Qwen4ExpGraphStateBindings, CacheSetupBindsDeclaredRolesBeforeFirstForward)
         INT32Tensor tokens{{1,4}};
         std::fill_n(pools.mutable_data(),pools.numel(),-71.0f);
         std::fill_n(partial.mutable_data(),partial.numel(),-72.0f);
-        BufferArena arena;
+        BufferArena arena{::llaminar2::test::cpuArenaFixtureConfig()};
         ASSERT_TRUE(arena.registerExternalBuffer(BufferId::QFN_QSA_POOLED_KEYS,&pools));
         ASSERT_TRUE(arena.registerExternalBuffer(BufferId::QFN_QSA_PARTIAL_KEYS,&partial));
         if(first==0)

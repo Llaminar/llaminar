@@ -2,9 +2,11 @@
  * @file ImmutableRowTableAdmissionWire.cpp
  * @brief Authenticate bounded setup-only table candidate metadata with no payload reads.
  *
- * Version8 retains the resolved arithmetic and original source-authored attention schedule
- * alongside common activation geometry. Unknown values reject before narrowing; reloadable debug
+ * Version9 also retains predictor head ownership beside resolved arithmetic and
+ * the original attention schedule. Unknown values reject before narrowing; reloadable debug
  * state is never consulted when restoring an admitted remote provision.
+ * Sender frames serialize and authenticate within readiness consensus before
+ * any table metadata payload collective begins.
  */
 #include "ImmutableRowTableAdmissionWire.h"
 #include "MemoryPlanner.h"
@@ -16,7 +18,7 @@ namespace llaminar2
 {
 namespace
 {
-    constexpr std::uint32_t Magic = 0x4e475231u, Version = 8;
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 9;
     /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
     constexpr std::array QfnLayoutWords{
         &Qwen4ExpMemoryGeometry::residual_width,
@@ -211,6 +213,9 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
                 if(a.attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform &&
                    a.attention_phase_schedule!=qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33)
                     throw std::invalid_argument("Ngram wire attention phase schedule is invalid");
+                if (a.mtp_shifted_kv_head_layout != MTPShiftedKVHeadLayout::PrimaryTensorParallelShard &&
+                    a.mtp_shifted_kv_head_layout != MTPShiftedKVHeadLayout::FullModelPerParticipant)
+                    throw std::invalid_argument("Ngram wire predictor ownership is invalid");
                 for (const int value : {a.local_d_ff,
                                         a.local_n_heads,
                                         a.local_n_kv_heads,
@@ -219,7 +224,8 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
                                         static_cast<int>(a.routed_compute_policy),
                                         static_cast<int>(a.mtp_terminal_logits_layout),
                                         static_cast<int>(a.attention_phase_schedule),
-                                        static_cast<int>(a.attention_arithmetic)})
+                                        static_cast<int>(a.attention_arithmetic),
+                                        static_cast<int>(a.mtp_shifted_kv_head_layout)})
                 {
                     if(value<0)throw std::invalid_argument("Ngram common activation geometry must be nonnegative");
                     append(out,static_cast<std::uint32_t>(value));
@@ -305,7 +311,7 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
             if(!canonical_source->flash_next || layout!=*canonical_source->flash_next)
                 throw std::invalid_argument("Ngram wire provision layout disagrees with independent receiver source metadata");
             const auto instances=in.read<std::uint32_t>();
-            if (instances == 0 || instances > in.remaining() / 112u)
+            if (instances == 0 || instances > in.remaining() / 116u)
                 throw std::invalid_argument("Ngram wire provision geometry count exceeds its exact frame");
             std::vector<ImmutableRowTableExecutionConsumer> geometry;
             for(std::uint32_t i=0;i<instances;++i)
@@ -321,7 +327,7 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
                 const auto coordinate=in.read<std::uint32_t>(),topology=in.read<std::uint32_t>();
                 if(coordinate>8 || topology>static_cast<std::uint32_t>(ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal))
                     throw std::invalid_argument("Ngram wire TP provenance is invalid");
-                int common[9];
+                int common[10];
                 for(int &field:common)
                 {
                     const auto value=in.read<std::uint32_t>();
@@ -330,7 +336,8 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
                     field=static_cast<int>(value);
                 }
                 if(common[4]>1 || common[5]>static_cast<int>(RoutedExpertComputePolicy::GateUpOwnedDownColumns) ||
-                    common[6]>static_cast<int>(MTPTerminalLogitsLayout::VocabularyShardPerParticipant))
+                    common[6]>static_cast<int>(MTPTerminalLogitsLayout::VocabularyShardPerParticipant) ||
+                    common[9]>static_cast<int>(MTPShiftedKVHeadLayout::FullModelPerParticipant))
                     throw std::invalid_argument("Ngram wire common activation policy is invalid");
                 if(common[7]!=static_cast<int>(qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform) &&
                    common[7]!=static_cast<int>(qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33))
@@ -371,7 +378,8 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
                     .generation_request_capacity = fields[9],
                     .attention_arithmetic = arithmetic,
                     .attention_phase_schedule =
-                        static_cast<qwen4exp::QwenSparseAttentionPhaseSchedule>(common[7])};
+                        static_cast<qwen4exp::QwenSparseAttentionPhaseSchedule>(common[7]),
+                    .mtp_shifted_kv_head_layout = static_cast<MTPShiftedKVHeadLayout>(common[9])};
                 geometry.push_back({r,fields[0],fields[1],fields[2],fields[3],fields[4],fields[5],fields[6],fields[7],fields[8],fields[9],activation,
                     static_cast<int>(coordinate)-1,static_cast<ImmutableRowTableTPTopology>(topology)});
             }
@@ -385,3 +393,20 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
     return result;
 }
 }
+
+namespace llaminar2
+{
+ImmutableRowTableAdmissionSendFrame ImmutableRowTableAdmissionSendFrame::prepare(
+    std::span<const ImmutableRowTableAdmissionRequest> requests, int sender_rank,
+    const ModelMemoryProfile *canonical_source)
+{
+    auto bytes = serializeImmutableRowTableAdmissionRequests(requests);
+    if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::overflow_error("Ngram admission sender metadata exceeds MPI extent");
+    // Decode with independently owned metadata and the actual sender before
+    // readiness consensus. This cannot defer a structural failure until peers
+    // have entered the first payload collective.
+    (void)parseImmutableRowTableAdmissionRequests(bytes, sender_rank, canonical_source);
+    return ImmutableRowTableAdmissionSendFrame(std::move(bytes), sender_rank);
+}
+} // namespace llaminar2

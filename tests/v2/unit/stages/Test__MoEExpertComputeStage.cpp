@@ -11,6 +11,9 @@
  */
 
 #include <gtest/gtest.h>
+#include "utils/CPUExpertStageTestAdmission.h"
+#include "utils/CPUStandaloneRouterTestAdmission.h"
+#include "utils/CPUActualRoutedStageTestWorkspace.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/moe/CanonicalMoERouteRecord.h"
@@ -23,6 +26,8 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/IMoEKernel.h"
 #include "kernels/cpu/moe/CPUCanonicalRouteReducer.h"
+#include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "memory/CPUGroupedMoEStorageBacking.h"
 #include "kernels/cpu/primitives/VectorPrimitives.h"
 #include "loaders/PreparedWeightStore.h"
 #include "interfaces/IWorkspaceConsumer.h"
@@ -625,43 +630,50 @@ protected:
         return formats;
     }
 
-    /// Compute routing results and return as FP32 tensors for MoEExpertComputeStage input.
-    /// Runs IMoEKernel::route() directly, converts indices to float.
+    std::vector<CPUPreparedRouterTestSource> routing_seeds_;
+
+    /** @brief Rebind actual graph-local producer before expert numerical replay. */
+    std::unique_ptr<CPUActualRoutedStageTestWorkspace> bindExpertWorkspace(
+        MoEExpertComputeStage &stage,const MoEExpertComputeStage::Params &params)
+    {
+        const CPUPreparedRouterTestSource *seed=nullptr;
+        for(const auto &candidate:routing_seeds_)
+            if(candidate.owner.lock()==params.routed_pipeline_kernel_owner && !candidate.owner.expired())
+            {seed=&candidate;break;}
+        return std::make_unique<CPUActualRoutedStageTestWorkspace>(stage,params,seed,cpu_ctx_.get());
+    }
+
+    /** @brief Setup routing oracle with its own exact explicitly admitted root. */
     struct RoutingResult
     {
-        std::shared_ptr<FP32Tensor> indices; // float-cast expert IDs [seq_len * top_k]
-        std::shared_ptr<FP32Tensor> weights; // normalized weights [seq_len * top_k]
+        std::shared_ptr<FP32Tensor> indices, weights;
         std::shared_ptr<MoERoutedPipelineKernelOwner> kernel_owner;
     };
 
     RoutingResult computeRouting(TensorBase *input, TensorBase *gate_weights,
                                  int seq_len, int d_model, int num_experts, int top_k,
-        bool norm_topk_prob = true)
+                                 bool norm_topk_prob = true)
     {
-        using KernelFactory = llaminar::v2::kernels::KernelFactory;
-        auto kernel_owner = std::make_shared<MoERoutedPipelineKernelOwner>();
-        kernel_owner->kernel = KernelFactory::createMoEKernel(DeviceId::cpu());
-        IMoEKernel *kernel = kernel_owner->kernel.get();
-        const size_t n = static_cast<size_t>(seq_len) * top_k;
-        auto indices = std::make_shared<FP32Tensor>(std::vector<size_t>{n, 1});
-        auto weights = std::make_shared<FP32Tensor>(std::vector<size_t>{n, 1});
-        MoERoutingResult routing;
-        if (!kernel->routeWithTensors(
-                input,
-                gate_weights,
-                seq_len,
-                d_model,
-                num_experts,
-                top_k,
-                norm_topk_prob,
-                indices.get(),
-                weights.get(),
-                routing))
-        {
-            throw std::runtime_error("CPU routing fixture failed to publish routing tensors");
-        }
-        return {indices, weights, std::move(kernel_owner)};
+        const size_t count=static_cast<size_t>(seq_len)*top_k;
+        auto indices=std::make_shared<FP32Tensor>(std::vector<size_t>{count,1});
+        auto weights=std::make_shared<FP32Tensor>(std::vector<size_t>{count,1});
+        MoERoutingStage::Params source;
+        source.device_id=DeviceId::cpu();source.input=input;source.gate_weights=gate_weights;
+        source.seq_len=seq_len;source.d_model=d_model;source.num_experts=num_experts;source.top_k=top_k;
+        source.norm_topk_prob=norm_topk_prob;source.output_indices=indices.get();source.output_weights=weights.get();
+        admitCPUStandaloneRouterForTest(source);
+        MoERoutingStage router(source);
+        if(!router.execute(cpu_ctx_.get()))
+            throw std::runtime_error("Explicitly admitted setup router failed");
+        auto owner=source.routed_pipeline_kernel_owner;
+        source.routed_pipeline_kernel_owner.reset();
+        std::erase_if(routing_seeds_,[](const CPUPreparedRouterTestSource &seed){return seed.owner.expired();});
+        routing_seeds_.push_back({owner,source,
+            std::vector<float>(indices->data(),indices->data()+count),
+            std::vector<float>(weights->data(),weights->data()+count)});
+        return {indices,weights,std::move(owner)};
     }
+
 };
 
 /**
@@ -1279,10 +1291,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
 
     // Extract 2D expert views from 3D packed tensors (required by GEMM path)
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+    const auto params_admission = test::admitCPUExpertStageForTest(
+        params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
-    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+    auto workspace = bindExpertWorkspace(stage, params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Output should be non-zero
@@ -1362,9 +1376,11 @@ TEST_F(MoEExpertComputeStageTest,
     router_params.output = router_output.get();
     router_params.routed_pipeline_kernel_owner = routing.kernel_owner;
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(router_params));
+    const auto router_params_admission = test::admitCPUExpertStageForTest(
+        router_params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(router_params));
-    MoEExpertComputeStage router_stage(std::move(router_params));
-    test::CPUStageTestWorkspace router_workspace(router_stage, 1);
+    MoEExpertComputeStage router_stage(router_params);
+    auto router_workspace = bindExpertWorkspace(router_stage, router_params);
     ASSERT_TRUE(router_stage.execute(cpu_ctx_.get()));
 
     auto transported_output = TestTensorFactory::createFP32({1, d});
@@ -1373,6 +1389,8 @@ TEST_F(MoEExpertComputeStageTest,
     transported_params.cpu_router_q8_input_publication =
         CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(transported_params));
+    const auto transported_params_admission = test::admitCPUExpertStageForTest(
+        transported_params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(transported_params));
     MoEExpertComputeStage transported_stage(std::move(transported_params));
     test::CPUStageTestWorkspace transported_workspace(transported_stage, 1);
@@ -1441,10 +1459,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q5K)
     params.expert_intermediate = inter;
 
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+    const auto params_admission = test::admitCPUExpertStageForTest(
+        params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
-    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+    auto workspace = bindExpertWorkspace(stage, params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     const float *out = output->data();
@@ -1499,10 +1519,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
     params.expert_intermediate = inter;
 
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+    const auto params_admission = test::admitCPUExpertStageForTest(
+        params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
-    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+    auto workspace = bindExpertWorkspace(stage, params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Each token should get a non-zero output
@@ -1728,12 +1750,14 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 params.expert_mask = *run_expert_mask;
             }
 
+            const auto params_admission = test::admitCPUExpertStageForTest(
+                params, PhysicalMemoryOwner::PrimaryModelWeights);
             if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             {
                 return false;
             }
             MoEExpertComputeStage stage(params);
-            test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+            auto workspace = bindExpertWorkspace(stage, params);
             return stage.execute(cpu_ctx_.get());
         };
 
@@ -2544,10 +2568,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3
 
         if (!MoEExpertComputeStage::extractExpertViews(params))
             return false;
+        const auto params_admission = test::admitCPUExpertStageForTest(
+            params, PhysicalMemoryOwner::PrimaryModelWeights);
         if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             return false;
         MoEExpertComputeStage stage(params);
-        test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+        auto workspace = bindExpertWorkspace(stage, params);
         return stage.execute(cpu_ctx_.get());
     };
 
@@ -2650,10 +2676,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_Qwe
 
         if (!MoEExpertComputeStage::extractExpertViews(params))
             return false;
+        const auto params_admission = test::admitCPUExpertStageForTest(
+            params, PhysicalMemoryOwner::PrimaryModelWeights);
         if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             return false;
         MoEExpertComputeStage stage(params);
-        test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+        auto workspace = bindExpertWorkspace(stage, params);
         return stage.execute(cpu_ctx_.get());
     };
 
@@ -2781,6 +2809,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_CPUActiveExpertWithoutPreparedEngineRet
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
 
     MoEExpertComputeStage stage(params);
+    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
     EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
 }
 
@@ -2821,6 +2850,8 @@ TEST_F(MoEExpertComputeStageTest, MTPMoESidecarReusesPreparedExpertSlabsAfterRaw
     auto initial = make_params();
     initial.prepared_store = &store;
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(initial));
+    const auto initial_admission = test::admitCPUExpertStageForTest(
+        initial, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(initial));
     ASSERT_TRUE(initial.gate_slab_ref.has_value());
     EXPECT_EQ(store.totalPopulatedExperts(), static_cast<size_t>(local_count * 3));
@@ -2835,6 +2866,8 @@ TEST_F(MoEExpertComputeStageTest, MTPMoESidecarReusesPreparedExpertSlabsAfterRaw
     auto sidecar = make_params();
     sidecar.prepared_store = &store;
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(sidecar));
+    const auto sidecar_admission = test::admitCPUExpertStageForTest(
+        sidecar, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(sidecar))
         << "MTP sidecar graph build must reuse PreparedWeightStore slabs after host raw data release";
 
@@ -2897,10 +2930,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     params.expert_intermediate = inter;
 
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+    const auto params_admission = test::admitCPUExpertStageForTest(
+        params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
-    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+    auto workspace = bindExpertWorkspace(stage, params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Token 0 and Token 1 should produce different outputs
@@ -2954,10 +2989,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.expert_intermediate = inter;
 
         ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+        const auto params_admission = test::admitCPUExpertStageForTest(
+            params, PhysicalMemoryOwner::PrimaryModelWeights);
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
         MoEExpertComputeStage stage(params);
-        test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+        auto workspace = bindExpertWorkspace(stage, params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
     }
 
@@ -2982,10 +3019,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         params.expert_intermediate = inter;
 
         ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
+        const auto params_admission = test::admitCPUExpertStageForTest(
+            params, PhysicalMemoryOwner::PrimaryModelWeights);
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
         MoEExpertComputeStage stage(params);
-        test::CPUStageTestWorkspace workspace(stage, params.seq_len);
+        auto workspace = bindExpertWorkspace(stage, params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
     }
 
@@ -3602,4 +3641,106 @@ TEST_F(MoEExpertComputeStageTest, IsNonGemmWeight_ExpertTensorsExcluded)
     EXPECT_FALSE(config.isNonGemmWeight("blk.0.ffn_up.weight"));
     EXPECT_FALSE(config.isNonGemmWeight("blk.0.ffn_down.weight"));
     EXPECT_FALSE(config.isNonGemmWeight("blk.0.attn_q.weight"));
+}
+
+/**
+ * @brief Real router/expert stages replay from one declared eight-root owner.
+ *
+ * Floating F>D exercises setup-created FP32 SwiGLU spans; native weights use
+ * the same graph-local Q8 producer and exact physical workspace declaration.
+ */
+TEST_F(MoEExpertComputeStageTest, DeclaredCPUWorkspacePreservesRouterOwnerAndReplay)
+{
+    ScopedOpenMPThreadCount threads(1);
+    for (const bool native : {false, true})
+    for (const int rows : {1, 3})
+    {
+        const int d = native ? 256 : 32;
+        const int f = native ? 256 : 64;
+        const int experts = 2, topk = 2;
+        auto input = TestTensorFactory::createFP32Random({rows,d}, -.25f,.25f,711);
+        auto router_weight = TestTensorFactory::createFP32Random({experts,d},-.1f,.1f,712);
+        auto indices = TestTensorFactory::createFP32({rows,topk});
+        auto weights = TestTensorFactory::createFP32({rows,topk});
+        auto output = TestTensorFactory::createFP32({rows,d});
+        std::shared_ptr<TensorBase> gate, up, down;
+        if (native)
+        {
+            gate=createExpertQ4K(experts,f,d,713);
+            up=createExpertQ4K(experts,f,d,714);
+            down=createExpertQ4K(experts,d,f,715);
+        }
+        else
+        {
+            // Packed expert sources use GGUF [input, output, expert] geometry.
+            gate=TestTensorFactory::createFP32Random({d,f,experts},-.1f,.1f,713);
+            up=TestTensorFactory::createFP32Random({d,f,experts},-.1f,.1f,714);
+            down=TestTensorFactory::createFP32Random({f,d,experts},-.1f,.1f,715);
+        }
+        auto owner=std::make_shared<MoERoutedPipelineKernelOwner>();
+        MoERoutingStage::Params rp;
+        rp.device_id=DeviceId::cpu(); rp.input=input.get();rp.gate_weights=router_weight.get();
+        rp.seq_len=rows;rp.d_model=d;rp.num_experts=experts;rp.top_k=topk;
+        rp.output_indices=indices.get();rp.output_weights=weights.get();rp.routed_pipeline_kernel_owner=owner;
+        MoEExpertComputeStage::Params ep;
+        ep.device_id=DeviceId::cpu();ep.input=input.get();ep.output=output.get();
+        ep.routing_indices=indices.get();ep.routing_weights=weights.get();
+        ep.gate_exps=gate.get();ep.up_exps=up.get();ep.down_exps=down.get();
+        ep.seq_len=rows;ep.d_model=d;ep.expert_intermediate=f;ep.num_experts=experts;ep.top_k=topk;
+        ep.routed_pipeline_kernel_owner=owner;
+        ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(ep));
+        auto admission=admitCPUExpertStageForTest(ep,PhysicalMemoryOwner::PrimaryModelWeights);
+        ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(ep));
+        MoERoutingStage router(rp);
+        MoEExpertComputeStage expert(ep);
+        auto requirements=expert.getWorkspaceRequirements(rows);
+        ASSERT_TRUE(requirements.cpu_grouped_moe_storage);
+        requirements.merge(router.getWorkspaceRequirements(rows));
+        CPUProjectionTestWorkspace arena(requirements);
+        const auto backing=arena.get()->cpuGroupedMoEStorage();
+        ASSERT_TRUE(backing);
+        EXPECT_EQ(backing->physicalBytes(),requirements.cpu_grouped_moe_storage->physicalBytes());
+        const auto *kernel_storage=backing->kernel_router_q8->data();
+        const auto *gate_storage=backing->gate->data();
+        router.bindWorkspace(arena.get());
+        expert.bindWorkspace(arena.get());
+        auto *const kernel=dynamic_cast<CPUMoEKernel *>(owner->kernel.get());
+        ASSERT_NE(kernel,nullptr);
+        // A consumer cannot invent a router publication from the input tensor.
+        EXPECT_EQ(kernel->publishedRouterQ8Hidden(input->data(),rows,d),nullptr);
+        std::vector<float> expected;
+        for(int replay=0;replay<3;++replay)
+        {
+            ASSERT_TRUE(router.execute(cpu_ctx_.get()));
+            EXPECT_EQ(kernel->publishedRouterQ8Hidden(input->data(),rows,d),kernel_storage);
+            ASSERT_TRUE(expert.execute(cpu_ctx_.get()));
+            if(replay==0) expected.assign(output->data(),output->data()+rows*d);
+            else EXPECT_EQ(std::memcmp(expected.data(),output->data(),rows*d*sizeof(float)),0);
+            EXPECT_EQ(backing->gate->data(),gate_storage);
+            EXPECT_EQ(backing->kernel_router_q8->data(),kernel_storage);
+            owner->kernel->resetDynamicState();
+            EXPECT_NO_THROW(expert.bindWorkspace(nullptr));
+            EXPECT_NO_THROW(router.bindWorkspace(nullptr));
+            EXPECT_FALSE(expert.hasWorkspace());
+            EXPECT_FALSE(router.hasWorkspace());
+            EXPECT_EQ(backing->kernel_router_q8->data(),kernel_storage);
+            router.bindWorkspace(arena.get());
+            expert.bindWorkspace(arena.get());
+            EXPECT_TRUE(router.hasWorkspace());
+            EXPECT_TRUE(expert.hasWorkspace());
+        }
+        expert.unbindWorkspace();router.unbindWorkspace();
+    }
+}
+
+/** @brief Missing or unrelated workspace cannot silently restore private roots. */
+TEST_F(MoEExpertComputeStageTest, DeclaredCPUWorkspaceRejectsMissingBundle)
+{
+    MoERoutingStage::Params rp;
+    rp.device_id=DeviceId::cpu();rp.seq_len=1;rp.d_model=32;rp.num_experts=2;rp.top_k=1;
+    MoERoutingStage router(rp);
+    EXPECT_NO_THROW(router.bindWorkspace(nullptr));
+    EXPECT_FALSE(router.hasWorkspace());
+    CPUProjectionTestWorkspace empty(cpuSwiGLUWorkspaceRequirements(1,32));
+    EXPECT_THROW(router.bindWorkspace(empty.get()),std::logic_error);
 }

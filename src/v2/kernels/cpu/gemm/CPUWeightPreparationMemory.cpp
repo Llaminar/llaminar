@@ -3,12 +3,13 @@
  * @brief Exact native CPU packer payload geometry for admitted startup samples.
  *
  * Encoding selection and interleaved strides come from the production packer.
- * The named temporary terms mirror its source-oriented passes. They are not a
- * multiplier over GGUF bytes or an anonymous safety reserve. Tests compare the
- * retained demand with prepared engines across the entire native-format catalog.
+ * Its one retained root uses the common native allocator's physical geometry.
+ * Setup demand describes the actual simultaneously live source-oriented vectors;
+ * it is not a multiplier over GGUF bytes or an anonymous safety reserve.
  */
 #include "CPUWeightPreparationMemory.h"
 #include "CPUNativeVNNIWeightPacker.h"
+#include "memory/CPUStorageRoot.h"
 #include <climits>
 #include <limits>
 #include <stdexcept>
@@ -28,7 +29,14 @@ namespace llaminar2
         if (!n || !k || n > size_t(INT_MAX - 63) || k > size_t(INT_MAX - 31))
             throw std::invalid_argument("CPU preparation requires representable positive matrix geometry");
         if (format == "F32" || format == "F16" || format == "BF16")
-            return {multiply(multiply(n, k), format == "F32" ? sizeof(float) : sizeof(uint16_t)), 0};
+        {
+            const auto elements=multiply(n,k);
+            const auto payload=multiply(elements,format=="F32"?sizeof(float):sizeof(uint16_t));
+            const auto physical=format=="F32"
+                ? CPUStoragePlacement::local().physicalBytes<float>(elements)
+                : CPUStoragePlacement::local().physicalBytes<uint16_t>(elements);
+            return {physical,0,payload};
+        }
 
         const auto *native = native_vnni_formats::forQuantType(format);
         if (!native || k % (native->is_superblock ? 256u : 32u))
@@ -38,28 +46,22 @@ namespace llaminar2
         const size_t units = multiply((n + 63) / 64, k / 32);
         const size_t blocks = multiply(units, 64);
         const size_t interleaved = multiply(units, footprint.weight_bytes_per_n_chunk_k_block);
+        const auto retained=CPUStoragePlacement::local().physicalBytes<uint8_t>(interleaved);
         switch (footprint.encoding)
         {
         case CPUNativeVNNIEncoding::NibbleLUTSourceScale:
         case CPUNativeVNNIEncoding::NibbleLUT:
-        {
-            // A retained scalar-oracle payload plus one temporary source-order
-            // payload, and two scale/min pairs, coexist with final interleaving.
-            const size_t payload = multiply(blocks, native->payload_bytes);
-            if (payload > std::numeric_limits<size_t>::max() - interleaved)
-                throw std::overflow_error("CPU retained payload extent overflow");
-            return {interleaved + payload,
-                multiply(blocks, native->payload_bytes + 4 * sizeof(uint16_t))};
-        }
+            // CPU source-order and GPU-interleaved payload vectors coexist
+            // with two scale/min pairs until the final root is complete.
+            // Neither payload survives publication of the prepared engine.
+            return {retained,multiply(blocks,2*native->payload_bytes+4*sizeof(uint16_t)),interleaved};
         case CPUNativeVNNIEncoding::Q6KNativeDualScale:
-            return {interleaved,
-                multiply(blocks, native->payload_bytes + 2 * sizeof(uint16_t))};
+            return {retained,multiply(blocks,native->payload_bytes+2*sizeof(uint16_t)),interleaved};
         case CPUNativeVNNIEncoding::IQ3SExpandedSourceScale:
         case CPUNativeVNNIEncoding::ExpandedInt8:
         case CPUNativeVNNIEncoding::CompactMultiScale:
-            // These paths already pack bounded stack blocks directly into the
-            // final allocation, without a matrix-sized decoded shadow.
-            return {interleaved, 0};
+            // These encodings use bounded stack blocks directly in final storage.
+            return {retained,0,interleaved};
         }
         throw std::logic_error("CPU preparation returned an unknown physical encoding");
     }

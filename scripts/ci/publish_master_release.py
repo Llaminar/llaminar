@@ -111,7 +111,8 @@ def validate_proof(e2e_directory: Path, benchmark_directory: Path,
             or pair["source"]["tree"] != master_tree
             or pair.get("workflow_revision") != develop_sha):
         raise ValueError("master tree or merged PR head differs from certified image source")
-    manifest, e2e_reports = suite.admit_e2e(e2e_directory, pair, require_model_kld=True)
+    manifest, e2e_reports = suite.admit_e2e(e2e_directory, pair, require_model_kld=True,
+                                                   require_qfn_source_admission=True)
     result, reports = suite.admit_benchmarks(benchmark_directory, pair, manifest, e2e_reports)
     coding = validate_coding_matrix(json.loads((coding_directory / 'opencode.json').read_text()),
                                     pair, manifest, e2e_reports, reports)
@@ -224,6 +225,10 @@ def release_assets(e2e: Path, benchmarks: Path, coding: Path, output: Path) -> l
     assets = output / "assets"
     assets.mkdir()
     sources = release_asset_sources(e2e, benchmarks, model_kld=True)
+    for isa in suite.ISAS:
+        lane = e2e / isa.lower() / 'source-admission'
+        sources[f'qfn-source-admission-{isa.lower()}.json'] = lane / 'admission/source-admission.json'
+        sources[f'qfn-source-admission-binding-{isa.lower()}.json'] = lane / 'image-binding.json'
     sources['opencode.json'] = coding / 'opencode.json'
     for name, source in sources.items():
         shutil.copyfile(source, assets / name)

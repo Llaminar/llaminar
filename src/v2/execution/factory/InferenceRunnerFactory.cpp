@@ -13,6 +13,9 @@
  * QFN graph construction revalidates original-source TP intent against retained
  * weight slicing. Cold initial declaration is explicit; absent prepared authority
  * cannot silently change query-local KV coverage into another execution family.
+ * Expert source loading and preparation share exact logical endpoint scopes;
+ * CPU storage identity alone never selects a sibling NUMA participant.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #include "InferenceRunnerFactory.h"
@@ -2184,6 +2187,26 @@ namespace llaminar2
     }
 
     /**
+     * @brief Resolve the graph's declared logical endpoint once for every setup consumer.
+     * @param runtime Original retained ExpertOverlay source.
+     * @param config Existing graph TP and rank ownership, never a hardware-derived ordinal.
+     * @param device Exact graph execution device.
+     * @return Source-bound view shared by source materialization and engine preparation.
+     * @throws std::invalid_argument For stale, missing or ambiguous participant ownership.
+     */
+    static MoEExpertOverlayGraphScope graphOverlayPreparationScope(
+        const MoEExpertOverlayRuntimePlan &runtime, const GraphConfig &config, DeviceId device)
+    {
+        const auto &execution = config.moe.expert_overlay_execution_plan;
+        const bool owns_cpu = execution && device.is_gpu() &&
+            execution->currentRankPlan().hasRole(OverlayRankRole::ContinuationRoot) &&
+            device == runtime.continuationDevice();
+        return MoEExpertOverlayGraphScope::resolveForTPParticipant(
+            runtime, device, config.tp_ctx, config.tp_device_idx,
+            owns_cpu ? MoEOverlayColocatedCPUOwnership::CurrentRank : MoEOverlayColocatedCPUOwnership::None);
+    }
+
+    /**
      * @brief Replace generic routed parents with exact graph-local ExpertOverlay slices.
      *
      * A generic dense continuation plan normally includes every routed-expert
@@ -2223,36 +2246,7 @@ namespace llaminar2
         if (!runtime)
             throw std::logic_error("ExpertOverlay source loading requires its frozen runtime plan");
 
-        const MoEExpertOwnerMap owner_map =
-            MoEExpertOwnerMap::build(*placement);
-        const int rank = execution->currentRankPlan().world_rank;
-        const bool graph_owns_colocated_cpu_endpoints =
-            graph_device.is_gpu() &&
-            graph_config.moe.expert_overlay_runtime_plan &&
-            execution->currentRankPlan().hasRole(
-                OverlayRankRole::ContinuationRoot) &&
-            graph_device == graph_config.moe.expert_overlay_runtime_plan
-                                ->continuationDevice();
-
-        std::vector<const MoEExpertOwnerParticipant *> graph_local;
-        for (const auto &participant : owner_map.participants())
-        {
-            if (!participant.world_rank_known)
-            {
-                throw std::runtime_error(
-                    "Tiered ExpertOverlay weight plan has a participant " +
-                    std::to_string(participant.participant_id) +
-                    " without an owning MPI rank; exact expert residency "
-                    "cannot be materialized");
-            }
-            if (participant.world_rank == rank &&
-                (participant.device == graph_device ||
-                 (graph_owns_colocated_cpu_endpoints &&
-                  participant.device.is_cpu())))
-            {
-                graph_local.push_back(&participant);
-            }
-        }
+        const auto scope = graphOverlayPreparationScope(*runtime, graph_config, graph_device);
 
         InferenceStrategy combined_strategy = base_plan.strategy();
         WeightPlan combined(
@@ -2279,15 +2273,10 @@ namespace llaminar2
             return combined;
         }
 
-        if (!graph_local.empty())
+        if (!scope.participants().empty())
         {
-            std::vector<DeviceId> devices;
-            for (const auto *participant : graph_local)
-                devices.push_back(participant->device);
-            std::sort(devices.begin(), devices.end());
-            devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
             const auto preparation = MoEExpertOverlayPreparationPlan::build(*runtime, model_ctx.concreteLoader())
-                .filteredForRank(execution->currentRankPlan()).filteredForDevices(devices);
+                .filteredForRank(execution->currentRankPlan()).filteredForGraphScope(*runtime, scope);
             const auto sources = preparation.sourceWeightPlan(
                 model_ctx.concreteLoader(), base_plan.strategy().model_id);
             for (const auto &requirement : sources.requirements())
@@ -2296,7 +2285,7 @@ namespace llaminar2
 
         LOG_DEBUG(
             "[InferenceRunner] Replaced generic routed parents with exact "
-            << graph_local.size()
+            << scope.participants().size()
             << " graph-local ExpertOverlay participant slice(s) on "
             << graph_device.to_string() << ": requirements="
             << combined.size());
@@ -3143,6 +3132,7 @@ namespace llaminar2
         graph_config.ngram_table_placement = config.ngram_table_placement;
         graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
+        graph_config.cpu_serial_expert_storage = config.cpu_serial_expert_storage;
 
         LOG_DEBUG("[InferenceRunner] KV cache scale: K=" << graph_config.kv_cache_scale_k
                                                          << ", V=" << graph_config.kv_cache_scale_v);
@@ -4003,9 +3993,9 @@ namespace llaminar2
 
         if (overlay_runtime_plan_for_weight_prep)
         {
-            if (!weight_mgr->prepareMoEExpertOverlayWeights(
+            if (!weight_mgr->prepareMoEExpertOverlayWeightsForGraph(
                     *overlay_runtime_plan_for_weight_prep,
-                    device,
+                    graphOverlayPreparationScope(*overlay_runtime_plan_for_weight_prep, graph_config, device),
                     &frozen_weights,
                     overlay_execution_plan_for_weight_prep,
                     config.prepared_weight_admission))
@@ -4138,7 +4128,8 @@ namespace llaminar2
     std::unique_ptr<IInferenceRunner> createTestableInferenceRunner(
         std::shared_ptr<IModelContext> model_ctx,
         DeviceId device,
-        const InferenceRunnerConfig &config)
+        const InferenceRunnerConfig &config,
+        const TestableInferenceRunnerOverrides &test_overrides)
     {
         LOG_DEBUG("[InferenceRunner] createTestableInferenceRunner called");
 
@@ -4147,6 +4138,10 @@ namespace llaminar2
             LOG_ERROR("[InferenceRunner] model_ctx is null");
             return nullptr;
         }
+
+        if (test_overrides.test_graph_allocation_admission &&
+            std::dynamic_pointer_cast<ModelContext>(model_ctx))
+            throw std::invalid_argument("Concrete model cannot accept test graph allocation admission");
 
         // Injected TP contexts use this factory in production too. Reject an
         // invalid PP scope before schema, arena, or weight preparation here as
@@ -4263,6 +4258,7 @@ namespace llaminar2
         graph_config.ngram_table_placement = config.ngram_table_placement;
         graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
+        graph_config.cpu_serial_expert_storage = config.cpu_serial_expert_storage;
 
         // TurboQuant context for TQ4/TQ KV cache
         std::shared_ptr<TurboQuantContext> turboquant_ctx;
@@ -4380,6 +4376,13 @@ namespace llaminar2
             config.reusable_execution_workspaces;
         deps.physical_memory_authority =
             physicalMemoryAuthorityForModel(model_ctx);
+        if (test_overrides.test_graph_allocation_admission)
+        {
+            deps.physical_memory_authority =
+                test_overrides.test_graph_allocation_admission(deps.graph_builder);
+            if (!deps.physical_memory_authority)
+                throw std::invalid_argument("Test graph allocation admission returned no authority");
+        }
         if (config.pp_stage_config.has_value())
             deps.pp_stage_config = config.pp_stage_config.value();
         if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
@@ -4543,9 +4546,9 @@ namespace llaminar2
             }
 
             if (overlay_runtime &&
-                !concrete_weight_mgr->prepareMoEExpertOverlayWeights(
+                !concrete_weight_mgr->prepareMoEExpertOverlayWeightsForGraph(
                     *overlay_runtime,
-                    device,
+                    graphOverlayPreparationScope(*overlay_runtime, graph_config, device),
                     &frozen_weights,
                     graph_config.moe.expert_overlay_execution_plan.get(),
                     config.prepared_weight_admission))
@@ -4760,9 +4763,9 @@ namespace llaminar2
                     if (graph_config.moe.expert_overlay_runtime_plan)
                     {
                         const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
-                        if (!concrete_weight_mgr->prepareMoEExpertOverlayWeights(
+                        if (!concrete_weight_mgr->prepareMoEExpertOverlayWeightsForGraph(
                                 *graph_config.moe.expert_overlay_runtime_plan,
-                                device,
+                                graphOverlayPreparationScope(*graph_config.moe.expert_overlay_runtime_plan, graph_config, device),
                                 &frozen_weights,
                                 execution_plan,
                                 config.prepared_weight_admission))
@@ -4922,9 +4925,9 @@ namespace llaminar2
                     if (concrete_weight_mgr)
                     {
                         const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
-                        if (!concrete_weight_mgr->prepareMoEExpertOverlayWeights(
+                        if (!concrete_weight_mgr->prepareMoEExpertOverlayWeightsForGraph(
                                 *graph_config.moe.expert_overlay_runtime_plan,
-                                device,
+                                graphOverlayPreparationScope(*graph_config.moe.expert_overlay_runtime_plan, graph_config, device),
                                 orchestrator->frozenWeightSet(),
                                 execution_plan,
                                 config.prepared_weight_admission))
@@ -4959,6 +4962,10 @@ namespace llaminar2
         std::unique_ptr<ILocalTPContext> tp_ctx,
         const RankOrchestrator::Config &config)
     {
+        if (config.test_runner_overrides.test_graph_allocation_admission &&
+            std::dynamic_pointer_cast<ModelContext>(model_ctx))
+            throw std::invalid_argument("Concrete rank model cannot accept test graph allocation admission");
+
         if (!model_ctx)
         {
             LOG_ERROR("[InferenceRunner] model_ctx is null for createRankOrchestrator");

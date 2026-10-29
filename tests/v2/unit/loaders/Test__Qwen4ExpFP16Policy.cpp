@@ -6,6 +6,7 @@
  * loader/store/stages without model files or accelerator discovery. This is a
  * component ownership proof, not full-model capacity or numerical qualification.
  */
+#include "../../utils/CPUPreparedStoreTestAdmission.h"
 #include "../../mocks/MockModelLoader.h"
 #include "../../utils/CPUProjectionTestWorkspace.h"
 #include "../../utils/TestTensorFactory.h"
@@ -14,6 +15,7 @@
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../utils/CPURouterKernelTestAdmission.h"
 #include "loaders/PreparedHalfWeights.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "loaders/PreparedWeightStore.h"
@@ -131,6 +133,9 @@ void prove(GDNProjectionArithmetic gdn, MoERouterArithmetic router)
     }
     const auto frozen = manager.materialize(plan);
     PreparedWeightStore store(strategy.model_id);
+    std::vector<const TensorBase *> preparedMatrices;
+    for (size_t i = 0; i < 4; ++i) preparedMatrices.push_back(frozen.layer(0, suffixes[i]).tensor);
+    test::admitCPUPreparedStoreForTest(store, preparedMatrices);
     std::array<PreparedWeightRef, 4> refs;
     for (size_t i = 0; i < original.size(); ++i)
     {
@@ -279,6 +284,7 @@ void prove(GDNProjectionArithmetic gdn, MoERouterArithmetic router)
     FP32Tensor ids({9, Top}), weights({9, Top});
     auto owner = std::make_shared<MoERoutedPipelineKernelOwner>();
     auto cpu = std::make_unique<CPUMoEKernel>();
+    admitCPURouterKernelForTest(*cpu,9,K);
     auto *actual = cpu.get();
     owner->kernel = std::move(cpu);
     MoERoutingStage::Params rp;
@@ -295,6 +301,8 @@ void prove(GDNProjectionArithmetic gdn, MoERouterArithmetic router)
     MoERoutingStage routing(rp);
     ASSERT_TRUE(routing.execute(&context));
     CPUMoEKernel reference, rounded;
+    admitCPURouterKernelForTest(reference,9,K);
+    admitCPURouterKernelForTest(rounded,9,K);
     ASSERT_TRUE(reference.publishTransportedRouterQ8Hidden(input.data(), 9, K));
     const auto *published = actual->publishedRouterQ8Hidden(input.data(), 9, K);
     const auto *required = reference.publishedRouterQ8Hidden(input.data(), 9, K);

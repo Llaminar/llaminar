@@ -1367,20 +1367,18 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEOverlayParticipantResidencyRegistry::
-        finalizeInitialBanksFromPreparedRegistry(
-            const ExpertGemmRegistry &registry,
-            std::string *error)
+    bool MoEOverlayParticipantResidencyRegistry::registerInitialLayerFromPreparedRegistry(
+        const ExpertGemmRegistry &registry, int layer_idx, std::string *error)
     {
-        if (error)
-            error->clear();
-
-        /*
-         * Do not hold the registry mutex while acquiring model-owned engine
-         * lifetimes or calling registerInitialLayer(). The configuration is
-         * immutable after construction, and registerInitialLayer owns the
-         * short assembly/publication critical section for each exact layer.
-         */
+        if (error) error->clear();
+        if (layer_idx < config_.first_model_layer ||
+            layer_idx - config_.first_model_layer >= config_.num_layers)
+        {
+            if (error) *error = "Prepared layer is outside the frozen residency interval: " + std::to_string(layer_idx);
+            return false;
+        }
+        // Configuration is immutable; registerInitialLayer owns the publication
+        // lock. Never hold it while retaining model registry engine lifetimes.
         const auto participant_ids = localParticipantIds();
         for (const int participant_id : participant_ids)
         {
@@ -1398,60 +1396,63 @@ namespace llaminar2
                 return false;
             }
 
-            for (int layer_idx = config_.first_model_layer;
-                 layer_idx < config_.first_model_layer + config_.num_layers;
-                 ++layer_idx)
+            const auto resident_mask =
+                config_.owner_map.expertMaskForParticipant(
+                    layer_idx,
+                    participant_id,
+                    config_.num_experts);
+            std::vector<MoEOverlayPreparedExpertPayload> experts;
+            std::string detail;
+            const auto ownership = config_.projection_preparation
+                ? std::optional(config_.projection_preparation->requireProjectionOwnershipForParticipant(
+                    *participant, layer_idx)) : std::nullopt;
+            if (!resolveMoEOverlayPreparedExpertPayloads(
+                    registry,
+                    *participant,
+                    layer_idx,
+                    config_.num_experts,
+                    resident_mask,
+                    experts,
+                    &detail,
+                    ownership))
             {
-                const auto resident_mask =
-                    config_.owner_map.expertMaskForParticipant(
-                        layer_idx,
-                        participant_id,
-                        config_.num_experts);
-                std::vector<MoEOverlayPreparedExpertPayload> experts;
-                std::string detail;
-                const auto ownership = config_.projection_preparation
-                    ? std::optional(config_.projection_preparation->requireProjectionOwnershipForParticipant(
-                        *participant, layer_idx)) : std::nullopt;
-                if (!resolveMoEOverlayPreparedExpertPayloads(
-                        registry,
-                        *participant,
-                        layer_idx,
-                        config_.num_experts,
-                        resident_mask,
-                        experts,
-                        &detail,
-                        ownership))
+                if (error)
                 {
-                    if (error)
-                    {
-                        *error =
-                            "ExpertOverlay initial-bank finalization could not "
-                            "resolve participant " +
-                            std::to_string(participant_id) + " layer " +
-                            std::to_string(layer_idx) + ": " + detail;
-                    }
-                    return false;
+                    *error =
+                        "ExpertOverlay initial-bank finalization could not "
+                        "resolve participant " +
+                        std::to_string(participant_id) + " layer " +
+                        std::to_string(layer_idx) + ": " + detail;
                 }
-                if (!registerInitialLayer(
-                        participant_id,
-                        layer_idx,
-                        resident_mask,
-                        experts,
-                        &detail))
+                return false;
+            }
+            if (!registerInitialLayer(
+                    participant_id,
+                    layer_idx,
+                    resident_mask,
+                    experts,
+                    &detail))
+            {
+                if (error)
                 {
-                    if (error)
-                    {
-                        *error =
-                            "ExpertOverlay initial-bank finalization rejected "
-                            "participant " +
-                            std::to_string(participant_id) + " layer " +
-                            std::to_string(layer_idx) + ": " + detail;
-                    }
-                    return false;
+                    *error =
+                        "ExpertOverlay initial-bank finalization rejected "
+                        "participant " +
+                        std::to_string(participant_id) + " layer " +
+                        std::to_string(layer_idx) + ": " + detail;
                 }
+                return false;
             }
         }
+        return true;
+    }
 
+    bool MoEOverlayParticipantResidencyRegistry::finalizeInitialBanksFromPreparedRegistry(
+        const ExpertGemmRegistry &registry, std::string *error)
+    {
+        for (int layer = config_.first_model_layer;
+             layer < config_.first_model_layer + config_.num_layers; ++layer)
+            if (!registerInitialLayerFromPreparedRegistry(registry, layer, error)) return false;
         if (!allInitialBanksReady())
         {
             if (error)

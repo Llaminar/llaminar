@@ -6,8 +6,12 @@
  * inventory fixtures, without loading weights or entering MPI. The tests lock
  * down continuation/follower ownership, exact model geometry, policy retention,
  * input immutability and idempotent normalization before physical admission.
+ * Runner installation tests exercise the real resolved-config publication
+ * boundary and its exact pre-freeze reuse/migration authority identity.
  */
 #include "planning/ResolvedRankOrchestration.h"
+#include "execution/runner/OrchestrationRunner.h"
+#include "execution/runner/PreparedWeightAuthorityIdentity.h"
 #include "planning/PlanningModelMetadata.h"
 #include "config/OrchestrationConfigParser.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
@@ -17,6 +21,26 @@
 #include <functional>
 
 using namespace llaminar2;
+
+namespace llaminar2
+{
+    /** @brief Narrow observation of the production resolved-admission install boundary. */
+    class OrchestrationRunnerResolvedAdmissionTestAccess
+    {
+    public:
+        /** @brief Publish the same compiler result consumed by buildExecutionPlan. */
+        static void install(OrchestrationRunner &runner, const ResolvedRankOrchestration &resolved)
+        {
+            runner.installResolvedExecutionPlan(resolved);
+        }
+
+        /** @return Exact request identity used by migration-profile/reuse contracts. */
+        static const std::string &identity(const OrchestrationRunner &runner)
+        {
+            return runner.requested_routed_weight_authority_identity_;
+        }
+    };
+}
 
 namespace
 {
@@ -658,4 +682,91 @@ TEST(ResolvedRankOrchestration, OrdinaryProjectionSurvivesImplicitMoERecompile)
         inventory(1, {card(DeviceType::ROCm, 0, 7), card(DeviceType::ROCm, 1, 7)}), builder, 0, demand);
     EXPECT_EQ(result.overlayOrigin(), MoEExpertOverlayAuthorityPlanDisposition::SynthesizedLocalTP);
     EXPECT_EQ(result.rankPlan().runtime.ordinary_terminal_projection, demand);
+}
+
+
+/**
+ * @brief Implicit CPU TP admission installs the synthesized request authority.
+ *
+ * Constructors see no overlay plan. The actual model-aware compiler introduces
+ * it, and the runner's real installation method must publish its identity with
+ * config/plan before migration calibration or retained-weight checks use it.
+ */
+TEST(ResolvedRankOrchestration, RunnerInstallsImplicitCPURoutedAuthorityWithResolvedPlan)
+{
+    using Access = OrchestrationRunnerResolvedAdmissionTestAccess;
+    auto cluster = inventory(1);
+    cluster.ranks[0].cpu.numa_node = -1;
+    cluster.ranks[0].numa_nodes = 2;
+    for (int node : {7, 4})
+    {
+        CPUSocketInfo socket;
+        socket.numa_node = node;
+        cluster.ranks[0].cpu_socket_info.push_back(std::move(socket));
+    }
+    cluster.buildNodeAggregations();
+    for (const auto mode : {MoERebalanceRuntimeMode::Off, MoERebalanceRuntimeMode::Dynamic})
+    {
+        SCOPED_TRACE(static_cast<int>(mode));
+        OrchestrationConfig request;
+        request.moe_rebalance.mode = mode;
+        request.routed_expert_owner_order = RoutedExpertOwnerOrder::Random;
+        request.tp_devices = {GlobalDeviceAddress::cpu(7), GlobalDeviceAddress::cpu(4)};
+        OrchestrationRunner runner(request, std::unique_ptr<IExecutionPlanBuilder>{});
+        EXPECT_TRUE(Access::identity(runner).empty());
+        const auto resolved = resolve(request, cluster, 0, true);
+        ASSERT_TRUE(resolved.config().moe_routed_expert_plan);
+        const auto expected = routedWeightAuthorityRequestIdentity(
+            resolved.config().moe_routed_expert_plan, resolved.config());
+        ASSERT_FALSE(expected.empty());
+        Access::install(runner, resolved);
+        EXPECT_EQ(Access::identity(runner), expected);
+        EXPECT_EQ(runner.executionPlan().toString(), resolved.rankPlan().toString());
+        EXPECT_EQ(runner.config().moe_rebalance.mode, mode);
+        ASSERT_TRUE(runner.config().moe_routed_expert_plan);
+        EXPECT_TRUE(runner.config().moe_routed_expert_plan->placements.empty());
+        EXPECT_FALSE(request.moe_routed_expert_plan);
+
+        // A repeated explicit declaration and a prebuilt-plan constructor must
+        // agree with the newly synthesized original authority. Runtime dynamic
+        // intent is preserved; no physical capacity freeze is rerun for reuse.
+        const auto explicit_resolution = resolve(resolved.config(), cluster, 0, true);
+        Access::install(runner, explicit_resolution);
+        EXPECT_EQ(Access::identity(runner), expected);
+        OrchestrationRunner prebuilt(resolved.config(), resolved.rankPlan());
+        EXPECT_EQ(Access::identity(prebuilt), expected);
+
+        auto different = resolved.config();
+        different.routed_expert_owner_order = RoutedExpertOwnerOrder::Ordinal;
+        different.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(
+            *different.moe_routed_expert_plan);
+        different.moe_routed_expert_plan->owner_order = RoutedExpertOwnerOrder::Ordinal;
+        const auto foreign = resolve(different, cluster, 0, true);
+        Access::install(runner, foreign);
+        EXPECT_NE(Access::identity(runner), expected)
+            << "Exact retained reuse must distinguish changed requested ownership";
+    }
+}
+
+/** @brief Pipeline aggregate and no-overlay requests keep their distinct canonical authority. */
+TEST(ResolvedRankOrchestration, RunnerResolvedInstallPreservesPipelineAndDenseAuthority)
+{
+    using Access = OrchestrationRunnerResolvedAdmissionTestAccess;
+    const auto request = pipeline(false, 2, 2);
+    const auto resolved = resolve(request, hybridInventory(), 0, true);
+    ASSERT_FALSE(resolved.pipelineStages().empty());
+    OrchestrationRunner runner(request, std::unique_ptr<IExecutionPlanBuilder>{});
+    Access::install(runner, resolved);
+    EXPECT_EQ(Access::identity(runner), pipelineRoutedWeightAuthorityRequestIdentity(resolved));
+    EXPECT_FALSE(Access::identity(runner).empty());
+    EXPECT_EQ(runner.executionPlan().toString(), resolved.rankPlan().toString());
+
+    OrchestrationConfig dense;
+    dense.tp_devices = {GlobalDeviceAddress::cpu(7)};
+    const auto dense_resolved = resolve(dense, inventory(1), 0, false);
+    ASSERT_FALSE(dense_resolved.config().moe_routed_expert_plan);
+    ASSERT_TRUE(dense_resolved.pipelineStages().empty());
+    OrchestrationRunner dense_runner(dense, std::unique_ptr<IExecutionPlanBuilder>{});
+    Access::install(dense_runner, dense_resolved);
+    EXPECT_TRUE(Access::identity(dense_runner).empty());
 }

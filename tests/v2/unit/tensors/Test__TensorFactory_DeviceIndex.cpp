@@ -19,6 +19,7 @@
 #include "v2/utils/MPIContext.h"
 #include "v2/execution/config/RuntimeConfig.h"
 #include "v2/backends/DeviceId.h"
+#include "v2/backends/BackendManager.h"
 
 using namespace llaminar2;
 
@@ -341,4 +342,37 @@ TEST_F(Test__TensorFactory_DeviceIndex, FloatingPointWeightsAdoptAlignedStorage)
     ASSERT_NE(bf16, nullptr);
     EXPECT_EQ(bf16->raw_data(), bf16_allocation);
     EXPECT_EQ(bf16->size_bytes(), 32u * sizeof(uint16_t));
+}
+
+/**
+ * @brief Allocation authority remains aggregate for every diagnostic MPI rank.
+ *
+ * This device-free test checks the real factory/backend interface and small CPU
+ * allocations. Actual kernel-policy and worker-inheritance observations belong
+ * to the separate model-free NUMA integration executable.
+ */
+TEST(TensorFactoryAllocationDomain, AggregateAuthorityNeverBecomesRankOrCurrentCPU)
+{
+    initCPUBackend(-1);
+    ASSERT_EQ(cpuBackendNUMANode(), -1);
+    for (const int rank : {0, 1, 7})
+    {
+        MPIContext context(rank, 8, MPI_COMM_NULL);
+        for (int repeat = 0; repeat < 3; ++repeat)
+        {
+            TensorFactory factory(context);
+            EXPECT_EQ(factory.getMPIRank(), rank);
+            ASSERT_EQ(factory.getNumaNode(), -1);
+            factory.ensureNumaBinding();
+            auto fp32 = factory.createFP32({32u});
+            auto fp16 = factory.createFP16({32u});
+            auto quantized = factory.createActivation(
+                {1u, 32u}, ActivationPrecision::Q8_1, DeviceId::cpu());
+            ASSERT_NE(fp32, nullptr);
+            ASSERT_NE(fp16, nullptr);
+            ASSERT_NE(quantized, nullptr);
+            EXPECT_EQ(factory.getNumaNode(), -1);
+        }
+    }
+    EXPECT_EQ(cpuBackendNUMANode(), -1);
 }

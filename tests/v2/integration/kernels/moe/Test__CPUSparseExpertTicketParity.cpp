@@ -27,6 +27,7 @@
 #include "transfer/TransferEngine.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/CPUProjectionTestWorkspace.h"
+#include "../../../utils/CPUSerialArenaTestAdmission.h"
 
 #include <array>
 #include <cmath>
@@ -146,8 +147,10 @@ void runSparseExpertTicketParity(DeviceId device)
             .return_layout = MoEOverlayReturnLayout::CanonicalExpertRoutes});
         auto input = packets.localExpertInput(0, 0);
         auto output = packets.localExpertOutput(0, 0);
+        // Preserve the authored coherent families and grouped/canonical roots;
+        // freeze their exact common layout before any backing is materialized.
         auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
-            MoELocalExpertSerialBufferArena::Config{
+            admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
                 .device_id = DeviceId::cpu(), .row_capacity = max_rows,
                 .row_capacity_buckets = {1, 3, max_rows},
                 .d_model = width, .routing_top_k = top_k,
@@ -158,7 +161,7 @@ void runSparseExpertTicketParity(DeviceId device)
                     CPUGroupedScratchStoragePolicy::RetainSerialMaximum,
                 .num_experts = experts, .expert_intermediate = intermediate,
                 .logical_participant_id = 1,
-                .debug_name = "integration.cpu_sparse_ticket"});
+                .debug_name = "integration.cpu_sparse_ticket"}));
         const std::array<DeviceId, 1> endpoints{device};
         auto metadata = TransferEngine::instance().createMappedHostArena(endpoints);
         auto ticket = std::make_shared<MoEOverlayCanonicalRouteReturnTicketStorage>();

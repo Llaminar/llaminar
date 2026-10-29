@@ -84,19 +84,20 @@ protected:
         return tensor;
     }
 
-    PreparedGemmFixture prepare(TensorBase *tensor)
+    PreparedGemmFixture prepare(TensorBase *tensor,
+        std::initializer_list<std::pair<size_t, size_t>> slices = {})
     {
         return makePreparedGemmFixture(
             tensor,
             DeviceId::cpu(),
-            "blk.0.ffn_down.weight");
+            "blk.0.ffn_down.weight", ModelContextId{9900}, slices);
     }
 };
 
 TEST_F(PreparedWeightStoreSlicedTest, CreatesSlicedKernel)
 {
     auto weights = createQ8_0(1024, 896);
-    auto fixture = prepare(weights.get());
+    auto fixture = prepare(weights.get(), {{0,512}});
 
     auto *kernel = fixture.store->slicedGemmKernel(fixture.ref, 0, 512);
     ASSERT_NE(kernel, nullptr);
@@ -110,7 +111,7 @@ TEST_F(PreparedWeightStoreSlicedTest, CreatesSlicedKernel)
 TEST_F(PreparedWeightStoreSlicedTest, SlicedKernelSecondHalf)
 {
     auto weights = createQ8_0(1024, 896);
-    auto fixture = prepare(weights.get());
+    auto fixture = prepare(weights.get(), {{512,1024}});
 
     auto *kernel = fixture.store->slicedGemmKernel(fixture.ref, 512, 1024);
     ASSERT_NE(kernel, nullptr);
@@ -124,7 +125,7 @@ TEST_F(PreparedWeightStoreSlicedTest, SlicedKernelSecondHalf)
 TEST_F(PreparedWeightStoreSlicedTest, CachesSlicedKernelsWithinStore)
 {
     auto weights = createQ8_0(1024, 896);
-    auto fixture = prepare(weights.get());
+    auto fixture = prepare(weights.get(), {{0,512}});
 
     auto *first = fixture.store->slicedGemmKernel(fixture.ref, 0, 512);
     auto *again = fixture.store->slicedGemmKernel(fixture.ref, 0, 512);
@@ -135,7 +136,7 @@ TEST_F(PreparedWeightStoreSlicedTest, CachesSlicedKernelsWithinStore)
 TEST_F(PreparedWeightStoreSlicedTest, DifferentSlicesGetDifferentKernels)
 {
     auto weights = createQ8_0(1024, 896);
-    auto fixture = prepare(weights.get());
+    auto fixture = prepare(weights.get(), {{0,512},{512,1024}});
 
     auto *first_half = fixture.store->slicedGemmKernel(fixture.ref, 0, 512);
     auto *second_half = fixture.store->slicedGemmKernel(fixture.ref, 512, 1024);
@@ -146,7 +147,7 @@ TEST_F(PreparedWeightStoreSlicedTest, DifferentSlicesGetDifferentKernels)
 TEST_F(PreparedWeightStoreSlicedTest, FullKernelDifferentFromSliced)
 {
     auto weights = createQ8_0(1024, 896);
-    auto fixture = prepare(weights.get());
+    auto fixture = prepare(weights.get(), {{0,1024}});
 
     auto *full = fixture.store->gemmKernel(fixture.ref);
     auto *sliced = fixture.store->slicedGemmKernel(fixture.ref, 0, 1024);
@@ -166,7 +167,7 @@ TEST_F(PreparedWeightStoreSlicedTest, FullKernelDifferentFromSliced)
 TEST_F(PreparedWeightStoreSlicedTest, ReleaseAllPreparedStateClearsSlicedEntries)
 {
     auto weights = createQ8_0(1024, 896);
-    auto fixture = prepare(weights.get());
+    auto fixture = prepare(weights.get(), {{0,512}});
 
     auto *kernel = fixture.store->slicedGemmKernel(fixture.ref, 0, 512);
     ASSERT_NE(kernel, nullptr);
@@ -215,7 +216,7 @@ TEST_F(PreparedWeightStoreSlicedTest, SlicedGemmProducesCorrectOutput)
     const size_t M = 1;
 
     auto weights = createQ8_0(N, K);
-    auto fixture = prepare(weights.get());
+    auto fixture = prepare(weights.get(), {{0,N/2},{N/2,N}});
     auto input = createFP32Random(M, K);
     auto output_full = createFP32(M, N, 0.0f);
     auto output_sliced1 = createFP32(M, N / 2, 0.0f);
@@ -265,7 +266,7 @@ TEST_F(PreparedWeightStoreSlicedTest, SlicedGemmProducesCorrectOutput)
 TEST_F(PreparedWeightStoreSlicedTest, WorksWithQ4_0)
 {
     auto weights = createQ4_0(1024, 896);
-    auto fixture = prepare(weights.get());
+    auto fixture = prepare(weights.get(), {{0,512}});
 
     auto *kernel = fixture.store->slicedGemmKernel(fixture.ref, 0, 512);
     ASSERT_NE(kernel, nullptr);

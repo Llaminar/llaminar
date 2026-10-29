@@ -7,10 +7,16 @@
  * packet storage is not guessed from a model name: a serial ExpertOverlay
  * participant family has one reusable packet per participant, whereas an
  * independently retained graph family has one per participating layer.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "planning/MemoryPlanner.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
+#include "memory/CPUGroupedMoEStorageLayout.h"
+#include "memory/CPURouterQ8StorageLayout.h"
+#include "loaders/WeightIdentity.h"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/CpuAdaptiveImmutableRowCache.h"
 #include <map>
@@ -229,9 +235,10 @@ size_t participatingRoutedLayerCount(
  * @brief Size one compact local-expert packet at the declared graph geometry.
  *
  * The packet contains compact hidden and output vectors plus one selected
- * expert index and weight per route.  Local compaction produces a route for
- * each router top-k choice, so the flattened request rows are expanded before
- * their FP32 storage is counted.
+ * expert index and weight per route. CPU hidden/output storage has one row
+ * per input token while routing metadata retains its independent top-k axis.
+ * The common declaration owns their separate allocator rounding. GPU packet
+ * admission retains its existing route-expanded geometry.
  */
 size_t compactLocalExpertPacketBytes(
     const ModelMemoryProfile& profile,
@@ -256,6 +263,9 @@ size_t compactLocalExpertPacketBytes(
                                   batches,
                                   rows,
                                   "expert participant rows");
+    if(config.device.is_cpu())
+        return CPUCompactPacketStorageLayout::declare(route_rows,profile.d_model,
+            profile.expert_used_count,config.device).physicalBytes();
     route_rows = checkedMultiply(route_rows, top_k, "expert participant routes");
     const size_t fp32_values_per_route = 2u * d_model + 2u;
     size_t bytes = checkedMultiply(
@@ -376,6 +386,14 @@ size_t routedParticipantActivationBytes(
          * may change data ownership, but they cannot add graph topology or
          * allocate a packet in the hot path.
          */
+        if(config.device.is_cpu())
+        {
+            if(!config.cpu_serial_expert_storage ||
+                config.cpu_serial_expert_storage->allocator!=PhysicalMemoryAllocatorIdentity{config.world_rank,config.device} ||
+                config.cpu_serial_expert_storage->participant_ids.size()!=size_t(config.serial_routed_expert_participant_count))
+                throw std::invalid_argument("CPU serial planning requires the exact frozen endpoint/worker layout");
+            return config.cpu_serial_expert_storage->physicalBytes();
+        }
         const size_t packet_bytes =
             config.serial_routed_expert_compact_rows > 0
                 ? serialCompactRouteFamilyBytes(
@@ -577,7 +595,8 @@ ActivationGraphMemoryGeometry continuationActivationGeometry(const ModelMemoryPr
                            : fixedHeadParticipants(profile, cfg))
                     : 0,
             .attention_arithmetic = cfg.attention_arithmetic,
-            .attention_phase_schedule = cfg.attention_phase_schedule};
+            .attention_phase_schedule = cfg.attention_phase_schedule,
+            .mtp_shifted_kv_head_layout = cfg.mtp_shifted_kv_head_layout};
 }
 /**
  * @brief Project one source-owned mandatory execution alternative.
@@ -1843,6 +1862,98 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     });
         }
 
+        bool ordinary_cpu_grouped_roots_charged = false;
+        if(cfg.device.is_cpu() && cfg.cpu_serial_expert_storage)
+        {
+            const auto &declaration=*cfg.cpu_serial_expert_storage;
+            if(cfg.concurrent_workspace_owners!=declaration.controller_devices.size())
+                throw std::invalid_argument("CPU serial workspace concurrency differs from its admitted controller identities");
+            const auto grouped=declaration.envelope->admitted()->workspaceBytes();
+            workspace_bytes=checkedAdd(workspace_bytes,
+                checkedMultiply(grouped,declaration.participant_ids.size(),"CPU serial grouped endpoint roots"),
+                "CPU serial grouped endpoint roots");
+        }
+
+        else if (cfg.device.is_cpu() && cfg.routed_expert_compact_buffer_lifetime ==
+                     RoutedExpertCompactBufferLifetime::PerLayerGraphOwned)
+        {
+            // Serial overlay topology is wholly authored by its endpoint
+            // identities above. A dense-only continuation with no endpoint
+            // declaration must not acquire an ordinary bundle merely because
+            // the global source model includes routed weights.
+            // An actual routed parent in this PP interval authors the local
+            // stage. Source expert widths are whole-expert CPU widths even
+            // when dense projections use TP; selected weight counts never
+            // turn model top-k into the old flattened (rows * K, 1) geometry.
+            const bool owns_grouped_stage = std::any_of(
+                profile.tensors.begin(), profile.tensors.end(), [&](const auto &tensor)
+                {
+                    if (!tensor.name.ends_with(".ffn_gate_exps.weight"))
+                        return false;
+                    const bool ordinary_main = tensor.layer_index >= cfg.first_layer &&
+                        tensor.layer_index <= last_layer && tensor.layer_index < profile.mainLayerCount() &&
+                        (!cfg.weight_residency.selectsRoutedExperts() ||
+                         cfg.weight_residency.selectedRoutedExpertsForLayer(tensor.layer_index) > 0);
+                    const bool retained_predictor = cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+                        cfg.mtp_enabled && owns_terminal_main_layer && profile.mtp_layer_count > 0 &&
+                        tensor.layer_index >= profile.mainLayerCount() && tensor.layer_index < profile.totalLayerCount();
+                    return ordinary_main || retained_predictor;
+                });
+            if (owns_grouped_stage)
+            {
+                size_t grouped_rows = checkedMultiply(size_t(std::max(1, cfg.batch_size)),
+                    size_t(activation_seq), "CPU grouped ordinary flattened rows");
+                if (cfg.mtp_enabled)
+                    grouped_rows = std::max(grouped_rows, size_t(std::max(1, cfg.mtp_target_query_rows)));
+                if (compact_routed_expert_token_rows)
+                    grouped_rows = std::max(grouped_rows, size_t(*compact_routed_expert_token_rows));
+                const auto grouped = CPUGroupedMoEStorageLayout::declare(grouped_rows,
+                    profile.d_model, profile.expert_feed_forward_length,
+                    profile.expert_count, profile.expert_used_count, cfg.device);
+                workspace_bytes = checkedAdd(workspace_bytes, grouped.physicalBytes(),
+                    "CPU ordinary grouped expert roots");
+                ordinary_cpu_grouped_roots_charged = true;
+            }
+        }
+
+        if (cfg.device.is_cpu() && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            !ordinary_cpu_grouped_roots_charged)
+        {
+            // A continuation may route every row to transported experts and
+            // own no local expert stage. Its graph-local router still publishes
+            // Q8 hidden rows. Serial endpoint kernels have different producers
+            // and their external bundle cannot supply this manager's backing.
+            const bool owns_router = std::any_of(profile.tensors.begin(), profile.tensors.end(),
+                [&](const auto &tensor)
+                {
+                    if (inferWeightRole(tensor.name) != WeightRole::MoERouter)
+                        return false;
+                    // Qwen's FFN builder requires a router and either a
+                    // routed parent or the explicit overlay residency role.
+                    if (!cfg.weight_residency.selectsRoutedExperts() &&
+                        !std::any_of(profile.tensors.begin(), profile.tensors.end(), [&](const auto &parent)
+                        { return parent.layer_index == tensor.layer_index &&
+                                 parent.name.ends_with(".ffn_gate_exps.weight"); }))
+                        return false;
+                    const bool ordinary_main = tensor.layer_index >= cfg.first_layer &&
+                        tensor.layer_index <= last_layer && tensor.layer_index < profile.mainLayerCount();
+                    const bool retained_predictor = cfg.mtp_enabled && owns_terminal_main_layer &&
+                        profile.mtp_layer_count > 0 && tensor.layer_index >= profile.mainLayerCount() &&
+                        tensor.layer_index < profile.totalLayerCount();
+                    return ordinary_main || retained_predictor;
+                });
+            if (owns_router)
+            {
+                size_t rows = checkedMultiply(size_t(std::max(1, cfg.batch_size)), size_t(activation_seq),
+                    "CPU router ordinary flattened rows");
+                if (cfg.mtp_enabled)
+                    rows = std::max(rows, size_t(std::max(1, cfg.mtp_target_query_rows)));
+                workspace_bytes = checkedAdd(workspace_bytes,
+                    CPURouterQ8StorageLayout::declare(rows, profile.d_model, cfg.device).physicalBytes(),
+                    "CPU continuation router-only Q8 publication root");
+            }
+        }
+
         // Distinct graph owners can reuse one serial family across shapes,
         // but cannot alias one physical block while they run concurrently.
         workspace_bytes = checkedMultiply(
@@ -2495,7 +2606,9 @@ std::shared_ptr<const ImmutableRowTableExecutionProvision> MemoryPlanner::restor
              a.routed_compute_policy!=RoutedExpertComputePolicy::TensorSharded &&
              a.routed_compute_policy!=RoutedExpertComputePolicy::GateUpOwnedDownColumns) ||
             (a.mtp_terminal_logits_layout!=MTPTerminalLogitsLayout::FullVocabularyPerParticipant &&
-             a.mtp_terminal_logits_layout!=MTPTerminalLogitsLayout::VocabularyShardPerParticipant))
+             a.mtp_terminal_logits_layout!=MTPTerminalLogitsLayout::VocabularyShardPerParticipant) ||
+            (a.mtp_shifted_kv_head_layout!=MTPShiftedKVHeadLayout::PrimaryTensorParallelShard &&
+             a.mtp_shifted_kv_head_layout!=MTPShiftedKVHeadLayout::FullModelPerParticipant))
             throw std::invalid_argument("Remote ngram provision has inconsistent common activation geometry");
         // A canonical unsharded descriptor cannot invent a smaller vocabulary
         // or projection. Unequal TP slices remain explicit sender-owned shape
@@ -2550,6 +2663,20 @@ std::shared_ptr<const ImmutableRowTableExecutionProvision> MemoryPlanner::restor
     auto result=std::shared_ptr<const ImmutableRowTableExecutionProvision>(new ImmutableRowTableExecutionProvision(
         requested,*profile.flash_next,input.hostPlacement(),std::move(consumers),std::move(execution),std::move(required_base)));
     result->require(requested,input,result->requiredBase());return result;
+}
+
+std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>>
+MemoryPlanner::cpuSerialExpertStorageAdmissions(std::span<const DevicePlanConfig> configs)
+{
+    std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> result;
+    for(const auto &config:configs)
+        if(config.cpu_serial_expert_storage)
+        {
+            if(config.cpu_serial_expert_storage->allocator!=PhysicalMemoryAllocatorIdentity{config.world_rank,config.device})
+                throw std::invalid_argument("CPU serial declaration differs from its admitted allocator");
+            result.push_back(config.cpu_serial_expert_storage);
+        }
+    return result;
 }
 
 } // namespace llaminar2

@@ -9,14 +9,18 @@
  * - Borrow tracking (read/write/aliasing conflicts)
  * - StageBufferContract building
  * - StageBoundBuffers typed access
+ * - Exact physical preclaims, rejection, root/view lifetime, and replay
  */
 
+#include "../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <limits>
 #include <set>
 #include <string>
+#include "planning/PhysicalMemoryAuthority.h"
 #include "memory/BufferArena.h"
+#include "memory/CPUTensorStorageDeclaration.h"
 #include "memory/BufferId.h"
 #include "memory/BufferAccess.h"
 #include "memory/StageBufferContract.h"
@@ -29,13 +33,37 @@
 
 using namespace llaminar2;
 
+namespace
+{
+/** @brief Admit an explicit device-free fixture CPU arena budget. */
+std::shared_ptr<PhysicalMemoryAuthority> arenaAuthority(size_t bytes, DeviceId device = DeviceId::cpu())
+{
+    PhysicalMemoryPlanBuilder plan;
+    plan.add(PhysicalMemoryResource{
+        .world_rank = 0,
+        .device = device,
+        .total_bytes = bytes,
+        .admission_available_bytes = bytes},
+        PhysicalMemoryOwner::ActivationArena, bytes);
+    return std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+}
+
+/** @brief Supply fixture admission explicitly rather than changing production defaults. */
+ArenaConfig fixtureArenaConfig()
+{
+    return test::cpuArenaFixtureConfig();
+}
+}
+
+
 // ============================================================================
 // Registration Tests
 // ============================================================================
 
 TEST(Test__BufferArena, RegisterBufferSucceeds)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     EXPECT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu()));
     EXPECT_TRUE(arena.isRegistered(BufferId::HIDDEN_STATE));
     EXPECT_EQ(arena.registeredCount(), 1u);
@@ -43,7 +71,7 @@ TEST(Test__BufferArena, RegisterBufferSucceeds)
 
 TEST(Test__BufferArena, RegisterBufferRejectsDoubleRegistration)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     EXPECT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu()));
     EXPECT_FALSE(arena.registerBuffer(BufferId::HIDDEN_STATE, 8, 896, "FP32", DeviceId::cpu()));
     EXPECT_EQ(arena.registeredCount(), 1u);
@@ -58,7 +86,7 @@ TEST(Test__BufferArena, RegisterBufferRejectsDoubleRegistration)
  */
 TEST(Test__BufferArena, GraphDescriptorRegistrationFlattensEveryTrailingAxis)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     const BufferDescriptor descriptor = BufferDescriptor::scratch(
         "moe_canonical_route_contributions",
         {7, 3, 5},
@@ -73,7 +101,7 @@ TEST(Test__BufferArena, GraphDescriptorRegistrationFlattensEveryTrailingAxis)
 
 TEST(Test__BufferArena, GraphDescriptorRegistrationPreservesRankOneCapacity)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     const BufferDescriptor descriptor = BufferDescriptor::scratch(
         "one_dimensional_scratch",
         {4096},
@@ -86,7 +114,7 @@ TEST(Test__BufferArena, GraphDescriptorRegistrationPreservesRankOneCapacity)
 
 TEST(Test__BufferArena, GraphDescriptorRegistrationRejectsInvalidShapes)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
 
     EXPECT_THROW(
         arena.registerBuffer(
@@ -110,7 +138,7 @@ TEST(Test__BufferArena, GraphDescriptorRegistrationRejectsInvalidShapes)
 
 TEST(Test__BufferArena, RegisterMultipleBuffers)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     EXPECT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu()));
     EXPECT_TRUE(arena.registerBuffer(BufferId::Q_PROJ, 4, 896, "FP32", DeviceId::cpu()));
     EXPECT_TRUE(arena.registerBuffer(BufferId::K_PROJ, 4, 128, "FP32", DeviceId::cpu()));
@@ -120,7 +148,7 @@ TEST(Test__BufferArena, RegisterMultipleBuffers)
 TEST(Test__BufferArena, RegisterExternalBufferSucceeds)
 {
     auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 896}, DeviceId::cpu());
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     EXPECT_TRUE(arena.registerExternalBuffer(BufferId::LOGITS, tensor.get()));
     EXPECT_TRUE(arena.isRegistered(BufferId::LOGITS));
 }
@@ -130,7 +158,7 @@ TEST(Test__BufferArena, BindExternalBufferCanReplaceDynamicScratch)
     auto first = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 128}, DeviceId::cpu());
     auto second = std::make_shared<FP32Tensor>(std::vector<size_t>{3, 128}, DeviceId::cpu());
 
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     ASSERT_TRUE(arena.bindExternalBuffer(BufferId::ALL_POSITION_LOGITS, first.get()));
     EXPECT_TRUE(arena.isRegistered(BufferId::ALL_POSITION_LOGITS));
     EXPECT_EQ(arena.getTensor(BufferId::ALL_POSITION_LOGITS), first.get());
@@ -154,7 +182,7 @@ TEST(Test__BufferArena, ArenaBindingsInstallStableBufferDebugNames)
         DeviceId::cpu());
     ASSERT_TRUE(external->debugName().empty());
 
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     ASSERT_TRUE(arena.bindExternalBuffer(
         BufferId::ALL_POSITION_LOGITS,
         external.get()));
@@ -182,7 +210,7 @@ TEST(Test__BufferArena, ArenaBindingsInstallStableBufferDebugNames)
  */
 TEST(Test__BufferArena, AllocationAddressMapSortsRealBufferRanges)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     ASSERT_TRUE(arena.registerBuffer(
         BufferId::REQUEST_POSITION_IDS,
         1,
@@ -232,7 +260,7 @@ TEST(Test__BufferArena, AllocationAddressMapSortsRealBufferRanges)
 
 TEST(Test__BufferArena, BindExternalBufferRejectsArenaOwnedSlot)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     ASSERT_TRUE(arena.registerBuffer(BufferId::LOGITS, 1, 128, "FP32", DeviceId::cpu()));
 
     auto external = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 128}, DeviceId::cpu());
@@ -241,7 +269,7 @@ TEST(Test__BufferArena, BindExternalBufferRejectsArenaOwnedSlot)
 
 TEST(Test__BufferArena, UnregisteredBufferReturnsNullTensor)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     EXPECT_FALSE(arena.isRegistered(BufferId::HIDDEN_STATE));
     EXPECT_EQ(arena.getTensor(BufferId::HIDDEN_STATE), nullptr);
 }
@@ -252,7 +280,7 @@ TEST(Test__BufferArena, UnregisteredBufferReturnsNullTensor)
 
 TEST(Test__BufferArena, AllocateCreatesOwnedTensors)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::Q_PROJ, 4, 896, "FP32", DeviceId::cpu());
 
@@ -270,7 +298,7 @@ TEST(Test__BufferArena, AllocateCreatesOwnedTensors)
 
 TEST(Test__BufferArena, AllocateRejectsDoubleAllocation)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     EXPECT_TRUE(arena.allocate());
     EXPECT_FALSE(arena.allocate()); // Second call should fail
@@ -279,7 +307,7 @@ TEST(Test__BufferArena, AllocateRejectsDoubleAllocation)
 TEST(Test__BufferArena, ExternalBufferNotAllocatedByArena)
 {
     auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 896}, DeviceId::cpu());
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerExternalBuffer(BufferId::LOGITS, tensor.get());
     EXPECT_TRUE(arena.allocate());
 
@@ -293,7 +321,7 @@ TEST(Test__BufferArena, ExternalBufferNotAllocatedByArena)
 
 TEST(Test__BufferArena, InitialCoherenceIsUninitialized)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -303,7 +331,7 @@ TEST(Test__BufferArena, InitialCoherenceIsUninitialized)
 
 TEST(Test__BufferArena, MarkWrittenSetsHostAuthority)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -315,7 +343,7 @@ TEST(Test__BufferArena, MarkWrittenSetsHostAuthority)
 
 TEST(Test__BufferArena, PrepareForWriteThenMarkWritten)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::FFN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -329,7 +357,7 @@ TEST(Test__BufferArena, PrepareForWriteThenMarkWritten)
 
 TEST(Test__BufferArena, PrepareForReadOnCPUAfterCPUWrite)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -344,7 +372,7 @@ TEST(Test__BufferArena, PrepareForReadOnCPUAfterCPUWrite)
 
 TEST(Test__BufferArena, MarkWrittenWithStreamSetsAuthority)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -358,7 +386,7 @@ TEST(Test__BufferArena, MarkWrittenWithStreamSetsAuthority)
 
 TEST(Test__BufferArena, MarkWrittenFlagsOnlySetsAuthority)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -411,7 +439,7 @@ TEST(Test__CoherenceState, DeviceNeedsTransferToDifferentGPU)
 
 TEST(Test__BufferArena, ReadBorrowIncrementsAndDecrements)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::Q_PROJ, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -427,7 +455,7 @@ TEST(Test__BufferArena, ReadBorrowIncrementsAndDecrements)
 
 TEST(Test__BufferArena, WriteBorrowTracking)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::Q_PROJ, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -443,7 +471,7 @@ TEST(Test__BufferArena, WriteBorrowTracking)
 
 TEST(Test__BufferArena, WriteBorrowConflictsWithReadBorrow)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::Q_PROJ, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -454,7 +482,7 @@ TEST(Test__BufferArena, WriteBorrowConflictsWithReadBorrow)
 
 TEST(Test__BufferArena, ReadBorrowConflictsWithWriteBorrow)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::Q_PROJ, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -465,7 +493,7 @@ TEST(Test__BufferArena, ReadBorrowConflictsWithWriteBorrow)
 
 TEST(Test__BufferArena, DoubleWriteBorrowDies)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::Q_PROJ, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -482,7 +510,7 @@ TEST(Test__BufferArena, DoubleWriteBorrowDies)
 
 TEST(Test__BufferArena, AliasingGroupAssignment)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
@@ -499,7 +527,7 @@ TEST(Test__BufferArena, AliasingGroupAssignment)
 // A write borrow on A must block a write borrow on C.
 TEST(Test__BufferArena, AliasingGroupMerge)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::UP_PROJ, 4, 4864, "FP32", DeviceId::cpu());
@@ -524,7 +552,7 @@ TEST(Test__BufferArena, AliasingGroupMerge)
 // Only writes conflict; reads can coexist freely.
 TEST(Test__BufferArena, AliasingConcurrentReadsAllowed)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
@@ -542,7 +570,7 @@ TEST(Test__BufferArena, AliasingConcurrentReadsAllowed)
 // not create duplicate groups or cause any issues.
 TEST(Test__BufferArena, AliasingIdempotent)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
@@ -559,7 +587,7 @@ TEST(Test__BufferArena, AliasingIdempotent)
 
 TEST(Test__BufferArena, AliasingSerialBorrowsSucceed)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
@@ -581,7 +609,7 @@ TEST(Test__BufferArena, AliasingSerialBorrowsSucceed)
 
 TEST(Test__BufferArena, AliasingWriteConflictDies)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
@@ -594,7 +622,7 @@ TEST(Test__BufferArena, AliasingWriteConflictDies)
 
 TEST(Test__BufferArena, AliasingWriteConflictsWithReadDies)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
@@ -610,7 +638,7 @@ TEST(Test__BufferArena, AliasingWriteConflictsWithReadDies)
 // directly aliased.
 TEST(Test__BufferArena, AliasingMergedGroupWriteConflictDies)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::UP_PROJ, 4, 4864, "FP32", DeviceId::cpu());
@@ -628,7 +656,7 @@ TEST(Test__BufferArena, AliasingMergedGroupWriteConflictDies)
 // Read on aliased buffer must block write on a different member (reversed direction)
 TEST(Test__BufferArena, AliasingReadBlocksWriteOnOtherMemberDies)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
     arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
@@ -648,7 +676,7 @@ TEST(Test__BufferArena, AliasingReadBlocksWriteOnOtherMemberDies)
 
 TEST(Test__BufferArena, RowsColsMatchRegistration)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -658,7 +686,7 @@ TEST(Test__BufferArena, RowsColsMatchRegistration)
 
 TEST(Test__BufferArena, DevicePtrReturnsCPUPointer)
 {
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
@@ -985,7 +1013,7 @@ TEST(Test__BufferId, EveryDeclaredIdHasUniqueNameAndArenaSlot)
 {
     const auto count = static_cast<size_t>(BufferId::_COUNT);
     ASSERT_GT(count, 0u);
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     std::set<std::string> names;
     for (size_t index = 0; index < count; ++index)
     {
@@ -1034,7 +1062,7 @@ TEST(Test__KVBufferId, ToString)
 TEST(Test__BufferArena, EndToEndCPUWorkflow)
 {
     // 1. Register buffers
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 2, 64, "FP32", DeviceId::cpu());
     arena.registerBuffer(BufferId::Q_PROJ, 2, 64, "FP32", DeviceId::cpu());
     ASSERT_TRUE(arena.allocate());
@@ -1120,7 +1148,7 @@ TEST(Test__ArenaContractCoherence, PrepareForReadWriteFromContract)
     // 3. Execute SwiGLU
     // 4. markWritten for outputs
 
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     DeviceId cpu = DeviceId::cpu();
 
     // Create tensors (simulating what buffer_manager_ allocates)
@@ -1176,7 +1204,7 @@ TEST(Test__ArenaContractCoherence, MarkWrittenFlagsOnlyDoesNotRecordEvent)
 {
     // On CPU, markWrittenFlagsOnly should update coherence state
     // without trying to record a GPU event
-    BufferArena arena;
+    BufferArena arena(fixtureArenaConfig());
     DeviceId cpu = DeviceId::cpu();
 
     auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 4}, DeviceId::cpu());
@@ -1199,7 +1227,7 @@ TEST(Test__BufferArena, AllocateWithFactoryCreatesFP32)
     MPIContext mpi_ctx(0, 1);
     TensorFactory factory(mpi_ctx);
 
-    ArenaConfig config;
+    ArenaConfig config = fixtureArenaConfig();
     config.factory = &factory;
 
     BufferArena arena(config);
@@ -1223,7 +1251,7 @@ TEST(Test__BufferArena, GpuActivationAndPublicationBuffersRemainDeviceLocal)
     MPIContext mpi_ctx(0, 1);
     TensorFactory factory(mpi_ctx);
 
-    ArenaConfig config;
+    ArenaConfig config = fixtureArenaConfig();
     config.factory = &factory;
 
     BufferArena arena(config);
@@ -1270,7 +1298,7 @@ TEST(Test__BufferArena, AllocateWithFactoryCreatesBF16)
     MPIContext mpi_ctx(0, 1);
     TensorFactory factory(mpi_ctx);
 
-    ArenaConfig config;
+    ArenaConfig config = fixtureArenaConfig();
     config.factory = &factory;
 
     BufferArena arena(config);
@@ -1289,7 +1317,7 @@ TEST(Test__BufferArena, AllocateWithFactoryCreatesQ8_1)
     MPIContext mpi_ctx(0, 1);
     TensorFactory factory(mpi_ctx);
 
-    ArenaConfig config;
+    ArenaConfig config = fixtureArenaConfig();
     config.factory = &factory;
 
     BufferArena arena(config);
@@ -1307,7 +1335,7 @@ TEST(Test__BufferArena, AllocationStatsTracked)
     MPIContext mpi_ctx(0, 1);
     TensorFactory factory(mpi_ctx);
 
-    ArenaConfig config;
+    ArenaConfig config = fixtureArenaConfig();
     config.factory = &factory;
 
     BufferArena arena(config);
@@ -1328,11 +1356,11 @@ TEST(Test__BufferArena, SetConfigAfterConstruction)
     MPIContext mpi_ctx(0, 1);
     TensorFactory factory(mpi_ctx);
 
-    BufferArena arena; // No config initially
+    BufferArena arena(fixtureArenaConfig()); // No config initially
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
 
     // Set config before allocate
-    ArenaConfig config;
+    ArenaConfig config = fixtureArenaConfig();
     config.factory = &factory;
     arena.setConfig(config);
 
@@ -1341,10 +1369,10 @@ TEST(Test__BufferArena, SetConfigAfterConstruction)
     EXPECT_EQ(arena.stats().total_buffers, 1u);
 }
 
-TEST(Test__BufferArena, FallbackWithoutFactory)
+TEST(Test__BufferArena, TypedStorageWithoutFactory)
 {
-    // Without factory, should still work (fallback to direct FP32 construction)
-    BufferArena arena;
+    // Explicit CPU storage works without a factory; its admitted dtype is preserved.
+    BufferArena arena(fixtureArenaConfig());
     arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
 
     EXPECT_TRUE(arena.allocate());
@@ -1353,4 +1381,264 @@ TEST(Test__BufferArena, FallbackWithoutFactory)
     EXPECT_EQ(t->rows(), 4u);
     EXPECT_EQ(t->cols(), 896u);
     EXPECT_EQ(arena.stats().total_buffers, 1u);
+}
+
+/** @test CPU physical ownership is mandatory at the allocating boundary. */
+TEST(Test__BufferArenaPhysicalMemory, RejectsMissingAuthority)
+{
+    BufferArena arena;
+    ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 1, 1, "FP32", DeviceId::cpu()));
+    EXPECT_THROW(arena.allocate(), std::logic_error);
+    EXPECT_EQ(arena.getSharedTensor(BufferId::HIDDEN_STATE), nullptr);
+}
+
+/** @test Every activation representation claims its allocator's exact capacity. */
+TEST(Test__BufferArenaPhysicalMemory, ClaimsRoundedPhysicalBytesForEveryDtype)
+{
+    MPIContext mpi(0, 1);
+    TensorFactory factory(mpi);
+    const std::array cases{
+        std::pair{"FP32", size_t{2 * 33 * sizeof(float)}},
+        std::pair{"FP16", size_t{2 * 33 * sizeof(uint16_t)}},
+        std::pair{"BF16", size_t{2 * 33 * sizeof(uint16_t)}},
+        std::pair{"INT32", size_t{2 * 33 * sizeof(int32_t)}},
+        std::pair{"Q8_1", size_t{2 * 2 * sizeof(Q8_1Block)}},
+        std::pair{"Q16_1", size_t{2 * 2 * sizeof(Q16_1Block)}}};
+    for (const auto &[dtype, payload] : cases)
+    {
+        SCOPED_TRACE(dtype);
+        const auto bytes = AlignedVector<uint8_t>::requiredAllocationBytes(payload);
+        auto authority = arenaAuthority(bytes);
+        {
+            BufferArena arena({.factory = &factory,
+                               .physical_memory_authority = authority});
+            ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 2, 33, dtype, DeviceId::cpu()));
+            ASSERT_TRUE(arena.allocate());
+            auto root = arena.getSharedTensor(BufferId::HIDDEN_STATE);
+            auto shared_root = root->shared_from_this();
+            EXPECT_EQ(shared_root.get(), root.get());
+            EXPECT_FALSE(shared_root.owner_before(root));
+            EXPECT_FALSE(root.owner_before(shared_root));
+            EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+            EXPECT_FALSE(arena.allocate());
+            EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+        }
+        EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    }
+}
+
+/** @test Admission rejects a bounded over-budget extent before any root is constructed. */
+TEST(Test__BufferArenaPhysicalMemory, RejectsCapacityBeforeConstruction)
+{
+    auto authority = arenaAuthority(4096);
+    BufferArena arena({.physical_memory_authority = authority});
+    ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 1, 1025, "FP32", DeviceId::cpu()));
+    EXPECT_THROW(arena.allocate(), std::logic_error);
+    EXPECT_EQ(arena.getSharedTensor(BufferId::HIDDEN_STATE), nullptr);
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+/** @test A structural view and shared family reference retain exactly one physical claim. */
+TEST(Test__BufferArenaPhysicalMemory, ClaimFollowsFinalRootAndViewLifetime)
+{
+    const auto bytes = AlignedVector<float>::requiredAllocationBytes(33);
+    auto authority = arenaAuthority(bytes);
+    std::shared_ptr<TensorBase> retained, view;
+    std::weak_ptr<TensorBase> weak;
+    {
+        BufferArena arena({.physical_memory_authority = authority});
+        ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 1, 33, "FP32", DeviceId::cpu()));
+        ASSERT_TRUE(arena.allocate());
+        retained = arena.getSharedTensor(BufferId::HIDDEN_STATE);
+        weak = retained;
+        view = retained->create_view({1, 16}, 1);
+        ASSERT_NE(view, nullptr);
+        BufferArena family;
+        ASSERT_TRUE(family.registerExternalBuffer(BufferId::HIDDEN_STATE, retained.get()));
+        ASSERT_TRUE(family.registerExternalBuffer(BufferId::Q_PROJ, view.get()));
+        ASSERT_TRUE(family.allocate());
+        EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+    }
+    retained.reset();
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+    view.reset();
+    EXPECT_TRUE(weak.expired());
+    // Retaining only a weak control block must not retain materialized bytes.
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+/** @test Declared borrow aliases own distinct CPU allocations and each is claimed once. */
+TEST(Test__BufferArenaPhysicalMemory, AliasDeclarationsDoNotInventSharedCpuStorage)
+{
+    const auto bytes = AlignedVector<float>::requiredAllocationBytes(1);
+    auto authority = arenaAuthority(2 * bytes);
+    BufferArena arena({.physical_memory_authority = authority});
+    ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 1, 1, "FP32", DeviceId::cpu()));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::Q_PROJ, 1, 1, "FP32", DeviceId::cpu()));
+    arena.registerAlias(BufferId::HIDDEN_STATE, BufferId::Q_PROJ);
+    ASSERT_TRUE(arena.allocate());
+    EXPECT_NE(arena.getSharedTensor(BufferId::HIDDEN_STATE)->raw_data(),
+              arena.getSharedTensor(BufferId::Q_PROJ)->raw_data());
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, PhysicalMemoryMaterializationKind::NewAllocation), 2 * bytes);
+}
+
+/** @test Replay across page/huge-page thresholds retires each exact allocation. */
+TEST(Test__BufferArenaPhysicalMemory, RepeatedSmallLargeSmallRootsUseExactAllocatorRounding)
+{
+    const std::array<size_t, 5> counts{1, 1025, 524289, 1025, 1};
+    const auto maximum = AlignedVector<float>::requiredAllocationBytes(524289);
+    auto authority = arenaAuthority(maximum);
+    for (const auto count : counts)
+    {
+        SCOPED_TRACE(count);
+        {
+            BufferArena arena({.physical_memory_authority = authority});
+            ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 1, count, "FP32", DeviceId::cpu()));
+            ASSERT_TRUE(arena.allocate());
+            EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,
+                                             PhysicalMemoryMaterializationKind::NewAllocation),
+                      AlignedVector<float>::requiredAllocationBytes(count));
+        }
+        EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,
+                                         PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    }
+}
+
+/** @test Partial setup failure keeps only constructed roots live until their final owner retires. */
+TEST(Test__BufferArenaPhysicalMemory, PartialAllocationFailureRetiresOnlyConstructedRoots)
+{
+    const auto bytes = AlignedVector<float>::requiredAllocationBytes(1);
+    auto authority = arenaAuthority(bytes);
+    std::shared_ptr<TensorBase> retained;
+    {
+        BufferArena arena({.physical_memory_authority = authority});
+        // HIDDEN_STATE precedes Q_PROJ in the canonical BufferId order.
+        ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 1, 1, "FP32", DeviceId::cpu()));
+        ASSERT_TRUE(arena.registerBuffer(BufferId::Q_PROJ, 1, 1025, "FP32", DeviceId::cpu()));
+        EXPECT_THROW(arena.allocate(), std::logic_error);
+        retained = arena.getSharedTensor(BufferId::HIDDEN_STATE);
+        ASSERT_NE(retained, nullptr);
+        EXPECT_EQ(arena.getSharedTensor(BufferId::Q_PROJ), nullptr);
+        EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,
+            PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+        EXPECT_THROW(arena.allocate(), std::logic_error);
+        EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,
+            PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+    }
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,
+        PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+    retained.reset();
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,
+        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+/** @test A NUMA CPU participant charges its admitted allocator, never CPU ordinal zero. */
+TEST(Test__BufferArenaPhysicalMemory, UsesExactCpuAllocatorIdentity)
+{
+    const DeviceId device(DeviceType::CPU, 1);
+    const auto bytes = AlignedVector<float>::requiredAllocationBytes(1);
+    auto authority = arenaAuthority(bytes, device);
+    BufferArena arena({.physical_memory_authority = authority});
+    ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 1, 1, "FP32", device));
+    ASSERT_TRUE(arena.allocate());
+    EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::ActivationArena,
+        PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+    EXPECT_FALSE(authority->contains(DeviceId::cpu()));
+}
+
+/** @test The shared declaration governs all six CPU dtypes even without a factory. */
+TEST(Test__BufferArenaPhysicalMemory, NativeDeclarationAllSixDtypesWithoutFactory)
+{
+    const DeviceId cpu1{DeviceType::CPU,1};
+    for(const auto dtype : {"FP32","FP16","BF16","INT32","Q8_1","Q16_1"})
+    {
+        SCOPED_TRACE(dtype);
+        const auto type=CPUTensorStorageDeclaration::requireDtype(dtype);
+        const CPUTensorStorageDeclaration declaration(2,33,type,PhysicalMemoryOwner::ActivationArena,cpu1);
+        auto memory=arenaAuthority(declaration.physicalBytes(),cpu1);
+        std::shared_ptr<TensorBase> retained;
+        std::weak_ptr<TensorBase> weak;
+        {
+            BufferArena arena({.physical_memory_authority=memory});
+            ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE,2,33,dtype,cpu1));
+            ASSERT_TRUE(arena.allocate());
+            retained=arena.getSharedTensor(BufferId::HIDDEN_STATE);
+            ASSERT_NE(retained,nullptr);
+            EXPECT_EQ(retained->home_device(),cpu1);
+            EXPECT_EQ(retained->native_type(),type==BufferTensorType::FP32?TensorType::FP32:
+                type==BufferTensorType::FP16?TensorType::FP16:type==BufferTensorType::BF16?TensorType::BF16:
+                type==BufferTensorType::INT32?TensorType::INT32:type==BufferTensorType::Q8_1?TensorType::Q8_1:TensorType::Q16_1);
+            const auto *raw=static_cast<const uint8_t *>(retained->raw_data());
+            ASSERT_NE(raw,nullptr);
+            for(size_t i=0;i<retained->size_bytes();++i) EXPECT_EQ(raw[i],0u);
+            EXPECT_EQ(memory->claimedBytes(cpu1,PhysicalMemoryOwner::ActivationArena,
+                PhysicalMemoryMaterializationKind::NewAllocation),declaration.physicalBytes());
+            weak=retained;
+        }
+        EXPECT_FALSE(weak.expired());
+        retained.reset();
+        EXPECT_TRUE(weak.expired());
+        EXPECT_EQ(memory->claimedBytes(cpu1,PhysicalMemoryOwner::ActivationArena,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+}
+/** @test Actual backing retirement ends the claim while tensor control ownership survives. */
+TEST(Test__BufferArenaPhysicalMemory, NativeBackingRetirementEndsLeaseBeforeTensorDestruction)
+{
+    for(const auto dtype : {"FP32","FP16","BF16","INT32","Q8_1","Q16_1"})
+    {
+        SCOPED_TRACE(dtype);
+        const CPUTensorStorageDeclaration declaration(2,33,CPUTensorStorageDeclaration::requireDtype(dtype),
+            PhysicalMemoryOwner::ActivationArena,DeviceId::cpu());
+        auto memory=arenaAuthority(declaration.physicalBytes());
+        BufferArena arena({.physical_memory_authority=memory});
+        ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE,2,33,dtype,DeviceId::cpu()));
+        ASSERT_TRUE(arena.allocate());
+        auto retained=arena.getSharedTensor(BufferId::HIDDEN_STATE);
+        retained->release_raw_data();
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationArena,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+}
+/** @test Unsupported dtype never becomes an anonymous FP32 root. */
+TEST(Test__BufferArenaPhysicalMemory, NativeDeclarationRejectsUnknownDtypeAndExactBudgetShortage)
+{
+    EXPECT_THROW(CPUTensorStorageDeclaration::requireDtype("Q8_0"),std::invalid_argument);
+    for(const auto dtype : {"FP32","FP16","BF16","INT32","Q8_1","Q16_1"})
+    {
+        const CPUTensorStorageDeclaration declaration(2,33,CPUTensorStorageDeclaration::requireDtype(dtype),
+            PhysicalMemoryOwner::ActivationArena,DeviceId::cpu());
+        auto memory=arenaAuthority(declaration.physicalBytes()-1);
+        BufferArena arena({.physical_memory_authority=memory});
+        ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE,2,33,dtype,DeviceId::cpu()));
+        EXPECT_THROW(arena.allocate(),std::exception);
+        EXPECT_EQ(arena.getSharedTensor(BufferId::HIDDEN_STATE),nullptr);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationArena,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+    auto memory=arenaAuthority(4096);
+    BufferArena arena({.physical_memory_authority=memory});
+    ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE,2,33,"unrecognized",DeviceId::cpu()));
+    EXPECT_THROW(arena.allocate(),std::invalid_argument);
+}
+
+/** @test Planning and registration consume the same flattened resolved descriptor. */
+TEST(Test__BufferArenaPhysicalMemory, DescriptorDeclarationSharesExactFlatteningContract)
+{
+    for(const auto shape : {std::vector<size_t>{7},std::vector<size_t>{7,3,5}})
+    {
+        auto descriptor=BufferDescriptor::scratch("typed_cpu_root",shape,BufferTensorType::Q8_1);
+        descriptor.device=DeviceId{DeviceType::CPU,1};
+        const auto declaration=CPUTensorStorageDeclaration::fromDescriptor(descriptor,PhysicalMemoryOwner::ActivationArena);
+        EXPECT_EQ(declaration.rows(),7u);
+        EXPECT_EQ(declaration.columns(),shape.size()==1?1u:15u);
+        auto memory=arenaAuthority(declaration.physicalBytes(),descriptor.device);
+        BufferArena arena({.physical_memory_authority=memory});
+        ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE,descriptor));
+        ASSERT_TRUE(arena.allocate());
+        EXPECT_EQ(arena.getRows(BufferId::HIDDEN_STATE),declaration.rows());
+        EXPECT_EQ(arena.getCols(BufferId::HIDDEN_STATE),declaration.columns());
+        EXPECT_EQ(memory->claimedBytes(descriptor.device,PhysicalMemoryOwner::ActivationArena,
+            PhysicalMemoryMaterializationKind::NewAllocation),declaration.physicalBytes());
+    }
 }

@@ -24,6 +24,7 @@
 #include "ITPContext.h"
 #include "NativeAllreduceRequestRows.h"
 #include <memory>
+#include <cstddef>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -213,6 +214,27 @@ namespace llaminar2
          * @return true on success, false on error
          */
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override = 0;
+
+        /**
+         * @brief Gather exact CPU byte spans in immutable participant order.
+         * @param local_send This participant's live bytes, possibly empty.
+         * @param full_receive Exact degree()*local_send.size() output span.
+         * @param participant Index in devices(), never a coarse CPU DeviceId.
+         * @param stage_name Common retained operation identity across participants.
+         * @return True after every output is published; false after fatal rejection.
+         *
+         * CPU participants rendezvous through their host-owned context. The
+         * operation never infers order from arrival, invents a GPU stream, or
+         * sends admitted capacity. Spans remain borrowed until all readers have
+         * completed. Unsupported contexts fail closed without another path.
+         */
+        virtual bool allgatherHostIndexed(std::span<const std::byte> local_send,
+            std::span<std::byte> full_receive, int participant,
+            const std::string &stage_name)
+        {
+            (void)local_send; (void)full_receive; (void)participant; (void)stage_name;
+            return false;
+        }
 
         /**
          * @brief All-gather raw device buffers across LOCAL devices.

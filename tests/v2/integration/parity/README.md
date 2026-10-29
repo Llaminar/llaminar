@@ -45,6 +45,41 @@ preflight gate.
 
 ## Building shared fixtures
 
+### Source admission without numerical references
+
+Setup-only admission uses plain parameterized fixtures, separate from numerical
+`SetUp`. `FullSourceAdmission` requires successful original-model initialization;
+`CandidateSourceAdmission` carries the same positive obligation for an explicitly
+unqualified configuration. `RejectUnsupportedSourceAdmission` retains an exact
+unsupported request and requires its precise production rejection.
+`RejectCapacitySourceAdmission` retains an explicitly capped request and requires
+its precise production capacity rejection; it is distinct from structural
+unsupported admission. Candidates are enabled tests, not expected failures or
+substituted execution modes.
+
+Canonical discovery labels these `Admission;RealModel;FullModel`, adds
+`UnqualifiedCandidate` or `NegativeAdmission` where appropriate, plus
+`CapacityAdmission` for capacity-rejection probes, and binds the
+actual participant backends, MPI world, source files and integration lock. They
+must not inherit PyTorch/golden-reference dependencies or enter the model-free
+production-preflight inventory. Device-free declaration, discovery and focused
+production-defect regressions belong in preflight independently.
+
+For QFN, build `v2_integration_parity_qwen4exp_production_matrix`, inspect CTest
+JSON, then run exact discovered admission registrations through CTest. Set
+`LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT` to a fresh absolute directory. The
+fixture authenticates source metadata and actual native owners without payload
+hashes or diagnostic snapshots, retires the final model owner, and removes only
+its disposable prefix child. Require both the CTest outcome and applicable
+`admission.csv`, `rejection.csv` or `capacity-rejection.csv` for its declared
+contract, PMA attestation and `retirement.csv`. A capacity probe also retains its
+canonical `capacity-diagnostic.txt`; a rejection must not carry a positive
+admission receipt. Preserve a passive driver diagnostic window for native GPU
+batches. Admission alone proves
+neither inference accuracy, request-time movement, captured replay nor speed.
+
+### Shared numerical fixtures
+
 Keep model registration separate from proof implementation. The Qwen3.5 node
 ExpertOverlay matrices link the same `v2_parity_qwen35moe_node_overlay` object
 library; the 35B and 122B registration sources select their own typed cases and

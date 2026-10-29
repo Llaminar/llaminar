@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import uuid
 
 import docker_paths
+from qfn_source_admission_image import SourceAdmissionRed, run_admission, validate_binding as validate_source_binding
 from production_artifacts import (digest, image_identity, positive, ratchet, validate_image_e2e,
                                   validate_image_e2e_coverage,
                                   validate_manifest, write_json)
@@ -167,16 +168,63 @@ def discover_inventory(args, pair: dict, directory: Path) -> dict:
 
 def build_driver(pair: dict, directory: Path) -> str:
     """Install only orchestration tools; inference images remain byte-for-byte fixed."""
-    tag = "llaminar-ci:published-suite-driver-" + pair["images"]["AVX2"]["id"][7:23]
-    pipeline.run(["docker", "buildx", "build", "--load", "--network=host", "--progress=plain",
-        "--file", str(ROOT / "scripts/ci/Dockerfile.published-suite-driver"),
-        "--build-arg", "RUNTIME_IMAGE=" + pair["images"]["AVX2"]["registry_ref"],
-        "--tag", tag, str(ROOT / "scripts/ci")], directory / "build-driver.log")
+    return build_driver_for_runtime(pair["images"]["AVX2"], directory)
+
+
+def build_driver_for_runtime(runtime: dict, directory: Path) -> str:
+    """Build tools from the exact admitted runtime via a resolvable Docker FROM.
+
+    Published siblings provide a pinned registry reference; the unpublished
+    feature sibling provides its source-owned local tag. The daemon-backed
+    BuildKit builder sees both without publishing the feature image. Reference
+    identity is checked before/after; inherited labels and base layer prefix
+    authenticate the resulting tools image. Inference still uses the original
+    immutable runtime ID, never these control-plane tools.
+    """
+    runtime_id = runtime.get('id')
+    labels, layers = runtime.get('labels'), runtime.get('layers')
+    if (not re.fullmatch(r'sha256:[0-9a-f]{64}', runtime_id or '')
+            or not isinstance(labels, dict) or labels.get('org.llaminar.image_role') != 'runtime'
+            or labels.get('org.llaminar.cpu_isa') not in ISAS
+            or not labels.get('org.opencontainers.image.revision') or not labels.get('org.llaminar.source_tree')
+            or labels.get('org.llaminar.build_type') != 'Release'
+            or labels.get('org.llaminar.cuda') != 'ON' or labels.get('org.llaminar.rocm') != 'ON'
+            or not isinstance(layers, list) or not layers):
+        raise ValueError('suite-driver build requires a complete admitted runtime identity')
+    if 'registry_ref' in runtime:
+        reference = runtime['registry_ref']
+        if not isinstance(reference, str) or not re.fullmatch(r'[^@\s]+@sha256:[0-9a-f]{64}', reference):
+            raise ValueError('suite-driver registry base must be pinned by manifest digest')
+    else:
+        reference = runtime.get('tag')
+        if (not isinstance(reference, str) or not re.fullmatch(r'[^@\s]+:[^@\s]+', reference)
+                or reference.startswith('sha256:')):
+            raise ValueError('suite-driver local base requires its existing named runtime tag')
+
+    def require_original_reference() -> None:
+        """Reject a retagged/foreign base rather than silently rebuilding other bytes."""
+        current = image_identity(reference)
+        if (current.get('id') != runtime_id or current.get('labels') != labels
+                or current.get('layers') != layers):
+            raise ValueError('suite-driver FROM reference changed its admitted runtime identity')
+
+    require_original_reference()
+    tag = 'llaminar-ci:published-suite-driver-' + runtime_id[7:23]
+    pipeline.run(['docker', 'buildx', 'build', '--builder', 'default', '--load',
+        '--network=host', '--progress=plain',
+        '--file', str(ROOT / 'scripts/ci/Dockerfile.published-suite-driver'),
+        '--build-arg', 'RUNTIME_IMAGE=' + reference,
+        '--tag', tag, str(ROOT)], directory / 'build-driver.log')
+    require_original_reference()
     image = image_identity(tag)
-    if image["labels"].get("org.llaminar.image_role") != "suite-driver":
-        raise ValueError("orchestration tools require a distinct non-runtime image role")
-    write_json(directory / "driver-image.json", image)
-    return image["id"]
+    tool_labels, tool_layers = image.get('labels', {}), image.get('layers', [])
+    if (tool_labels.get('org.llaminar.image_role') != 'suite-driver'
+            or any(tool_labels.get(key) != value for key, value in labels.items()
+                   if key != 'org.llaminar.image_role')
+            or tool_layers[:len(layers)] != layers):
+        raise ValueError('suite-driver tools lost their exact runtime source/ISA/base binding')
+    write_json(directory / 'driver-image.json', image)
+    return image['id']
 
 
 def restore_lane_ownership(driver: str, lane: Path, owner_uid: int, owner_gid: int) -> None:
@@ -386,6 +434,30 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
             restore_lane_ownership(driver, lane, lane_owner_uid, lane_owner_gid)
 
 
+def run_source_pair(args, pair: dict, directory: Path, receipt: dict) -> None:
+    """Gather complete ordinary red source results on both ISAs before any HTTP work."""
+    failures = receipt.setdefault('failed_qfn_source_cells', {})
+    for isa in ISAS:
+        lane = directory / isa.lower()
+        lane.mkdir()
+        work = lane / 'source-companion'
+        work.mkdir()
+        companion = inventory_companion(SimpleNamespace(cpu_isa=isa), pair['source'], work)
+        try:
+            binding = run_admission(companion, pair['source'], isa, lane / 'source-admission',
+                                    args.models, pair['images'][isa])
+        except SourceAdmissionRed as red:
+            # The helper authenticated complete coverage, clean boot/driver
+            # evidence and exact container/prefix retirement. Unknown native
+            # contract retirement stays unknown in the underlying red report.
+            binding = red.binding
+            failures[isa] = [exact for exact, row in red.report['results'].items() if not row['passed']]
+        receipt['qfn_source_admission_reports'][isa] = digest(binding)
+        write_json(directory / 'e2e-receipt.json', receipt)
+    if failures:
+        raise ValueError('QFN source-admission cell failures remain on the ISA pair')
+
+
 def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
     """Collect every independent HTTP cell on both ISAs before judging the pair.
 
@@ -395,14 +467,18 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
     """
     receipt = {"schema": 1, "complete": False, "images_digest": digest(pair),
                "manifest_digest": digest(manifest), "reports": {}, "failed_cells": {}}
+    receipt['qfn_source_admission_required'] = getattr(args, 'qfn_source_admission', False)
+    receipt['qfn_source_admission_reports'] = {}
     receipt['model_kld_required'] = getattr(args, 'model_kld_canaries', False)
     receipt['model_kld_reports'] = {}
     receipt['failed_model_kld_cells'] = {}
     write_json(directory / "e2e-receipt.json", receipt)
+    if getattr(args, 'qfn_source_admission', False):
+        run_source_pair(args, pair, directory, receipt)
     driver = build_driver(pair, directory)
     for isa in ISAS:
         lane = directory / isa.lower()
-        lane.mkdir()
+        lane.mkdir(exist_ok=getattr(args, 'qfn_source_admission', False))
         report = lane / "e2e.json"
         print(f"[published-images] E2E {isa}: {len(manifest['cells'])} canonical cells", flush=True)
         cell_failure = None
@@ -516,7 +592,8 @@ def run_opencode(args, pair: dict, directory: Path) -> dict:
     return result
 
 
-def admit_e2e(bundle: Path, pair: dict, *, require_model_kld: bool = False) -> tuple[dict, dict]:
+def admit_e2e(bundle: Path, pair: dict, *, require_model_kld: bool = False,
+              require_qfn_source_admission: bool = False) -> tuple[dict, dict]:
     """Authenticate both image-bound suites before any benchmark is started."""
     previous = json.loads((bundle / "images.json").read_text())
     validate_pair(previous)
@@ -540,6 +617,21 @@ def admit_e2e(bundle: Path, pair: dict, *, require_model_kld: bool = False) -> t
         if digest(report) != receipt["reports"][isa]:
             raise ValueError("E2E report differs from its completed receipt")
         reports[isa] = report
+    if require_qfn_source_admission and receipt.get('qfn_source_admission_required') is not True:
+        raise ValueError('Master release requires QFN source admission')
+    if receipt.get('qfn_source_admission_required'):
+        if set(receipt.get('qfn_source_admission_reports', {})) != set(ISAS):
+            raise ValueError('Incomplete QFN source-admission ISA pair')
+        for isa in ISAS:
+            lane = bundle / isa.lower() / 'source-admission'
+            binding = json.loads((lane / 'image-binding.json').read_text())
+            source_report = json.loads((lane / 'admission/source-admission.json').read_text())
+            from qfn_source_admission_image import validate_driver_window
+            validate_driver_window(lane, binding)
+            validate_source_binding(binding, source_report, source=pair['source'], isa=isa,
+                                    runtime=pair['images'][isa]['id'])
+            if digest(binding) != receipt['qfn_source_admission_reports'][isa]:
+                raise ValueError('QFN source-admission binding changed after E2E')
     if require_model_kld and receipt.get('model_kld_required') is not True:
         raise ValueError('Master release requires GPU KL canaries')
     if receipt.get('model_kld_required'):
@@ -663,7 +755,7 @@ def run_benchmarks(args, pair: dict, directory: Path) -> dict:
         bundle, evidence_url = args.e2e_bundle.resolve(strict=True), "local"
     else:
         bundle, evidence_url = download_e2e(args, directory / "e2e-evidence")
-    manifest, e2e = admit_e2e(bundle, pair)
+    manifest, e2e = admit_e2e(bundle, pair, require_qfn_source_admission=getattr(args, 'qfn_source_admission', False))
     write_json(directory / "manifest.json", manifest)
     reports = {}
     driver = build_driver(pair, directory)
@@ -780,6 +872,8 @@ def parse_arguments(argv=None):
     parser.add_argument('--benchmark-bundle', type=Path, help='complete passing benchmark pair; required for coding')
     parser.add_argument('--cpu-isa', choices=ISAS, help='one canonical coding job ISA')
     parser.add_argument('--cell', help='one exact blessed coding cell; no regex selection')
+    parser.add_argument("--qfn-source-admission", action="store_true",
+                        help="master PR: real QFN source admission on both exact-source ISA companions")
     parser.add_argument("--model-kld-canaries", action="store_true", help="master PR GPU numerical gate; requires the pinned corpus")
     parser.add_argument("--run-url", default="local")
     parser.add_argument("--publish", action="store_true", help="commit only successful complete benchmark results")
@@ -787,6 +881,8 @@ def parse_arguments(argv=None):
     if args.expected_source_revision is not None and not re.fullmatch(
             r"[0-9a-f]{40}", args.expected_source_revision):
         parser.error("--expected-source-revision requires a full Git SHA")
+    if args.qfn_source_admission and args.suite not in ("e2e", "benchmarks"):
+        parser.error("QFN source admission belongs to model/E2E execution or benchmark receipt admission")
     if args.model_kld_canaries and args.suite != "e2e":
         parser.error("KL canaries belong to the model/E2E gate")
     if args.suite == "e2e" and (args.publish or args.e2e_run or args.e2e_bundle):

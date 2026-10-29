@@ -14,6 +14,8 @@
  * CPU accepted-state publication copies the selected verifier logits row into
  * canonical storage alongside KV/recurrent/terminal-hidden publication; a
  * retained multirow verifier allocation never implicitly owns scalar row zero.
+ * Arena registration consumes the same resolved physical-root inventory as
+ * admission, including explicit phase-split and retained MTP mailboxes.
  */
 
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
@@ -67,6 +69,7 @@
 #include "../../moe/MoEOverlayInferenceTransactionService.h"
 #include "../../moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "../../moe/MoEOverlayResidencyAuthority.h"
+#include "../../moe/MoEOverlayParticipantResidency.h"
 #include "../../moe/MoEOverlayRetainedParentComposer.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/RoutedExpertOwnerAssignment.h"
@@ -88,6 +91,7 @@
 #include "../graph/GraphCaptureGuard.h"
 #include "../graph/RequestInputPositionAdmission.h"
 #include "../graph/SchemaFactoryRegistry.h"
+#include "memory/GraphArenaStorageLayout.h"
 #include "MTPSidecarStreamBinding.h"
 #include "PipelineForwardGraphEdges.h"
 #include "execution/moe/DeviceMoERebalancePerfStats.h"
@@ -6503,6 +6507,7 @@ namespace llaminar2
         // =====================================================================
         ArenaConfig arena_config;
         arena_config.factory = tensor_factory_;
+        arena_config.physical_memory_authority = physical_memory_authority_;
 
         /*
          * Snapshot publication does not alter activation placement. Selected
@@ -6558,116 +6563,23 @@ namespace llaminar2
         // Create BufferArena with config
         arena_ = std::make_unique<BufferArena>(arena_config);
 
-        // =====================================================================
-        // Register layer buffers from schema
-        // =====================================================================
-        auto layer_reqs = BufferAllocator::resolveLayerBuffers(schema, resolver_config);
-        for (const auto &desc : layer_reqs.buffers)
+        // Admission and allocation resolve one physical root inventory. Alias
+        // annotations do not merge storage; unused attention scratch is omitted
+        // by the common resolver, and continuation mailboxes are explicit roots.
+        const bool retained_mtp = retainsMTPGraphCapacity(config.mtp);
+        const auto arena_layout = GraphArenaStorageLayout::resolve(schema, resolver_config, {
+            .full_prefill_kv_handoff = config.dense_tp_enabled &&
+                config.dense_tp_decode_replicated && config.qkv_column_parallel,
+            .terminal_hidden_rows = retained_mtp
+                ? static_cast<size_t>(resolveMTPTerminalHiddenRowCapacity(state_.batch_size, config.mtp)) : 0,
+            .terminal_hidden_columns = retained_mtp ? static_cast<size_t>(config.residualWidth()) : 0});
+        for (const auto &entry : arena_layout.entries())
         {
-            BufferId id = BufferArena::bufferNameToId(desc.name);
-            if (id == BufferId::_COUNT)
-            {
-                // Check model-provided buffer mappings
-                auto it = resolver_config.buffer_name_to_id.find(desc.name);
-                if (it != resolver_config.buffer_name_to_id.end())
-                {
-                    id = it->second;
-                }
-                else
-                {
-                    LOG_WARN("[DeviceGraphOrchestrator] No BufferId mapping for layer buffer '" << desc.name << "', skipping");
-                    continue;
-                }
-            }
-
-            // Skip unused O(S²) attention workspace buffers.
-            // All flash attention kernels (CPU, CUDA, ROCm) use tiled online
-            // softmax and never read these buffers — they accept them as
-            // optional parameters and (void)-cast them.  Skipping avoids
-            // allocating seq_len² × n_heads × sizeof(float) bytes that would
-            // otherwise dominate memory at long context lengths.
-            if (id == BufferId::ATTN_SCORES_WORKSPACE || id == BufferId::ATTN_CONTEXT_WORKSPACE)
-            {
-                LOG_DEBUG("[DeviceGraphOrchestrator] Skipping unused O(S²) buffer: " << bufferIdName(id));
-                continue;
-            }
-
-            const char *dtype = BufferArena::bufferTensorTypeToStr(desc.tensor_type);
-            if (!arena_->registerBuffer(id, desc))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register layer buffer: " << desc.name);
-                return false;
-            }
-            LOG_DEBUG("[DeviceGraphOrchestrator] Registered layer buffer: '" << desc.name
-                                                                               << "' → " << bufferIdName(id)
-                                                                               << " [" << arena_->getRows(id)
-                                                                               << "x" << arena_->getCols(id)
-                                                                               << "] dtype=" << dtype);
-        }
-
-        // Phase-split dense execution keeps prefill Q/K/V projections TP-local
-        // but seeds a replicated decode KV cache. Register explicit full-width
-        // K/V rows only for that handoff so non-phase-split runs do not pay the
-        // extra activation memory.
-        const bool needs_phase_split_prefill_kv_handoff =
-            state_.device_id.is_gpu() &&
-            config.dense_tp_enabled &&
-            config.dense_tp_decode_replicated &&
-            config.qkv_column_parallel &&
-            config.n_kv_heads > 0 &&
-            config.head_dim > 0;
-        if (needs_phase_split_prefill_kv_handoff)
-        {
-            const size_t kv_cols =
-                static_cast<size_t>(config.n_kv_heads) *
-                static_cast<size_t>(config.head_dim);
-            if (kv_cols == 0)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Invalid full KV width for phase-split prefill handoff");
-                return false;
-            }
-            if (!arena_->registerBuffer(BufferId::K_FULL_PREFILL,
-                                        static_cast<size_t>(seq_len),
-                                        kv_cols,
-                                        "FP32",
-                                        state_.device_id) ||
-                !arena_->registerBuffer(BufferId::V_FULL_PREFILL,
-                                        static_cast<size_t>(seq_len),
-                                        kv_cols,
-                                        "FP32",
-                                        state_.device_id))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register phase-split full prefill K/V buffers");
-                return false;
-            }
-        }
-
-        // =====================================================================
-        // Register model-level buffers (current_hidden, logits)
-        // =====================================================================
-        auto model_reqs = BufferAllocator::resolveModelBuffers(schema, resolver_config);
-        for (const auto &desc : model_reqs.buffers)
-        {
-            BufferId id = BufferArena::bufferNameToId(desc.name);
-            if (id == BufferId::_COUNT)
-            {
-                // Check model-provided buffer mappings
-                auto it = resolver_config.buffer_name_to_id.find(desc.name);
-                if (it != resolver_config.buffer_name_to_id.end())
-                {
-                    id = it->second;
-                }
-                else
-                {
-                    LOG_WARN("[DeviceGraphOrchestrator] No BufferId mapping for model buffer '" << desc.name << "', skipping");
-                    continue;
-                }
-            }
-            if (!arena_->registerBuffer(id, desc))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register model buffer: " << desc.name);
-                return false;
-            }
+            if (!arena_->registerBuffer(entry.id, entry.descriptor))
+                throw std::logic_error("Graph arena failed to register declared root: " + entry.descriptor.name);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Registered arena root: '" << entry.descriptor.name
+                << "' -> " << bufferIdName(entry.id) << " [" << arena_->getRows(entry.id)
+                << "x" << arena_->getCols(entry.id) << "]");
         }
 
         // =====================================================================
@@ -6724,10 +6636,10 @@ namespace llaminar2
             MTPSidecarCaptureLayout(mtp_sidecar_condition_token_slot_width_);
         mtp_terminal_hidden_contiguous_rows_select_caches_.clear();
         mtp_terminal_hidden_contiguous_rows_select_caches_.reserve(
-            mtp_graph_owner_plan_.terminalHiddenContiguousGraphSlots());
+            mtp_graph_owner_plan_.terminalHiddenContiguousRegistryCapacity());
         for (size_t slot = 0;
              slot <
-                 mtp_graph_owner_plan_.terminalHiddenContiguousGraphSlots();
+                 mtp_graph_owner_plan_.terminalHiddenContiguousRegistryCapacity();
              ++slot)
         {
             mtp_terminal_hidden_contiguous_rows_select_caches_.push_back(
@@ -6736,10 +6648,10 @@ namespace llaminar2
         mtp_terminal_hidden_device_accepted_rows_select_caches_.clear();
         mtp_terminal_hidden_device_accepted_rows_select_caches_.reserve(
             mtp_graph_owner_plan_
-                .terminalHiddenDeviceAcceptedGraphSlots());
+                .terminalHiddenDeviceAcceptedRegistryCapacity());
         for (size_t slot = 0;
              slot < mtp_graph_owner_plan_
-                        .terminalHiddenDeviceAcceptedGraphSlots();
+                        .terminalHiddenDeviceAcceptedRegistryCapacity();
              ++slot)
         {
             mtp_terminal_hidden_device_accepted_rows_select_caches_.push_back(
@@ -6748,10 +6660,10 @@ namespace llaminar2
         mtp_terminal_hidden_request_rows_select_caches_.clear();
         mtp_terminal_hidden_request_rows_select_caches_.reserve(
             mtp_graph_owner_plan_
-                .terminalHiddenRequestTerminalGraphSlots());
+                .terminalHiddenRequestTerminalRegistryCapacity());
         for (size_t slot = 0;
              slot < mtp_graph_owner_plan_
-                        .terminalHiddenRequestTerminalGraphSlots();
+                        .terminalHiddenRequestTerminalRegistryCapacity();
              ++slot)
         {
             mtp_terminal_hidden_request_rows_select_caches_.push_back(
@@ -6760,7 +6672,7 @@ namespace llaminar2
         mtp_shifted_prefill_hidden_rows_select_caches_.clear();
         const size_t shifted_prefill_selector_count =
             mtp_graph_owner_plan_
-                .terminalHiddenShiftedPrefillGraphSlots();
+                .terminalHiddenShiftedPrefillRegistryCapacity();
         mtp_shifted_prefill_hidden_rows_select_caches_.reserve(
             shifted_prefill_selector_count);
         for (size_t cache_index = 0;
@@ -6772,40 +6684,14 @@ namespace llaminar2
         }
         mtp_sidecar_depth0_kv_only_batch_caches_.clear();
         mtp_sidecar_depth0_kv_only_batch_caches_.reserve(
-            mtp_graph_owner_plan_.sidecarKVOnlyBatchGraphSlots());
+            mtp_graph_owner_plan_.sidecarKVOnlyBatchRegistryCapacity());
         for (size_t cache_index = 0;
              cache_index <
-                 mtp_graph_owner_plan_.sidecarKVOnlyBatchGraphSlots();
+                 mtp_graph_owner_plan_.sidecarKVOnlyBatchRegistryCapacity();
              ++cache_index)
         {
             mtp_sidecar_depth0_kv_only_batch_caches_.push_back(
                 std::make_unique<MTPSidecarGraphCache>());
-        }
-
-        /*
-         * Every MTP graph, including the ordinary CPU executable graph, binds
-         * PREFIX_TERMINAL_HIDDEN by address.  Reserve the largest configured
-         * publication shape before any graph is built so a later transition
-         * from scalar decode to grouped verification cannot replace that
-         * address underneath an already-cached stage.
-         */
-        if (retainsMTPGraphCapacity(config.mtp))
-        {
-            const size_t terminal_hidden_row_capacity =
-                static_cast<size_t>(
-                    resolveMTPTerminalHiddenRowCapacity(
-                        state_.batch_size,
-                        config.mtp));
-            if (!arena_->registerBuffer(
-                    BufferId::PREFIX_TERMINAL_HIDDEN,
-                    terminal_hidden_row_capacity,
-                    static_cast<size_t>(config.residualWidth()),
-                    "FP32",
-                    state_.device_id))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register the persistent MTP terminal-hidden archive");
-                return false;
-            }
         }
 
         if (state_.device_id.is_gpu())
@@ -7000,9 +6886,9 @@ namespace llaminar2
             mtp_direct_token_history_graph_.invalidate();
             mtp_draft_token_publication_graphs_.clear();
             mtp_draft_token_publication_graphs_.reserve(
-                mtp_graph_owner_plan_.draftPublicationGraphSlots());
+                mtp_graph_owner_plan_.draftPublicationRegistryCapacity());
             for (size_t slot = 0;
-                 slot < mtp_graph_owner_plan_.draftPublicationGraphSlots();
+                 slot < mtp_graph_owner_plan_.draftPublicationRegistryCapacity();
                  ++slot)
             {
                 mtp_draft_token_publication_graphs_.push_back(
@@ -7014,7 +6900,7 @@ namespace llaminar2
             const size_t verifier_preparation_registry_size =
                 mtp_graph_owner_plan_.retainsGraphCapacity()
                     ? mtp_graph_owner_plan_
-                          .verifierPreparationGraphSlots()
+                          .verifierPreparationRegistryCapacity()
                     : kMTPVerifierPreparationControlPolicyCount *
                           static_cast<size_t>(
                               stochastic_batch_output_request_capacity_) *
@@ -17014,6 +16900,7 @@ namespace llaminar2
             PerfStatsCollector::addCounter("forward_graph", "serving_graph_family_materializations",
                 1.0, "setup", state_.device_id.toString(),
                 {{"role", purpose ? "mtp_condition" : "mtp_grouped_verifier"},
+                 {"sparse_query_program", std::to_string(sparseQueryExecutionProgramIndex(sparseQueryGraphProgram()))},
                  {"physical_rows", std::to_string(input.seq_len)},
                  {"commit_purpose", purpose ? std::to_string(static_cast<int>(*purpose)) : "none"},
                  {"draft_depth", std::to_string(input.moe_overlay_mtp_depth)},
@@ -20841,6 +20728,11 @@ namespace llaminar2
         const int32_t *external_device_row_indices,
         int request_index)
     {
+        if (!mtp_graph_owner_plan_.ownsControllerExecutables())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pipeline follower cannot materialize terminal-hidden helper executables");
+            return false;
+        }
         if (!state_.device_id.is_gpu() || !state_.hidden ||
             !state_.prefix_terminal_hidden || selected_row_count <= 0 ||
             graph_builder_->config().residualWidth() <= 0)
@@ -25889,6 +25781,12 @@ namespace llaminar2
         int first_seq_idx,
         DeviceGraphExecutor::GraphInitialSubmissionPolicy submission)
     {
+        if (state_.device_id.is_gpu() && !mtp_graph_owner_plan_.ownsControllerExecutables())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Pipeline follower cannot execute or materialize predictor sidecar graphs");
+            return false;
+        }
+
         const bool materialize_only = submission ==
             DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch;
         if (submission != DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch &&
@@ -34235,6 +34133,9 @@ namespace llaminar2
         if (error)
             error->clear();
 
+        if (!mtp_graph_owner_plan_.ownsControllerExecutables())
+            return fail("Pipeline follower cannot materialize controller-owned MTP helper executables");
+
         const uint64_t generation = workspaceGeneration(state_.device_id);
         if (!state_.device_id.is_gpu() || generation == 0 || row < 0 ||
             slot < 0 || slot >= mtp_max_draft_depth_ ||
@@ -34818,6 +34719,9 @@ namespace llaminar2
         if (error)
             error->clear();
 
+        if (!mtp_graph_owner_plan_.ownsControllerExecutables())
+            return fail("Pipeline follower cannot materialize controller-owned MTP helper executables");
+
         const uint64_t generation = workspaceGeneration(state_.device_id);
         if (!key || !state_.device_id.is_gpu() || generation == 0 ||
             params.device_id != state_.device_id ||
@@ -35072,6 +34976,9 @@ namespace llaminar2
         };
         if (error)
             error->clear();
+
+        if (!mtp_graph_owner_plan_.ownsControllerExecutables())
+            return fail("Pipeline follower cannot materialize controller-owned MTP helper executables");
 
         const uint64_t generation = workspaceGeneration(state_.device_id);
         if (!state_.device_id.is_gpu() || generation == 0 || row_count <= 0 ||
@@ -35343,6 +35250,9 @@ namespace llaminar2
         };
         if (error)
             error->clear();
+
+        if (!mtp_graph_owner_plan_.ownsControllerExecutables())
+            return fail("Pipeline follower cannot materialize controller-owned MTP helper executables");
 
         const uint64_t generation = workspaceGeneration(state_.device_id);
         if (!state_.device_id.is_gpu() || generation == 0 || !requests ||
@@ -62308,6 +62218,7 @@ namespace llaminar2
 
         const GraphConfig &cfg = graph_builder_->config();
         int prepared_depths = 0;
+        int reused_depths = 0;
 
         for (const auto &depth : bindings.mtp.depths)
         {
@@ -62318,6 +62229,30 @@ namespace llaminar2
                 depth.fa_block.moe_down_exps;
             if (!has_any_moe_weight)
                 continue;
+
+            if (cfg.moe.usesExpertOverlayDurableResidencyAuthority())
+            {
+                const auto &residency = cfg.moe.expert_overlay_participant_residency;
+                const auto manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_);
+                if (!cfg.moe.expert_overlay_residency_authority || !residency ||
+                    !manager || residency->localParticipantIds().empty())
+                {
+                    LOG_ERROR("[DGO] MTP expert reuse has no complete model-owned overlay residency authority");
+                    return false;
+                }
+                const int source_layer = depth.source_layer_index >= 0
+                    ? depth.source_layer_index : cfg.n_layers + depth.depth_index;
+                std::string error;
+                if (!residency->registerInitialLayerFromPreparedRegistry(
+                        manager->expertGemmRegistry(), source_layer, &error))
+                {
+                    LOG_ERROR("[DGO] MTP expert residency reuse rejected source layer "
+                        << source_layer << ": " << error);
+                    return false;
+                }
+                ++reused_depths;
+                continue;
+            }
 
             TensorBase *gate_exps = legacyTensor(depth.fa_block.moe_gate_exps);
             TensorBase *up_exps = legacyTensor(depth.fa_block.moe_up_exps);
@@ -62352,6 +62287,7 @@ namespace llaminar2
             params.up_exps = up_exps;
             params.down_exps = down_exps;
             params.prepared_store = prepared_weight_store_.get();
+            params.persistent_weight_owner = frozen_weight_set_->physicalMemoryOwner();
 
             if (cfg.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
             {
@@ -62380,6 +62316,10 @@ namespace llaminar2
 
             ++prepared_depths;
         }
+
+        if (reused_depths > 0)
+            PerfStatsCollector::addCounter("weight_loading", "mtp_moe_expert_residency_reuses",
+                static_cast<double>(reused_depths), "load", device.to_string());
 
         if (prepared_depths > 0)
         {
@@ -64757,6 +64697,8 @@ namespace llaminar2
             throw std::runtime_error(
                 "Cross-rank CPU expert movement requires a rank-local NUMA-bound CPU backend");
         }
+        if (!frozen_weight_set_)
+            throw std::logic_error("CPU ownership transfer requires its frozen persistent weight owner");
         result.prepared = ExpertWeightTransfer::transferLayeredPreparedCPU(
             manifest,
             get_weights,
@@ -64764,7 +64706,10 @@ namespace llaminar2
             my_rank,
             target_numa_node,
             comm,
-            &evidence);
+            &evidence,
+            CPUWeightStoragePlacement::accounted(physical_memory_authority_, primaryDeviceId(),
+                frozen_weight_set_->physicalMemoryOwner(),
+                CPUWeightStoragePlacement::onNode(target_numa_node)));
 
         const std::string device =
             primaryDeviceId().is_valid() ? primaryDeviceId().toString() : std::string{};
@@ -64922,7 +64867,10 @@ namespace llaminar2
                     return expert_consumer
                         .cloneCPUCurrentBatchLLEPPreparedExpert(
                             expert_id,
-                            state.durable_parent_epoch);
+                            state.durable_parent_epoch,
+                            CPUWeightStoragePlacement::accounted(physical_memory_authority_, primaryDeviceId(),
+                                PhysicalMemoryOwner::ExpertMigrationStaging,
+                                CPUWeightStoragePlacement::local()));
                 };
                 auto make_engine =
                     [](std::unique_ptr<IPackedWeights> weights)
@@ -64940,7 +64888,10 @@ namespace llaminar2
                         state.participant_id,
                         cpuBackendNUMANode(),
                         tp_ctx.communicator(),
-                        &evidence);
+                        &evidence,
+                        CPUWeightStoragePlacement::accounted(physical_memory_authority_, primaryDeviceId(),
+                            PhysicalMemoryOwner::ExpertShadowSlots,
+                            CPUWeightStoragePlacement::onNode(cpuBackendNUMANode())));
             }
 
             const std::unordered_map<int, PreparedExpertEngines> *
@@ -65125,6 +65076,8 @@ namespace llaminar2
         ExpertTransferResult result;
         if (primaryDeviceId().is_cpu())
         {
+            if (!frozen_weight_set_)
+                throw std::logic_error("CPU replica transfer requires its frozen persistent weight owner");
             auto get_weights =
                 [&](int layer_idx, int expert_id) -> ExpertPackedWeights
             {
@@ -65151,7 +65104,10 @@ namespace llaminar2
                     my_rank,
                     cpuBackendNUMANode(),
                     comm,
-                    &evidence);
+                    &evidence,
+                    CPUWeightStoragePlacement::accounted(physical_memory_authority_, primaryDeviceId(),
+                        frozen_weight_set_->physicalMemoryOwner(),
+                        CPUWeightStoragePlacement::onNode(cpuBackendNUMANode())));
         }
         else
         {
@@ -65169,7 +65125,10 @@ namespace llaminar2
                 return it->second->serializeExpert(expert_id);
             };
             result.serialized = ExpertWeightTransfer::transferLayered(
-                manifest, get_blobs, my_rank, comm, &evidence);
+                manifest, get_blobs, my_rank, comm, &evidence,
+                CPUWeightStoragePlacement::accounted(physical_memory_authority_, DeviceId::cpu(),
+                    PhysicalMemoryOwner::ExpertMigrationStaging,
+                    CPUWeightStoragePlacement::local()));
         }
 
         const std::string device = primaryDeviceId().is_valid()

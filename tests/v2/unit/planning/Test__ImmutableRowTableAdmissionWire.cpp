@@ -118,3 +118,25 @@ TEST(ImmutableRowTableAdmissionWire, LocalityWireRejectsInvalidOrDiscardedPolicy
     }
 }
 }
+
+namespace llaminar2::test
+{
+/** @test Sender readiness freezes exact live bytes and rejects local invalid/foreign contributions. */
+TEST(ImmutableRowTableAdmissionWire, PreparedSenderFrameAuthenticatesBeforeCollective)
+{
+    const std::array values{request()};
+    const auto frame = ImmutableRowTableAdmissionSendFrame::prepare(values, 2);
+    const auto encoded = serializeImmutableRowTableAdmissionRequests(values);
+    EXPECT_EQ(frame.senderRank(), 2);
+    EXPECT_EQ(frame.byteCount(), static_cast<int>(encoded.size()));
+    EXPECT_EQ(std::vector<std::uint8_t>(frame.bytes().begin(), frame.bytes().end()), encoded);
+    ASSERT_EQ(parseImmutableRowTableAdmissionRequests(frame.bytes(), 2).size(), 1u);
+    const std::array malformed{request(), request()};
+    EXPECT_THROW((void)ImmutableRowTableAdmissionSendFrame::prepare(malformed, 2), std::invalid_argument);
+    EXPECT_THROW((void)ImmutableRowTableAdmissionSendFrame::prepare(values, 3), std::invalid_argument);
+    EXPECT_THROW((void)ImmutableRowTableAdmissionSendFrame::prepare({}, -1), std::invalid_argument);
+    const auto empty = ImmutableRowTableAdmissionSendFrame::prepare({}, 4);
+    EXPECT_GT(empty.byteCount(), 0);
+    EXPECT_TRUE(parseImmutableRowTableAdmissionRequests(empty.bytes(), 4).empty());
+}
+} // namespace llaminar2::test

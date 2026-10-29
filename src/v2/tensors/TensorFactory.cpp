@@ -1,6 +1,10 @@
 /**
  * @file TensorFactory.cpp
- * @brief Factory implementation for creating tensors with NUMA-aware allocation
+ * @brief Tensor construction governed by the admitted rank CPU allocation domain.
+ *
+ * Aggregate CPU admission must remain aggregate even when this thread happens to
+ * run on one socket. Only an explicitly node-bound CPU backend permits this
+ * factory to install the existing persistent thread allocation policy.
  * @author David Sanftenberg
  */
 
@@ -8,6 +12,7 @@
 #include "BlockStructures.h"
 #include "TensorClasses.h"
 #include "../utils/Logger.h"
+#include "../backends/BackendManager.h"
 #include <cerrno>
 #include <stdexcept>
 #include <sstream>
@@ -16,7 +21,6 @@
 
 #include <numa.h>
 #include <numaif.h>
-#include <sched.h> // For sched_getcpu() in NUMA node detection
 
 #if defined(HAVE_ROCM)
 #include <hip/hip_runtime.h>
@@ -25,12 +29,11 @@
 namespace llaminar2
 {
     TensorFactory::TensorFactory(const IMPIContext &mpi_ctx)
-        : mpi_rank_(mpi_ctx.rank()), numa_node_(-1)
+        : mpi_rank_(mpi_ctx.rank()), numa_node_(cpuBackendNUMANode())
     {
-        // Determine NUMA node for this MPI rank
-        numa_node_ = getNumaNodeForRank(mpi_rank_);
-
-        // Bind current thread to NUMA node if available
+        // CPUBackend owns rank allocation locality. Aggregate (-1) intentionally
+        // leaves the caller policy untouched; execution affinity is not admission.
+        // Explicit bound-node mode retains its existing persistent policy.
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
@@ -442,10 +445,9 @@ namespace llaminar2
             return;
         }
 
-        // Parallel memcpy ensures destination pages are first-touched by
-        // multiple threads on the correct NUMA node (set via membind).
-        // Each thread copies a contiguous chunk, triggering page faults
-        // that place physical pages on the bound NUMA node.
+        // Each worker first-touches a contiguous range under its existing
+        // allocation policy. Copying must not introduce a node constraint into
+        // aggregate admission or overwrite a caller-established worker policy.
         auto *d = static_cast<char *>(dst);
         const auto *s = static_cast<const char *>(src);
 
@@ -512,43 +514,6 @@ namespace llaminar2
                 << "). In Docker, run with --security-opt seccomp=unconfined.";
             throw std::runtime_error(oss.str());
         }
-    }
-
-    int TensorFactory::getNumaNodeForRank(int rank)
-    {
-        if (numa_available() < 0)
-        {
-            return -1;
-        }
-
-        int max_node = numa_max_node();
-        if (max_node <= 0)
-        {
-            return -1; // Only one NUMA node
-        }
-
-        // Detect actual NUMA node from the CPU this thread is running on.
-        // This correctly handles cases where process binding doesn't follow
-        // rank order, e.g. `-d cpu:1` with a single rank bound to socket 1
-        // (rank=0 but NUMA node=1).  The old round-robin mapping
-        // (`rank % (max_node+1)`) would incorrectly return node 0.
-        int cpu = sched_getcpu();
-        if (cpu >= 0)
-        {
-            int node = numa_node_of_cpu(cpu);
-            if (node >= 0 && node <= max_node)
-            {
-                LOG_DEBUG("[TensorFactory] Detected NUMA node " << node
-                                                                << " for rank " << rank << " (cpu " << cpu << ")");
-                return node;
-            }
-        }
-
-        // Fallback: round-robin mapping (only reached if sched_getcpu fails)
-        int fallback = rank % (max_node + 1);
-        LOG_WARN("[TensorFactory] sched_getcpu() failed, using round-robin NUMA mapping: "
-                 << "rank " << rank << " -> node " << fallback);
-        return fallback;
     }
 
 } // namespace llaminar2

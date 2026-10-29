@@ -1,6 +1,9 @@
 /**
  * @file TensorFactory.h
- * @brief Factory for creating tensors with NUMA-aware allocation
+ * @brief Tensor construction preserving the admitted rank CPU allocation domain.
+ *
+ * CPUBackend supplies aggregate (-1) or explicit node-bound allocation intent.
+ * Current CPU affinity and MPI rank numbers never redefine that resource domain.
  * @author David Sanftenberg
  */
 
@@ -23,19 +26,27 @@ namespace llaminar2
      * @brief Factory for creating tensors with NUMA-aware allocation
      *
      * Handles:
-     * - NUMA node binding based on MPI rank
+     * - NUMA policy from the initialized rank CPU backend
      * - Automatic tensor type selection based on data format
-     * - Memory allocation on local NUMA node for optimal performance
+     * - Aggregate placement or the explicitly admitted NUMA node
      *
-     * Thread-safe: Can be called from multiple threads, but each thread
-     * should ideally be pinned to the same NUMA node as its MPI rank.
+     * Aggregate factories never alter a calling thread's memory policy. Bound
+     * factories retain the existing persistent MPOL_BIND behavior on each calling
+     * thread; they do not restore that policy at destruction. CPU affinity alone
+     * is never evidence that a single-node memory constraint was admitted.
      */
     class TensorFactory
     {
     public:
         /**
-         * @brief Initialize factory with MPI context
-         * @param mpi_ctx MPI context for rank-to-NUMA mapping
+         * @brief Snapshot the existing CPU backend allocation domain.
+         * @param mpi_ctx MPI context retained only for rank diagnostics.
+         *
+         * cpuBackendNUMANode() is authoritative: -1 preserves aggregate intent
+         * and the caller's current policy, including an externally imposed bind.
+         * A non-negative admitted node retains explicit MPOL_BIND semantics.
+         * When no CPU backend exists the authority reports aggregate (-1); this
+         * constructor neither initializes a backend nor invents rank placement.
          */
         explicit TensorFactory(const IMPIContext &mpi_ctx);
 
@@ -242,24 +253,27 @@ namespace llaminar2
         /**
          * @brief Ensure NUMA memory binding is active for the calling thread
          *
-         * Sets a strict MPOL_BIND policy so all subsequent allocations on this thread
-         * land on the NUMA node associated with this factory's MPI rank.
+         * For an explicitly node-bound CPU backend, sets strict MPOL_BIND so
+         * subsequent allocations use that admitted node. The policy persists
+         * beyond the call and is not restored when the factory is destroyed.
          *
          * Call this before allocating temporary buffers (e.g. file I/O scratch)
          * that should be NUMA-local. The create* methods already call this
          * internally, but callers who allocate their own buffers before
          * passing data to the factory should call this first.
          *
-         * No-op only when the factory has no NUMA node.
+         * Aggregate (-1) is a no-op: it neither installs a singleton policy nor
+         * clears an external caller policy. The current CPU and MPI rank do not
+         * narrow the aggregate CPU resource.
          */
         void ensureNumaBinding();
 
         /**
          * @brief Parallel NUMA-aware memcpy for large buffers
          *
-         * Uses OpenMP to copy data in parallel, ensuring destination pages are
-         * first-touched by threads bound to the correct NUMA node. Falls back
-         * to std::memcpy for small buffers (< 128 KB).
+         * Uses OpenMP to copy contiguous ranges; first-touch placement follows
+         * each worker's existing policy. This operation does not infer a NUMA
+         * node or change worker policy. Small buffers (< 128 KB) use std::memcpy.
          *
          * @param dst  Destination buffer (should be allocated with NUMA binding)
          * @param src  Source buffer
@@ -268,8 +282,8 @@ namespace llaminar2
         static void numaMemcpy(void *dst, const void *src, size_t bytes);
 
         /**
-         * @brief Get NUMA node for current MPI rank
-         * @return NUMA node index, or -1 for single-node/no explicit NUMA binding
+         * @brief Return the snapshotted CPU backend allocation domain.
+         * @return Explicit admitted node, or -1 for aggregate CPU allocation.
          */
         int getNumaNode() const { return numa_node_; }
 
@@ -287,20 +301,15 @@ namespace llaminar2
 
     private:
         int mpi_rank_;
-        int numa_node_; // NUMA node for this rank
+        int numa_node_; // CPU backend allocation authority; -1 means aggregate.
 
         /**
-         * @brief Bind current thread to NUMA node
-         * Called before allocating large tensors
+         * @brief Install the existing persistent policy for an admitted node.
+         * Called only for non-negative CPU backend allocation authority. The
+         * aggregate branch never invokes this method or changes caller policy.
          */
         void bindToNumaNode();
 
-        /**
-         * @brief Get NUMA node for given MPI rank
-         * @param rank MPI rank
-         * @return NUMA node index, or -1 if not available
-         */
-        static int getNumaNodeForRank(int rank);
     };
 
 } // namespace llaminar2

@@ -26,6 +26,10 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../utils/CPURouterKernelTestAdmission.h"
+#include <array>
+#include <cstring>
 #include "../../mocks/MockBackend.h"
 
 #include <limits>
@@ -159,18 +163,23 @@ TEST(PreparedExpertServiceView, CPUWorkspaceBOMMatchesEveryPayload)
             for (int intermediate : {256, 1024})
                 for (int top_k : {1, 2, 4})
                 {
-                    const CPUGroupedMoESerialWorkspace::Config geometry{
+                    CPUGroupedMoESerialWorkspace::Config geometry{
                         .row_capacity = rows, .d_model = hidden,
                         .expert_intermediate = intermediate, .num_experts = 4,
-                        .routing_top_k = top_k};
+                        .routing_top_k = top_k, .device_id = DeviceId::cpu()};
                     const auto bytes = CPUGroupedMoESerialWorkspace::plannedAllocationBytes(geometry);
+                    PhysicalMemoryPlanBuilder plan;
+                    plan.add({0, geometry.device_id, bytes, bytes}, PhysicalMemoryOwner::ExecutionWorkspace, bytes);
+                    geometry.physical_memory_authority = std::make_shared<PhysicalMemoryAuthority>(
+                        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
                     CPUGroupedMoESerialWorkspace workspace(geometry);
                     EXPECT_EQ(workspace.allocationBytes(), bytes);
                 }
     EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes({}), std::invalid_argument);
     EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes({
         .row_capacity = std::numeric_limits<size_t>::max(), .d_model = 256,
-        .expert_intermediate = 256, .num_experts = 4, .routing_top_k = 4}), std::overflow_error);
+        .expert_intermediate = 256, .num_experts = 4, .routing_top_k = 4,
+        .device_id = DeviceId::cpu()}), std::overflow_error);
 }
 
 /** @brief Prepared CPU execution shares immutable bytes, never a GPU binding. */
@@ -883,4 +892,106 @@ TEST_F(Test__KernelFactory, CreateGemmRaw_IQ4_NL_CPU)
 
     // Clean up
     delete kernel;
+}
+
+/** @test All eight final roots retain exact claims and unwind partial materialization. */
+TEST(PreparedExpertServiceView, CPUWorkspaceBackingClaimsReplayAndPartialFailure)
+{
+    for (const DeviceId device : {DeviceId::cpu(), DeviceId{DeviceType::CPU, 1}})
+    {
+        CPUGroupedMoESerialWorkspace::Config config{
+            .row_capacity = 3, .d_model = 35, .expert_intermediate = 65,
+            .num_experts = 4, .routing_top_k = 2, .device_id = device};
+        const auto fp = [](size_t elements) { return AlignedVector<float>::requiredAllocationBytes(elements); };
+        const auto q8 = [](size_t elements) { return AlignedVector<Q8_1Block>::requiredAllocationBytes(elements); };
+        const size_t expected = fp(3 * 35) + 2 * fp(6 * 65) + fp(6 * 35) + fp(6 * std::max(35, 65)) + q8(6 * 2) + q8(6 * 3) + q8(3 * 2);
+        EXPECT_EQ(CPUGroupedMoESerialWorkspace::storageLayout(config).physicalBytes(), expected);
+        auto authority = [&](size_t admitted)
+        {
+            PhysicalMemoryPlanBuilder plan;
+            plan.add({0, device, expected, expected}, PhysicalMemoryOwner::ExecutionWorkspace, admitted);
+            return std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+        };
+        auto live = [&](const PhysicalMemoryAuthority &memory)
+        {
+            size_t bytes = 0;
+            for (const auto &line : memory.rankAttestation())
+                if (line.owner == PhysicalMemoryOwner::ExecutionWorkspace)
+                    bytes += line.materialized_new_bytes;
+            return bytes;
+        };
+        EXPECT_THROW((void)CPUGroupedMoESerialWorkspace(config), std::logic_error);
+        config.physical_memory_authority = authority(expected);
+        const auto declared = std::make_shared<CPUGroupedMoEStorageLayout>(
+            CPUGroupedMoESerialWorkspace::storageLayout(config));
+        config.declared_storage = declared;
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            {
+                CPUGroupedMoESerialWorkspace workspace(config);
+                EXPECT_EQ(live(*config.physical_memory_authority), expected);
+                for (const int rows : {3, 1, 2, 3})
+                {
+                    auto invocation = workspace.acquire(rows, 2, 35, 65, 4, 0);
+                    EXPECT_THROW((void)workspace.acquire(1, 1, 35, 65, 4, 1), std::logic_error);
+                    EXPECT_EQ(live(*config.physical_memory_authority), expected);
+                }
+            }
+            EXPECT_EQ(live(*config.physical_memory_authority), 0u);
+        }
+        auto stale = std::make_shared<CPUGroupedMoEStorageLayout>(*declared);
+        --stale->route_capacity;
+        config.declared_storage = stale;
+        EXPECT_THROW((void)CPUGroupedMoESerialWorkspace(config), std::logic_error);
+        EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes(config), std::logic_error);
+        EXPECT_EQ(live(*config.physical_memory_authority), 0u);
+        config.declared_storage = declared;
+        config.physical_memory_authority = authority(expected - 1);
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            EXPECT_THROW((void)CPUGroupedMoESerialWorkspace(config), std::logic_error);
+            EXPECT_EQ(live(*config.physical_memory_authority), 0u);
+        }
+    }
+}
+
+/** @test Bound router publication keeps its original root through partial and repeated replay. */
+TEST(PreparedExpertServiceView, DeclaredRouterPublicationReplaysWithoutAllocationOrRebinding)
+{
+    const DeviceId device{DeviceType::CPU, 1};
+    const CPUStorageRoot<Q8_1Block> root(8, PhysicalMemoryOwner::ExecutionWorkspace, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({0, device, root.physicalBytes(), root.physicalBytes()}, PhysicalMemoryOwner::ExecutionWorkspace, root.physicalBytes());
+    const auto memory = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    std::array<float, 4 * 33> input;
+    for (size_t i = 0; i < input.size(); ++i)
+        input[i] = static_cast<float>(static_cast<int>(i % 17) - 8) * 0.125f;
+    {
+        CPUMoEKernel kernel;
+        kernel.bindRouterQ8HiddenStorage(root.allocate(memory));
+        const Q8_1Block *address = nullptr;
+        for (const int rows : {4, 1, 3, 4})
+        {
+            CPUMoEKernel reference;
+            llaminar2::test::admitCPURouterKernelForTest(reference,rows,33,device);
+            ASSERT_TRUE(reference.publishTransportedRouterQ8Hidden(input.data(), rows, 33));
+            ASSERT_TRUE(kernel.publishTransportedRouterQ8Hidden(input.data(), rows, 33));
+            const auto *published = kernel.publishedRouterQ8Hidden(input.data(), rows, 33);
+            ASSERT_NE(published, nullptr);
+            if (address) EXPECT_EQ(published, address);
+            address = published;
+            EXPECT_EQ(std::memcmp(published, reference.publishedRouterQ8Hidden(input.data(), rows, 33),
+                static_cast<size_t>(rows) * 2 * sizeof(Q8_1Block)), 0);
+            ASSERT_TRUE(kernel.reserveRouterQ8HiddenCapacity(4, 33));
+            EXPECT_FALSE(kernel.reserveRouterQ8HiddenCapacity(5, 33));
+            for (const auto &line : memory->rankAttestation())
+                if (line.owner == PhysicalMemoryOwner::ExecutionWorkspace)
+                    EXPECT_EQ(line.materialized_new_bytes, root.physicalBytes());
+        }
+        EXPECT_THROW(kernel.publishTransportedRouterQ8Hidden(input.data(), 5, 33), std::logic_error);
+    }
+    for (const auto &line : memory->rankAttestation())
+        EXPECT_EQ(line.materialized_new_bytes, 0u);
 }

@@ -5,7 +5,9 @@
  * Native setup/control publications only: these cases inspect actual HC GEMM
  * Params/signatures, not claimed projection capture/replay or arithmetic. All
  * original source and query owners retire through their exact setup stream.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../utils/CPUActivationArenaFixture.h"
 #include "../../../utils/Qwen4ExpHCQueryFixture.h"
 #include "backends/ExplicitGPUStream.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -120,7 +122,7 @@ class NativeRequestQuery final
 public:
     /** @brief Allocate original request roles only, with exact host/device PMA claims and an original geometry record. */
     NativeRequestQuery(IBackend &backend,DeviceId device,void *stream,int rows)
-        :backend_(backend),device_(device),stream_(stream),factory_(mpi_),arena_(ArenaConfig{.factory=&factory_})
+        :backend_(backend),device_(device),stream_(stream),factory_(mpi_),arena_(::llaminar2::test::cpuArenaFixtureConfig(&factory_))
     {
         const auto bytes=static_cast<std::size_t>(rows)*2*sizeof(std::int32_t)+2*sizeof(std::int32_t);
         const auto resource=[](DeviceId owner){return PhysicalMemoryResource{.world_rank=0,.device=owner,
@@ -174,7 +176,7 @@ private:
     PhysicalMemoryAllocationLease host_,gpu_;
     test::MockMPIContext mpi_;
     TensorFactory factory_;
-    BufferArena arena_;
+    BufferArena arena_{::llaminar2::test::cpuArenaFixtureConfig()};
 };
 /** @brief Inspect actual workspace and non-chunked ingress HC sites; no projection is executed. */
 void proveWorkspaceAndRequestHC(DeviceId device)

@@ -13,6 +13,7 @@
  * rows and route records arrive exclusively through the sparse collective, so
  * remote ranks never construct a dense model graph or a host shadow of root
  * execution state.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
@@ -73,6 +74,8 @@ namespace llaminar2
     {
         /** @brief Immutable model/weight authority for this rank-local graph. */
         std::shared_ptr<ModelContext> model_context;
+        /// Frozen CPU roots for every admitted endpoint/controller on this rank.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         /**
          * @brief Whether this runner creates or adopts its expert engines.
          *
@@ -145,6 +148,8 @@ namespace llaminar2
          * participant runner may add decode/MTP shapes below this ladder, but
          * it must never invent or omit a prefill shape independently.
          */
+        /// Common capacity named by the exact published prefill bucket policy.
+        int prefill_graph_row_capacity = 0;
         std::vector<int> prefill_graph_row_shapes;
         /**
          * @brief Largest decode-family row count, including grouped MTP verification.

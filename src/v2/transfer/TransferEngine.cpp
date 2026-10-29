@@ -11,6 +11,7 @@
  */
 
 #include "transfer/TransferEngine.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
 #include <array>
@@ -1840,6 +1841,35 @@ namespace llaminar2
             {{"mapping", "parent_subregion"},
              {"native_registration", "false"}});
         return slice;
+    }
+
+    CPUMappedPublicationRoot::CPUMappedPublicationRoot(
+        size_t payload_bytes, DeviceId host_allocator, DeviceId consumer)
+        : payload_bytes_(payload_bytes),
+          physical_bytes_(TransferEngine::mappedHostRegionAllocationBytes(payload_bytes)),
+          host_allocator_(host_allocator), consumer_(consumer)
+    {
+        if (!host_allocator_.is_valid() || !host_allocator_.is_cpu() ||
+            !consumer_.is_valid() || !consumer_.is_gpu())
+            throw std::invalid_argument("CPU mapped publication requires exact CPU owner and GPU consumer");
+    }
+
+    std::shared_ptr<MappedHostTransferRegion> TransferEngine::allocateMappedHostRegion(
+        const CPUMappedPublicationRoot &root,
+        const std::shared_ptr<PhysicalMemoryAuthority> &authority) const
+    {
+        if (!authority)
+            throw std::logic_error("CPU mapped publication requires physical-memory admission");
+        // Admission precedes backend discovery/native allocation. On any setup
+        // failure native cleanup runs before this local claim retires.
+        auto claim = std::make_shared<PhysicalMemoryAllocationLease>(authority->claimNewAllocation(
+            root.hostAllocator(), root.owner(), root.physicalBytes()));
+        const std::array devices{root.consumer()};
+        auto region = allocateMappedHostRegion(root.payloadBytes(), devices);
+        if (region->sizeBytes() != root.physicalBytes())
+            throw std::logic_error("CPU mapped publication allocation disagrees with its declaration");
+        region->allocation_claim_ = std::move(claim);
+        return region;
     }
 
     size_t TransferEngine::mappedHostRegionAllocationBytes(size_t bytes)

@@ -5,6 +5,7 @@
  * Every stage reuses the existing model-aware placement resolver and checked
  * residency constructor. Only the immutable initial placements cross runner
  * lifetimes; the same PMA remains the sole allocator authority throughout.
+ * CPU root declarations remain stage-owned across child projection and reuse.
  */
 #include "MoEPipelinePreparedPlan.h"
 #include "MoEOverlayPipelineStageBinding.h"
@@ -84,7 +85,8 @@ namespace llaminar2
                 .capacity = *admitted.capacity(), .memory = memory});
             auto binding = MoEOverlayPipelineStageBinding::seal(admitted.topology().scope(), prepared.metadata,
                 domain->participants, {.authority = setup.authority(), .residency = setup.residency(),
-                    .histogram = setup.histogram(), .mpi = context});
+                    .histogram = setup.histogram(), .mpi = context,
+                    .cpu_serial_expert_storage = admitted.capacity()->cpu_serial_expert_storage});
             const auto &requested_plan = *requested.config().moe_routed_expert_plan;
             const auto destination = std::find_if(requested_plan.domains.begin(), requested_plan.domains.end(),
                 [&](const auto &value) { return value.name == requested_plan.effectiveBaseModelDomain(); });

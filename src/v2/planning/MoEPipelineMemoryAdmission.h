@@ -6,6 +6,7 @@
  * source geometry. This adapter composes their existing fixed and expert BOM
  * builders before publishing any result. It owns no allocator, live byte ledger,
  * GPU context, weight payload or mutable inference state.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 #pragma once
 
@@ -100,7 +101,7 @@ namespace llaminar2
          * MTP capacity permits different enabled/depth choices on later requests.
          * This operation neither allocates nor reopens any admission decision.
          */
-        void publishRuntimeCapacity(RuntimeConfig &runtime) const noexcept;
+        void publishRuntimeCapacity(RuntimeConfig &runtime) const;
         /** @return Immutable ordered stages; no borrowed setup references survive. */
         const std::vector<AdmittedMoEPipelineStage> &stages() const noexcept { return stages_; }
         /** @return Sole aggregate admission behind every stage's quota evidence. */

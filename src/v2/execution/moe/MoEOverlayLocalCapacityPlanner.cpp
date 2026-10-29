@@ -14,6 +14,7 @@
  * Ordinary single-domain native QFN TP shares original consumer declarations
  * with weight construction; separately retained dense/overlay families keep
  * their explicit full-bank demand and never recover from a selected-mode error.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #include "MoEOverlayLocalCapacityPlanner.h"
@@ -27,6 +28,8 @@
 #include "planning/ActivationBufferSizing.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/MemoryPlanner.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
+#include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "config/BackendSelector.h"
@@ -751,6 +754,34 @@ namespace llaminar2
                     config.mtp_enabled
                         ? config.mtp_target_query_rows
                         : 1);
+                if(device.is_cpu() && config.serial_routed_expert_participant_count>0)
+                {
+                    const auto &capture=debugEnv().execution;
+                    if(capture.prefill_graph_max_cached_buckets<=int(kExpertOverlayPrefillGraphIdentityReserve))
+                        throw std::invalid_argument("CPU serial admission has no retained prefill identity budget");
+                    auto admission=std::make_shared<CPUSerialExpertStorageAdmission>();
+                    admission->allocator={rank_plan.rank,device};
+                    for(const auto &endpoint:bound)
+                        if(endpoint.world_rank==rank_plan.rank && endpoint.device==device)
+                            admission->participant_ids.push_back(endpoint.participant_id);
+                    std::sort(admission->participant_ids.begin(),admission->participant_ids.end());
+                    for(const auto &controller:continuation_shards)
+                        admission->controller_devices.push_back(controller.device);
+                    if(admission->controller_devices.empty()) admission->controller_devices.push_back(device);
+                    std::sort(admission->controller_devices.begin(),admission->controller_devices.end());
+                    admission->controller_devices.erase(std::unique(admission->controller_devices.begin(),
+                        admission->controller_devices.end()),admission->controller_devices.end());
+                    admission->envelope=std::make_shared<const CPUSerialExpertStorageEnvelope>(device,
+                        overlay_segment_rows,config.mtp_enabled?config.mtp_target_query_rows:1,
+                        profile.d_model,profile.expert_used_count,capture.prefill_graph_bucket_sizes,
+                        capture.prefill_graph_min_seq,
+                        size_t(capture.prefill_graph_max_cached_buckets)-kExpertOverlayPrefillGraphIdentityReserve,true,
+                        continuation_shards.empty()?CPUSerialExpertFamilyPolicy::PublishedSchedule:
+                            CPUSerialExpertFamilyPolicy::LocalPowerOfTwo,
+                        profile.expert_feed_forward_length,profile.expert_count);
+                    config.cpu_serial_expert_storage=std::move(admission);
+                    config.concurrent_workspace_owners=config.cpu_serial_expert_storage->controller_devices.size();
+                }
                 config.execution_role = role;
                 if (role == DeviceExecutionMemoryRole::ContinuationGraph)
                 {

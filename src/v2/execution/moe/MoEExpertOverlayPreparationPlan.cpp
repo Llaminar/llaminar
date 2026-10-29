@@ -859,6 +859,41 @@ namespace llaminar2
         return filtered;
     }
 
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::filteredForGraphScope(
+        const MoEExpertOverlayRuntimePlan &runtime, const MoEExpertOverlayGraphScope &scope) const
+    {
+        scope.validate(runtime, scope.device());
+        MoEExpertOverlayPreparationPlan filtered;
+        std::set<std::tuple<std::string, DeviceId, int, int, WeightResidencyCategory, int, int>> counted_experts;
+
+        for (const auto &request : requests_)
+        {
+            if (!request.participant_world_rank_known ||
+                !scope.contains(request.domain_name, request.device,
+                    request.participant_world_rank, request.participant_index))
+                continue;
+
+            filtered.requests_.push_back(request);
+            auto &stats = recordRequestStats(filtered.diagnostics_, request);
+            const auto expert_key = std::make_tuple(
+                request.domain_name,
+                request.device,
+                request.participant_index,
+                request.participant_world_rank,
+                request.residency_category,
+                request.layer,
+                request.expert_id);
+            if (request.role == ExpertGemmRegistry::WeightRole::GATE && counted_experts.insert(expert_key).second)
+            {
+                ++stats.assigned_routed_experts;
+                stats.estimated_routed_bytes += request.estimated_routed_bytes;
+            }
+        }
+
+        sortDiagnostics(filtered.diagnostics_);
+        return filtered;
+    }
+
     bool MoEExpertOverlayPreparationPlan::shouldPrepare(
         DeviceId device,
         int layer,

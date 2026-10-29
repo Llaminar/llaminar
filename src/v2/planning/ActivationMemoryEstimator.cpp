@@ -4,17 +4,23 @@
  *
  * BufferArena currently allocates each registered BufferId independently;
  * alias metadata validates lifetimes but does not merge physical storage.
- * Consequently this implementation sums the same declarative owner union used
- * by Qwen graph construction instead of estimating a phase peak.
+ * CPU admission resolves the production GraphSchema into the same root inventory
+ * consumed by graph setup. CPUTensorStorageDeclaration owns native extents and
+ * allocator rounding. GPU estimates retain their existing geometry policy.
  */
 
 #include "planning/ActivationMemoryEstimator.h"
+#include "tensors/AlignedVector.h"
+#include <initializer_list>
 #include "kernels/gdn/GDNPreparedQK.h"
 #include "execution/mtp/GenerationRequestSeeds.h"
 #include "execution/mtp/MTPTerminalGatherGeometry.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "models/qwen4exp/Qwen4ExpBufferLayout.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
+#include "models/qwen/Qwen2Schema.h"
+#include "config/GDNHeadAssignment.h"
+#include "memory/GraphArenaStorageLayout.h"
 #include "execution/local_execution/graph/GraphResolver.h"
 
 #include <algorithm>
@@ -72,11 +78,16 @@ std::pair<GraphResolverConfig, Qwen4ExpBufferDimensions> qwenLookupGeometry(
     resolver.default_device = device;
     resolver.custom_formulas["mtp_kv_prefill_rows"] = std::max(flattened, static_cast<std::size_t>(geometry.mtp_target_query_rows));
     resolver.custom_formulas["mtp_target_query_rows"] = static_cast<std::size_t>(geometry.mtp_target_query_rows);
+    resolver.custom_formulas["terminal_logit_row_capacity"] = static_cast<size_t>(
+        std::max(geometry.batch_size, geometry.mtp_target_query_rows));
     const Qwen4ExpBufferDimensions dimensions{
         .main_layers = profile.n_layers, .first_layer = geometry.first_layer,
         .layer_count = (geometry.last_layer < 0 ? profile.n_layers - 1 : geometry.last_layer) - geometry.first_layer + 1,
         .compute_width = profile.d_model, .context_tokens = geometry.context_tokens,
-        .request_capacity = geometry.generation_request_capacity,
+        // Sparse request banks follow GraphConfig.max_request_count, which
+        // the production factory projects from ordinary runtime batch size.
+        // MTP request/seed capacity is a separate retained storage contract.
+        .request_capacity = geometry.batch_size,
         .flattened_rows = static_cast<int>(flattened), .local_query_heads = geometry.local_n_heads,
         .retained_mtp_candidate_rows = geometry.retained_mtp_candidate_rows,
         .device = device, .attention_phase_schedule=geometry.attention_phase_schedule, .ngram_lookup = geometry.ngram_lookup,
@@ -84,14 +95,27 @@ std::pair<GraphResolverConfig, Qwen4ExpBufferDimensions> qwenLookupGeometry(
     return {std::move(resolver), dimensions};
 }
 
-/** @brief Return bytes for one FP32 row bank with checked arithmetic. */
-size_t fp32RowBankBytes(
-    size_t rows,
-    size_t columns,
-    std::string_view contribution)
+/**
+ * @brief Price independently allocated FP32 roots using native allocator rounding.
+ * @param rows Shared row capacity of these roots.
+ * @param widths Column capacity for each distinct physical root, not a concatenated bank.
+ * @param device Allocator owner; CPU storage follows AlignedVector's physical contract.
+ * @param contribution Diagnostic name for checked geometry arithmetic.
+ * @return Sum of exact root extents; GPU retains its native unrounded tensor extent.
+ */
+size_t fp32RootBytes(size_t rows, std::initializer_list<size_t> widths,
+    DeviceId device, std::string_view contribution)
 {
-    const size_t elements = checkedMultiply(rows, columns, contribution);
-    return checkedMultiply(elements, sizeof(float), contribution);
+    size_t bytes = 0;
+    for (const auto width : widths)
+    {
+        const auto elements = checkedMultiply(rows, width, contribution);
+        const auto root_bytes = device.is_cpu()
+            ? AlignedVector<float>::requiredAllocationBytes(elements)
+            : checkedMultiply(elements, sizeof(float), contribution);
+        bytes = checkedAdd(bytes, root_bytes, contribution);
+    }
+    return bytes;
 }
 
 size_t projectionOutputRows(
@@ -159,6 +183,114 @@ bool hasHybridRecurrentLayer(
 
 } // namespace
 
+GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
+    const ModelMemoryProfile &profile, const ActivationGraphMemoryGeometry &geometry, DeviceId device)
+{
+    if (!device.is_valid() || !device.is_cpu() || geometry.batch_size <= 0 ||
+        geometry.resident_graph_rows <= 0 || geometry.total_shards <= 0 ||
+        geometry.mtp_target_query_rows <= 0)
+        throw std::invalid_argument("CPU graph storage requires exact allocator and positive admitted geometry");
+    const size_t rows = checkedMultiply(static_cast<size_t>(geometry.batch_size),
+        static_cast<size_t>(geometry.resident_graph_rows), "CPU flattened graph rows");
+    if (rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::overflow_error("CPU graph rows exceed resolver representation");
+
+    // This adapter projects source metadata into the graph resolver. Physical
+    // root names, shapes, placement and dtypes remain exclusively in schemas;
+    // no root count or byte formula is reconstructed by the estimator.
+    GraphResolverConfig resolver;
+    resolver.default_device = device;
+    resolver.seq_len = static_cast<int>(rows);
+    resolver.batch_size = 1;
+    resolver.n_layers = profile.n_layers;
+    resolver.d_model = profile.d_model;
+    resolver.d_ff = profile.d_ff;
+    resolver.n_heads = profile.n_heads;
+    resolver.n_kv_heads = profile.n_kv_heads;
+    resolver.head_dim = profile.head_dim;
+    resolver.vocab_size = profile.vocab_size;
+    resolver.local_d_ff = geometry.local_d_ff;
+    resolver.local_n_heads = geometry.local_n_heads;
+    resolver.local_n_kv_heads = geometry.local_n_kv_heads;
+    resolver.local_vocab = geometry.local_vocab > 0 ? geometry.local_vocab
+        : static_cast<int>(shardColumns(static_cast<size_t>(profile.vocab_size), geometry.total_shards));
+    auto &formulas = resolver.custom_formulas;
+    const size_t target_rows = static_cast<size_t>(geometry.mtp_target_query_rows);
+    const size_t query_columns = checkedMultiply(static_cast<size_t>(geometry.local_n_heads),
+        static_cast<size_t>(profile.head_dim), "CPU query columns");
+    const size_t kv_columns = checkedMultiply(static_cast<size_t>(geometry.local_n_kv_heads),
+        static_cast<size_t>(profile.head_dim), "CPU KV columns");
+    formulas["mtp_target_query_rows"] = target_rows;
+    // Ordinary compact terminal rows follow GraphConfig.max_request_count's
+    // production batch projection, independently of MTP request/seed capacity.
+    formulas["terminal_logit_row_capacity"] = std::max(static_cast<size_t>(geometry.batch_size), target_rows);
+    formulas["mtp_kv_prefill_rows"] = std::max(rows, target_rows);
+    const bool replicated_predictor = geometry.mtp_shifted_kv_head_layout ==
+        MTPShiftedKVHeadLayout::FullModelPerParticipant;
+    formulas["mtp_q_dim"] = replicated_predictor ? checkedMultiply(
+        static_cast<size_t>(profile.n_heads), static_cast<size_t>(profile.head_dim), "CPU replicated predictor Q") : query_columns;
+    formulas["mtp_kv_dim"] = replicated_predictor ? checkedMultiply(
+        static_cast<size_t>(profile.n_kv_heads), static_cast<size_t>(profile.head_dim), "CPU replicated predictor KV") : kv_columns;
+    formulas["mtp_d_ff"] = static_cast<size_t>(replicated_predictor ? profile.d_ff : geometry.local_d_ff);
+    formulas["mtp_vocab"] = geometry.mtp_terminal_logits_layout == MTPTerminalLogitsLayout::FullVocabularyPerParticipant
+        ? static_cast<size_t>(profile.vocab_size) : static_cast<size_t>(resolver.local_vocab);
+    const auto gather = MTPTerminalGatherGeometry::resolve(geometry.mtp_terminal_logits_layout,
+        target_rows, static_cast<size_t>(profile.vocab_size));
+    formulas["mtp_gather_rows"] = gather.rows();
+    formulas["mtp_gather_vocab"] = gather.columns();
+
+    const bool hybrid = profile.flash_next || hasHybridRecurrentLayer(profile, 0, std::max(0, profile.n_layers - 1));
+    GraphSchema schema = hybrid ? (profile.expert_count > 0
+        ? Qwen35MoESchemaFactory{}.createSchema() : Qwen35SchemaFactory{}.createSchema())
+        : Qwen2SchemaFactory{}.createSchema();
+    if (hybrid)
+    {
+        if (profile.gdn_state_size <= 0 || profile.gdn_group_count <= 0 ||
+            profile.gdn_time_step_rank <= 0 || profile.gdn_inner_size <= 0)
+            throw std::invalid_argument("CPU hybrid arena requires complete source GDN metadata");
+        const auto heads = GDNHeadAssignment::fromPartition(profile.gdn_group_count,
+            profile.gdn_time_step_rank, 0, geometry.local_n_heads, profile.n_heads);
+        const size_t inner = checkedMultiply(static_cast<size_t>(profile.gdn_inner_size),
+            static_cast<size_t>(heads.localValueHeads()), "CPU local GDN width") /
+            static_cast<size_t>(profile.gdn_time_step_rank);
+        const size_t keys = checkedMultiply(static_cast<size_t>(heads.localKeyHeads()),
+            static_cast<size_t>(profile.gdn_state_size), "CPU local GDN keys");
+        formulas["gdn_inner_size"] = inner;
+        formulas["gdn_qkv_dim"] = checkedAdd(checkedMultiply(2, keys, "CPU GDN Q/K"), inner, "CPU GDN QKV");
+        formulas["gdn_time_step_rank"] = static_cast<size_t>(heads.localValueHeads());
+        formulas["fa_q_full_dim"] = checkedMultiply(2, query_columns, "CPU FA query/gate");
+        formulas["mtp_fa_q_full_dim"] = checkedMultiply(2, formulas.at("mtp_q_dim"), "CPU predictor query/gate");
+        formulas["attn_output_dim"] = std::max(query_columns, inner);
+        formulas["mtp_attn_output_dim"] = std::max(formulas.at("mtp_q_dim"), formulas.at("attn_output_dim"));
+    }
+    if (hybrid && profile.expert_count > 0)
+    {
+        if (geometry.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+            throw std::invalid_argument("MoE projection arena requires a native GPU domain");
+        formulas["moe_top_k"] = static_cast<size_t>(profile.expert_used_count);
+        formulas["moe_canonical_publication_slots"] = checkedAdd(
+            static_cast<size_t>(profile.expert_used_count), static_cast<size_t>(geometry.total_shards),
+            "CPU MoE publication slots");
+        formulas["moe_expert_intermediate"] = static_cast<size_t>(profile.expert_feed_forward_length);
+        formulas["moe_ffn_intermediate_max"] = static_cast<size_t>(std::max(
+            profile.expert_feed_forward_length, profile.expert_shared_feed_forward_length));
+        formulas["moe_activation_rows"] = std::max(rows,
+            geometry.retained_mtp_candidate_rows > 0 ? target_rows : size_t{1});
+    }
+    if (profile.flash_next)
+    {
+        const auto [unused, dimensions] = qwenLookupGeometry(profile, geometry, device);
+        applyQwen4ExpBufferLayout(schema, *profile.flash_next, dimensions);
+        applyQwen4ExpBufferGeometry(resolver, *profile.flash_next, dimensions);
+    }
+    const bool retained_mtp = geometry.retained_mtp_candidate_rows > 0;
+    return GraphArenaStorageLayout::resolve(schema, resolver, {
+        .full_prefill_kv_handoff = geometry.replicated_dense_decode,
+        .terminal_hidden_rows = retained_mtp ? std::max(static_cast<size_t>(geometry.batch_size), target_rows) : 0,
+        .terminal_hidden_columns = retained_mtp ? (profile.flash_next
+            ? static_cast<size_t>(profile.flash_next->residual_width) : static_cast<size_t>(profile.d_model)) : 0});
+}
+
 size_t ActivationMemoryEstimator::estimate(
     int batch_size,
     int max_seq_len,
@@ -183,7 +315,7 @@ size_t ActivationMemoryEstimator::estimate(
     const size_t HK = static_cast<size_t>(std::max(0, n_kv_heads));
     const size_t HD = static_cast<size_t>(std::max(0, head_dim));
     const size_t V = static_cast<size_t>(std::max(0, vocab_size));
-    (void)device;
+
 
     // All sizes in bytes (FP32 = 4 bytes per element unless noted)
     const size_t Q = checkedMultiply(H, HD, "query columns");
@@ -204,29 +336,11 @@ size_t ActivationMemoryEstimator::estimate(
      * Graphs with different row buckets use these same BufferIds serially, so
      * this is one largest-participant arena rather than one arena per graph.
      */
-    size_t resident_row_elements = checkedMultiply(5u, D, "common D columns");
-    resident_row_elements = checkedAdd(
-        resident_row_elements,
-        checkedMultiply(2u, Q, "common Q columns"),
-        "common Q columns");
-    resident_row_elements = checkedAdd(
-        resident_row_elements,
-        checkedMultiply(2u, KV, "common KV columns"),
-        "common KV columns");
-    resident_row_elements = checkedAdd(
-        resident_row_elements,
-        checkedMultiply(2u, F, "common FFN columns"),
-        "common FFN columns");
-    resident_row_elements = checkedAdd(
-        resident_row_elements, S, "causal-mask columns");
     const size_t resident_rows = checkedMultiply(B, S, "resident graph rows");
-    const size_t resident_buffers = fp32RowBankBytes(
-        resident_rows, resident_row_elements, "common graph arena");
-
-    // Ordinary prefill/decode computes only the selected terminal logits row.
-    const size_t terminal_logits = fp32RowBankBytes(
-        B, V, "terminal logits");
-    return checkedAdd(resident_buffers, terminal_logits, "terminal logits");
+    const auto resident_buffers = fp32RootBytes(resident_rows,
+        {D, D, D, D, D, Q, Q, KV, KV, F, F, S}, device, "common graph roots");
+    return checkedAdd(resident_buffers,
+        fp32RootBytes(B, {V}, device, "terminal logits"), "terminal logits");
 }
 
 size_t ActivationMemoryEstimator::estimate(
@@ -244,6 +358,9 @@ size_t ActivationMemoryEstimator::estimate(
             "Activation graph memory geometry requires positive rows, batch, "
             "shards, and MTP capacity with non-negative local widths");
     }
+
+    if (device.is_cpu())
+        return declareCPUStorage(profile, geometry, device).cpuPhysicalBytes();
 
     size_t bytes = estimate(
         geometry.batch_size,
@@ -292,22 +409,19 @@ size_t ActivationMemoryEstimator::estimate(
 
     if (geometry.replicated_dense_decode && device.is_gpu())
     {
-        // The prefill graph writes TP-local K/V, then a captured handoff
-        // publishes separate full-width rows to the replicated decode bank.
+        // The prefill graph writes TP-local K/V, then its indexed CPU or
+        // captured native GPU handoff publishes full replicated decode rows.
         // These two BufferIds coexist with the ordinary K/V arena owners.
         bytes = checkedAdd(
             bytes,
-            fp32RowBankBytes(
-                rows,
-                checkedMultiply(2u, full_kv, "phase-split full KV handoff"),
-                "phase-split full KV handoff"),
+            fp32RootBytes(rows, {full_kv, full_kv}, device, "phase-split full KV handoff"),
             "phase-split full KV handoff");
     }
 
     /* The model schema registers a participant-local terminal-logit shard. */
     bytes = checkedAdd(
         bytes,
-        fp32RowBankBytes(1u, local_vocab, "local terminal logits"),
+        fp32RootBytes(1u, {local_vocab}, device, "local terminal logits"),
         "local terminal logits");
 
     /*
@@ -384,10 +498,8 @@ size_t ActivationMemoryEstimator::estimate(
     {
         bytes = checkedAdd(
             bytes,
-            fp32RowBankBytes(
-                rows,
-                attention_output - local_q,
-                "hybrid attention-output width delta"),
+            fp32RootBytes(rows, {attention_output}, device, "hybrid attention-output root") -
+                fp32RootBytes(rows, {local_q}, device, "base attention-output root"),
             "hybrid attention-output width delta");
     }
 
@@ -410,17 +522,9 @@ size_t ActivationMemoryEstimator::estimate(
     }
 
     /* gdn_qkv and gdn_recurrence_in are distinct simultaneous owners. */
-    const size_t hybrid_columns =
-        full_attention_q +
-        full_attention_gate +
-        checkedMultiply(2u, gdn_qkv, "GDN projection and recurrence columns") +
-        gdn_z +
-        gdn_alpha +
-        gdn_beta;
-    bytes = checkedAdd(
-        bytes,
-        fp32RowBankBytes(rows, hybrid_columns, "hybrid graph arena"),
-        "hybrid graph arena");
+    bytes = checkedAdd(bytes, fp32RootBytes(rows,
+        {full_attention_q, full_attention_gate, gdn_qkv, gdn_qkv, gdn_z, gdn_alpha, gdn_beta},
+        device, "hybrid graph roots"), "hybrid graph roots");
 
     /*
      * Qwen3.5 registers one complete MTP sidecar union. Shifted prefill reuses
@@ -428,66 +532,35 @@ size_t ActivationMemoryEstimator::estimate(
      * target-row capacity. These addresses exist even before the first MTP
      * transaction and therefore belong in fixed admission.
      */
-    size_t mtp_prefill_columns = checkedMultiply(
-        6u, d_model, "MTP hidden/concat columns");
-    mtp_prefill_columns = checkedAdd(
-        mtp_prefill_columns, full_attention_q, "MTP raw-Q columns");
-    mtp_prefill_columns = checkedAdd(
-        mtp_prefill_columns,
-        checkedMultiply(2u, local_q, "MTP query/gate columns"),
-        "MTP query/gate columns");
-    mtp_prefill_columns = checkedAdd(
-        mtp_prefill_columns,
-        checkedMultiply(2u, local_kv, "MTP local KV columns"),
-        "MTP local KV columns");
-    mtp_prefill_columns = checkedAdd(
-        mtp_prefill_columns,
-        checkedMultiply(2u, full_kv, "MTP full KV handoff columns"),
-        "MTP full KV handoff columns");
-    bytes = checkedAdd(
-        bytes,
-        fp32RowBankBytes(
-            mtp_prefill_rows,
-            mtp_prefill_columns,
-            "MTP shifted-prefill arena"),
-        "MTP shifted-prefill arena");
+    bytes = checkedAdd(bytes, fp32RootBytes(mtp_prefill_rows,
+        {d_model, d_model, d_model, checkedMultiply(2u, d_model, "MTP concat"), d_model,
+         full_attention_q, local_q, local_q, local_kv, local_kv, full_kv, full_kv},
+        device, "MTP shifted-prefill roots"), "MTP shifted-prefill roots");
 
     const size_t mtp_vocab =
         geometry.mtp_terminal_logits_layout ==
                 MTPTerminalLogitsLayout::FullVocabularyPerParticipant
             ? static_cast<size_t>(std::max(0, profile.vocab_size))
             : local_vocab;
-    size_t mtp_target_columns = checkedMultiply(
-        3u, d_model, "MTP hidden/projection/output columns");
-    mtp_target_columns = checkedAdd(
-        mtp_target_columns, attention_output, "MTP attention output columns");
-    mtp_target_columns = checkedAdd(
-        mtp_target_columns,
-        checkedMultiply(2u, local_d_ff, "MTP FFN projection columns"),
-        "MTP FFN projection columns");
-    mtp_target_columns = checkedAdd(
-        mtp_target_columns, mtp_vocab, "MTP terminal logits columns");
-    bytes = checkedAdd(
-        bytes,
-        fp32RowBankBytes(
-            target_rows, mtp_target_columns, "MTP target-row arena"),
-        "MTP target-row arena");
+    bytes = checkedAdd(bytes, fp32RootBytes(target_rows,
+        {d_model, d_model, d_model, attention_output, local_d_ff, local_d_ff, mtp_vocab},
+        device, "MTP target-row roots"), "MTP target-row roots");
 
     /* Stable selected-row input and the exact retained terminal output bank. */
     bytes = checkedAdd(
         bytes,
-        fp32RowBankBytes(1u, d_model, "LM-head selected row"),
+        fp32RootBytes(1u, {d_model}, device, "LM-head selected row"),
         "LM-head selected row");
     bytes = checkedAdd(
         bytes,
-        fp32RowBankBytes(
-            target_rows, d_model, "LM-head verifier rows"),
-        "LM-head verifier rows");
+        fp32RootBytes(std::max(static_cast<size_t>(geometry.batch_size), target_rows),
+            {d_model}, device, "LM-head compact terminal rows"),
+        "LM-head compact terminal rows");
     const auto mtp_gather = MTPTerminalGatherGeometry::resolve(
         geometry.mtp_terminal_logits_layout, target_rows,
         static_cast<size_t>(profile.vocab_size));
     bytes = checkedAdd(bytes,
-        fp32RowBankBytes(mtp_gather.rows(), mtp_gather.columns(), "MTP gathered logits"),
+        fp32RootBytes(mtp_gather.rows(), {mtp_gather.columns()}, device, "MTP gathered logits"),
         "MTP gathered logits");
 
     if (profile.expert_count > 0)
@@ -507,41 +580,24 @@ size_t ActivationMemoryEstimator::estimate(
             profile.expert_feed_forward_length,
             profile.expert_shared_feed_forward_length));
 
-        size_t moe_columns = checkedMultiply(
-            2u, top_k, "MoE router index/weight columns");
-        moe_columns = checkedAdd(
-            moe_columns,
-            checkedMultiply(2u, d_model, "MoE compact output columns"),
-            "MoE compact output columns");
+        bytes = checkedAdd(bytes, fp32RootBytes(mtp_prefill_rows,
+            {top_k, top_k, d_model, d_model, max_expert_intermediate, max_expert_intermediate},
+            device, "MoE independent roots"), "MoE independent roots");
         if (geometry.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
         {
             if (!device.is_gpu())
                 throw std::invalid_argument("MoE projection arena requires a native GPU domain");
-            // Exactly the schema's replacement owner set, not an extra reserve
-            // beside the complete-expert route tensor that no longer exists.
             bytes = checkedAdd(bytes,
                 MoEProjectionArenaGeometry::resolve(profile, geometry.total_shards).bytes(mtp_prefill_rows),
                 "MoE projection transaction arena");
         }
         else
         {
-            const size_t canonical_slots = checkedAdd(top_k, canonical_participants, "MoE canonical publication slots");
-            moe_columns = checkedAdd(moe_columns,
-                checkedMultiply(canonical_slots, d_model, "MoE canonical route-contribution columns"),
-                "MoE canonical route-contribution columns");
+            const size_t slots = checkedAdd(top_k, canonical_participants, "MoE canonical publication slots");
+            bytes = checkedAdd(bytes, fp32RootBytes(mtp_prefill_rows,
+                {checkedMultiply(slots, d_model, "MoE canonical columns")},
+                device, "MoE canonical root"), "MoE canonical root");
         }
-        moe_columns = checkedAdd(
-            moe_columns,
-            checkedMultiply(
-                2u,
-                max_expert_intermediate,
-                "MoE gate/up scratch columns"),
-            "MoE gate/up scratch columns");
-        bytes = checkedAdd(
-            bytes,
-            fp32RowBankBytes(
-                mtp_prefill_rows, moe_columns, "MoE graph arena"),
-            "MoE graph arena");
     }
     if (profile.flash_next)
     {

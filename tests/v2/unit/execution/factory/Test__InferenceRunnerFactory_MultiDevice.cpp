@@ -935,15 +935,19 @@ namespace
                 "src/v2/execution/factory/InferenceRunnerFactory.cpp");
         ASSERT_FALSE(source.empty());
 
-        EXPECT_NE(source.find("participant.world_rank == rank &&"),
+        EXPECT_NE(source.find("MoEExpertOverlayGraphScope::resolveForTPParticipant("),
                   std::string::npos)
-            << "overlay slice selection must authenticate the exact MPI rank";
-        EXPECT_NE(source.find("participant.device == graph_device ||"),
+            << "logical rank/device/index ownership must use the source-bound scope";
+        EXPECT_NE(source.find("filteredForGraphScope(*runtime, scope)"),
                   std::string::npos)
-            << "ordinary LocalTP slices must authenticate the exact graph device";
-        EXPECT_NE(source.find("graph_owns_colocated_cpu_endpoints &&"),
+            << "source loading must consume the same exact scope as preparation";
+        EXPECT_NE(source.find("hasRole(OverlayRankRole::ContinuationRoot)"),
+                  std::string::npos);
+        EXPECT_NE(source.find("device == runtime.continuationDevice()"),
                   std::string::npos)
-            << "only the continuation-root graph may add colocated CPU sparse endpoints";
+            << "only the exact continuation graph can own colocated endpoints";
+        EXPECT_NE(source.find("MoEOverlayColocatedCPUOwnership::CurrentRank"),
+                  std::string::npos);
         EXPECT_GE(
             countFactorySourceOccurrences(
                 source,

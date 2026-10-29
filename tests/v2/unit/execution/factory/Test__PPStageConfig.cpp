@@ -13,10 +13,14 @@
 #include <gtest/gtest.h>
 
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
+#include "loaders/WeightManager.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "backends/BackendManager.h"
 #include "mocks/MockModelContext.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUFactoryTestAdmission.h"
+#include "loaders/ModelContext.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -170,7 +174,8 @@ TEST(Test__FactoryPPStageConfig, PipelineConstructionLeavesGraphDeclarationToCom
         config.max_seq_len = config.activation_seq_len = 64;
         config.pp_stage_config = FactoryPPStageConfig{
             stage, stage + 1, stage == 0, stage == 2};
-        auto runner = createTestableInferenceRunner(model, DeviceId::cpu(), config);
+        auto runner = createTestableInferenceRunner(model,DeviceId::cpu(),config,
+            cpuFactoryTestAdmission(model,config.batch_size,config.max_seq_len));
         ASSERT_NE(runner, nullptr);
         ASSERT_NE(runner->getHiddenState(), nullptr);
         auto *device = dynamic_cast<DeviceGraphOrchestrator *>(runner.get());
@@ -397,4 +402,48 @@ TEST(Test__FactoryPPStageConfig, DesignatedInitializerSyntax)
     EXPECT_TRUE(config.has_lm_head);
     EXPECT_TRUE(config.isValid());
     EXPECT_EQ(config.layerCount(), 12);
+}
+
+
+/** @test Concrete model allocation authority cannot be replaced by a test hook. */
+TEST(Test__FactoryPPStageConfig, ConcreteModelRejectsTestGraphAllocationAdmission)
+{
+    const auto model=ModelContext::createForTesting("factory_admission_rejection.gguf",nullptr,1,true);
+    bool invoked=false;
+    TestableInferenceRunnerOverrides overrides;
+    overrides.test_graph_allocation_admission=[&](const std::shared_ptr<IGraphBuilder>&)
+        ->std::shared_ptr<PhysicalMemoryAuthority> {invoked=true;return {};};
+    EXPECT_THROW((void)createTestableInferenceRunner(model,DeviceId::cpu(),{},overrides),std::invalid_argument);
+    EXPECT_FALSE(invoked);
+}
+
+/** @test Direct rank construction rejects test admission before graph callbacks or physical setup. */
+TEST(Test__FactoryPPStageConfig, DirectConcreteRankRejectsTestAdmissionBeforeSetup)
+{
+    const auto model=ModelContext::createForTesting("direct_rank_admission_rejection.gguf",nullptr,1,true);
+    ASSERT_TRUE(model);ASSERT_TRUE(model->concreteWeightManager());
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({0,DeviceId::cpu(),1,1},PhysicalMemoryOwner::ExecutionWorkspace,0);
+    auto memory=std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+    model->concreteWeightManager()->installPhysicalMemoryAuthority(memory);
+    bool invoked=false;
+    RankOrchestrator::Config config;
+    config.devices={GlobalDeviceAddress::cpu()};
+    config.test_runner_overrides.test_graph_allocation_admission=
+        [&](const std::shared_ptr<IGraphBuilder>&)->std::shared_ptr<PhysicalMemoryAuthority>
+        {invoked=true;return memory;};
+    try
+    {
+        RankOrchestrator rank(model,config);
+        FAIL()<<"Concrete direct constructor accepted test admission";
+    }
+    catch(const std::invalid_argument &error)
+    {
+        EXPECT_STREQ(error.what(),"Concrete rank model cannot accept test graph allocation admission");
+    }
+    EXPECT_FALSE(invoked);
+    EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    EXPECT_EQ(model->concreteWeightManager()->physicalMemoryAuthority(),memory);
 }

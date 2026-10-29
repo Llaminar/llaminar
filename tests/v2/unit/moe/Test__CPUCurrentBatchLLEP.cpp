@@ -128,7 +128,8 @@ namespace
 
         ExpertPackedWeights cloneCPUCurrentBatchLLEPPreparedExpert(
             int,
-            uint64_t) const override
+            uint64_t,
+            CPUWeightStoragePlacement) const override
         {
             throw std::logic_error(
                 "The recording executor does not request packed weights");

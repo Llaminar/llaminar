@@ -13,6 +13,9 @@
  * Publication provenance is revoked before mutation and becomes visible only
  * after the complete row workshare has joined. Optional worker diagnostics
  * observe completed work without controlling execution or allocating when off.
+ * Serial workspace publication borrows no competing cache: setup moves its
+ * declared physical backing into the kernel, which keeps that address across
+ * partial and repeated publication until the final owner retires.
  */
 
 #include "CPUMoEKernel.h"
@@ -638,8 +641,9 @@ namespace llaminar2
 
         const int blocks_per_row = (d_model + Q8_1Block::BLOCK_SIZE - 1) /
                                    Q8_1Block::BLOCK_SIZE;
-        router_q8_hidden_.resize(
-            static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row));
+        const size_t required_blocks = static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row);
+        if (!router_q8_hidden_ || required_blocks > router_q8_hidden_->size())
+            throw std::logic_error("CPU router publication requires a sufficient declared physical root");
 
         if (!quantizeRouterQ8Rows(
                 source,
@@ -647,8 +651,8 @@ namespace llaminar2
                 d_model,
                 /*source_row_indices=*/nullptr,
                 rows,
-                router_q8_hidden_.data(),
-                router_q8_hidden_.size()))
+                router_q8_hidden_->data(),
+                router_q8_hidden_->size()))
         {
             return false;
         }
@@ -812,11 +816,11 @@ namespace llaminar2
             router_q8_hidden_rows_ < rows ||
             d_model <= 0 ||
             router_q8_hidden_d_model_ != d_model ||
-            router_q8_hidden_.empty())
+            (!router_q8_hidden_ || router_q8_hidden_->empty()))
         {
             return nullptr;
         }
-        return router_q8_hidden_.data();
+        return router_q8_hidden_->data();
     }
 
     bool CPUMoEKernel::publishTransportedRouterQ8Hidden(
@@ -878,9 +882,21 @@ namespace llaminar2
         {
             return false;
         }
-        router_q8_hidden_.resize(
-            static_cast<size_t>(rows) * blocks_per_row);
-        return true;
+        const size_t required_blocks = static_cast<size_t>(rows) * blocks_per_row;
+        return router_q8_hidden_ && required_blocks <= router_q8_hidden_->size();
+    }
+
+    void CPUMoEKernel::bindRouterQ8HiddenStorage(
+        std::shared_ptr<AlignedVector<Q8_1Block>> storage)
+    {
+        if (!storage || storage->empty())
+            throw std::invalid_argument("CPU router publication requires positive declared capacity");
+        // Rebinding the same graph-local producer/consumer pair preserves the
+        // publication; a different physical domain starts with no valid rows.
+        if (router_q8_hidden_ == storage)
+            return;
+        invalidateRouterQ8HiddenPublication();
+        router_q8_hidden_ = std::move(storage);
     }
 
     bool CPUMoEKernel::route(

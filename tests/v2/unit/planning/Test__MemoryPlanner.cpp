@@ -8,10 +8,12 @@
  * stable sparse-route buffers before captured graph construction begins.
  * Native FP16 admission also authenticates the configured codec and declared
  * schema visibility against exact local and replicated attention geometry.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
+#include "memory/CPUCompactPacketStorageLayout.h"
 #include "planning/ServingSnapshotArenaInventory.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "loaders/ImmutableRowTable.h"
@@ -19,6 +21,8 @@
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
 #include "../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "memory/CPUGroupedMoEStorageLayout.h"
+#include "memory/CPURouterQ8StorageLayout.h"
 #include "utils/DebugEnv.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "models/qwen35/Qwen35Schema.h"
@@ -244,6 +248,24 @@ namespace
         return config;
     }
 
+/** @brief Author this fixture's exact CPU endpoint/controller and bounded family policy. */
+    void declareCPUSerialFixture(DevicePlanConfig &config, const ModelMemoryProfile &profile)
+    {
+        if (!config.device.is_cpu()) return;
+        const int rows = config.serial_routed_expert_compact_rows > 0
+            ? config.serial_routed_expert_compact_rows : config.batch_size * config.activation_seq_len;
+        auto admission = std::make_shared<CPUSerialExpertStorageAdmission>();
+        admission->allocator = {config.world_rank, config.device};
+        for (int participant = 0; participant < config.serial_routed_expert_participant_count; ++participant)
+            admission->participant_ids.push_back(participant);
+        admission->controller_devices = {config.device};
+        admission->envelope = std::make_shared<const CPUSerialExpertStorageEnvelope>(
+            config.device, rows, 1, profile.d_model, profile.expert_used_count,
+            std::vector<int>{1,2,4,8,16,32,64,128,256,512,1024,2048,4096}, 1, 16,
+            true, CPUSerialExpertFamilyPolicy::LocalPowerOfTwo,
+            profile.expert_feed_forward_length, profile.expert_count);
+        config.cpu_serial_expert_storage = std::move(admission);
+    }
 } // anonymous namespace
 
 /** @test Canonical physical admission charges each compact domain edge once on CPU and GPU. */
@@ -1058,11 +1080,11 @@ TEST(Test__MemoryPlanner, ExactHostedVerifierFamilyPricesEveryModelAndPublicatio
         EXPECT_EQ(owners.generationParentWidthCount(), follower ? 15u : 1u);
         EXPECT_EQ(owners.generationParentGraphSlots(), follower ? 15u : 1u);
         EXPECT_EQ(owners.samplerHelperWidthCount(), 15u);
-        EXPECT_EQ(owners.samplerHelperGraphSlots(), 30u);
-        EXPECT_EQ(owners.controllerGraphSlots(), follower ? 60u : 47u);
-        EXPECT_EQ(owners.auxiliaryExecutableSlotCount(), follower ? 163u : 150u);
-        EXPECT_EQ(owners.generalAuxiliaryExecutableSlotCount(), follower ? 81u : 67u);
-        EXPECT_EQ(owners.boundedHelperExecutableSlotCount(), follower ? 82u : 83u);
+        EXPECT_EQ(owners.samplerHelperGraphSlots(), follower ? 0u : 30u);
+        EXPECT_EQ(owners.controllerGraphSlots(), follower ? 30u : 47u);
+        EXPECT_EQ(owners.auxiliaryExecutableSlotCount(), follower ? 30u : 150u);
+        EXPECT_EQ(owners.generalAuxiliaryExecutableSlotCount(), follower ? 30u : 67u);
+        EXPECT_EQ(owners.boundedHelperExecutableSlotCount(), follower ? 0u : 83u);
         EXPECT_EQ(owners.sidecarGraphSlots(), bounded.mtp_graph_owners.sidecarGraphSlots());
         EXPECT_EQ(owners.verifierPreparationGraphSlots(), bounded.mtp_graph_owners.verifierPreparationGraphSlots());
         EXPECT_EQ(owners.terminalHiddenGraphSlots(), bounded.mtp_graph_owners.terminalHiddenGraphSlots());
@@ -1077,9 +1099,9 @@ TEST(Test__MemoryPlanner, ExactHostedVerifierFamilyPricesEveryModelAndPublicatio
         EXPECT_EQ(two_programs.mtp_graph_owners.speculativePublicationGraphSlots(), 30u);
         EXPECT_EQ(two_programs.mtp_graph_owners.generationParentGraphSlots(), follower ? 30u : 2u);
         EXPECT_EQ(two_programs.mtp_graph_owners.samplerHelperWidthCount(), 15u);
-        EXPECT_EQ(two_programs.mtp_graph_owners.samplerHelperGraphSlots(), 30u);
-        EXPECT_EQ(two_programs.mtp_graph_owners.controllerGraphSlots(), follower ? 90u : 63u);
-        EXPECT_EQ(two_programs.mtp_graph_owners.boundedHelperExecutableSlotCount(), follower ? 82u : 83u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.samplerHelperGraphSlots(), follower ? 0u : 30u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.controllerGraphSlots(), follower ? 60u : 63u);
+        EXPECT_EQ(two_programs.mtp_graph_owners.boundedHelperExecutableSlotCount(), follower ? 0u : 83u);
 
         DevicePlanConfig cfg;
         cfg.device = device;
@@ -1155,7 +1177,7 @@ TEST(Test__MemoryPlanner, ExactHostedSamplerHelpersRemainSharedAcrossQueryProgra
             ? mtpVerifierGraphFamilyWidthCount(capacity + 1, family) : 1u;
         EXPECT_EQ(one.samplerHelperWidthCount(), expected_widths);
         EXPECT_EQ(two.samplerHelperWidthCount(), expected_widths);
-        EXPECT_EQ(one.samplerHelperGraphSlots(), 2u * expected_widths);
+        EXPECT_EQ(one.samplerHelperGraphSlots(), role == MTPGenerationParentRole::Controller ? 2u * expected_widths : 0u);
         EXPECT_EQ(two.samplerHelperGraphSlots(), one.samplerHelperGraphSlots());
         EXPECT_EQ(one.controllerGraphSlots(), one.samplerHelperGraphSlots() +
             one.generationParentGraphSlots() + one.speculativePublicationGraphSlots() + one.directTokenHistoryGraphSlots());
@@ -3080,6 +3102,7 @@ TEST(Test__MemoryPlanner, CPUOverlayContinuationAdmitsCompactProjectionWorkspace
         cfg.serial_routed_expert_participant_count = 1;
         cfg.serial_routed_expert_compact_rows = declared_rows;
         const int token_rows = declared_rows > 0 ? declared_rows : batch * cfg.activation_seq_len;
+        declareCPUSerialFixture(cfg, profile);
 
         // Remove only the expert matrices to isolate their named workspace
         // contribution from the independent attention family in the same BOM.
@@ -3119,7 +3142,8 @@ TEST(Test__MemoryPlanner, CPUOverlayContinuationAdmitsCompactProjectionWorkspace
             auto follower = cfg;
             follower.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
             follower.weight_residency = DeviceWeightResidency::selectedRoutedExpertsOnly(8, {1});
-            EXPECT_EQ(MemoryPlanner::plan(profile, {follower}).devices.front().workspace_bytes(), required);
+            EXPECT_EQ(MemoryPlanner::plan(profile, {follower}).devices.front().workspace_bytes(),
+                required + follower.cpu_serial_expert_storage->envelope->admitted()->workspaceBytes());
         }
     }
     auto invalid = overlayDeviceConfig(DeviceId::cpu());
@@ -3144,6 +3168,7 @@ TEST(Test__MemoryPlanner, OverlayCompactWorkspaceCapacityIsFlattenedOnEveryBacke
         cfg.routed_expert_compact_buffer_lifetime = RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
         cfg.serial_routed_expert_participant_count = 1;
         cfg.serial_routed_expert_compact_rows = 31;
+        declareCPUSerialFixture(cfg, profile);
         const auto one = MemoryPlanner::plan(profile, {cfg}).devices.front().workspace_bytes();
         ASSERT_GT(one, 0u);
         for (int batch : {2, 3, 8})
@@ -4455,5 +4480,308 @@ TEST(Test__MemoryPlanner, MTPDirectTokenHistoryOwnerIsSingleBoundedControllerHel
         const MTPGraphOwnerPlan absent(MTPRuntimeConfig{}, MTPVerifierGraphFamily::ExactRows, role);
         EXPECT_EQ(absent.directTokenHistoryGraphSlots(), 0u);
         EXPECT_EQ(absent.auxiliaryExecutableSlotCount(), 0u);
+    }
+}
+
+/** @test Every independently retained controller is explicit in the serial workspace BOM. */
+TEST(Test__MemoryPlanner, CPUDeclaredSerialControllersRequireExactWorkspaceConcurrency)
+{
+    const auto profile = createMoEOverlayProfile();
+    auto config = overlayDeviceConfig(DeviceId::cpu());
+    config.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    // This profile owns both routed layers; concurrency must not be tested
+    // through an incomplete per-layer residency declaration.
+    config.weight_residency = DeviceWeightResidency::selectedRoutedExpertsOnly(
+        profile.expert_count,std::vector<int>(static_cast<size_t>(profile.n_layers),2));
+    config.routed_expert_compact_buffer_lifetime = RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+    config.serial_routed_expert_participant_count = 2;
+    config.serial_routed_expert_compact_rows = 31;
+    declareCPUSerialFixture(config,profile);
+    const auto single = MemoryPlanner::plan(profile,{config}).devices.front().workspace_bytes();
+    auto declared = std::make_shared<CPUSerialExpertStorageAdmission>(*config.cpu_serial_expert_storage);
+    declared->controller_devices.push_back(DeviceId{DeviceType::CPU,1});
+    std::sort(declared->controller_devices.begin(),declared->controller_devices.end());
+    config.cpu_serial_expert_storage = declared;
+    EXPECT_THROW((void)MemoryPlanner::plan(profile,{config}),std::invalid_argument);
+    config.concurrent_workspace_owners = declared->controller_devices.size();
+    EXPECT_EQ(MemoryPlanner::plan(profile,{config}).devices.front().workspace_bytes(),single*2);
+}
+
+namespace
+{
+/**
+ * @brief Reproduce the existing named-workspace source projection for this
+ * tiny CPU fixture with balanced TP; the grouped physical roots are intentionally
+ * priced independently through their shared production declaration.
+ */
+size_t ordinaryCPUNamedWorkspace(const ModelMemoryProfile &profile,const DevicePlanConfig &cfg)
+{
+    WorkspaceMemoryGeometry geometry{
+        .device=cfg.device,.device_compute_units=cfg.device_compute_units,
+        .cpu_execution=cfg.cpu_execution,.batch_size=cfg.batch_size,
+        .ordinary_terminal_projection=cfg.ordinary_terminal_projection,
+        .resident_graph_rows=cfg.activation_seq_len,.max_context_rows=cfg.max_seq_len,
+        .owns_embedding=cfg.execution_role==DeviceExecutionMemoryRole::ContinuationGraph && cfg.owns_embedding,
+        .shard_index=cfg.shard_index,.local_d_ff=std::max(1,profile.d_ff/cfg.total_shards),
+        .local_query_head_start=cfg.shard_index*std::max(1,profile.n_heads/cfg.total_shards),
+        .local_query_heads=std::max(1,profile.n_heads/cfg.total_shards),
+        .local_kv_head_start=cfg.shard_index*std::max(1,profile.n_kv_heads/cfg.total_shards),
+        .local_kv_heads=std::max(1,profile.n_kv_heads/cfg.total_shards),
+        .first_layer=cfg.first_layer,.last_layer=cfg.last_layer,
+        .total_shards=cfg.total_shards,
+        .apportioned_routed_experts=cfg.weight_residency.selectsRoutedExperts(),
+        .runtime_device_policy_available=cfg.runtime_device_policy_available,
+        .mtp_target_query_rows=cfg.mtp_enabled?cfg.mtp_target_query_rows:0,
+        .generation_request_capacity=cfg.generation_request_capacity,
+    };
+    if(cfg.weight_residency.selectsRoutedExperts() ||
+        cfg.execution_role==DeviceExecutionMemoryRole::RoutedExpertParticipant)
+        geometry.compact_routed_expert_token_rows=cfg.serial_routed_expert_compact_rows>0?
+            cfg.serial_routed_expert_compact_rows:cfg.batch_size*cfg.activation_seq_len;
+    if(cfg.execution_role==DeviceExecutionMemoryRole::ContinuationGraph)
+        geometry.attention_kv_format=KVCacheMemoryEstimator::attentionExecutionFormat(cfg.kv_precision);
+    return cfg.execution_role==DeviceExecutionMemoryRole::ContinuationGraph?
+        WorkspaceMemoryEstimator::estimate(profile,geometry):
+        WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile,geometry);
+}
+}
+/** @test One canonical eight-root bundle covers ordinary and retained CPU rows, once per concurrent owner. */
+TEST(Test__MemoryPlanner, OrdinaryCPUGroupedRootsUseExactDeclarationAndOwnerMultiplicity)
+{
+    const auto profile=createMoEOverlayProfile(); // F=64 exceeds D=32.
+    for(const auto device:{DeviceId::cpu(),DeviceId{DeviceType::CPU,1}})
+    for(const bool retained:{false,true})
+    for(const int degree:{1,2})
+    for(const size_t owners:{1u,3u})
+    {
+        auto cfg=overlayDeviceConfig(device);cfg.batch_size=2;cfg.activation_seq_len=3;
+        cfg.mtp_enabled=retained;cfg.mtp_target_query_rows=17;cfg.total_shards=degree;
+        cfg.concurrent_workspace_owners=owners;
+        const size_t rows=retained?17u:6u; // Target rows are already flattened.
+        const auto expected=CPUGroupedMoEStorageLayout::declare(rows,profile.d_model,
+            profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,device);
+        const auto planned=MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes();
+        EXPECT_EQ(planned,(ordinaryCPUNamedWorkspace(profile,cfg)+expected.physicalBytes())*owners)
+            << "device="<<device.to_string()<<" retained="<<retained<<" degree="<<degree<<" owners="<<owners;
+    }
+}
+/** @test Retained local endpoints retain original compact rows and model top-k, without flattening K twice. */
+TEST(Test__MemoryPlanner, RetainedNonserialCPUGroupedRootsPreserveCompactRowsAndModelTopK)
+{
+    const auto profile=createMoEOverlayProfile();auto cfg=overlayDeviceConfig(DeviceId{DeviceType::CPU,1});
+    cfg.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    cfg.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{2,2});
+    cfg.batch_size=2;cfg.activation_seq_len=3;cfg.serial_routed_expert_compact_rows=11;
+    cfg.mtp_enabled=true;cfg.mtp_target_query_rows=7;
+    const auto grouped=CPUGroupedMoEStorageLayout::declare(11,profile.d_model,
+        profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,cfg.device);
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+grouped.physicalBytes());
+}
+/** @test A PP interval without a routed graph stage must not acquire grouped roots from global model metadata. */
+TEST(Test__MemoryPlanner, CPUGroupedRootsRespectActualRoutedLayerInventory)
+{
+    auto profile=createMoEOverlayProfile();
+    std::erase_if(profile.tensors,[](const auto &tensor){return tensor.layer_index==1 &&
+        (tensor.name.ends_with(".ffn_gate_exps.weight") || tensor.name.ends_with(".ffn_up_exps.weight") ||
+         tensor.name.ends_with(".ffn_down_exps.weight"));});
+    for(const int layer:{0,1})
+    {
+        auto cfg=overlayDeviceConfig(DeviceId::cpu());cfg.first_layer=cfg.last_layer=layer;
+        const auto grouped=CPUGroupedMoEStorageLayout::declare(size_t(cfg.activation_seq_len),profile.d_model,
+            profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,cfg.device);
+        EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+            ordinaryCPUNamedWorkspace(profile,cfg)+(layer==0?grouped.physicalBytes():0u))<<"PP layer="<<layer;
+    }
+}
+/** @test An existing immutable serial envelope owns the bundle; ordinary admission must not add another copy. */
+TEST(Test__MemoryPlanner, DeclaredCPUSerialBundleHasNoOrdinaryDuplicate)
+{
+    const auto profile=createMoEOverlayProfile();auto cfg=overlayDeviceConfig(DeviceId::cpu());
+    cfg.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    cfg.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{2,2});
+    cfg.routed_expert_compact_buffer_lifetime=RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+    cfg.serial_routed_expert_participant_count=2;cfg.serial_routed_expert_compact_rows=11;
+    declareCPUSerialFixture(cfg,profile);
+    const auto grouped=cfg.cpu_serial_expert_storage->envelope->admitted()->workspaceBytes();
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+grouped*2u);
+    // A real retained endpoint remains present at an initially empty epoch;
+    // topology identities, not current ownership, retain the serial bundle.
+    cfg.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{0,0});
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+grouped*2u);
+}
+
+/** @test Empty selected portable endpoints and dense-only serial continuations own no grouped stage. */
+TEST(Test__MemoryPlanner, CPUGroupedRootsFollowEndpointTopologyForSelectedZeroOwners)
+{
+    const auto profile=createMoEOverlayProfile();
+    for(const auto lifetime:{RoutedExpertCompactBufferLifetime::PerLayerGraphOwned,
+                             RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant})
+    {
+        auto cfg=overlayDeviceConfig(DeviceId{DeviceType::CPU,1});
+        cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,{0,0});
+        cfg.routed_expert_compact_buffer_lifetime=lifetime;
+        cfg.serial_routed_expert_participant_count=0;
+        ASSERT_EQ(cfg.cpu_serial_expert_storage,nullptr);
+        EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+            ordinaryCPUNamedWorkspace(profile,cfg));
+    }
+    // Per-layer endpoint masks are layer-local: positive ownership outside
+    // this PP interval cannot author an otherwise absent local stage.
+    auto cfg=overlayDeviceConfig(DeviceId::cpu());cfg.first_layer=cfg.last_layer=1;
+    cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+        profile.expert_count,{2,0});
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg));
+}
+
+/** @test Dormant predictor expert parents are absent; a retained terminal-owned predictor uses the same bundle. */
+TEST(Test__MemoryPlanner, CPUGroupedRootsRespectRetainedPredictorOwnership)
+{
+    auto profile=createMoEOverlayProfile();profile.mtp_layer_count=1;
+    // Ordinary Qwen metadata includes its predictor in n_layers. The only
+    // routed parent is the trailing predictor; the main PP interval is dense.
+    std::erase_if(profile.tensors,[](const auto &tensor){return tensor.layer_index==0 &&
+        (tensor.name.ends_with(".ffn_gate_exps.weight") || tensor.name.ends_with(".ffn_up_exps.weight") ||
+         tensor.name.ends_with(".ffn_down_exps.weight"));});
+    for(const bool retained:{false,true})
+    {
+        auto cfg=overlayDeviceConfig(DeviceId::cpu());cfg.last_layer=0;
+        cfg.mtp_enabled=retained;cfg.mtp_target_query_rows=37;
+        const auto grouped=CPUGroupedMoEStorageLayout::declare(37,profile.d_model,
+            profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,cfg.device);
+        EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+            ordinaryCPUNamedWorkspace(profile,cfg)+(retained?grouped.physicalBytes():0u));
+    }
+}
+
+namespace
+{
+/** @brief Add canonical source-owned router matrices absent from the legacy expert-only metadata fixture. */
+ModelMemoryProfile cpuRouterPlanningProfile()
+{
+    auto profile=createMoEOverlayProfile();
+    for(int layer=0;layer<profile.n_layers;++layer)
+    {
+        TensorSizeInfo tensor; tensor.name="blk."+std::to_string(layer)+".ffn_gate_inp.weight";
+        tensor.layer_index=layer;tensor.K=profile.d_model;
+        tensor.elements=size_t(profile.expert_count)*size_t(profile.d_model);
+        tensor.quant_type="F32";tensor.native_bytes=tensor.elements*sizeof(float);
+        profile.total_native_bytes+=tensor.native_bytes;profile.tensors.push_back(std::move(tensor));
+    }
+    return profile;
+}
+}
+/** @test Router-only continuations own precisely one Q8 publication root even at zero selected experts. */
+TEST(Test__MemoryPlanner, CPUOnlyRouterPublicationUsesCanonicalPhysicalRoot)
+{
+    const auto profile=cpuRouterPlanningProfile();
+    for(const auto device:{DeviceId::cpu(),DeviceId{DeviceType::CPU,1}})
+    for(const bool retained:{false,true})
+    for(const size_t owners:{1u,2u})
+    {
+        auto cfg=overlayDeviceConfig(device);cfg.batch_size=2;cfg.activation_seq_len=3;
+        cfg.mtp_enabled=retained;cfg.mtp_target_query_rows=17;cfg.concurrent_workspace_owners=owners;
+        cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(profile.expert_count,{0,0});
+        const auto router=CPURouterQ8StorageLayout::declare(retained?17:6,profile.d_model,device);
+        EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+            (ordinaryCPUNamedWorkspace(profile,cfg)+router.physicalBytes())*owners);
+    }
+}
+/** @test Same-manager grouped storage supplies its router root exactly once. */
+TEST(Test__MemoryPlanner, CPUOrdinaryRouterCoalescesWithItsGroupedExpertBundle)
+{
+    const auto profile=cpuRouterPlanningProfile();auto cfg=overlayDeviceConfig(DeviceId::cpu());
+    const auto grouped=CPUGroupedMoEStorageLayout::declare(size_t(cfg.activation_seq_len),profile.d_model,
+        profile.expert_feed_forward_length,profile.expert_count,profile.expert_used_count,cfg.device);
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+grouped.physicalBytes());
+}
+/** @test A transported serial endpoint's kernel cannot provide a separate continuation router's backing. */
+TEST(Test__MemoryPlanner, CPUSerialEndpointDoesNotAliasContinuationRouterPublication)
+{
+    const auto profile=cpuRouterPlanningProfile();auto cfg=overlayDeviceConfig(DeviceId{DeviceType::CPU,1});
+    cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(profile.expert_count,{0,0});
+    cfg.routed_expert_compact_buffer_lifetime=RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+    cfg.serial_routed_expert_participant_count=2;cfg.serial_routed_expert_compact_rows=11;
+    declareCPUSerialFixture(cfg,profile);
+    const auto endpoint=cfg.cpu_serial_expert_storage->envelope->admitted()->workspaceBytes();
+    const auto router=CPURouterQ8StorageLayout::declare(size_t(cfg.activation_seq_len),profile.d_model,cfg.device);
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+endpoint*2u+router.physicalBytes());
+    cfg.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    cfg.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{0,0});
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),
+        ordinaryCPUNamedWorkspace(profile,cfg)+endpoint*2u);
+}
+/** @test A router outside the current PP interval cannot author a local root. */
+TEST(Test__MemoryPlanner, CPURouterPublicationRespectsActualGraphScope)
+{
+    auto profile=cpuRouterPlanningProfile();
+    std::erase_if(profile.tensors,[](const auto &tensor){return tensor.layer_index==1 &&
+        tensor.name.ends_with(".ffn_gate_inp.weight");});
+    auto cfg=overlayDeviceConfig(DeviceId::cpu());cfg.first_layer=cfg.last_layer=1;
+    cfg.weight_residency=DeviceWeightResidency::continuationWithSelectedRoutedExperts(profile.expert_count,{0,0});
+    EXPECT_EQ(MemoryPlanner::plan(profile,{cfg}).devices.front().workspace_bytes(),ordinaryCPUNamedWorkspace(profile,cfg));
+}
+
+/** @test Per-layer CPU packet BOM uses exactly the common four native roots for each layer. */
+TEST(Test__MemoryPlanner, CpuPerLayerPacketUsesExactIndependentRootDeclarations)
+{
+    const auto profile=createMoEOverlayProfile();
+    for(const auto device:{DeviceId::cpu(),DeviceId(DeviceType::CPU,1)})
+    for(const int batch:{1,2})
+    {
+        auto config=overlayDeviceConfig(device);
+        config.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+        config.batch_size=batch;config.activation_seq_len=3;
+        config.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,
+            std::vector<int>(static_cast<size_t>(profile.n_layers),2));
+        const auto layout=CPUCompactPacketStorageLayout::declare(size_t(batch)*3,
+            profile.d_model,profile.expert_used_count,device);
+        auto plan=MemoryPlanner::plan(profile,{config});
+        ASSERT_EQ(plan.devices.size(),1u);
+        EXPECT_EQ(plan.devices.front().activation_bytes(),layout.physicalBytes()*profile.n_layers);
+        config.weight_residency=DeviceWeightResidency::selectedRoutedExpertsOnly(profile.expert_count,{2,0});
+        plan=MemoryPlanner::plan(profile,{config});
+        EXPECT_EQ(plan.devices.front().activation_bytes(),layout.physicalBytes());
+    }
+}
+
+/** @brief Followers retain native main/publication parents without acquiring terminal helper owners. */
+TEST(Test__MemoryPlanner, MTPFollowerExecutableOwnershipPreservesRegistryGeometry)
+{
+    for (const int depth : {1, 3, 15})
+    for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+    for (const auto family : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+    for (std::size_t programs = 1; programs <= kSparseQueryExecutionProgramCount; ++programs)
+    {
+        MTPRuntimeConfig config;
+        config.enabled = true;
+        config.draft_tokens = depth;
+        config.graph_capacity_draft_tokens = depth;
+        config.max_request_batch = 2;
+        config.depth_policy.mode = mode;
+        config.depth_policy.max_depth = depth;
+        const MTPGraphOwnerPlan controller(config, family, MTPGenerationParentRole::Controller, programs);
+        const MTPGraphOwnerPlan follower(config, family, MTPGenerationParentRole::PipelineFollower, programs);
+        EXPECT_EQ(follower.parentRole(), MTPGenerationParentRole::PipelineFollower);
+        EXPECT_EQ(follower.verifierPreparationRegistryCapacity(), controller.verifierPreparationRegistryCapacity());
+        EXPECT_EQ(follower.draftPublicationRegistryCapacity(), controller.draftPublicationRegistryCapacity());
+        EXPECT_GT(follower.verifierPreparationRegistryCapacity(), 0u);
+        EXPECT_EQ(follower.sidecarGraphSlots(), 0u);
+        EXPECT_EQ(follower.terminalHiddenGraphSlots(), 0u);
+        EXPECT_EQ(follower.draftPublicationGraphSlots(), 0u);
+        EXPECT_EQ(follower.verifierPreparationGraphSlots(), 0u);
+        EXPECT_EQ(follower.samplerHelperGraphSlots(), 0u);
+        EXPECT_EQ(follower.boundedHelperExecutableSlotCount(), 0u);
+        EXPECT_EQ(follower.auxiliaryExecutableSlotCount(), follower.generationParentGraphSlots() +
+            follower.speculativePublicationGraphSlots());
+        EXPECT_EQ(follower.generalAuxiliaryExecutableSlotCount(), follower.auxiliaryExecutableSlotCount());
+        EXPECT_GT(follower.generationParentGraphSlots(), 0u);
+        EXPECT_EQ(follower.speculativePublicationGraphSlots(), controller.speculativePublicationGraphSlots());
     }
 }

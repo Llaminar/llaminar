@@ -17,6 +17,8 @@
  * before it exceeds @c max_graph_activation_rows.  This runner refuses to
  * resize a captured/manual-boundary graph's storage at execution time, keeping
  * graph identity and memory admission authoritative.
+ * CPU serial storage declarations survive admission and runtime projection.
+ * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
 #include "MoEOverlayParticipantGraphRunner.h"
@@ -1526,6 +1528,18 @@ namespace llaminar2
             arena_config.routing_top_k = routing_top_k;
             if (participant->device.is_cpu())
             {
+                const auto manager=config_.model_context->concreteWeightManager();
+                const auto memory=manager?manager->physicalMemoryAuthority():nullptr;
+                if(!memory) throw std::logic_error("CPU follower serial roots require the existing model PMA");
+                const auto &admission=requireCPUSerialExpertStorageAdmission(config_.cpu_serial_expert_storage,
+                    {memory->worldRank(),participant->device},participant->participant_id,participant->device);
+                arena_config.cpu_storage_layout=admission.envelope->project(config_.prefill_graph_row_capacity,
+                    config_.max_decode_activation_rows,config_.prefill_graph_row_shapes);
+                arena_config.row_capacity=arena_config.cpu_storage_layout->maximumRows();
+                arena_config.row_capacity_buckets.clear();
+                for(const auto &family:arena_config.cpu_storage_layout->families())
+                    arena_config.row_capacity_buckets.push_back(family.rows);
+                arena_config.physical_memory_authority=memory;
                 arena_config.cpu_canonical_route_storage =
                     MoELocalExpertSerialBufferArena::
                         CPUCanonicalRouteStoragePolicy::RetainSerialMaximum;
@@ -2681,6 +2695,8 @@ namespace llaminar2
                     local_params.overlay_participant_residency =
                         participant_residency;
                     local_params.prepared_store = prepared_store_.get();
+                    local_params.physical_memory_authority = prepared_store_
+                        ? prepared_store_->physicalMemoryAuthority() : nullptr;
                     local_params.expert_registry = &registry;
                     local_params.runtime_participant_index =
                         endpoint->participant_id;
@@ -3701,6 +3717,8 @@ namespace llaminar2
                             layer, target, num_experts);
                     local_params.prepared_store =
                         prepared_store_.get();
+                    local_params.physical_memory_authority = prepared_store_
+                        ? prepared_store_->physicalMemoryAuthority() : nullptr;
                     local_params.expert_registry = &registry;
                     local_params.runtime_participant_index =
                         target;

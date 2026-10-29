@@ -10,6 +10,8 @@
  * real descriptor broadcasts, and fatal read errors before any payload exists.
  * The actual distributed runner must preserve these errors through admission
  * and teardown; the device-free reader Unit cannot certify that MPI boundary.
+ * Sender-wire preparation authenticates malformed rank-local requests before
+ * table payload collectives, using the same exact readiness agreement.
  * Overlay BOM construction also runs inside a readiness phase: malformed
  * capture policy on one rank must prevent every peer entering budget exchange.
  *
@@ -21,6 +23,9 @@
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/ImmutableRowTableAdmissionWire.h"
+#include <array>
+#include <optional>
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "utils/MPIContext.h"
@@ -329,4 +334,56 @@ namespace llaminar2::test
         }
     }
 
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+/**
+ * @test One malformed sender fails both input phases before any wire payload exchange.
+ *
+ * The real production frame factory throws only on rank1. Both peers vote the
+ * failure and enter the next aligned terminal phase, proving no peer was left
+ * inside an unmatched table allgather. No model or physical backing is created.
+ */
+TEST(Test__RankInitializationLifecycleMPI, MalformedTableSenderFailsBeforePayloadCollective)
+{
+    const int rank = requireTwoRanks();
+    ASSERT_GE(rank, 0);
+    for (const char *phase : {"overlay-candidate.fixed-head-inputs", "overlay.final-ngram-local-inputs"})
+    {
+        const PhysicalMemoryResource host{rank, DeviceId::cpu(), 1u << 20, 1u << 20};
+        const std::array consumers{host};
+        auto input = ImmutableRowTablePlacementInput::forConsumers(
+            ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0), 32, 32),
+            host, consumers, ImmutableRowTableHostPlacement::onNode(0));
+        ImmutableRowTableAdmissionRequest request{{ImmutableRowStoragePreference::Automatic},
+            std::move(input), {PhysicalMemoryPlan{}, PhysicalMemoryPlan{}, PhysicalMemoryPlan{}}};
+        std::vector<ImmutableRowTableAdmissionRequest> local{request};
+        if (rank == 1) local.push_back(request); // Illegal second rank authority.
+        std::optional<ImmutableRowTableAdmissionSendFrame> frame;
+        const auto result = RankInitializationLifecycle::execute({61, phase}, [&]
+        {
+            frame.emplace(ImmutableRowTableAdmissionSendFrame::prepare(local, rank));
+            return true;
+        }, reachConsensus);
+        EXPECT_FALSE(result.succeeded());
+        EXPECT_EQ(result.status, rank == 1
+            ? RankInitializationPhaseStatus::LocalStepThrewException
+            : RankInitializationPhaseStatus::PeerStepFailed);
+        int entered = 0;
+        if (result.succeeded())
+        {
+            entered = 1;
+            const int bytes = frame->byteCount();
+            std::array<int, 2> lengths{};
+            ASSERT_EQ(MPI_Allgather(&bytes, 1, MPI_INT, lengths.data(), 1, MPI_INT, MPI_COMM_WORLD), MPI_SUCCESS);
+        }
+        int total_entered = -1;
+        ASSERT_EQ(MPI_Allreduce(&entered, &total_entered, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD), MPI_SUCCESS);
+        EXPECT_EQ(total_entered, 0);
+        const auto terminal = RankInitializationLifecycle::execute(
+            {62, "overlay.table-wire-failure-terminal"}, [] { return true; }, reachConsensus);
+        EXPECT_TRUE(terminal.succeeded());
+    }
+}
 } // namespace llaminar2::test

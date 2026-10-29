@@ -3,7 +3,7 @@
  * @brief Regression tests for CPU TP barrier-synchronized collectives
  *
  * These tests verify that LocalTPContext correctly handles multi-device CPU TP
- * (HOST backend) with barrier-synchronized allreduce and allgather. They are
+ * (HOST backend) with barrier sums and explicit indexed byte gathers. They are
  * regression tests for three bugs discovered during CPU TP bringup:
  *
  * Bug 1: allreduce() with HOST backend fell through to GPU paths that called
@@ -21,6 +21,8 @@
 
 #include <gtest/gtest.h>
 #include <thread>
+#include <array>
+#include <span>
 #include <atomic>
 #include <chrono>
 #include <vector>
@@ -152,60 +154,37 @@ TEST_F(Test__LocalTPContext_CpuBarrier, TwoCpuDevicesAllreduceCorrectSum)
 }
 
 // =============================================================================
-// Bug 3 Regression: allgather must not deadlock (unique_lock)
+// Indexed host allgather retains the deadlock regression and fixes actual
+// participant ordering plus publication into every output, not only the last.
 // =============================================================================
 
-/**
- * @test Two CPU devices allgather completes without deadlock.
- *
- * Regression for: allgather() used lock_guard on mutex_, which cannot be
- * unlocked before entering the barrier. All threads blocked waiting to acquire
- * mutex_ that only the first thread held → deadlock.
- * Fix: Changed to unique_lock with explicit lock.unlock() before barrier entry.
- *
- * This test has a 10-second timeout to detect deadlocks.
- */
+/** @test Explicit participant order and both outputs survive the former CPU barrier defect. */
 TEST_F(Test__LocalTPContext_CpuBarrier, TwoCpuDevicesAllgatherDoesNotDeadlock)
 {
-    auto ctx = createLocalTPContext(
-        {cpu0_, cpu1_}, {0.5f, 0.5f}, CollectiveBackendType::HOST);
+    auto ctx = createLocalTPContext({cpu0_, cpu1_}, {0.5f, 0.5f}, CollectiveBackendType::HOST);
     ASSERT_NE(ctx, nullptr);
-
-    const size_t shard_size = 128;
+    constexpr size_t shard_size = 128;
     auto shard0 = TestTensorFactory::createFP32({shard_size});
     auto shard1 = TestTensorFactory::createFP32({shard_size});
     auto global0 = TestTensorFactory::createFP32({shard_size * 2});
     auto global1 = TestTensorFactory::createFP32({shard_size * 2});
-
-    for (size_t i = 0; i < shard_size; ++i)
-    {
-        shard0->mutable_data()[i] = 1.0f;
-        shard1->mutable_data()[i] = 2.0f;
-    }
-
-    std::atomic<bool> success0{false};
-    std::atomic<bool> success1{false};
-    std::atomic<bool> finished{false};
-
-    std::thread t0([&]()
-                   { success0 = ctx->allgather(shard0.get(), global0.get()); });
-
-    std::thread t1([&]()
-                   { success1 = ctx->allgather(shard1.get(), global1.get()); });
-
-    // Deadlock detection: join with timeout
-    std::thread watchdog([&]()
-                         {
-        t0.join();
-        t1.join();
-        finished.store(true); });
-
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    watchdog.join();
-
-    ASSERT_TRUE(finished.load()) << "allgather deadlocked (did not complete within 10s)";
-    EXPECT_TRUE(success0.load()) << "Thread 0 allgather failed";
-    EXPECT_TRUE(success1.load()) << "Thread 1 allgather failed";
+    std::fill_n(shard0->mutable_data(), shard_size, 1.0f);
+    std::fill_n(shard1->mutable_data(), shard_size, 2.0f);
+    std::array<bool, 2> ok{};
+    std::jthread second([&] { ok[1] = ctx->allgatherHostIndexed(
+        std::as_bytes(std::span(shard1->data(), shard_size)),
+        std::as_writable_bytes(std::span(global1->mutable_data(), shard_size * 2)), 1, "cpu_gather"); });
+    std::jthread first([&] { ok[0] = ctx->allgatherHostIndexed(
+        std::as_bytes(std::span(shard0->data(), shard_size)),
+        std::as_writable_bytes(std::span(global0->mutable_data(), shard_size * 2)), 0, "cpu_gather"); });
+    first.join();second.join();
+    ASSERT_TRUE(ok[0]);ASSERT_TRUE(ok[1]);
+    for (const auto *output : {global0.get(), global1.get()})
+        for (size_t i = 0; i < shard_size; ++i)
+        {
+            EXPECT_EQ(output->data()[i], 1.0f);
+            EXPECT_EQ(output->data()[shard_size + i], 2.0f);
+        }
 }
 
 // =============================================================================

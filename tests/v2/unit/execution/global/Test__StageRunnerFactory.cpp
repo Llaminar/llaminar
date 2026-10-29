@@ -29,6 +29,7 @@
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/TensorClasses.h"
 #include "mocks/MockModelContext.h"
+#include "utils/CPUFactoryTestAdmission.h"
 
 namespace llaminar2::test
 {
@@ -76,6 +77,8 @@ namespace llaminar2::test
         ctx.runtime.max_seq_len = 128;
         ctx.runtime.batch_size = 1;
         ctx.prepared_weight_store = std::make_shared<PreparedWeightStore>();
+        ctx.test_runner_overrides = cpuFactoryTestAdmission(
+            ctx.model_ctx,ctx.runtime.batch_size,ctx.runtime.max_seq_len);
         ctx.domain_registry = registry;
         return ctx;
     }

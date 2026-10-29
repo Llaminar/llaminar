@@ -63,6 +63,10 @@ namespace llaminar2
                 std::to_string(action.stage_id) + ")");
         }
 
+        if (ctx.test_runner_overrides.test_graph_allocation_admission &&
+            std::dynamic_pointer_cast<ModelContext>(ctx.model_ctx))
+            throw std::invalid_argument("Concrete stage model cannot accept test graph allocation admission");
+
         const FactoryPPStageConfig pp_cfg = makePPStageConfig(action);
 
         if (action.is_global_tp)
@@ -129,7 +133,7 @@ namespace llaminar2
         }
         else
         {
-            runner = createTestableInferenceRunner(ctx.model_ctx, device, runner_cfg);
+            runner = createTestableInferenceRunner(ctx.model_ctx, device, runner_cfg, ctx.test_runner_overrides);
         }
         if (!runner)
         {
@@ -192,6 +196,7 @@ namespace llaminar2
         ro_config.backend = action.backend;
         ro_config.nested_pp_stage_config = pp_cfg;
         ro_config.prepared_weight_store = weight_context->prepared_store;
+        ro_config.test_runner_overrides = ctx.test_runner_overrides;
 
         auto rank_runner = createRankOrchestrator(
             ctx.model_ctx,
@@ -277,7 +282,7 @@ namespace llaminar2
         }
         else
         {
-            runner = createTestableInferenceRunner(ctx.model_ctx, device, runner_cfg);
+            runner = createTestableInferenceRunner(ctx.model_ctx, device, runner_cfg, ctx.test_runner_overrides);
         }
         if (!runner)
         {

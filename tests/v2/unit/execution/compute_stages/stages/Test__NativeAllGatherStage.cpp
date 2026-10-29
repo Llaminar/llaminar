@@ -6,7 +6,9 @@
  * host storage as executable GPU data. Mock-backed allocation tests exercise
  * ordinary storage preparation and immutable seals without native enqueue. Native capture/replay and publication
  * are proved separately by the CUDA/ROCm integration registrations.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "../../../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/NativeAllGatherStage.h"
 #include "execution/compute_stages/stages/NativeVocabularyAllGatherStage.h"
@@ -613,7 +615,7 @@ struct ReceiptController {
     CountStorageBackend backend{DeviceType::ROCm};
     test::MockMPIContext mpi;
     TensorFactory factory{mpi};
-    BufferArena arena{ArenaConfig{.factory=&factory}};
+    BufferArena arena{::llaminar2::test::cpuArenaFixtureConfig(&factory)};
     /** @brief Ordinary setup allocation and publication, without native startup. */
     explicit ReceiptController(DeviceId device,void *stream) {
         if(!arena.registerBuffer(BufferId::MTP_GENERATION_CONTROL,2,sampling_math::kDeviceGenerationControlCount,"INT32",DeviceId::cpu()) ||

@@ -8,6 +8,7 @@
  */
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/AlignedVector.h"
 #include <gtest/gtest.h>
 #include <limits>
 
@@ -18,7 +19,9 @@ TEST(CPUWeightPreparationMemory, FloatingNativeBytesNeedNoPackingShadow)
     for (const auto format : {"F16", "BF16", "F32"})
     {
         const auto demand = CPUWeightPreparationMemory::sourceNative(format, 65, 259);
-        EXPECT_EQ(demand.persistent_bytes, 65u * 259u * (std::string_view(format) == "F32" ? 4 : 2));
+        const size_t payload=65u*259u*(std::string_view(format)=="F32"?4:2);
+        EXPECT_EQ(demand.persistent_payload_bytes,payload);
+        EXPECT_EQ(demand.persistent_bytes,AlignedVector<uint8_t>::requiredAllocationBytes(payload));
         EXPECT_EQ(demand.temporary_bytes, 0u);
     }
 }
@@ -31,18 +34,22 @@ TEST(CPUWeightPreparationMemory, EveryNativeCodebookHasPaddedAllocationGeometry)
         const auto full = CPUWeightPreparationMemory::sourceNative(format.quant_type, 64, 256);
         const auto tail = CPUWeightPreparationMemory::sourceNative(format.quant_type, 65, 256);
         EXPECT_GT(full.persistent_bytes, 0u);
-        EXPECT_EQ(tail.persistent_bytes, 2 * full.persistent_bytes);
+        EXPECT_EQ(tail.persistent_payload_bytes,2*full.persistent_payload_bytes);
+        EXPECT_EQ(full.persistent_bytes,AlignedVector<uint8_t>::requiredAllocationBytes(full.persistent_payload_bytes));
+        EXPECT_EQ(tail.persistent_bytes,AlignedVector<uint8_t>::requiredAllocationBytes(tail.persistent_payload_bytes));
         EXPECT_EQ(tail.temporary_bytes, 2 * full.temporary_bytes);
     }
 }
 
-TEST(CPUWeightPreparationMemory, DistinguishesNibbleOracleFromConsumedCacheFootprint)
+TEST(CPUWeightPreparationMemory, NibbleSetupPayloadsRetireBeforePublication)
 {
     const auto q4 = CPUWeightPreparationMemory::sourceNative("Q4_0", 64, 32);
-    EXPECT_EQ(q4.persistent_bytes, 1280u + 64u * 16u);
-    EXPECT_EQ(q4.temporary_bytes, 64u * (16u + 8u));
+    EXPECT_EQ(q4.persistent_bytes,1280u);
+    EXPECT_EQ(q4.persistent_payload_bytes,1280u);
+    EXPECT_EQ(q4.temporary_bytes,64u*(2u*16u+8u));
     const auto q6 = CPUWeightPreparationMemory::sourceNative("Q6_K", 64, 256);
-    EXPECT_EQ(q6.persistent_bytes, 8u * 1792u);
+    EXPECT_EQ(q6.persistent_payload_bytes,8u*1792u);
+    EXPECT_EQ(q6.persistent_bytes,AlignedVector<uint8_t>::requiredAllocationBytes(8u*1792u));
     EXPECT_EQ(q6.temporary_bytes, 8u * 64u * (24u + 4u));
     EXPECT_EQ(CPUWeightPreparationMemory::sourceNative("IQ2_S", 64, 256).temporary_bytes, 0u);
 }

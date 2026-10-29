@@ -240,8 +240,16 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
         c.queryRows>0 && c.requests==rows.requests() && c.queryRows==rows.physicalRows() &&
         requests.size()==std::size_t(rows.requests()) && p.hidden>0 && p.tokenCapacity==c.cache->max_seq_len(),
         "QSA graph requires exact canonical request geometry, native cache and admitted arena views");
-    require(c.kvHeads==c.cache->local_n_kv_heads() && c.kvHeadStart==c.cache->kv_head_start(),
-        "QSA graph native KV shard does not match its declared cache authority");
+    if(c.kvHeads!=c.cache->local_n_kv_heads() || c.kvHeadStart!=c.cache->kv_head_start())
+        throw std::invalid_argument("QSA graph native KV shard does not match its declared cache authority: device="+
+            c.device.to_string()+" model_layer="+std::to_string(c.modelLayer)+" cache_layer="+std::to_string(c.cacheLayer)+
+            " query_heads="+std::to_string(c.queryHeads)+" query_head_start="+std::to_string(c.queryHeadStart)+
+            " declared_kv_heads="+std::to_string(c.kvHeads)+" declared_kv_head_start="+std::to_string(c.kvHeadStart)+
+            " cache_local_kv_heads="+std::to_string(c.cache->local_n_kv_heads())+
+            " cache_kv_head_start="+std::to_string(c.cache->kv_head_start())+
+            " cache_global_kv_heads="+std::to_string(c.cache->n_kv_heads())+
+            " cache_sharded="+std::to_string(c.cache->is_sharded())+
+            " cache_layout="+std::to_string(static_cast<int>(c.cache->kv_layout())));
     require(p.projectionArithmetic==Qwen4ExpProjectionArithmetic::Ordinary ||
         p.projectionArithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,"QSA projection arithmetic policy is invalid");
     if(p.projectionRows)require(rows.requests()==1 && p.projectionRows->physicalRows()==c.queryRows &&

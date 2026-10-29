@@ -6,6 +6,13 @@
  *
  * Encapsulates runtime parameters that affect inference behavior but are not
  * part of the model architecture (which comes from GGUF metadata).
+ *
+ * Typed MoE maintenance policy is a complete value identity: defaulted equality
+ * includes every scheduling, capacity, ownership and explicit optional setting.
+ * Admission observers compare the original request with resolved configuration
+ * and execution-plan publication through that identity; normalization must not
+ * silently substitute a different maintenance mode or erase an explicit value.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #pragma once
@@ -41,6 +48,7 @@
 
 namespace llaminar2
 {
+    struct CPUSerialExpertStorageAdmission;
     class ResolvedImmutableRowTablePlacement;
 
 
@@ -2101,6 +2109,9 @@ namespace llaminar2
          */
         int device_initial_maintenance_period_tokens = -1;
         bool release_raw_expert_weights = false;
+
+        /** @brief Exact policy identity, including explicit optional scheduling values. */
+        bool operator==(const MoERebalanceRuntimeConfig &) const = default;
     };
 
     /**
@@ -2180,6 +2191,8 @@ namespace llaminar2
          * distributed.
          */
         OverlayPrefillScheduleContract overlay_prefill_schedule;
+        /// Exact frozen CPU endpoint/worker root declarations retained with admission.
+        std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
 
         /// Maximum active request batch size for runner-owned state.
         int batch_size = 1;

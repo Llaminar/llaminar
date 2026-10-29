@@ -1730,6 +1730,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/config/HybridPrecisionConfig.cpp
     execution/config/InferenceMode.cpp
     execution/local_execution/device/DeviceWorkspaceManager.cpp
+    execution/local_execution/device/WorkspaceDescriptor.cpp
     execution/local_execution/device/WorkspaceAllocator.cpp
     # Unified transfer engine (explicit coherence state machine + centralized data movement)
     transfer/TransferEngine.cpp
@@ -2059,6 +2060,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     memory/NUMAAllocator.cpp
     # Buffer harmonization (Phase 1: BufferArena + CoherenceTracker)
     memory/BufferArena.cpp
+    memory/CPUTensorStorageDeclaration.cpp
+    memory/CPUGroupedMoEStorageBacking.cpp
+    memory/GraphArenaStorageLayout.cpp
     memory/CoherenceTracker.cpp
     # LOCAL tensor parallelism (Phase 4: multi-device within single MPI rank)
     collective/LocalTPContext.cpp

@@ -8,6 +8,7 @@
  * Qwen-family graph builders (Qwen2, Qwen3, Qwen3.5).
  * Contains shared infrastructure: forward graph construction, FFN,
  * embedding, LM head, TP/PP support, arena management.
+ * Arena MTP target rows follow retained admission independently of execution policy.
  */
 
 #include "QwenGraphBase.h"
@@ -860,7 +861,7 @@ namespace llaminar2
         IKVCache *kv_cache,
         DeviceId device) const
     {
-        if (!kv_cache || !device.is_gpu())
+        if (!kv_cache || (!device.is_gpu() && !device.is_cpu()))
             return false;
         if (!config_.dense_tp_enabled ||
             !config_.dense_tp_decode_replicated ||
@@ -892,7 +893,9 @@ namespace llaminar2
         if (!mtp_kv_cache_only_graph_active_ &&
             (useReplicatedAttentionStateWeights() || useDecodeReplicatedDenseWeights()))
             return false;
-        if (total_tokens <= 1)
+        // Explicit one-row Prefill is still sharded. Decode's replicated
+        // projection was excluded above by its actual typed graph scope.
+        if (total_tokens <= 0)
             return false;
         if (config_.n_kv_heads <= 0 ||
             config_.head_dim <= 0 ||
@@ -3991,8 +3994,18 @@ namespace llaminar2
         if (config.local_vocab <= 0)
             config.local_vocab = config_.vocab_size;
 
+        // Arena storage follows admitted retained capacity. Disabled execution
+        // with no retained family owns only the schema's single-row placeholder;
+        // its configured execution-depth policy cannot create live MTP capacity.
+        const int mtp_storage_target_rows = std::max(1, resolveMTPRetainedTargetQueryRows(config_.mtp));
         config.custom_formulas["mtp_target_query_rows"] =
-            static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp));
+            static_cast<size_t>(mtp_storage_target_rows);
+        // Ordinary request-batched prefill selects one terminal row per
+        // admitted request even with no speculative graph family. Share this
+        // compact input bank with verifier selection without enlarging MTP
+        // projection/state scratch or deriving capacity from execution depth.
+        config.custom_formulas["terminal_logit_row_capacity"] = static_cast<size_t>(
+            std::max(std::max(1, config_.max_request_count), mtp_storage_target_rows));
         /*
          * Grouped verification remains bounded by configured speculative depth,
          * while graph-integrated shifted prefill performs one KV-only MTP pass
@@ -4002,7 +4015,7 @@ namespace llaminar2
         config.custom_formulas["mtp_kv_prefill_rows"] =
             static_cast<size_t>(std::max(
                 std::max(1, seq_len),
-                resolveMTPMaxTargetQueryRows(config_.mtp)));
+                mtp_storage_target_rows));
 
         /*
          * Main prefill remains TP-sharded when only the compact MTP predictor
@@ -4048,7 +4061,7 @@ namespace llaminar2
          */
         const auto mtp_gather = MTPTerminalGatherGeometry::resolve(
             config_.mtpTerminalLogitsLayout(),
-            static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp)),
+            static_cast<size_t>(mtp_storage_target_rows),
             static_cast<size_t>(config_.vocab_size));
         config.custom_formulas["mtp_gather_rows"] = mtp_gather.rows();
         config.custom_formulas["mtp_gather_vocab"] = mtp_gather.columns();
@@ -4730,7 +4743,9 @@ namespace llaminar2
                     LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires a LocalTP context");
                     throw std::runtime_error("phase-split prefill KV handoff requires LocalTP context");
                 }
-                if (!local_tp->supportsRawAllgatherOnStreamGraphCapture())
+                if (device.is_cpu() && local_tp->backend() != CollectiveBackendType::HOST)
+                    throw std::runtime_error("phase-split CPU prefill KV handoff requires the declared HOST LocalTP domain");
+                if (device.is_gpu() && !local_tp->supportsRawAllgatherOnStreamGraphCapture())
                 {
                     LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires graph-capturable raw allgather");
                     throw std::runtime_error("phase-split prefill KV handoff requires graph-capturable raw allgather");

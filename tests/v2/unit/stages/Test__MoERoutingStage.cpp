@@ -20,6 +20,8 @@
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUStandaloneRouterTestAdmission.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 #include "../../utils/ObservedExpertDemandFixture.h"
 #include "utils/DebugEnv.h"
 
@@ -233,6 +235,7 @@ TEST_F(MoERoutingStageTest, PipelineStageRouteApplyUsesCompactRowsAndPreservesAl
             params.device_rebalance_config.num_layers = geometry == 1 ? 3u : 2u;
             params.device_rebalance_config.num_experts = geometry == 2 ? NUM_EXPERTS + 1u : NUM_EXPERTS;
             params.device_rebalance_config.top_k = geometry == 3 ? 1u : TOP_K;
+            admitCPUStandaloneRouterForTest(params);
             MoERoutingStage stage(params);
             RecordingStageRouteKernel kernel;
             stage.setMoEKernelForTesting(&kernel);
@@ -283,6 +286,8 @@ TEST_F(MoERoutingStageTest, BasicRouting)
     params.top_k = TOP_K;
     params.norm_topk_prob = true;
     params.layer_idx = 0;
+
+    admitCPUStandaloneRouterForTest(params);
 
     MoERoutingStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -364,6 +369,8 @@ TEST_F(MoERoutingStageTest, CPUGroupedRoutingEvidenceExcludesPhysicalSuffix)
     params.host_logical_row_count = kLogicalRows;
     params.host_routing_source = ExpertHistogramSource::PrefillChunk;
 
+    admitCPUStandaloneRouterForTest(params);
+
     MoERoutingStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
@@ -430,6 +437,7 @@ TEST_F(MoERoutingStageTest, CPUGroupedRoutingEvidenceRequiresLogicalGeometry)
     params.decode_histogram = &histogram;
 
     params.host_routing_source = ExpertHistogramSource::PrefillChunk;
+    admitCPUStandaloneRouterForTest(params);
     MoERoutingStage stage(params);
     EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
     EXPECT_EQ(histogram.windowTokenCount(), 0u);
@@ -455,6 +463,8 @@ TEST_F(MoERoutingStageTest, SingleToken)
     params.top_k = TOP_K;
     params.norm_topk_prob = true;
     params.layer_idx = 0;
+
+    admitCPUStandaloneRouterForTest(params);
 
     MoERoutingStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -510,6 +520,8 @@ TEST_F(MoERoutingStageTest, GPUWorkspaceRowsCoverConcreteAndFamilyEnvelope)
         params.d_model = kModelWidth;
         params.num_experts = kExperts;
         params.top_k = 8;
+
+        admitCPUStandaloneRouterForTest(params);
 
         MoERoutingStage stage(params);
 
@@ -576,6 +588,8 @@ TEST_F(MoERoutingStageTest, CPUVerifierTwoRowsMatchSplitDecodeRoutes)
         params.top_k = top_k;
         params.norm_topk_prob = true;
         params.layer_idx = 0;
+
+        admitCPUStandaloneRouterForTest(params);
 
         MoERoutingStage stage(params);
         return stage.execute(cpu_ctx_.get());
@@ -648,6 +662,7 @@ TEST_F(MoERoutingStageTest, CPUDecodeEquivalentVerifierFlagSplitsRows)
 
     auto flagged_params = make_params(input.get(), flagged_indices.get(), flagged_weights.get(), seq);
     flagged_params.force_decode_equivalent_verifier_prefill = true;
+    admitCPUStandaloneRouterForTest(flagged_params);
     MoERoutingStage flagged_stage(flagged_params);
     ASSERT_TRUE(flagged_stage.execute(cpu_ctx_.get()));
 
@@ -660,7 +675,9 @@ TEST_F(MoERoutingStageTest, CPUDecodeEquivalentVerifierFlagSplitsRows)
                     d_model,
                     row_input.mutable_data());
 
-        MoERoutingStage row_stage(make_params(&row_input, &row_indices, &row_weights, 1));
+        auto row_params=make_params(&row_input,&row_indices,&row_weights,1);
+        admitCPUStandaloneRouterForTest(row_params);
+        MoERoutingStage row_stage(row_params);
         ASSERT_TRUE(row_stage.execute(cpu_ctx_.get())) << "row " << row;
         std::copy_n(row_indices.data(),
                     top_k,
@@ -730,6 +747,8 @@ TEST_F(MoERoutingStageTest, CPUGroupedVerifierEvidenceRetainsExecutedBatches)
         params.host_logical_row_count = rows;
         params.host_routing_source = ExpertHistogramSource::GroupedVerifier;
         params.force_decode_equivalent_verifier_prefill = true;
+
+        admitCPUStandaloneRouterForTest(params);
 
         MoERoutingStage stage(params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -801,6 +820,7 @@ TEST_F(MoERoutingStageTest, CPUGroupedVerifierEvidenceRejectsInvalidGeometry)
     params.host_logical_row_count = rows + 1;
     params.host_routing_source = ExpertHistogramSource::GroupedVerifier;
     params.force_decode_equivalent_verifier_prefill = true;
+    admitCPUStandaloneRouterForTest(params);
     MoERoutingStage stage(params);
     EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
     EXPECT_EQ(histogram.windowTokenCount(), 0u);
@@ -842,6 +862,7 @@ TEST_F(MoERoutingStageTest, CPUOneRowRoutingEvidenceHasExplicitPhase)
         params.decode_histogram = &histogram;
         EXPECT_THROW((void)MoERoutingStage(params), std::invalid_argument);
         params.host_routing_source = phase;
+        admitCPUStandaloneRouterForTest(params);
         MoERoutingStage stage(params);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
         const auto frozen = histogram.freezeAndRotateWindow();
@@ -867,6 +888,8 @@ TEST_F(MoERoutingStageTest, NullInputsReturnError)
     params.num_experts = NUM_EXPERTS;
     params.top_k = TOP_K;
 
+    admitCPUStandaloneRouterForTest(params);
+
     MoERoutingStage stage(params);
     EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
 }
@@ -883,6 +906,8 @@ TEST_F(MoERoutingStageTest, StageMetadata)
     params.d_model = D_MODEL;
     params.num_experts = NUM_EXPERTS;
     params.top_k = TOP_K;
+
+    admitCPUStandaloneRouterForTest(params);
 
     MoERoutingStage stage(params);
     EXPECT_EQ(stage.type(), ComputeStageType::MOE_ROUTER);
@@ -902,11 +927,14 @@ TEST_F(MoERoutingStageTest, GraphCapturableRejectsCPUAndPrefill)
     params.num_experts = NUM_EXPERTS;
     params.top_k = TOP_K;
 
+    admitCPUStandaloneRouterForTest(params);
+
     MoERoutingStage cpu_stage(params);
     EXPECT_FALSE(cpu_stage.isGraphCapturable());
 
     params.device_id = DeviceId::rocm(0);
     params.seq_len = SEQ_LEN;
+    admitCPUStandaloneRouterForTest(params);
     MoERoutingStage prefill_stage(params);
     EXPECT_FALSE(prefill_stage.isGraphCapturable());
 }
@@ -940,6 +968,8 @@ TEST_F(MoERoutingStageTest, GraphCapturableRejectsHistogramWithoutRuntimeTable)
     params.num_experts = NUM_EXPERTS;
     params.top_k = TOP_K;
     params.decode_histogram = &histogram;
+
+    admitCPUStandaloneRouterForTest(params);
 
     MoERoutingStage stage(params);
     EXPECT_FALSE(stage.isGraphCapturable());
@@ -981,6 +1011,8 @@ TEST_F(MoERoutingStageTest, GraphCapturableAllowsHistogramWithInitializedRuntime
     params.decode_histogram = &histogram;
     params.moe_runtime_table = &runtime_table;
 
+    admitCPUStandaloneRouterForTest(params);
+
     MoERoutingStage stage(params);
 #if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.isGraphCapturable());
@@ -1009,12 +1041,14 @@ TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsRuntimeTableFlags)
 
     {
         ScopedRocmMoEFlags flags(false, true);
+        admitCPUStandaloneRouterForTest(params);
         MoERoutingStage stage(params);
         EXPECT_FALSE(stage.isGraphCapturable());
     }
 
     {
         ScopedRocmMoEFlags flags(true, true);
+        admitCPUStandaloneRouterForTest(params);
         MoERoutingStage stage(params);
         EXPECT_FALSE(stage.isGraphCapturable());
 
@@ -1023,6 +1057,8 @@ TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsRuntimeTableFlags)
         ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
         params.layer_idx = 0;
         params.moe_runtime_table = &runtime_table;
+
+        admitCPUStandaloneRouterForTest(params);
 
         MoERoutingStage runtime_stage(params);
 #if defined(HAVE_ROCM)
@@ -1057,6 +1093,8 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
     params.layer_idx = 0;
     params.moe_runtime_table = &runtime_table;
 
+    admitCPUStandaloneRouterForTest(params);
+
     MoERoutingStage unprepared_stage(params);
     EXPECT_FALSE(unprepared_stage.isGraphCapturable());
 #if defined(HAVE_ROCM)
@@ -1067,6 +1105,8 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
 
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
     ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+    admitCPUStandaloneRouterForTest(params);
 
     MoERoutingStage prepared_stage(params);
 #if defined(HAVE_ROCM)
@@ -1101,6 +1141,8 @@ TEST_F(MoERoutingStageTest, OverlayTicketDecodeIsAColdCaptureContractWithoutRunt
     params.decode_route_publication =
         MoEDecodeRoutePublicationPolicy::FixedCapacityOverlayTicket;
 
+    admitCPUStandaloneRouterForTest(params);
+
     MoERoutingStage stage(params);
     EXPECT_EQ(stage.decodeRoutePublicationPolicyForTesting(),
               MoEDecodeRoutePublicationPolicy::FixedCapacityOverlayTicket);
@@ -1116,6 +1158,7 @@ TEST_F(MoERoutingStageTest, OverlayTicketDecodeIsAColdCaptureContractWithoutRunt
     MoERuntimeTable conflicting_runtime_table(
         DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
     params.moe_runtime_table = &conflicting_runtime_table;
+    admitCPUStandaloneRouterForTest(params);
     MoERoutingStage conflicting_authorities(params);
     EXPECT_FALSE(conflicting_authorities.supportsGraphCaptureAfterLaunchPreparation())
         << "A decode graph cannot publish through both a runtime table and a ticket";
@@ -1144,6 +1187,8 @@ TEST_F(MoERoutingStageTest, OutputDimensions)
     params.top_k = topk;
     params.norm_topk_prob = true;
     params.layer_idx = 0;
+
+    admitCPUStandaloneRouterForTest(params);
 
     MoERoutingStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -1213,6 +1258,8 @@ TEST_F(MoERoutingStageTest, CUDARoutingOutputsRemainDeviceCoherentWithWorkspace)
     params.norm_topk_prob = true;
     params.layer_idx = 0;
 
+	admitCPUStandaloneRouterForTest(params);
+
 	MoERoutingStage stage(params);
 	stage.setGPUStream(stream.stream);
 	auto reqs = stage.getWorkspaceRequirements(0, 0, 0);
@@ -1240,4 +1287,58 @@ TEST_F(MoERoutingStageTest, CUDARoutingOutputsRemainDeviceCoherentWithWorkspace)
     }
     EXPECT_TRUE(any_non_zero_index) << "Routing indices read back from CUDA remained all zero";
 #endif
+}
+
+
+/** @brief Router-only continuation owns its exact publication, never eight roots. */
+TEST_F(MoERoutingStageTest, CPUStandaloneRouterDeclarationClaimsOnlyPublicationAndReplays)
+{
+    constexpr int rows=3,d=33,experts=4,topk=2;
+    auto input=TestTensorFactory::createFP32Random({rows,d},-.25f,.25f,9001);
+    auto gate=TestTensorFactory::createFP32Random({experts,d},-.1f,.1f,9002);
+    auto indices=TestTensorFactory::createFP32({rows,topk});
+    auto weights=TestTensorFactory::createFP32({rows,topk});
+    MoERoutingStage::Params params;
+    params.device_id=DeviceId::cpu();params.seq_len=rows;params.d_model=d;
+    params.num_experts=experts;params.top_k=topk;params.input=input.get();
+    params.gate_weights=gate.get();params.output_indices=indices.get();params.output_weights=weights.get();
+    MoERoutingStage stage(params);
+    auto requirements=stage.getWorkspaceRequirements(rows);
+    ASSERT_TRUE(requirements.cpu_router_q8_storage);
+    EXPECT_FALSE(requirements.cpu_grouped_moe_storage);
+    EXPECT_TRUE(requirements.buffers.empty());
+    const auto declaration=CPURouterQ8StorageLayout::declare(rows,d,DeviceId::cpu());
+    EXPECT_EQ(*requirements.cpu_router_q8_storage,declaration);
+    CPUProjectionTestWorkspace workspace(requirements);
+    EXPECT_FALSE(workspace.get()->cpuGroupedMoEStorage());
+    const auto backing=workspace.get()->cpuRouterQ8Storage();
+    ASSERT_TRUE(backing);
+    EXPECT_EQ(backing->size(),size_t{rows}*2);
+    const auto *address=backing->data();
+    stage.bindWorkspace(workspace.get());
+    std::vector<float> expected_indices,expected_weights;
+    for(int replay=0;replay<3;++replay)
+    {
+        ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+        if(replay==0)
+        {
+            expected_indices.assign(indices->data(),indices->data()+rows*topk);
+            expected_weights.assign(weights->data(),weights->data()+rows*topk);
+        }
+        else
+        {
+            EXPECT_EQ(std::memcmp(expected_indices.data(),indices->data(),rows*topk*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(expected_weights.data(),weights->data(),rows*topk*sizeof(float)),0);
+        }
+        EXPECT_EQ(workspace.get()->cpuRouterQ8Storage()->data(),address);
+        stage.resetSessionStatePreservingCapturedReplay();
+        EXPECT_NO_THROW(stage.unbindWorkspace());
+        EXPECT_FALSE(stage.hasWorkspace());
+        EXPECT_NO_THROW(stage.bindWorkspace(nullptr));
+        EXPECT_FALSE(stage.hasWorkspace());
+        EXPECT_EQ(backing->data(),address);
+        stage.bindWorkspace(workspace.get());
+        EXPECT_TRUE(stage.hasWorkspace());
+    }
+    stage.unbindWorkspace();
 }

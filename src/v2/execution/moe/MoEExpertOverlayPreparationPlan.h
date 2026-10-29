@@ -10,6 +10,7 @@
 #pragma once
 
 #include "MoEExpertOverlayRuntimePlan.h"
+#include "MoEExpertOverlayGraphScope.h"
 #include "MoEExpertProjectionOwnership.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/WeightIdentity.h"
@@ -191,6 +192,16 @@ namespace llaminar2
          */
         MoEExpertOverlayPreparationPlan filteredForDevices(
             const std::vector<DeviceId> &devices) const;
+
+        /**
+         * @brief Retain exact logical graph participants before source loading or preparation.
+         * @param runtime Original immutable source authenticated by the scope.
+         * @param scope Shared source-bound domain/device/rank/index selection.
+         * @return Exact requests with rebuilt diagnostics; projection identity is unchanged.
+         * @throws std::invalid_argument For a scope belonging to another runtime.
+         */
+        MoEExpertOverlayPreparationPlan filteredForGraphScope(
+            const MoEExpertOverlayRuntimePlan &runtime, const MoEExpertOverlayGraphScope &scope) const;
 
         /** @return Whether this exact local expert projection is requested. */
         bool shouldPrepare(

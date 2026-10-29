@@ -14,6 +14,7 @@
 #include "models/qwen/QwenStandardGraph.h"
 #include "mocks/MockComputeStage.h"
 #include "tensors/Tensors.h"
+#include "utils/CPUOrchestratorTestAdmission.h"
 
 #include <algorithm>
 #include <memory>
@@ -101,7 +102,9 @@ namespace llaminar2::test
         {
             SCOPED_TRACE(head ? "CPU producer" : "CPU consumer");
             auto graph = std::make_shared<CPUPipelineRowProbe>(config);
-            DeviceGraphOrchestrator runner(graph, nullptr);
+            auto owner = DeviceGraphOrchestrator::createForTest(
+                cpuGraphStateFixtureDependencies(graph, nullptr, 1, 256, 256));
+            auto &runner = *owner;
             runner.setPPStageConfig({.first_layer = 0, .last_layer = 1,
                                      .has_embedding = head, .has_lm_head = !head});
             ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, 256, DeviceId::cpu()));

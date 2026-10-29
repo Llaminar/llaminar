@@ -20,8 +20,10 @@
  *
  * 5. **Policy-driven behaviour**: weight_coherence is gated by StageRunPolicy.
  *    fastDecode() disables it entirely.
+ * CPU arena roots use an explicit model-free fixture admission authority.
  */
 
+#include "../../../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -51,7 +53,7 @@ protected:
         cpu_ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
 
         // Set up a minimal arena so the executor takes the contract path
-        arena_ = std::make_unique<BufferArena>();
+        arena_ = std::make_unique<BufferArena>(::llaminar2::test::cpuArenaFixtureConfig());
         arena_->registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu());
         arena_->registerBuffer(BufferId::NORMALIZED, 4, 896, "FP32", DeviceId::cpu());
         arena_->registerBuffer(BufferId::Q_PROJ, 4, 896, "FP32", DeviceId::cpu());

@@ -3,10 +3,10 @@
  * @brief CPU source-native preparation demand contributed to physical admission.
  *
  * This is an allocation-shape description, not a capacity decision or a live
- * ledger. NativeVNNI's consumed cache footprint is smaller than its allocation
- * footprint for layouts retaining a scalar payload. Preparation also overlaps
- * final storage with format-specific temporary matrices. Callers contribute
- * both named demands to PhysicalMemoryAuthority before invoking the packer.
+ * ledger. The native packer retains only its final interleaved root; source
+ * payloads used to build it retire inside the synchronous preparation call.
+ * Allocator-rounded retained bytes and logical engine bytes are distinct.
+ * Callers contribute retained and setup-peak demands before preparation.
  */
 #pragma once
 
@@ -18,15 +18,17 @@ namespace llaminar2
     /** @brief Distinct lifetimes of final prepared weights and setup scratch. */
     struct CPUWeightPreparationMemory final
     {
-        size_t persistent_bytes; ///< Retained until the prepared engine retires.
-        size_t temporary_bytes;  ///< Retired when native preparation completes.
+        size_t persistent_bytes; ///< Exact local physical root, retained by actual backing.
+        size_t temporary_bytes;  ///< Exact simultaneous setup vectors, retired before synchronous return.
+        size_t persistent_payload_bytes; ///< Logical engine payload, excluding allocator rounding.
 
         /**
          * @brief Describe the canonical unrotated CPU expert preparation path.
          * @param format Exact native source name, including F32/F16/BF16.
          * @param n Complete matrix output rows before 64-column packing padding.
          * @param k Source-codebook-aligned inner dimension.
-         * @return Exact payload allocations, excluding caller-owned source bytes.
+         * @return Exact local retained allocation, setup peak and logical payload;
+         *         caller-owned source bytes are excluded.
          * @throws std::invalid_argument for unsupported formats or geometry.
          * @throws std::overflow_error for unrepresentable allocation geometry.
          *

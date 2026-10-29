@@ -7,6 +7,7 @@
  * mmap must produce the same values and preserve accepted histories. This
  * fixture intentionally includes an EOS and nonzero prior convolution rows.
  */
+#include "../../../utils/CPUPreparedStoreTestAdmission.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -110,6 +111,7 @@ struct Fixture
         std::memcpy(tokens.raw_mutable_data(),input.data(),sizeof(input));
         auto *p=static_cast<std::int32_t *>(prior.raw_mutable_data());p[0]=11;p[1]=13;
         *static_cast<int *>(live.raw_mutable_data())=rows;
+        test::admitCPUPreparedStoreForTest(store, {&keyW, &valueW});
         keyBinding=prepare(keyW,"ple_key.weight");valueBinding=prepare(valueW,"ple_value.weight");
     }
     /** @brief Preserve native prepared-store identity for both projection shapes. */

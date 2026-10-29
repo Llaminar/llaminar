@@ -11,6 +11,7 @@ from copy import deepcopy
 from contextlib import nullcontext
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -104,6 +105,29 @@ def write_e2e_bundle(root, pair=None):
         numerical = canary_report(pair['source']['revision'], pair['images'][isa]['id'], isa, approval['manifest_digest'])
         write_json(root / isa.lower() / 'kld/kld-canaries.json', numerical)
         receipt['model_kld_reports'][isa] = digest(numerical)
+    receipt.update(qfn_source_admission_required=True, qfn_source_admission_reports={})
+    for isa in suite.ISAS:
+        admission = {'schema': 1, 'complete': True, 'passed': True, 'all_resources_retired': True,
+                     'selected_cases': ['Source.CandidateSourceAdmission/Opaque'], 'selected': 1,
+                     'discovered': 1, 'hardware_ineligible': 0, 'unqualified': {},
+                     'attempted': 1, 'passed_cells': 1, 'failed_cells': 0, 'unexecuted_selected': 0,
+                     'inventory_digest': digest({'inventory': 'fixture'}), 'hardware_digest': digest({'hardware': 'fixture'}),
+                     'results': {'Source.CandidateSourceAdmission/Opaque': {
+                         'passed': True, 'retirement_proved': True, 'qualification': 'native-source-admission', 'contract': 'positive-source-admission'}}}
+        binding = {'schema': 1, 'source': pair['source'], 'cpu_isa': isa,
+                   'test_runner_image': 'companion-' + isa, 'runtime_image': pair['images'][isa]['id'],
+                   'report_digest': digest(admission), 'container_retired': True, 'prefix_cleanup_complete': True}
+        companion = inventory_image(pair['source'])
+        companion['labels']['org.llaminar.cpu_isa'] = isa
+        companion['id'] = binding['test_runner_image']
+        binding['test_runner_identity'] = companion
+        lane = root / isa.lower() / 'source-admission'
+        write_json(lane / 'admission/source-admission.json', admission)
+        driver_evidence = clean_driver_evidence(lane)
+        write_json(lane / 'source.driver-diagnostics.json', driver_evidence)
+        binding['driver_report_digest'] = digest(driver_evidence)
+        write_json(lane / 'image-binding.json', binding)
+        receipt['qfn_source_admission_reports'][isa] = digest(binding)
     write_json(root / "e2e-receipt.json", receipt)
     return manifest
 
@@ -978,6 +1002,13 @@ class PublishedImageSuiteTests(unittest.TestCase):
         jobs = workflow["jobs"]
         self.assertEqual(jobs["e2e"]["needs"], "source")
         self.assertEqual(jobs["benchmarks"]["needs"], "e2e")
+        for job, subcommand in (("e2e", "e2e"), ("benchmarks", "benchmarks")):
+            commands = [step["run"] for step in jobs[job]["steps"]
+                        if f"run_published_image_suite.py {subcommand} " in step.get("run", "")]
+            self.assertEqual(len(commands), 1)
+            tokens = shlex.split(commands[0].split("exec ", 1)[1].replace("\\\n", ""))
+            self.assertEqual(tokens.count("--qfn-source-admission"), 1)
+
         self.assertEqual(jobs["e2e"]["concurrency"]["group"], "llaminar-develop-image-gate")
         self.assertEqual(jobs["benchmarks"]["concurrency"]["group"], "llaminar-develop-image-gate")
         self.assertEqual(jobs["benchmarks"]["permissions"]["pull-requests"], "write")

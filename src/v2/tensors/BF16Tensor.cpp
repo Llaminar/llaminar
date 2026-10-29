@@ -2,6 +2,9 @@
  * @file BF16Tensor.cpp
  * @brief BF16 tensor implementation (Brain Float 16)
  * @author David Sanftenberg
+ * Native CPU storage adoption moves the actual aligned backing, including its
+ * physical allocation lease, without initializing or copying a second payload.
+ * Exact CPU home identity and native extent are validated before publication.
  */
 
 #include "TensorClasses.h"
@@ -68,11 +71,13 @@ namespace llaminar2
 
     BF16Tensor::BF16Tensor(
         const std::vector<size_t> &shape,
-        AlignedVector<uint16_t> bf16_data)
-        : shape_(shape), device_(DeviceId::cpu()), is_view_(false),
+        AlignedVector<uint16_t> bf16_data, DeviceId device)
+        : shape_(shape), device_(device), is_view_(false),
           host_bf16_data_(std::move(bf16_data)), parent_data_ptr_(nullptr),
           view_offset_(0), parent_(nullptr), device_data_(nullptr)
     {
+        if (!device.is_valid() || !device.is_cpu())
+            throw std::invalid_argument("BF16Tensor owned CPU storage requires an exact CPU home device");
         if (shape.empty())
             throw std::invalid_argument("BF16Tensor: shape cannot be empty");
 

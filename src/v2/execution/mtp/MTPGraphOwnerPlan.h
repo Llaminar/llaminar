@@ -12,7 +12,8 @@
  *
  * This value object is the sole arithmetic authority for those directories.
  * DeviceGraphOrchestrator uses it to allocate every cache owner and the memory
- * planner charges the resulting retained slot count.  Adding a new directory
+ * planner charges only role-eligible native executables; metadata registry
+ * capacities remain available independently of physical executable ownership.  Adding a new directory
  * therefore requires extending this type rather than copying another formula
  * into setup or preflight.
  */
@@ -73,7 +74,8 @@ namespace llaminar2
          */
         explicit MTPGraphOwnerPlan(const MTPRuntimeConfig &config, MTPVerifierGraphFamily family,
                                    MTPGenerationParentRole parent_role, std::size_t query_programs = 1u)
-            : retains_graph_capacity_(retainsMTPGraphCapacity(config)),
+            : parent_role_(parent_role),
+              retains_graph_capacity_(retainsMTPGraphCapacity(config)),
               query_programs_(query_programs),
               draft_depth_(resolveMTPMaximumDraftDepth(config)),
               request_capacity_(std::max(1, config.max_request_batch))
@@ -240,11 +242,11 @@ namespace llaminar2
         /** @return Independently resident MTP sidecar executable slots. */
         [[nodiscard]] std::size_t sidecarGraphSlots() const noexcept
         {
-            return sidecar_graph_slots_;
+            return ownsControllerExecutables() ? sidecar_graph_slots_ : 0u;
         }
 
-        /** @return Shape-indexed multi-row KV-only sidecar cache slots. */
-        [[nodiscard]] std::size_t sidecarKVOnlyBatchGraphSlots() const noexcept
+        /** @return Metadata registry capacity only; native executable eligibility is accounted by the role-gated family total. */
+        [[nodiscard]] std::size_t sidecarKVOnlyBatchRegistryCapacity() const noexcept
         {
             return sidecar_kv_only_batch_graph_slots_;
         }
@@ -252,12 +254,12 @@ namespace llaminar2
         /** @return Independently resident terminal-hidden publication slots. */
         [[nodiscard]] std::size_t terminalHiddenGraphSlots() const noexcept
         {
-            return terminal_hidden_graph_slots_;
+            return ownsControllerExecutables() ? terminal_hidden_graph_slots_ : 0u;
         }
 
-        /** @return Fixed-contiguous terminal-hidden graph slots. */
+        /** @return Metadata registry capacity only; native executable eligibility is accounted by the role-gated family total. */
         [[nodiscard]] std::size_t
-        terminalHiddenContiguousGraphSlots() const noexcept
+        terminalHiddenContiguousRegistryCapacity() const noexcept
         {
             return terminal_hidden_contiguous_graph_slots_;
         }
@@ -266,28 +268,28 @@ namespace llaminar2
         [[nodiscard]] std::size_t
         genericTerminalHiddenGraphSlots() const noexcept
         {
-            return retains_graph_capacity_
+            return retains_graph_capacity_ && ownsControllerExecutables()
                        ? kGenericTerminalHiddenGraphSlots
                        : 0u;
         }
 
-        /** @return Device-accepted-row graph slots indexed by request count. */
+        /** @return Metadata registry capacity only; native executable eligibility is accounted by the role-gated family total. */
         [[nodiscard]] std::size_t
-        terminalHiddenDeviceAcceptedGraphSlots() const noexcept
+        terminalHiddenDeviceAcceptedRegistryCapacity() const noexcept
         {
             return terminal_hidden_device_accepted_graph_slots_;
         }
 
-        /** @return Request-terminal graph slots indexed by request count. */
+        /** @return Metadata registry capacity only; native executable eligibility is accounted by the role-gated family total. */
         [[nodiscard]] std::size_t
-        terminalHiddenRequestTerminalGraphSlots() const noexcept
+        terminalHiddenRequestTerminalRegistryCapacity() const noexcept
         {
             return terminal_hidden_request_terminal_graph_slots_;
         }
 
-        /** @return Shifted-prefill graph slots indexed by request and row count. */
+        /** @return Metadata registry capacity only; native executable eligibility is accounted by the role-gated family total. */
         [[nodiscard]] std::size_t
-        terminalHiddenShiftedPrefillGraphSlots() const noexcept
+        terminalHiddenShiftedPrefillRegistryCapacity() const noexcept
         {
             return terminal_hidden_shifted_prefill_graph_slots_;
         }
@@ -295,16 +297,16 @@ namespace llaminar2
         /** @return Independently resident draft-token publication slots. */
         [[nodiscard]] std::size_t draftPublicationGraphSlots() const noexcept
         {
-            return draft_publication_graph_slots_;
+            return ownsControllerExecutables() ? draft_publication_graph_slots_ : 0u;
         }
 
         /** @return Independently resident grouped-verifier preparation slots. */
         [[nodiscard]] std::size_t verifierPreparationGraphSlots() const noexcept
         {
-            return verifier_preparation_graph_slots_;
+            return ownsControllerExecutables() ? verifier_preparation_graph_slots_ : 0u;
         }
 
-        /** @return Immutable widths of each shared sampler helper family, independent of query programs. */
+        /** @return Metadata width capacity of shared sampler directories; followers retain no native sampler executable. */
         [[nodiscard]] std::size_t samplerHelperWidthCount() const noexcept
         {
             return sampler_helper_widths_;
@@ -313,7 +315,7 @@ namespace llaminar2
         /** @return Outcome plus target-distribution owners across every admitted helper width. */
         [[nodiscard]] std::size_t samplerHelperGraphSlots() const noexcept
         {
-            return sampler_helper_graph_slots_;
+            return ownsControllerExecutables() ? sampler_helper_graph_slots_ : 0u;
         }
 
         /** @return Complete parent widths per query program; exact followers retain every member. */
@@ -360,7 +362,8 @@ namespace llaminar2
             // Each outcome/distribution width remains shared across query
             // programs; parent and publication directories retain their own owners.
             // Direct scalar history publication is one controller-only owner.
-            return controller_graph_slots_;
+            return ownsControllerExecutables() ? controller_graph_slots_ :
+                generation_parent_graph_slots_ + speculative_publication_graph_slots_;
         }
 
         /**
@@ -396,7 +399,7 @@ namespace llaminar2
          */
         [[nodiscard]] std::size_t boundedHelperExecutableSlotCount() const
         {
-            if (!retains_graph_capacity_)
+            if (!retains_graph_capacity_ || !ownsControllerExecutables())
                 return 0u;
             const auto requests = std::min(
                 static_cast<std::size_t>(request_capacity_), kMaximumBoundedVerifierRequests);
@@ -428,20 +431,33 @@ namespace llaminar2
         {
             return checkedSizeAdd(
                 checkedSizeAdd(
-                    sidecar_graph_slots_,
-                    terminal_hidden_graph_slots_,
+                    sidecarGraphSlots(),
+                    terminalHiddenGraphSlots(),
                     "MTP auxiliary graph slots"),
                 checkedSizeAdd(
-                    draft_publication_graph_slots_,
+                    draftPublicationGraphSlots(),
                     checkedSizeAdd(
-                        verifier_preparation_graph_slots_,
+                        verifierPreparationGraphSlots(),
                         controllerGraphSlots(),
                         "MTP auxiliary graph slots"),
                     "MTP auxiliary graph slots"),
                 "MTP auxiliary graph slots");
         }
 
+        /** @return Frozen native execution owner; followers never own predictor/sampler helpers. */
+        [[nodiscard]] MTPGenerationParentRole parentRole() const noexcept { return parent_role_; }
+        /** @return Whether this participant may materialize terminal predictor/controller helpers. */
+        [[nodiscard]] bool ownsControllerExecutables() const noexcept
+        { return parent_role_ == MTPGenerationParentRole::Controller; }
+        /** @return Metadata directory capacity, independent of role-eligible native executable count. */
+        [[nodiscard]] std::size_t verifierPreparationRegistryCapacity() const noexcept
+        { return verifier_preparation_graph_slots_; }
+        /** @return Metadata directory capacity preserved even when followers own no draft executable. */
+        [[nodiscard]] std::size_t draftPublicationRegistryCapacity() const noexcept
+        { return draft_publication_graph_slots_; }
+
     private:
+        MTPGenerationParentRole parent_role_ = MTPGenerationParentRole::Controller; ///< Immutable native ownership.
         /** Add two size values without allowing admission arithmetic to wrap. */
         [[nodiscard]] static std::size_t checkedSizeAdd(
             std::size_t left,

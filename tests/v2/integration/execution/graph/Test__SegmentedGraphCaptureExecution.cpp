@@ -26,6 +26,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../utils/CPUSerialArenaTestAdmission.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include <memory>
 #include <span>
@@ -1725,7 +1726,7 @@ TEST_F(CachedGraphReplayExecutionTest,
         TransferEngine::instance().createMappedHostArena(mapped_devices);
     auto cpu_canonical_arena =
         std::make_shared<MoELocalExpertSerialBufferArena>(
-            MoELocalExpertSerialBufferArena::Config{
+            llaminar2::test::admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
                 .device_id = DeviceId::cpu(),
                 .row_capacity = bucket_rows,
                 .row_capacity_buckets = {bucket_rows},
@@ -1737,7 +1738,7 @@ TEST_F(CachedGraphReplayExecutionTest,
                 .cpu_canonical_route_gpu_consumer = device,
                 .debug_name =
                     "integration.production_mapped_cpu_canonical_routes",
-            });
+            }));
     auto contribution_region =
         cpu_canonical_arena->mappedCPUCanonicalRoutes(device);
     ASSERT_NE(contribution_region, nullptr);

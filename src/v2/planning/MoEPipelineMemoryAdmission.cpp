@@ -6,6 +6,7 @@
  * planner once. Expert capacity then joins every contribution through PMA before
  * optional replicas consume remaining capacity. No per-stage free-byte arithmetic
  * or temporary publication of a partially admitted topology is permitted here.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 #include "planning/MoEPipelineMemoryAdmission.h"
 #include "planning/MoEOverlayPlanningInputs.h"
@@ -17,12 +18,13 @@
 
 namespace llaminar2
 {
-    void AdmittedMoEPipelineMemory::publishRuntimeCapacity(RuntimeConfig &runtime) const noexcept
+    void AdmittedMoEPipelineMemory::publishRuntimeCapacity(RuntimeConfig &runtime) const
     {
         runtime.resident_graph_rows = rank_plan_.runtime.resident_graph_rows;
         runtime.moe_routed_prefill.overlay_segment_rows = rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows;
         runtime.ngram_table_placement = rank_plan_.runtime.ngram_table_placement;
         runtime.attention_participants = rank_plan_.runtime.attention_participants;
+        runtime.cpu_serial_expert_storage = rank_plan_.runtime.cpu_serial_expert_storage;
     }
 
     AdmittedMoEPipelineMemory AdmittedMoEPipelineMemory::admit(
@@ -150,6 +152,9 @@ namespace llaminar2
                         throw std::logic_error("MoE pipeline stages disagree on their aggregate admission or row envelope");
                     auto &stage = result.stages_[index];
                     capacities[index].host_demand_memory = selected_fixed[index].host_demand_memory;
+                    capacities[index].cpu_serial_expert_storage =
+                        MemoryPlanner::cpuSerialExpertStorageAdmissions(selected_fixed[index].device_inputs);
+                    stage.rank_plan_.runtime.cpu_serial_expert_storage = capacities[index].cpu_serial_expert_storage;
                     stage.capacity_ = std::make_shared<const MoEOverlayResolvedCapacityPlan>(std::move(capacities[index]));
                     stage.devices_ = std::move(selected_fixed[index].device_inputs);
                     stage.rank_plan_.runtime.resident_graph_rows = selected_fixed[index].resident_graph_rows;

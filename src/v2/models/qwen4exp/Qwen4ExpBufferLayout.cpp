@@ -6,8 +6,11 @@
  * and BufferId. In particular, selected-attention partials are one reusable
  * scratch bank across layers; only accepted recurrent/indexer state scales
  * with model layers. Native row payloads retain their exact GGUF byte width.
+ * CPU arena contributions apply physical allocator rounding to each root before
+ * computing extension deltas, so widened roots retain one allocation authority.
  */
 #include "Qwen4ExpBufferLayout.h"
+#include "../../tensors/AlignedVector.h"
 #include "Qwen4ExpConfig.h"
 #include "../../loaders/ResolvedImmutableRowTablePlacement.h"
 #include "../GraphTypes.h"
@@ -152,15 +155,25 @@ Qwen4ExpBufferDimensions dimensionsFor(const GraphConfig &model, int flattened_r
             ? static_cast<int>(model.ngram_table_placement->consumers().size()) : 0};
 }
 
-/** @brief Check every multiplication before using the generic allocator's scalar-byte view. */
-std::size_t resolvedBytes(const BufferSpec &spec, const GraphResolverConfig &resolver)
+/**
+ * @brief Resolve one declared root using its scalar ABI and physical allocator.
+ * @param spec One canonical root declaration, never an aggregate owner width.
+ * @param resolver Frozen expression geometry.
+ * @param device Participant allocator supplied by the typed layout dimensions.
+ * @return Exact CPU physical extent or native GPU tensor payload extent.
+ * @throws std::invalid_argument for unsupported scalar storage.
+ * @throws std::overflow_error for unrepresentable root geometry.
+ */
+std::size_t resolvedBytes(const BufferSpec &spec, const GraphResolverConfig &resolver, DeviceId device)
 {
     const auto resolved = BufferAllocator::resolve(spec, resolver);
     if (resolved.dtype != "fp32" && resolved.dtype != "float32" && resolved.dtype != "int32")
         throw std::invalid_argument("Flash Next arena declaration has an unsupported scalar byte contract: " + spec.name);
     std::size_t count = resolved.shape.empty() ? 0 : 1;
     for (const auto dimension : resolved.shape) count = product(count, dimension);
-    return product(count, sizeof(std::int32_t));
+    const auto payload = product(count, sizeof(std::int32_t));
+    return device.is_cpu()
+        ? AlignedVector<std::uint8_t>::requiredAllocationBytes(payload) : payload;
 }
 
 /** @brief Sum exact additional arena owners without an anonymous reserve. */
@@ -322,8 +335,8 @@ std::size_t qwen4ExpArenaExtensionBytes(const GraphSchema &common_schema, GraphR
             const auto prior = std::find_if(original.begin(), original.end(),
                 [&](const auto &candidate) { return candidate.name == spec.name; });
             if (prior != original.end() && prior->shape == spec.shape && prior->dtype == spec.dtype) continue;
-            const auto next = resolvedBytes(spec, resolver);
-            const auto before = prior == original.end() ? 0 : resolvedBytes(*prior, resolver);
+            const auto next = resolvedBytes(spec, resolver, dimensions.device);
+            const auto before = prior == original.end() ? 0 : resolvedBytes(*prior, resolver, dimensions.device);
             if (before > next) throw std::logic_error("Flash Next arena extension unexpectedly shrinks a shared role");
             bytes = add(bytes, next - before);
         }
@@ -350,7 +363,7 @@ std::size_t qwen4ExpLookupArenaBytes(GraphResolverConfig resolver,
             (declaration->placement == Qwen4ExpBufferPlacement::PLEHostStorage ||
              declaration->placement == Qwen4ExpBufferPlacement::PLEGPUHostStorage ||
              declaration->placement == Qwen4ExpBufferPlacement::PLEFixedHeadStorage))
-            bytes = add(bytes, resolvedBytes(spec, resolver));
+            bytes = add(bytes, resolvedBytes(spec, resolver, dimensions.device));
     }
     return bytes;
 }

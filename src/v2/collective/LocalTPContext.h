@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 
 namespace llaminar2
@@ -118,6 +119,10 @@ namespace llaminar2
             const NativeCollectiveRows *live_rows = nullptr) override;
         bool allreduce(const TensorBase *input, TensorBase *output) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
+        /** @copydoc ILocalTPContext::allgatherHostIndexed */
+        bool allgatherHostIndexed(std::span<const std::byte> local_send,
+            std::span<std::byte> full_receive, int participant,
+            const std::string &stage_name) override;
         bool allgatherRawOnStream(
             const void *local_send,
             void *full_recv,
@@ -524,6 +529,38 @@ namespace llaminar2
         std::vector<LocalTPCollectiveSidebandBuffer> grouped_onstream_allreduce_reference_sidebands_;
         std::vector<std::vector<LocalTPCollectiveSidebandBuffer>> grouped_onstream_allreduce_sidebands_;
 
+        /**
+         * @brief CPU-only indexed gather metadata, allocated once with the context.
+         *
+         * No payload storage or alternate ledger is owned here. Every span
+         * borrows a participant's admitted workspace until all outputs finish;
+         * departure prevents a fast next round overwriting live input storage.
+         */
+        /**
+         * @brief Publish one fatal abort while owning the gather predicate lock.
+         * @param lock Owning lock for host_allgather_mutex_; foreign/unlocked tokens fail.
+         *
+         * Public cancellation acquires this lock, while rejected arrivals pass
+         * their existing lock. The atomic predicate and notification therefore
+         * cannot race the waiter's false-predicate-to-block boundary, and a
+         * rejected generation cannot publish output before cancellation. The
+         * lock is consumed before logging, trace locks or unrelated CV wakes.
+         * @post lock no longer owns its mutex; callers must not access guarded
+         *       gather metadata after this operation.
+         */
+        void publishAbortWithHostGatherLock(std::unique_lock<std::mutex> &lock);
+        friend struct LocalTPIndexedHostKVTestPeer; ///< Device-free synchronization-boundary control only.
+        std::mutex host_allgather_mutex_;
+        std::condition_variable host_allgather_cv_;
+        std::vector<std::span<const std::byte>> host_allgather_inputs_;
+        std::vector<std::span<std::byte>> host_allgather_outputs_;
+        std::vector<bool> host_allgather_seen_;
+        size_t host_allgather_arrivals_ = 0;
+        size_t host_allgather_departures_ = 0;
+        size_t host_allgather_bytes_ = 0;
+        bool host_allgather_ready_ = false;
+        std::string_view host_allgather_stage_; ///< Borrowed retained stage name until final departure.
+
         // =====================================================================
         // GPU graph-capture lifecycle rendezvous.
         // =====================================================================
@@ -727,19 +764,6 @@ namespace llaminar2
             const std::string &stage_name = "",
             size_t count = 0,
             void *producer_stream = nullptr);
-
-        /**
-         * @brief Barrier-synchronized allgather for CPU-only TP
-         *
-         * For LOCAL TP where all devices are CPU, each worker thread contributes
-         * its local shard. The last-arriving thread concatenates all shards into
-         * each thread's global output tensor.
-         *
-         * @param local_shard This thread's local shard (in host memory)
-         * @param global_tensor Output tensor to receive all gathered shards
-         * @return true on success (same result for all participants)
-         */
-        bool allgatherCpuBarrier(const TensorBase *local_shard, TensorBase *global_tensor);
 
         /**
          * @brief Validate barrier-collected tensors before multi-GPU allreduce launch.

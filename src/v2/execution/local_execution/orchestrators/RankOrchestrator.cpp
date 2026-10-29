@@ -27,6 +27,7 @@
  *
  * Ordinary native QFN local TP derives one immutable assignment from the original
  * directory before weight slicing; physical device order remains context-owned.
+ * CPU serial storage declarations survive admission and runtime projection.
  */
 
 #include "RankOrchestrator.h"
@@ -760,6 +761,12 @@ namespace llaminar2
           config_(config),
           current_batch_size_(std::max(1, config.batch_size))
     {
+        // This constructor is also called directly by serving and nested PP;
+        // reject a test-only issuer before scratch or child setup can start.
+        if (config_.test_runner_overrides.test_graph_allocation_admission &&
+            std::dynamic_pointer_cast<ModelContext>(model_ctx_))
+            throw std::invalid_argument("Concrete rank model cannot accept test graph allocation admission");
+
         if (!config_.validate())
         {
             throw std::invalid_argument("Invalid RankOrchestrator configuration");
@@ -1402,7 +1409,10 @@ namespace llaminar2
                     DeviceId dev_id = addr.toLocalDeviceId();
                     try
                     {
-                        const auto &assignment = tp_config->forDevice(dev_id);
+                        // Logical TP rank owns the slice. Distinct CPU NUMA
+                        // participants intentionally share one CPU address-space
+                        // DeviceId, so a device-only lookup is ambiguous.
+                        const auto &assignment = tp_config->forRank(dev_idx);
                         LOG_DEBUG("RankOrchestrator: Device " << dev_idx << " (" << dev_id.to_string() << ") assignment:"
                                                               << " head_start=" << assignment.head_start
                                                               << " head_count=" << assignment.head_count
@@ -1699,6 +1709,7 @@ namespace llaminar2
                                                  runner_config.activation_seq_len = config_.resident_graph_rows;
                                                  runner_config.attention_participants =
                                                      config_.attention_participants;
+                                                 runner_config.cpu_serial_expert_storage = config_.cpu_serial_expert_storage;
                                                  runner_config.batch_size = config_.batch_size;
                                                  runner_config.ordinary_terminal_projection = config_.ordinary_terminal_projection;
                                                  runner_config.activation_precision = config_.activation_precision;
@@ -1765,7 +1776,7 @@ namespace llaminar2
                                                  }
 
                                                  // Create the inference runner
-                                                 result.runner = createTestableInferenceRunner(model_ctx_, device_id, runner_config);
+                                                 result.runner = createTestableInferenceRunner(model_ctx_, device_id, runner_config, config_.test_runner_overrides);
                                                  if (!result.runner)
                                                  {
                                                      result.error = "Failed to create inference runner for device " +
@@ -2058,6 +2069,7 @@ namespace llaminar2
             runner_config.max_seq_len = static_cast<int>(child_config.max_seq_len);
             runner_config.activation_seq_len = child_config.resident_graph_rows;
             runner_config.attention_participants = child_config.attention_participants;
+            runner_config.cpu_serial_expert_storage = child_config.cpu_serial_expert_storage;
             runner_config.batch_size = child_config.batch_size;
             runner_config.ordinary_terminal_projection = child_config.ordinary_terminal_projection;
             runner_config.activation_precision = child_config.activation_precision;
@@ -2845,15 +2857,41 @@ namespace llaminar2
                 "non-empty LocalTP graph and a valid frozen family plan");
             return false;
         }
+        if (!tp_ctx_ || tp_ctx_->degree() != static_cast<int>(device_runners_.size()) ||
+            tp_ctx_->devices().size() != device_runners_.size())
+        {
+            LOG_ERROR("RankOrchestrator serving graph setup lost its exact LocalTP participant inventory");
+            return false;
+        }
+        const auto preparation_kind = servingGraphPreparationKind();
+        if (preparation_kind != ServingGraphPreparationKind::EagerHostGraph &&
+            preparation_kind != ServingGraphPreparationKind::NativeDeviceExecutableFamily)
+        {
+            LOG_ERROR("RankOrchestrator serving graph setup requires one declared homogeneous preparation lifecycle");
+            return false;
+        }
+        // Validate the entire immutable participant set before visiting any
+        // child. CPU endpoints share DeviceId::cpu(), so their original vector
+        // index remains the worker/runner binding; never infer a NUMA ordinal
+        // from storage identity or substitute a GPU capture lifecycle.
         for (std::size_t index = 0; index < device_runners_.size(); ++index)
         {
-            if (!device_runners_[index] ||
-                !device_runners_[index]->primaryDeviceId().is_gpu())
+            const auto &runner = device_runners_[index];
+            if (!runner)
             {
-                LOG_ERROR(
-                    "RankOrchestrator serving graph setup found a missing or "
-                    "non-GPU LocalTP participant at index "
-                    << index);
+                LOG_ERROR("RankOrchestrator serving graph setup found a missing LocalTP participant at index " << index);
+                return false;
+            }
+            const auto device = runner->primaryDeviceId();
+            const bool supported_locus =
+                (device.is_cpu() && preparation_kind == ServingGraphPreparationKind::EagerHostGraph) ||
+                (device.is_gpu() && preparation_kind == ServingGraphPreparationKind::NativeDeviceExecutableFamily);
+            if (!device.is_valid() || !supported_locus ||
+                runner->servingGraphPreparationKind() != preparation_kind ||
+                device != tp_ctx_->devices()[index].toLocalDeviceId())
+            {
+                LOG_ERROR("RankOrchestrator serving graph setup found incompatible declared lifecycle/device at LocalTP index "
+                    << index << " device=" << device.toString());
                 return false;
             }
         }
@@ -2865,11 +2903,12 @@ namespace llaminar2
         }
 
         /*
-         * Native graph capture can enter LocalTP collective nodes.  All
-         * participant graphs must therefore build and capture on persistent
-         * workers at the same time; a serial setup loop deadlocks at the first
-         * collective and a process-wide cache-miss mutex creates the same
-         * asymmetry less visibly.
+         * Native graph capture can enter LocalTP collective nodes. All native
+         * participants therefore build/capture on their persistent workers at
+         * the same time. CPU participants use those same original worker slots
+         * to declare workspace and seal their host engine, without executing
+         * arithmetic, capturing a GPU graph or changing inherited CPU placement.
+         * A serial native setup loop would deadlock at the first collective.
          */
         if (!tp_worker_pool_)
         {
@@ -2917,8 +2956,8 @@ namespace llaminar2
 
                 const DeviceId device =
                     device_runners_[index]->primaryDeviceId();
-                ROCmKernelProfiler::setCurrentDevice(device.ordinal);
-                CUDAKernelProfiler::setCurrentDevice(device.ordinal);
+                if (device.is_rocm()) ROCmKernelProfiler::setCurrentDevice(device.ordinal);
+                if (device.is_cuda()) CUDAKernelProfiler::setCurrentDevice(device.ordinal);
                 const auto started = std::chrono::steady_clock::now();
                 LOG_INFO(
                     "[ServingGraphMaterialization] LocalTP worker begin"
@@ -2974,7 +3013,9 @@ namespace llaminar2
             {{"participants", std::to_string(device_runners_.size())},
              {"prefill_buckets",
               std::to_string(plan.prefill_bucket_rows.size())},
-             {"fanout", "concurrent_persistent_workers"}});
+             {"fanout", "concurrent_persistent_workers"},
+             {"preparation_kind", preparation_kind == ServingGraphPreparationKind::EagerHostGraph
+                 ? "eager_host_graph" : "native_device_executable_family"}});
         return true;
     }
 

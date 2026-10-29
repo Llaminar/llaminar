@@ -34,11 +34,16 @@ Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
 Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build one
-AVX512 full-backend image pair and run only complete Unit and
-ProductionTestPreflight inside its test runner. This is the pre-commit scope,
-not certification: no AVX2, models, E2E, benchmarks or publication. It calls the
-existing image driver with `--cpu-isa AVX512` and no `--publish`, using the same
-host-only cache and shared accelerator concurrency group. See
+AVX512 full-backend image pair and run complete Unit and
+ProductionTestPreflight, followed by the separate QFN source-admission gate.
+This is pre-merge validation, not release certification: no AVX2, numerical
+reference run, HTTP E2E, benchmarks or publication. It calls the existing image
+driver with `--cpu-isa AVX512 --source-admission` and no `--publish`, using the
+same host-only cache and shared accelerator concurrency group. Source admission
+uses the FULL_MATRIX test companion, code-owned CTest/GTest membership, exact
+native hardware eligibility and canonical read-only GGUF inputs. All selected
+cells, including Candidates, must execute and pass without skips; unavailable
+hardware is explicitly unqualified. The default develop push remains model-free. See
 `docs/production-ci.md` for its same-repository trust boundary and local command.
 The `develop` ruleset requires that exact check on an up-to-date PR and rejects
 direct human pushes. The trusted base-branch auto-merge workflow arms native
@@ -56,9 +61,11 @@ generation, mathematical parity, HTTP E2E, remote MPI, benchmarks, or attach a
 certificate. Use it for fast shippable developer images; use the full pipeline
 when requesting a certified artifact.
 The `develop` → `master` PR gate is separate: its required pull-request E2E
-check waits for the exact develop-head image pair, proves both ISAs on the full
-HTTP matrix, then its dependent benchmark check consumes that same image-bound
-E2E receipt. The benchmark check runs both ISAs even when the first has a
+check waits for the exact develop-head image pair, runs QFN source admission in
+source/ISA-authenticated full-matrix test companions for both ISAs, then proves
+both runtime ISAs on the full HTTP matrix. Its dependent benchmark check consumes
+that same image-bound E2E receipt, including source-admission bindings. The
+benchmark check runs both ISAs even when the first has a
 complete red ratchet report, comments the per-cell red/amber/green numbers on
 the PR, and fails if any measured phase exceeds the high-water tolerance.
 Only after both benchmark lanes pass, the required OpenCode check runs one

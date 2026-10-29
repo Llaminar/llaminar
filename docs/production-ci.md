@@ -30,6 +30,51 @@ test-runner image**. This is the pre-commit test scope in a reproducible image,
 not release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
+The same required job then runs **QFN source admission**, separately from
+model-free preflight, using the AVX512 full-matrix test companion. CTest and
+source-only typed GoogleTest parameters own all cells, MTP policies, source
+files, ranks and exact CPU NUMA/GPU identities. The companion's native startup
+hardware observation selects eligible cells. Every selected cell must execute
+without skips and retire native owners and disposable prefix files. Candidate
+compositions are positive obligations: an unsupported native implementation
+fails the check. Hardware-ineligible cells are listed as **unqualified**, never
+passed; this receipt certifies only its recorded hardware projection.
+The original CUDA TP2 fixed-head eight-expert active/full15 positives additionally
+require an explicitly authored 32GiB physical VRAM class per participating GPU.
+Smaller cards retain visible unqualified coverage; they do not turn a positive
+admission failure into a pass. Off, retained3 fitting controls and rejection
+controls remain mandatory. See [source provisioning](testing/QFN_SOURCE_PROVISIONING.md)
+for the schema and boundary of 24 registrations.
+
+The runner uses existing read-only canonical model-cache inputs. It validates
+all selected `REQUIRED_FILES` before suppressing the broad optional fetch
+fixture with the existing no-download policy. Missing GGUFs are fatal; there is
+no reference pack, corpus download, numerical comparison or source-tier remap.
+The workflow retains discovered membership, hardware, exact-cell logs, native
+admission/retirement evidence and source/ISA/image-bound receipts. Ordinary
+contract failures are collected across selected cases and both release ISAs
+before the source stage fails; HTTP never starts after a source red. Driver or
+infrastructure failure remains terminal. Native retirement proof is tracked
+independently of contract success, and unavailable proof is never asserted. It never
+uploads model payloads. Cancellation retires the exact container; failed cells
+remove only their private disposable prefix-cache directories.
+The same established suite-driver tools image owns passive kernel observation
+through its existing `SYSLOG` and read-only `/dev/kmsg` scope; the ARC runner
+pod and inference companion receive no new privileges. One continuous native
+boot/cursor window starts before hardware discovery and closes after companion
+and prefix retirement. Receipt creation and reuse validate the retained driver
+report and journal; reboot, missing reader access or incomplete observation is
+fatal. No kernel or driver settings are changed.
+
+The develop-to-master required model/E2E job adds the same source-admission
+transaction on **both AVX512 and AVX2**, with full-matrix companions authenticated
+against each published runtime sibling's exact source and ISA. A source failure
+fails that existing required check before HTTP qualification can complete.
+Benchmark/release receipt admission revalidates these source reports and image
+bindings. Numerical matrix membership and its approved references are unchanged.
+The ordinary develop image-push driver stays model-free unless its explicit
+`--source-admission` feature-PR flag is supplied.
+
 The active `develop` ruleset requires this exact GitHub Actions check, an
 up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
@@ -56,16 +101,21 @@ Create the token in GitHub's fine-grained token settings with resource owner
 prompts for the value; credential values do not belong in source or evidence
 files. Replace the secret before its configured expiration.
 
-The workflow calls the existing `run_develop_image_gate.py --cpu-isa AVX512`
-without `--publish`. It runs no AVX2 lane, model discovery/staging, generation,
-HF parity, HTTP/remote E2E, benchmarks, image publication or release creation.
+The workflow calls `run_develop_image_gate.py` with
+`--cpu-isa AVX512 --source-admission` and without `--publish`. After model-free
+Unit/preflight, it
+discovers the canonical QFN source-admission cells and stages their exact
+hardware-eligible source closures in the full-matrix companion. It runs no AVX2
+lane, numerical generation/parity, HTTP/remote E2E, benchmarks, image publication
+or release creation.
 Every repository job that builds an image, runs tests, or prepares the
 self-hosted test toolchain shares `llaminar-develop-image-gate` with
 `queue: max` and `cancel-in-progress: false`. The ARC scale set also has
 `maxRunners: 1`. Thus separate PRs and certification runs wait their turn;
 GitHub must neither overlap their hardware work nor replace an older pending
-run with a newer one. Read-only policy, source-admission, and documentation
-publication jobs do not occupy that hardware queue.
+run with a newer one. Read-only policy and source-SHA/image admission checks,
+and documentation publication jobs, do not occupy that hardware queue. Real-model
+QFN source admission runs inside the queued hardware gate.
 No registry-write permission or login is granted. Untrusted fork PRs do not
 acquire the privileged host runner; review/import them onto a repository branch
 before running this gate. Branch protection is configured independently.
@@ -77,7 +127,7 @@ uploaded to GitHub, never cache contents. Run the equivalent locally with:
 
 ```bash
 python3 scripts/ci/run_develop_image_gate.py \
-  --cpu-isa AVX512 --output parity-results/develop-pr-gate
+  --cpu-isa AVX512 --source-admission --output parity-results/develop-pr-gate
 ```
 
 After merge, the ordinary develop push workflow below builds/tests **both**

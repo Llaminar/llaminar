@@ -156,4 +156,43 @@ TEST(TensorParallelAssignmentDeclaration, PassiveContextDirectoryIsTheOriginalBo
     EXPECT_EQ(view.ggufDirectory(),before);EXPECT_EQ(before->tensors.size(),tensors);
     EXPECT_EQ(before->metadata.size(),metadata);EXPECT_EQ(context->concreteWeightManager(),nullptr);
 }
+/** @test CPU NUMA participants retain rank-indexed shards within one host address space. */
+TEST(TensorParallelAssignmentDeclaration, CPURanksShareAddressSpaceWithoutLosingShardIdentity)
+{
+    const auto directory=declarationDirectory(false);
+    const auto profile=ModelMemoryProfile::fromGGUF(directory);
+    MTPRuntimeConfig mtp;mtp.enabled=false;mtp.graph_capacity_draft_tokens=0;
+    // These are storage IDs after actual CPU-domain validation, not invented
+    // NUMA ordinals. Both participants intentionally name the same host memory.
+    const std::vector<DeviceId> devices{DeviceId::cpu(),DeviceId::cpu()};
+    const auto source=resolveProfileTPDeclaration(profile,TensorParallelMainPlacement::FullMainRankLocal,
+        mtp,DenseParallelPolicy::TensorParallel,devices);
+    ASSERT_EQ(source.coverage(),KVHeadCoveragePolicy::Legacy);
+    const auto assigned=source.partition(devices,{},profile.d_ff,profile.vocab_size);
+    ASSERT_TRUE(assigned.validate())<<assigned.validationError();
+    EXPECT_NO_THROW(source.validate(assigned,devices));
+    const auto &first=assigned.forRank(0),&second=assigned.forRank(1);
+    EXPECT_EQ(first.device,DeviceId::cpu());EXPECT_EQ(second.device,DeviceId::cpu());
+    EXPECT_EQ(first.local_rank,0);EXPECT_EQ(second.local_rank,1);
+    EXPECT_EQ(first.head_start,0);EXPECT_EQ(first.headEnd(),second.head_start);
+    EXPECT_EQ(second.headEnd(),profile.n_heads);
+    EXPECT_EQ(first.dFFEnd(),second.d_ff_start);EXPECT_EQ(second.dFFEnd(),profile.d_ff);
+    EXPECT_EQ(first.vocabEnd(),second.vocab_start);EXPECT_EQ(second.vocabEnd(),profile.vocab_size);
+    EXPECT_THROW(assigned.forDevice(DeviceId::cpu()),std::invalid_argument);
+    EXPECT_THROW(assigned.forRank(2),std::out_of_range);
+    auto stale=assigned.assignments();stale[1].local_rank=0;
+    EXPECT_FALSE(TensorParallelConfig(stale).validate());
+    EXPECT_THROW(source.validate(TensorParallelConfig(stale),devices),std::invalid_argument);
+    // Device uniqueness remains mandatory for both accelerator backends.
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        auto duplicate=assigned.assignments();for(auto &local:duplicate)local.device=device;
+        const TensorParallelConfig invalid(duplicate);
+        EXPECT_FALSE(invalid.validate());
+        EXPECT_NE(invalid.validationError().find("Duplicate device"),std::string::npos);
+        EXPECT_THROW(invalid.forDevice(device),std::invalid_argument);
+    }
+    const auto single=TensorParallelConfig::singleDevice(DeviceId::cpu(),24,2,640,248320);
+    EXPECT_EQ(&single.forDevice(DeviceId::cpu()),&single.forRank(0));
+}
 } // namespace llaminar2::test

@@ -1,9 +1,15 @@
 /**
  * @file BufferArena.cpp
- * @brief Implementation of the central buffer management system
+ * @brief Activation storage with preclaimed, root-lifetime CPU memory ownership.
+ *
+ * CPU roots claim the allocator-rounded physical extent before construction.
+ * The common typed tensor declaration projects and materializes the same
+ * physical root. Its actual aligned backing owns the allocation lease, including
+ * when native views retain that backing beyond the arena lifetime.
  */
 
 #include "BufferArena.h"
+#include "CPUTensorStorageDeclaration.h"
 
 #include "../transfer/TransferEngine.h"
 #include "CoherenceTracker.h"
@@ -12,6 +18,8 @@
 #include "tensors/TensorClasses.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/ITensor.h"
+#include "tensors/NativeTensorExtent.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "models/qwen/Qwen2BufferSpec.h"
 #include "utils/Logger.h"
 #include "utils/VramBillOfMaterials.h"
@@ -115,6 +123,14 @@ namespace llaminar2
         BufferId id,
         const BufferDescriptor &descriptor)
     {
+        if(descriptor.device.is_cpu())
+        {
+            const auto declaration=CPUTensorStorageDeclaration::fromDescriptor(
+                descriptor,PhysicalMemoryOwner::ActivationArena);
+            return registerBuffer(id,declaration.rows(),declaration.columns(),
+                bufferTensorTypeToStr(declaration.dtype()),descriptor.device);
+        }
+
         if (descriptor.shape.empty())
         {
             throw std::invalid_argument(
@@ -352,6 +368,23 @@ namespace llaminar2
         // FA (Full Attention) extended buffers
         if (name == "fa_q_raw")
             return BufferId::FA_Q_RAW;
+
+        // MoE identities belong to the shared arena boundary so metadata-only
+        // admission and model graph registration resolve the same schema.
+        if (name == "moe_expert_indices")
+            return BufferId::MOE_EXPERT_INDICES;
+        if (name == "moe_expert_weights")
+            return BufferId::MOE_EXPERT_WEIGHTS;
+        if (name == "moe_combined_output")
+            return BufferId::MOE_COMBINED_OUTPUT;
+        if (name == "moe_canonical_route_contributions")
+            return BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+        if (name == "moe_shared_expert_output")
+            return BufferId::MOE_SHARED_EXPERT_OUTPUT;
+        if (name == "moe_gate_scratch")
+            return BufferId::MOE_GATE_SCRATCH;
+        if (name == "moe_up_scratch")
+            return BufferId::MOE_UP_SCRATCH;
         if (name == "fa_gate")
             return BufferId::FA_GATE;
 
@@ -452,10 +485,20 @@ namespace llaminar2
         }
     }
 
-    std::shared_ptr<TensorBase> BufferArena::createTensorForBuffer(
+    std::unique_ptr<TensorBase> BufferArena::createTensorForBuffer(
         const ManagedBuffer &b, BufferId id) const
     {
         std::vector<size_t> shape{b.rows, b.cols};
+        if (b.home_device.is_cpu())
+        {
+            if (!b.dtype)
+                throw std::invalid_argument("BufferArena CPU root requires an explicit native dtype");
+            const CPUTensorStorageDeclaration declaration(b.rows,b.cols,
+                CPUTensorStorageDeclaration::requireDtype(b.dtype),
+                PhysicalMemoryOwner::ActivationArena,b.home_device);
+            return declaration.materialize(config_.physical_memory_authority,config_.factory);
+        }
+
         const std::string dtype = b.dtype ? std::string(b.dtype) : "FP32";
         const bool is_fp32 = dtype == "FP32";
 
@@ -497,7 +540,7 @@ namespace llaminar2
         }
 
         // ── Fallback: direct FP32 construction (no factory, no NUMA) ────
-        return std::make_shared<FP32Tensor>(shape, b.home_device);
+        return std::make_unique<FP32Tensor>(shape, b.home_device);
     }
 
     // =========================================================================
@@ -525,7 +568,9 @@ namespace llaminar2
                 continue; // Should not happen
 
             auto bid = static_cast<BufferId>(i);
-            auto tensor = createTensorForBuffer(b, bid);
+            // Native CPU constructors adopt backing-owned leases; ordinary
+            // shared ownership now preserves the exact physical owner naturally.
+            std::shared_ptr<TensorBase> tensor(createTensorForBuffer(b,bid));
             if (!tensor)
             {
                 LOG_ERROR("[BufferArena] Failed to allocate buffer '"

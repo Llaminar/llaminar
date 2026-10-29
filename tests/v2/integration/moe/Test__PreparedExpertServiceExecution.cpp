@@ -7,7 +7,9 @@
  * routing, activations and workspace. GPU observations come from captured
  * complete expert FFNs on distinct explicit streams, never three stand-alone
  * GEMM estimates. CPU uses the production transported-row grouped workspace.
- * These are model-free ownership/capture regressions, not economy benchmarks.
+ * Each native workspace is admitted from its real descriptor; the exact backing
+ * and live PMA claim must agree. These are model-free ownership/capture
+ * regressions, not economy benchmarks.
  */
 
 #include <gtest/gtest.h>
@@ -38,6 +40,7 @@
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #endif
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -179,14 +182,26 @@ namespace llaminar2::test
                 p.prepared_up_gemm[kExpert] = engines_.up().get();
                 p.prepared_down_gemm[kExpert] = engines_.down().get();
                 p.expert_weight_resolution_policy = MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+                std::shared_ptr<PhysicalMemoryAuthority> workspace_memory;
                 if (device.is_cpu())
                 {
                     p.cpu_router_q8_input_publication = CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
+                    // Freeze the complete real stage declaration before either
+                    // its supplied serial bundle or named invocation workspace
+                    // is materialized. Both retain this one exact PMA issuer.
+                    MoEExpertComputeStage declaration(p);
+                    const auto requirements=declaration.getWorkspaceRequirements(rows);
+                    const size_t bytes=requirements.total_bytes_with_alignment();
+                    PhysicalMemoryPlanBuilder plan;
+                    plan.add({0,device,bytes,bytes},PhysicalMemoryOwner::ExecutionWorkspace,bytes);
+                    workspace_memory=std::make_shared<PhysicalMemoryAuthority>(
+                        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
                     p.cpu_grouped_serial_workspace = std::make_shared<CPUGroupedMoESerialWorkspace>(
                         CPUGroupedMoESerialWorkspace::Config{
                             .row_capacity = static_cast<size_t>(rows), .d_model = kWidth,
                             .expert_intermediate = kWidth, .num_experts = kExperts,
-                            .routing_top_k = 1, .debug_name = "prepared_service_execution_test"});
+                            .routing_top_k = 1, .debug_name = "prepared_service_execution_test",
+                            .device_id=device,.physical_memory_authority=workspace_memory});
                 }
                 else
                 {
@@ -197,9 +212,34 @@ namespace llaminar2::test
                 }
                 stage_ = std::make_unique<MoEExpertComputeStage>(std::move(p));
                 const auto requirements = stage_->getWorkspaceRequirements(rows);
+                const size_t workspace_bytes=requirements.total_bytes_with_alignment();
+                if (device.is_gpu())
+                {
+                    // Prepared engines author this backend's scratch capacity.
+                    // Admit that named capacity before captured workspace
+                    // construction, without borrowing another format's budget.
+                    PhysicalMemoryPlanBuilder plan;
+                    const size_t capacity=std::max(size_t{1},workspace_bytes);
+                    plan.add({0,device,capacity,capacity},PhysicalMemoryOwner::ExecutionWorkspace,workspace_bytes);
+                    workspace_memory=std::make_shared<PhysicalMemoryAuthority>(
+                        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+                }
                 workspace_ = std::make_unique<DeviceWorkspaceManager>(
-                    device, requirements.total_bytes_with_alignment());
+                    device, requirements.total_bytes_with_alignment(), workspace_memory);
                 require(workspace_->allocate(requirements), "private stage workspace allocation");
+                if (device.is_gpu())
+                {
+                    // Descriptor capacity includes per-buffer tail alignment;
+                    // the contiguous allocation need not retain unused tail
+                    // padding. The live claim must match its actual backing.
+                    const size_t physical_bytes=workspace_->allocatedPhysicalBytes();
+                    require(physical_bytes<=workspace_bytes &&
+                            (workspace_bytes==0 || physical_bytes>0),
+                        "prepared GPU workspace fits its source descriptor capacity");
+                    require(workspace_memory->claimedBytes(device,PhysicalMemoryOwner::ExecutionWorkspace,
+                        PhysicalMemoryMaterializationKind::NewAllocation)==physical_bytes,
+                        "prepared GPU workspace live claim matches its physical allocation");
+                }
                 stage_->bindWorkspace(workspace_.get());
                 if (!device.is_gpu()) return;
                 require(stage_->prepareGraphLaunch(context_.get(), stream), "private stage capture preparation");

@@ -62,6 +62,9 @@ namespace llaminar2
         /// One model-owned additive binding namespace, shared by every stage.
         std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
+        /// Explicit model-light admission, rejected for concrete model contexts.
+        TestableInferenceRunnerOverrides test_runner_overrides;
+
         /// Registry of domain communicators for global TP stages.
         /// May be nullptr; if so, global TP stage building will throw.
         DomainCommunicatorRegistry *domain_registry = nullptr;

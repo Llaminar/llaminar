@@ -14,6 +14,7 @@
 #include "mocks/MockMPIContext.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUPreparedStoreTestAdmission.h"
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -132,6 +133,17 @@ namespace llaminar2::test
     {
         const FrozenModelWeightSet *frozen = orchestrator.frozenWeightSet();
         ASSERT_NE(frozen, nullptr);
+        if (device.is_cpu())
+        {
+            // The same immutable source set drives the fixture admission and
+            // the production preparation below; floating matrices stay borrowed.
+            std::vector<const TensorBase *> matrices;
+            for (const auto &binding : frozen->bindings())
+                if (binding.tensor && binding.tensor->shape().size() == 2 &&
+                    binding.identity.role != WeightRole::Embedding)
+                    matrices.push_back(binding.tensor);
+            admitCPUPreparedStoreForTest(store, matrices, device);
+        }
 
         for (const auto &source_binding : frozen->bindings())
         {

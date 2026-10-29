@@ -12,6 +12,7 @@
  */
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../utils/CPURouterKernelTestAdmission.h"
 #include <gtest/gtest.h>
 #include <omp.h>
 #include <algorithm>
@@ -106,6 +107,8 @@ void proveRouter(int m,int workers){
     FP32Tensor hidden({size_t(m),K}),ids({size_t(m),Top}),coeff({size_t(m),Top});
     std::copy(source.begin(),source.end(),hidden.mutable_data());
     FP16Tensor gate({E,K},words);CPUMoEKernel typed,reference,original,q8;MoERoutingResult actual,want,old;
+    for(auto *kernel:{&typed,&reference,&original,&q8})
+        admitCPURouterKernelForTest(*kernel,m,K);
     ASSERT_TRUE(typed.routeWithTensors(&hidden,&gate,m,K,E,Top,true,&ids,&coeff,actual));
     ASSERT_TRUE(reference.route(rounded.data(),weights.data(),m,K,E,Top,true,want));
     ASSERT_TRUE(original.route(source.data(),weights.data(),m,K,E,Top,true,old));
@@ -149,6 +152,9 @@ void proveBF16Router(int m, int k, int workers) {
     FP32Tensor hidden({size_t(m+2),size_t(k)}), ids({size_t(m+2),Top}), coeff({size_t(m+2),Top});
     std::copy(source.begin(),source.end(),hidden.mutable_data());
     CPUMoEKernel grouped, serial, q8;
+    admitCPURouterKernelForTest(grouped,m,k);
+    admitCPURouterKernelForTest(serial,1,k);
+    admitCPURouterKernelForTest(q8,m,k);
     MoERoutingResult actual, expected;
     // Reuse the large bank after shrinking the live geometry to one row.
     for(int live : {m,1}) {

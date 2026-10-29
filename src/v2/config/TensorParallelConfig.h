@@ -8,6 +8,7 @@
  * Design:
  * - DeviceShardingAssignment: Per-device assignment of heads, FFN slices, vocab
  * - TensorParallelConfig: Container with factory methods for common patterns
+ * CPU ranks may share one host DeviceId; rank identity selects their shards.
  * Explicit QueryInterval coverage retains original source bounds and permits
  * only the overlaps justified by actual Q consumers. Defaults remain legacy.
  *
@@ -153,6 +154,13 @@ namespace llaminar2
         // =========================================================================
 
         const std::vector<DeviceShardingAssignment> &assignments() const { return assignments_; }
+        /**
+         * @brief Select a shard by an unambiguous storage-device identity.
+         * @param device Exact storage address space to find.
+         * @return The sole assignment naming that device.
+         * @throws std::out_of_range When the device is absent.
+         * @throws std::invalid_argument When multiple ranks share the device; use forRank.
+         */
         const DeviceShardingAssignment &forDevice(DeviceId device) const;
         const DeviceShardingAssignment &forRank(int rank) const;
         int worldSize() const { return static_cast<int>(assignments_.size()); }

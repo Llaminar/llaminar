@@ -14,6 +14,8 @@
 #include "transfer/TransferEngine.h"
 #include "transfer/BackgroundTransferProgressBinding.h"
 #include "transfer/TransferProducerDependency.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include <functional>
 #include "../../mocks/MockBackend.h"
 
 #include <gtest/gtest.h>
@@ -102,6 +104,8 @@ namespace
             mapped_allocation_ordinal = device_id;
             void *const allocation =
                 MockBackend::allocateMapped(bytes, device_id, device_ptr);
+            if (force_null_mapped_alias && device_ptr)
+                *device_ptr = nullptr;
             mapped_allocation_host = allocation;
             mapped_allocation_alias =
                 device_ptr ? *device_ptr : nullptr;
@@ -136,6 +140,8 @@ namespace
         /** @brief Record native mapped retirement before delegating to the mock. */
         void freeMapped(void *host_ptr, int device_id) override
         {
+            if (before_mapped_free)
+                before_mapped_free();
             ++mapped_free_count;
             mapped_free_host = host_ptr;
             mapped_free_ordinal = device_id;
@@ -284,6 +290,8 @@ namespace
         MappedTransferWakeState service_wake_value =
             MappedTransferWakeState::InferenceComplete;
         MappedTransferServiceRun service_run = MappedTransferServiceRun::FinitePass;
+        bool force_null_mapped_alias = false;
+        std::function<void()> before_mapped_free;
         bool registration_succeeds = true;
         bool portable_mapped_supported = false;
         bool timeline_calls_succeed = true;
@@ -1005,4 +1013,65 @@ TEST_F(
     slices.clear();
     EXPECT_EQ(cuda_->unregister_count, snapshot.backing_region_count);
     EXPECT_EQ(rocm_->unregister_count, snapshot.backing_region_count);
+}
+
+/** @test A mapped declaration rejects absent/capacity admission before native allocation. */
+TEST_F(Test__MappedHostTransferRegion, PublicationRootRejectsUnadmittedBackingBeforeNativeAllocation)
+{
+    const DeviceId host{DeviceType::CPU, 1};
+    const CPUMappedPublicationRoot root(123, host, DeviceId::cuda(0));
+    EXPECT_EQ(root.physicalBytes(), TransferEngine::mappedHostRegionAllocationBytes(123));
+    EXPECT_EQ(root.owner(), PhysicalMemoryOwner::ActivationArena);
+    EXPECT_THROW((void)CPUMappedPublicationRoot(1, DeviceId::cuda(0), DeviceId::cuda(0)), std::invalid_argument);
+    EXPECT_THROW((void)CPUMappedPublicationRoot(1, host, DeviceId::cpu()), std::invalid_argument);
+    EXPECT_THROW(engine_.allocateMappedHostRegion(root, {}), std::logic_error);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({0, host, root.physicalBytes(), root.physicalBytes()}, root.owner(), root.physicalBytes() - 1);
+    const auto memory = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    EXPECT_THROW(engine_.allocateMappedHostRegion(root, memory), std::logic_error);
+    EXPECT_EQ(cuda_->mapped_allocate_count, 0u);
+    EXPECT_EQ(cuda_->register_count, 0u);
+    for (const auto &line : memory->rankAttestation())
+        EXPECT_EQ(line.materialized_new_bytes, 0u);
+}
+
+/** @test Alias ownership retains exactly one physical claim until native free completes. */
+TEST_F(Test__MappedHostTransferRegion, PublicationRootClaimFollowsAliasAndNativeRetirement)
+{
+    const DeviceId host{DeviceType::CPU, 1};
+    const CPUMappedPublicationRoot root(123, host, DeviceId::cuda(0));
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({0, host, root.physicalBytes(), root.physicalBytes()}, root.owner(), root.physicalBytes());
+    const auto memory = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    const auto live = [&]()
+    {
+        size_t bytes = 0;
+        for (const auto &line : memory->rankAttestation())
+            if (line.owner == root.owner()) bytes += line.materialized_new_bytes;
+        return bytes;
+    };
+    cuda_->before_mapped_free = [&]() { EXPECT_EQ(live(), root.physicalBytes()); };
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        auto region = engine_.allocateMappedHostRegion(root, memory);
+        auto alias = region;
+        EXPECT_EQ(region->sizeBytes(), root.physicalBytes());
+        EXPECT_TRUE(region->hasDevice(root.consumer()));
+        EXPECT_EQ(live(), root.physicalBytes());
+        region.reset();
+        EXPECT_EQ(live(), root.physicalBytes());
+        EXPECT_NE(alias->deviceAlias(root.consumer()), nullptr);
+        alias.reset();
+        EXPECT_EQ(live(), 0u);
+        EXPECT_EQ(cuda_->mapped_free_count, static_cast<size_t>(replay + 1));
+    }
+    // A failed alias publication still frees native storage before retiring
+    // its already-acquired physical claim; no partial region escapes setup.
+    cuda_->force_null_mapped_alias = true;
+    EXPECT_THROW(engine_.allocateMappedHostRegion(root, memory), std::runtime_error);
+    EXPECT_EQ(live(), 0u);
+    EXPECT_EQ(cuda_->mapped_allocate_count, 4u);
+    EXPECT_EQ(cuda_->mapped_free_count, 4u);
 }

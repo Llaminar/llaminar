@@ -946,13 +946,13 @@ TEST(Test__PrefixMTPConfig,
     EXPECT_EQ(owner_plan.flattenedTargetRows(), 8);
     EXPECT_EQ(owner_plan.stochasticTargetRows(), 8);
     EXPECT_EQ(owner_plan.stochasticDraftRows(), 6);
-    EXPECT_EQ(owner_plan.sidecarKVOnlyBatchGraphSlots(), 7u);
+    EXPECT_EQ(owner_plan.sidecarKVOnlyBatchRegistryCapacity(), 7u);
     EXPECT_EQ(owner_plan.sidecarGraphSlots(), 13u);
     EXPECT_EQ(owner_plan.genericTerminalHiddenGraphSlots(), 1u);
-    EXPECT_EQ(owner_plan.terminalHiddenContiguousGraphSlots(), 8u);
-    EXPECT_EQ(owner_plan.terminalHiddenDeviceAcceptedGraphSlots(), 2u);
-    EXPECT_EQ(owner_plan.terminalHiddenRequestTerminalGraphSlots(), 2u);
-    EXPECT_EQ(owner_plan.terminalHiddenShiftedPrefillGraphSlots(), 16u);
+    EXPECT_EQ(owner_plan.terminalHiddenContiguousRegistryCapacity(), 8u);
+    EXPECT_EQ(owner_plan.terminalHiddenDeviceAcceptedRegistryCapacity(), 2u);
+    EXPECT_EQ(owner_plan.terminalHiddenRequestTerminalRegistryCapacity(), 2u);
+    EXPECT_EQ(owner_plan.terminalHiddenShiftedPrefillRegistryCapacity(), 16u);
     EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 29u);
     EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 6u);
     EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 16u);
@@ -971,7 +971,7 @@ TEST(Test__PrefixMTPConfig,
     EXPECT_EQ(owner_plan.stochasticTargetRows(), 4);
     EXPECT_EQ(owner_plan.stochasticDraftRows(), 3);
     EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 0u);
-    EXPECT_EQ(owner_plan.sidecarKVOnlyBatchGraphSlots(), 0u);
+    EXPECT_EQ(owner_plan.sidecarKVOnlyBatchRegistryCapacity(), 0u);
     EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 0u);
 }
 
