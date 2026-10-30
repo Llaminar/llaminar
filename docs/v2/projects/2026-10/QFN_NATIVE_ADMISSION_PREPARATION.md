@@ -161,14 +161,24 @@ zero skips. Its unchanged target set is CUDA 80/86/89/90 and HIP gfx906. The
 existing physical-authority executable includes the original direct-Admitted
 tests, preparation/permit tests and actual optional-placement regression.
 
-Four explicit `ProductionTestPreflight` replay registrations pass **20 repetitions
-each**: preparation, exact permits, optional placement and cancelled execution.
+Five explicit `ProductionTestPreflight` replay registrations pass **20 repetitions
+each**: preparation, exact permits, optional placement, resource programs and
+cancelled execution.
 The source policy and its negative controls also pass. Compile-time access
 checks reject public preparation construction, aggregate-only final callbacks
 and direct native-root claims. A fully instrumented actual PMA implementation
 and its 45 core tests pass **20 repetitions under ThreadSanitizer**; only that
 diagnostic process disables ASLR, with no host or production setting changes.
-Evidence is `/tmp/qfn-native-preparation-main-r1/`.
+The original core evidence is `/tmp/qfn-native-preparation-main-r1/`; the expanded
+Unit/replay run is `/tmp/qfn-native-resource-programs-main-r1/`.
+
+The resource-program replay covers all seven native allocator kinds across
+12 device-free inventories: CPU-only; CUDA and ROCm with 1/2/4/8 GPUs; and mixed
+CUDA/ROCm with 2/4/8 GPUs. Reversed discovery order preserves canonical resource
+indices. NUMA placement shares CPU0 accounting; a changed vendor or CPU ordinal
+cannot spend another descriptor's capacity. Every program proves materialized
+bytes per resource and final retirement. These synthetic resource declarations
+do not qualify those hardware topologies or their transports.
 
 Review found that cancellation originally shared the successful executable-seal
 state. A fully published session could consequently cancel and then seal for

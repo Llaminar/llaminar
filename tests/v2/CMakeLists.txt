@@ -25763,7 +25763,8 @@ add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalMemoryAuthority.cpp
     unit/planning/Test__NativeStoragePreparing.cpp
     unit/planning/Test__NativeStoragePreparedPermits.cpp
-    unit/planning/Test__NativeStoragePreparingPlacement.cpp)
+    unit/planning/Test__NativeStoragePreparingPlacement.cpp
+    unit/planning/Test__NativeStorageResourcePrograms.cpp)
 target_link_libraries(v2_test_physical_memory_authority
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_physical_memory_authority PRIVATE
@@ -25778,7 +25779,8 @@ add_v2_test(V2_Unit_PhysicalMemoryAuthority
 # small physical declarations and the real optional-placement selector, without
 # initializing a device or loading a model.
 foreach(native_admission_suite IN ITEMS
-        NativeStoragePreparing NativeStoragePreparedPermits NativeStoragePreparingPlacement)
+        NativeStoragePreparing NativeStoragePreparedPermits NativeStoragePreparingPlacement
+        NativeStorageResourcePrograms)
     add_v2_test(V2_Integration_${native_admission_suite}Replay
         COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
             --gtest_filter=${native_admission_suite}.*
