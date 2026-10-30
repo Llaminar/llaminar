@@ -64,6 +64,11 @@ Piggyback compact control sidebands on existing ILocalTPContext/allreduceWithSid
 
 One common declaration prices every actual owner's native payload, directory/policy state, slots/pins/generations, frames, source read scratch, CPU RAM cache, pinned/mapped channels, per-edge device banks, native connector/graph owners and publication objects. Place host resources on the exact world-rank/CPU0 physical allocator, with NUMA policy recorded separately as placement metadata; distinct NUMA workers do not create additional host capacity ledgers. GPU resources name their exact world-rank/vendor/ordinal. Native reservation units remain certified; multiplicity follows real retained graph owners and concurrency. Tier capacity is lowest-priority optional storage after mandatory execution and protocol roots. PMA performs all admission, materialization, shared-root lifetime and release; caches may track logical occupancy, not a second physical budget.
 
+The [native preparation plan](QFN_NATIVE_ADMISSION_PREPARATION.md) closes the
+early CPU-storage dependency through a one-way Preparing→Admitted transition
+in that same PMA state. Its exact SDK declarations must precede optional fill;
+the plan is approved implementation work, not current native qualification.
+
 Prove simultaneous graphs' concurrency explicitly. One serial family may borrow max-sized frame banks; concurrent consumers require exclusive frames and safe shared cache pin/generation protocol. Accepted allocation plans survive cancellation until all grants, fills and ACKs retire. Host source worker and network/device channel closures drain accepted operations before source/cache roots disappear. Reuse authenticates source files/ranges, owner/coordinator mappings, policy, capacities, graph generations and native transport identity. Faults poison the exact frame and fail fatally; no silent alternate tier or topology outside the declared policy.
 
 ### Implementable sequence toward the complete feature
