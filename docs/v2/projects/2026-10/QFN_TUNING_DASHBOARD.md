@@ -1,6 +1,6 @@
 # QFN tuning dashboard
 
-Updated 2026-10-29. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-10-30. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
@@ -38,7 +38,7 @@ and [online rescale][online-rescale]. Component savings do not establish model g
 
 | Next action | State / decision |
 |---|---|
-| Admission | [Matrix](QFN_SOURCE_ADMISSION_MATRIX.md): Unit 790/790; focused 8/8; native 1,030 pass; 468 source cells eligible. |
+| Admission | [Matrix](QFN_SOURCE_ADMISSION_MATRIX.md): `6f4c742e7` prerequisites green (3,048 passes/29 hardware skips); CUDA15/CPU33 16/16 source passes; 484 eligible. |
 | CUDA QSA timing | First M1/512 component saves 22.685%; remaining shapes pending, no model claim. |
 | Broader topologies | Tune admitted A rows, then qualify B–D with matched references. |
 
