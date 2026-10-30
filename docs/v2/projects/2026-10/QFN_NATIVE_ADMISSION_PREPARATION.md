@@ -58,6 +58,28 @@ lifetime tokens. Numeric pointers or anchor IDs alone are not lifetime proof.
 Materialization consumes the same immutable geometry rather than calculating
 another allocation plan.
 
+The SDK program may record immutable creator facts from its actual metadata
+allocators. Its record pages must themselves be preclaimed and self-declared
+without recursively allocating another record page. Retained and scoped
+factory allocations use distinct typed authorities: only retained containers
+enter the creator visitor, while scoped scratch retires before planning. If
+record insertion fails, release the pending canonical claim before the requesting
+allocator reaches Create. A later Create or constructor failure invalidates the
+whole factory. Only the actual successful preparation jobs' return/join proof
+may freeze it. Actual container owners release their allocations; declaration
+records neither free described roots nor become an allocation lookup registry.
+
+Final callbacks consume an exact source descriptor once, under the existing
+PMA mutex. The permit retains its original root anchor, allocator, placement,
+geometry, family, lifetime and phase; an aggregate byte reservation alone is
+insufficient. Changed or duplicate roots cannot spend another descriptor's
+capacity. Failed creation returns its pending bytes but does not recycle the
+consumed program slot. Failed physical cleanup retains both the actual token
+and its charge. These permits carry lifecycle state, not a second byte ledger.
+The prepared-program path replaces the preliminary setup-slack callback path;
+CPU0 preparation probes use Preparing, and other selected roots require exact
+source declarations before final admission.
+
 Temporary lifetime sharing requires an SDK-authored concurrency relation that
 the actual native schedule enforces. A numeric interval ID is insufficient.
 Retained recording metadata derives from the actual typed operation program
@@ -89,6 +111,18 @@ existing private callback-double tests must be replaced by the real PMA
 Preparing state before it qualifies this integration boundary. Full communicator,
 channel, proxy, recording and graph ownership remains subsequent work.
 
+Opaque driver resources remain a separate, unqualified integration boundary.
+The current CUDA `prepareNativeExecutionContextStorage` probes stack growth and
+restores it before requesting a measured lease; the current
+`claimMeasuredRuntimeContextStorage` creates a separate authority. Neither is a
+pre-creation certificate for new SDK streams, events, mempools or capture
+resources. The exact-root transition does not extend or certify that route.
+The selected SDK source must enumerate those creation sites and lifetimes.
+Any prepared backend handle it borrows needs a real retained owner and original
+admission proof; a numeric context ID or handle is insufficient. Newly created
+resources cannot be relabeled as pre-existing occupancy. Resolve that backend
+contract before qualifying the complete native program.
+
 Focused regressions must be explicit in Unit and `ProductionTestPreflight`:
 
 - Competing last-capacity preparation claims; malformed identity, NUMA,
@@ -103,6 +137,13 @@ Focused regressions must be explicit in Unit and `ProductionTestPreflight`:
   can reduce optional VRAM placement. Each physical root is charged once.
 - Actual SDK preparation/consume/retire through the same authority, including
   rejected final admission, source-first destruction and physical-cleanup faults.
+- Exact descriptor consumption with spare aggregate capacity: changed root
+  geometry, duplicate anchors and simultaneous claims must reject before Create.
+  Failed Create cannot make the consumed descriptor available again; recording
+  metadata cannot be claimed during preparation or executable replay.
+- Source-owned metadata recording: self-declared page growth, insertion-failure
+  rollback before Create, failed constructor preventing factory freeze, and
+  child-container retirement before the declaration pages disappear.
 - Existing direct-Admitted behavior, source guards and the complete Unit suite.
 
 After the host-owned lifecycle is proven, run the native selected-root/captured
