@@ -38,7 +38,7 @@ and [online rescale][online-rescale]. Component savings do not establish model g
 
 | Next action | State / decision |
 |---|---|
-| Admission | [Matrix](QFN_SOURCE_ADMISSION_MATRIX.md): `6f4c742e7` prerequisites green (3,048 passes/29 hardware skips); CUDA15/CPU33 16/16 source passes; 484 eligible. |
+| Admission | [Matrix](QFN_SOURCE_ADMISSION_MATRIX.md): `6f4c742e7` prerequisites green (3,048 passes/29 hardware skips); CUDA15/CPU33 16/16 source passes; 484 eligible. [Native init fix](QFN_NCCL_GIN_INITIALIZATION.md). |
 | CUDA QSA timing | First M1/512 component saves 22.685%; remaining shapes pending, no model claim. |
 | Broader topologies | Tune admitted A rows, then qualify B–D with matched references. |
 

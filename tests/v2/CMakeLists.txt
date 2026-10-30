@@ -4306,6 +4306,11 @@ set_tests_properties(V2_Integration_ROCmBLASKernelPackaging PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;ROCm;BLAS;Regression"
     TIMEOUT 30)
 include(cmake/V2RCCLProtocolDefaultsTests.cmake)
+include(cmake/V2NCCLGinSelectionTests.cmake)
+add_test(NAME V2_Unit_NCCLGinProof
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_nccl_gin_selection.py")
+set_tests_properties(V2_Unit_NCCLGinProof PROPERTIES
+    LABELS "V2;Unit;NCCL;DeviceFree;Regression" TIMEOUT 30)
 include(cmake/V2RCCLSelectorTests.cmake)
 include(cmake/V2RCCLSmallAllGatherTests.cmake)
 add_test(NAME V2_Unit_RCCLSmallAllGatherProof

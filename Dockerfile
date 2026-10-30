@@ -108,6 +108,9 @@ COPY scripts/docker/patches/nccl-capture-reentry.patch \
      /tmp/install-scripts/patches/nccl-capture-reentry.patch
 COPY scripts/docker/patches/nccl-device-live-rows.patch \
      /tmp/install-scripts/patches/nccl-device-live-rows.patch
+COPY scripts/docker/patches/nccl-gin-auto-selection.patch \
+     /tmp/install-scripts/patches/nccl-gin-auto-selection.patch
+COPY scripts/docker/nccl-gin-selection/ /tmp/install-scripts/nccl-gin-selection/
 COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
      scripts/docker/patches/rocm-hip-host-queue-native-stack.patch \
      scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch \

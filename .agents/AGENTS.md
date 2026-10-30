@@ -472,6 +472,11 @@ configuring. The runtime deliberately loads its distinct SONAME, not the
 distribution NCCL package, because retained parent recording requires the
 corrected stream-membership lifecycle. Do not substitute a system library to
 make dependency discovery pass.
+The same installer repairs native GIN auto selection when a successful probe
+finds no compatible devices. `V2_Integration_NCCLGinSelection` belongs to
+production preflight: the dependency builder replays the actual selector and
+the original failing code, while installed runners authenticate the resulting
+source/DSO-bound proof without an SDK or accelerator.
 
 RCCL runtime loading uses the exact `RCCL_LIBRARY` selected by CMake, without a
 second runtime search. Select the compatible library explicitly when configuring

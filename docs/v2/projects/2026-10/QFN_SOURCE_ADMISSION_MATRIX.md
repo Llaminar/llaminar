@@ -89,7 +89,7 @@ CUDA/CPU 15/33 layer family.
 
 | Scope | Evidence and result |
 |---|---|
-| Current complete prerequisites | **r13 green**: 790/790 Unit; 2,258 preflight passes and 29 unavailable-hardware skips; zero failures. Complete 3,077-registration gate took 5,088.69s. Driver window clean. `/tmp/qfn-admission-r13-prerequisites/` and sibling `-observer/` authenticate checkpoint `6f4c742e7`. |
+| Last complete prerequisites | **r13 green**: 790/790 Unit; 2,258 preflight passes and 29 unavailable-hardware skips; zero failures. Complete 3,077-registration gate took 5,088.69s. Driver window clean. `/tmp/qfn-admission-r13-prerequisites/` and sibling `-observer/` authenticate checkpoint `6f4c742e7`. |
 | Focused repair proof | 13/13 affected preflight checks pass; original workspace implementation fails all three ownership regressions. `/tmp/qfn-cuda-cpu-fit-r12-focused.xml`. Earlier CI-builder failure and scoped closure remain in `/tmp/qfn-admission-r5-{prerequisites,focused-closure}/`. |
 | Current native slice | r10: **21/28 pass; 28/28 retire**, unchanged runtime and clean driver window. Eight CPU TP2/PP2 and four all-GPU ROCm TP4 RAM controls pass across Off/fixed1/fixed3/Dynamic. Nine composed RAM candidates pass: CUDA2→CPU2 Off; ROCm2→CPU2 and CUDA2→ROCm2→CPU2 in all four modes. `source-admission-cpu-mtp-r10/`. |
 | Workspace-owner native repeat | r11: 6/11 pass; all retire, runtime unchanged, driver clean. Earlier GPU stages no longer pay for CPU-tail head/predictor workspace: 1,121,648,640 B/GPU saved. Original CUDA16/CPU32 active cases still exceed observed available VRAM by 137,388,696 B. ROCm PP still needs native composition/capacity work. `source-admission-workspace-owner-r11/`. |
@@ -97,6 +97,7 @@ CUDA/CPU 15/33 layer family.
 | CUDA capacity controls | Four-expert VRAM retained3 positives and eight-expert 13GiB-cap rejections pass 8/8 with exact MTP/cap evidence and retirement. `source-admission-cuda-capacity-controls-r5/`. |
 | Added CUDA15/CPU33 family | **16/16 native pass**: four storage policies × Off/fixed1/fixed3/Dynamic, all with exact retirement, unchanged runtime and clean driver checks. `source-admission-cuda-cpu15-full15-r12/`. |
 | Current discovery | 628 declared, 484 selected, 144 hardware-unqualified; r12 `hardware-selection.json` retains exact identities. This is not full-matrix execution. |
+| Native init repair | [NCCL GIN fix](QFN_NCCL_GIN_INITIALIZATION.md): source replay and CUDA capture/reset pass; full native admission remains open. |
 
 Three r10 intervals conservatively overlapped private CUDA property queries.
 `source-admission-cpu-mtp-r10-quiet/` repeats their same two passes and one
