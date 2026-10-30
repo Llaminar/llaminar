@@ -82,7 +82,7 @@ Sources: [typed extensions](../../../../tests/v2/integration/parity/qwen4exp/Qwe
 
 ## Current qualification
 
-Remote checkpoint `6f4c742e7` contains stage-owned CPU maintenance, NUMA
+Full-gate checkpoint `6f4c742e7` contains stage-owned CPU maintenance, NUMA
 transfer planning, exact MTP routed-parent/workspace ownership and the distinct
 CUDA/CPU 15/33 layer family.
 **The complete source matrix is not qualified.**
@@ -90,14 +90,14 @@ CUDA/CPU 15/33 layer family.
 | Scope | Evidence and result |
 |---|---|
 | Last complete prerequisites | **r13 green**: 790/790 Unit; 2,258 preflight passes and 29 unavailable-hardware skips; zero failures. Complete 3,077-registration gate took 5,088.69s. Driver window clean. `/tmp/qfn-admission-r13-prerequisites/` and sibling `-observer/` authenticate checkpoint `6f4c742e7`. |
-| Focused repair proof | 13/13 affected preflight checks pass; original workspace implementation fails all three ownership regressions. `/tmp/qfn-cuda-cpu-fit-r12-focused.xml`. Earlier CI-builder failure and scoped closure remain in `/tmp/qfn-admission-r5-{prerequisites,focused-closure}/`. |
+| Focused repair proof | 13/13 affected checks pass; original workspace code fails all three ownership regressions. `/tmp/qfn-cuda-cpu-fit-r12-focused.xml`. |
 | Current native slice | r10: **21/28 pass; 28/28 retire**, unchanged runtime and clean driver window. Eight CPU TP2/PP2 and four all-GPU ROCm TP4 RAM controls pass across Off/fixed1/fixed3/Dynamic. Nine composed RAM candidates pass: CUDA2→CPU2 Off; ROCm2→CPU2 and CUDA2→ROCm2→CPU2 in all four modes. `source-admission-cpu-mtp-r10/`. |
 | Workspace-owner native repeat | r11: 6/11 pass; all retire, runtime unchanged, driver clean. Earlier GPU stages no longer pay for CPU-tail head/predictor workspace: 1,121,648,640 B/GPU saved. Original CUDA16/CPU32 active cases still exceed observed available VRAM by 137,388,696 B. ROCm PP still needs native composition/capacity work. `source-admission-workspace-owner-r11/`. |
 | Original-code controls | Reproduce NUMA allocator duplication, MTP routed-parent duplication and incorrect CPU global-layer certification. `/tmp/qfn-cpu-numa-original-control-r10/`, `/tmp/qfn-mtp-routed-replica-owner-r1/`, `/tmp/qfn-cpu-offset-original-control-r8/`. |
 | CUDA capacity controls | Four-expert VRAM retained3 positives and eight-expert 13GiB-cap rejections pass 8/8 with exact MTP/cap evidence and retirement. `source-admission-cuda-capacity-controls-r5/`. |
 | Added CUDA15/CPU33 family | **16/16 native pass**: four storage policies × Off/fixed1/fixed3/Dynamic, all with exact retirement, unchanged runtime and clean driver checks. `source-admission-cuda-cpu15-full15-r12/`. |
 | Current discovery | 628 declared, 484 selected, 144 hardware-unqualified; r12 `hardware-selection.json` retains exact identities. This is not full-matrix execution. |
-| Native repairs | [NCCL init](QFN_NCCL_GIN_INITIALIZATION.md) and [I/O retirement](QFN_IMMUTABLE_WORKER_RETIREMENT.md) pass focused gates; full native admission remains open. |
+| Native repairs | [NCCL init](QFN_NCCL_GIN_INITIALIZATION.md), [I/O retirement](QFN_IMMUTABLE_WORKER_RETIREMENT.md) and [PMA preparation/permits](QFN_NATIVE_ADMISSION_PREPARATION.md) pass focused gates. Current Unit: **794/794**; full native admission remains open. |
 
 Three r10 intervals conservatively overlapped private CUDA property queries.
 `source-admission-cpu-mtp-r10-quiet/` repeats their same two passes and one
@@ -189,7 +189,7 @@ Temporary prefix directories must be absent after final retirement.
 1. Resolve remaining composed capacity/native-domain failures while preserving
    original full15 requests; CUDA15/CPU33 now passes its complete family.
 2. Keep the complete gate green as further implementations land; r13 qualifies
-   the installed checkpoint, not the private native-transport/pooled work.
+   `6f4c742e7`, not subsequent native preparation/transport/pooled changes.
 3. Run remaining locally available placement/ownership/MTP cases without
    equating a sampled batch with the full matrix.
 4. Resolve native ROCm PP(TP2, TP2) composition and active capacity failures.

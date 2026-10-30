@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace llaminar2
 {
@@ -46,6 +47,14 @@ namespace llaminar2
     };
 
     class PhysicalMemoryPlanBuilder;
+    class NativeStoragePmaBinding;
+    class NativeStoragePreparationPmaBinding;
+    class NativeMandatoryStorageDeclarations;
+    class NativePreparationPlanningSnapshot;
+    namespace test
+    {
+        struct NativeStoragePreparationReplayAccess;
+    }
 
     /** @brief Immutable aggregate BOM for every physical allocator in a plan. */
     class PhysicalMemoryPlan final
@@ -209,6 +218,77 @@ namespace llaminar2
         AdoptedResident,
     };
 
+    /** @brief One-way canonical authority lifecycle; cancellation never erases root ownership. */
+    enum class PhysicalMemoryAuthorityPhase : std::uint8_t
+    {
+        Preparing,
+        Admitted,
+        Cancelled
+    };
+    /** @return Explicit canonical lifecycle spelling for passive source attestations. */
+    [[nodiscard]] inline constexpr std::string_view toString(
+        PhysicalMemoryAuthorityPhase phase) noexcept
+    {
+        switch (phase)
+        {
+        case PhysicalMemoryAuthorityPhase::Preparing:
+            return "Preparing";
+        case PhysicalMemoryAuthorityPhase::Admitted:
+            return "Admitted";
+        case PhysicalMemoryAuthorityPhase::Cancelled:
+            return "Cancelled";
+        }
+        return "Invalid";
+    }
+
+    /** @brief Actual native source phase, independently frozen in each root descriptor. */
+    enum class PhysicalMemoryNativeRootPhase : std::uint32_t
+    {
+        ColdProbe = 1,
+        RetainedSetup = 2,
+        GraphRecordingHostMetadata = 3
+    };
+
+    /**
+     * @brief Immutable source-issued identity/geometry attached to an actual native root lease.
+     * No pointer lookup, byte balance or alias registry is represented here.
+     */
+    struct PhysicalMemoryNativeRootDeclaration final
+    {
+        std::uint64_t owner_identity = 0; ///< Actual native root record, bound before Create.
+        std::uint64_t shared_anchor_identity =
+            0; ///< Stable source root-cell identity, never dereferenced by PMA.
+        std::size_t requested_bytes = 0; ///< Exact native logical allocation request.
+        std::size_t physical_bytes = 0;  ///< Actual allocator-rounded physical creation extent.
+        std::size_t allocation_granularity =
+            0; ///< Granularity from the selected native allocator properties.
+        std::uint64_t allocator_flags =
+            0; ///< Frozen native allocator/handle/access policy identity.
+        DeviceId device =
+            DeviceId::invalid(); ///< Physical allocator; host placement always uses CPU0.
+        std::int32_t host_numa =
+            -1; ///< Placement metadata, independently preserved from allocator identity.
+        std::uint32_t owner_family = 0;   ///< SDK-issued actual native owner family.
+        std::uint32_t lifetime = 0;       ///< SDK-issued source ownership/retirement lifetime.
+        std::uint32_t allocator_kind = 0; ///< Exact selected allocator; no implicit substitution.
+        PhysicalMemoryNativeRootPhase source_phase = PhysicalMemoryNativeRootPhase::RetainedSetup;
+        bool operator==(const PhysicalMemoryNativeRootDeclaration &) const = default;
+        /**
+         * @brief Compare immutable geometry while permitting only actual owner binding.
+         * @param other Actual callback declaration for this same source root cell.
+         * @return Whether every frozen source field matches; only owner_identity is ignored.
+         */
+        [[nodiscard]] bool samePreparedGeometry(
+            const PhysicalMemoryNativeRootDeclaration &other) const noexcept
+        {
+            auto left = *this;
+            auto right = other;
+            left.owner_identity = 0;
+            right.owner_identity = 0;
+            return left == right;
+        }
+    };
+
     /**
      * @brief Atomic owner-level view of one admitted allocator ledger.
      *
@@ -221,6 +301,8 @@ namespace llaminar2
     struct PhysicalMemoryOwnerAttestation
     {
         PhysicalMemoryAllocatorIdentity identity; ///< Physical allocator.
+        PhysicalMemoryAuthorityPhase phase =
+            PhysicalMemoryAuthorityPhase::Admitted; ///< Atomic source admission phase.
         PhysicalMemoryOwner owner =
             PhysicalMemoryOwner::Count; ///< Exact BOM owner line.
         std::size_t planned_new_bytes = 0u; ///< Admitted new allocation.
@@ -229,25 +311,53 @@ namespace llaminar2
         std::size_t committed_new_bytes = 0u; ///< Direct plus reserved capacity.
         std::size_t adopted_resident_bytes = 0u; ///< Live retained allocation.
 
+        std::size_t preparation_committed_bytes =
+            0u; ///< Exact source preparation backing, included once after admission.
+        std::size_t preparation_materialized_bytes = 0u; ///< Published early physical roots.
+        std::size_t native_declared_preclaimed_bytes =
+            0u; ///< Unpublished native children within source BOM reservations.
+
+        /** @return All canonical source commitments, including exact native preparation/SDK roots.
+         */
+        [[nodiscard]] std::size_t totalCommittedNewBytes() const noexcept
+        {
+            return committed_new_bytes;
+        }
+        /** @return All canonical physical source bytes; preparation/SDK children occur exactly
+         * once. */
+        [[nodiscard]] std::size_t totalMaterializedNewBytes() const noexcept
+        {
+            return materialized_new_bytes;
+        }
+
         /** @return Whether every admitted byte is physically live now. */
         [[nodiscard]] bool complete() const noexcept
         {
-            return materialized_new_bytes == planned_new_bytes &&
-                   adopted_resident_bytes == planned_resident_bytes;
+            return phase == PhysicalMemoryAuthorityPhase::Admitted &&
+                   materialized_new_bytes == planned_new_bytes &&
+                   adopted_resident_bytes == planned_resident_bytes &&
+                   native_declared_preclaimed_bytes == 0u;
         }
 
         /** @return Whether every admitted byte has a unique live/reserved owner. */
         [[nodiscard]] bool committed() const noexcept
         {
-            return committed_new_bytes == planned_new_bytes &&
+            return phase == PhysicalMemoryAuthorityPhase::Admitted &&
+                   committed_new_bytes == planned_new_bytes &&
                    adopted_resident_bytes == planned_resident_bytes;
         }
     };
+
+    class PhysicalMemoryOwnerReservation;
 
     namespace detail
     {
         struct PhysicalMemoryMaterializationState;
         struct PhysicalMemoryReservationState;
+        struct PhysicalMemoryNativeSetupEpochState;
+        struct PhysicalMemoryPreparationRootState;
+        struct PhysicalMemoryNativeRootPermitState;
+        struct PhysicalMemoryPreparationSnapshotState;
     }
 
     /**
@@ -304,6 +414,241 @@ namespace llaminar2
         PhysicalMemoryMaterializationKind kind_ =
             PhysicalMemoryMaterializationKind::NewAllocation;
         std::size_t bytes_ = 0u;
+    };
+
+    /**
+     * @brief Unique preclaim and physical-publication authority for one native root.
+     *
+     * The existing PMA state and immutable source demand remain retained until
+     * the actual native allocation and every physical alias have retired. Only
+     * this move-only lease can publish materialization or return its exact claim.
+     */
+    class PhysicalMemoryNativeSetupLease final
+    {
+    public:
+        /** @brief Construct an inactive lease without claiming capacity. */
+        PhysicalMemoryNativeSetupLease();
+        /** @brief Return the exact preclaim after its native owner frees backing. */
+        ~PhysicalMemoryNativeSetupLease();
+        PhysicalMemoryNativeSetupLease(const PhysicalMemoryNativeSetupLease &) = delete;
+        PhysicalMemoryNativeSetupLease &operator=(const PhysicalMemoryNativeSetupLease &) = delete;
+        PhysicalMemoryNativeSetupLease(PhysicalMemoryNativeSetupLease &&other) noexcept;
+        PhysicalMemoryNativeSetupLease &operator=(PhysicalMemoryNativeSetupLease &&other) noexcept;
+        /** @return Whether this token uniquely retains its native-root preclaim. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return bool(epoch_) && bytes_ != 0;
+        }
+        /** @return Actual allocator-declared physical creation extent. */
+        [[nodiscard]] std::size_t bytes() const noexcept
+        {
+            return bytes_;
+        }
+        /** @return Whether successful native creation has been published. */
+        [[nodiscard]] bool materialized() const noexcept
+        {
+            return materialized_;
+        }
+        /**
+         * @brief Publish successful physical creation before exposing any consumer.
+         * @throws std::logic_error For inactive, duplicate or closed-epoch publication.
+         */
+        void materialize();
+
+    private:
+        friend class PhysicalMemoryNativeSetupEpoch;
+        /** @brief Bind one already-reserved native root without another ledger. */
+        PhysicalMemoryNativeSetupLease(
+            std::shared_ptr<detail::PhysicalMemoryNativeSetupEpochState> epoch,
+            std::size_t resource_index, PhysicalMemoryOwner owner, std::size_t bytes);
+        /** @brief Return committed/materialized columns exactly once. */
+        void release() noexcept;
+        std::shared_ptr<detail::PhysicalMemoryNativeSetupEpochState> epoch_;
+        std::shared_ptr<detail::PhysicalMemoryReservationState> declared_reservation_;
+        std::unique_ptr<detail::PhysicalMemoryPreparationRootState> preparation_root_;
+        std::shared_ptr<detail::PhysicalMemoryNativeRootPermitState> permit_;
+        std::size_t resource_index_ = 0;
+        PhysicalMemoryOwner owner_ = PhysicalMemoryOwner::Count;
+        std::size_t bytes_ = 0;
+        bool materialized_ = false;
+    };
+
+    /**
+     * @brief Shared immutable setup identity with one-way capture/retirement closure.
+     *
+     * Callback copies share this exact epoch. Claim, materialization, closure
+     * and retirement synchronize through the existing PMA materialization mutex.
+     * A retired session is required before an independent source re-admission;
+     * process-lived roots cannot be hidden in a second source authority.
+     */
+    class PhysicalMemoryNativeSetupEpoch final
+    {
+    public:
+        /** @brief Construct an inactive lifecycle handle without creating an authority. */
+        PhysicalMemoryNativeSetupEpoch() = default;
+        /** @return Original same-session identity retained through final source admission. */
+        [[nodiscard]] std::uint64_t identity() const noexcept;
+        /** @brief Enter cold host recording after every required GPU root is prepared. */
+        void beginHostRecording() const;
+        /**
+         * @brief Close native growth before executable publication/replay.
+         * Repeated successful sealing is idempotent while all required roots remain published.
+         * @throws std::logic_error For abandoned setup or missing/unpublished retained roots.
+         */
+        void sealForExecution() const;
+        /** @return Whether growth has permanently closed for this native session. */
+        [[nodiscard]] bool sealed() const;
+        /** @return Whether every actual source/root/alias has physically retired. */
+        [[nodiscard]] bool retired() const;
+        /** @brief Reject independent source admission until final SDK root retirement. */
+        void requireRetired() const;
+
+    private:
+        friend class PhysicalMemoryMaterializationLedger;
+        friend class NativeStoragePreparationPmaBinding;
+        friend class NativeMandatoryStorageDeclarations;
+        /**
+         * @brief Preclaim an exact source preparation root before native Create.
+         * @param declaration SDK-issued CPU0 allocator geometry and stable actual owner anchor.
+         * @return Unique physical-root lease retaining the original state and epoch.
+         * @throws std::invalid_argument For malformed/duplicate creator declarations.
+         * @throws PhysicalMemoryCapacityExhausted Before Create when original CPU0 capacity is
+         * exhausted.
+         * @throws std::logic_error If Preparing growth has closed.
+         */
+        [[nodiscard]] PhysicalMemoryNativeSetupLease claimPreparation(
+            const PhysicalMemoryNativeRootDeclaration &declaration) const;
+        /**
+         * @brief Close early growth and snapshot actual declarations under the canonical mutex.
+         * @return Immutable source floor/identity used before optional placement.
+         * @throws std::logic_error For pending publication, cancellation or repeated closure.
+         * Allocation failure leaves the original open phase and every token unchanged.
+         */
+        [[nodiscard]] std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState>
+        closePreparationForPlanning() const;
+        /**
+         * @brief Cancel early setup while all actual tokens remain releasable.
+         * @throws std::logic_error If final admission already transferred ownership.
+         */
+        void cancelPreparation() const;
+        friend class NativeStoragePmaBinding;
+        /**
+         * @brief Close failed admitted setup without publishing an executable.
+         * @throws std::logic_error For a source that never reached Admitted.
+         * This changes no physical counters and does not recycle descriptor permits.
+         * Abandoned setup can never publish an executable. Repeated abandonment is idempotent;
+         * destruction after a successful executable seal preserves that successful state.
+         */
+        void abandonSetup() const;
+        /**
+         * @brief Consume one exact immutable descriptor before native Create.
+         * @param declaration Actual native owner request, including its frozen source anchor.
+         * @return Sole root lease after descriptor consumption and source preclaim commit
+         * atomically.
+         * @throws std::logic_error For changed/consumed descriptors or an incompatible setup phase.
+         */
+        [[nodiscard]] PhysicalMemoryNativeSetupLease claimPreparedNative(
+            const PhysicalMemoryNativeRootDeclaration &declaration) const;
+        /**
+         * @brief Build future root permits without publishing inventory or capacity.
+         * @param declarations Exact immutable SDK creator declarations, excluding existing
+         * preparation roots.
+         * @param reservations Prebuilt source owner lifetimes, still unpublished.
+         * @return Stable descriptor objects attached to those same owner lifetimes.
+         * @throws std::logic_error If source extents do not exactly cover their declared
+         * reservation.
+         */
+        [[nodiscard]] std::vector<std::shared_ptr<detail::PhysicalMemoryNativeRootPermitState>>
+        prepareNativePermits(std::span<const PhysicalMemoryNativeRootDeclaration> declarations,
+                             const std::vector<PhysicalMemoryOwnerReservation> &reservations) const;
+        /**
+         * @brief Prebuild exact source reservations without publishing counters.
+         * @param snapshot Original closed preparation identity and retained root floor.
+         * @param mandatory Source-native creator BOM merged before optional fill.
+         * @param final Complete immutable certificate using the original observation registry.
+         * @return Unpublished owner handles; allocation failure leaves the source unchanged.
+         * @throws std::logic_error For stale floors, missing mandatory storage or wrong lifecycle.
+         */
+        [[nodiscard]] std::vector<PhysicalMemoryOwnerReservation> prepareNativeAdmission(
+            const std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState> &snapshot,
+            const PhysicalMemoryPlan &mandatory,
+            const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &final) const;
+        /**
+         * @brief Publish the complete prebuilt final bundle atomically in the same state.
+         * @param snapshot Original closed identity, revalidated under the one canonical mutex.
+         * @param mandatory Exact SDK creator BOM already priced before optional fill.
+         * @param final Immutable complete source certificate; never replaced after success.
+         * @param reservations Future native source owner handles, currently unpublished.
+         * @param permits Complete immutable future descriptor inventory with unconsumed lifecycle
+         * state.
+         * @param retainedPreparations Prebuilt exact original preparation declaration inventory.
+         * @param context Private unpublished callback-binding transfer record.
+         * @param arm Noexcept ownership/arm operation; it performs no native allocation or
+         * callback.
+         * @throws Before mutation for any stale/partial/changed source bundle.
+         * After validation only noexcept pointer/vector moves, counters and arm remain.
+         */
+        void publishNativeAdmission(
+            const std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState> &snapshot,
+            const PhysicalMemoryPlan &mandatory,
+            std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> final,
+            const std::vector<PhysicalMemoryOwnerReservation> &reservations,
+            std::vector<std::shared_ptr<detail::PhysicalMemoryNativeRootPermitState>> permits,
+            std::vector<PhysicalMemoryNativeRootDeclaration> retainedPreparations, void *context,
+            void (*arm)(void *) noexcept) const;
+        /** @brief Bind this handle to the sole canonical epoch state. */
+        explicit PhysicalMemoryNativeSetupEpoch(
+            std::shared_ptr<detail::PhysicalMemoryNativeSetupEpochState> epoch)
+            : epoch_(std::move(epoch))
+        {
+        }
+        /** @brief Admit one declared child under the same PMA mutex and epoch boundary. */
+        std::shared_ptr<detail::PhysicalMemoryNativeSetupEpochState> epoch_;
+    };
+
+    /** @brief Closed source preparation snapshot; no additional live allocation ledger. */
+    class NativePreparationPlanningSnapshot final
+    {
+    public:
+        NativePreparationPlanningSnapshot(const NativePreparationPlanningSnapshot &) = delete;
+        NativePreparationPlanningSnapshot &operator=(const NativePreparationPlanningSnapshot &) =
+            delete;
+        NativePreparationPlanningSnapshot(NativePreparationPlanningSnapshot &&) noexcept = default;
+        NativePreparationPlanningSnapshot &operator=(
+            NativePreparationPlanningSnapshot &&) noexcept = default;
+        /**
+         * @return Original single observation registry with stable resource indices.
+         * @throws std::logic_error If final publication consumed this snapshot.
+         */
+        [[nodiscard]] std::span<const PhysicalMemoryResource> initialObservations() const;
+        /**
+         * @return Exact retained preparation backing, merged before optional placement.
+         * @throws std::logic_error If final publication consumed this snapshot.
+         */
+        [[nodiscard]] const PhysicalMemoryPlan &retainedPreparationBOM() const;
+        /** @return Original native session epoch; final callbacks retain this exact identity. */
+        [[nodiscard]] std::uint64_t epochIdentity() const;
+        /** @return Rank owning the original physical observations for this session. */
+        [[nodiscard]] int worldRank() const;
+        /** @return Whether this unconsumed snapshot still binds its original epoch. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return bool(snapshot_);
+        }
+
+    private:
+        friend class NativeStoragePreparationPmaBinding;
+        friend struct test::NativeStoragePreparationReplayAccess;
+        friend class NativeMandatoryStorageDeclarations;
+        /** @brief Bind immutable values captured under the canonical state mutex. */
+        explicit NativePreparationPlanningSnapshot(
+            std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState> value)
+            : snapshot_(std::move(value))
+        {
+        }
+        /** @brief Exact actual-root declarations, accessible only to SDK creator projection. */
+        [[nodiscard]] std::span<const PhysicalMemoryNativeRootDeclaration> declarations() const;
+        std::shared_ptr<const detail::PhysicalMemoryPreparationSnapshotState> snapshot_;
     };
 
     /**
@@ -391,6 +736,9 @@ namespace llaminar2
         /** @return Capacity still available for a child allocation. */
         [[nodiscard]] std::size_t remainingBytes() const;
 
+        /** @return Immutable physical allocator identity retained by this exact reservation. */
+        [[nodiscard]] PhysicalMemoryAllocatorIdentity allocatorIdentity() const noexcept;
+
         /** @return Typed BOM owner of every child in this pool. */
         [[nodiscard]] PhysicalMemoryOwner owner() const noexcept;
 
@@ -409,6 +757,8 @@ namespace llaminar2
 
     private:
         friend class PhysicalMemoryMaterializationLedger;
+        friend class PhysicalMemoryNativeSetupEpoch;
+        friend class NativeStoragePreparationPmaBinding;
 
         explicit PhysicalMemoryOwnerReservation(
             std::shared_ptr<detail::PhysicalMemoryReservationState> state);
@@ -437,9 +787,8 @@ namespace llaminar2
                 certificate);
 
         /** @return Exact immutable authority from which claims are issued. */
-        [[nodiscard]] const std::shared_ptr<
-            const PhysicalMemoryPlanAdmissionCertificate> &admission()
-            const noexcept;
+        [[nodiscard]] const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &
+        admission() const;
 
         /**
          * @brief Claim bytes newly allocated after the capacity observation.
@@ -471,7 +820,10 @@ namespace llaminar2
             PhysicalMemoryOwner owner,
             std::size_t bytes);
 
-        /** @return Currently live bytes of one kind for an owner/resource. */
+        /**
+         * @return Source-BOM live bytes of one kind for an owner/resource.
+         * Exact preparation and SDK roots occur in these canonical source totals.
+         */
         [[nodiscard]] std::size_t claimedBytes(
             PhysicalMemoryAllocatorIdentity identity,
             PhysicalMemoryOwner owner,
@@ -483,7 +835,7 @@ namespace llaminar2
             PhysicalMemoryOwner owner) const;
 
         /**
-         * @return Direct live bytes plus reserved capacity for one claim kind.
+         * @return Source-BOM direct live bytes plus reserved capacity for one claim kind.
          *
          * New-allocation reservations count at full capacity; their child
          * allocations are already contained within that capacity. Adopted
@@ -542,6 +894,19 @@ namespace llaminar2
         attestation() const;
 
     private:
+        friend class PhysicalMemoryAuthority;
+        friend class NativeStoragePreparationPmaBinding;
+        /**
+         * @brief Start the same canonical state without inventing an admission certificate.
+         * @param observations Original unique allocator observations, canonically sorted internally
+         * once.
+         * @throws std::invalid_argument For conflicting/duplicate resources or unsupported CPU
+         * ordinals.
+         */
+        explicit PhysicalMemoryMaterializationLedger(
+            std::span<const PhysicalMemoryResource> observations);
+        /** @brief Open the one native session epoch while central authority is Preparing. */
+        [[nodiscard]] PhysicalMemoryNativeSetupEpoch beginPreparationEpoch(int world_rank);
         std::shared_ptr<detail::PhysicalMemoryMaterializationState> state_;
 
         /** @brief Shared checked implementation for new and retained claims. */
@@ -591,16 +956,18 @@ namespace llaminar2
         PhysicalMemoryAuthority &operator=(
             const PhysicalMemoryAuthority &) = delete;
 
+        /** @return Canonical phase copied under the materialization mutex. */
+        [[nodiscard]] PhysicalMemoryAuthorityPhase phase() const;
+
         /** @return MPI rank whose physical allocators may be claimed. */
         [[nodiscard]] int worldRank() const noexcept { return world_rank_; }
 
         /** @return Exact topology-wide admission object retained by the ledger. */
-        [[nodiscard]] const std::shared_ptr<
-            const PhysicalMemoryPlanAdmissionCertificate> &admission()
-            const noexcept;
+        [[nodiscard]] const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &
+        admission() const;
 
         /** @return Whether this rank's plan contains @p device. */
-        [[nodiscard]] bool contains(DeviceId device) const noexcept;
+        [[nodiscard]] bool contains(DeviceId device) const;
 
         /**
          * @brief Return complete planned bytes for one local owner/device.
@@ -657,7 +1024,10 @@ namespace llaminar2
             PhysicalMemoryResource observed,
             std::size_t bytes) const;
 
-        /** @return Currently live bytes for one local owner and claim kind. */
+        /**
+         * @return Source-BOM live bytes for one local owner and claim kind.
+         * Preparation and exact SDK roots occur in the same source-BOM totals.
+         */
         [[nodiscard]] std::size_t claimedBytes(
             DeviceId device,
             PhysicalMemoryOwner owner,
@@ -668,7 +1038,10 @@ namespace llaminar2
             DeviceId device,
             PhysicalMemoryOwner owner) const;
 
-        /** @return Local bytes committed by direct claims or pool capacity. */
+        /**
+         * @return Source-BOM local commitment by direct claims or pool capacity.
+         * Preparation and exact SDK roots occur in the same source-BOM totals.
+         */
         [[nodiscard]] std::size_t committedBytes(
             DeviceId device,
             PhysicalMemoryOwner owner,
@@ -717,6 +1090,20 @@ namespace llaminar2
             bool include_zero_lines = false) const;
 
     private:
+        friend class NativeStoragePmaBinding;
+        friend class NativeStoragePreparationPmaBinding;
+        struct PreparingNativeStorageTag
+        {
+        };
+        /**
+         * @brief Construct only the typed native preparation authority.
+         * @param observations Original physical observations; no later free-memory sample is
+         * accepted.
+         * @param world_rank Rank owning the required CPU0 preparation allocator.
+         * @throws std::invalid_argument If the rank has no original CPU0 resource.
+         */
+        PhysicalMemoryAuthority(std::span<const PhysicalMemoryResource> observations,
+                                int world_rank, PreparingNativeStorageTag);
         /** @return Checked rank-local allocator identity for @p device. */
         [[nodiscard]] PhysicalMemoryAllocatorIdentity identity(
             DeviceId device) const;

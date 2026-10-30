@@ -25760,15 +25760,67 @@ add_v2_test(V2_Integration_RecurrentOnlyPipelinePrefixAdmission
 
 # Test: canonical topology-wide CPU/GPU admission and live allocation ledger
 add_executable(v2_test_physical_memory_authority
-    unit/planning/Test__PhysicalMemoryAuthority.cpp)
+    unit/planning/Test__PhysicalMemoryAuthority.cpp
+    unit/planning/Test__NativeStoragePreparing.cpp
+    unit/planning/Test__NativeStoragePreparedPermits.cpp
+    unit/planning/Test__NativeStoragePreparingPlacement.cpp)
 target_link_libraries(v2_test_physical_memory_authority
     llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_physical_memory_authority PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
 add_v2_test(V2_Unit_PhysicalMemoryAuthority
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
     LABELS "V2;Unit;Planning;MemoryPlan;MemoryBudget;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
+# Replay the same canonical authority used by native startup. These tests use
+# small physical declarations and the real optional-placement selector, without
+# initializing a device or loading a model.
+foreach(native_admission_suite IN ITEMS
+        NativeStoragePreparing NativeStoragePreparedPermits NativeStoragePreparingPlacement)
+    add_v2_test(V2_Integration_${native_admission_suite}Replay
+        COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+            --gtest_filter=${native_admission_suite}.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PhysicalMemoryAuthority;NativeStorage;Lifecycle;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+                    "LLAMINAR_SKIP_CUDA_STARTUP=1"
+                    "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_${native_admission_suite}Replay)
+endforeach()
+add_v2_test(V2_Integration_NativeStorageCancelledExecutionReplay
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=NativeStoragePreparedPermits.CancelledPublishedSessionCannotBecomeExecutable:NativeStoragePreparedPermits.SuccessfulExecutableSealIsIdempotentWhileRootsRemainPublished
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PhysicalMemoryAuthority;NativeStorage;Lifecycle;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+                "LLAMINAR_SKIP_CUDA_STARTUP=1"
+                "LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_NativeStorageCancelledExecutionReplay)
+foreach(native_policy_gate IN ITEMS Unit Integration)
+    add_test(NAME V2_${native_policy_gate}_NativeStoragePreparationSourcePolicy
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_native_storage_preparation_policy.py
+            --root ${CMAKE_SOURCE_DIR}/../..)
+    add_test(NAME V2_${native_policy_gate}_NativeStoragePreparationSourcePolicyNegativeControls
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_storage_preparation_policy.py)
+    set(native_policy_labels
+        "V2;${native_policy_gate};DeviceFree;Planning;PhysicalMemoryAuthority;NativeStorage;SourcePolicy;Regression")
+    if(native_policy_gate STREQUAL "Integration")
+        list(APPEND native_policy_labels "ProductionTestPreflight")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_NativeStoragePreparationSourcePolicy
+            V2_Integration_NativeStoragePreparationSourcePolicyNegativeControls)
+    endif()
+    set_tests_properties(
+        V2_${native_policy_gate}_NativeStoragePreparationSourcePolicy
+        V2_${native_policy_gate}_NativeStoragePreparationSourcePolicyNegativeControls
+        PROPERTIES LABELS "${native_policy_labels}" TIMEOUT 30)
+endforeach()
 add_v2_test(V2_Integration_NativeExecutionContextMemoryAdmission
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
         --gtest_filter=PhysicalMemoryAuthority.RuntimeContextAdmissionProtectsUnmaterializedPools:PhysicalMemoryAuthority.RuntimeContextAdmissionCountsOnlyUnmaterializedChildren:PhysicalMemoryAuthority.RuntimeContextLeaseSurvivesSourceAuthority:PhysicalMemoryAuthority.RuntimeContextAdmissionRejectsResourceSubstitution

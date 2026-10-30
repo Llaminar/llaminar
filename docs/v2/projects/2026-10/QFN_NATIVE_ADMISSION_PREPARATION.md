@@ -1,8 +1,9 @@
 # Native preparation before QFN source admission
 
-Implementation plan. The interfaces below are approved for the private QFN
-admission work; they are not yet installed or qualified. The existing complete
-preflight checkpoint and source-cell results remain in
+The canonical PMA lifecycle and exact descriptor permits below are implemented
+and pass the focused qualification recorded below. Complete SDK preparation,
+application wiring and native capture remain under implementation. The existing
+complete preflight checkpoint and source-cell results remain in
 [the admission matrix](QFN_SOURCE_ADMISSION_MATRIX.md).
 
 ## Problem and target
@@ -152,3 +153,34 @@ fixed1, fixed3 and Dynamic while preserving the declared retained capacity.
 Keep CPU, CUDA, ROCm and composed expert/ngram placements in the canonical
 matrix. Complete production preflight and every hardware-eligible source cell
 remain required before declaring the expanded admission work qualified.
+
+## Core qualification, 2026-10-30
+
+The main Integration/AVX512 build passes all **794 Unit registrations**, with
+zero skips. Its unchanged target set is CUDA 80/86/89/90 and HIP gfx906. The
+existing physical-authority executable includes the original direct-Admitted
+tests, preparation/permit tests and actual optional-placement regression.
+
+Four explicit `ProductionTestPreflight` replay registrations pass **20 repetitions
+each**: preparation, exact permits, optional placement and cancelled execution.
+The source policy and its negative controls also pass. Compile-time access
+checks reject public preparation construction, aggregate-only final callbacks
+and direct native-root claims. A fully instrumented actual PMA implementation
+and its 45 core tests pass **20 repetitions under ThreadSanitizer**; only that
+diagnostic process disables ASLR, with no host or production setting changes.
+Evidence is `/tmp/qfn-native-preparation-main-r1/`.
+
+Review found that cancellation originally shared the successful executable-seal
+state. A fully published session could consequently cancel and then seal for
+execution. `Abandoned` now permanently rejects recording and executable
+publication while preserving physical retirement. The preserved original
+implementation fails the new cancellation regression. Earlier aggregate-only
+permits also fail changed-root and duplicate-root controls despite spare quota.
+Those controls and the frozen import are retained under
+`/tmp/qfn-native-pma-preparing-transition-r1/`.
+
+This is a core lifecycle checkpoint, not a fresh complete preflight receipt or
+qualification of a whole SDK communicator. CUDA/ROCm owner subtrees and the
+source-owned metadata recorder have separate private CPU-double/ASan proofs;
+their actual selected transport, backend-resource, captured-operation and
+application re-admission boundaries must still be integrated and qualified.
