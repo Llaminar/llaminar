@@ -294,7 +294,7 @@ std::size_t ImmutableLookupService::hostBytes(ImmutableLookupLayout layout)
 
 std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shared_ptr<HostImmutableRowProvider> table,
     ImmutableLookupLayout layout,std::span<const DeviceId> devices,std::shared_ptr<PhysicalMemoryAuthority> memory,
-    DeviceId hostDevice)
+    DeviceId hostDevice,TransferEngine &transfers)
 {
     if(!table||!memory||!hostDevice.is_cpu()||devices.empty()||table->source().rowBytes()!=layout.rowBytes()||
         table->retainedOwnerObservation().allocator()!=PhysicalMemoryAllocatorIdentity{memory->worldRank(),hostDevice})
@@ -315,7 +315,7 @@ std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shar
         throw std::invalid_argument("Subordinate source cannot enter the ordinary channel ABI");
     const auto bytes=hostBytes(layout);
     auto physical=memory->claimNewAllocation(hostDevice,PhysicalMemoryOwner::ImmutableLookupStaging,bytes);
-    auto mapped=TransferEngine::instance().allocateMappedHostRegion(layout.bytes(),devices);
+    auto mapped=transfers.allocateMappedHostRegion(layout.bytes(),devices);
     if(!mapped||!mapped->isBound()||mapped->sizeBytes()!=bytes)
         throw std::runtime_error("Immutable lookup mapped allocation differs from its admitted physical extent");
     auto backing=std::make_shared<ImmutableLookupChannelBacking>(ImmutableLookupChannelBacking{
@@ -340,10 +340,11 @@ ImmutableLookupService::ImmutableLookupService(std::shared_ptr<HostImmutableRowP
 
 ImmutableLookupService::~ImmutableLookupService()
 {
-    cancel();
+    if(outstanding_.valid())
+        (void)cancel(outstanding_);
     if(outstanding_.valid())
     {
-        try{(void)worker_.await(outstanding_);}catch(...){/* Teardown retains bytes until the worker stops. */}
+        try{(void)worker_.await({outstanding_.invocation});}catch(...){/* Teardown retains bytes until the worker stops. */}
     }
 }
 
@@ -497,7 +498,11 @@ ImmutableLookupService::Ticket ImmutableLookupService::arm(std::uint64_t generat
     if(state_!=Lifecycle::Idle||outstanding_.valid()||generation==0||generation<=generation_)
         throw std::logic_error("Immutable lookup service requires an idle healthy lane and a newer admission generation");
     generation_=generation;cancelled_.store(false,std::memory_order_release);state_=Lifecycle::Serving;
-    outstanding_=worker_.dispatch(&ImmutableLookupService::run,this);
+    // run() acquires lifecycle_ before reading this immutable ticket. dispatch
+    // may wake the retained thread before returning, so publication stays under
+    // the same lock until the actual worker invocation has been assigned.
+    const auto invocation=worker_.dispatch(&ImmutableLookupService::run,this);
+    outstanding_={generation,invocation.generation};
     return outstanding_;
 }
 
@@ -505,7 +510,7 @@ bool ImmutableLookupService::await(Ticket ticket)
 {
     {
         std::lock_guard lock(lifecycle_);
-        if(state_!=Lifecycle::Serving||!ticket.valid()||ticket.generation!=outstanding_.generation)
+        if(state_!=Lifecycle::Serving||!ticket.valid()||ticket.generation!=outstanding_.generation||ticket.invocation!=outstanding_.invocation)
             throw std::logic_error("Immutable lookup await names a stale or unrelated service invocation");
     }
     // await() is a terminal boundary. A complete GPU parent must have published
@@ -513,8 +518,8 @@ bool ImmutableLookupService::await(Ticket ticket)
     auto *ack=reinterpret_cast<ImmutableLookupAcknowledgement *>(
         backing_->mapped->mutableHostData(backing_->layout.acknowledgementOffset()));
     const bool missingClose=acquire(ack->closedGeneration)!=generation_;
-    if(missingClose)cancel();
-    const bool result=worker_.await(ticket);
+    if(missingClose)(void)cancel(ticket);
+    const bool result=worker_.await({ticket.invocation});
     std::lock_guard lock(lifecycle_);
     // The worker is retired before touching its diagnostic string.
     if(missingClose)serviceFailure_="Immutable lookup GPU terminal did not publish its explicit service close";
@@ -522,20 +527,73 @@ bool ImmutableLookupService::await(Ticket ticket)
     return result;
 }
 
+bool ImmutableLookupService::cancel(Ticket ticket)
+{
+    std::lock_guard lock(lifecycle_);
+    if(state_!=Lifecycle::Serving || !ticket.valid() || ticket.generation!=outstanding_.generation ||
+       ticket.invocation!=outstanding_.invocation)
+        return false;
+    auto *ack=reinterpret_cast<ImmutableLookupAcknowledgement *>(
+        backing_->mapped->mutableHostData(backing_->layout.acknowledgementOffset()));
+    // The worker publishes retirement under this same lifecycle lock. A late
+    // caller cannot add an unobserved cancellation message after retirement.
+    const auto retiredInvocation=acquire(ack->retiredInvocation);
+    const auto retiredGeneration=acquire(ack->retiredGeneration);
+    if(ImmutableLookupProtocol::matchesInvocation(retiredInvocation,retiredGeneration,ticket.generation,ticket.invocation))
+        return false;
+    // The complete terminal boundary can repeat cancellation while joining the
+    // same live invocation. Its one metadata message is published exactly once.
+    if(cancelled_.load(std::memory_order_acquire))return true;
+    // This is CPU I/O control only. No GPU state or terminal result is read.
+    // Both fields are atomic because readers can reject an older publication
+    // while a later admission publishes its distinct generation body.
+    release(ack->cancelledGeneration,ticket.generation);
+    release(ack->cancelledInvocation,ticket.invocation);
+    cancelled_.store(true,std::memory_order_release);
+    return true;
+}
+
+void ImmutableLookupHostProcessor::retireInvocation(std::uint64_t generation,std::uint64_t invocation) noexcept
+{
+    subordinateGrant_.reset();
+    auto *ack=reinterpret_cast<ImmutableLookupAcknowledgement *>(channel_.data()+layout_.acknowledgementOffset());
+    // Old borrowed Pins retain their own original source backing. Dropping the
+    // acquired request never frees the channel or any captured source frame.
+    const auto cancelledInvocation=acquire(ack->cancelledInvocation);
+    const auto cancelledGeneration=acquire(ack->cancelledGeneration);
+    if(ImmutableLookupProtocol::matchesInvocation(cancelledInvocation,cancelledGeneration,generation,invocation))
+        stats_.terminalBytes+=2*sizeof(std::uint64_t);
+    release(ack->retiredGeneration,generation);
+    release(ack->retiredInvocation,invocation);
+    stats_.terminalBytes+=2*sizeof(std::uint64_t);
+}
+
 bool ImmutableLookupService::run(void *context)
 {
     auto &self=*static_cast<ImmutableLookupService *>(context);
+    Ticket admitted;
+    {
+        std::lock_guard lock(self.lifecycle_);
+        admitted=self.outstanding_;
+    }
+    const auto retire=[&](void*) noexcept {
+        // This lock orders only host I/O cancellation and retirement. Device
+        // model/control state is neither queried nor mirrored by this worker.
+        std::lock_guard lock(self.lifecycle_);
+        self.processor_.retireInvocation(admitted.generation,admitted.invocation);
+    };
+    const std::unique_ptr<void,decltype(retire)> retirement(&self,retire);
     try
     {
         while(!self.cancelled_.load(std::memory_order_acquire))
         {
-            (void)self.processor_.poll(self.generation_);
+            (void)self.processor_.poll(admitted.generation);
             if(self.processor_.lastStatus()!=ImmutableLookupStatus::Success)
             {
                 self.fatalStatus_.store(self.processor_.lastStatus(),std::memory_order_release);
                 return false; // The failed completion is already visible; this lane cannot accept another request.
             }
-            if(self.processor_.closed(self.generation_))return self.processor_.lastFailure().empty();
+            if(self.processor_.closed(admitted.generation))return self.processor_.lastFailure().empty();
             std::this_thread::sleep_for(std::chrono::microseconds(20));
         }
         self.serviceFailure_="Immutable lookup service cancelled before the GPU terminal close";

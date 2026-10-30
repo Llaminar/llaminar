@@ -421,7 +421,7 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
             adaptive_->setupRetirement->retireFailedAdmission(stream);
         else
             admissionRetirement_->retireFailedAdmission(stream);
-        service_->cancel();
+        (void)service_->cancel(ticket_);
         try{(void)service_->await(ticket_);}catch(...){std::terminate();}
         ticket_={};throw;
     }

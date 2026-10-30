@@ -69,12 +69,19 @@ struct alignas(64) ImmutableLookupCompletion
     std::uint64_t protocol = kImmutableLookupProtocol;
     std::uint64_t protocolComplement = ~kImmutableLookupProtocol;
 };
-/** @brief GPU-authored response retirement and complete captured-interval close. */
+/** @brief Disjoint GPU response/terminal and CPU cancellation/worker-retirement publications.
+ * @details CPU publications name both the API admission and the actual retained
+ * worker invocation. The invocation word is released last; an acquired matching
+ * pair proves only that worker's retirement, never successful payload delivery
+ * or graph/reader retirement. The backing remains owned by retained bindings.
+ */
 struct alignas(64) ImmutableLookupAcknowledgement
 {
     std::uint64_t consumedSequence = 0; ///< Release after every response-byte reader has completed.
     std::uint64_t closedGeneration = 0; ///< Release only at the complete generation graph's terminal.
-    std::uint64_t reserved[6]{};
+    std::uint64_t cancelledGeneration = 0, cancelledInvocation = 0;
+    std::uint64_t retiredGeneration = 0, retiredInvocation = 0;
+    std::uint64_t reserved[2]{};
 };
 /** @brief Private GPU-owned slot state, retained unchanged across request resets.
  * @details issuedSequence never resets while the mapped channel is retained.
@@ -154,6 +161,19 @@ private:
 /** @brief Pure shared validation used before either side dereferences a payload. */
 struct ImmutableLookupProtocol final
 {
+    /** @brief Match one acquired CPU publication against the exact admitted I/O invocation.
+     * @param acquiredInvocation System-acquired invocation publication, read before its generation body.
+     * @param publishedGeneration Generation body belonging to that publication.
+     * @param generation Positive original API-admission generation.
+     * @param invocation Positive original retained-worker ticket.
+     * @return True only for this exact interval; old words cannot abort later requests.
+     */
+    QFN_LOOKUP_HD static bool matchesInvocation(std::uint64_t acquiredInvocation,
+        std::uint64_t publishedGeneration,std::uint64_t generation,std::uint64_t invocation) noexcept
+    {
+        return generation && invocation && acquiredInvocation==invocation && publishedGeneration==generation;
+    }
+
     /** @brief Validate an acquired request without reading any token/model state. */
     QFN_LOOKUP_HD static ImmutableLookupStatus validateRequest(const ImmutableLookupRequest &request,
         std::uint64_t acquiredSequence,std::uint64_t expectedGeneration,std::uint64_t expectedTable,

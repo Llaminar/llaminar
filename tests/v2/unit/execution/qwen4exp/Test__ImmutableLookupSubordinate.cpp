@@ -9,6 +9,12 @@
  */
 #include "execution/qwen4exp/ImmutableLookupService.h"
 #include <gtest/gtest.h>
+#include "../../../mocks/MockBackend.h"
+#include <chrono>
+#include <thread>
+#include <cstdio>
+#include <limits>
+#include <sys/resource.h>
 #include <array>
 #include <algorithm>
 #include <cstdlib>
@@ -25,6 +31,11 @@
 namespace llaminar2::qwen4exp {
 /** @brief Deterministic interleaving at the real serial borrow boundary; no capability constructor or copied pin logic. */
 struct ImmutableLookupSubordinateTestAccess final {
+    /** @brief Inspect only joined CPU-owned state; callers have already awaited this actual service worker. */
+    static bool ownsAcquiredGrant(const ImmutableLookupService &service) {
+        if(!service.worker_.idle())throw std::logic_error("Grant observation requires joined worker");
+        return service.processor_.subordinateGrant_.has_value();
+    }
     /** @brief Insert a wire retirement/refill after the production acquire, before its production completion. */
     template<class Mutation>
     static auto borrowAcross(ImmutableLookupHostProcessor &processor,std::size_t row,Mutation mutate) {
@@ -381,4 +392,276 @@ TEST(ImmutableLookupSubordinate, SourceAndGrantScratchRequireExactPmaAndNoForeig
         auto foreign=file.source;foreign.rows-=1;
         EXPECT_THROW((void)CpuAdaptiveImmutableRowCache::create(foreign,geometry,memory),std::invalid_argument);
     }
+}
+
+namespace {
+/** @brief CPU-only mapped allocator; no vendor runtime, kernel or GPU memory query is used. */
+class WorkerMappedBackend final : public llaminar2::test::MockBackend {
+public:
+    WorkerMappedBackend():MockBackend(DeviceType::CUDA) {}
+    /** @brief Materialize the real TransferEngine request with the wire's required alignment. */
+    void *allocateMapped(std::size_t bytes,int,void **alias) override {
+        if(address)throw std::logic_error("Worker fixture allocated its one mapped channel twice");
+        address=std::aligned_alloc(64,(bytes+63)/64*64);
+        if(alias)*alias=address;
+        return address;
+    }
+    /** @brief Count actual final mapping destruction, independently of CPU worker completion. */
+    void freeMapped(void *pointer,int) override {
+        if(pointer!=address)std::terminate();
+        std::free(address);address=nullptr;++frees;
+    }
+    void *address=nullptr;unsigned frees=0;
+};
+WorkerMappedBackend *workerBackend=nullptr;
+/** @return One explicitly installed hardware-free mapping endpoint. */
+IBackend *resolveWorkerMapping(DeviceId device) {
+    return device==DeviceId::cuda(0)?workerBackend:nullptr;
+}
+/** @brief Actual PMA provider, service, mapped backing and persistent worker with simulated GPU wire publications. */
+struct ServiceLane {
+    WorkerMappedBackend backend;
+    TransferEngine transfers{&resolveWorkerMapping};
+    NativeFile file;
+    ImmutableLookupLayout layout=ImmutableLookupLayout::createSubordinate(8,file.source.rowBytes());
+    std::shared_ptr<PhysicalMemoryAuthority> memory;
+    std::shared_ptr<HostImmutableRowProvider> provider;
+    std::shared_ptr<ImmutableLookupService> service;
+    std::optional<ImmutableSubordinateLookupBinding> binding;
+    /** @brief Use the production service create/arm/poll/retire/await path with original allocator identities. */
+    explicit ServiceLane(std::size_t gpuSlots=2,std::size_t ramSlots=2) {
+        if(workerBackend)throw std::logic_error("Overlapping serial mapping fixture");
+        workerBackend=&backend;
+        try {
+            const auto geometry=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(
+                layoutFor(file,DeviceId::cuda(0),ramSlots,gpuSlots),hostId,{0,DeviceId::cuda(0)});
+            PhysicalMemoryPlanBuilder plan(geometry.bom(hostResource()));
+            plan.add(hostResource(),PhysicalMemoryOwner::ImmutableLookupStaging,ImmutableLookupService::hostBytes(layout));
+            memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+            provider=HostImmutableRowProvider::fromSubordinateAdaptiveCache(CpuAdaptiveImmutableRowCache::create(file.source,geometry,memory));
+            const std::array endpoints{DeviceId::cuda(0)};
+            service=ImmutableLookupService::create(provider,layout,endpoints,memory,DeviceId::cpu(),transfers);
+            binding.emplace(service->bindSubordinate(endpoints[0]));
+        } catch(...) {workerBackend=nullptr;throw;}
+    }
+    /** @brief Final captured binding retires before its mapped backend and source fixture. */
+    ~ServiceLane(){binding.reset();service.reset();provider.reset();workerBackend=nullptr;}
+    /** @return Exact shared metadata retained by the original source binding. */
+    ImmutableLookupAcknowledgement &ack(){return *binding->deviceView().base.acknowledgement;}
+    /** @return Original acquired-completion channel, never a copied successful observation. */
+    ImmutableLookupCompletion &completion(){return *binding->deviceView().base.completion;}
+    /** @brief Release an exact live request through the real protocol2 ABI. */
+    void publish(std::uint64_t sequence,std::uint64_t generation,std::span<const std::int64_t> ids,
+                 std::span<const Intent> intents) {
+        auto &view=binding->deviceView();
+        if(ids.size()!=intents.size() || ids.size()>layout.maximumIds())throw std::invalid_argument("Invalid service fixture frame");
+        if(!ids.empty()) {
+            std::memcpy(view.base.ids,ids.data(),ids.size_bytes());
+            std::memcpy(view.intents,intents.data(),intents.size_bytes());
+        }
+        ImmutableLookupRequest request;
+        request.sequenceComplement=~sequence;request.generation=generation;request.generationComplement=~generation;
+        request.table=view.base.table;request.tableComplement=~request.table;
+        request.idCount=ids.size();request.idCountComplement=~request.idCount;
+        request.idBytes=ids.size_bytes();request.idBytesComplement=~request.idBytes;
+        request.rowBytes=layout.rowBytes();request.rowBytesComplement=~request.rowBytes;
+        request.protocol=layout.protocol();request.protocolComplement=~request.protocol;
+        std::memcpy(reinterpret_cast<std::byte*>(view.base.request)+8,reinterpret_cast<const std::byte*>(&request)+8,kLookupRequestLiveBytes-8);
+        std::atomic_ref(view.base.request->publication).store(sequence,std::memory_order_release);
+    }
+    /** @brief Acquire one actual worker publication with a bounded test-only wait. */
+    static void wait(std::uint64_t &word,std::uint64_t expected) {
+        const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        while(std::atomic_ref(word).load(std::memory_order_acquire)!=expected) {
+            if(std::chrono::steady_clock::now()>=until)throw std::runtime_error("Actual immutable worker publication did not retire");
+            std::this_thread::yield();
+        }
+    }
+    /** @brief Simulate complete consumer retirement and graph terminal, never before actual completion. */
+    void close(std::uint64_t sequence,std::uint64_t generation) {
+        std::atomic_ref(ack().consumedSequence).store(sequence,std::memory_order_release);
+        std::atomic_ref(ack().closedGeneration).store(generation,std::memory_order_release);
+    }
+};
+}
+
+/** @test Cancellation without any acquired completion releases an exact worker witness and keeps captured backing alive. */
+TEST(ImmutableLookupSubordinate, WorkerCancelBeforePublicationAndBeforePollRetiresExactInvocation) {
+    for(auto gpuSlots:{0u,2u})for(bool publishAfterCancel:{false,true}) {
+        ServiceLane lane(gpuSlots);
+        const auto retained=lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation);
+        ASSERT_GE(retained,ImmutableLookupService::hostBytes(lane.layout));
+        const auto ticket=lane.service->arm(17);
+        EXPECT_FALSE(lane.service->cancel({ticket.generation+1,ticket.invocation}));
+        EXPECT_FALSE(lane.service->cancel({ticket.generation,ticket.invocation+1}));
+        ASSERT_TRUE(lane.service->cancel(ticket));
+        // A queued GPU producer can publish after CPU cancellation. Wait for
+        // actual retirement first so the before-poll interleaving is exact,
+        // independent of host thread scheduling, and cannot fabricate a reply.
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        if(publishAfterCancel) {
+            const std::array<std::int64_t,1> ids{3};const std::array<Intent,1> read{};
+            lane.publish(1,ticket.generation,ids,read);
+        }
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        EXPECT_TRUE(ImmutableLookupProtocol::matchesInvocation(lane.ack().retiredInvocation,
+            lane.ack().retiredGeneration,ticket.generation,ticket.invocation));
+        EXPECT_EQ(lane.completion().publication,0u); // Retirement never manufactures Consumed.
+        EXPECT_EQ(lane.ack().consumedSequence,0u);
+        EXPECT_FALSE(lane.service->cancel(ticket)); // Retirement rejects late writes, including await's missing-close path.
+        EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_EQ(lane.service->stats().terminalBytes,4*sizeof(std::uint64_t));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_FALSE(lane.service->cancel(ticket));
+        lane.service.reset();lane.provider.reset();
+        EXPECT_EQ(lane.backend.frees,0u); // Captured binding, not worker retirement, owns backing.
+        EXPECT_EQ(lane.ack().retiredGeneration,ticket.generation);
+        EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),retained);
+        lane.binding.reset();EXPECT_EQ(lane.backend.frees,1u);
+        EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+}
+
+/** @test A completed but unconsumed source grant retires on cancellation; original invalidation tokens remain immutable. */
+TEST(ImmutableLookupSubordinate, WorkerCancelAcquiredRequestDropsGrantWithoutFakeConsumption) {
+    for(auto gpuSlots:{0u,2u}) {
+        ServiceLane lane(gpuSlots);const auto ticket=lane.service->arm(2);
+        const std::array<std::int64_t,2> ids{3,4};
+        const std::array<Intent,2> intents{{{Operation::Read,0},{Operation::ReadAndInvalidate,0xfedcba9876543210ULL}}};
+        lane.publish(1,ticket.generation,ids,intents);ServiceLane::wait(lane.completion().publication,1);
+        ASSERT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+        EXPECT_EQ(lane.binding->deviceView().acknowledgements[0].destination_grant,0u);
+        EXPECT_EQ(lane.binding->deviceView().acknowledgements[1].destination_grant,intents[1].destination_grant);
+        ASSERT_TRUE(lane.service->cancel(ticket));ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_EQ(lane.ack().consumedSequence,0u);
+        EXPECT_EQ(lane.completion().publication,1u);
+        EXPECT_EQ(lane.binding->deviceView().acknowledgements[1].destination_grant,intents[1].destination_grant);
+    }
+}
+
+/** @test Request reset reuses one worker/channel and rejects old cancellation/retirement pairs across large-to-small frames. */
+TEST(ImmutableLookupSubordinate, WorkerLargeSmallResetRejectsStaleCancellationAndRetirement) {
+    ServiceLane lane(0);ImmutableLookupService::Ticket previous{};
+    std::uint64_t sequence=0;
+    for(const auto count:{8u,1u,0u,3u}) {
+        const auto ticket=lane.service->arm(100+sequence);
+        if(previous.valid()) {
+            EXPECT_FALSE(lane.service->cancel(previous));
+            EXPECT_FALSE(ImmutableLookupProtocol::matchesInvocation(lane.ack().retiredInvocation,
+                lane.ack().retiredGeneration,ticket.generation,ticket.invocation));
+            EXPECT_FALSE(ImmutableLookupProtocol::matchesInvocation(ticket.invocation,
+                previous.generation,ticket.generation,ticket.invocation));
+        }
+        std::array<std::int64_t,8> ids{0,1,2,3,4,5,6,7};std::array<Intent,8> intents{};
+        ++sequence;lane.publish(sequence,ticket.generation,std::span(ids).first(count),std::span(intents).first(count));
+        ServiceLane::wait(lane.completion().publication,sequence);
+        EXPECT_EQ(lane.completion().idCount,count);EXPECT_EQ(lane.completion().nativeBytes,count*lane.layout.rowBytes());
+        lane.close(sequence,ticket.generation);
+        EXPECT_TRUE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_TRUE(ImmutableLookupProtocol::matchesInvocation(lane.ack().retiredInvocation,
+            lane.ack().retiredGeneration,ticket.generation,ticket.invocation));
+        previous=ticket;
+    }
+    EXPECT_EQ(lane.backend.frees,0u);
+}
+
+/** @test Concurrent publication/cancellation permits either truthful completion or absence, and never invents consumption. */
+TEST(ImmutableLookupSubordinate, WorkerCancelPublicationRaceHasOnlyTruthfulTerminalOutcomes) {
+    for(unsigned repeat=0;repeat<20;++repeat) {
+        ServiceLane lane(repeat%2?0:2);const auto ticket=lane.service->arm(9);
+        const std::array<std::int64_t,2> ids{11,12};
+        const std::array<Intent,2> intents{{{Operation::Read,0},{Operation::ReadAndInvalidate,0x123456789abcdef0ULL}}};
+        lane.publish(1,ticket.generation,ids,intents);
+        ASSERT_TRUE(lane.service->cancel(ticket));
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        EXPECT_EQ(lane.ack().retiredGeneration,ticket.generation);
+        const auto acquired=std::atomic_ref(lane.completion().publication).load(std::memory_order_acquire);
+        if(acquired) {
+            const auto status=ImmutableLookupProtocol::validateCompletion(lane.completion(),acquired,1,ticket.generation,
+                lane.binding->deviceView().base.table,ids.size(),lane.layout.rowBytes(),lane.layout.protocol());
+            EXPECT_TRUE(status==ImmutableLookupStatus::Success || status==ImmutableLookupStatus::Cancelled);
+            EXPECT_EQ(lane.completion().nativeBytes,status==ImmutableLookupStatus::Success?ids.size()*lane.layout.rowBytes():0u);
+        }
+        EXPECT_EQ(lane.ack().consumedSequence,0u);
+        EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_EQ(lane.binding->deviceView().intents[1].destination_grant,intents[1].destination_grant);
+    }
+}
+
+/** @test The actual SSD worker can copy a payload prefix and fail without releasing any promotion ACK or successful bytes. */
+TEST(ImmutableLookupSubordinate, WorkerFailedPartialPayloadRetainsOriginalIntentAndBacking) {
+    struct DeathStyle {
+        std::string previous=GTEST_FLAG_GET(death_test_style);
+        /** @brief Isolate the address-space bound from other test workers in a fresh process. */
+        DeathStyle(){GTEST_FLAG_SET(death_test_style,"threadsafe");}
+        /** @brief Restore process-wide GTest policy. */
+        ~DeathStyle(){GTEST_FLAG_SET(death_test_style,previous);}
+    } deathStyle;
+    ASSERT_EXIT(([] {
+        ServiceLane lane(0,0);
+        const std::array<std::int64_t,1> first{0};const std::array<Intent,1> read{};
+        const auto warm=lane.service->arm(1);lane.publish(1,1,first,read);
+        ServiceLane::wait(lane.completion().publication,1);lane.close(1,1);
+        if(!lane.service->await(warm))::_exit(2);
+        auto &view=lane.binding->deviceView();
+        std::memset(view.base.nativeRows,0xa5,2*lane.layout.rowBytes());
+        std::memset(view.acknowledgements,0xa5,2*sizeof(ImmutableRowInvalidationAcknowledgement));
+        const std::array<std::int64_t,2> ids{0,64};
+        const std::array<Intent,2> intents{{{Operation::ReadAndInvalidate,0x100000001ULL},
+                                          {Operation::ReadAndInvalidate,0xfedcba9876543210ULL}}};
+        const auto ticket=lane.service->arm(2);
+        rlimit saved{};
+        if(::getrlimit(RLIMIT_AS,&saved)!=0)::_exit(3);
+        auto *statm=std::fopen("/proc/self/statm","r");unsigned long long pages=0;
+        if(!statm)::_exit(4);
+        const auto parsed=std::fscanf(statm,"%llu",&pages);std::fclose(statm);
+        const auto pageBytes=::sysconf(_SC_PAGESIZE);
+        if(parsed!=1 || pageBytes<=0 || pages>std::numeric_limits<rlim_t>::max()/static_cast<unsigned long long>(pageBytes))::_exit(5);
+        rlimit bounded=saved;bounded.rlim_cur=pages*static_cast<rlim_t>(pageBytes);
+        if(::setrlimit(RLIMIT_AS,&bounded)!=0)::_exit(6);
+        lane.publish(2,2,ids,intents);
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        if(::setrlimit(RLIMIT_AS,&saved)!=0)std::terminate();
+        EXPECT_EQ(lane.completion().publication,2u);
+        EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::StorageFailure));
+        EXPECT_EQ(lane.completion().nativeBytes,0u);
+        EXPECT_EQ(std::memcmp(view.base.nativeRows,lane.file.bytes.data()+lane.file.source.file_offset,lane.layout.rowBytes()),0);
+        for(std::size_t i=lane.layout.rowBytes();i<2*lane.layout.rowBytes();++i)EXPECT_EQ(view.base.nativeRows[i],std::byte{0xa5});
+        for(std::size_t i=0;i<2;++i) {
+            EXPECT_EQ(view.acknowledgements[i].destination_grant,0xa5a5a5a5a5a5a5a5ULL);
+            EXPECT_EQ(view.intents[i].destination_grant,intents[i].destination_grant);
+        }
+        lane.close(2,2);EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        lane.service.reset();lane.provider.reset();EXPECT_EQ(lane.backend.frees,0u);
+        lane.binding.reset();EXPECT_EQ(lane.backend.frees,1u);
+        ::_exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test Late cancellation before await cannot publish uncounted metadata after the actual CPU worker retires. */
+TEST(ImmutableLookupSubordinate, WorkerLateCancelBeforeAwaitRejectsWithoutPublication) {
+    ServiceLane lane(0);const auto ticket=lane.service->arm(71);
+    const std::array<std::int64_t,1> ids{7};const std::array<Intent,1> read{};
+    lane.publish(1,ticket.generation,ids,read);ServiceLane::wait(lane.completion().publication,1);
+    ASSERT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+    lane.close(1,ticket.generation);ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+    EXPECT_FALSE(lane.service->cancel(ticket));
+    EXPECT_FALSE(lane.service->cancel(ticket));
+    EXPECT_EQ(lane.ack().cancelledInvocation,0u);EXPECT_EQ(lane.ack().cancelledGeneration,0u);
+    EXPECT_TRUE(lane.service->await(ticket));
+    EXPECT_EQ(lane.service->stats().terminalBytes,3*sizeof(std::uint64_t));
+    EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+    const auto next=lane.service->arm(72);
+    EXPECT_FALSE(lane.service->cancel(ticket));
+    EXPECT_TRUE(lane.service->cancel(next));ServiceLane::wait(lane.ack().retiredInvocation,next.invocation);
+    EXPECT_FALSE(lane.service->cancel(next));EXPECT_FALSE(lane.service->await(next));
+    EXPECT_EQ(lane.service->stats().terminalBytes,7*sizeof(std::uint64_t));
 }

@@ -30467,6 +30467,17 @@ add_v2_test(V2_Integration_ImmutableLookupSubordinateCPU
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ImmutableLookupSubordinateCPU)
+
+# The actual retained I/O worker must retire even when cancellation precedes its
+# first acquired request. This explicit gate is independent of broad protocol coverage.
+add_v2_test(V2_Integration_ImmutableLookupWorkerCancellationReplay
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=ImmutableLookupSubordinate.Worker*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1"
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ImmutableLookupWorkerCancellationReplay)
 # Retain the existing V2_Unit_Qwen4ExpPrimitives and ordinary/adaptive protocol/provider/cache aliases unchanged.
 
 # Apply only with the exact reviewed production adaptive component and protocol2 dependency.

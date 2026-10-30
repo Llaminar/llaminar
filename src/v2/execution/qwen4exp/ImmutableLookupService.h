@@ -88,6 +88,13 @@ public:
     ImmutableLookupStatus lastStatus() const noexcept{return lastStatus_;}
 private:
     friend struct ImmutableLookupSubordinateTestAccess;
+    friend class ImmutableLookupService;
+    /** @brief Drop this worker's acquired source grant before releasing its exact terminal witness.
+     * @param generation Original admitted I/O interval, never a model-state observation.
+     * @param invocation Actual retained-worker dispatch ticket.
+     * @note This does not release channel/frame backing or independently held reader pins.
+     */
+    void retireInvocation(std::uint64_t generation,std::uint64_t invocation) noexcept;
     /** @brief Immutable identity of one actual acquire; it neither keeps a mutable-frame reference nor promises borrowed bytes. */
     class SubordinateReadBorrow final {
         friend class ImmutableLookupHostProcessor;
@@ -131,7 +138,12 @@ struct ImmutableLookupChannelBacking final
 class ImmutableLookupService final : public std::enable_shared_from_this<ImmutableLookupService>
 {
 public:
-    using Ticket=RetainedParentTicketServiceWorker::Ticket;
+    /** @brief Exact admitted I/O interval and actual retained-worker invocation; neither can be substituted. */
+    struct Ticket final {
+        std::uint64_t generation=0, invocation=0;
+        /** @return Whether both original identities name a real admission. */
+        constexpr bool valid() const noexcept { return generation && invocation; }
+    };
     /** @brief Strong service/backing lifetime plus one exact native alias address space. */
     class Binding final
     {
@@ -157,11 +169,13 @@ public:
      * @param devices Explicit mapped endpoint set, supplied by graph placement.
      * @param memory Canonical rank-bound physical admission authority.
      * @param hostDevice Exact CPU/NUMA allocator charged for staging.
+     * @param transfers Public mapping authority, retaining its exact backend bindings; setup injection permits device-free worker proofs.
      * @return Shared service whose binding can safely outlive caller teardown.
      */
     static std::shared_ptr<ImmutableLookupService> create(std::shared_ptr<HostImmutableRowProvider> table,
         ImmutableLookupLayout layout,std::span<const DeviceId> devices,
-        std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId hostDevice);
+        std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId hostDevice,
+        TransferEngine &transfers=TransferEngine::instance());
     /** @brief Cancel/retire any outstanding host invocation before owned state is released. */
     ~ImmutableLookupService();
     /** @brief Freeze one exact device alias during setup, retaining this service lifetime. */
@@ -175,8 +189,12 @@ public:
     Ticket arm(std::uint64_t generation);
     /** @brief Join one exact completed service interval after native terminal observation. */
     bool await(Ticket ticket);
-    /** @brief Abort host I/O polling during a failed/cancelled native generation. */
-    void cancel() noexcept { cancelled_.store(true,std::memory_order_release); }
+    /** @brief Cancel only the exact outstanding I/O admission without claiming response consumption.
+     * @param ticket Original admission and actual worker invocation returned by arm().
+     * @return False for a stale/foreign invocation, leaving the current admission untouched.
+     * @note Worker retirement is separately release-published after acquired source grants retire.
+     */
+    bool cancel(Ticket ticket);
     /** @brief Return terminal I/O statistics; rejected while an invocation is live. */
     ImmutableLookupServiceStats stats() const;
     /** @brief Immutable actual table policy; no worker or device observation is performed. */
@@ -194,6 +212,7 @@ public:
     /** @brief Reject an I/O lane that already release-published a fatal completion. */
     void requireHealthy() const;
 private:
+    friend struct ImmutableLookupSubordinateTestAccess;
     friend class ImmutableSubordinateLookupBinding; ///< Original source/backing validation and closed setup
                                                     ///< factory.
     /**

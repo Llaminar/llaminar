@@ -279,7 +279,9 @@ void lifecycle(DeviceId device){
                 EXPECT_EQ(after.acknowledgementBytes-stats.acknowledgementBytes,misses*8);
                 EXPECT_EQ(after.metadataBytes-stats.metadataBytes,misses*(kLookupRequestLiveBytes+kLookupCompletionLiveBytes+sizeof(ImmutableRowSubordinateIntent)+sizeof(ImmutableRowInvalidationAcknowledgement)));
                 if(!misses){EXPECT_EQ(after.ramRows,stats.ramRows);EXPECT_EQ(after.sourceRows,stats.sourceRows);EXPECT_EQ(after.duplicateRows,stats.duplicateRows);EXPECT_EQ(after.cacheAdmissions,stats.cacheAdmissions);EXPECT_EQ(after.cacheEvictions,stats.cacheEvictions);EXPECT_EQ(after.adaptiveBatches,stats.adaptiveBatches);}
-                EXPECT_EQ(after.terminalBytes-stats.terminalBytes,8u);
+                // One GPU close word and the CPU worker's generation/invocation
+                // retirement pair are required even for an empty interval.
+                EXPECT_EQ(after.terminalBytes-stats.terminalBytes,3u*sizeof(std::uint64_t));
             }
             if(capacity>1&&slots==64){
                 const auto pinned=workload(capacity,64);c.admit();c.workload(capacity,pinned);c.launch();c.join();outputAndRecords(c,pinned);EXPECT_TRUE(c.close());

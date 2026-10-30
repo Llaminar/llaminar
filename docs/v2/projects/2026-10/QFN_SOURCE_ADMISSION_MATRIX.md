@@ -97,7 +97,7 @@ CUDA/CPU 15/33 layer family.
 | CUDA capacity controls | Four-expert VRAM retained3 positives and eight-expert 13GiB-cap rejections pass 8/8 with exact MTP/cap evidence and retirement. `source-admission-cuda-capacity-controls-r5/`. |
 | Added CUDA15/CPU33 family | **16/16 native pass**: four storage policies × Off/fixed1/fixed3/Dynamic, all with exact retirement, unchanged runtime and clean driver checks. `source-admission-cuda-cpu15-full15-r12/`. |
 | Current discovery | 628 declared, 484 selected, 144 hardware-unqualified; r12 `hardware-selection.json` retains exact identities. This is not full-matrix execution. |
-| Native init repair | [NCCL GIN fix](QFN_NCCL_GIN_INITIALIZATION.md): source replay and CUDA capture/reset pass; full native admission remains open. |
+| Native repairs | [NCCL init](QFN_NCCL_GIN_INITIALIZATION.md) and [I/O retirement](QFN_IMMUTABLE_WORKER_RETIREMENT.md) pass focused gates; full native admission remains open. |
 
 Three r10 intervals conservatively overlapped private CUDA property queries.
 `source-admission-cpu-mtp-r10-quiet/` repeats their same two passes and one

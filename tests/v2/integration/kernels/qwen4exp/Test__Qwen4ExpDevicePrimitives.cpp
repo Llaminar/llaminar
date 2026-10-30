@@ -905,7 +905,9 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
                 }
                 EXPECT_EQ(observation.counters.requests,1u);EXPECT_EQ(observation.counters.ids,static_cast<std::uint64_t>(rows)*16);
                 EXPECT_EQ(observation.counters.nativeBytes,static_cast<std::uint64_t>(rows)*16*rowBytes);
-                EXPECT_EQ(observation.counters.terminalBytes,8u);
+                // Terminal traffic includes the GPU close and the worker's
+                // exact generation/invocation retirement publication.
+                EXPECT_EQ(observation.counters.terminalBytes,3u*sizeof(std::uint64_t));
                 const auto nativeBytes=storage.download(scratch,maxIds*rowBytes);
                 const auto liveIds=static_cast<std::size_t>(rows)*16;
                 std::vector<float> expected(liveIds*width);
@@ -923,7 +925,8 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
             const auto stats=service->stats();EXPECT_EQ(stats.requests,epoch);EXPECT_EQ(stats.ids,idCount);
             EXPECT_EQ(stats.idBytes,idCount*8);EXPECT_EQ(stats.nativeBytes,idCount*rowBytes);
             EXPECT_EQ(stats.metadataBytes,epoch*(kLookupRequestLiveBytes+kLookupCompletionLiveBytes));
-            EXPECT_EQ(stats.acknowledgementBytes,epoch*8);EXPECT_EQ(stats.terminalBytes,epoch*8);
+            EXPECT_EQ(stats.acknowledgementBytes,epoch*8);
+            EXPECT_EQ(stats.terminalBytes,epoch*3u*sizeof(std::uint64_t));
             EXPECT_EQ(stats.failures,0u);
             const auto finalState=storage.download(state,1)[0];
             EXPECT_EQ(finalState.issuedSequence,epoch);EXPECT_EQ(finalState.consumedSequence,epoch);
@@ -995,7 +998,7 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
                     const auto after=service->stats();
                     EXPECT_EQ(after.requests-before.requests,noWork?0u:1u);
                     EXPECT_EQ(after.nativeBytes-before.nativeBytes,noWork?0u:maxIds*rowBytes);
-                    EXPECT_EQ(after.terminalBytes-before.terminalBytes,8u);
+                    EXPECT_EQ(after.terminalBytes-before.terminalBytes,3u*sizeof(std::uint64_t));
                     if(!noWork)idCount+=maxIds;
                 }
                 parent.reset();terminal.reset();child.reset();

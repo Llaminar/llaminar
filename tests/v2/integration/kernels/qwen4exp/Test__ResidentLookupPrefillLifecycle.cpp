@@ -547,7 +547,10 @@ void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
             reset();ASSERT_FALSE(boundary->hasActiveInterval());EXPECT_GT(Peer::epoch(runner),oldEpoch);
             auto terminal=boundary->terminalObservation();EXPECT_EQ(terminal.generation,1u);
             EXPECT_EQ(terminal.counters.requests,1u);EXPECT_EQ(terminal.counters.ids,idCapacity);
-            EXPECT_EQ(terminal.counters.nativeBytes,idCapacity*stride);EXPECT_EQ(terminal.counters.terminalBytes,8u);
+            EXPECT_EQ(terminal.counters.nativeBytes,idCapacity*stride);
+            // Reset closes the GPU interval and joins its exact CPU worker;
+            // both the close word and the two-word retirement witness count.
+            EXPECT_EQ(terminal.counters.terminalBytes,3u*sizeof(std::uint64_t));
             EXPECT_EQ(HostedEvidence::total("reset_terminal_closes"),++closes);
             EXPECT_EQ(HostedEvidence::total("reset_terminal_waits"),++waits);
             EXPECT_EQ(HostedEvidence::total("intervals"),++intervals);

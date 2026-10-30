@@ -51,7 +51,8 @@ struct StageRetirement final
             // that second frontier before cancelling its mapped source worker.
             if (!component.backend->synchronizeStream(component.stream, component.device.ordinal))
                 std::terminate();
-            component.service->cancel();
+            // awaitTerminal owns the exact boundary ticket and cancels that
+            // invocation if its complete terminal close is missing.
             try
             {
                 if (boundary->hasActiveInterval())

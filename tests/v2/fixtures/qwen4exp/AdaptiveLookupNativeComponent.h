@@ -217,7 +217,7 @@ public:
                 // are still live, then cancel/await the CPU service.
                 if (!backend->synchronizeStream(stream, device.ordinal))
                     std::terminate();
-                service->cancel();
+                (void)service->cancel(*ticket);
                 try
                 {
                     (void)service->await(*ticket);
