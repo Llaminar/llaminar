@@ -134,3 +134,18 @@ driver window has 25 new records and zero findings. `completion-audit.json`
 joins the exact CTest registrations, native receipts and cleanup observations.
 This closes those six historical failures without changing their policies.
 The four original ROCm PP(TP2, TP2) capacity/composition failures remain open.
+
+The CUDA TP2 eight-expert RAM placement sweep then passed **16/16** in
+2,717.51 seconds (`source-admission-cuda-tp2-ram-policies-r27/`). It crosses
+Static/Dynamic placement, ordinal/random ownership and Off/fixed1/fixed3/Dynamic
+MTP, retaining all 48 layers and active capacity15. The closed-batch audit
+validates all source/MTP/retirement receipts against their actual registrations,
+all 16 empty session bases, unchanged runtime/source metadata and the clean
+driver window (124 new records, zero findings).
+
+The metadata-only coverage projection in
+`/tmp/qfn-source-admission-coverage-r27-r1/` records 142 passing local identities
+across their original runtimes, four latest failures and 338 local identities
+without a completed retained result. Earlier Off receipts lacking the current
+MTP CSV remain explicitly labeled legacy evidence. This inventory does not
+promote earlier runs to current-binary certification.

@@ -8,6 +8,12 @@ adds exactly priced owner receive spans, and protects seal receipts, packet
 reuse and terminal metadata lifetime. It does not yet qualify distributed
 publication, reading, cancellation or native transport.
 
+The private participant factories currently cover all-remote owner cohorts;
+the installed local path covers one owner. A mixed local/remote cohort also
+needs direct local pin/free/victim edges with actual producer and receipt
+dependencies. This is required for the usual TP2 arrangement before its
+source/fill component can be qualified; local completion cannot be assumed.
+
 ## Existing target and installed boundary
 
 The existing [tiered storage plan](QFN_NGRAM_TIERED_STORAGE_PLAN.md), especially “Next distributed runtime slice”, fixed-phase protocol, directed transport, and qualification sections. It explicitly says pooled adaptive TP and native variable-size collectives remain uninstalled. Historical component passes are not current full-model/economy qualification.
