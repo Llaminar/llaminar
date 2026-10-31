@@ -8,6 +8,7 @@
  */
 #pragma once
 #include "PooledImmutableNativeStorage.h"
+#include "loaders/ImmutableLookupNativeOwnership.h"
 #include "execution/qwen4exp/Qwen4ExpPreparedStorage.h"
 #include "transfer/TransferEngine.h"
 #include <array>
@@ -37,6 +38,11 @@ public:
     PooledImmutableNativeRoots roots()const;
     /** @brief Require exact still-live native storage without GPU queries, allocation or mutable reads. */
     void require()const;
+    /** @brief Reject another PMA even when its immutable certificate has equal bytes.
+     * @param memory Actual original authority retained by the model/source owner. */
+    void requireAuthority(const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const;
+    /** @return Exact actual still-retained root claims, without native state reads. */
+    ImmutableLookupNativeOwnerObservation retainedOwnerObservation()const;
     /** @return Complete immutable root/type/backend/runtime/claim identity. */
     std::uint64_t identity()const;
     /** @brief Join the exact original setup event on a consumer stream; never wait on the host. */

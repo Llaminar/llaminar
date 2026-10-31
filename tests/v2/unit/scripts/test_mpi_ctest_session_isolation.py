@@ -145,6 +145,39 @@ class MPICTestOwnerTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "overrides its MPI owner's"):
             self.validate(test)
 
+    def test_model_only_mpi_cannot_hide_behind_an_unrelated_gate(self) -> None:
+        """The original label filter silently ignored raw model/campaign MPI jobs."""
+        for labels in (["Admission", "RealModel"], ["Campaign", "FullModel", "CPU"], []):
+            with self.subTest(labels=labels):
+                model = self.registration("model")
+                model["properties"][0]["value"] = labels
+                model["command"] = model["command"][4:]
+                with self.assertRaisesRegex(AssertionError, "no original MPI"):
+                    self.validate(model, self.registration("gate"))
+
+    def test_model_only_owned_worlds_are_checked_and_distinct(self) -> None:
+        """Real-model labels never exempt the original owner or unique root."""
+        source, campaign = self.registration("source"), self.registration("campaign")
+        source["properties"][0]["value"] = ["Admission", "RealModel", "ProcessOwned"]
+        campaign["properties"][0]["value"] = ["Campaign", "FullModel", "ProcessOwned"]
+        self.assertEqual(set(self.validate(source, campaign)), {"source", "campaign"})
+        campaign["command"][2] = source["command"][2]
+        with self.assertRaisesRegex(AssertionError, "shares its MPI session root"):
+            self.validate(source, campaign)
+
+    def test_owned_model_without_scheduling_label_is_rejected(self) -> None:
+        """Campaign retirement consumers must be able to find the actual owner."""
+        model = self.registration("model")
+        model["properties"][0]["value"] = ["Admission", "FullModel"]
+        with self.assertRaisesRegex(AssertionError, "no ProcessOwned"):
+            self.validate(model, self.registration("gate"))
+
+    def test_model_script_launcher_operand_remains_opaque_data(self) -> None:
+        """Extending label coverage must not reinterpret model script arguments."""
+        model = {"name": "script", "command": ["python3", "model.py", "--mpirun", "/usr/bin/mpirun"],
+                 "properties": [{"name": "LABELS", "value": ["FullModel"]}]}
+        self.assertEqual(set(self.validate(model, self.registration())), {"first"})
+
 
 if __name__ == "__main__":
     unittest.main()

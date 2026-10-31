@@ -9,16 +9,19 @@
  *
  * @author David Sanftenberg
  * Physical identity and limits share the admitted process inventory; live free
- * memory and context-retirement observations remain runtime-owned discovery.
+ * memory and checked primary-context reference-release requests remain runtime
+ * observations. A successful release is not proof of context destruction or
+ * returned capacity; complete opaque context ownership is a separate contract.
  */
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h> // For hipDevicePrimaryCtxRelease, hipDevicePrimaryCtxGetState
-#include <hipblas/hipblas.h>
 #include <vector>
 #include <string>
 #include <cstring>
 #include <cstdio>
+#include <exception>
+#include <stdexcept>
 #include "ComputeBackend.h"
 #include "GPUEnumeration.h"
 #include "DeviceUUID.h"
@@ -31,6 +34,107 @@ namespace llaminar2
 {
     namespace rocm_enumeration
     {
+
+        namespace
+        {
+            /**
+             * @brief Restore the exact caller ordinal and check existing primary-reference releases.
+             *
+             * Context-state observations precede every selection. A previously
+             * inactive context is eligible for the existing release request only
+             * after a successful selection. This scope never reports context
+             * destruction, released VRAM or an opaque resource-admission proof.
+             */
+            class ROCmEnumerationDeviceScope final
+            {
+            public:
+                /** @brief Authenticate current selection and all original context states before touching capacity. */
+                explicit ROCmEnumerationDeviceScope(const ROCmHardwareInventory& inventory)
+                    : contexts_(inventory.size())
+                {
+                    const auto status=hipGetDevice(&saved_);
+                    if(status!=hipSuccess)
+                        throw std::runtime_error(std::string("ROCm discovery cannot preserve current device: ")+hipGetErrorString(status));
+                    (void)inventory.at(saved_);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+                    for(std::size_t i=0;i<contexts_.size();++i){
+                        auto& context=contexts_[i];
+                        const auto device_status=hipDeviceGet(&context.device,static_cast<int>(i));
+                        if(device_status!=hipSuccess)
+                            throw std::runtime_error("ROCm context observation hipDeviceGet failed at ordinal "+std::to_string(i)+": "+hipGetErrorString(device_status));
+                        unsigned int flags=0;int active=0;
+                        const auto state_status=hipDevicePrimaryCtxGetState(context.device,&flags,&active);
+                        if(state_status!=hipSuccess)
+                            throw std::runtime_error("ROCm context observation hipDevicePrimaryCtxGetState failed at ordinal "+std::to_string(i)+": "+hipGetErrorString(state_status));
+                        context.had_context=active!=0;
+                    }
+#pragma GCC diagnostic pop
+                }
+                /** @brief Unwinding must restore/release successfully; cleanup errors cannot become successful discovery. */
+                ~ROCmEnumerationDeviceScope()
+                {
+                    if(!active_)return;
+                    const auto result=cleanup();
+                    if(result.restore!=hipSuccess || result.release!=hipSuccess){
+                        LOG_ERROR("ROCm discovery cleanup failed: restore="<<hipGetErrorString(result.restore)
+                            <<", primary-reference release ordinal="<<result.ordinal<<" status="<<hipGetErrorString(result.release));
+                        std::terminate();
+                    }
+                }
+                /** @brief Select one exact inventory member, retaining no successful status from a failed native call. */
+                void select(int ordinal)
+                {
+                    auto& context=contexts_.at(static_cast<std::size_t>(ordinal));
+                    const auto status=hipSetDevice(ordinal);
+                    if(status!=hipSuccess)
+                        throw std::runtime_error("ROCm capacity observation could not select ordinal "+std::to_string(ordinal)+": "+hipGetErrorString(status));
+                    context.selected=true;
+                }
+                /** @brief Complete checked restoration/releases once before publishing any inventory projection. */
+                void finish()
+                {
+                    const auto result=cleanup();
+                    if(result.restore!=hipSuccess || result.release!=hipSuccess){
+                        std::string error;
+                        if(result.restore!=hipSuccess)
+                            error="ROCm discovery failed to restore exact current ordinal "+std::to_string(saved_)+": "+hipGetErrorString(result.restore);
+                        if(result.release!=hipSuccess){
+                            if(!error.empty())error+="; ";
+                            error+="ROCm discovery hipDevicePrimaryCtxRelease failed at ordinal "+std::to_string(result.ordinal)+": "+hipGetErrorString(result.release);
+                        }
+                        throw std::runtime_error(error);
+                    }
+                }
+                ROCmEnumerationDeviceScope(const ROCmEnumerationDeviceScope&)=delete;
+                ROCmEnumerationDeviceScope& operator=(const ROCmEnumerationDeviceScope&)=delete;
+            private:
+                /** @brief Original primary-context observation and whether this scope successfully selected it. */
+                struct Context {hipDevice_t device{};bool had_context=false,selected=false;};
+                /** @brief Native cleanup outcome, with no throwing allocation during unwinding. */
+                struct Cleanup {hipError_t restore=hipSuccess,release=hipSuccess;int ordinal=-1;};
+                /** @brief Restore once, then check every eligible release request without retrying native failures. */
+                Cleanup cleanup()noexcept
+                {
+                    active_=false;Cleanup result;
+                    result.restore=hipSetDevice(saved_);
+                    if(result.restore==hipSuccess)contexts_[static_cast<std::size_t>(saved_)].selected=true;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+                    for(std::size_t i=0;i<contexts_.size();++i){
+                        const auto& context=contexts_[i];
+                        if(!context.selected || context.had_context)continue;
+                        const auto status=hipDevicePrimaryCtxRelease(context.device);
+                        if(status!=hipSuccess && result.release==hipSuccess){result.release=status;result.ordinal=static_cast<int>(i);}
+                    }
+#pragma GCC diagnostic pop
+                    return result;
+                }
+                std::vector<Context> contexts_;
+                int saved_=-1;
+                bool active_=true;
+            };
+        }
 
         /** @return Observed devices with immutable UUIDs and current capacities. */
         std::vector<ComputeDevice> enumerate_rocm_devices()
@@ -51,28 +155,9 @@ namespace llaminar2
 
             LOG_DEBUG("[ROCm] Found " << device_count << " ROCm device(s)");
 
-            // Save the current device so we can restore it after enumeration
-            int saved_device = 0;
-            (void)hipGetDevice(&saved_device);
-
-            // Track which devices already had an active primary context before
-            // we touch them.  We will release contexts we created so that
-            // enumeration-only processes don't keep GPU memory alive.
-            std::vector<bool> had_context(device_count, false);
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-            for (int i = 0; i < device_count; ++i)
-            {
-                unsigned int flags = 0;
-                int active = 0;
-                hipDevice_t hip_dev;
-                if (hipDeviceGet(&hip_dev, i) == hipSuccess &&
-                    hipDevicePrimaryCtxGetState(hip_dev, &flags, &active) == hipSuccess)
-                {
-                    had_context[i] = (active != 0);
-                }
-            }
-#pragma GCC diagnostic pop
+            // Preserve the exact current ordinal and acquire checked original
+            // context observations before any volatile capacity selection.
+            ROCmEnumerationDeviceScope current_device(rocmHardwareMetadata());
 
             for (int i = 0; i < device_count; ++i)
             {
@@ -142,15 +227,11 @@ namespace llaminar2
 
                 // Get free memory
                 size_t free_bytes = 0, total_bytes = 0;
-                if (hipSetDevice(i) == hipSuccess)
-                {
-                    (void)hipMemGetInfo(&free_bytes, &total_bytes);
-                    dev.free_memory_bytes = free_bytes;
-                }
-                else
-                {
-                    dev.free_memory_bytes = dev.total_memory_bytes;
-                }
+                current_device.select(i);
+                const auto memory_status=hipMemGetInfo(&free_bytes,&total_bytes);
+                if(memory_status!=hipSuccess)
+                    throw std::runtime_error("ROCm capacity observation failed at ordinal "+std::to_string(i)+": "+hipGetErrorString(memory_status));
+                dev.free_memory_bytes=free_bytes;
 
                 // Feature detection based on architecture
                 // gfx900+ supports FP16, gfx908+ supports BF16 and matrix cores
@@ -168,27 +249,9 @@ namespace llaminar2
                 devices.push_back(dev);
             }
 
-            // Restore the original device to avoid side effects on callers
-            (void)hipSetDevice(saved_device);
-
-            // Release primary contexts that we created during enumeration.
-            // hipSetDevice() implicitly retains the primary context; if we
-            // don't release it, each enumerated device keeps GPU memory
-            // allocated even when the process never uses that GPU.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-            for (int i = 0; i < device_count; ++i)
-            {
-                if (!had_context[i])
-                {
-                    hipDevice_t hip_dev;
-                    if (hipDeviceGet(&hip_dev, i) == hipSuccess)
-                    {
-                        (void)hipDevicePrimaryCtxRelease(hip_dev);
-                    }
-                }
-            }
-#pragma GCC diagnostic pop
+            // No capacity projection escapes after failed restoration or an
+            // unchecked primary-reference release. This proves no destruction.
+            current_device.finish();
 
             return devices;
         }
@@ -244,10 +307,10 @@ namespace llaminar2
                     int can_access = 0;
                     hipError_t err = hipDeviceCanAccessPeer(&can_access,
                                                             devices[i].device_id, devices[j].device_id);
-                    if (err == hipSuccess && can_access)
-                    {
-                        matrix.can_access[i][j] = true;
-                    }
+                    if(err!=hipSuccess)
+                        throw std::runtime_error("ROCm P2P observation failed for ordinals "+std::to_string(devices[i].device_id)+
+                            " -> "+std::to_string(devices[j].device_id)+": "+hipGetErrorString(err));
+                    matrix.can_access[i][j]=can_access!=0;
                 }
             }
 

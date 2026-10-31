@@ -42,6 +42,7 @@ static_assert(std::is_convertible_v<ImmutableLookupStage::GPUStorage,Qwen4ExpPLE
 static_assert(std::is_convertible_v<ImmutableLookupStage::ResidentGPUStorage,Qwen4ExpPLEBuilder::LookupStorage>);
 static_assert(std::is_convertible_v<ImmutableLookupStage::Storage,Qwen4ExpPLEBuilder::LookupStorage>);
 static_assert(std::is_convertible_v<Qwen4ExpFixedHeadLookupStorage,Qwen4ExpPLEBuilder::LookupStorage>);
+static_assert(std::is_convertible_v<Qwen4ExpPooledLookupStorage,Qwen4ExpPLEBuilder::LookupStorage>);
 /** @brief Real native source with its descriptor and allocation certificate. */
 struct Source
 {

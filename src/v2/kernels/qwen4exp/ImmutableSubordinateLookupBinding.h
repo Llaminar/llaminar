@@ -9,13 +9,11 @@
  */
 #pragma once
 #include "ImmutableLookupKernels.h"
-#include "AdaptiveImmutableRowCacheNativePlan.h"
 #include <memory>
 #include <utility>
 namespace llaminar2::qwen4exp
 {
 class ImmutableLookupService;
-class AdaptiveLookupPreparedStorage;
 class PooledImmutableSourceGeometry;
 class PooledImmutableSourcePreparedStorage;
 class PooledImmutableOwnerPreparedStorage;
@@ -50,34 +48,6 @@ public:
     {
         return device_;
     }
-    /** @brief Reject changed source/layout/allocator aliases without reading mutable GPU values. */
-    void requireFor(const AdaptiveNativeParameters &parameters) const;
-    /**
-     * @brief Declare/reuse this source channel's one original prepared storage owner.
-     * @param plan Exact checked source/consumer/policy/frame geometry.
-     * @param cache Original optional native cache root, absent exactly at C0.
-     * @param frame Original mandatory frame root.
-     * @param protocol Original64B sequence/admission root.
-     * @return Same strong setup owner on an identical declaration; no root can be replaced.
-     * @throws std::exception On foreign/replaced roots, plan, failed source or capture-time declaration.
-     * @note The service retains this owner for its whole lifetime. The owner does not retain the service.
-     */
-    std::shared_ptr<AdaptiveLookupPreparedStorage>
-    declareStorage(const AdaptiveImmutableRowCacheNativePlan &plan, std::shared_ptr<TensorBase> cache,
-                   std::shared_ptr<TensorBase> frame, std::shared_ptr<TensorBase> protocol) const;
-    /**
-     * @brief Require this source's original owner to be physically sealed before native codebook setup.
-     * @param plan Exact factory geometry; it cannot be changed after preparation.
-     * @throws std::exception For absent, unprepared, replaced or stale original storage.
-     * @note This prevents a codebook bundle from preceding the runtime generation its roots authenticate.
-     */
-    void requirePreparedStorage(const AdaptiveImmutableRowCacheNativePlan &plan)const;
-    /**
-     * @brief Authenticate the original source-domain setup owner, not merely equal byte geometry.
-     * @param storage Actual owner returned by this binding's declareStorage factory.
-     * @throws std::invalid_argument Before native work for a missing or foreign service-issued owner.
-     */
-    void requireStorage(const AdaptiveLookupPreparedStorage &storage) const;
     /** @return Actual retained immutable source metadata; the binding retains the provider through every reader. */
     const ImmutableRowTableSource& source()const;
     /** @return Original service-instance source generation, distinct from request admission and I/O sequences. */
@@ -96,7 +66,7 @@ public:
      * @param coordinator Actual retained policy/coalescing authority.
      * @param memory The exact original service/provider PMA.
      * @param stream Exact setup allocation stream; no request or live metadata is read.
-     * @return Same source registration for an identical declaration; competing roots/arms fail.
+     * @return Same source registration for an identical declaration; competing roots fail.
      */
     std::shared_ptr<PooledImmutableSourcePreparedStorage> preparePooled(const PooledImmutableSourceGeometry& geometry,
         std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,

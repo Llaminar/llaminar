@@ -908,6 +908,20 @@ same role. Disjoint PP followers retain rollback state for their own main
 layers but never allocate shifted predictor caches; the terminal vocabulary
 owner retains those caches. A same-layer TP replica is not a PP follower.
 
+The explicit single-GPU adaptive ngram policy uses separate native physical
+slot, policy/coordinator and source roots retained by the original ModelContext.
+`AdaptiveImmutableLookupGeometry` derives their exact C0 floor and selected
+slot-dependent root portions from the same native layout factories. The final
+existing PMA candidate adds those portions and optional GPU/RAM caches to the
+frozen execution plan; explicit GPU cache limits include native/source bank
+growth. Original PLE hashes remain packed INT64 values. The flat PLE builder
+expands the original device-owned token range by sixteen heads and wires the
+complete retained source/owner transaction between hashing and projections.
+Frame work is observed before grants retire, then committed to the original
+terminal controller only after every source/owner/coordinator retirement. This
+single-GPU implementation does not admit distributed owners or replace the
+separate typed transport and continuation qualification obligations.
+
 `PhysicalMemoryAuthority` owns the canonical physical admission, reservation,
 materialization, and release ledger. Planners contribute typed BOMs, not live
 capacity arithmetic. Opaque native graph pools are admitted as complete retained

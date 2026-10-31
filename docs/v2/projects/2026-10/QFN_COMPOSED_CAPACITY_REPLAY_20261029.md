@@ -81,3 +81,28 @@ The original 24/24 declarations remain positive obligations. The native
 homogeneous PP(TP,TP) transport implementation is a separate unfinished
 requirement; changing the split does not bypass that requirement. No 25/23
 source-admission family or new runtime capability was installed by this replay.
+
+## Follow-up ownership audit, 2026-10-31
+
+The later r29 metadata receipt already includes the replicated physical-root
+repair. The unchanged 24/24 full15 case requires **31,294,579,056 bytes** per
+earlier-stage GPU and **34,408,868,572 bytes** per terminal-stage GPU. The latter
+is 317,565,660 bytes above the recorded usable capacity and 49,130,204 bytes
+above even raw 32 GiB. These are updated totals; do not subtract the earlier
+403,624,960-byte repair again.
+
+An independent review found no additional demonstrated duplicate in prepared
+weights, workspace, retained checkpoints, prefix storage, graph executables or
+expert-migration roots. Cold weight-upload staging occupies 536,870,400 bytes
+and eventually retires, but initial state already exists while loading. The
+current authority has no enforced device-memory sharing contract between that
+staging and later execution owners. Subtracting it would not prove a valid
+physical peak. Phase sharing would be a separate implementation requiring
+explicit ordering and lifetime proof.
+
+The existing admission rejection is therefore correct under the current
+declaration. This audit changes no capacity allowance, expert population, MTP
+depth or layer split and does not qualify the diagnostic 25/23 case. Exact
+receipts and source authentication are retained in
+`/tmp/qfn-rocm-pp-capacity-r29/` and the independent
+`/tmp/qfn-rocm-pp-capacity-review-r2/diagnosis.md`.

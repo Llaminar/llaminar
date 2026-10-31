@@ -41,28 +41,7 @@ public:
         std::shared_ptr<const ResidentImmutableRowTable> table;
         DeviceGenerationControlBinding control;
     };
-    /**
-     * @brief One GPU-owned cache plus its explicit subordinate RAM/SSD
-     * boundary.
-     *
-     * Roots are the exact model-owned allocations registered under canonical
-     * arena roles before graph materialization. Their IDs participate in
-     * dependency and publication contracts; no stage allocates, aliases or
-     * rebinds them.
-     */
-    struct AdaptiveGPUStorage
-    {
-        std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
-        DeviceGenerationControlBinding control;
-        std::optional<Qwen4ExpArenaBinding<TensorType::INT8>> cache;
-        Qwen4ExpArenaBinding<TensorType::INT8> frame;
-        Qwen4ExpIntBinding state;
-        /** @brief Complete original helper-issued query prefix, including counted M1/live0. */
-        DeviceRowRange originalRows;
-        /** @brief Original arena count subview, present exactly for counted queries. */
-        std::optional<Qwen4ExpIntBinding> count;
-    };
-    using Storage = std::variant<CPUStorage, GPUStorage, ResidentGPUStorage, AdaptiveGPUStorage>;
+    using Storage = std::variant<CPUStorage, GPUStorage, ResidentGPUStorage>;
     /** @brief Immutable storage policy, exact extents and typed output views. */
     struct Params
     {
@@ -88,11 +67,6 @@ public:
     std::uint64_t graphCaptureVariantSignature() const override;
     /** @brief Stable semantic operation shared by all backends. */
     ComputeStageType type() const override { return ComputeStageType::QWEN4EXP_NGRAM_LOOKUP; }
-    /** @return The explicit adaptive arm consumes its complete original counted query prefix. */
-    bool supportsPaddedPrefillRealLengthContract() const override
-    {
-        return std::holds_alternative<AdaptiveGPUStorage>(params_.storage);
-    }
     /** @brief Native decoding is linear in the exact gathered values. */
     std::size_t estimatedFlops() const override;
     /** @brief Return declared maximum read/write traffic, excluding unused table bytes. */

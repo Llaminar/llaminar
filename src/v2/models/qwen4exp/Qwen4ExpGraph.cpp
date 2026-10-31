@@ -8,6 +8,7 @@
  * so reset, rollback and prefix archive share one lifecycle and frontier.
  */
 #include "Qwen4ExpGraph.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "Qwen4ExpConfig.h"
 #include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "Qwen4ExpBufferLayout.h"
@@ -185,14 +186,17 @@ std::shared_ptr<IRetainedGraphStorageBoundary> Qwen4ExpGraph::retainedStorageBou
         if (!sourcePlacement || *sourcePlacement != *config_.ngram_table_placement)
             throw std::logic_error("Adaptive graph and original source have different admitted placements");
         auto boundary = model_ctx_->adaptiveImmutableLookupBoundary(device);
-        if (!boundary || !boundary->isAdaptive() || boundary->device() != device ||
+        if (!boundary || !boundary->isPooled() || boundary->device() != device ||
             (lookup_ && lookup_ != boundary))
             throw std::logic_error(
                 "Flash Next adaptive lookup replaced or lost its model-owned source boundary");
         // Register original model-owned external roots only. The shared arena
         // inventory never allocates a second cache, frame or protocol tensor.
-        if (arena_)
-            boundary->bindAdaptiveArena(*arena_);
+        if(arena_){
+            bindPooledNativeRoots(*arena_,*boundary->pooledStorage()->owner());
+            bindPooledNativeRoots(*arena_,*boundary->pooledStorage()->coordinator());
+            bindPooledSourceRoots(*arena_,*boundary);
+        }
         lookup_ = std::move(boundary);
         return lookup_;
     }
@@ -415,17 +419,16 @@ std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardI
                 throw std::logic_error(
                     "Adaptive PLE requires its original source boundary and canonical arena");
             const auto original = singleRequestProjectionQueryRows(input.seq_len, device);
-            const auto roots = lookup_->adaptiveRoots();
-            return ImmutableLookupStage::Storage{ImmutableLookupStage::AdaptiveGPUStorage{
-                lookup_,
-                DeviceGenerationControlBinding::admit(*arena_, device, 0),
-                roots.cache ? std::optional{Qwen4ExpArenaBinding<TensorType::INT8>(
-                                  *roots.cache, BufferId::QFN_NGRAM_ADAPTIVE_CACHE)}
-                            : std::nullopt,
-                {*roots.frame, BufferId::QFN_NGRAM_ADAPTIVE_FRAME},
-                {*roots.protocol, BufferId::QFN_NGRAM_LOOKUP_STATE},
-                original,
-                adaptiveCountBinding(input, original)}};
+            std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code;
+#ifdef HAVE_CUDA
+            if(device.is_cuda())code=qwen4exp::createCUDAPooledImmutableNativeKernels();
+#endif
+#ifdef HAVE_ROCM
+            if(device.is_rocm())code=qwen4exp::createROCmPooledImmutableNativeKernels();
+#endif
+            if(!code)throw std::invalid_argument("PLE split lookup requires its compiled original native backend");
+            return Qwen4ExpPooledLookupStorage{arena_,lookup_,std::move(code),
+                DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original)};
         }
         if (tier==ImmutableRowLookupExecution::ResidentGPU)
         {

@@ -9,6 +9,7 @@
  * - Per-device HIP streams and completion events
  * - Proper rcclGroupStart/End semantics for multi-GPU collectives
  * - Thread-safe work queue for operation submission
+ * - Mutex-owned complete readiness publication before callers may retire the owner
  *
  * Setup and grouped host transactions use the coordinator worker. Captured
  * participant-local operations enqueue directly on their caller's explicit
@@ -564,6 +565,12 @@ namespace llaminar2
     // Coordinator Thread Implementation
     // ============================================================================
 
+    /**
+     * @brief Initialize, atomically publish readiness, then drain the original work queue.
+     * @note Readiness and shutdown use the same predicate mutex. The complete
+     * running outcome precedes init_complete so an immediate owner retirement
+     * cannot be overwritten or lose its notification before worker waiting.
+     */
     void RCCLCoordinator::coordinatorLoop()
     {
         LOG_TRACE("[RCCLCoordinator] Coordinator thread starting");
@@ -571,8 +578,14 @@ namespace llaminar2
         // Initialize on this thread
         initializeOnThread();
 
-        // Signal that initialization is complete
-        init_complete_.store(true);
+        // Publish the whole ready outcome while holding the constructor's
+        // predicate mutex. An immediate shutdown may clear running_ after this
+        // publication; the worker must never overwrite that stop afterwards.
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            running_.store(init_success_.load());
+            init_complete_.store(true);
+        }
         queue_cv_.notify_all();
 
         if (!init_success_.load())
@@ -581,7 +594,6 @@ namespace llaminar2
             return;
         }
 
-        running_.store(true);
         LOG_TRACE("[RCCLCoordinator] Coordinator loop started");
 
         // Main work loop

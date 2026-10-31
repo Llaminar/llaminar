@@ -72,13 +72,13 @@ std::vector<PerfStatRecord> example(DeviceId owner=DeviceId::cuda(0),bool zero=f
     for(std::size_t i=0;i<gpu.size();++i)
         records.push_back({.kind=PerfStatRecord::Kind::Counter,.domain="immutable_lookup",
             .name=std::string(kGPUAdaptiveLookupCounters[i]),.phase="generation_terminal",.device=owner.toString(),
-            .tags={{"request","0"},{"storage","vram"},{"transport","adaptive_subordinate"},
+            .tags={{"request","0"},{"storage","vram"},{"transport","pooled_subordinate"},
                 {"authority","terminal_device_generation_control"}},.count=1,.value=static_cast<double>(gpu[i])});
     for(std::size_t i=0;i<source.size();++i)
         records.push_back({.kind=PerfStatRecord::Kind::Counter,.domain="immutable_lookup",
             .name=std::string(kGPUAdaptiveSourceCounters[i]),.phase="generation_terminal",.device=owner.toString(),
             .tags={{"storage",std::string(hostImmutableRowModeName(HostImmutableRowMode::AdaptiveRAMSSD))},
-                {"transport","adaptive_subordinate"}},.count=1,.value=static_cast<double>(source[i])});
+                {"transport","pooled_subordinate"}},.count=1,.value=static_cast<double>(source[i])});
     return records;
 }
 /** @return The actual validator's complete evidence, without fabricating a provider or native source. */
@@ -283,7 +283,7 @@ TEST(Qwen4ExpGPUAdaptiveLookupEvidence, RawCSVAndInputsRemainUntouchedOnFailure)
 {
     auto records=example();records[4].value=8192;const auto value=records[4].value;
     std::ostringstream csv;writeQwen4ExpLookupCounterCSV(csv,records);
-    EXPECT_NE(csv.str().find("vram,adaptive_subordinate,generation_terminal,CUDA:0,adaptive_source_rows,8192\n"),std::string::npos);
+    EXPECT_NE(csv.str().find("vram,pooled_subordinate,generation_terminal,CUDA:0,adaptive_source_rows,8192\n"),std::string::npos);
     EXPECT_THROW((void)validate(records),std::invalid_argument);
     EXPECT_EQ(records[4].value,value);EXPECT_EQ(records.size(),29u);
 }

@@ -13,6 +13,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/ModelContext.h"
 #include "planning/MemoryPlanner.h"
 #include "planning/PlanningModelMetadata.h"
@@ -100,20 +101,20 @@ void prove(DeviceId device)
             auto graph = std::make_unique<Qwen4ExpGraph>(graphConfig);
             graph->setModelContext(context);
             graph->bindStorageMemoryAuthority(memory);
-            BufferArena declarationArena;
+            auto declarationArena=std::make_unique<BufferArena>();
             std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
-            AdaptiveImmutableLookupRoots roots;
+            std::array<qwen4exp::PooledImmutableNativeRoots,3> roots;
             // All owners declared above survive this guard's terminal wait on
             // exceptional assertion exits. Successful boundary teardown also
             // independently retains/proves its ordinary setup frontier.
             SetupRetirement retire{backend,device,stream};
             ASSERT_FALSE(context->resolvedImmutableRowTablePlacement());
-            ASSERT_NO_THROW(graph->setArena(&declarationArena));
+            ASSERT_NO_THROW(graph->setArena(declarationArena.get()));
             EXPECT_FALSE(context->adaptiveImmutableLookupBoundary(device));
-            for (const auto role : {BufferId::QFN_NGRAM_ADAPTIVE_CACHE,
-                                   BufferId::QFN_NGRAM_ADAPTIVE_FRAME,
-                                   BufferId::QFN_NGRAM_LOOKUP_STATE})
-                EXPECT_FALSE(declarationArena.isRegistered(role));
+            for (const auto role : {BufferId::QFN_POOLED_OWNER_CACHE,
+                                   BufferId::QFN_POOLED_OWNER_FRAME,
+                                   BufferId::QFN_POOLED_OWNER_NATIVE})
+                EXPECT_FALSE(declarationArena->isRegistered(role));
             // Real binding remains strict: declaration cannot substitute a
             // prepared ModelContext source or consume any PMA claim.
             try
@@ -134,12 +135,13 @@ void prove(DeviceId device)
                 TransferEngine::instance(),AdaptiveImmutableLookupDevicePreparation{device,stream});
             context->requireImmutableRowTablePlacementComplete(*selected.placement,memory);
             boundary=context->adaptiveImmutableLookupBoundary(device);ASSERT_TRUE(boundary);
-            roots=boundary->adaptiveRoots();ASSERT_TRUE(roots.frame);ASSERT_TRUE(roots.protocol);
-            EXPECT_EQ(bool(roots.cache),slots!=0);
+            roots={boundary->pooledStorage()->owner()->roots(),boundary->pooledStorage()->coordinator()->roots(),boundary->pooledStorage()->roots()};
+            ASSERT_TRUE(boundary->isPooled());ASSERT_TRUE(roots[0].frame);ASSERT_TRUE(roots[0].native);
+            EXPECT_EQ(bool(roots[0].cache),slots!=0);
             ASSERT_EQ(graph->retainedStorageBoundary(device).get(),boundary.get());
-            EXPECT_EQ(declarationArena.getTensor(BufferId::QFN_NGRAM_ADAPTIVE_CACHE),roots.cache.get());
-            EXPECT_EQ(declarationArena.getTensor(BufferId::QFN_NGRAM_ADAPTIVE_FRAME),roots.frame.get());
-            EXPECT_EQ(declarationArena.getTensor(BufferId::QFN_NGRAM_LOOKUP_STATE),roots.protocol.get());
+            EXPECT_EQ(declarationArena->getTensor(BufferId::QFN_POOLED_OWNER_CACHE),roots[0].cache.get());
+            EXPECT_EQ(declarationArena->getTensor(BufferId::QFN_POOLED_OWNER_FRAME),roots[0].frame.get());
+            EXPECT_EQ(declarationArena->getTensor(BufferId::QFN_POOLED_OWNER_NATIVE),roots[0].native.get());
             EXPECT_EQ(graph->retainedStorageBoundary(device).get(),boundary.get());
             // An independently admitted changed policy cannot bind the existing
             // source even when its payload/cache byte geometry happens to match.
@@ -170,18 +172,18 @@ void prove(DeviceId device)
                     EXPECT_NE(std::string(error.what()).find(
                         "Adaptive graph and original source have different admitted placements"), std::string::npos);
                 }
-                EXPECT_FALSE(differentArena.isRegistered(BufferId::QFN_NGRAM_ADAPTIVE_CACHE));
-                EXPECT_FALSE(differentArena.isRegistered(BufferId::QFN_NGRAM_ADAPTIVE_FRAME));
-                EXPECT_FALSE(differentArena.isRegistered(BufferId::QFN_NGRAM_LOOKUP_STATE));
+                EXPECT_FALSE(differentArena.isRegistered(BufferId::QFN_POOLED_OWNER_CACHE));
+                EXPECT_FALSE(differentArena.isRegistered(BufferId::QFN_POOLED_OWNER_FRAME));
+                EXPECT_FALSE(differentArena.isRegistered(BufferId::QFN_POOLED_OWNER_NATIVE));
                 EXPECT_EQ(context->adaptiveImmutableLookupBoundary(device).get(),boundary.get());
             }
-            EXPECT_TRUE(roots.frame->is_raw_data_released());EXPECT_TRUE(roots.protocol->is_raw_data_released());
-            EXPECT_THROW((void)roots.frame->data(),std::logic_error);
-            EXPECT_THROW((void)roots.protocol->data(),std::logic_error);
-            if(roots.cache)
+            EXPECT_TRUE(roots[0].frame->is_raw_data_released());EXPECT_TRUE(roots[0].native->is_raw_data_released());
+            EXPECT_THROW((void)roots[0].frame->data(),std::logic_error);
+            EXPECT_THROW((void)roots[0].native->data(),std::logic_error);
+            if(roots[0].cache)
             {
-                EXPECT_TRUE(roots.cache->is_raw_data_released());
-                EXPECT_THROW((void)roots.cache->data(),std::logic_error);
+                EXPECT_TRUE(roots[0].cache->is_raw_data_released());
+                EXPECT_THROW((void)roots[0].cache->data(),std::logic_error);
             }
             EXPECT_FALSE(context->residentImmutableRowTable(device));EXPECT_EQ(context->residentImmutableRowTableBytes(device),0u);
             auto provider=context->hostImmutableRowProvider();ASSERT_TRUE(provider);
@@ -191,25 +193,25 @@ void prove(DeviceId device)
             const std::array<std::int64_t,1> ids{0};
             EXPECT_THROW((void)provider->gather(ids,response),std::logic_error);
             for(const auto value:response)EXPECT_EQ(value,std::byte{0x55});
-            const auto actualGPU=boundary->rootStorage()->retainedOwnerObservation();
+            const auto actualGPU=boundary->pooledStorage()->retainedOwnerObservation();
             const auto actualHost=boundary->retainedSourceOwnerObservation();
             EXPECT_EQ(actualGPU.authority().get(),memory.get());EXPECT_EQ(actualHost.authority().get(),memory.get());
-            EXPECT_EQ(actualGPU.tableStorageBytes(),geometry.gpu().cache().bytes);
-            EXPECT_EQ(actualGPU.lookupStagingBytes(),geometry.gpu().mandatoryDeviceBytes());
+            EXPECT_EQ(actualGPU.tableStorageBytes(),geometry.gpuCacheBytes());
+            EXPECT_EQ(actualGPU.lookupStagingBytes(),geometry.mandatoryDeviceBytes());
             const auto *hostLines=component.find({0,DeviceId::cpu()});ASSERT_NE(hostLines,nullptr);
             EXPECT_EQ(actualHost.tableStorageBytes(),hostLines->bytes(PhysicalMemoryOwner::ImmutableTableStorage));
             EXPECT_EQ(actualHost.lookupStagingBytes(),hostLines->bytes(PhysicalMemoryOwner::ImmutableLookupStaging));
-            const auto identity=boundary->captureIdentity();const auto frame=roots.frame.get();const auto protocol=roots.protocol.get();
+            const auto identity=boundary->captureIdentity();const auto frame=roots[0].frame.get();const auto protocol=roots[0].native.get();
             context->prepareImmutableRowTableForConsumer(*selected.placement,memory,device,std::nullopt,TransferEngine::instance());
             EXPECT_EQ(context->adaptiveImmutableLookupBoundary(device).get(),boundary.get());
-            EXPECT_EQ(boundary->captureIdentity(),identity);EXPECT_EQ(boundary->adaptiveRoots().frame.get(),frame);
-            EXPECT_EQ(boundary->adaptiveRoots().protocol.get(),protocol);
+            EXPECT_EQ(boundary->captureIdentity(),identity);EXPECT_EQ(boundary->pooledStorage()->owner()->roots().frame.get(),frame);
+            EXPECT_EQ(boundary->pooledStorage()->owner()->roots().native.get(),protocol);
             auto foreign=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(component),0);
             EXPECT_THROW(context->prepareImmutableRowTableForConsumer(*selected.placement,foreign,device,std::nullopt,TransferEngine::instance()),std::logic_error);
-            EXPECT_THROW(boundary->rootStorage()->requireFor(geometry.gpu().nativePlan(),foreign),std::logic_error);
+            EXPECT_THROW(boundary->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),nativeSource(profile),foreign),std::logic_error);
             auto changed=selected.placement->gpuAdaptiveRequest();++changed.gpu_policy.aging_accesses;
-            const auto changedPlan=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),nativeSource(profile),changed).gpu().nativePlan();
-            EXPECT_THROW(boundary->rootStorage()->requireFor(changedPlan,memory),std::logic_error);
+            const auto changedPlan=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),nativeSource(profile),changed);
+            EXPECT_THROW(boundary->pooledStorage()->requireFor(changedPlan.physical(),changedPlan.coordinator(),nativeSource(profile),memory),std::logic_error);
             EXPECT_EQ(boundary->captureIdentity(),identity);
             EXPECT_TRUE(backend->synchronizeStream(stream,device.ordinal));
             graph.reset();
@@ -229,6 +231,14 @@ void prove(DeviceId device)
             EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableLookupStaging,
                 PhysicalMemoryMaterializationKind::NewAllocation),actualGPU.lookupStagingBytes());
             roots={};
+            // External arena slots retain the same original Tensor owners,
+            // physical allocations and PMA leases after graph/source/root
+            // aliases retire. Its last borrow must release every exact claim.
+            EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableLookupStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),actualGPU.lookupStagingBytes());
+            EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableTableStorage,
+                PhysicalMemoryMaterializationKind::NewAllocation),actualGPU.tableStorageBytes());
+            declarationArena.reset();
             EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableLookupStaging,
                 PhysicalMemoryMaterializationKind::NewAllocation),0u);
             EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableTableStorage,

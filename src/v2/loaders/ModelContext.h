@@ -23,7 +23,7 @@
 #include "ImmutableRowTable.h"
 #include "HostImmutableRowProvider.h"
 #include "ResidentImmutableRowTable.h"
-#include "AdaptiveImmutableLookupRootStorage.h"
+#include "ImmutableLookupNativeOwnership.h"
 #include <map>
 #include <span>
 #include <condition_variable>

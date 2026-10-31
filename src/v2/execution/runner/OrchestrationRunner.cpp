@@ -49,6 +49,7 @@
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "planning/ImmutableRowTableAdmissionWire.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/ImmutableRowTable.h"
 #include "OrchestrationRunner.h"
 #include "execution/moe/MoEOverlayCPUHostMaintenance.h"
@@ -21741,7 +21742,7 @@ namespace llaminar2
                 {
                     const auto boundary=model_ctx_->adaptiveImmutableLookupBoundary(device);
                     if(!boundary)throw std::invalid_argument("Adaptive retention has no original source boundary");
-                    const auto actual=boundary->rootStorage()->retainedOwnerObservation();
+                    const auto actual=boundary->pooledStorage()->retainedOwnerObservation();
                     if(actual.authority().get()!=physical_memory_authority_.get() || actual.allocator()!=PhysicalMemoryAllocatorIdentity{plan_.rank,device})
                         throw std::invalid_argument("Adaptive retention must observe its exact original GPU/PMA root claims");
                     immutable_table_bytes=actual.tableStorageBytes();
@@ -22230,7 +22231,7 @@ namespace llaminar2
                     {
                         const auto boundary=model_ctx_->adaptiveImmutableLookupBoundary(cfg.device);
                         if(!boundary)throw std::invalid_argument("Retained mixed ngrams lost their original source boundary");
-                        const auto gpu=boundary->rootStorage()->retainedOwnerObservation();
+                        const auto gpu=boundary->pooledStorage()->retainedOwnerObservation();
                         const auto source=boundary->retainedSourceOwnerObservation();
                         if(gpu.authority().get()!=physical_memory_authority_.get() || source.authority().get()!=physical_memory_authority_.get() ||
                             gpu.allocator()!=PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device} ||

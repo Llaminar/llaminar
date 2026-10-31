@@ -113,90 +113,6 @@ ImmutableLookupStage::ImmutableLookupStage(Params params)
         require(bool(resident_kernels_) && resident_kernels_->table()==view,
             "Resident lookup backend did not bind the exact immutable source");
     }
-    else
-    {
-        const auto &adaptive = std::get<AdaptiveGPUStorage>(params_.storage);
-        require(device().is_gpu() && adaptive.boundary && adaptive.boundary->device() == device() &&
-                    adaptive.boundary->isAdaptive(),
-                "Adaptive lookup requires its exact protocol2 source boundary");
-        const auto &plan = adaptive.boundary->adaptiveKernels().plan().parameters();
-        require(plan.format == params_.format && plan.row_elements == params_.rowElements &&
-                    plan.row_bytes == params_.rowBytes && count <= plan.maximum_ids,
-                "Adaptive lookup differs from its source-native geometry or "
-                "admitted frame capacity");
-        check(adaptive.frame, plan.frame.bytes);
-        check(adaptive.state, sizeof(qwen4exp::ImmutableLookupDeviceState),
-              alignof(qwen4exp::ImmutableLookupDeviceState));
-        require(adaptive.frame.byteOffset == 0 && adaptive.state.byteOffset == 0,
-                "Adaptive lookup must bind complete original frame and protocol "
-                "roots");
-        if (adaptive.cache)
-        {
-            check(*adaptive.cache, plan.cache.bytes);
-            require(adaptive.cache->byteOffset == 0, "Adaptive cache requires its complete original root");
-        }
-        adaptive.boundary->requireAdaptiveRoots(adaptive.cache ? adaptive.cache->tensor : nullptr,
-                                                adaptive.frame.tensor, adaptive.state.tensor);
-        adaptive.control.requireFor(device());
-        if (params_.rows.liveRows)
-            if (const auto *native = std::get_if<Qwen4ExpNativeIntInput>(&params_.rows.liveRows->value))
-                require(native->capacity == 1, "Adaptive queries require their exact "
-                                               "single original count word");
-        const auto original = params_.rows.liveRows
-                                  ? DeviceRowRange::deviceCounted(params_.rows.capacity, liveCount())
-                                  : DeviceRowRange::fullyActive(params_.rows.capacity);
-        require(adaptive.originalRows.captureIdentity() == original.captureIdentity(),
-                "Adaptive lookup must retain the complete original query descriptor");
-        require(static_cast<bool>(adaptive.count) == (adaptive.originalRows.countOwner() != nullptr),
-                "Adaptive counted queries must declare their original arena "
-                "count owner");
-        if (adaptive.count)
-        {
-            check(*adaptive.count, sizeof(std::int32_t));
-            require(pointer<const std::int32_t>(*adaptive.count) == adaptive.originalRows.countOwner(),
-                    "Adaptive query count differs from its exact declared original "
-                    "arena subview");
-            require(adaptive.count->tensor != params_.ids.tensor &&
-                        adaptive.count->tensor != params_.output.tensor &&
-                        adaptive.count->buffer != params_.ids.buffer &&
-                        adaptive.count->buffer != params_.output.buffer &&
-                        adaptive.count->tensor != adaptive.frame.tensor &&
-                        adaptive.count->tensor != adaptive.state.tensor &&
-                        (!adaptive.cache || adaptive.count->tensor != adaptive.cache->tensor),
-                    "Adaptive original count cannot alias mutable "
-                    "cache/frame/protocol storage");
-        }
-        // Each mutable physical owner has one canonical arena role. Merely
-        // retaining pointer lifetimes would hide ordering from the executor.
-        const std::array<TensorBase *, 4> mutableRoots{adaptive.cache ? adaptive.cache->tensor : nullptr,
-                                                       adaptive.frame.tensor, adaptive.state.tensor,
-                                                       adaptive.control.owner()};
-        const std::array<BufferId, 4> mutableRoles{adaptive.cache ? adaptive.cache->buffer : BufferId::_COUNT,
-                                                   adaptive.frame.buffer, adaptive.state.buffer,
-                                                   BufferId::MTP_GENERATION_CONTROL};
-        for (std::size_t i = 0; i < mutableRoots.size(); ++i)
-        {
-            if (!mutableRoots[i])
-                continue;
-            require(mutableRoots[i] != params_.ids.tensor && mutableRoots[i] != params_.output.tensor &&
-                        mutableRoles[i] != params_.ids.buffer && mutableRoles[i] != params_.output.buffer,
-                    "Adaptive mutable roots must not alias original IDs or decoded "
-                    "output");
-            for (std::size_t j = 0; j < i; ++j)
-                if (mutableRoots[j])
-                    require(mutableRoots[j] != mutableRoots[i] && mutableRoles[j] != mutableRoles[i],
-                            "Adaptive cache, frame, protocol and controller must have "
-                            "distinct original roles");
-            if (adaptive.count)
-                require((adaptive.count->tensor == mutableRoots[i]) ==
-                            (adaptive.count->buffer == mutableRoles[i]),
-                        "Adaptive count role must identify its same original tensor "
-                        "owner");
-            roots.push_back(mutableRoots[i]);
-        }
-        if (adaptive.count && std::find(roots.begin(), roots.end(), adaptive.count->tensor) == roots.end())
-            roots.push_back(adaptive.count->tensor);
-    }
     prepared_.emplace(device(),roots);
 }
 
@@ -220,15 +136,6 @@ bool ImmutableLookupStage::prepareGraphLaunch(IDeviceContext *context,void *stre
         auto &transfers=TransferEngine::instance();
         if (!resident_read_) resident_read_.emplace(resident->table->acquire(stream,transfers));
         transfers.requireImmutableNativeDeviceInput(*resident_read_,device(),stream);
-    }
-    if (const auto *adaptive = std::get_if<AdaptiveGPUStorage>(&params_.storage))
-    {
-        adaptive->control.requireFor(device());
-        adaptive->boundary->bindAdaptiveGenerationControl(adaptive->control);
-        // The executor owns the typed frontier AFTER launch preparation.
-        // Setup records stable original addresses before admission produces
-        // protocol bytes; ordinary capture/replay still requires ready bytes.
-        // Acquiring these roots here would bypass that exact authority.
     }
     return true;
 }
@@ -291,31 +198,6 @@ bool ImmutableLookupStage::execute(IDeviceContext *context)
             pointer<float>(params_.output),count*params_.rowElements,resident->control.healthy(),resident->control.error()},gpuStream());
         return true;
     }
-    if (const auto *adaptive = std::get_if<AdaptiveGPUStorage>(&params_.storage))
-    {
-        adaptive->control.requireFor(device());
-        for (auto *root : {adaptive->cache ? adaptive->cache->tensor : nullptr, adaptive->frame.tensor,
-                           adaptive->state.tensor, adaptive->control.owner()})
-            if (root)
-            {
-                execution.requirePreparedInput(root);
-                execution.requirePreparedOutput(root);
-            }
-        if (adaptive->count)
-            execution.requirePreparedInput(adaptive->count->tensor);
-        const auto count = static_cast<std::size_t>(params_.rows.capacity) * qwen4exp::kNgramHeads;
-        adaptive->boundary->adaptiveKernels().gather(
-            *adaptive->boundary->adaptiveStorage(),
-            {adaptive->originalRows, pointer<const std::int64_t>(params_.ids), count,
-             pointer<float>(params_.output), count * params_.rowElements},
-            adaptive->control, gpuStream());
-        for (auto *root : {adaptive->cache ? adaptive->cache->tensor : nullptr, adaptive->frame.tensor,
-                           adaptive->state.tensor, adaptive->control.owner()})
-            if (root)
-                execution.publish(root);
-        execution.publish(params_.output.tensor);
-        return true;
-    }
     const auto &gpu=std::get<GPUStorage>(params_.storage);
     execution.requirePreparedInput(gpu.state.tensor);
     execution.requirePreparedOutput(gpu.nativeRows.tensor);
@@ -352,16 +234,6 @@ StageBufferContract ImmutableLookupStage::bufferContract() const
         if(auto *arena=std::get_if<Qwen4ExpIntBinding>(&params_.rows.liveRows->value))
             contract.addInput(arena->buffer,"INT32");
     if(auto *gpu=std::get_if<GPUStorage>(&params_.storage)) contract.addInOut(gpu->state.buffer,"INT32");
-    if (const auto *adaptive = std::get_if<AdaptiveGPUStorage>(&params_.storage))
-    {
-        if (adaptive->count && adaptive->count->buffer != BufferId::MTP_GENERATION_CONTROL)
-            contract.addInput(adaptive->count->buffer, "INT32");
-        if (adaptive->cache)
-            contract.addPreallocatedInOut(adaptive->cache->buffer, "INT8");
-        contract.addPreallocatedInOut(adaptive->frame.buffer, "INT8")
-            .addPreallocatedInOut(adaptive->state.buffer, "INT32")
-            .addPreallocatedInOut(BufferId::MTP_GENERATION_CONTROL, "INT32");
-    }
     return contract;
 }
 StageDumpInfo ImmutableLookupStage::buildDumpInfoImpl() const
@@ -415,27 +287,6 @@ std::uint64_t ImmutableLookupStage::graphCaptureVariantSignature() const
         mix(view.nativeBytes());
         mix(view.storageGeneration());
         mix(resident.control.captureIdentity());
-    }
-    if (const auto *adaptive = std::get_if<AdaptiveGPUStorage>(&params_.storage))
-    {
-        adaptive->control.requireFor(device());
-        adaptive->boundary->requireAdaptiveRoots(adaptive->cache ? adaptive->cache->tensor : nullptr,
-                                                 adaptive->frame.tensor, adaptive->state.tensor);
-        mix(adaptive->boundary->captureIdentity());
-        mix(adaptive->control.captureIdentity());
-        const auto rows = adaptive->originalRows.captureIdentity();
-        mix(reinterpret_cast<std::uintptr_t>(rows.count));
-        mix(rows.count_capacity);
-        mix(rows.first_physical_row);
-        mix(rows.physical_rows);
-        mix(rows.repeats_per_row);
-        mix(rows.schema_version);
-        if (adaptive->cache)
-            binding(*adaptive->cache);
-        binding(adaptive->frame);
-        binding(adaptive->state);
-        if (adaptive->count)
-            binding(*adaptive->count);
     }
     return value ? value : 1;
 }

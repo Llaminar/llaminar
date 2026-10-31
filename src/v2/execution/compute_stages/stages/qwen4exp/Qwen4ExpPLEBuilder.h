@@ -11,6 +11,7 @@
 #include "ImmutableLookupStage.h"
 #include "Qwen4ExpFixedHeadLookupStage.h"
 #include "Qwen4ExpHyperconnectionBuilder.h"
+#include "execution/qwen4exp/PooledImmutableLocalLookupGraph.h"
 #include <variant>
 
 namespace llaminar2
@@ -50,12 +51,21 @@ struct Qwen4ExpPLEBuffers
     Qwen4ExpFloatBinding embedding,key,value,query,gated,normalized;
     Qwen4ExpFloatBinding priorConvolution,trunk;
 };
+/** @brief Exact original split-native source domain, canonical controller and token-count authority. */
+struct Qwen4ExpPooledLookupStorage {
+    BufferArena* arena;
+    std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code;
+    DeviceGenerationControlBinding control;
+    DeviceRowRange originalRows; ///< Original token rows; sixteen-head expansion borrows this exact count.
+    std::optional<Qwen4ExpIntBinding> count;
+};
 /** @brief Reusable flat graph wiring with independent accepted-state publication. */
 class Qwen4ExpPLEBuilder final
 {
 public:
     /** @brief Explicit whole-storage versus fixed-range composition; no automatic substitution. */
-    using LookupStorage=std::variant<ImmutableLookupStage::Storage,Qwen4ExpFixedHeadLookupStorage>;
+    using LookupStorage=std::variant<ImmutableLookupStage::Storage,Qwen4ExpFixedHeadLookupStorage,Qwen4ExpPooledLookupStorage>;
     /**
      * @brief Append lexical computation using its explicitly admitted whole-table or fixed-head storage.
      * @param graph Existing participant-local declarative graph.

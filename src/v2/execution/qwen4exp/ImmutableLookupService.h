@@ -191,7 +191,7 @@ public:
     ~ImmutableLookupService();
     /** @brief Freeze one exact device alias during setup, retaining this service lifetime. */
     Binding bind(DeviceId device);
-    /** @brief Bind explicit protocol2 only to the checked single-GPU adaptive component; no public serving mode is selected. */
+    /** @brief Bind explicit protocol2 to the original source-issued pooled native storage; ordinary protocol1 remains distinct. */
     ImmutableSubordinateLookupBinding bindSubordinate(DeviceId device);
     /** @brief Arm I/O before launching the retained generation parent.
      * @param generation Monotonic API-admission identity; never a host token/loop decision.
@@ -226,23 +226,12 @@ private:
     friend struct ImmutableLookupSubordinateTestAccess;
     friend class ImmutableSubordinateLookupBinding; ///< Original source/backing validation and closed setup
                                                     ///< factory.
-    /**
-     * @brief Mint exactly one strong native prepared-storage owner for this actual source channel.
-     * @details Identical setup callers join the existing owner; competing root/plan declarations fail.
-     * The owner retains roots only, so no service/binding ownership cycle exists.
-     */
-    std::shared_ptr<AdaptiveLookupPreparedStorage>
-    declareAdaptiveStorage(const ImmutableSubordinateLookupBinding &binding,
-                           const AdaptiveImmutableRowCacheNativePlan &plan, std::shared_ptr<TensorBase> cache,
-                           std::shared_ptr<TensorBase> frame, std::shared_ptr<TensorBase> protocol);
-    /** @brief Create/reuse one actual pooled source registration; mutually exclusive with the existing single-GPU adaptive arm. */
+    /** @brief Create/reuse this original source channel's exact pooled registration before capture. */
     std::shared_ptr<PooledImmutableSourcePreparedStorage> declarePooledSourceStorage(const ImmutableSubordinateLookupBinding& binding,
         const PooledImmutableSourceGeometry& geometry,std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,
         std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream);
     std::shared_ptr<PooledImmutableSourcePreparedStorage> pooled_storage_; ///< Roots only; never retains service/binding and creates no ownership cycle.
-    std::mutex adaptive_setup_; ///< Setup metadata publication only, independent of live device state.
-    std::shared_ptr<AdaptiveLookupPreparedStorage>
-        adaptive_storage_; ///< Strong until the source channel retires.
+    std::mutex pooled_setup_; ///< Setup metadata publication only, independent of live device state.
     /** @brief Construct only through PMA-authenticated create(). */
     ImmutableLookupService(std::shared_ptr<HostImmutableRowProvider> table,
                            std::shared_ptr<ImmutableLookupChannelBacking> backing,

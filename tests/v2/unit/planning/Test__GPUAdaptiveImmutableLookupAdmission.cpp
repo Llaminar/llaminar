@@ -12,7 +12,7 @@
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
-#include "loaders/AdaptiveImmutableLookupRootStorage.h"
+#include "kernels/qwen4exp/PooledImmutableNativeStorage.h"
 #include "transfer/TransferEngine.h"
 #include "models/qwen4exp/Qwen4ExpGraph.h"
 #include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
@@ -91,8 +91,8 @@ TEST(GPUAdaptiveImmutableLookupAdmission, MandatoryOwnersAndFinalOptionalSlotsUs
         const auto selected=ImmutableRowTablePlacementPlanner::select(q,frozen);
         ASSERT_TRUE(selected.placement->isGPUAdaptive());EXPECT_TRUE(selected.physical_plan.fits());
         const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),source(profile),q.requested.gpu_adaptive);
-        EXPECT_EQ(geometry.gpu().slots(),64u);EXPECT_EQ(geometry.host().slots(),64u);
-        const auto optional=geometry.cacheBOM(q.input.consumers().front(),q.input.host());
+        EXPECT_EQ(geometry.physical().owners().front().slots,64u);EXPECT_EQ(geometry.host().slots(),64u);
+        const auto optional=geometry.slotDependentBOM(q.input.consumers().front(),q.input.host());
         for(const auto &bom:frozen.resources())for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i)
         {
             const auto owner=PhysicalMemoryBOM::ownerAt(i);const PhysicalMemoryAllocatorIdentity id{bom.resource().world_rank,bom.resource().device};
@@ -147,15 +147,15 @@ TEST(GPUAdaptiveImmutableLookupAdmission, ExactFitAndOneByteShortOnlyChangeLowes
         const auto frozen=MemoryPlanner::plan(profile,{c}).physicalPlan();q=request(profile,{c});
         const auto exact=ImmutableRowTablePlacementPlanner::select(q,frozen);
         const auto exactGeometry=AdaptiveImmutableLookupGeometry::fromLayout(exact.placement->gpuAdaptiveLayout(),source(profile),q.requested.gpu_adaptive);
-        EXPECT_EQ(exactGeometry.gpu().slots(),64u);
+        EXPECT_EQ(exactGeometry.physical().owners().front().slots,64u);
         --c.device_free_bytes;const auto shortFrozen=MemoryPlanner::plan(profile,{c}).physicalPlan();const auto shortQ=request(profile,{c});
         const auto shortSelected=ImmutableRowTablePlacementPlanner::select(shortQ,shortFrozen);
         const auto shortGeometry=AdaptiveImmutableLookupGeometry::fromLayout(shortSelected.placement->gpuAdaptiveLayout(),source(profile),q.requested.gpu_adaptive);
-        EXPECT_LT(shortGeometry.gpu().slots(),64u);EXPECT_EQ(shortGeometry.host().slots(),64u);
+        EXPECT_LT(shortGeometry.physical().owners().front().slots,64u);EXPECT_EQ(shortGeometry.host().slots(),64u);
         EXPECT_EQ(c.activation_seq_len,32);EXPECT_EQ(c.max_seq_len,64);
         for(const auto &bom:frozen.resources())for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i)
         {
-            const auto owner=PhysicalMemoryBOM::ownerAt(i);if(owner==PhysicalMemoryOwner::ImmutableTableStorage)continue;
+            const auto owner=PhysicalMemoryBOM::ownerAt(i);if(owner==PhysicalMemoryOwner::ImmutableTableStorage || owner==PhysicalMemoryOwner::ImmutableLookupStaging)continue;
             const PhysicalMemoryAllocatorIdentity id{bom.resource().world_rank,bom.resource().device};
             EXPECT_EQ(bytes(exact.physical_plan,id,owner),bytes(shortSelected.physical_plan,id,owner));
         }
@@ -272,10 +272,10 @@ TEST(GPUAdaptiveImmutableLookupAdmission, MissingMandatoryAndInvalidSetupRejectB
     auto noMandatory=c;noMandatory.ngram_execution_policy.reset();
     EXPECT_THROW((void)ImmutableRowTablePlacementPlanner::select(q,MemoryPlanner::plan(profile,{noMandatory}).physicalPlan()),std::invalid_argument);
     const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(q.input.gpuAdaptiveLayout(q.requested,0,0,q.execution_provision->maximumLiveIds()),source(profile),q.requested.gpu_adaptive);
-    EXPECT_THROW((void)AdaptiveImmutableLookupRootStorage::create(geometry.gpu().nativePlan(),{},nullptr),std::invalid_argument);
+    EXPECT_THROW((void)qwen4exp::PooledImmutableOwnerPreparedStorage::create(qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(geometry.physical(),geometry.coordinator(),0,701,17),{},nullptr),std::invalid_argument);
     auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(frozen),0);
-    EXPECT_THROW((void)AdaptiveImmutableLookupRootStorage::create(geometry.gpu().nativePlan(),memory,nullptr),std::invalid_argument);
-    EXPECT_THROW((void)AdaptiveImmutableLookupRootStorage::create(geometry.gpu().nativePlan(),memory,reinterpret_cast<void *>(1)),std::invalid_argument);
+    EXPECT_THROW((void)qwen4exp::PooledImmutableOwnerPreparedStorage::create(qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(geometry.physical(),geometry.coordinator(),0,701,17),memory,nullptr),std::invalid_argument);
+    EXPECT_THROW((void)qwen4exp::PooledImmutableOwnerPreparedStorage::create(qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(geometry.physical(),geometry.coordinator(),0,701,17),memory,reinterpret_cast<void *>(1)),std::invalid_argument);
     EXPECT_EQ(memory->claimedBytes(c.device,PhysicalMemoryOwner::ImmutableTableStorage,
         PhysicalMemoryMaterializationKind::NewAllocation),0u);
     EXPECT_EQ(memory->claimedBytes(c.device,PhysicalMemoryOwner::ImmutableLookupStaging,
@@ -342,8 +342,8 @@ TEST(GPUAdaptiveImmutableLookupAdmission, GraphArenaDeclarationDoesNotAcquireUnp
             // This is the actual factory's declaration order, before any model
             // source boundary exists. No backend or physical owner is created.
             ASSERT_NO_THROW(graph.setArena(&arena));
-            for (const auto role : {BufferId::QFN_NGRAM_ADAPTIVE_CACHE,
-                                   BufferId::QFN_NGRAM_ADAPTIVE_FRAME,
+            for (const auto role : {BufferId::QFN_POOLED_OWNER_CACHE,
+                                   BufferId::QFN_POOLED_OWNER_FRAME,
                                    BufferId::QFN_NGRAM_LOOKUP_STATE})
                 EXPECT_FALSE(arena.isRegistered(role));
             EXPECT_EQ(graph.config().ngram_table_placement.get(), selected.placement.get());
@@ -359,4 +359,122 @@ TEST(GPUAdaptiveImmutableLookupAdmission, GraphArenaDeclarationDoesNotAcquireUnp
             }
             ASSERT_NO_THROW(graph.setArena(nullptr));
         }
+}
+
+/** @test Exact root partitions, not a K-bank reserve or aggregate owner subtraction, compose every candidate. */
+TEST(GPUAdaptiveImmutableLookupAdmission, SplitCandidateFloorAndGrowthEqualActualRootsAtCapacityBoundaries)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource original(file.path());const auto& profile=original.metadata().memoryProfile();
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}){
+        auto c=consumer(backend,2048);const auto q=request(profile,{c});const auto nativeSource=source(profile);
+        const auto gpu=q.input.consumers().front(),host=q.input.host();
+        for(const std::size_t ids:{16u,32u,256u,272u,512u}){
+            const auto zero=AdaptiveImmutableLookupGeometry::fromLayout(q.input.gpuAdaptiveLayout(q.requested,0,0,ids),nativeSource,q.requested.gpu_adaptive);
+            const auto floor=zero.mandatoryBOM(gpu,host);
+            for(const auto slots:std::array<std::size_t,13>{0,1,2,3,7,8,15,16,17,ids-1,ids,ids+1,2*ids+1})
+                for(const std::size_t ram:{0u,3u}){
+                    SCOPED_TRACE(::testing::Message()<<"backend="<<static_cast<int>(backend)<<" ids="<<ids<<" slots="<<slots<<" ram="<<ram);
+                    const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(q.input.gpuAdaptiveLayout(q.requested,slots,ram,ids),nativeSource,q.requested.gpu_adaptive);
+                    const auto growth=geometry.slotDependentBOM(gpu,host);
+                    PhysicalMemoryPlanBuilder partitioned(floor),complete(geometry.mandatoryBOM(gpu,host));
+                    for(const auto& line:growth.resources())partitioned.add(line);
+                    // resources() borrows its owning plan; retain that plan
+                    // through every aggregate contribution.
+                    const auto optional=geometry.cacheBOM(gpu,host);
+                    for(const auto& line:optional.resources())complete.add(line);
+                    EXPECT_EQ(partitioned.build().summary(),complete.build().summary());
+                    const auto* gpuGrowth=growth.find({gpu.world_rank,gpu.device});ASSERT_NE(gpuGrowth,nullptr);
+                    EXPECT_EQ(gpuGrowth->totalBytes(),geometry.gpuSlotDependentBytes());
+                    EXPECT_EQ(geometry.physical().owners().front().cache.bytes%64,0u);
+                    EXPECT_EQ(geometry.coordinator().policyOffsets().bytes%64,0u);
+                    const auto owner=qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(geometry.physical(),geometry.coordinator(),0,701,17);
+                    const auto policy=qwen4exp::PooledImmutableCoordinatorNativePlan::fromGeometry(geometry.physical(),geometry.coordinator(),701,17);
+                    const auto sourceGeometry=qwen4exp::PooledImmutableSourceGeometry::fromPlans(owner,policy,nativeSource);
+                    const auto& o=owner.parameters();const auto& p=policy.parameters();const auto& io=sourceGeometry.parameters().offsets;
+                    EXPECT_EQ(geometry.mandatoryDeviceBytes(),o.frame.bytes+o.native.bytes+p.frame.bytes+p.native.bytes+io.frame_bytes+io.native_bytes);
+                    EXPECT_EQ(o.native.reply_capacity,std::min(slots,ids));
+                    EXPECT_EQ(io.frame_bytes%64,0u);
+                    if(!slots)EXPECT_EQ(gpuGrowth->totalBytes(),0u);
+                    else EXPECT_GT(gpuGrowth->bytes(PhysicalMemoryOwner::ImmutableLookupStaging),0u);
+                }
+        }
+    }
+    // A full15 verifier has sixteen target positions. Keep every original head
+    // without growing a second counter or reducing the admitted MTP geometry.
+    EXPECT_EQ(immutableRowTableMaximumLiveIds(1,1,16,16,16),256u);
+}
+
+/** @test An explicit cache ceiling pays native/source bank growth as well as cache/policy payloads. */
+TEST(GPUAdaptiveImmutableLookupAdmission, SplitCandidateCacheCeilingIncludesExactNativeAndSourceGrowth)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource original(file.path());const auto& profile=original.metadata().memoryProfile();
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}){
+        auto c=consumer(backend);auto q=request(profile,{c});
+        const auto full=ImmutableRowTablePlacementPlanner::select(q,MemoryPlanner::plan(profile,{c}).physicalPlan());
+        const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(full.placement->gpuAdaptiveLayout(),source(profile),q.requested.gpu_adaptive);
+        ASSERT_GT(geometry.gpuSlotDependentBytes(),geometry.gpuCacheBytes());
+        c.ngram_execution_policy->gpu_adaptive.gpu_cache_physical_byte_limit=geometry.gpuCacheBytes();
+        q=request(profile,{c});const auto frozen=MemoryPlanner::plan(profile,{c}).physicalPlan();
+        const auto bounded=ImmutableRowTablePlacementPlanner::select(q,frozen);
+        const auto actual=AdaptiveImmutableLookupGeometry::fromLayout(bounded.placement->gpuAdaptiveLayout(),source(profile),q.requested.gpu_adaptive);
+        EXPECT_LT(actual.physical().owners().front().slots,geometry.physical().owners().front().slots);
+        EXPECT_LE(actual.gpuSlotDependentBytes(),q.requested.gpu_adaptive.gpu_cache_physical_byte_limit);
+        for(const auto& line:frozen.resources())for(std::size_t index=0;index<PhysicalMemoryBOM::ownerCount();++index){
+            const auto owner=PhysicalMemoryBOM::ownerAt(index);
+            if(owner==PhysicalMemoryOwner::ImmutableTableStorage || owner==PhysicalMemoryOwner::ImmutableLookupStaging)continue;
+            EXPECT_EQ(bytes(bounded.physical_plan,{line.resource().world_rank,line.resource().device},owner),line.bytes(owner));
+        }
+    }
+}
+
+/** @test Public PMA selection and resolved placement retain complete exact physical-root costs. */
+TEST(GPUAdaptiveImmutableLookupAdmission, SplitCandidateResolvedPlacementUsesCompleteOriginalByteCeiling)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource original(file.path());const auto& profile=original.metadata().memoryProfile();
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}){
+        const auto c=consumer(backend);const auto q=request(profile,{c});
+        const auto frozen=MemoryPlanner::plan(profile,{c}).physicalPlan();
+        const auto selected=ImmutableRowTablePlacementPlanner::select(q,frozen);
+        const auto nativeSource=source(profile);
+        const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),nativeSource,q.requested.gpu_adaptive);
+        ASSERT_GT(geometry.gpuSlotDependentBytes(),geometry.gpuCacheBytes());
+        const auto originalSlots=geometry.physical().owners().front().slots;
+        // These exact source-bound native factories declare every original
+        // cache/frame/native root; the test owns no allocation/capacity ledger.
+        const auto roots=[&](const AdaptiveImmutableLookupGeometry& candidate){
+            const auto owner=qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(candidate.physical(),candidate.coordinator(),0,701,17);
+            const auto coordinator=qwen4exp::PooledImmutableCoordinatorNativePlan::fromGeometry(candidate.physical(),candidate.coordinator(),701,17);
+            const auto sourceGeometry=qwen4exp::PooledImmutableSourceGeometry::fromPlans(owner,coordinator,nativeSource);
+            const auto& o=owner.parameters();const auto& p=coordinator.parameters();const auto& io=sourceGeometry.parameters().offsets;
+            return std::array<std::size_t,2>{o.cache.bytes+p.cache.bytes,
+                o.frame.bytes+o.native.bytes+p.frame.bytes+p.native.bytes+io.frame_bytes+io.native_bytes};
+        };
+        for(const auto ceiling:std::array{geometry.gpuSlotDependentBytes(),geometry.gpuSlotDependentBytes()-1,geometry.gpuCacheBytes()}){
+            auto bounded=c;bounded.ngram_execution_policy->gpu_adaptive.gpu_cache_physical_byte_limit=ceiling;
+            const auto input=request(profile,{bounded});
+            // Canonical PMA selection alone creates the private resolved
+            // placement. No test friend, constructor bypass or fake admission
+            // may introduce an invalid physical candidate.
+            const auto actual=ImmutableRowTablePlacementPlanner::select(input,frozen);
+            const auto retained=AdaptiveImmutableLookupGeometry::fromLayout(actual.placement->gpuAdaptiveLayout(),nativeSource,input.requested.gpu_adaptive);
+            const auto zero=AdaptiveImmutableLookupGeometry::fromLayout(input.input.gpuAdaptiveLayout(input.requested,0,0,input.execution_provision->maximumLiveIds()),nativeSource,input.requested.gpu_adaptive);
+            const auto fullRoots=roots(retained),floorRoots=roots(zero);
+            ASSERT_GE(fullRoots[1],floorRoots[1]);
+            EXPECT_EQ(retained.gpuCacheBytes(),fullRoots[0]);
+            EXPECT_EQ(retained.mandatoryDeviceBytes(),fullRoots[1]);
+            EXPECT_EQ(retained.gpuSlotDependentBytes(),fullRoots[0]+fullRoots[1]-floorRoots[1]);
+            EXPECT_LE(retained.gpuSlotDependentBytes(),ceiling);
+            const PhysicalMemoryAllocatorIdentity allocator{c.world_rank,c.device};
+            EXPECT_EQ(bytes(actual.physical_plan,allocator,PhysicalMemoryOwner::ImmutableTableStorage),
+                bytes(frozen,allocator,PhysicalMemoryOwner::ImmutableTableStorage)+fullRoots[0]);
+            EXPECT_EQ(bytes(actual.physical_plan,allocator,PhysicalMemoryOwner::ImmutableLookupStaging),
+                bytes(frozen,allocator,PhysicalMemoryOwner::ImmutableLookupStaging)+fullRoots[1]-floorRoots[1]);
+            PhysicalMemoryPlanBuilder complete(frozen);
+            const auto contribution=retained.slotDependentBOM(input.input.consumers().front(),input.input.host());
+            for(const auto& line:contribution.resources())complete.add(line);
+            EXPECT_EQ(actual.physical_plan.summary(),complete.build().summary());
+            if(ceiling==geometry.gpuSlotDependentBytes())EXPECT_EQ(retained.physical().owners().front().slots,originalSlots);
+            else EXPECT_LT(retained.physical().owners().front().slots,originalSlots);
+        }
+    }
 }

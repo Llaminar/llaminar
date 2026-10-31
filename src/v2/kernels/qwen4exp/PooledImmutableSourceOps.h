@@ -12,6 +12,7 @@
 #include "PooledImmutableNativeOps.h"
 #include "ImmutableLookupKernels.h"
 #include "ImmutableSubordinateLookupBinding.h"
+#include "QwenAdaptiveTerminalCounters.h"
 namespace llaminar2::qwen4exp::pooled_source {
 namespace n=pooled_native;
 namespace p=n::p;
@@ -50,6 +51,7 @@ struct DeviceArgs {
     std::byte *frame,*native;
     ImmutableSubordinateLookupDeviceView channel;
     int *healthy,*error;
+    int* control=nullptr; ///< Original terminal reporting row; absent only in decoded parser-only replay.
 };
 /** @return Same persistent native I/O sequence authority used by the existing service boundary. */
 QFN_ADAPTIVE_HD inline ImmutableLookupDeviceState& protocol(const DeviceArgs& a)
@@ -248,6 +250,84 @@ QFN_ADAPTIVE_HD inline const std::byte* deliveryRow(const DeviceArgs& a,std::uin
     const auto& grant=n::grants(a.owner)[accepted];
     const auto coordinate=n::at<std::uint32_t>(a.frame,a.plan.offsets.coordinates)[grant.unique];
     return n::at<std::byte>(a.frame,a.plan.offsets.responses)+std::size_t{coordinate}*a.plan.owner.row_bytes;
+}
+/**
+ * @brief Snapshot actual completed phase work before the original grant banks retire.
+ * @param a Original source/coordinator/owner/control roots, all graph-ordered.
+ * @return False for a duplicate, malformed or incompletely acquired observation.
+ * @note These reporting values decide no policy. Pins and Ready state are read
+ * directly at their actual owner, and allocation counts are executed receipts.
+ */
+template<class Slot> QFN_ADAPTIVE_HD inline bool snapshotObservation(const DeviceArgs& a)
+{
+    if(!a.native || !a.owner.frame || !a.coordinator.frame || !a.healthy || !a.plan.owner.row_bytes)return false;
+    const auto v=n::coordinatorView(a.coordinator);const auto owner=n::ownerView<Slot>(a.owner);
+    const auto& allocation=n::allocationFrame(a.owner);
+    auto& ordinal=*n::at<std::uint64_t>(a.native,a.plan.offsets.observation_ordinal);
+    const auto reported=*n::at<std::uint64_t>(a.native,a.plan.offsets.reported_ordinal);
+    if(a.plan.owner.owner.participants()!=1 || a.plan.coordinator.policy.participants()!=1 ||
+       !v.frame->ordinal || v.frame->ordinal<=reported || ordinal>reported ||
+       v.frame->unique_rows>v.frame->original_ids || v.frame->original_ids>a.plan.coordinator.policy.maximumOriginal() ||
+       allocation.free_count>allocation.count || allocation.count>a.plan.owner.native.reply_capacity ||
+       (stage(a)!=ResponseStage::Consumed && stage(a)!=ResponseStage::Aborted))return false;
+    QwenAdaptiveCounterTotals actual;actual.calls=1;
+    for(std::uint32_t unique=0;unique<v.frame->unique_rows;++unique){
+        if(v.unique[unique].phase==p::UniquePhase::Read)++actual.hit_rows;
+        else ++actual.miss_rows;
+    }
+    p::OwnerOperations<Slot> physical(owner);
+    for(std::uint32_t accepted=0;accepted<allocation.count;++accepted)
+        actual.promotions+=physical.readable(v.frame->interval,n::grants(a.owner)[accepted]);
+    actual.evictions=allocation.count-allocation.free_count;
+    actual.source_bytes=protocol(a).nativeBytes;
+    if(actual.source_bytes%a.plan.owner.row_bytes)return false;
+    actual.source_rows=actual.source_bytes/a.plan.owner.row_bytes;
+    actual.failed_frames=!*a.healthy || frontier(a).status!=Status::Success;
+    actual.completed_live_ids=actual.failed_frames?0:v.frame->original_ids;
+    *n::at<QwenAdaptiveCounterTotals>(a.native,a.plan.offsets.observation)=actual;
+    ordinal=v.frame->ordinal;return true;
+}
+/**
+ * @brief Publish reporting words only after every actual source/owner/coordinator retirement.
+ * @param a Original retained source roots and canonical terminal controller.
+ * @return False before reporting mutation for partial retirement, repeated observation or overflow.
+ */
+QFN_ADAPTIVE_HD inline bool observeRetired(const DeviceArgs& a)
+{
+    if(!a.native || !a.owner.frame || !a.owner.native || !a.coordinator.frame || !a.healthy || !a.control)return false;
+    const auto v=n::coordinatorView(a.coordinator);
+    const auto& owner=*n::at<p::OwnerFrame>(a.owner.frame,a.plan.owner.frame.control);
+    const auto ordinal=*n::at<std::uint64_t>(a.native,a.plan.offsets.observation_ordinal);
+    auto& reported=*n::at<std::uint64_t>(a.native,a.plan.offsets.reported_ordinal);
+    const auto& receipt=*n::at<p::RetiredHeader>(a.owner.native,a.plan.owner.native.header);
+    if(!a.control || !a.healthy || !ordinal || ordinal!=v.frame->ordinal || ordinal<=reported ||
+       stage(a)!=ResponseStage::ReadersComplete || v.frame->phase!=p::LookupPhase::Idle ||
+       owner.phase!=p::OwnerPhase::Idle || owner.held_pins || owner.reservations ||
+       n::progress(a.owner).header_bytes!=sizeof(p::RetiredHeader) || !n::same(receipt.interval,v.frame->interval) ||
+       !n::same(receipt.source,v.frame->source) || receipt.owner!=a.plan.owner.owner.coordinate() ||
+       (receipt.status!=Status::Success && receipt.status!=Status::Cancelled))return false;
+    auto actual=*n::at<QwenAdaptiveCounterTotals>(a.native,a.plan.offsets.observation);
+    if(!*a.healthy){actual.failed_frames=1;actual.completed_live_ids=0;}
+    if(!accumulateQwenAdaptiveCounters(a.control,sampling_math::kDeviceGenerationControlCount,actual))return false;
+    reported=ordinal;return true;
+}
+static_assert(sizeof(QwenAdaptiveCounterTotals)==72);
+
+/**
+ * @brief Publish the canonical cancellation before any Reserved row can become Ready.
+ * @param a Actual original source, owner/coordinator and canonical controller roots.
+ * @return True for a successful consumed/source-free frontier; cancelled requests
+ * retain the actual source-disposition witness while subsequent failure arms drain grants.
+ * @note This fixed graph node follows acknowledged private/native copies and
+ * acquired owner publication. It reads the original controller once and never
+ * invents a host health shadow or a second source-consumption acknowledgement.
+ */
+QFN_ADAPTIVE_HD inline bool beforeReady(const DeviceArgs& a)
+{
+    if(!a.healthy || !a.error)return reject(a,ImmutableLookupStatus::InvalidProtocol);
+    if(!*a.healthy && frontier(a).status==Status::Success)
+        return reject(a,ImmutableLookupStatus::Cancelled);
+    return frontier(a).status==Status::Success;
 }
 /** @return One real consumer's immutable row only after successful global Ready and actual source retirement. */
 template<class Slot> QFN_ADAPTIVE_HD inline const std::byte* readableRow(const DeviceArgs& a,std::uint32_t unique)

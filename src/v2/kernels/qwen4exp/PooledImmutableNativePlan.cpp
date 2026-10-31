@@ -156,20 +156,47 @@ PooledImmutableCoordinatorNativePlan PooledImmutableCoordinatorNativePlan::fromG
     identity.mix(offsets.reply_capacity);identity.mix(offsets.pin_cursors);identity.mix(offsets.radix_offsets);identity.mix(offsets.radix_blocks);identity.mix(offsets.availability);identity.mix(offsets.free_headers);identity.mix(offsets.free_slices);identity.mix(offsets.victim_headers);
     identity.mix(offsets.victim_slices);identity.mix(offsets.sorted_releases);identity.mix(offsets.bytes);
     for(const auto owner:coordinator.owners()){identity.mix(owner.first_entry);identity.mix(owner.slots);}
+    // Source staging may be declared before transport exists, so retain the
+    // exact expected native owner identity here instead of inferring physical
+    // membership later from the coordinator's deliberately compact slot map.
+    std::vector<OriginalOwner> originalOwners;
+    originalOwners.reserve(physical.owners().size());
+    for(std::uint32_t coordinate=0;coordinate<physical.owners().size();++coordinate){
+        const auto owner=PooledImmutableOwnerNativePlan::fromGeometry(physical,coordinator,coordinate,table,generation);
+        originalOwners.push_back({owner.allocator(),owner.parameters().identity});
+    }
     return {{policy,c,f,offsets,physical.coordinator().device,table,generation,identity.value()},physical.coordinator(),
-        {coordinator.owners().begin(),coordinator.owners().end()}};
+        {coordinator.owners().begin(),coordinator.owners().end()},std::move(originalOwners)};
+}
+void PooledImmutableCoordinatorNativePlan::requireOwnerPlan(const PooledImmutableOwnerNativePlan& owner)const
+{
+    const auto coordinate=owner.parameters().owner.coordinate();
+    if(coordinate>=original_owners_.size() ||
+       original_owners_[coordinate].allocator!=owner.allocator() ||
+       original_owners_[coordinate].native_identity!=owner.parameters().identity)
+        throw std::invalid_argument("Pooled source owner is not the original native coordinator cohort member");
 }
 PhysicalMemoryPlan PooledImmutableCoordinatorNativePlan::mandatoryBOM(PhysicalMemoryResource observed)const
 {return bom(allocator_,parameters_.native.bytes,observed);}
+n::OwnerOffsets PooledImmutableOwnerNativePlan::rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
+    const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate){
+    requireGeometry(physical,coordinator);
+    if(coordinate>=physical.owners().size())throw std::out_of_range("Native owner root coordinate is not declared");
+    return ownerOffsets(physical.owners()[coordinate].slots,physical.maximumUniqueRows());
+}
+n::CoordinatorOffsets PooledImmutableCoordinatorNativePlan::rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
+    const PooledImmutableCoordinatorGeometry& coordinator){
+    requireGeometry(physical,coordinator);return coordinatorOffsets(coordinator.parameters());
+}
 PhysicalMemoryPlan PooledImmutableOwnerNativePlan::mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,PhysicalMemoryResource observed){
     requireGeometry(physical,coordinator);
     if(coordinate>=physical.owners().size())throw std::out_of_range("Native owner BOM coordinate is not declared");
-    const auto& owner=physical.owners()[coordinate];return bom(owner.allocator,ownerOffsets(owner.slots,physical.maximumUniqueRows()).bytes,observed);
+    const auto& owner=physical.owners()[coordinate];return bom(owner.allocator,rootOffsets(physical,coordinator,coordinate).bytes,observed);
 }
 PhysicalMemoryPlan PooledImmutableCoordinatorNativePlan::mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,PhysicalMemoryResource observed){
-    requireGeometry(physical,coordinator);return bom(physical.coordinator(),coordinatorOffsets(coordinator.parameters()).bytes,observed);
+    return bom(physical.coordinator(),rootOffsets(physical,coordinator).bytes,observed);
 }
 
 }

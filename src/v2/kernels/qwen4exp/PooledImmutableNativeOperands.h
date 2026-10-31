@@ -64,6 +64,8 @@ public:
     void seal();
     /** @brief Reject changed role/type/extent/device/backend/runtime or operation before native submission. */
     void require(pooled_native::OwnerAction action,const PooledImmutableOwnerNativePlan& plan)const;
+    /** @brief Reject foreign action/geometry and invalid original declarations before native materialization. */
+    void requireDeclarations(pooled_native::OwnerAction action,const PooledImmutableOwnerNativePlan& plan)const;
     /** @return Stable semantic declarations; a later prepared seal rejects every physical drift. */
     std::uint64_t declarationIdentity()const;
     /** @brief Validate declarations and, when sealed, original physical addresses/runtime. */
@@ -106,6 +108,8 @@ public:
     void seal();
     /** @brief Reject operation/geometry/root/count/runtime drift before recording native work. */
     void require(pooled_native::CoordinatorAction action,const PooledImmutableCoordinatorNativePlan& plan)const;
+    /** @brief Reject foreign action/geometry and invalid original declarations before native materialization. */
+    void requireDeclarations(pooled_native::CoordinatorAction action,const PooledImmutableCoordinatorNativePlan& plan)const;
     /** @return Stable semantic declaration including the original count pointer/geometry. */
     std::uint64_t declarationIdentity()const;
     /** @brief Validate declarations and any installed original physical seal. */

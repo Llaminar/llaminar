@@ -80,7 +80,7 @@ inline GPUAdaptiveLookupCounterRole classifyQwen4ExpGPUAdaptiveLookupCounter(
         record.value>9007199254740991.0)
         throw std::invalid_argument("GPU adaptive lookup requires an exact completed counter from its sole native consumer");
     const auto storage=record.tags.find("storage"),transport=record.tags.find("transport");
-    if(storage==record.tags.end() || transport==record.tags.end() || transport->second!="adaptive_subordinate")
+    if(storage==record.tags.end() || transport==record.tags.end() || transport->second!="pooled_subordinate")
         throw std::invalid_argument("GPU adaptive counter lost its actual subordinate transport identity");
     if(storage->second=="vram")
     {

@@ -10,12 +10,17 @@
 #include "kernels/qwen4exp/PooledImmutableNativePlan.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOperands.h"
 #include "kernels/qwen4exp/PooledImmutableSourceOps.h"
+#include "kernels/common/SamplingMath.h"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/ModelLoader.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <algorithm>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <stdexcept>
 #include <vector>
 namespace llaminar2::test {
@@ -31,14 +36,21 @@ struct Bytes {
     explicit Bytes(std::size_t bytes):blocks((bytes+63)/64){if(bytes)std::memset(data(),0xcc,blocks.size()*64);}
     std::byte* data(){return blocks.empty()?nullptr:reinterpret_cast<std::byte*>(blocks.data());}
 };
-/** @return Uneven arbitrary owner order with independent cross-vendor coordinator and CPU consumer. */
-q::PooledImmutablePhysicalOwnerGeometry declared(std::span<const std::uint32_t> capacities)
+/**
+ * @brief Declare arbitrary owner order with an independent coordinator and CPU consumer.
+ * @param capacities Exact slots per original owner, including C0.
+ * @param replacement Optional recorded physical-cohort corruption at one coordinate.
+ * @return Checked declarations only, without device discovery or allocation.
+ */
+q::PooledImmutablePhysicalOwnerGeometry declared(std::span<const std::uint32_t> capacities,
+    std::optional<std::pair<std::size_t,PhysicalMemoryAllocatorIdentity>> replacement=std::nullopt)
 {
     std::vector<PhysicalMemoryAllocatorIdentity> order;
     std::vector<ImmutableRowTableLayoutOwner> owners;
     bool positive=false;
     for(std::uint32_t i=0;i<capacities.size();++i){
         order.push_back({static_cast<int>(i),i%2?DeviceId::rocm(static_cast<int>(i)):DeviceId::cuda(static_cast<int>(i))});
+        if(replacement && replacement->first==i)order.back()=replacement->second;
         owners.push_back({{order.back(),ImmutableRowStorage::VRAM},0,capacities[i],{}});positive|=capacities[i]!=0;
     }
     const PhysicalMemoryAllocatorIdentity coordinator{101,DeviceId::rocm(11)};
@@ -166,7 +178,7 @@ struct Pool {
             for(auto& owner:owners){owner->args.input.frontier=receipts.data();require(owner->run<n::OwnerAction::AcquireFree>());owner->args.input.frontier=nullptr;}}
     }
     /** @brief Replay exact source response validation, unchanged native row copy, ACK/Ready and final retirement. */
-    void finish(){
+    void finish(std::function<void(const n::SourceFrontier&)> beforeRetirement={},std::function<void()> afterRetirement={}){
         bool misses=false;for(std::uint32_t i=0;i<view().frame->unique_rows;++i)misses|=view().unique[i].phase!=p::UniquePhase::Read;
         n::SourceFrontier source{view().frame->interval,misses?p::SourceWindow{701,17,++source_sequence}:p::SourceWindow{},
             misses?n::SourceDisposition::Published:n::SourceDisposition::Unpublished,a::Status::Success,n::Version};
@@ -191,7 +203,9 @@ struct Pool {
         const auto published=headers<p::PublishHeader>();
         for(auto& owner:owners){owner->args.input.frontier=published.data();require(owner->run<n::OwnerAction::AcquirePublication>());owner->args.input.frontier=nullptr;require(owner->run<n::OwnerAction::MakeReady>());require(owner->run<n::OwnerAction::ReadyReceipt>());}
         const auto ready=headers<p::ReadyHeader>();args.input.frontier=ready.data();args.input.source=&source;run<n::CoordinatorAction::Publish>();args.input={};
+        if(beforeRetirement)beforeRetirement(source);
         all<n::OwnerAction::Release>();all<n::OwnerAction::Retire>();const auto retired=headers<p::RetiredHeader>();args.input.frontier=retired.data();run<n::CoordinatorAction::Finish>();args.input={};
+        if(afterRetirement)afterRetirement();
     }
     void complete(std::span<const std::uint64_t> original,std::uint64_t admission=1){begin(original,admission);wave<false>();wave<true>();finish();}
 };
@@ -369,8 +383,20 @@ TEST(PooledImmutableNative, ClosedProducerSpansRejectUnusedInvalidRoleAndOverlap
     spans[invocation]=q::PooledNativeTensorSpan{root,BufferId::QFN_NGRAM_LOOKUP_STATE,0,sizeof(n::Invocation)};
     EXPECT_NO_THROW(q::PooledImmutableOwnerOperands(n::OwnerAction::Pin,plan,spans));
     q::PooledImmutableOwnerOperands declared(n::OwnerAction::Pin,plan,spans);
+    const auto identity=declared.declarationIdentity();
+    EXPECT_NO_THROW(declared.requireDeclarations(n::OwnerAction::Pin,plan));
+    EXPECT_THROW(declared.requireDeclarations(n::OwnerAction::Begin,plan),std::invalid_argument);
+    Pool foreign(std::array{4u});
+    EXPECT_THROW(declared.requireDeclarations(n::OwnerAction::Pin,foreign.owners[0]->plan),std::invalid_argument);
     EXPECT_THROW(declared.captureIdentity(),std::logic_error);
-    EXPECT_THROW(declared.seal(),std::logic_error); // Missing GPU address rejects before backend/runtime discovery.
+    EXPECT_THROW(declared.require(n::OwnerAction::Pin,plan),std::logic_error);
+    EXPECT_THROW(declared.seal(),std::logic_error);
+    EXPECT_EQ(declared.declarationIdentity(),identity);
+    EXPECT_EQ(root->gpu_data_ptr(),nullptr);
+    q::PooledImmutableCoordinatorOperands metadata(n::CoordinatorAction::PinCommands,pool.plan,std::nullopt,{});
+    EXPECT_NO_THROW(metadata.requireDeclarations(n::CoordinatorAction::PinCommands,pool.plan));
+    EXPECT_THROW(metadata.requireDeclarations(n::CoordinatorAction::PlanVictims,pool.plan),std::invalid_argument);
+    EXPECT_THROW(metadata.requireDeclarations(n::CoordinatorAction::PinCommands,foreign.plan),std::invalid_argument); // Missing GPU address rejects before backend/runtime discovery.
 
     auto invalid=spans;invalid[invocation]->buffer=static_cast<BufferId>(static_cast<unsigned>(BufferId::_COUNT)+1);
     EXPECT_THROW(q::PooledImmutableOwnerOperands(n::OwnerAction::Pin,plan,invalid),std::invalid_argument);
@@ -651,6 +677,43 @@ TEST(PooledImmutableNative, IdentityFreeNativeBOMMatchesActualSourceBoundMateria
 }
 
 
+/** @brief Source geometry must reject same-sized foreign owners and any replaced member of the original cohort. */
+TEST(PooledImmutableNative, SourceOwnerCohortIdentityRejectsForeignAllocatorAndReplacedPeer)
+{
+    const ImmutableRowTableSource descriptor{.path="cpu_parser_original_source",.tensor_name="per_layer_token_embd.weight",
+        .file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+    for(const auto participants:{1u,2u,4u,8u}){
+        std::vector<std::uint32_t> capacities(participants,3u);capacities.front()=0;
+        const auto original=declared(capacities);
+        const auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(original,{65536,1,2},64);
+        const auto coordinator=q::PooledImmutableCoordinatorNativePlan::fromGeometry(original,policy,701,17);
+        for(std::uint32_t coordinate=0;coordinate<participants;++coordinate){
+            SCOPED_TRACE(::testing::Message()<<"participants="<<participants<<" owner="<<coordinate);
+            const auto actual=q::PooledImmutableOwnerNativePlan::fromGeometry(original,policy,coordinate,701,17);
+            EXPECT_NO_THROW(coordinator.requireOwnerPlan(actual));
+            EXPECT_NO_THROW(q::PooledImmutableSourceGeometry::fromPlans(actual,coordinator,descriptor));
+            const auto allocator=actual.allocator();
+            const std::array replacements{
+                PhysicalMemoryAllocatorIdentity{allocator.world_rank+1000,allocator.device},
+                PhysicalMemoryAllocatorIdentity{allocator.world_rank,{allocator.device.type,allocator.device.ordinal+16}},
+                PhysicalMemoryAllocatorIdentity{allocator.world_rank,allocator.device.type==DeviceType::CUDA?
+                    DeviceId::rocm(allocator.device.ordinal):DeviceId::cuda(allocator.device.ordinal)}};
+            for(const auto replacement:replacements){
+                const auto foreign=declared(capacities,std::pair<std::size_t,PhysicalMemoryAllocatorIdentity>{coordinate,replacement});
+                const auto foreignPolicy=q::PooledImmutableCoordinatorGeometry::fromOwners(foreign,{65536,1,2},64);
+                for(std::uint32_t candidate=0;candidate<participants;++candidate){
+                    // The complete cohort is part of each native identity:
+                    // replacing only another peer must reject this owner too.
+                    const auto owner=q::PooledImmutableOwnerNativePlan::fromGeometry(foreign,foreignPolicy,candidate,701,17);
+                    ASSERT_EQ(owner.parameters().owner.capacity(),capacities[candidate]);
+                    EXPECT_THROW(coordinator.requireOwnerPlan(owner),std::invalid_argument);
+                    EXPECT_THROW(q::PooledImmutableSourceGeometry::fromPlans(owner,coordinator,descriptor),std::invalid_argument);
+                }
+            }
+        }
+    }
+}
+
 /** @brief Actual source parsers reject stale envelopes and partial/malformed ACKs before producing any accepted fill. */
 TEST(PooledImmutableNative, ActualSourceCompletionAndPartialAcknowledgementsPreserveOriginalGrantBanks)
 {
@@ -775,4 +838,94 @@ TEST(PooledImmutableNative, SourceUniqueBoundRejectsOneBeyondBeforeAnyOwnerFrame
     }
 }
 
+}
+
+namespace llaminar2::test {
+/** @test Exact original phase work reaches terminal words once, only after all physical/read/source retirement. */
+TEST(PooledImmutableNative, SplitTerminalObservationWaitsForActualRetirementAndReplaysResetEmptyAndHighRows)
+{
+    namespace source=q::pooled_source;
+    const ImmutableRowTableSource descriptor{.path="decoded_observation_trace",.tensor_name="per_layer_token_embd.weight",
+        .rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+    for(const auto slots:{0u,1u,4u}){
+        Pool pool(std::array{slots});
+        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor);
+        Bytes frame(geometry.parameters().offsets.frame_bytes),native(geometry.parameters().offsets.native_bytes);
+        std::memset(native.data(),0,geometry.parameters().offsets.native_bytes);
+        std::array<int,sampling_math::kDeviceGenerationControlCount> control{};control[sampling_math::kDeviceGenerationControlOk]=1;
+        source::DeviceArgs actual{geometry.parameters(),pool.owners.front()->args,pool.args,frame.data(),native.data(),{},
+            control.data()+sampling_math::kDeviceGenerationControlOk,control.data()+sampling_math::kDeviceGenerationControlErrorCode,control.data()};
+        q::QwenAdaptiveCounterTotals expected;
+        for(unsigned replay=0;replay<5;++replay){
+            if(replay==3){
+                // Reset only canonical reporting data; source ordinals, warmed
+                // slots and all original root identities remain unchanged.
+                std::fill_n(control.data()+sampling_math::kDeviceGenerationControlAdaptiveCallsLow,18,0);
+                expected={};
+            }
+            std::vector<std::uint64_t> ids(replay==2?0:replay==3?16:32,0x100000007ULL);
+            for(std::size_t i=0;i<ids.size();++i)if(i%3==1)ids[i]=replay==4?701:700;
+            ASSERT_NO_THROW(pool.begin(ids,replay<3?1:2));
+            ASSERT_NO_THROW(pool.wave<false>());
+            ASSERT_NO_THROW(pool.wave<true>());
+            ASSERT_NO_THROW(pool.finish([&](const n::SourceFrontier& frontier){
+                source::frontier(actual)=frontier;source::stage(actual)=source::ResponseStage::Consumed;
+                auto v=pool.view();std::uint64_t misses=0;
+                for(std::uint32_t i=0;i<v.frame->unique_rows;++i)misses+=v.unique[i].phase!=p::UniquePhase::Read;
+                source::protocol(actual).nativeBytes=misses*90;
+                ASSERT_TRUE(source::snapshotObservation<a::Slot64>(actual));
+                const auto tuple=*n::at<q::QwenAdaptiveCounterTotals>(actual.native,geometry.parameters().offsets.observation);
+                expected.calls+=tuple.calls;expected.completed_live_ids+=tuple.completed_live_ids;
+                expected.hit_rows+=tuple.hit_rows;expected.miss_rows+=tuple.miss_rows;expected.source_rows+=tuple.source_rows;
+                expected.source_bytes+=tuple.source_bytes;expected.promotions+=tuple.promotions;expected.evictions+=tuple.evictions;
+                source::stage(actual)=source::ResponseStage::ReadersComplete;
+                q::QwenAdaptiveCounterTotals before;ASSERT_TRUE(q::readQwenAdaptiveCounters(control.data(),control.size(),before));
+                EXPECT_FALSE(source::observeRetired(actual));
+                q::QwenAdaptiveCounterTotals after;ASSERT_TRUE(q::readQwenAdaptiveCounters(control.data(),control.size(),after));EXPECT_EQ(before,after);
+            },[&]{
+                const auto bytes=n::progress(actual.owner).header_bytes;n::progress(actual.owner).header_bytes=0;
+                EXPECT_FALSE(source::observeRetired(actual));n::progress(actual.owner).header_bytes=bytes;
+                ASSERT_TRUE(source::observeRetired(actual));EXPECT_FALSE(source::observeRetired(actual));
+            }));
+            q::QwenAdaptiveCounterTotals observed;ASSERT_TRUE(q::readQwenAdaptiveCounters(control.data(),control.size(),observed));
+            EXPECT_EQ(observed,expected);EXPECT_TRUE(q::validQwenAdaptiveCounters(observed,90,64));
+            if(!slots){EXPECT_EQ(observed.promotions,0u);EXPECT_EQ(observed.evictions,0u);EXPECT_EQ(observed.hit_rows,0u);}
+        }
+    }
+}
+
+}
+
+namespace llaminar2::test {
+/** @test The actual source authorization preserves consumed bytes/sequence while cancellation forbids the Ready branch across reset. */
+TEST(PooledImmutableNative, BeforeReadyCancellationPreservesConsumedWitnessAndReplaysResetPartialEmpty)
+{
+    namespace source=q::pooled_source;
+    for(const auto capacity:{0u,2u}){
+        Pool pool(std::array{capacity});
+        const ImmutableRowTableSource descriptor{.path="cpu_original_source",.tensor_name="per_layer_token_embd.weight",
+            .file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor);
+        Bytes frame(geometry.parameters().offsets.frame_bytes),native(geometry.parameters().offsets.native_bytes);
+        std::memset(native.data(),0,geometry.parameters().offsets.native_bytes);
+        int healthy=1,error=0;
+        source::DeviceArgs actual{geometry.parameters(),pool.owners.front()->args,pool.args,frame.data(),native.data(),{},&healthy,&error};
+        for(unsigned replay=0;replay<20;++replay)for(const auto count:{64u,17u,1u,0u}){
+            const p::Interval interval{701,17+replay,1+count};const p::SourceWindow window=count?p::SourceWindow{701,17+replay,1+count}:p::SourceWindow{};
+            source::frontier(actual)={interval,window,count?n::SourceDisposition::Consumed:n::SourceDisposition::Unpublished,a::Status::Success,n::Version};
+            source::stage(actual)=source::ResponseStage::Consumed;
+            auto& io=source::protocol(actual);io.issuedSequence=io.consumedSequence=1+count;io.nativeBytes=count?90:0;io.idCount=count?1:0;
+            io.status=0;healthy=1;error=0;
+            ASSERT_TRUE(source::beforeReady(actual));
+            EXPECT_EQ(n::sourceGate(n::SourceCondition::AfterSuccess,&source::frontier(actual),interval,701,window),n::SourceGate::Run);
+            const auto consumed=source::frontier(actual).disposition;const auto bytes=io.nativeBytes;
+            healthy=0;error=static_cast<int>(sampling_math::DeviceGenerationError::InvalidController);
+            EXPECT_FALSE(source::beforeReady(actual));EXPECT_FALSE(source::beforeReady(actual));
+            EXPECT_EQ(source::frontier(actual).status,a::Status::Cancelled);EXPECT_EQ(source::frontier(actual).disposition,consumed);
+            EXPECT_EQ(io.nativeBytes,bytes);EXPECT_EQ(io.issuedSequence,io.consumedSequence);
+            EXPECT_EQ(n::sourceGate(n::SourceCondition::AfterSuccess,&source::frontier(actual),interval,701,window),n::SourceGate::Skip);
+            EXPECT_EQ(n::sourceGate(n::SourceCondition::AfterFailure,&source::frontier(actual),interval,701,window),n::SourceGate::Run);
+        }
+    }
+}
 }

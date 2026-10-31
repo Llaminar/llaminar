@@ -7,6 +7,8 @@
 # Production binaries identify their model/scope and matrix role, never one
 # placement, precision, or MTP cell. Discovery enforces that role before it
 # publishes campaign registrations; focused-only binaries remain independent.
+# The original native MPI owner wraps every focused/campaign process world;
+# bounded metadata hashes keep exact long logical names out of filesystem components.
 # FullSourceAdmission, CandidateSourceAdmission, RejectUnsupportedSourceAdmission
 # and RejectCapacitySourceAdmission
 # are setup-only contracts:
@@ -21,6 +23,8 @@
 # Inputs (via -D):
 #   TEST_EXECUTABLE  - Full path to the GTest binary
 #   CTEST_FILE       - Output .cmake file to generate
+#   MPI_SESSION_HELPER - Exact built original native MPI owner executable
+#   MPI_SESSION_ROOT - Absolute build-owned parent for per-test session bases
 #   TEST_PREFIX      - CTest name prefix (e.g. V2_Integration_Parity_Qwen2_SingleDevice)
 #   LABELS           - Semicolon-separated CTest labels
 #   MPI_PROCS        - Number of MPI processes for test execution
@@ -43,6 +47,18 @@
 # timeout. This separate ceiling exists only to terminate a stuck standalone
 # campaign; the aggregate runner applies the same safety horizon to the matrix.
 set(_production_campaign_completion_timeout_seconds 21600)
+
+# The original owner and builder namespace are mandatory registration inputs.
+# No runtime search or global /tmp directory may substitute for either one.
+if(CMAKE_VERSION VERSION_LESS "3.27")
+    message(FATAL_ERROR "Parity MPI ownership requires CMake/CTest >= 3.27 timeout signal grace")
+endif()
+if(NOT IS_ABSOLUTE "${MPI_SESSION_HELPER}" OR NOT EXISTS "${MPI_SESSION_HELPER}" OR IS_DIRECTORY "${MPI_SESSION_HELPER}")
+    message(FATAL_ERROR "Parity discovery requires its exact built MPI_SESSION_HELPER")
+endif()
+if(NOT IS_ABSOLUTE "${MPI_SESSION_ROOT}")
+    message(FATAL_ERROR "Parity discovery requires its absolute build-owned MPI_SESSION_ROOT")
+endif()
 
 # --- Run the binary to discover tests (no mpirun needed) --------------------
 execute_process(
@@ -177,6 +193,7 @@ set(_all_production_model_files
 list(REMOVE_DUPLICATES _all_production_model_files)
 
 set(_env_vars
+    "LLAMINAR_TEST_MPI_SESSION_HELPER=${MPI_SESSION_HELPER}"
     "LLAMINAR_LOG_LEVEL=DEBUG"
     "LLAMINAR_TP_COLLECT_TIMEOUT_MS=30000"
     "HWLOC_COMPONENTS=-gl,-opencl"
@@ -349,8 +366,12 @@ foreach(_full_name IN LISTS _all_tests)
         list(APPEND _test_mpi_cmd "-x" "LLAMINAR_PROFILE_KERNELS=1")
     endif()
 
-    # Build the full command: mpirun ... <binary> --gtest_filter=<full_name>
-    set(_cmd ${_test_mpi_cmd} "${TEST_EXECUTABLE}" "--gtest_filter=${_full_name}")
+    # Keep exact logical identity while bounding the filesystem component.
+    string(SHA256 _session_component "${TEST_EXECUTABLE}\n${_ctest_name}")
+    set(_session_base "${MPI_SESSION_ROOT}/${_session_component}")
+    file(MAKE_DIRECTORY "${_session_base}")
+    set(_cmd "${MPI_SESSION_HELPER}" --session-base "${_session_base}" --
+        ${_test_mpi_cmd} -- "${TEST_EXECUTABLE}" "--gtest_filter=${_full_name}")
 
     # Convert command list to space-separated string for add_test
     # We need to properly quote each argument
@@ -365,7 +386,7 @@ foreach(_full_name IN LISTS _all_tests)
 
     string(APPEND _output "add_test(\"${_ctest_name}\" ${_cmd_str})\n")
 
-    set(_test_labels ${LABELS})
+    set(_test_labels ${LABELS} ProcessOwned)
     set(_focused_source_admission FALSE)
     set(_focused_active_mtp FALSE)
     set(_focused_model_files "")
@@ -457,6 +478,8 @@ foreach(_full_name IN LISTS _all_tests)
     string(JOIN ";" _env_joined ${_test_env_vars})
 
     string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n")
+    string(APPEND _output "    TIMEOUT_SIGNAL_NAME SIGTERM\n")
+    string(APPEND _output "    TIMEOUT_SIGNAL_GRACE_PERIOD 36\n")
     string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
     if(_focused_source_admission)
         string(JOIN ";" _focused_model_files_joined ${_focused_model_files})
@@ -616,9 +639,11 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     foreach(_export IN LISTS _campaign_runtime_env)
         list(APPEND _campaign_mpi_cmd "-x" "${_export}")
     endforeach()
-    set(_cmd
-        ${_campaign_mpi_cmd}
-        "${TEST_EXECUTABLE}"
+    string(SHA256 _session_component "${TEST_EXECUTABLE}\n${_ctest_name}")
+    set(_session_base "${MPI_SESSION_ROOT}/${_session_component}")
+    file(MAKE_DIRECTORY "${_session_base}")
+    set(_cmd "${MPI_SESSION_HELPER}" --session-base "${_session_base}" --
+        ${_campaign_mpi_cmd} -- "${TEST_EXECUTABLE}"
         "--gtest_filter=${_gtest_filter}")
 
     set(_cmd_str "")
@@ -631,7 +656,7 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     endforeach()
     string(APPEND _output "add_test(\"${_ctest_name}\" ${_cmd_str})\n")
 
-    set(_campaign_labels ${LABELS})
+    set(_campaign_labels ${LABELS} ProcessOwned)
     # Target-level labels describe every parameter in a binary. Policy labels
     # must instead describe this exact process campaign.
     list(REMOVE_ITEM _campaign_labels
@@ -687,6 +712,8 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     string(JOIN ";" _env_joined ${_campaign_env_vars})
 
     string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n")
+    string(APPEND _output "    TIMEOUT_SIGNAL_NAME SIGTERM\n")
+    string(APPEND _output "    TIMEOUT_SIGNAL_GRACE_PERIOD 36\n")
     string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
     string(APPEND _output "    LABELS \"${_labels_joined}\"\n")
     string(APPEND _output "    ENVIRONMENT \"${_env_joined}\"\n")

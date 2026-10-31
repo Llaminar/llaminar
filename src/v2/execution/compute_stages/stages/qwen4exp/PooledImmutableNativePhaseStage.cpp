@@ -22,10 +22,10 @@ std::array<std::shared_ptr<TensorBase>,3> tensors(const Roots& roots){return {ro
 void bind(BufferArena& arena,const Roots& roots,bool owner){
     if(isGraphCaptureActive())throw std::logic_error("Pooled native roots must be declared before capture");
     const auto ids=roles(owner);const auto values=tensors(roots);
-    for(std::size_t i=0;i<values.size();++i)if(arena.isRegistered(ids[i]))
-        throw std::logic_error("Pooled native canonical arena role was already declared");
+    for(std::size_t i=0;i<values.size();++i)if(arena.isRegistered(ids[i]) && arena.getTensor(ids[i])!=values[i].get())
+        throw std::logic_error("Pooled native canonical arena role belongs to another original root");
     if(!values[1] || !values[2])throw std::invalid_argument("Pooled native binding requires original complete mandatory roots");
-    for(std::size_t i=0;i<values.size();++i)if(values[i] && !arena.registerExternalBuffer(ids[i],values[i]))
+    for(std::size_t i=0;i<values.size();++i)if(values[i] && !arena.isRegistered(ids[i]) && !arena.registerExternalBuffer(ids[i],values[i]))
         throw std::logic_error("Pooled native original root registration failed");
 }
 /** @return Exact native participant, rejecting absent retained storage before any member access. */
@@ -43,12 +43,11 @@ PooledImmutableNativePhaseStage::PooledImmutableNativePhaseStage(BufferArena& ar
 {
     if(isGraphCaptureActive() || !device().is_gpu() || !code_ || code_->backend()!=device().type || !code_->codeIdentity())
         throw std::invalid_argument("Pooled native stage requires exact prepared GPU storage and matching native code before capture");
-    std::visit([](auto& value){value.operands.seal();value.operands.require(value.action,value.storage->plan());},phase_);
     identity_=graphCaptureVariantSignature();
 }
 Roots PooledImmutableNativePhaseStage::roots()const{return std::visit([](const auto& value){return value.storage->roots();},phase_);}
 const qwen4exp::PooledNativeOperandSpans& PooledImmutableNativePhaseStage::inputs()const{return std::visit([](const auto& value)->const qwen4exp::PooledNativeOperandSpans&{return value.operands.spans();},phase_);}
-void PooledImmutableNativePhaseStage::requireBindings()const{
+void PooledImmutableNativePhaseStage::requireDeclarations()const{
     if(!arena_ || !code_ || code_->backend()!=device().type)throw std::logic_error("Pooled native phase lost its original arena or backend code");
     const auto ids=roles(std::holds_alternative<Owner>(phase_));const auto values=tensors(roots());
     for(std::size_t i=0;i<values.size();++i)
@@ -59,16 +58,24 @@ void PooledImmutableNativePhaseStage::requireBindings()const{
             ((span->root==values[i])!=(span->buffer==ids[i])))
             throw std::logic_error("Pooled native input role aliases a different mutable authority");
     }
-    std::visit([](const auto& value){value.storage->captureIdentity();value.operands.require(value.action,value.storage->plan());},phase_);
+    std::visit([](const auto& value){value.storage->captureIdentity();value.operands.requireDeclarations(value.action,value.storage->plan());},phase_);
+}
+void PooledImmutableNativePhaseStage::requirePreparedBindings()const{
+    requireDeclarations();
+    std::visit([](const auto& value){value.operands.require(value.action,value.storage->plan());},phase_);
 }
 bool PooledImmutableNativePhaseStage::prepareGraphLaunch(IDeviceContext* context,void* stream){
     exactStream(stream);if(!context || context->deviceId()!=device())throw std::invalid_argument("Pooled native capture has a foreign participant");
-    requireBindings();if(graphCaptureVariantSignature()!=identity_)throw std::logic_error("Pooled native capture identity changed");
+    requireDeclarations();if(graphCaptureVariantSignature()!=identity_)throw std::logic_error("Pooled native capture identity changed");
+    // The executor binds ordinary arena producer storage before CaptureOnly
+    // preparation. Retain those original allocations here, never at graph declaration.
+    std::visit([](auto& value){value.operands.seal();},phase_);
+    requirePreparedBindings();
     setGPUStream(stream);std::visit([&](const auto& value){value.storage->acquireSetup(stream);},phase_);return true;
 }
 bool PooledImmutableNativePhaseStage::execute(IDeviceContext* context){
     if(!context || context->deviceId()!=device())throw std::invalid_argument("Pooled native phase has a foreign execution context");
-    requireBindings();if(graphCaptureVariantSignature()!=identity_)throw std::logic_error("Pooled native phase changed after capture");
+    requirePreparedBindings();if(graphCaptureVariantSignature()!=identity_)throw std::logic_error("Pooled native phase changed after capture");
     auto execution=gpuExecution();
     for(const auto& root:tensors(roots()))if(root){execution.requirePreparedInput(root.get());execution.requirePreparedOutput(root.get());}
     for(const auto& span:inputs())if(span)execution.requirePreparedInput(span->root.get());
@@ -77,15 +84,15 @@ bool PooledImmutableNativePhaseStage::execute(IDeviceContext* context){
     return true;
 }
 std::uint64_t PooledImmutableNativePhaseStage::graphCaptureVariantSignature()const{
-    requireBindings();std::uint64_t hash=1469598103934665603ULL;const auto mix=[&](std::uint64_t word){hash=(hash^word)*1099511628211ULL;};
+    requireDeclarations();std::uint64_t hash=1469598103934665603ULL;const auto mix=[&](std::uint64_t word){hash=(hash^word)*1099511628211ULL;};
     mix(1);mix(phase_.index());mix(static_cast<std::uint64_t>(device().type));mix(device().ordinal);mix(code_->codeIdentity());
-    std::visit([&](const auto& value){mix(static_cast<std::uint64_t>(value.action));mix(value.storage->captureIdentity());mix(value.operands.captureIdentity());},phase_);
+    std::visit([&](const auto& value){mix(static_cast<std::uint64_t>(value.action));mix(value.storage->captureIdentity());mix(value.operands.declarationIdentity());},phase_);
     for(const auto id:roles(std::holds_alternative<Owner>(phase_)))mix(static_cast<std::uint64_t>(id));return hash?hash:1;
 }
 bool PooledImmutableNativePhaseStage::supportsBackend(ComputeBackendType backend)const{return
     (device().is_cuda() && backend==ComputeBackendType::GPU_CUDA) || (device().is_rocm() && backend==ComputeBackendType::GPU_ROCM);}
 StageBufferContract PooledImmutableNativePhaseStage::bufferContract()const{
-    requireBindings();auto contract=StageBufferContract::build();const auto ids=roles(std::holds_alternative<Owner>(phase_));const auto values=tensors(roots());
+    requireDeclarations();auto contract=StageBufferContract::build();const auto ids=roles(std::holds_alternative<Owner>(phase_));const auto values=tensors(roots());
     for(std::size_t i=0;i<values.size();++i)if(values[i])contract.addPreallocatedInOut(ids[i],"INT8");
     std::array<bool,static_cast<std::size_t>(BufferId::_COUNT)> declared{};
     for(std::size_t i=0;i<values.size();++i)if(values[i])declared[static_cast<std::size_t>(ids[i])]=true;

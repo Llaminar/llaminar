@@ -631,7 +631,7 @@ TEST(ImmutableLookupProtocol, AdaptiveObservationModeAndPartitionRejectWithoutCo
 
 /** @test Protocol2 source evidence stays distinct and invalid projections do
  * not consume freshness. */
-TEST(ImmutableLookupProtocol, AdaptiveSubordinateTransportIsExactAndDoesNotEraseSourceMode)
+TEST(ImmutableLookupProtocol, PooledSubordinateTransportIsExactAndDoesNotEraseSourceMode)
 {
     struct Environment final
     {
@@ -669,7 +669,7 @@ TEST(ImmutableLookupProtocol, AdaptiveSubordinateTransportIsExactAndDoesNotErase
         {.requests = 1, .ids = 2, .idBytes = 16, .nativeBytes = 180});
     observed.transport = static_cast<RetainedStorageTransport>(255);
     EXPECT_THROW(stats.publish(observed, "CUDA:0"), std::invalid_argument);
-    observed.transport = RetainedStorageTransport::AdaptiveSubordinate;
+    observed.transport = RetainedStorageTransport::PooledSubordinate;
     observed.mode = HostImmutableRowMode::WholeMemoryMapped;
     EXPECT_THROW(stats.publish(observed, "CUDA:0"), std::invalid_argument);
     EXPECT_TRUE(PerfStatsCollector::snapshot({"immutable_lookup"}).empty());
@@ -679,7 +679,7 @@ TEST(ImmutableLookupProtocol, AdaptiveSubordinateTransportIsExactAndDoesNotErase
     ASSERT_FALSE(records.empty());
     for (const auto &record : records)
     {
-        EXPECT_EQ(record.tags.at("transport"), "adaptive_subordinate");
+        EXPECT_EQ(record.tags.at("transport"), "pooled_subordinate");
         EXPECT_EQ(record.tags.at("storage"), hostImmutableRowModeName(HostImmutableRowMode::AdaptiveRAMSSD));
     }
     PerfStatsCollector::reset();

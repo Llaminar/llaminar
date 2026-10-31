@@ -267,9 +267,9 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
             PhysicalMemoryPlanBuilder plan(higher_priority);
             plan.add(input.host(),PhysicalMemoryOwner::ImmutableTableStorage,0u);
             for(const auto &consumer:input.consumers())plan.add(consumer,PhysicalMemoryOwner::ImmutableTableStorage,0u);
-            const auto optional=geometry.cacheBOM(input.consumers().front(),input.host());
+            const auto optional=geometry.slotDependentBOM(input.consumers().front(),input.host());
             for(const auto &bom:optional.resources())plan.add(bom);
-            const bool ceilings=geometry.gpu().cache().bytes<=requested.gpu_adaptive.gpu_cache_physical_byte_limit &&
+            const bool ceilings=geometry.gpuSlotDependentBytes()<=requested.gpu_adaptive.gpu_cache_physical_byte_limit &&
                 geometry.host().storageBytes()<=requested.gpu_adaptive.host.cache_physical_byte_limit;
             return std::pair{ceilings,plan.build()};
         };

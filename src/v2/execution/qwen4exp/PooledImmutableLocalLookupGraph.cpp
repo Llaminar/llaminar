@@ -23,7 +23,7 @@ void input(q::PooledNativeOperandSpans& spans,q::PooledNativeOperand role,std::s
 PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<q::ImmutableLookupExecutionBoundary> boundary,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
     n::OriginalRows original,q::PooledNativeOperandSpans begin,DeviceGenerationControlBinding control,
-    q::PooledNativeTensorSpan output,const std::string& identity){
+    q::PooledNativeTensorSpan output,const std::string& identity,const std::string& outputIdentity){
     if(isGraphCaptureActive() || !boundary || !boundary->isPooled() || !code || identity.empty())
         throw std::invalid_argument("Local pooled lookup graph requires its original real-provider boundary outside capture");
     const auto source=boundary->pooledStorage();const auto owner=source->owner();const auto coordinator=source->coordinator();
@@ -33,8 +33,8 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
     graph.setRetainedStorageBoundary(boundary);
     const auto own=owner->roots(),coord=coordinator->roots(),src=source->roots();
     const auto capacity=o.native.reply_capacity;PooledImmutableLookupGraphEndpoints endpoints;std::size_t ordinal=0;
-    const auto append=[&](std::unique_ptr<IComputeStage> stage){
-        const auto name=identity+"/"+std::to_string(ordinal++);graph.addNode(name,std::move(stage),boundary->device());
+    const auto append=[&](std::unique_ptr<IComputeStage> stage,const std::string& semanticName=std::string{}){
+        const auto name=semanticName.empty()?identity+"/"+std::to_string(ordinal++):semanticName;graph.addNode(name,std::move(stage),boundary->device());
         if(endpoints.first.empty())endpoints.first=name;
         if(!endpoints.last.empty())graph.addDependency(name,endpoints.last);
         endpoints.last=name;
@@ -110,7 +110,7 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
         append(std::make_unique<PooledImmutableNativePhaseStage>(arena,code,PooledImmutableNativePhaseStage::Coordinator{action,coordinator,std::move(operands)}));
     };
     const auto sourcePhase=[&](q::PooledSourceAction action){append(std::make_unique<PooledImmutableSourcePhaseStage>(arena,boundary,action,control,
-        action==q::PooledSourceAction::Read?std::optional(output):std::nullopt));};
+        action==q::PooledSourceAction::Read?std::optional(output):std::nullopt),action==q::PooledSourceAction::Read?outputIdentity:std::string{});};
     coordinatorPhase(n::CoordinatorAction::Begin);ownerPhase(n::OwnerAction::Begin);
     coordinatorPhase(n::CoordinatorAction::PinCommands);ownerPhase(n::OwnerAction::Pin);ownerPhase(n::OwnerAction::SealPins);
     coordinatorPhase(n::CoordinatorAction::AcquirePins);coordinatorPhase(n::CoordinatorAction::SealPins);ownerPhase(n::OwnerAction::AcquirePins);
@@ -123,12 +123,35 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
     sourcePhase(q::PooledSourceAction::Publish);sourcePhase(q::PooledSourceAction::Acquire);
     ownerPhase(n::OwnerAction::ApplySourceDelivery,n::SourceCondition::AfterSuccess);
     ownerPhase(n::OwnerAction::ValidateFills,n::SourceCondition::AfterSuccess);ownerPhase(n::OwnerAction::AcquirePublication,n::SourceCondition::AfterSuccess);
+    sourcePhase(q::PooledSourceAction::BeforeReady);
     ownerPhase(n::OwnerAction::MakeReady,n::SourceCondition::AfterSuccess);ownerPhase(n::OwnerAction::ReadyReceipt,n::SourceCondition::AfterSuccess);
     coordinatorPhase(n::CoordinatorAction::Publish,n::SourceCondition::AfterSuccess);
     sourcePhase(q::PooledSourceAction::Read);sourcePhase(q::PooledSourceAction::ReadersRetired);
     ownerPhase(n::OwnerAction::CancelSource,n::SourceCondition::AfterFailure);ownerPhase(n::OwnerAction::Release);
     coordinatorPhase(n::CoordinatorAction::Cancel,n::SourceCondition::AfterFailure);
     ownerPhase(n::OwnerAction::Retire);coordinatorPhase(n::CoordinatorAction::Finish);
+    sourcePhase(q::PooledSourceAction::ObserveRetired);
     return endpoints;
 }
+PooledImmutableLookupGraphEndpoints appendPooledImmutablePLELookupGraph(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<q::ImmutableLookupExecutionBoundary> boundary,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
+    DeviceRowRange tokens,q::PooledNativeTensorSpan ids,std::optional<q::PooledNativeTensorSpan> count,
+    DeviceGenerationControlBinding control,q::PooledNativeTensorSpan output,const std::string& identity,const std::string& outputIdentity){
+    if(!boundary || !boundary->isPooled() || bool(count)!=bool(tokens.countOwner()))
+        throw std::invalid_argument("PLE split lookup requires its exact original source and token-count authority");
+    const auto expanded=tokens.repeatEachRow(16);const auto storage=boundary->pooledStorage();
+    const auto& declared=storage->geometry().parameters();
+    if(ids.bytes!=std::size_t{expanded.physicalRows()}*sizeof(std::uint64_t) || ids.offset%alignof(std::uint64_t) ||
+       output.bytes!=std::size_t{expanded.physicalRows()}*declared.row_elements*sizeof(float))
+        throw std::invalid_argument("PLE split lookup requires complete original INT64 hash IDs and matching embedding rows");
+    q::PooledNativeOperandSpans begin{};
+    begin[static_cast<unsigned>(q::PooledNativeOperand::Ids)]=std::move(ids);
+    if(count)begin[static_cast<unsigned>(q::PooledNativeOperand::OriginalCount)]=std::move(*count);
+    begin[static_cast<unsigned>(q::PooledNativeOperand::Admission)]=q::PooledNativeTensorSpan{
+        storage->roots().native,BufferId::QFN_POOLED_SOURCE_NATIVE,
+        declared.offsets.protocol+offsetof(q::ImmutableLookupDeviceState,admissionGeneration),sizeof(std::uint64_t)};
+    return appendPooledImmutableLocalLookupGraph(graph,arena,std::move(boundary),std::move(code),
+        {expanded,n::OriginalIdWidth::UInt64},std::move(begin),control,std::move(output),identity,outputIdentity);
+}
+
 }

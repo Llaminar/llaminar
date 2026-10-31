@@ -15,9 +15,12 @@ namespace llaminar2 {class DeviceGenerationControlBinding;}
 namespace llaminar2::qwen4exp {
 class PooledImmutableSourcePreparedStorage;
 /** @brief Distinct source producers/readers with explicit owner/coordinator graph edges between them. */
-enum class PooledSourceAction:std::uint32_t {Plan,Publish,Acquire,Read,ReadersRetired};
+enum class PooledSourceAction:std::uint32_t {Plan,Publish,Acquire,Read,ReadersRetired,ObserveRetired,BeforeReady};
 /** @brief Native output already retained/sealed by its actual reusable graph stage. */
-struct PooledSourceQuery {float* output=nullptr;std::size_t elements=0;};
+struct PooledSourceQuery {
+    float* output=nullptr; ///< Original canonical embedding output, without aliasing native authority.
+    std::size_t elements=0; ///< This graph's exact physical FP32 envelope, no larger than the shared source declaration.
+};
 /** @brief Checked participant-local source code; arbitrary directed owner edges remain explicit transport contracts. */
 class IPooledImmutableSourceKernels {
 public:

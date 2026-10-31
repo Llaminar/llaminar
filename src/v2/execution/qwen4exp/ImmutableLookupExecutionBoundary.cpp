@@ -75,12 +75,10 @@ class ImmutableLookupSubmissionRetirement final
     /** @brief Create the event and retain all owners before the first metadata enqueue. */
     ImmutableLookupSubmissionRetirement(DeviceId device, void *stream,
                                         std::shared_ptr<ImmutableLookupService> service,
-                                        std::shared_ptr<AdaptiveLookupPreparedStorage> storage,
-                                        std::shared_ptr<const AdaptiveImmutableLookupRootStorage> roots,
                                         std::shared_ptr<TensorBase> protocol,
                                         std::shared_ptr<PooledImmutableSourcePreparedStorage> pooled = {})
         : device_(device), stream_(stream), backend_(getBackendFor(device)), service_(std::move(service)),
-          storage_(std::move(storage)), roots_(std::move(roots)), protocol_(std::move(protocol)),pooled_(std::move(pooled))
+          protocol_(std::move(protocol)),pooled_(std::move(pooled))
     {
         if (!backend_ || !(event_ = backend_->createEvent(device.ordinal)))
             throw std::runtime_error("Immutable lookup could not create its submission-retirement event");
@@ -140,8 +138,6 @@ class ImmutableLookupSubmissionRetirement final
     IBackend *backend_;
     bool recorded_ = false; ///< Immutable setup-frontier seal, never live GPU state.
     std::shared_ptr<ImmutableLookupService> service_;
-    std::shared_ptr<AdaptiveLookupPreparedStorage> storage_;
-    std::shared_ptr<const AdaptiveImmutableLookupRootStorage> roots_;
     std::shared_ptr<TensorBase>
         protocol_; ///< Original ordinary/adaptive protocol owner, never replacement bytes.
     std::shared_ptr<PooledImmutableSourcePreparedStorage> pooled_; ///< Original source roots through partial setup/admission retirement.
@@ -207,68 +203,8 @@ ImmutableLookupExecutionBoundary::ImmutableLookupExecutionBoundary(
     // before DGO publishes its state-ready event, so caller retirement alone
     // cannot cover it. No stream/work is named until a real admission begins.
     admissionRetirement_ = std::make_shared<ImmutableLookupSubmissionRetirement>(device, nullptr, service_,
-                                                                                 nullptr, nullptr, protocol_);
+                                                                                 protocol_);
 }
-std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBoundary::createAdaptive(
-    std::shared_ptr<ImmutableLookupService> service, AdaptiveImmutableRowCacheNativePlan plan,
-    std::shared_ptr<const AdaptiveImmutableLookupRootStorage> roots, void *setupStream)
-{
-    if (!service || !roots || isGraphCaptureActive() || !setupStream ||
-        reinterpret_cast<std::uintptr_t>(setupStream) <= 2)
-        throw std::invalid_argument(
-            "Adaptive storage setup requires its source/root owners and exact noncapture stream");
-    const auto sourceOwner = service->retainedSourceOwnerObservation();
-    roots->requireFor(plan, sourceOwner.authority());
-    const auto device = plan.parameters().device;
-    const auto original = roots->roots();
-    (void)protocolState(original.protocol, device);
-    service->requireHealthy();
-    auto source = service->bindSubordinate(device);
-    auto storage = source.declareStorage(plan, original.cache, original.frame, original.protocol);
-    roots->bindPreparedStorage(storage);
-    storage->seal();
-    std::unique_ptr<IImmutableAdaptiveLookupKernels> kernels;
-#ifdef HAVE_CUDA
-    if (device.is_cuda())
-        kernels = createCUDAImmutableAdaptiveLookupKernels(plan, source);
-#endif
-#ifdef HAVE_ROCM
-    if (device.is_rocm())
-        kernels = createROCmImmutableAdaptiveLookupKernels(plan, source);
-#endif
-    if (!kernels)
-        throw std::runtime_error("Adaptive storage requested native backend was not compiled");
-    // The same setup event covers partial construction failure and successful
-    // setup whose runner is abandoned before any graph acquires its frontier.
-    auto retirement = std::make_shared<ImmutableLookupSubmissionRetirement>(
-        device, setupStream, service, storage, roots, original.protocol);
-    kernels->initialize(*storage, setupStream);
-    retirement->recordCompletion();
-    Adaptive adaptive{
-        std::move(roots),     sourceOwner.authority(), std::move(storage), std::move(kernels), {},
-        std::move(retirement)};
-    auto result = std::shared_ptr<ImmutableLookupExecutionBoundary>(
-        new ImmutableLookupExecutionBoundary(std::move(service), original.protocol, std::move(adaptive)));
-    return result;
-}
-
-ImmutableLookupExecutionBoundary::ImmutableLookupExecutionBoundary(
-    std::shared_ptr<ImmutableLookupService> service, std::shared_ptr<TensorBase> protocol, Adaptive adaptive)
-    : service_(std::move(service)), device_(adaptive.kernels->plan().parameters().device),
-      adaptive_(std::move(adaptive)), protocol_(std::move(protocol)), backend_(getBackendFor(device_)),
-      state_(protocolState(protocol_, device_)),
-      generation_(reinterpret_cast<std::uint64_t *>(
-          reinterpret_cast<std::byte *>(state_) + offsetof(ImmutableLookupDeviceState, admissionGeneration)))
-{
-    runtimeGeneration_ = backend_ ? backend_->deviceRuntimeGeneration(device_.ordinal) : 0;
-    if (!runtimeGeneration_)
-        throw std::invalid_argument("Adaptive boundary requires its live original native runtime");
-    const std::array<TensorBase *, 1> roots{protocol_.get()};
-    protocolSeal_ = std::make_unique<Qwen4ExpPreparedStorage>(device_, roots);
-    protocolSeal_->seal();
-    identity_ = adaptive_->kernels->captureIdentity(*adaptive_->storage);
-}
-
 std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBoundary::createPooled(
     std::shared_ptr<ImmutableLookupService> service,PooledImmutableSourceGeometry geometry,
     std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
@@ -288,7 +224,7 @@ std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBounda
     auto protocol=storage->roots().native;
     // Retain the actual backing and an event before the first initialization
     // enqueue. Failed factory/constructor paths drain only their own producer.
-    auto retirement=std::make_shared<ImmutableLookupSubmissionRetirement>(device,stream,service,nullptr,nullptr,protocol,storage);
+    auto retirement=std::make_shared<ImmutableLookupSubmissionRetirement>(device,stream,service,protocol,storage);
     kernels->initialize(*storage,stream);retirement->recordCompletion();
     Pooled pooled{std::move(storage),std::move(kernels),std::nullopt,std::move(retirement)};
     return std::shared_ptr<ImmutableLookupExecutionBoundary>(new ImmutableLookupExecutionBoundary(std::move(service),std::move(protocol),std::move(pooled)));
@@ -313,6 +249,7 @@ void ImmutableLookupExecutionBoundary::bindPooledGenerationControl(DeviceGenerat
     (void)pooledStorage();control.requireFor(device());
     if(pooled_->control && pooled_->control->captureIdentity()!=control.captureIdentity())
         throw std::invalid_argument("Pooled source boundary cannot replace its original canonical controller");
+    bindGenerationControl({control.healthy(),control.error()});
     pooled_->control=control;
 }
 
@@ -331,91 +268,14 @@ const IImmutableLookupKernels &ImmutableLookupExecutionBoundary::kernels() const
     return *kernels_;
 }
 
-AdaptiveImmutableLookupRoots ImmutableLookupExecutionBoundary::adaptiveRoots() const
-{
-    (void)adaptiveStorage();
-    return adaptive_->roots->roots();
-}
-
-const std::shared_ptr<const AdaptiveImmutableLookupRootStorage> &
-ImmutableLookupExecutionBoundary::rootStorage() const
-{
-    (void)adaptiveStorage();
-    return adaptive_->roots;
-}
-
 HostImmutableRowOwnerObservation ImmutableLookupExecutionBoundary::retainedSourceOwnerObservation() const
 {
     return service_->retainedSourceOwnerObservation();
 }
 
-void ImmutableLookupExecutionBoundary::bindAdaptiveArena(BufferArena &arena) const
-{
-    const auto roots = adaptiveRoots();
-    if (isGraphCaptureActive())
-        throw std::logic_error("Adaptive original roots bind only during ordinary graph setup");
-    const std::array<std::pair<BufferId, TensorBase *>, 3> bindings{
-        {{BufferId::QFN_NGRAM_ADAPTIVE_CACHE, roots.cache.get()},
-         {BufferId::QFN_NGRAM_ADAPTIVE_FRAME, roots.frame.get()},
-         {BufferId::QFN_NGRAM_LOOKUP_STATE, roots.protocol.get()}}};
-    // Validate the entire declaration before registering any missing role.
-    // Reusing an identical model owner is legal; replacing arena-owned scratch
-    // or another source-domain owner is never a runtime binding operation.
-    for (const auto &[role, root] : bindings)
-        if (arena.isRegistered(role) && (!root || arena.getTensor(role) != root))
-            throw std::invalid_argument("Adaptive arena role already belongs to a different original root");
-    for (const auto &[role, root] : bindings)
-        if (root && !arena.isRegistered(role) && !arena.registerExternalBuffer(role, root))
-            throw std::logic_error("Adaptive original external arena registration failed");
-}
-
-const std::shared_ptr<AdaptiveLookupPreparedStorage> &
-ImmutableLookupExecutionBoundary::adaptiveStorage() const
-{
-    if (!adaptive_)
-        throw std::logic_error("Ordinary storage has no adaptive prepared owner");
-    requireProtocolOwner();
-    adaptive_->kernels->source().requireStorage(*adaptive_->storage);
-    return adaptive_->storage;
-}
-
-const IImmutableAdaptiveLookupKernels &ImmutableLookupExecutionBoundary::adaptiveKernels() const
-{
-    (void)adaptiveStorage();
-    return *adaptive_->kernels;
-}
-
-void ImmutableLookupExecutionBoundary::requireAdaptiveRoots(const TensorBase *cache, const TensorBase *frame,
-                                                            const TensorBase *protocol) const
-{
-    (void)adaptiveStorage();
-    const auto original = adaptive_->roots->roots();
-    if (cache != original.cache.get() || frame != original.frame.get() || protocol != original.protocol.get())
-        throw std::invalid_argument("Adaptive graph bindings replaced the original source-owned roots");
-}
-
-void ImmutableLookupExecutionBoundary::bindAdaptiveGenerationControl(DeviceGenerationControlBinding control)
-{
-    (void)adaptiveStorage();
-    control.requireFor(device_);
-    if (adaptive_->control && adaptive_->control->captureIdentity() != control.captureIdentity())
-        throw std::invalid_argument("Adaptive storage replaced its original "
-                                    "canonical generation controller");
-    bindGenerationControl({control.healthy(), control.error()});
-    adaptive_->control = control;
-}
-
 void ImmutableLookupExecutionBoundary::requireProtocolOwner() const
 {
     protocolSeal_->validate();
-    if (adaptive_)
-    {
-        adaptive_->roots->requireFor(adaptive_->kernels->plan(), adaptive_->authority);
-        adaptive_->storage->requireFor(adaptive_->kernels->plan());
-        if (adaptive_->kernels->captureIdentity(*adaptive_->storage) != identity_)
-            throw std::logic_error("Adaptive boundary source/plan/prepared "
-                                   "identity changed after setup");
-    }
     if(pooled_ && (protocol_!=pooled_->storage->roots().native ||
        pooled_->kernels->captureIdentity(*pooled_->storage)!=identity_))
         throw std::logic_error("Pooled source original roots/provider/code identity changed after setup");
@@ -438,17 +298,17 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
     const auto interval=intervalGeneration_+1;
     intervalStart_=service_->stats();terminal_.reset();
     service_->requireHealthy();
-    if (adaptive_ || pooled_)
+    if (pooled_)
     {
         // Authenticate the original file/provider once at this ordinary request
         // boundary. Binding performs no gather, policy touch, sequence change
         // or GPU-value observation; all-hit captured transactions still do U0.
         const auto source = service_->bindSubordinate(device_);
-        if (source.captureIdentity() != (pooled_?pooled_->kernels->source().captureIdentity():adaptive_->kernels->source().captureIdentity()))
+        if (source.captureIdentity() != pooled_->kernels->source().captureIdentity())
             throw std::logic_error("Adaptive admission replaced its original source channel");
     }
     ticket_=service_->arm(interval);
-    if (!adaptive_ && !pooled_)
+    if (!pooled_)
         admissionRetirement_->beginSubmission(stream);
     try {
         if (pooled_) {
@@ -460,27 +320,13 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
             pooled_->kernels->admit(*pooled_->storage,ticket_.generation,ticket_.invocation,stream);
             pooled_->setupRetirement->recordCompletion();
         }
-        else if (adaptive_)
-        {
-            // Initialization or the prior frame is the actual producer of
-            // cache/frame metadata. Join those canonical events before a new
-            // admission frontier replaces our retained setup event. Protocol
-            // is an output of this admission, not a cold input to be guessed.
-            const auto roots = adaptive_->roots->roots();
-            if (roots.cache)
-                TransferEngine::requireDeviceInput(roots.cache.get(), device(), stream);
-            TransferEngine::requireDeviceInput(roots.frame.get(), device(), stream);
-            adaptive_->setupRetirement->beginSubmission(stream);
-            adaptive_->kernels->admit(*adaptive_->storage, interval, initialization_, stream);
-            adaptive_->setupRetirement->recordCompletion();
-        }
         else
             kernels_->admit({interval, generation_, state_, initialization_}, stream);
         // The admission kernel is the real producer of these bytes. Publish its
         // exact stream/event before RequireReadyBytes joins any capture frontier.
         // The adaptive component publishes this same original root itself.
         // Ordinary protocol kernels retain their existing boundary publication.
-        if (!adaptive_ && !pooled_)
+        if (!pooled_)
         {
             TransferEngine::publishDeviceWrite(protocol_.get(), device(), stream);
             admissionRetirement_->recordCompletion();
@@ -492,8 +338,6 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
         // Successful admissions and all captured transactions never wait here.
         if (pooled_)
             pooled_->setupRetirement->retireFailedAdmission(stream);
-        else if (adaptive_)
-            adaptive_->setupRetirement->retireFailedAdmission(stream);
         else
             admissionRetirement_->retireFailedAdmission(stream);
         (void)service_->cancel(ticket_);
@@ -534,20 +378,6 @@ void ImmutableLookupExecutionBoundary::recordTerminalClose(void *stream,const in
             pooled_->kernels->closeWhenTerminal(*pooled_->storage,*pooled_->control,stream);
         }
     }
-    else if (adaptive_)
-    {
-        if (!healthy && !complete)
-            adaptive_->kernels->close(*adaptive_->storage, stream);
-        else
-        {
-            if (!adaptive_->control || healthy != adaptive_->control->healthy() ||
-                complete !=
-                    adaptive_->control->row() + sampling_math::kDeviceGenerationControlRequestComplete)
-                throw std::invalid_argument("Adaptive terminal predicates must be "
-                                            "the original canonical controller");
-            adaptive_->kernels->closeWhenTerminal(*adaptive_->storage, *adaptive_->control, stream);
-        }
-    }
     else
         kernels_->close({generation_, state_, binding_->deviceView(), healthy, complete}, stream);
 }
@@ -558,8 +388,8 @@ void ImmutableLookupExecutionBoundary::awaitTerminal()
     if(!armed_.load(std::memory_order_acquire))throw std::logic_error("Immutable lookup terminal has no armed storage interval");
     const bool success=service_->await(ticket_);ticket_={};
     terminal_=RetainedStorageTerminalObservation::between(intervalGeneration_,service_->mode(),intervalStart_,service_->stats());
-    if (adaptive_ || pooled_)
-        terminal_->transport = pooled_?RetainedStorageTransport::PooledSubordinate:RetainedStorageTransport::AdaptiveSubordinate;
+    if (pooled_)
+        terminal_->transport = RetainedStorageTransport::PooledSubordinate;
     armed_.store(false,std::memory_order_release);
     if(!success)throw std::runtime_error("Immutable lookup retained-generation storage failed: "+service_->lastFailure());
 }

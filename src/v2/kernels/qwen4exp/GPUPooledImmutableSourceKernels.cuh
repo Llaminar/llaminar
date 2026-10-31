@@ -104,6 +104,9 @@ __device__ __forceinline__ void aborted(const DeviceArgs& a){
 /** @brief Initialize only protocol/source metadata; inactive packet/payload banks remain untouched. */
 __global__ void initialize(DeviceArgs a){
     s::protocol(a)={};s::frontier(a)={};s::invocation(a)=0;s::stage(a)=ResponseStage::Idle;
+    *n::at<QwenAdaptiveCounterTotals>(a.native,a.plan.offsets.observation)={};
+    *n::at<std::uint64_t>(a.native,a.plan.offsets.observation_ordinal)=0;
+    *n::at<std::uint64_t>(a.native,a.plan.offsets.reported_ordinal)=0;
     *n::at<std::uint64_t>(a.native,a.plan.offsets.record_bytes)=0;
     *n::at<std::uint64_t>(a.native,a.plan.offsets.payload_bytes)=0;
 }
@@ -244,6 +247,8 @@ __global__ void retireResponse(DeviceArgs a,std::uint64_t timeout){
     frontier.disposition=n::SourceDisposition::Consumed;s::stage(a)=ResponseStage::Consumed;
     if(io.status || !*a.healthy){s::reject(a,io.status?static_cast<ImmutableLookupStatus>(io.status):ImmutableLookupStatus::Cancelled);unhealthy(a);}
 }
+/** @brief Observe canonical cancellation after ACK/fill and before the owner Ready edge. */
+__global__ void beforeReady(DeviceArgs a){(void)s::beforeReady(a);}
 /** @brief Authenticate all consumer rows in parallel before any output writer can run. */
 template<class Slot> __global__ void validateReaders(DeviceArgs a){
     if(s::frontier(a).status!=adaptive_lookup::Status::Success || !*a.healthy)return;
@@ -256,7 +261,10 @@ template<class Slot> __global__ void validateReaders(DeviceArgs a){
         }
 }
 /** @brief One source outcome writer incorporates the canonical failure before any output write. */
-__global__ void readerOutcome(DeviceArgs a){
+__global__ void readerOutcome(DeviceArgs a,PooledSourceQuery query){
+    if(n::coordinatorView(a.coordinator).frame->original_ids>query.elements/a.plan.row_elements){
+        s::reject(a,ImmutableLookupStatus::InvalidExtent);unhealthy(a);
+    }
     if(!*a.healthy && s::frontier(a).status==adaptive_lookup::Status::Success)s::reject(a,ImmutableLookupStatus::Cancelled);
 }
 /** @brief Decode only original live positions through the unchanged stable coalescing permutation. */
@@ -271,9 +279,16 @@ template<TensorType Format,class Slot> __global__ void read(DeviceArgs a,PooledS
 }
 /** @brief Only the explicit last-reader edge permits later source-frame reuse; graph owners still retain physical backing. */
 __global__ void readersRetired(DeviceArgs a){
+    const bool observed=a.plan.owner.owner.rowWidth()==adaptive_lookup::RowKeyWidth::UInt32?
+        s::snapshotObservation<adaptive_lookup::Slot32>(a):s::snapshotObservation<adaptive_lookup::Slot64>(a);
+    if(!observed){s::reject(a,ImmutableLookupStatus::InvalidProtocol);unhealthy(a);return;}
     if(!*a.healthy && s::frontier(a).status==adaptive_lookup::Status::Success)s::reject(a,ImmutableLookupStatus::Cancelled);
     if(s::stage(a)==ResponseStage::Consumed || s::stage(a)==ResponseStage::Aborted)s::stage(a)=ResponseStage::ReadersComplete;
     else {s::reject(a,ImmutableLookupStatus::InvalidProtocol);unhealthy(a);}
+}
+/** @brief Commit actual reporting only after original reader/owner/coordinator retirement. */
+__global__ void observeRetired(DeviceArgs a){
+    if(!s::observeRetired(a)){s::reject(a,ImmutableLookupStatus::InvalidProtocol);unhealthy(a);}
 }
 /** @brief Complete-parent terminal close is separate from worker retirement and retains all original root owners. */
 __global__ void close(DeviceArgs a,const int* complete){
@@ -310,7 +325,7 @@ public:
 protected:
     std::uint64_t codeIdentity()const noexcept override{
         std::uint64_t h=1469598103934665603ULL;const auto mix=[&](std::uint64_t word){h=(h^word)*1099511628211ULL;};
-        mix(2);mix(n::Version);mix(kImmutableLookupAcknowledgementVersion);mix(static_cast<std::uint64_t>(Format));mix(timeout_);mix(256);
+        mix(4);mix(n::Version);mix(kImmutableLookupAcknowledgementVersion);mix(static_cast<std::uint64_t>(Format));mix(timeout_);mix(256);
         mix(reinterpret_cast<std::uintptr_t>(tables_.iq3s));mix(reinterpret_cast<std::uintptr_t>(tables_.iq3xxs));
         mix(reinterpret_cast<std::uintptr_t>(tables_.iq2s));mix(reinterpret_cast<std::uintptr_t>(tables_.iq2xs));
         mix(reinterpret_cast<std::uintptr_t>(tables_.iq2xxs));mix(reinterpret_cast<std::uintptr_t>(tables_.iq1s));
@@ -332,13 +347,15 @@ protected:
             retireResponse<<<1,1,0,stream>>>(a,timeout_);break;
         case PooledSourceAction::Read:
             if(a.plan.owner.owner.rowWidth()==adaptive_lookup::RowKeyWidth::UInt32){
-                validateReaders<adaptive_lookup::Slot32><<<blocks(maximum),256,0,stream>>>(a);readerOutcome<<<1,1,0,stream>>>(a);
+                validateReaders<adaptive_lookup::Slot32><<<blocks(maximum),256,0,stream>>>(a);readerOutcome<<<1,1,0,stream>>>(a,query);
                 read<Format,adaptive_lookup::Slot32><<<blocks(std::uint64_t{a.plan.coordinator.policy.maximumOriginal()}*a.plan.row_elements),256,0,stream>>>(a,query,tables_);
             }else{
-                validateReaders<adaptive_lookup::Slot64><<<blocks(maximum),256,0,stream>>>(a);readerOutcome<<<1,1,0,stream>>>(a);
+                validateReaders<adaptive_lookup::Slot64><<<blocks(maximum),256,0,stream>>>(a);readerOutcome<<<1,1,0,stream>>>(a,query);
                 read<Format,adaptive_lookup::Slot64><<<blocks(std::uint64_t{a.plan.coordinator.policy.maximumOriginal()}*a.plan.row_elements),256,0,stream>>>(a,query,tables_);
             }break;
         case PooledSourceAction::ReadersRetired:readersRetired<<<1,1,0,stream>>>(a);break;
+        case PooledSourceAction::ObserveRetired:QFN_SOURCE_NAMESPACE::observeRetired<<<1,1,0,stream>>>(a);break;
+        case PooledSourceAction::BeforeReady:QFN_SOURCE_NAMESPACE::beforeReady<<<1,1,0,stream>>>(a);break;
         }
         check();
     }

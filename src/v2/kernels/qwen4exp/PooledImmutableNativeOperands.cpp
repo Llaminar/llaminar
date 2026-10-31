@@ -28,7 +28,7 @@ std::size_t times(std::size_t a,std::size_t b)
     return a*b;
 }
 /** @brief Reject missing/extra/foreign/aliased declarations before physical sealing or native work. */
-void requireDeclarations(const PooledNativeOperandSpans& spans,const PooledNativeOperandSchema& schema)
+void requireSpanDeclarations(const PooledNativeOperandSpans& spans,const PooledNativeOperandSchema& schema)
 {
     for(std::size_t i=0;i<spans.size();++i){
         if(bool(spans[i])!=(schema[i].bytes!=0))throw std::invalid_argument("Pooled native phase has missing or unused operands");
@@ -206,13 +206,17 @@ PooledImmutableOwnerOperands::PooledImmutableOwnerOperands(n::OwnerAction action
 {
     declarations();const auto original=roots(spans_);prepared_.emplace(plan_.device,original);
 }
-void PooledImmutableOwnerOperands::declarations()const{requireDeclarations(spans_,schema_);}
+void PooledImmutableOwnerOperands::declarations()const{requireSpanDeclarations(spans_,schema_);}
 void PooledImmutableOwnerOperands::seal(){declarations();prepared_->seal();requirePrepared(spans_,schema_,plan_.device);retainInputs(spans_,plan_.device,captured_);}
 void PooledImmutableOwnerOperands::validateIfSealed()const{declarations();prepared_->validateIfSealed();}
-void PooledImmutableOwnerOperands::require(n::OwnerAction action,const PooledImmutableOwnerNativePlan& plan)const
+void PooledImmutableOwnerOperands::requireDeclarations(n::OwnerAction action,const PooledImmutableOwnerNativePlan& plan)const
 {
     if(action!=action_ || plan.parameters().identity!=plan_.identity)throw std::invalid_argument("Pooled owner operands changed operation or geometry");
-    declarations();prepared_->validate();requirePrepared(spans_,schema_,plan_.device);requireInputs(spans_,plan_.device,captured_);
+    validateIfSealed();
+}
+void PooledImmutableOwnerOperands::require(n::OwnerAction action,const PooledImmutableOwnerNativePlan& plan)const
+{
+    requireDeclarations(action,plan);prepared_->validate();requirePrepared(spans_,schema_,plan_.device);requireInputs(spans_,plan_.device,captured_);
 }
 std::uint64_t PooledImmutableOwnerOperands::declarationIdentity()const{validateIfSealed();return combine(combine(declaration(spans_,plan_.identity,static_cast<std::uint64_t>(action_)),static_cast<unsigned>(condition_)),static_cast<unsigned>(records_));}
 std::uint64_t PooledImmutableOwnerOperands::captureIdentity()const{requireInputs(spans_,plan_.device,captured_);return combine(declarationIdentity(),prepared_->preparedIdentity());}
@@ -238,7 +242,7 @@ PooledImmutableCoordinatorOperands::PooledImmutableCoordinatorOperands(n::Coordi
     // remains independently sealed; no dummy operand is manufactured.
     if(!original.empty())prepared_.emplace(plan_.device,original);
 }
-void PooledImmutableCoordinatorOperands::declarations()const{requireDeclarations(spans_,schema_);}
+void PooledImmutableCoordinatorOperands::declarations()const{requireSpanDeclarations(spans_,schema_);}
 void PooledImmutableCoordinatorOperands::seal()
 {
     declarations();if(prepared_)prepared_->seal();requirePrepared(spans_,schema_,plan_.device);retainInputs(spans_,plan_.device,captured_);
@@ -246,10 +250,14 @@ void PooledImmutableCoordinatorOperands::seal()
         throw std::logic_error("Pooled original row range differs from its exact original count owner");
 }
 void PooledImmutableCoordinatorOperands::validateIfSealed()const{declarations();if(prepared_)prepared_->validateIfSealed();}
-void PooledImmutableCoordinatorOperands::require(n::CoordinatorAction action,const PooledImmutableCoordinatorNativePlan& plan)const
+void PooledImmutableCoordinatorOperands::requireDeclarations(n::CoordinatorAction action,const PooledImmutableCoordinatorNativePlan& plan)const
 {
     if(action!=action_ || plan.parameters().identity!=plan_.identity)throw std::invalid_argument("Pooled coordinator operands changed operation or geometry");
-    declarations();if(prepared_)prepared_->validate();requirePrepared(spans_,schema_,plan_.device);requireInputs(spans_,plan_.device,captured_);
+    validateIfSealed();
+}
+void PooledImmutableCoordinatorOperands::require(n::CoordinatorAction action,const PooledImmutableCoordinatorNativePlan& plan)const
+{
+    requireDeclarations(action,plan);if(prepared_)prepared_->validate();requirePrepared(spans_,schema_,plan_.device);requireInputs(spans_,plan_.device,captured_);
     if(action_==n::CoordinatorAction::Begin && rows_->rows.countOwner()!=address(spans_,PooledNativeOperand::OriginalCount))
         throw std::logic_error("Pooled original count owner changed after sealing");
 }

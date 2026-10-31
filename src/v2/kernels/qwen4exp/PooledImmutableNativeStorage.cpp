@@ -93,6 +93,17 @@ void PooledNativeRootStorage::require()const
         TransferEngine::instance().requireCapturedDeviceStorage(*captured_[i],*root,allocator_.device,bytes_[i]);
     }
 }
+void PooledNativeRootStorage::requireAuthority(const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const
+{
+    require();if(!memory || memory.get()!=memory_.get())
+        throw std::logic_error("Pooled physical roots cannot replace their original PMA");
+}
+ImmutableLookupNativeOwnerObservation PooledNativeRootStorage::retainedOwnerObservation()const
+{
+    require();
+    return {memory_,allocator_,claims_[0].valid()?claims_[0].bytes():0,
+        claims_[1].bytes()+claims_[2].bytes()};
+}
 std::uint64_t PooledNativeRootStorage::identity()const
 {
     require();std::uint64_t value=1469598103934665603ULL;
@@ -146,6 +157,8 @@ std::shared_ptr<PooledImmutableOwnerPreparedStorage> PooledImmutableOwnerPrepare
     return std::shared_ptr<PooledImmutableOwnerPreparedStorage>(new PooledImmutableOwnerPreparedStorage(std::move(plan),std::move(roots)));
 }
 PooledImmutableNativeRoots PooledImmutableOwnerPreparedStorage::roots()const{return roots_->roots();}
+void PooledImmutableOwnerPreparedStorage::requireAuthority(const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const{roots_->requireAuthority(memory);}
+ImmutableLookupNativeOwnerObservation PooledImmutableOwnerPreparedStorage::retainedOwnerObservation()const{return roots_->retainedOwnerObservation();}
 std::uint64_t PooledImmutableOwnerPreparedStorage::captureIdentity()const{return roots_->identity();}
 void PooledImmutableOwnerPreparedStorage::acquireSetup(void* stream)const{roots_->acquire(stream);}
 std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> PooledImmutableCoordinatorPreparedStorage::create(
@@ -156,6 +169,8 @@ std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> PooledImmutableCoordi
     return std::shared_ptr<PooledImmutableCoordinatorPreparedStorage>(new PooledImmutableCoordinatorPreparedStorage(std::move(plan),std::move(roots)));
 }
 PooledImmutableNativeRoots PooledImmutableCoordinatorPreparedStorage::roots()const{return roots_->roots();}
+void PooledImmutableCoordinatorPreparedStorage::requireAuthority(const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const{roots_->requireAuthority(memory);}
+ImmutableLookupNativeOwnerObservation PooledImmutableCoordinatorPreparedStorage::retainedOwnerObservation()const{return roots_->retainedOwnerObservation();}
 std::uint64_t PooledImmutableCoordinatorPreparedStorage::captureIdentity()const{return roots_->identity();}
 void PooledImmutableCoordinatorPreparedStorage::acquireSetup(void* stream)const{roots_->acquire(stream);}
 }

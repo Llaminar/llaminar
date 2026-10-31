@@ -3305,7 +3305,6 @@ namespace llaminar2
         size_t byte_size() const override { return element_count() * sizeof(int8_t); }
 
     private:
-        friend class AdaptiveImmutableLookupRootStorage;
         friend class qwen4exp::detail::PooledNativeRootStorage;
         /** @brief Private setup-only construction without a transient host mirror. */
         struct DeviceOnlyStorageTag final {};
@@ -3484,7 +3483,6 @@ namespace llaminar2
         size_t byte_size() const override { return element_count() * sizeof(int32_t); }
 
     private:
-        friend class AdaptiveImmutableLookupRootStorage;
         /** @brief Private setup-only construction without a transient host mirror. */
         struct DeviceOnlyStorageTag final {};
         /** @brief Source-owned PMA root factory alone supplies this checked GPU-only constructor. */

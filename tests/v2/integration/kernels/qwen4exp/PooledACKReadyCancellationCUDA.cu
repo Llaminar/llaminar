@@ -1,5 +1,5 @@
 /**
- * @file AdaptiveACKReadyCancellationCUDA.cu
+ * @file PooledACKReadyCancellationCUDA.cu
  * @brief CUDA-only setup graph editing with original Driver kernel identities.
  *
  * Driver identities match CUDAGraphCapture inspection; runtime host-stub addresses
@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <stdexcept>
-namespace llaminar2::test::adaptive_native::cuda_ack_cancel
+namespace llaminar2::test::pooled_ack::cuda_ack_cancel
 {
 /** @brief Preserve exact native error status during setup-only graph inspection/edit. */
 inline void check(cudaError_t status)
@@ -39,7 +39,7 @@ inline std::uintptr_t originalIdentity(const CUDA_KERNEL_NODE_PARAMS &params)
     return 0;
 #endif
 }
-} // namespace llaminar2::test::adaptive_native::cuda_ack_cancel
+} // namespace llaminar2::test::pooled_ack::cuda_ack_cancel
 #define ACK_CANCEL_NAMESPACE cuda_ack_cancel
 #define ACK_DEVICE_PREDICATE is_cuda
 #define ACK_CAPTURE CUDAGraphCapture
@@ -50,12 +50,12 @@ inline std::uintptr_t originalIdentity(const CUDA_KERNEL_NODE_PARAMS &params)
 #define ACK_CHECK(STATUS) check(STATUS)
 #define ACK_DEPENDENCIES(NODE, DEPS, COUNT) cudaGraphNodeGetDependencies(NODE, DEPS, nullptr, COUNT)
 #define ACK_ADD_DEPENDENCIES(GRAPH, FROM, TO, COUNT) cudaGraphAddDependencies(GRAPH, FROM, TO, nullptr, COUNT)
-#include "AdaptiveACKReadyCancellationNative.cuh"
-namespace llaminar2::test::adaptive_native
+#include "PooledACKReadyCancellationNative.cuh"
+namespace llaminar2::test::pooled_ack
 {
-void spliceCUDAAdaptiveACKReadyCancellation(IGPUGraphCapture &graph,
-                                           const qwen4exp::AdaptiveLookupDeviceArgs &expected, void *stream)
+void spliceCUDA(IGPUGraphCapture &graph,
+                                           const qwen4exp::pooled_source::DeviceArgs &expected, void *stream, AuthorizationReplay replay)
 {
-    cuda_ack_cancel::splice(graph, expected, stream);
+    cuda_ack_cancel::splice(graph, expected, stream, replay);
 }
-} // namespace llaminar2::test::adaptive_native
+} // namespace llaminar2::test::pooled_ack

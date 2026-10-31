@@ -14,9 +14,7 @@
 #include "ImmutableLookupService.h"
 #include "Qwen4ExpPreparedStorage.h"
 #include "execution/mtp/DeviceGenerationControlBinding.h"
-#include "kernels/qwen4exp/AdaptiveLookupPreparedStorage.h"
 #include "kernels/qwen4exp/PooledImmutableSourceKernels.h"
-#include "loaders/AdaptiveImmutableLookupRootStorage.h"
 #include "tensors/Tensors.h"
 #include <atomic>
 #include <memory>
@@ -41,28 +39,6 @@ public:
         DeviceId device,std::shared_ptr<TensorBase> protocol,std::size_t maximumTokenRows,
         std::shared_ptr<PhysicalMemoryAuthority> memory);
     /**
-     * @brief Retain a prepared protocol2 component in the existing storage
-     * interval authority.
-     * @param service Exact single-GPU subordinate service, already PMA
-     * materialized.
-     * @param plan Checked original source/policy/frame declaration.
-     * @param roots Actual model-owned root carrier retaining all original GPU PMA leases.
-     * @param setupStream Exact setup producer stream, outside graph capture.
-     * @return One boundary retained by the model/source owner across graph
-     * families and resets.
-     * @throws std::exception For foreign/unprepared roots, duplicate metadata
-     * initialization, unsupported native backend, or partial setup/publication
-     * failure.
-     * @note This factory neither allocates roots nor admits memory. The model
-     * owner must create it once and retain it; later graph builders borrow the
-     * same boundary. Once-only initialization is event-published without a
-     * success wait. The boundary retains that setup event through final teardown,
-     * so abandoned runner setup cannot free roots ahead of native metadata writes.
-     */
-    static std::shared_ptr<ImmutableLookupExecutionBoundary>
-    createAdaptive(std::shared_ptr<ImmutableLookupService> service, AdaptiveImmutableRowCacheNativePlan plan,
-                   std::shared_ptr<const AdaptiveImmutableLookupRootStorage> roots, void *setupStream);
-    /**
      * @brief Bind one real provider/channel to its existing pooled owner/coordinator roots and retained graph boundary.
      * @param service Actual already-admitted subordinate RAM/SSD source worker.
      * @param geometry Exact original source/accepted-owner/coordinator staging declaration.
@@ -85,49 +61,8 @@ public:
     const std::shared_ptr<PooledImmutableSourcePreparedStorage>& pooledStorage()const;
     /** @return Actual retained provider-native code bundle; no test source producer can substitute. */
     const IPooledImmutableSourceKernels& pooledKernels()const;
-    /** @return Whether the declared transport is the checked protocol2 native
-     * cache component. */
-    bool isAdaptive() const noexcept
-    {
-        return adaptive_.has_value();
-    }
-    /**
-     * @brief Bind the stage's actual canonical controller before captured
-     * terminal construction.
-     * @param control Original controller owner, not caller-provided
-     * health/completion addresses.
-     * @throws std::exception For another controller/request/device or
-     * conflicting prior binding.
-     */
-    void bindAdaptiveGenerationControl(DeviceGenerationControlBinding control);
-    /** @return The same original root aliases, each retaining their actual physical lease owner. */
-    AdaptiveImmutableLookupRoots adaptiveRoots() const;
-    /** @brief Register/validate original model roots as external canonical arena roles before capture.
-     * @param arena Actual participant arena, retained by the enclosing graph family.
-     * @throws std::exception For conflicts or capture-time registration before mutating roles.
-     */
-    void bindAdaptiveArena(BufferArena &arena) const;
-    /** @return Actual GPU root/lease owner, rejecting ordinary protocol storage. */
-    const std::shared_ptr<const AdaptiveImmutableLookupRootStorage> &rootStorage() const;
     /** @return Actual CPU provider plus mapped-channel leases after worker retirement. */
     HostImmutableRowOwnerObservation retainedSourceOwnerObservation() const;
-    /** @return Actual source-owned prepared storage, rejecting the ordinary
-     * protocol arm. */
-    const std::shared_ptr<AdaptiveLookupPreparedStorage> &adaptiveStorage() const;
-    /** @return Actual stateless native bundle, rejecting the ordinary protocol
-     * arm. */
-    const IImmutableAdaptiveLookupKernels &adaptiveKernels() const;
-    /**
-     * @brief Authenticate all original root aliases before graph binding or
-     * frontier acquisition.
-     * @param cache Original optional cache; must be absent at zero slots.
-     * @param frame Original complete work-frame root.
-     * @param protocol Original complete protocol root.
-     * @throws std::invalid_argument For copied, replaced, foreign or missing
-     * roots.
-     */
-    void requireAdaptiveRoots(const TensorBase *cache, const TensorBase *frame,
-                              const TensorBase *protocol) const;
     /** @brief Bind admitted state/generation storage and setup-created backend kernels.
      * @param service Exact lane owner retaining the immutable table and mapped backing.
      * @param device Exact alias address space and owning execution participant.
@@ -171,23 +106,6 @@ private:
     /** @brief Reject changed original tensor/native device/capacity/backend generation before any operation. */
     void requireProtocolOwner() const;
     std::shared_ptr<ImmutableLookupService> service_;
-    /** @brief One native component; no second interval, sequence, cache-state
-     * or memory ledger. */
-    struct Adaptive final
-    {
-        std::shared_ptr<const AdaptiveImmutableLookupRootStorage> roots;
-        std::shared_ptr<const PhysicalMemoryAuthority> authority;
-        std::shared_ptr<AdaptiveLookupPreparedStorage> storage;
-        std::unique_ptr<IImmutableAdaptiveLookupKernels> kernels;
-        std::optional<DeviceGenerationControlBinding> control;
-        // Declared last so setup retirement completes before roots or kernels
-        // release ownership, including setup abandoned before the first graph.
-        std::shared_ptr<ImmutableLookupSubmissionRetirement> setupRetirement;
-    };
-    /** @brief Only createAdaptive constructs this already-prepared transport
-     * alternative. */
-    ImmutableLookupExecutionBoundary(std::shared_ptr<ImmutableLookupService> service,
-                                     std::shared_ptr<TensorBase> protocol, Adaptive adaptive);
     /** @brief Source packet roots only; physical cache state remains with the original pooled owners. */
     struct Pooled final {
         std::shared_ptr<PooledImmutableSourcePreparedStorage> storage;
@@ -200,7 +118,6 @@ private:
         std::shared_ptr<TensorBase> protocol,Pooled pooled);
     DeviceId device_;
     std::optional<ImmutableLookupService::Binding> binding_;
-    std::optional<Adaptive> adaptive_;
     std::optional<Pooled> pooled_;
     std::unique_ptr<IImmutableLookupKernels> kernels_;
     std::shared_ptr<TensorBase> protocol_; ///< Sole retained physical protocol owner, never a second allocation.

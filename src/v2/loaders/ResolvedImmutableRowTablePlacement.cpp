@@ -5,7 +5,7 @@
  */
 #include "ResolvedImmutableRowTablePlacement.h"
 #include "CpuAdaptiveImmutableRowCache.h"
-#include "kernels/qwen4exp/AdaptiveImmutableRowCacheGeometry.h"
+#include "AdaptiveImmutableLookupGeometry.h"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -80,13 +80,11 @@ ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(Immutable
     policy.validate();
     const auto &e=g.extent();
     const ImmutableRowTableSource source{.rows=e.rows(),.row_elements=row_elements,.format=e.format()};
-    const auto gpu=qwen4exp::AdaptiveImmutableRowCacheGeometry::fromLayout(g,g.consumers().front(),source,
-        static_cast<std::size_t>(g.maximumInflightRows()/16),
-        {requested.gpu_policy.aging_accesses,requested.gpu_policy.protected_numerator,requested.gpu_policy.protected_denominator});
-    const auto host=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(g,g.sourceServices().front().allocator,
-        g.consumers().front(),requested.host.policy);
-    if(gpu.slots()>requested.maximum_gpu_cache_rows || gpu.cache().bytes>requested.gpu_cache_physical_byte_limit ||
-        host.slots()>requested.host.maximum_cache_rows || host.storageBytes()>requested.host.cache_physical_byte_limit)
+    const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(g,source,requested);
+    if(geometry.physical().owners().front().slots>requested.maximum_gpu_cache_rows ||
+        geometry.gpuSlotDependentBytes()>requested.gpu_cache_physical_byte_limit ||
+        geometry.host().slots()>requested.host.maximum_cache_rows ||
+        geometry.host().storageBytes()>requested.host.cache_physical_byte_limit)
         throw std::invalid_argument("GPU adaptive placement exceeds its original GPU/host slot or physical-byte ceiling");
 }
 ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry layout)

@@ -25,6 +25,13 @@ using namespace llaminar2;
 
 namespace
 {
+    /** @brief Check the actual borrowing expression, including a deleted rvalue overload. */
+    template<class Plan>
+    concept CanBorrowPlanResources = requires(Plan&& plan)
+    {
+        std::forward<Plan>(plan).resources();
+    };
+
     /** @brief Build one resource observation with small readable byte counts. */
     PhysicalMemoryResource resource(
         int rank,
@@ -39,6 +46,17 @@ namespace
             .admission_available_bytes = available,
         };
     }
+}
+
+/** @test The actual API accepts retained lvalues and rejects both mutable and const temporary plan borrows. */
+TEST(PhysicalMemoryAuthority, ResourceViewsRequireRetainedPlanLvalues)
+{
+    static_assert(CanBorrowPlanResources<PhysicalMemoryPlan&>);
+    static_assert(CanBorrowPlanResources<const PhysicalMemoryPlan&>);
+    static_assert(!CanBorrowPlanResources<PhysicalMemoryPlan>);
+    static_assert(!CanBorrowPlanResources<const PhysicalMemoryPlan>);
+    const auto retained=PhysicalMemoryPlanBuilder().build();
+    EXPECT_TRUE(retained.resources().empty());
 }
 
 TEST(PhysicalMemoryAuthority, CoalescesCpuAndGpuOwnersExactlyOnce)

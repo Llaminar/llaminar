@@ -58,10 +58,6 @@ target_link_libraries(v2_perf_q8_residual_prepared_projection PRIVATE llaminar2_
 if(HAVE_CUDA OR HAVE_ROCM)
     v2_test_device_scope(v2_perf_q8_residual_prepared_projection FullInventory)
 
-    add_executable(v2_perf_immutable_adaptive_lookup
-        "${_qfn_test_sources}/performance/kernels/qwen4exp/Measure__ImmutableAdaptiveLookup.cpp")
-    target_include_directories(v2_perf_immutable_adaptive_lookup PRIVATE "${_qfn_test_sources}")
-    target_link_libraries(v2_perf_immutable_adaptive_lookup PRIVATE llaminar2_core)
 endif()
 
 foreach(_qfn_backend IN ITEMS CUDA ROCm)

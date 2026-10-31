@@ -35,7 +35,7 @@ pooled_source::DeviceArgs IPooledImmutableSourceKernels::args(const PooledImmuta
     const auto own=storage.owner()->roots(),coord=storage.coordinator()->roots(),root=storage.roots();
     return {geometry().parameters(),{geometry().parameters().owner,address(own.cache),address(own.frame),address(own.native),{}},
         {geometry().parameters().coordinator,address(coord.cache),address(coord.frame),address(coord.native),{}},
-        address(root.frame),address(root.native),source().deviceView(),control?control->healthy():nullptr,control?control->error():nullptr};
+        address(root.frame),address(root.native),source().deviceView(),control?control->healthy():nullptr,control?control->error():nullptr,control?control->row():nullptr};
 }
 void IPooledImmutableSourceKernels::initialize(PooledImmutableSourcePreparedStorage& storage,void* stream)const{
     exact(stream);requireStorage(storage);
@@ -53,11 +53,11 @@ void IPooledImmutableSourceKernels::enqueue(PooledSourceAction action,PooledImmu
     exact(stream);requireStorage(storage);storage.roots_->requireInitialized();control.requireFor(geometry().allocator().device);
     const auto& plan=geometry().parameters();
     if(action!=PooledSourceAction::Plan && action!=PooledSourceAction::Publish && action!=PooledSourceAction::Acquire &&
-       action!=PooledSourceAction::Read && action!=PooledSourceAction::ReadersRetired)
+       action!=PooledSourceAction::Read && action!=PooledSourceAction::ReadersRetired && action!=PooledSourceAction::ObserveRetired && action!=PooledSourceAction::BeforeReady)
         throw std::invalid_argument("Unknown pooled source operation");
     const auto count=std::size_t{plan.coordinator.policy.maximumOriginal()}*plan.row_elements;
     if(count>std::numeric_limits<std::size_t>::max()/sizeof(float))throw std::overflow_error("Pooled source original output extent overflows");
-    if((action==PooledSourceAction::Read)?(!query.output || reinterpret_cast<std::uintptr_t>(query.output)%4 || query.elements!=count):
+    if((action==PooledSourceAction::Read)?(!query.output || reinterpret_cast<std::uintptr_t>(query.output)%4 || (!query.elements || query.elements>count || query.elements%plan.row_elements)):
         (query.output || query.elements))throw std::invalid_argument("Pooled source output belongs exactly to the actual original-order consumer");
     const auto controlBytes=control.owner()->size_bytes();const auto* controller=control.owner()->gpu_data_ptr();
     for(const auto roots:{storage.roots(),storage.owner()->roots(),storage.coordinator()->roots()})

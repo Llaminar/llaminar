@@ -4,8 +4,9 @@
  *
  * A model declares these phases and explicit collective/source boundaries. This
  * stage retains the original storage, code and producer roots, and performs no
- * rank coordination or source I/O. Every physical address is sealed before the
- * stage enters a graph, so its cache identity is complete even before capture.
+ * rank coordination or source I/O. Ordinary activation producers are declarations
+ * until the executor materializes their storage. Capture-only preparation seals
+ * every original address and allocator lease; later identity queries reject drift.
  */
 #pragma once
 #include "execution/compute_stages/IComputeStage.h"
@@ -35,24 +36,26 @@ public:
     };
     using Phase=std::variant<Owner,Coordinator>;
     /**
-     * @brief Retain the original bound arena and seal every already-prepared input before graph insertion.
+     * @brief Retain exact original producer declarations before ordinary arena materialization.
      * @param arena Original arena that retains all canonical roles through graph retirement.
      * @param code Backend code only, with no device discovery or mutable execution state.
      * @param phase Actual typed owner/coordinator operation and its exact producer inputs.
-     * @throws std::exception On absent roots, wrong roles, backend mismatch or unprepared input addresses.
+     * @throws std::exception On absent roots, wrong roles, invalid extents or backend mismatch.
      */
     PooledImmutableNativePhaseStage(BufferArena& arena,std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,Phase phase);
-    /** @brief Join only the original setup event on the exact capture stream and revalidate immutable seals. */
+    /** @brief Seal ordinary prepared inputs, retain their original allocation leases and join exact setup events. */
     bool prepareGraphLaunch(IDeviceContext* context,void* stream)override;
     /** @brief Record the checked phase and publish original mutable roots on the executor's exact stream. */
     bool execute(IDeviceContext* context)override;
     /** @return Setup event joins occur once for each retained capture, never each replay. */
     GraphLaunchPreparationPolicy graphLaunchPreparationPolicy()const override{return GraphLaunchPreparationPolicy::CaptureOnly;}
-    /** @return Every original pointer/runtime/geometry/action/code/input and arena role in one complete identity. */
+    /** @return Stable declaration identity; installed physical seals reject pointer/runtime drift on every query. */
     std::uint64_t graphCaptureVariantSignature()const override;
     /** @return Stable semantic native-phase type; this does not advertise a serving policy. */
     ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_POOLED_NATIVE_PHASE;}
     /** @return Only its exact explicit GPU backend can execute this stage. */
+    /** @return Original counted Begin and all subsequent actual-live native phases support partial/empty replay. */
+    bool supportsPaddedPrefillRealLengthContract()const override{return true;}
     bool supportsBackend(ComputeBackendType backend)const override;
     /** @return All roots were already declared/materialized; no hidden workspace is requested. */
     StageBufferRequirements getBufferRequirements()const override{return {};}
@@ -65,8 +68,10 @@ private:
     qwen4exp::PooledImmutableNativeRoots roots()const;
     /** @return Actual immutable producer spans for this nominal operation. */
     const qwen4exp::PooledNativeOperandSpans& inputs()const;
-    /** @brief Reject any role/address/type/runtime/code/root drift before capture or launch. */
-    void requireBindings()const;
+    /** @brief Validate original role/type/extent ownership and any installed immutable physical seal. */
+    void requireDeclarations()const;
+    /** @brief Require every native input seal and original allocator lease before capture or enqueue. */
+    void requirePreparedBindings()const;
     BufferArena* arena_;
     std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code_;
     Phase phase_;

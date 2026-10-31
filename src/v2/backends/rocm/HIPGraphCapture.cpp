@@ -722,6 +722,13 @@ namespace llaminar2
                     hipFuncAttributes attributes{};
                     if (!resolveHIPGraphKernel(params.func, node_path, function, attributes, error))
                         return false;
+                    // Empty HIP kernels can use zero VGPRs. Preserve that
+                    // observation while rejecting malformed signed metadata.
+                    if (attributes.numRegs < 0)
+                    {
+                        error = "HIP kernel node has a negative register count at " + node_path;
+                        return false;
+                    }
                     const auto *module = std::get_if<HIPModuleKernel>(&function);
                     const char *runtime_name = module != nullptr
                         ? hipKernelNameRef(module->function)
@@ -773,7 +780,7 @@ namespace llaminar2
                         .static_shared_memory_bytes = attributes.sharedSizeBytes,
                         .local_memory_bytes_per_thread = attributes.localSizeBytes,
                         .registers_per_thread = static_cast<uint32_t>(
-                            std::max(0, attributes.numRegs)),
+                            attributes.numRegs),
                         .max_threads_per_block = static_cast<uint32_t>(
                             std::max(0, attributes.maxThreadsPerBlock)),
                         .max_active_blocks_per_sm = static_cast<uint32_t>(

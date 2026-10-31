@@ -14,6 +14,8 @@
 #include "transfer/TransferEngine.h"
 #include "AdaptiveImmutableLookupGeometry.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableNativeKernels.h"
 #include <array>
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../utils/Logger.h"
@@ -250,7 +252,7 @@ namespace llaminar2
         {
             // Source authentication is an owner readiness operation, never an
             // empty gather or a CPU readback of warmed GPU cache state.
-            ready->rootStorage()->requireFor(geometry.gpu().nativePlan(),authority);
+            ready->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),source,authority);
             const auto observed=ready->retainedSourceOwnerObservation();
             if(observed.authority().get()!=authority.get() || observed.allocator()!=host ||
                 observed.hostPlacement()!=placement.hostPlacement())
@@ -264,10 +266,28 @@ namespace llaminar2
             // sticky; an in-flight partial source is never replaced or retried.
             auto provider=HostImmutableRowProvider::fromSubordinateAdaptiveCache(
                 CpuAdaptiveImmutableRowCache::create(source,geometry.host(),authority));
-            auto service=qwen4exp::ImmutableLookupService::create(provider,geometry.gpu().channelLayout(),
+            auto service=qwen4exp::ImmutableLookupService::create(provider,geometry.channelLayout(),
                 std::array{consumer},authority,host.device);
-            auto roots=AdaptiveImmutableLookupRootStorage::create(geometry.gpu().nativePlan(),authority,setup->stream);
-            auto boundary=qwen4exp::ImmutableLookupExecutionBoundary::createAdaptive(service,geometry.gpu().nativePlan(),roots,setup->stream);
+            const auto binding=service->bindSubordinate(consumer);
+            const auto table=binding.deviceView().base.table,generation=binding.storageGeneration();
+            const auto ownerPlan=qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(
+                geometry.physical(),geometry.coordinator(),0,table,generation);
+            const auto policyPlan=qwen4exp::PooledImmutableCoordinatorNativePlan::fromGeometry(
+                geometry.physical(),geometry.coordinator(),table,generation);
+            auto owner=qwen4exp::PooledImmutableOwnerPreparedStorage::create(ownerPlan,authority,setup->stream);
+            auto coordinator=qwen4exp::PooledImmutableCoordinatorPreparedStorage::create(policyPlan,authority,setup->stream);
+            std::unique_ptr<qwen4exp::IPooledImmutableNativeKernels> code;
+#ifdef HAVE_CUDA
+            if(consumer.is_cuda())code=qwen4exp::createCUDAPooledImmutableNativeKernels();
+#endif
+#ifdef HAVE_ROCM
+            if(consumer.is_rocm())code=qwen4exp::createROCmPooledImmutableNativeKernels();
+#endif
+            if(!code)throw std::invalid_argument("Adaptive split lookup requires its compiled original native backend");
+            code->initialize(*owner,setup->stream);code->initialize(*coordinator,setup->stream);
+            const auto packets=qwen4exp::PooledImmutableSourceGeometry::fromPlans(ownerPlan,policyPlan,source);
+            auto boundary=qwen4exp::ImmutableLookupExecutionBoundary::createPooled(
+                service,packets,std::move(owner),std::move(coordinator),authority,setup->stream);
             const auto actual=provider->identity();
             {
                 std::lock_guard lock(immutable_row_table_mutex_);
@@ -458,7 +478,7 @@ namespace llaminar2
                 throw std::logic_error("Ready adaptive model has no sole GPU/subordinate source boundary");
             lock.unlock();
             const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(placement.gpuAdaptiveLayout(),*source,placement.gpuAdaptiveRequest());
-            boundary->rootStorage()->requireFor(geometry.gpu().nativePlan(),authority);
+            boundary->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),*source,authority);
             const auto host=boundary->retainedSourceOwnerObservation();
             if(host.authority().get()!=authority.get() || host.allocator()!=placement.gpuAdaptiveLayout().sourceServices().front().allocator ||
                 host.hostPlacement()!=placement.hostPlacement())

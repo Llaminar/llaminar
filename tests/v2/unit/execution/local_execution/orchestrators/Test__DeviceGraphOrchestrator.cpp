@@ -21,6 +21,7 @@
 #include "../../../../utils/CPUOrchestratorTestAdmission.h"
 #include "../../../../utils/CPUPreparedStoreTestAdmission.h"
 #include <gtest/gtest.h>
+#include <type_traits>
 #include "backends/BackendManager.h"
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
@@ -2319,29 +2320,31 @@ TEST_F(Test__DeviceGraphOrchestrator, InvalidateGraphCacheOutOfBounds)
     EXPECT_NO_THROW(orchestrator->invalidateGraphCache(-2));
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, MoveConstruction)
+TEST_F(Test__DeviceGraphOrchestrator, UniqueOwnerRelocationKeepsObjectAddress)
 {
-    auto orchestrator1 = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
-    orchestrator1->initializeGraphCache(24);
-
-    // Move construct
-    auto orchestrator2 = std::move(orchestrator1);
-
-    EXPECT_NE(orchestrator2, nullptr);
-    EXPECT_EQ(std::as_const(*orchestrator2).graphBuilder(), graph_builder_.get());
+    auto original_owner = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    original_owner->initializeGraphCache(24);
+    const auto *const original_address = original_owner.get();
+    auto constructed_owner = std::move(original_owner);
+    EXPECT_EQ(original_owner, nullptr);
+    EXPECT_EQ(constructed_owner.get(), original_address);
+    EXPECT_EQ(std::as_const(*constructed_owner).graphBuilder(), graph_builder_.get());
+    std::unique_ptr<DeviceGraphOrchestrator> assigned_owner;
+    assigned_owner = std::move(constructed_owner);
+    EXPECT_EQ(constructed_owner, nullptr);
+    EXPECT_EQ(assigned_owner.get(), original_address);
+    EXPECT_EQ(std::as_const(*assigned_owner).graphBuilder(), graph_builder_.get());
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, MoveAssignment)
+TEST_F(Test__DeviceGraphOrchestrator, FixedAddressOwnerCannotMoveObjects)
 {
-    auto orchestrator1 = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
-    orchestrator1->initializeGraphCache(24);
-
-    auto orchestrator2 = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
-
-    // Move assign
-    *orchestrator2 = std::move(*orchestrator1);
-
-    EXPECT_EQ(std::as_const(*orchestrator2).graphBuilder(), graph_builder_.get());
+    static_assert(!std::is_copy_constructible_v<DeviceGraphOrchestrator>);
+    static_assert(!std::is_copy_assignable_v<DeviceGraphOrchestrator>);
+    static_assert(!std::is_move_constructible_v<DeviceGraphOrchestrator>);
+    static_assert(!std::is_move_assignable_v<DeviceGraphOrchestrator>);
+    static_assert(std::is_nothrow_move_constructible_v<std::unique_ptr<DeviceGraphOrchestrator>>);
+    static_assert(std::is_nothrow_move_assignable_v<std::unique_ptr<DeviceGraphOrchestrator>>);
+    SUCCEED();
 }
 
 // =============================================================================
@@ -3913,12 +3916,11 @@ TEST_F(
     EXPECT_EQ(destructor_body.find("synchronize("), std::string::npos);
     EXPECT_EQ(destructor_body.find("synchronizeStream("), std::string::npos);
 
-    const auto move_constructor_pos =
+    const auto next_method_pos =
         source.find(
-            "DeviceGraphOrchestrator::DeviceGraphOrchestrator("
-            "DeviceGraphOrchestrator &&)",
+            "void DeviceGraphOrchestrator::setForwardGraphExecutionRendezvous(",
             topology_destruction_pos);
-    ASSERT_NE(move_constructor_pos, std::string::npos);
+    ASSERT_NE(next_method_pos, std::string::npos);
     const std::string retirement_body =
         source.substr(
             retirement_pos,
@@ -3935,7 +3937,7 @@ TEST_F(
     const std::string topology_destruction_body =
         source.substr(
             topology_destruction_pos,
-            move_constructor_pos - topology_destruction_pos);
+            next_method_pos - topology_destruction_pos);
     const auto parent_release = topology_destruction_body.find(
         "releaseRetainedStorageGenerationTopology();");
     const auto forward_release = topology_destruction_body.find(

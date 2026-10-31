@@ -844,11 +844,13 @@ namespace llaminar2
 
         ~DeviceGraphOrchestrator();
 
-        // Non-copyable, movable
+        /** @brief Fixed-address executor/arena/capture owner; relocate only its unique_ptr. */
         DeviceGraphOrchestrator(const DeviceGraphOrchestrator &) = delete;
         DeviceGraphOrchestrator &operator=(const DeviceGraphOrchestrator &) = delete;
-        DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) noexcept;
-        DeviceGraphOrchestrator &operator=(DeviceGraphOrchestrator &&) noexcept;
+        /** @brief Moving the object would invalidate its engine's executor reference and captured owner addresses. */
+        DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) = delete;
+        /** @brief Replacement must run full destructor retirement; memberwise owner assignment is forbidden. */
+        DeviceGraphOrchestrator &operator=(DeviceGraphOrchestrator &&) = delete;
 
         /**
          * @brief Arm or clear a one-shot pre-execution rendezvous for the next forward.

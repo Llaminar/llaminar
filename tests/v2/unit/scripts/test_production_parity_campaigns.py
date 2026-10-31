@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from test_source_admission_discovery import discovery_session_arguments
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -3222,6 +3223,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_Fake",
                     "-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm;NCCL;RCCL",
                     "-DMPI_PROCS=1",
@@ -3361,7 +3363,7 @@ time.sleep(30)
                     binary.write_text("#!/bin/sh\n" + script + "\n")
                     binary.chmod(0o755)
                     result = subprocess.run(["cmake", f"-DTEST_EXECUTABLE={binary}",
-                        f"-DCTEST_FILE={output}", "-P", str(discovery)],
+                        f"-DCTEST_FILE={output}", *discovery_session_arguments(root), "-P", str(discovery)],
                         capture_output=True, text=True, check=False)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(output.exists())
@@ -3393,6 +3395,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_FakeNodeTP",
                     "-DLABELS=V2;Integration;Parity;CPU;MPI",
                     "-DMPI_PROCS=2",
@@ -3463,6 +3466,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_FocusedMPI",
                     "-DLABELS=V2;Integration;Parity;CPU;ROCm;MPI",
                     "-DMPI_PROCS=1",
@@ -3534,6 +3538,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_FakePolicy",
                     "-DLABELS=V2;Integration;Parity;CPU;Static;Dynamic;LLEP",
                     "-DMPI_PROCS=1",
@@ -3618,6 +3623,7 @@ time.sleep(30)
                     "cmake",
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
+                    *discovery_session_arguments(directory),
                     "-DTEST_PREFIX=V2_Integration_Parity_FakeOverlay",
                     "-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm;MPI",
                     "-DMPI_PROCS=2",

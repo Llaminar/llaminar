@@ -11,8 +11,8 @@
  * writers. Exact-ticket I/O abort accounting occurs after the actual worker
  * joins so publication racing its retirement cannot disappear from the ledger.
  */
-#include "kernels/qwen4exp/AdaptiveLookupPreparedStorage.h"
 #include "ImmutableLookupService.h"
+#include "../local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <algorithm>
@@ -391,40 +391,6 @@ ImmutableSubordinateLookupBinding ImmutableLookupService::bindSubordinate(Device
          reinterpret_cast<ImmutableRowSubordinateIntent *>(base + l.intentsOffset()),
          reinterpret_cast<ImmutableRowInvalidationAcknowledgement *>(base + l.invalidationsOffset())});
 }
-std::shared_ptr<AdaptiveLookupPreparedStorage> ImmutableSubordinateLookupBinding::declareStorage(
-    const AdaptiveImmutableRowCacheNativePlan &plan, std::shared_ptr<TensorBase> cache,
-    std::shared_ptr<TensorBase> frame, std::shared_ptr<TensorBase> protocol) const
-{
-    requireFor(plan.parameters());
-    return owner_->declareAdaptiveStorage(*this, plan, std::move(cache), std::move(frame),
-                                          std::move(protocol));
-}
-std::shared_ptr<AdaptiveLookupPreparedStorage> ImmutableLookupService::declareAdaptiveStorage(
-    const ImmutableSubordinateLookupBinding &binding, const AdaptiveImmutableRowCacheNativePlan &plan,
-    std::shared_ptr<TensorBase> cache, std::shared_ptr<TensorBase> frame,
-    std::shared_ptr<TensorBase> protocol)
-{
-    if (isGraphCaptureActive())
-        throw std::logic_error("Adaptive storage owner must be declared before capture");
-    binding.requireFor(plan.parameters());
-    requireHealthy();
-    // This mutex serializes declarations only; no file operation, native upload,
-    // physical claim or live GPU state is performed while holding it.
-    std::lock_guard lock(adaptive_setup_);
-    if(pooled_storage_)throw std::invalid_argument("Original source channel already belongs to the pooled source arm");
-    if (adaptive_storage_)
-    {
-        if (adaptive_storage_->plan_ != plan || adaptive_storage_->cache_ != cache ||
-            adaptive_storage_->frame_ != frame || adaptive_storage_->protocol_ != protocol)
-            throw std::invalid_argument(
-                "Adaptive source channel cannot replace its original storage/plan owner");
-        adaptive_storage_->declarations();
-        return adaptive_storage_;
-    }
-    adaptive_storage_ = std::shared_ptr<AdaptiveLookupPreparedStorage>(
-        new AdaptiveLookupPreparedStorage(plan, std::move(cache), std::move(frame), std::move(protocol)));
-    return adaptive_storage_;
-}
 const ImmutableRowTableSource& ImmutableSubordinateLookupBinding::source()const{
     if(!owner_)throw std::logic_error("Subordinate source binding has lost its original service");
     return owner_->table_->source();
@@ -468,8 +434,7 @@ std::shared_ptr<PooledImmutableSourcePreparedStorage> ImmutableLookupService::de
     table_->authenticateSource();
     // Cold declaration is serialized once. No model state or host policy shadow
     // is consulted; failure never publishes partial roots into this service.
-    std::lock_guard lock(adaptive_setup_);
-    if(adaptive_storage_)throw std::invalid_argument("Original source channel already belongs to the single-GPU adaptive arm");
+    std::lock_guard lock(pooled_setup_);
     if(pooled_storage_){
         if(pooled_storage_->geometry().parameters().identity!=geometry.parameters().identity || pooled_storage_->owner()!=owner || pooled_storage_->coordinator()!=coordinator)
             throw std::invalid_argument("Pooled source cannot replace its original native source/accepted-owner/coordinator registration");
@@ -477,53 +442,6 @@ std::shared_ptr<PooledImmutableSourcePreparedStorage> ImmutableLookupService::de
     }
     auto storage=PooledImmutableSourcePreparedStorage::materialize(geometry,std::move(owner),std::move(coordinator),std::move(memory),stream);
     pooled_storage_=std::move(storage);return pooled_storage_;
-}
-void ImmutableSubordinateLookupBinding::requireFor(const AdaptiveNativeParameters &p) const
-{
-    if (!owner_ || p.device != device_ || !owner_->backing_->layout.subordinate() ||
-        !owner_->backing_->mapped->hasDevice(device_))
-        throw std::invalid_argument("Adaptive native source has changed channel/device ownership");
-    // Identity authentication must remain usable for terminal cleanup of a
-    // failed source lane. The enclosing launch boundary owns requireHealthy();
-    // native sticky failure still prevents a failed component from doing work.
-    const auto requester = owner_->table_->subordinateRequester();
-    const auto &source = owner_->table_->source();
-    if (!requester || requester->device != device_ || requester->world_rank != p.world_rank ||
-        source.rows != p.source_rows || source.row_elements != static_cast<std::uint64_t>(p.row_elements) ||
-        ggufToTensorType(source.format) != p.format || source.rowBytes() != p.row_bytes ||
-        owner_->backing_->tableId != view_.base.table ||
-        owner_->backing_->layout.maximumIds() != p.maximum_ids || view_.base.maximumIds != p.maximum_ids ||
-        view_.base.rowBytes != p.row_bytes)
-        throw std::invalid_argument("Adaptive native source/layout differs from its checked declaration");
-    auto *base = static_cast<std::byte *>(owner_->backing_->mapped->deviceAlias(device_));
-    const auto &l = owner_->backing_->layout;
-    if (view_.base.request != reinterpret_cast<ImmutableLookupRequest *>(base + l.requestOffset()) ||
-        view_.base.completion != reinterpret_cast<ImmutableLookupCompletion *>(base + l.completionOffset()) ||
-        view_.base.acknowledgement !=
-            reinterpret_cast<ImmutableLookupAcknowledgement *>(base + l.acknowledgementOffset()) ||
-        view_.base.ids != reinterpret_cast<std::int64_t *>(base + l.idsOffset()) ||
-        view_.base.nativeRows != base + l.payloadOffset() ||
-        view_.intents != reinterpret_cast<ImmutableRowSubordinateIntent *>(base + l.intentsOffset()) ||
-        view_.acknowledgements !=
-            reinterpret_cast<ImmutableRowInvalidationAcknowledgement *>(base + l.invalidationsOffset()))
-        throw std::invalid_argument("Adaptive native mapped aliases changed after binding");
-}
-void ImmutableSubordinateLookupBinding::requirePreparedStorage(const AdaptiveImmutableRowCacheNativePlan &plan)const
-{
-    requireFor(plan.parameters());
-    std::shared_ptr<AdaptiveLookupPreparedStorage> storage;
-    {std::lock_guard lock(owner_->adaptive_setup_);storage=owner_->adaptive_storage_;}
-    if(!storage)throw std::logic_error("Adaptive native factory requires its original prepared source owner");
-    storage->requireFor(plan);
-}
-void ImmutableSubordinateLookupBinding::requireStorage(const AdaptiveLookupPreparedStorage &storage) const
-{
-    if (!owner_)
-        throw std::invalid_argument("Adaptive storage binding has no source service");
-    std::lock_guard lock(owner_->adaptive_setup_);
-    if (owner_->adaptive_storage_.get() != &storage)
-        throw std::invalid_argument(
-            "Adaptive cache/frame/protocol belong to another original source service");
 }
 std::uint64_t ImmutableSubordinateLookupBinding::captureIdentity() const noexcept
 {

@@ -8,6 +8,7 @@
  * Source-success and failure cleanup branches are fixed captured nodes.
  */
 #pragma once
+#include <optional>
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableSourcePhaseStage.h"
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -25,6 +26,7 @@ struct PooledImmutableLookupGraphEndpoints {std::string first,last;};
  * @param control Same canonical request controller borrowed by every source branch.
  * @param output Exact prepared original-order FP32 output span.
  * @param identity Unique stable node prefix; no execution policy is selected by strings.
+ * @param outputIdentity Optional canonical model snapshot node name for the actual native reader.
  * @return Actual first/last graph nodes for explicit external producer/consumer dependencies.
  * @throws std::exception For missing directed topology, foreign roots or capture-time construction.
  */
@@ -32,5 +34,23 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
     std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary,
     std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,qwen4exp::pooled_native::OriginalRows original,
     qwen4exp::PooledNativeOperandSpans begin,DeviceGenerationControlBinding control,
-    qwen4exp::PooledNativeTensorSpan output,const std::string& identity);
+    qwen4exp::PooledNativeTensorSpan output,const std::string& identity,const std::string& outputIdentity={});
+/**
+ * @brief Append the actual PLE hash-ID lookup using the original sixteen-head token count authority.
+ * @param graph Existing participant-local graph. @param arena Original bound model arena.
+ * @param boundary Original real-provider split source domain. @param code Exact native backend bundle.
+ * @param tokens Original complete token-query descriptor, including counted M1/empty replay.
+ * @param ids Original packed INT64 hash IDs, without narrowing or a converted shadow buffer.
+ * @param count Original token-count arena subview, present exactly for counted queries.
+ * @param control Canonical device generation controller. @param output Actual FP32 embedding span.
+ * @param identity Stable local protocol node prefix. @param outputIdentity Actual model snapshot node name.
+ * @return Complete captured transaction endpoints, with no host count read or new count scalar.
+ */
+PooledImmutableLookupGraphEndpoints appendPooledImmutablePLELookupGraph(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary,
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,DeviceRowRange tokens,
+    qwen4exp::PooledNativeTensorSpan ids,std::optional<qwen4exp::PooledNativeTensorSpan> count,
+    DeviceGenerationControlBinding control,qwen4exp::PooledNativeTensorSpan output,
+    const std::string& identity,const std::string& outputIdentity);
+
 }

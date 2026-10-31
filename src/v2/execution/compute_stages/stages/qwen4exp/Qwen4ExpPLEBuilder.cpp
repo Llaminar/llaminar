@@ -11,6 +11,7 @@
 #include "Qwen4ExpPLEBuilder.h"
 #include "../GEMMStage.h"
 #include "../NativeAllGatherStage.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "../../../local_execution/graph/ComputeGraph.h"
 #include <array>
 #include <cmath>
@@ -97,10 +98,43 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
         keyNorm=c.prefix+"key_norm",queryNorm=c.prefix+"query_norm",gate=c.prefix+"gate",
         convNorm=c.prefix+"conv_norm",convolution=c.prefix+"convolution";
     std::vector<Pending> nodes;
+    std::optional<ComputeGraph> pooledGraph;
+    std::string lookupTerminal=gather;
     nodes.push_back({hash,std::make_unique<Stage>(Stage::Params{
         .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
         .operation=Stage::NgramHash{b.tokens,b.priorTokens,b.ids,c.hash}}),dependencies});
-    if(auto *fixed=std::get_if<Qwen4ExpFixedHeadLookupStorage>(&storage))
+    if(auto* pooled=std::get_if<Qwen4ExpPooledLookupStorage>(&storage))
+    {
+        require(pooled->arena && pooled->boundary && pooled->boundary->isPooled() && pooled->code &&
+            pooled->boundary->device()==c.device,"PLE split lookup lost its original model-owned source domain");
+        const auto& declared=pooled->boundary->pooledStorage()->geometry().parameters();
+        require(declared.format==c.nativeFormat && declared.row_elements==static_cast<std::uint32_t>(c.nativeRowElements) &&
+            declared.owner.row_bytes==c.nativeRowBytes,"PLE split lookup differs from original source precision");
+        const auto* native=c.rows.liveRows?std::get_if<Qwen4ExpNativeIntInput>(&c.rows.liveRows->value):nullptr;
+        require(!c.rows.liveRows || (native && native->owner==c.device && native->capacity==1 && native->data),
+            "PLE split lookup requires the original complete native token-count producer");
+        const auto original=native?DeviceRowRange::deviceCounted(c.rows.capacity,native->data):DeviceRowRange::fullyActive(c.rows.capacity);
+        require(original.captureIdentity()==pooled->originalRows.captureIdentity() &&
+            bool(pooled->count)==bool(original.countOwner()),"PLE split original query/count authority changed");
+        const auto expanded=original.repeatEachRow(16);
+        const auto ids=pooled->arena->getSharedTensor(b.ids.buffer),output=pooled->arena->getSharedTensor(b.embedding.buffer);
+        require(ids && output && ids.get()==b.ids.tensor && output.get()==b.embedding.tensor,
+            "PLE split lookup requires original arena-owned hash and embedding roots");
+        std::optional<qwen4exp::PooledNativeTensorSpan> countSpan;
+        if(pooled->count){
+            const auto count=pooled->arena->getSharedTensor(pooled->count->buffer);
+            require(count && count.get()==pooled->count->tensor,"PLE split original count lost its original arena root");
+            countSpan=qwen4exp::PooledNativeTensorSpan{count,pooled->count->buffer,pooled->count->byteOffset,sizeof(std::int32_t)};
+        }
+        pooledGraph.emplace();
+        const auto edge=appendPooledImmutablePLELookupGraph(*pooledGraph,*pooled->arena,pooled->boundary,pooled->code,
+            original,{ids,b.ids.buffer,b.ids.byteOffset,std::size_t{expanded.physicalRows()}*sizeof(std::uint64_t)},
+            std::move(countSpan),pooled->control,
+            {output,b.embedding.buffer,b.embedding.byteOffset,std::size_t{expanded.physicalRows()}*c.nativeRowElements*sizeof(float)},
+            c.prefix+"pooled",gather);
+        lookupTerminal=edge.last;
+    }
+    else if(auto *fixed=std::get_if<Qwen4ExpFixedHeadLookupStorage>(&storage))
     {
         const auto *native=c.rows.liveRows?std::get_if<Qwen4ExpNativeIntInput>(&c.rows.liveRows->value):nullptr;
         require(!c.rows.liveRows || (native && native->owner==c.device && native->capacity==1 && native->data),
@@ -152,8 +186,8 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
             .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,.ids=b.ids,.output=b.embedding,
             .format=c.nativeFormat,.rowElements=c.nativeRowElements,.rowBytes=c.nativeRowBytes,
             .storage=std::get<ImmutableLookupStage::Storage>(storage)}),{hash}});
-    nodes.push_back({key,project(c,w.key,b.embedding,b.key,4*c.hidden),{gather}});
-    nodes.push_back({value,project(c,w.value,b.embedding,b.value,c.hidden),{gather}});
+    nodes.push_back({key,project(c,w.key,b.embedding,b.key,4*c.hidden),{lookupTerminal}});
+    nodes.push_back({value,project(c,w.value,b.embedding,b.value,c.hidden),{lookupTerminal}});
     nodes.push_back({keyNorm,norm(c,b.key,w.keyNorm,b.key),{key}});
     nodes.push_back({queryNorm,norm(c,b.trunk,w.queryNorm,b.query),dependencies});
     nodes.push_back({gate,std::make_unique<Stage>(Stage::Params{
@@ -168,11 +202,15 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
         require(!graph.getNode(nodes[i].name),"PLE node name collides with an existing producer");
         for(const auto &edge:nodes[i].dependencies)
         {
-            bool exists=graph.getNode(edge)!=nullptr;
+            bool exists=graph.getNode(edge)!=nullptr || (pooledGraph && pooledGraph->getNode(edge));
             for(std::size_t j=0;j<i;++j) exists=exists || nodes[j].name==edge;
             require(exists,"PLE graph dependency is absent or points to a later node");
         }
     }
+    if(pooledGraph)
+        for(const auto& name:pooledGraph->getExecutionOrder())
+            require(!graph.getNode(name),"PLE pooled node name collides with an existing producer");
+    if(pooledGraph)graph.setRetainedStorageBoundary(pooledGraph->retainedStorageBoundary());
     if(auto *whole=std::get_if<ImmutableLookupStage::Storage>(&storage))
         if(auto *gpu=std::get_if<ImmutableLookupStage::GPUStorage>(whole))
             graph.setRetainedStorageBoundary(gpu->boundary);
@@ -180,6 +218,7 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
     {
         graph.addNode(node.name,std::move(node.stage),c.device);
         for(const auto &edge:node.dependencies) graph.addDependency(node.name,edge);
+        if(pooledGraph && node.name==hash){graph.merge(std::move(*pooledGraph),hash);pooledGraph.reset();}
     }
     return convolution;
 }

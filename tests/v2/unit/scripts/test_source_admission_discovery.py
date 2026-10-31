@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_source_admission_discovery.py
+#  @brief Actual parity discovery preserves source identities and original MPI ownership without models.
 """Exercise setup-only source admission through the real CMake discovery path.
 
 An executable emits only GTest inventory text; it never loads models, initializes
@@ -7,7 +9,10 @@ source closure, participant backends, MPI world and integration serialization,
 while keeping numerical campaigns and their reference obligations separate.
 """
 import argparse
+import importlib.util
 import json
+import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +22,26 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parents[4]
 DISCOVERY = SOURCE / "tests/v2/cmake/V2ParityTestDiscovery.cmake"
+
+
+OWNER_SPEC = importlib.util.spec_from_file_location("source_discovery_mpi_owner",
+    SOURCE / "tests/v2/integration/scripts/test_mpi_ctest_session_isolation.py")
+assert OWNER_SPEC and OWNER_SPEC.loader
+OWNER = importlib.util.module_from_spec(OWNER_SPEC)
+OWNER_SPEC.loader.exec_module(OWNER)
+
+
+def discovery_session_arguments(build_root: Path) -> list[str]:
+    """Copy the real installed owner into this disposable metadata build, without executing it."""
+    helper = Path(os.environ.get("LLAMINAR_TEST_MPI_SESSION_HELPER", ""))
+    if not helper.is_file() or helper.name != "llaminar_mpi_session":
+        raise AssertionError("Discovery fixture requires the actual build-owned MPI session helper")
+    build_root.mkdir(parents=True, exist_ok=True)
+    owned_helper = build_root / "llaminar_mpi_session"
+    if owned_helper.resolve() != helper.resolve():
+        shutil.copy2(helper, owned_helper)
+    return [f"-DMPI_SESSION_HELPER={owned_helper}",
+            f"-DMPI_SESSION_ROOT={build_root / 'mpi-sessions' / 'parity'}"]
 
 
 class SourceAdmissionDiscovery(unittest.TestCase):
@@ -29,14 +54,15 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                  mtp_source_kind: str = "", predictor_files: tuple[str, ...] = (),
                  timeout: str | None = "30", source_timeout: str | None = None):
         """Run canonical discovery and parse the resulting real CTest properties."""
-        with tempfile.TemporaryDirectory(prefix="llaminar-source-admission-") as directory:
+        with tempfile.TemporaryDirectory(prefix="llaminar source admission ") as directory:
             root = Path(directory)
             executable = root / "v2_integration_parity_admission_contract_matrix"
             executable.write_text(f"#!{sys.executable}\nprint({listing!r})\n")
             executable.chmod(0o755)
             generated = root / "discovered.cmake"
             command = [self.cmake, f"-DTEST_EXECUTABLE={executable}",
-                       f"-DCTEST_FILE={generated}", "-DTEST_PREFIX=V2_AdmissionContract",
+                       f"-DCTEST_FILE={generated}", *discovery_session_arguments(root / "build"),
+                       "-DTEST_PREFIX=V2_AdmissionContract",
                        "-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm;PyTorch;GoldenReference;FullModel",
                        "-DMPI_PROCS=1", "-DNUM_SOCKETS=2", "-DCORES_PER_SOCKET=2",
                        f"-DWORKING_DIR={root}"]
@@ -71,7 +97,20 @@ class SourceAdmissionDiscovery(unittest.TestCase):
             inventory = subprocess.run(
                 [str(Path(self.cmake).with_name("ctest")), "--test-dir", str(root / "build"),
                  "--show-only=json-v1"], capture_output=True, text=True, timeout=10, check=True)
-            return result, json.loads(inventory.stdout)["tests"]
+            tests = json.loads(inventory.stdout)["tests"]
+            checked = OWNER._validate_session_ownership({"tests": tests}, root / "build")
+            self.assertEqual(set(checked), {test["name"] for test in tests})
+            for test in tests:
+                props = {p["name"]: p["value"] for p in test["properties"]}
+                command = test["command"]
+                self.assertEqual(command[:2], [str(root / "build/llaminar_mpi_session"), "--session-base"])
+                self.assertEqual(command[3:5], ["--", "mpirun"])
+                self.assertRegex(Path(command[2]).name, r"^[0-9a-f]{64}$")
+                boundary = command.index("--", 5)
+                self.assertEqual(command[boundary + 1], str(executable))
+                environment = dict(item.split("=", 1) for item in props["ENVIRONMENT"])
+                self.assertEqual(environment["LLAMINAR_TEST_MPI_SESSION_HELPER"], command[0])
+            return result, tests
 
     def test_actual_participants_sources_and_world_are_preserved(self):
         """Every hardware signature owns exact sources and disabled foreign startup."""
@@ -262,6 +301,7 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                     "cmake_minimum_required(VERSION 3.25)\n"
                     "project(SourceDeadlineIdentity LANGUAGES NONE)\n"
                     "enable_testing()\n"
+                    f'include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")\n'
                     "add_custom_target(v2_integration_parity_qwen4exp_production_matrix)\n"
                     # Compilation and command scheduling are not the policy under
                     # test. Capture the actual POST_BUILD argv without a build.
@@ -277,17 +317,69 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 return root / "build"
             build = configure(declaration)
-            name = "v2_integration_parity_qwen4exp_production_matrix_discovery_identity.txt"
+            name = "v2_integration_parity_qwen4exp_production_matrix_discovery_identity_.txt"
             identity = (build / name).read_text()
             self.assertIn("source_admission_timeout=900\n", identity)
             self.assertIn("SOURCE_ADMISSION_TIMEOUT=900", (build / "post-build.txt").read_text())
-            self.assertIn(str(build / name), (build / "dependencies.txt").read_text())
+            self.assertIn(str(build / name), (build / "dependencies.txt").read_text().replace("$<CONFIG>", ""))
+            self.assertIn("mpi_session_helper=" + os.environ["LLAMINAR_TEST_MPI_SESSION_HELPER"] + "\n", identity)
+            self.assertIn("mpi_session_root=" + str(build / "mpi-sessions/parity") + "\n", identity)
+            self.assertIn("MPI_SESSION_HELPER=$<TARGET_FILE:llaminar_mpi_session>", (build / "post-build.txt").read_text())
+            self.assertIn("$<TARGET_FILE:llaminar_mpi_session>", (build / "dependencies.txt").read_text().replace("$<CONFIG>", ""))
+            unchanged_time = (build / name).stat().st_mtime_ns
+            configure(declaration)
+            self.assertEqual((build / name).stat().st_mtime_ns, unchanged_time)
             changed = declaration.replace("SOURCE_ADMISSION_TIMEOUT 900", "SOURCE_ADMISSION_TIMEOUT 901")
             self.assertNotEqual(changed, declaration)
             configure(changed)
             self.assertNotEqual((build / name).read_text(), identity)
             self.assertIn("source_admission_timeout=901\n", (build / name).read_text())
             self.assertIn("SOURCE_ADMISSION_TIMEOUT=901", (build / "post-build.txt").read_text())
+            # The helper remains the installed original binary, but its selected
+            # location must participate in the actual generated link identity.
+            prior_helper = os.environ["LLAMINAR_TEST_MPI_SESSION_HELPER"]
+            relocated = root / "relocated installed helper" / "llaminar_mpi_session"
+            relocated.parent.mkdir(); shutil.copy2(prior_helper, relocated)
+            before_relocation = (build / name).read_text()
+            try:
+                os.environ["LLAMINAR_TEST_MPI_SESSION_HELPER"] = str(relocated)
+                configure(changed)
+            finally:
+                os.environ["LLAMINAR_TEST_MPI_SESSION_HELPER"] = prior_helper
+            after_relocation = (build / name).read_text()
+            self.assertNotEqual(after_relocation, before_relocation)
+            self.assertIn("mpi_session_helper=" + str(relocated) + "\n", after_relocation)
+            self.assertNotIn("mpi_session_helper=" + prior_helper + "\n", after_relocation)
+
+    def test_actual_helper_identity_is_configuration_owned(self):
+        """Different native helper outputs cannot collide at CMake generation."""
+        source = (SOURCE / "tests/v2/CMakeLists.txt").read_text()
+        begin = source.index("function(discover_v2_parity_tests TARGET)")
+        end = source.index("endfunction()", begin) + len("endfunction()")
+        with tempfile.TemporaryDirectory(prefix="llaminar multi config identity ") as temporary:
+            root = Path(temporary)
+            for config in ("Debug", "Release"):
+                destination = root / config / "llaminar_mpi_session"
+                destination.parent.mkdir()
+                shutil.copy2(os.environ["LLAMINAR_TEST_MPI_SESSION_HELPER"], destination)
+            (root / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.27)\n"
+                "project(ConfigurationIdentity LANGUAGES NONE)\n"
+                "enable_testing()\n"
+                "add_executable(llaminar_mpi_session IMPORTED GLOBAL)\n"
+                f'set_target_properties(llaminar_mpi_session PROPERTIES IMPORTED_LOCATION_DEBUG "{root}/Debug/llaminar_mpi_session" IMPORTED_LOCATION_RELEASE "{root}/Release/llaminar_mpi_session")\n'
+                "add_custom_target(parity_probe)\n"
+                "function(target_compile_definitions)\nendfunction()\n"
+                "function(add_custom_command)\nendfunction()\n"
+                + source[begin:end] + "\ndiscover_v2_parity_tests(parity_probe)\n")
+            result = subprocess.run([self.cmake, "-S", str(root), "-B", str(root / "build"),
+                "-G", "Ninja Multi-Config", f"-DCMAKE_MAKE_PROGRAM={self.ninja}",
+                "-DCMAKE_CONFIGURATION_TYPES=Debug;Release"],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for config in ("Debug", "Release"):
+                identity = (root / "build" / f"parity_probe_discovery_identity_{config}.txt").read_text()
+                self.assertIn(f"mpi_session_helper={root}/{config}/llaminar_mpi_session\n", identity)
 
     def test_capacity_rejection_is_distinct_and_keeps_typed_source_staging(self):
         """Capacity controls remain real native source contracts, not unsupported skips."""
@@ -370,6 +462,50 @@ class SourceAdmissionDiscovery(unittest.TestCase):
         self.assertEqual(tests[0]["command"][-1],
                          "--gtest_filter=CandidateMatrix.CandidateSourceAdmission/"
                          "CUDA0_CUDA1_CPU0_CPU1_TP2PP2_NgramMmap")
+
+    def test_long_distinct_source_and_campaign_worlds_keep_original_owner(self):
+        """Actual CMake output retains long names, spaced paths, ranks and source/model identity."""
+        long_cell = "Cell" * 90
+        source = "CPU0_CPU1_PP_2xMPI_" + long_cell
+        result, tests = self.discover("OwnedMatrix.\n"
+            + "  FullSourceAdmission/" + source + "A\n"
+            + "  FullSourceAdmission/" + source + "B\n"
+            + "  ProductionParity/CPU_2xMPI_FP16\n"
+            + "  ProductionParity/CUDA_1xMPI_FP16\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(tests), 4)
+        bases = {test["command"][2] for test in tests}
+        self.assertEqual(len(bases), 4)
+        for test in tests:
+            command = test["command"]
+            props = {p["name"]: p["value"] for p in test["properties"]}
+            self.assertFalse({"Unit", "ProductionTestPreflight"} & set(props["LABELS"]))
+            self.assertIn("ProcessOwned", props["LABELS"])
+            self.assertIn(" ", command[0])
+            if "FullSourceAdmission" in test["name"]:
+                self.assertGreater(len(test["name"]), 255)
+                self.assertEqual(command[command.index("-np") + 1], "2")
+                self.assertIn(long_cell, command[-1])
+            else:
+                self.assertEqual(command[command.index("-np") + 1], "1" if "CUDA" in test["name"] else "2")
+
+    def test_missing_original_discovery_owner_inputs_are_fatal(self):
+        """A missing helper/root cannot publish a smaller apparently green discovery."""
+        with tempfile.TemporaryDirectory(prefix="missing discovery owner ") as directory:
+            root = Path(directory)
+            binary = root / "inventory"
+            binary.write_text("#!/bin/sh\nprintf 'Inventory.\\n  FocusedCPU\\n'\n")
+            binary.chmod(0o755)
+            owned = discovery_session_arguments(root / "build")
+            for omitted, diagnostic in ((0, "MPI_SESSION_HELPER"), (1, "MPI_SESSION_ROOT")):
+                with self.subTest(omitted=omitted):
+                    output = root / f"missing-{omitted}.cmake"
+                    command = [self.cmake, f"-DTEST_EXECUTABLE={binary}", f"-DCTEST_FILE={output}",
+                               *[value for index, value in enumerate(owned) if index != omitted], "-P", str(DISCOVERY)]
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

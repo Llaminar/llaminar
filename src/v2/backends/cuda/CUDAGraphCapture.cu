@@ -1113,6 +1113,15 @@ namespace llaminar2
                         return false;
                     }
 
+                    // Zero is a genuine compiler result for an empty kernel.
+                    // A negative result is malformed, not an unknown value to
+                    // turn into a valid zero-register observation.
+                    if (registers_per_thread < 0)
+                    {
+                        error = "CUDA kernel node has a negative register count at " + node_path;
+                        return false;
+                    }
+
                     const uint64_t captured_block_threads =
                         static_cast<uint64_t>(params.blockDimX) *
                         static_cast<uint64_t>(params.blockDimY) *
@@ -1158,7 +1167,7 @@ namespace llaminar2
                         .local_memory_bytes_per_thread = static_cast<size_t>(
                             std::max(0, local_memory_bytes_per_thread)),
                         .registers_per_thread = static_cast<uint32_t>(
-                            std::max(0, registers_per_thread)),
+                            registers_per_thread),
                         .max_threads_per_block = static_cast<uint32_t>(
                             std::max(0, max_threads_per_block)),
                         .max_active_blocks_per_sm = static_cast<uint32_t>(

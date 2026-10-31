@@ -1,5 +1,5 @@
 /**
- * @file AdaptiveACKReadyCancellationROCm.hip
+ * @file PooledACKReadyCancellationROCm.hip
  * @brief HIP-only original graph identity/edge authentication for cancellation.
  *
  * Native function identity and argument metadata are inspected before the single
@@ -9,7 +9,7 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <stdexcept>
-namespace llaminar2::test::adaptive_native::rocm_ack_cancel
+namespace llaminar2::test::pooled_ack::rocm_ack_cancel
 {
 /** @brief Preserve exact native error status during setup-only graph inspection/edit. */
 inline void check(hipError_t status)
@@ -29,7 +29,7 @@ inline std::uintptr_t originalIdentity(const hipKernelNodeParams &params)
 {
     return reinterpret_cast<std::uintptr_t>(params.func);
 }
-} // namespace llaminar2::test::adaptive_native::rocm_ack_cancel
+} // namespace llaminar2::test::pooled_ack::rocm_ack_cancel
 #define ACK_CANCEL_NAMESPACE rocm_ack_cancel
 #define ACK_DEVICE_PREDICATE is_rocm
 #define ACK_CAPTURE HIPGraphCapture
@@ -40,12 +40,12 @@ inline std::uintptr_t originalIdentity(const hipKernelNodeParams &params)
 #define ACK_CHECK(STATUS) check(STATUS)
 #define ACK_DEPENDENCIES(NODE, DEPS, COUNT) hipGraphNodeGetDependencies(NODE, DEPS, COUNT)
 #define ACK_ADD_DEPENDENCIES(GRAPH, FROM, TO, COUNT) hipGraphAddDependencies(GRAPH, FROM, TO, COUNT)
-#include "AdaptiveACKReadyCancellationNative.cuh"
-namespace llaminar2::test::adaptive_native
+#include "PooledACKReadyCancellationNative.cuh"
+namespace llaminar2::test::pooled_ack
 {
-void spliceROCmAdaptiveACKReadyCancellation(IGPUGraphCapture &graph,
-                                           const qwen4exp::AdaptiveLookupDeviceArgs &expected, void *stream)
+void spliceROCm(IGPUGraphCapture &graph,
+                                           const qwen4exp::pooled_source::DeviceArgs &expected, void *stream, AuthorizationReplay replay)
 {
-    rocm_ack_cancel::splice(graph, expected, stream);
+    rocm_ack_cancel::splice(graph, expected, stream, replay);
 }
-} // namespace llaminar2::test::adaptive_native
+} // namespace llaminar2::test::pooled_ack

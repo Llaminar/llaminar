@@ -10,6 +10,7 @@
 #pragma once
 #include "PooledImmutableNativePlan.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "loaders/ImmutableLookupNativeOwnership.h"
 #include "tensors/TensorClasses.h"
 #include <memory>
 namespace llaminar2::qwen4exp
@@ -43,6 +44,10 @@ public:
     const PooledImmutableOwnerNativePlan& plan()const noexcept{return plan_;}
     /** @return Actual canonical root aliases, with no replacement or allocation. */
     PooledImmutableNativeRoots roots()const;
+    /** @brief Authenticate the actual original PMA, never an equal-sized replacement certificate. */
+    void requireAuthority(const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const;
+    /** @return Actual retained physical root claims without device state observation. */
+    ImmutableLookupNativeOwnerObservation retainedOwnerObservation()const;
     /** @return Complete prepared geometry/allocator/runtime/root identity, rejecting stale storage. */
     std::uint64_t captureIdentity()const;
     /** @brief Validate actual roots and join only their original setup event on the exact consumer stream. */
@@ -77,6 +82,10 @@ public:
     const PooledImmutableCoordinatorNativePlan& plan()const noexcept{return plan_;}
     /** @return Strong actual canonical root aliases. */
     PooledImmutableNativeRoots roots()const;
+    /** @brief Authenticate the actual original PMA before model/source reuse. */
+    void requireAuthority(const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const;
+    /** @return Actual original policy/frame/native root claims. */
+    ImmutableLookupNativeOwnerObservation retainedOwnerObservation()const;
     /** @return Complete immutable native geometry and prepared physical identity. */
     std::uint64_t captureIdentity()const;
     /** @brief Acquire the exact existing setup producer event before graph capture; no host wait. */

@@ -516,7 +516,7 @@ protected:
             ASSERT_TRUE(boundary);
             const auto source_before=boundary->retainedSourceOwnerObservation();
             const auto provider_before=context->hostImmutableRowProvider();
-            const auto roots_before=boundary->adaptiveRoots();
+            const std::array roots_before{boundary->pooledStorage()->owner()->roots(),boundary->pooledStorage()->coordinator()->roots(),boundary->pooledStorage()->roots()};
             const auto identity_before=boundary->captureIdentity();
             const auto original_path=Base::ensureResultsDir()/"production_path.csv";
             ASSERT_TRUE(std::filesystem::copy_file(original_path,
@@ -554,9 +554,12 @@ protected:
             EXPECT_EQ(source_after.hostPlacement(),source_before.hostPlacement());
             EXPECT_EQ(source_after.tableStorageBytes(),source_before.tableStorageBytes());
             EXPECT_EQ(source_after.lookupStagingBytes(),source_before.lookupStagingBytes());
-            EXPECT_EQ(boundary->adaptiveRoots().cache.get(),roots_before.cache.get());
-            EXPECT_EQ(boundary->adaptiveRoots().frame.get(),roots_before.frame.get());
-            EXPECT_EQ(boundary->adaptiveRoots().protocol.get(),roots_before.protocol.get());
+            const std::array roots_after{boundary->pooledStorage()->owner()->roots(),boundary->pooledStorage()->coordinator()->roots(),boundary->pooledStorage()->roots()};
+            for(std::size_t group=0;group<roots_before.size();++group){
+                EXPECT_EQ(roots_after[group].cache.get(),roots_before[group].cache.get());
+                EXPECT_EQ(roots_after[group].frame.get(),roots_before[group].frame.get());
+                EXPECT_EQ(roots_after[group].native.get(),roots_before[group].native.get());
+            }
             EXPECT_EQ(boundary->captureIdentity(),identity_before);
             ASSERT_EQ(Base::activeModelContextForDiagnostics(),context);
             EXPECT_EQ(context->adaptiveImmutableLookupBoundary(boundary->device()).get(),boundary.get());
@@ -566,7 +569,7 @@ protected:
             const auto provider=context->hostImmutableRowProvider();ASSERT_TRUE(provider);
             const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),placement->gpuAdaptiveRequest());
             ASSERT_NO_THROW((void)requireQwen4ExpGPUAdaptiveLookupEvidence(records,layout.consumers().front().device,
-                placement->extent().rowBytes(),placement->gpuAdaptiveMaximumLiveRows(),geometry.gpu().slots(),geometry.host().slots()));
+                placement->extent().rowBytes(),placement->gpuAdaptiveMaximumLiveRows(),geometry.physical().owners().front().slots,geometry.host().slots()));
             // Refresh from actual work while preserving every inherited raw
             // numerical/prefix result. No ModelContext reuse claim is inferred.
             Base::finishProductionParityEvidence();

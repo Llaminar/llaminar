@@ -19,7 +19,8 @@ TEST(ImmutableRowTableUploadGeometry, ExactOriginalSlotBoundsNativeRowsWithoutTa
     EXPECT_TRUE(residentImmutableRowUploadFits(512,ordinary));
     EXPECT_FALSE(residentImmutableRowUploadFits(513,ordinary));
     EXPECT_FALSE(residentImmutableRowUploadFits(1024*1024,ordinary));
-    EXPECT_TRUE(residentImmutableRowUploadIncrementalBOM().resources().empty());
+    const auto incremental=residentImmutableRowUploadIncrementalBOM();
+    EXPECT_TRUE(incremental.resources().empty());
     const auto absent=resolveGPUWeightLoadMemoryGeometry(0,{.staging_stream_count=1});
     EXPECT_FALSE(residentImmutableRowUploadFits(1,absent));
 }

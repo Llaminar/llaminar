@@ -2,7 +2,7 @@
 #  @brief Verify that concurrently scheduled CTest MPI jobs own distinct
 #  launcher owners and that those registrations execute and retire successfully.
 
-"""Protect the Unit/preflight gates from Open MPI session-directory races."""
+"""Protect every actual CTest MPI/process-owned job from session-directory races."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def _run(command: list[str]) -> str:
 
 
 def _validate_session_ownership(inventory: dict, build_dir: Path) -> dict[str, Path]:
-    """Require the shared production owner around every actual MPI gate command."""
+    """Require the shared production owner around every actual MPI/process-owned command."""
     owners: dict[Path, str] = {}
     checked: dict[str, Path] = {}
     for test in inventory["tests"]:
@@ -34,21 +34,22 @@ def _validate_session_ownership(inventory: dict, build_dir: Path) -> dict[str, P
         # A script's --mpirun operand or an application's prompt is not the
         # process being launched. Only the original command slot owns grammar.
         raw_native = bool(command) and Path(command[0]).name in native_names
+        owned_command = bool(command) and Path(command[0]).name == "llaminar_mpi_session"
         owned_native = len(command) > 4 and Path(command[4]).name in native_names
         labels = next(
             (item["value"] for item in test.get("properties", [])
              if item["name"] == "LABELS"),
             [],
         )
-        if "Unit" not in labels and "ProductionTestPreflight" not in labels:
-            continue
-        if not raw_native and not owned_native and "ProcessOwned" not in labels:
+        if not raw_native and not owned_command and "ProcessOwned" not in labels:
             continue
 
         name = test["name"]
         if (len(command) < 5 or Path(command[0]).name != "llaminar_mpi_session"
                 or command[1] != "--session-base" or command[3] != "--"):
             raise AssertionError(f"{name} has no original MPI process/file owner")
+        if "ProcessOwned" not in labels:
+            raise AssertionError(f"{name} has no ProcessOwned scheduling/retirement label")
         properties = {item["name"]: item["value"] for item in test.get("properties", [])}
         if (properties.get("TIMEOUT_SIGNAL_NAME") != "SIGTERM"
                 or properties.get("TIMEOUT_SIGNAL_GRACE_PERIOD") != 36):
@@ -86,7 +87,7 @@ def _validate_session_ownership(inventory: dict, build_dir: Path) -> dict[str, P
         checked[name] = session_dir
 
     if not checked:
-        raise AssertionError("No MPI/process-owned Unit/preflight registrations were checked")
+        raise AssertionError("No MPI/process-owned registrations were checked")
     return checked
 
 
@@ -129,7 +130,7 @@ def main() -> None:
     for name in repeated:
         if leaked := set(checked[name].iterdir()) - before[name]:
             raise AssertionError(f"{name} retained runtime files after exit: {sorted(leaked)}")
-    print(f"MPI session ownership and retirement passed for {len(checked)} Unit/preflight jobs")
+    print(f"MPI session ownership and retirement passed for {len(checked)} CTest jobs")
 
 
 if __name__ == "__main__":

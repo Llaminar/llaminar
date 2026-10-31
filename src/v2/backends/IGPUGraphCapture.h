@@ -88,7 +88,7 @@ namespace llaminar2
         size_t dynamic_shared_memory_bytes = 0;   ///< Per-block dynamic shared memory.
         size_t static_shared_memory_bytes = 0;    ///< Compiler-owned shared memory per block.
         size_t local_memory_bytes_per_thread = 0; ///< Compiler-owned local memory per thread.
-        uint32_t registers_per_thread = 0;         ///< Compiler-assigned registers per thread.
+        uint32_t registers_per_thread = 0;         ///< Compiler-assigned registers; a native empty kernel can legitimately use zero.
         uint32_t max_threads_per_block = 0;        ///< Backend launch ceiling for this kernel.
         uint32_t max_active_blocks_per_sm = 0;     ///< Occupancy ceiling at captured geometry.
         size_t nesting_depth = 0;                 ///< Number of enclosing child graphs.
@@ -98,14 +98,18 @@ namespace llaminar2
          * @brief Verify that the record describes a launchable kernel node.
          *
          * @return true when function identity and every launch dimension are
-         *         present. A symbolic name is intentionally not required because
-         *         opaque library kernels must still be represented.
+         *         present, with resolved positive launch and occupancy limits.
+         *         Zero registers is a valid compiler result for an empty kernel;
+         *         it must not be confused with absent launch metadata. Native
+         *         inspectors reject failed resource queries before publication.
+         *         A symbolic name is intentionally not required because opaque
+         *         library kernels must still be represented.
          */
         [[nodiscard]] bool valid() const noexcept
         {
             return function_identity != 0 && grid_x > 0 && grid_y > 0 &&
                    grid_z > 0 && block_x > 0 && block_y > 0 && block_z > 0 &&
-                   registers_per_thread > 0 && max_threads_per_block > 0 &&
+                   max_threads_per_block > 0 &&
                    max_active_blocks_per_sm > 0;
         }
     };

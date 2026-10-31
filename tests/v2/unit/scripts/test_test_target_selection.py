@@ -125,8 +125,6 @@ endforeach()
                 with self.subTest(performance_only=performance_only, cuda=cuda, rocm=rocm):
                     expected = ["v2_perf_qwen_sparse_selection",
                                 "v2_perf_q8_residual_prepared_projection"]
-                    if cuda or rocm:
-                        expected += ["v2_perf_immutable_adaptive_lookup"]
                     if cuda:
                         expected += ["v2_perf_cuda_qwen_sparse_selection",
                                      "v2_perf_cuda_qwen_sparse_observations"]
@@ -146,6 +144,9 @@ add_library(hip::host INTERFACE IMPORTED)
 add_library(CUDA::cudart INTERFACE IMPORTED)
 include("{QFN_PERFORMANCE.as_posix()}")
 include("{QFN_PERFORMANCE.as_posix()}")
+if(TARGET v2_perf_immutable_adaptive_lookup)
+    message(FATAL_ERROR "Retired combined adaptive lookup performance entrypoint remains")
+endif()
 if(HAVE_CUDA)
     get_target_property(hc103_sources v2_perf_q8_residual_prepared_projection SOURCES)
     get_target_property(hc103_standard v2_perf_q8_residual_prepared_projection CUDA_STANDARD)

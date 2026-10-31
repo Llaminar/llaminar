@@ -6,6 +6,8 @@
  * transport or allocation permission. The existing subordinate service binding
  * authenticates these declarations against its actual provider/channel before
  * any producer is created. Directed transport remains an explicit graph edge.
+ * Reporting scratch preserves actual operation receipts before grant retirement;
+ * the canonical terminal row is written only after every physical owner retires.
  */
 #pragma once
 #include "PooledImmutableNativePlan.h"
@@ -16,7 +18,8 @@ namespace llaminar2::qwen4exp {
 /** @brief Exact private source packet banks; only acquired live prefixes are consumed. */
 struct PooledSourceOffsets {
     std::size_t coordinates=0,responses=0,invalidations=0,fills=0,payload=0,frame_bytes=0;
-    std::size_t protocol=0,frontier=64,record_bytes=128,payload_bytes=136,invocation=144,response_stage=152,native_bytes=192;
+    std::size_t protocol=0,frontier=64,record_bytes=128,payload_bytes=136,invocation=144,response_stage=152;
+    std::size_t observation=192,observation_ordinal=264,reported_ordinal=272,native_bytes=320;
     bool operator==(const PooledSourceOffsets&)const=default;
 };
 /** @brief Complete immutable source-native declarations; actual authority is retained by its service-issued binder. */
@@ -64,6 +67,12 @@ public:
     static PhysicalMemoryPlan mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& physical,
         const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,const ImmutableRowTableSource& source,
         PhysicalMemoryResource resource);
+    /** @return Exact identity-free physical source roots from the runtime factory's checked layout.
+     * @param physical Original complete physical declaration. @param coordinator Matching coalescing policy.
+     * @param coordinate Actual owner delivery edge. @param source Original source metadata.
+     * @throws std::exception For incompatible source/owner declarations or byte overflow. */
+    static PooledSourceOffsets rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
+        const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,const ImmutableRowTableSource& source);
     /** @return The existing protocol2 mapped-channel layout; hostBytes remains the existing service's authority. */
     ImmutableLookupLayout channelLayout()const;
 private:

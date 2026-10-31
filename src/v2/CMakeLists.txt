@@ -428,7 +428,6 @@ if(HAVE_CUDA)
         kernels/cuda/qwen4exp/CUDAQwen4ExpKernels.cu # Flash Next residual and PLE primitives
         kernels/cuda/qwen4exp/CUDADiagnosticSnapshotCopy.cu
         kernels/cuda/qwen4exp/CUDAImmutableLookupKernels.cu
-        kernels/cuda/qwen4exp/CUDAImmutableAdaptiveLookupKernels.cu
         kernels/cuda/qwen4exp/CUDAImmutableFixedHeadLookupKernels.cu
         kernels/cuda/attention/CUDAQwenSparseReplay.cu
         kernels/cuda/attention/CUDAQwen4ExpStateIO.cu
@@ -724,7 +723,6 @@ if(HAVE_ROCM)
         kernels/rocm/qwen4exp/ROCmQwen4ExpKernels.hip # Flash Next residual and PLE primitives
         kernels/rocm/qwen4exp/ROCmDiagnosticSnapshotCopy.hip
         kernels/rocm/qwen4exp/ROCmImmutableLookupKernels.hip
-        kernels/rocm/qwen4exp/ROCmImmutableAdaptiveLookupKernels.hip
         kernels/rocm/qwen4exp/ROCmImmutableFixedHeadLookupKernels.hip
         kernels/rocm/attention/ROCmQwenSparseReplay.hip
         kernels/rocm/attention/ROCmQwen4ExpStateIO.hip
@@ -1862,7 +1860,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     loaders/ImmutableRowTable.cpp
     loaders/CpuAdaptiveImmutableRowCache.cpp
     loaders/HostImmutableRowProvider.cpp
-    loaders/AdaptiveImmutableLookupRootStorage.cpp
     loaders/ImmutableRowTablePolicy.cpp
     loaders/ImmutableRowTableExtent.cpp
     loaders/ImmutableRowTableLayoutGeometry.cpp
@@ -1947,8 +1944,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/qwen4exp/CPUQwen4ExpKernels.cpp
     kernels/cpu/qwen4exp/CPUImmutableLookupKernels.cpp
     kernels/qwen4exp/ImmutableFixedHeadLookupKernels.cpp
-    kernels/qwen4exp/AdaptiveImmutableRowCacheGeometry.cpp
-    kernels/qwen4exp/ImmutableAdaptiveLookupKernels.cpp
     kernels/qwen4exp/QwenSparseAttention.cpp
     kernels/cpu/attention/CPUQwenSparseAttention.cpp
     tensors/TensorBase.cpp

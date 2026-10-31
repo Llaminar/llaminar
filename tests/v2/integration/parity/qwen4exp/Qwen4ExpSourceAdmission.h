@@ -23,6 +23,7 @@
 #include "config/OrchestrationStartupPolicy.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
@@ -175,7 +176,7 @@ inline void expectQwen4ExpSourceGPUAdaptiveOwners(const ModelParityCase &cell, I
     ASSERT_TRUE(gpu.device.is_gpu());ASSERT_TRUE(host.device.is_cpu());EXPECT_EQ(gpu.world_rank,host.world_rank);
     EXPECT_EQ(placement->lookupForConsumer(gpu),ImmutableRowLookupExecution::AdaptiveGPUCache);
     const auto boundary=context->adaptiveImmutableLookupBoundary(gpu.device);ASSERT_TRUE(boundary);
-    ASSERT_TRUE(boundary->isAdaptive());EXPECT_EQ(boundary->device(),gpu.device);
+    ASSERT_TRUE(boundary->isPooled());EXPECT_EQ(boundary->device(),gpu.device);
     EXPECT_EQ(context->adaptiveImmutableLookupBoundary(gpu.device).get(),boundary.get());
     const auto provider=context->hostImmutableRowProvider();ASSERT_TRUE(provider);
     EXPECT_EQ(provider->mode(),HostImmutableRowMode::AdaptiveRAMSSD);
@@ -193,7 +194,7 @@ inline void expectQwen4ExpSourceGPUAdaptiveOwners(const ModelParityCase &cell, I
     EXPECT_EQ(context->residentImmutableRowTable(gpu.device),nullptr);
     EXPECT_EQ(context->residentImmutableRowTableBytes(gpu.device),0u);
     const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),request);
-    const auto gpu_slots=geometry.gpu().slots();
+    const auto gpu_slots=geometry.physical().owners().front().slots;
     const auto ram_slots=geometry.host().slots();
     EXPECT_LE(gpu_slots,request.maximum_gpu_cache_rows);EXPECT_LE(ram_slots,request.host.maximum_cache_rows);
     if(request.maximum_gpu_cache_rows && request.gpu_cache_physical_byte_limit)
@@ -206,18 +207,18 @@ inline void expectQwen4ExpSourceGPUAdaptiveOwners(const ModelParityCase &cell, I
         EXPECT_GT(ram_slots,0u) << "Positive RAM-cache cell cannot certify a zero optional grant";
     }
     else { EXPECT_EQ(ram_slots,0u); }
-    const auto roots=boundary->adaptiveRoots();ASSERT_TRUE(roots.frame);ASSERT_TRUE(roots.protocol);
-    EXPECT_EQ(bool(roots.cache),gpu_slots!=0);EXPECT_TRUE(roots.frame->is_raw_data_released());
-    EXPECT_TRUE(roots.protocol->is_raw_data_released());
-    if(roots.cache) { EXPECT_TRUE(roots.cache->is_raw_data_released()); }
-    EXPECT_EQ(roots.frame.get(),boundary->adaptiveRoots().frame.get());
-    EXPECT_EQ(roots.protocol.get(),boundary->adaptiveRoots().protocol.get());
-    const auto gpu_owner=boundary->rootStorage()->retainedOwnerObservation();
+    const auto storage=boundary->pooledStorage();
+    const std::array roots{storage->owner()->roots(),storage->coordinator()->roots(),storage->roots()};
+    EXPECT_EQ(bool(roots[0].cache),gpu_slots!=0);EXPECT_EQ(bool(roots[1].cache),gpu_slots!=0);
+    for(const auto& group:roots)for(const auto& root:{group.cache,group.frame,group.native})if(root){
+        EXPECT_TRUE(root->is_raw_data_released());EXPECT_NE(root->gpu_data_ptr(),nullptr);
+    }
+    const auto gpu_owner=storage->retainedOwnerObservation();
     const auto source_owner=boundary->retainedSourceOwnerObservation();
     const auto provider_owner=provider->retainedOwnerObservation();
     ASSERT_TRUE(retained->physical_memory_authority);
     const auto &memory=retained->physical_memory_authority;
-    ASSERT_NO_THROW(boundary->rootStorage()->requireFor(geometry.gpu().nativePlan(),memory));
+    ASSERT_NO_THROW(storage->requireFor(geometry.physical(),geometry.coordinator(),provider->source(),memory));
     EXPECT_EQ(gpu_owner.authority().get(),memory.get());EXPECT_EQ(source_owner.authority().get(),memory.get());
     EXPECT_EQ(provider_owner.authority().get(),memory.get());
     EXPECT_EQ(gpu_owner.allocator(),gpu);EXPECT_EQ(source_owner.allocator(),host);
@@ -225,10 +226,10 @@ inline void expectQwen4ExpSourceGPUAdaptiveOwners(const ModelParityCase &cell, I
     EXPECT_EQ(source_owner.tableStorageBytes(),provider_owner.tableStorageBytes());
     EXPECT_GE(source_owner.lookupStagingBytes(),provider_owner.lookupStagingBytes());
     EXPECT_EQ(source_owner.lookupStagingBytes()-provider_owner.lookupStagingBytes(),
-        ::llaminar2::qwen4exp::ImmutableLookupService::hostBytes(geometry.gpu().channelLayout()));
-    EXPECT_EQ(gpu_owner.tableStorageBytes(),geometry.gpu().cache().bytes);
-    EXPECT_EQ(gpu_owner.lookupStagingBytes(),geometry.gpu().mandatoryDeviceBytes());
-    EXPECT_LE(gpu_owner.tableStorageBytes(),request.gpu_cache_physical_byte_limit);
+        ::llaminar2::qwen4exp::ImmutableLookupService::hostBytes(geometry.channelLayout()));
+    EXPECT_EQ(gpu_owner.tableStorageBytes(),geometry.gpuCacheBytes());
+    EXPECT_EQ(gpu_owner.lookupStagingBytes(),geometry.mandatoryDeviceBytes());
+    EXPECT_LE(geometry.gpuSlotDependentBytes(),request.gpu_cache_physical_byte_limit);
     EXPECT_LE(geometry.host().storageBytes(),request.host.cache_physical_byte_limit);
     ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, gpu,
         PhysicalMemoryOwner::ImmutableTableStorage, gpu_owner.tableStorageBytes()));

@@ -60,12 +60,18 @@ namespace llaminar2
     class PhysicalMemoryPlan final
     {
     public:
-        /** @return Deterministically ordered, unique physical-resource BOMs. */
+        /**
+         * @return Deterministically ordered, unique physical-resource BOMs borrowed from this retained plan.
+         * @note The caller retains the lvalue plan for the complete borrow. A
+         * temporary plan cannot expose a vector reference beyond its lifetime.
+         */
         [[nodiscard]] const std::vector<PhysicalMemoryBOM> &resources()
-            const noexcept
+            const & noexcept
         {
             return resources_;
         }
+        /** @brief Reject borrowing resource storage from a temporary plan, including const rvalues. */
+        const std::vector<PhysicalMemoryBOM> &resources() const && noexcept = delete;
 
         /** @return Exact BOM for @p identity, or nullptr when it is absent. */
         [[nodiscard]] const PhysicalMemoryBOM *find(

@@ -223,8 +223,6 @@ namespace llaminar2
         QFN_PLE_PRIOR_CONV_HISTORY, ///< Dedicated immutable verifier original nine-row convolution suffixes.
         QFN_QSA_TRANSACTION_PRIOR, ///< Packed immutable original replay and up to three raw tail rows per sparse layer/request.
         QFN_QSA_TRANSACTION_PRIOR_TRAFFIC, ///< Native required metadata bytes and actual live original-tail payload bytes.
-        QFN_NGRAM_ADAPTIVE_CACHE, ///< Original model-owned optional native slots and directory/policy metadata.
-        QFN_NGRAM_ADAPTIVE_FRAME, ///< Original mandatory single-inflight native work frame, including zero-slot mode.
         QFN_POOLED_OWNER_CACHE, ///< Exact optional physical owner cache; C0 has no allocation.
         QFN_POOLED_OWNER_FRAME, ///< Original owner frame and both immutable accepted wave banks.
         QFN_POOLED_OWNER_NATIVE, ///< Native owner directed reply/header staging.
@@ -512,8 +510,6 @@ namespace llaminar2
         case BufferId::QFN_NGRAM_ROW_IDS: return "QFN_NGRAM_ROW_IDS";
         case BufferId::QFN_NGRAM_NATIVE_ROWS: return "QFN_NGRAM_NATIVE_ROWS";
         case BufferId::QFN_NGRAM_LOOKUP_STATE: return "QFN_NGRAM_LOOKUP_STATE";
-        case BufferId::QFN_NGRAM_ADAPTIVE_CACHE: return "QFN_NGRAM_ADAPTIVE_CACHE";
-        case BufferId::QFN_NGRAM_ADAPTIVE_FRAME: return "QFN_NGRAM_ADAPTIVE_FRAME";
         case BufferId::QFN_NGRAM_SHARD_LOCAL_HEADER: return "QFN_NGRAM_SHARD_LOCAL_HEADER";
         case BufferId::QFN_NGRAM_SHARD_HEADERS: return "QFN_NGRAM_SHARD_HEADERS";
         case BufferId::QFN_NGRAM_SHARD_TRANSPORT_ROWS: return "QFN_NGRAM_SHARD_TRANSPORT_ROWS";

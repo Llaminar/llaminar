@@ -5213,9 +5213,6 @@ namespace llaminar2
         }
     }
 
-    DeviceGraphOrchestrator::DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) noexcept = default;
-    DeviceGraphOrchestrator &DeviceGraphOrchestrator::operator=(DeviceGraphOrchestrator &&) noexcept = default;
-
     void DeviceGraphOrchestrator::setForwardGraphExecutionRendezvous(
         std::shared_ptr<ForwardGraphExecutionRendezvous> rendezvous)
     {
@@ -55333,7 +55330,7 @@ namespace llaminar2
                         {values[metric]}, "generation_terminal", state_.device_id.toString(),
                         {{"request", std::to_string(request)},
                          {"storage", "vram"},
-                         {"transport", "adaptive_subordinate"},
+                         {"transport", "pooled_subordinate"},
                          {"authority", "terminal_device_generation_control"}});
             }
         }

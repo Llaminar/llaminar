@@ -18,7 +18,7 @@ void bindPooledSourceRoots(BufferArena& arena,const qwen4exp::ImmutableLookupExe
 class PooledImmutableSourcePhaseStage final:public IComputeStage {
 public:
     /**
-     * @brief Retain the existing source boundary and seal every embedded output/control address before graph insertion.
+     * @brief Retain original source/control roots and output declarations before arena materialization.
      * @param arena Exact participant arena, retaining all original source/owner/coordinator/controller roles.
      * @param boundary Original mutually exclusive pooled service arm; no alternate provider is accepted.
      * @param action Fixed source producer/reader operation.
@@ -28,27 +28,32 @@ public:
     PooledImmutableSourcePhaseStage(BufferArena& arena,std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary,
         qwen4exp::PooledSourceAction action,DeviceGenerationControlBinding control,
         std::optional<qwen4exp::PooledNativeTensorSpan> output=std::nullopt);
-    /** @brief Revalidate actual roots/runtime and join only exact original setup events on the supplied stream. */
+    /** @brief Seal ordinary prepared output, retain its original allocation lease and join exact setup events. */
     bool prepareGraphLaunch(IDeviceContext*,void*)override;
     /** @brief Enqueue one fixed source phase on the executor's exact stream and publish its original writers. */
     bool execute(IDeviceContext*)override;
     /** @return Setup event joins occur once for retained recording; request reset never changes topology. */
     GraphLaunchPreparationPolicy graphLaunchPreparationPolicy()const override{return GraphLaunchPreparationPolicy::CaptureOnly;}
-    /** @return Every service/root/address/runtime/action/controller/output/code configuration in one immutable identity. */
+    /** @return Stable complete declarations; installed physical seals reject address/runtime drift on later queries. */
     std::uint64_t graphCaptureVariantSignature()const override;
     /** @return Semantic real-provider stage kind, with no serving/topology support advertisement. */
-    ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_POOLED_SOURCE_PHASE;}
+    ComputeStageType type()const override{return action_==qwen4exp::PooledSourceAction::Read?
+        ComputeStageType::QWEN4EXP_NGRAM_LOOKUP:ComputeStageType::QWEN4EXP_POOLED_SOURCE_PHASE;}
+    /** @return Every phase consumes only actual native invocation/live counts, including empty replay. */
+    bool supportsPaddedPrefillRealLengthContract()const override{return true;}
     /** @return Only the declared actual GPU backend can execute this phase. */
     bool supportsBackend(ComputeBackendType)const override;
     /** @return All storage was already declared/materialized under its original PMA owner. */
     StageBufferRequirements getBufferRequirements()const override{return {};}
     /** @return Original authority inputs, source inouts, canonical controller and actual output. */
     StageBufferContract bufferContract()const override;
-    /** @return Static source/action metadata only; no live protocol fields are read. */
+    /** @return Static source/action and actual output-view geometry; no live protocol fields are read. */
     StageDumpInfo buildDumpInfoImpl()const override;
 private:
-    /** @brief Reject source/role/root/controller/runtime drift before any enqueue. */
-    void requireBindings()const;
+    /** @brief Validate original source/role/root/controller declarations and any installed physical seals. */
+    void requireDeclarations()const;
+    /** @brief Require ordinary output preparation and its original allocator lease before native enqueue. */
+    void requirePreparedBindings()const;
     BufferArena* arena_;
     std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary_;
     qwen4exp::PooledSourceAction action_;

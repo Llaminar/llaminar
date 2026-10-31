@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_qfn_tp4_source_closure.py
+#  @brief Validate actual QFN source closure and owned registration metadata without model execution.
 """Exercise QFN's real CMake source declaration, discovery and strict inventory.
 
 Tiny fake GGUF bytes and a metadata-only GoogleTest lister isolate registration:
@@ -14,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from test_source_admission_discovery import discovery_session_arguments
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'scripts/ci'))
@@ -103,6 +106,7 @@ endfunction()
                    '-DTEST_PREFIX=V2_Integration_Parity_Qwen4Exp_Fixture',
                    '-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm', '-DMPI_PROCS=1',
                    '-DCORES_PER_SOCKET=1', '-DNUM_SOCKETS=1', '-DWORKING_DIR=' + str(self.root)]
+        command += discovery_session_arguments(self.root)
         for scope, values in sources.items():
             if omit_predictor and scope == 'ROCM_MODEL_FILES':
                 values = [v for v in values if Path(v).name != PREDICTOR]

@@ -52,6 +52,7 @@ PhysicalMemoryPlan sourceBOM(PhysicalMemoryAllocatorIdentity allocator,PooledSou
 PooledImmutableSourceGeometry PooledImmutableSourceGeometry::fromPlans(const PooledImmutableOwnerNativePlan& owner,
     const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source)
 {
+    coordinator.requireOwnerPlan(owner);
     const auto& o=owner.parameters();const auto& c=coordinator.parameters();
     if(!source.rows || !source.row_elements || source.row_elements>static_cast<std::uint64_t>(std::numeric_limits<int>::max()) || source.rows>static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
         o.owner.sourceRows()!=source.rows || c.policy.sourceRows()!=source.rows || o.row_bytes!=source.rowBytes() ||
@@ -66,7 +67,7 @@ PooledImmutableSourceGeometry PooledImmutableSourceGeometry::fromPlans(const Poo
     std::uint64_t identity=1469598103934665603ULL;const auto mix=[&](std::uint64_t x){identity=(identity^x)*1099511628211ULL;};
     mix(pooled_native::Version);mix(1);mix(o.identity);mix(c.identity);mix(static_cast<std::uint64_t>(format));mix(source.row_elements);
     for(const auto offset:{offsets.coordinates,offsets.responses,offsets.invalidations,offsets.fills,offsets.payload,offsets.frame_bytes,
-        offsets.protocol,offsets.frontier,offsets.record_bytes,offsets.payload_bytes,offsets.invocation,offsets.response_stage,offsets.native_bytes})mix(offset);
+        offsets.protocol,offsets.frontier,offsets.record_bytes,offsets.payload_bytes,offsets.invocation,offsets.response_stage,offsets.observation,offsets.observation_ordinal,offsets.reported_ordinal,offsets.native_bytes})mix(offset);
     return {{o,c,offsets,format,static_cast<std::uint32_t>(source.row_elements),identity?identity:1},coordinator.allocator()};
 }
 PhysicalMemoryPlan PooledImmutableSourceGeometry::mandatoryBOM(PhysicalMemoryResource resource)const{
@@ -75,6 +76,10 @@ PhysicalMemoryPlan PooledImmutableSourceGeometry::mandatoryBOM(PhysicalMemoryRes
 PhysicalMemoryPlan PooledImmutableSourceGeometry::mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,const ImmutableRowTableSource& source,
     PhysicalMemoryResource resource){
+    return sourceBOM(physical.coordinator(),rootOffsets(physical,coordinator,coordinate,source),resource);
+}
+PooledSourceOffsets PooledImmutableSourceGeometry::rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
+    const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,const ImmutableRowTableSource& source){
     const auto policy=coordinator.parameters();
     if(coordinate>=physical.owners().size() || physical.coordinator()!=coordinator.coordinator() ||
        physical.extent().format()!=source.format || physical.extent().rows()!=source.rows || physical.rowBytes()!=source.rowBytes() ||
@@ -84,7 +89,7 @@ PhysicalMemoryPlan PooledImmutableSourceGeometry::mandatoryBOM(const PooledImmut
         throw std::invalid_argument("Pooled source BOM requires original matching physical/coalescing/source declarations");
     lookup_detail::validateGeometry(ggufToTensorType(source.format),static_cast<int>(source.row_elements),source.rowBytes());
     const auto local=std::min(physical.owners()[coordinate].slots,physical.maximumUniqueRows());
-    return sourceBOM(physical.coordinator(),sourceOffsets(physical.maximumUniqueRows(),local,source.rowBytes()),resource);
+    return sourceOffsets(physical.maximumUniqueRows(),local,source.rowBytes());
 }
 ImmutableLookupLayout PooledImmutableSourceGeometry::channelLayout()const{
     return ImmutableLookupLayout::createSubordinate(parameters_.coordinator.policy.maximumUnique(),parameters_.owner.row_bytes);

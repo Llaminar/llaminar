@@ -105,12 +105,28 @@ retirement actually succeeds.
 
 ## Implementation and tests
 
-The first combined vertical slice uses the actual native abort-owner subtree:
+The private abort-owner slice now exercises the real PMA Preparing state:
 CPU0 preparation container, exact host-VMM descriptor, one-shot final consume,
-actual communicator abort fields/refcount and final alias retirement. Its
-existing private callback-double tests must be replaced by the real PMA
-Preparing state before it qualifies this integration boundary. Full communicator,
-channel, proxy, recording and graph ownership remains subsequent work.
+original abort fields/refcount and final alias retirement. This is still a
+subtree, not a complete communicator factory. Its source and actual-loader
+lifetime evidence are retained in `/tmp/qfn-native-session-preparation-r1/`.
+
+A separate private host-parent slice constructs the real NCCL/RCCL comm,
+shared-resource, rank-map and connection-mask objects through the actual
+initializer's owner-bearing allocation/free entrypoints. It retains one source
+owner and same-PMA claims through partial construction, source-first aliases,
+concurrent final aliases and failed child unmap. Final CPU proofs exercise
+320 lifecycles per backend, including true joint TP2 preparation under one PMA.
+The actual raw static initializer guards and a misplaced-guard negative are
+also exercised. SDK runtime paths are not executed by this host-only proof.
+Source/binary manifests are in `/tmp/qfn-native-selected-parent-r2/`; independent
+review is `/tmp/qfn-native-selected-parent-review-r2/review.md`.
+
+The next continuation joins those two original ownership subtrees into the
+same source-created parent before implementing topology/channel/recording
+preparation. These private patches are not installed native dependencies or
+permission to admit the complete factory. Full communicator, proxy, graph and
+opaque-resource ownership remain unfinished.
 
 The user approved typed, certified limits for opaque driver resources on
 2026-10-30. This is a bounded exception for private runtime storage whose native
@@ -149,7 +165,10 @@ The implementation sequence is:
 
 The existing `GPUGraphMemoryContract` supplies retained-family geometry and
 native tests to extend. Its current constants alone do not certify another
-driver, streams/events, or the complete SDK context. The new tests must cover
+driver, streams/events, or the complete SDK context. Native function-attribute
+queries and initialization can load modules; they must consume the admitted
+original context/pool contract and cannot be treated as free preparation
+queries merely because they return metadata. The new tests must cover
 joint maximum inventories, cold/warm/repeated lifetimes, partial setup failure,
 and real context retirement on both backends. Fast replay must reject missing,
 foreign, duplicate and stale declarations; verify unchanged admission after
