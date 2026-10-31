@@ -122,3 +122,15 @@ Evidence is `full-gate/`, `r30-audit.json` and `r30-session-retirement.json`
 under the r30 directory.
 This qualifies the integrated model-free slice; the complete real-model
 source matrix and distributed continuation implementation remain separate.
+
+The next focused source rerun (`source-admission-implemented-topology-recheck-r26/`)
+passes all six previously failing implemented-topology cases in 705.38 seconds:
+mixed CUDA/ROCm/CPU PP fixed3/Dynamic, ROCm TP4 random dynamic expert ownership
+with sharded VRAM ngrams fixed1/fixed3, and CPU NUMA PP2 positive host-adaptive
+RAM/SSD fixed1/fixed3. All retain the original 48 layers and active MTP capacity15.
+Native owners retire, fixture prefix files are removed and all six declared
+MPI session bases are empty afterward. Runtime identity is unchanged; the
+driver window has 25 new records and zero findings. `completion-audit.json`
+joins the exact CTest registrations, native receipts and cleanup observations.
+This closes those six historical failures without changing their policies.
+The four original ROCm PP(TP2, TP2) capacity/composition failures remain open.

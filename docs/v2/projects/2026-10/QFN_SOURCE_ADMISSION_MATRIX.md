@@ -53,21 +53,16 @@ slice publication is unimplemented. These tests require that exact rejection,
 with no changed expert policy, device count or storage tier. Table-head
 sharding and internal expert sharding are distinct axes.
 
-The original vectors plus the 15/33 layer family contain **152 Off identities**. Three special probes cover
-CPU Automatic, CUDA Automatic under an explicit 24 GiB cap, and whole-table
-ROCm VRAM in a PLE-owning pipeline stage. These form **155 Off seeds**.
-
-Every seed now expands over **Off, fixed1, fixed3, and Dynamic**: **620 declared
-base source-admission cases**, comprising 492 supported-intent positives, 80
-composed candidates and 48 precise rejections. Two additional
-authored four-policy families bring the total to **628**: 496 supported-intent
-positives, 80 candidates, and 52 rejection controls. CUDA TP2 adds a four-expert
-VRAM family with retained MTP capacity3 and an eight-expert family under an
-explicit 13GiB public GPU cap. Original full15 identities remain unchanged. Generated discovery
-and 11 focused declaration/evidence regressions pass. Existing Off names
-and source closures remain unchanged. Base active cells retain depth15 capacity; the bounded CUDA family retains
-depth3. Both use the original R1 predictor; Dynamic keeps automatic initial depth and the default
-controller cadence. The production speculative verifier remains selected.
+The 155 original seeds expand over **Off, fixed1, fixed3, and Dynamic**. Two
+additional four-policy CUDA TP2 families bring the total to **628**: 496
+supported-intent positives, 80 composed candidates and 52 rejection controls.
+The added families cover four-expert VRAM with retained MTP capacity3 and
+eight-expert admission under an explicit 13GiB public GPU cap. Original names,
+sources and full15 identities remain unchanged. Generated discovery and 11
+focused declaration/evidence regressions pass. Active cells retain depth15
+except the explicit depth3 CUDA family. Both use the original R1 predictor;
+Dynamic keeps automatic initial depth, default controller cadence and the
+production speculative verifier.
 
 Active setup checks original main/predictor sources, real prepared source48
 weights, PMA owners, and exact serving participant/role/row/outcome families.
@@ -88,6 +83,7 @@ Sources: [typed extensions](../../../../tests/v2/integration/parity/qwen4exp/Qwe
 |---|---|
 | Latest prerequisites | Complete Unit/preflight r30: **3,263 passes, zero failures and 29 unchanged hardware-unqualified cases**. Source/runtime unchanged; clean final driver window. Includes pooled lookup, readiness/discovery repairs and process-owned parity discovery. [Defects/evidence](QFN_RUNTIME_RETIREMENT_REPAIRS.md). |
 | Current native slices | Original **CUDA16/CPU32 and ROCm16/CPU32: all 32 host-tier/MTP identities pass**. RAM retains r10/r20 evidence; mmap and zero/positive host-adaptive cache pass 12/12 per backend in r23/r24. All 48 layers, active retained15, exact retirement, no prefix files and clean driver windows. Each receipt retains its actual runtime. |
+| Rechecked failures | **6/6 pass in r26**: mixed CUDA/ROCm/CPU PP fixed3/Dynamic; ROCm TP4 random dynamic expert placement with sharded VRAM ngrams fixed1/fixed3; CPU NUMA PP2 host-adaptive fixed1/fixed3. Original full48/retained15 policies, retirement, empty session bases and driver checks pass. |
 | Prepared physical roots | r19 shares the runtime's exact identity predicate with planning, removing replicated-decode sidecar double charges. The original CUDA16/CPU32 capacity failure is resolved by r20 native evidence. ROCm24/24 retains a 317,565,660-byte active-capacity deficit and separate native-domain composition work. |
 | Original-code controls | Reproduce NUMA allocator duplication, MTP routed-parent duplication and incorrect CPU global-layer certification. `/tmp/qfn-cpu-numa-original-control-r10/`, `/tmp/qfn-mtp-routed-replica-owner-r1/`, `/tmp/qfn-cpu-offset-original-control-r8/`. |
 | CUDA capacity controls | Four-expert VRAM retained3 positives and eight-expert 13GiB-cap rejections pass 8/8 with exact MTP/cap evidence and retirement. `source-admission-cuda-capacity-controls-r5/`. |
@@ -101,11 +97,6 @@ Native evidence directories above are under
 `parity-results/qwen-flash-next/` unless an absolute path is given. Earlier
 MTP and automatic-placement receipts remain independent earlier evidence;
 they do not certify the expanded matrix.
-
-The added CUDA15/CPU33 family retains all expert policies, full15 MTP capacity
-and every host-table placement. It complements the unchanged CUDA16/CPU32
-positive. Its complete source-admission family now passes; inference and
-numerical qualification remain separate.
 
 [Composed capacity replay](QFN_COMPOSED_CAPACITY_REPLAY_20261029.md) records
 earlier deficits; CUDA16/CPU32 RAM now passes unchanged. An explicit ROCm25/23
@@ -183,8 +174,8 @@ Temporary prefix directories must be absent after final retirement.
    CUDA/ROCm16→CPU32 now pass all host-table tiers and MTP modes.
 2. Continue native SDK preparation and distributed ownership with scoped
    qualification; pooled lookup and lifecycle repairs have complete r30 preflight.
-3. Run remaining locally available placement/ownership/MTP cases without
-   equating a sampled batch with the full matrix.
+3. Run remaining locally available placement/ownership/MTP cases. The six
+   implemented-topology historical failures now pass; broader coverage is open.
 4. Resolve native ROCm PP(TP2, TP2) composition and active capacity failures.
    Qualify CPU-tail placements outside CUDA16/32, ROCm16/32 and CUDA15/33
    families; preserve authored full15 positives. CUDA4/8 and ROCm8

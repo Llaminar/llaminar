@@ -1,6 +1,12 @@
 # QFN pooled ngrams across continuation topologies
 
-Implementation contract, updated 2026-10-31. Distributed tiering is not implemented or qualified. The single-GPU adaptive path now uses separate pooled owner, coordinator and source components; its production integration is under qualification. This note records the remaining implementation and testing work; source admission alone does not qualify inference.
+Implementation contract, updated 2026-10-31. Distributed tiering is not implemented or qualified. The single-GPU adaptive path now uses separate pooled owner, coordinator and source components; its focused source-admission and model-free preflight gates pass. This note records the remaining implementation and testing work; source admission alone does not qualify inference.
+
+The next [source/fill implementation plan](QFN_POOLED_SOURCE_FILL_PLAN.md)
+is reviewed and in private implementation. It retains one actual provider,
+adds exactly priced owner receive spans, and protects seal receipts, packet
+reuse and terminal metadata lifetime. It does not yet qualify distributed
+publication, reading, cancellation or native transport.
 
 ## Existing target and installed boundary
 
