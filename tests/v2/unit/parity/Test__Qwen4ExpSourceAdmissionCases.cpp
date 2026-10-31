@@ -1162,6 +1162,73 @@ TEST(Qwen4ExpSourceAdmissionCases, ExplicitFixedHeadCapacityControlsKeepOriginal
         std::invalid_argument);
 }
 
+/** @test The physical shortage has a distinct capped regression, retaining both original expert policies and all active MTP modes. */
+TEST(Qwen4ExpSourceAdmissionCases, ROCmReplicatedCapacityControlsRetainAllOriginalOwners)
+{
+    const auto original = qwen4ExpExpandSourceAdmissionMTP(qwen4ExpROCm4OverlayPolicyProductionCases());
+    const auto &controls = qwen4ExpROCm4ReplicatedCapacityRejectionCases();
+    ASSERT_EQ(controls.size(), 6u);
+    std::set<std::pair<RoutedExpertComputePolicy, ModelParityMTP>> axes;
+    std::set<std::string> names;
+    for (const auto &control : controls)
+    {
+        SCOPED_TRACE(control.testName());
+        auto restored = control.cell;
+        const auto suffix = restored.topology.test_id.rfind("_Capacity32GiB");
+        ASSERT_NE(suffix, std::string::npos);
+        restored.topology.test_id.resize(suffix);
+        const auto positive = std::find_if(original.begin(), original.end(),
+            [&](const auto &cell) { return cell.testName() == restored.testName(); });
+        ASSERT_NE(positive, original.end());
+        EXPECT_TRUE(names.insert(control.testName()).second);
+        EXPECT_LT(control.testName().size(), 256u);
+        EXPECT_NE(control.cell.mtp, ModelParityMTP::Off);
+        EXPECT_EQ(control.cell.retained_mtp_draft_capacity, 15);
+        EXPECT_EQ(control.cell.model.model_path, positive->model.model_path);
+        EXPECT_EQ(control.cell.model.shared_predictor, positive->model.shared_predictor);
+        EXPECT_EQ(control.cell.ngram_table_policy, positive->ngram_table_policy);
+        EXPECT_EQ(control.boundary, Qwen4ExpSourceCapacityBoundary::RoutedExpertResidency);
+        EXPECT_EQ(control.gpu_memory_cap_mb, 32768u);
+        const auto p = qwen4ExpSourceAdmissionCapacityConfig(*positive, positive->model.model_path, 0);
+        const auto n = qwen4ExpSourceAdmissionCapacityConfig(control.cell, control.cell.model.model_path, 0,
+            control.gpu_memory_cap_mb);
+        EXPECT_FALSE(p.max_gpu_memory_mb.has_value());
+        EXPECT_EQ(n.memoryLimitBytes(DeviceType::ROCm), std::size_t{32} * 1024 * 1024 * 1024);
+        EXPECT_EQ(n.mtp.graph_capacity_draft_tokens, p.mtp.graph_capacity_draft_tokens);
+        EXPECT_EQ(n.mtp.depth_policy.initial_depth, p.mtp.depth_policy.initial_depth);
+        const auto &plan = *n.moe_routed_expert_plan;
+        ASSERT_EQ(plan.domains.size(), 1u);
+        ASSERT_EQ(plan.routed_tiers.size(), 1u);
+        EXPECT_EQ(plan.routed_tiers.front().max_experts_per_layer, 0);
+        EXPECT_EQ(plan.domains.front().participants, p.moe_routed_expert_plan->domains.front().participants);
+        EXPECT_EQ(plan.continuation_domain_spec.effectiveDensePolicy(),
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
+        EXPECT_TRUE(axes.emplace(plan.domains.front().routed_compute_policy, control.cell.mtp).second);
+    }
+    EXPECT_EQ(axes.size(), 6u);
+}
+
+/** @test A capacity control cannot pass from a different boundary or an unrelated initialization failure. */
+TEST(Qwen4ExpSourceAdmissionCases, CapacityDiagnosticRequiresItsAuthoredBoundary)
+{
+    const std::string table = "Explicit fixed head native ranges exceed complete frozen PMA capacity; "
+        "immutable_table_storage=17000000000 deficit_bytes=3000000000";
+    const std::string experts = "ExpertOverlay has no resident captured-prefill shape with complete expert coverage "
+        "under the physical BOM: ExpertOverlay capacity step threw: 'overlay-candidate.complete-bom': "
+        "ExpertOverlay tier 'all_gpu' cannot admit its fallback remainder for layer 40: "
+        "requires_additional_bytes=2048000 remaining_bytes=842040 fixed_bytes=11130185704 "
+        "staging_bytes=536870624 live_expert_bytes=22324838400";
+    EXPECT_TRUE(qwen4ExpSourceCapacityDiagnosticMatches(Qwen4ExpSourceCapacityBoundary::FixedHeadTable, table));
+    EXPECT_TRUE(qwen4ExpSourceCapacityDiagnosticMatches(Qwen4ExpSourceCapacityBoundary::RoutedExpertResidency, experts));
+    EXPECT_FALSE(qwen4ExpSourceCapacityDiagnosticMatches(Qwen4ExpSourceCapacityBoundary::FixedHeadTable, experts));
+    EXPECT_FALSE(qwen4ExpSourceCapacityDiagnosticMatches(Qwen4ExpSourceCapacityBoundary::RoutedExpertResidency, table));
+    for (const auto *error : {"", "GPU allocation failed", "RCCL communicator creation failed",
+            "ExpertOverlay fixed-bom schema is invalid", "captured prefill is unsupported"})
+        EXPECT_FALSE(qwen4ExpSourceCapacityDiagnosticMatches(Qwen4ExpSourceCapacityBoundary::RoutedExpertResidency, error));
+    EXPECT_THROW(qwen4ExpSourceCapacityDiagnosticMatches(static_cast<Qwen4ExpSourceCapacityBoundary>(99), experts),
+        std::invalid_argument);
+}
+
 /**
  * @test Every existing source-admission identity retains all four MTP policies,
  * including candidate and precise-rejection families without reclassification.

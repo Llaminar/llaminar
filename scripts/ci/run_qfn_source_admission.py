@@ -60,20 +60,25 @@ def identity(device: dict) -> tuple[str, int, int]:
     return backend, ordinal, numa if backend == 'cpu' else -1
 
 
-def provisioning_requirement(record: dict) -> int | None:
-    """Read an authored physical test class; never derive a memory estimate."""
-    minimum = record.get('minimum_cuda_total_memory_bytes')
+def provisioning_requirements(record: dict) -> dict[str, int]:
+    """Read each authored vendor's physical test class, never a memory estimate."""
+    result = {}
     participants = record.get('participants')
-    if 'minimum_cuda_total_memory_bytes' in record and (not isinstance(participants, list)
-            or not all(isinstance(p, dict) for p in participants)):
-        raise ValueError('physical provisioning requires typed participant identities')
-    if 'minimum_cuda_total_memory_bytes' in record and (type(minimum) is not int or minimum <= 0
-            or record.get('mtp_enabled') is not True
-            or record.get('retained_mtp_draft_capacity') != 15
-            or 'gpu_memory_cap_mb' in record
-            or not any(p.get('backend') == 'cuda' for p in record.get('participants', []))):
-        raise ValueError('invalid authored CUDA physical provisioning prerequisite')
-    return minimum
+    for backend in ('cuda', 'rocm'):
+        field = f'minimum_{backend}_total_memory_bytes'
+        if field not in record:
+            continue
+        minimum = record[field]
+        if not isinstance(participants, list) or not all(isinstance(p, dict) for p in participants):
+            raise ValueError('physical provisioning requires typed participant identities')
+        if (type(minimum) is not int or minimum <= 0
+                or record.get('mtp_enabled') is not True
+                or record.get('retained_mtp_draft_capacity') != 15
+                or 'gpu_memory_cap_mb' in record
+                or not any(p.get('backend') == backend for p in participants)):
+            raise ValueError(f'invalid authored {backend} physical provisioning prerequisite')
+        result[backend] = minimum
+    return result
 
 
 def valid_unqualified(row: dict) -> bool:
@@ -92,7 +97,7 @@ def valid_unqualified(row: dict) -> bool:
                 or type(entry['participant'].get('rank')) is not int or entry['participant']['rank'] < 0):
             return False
         try:
-            if identity(entry['participant'])[0] != 'cuda':
+            if identity(entry['participant'])[0] not in ('cuda', 'rocm'):
                 return False
         except ValueError:
             return False
@@ -121,7 +126,7 @@ def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
                 or len(record['id'].encode()) >= 256
                 or not isinstance(participants, list) or not participants):
             raise ValueError('missing or stale typed source-admission metadata')
-        minimum = provisioning_requirement(record)
+        minimums = provisioning_requirements(record)
         declared = set()
         missing = []
         insufficient = []
@@ -133,10 +138,11 @@ def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
             declared.add((rank, address))
             if address not in available:
                 missing.append(participant)
-            elif minimum is not None and address[0] == 'cuda':
+            elif address[0] in minimums:
+                minimum = minimums[address[0]]
                 total = observed_devices[address].get('total_memory_bytes')
                 if type(total) is not int or total <= 0:
-                    raise ValueError('required CUDA physical total is missing or stale')
+                    raise ValueError(f'required {address[0]} physical total is missing or stale')
                 if total < minimum:
                     insufficient.append({'participant': participant,
                         'required_total_memory_bytes': minimum, 'observed_total_memory_bytes': total})
@@ -168,8 +174,8 @@ def source_parameters(document: dict) -> dict:
             capacity = SOURCE_METHOD_CONTRACTS[test['name'].split('/', 1)[0]] == SourceAdmissionContract.CAPACITY_REJECTION
             if type(record.get('qfn_source_admission_schema')) is not int or record['qfn_source_admission_schema'] != 2:
                 raise ValueError('stale source provisioning metadata schema; rebuild discovery')
-            minimum = provisioning_requirement(record)
-            if minimum is not None and SOURCE_METHOD_CONTRACTS[test['name'].split('/', 1)[0]] != SourceAdmissionContract.POSITIVE:
+            minimums = provisioning_requirements(record)
+            if minimums and SOURCE_METHOD_CONTRACTS[test['name'].split('/', 1)[0]] != SourceAdmissionContract.POSITIVE:
                 raise ValueError('physical provisioning belongs only to authored positive source coverage')
             retained = record.get('retained_mtp_draft_capacity')
             active = record.get('mtp_enabled')
@@ -181,6 +187,10 @@ def source_parameters(document: dict) -> dict:
                 raise ValueError('capacity source metadata requires its positive authored GPU cap')
             if not capacity and 'gpu_memory_cap_mb' in record:
                 raise ValueError('GPU cap metadata belongs only to the explicit capacity contract')
+            if capacity and record.get('capacity_boundary') not in ('fixed-head-table', 'routed-expert-residency'):
+                raise ValueError('capacity source metadata requires its exact authored boundary; rebuild discovery')
+            if not capacity and 'capacity_boundary' in record:
+                raise ValueError('invalid explicit source capacity boundary')
             if record.get('id') != test['name'].split('/', 1)[1]:
                 raise ValueError('stale source parameter name/identity')
             records[exact] = record
@@ -292,6 +302,8 @@ def validate_retirement(root: Path, record: dict, *, contract: SourceAdmissionCo
             if (type(cap) is not int or cap <= 0 or rows[0].get('gpu_memory_cap_mb') != str(cap)
                     or rows[0].get('initialized') != '0' or rows[0].get('capacity_rejected') != '1'
                     or rows[0].get('numerical_inference_executed') != '0'
+                    or record.get('capacity_boundary') not in ('fixed-head-table', 'routed-expert-residency')
+                    or rows[0].get('capacity_boundary') != record['capacity_boundary']
                     or (directory / 'admission.csv').exists() or (directory / 'rejection.csv').exists()
                     or not (directory / 'capacity-diagnostic.txt').is_file()
                     or not (directory / 'capacity-diagnostic.txt').read_text().strip()):

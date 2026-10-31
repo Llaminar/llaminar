@@ -15,6 +15,7 @@
 
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpMTPAdmissionCases.h"
+#include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
 #include "backends/HardwareInventory.h"
 
 #include <array>
@@ -24,6 +25,7 @@
 #include <iterator>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 
 namespace llaminar2::test::parity::qwen4exp
 {
@@ -172,11 +174,52 @@ inline const std::vector<ModelParityCase> &qwen4ExpCUDAFixedHeadFourExpertRetain
     return cases;
 }
 
+/** @brief Exact production admission boundary required by a capacity control. */
+enum class Qwen4ExpSourceCapacityBoundary { FixedHeadTable, RoutedExpertResidency };
+
+/** @brief Name an authored physical-admission boundary without inspecting a case name.
+ * @param boundary Exact typed negative control.
+ * @return Stable receipt spelling for that boundary.
+ * @throws std::invalid_argument For an unknown enum value. */
+inline const char *qwen4ExpSourceCapacityBoundaryName(Qwen4ExpSourceCapacityBoundary boundary)
+{
+    switch (boundary)
+    {
+    case Qwen4ExpSourceCapacityBoundary::FixedHeadTable: return "fixed-head-table";
+    case Qwen4ExpSourceCapacityBoundary::RoutedExpertResidency: return "routed-expert-residency";
+    }
+    throw std::invalid_argument("Unknown QFN source capacity boundary");
+}
+
+/** @brief Require the actual boundary diagnostic, never an unrelated initialization failure.
+ * @param boundary Authored negative control, independent of its topology name.
+ * @param error Original production runner diagnostic.
+ * @return True only for that complete physical-admission boundary's diagnostic.
+ * @throws std::invalid_argument For an unknown boundary. */
+inline bool qwen4ExpSourceCapacityDiagnosticMatches(Qwen4ExpSourceCapacityBoundary boundary,
+    std::string_view error)
+{
+    const auto has = [&](std::string_view text) { return error.find(text) != std::string_view::npos; };
+    switch (boundary)
+    {
+    case Qwen4ExpSourceCapacityBoundary::FixedHeadTable:
+        return has("Explicit fixed head native ranges exceed complete frozen PMA capacity") &&
+            has("immutable_table_storage=") && has("deficit_bytes=");
+    case Qwen4ExpSourceCapacityBoundary::RoutedExpertResidency:
+        return has("no resident captured-prefill shape with complete expert coverage under the physical BOM") &&
+            has("overlay-candidate.complete-bom") && has("cannot admit its fallback remainder") &&
+            has("requires_additional_bytes=") && has("remaining_bytes=") &&
+            has("fixed_bytes=") && has("staging_bytes=") && has("live_expert_bytes=");
+    }
+    throw std::invalid_argument("Unknown QFN source capacity boundary");
+}
+
 /** @brief Explicit public capacity input, distinct from unsupported policy rejection. */
 struct Qwen4ExpSourceCapacityAdmissionCase
 {
     ModelParityCase cell;
     std::size_t gpu_memory_cap_mb;
+    Qwen4ExpSourceCapacityBoundary boundary = Qwen4ExpSourceCapacityBoundary::FixedHeadTable;
     /** @return Existing source identity including the authored capacity-control suffix. */
     std::string testName() const { return cell.testName(); }
 };
@@ -200,6 +243,33 @@ inline const std::vector<Qwen4ExpSourceCapacityAdmissionCase> &qwen4ExpCUDAFixed
         std::vector<Qwen4ExpSourceCapacityAdmissionCase> result;
         for (auto &cell : qwen4ExpExpandSourceAdmissionMTP(seeds))
             result.push_back({std::move(cell), 13u * 1024u});
+        return result;
+    }();
+    return cases;
+}
+
+/**
+ * @return Six full15 replicated-decode requests under an explicit 32GiB public cap.
+ * @note These retain all original sources, 49 expert banks, RAM ngrams and both
+ * routed policies. Positive larger-card cases keep their identities separately.
+ * The cap also makes the same rejection mandatory on larger qualifying cards.
+ */
+inline const std::vector<Qwen4ExpSourceCapacityAdmissionCase> &qwen4ExpROCm4ReplicatedCapacityRejectionCases()
+{
+    static const auto cases = [] {
+        std::vector<Qwen4ExpSourceCapacityAdmissionCase> result;
+        for (auto cell : qwen4ExpExpandSourceAdmissionMTP(qwen4ExpROCm4OverlayPolicyProductionCases()))
+        {
+            if (cell.mtp == ModelParityMTP::Off ||
+                cell.topology.expert_overlay_plan->continuation_domain_spec.effectiveDensePolicy() !=
+                    DenseParallelPolicy::PrefillTensorParallelDecodeReplicated)
+                continue;
+            cell.topology.test_id += "_Capacity32GiB";
+            result.push_back({std::move(cell), 32u * 1024u,
+                Qwen4ExpSourceCapacityBoundary::RoutedExpertResidency});
+        }
+        if (result.size() != 6u)
+            throw std::logic_error("ROCm replicated-decode capacity controls lost their original policy dimension");
         return result;
     }();
     return cases;

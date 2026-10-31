@@ -237,7 +237,7 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpFullROCmTP4SourceAdmission, Qwen4ExpSourceAdmis
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpROCm4OverlayPolicySourceAdmission, Qwen4ExpSourceAdmissionTest,
-    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpROCm4OverlayPolicyProductionCases()))),
+    ::testing::ValuesIn(qwen4ExpROCm4OverlayPolicySourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpROCm4OverlayPolicyProductionCases()))),
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
 
 // This explicit bounded family complements the unchanged full15 request;
@@ -254,12 +254,17 @@ class Qwen4ExpCapacitySourceAdmissionTest : public ::testing::Test, public Qwen4
 TEST_P(Qwen4ExpCapacitySourceAdmissionTest, RejectCapacitySourceAdmission)
 {
     ASSERT_TRUE(GetParam().gpu_memory_cap_mb.has_value());
+    ASSERT_TRUE(GetParam().capacity_boundary.has_value());
     ASSERT_NO_FATAL_FAILURE(admitQwen4ExpSourceCapacityRejected(
-        modelParityCase(), *GetParam().gpu_memory_cap_mb));
+        modelParityCase(), *GetParam().gpu_memory_cap_mb, *GetParam().capacity_boundary));
 }
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpFixedHeadCapacitySourceAdmission, Qwen4ExpCapacitySourceAdmissionTest,
     ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpCUDAFixedHeadCapacityRejectionCases())),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpROCm4ReplicatedCapacitySourceAdmission, Qwen4ExpCapacitySourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpROCm4ReplicatedCapacityRejectionCases())),
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
 
 // Source-only extensions share this lifecycle without entering the numerical
@@ -374,7 +379,7 @@ TEST_P(Qwen4ExpNgramAdmissionTest, FullSourceAdmission)
     if (config.moe_routed_expert_plan)
         authored.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*config.moe_routed_expert_plan);
     Qwen4ExpSourceAdmissionLifetime lifetime(config, output / "prefix-cache");
-    {
+    observeQwen4ExpAdmissionThenRetire([&] {
         auto *runner = &lifetime.runner();
         runner->disableSnapshotCapture();
         std::vector<PerfStatRecord> mtp_setup_before;
@@ -479,14 +484,17 @@ TEST_P(Qwen4ExpNgramAdmissionTest, FullSourceAdmission)
             << ",48,1,0," << placement->extent().nativeBytes() << ",0\n";
         csv.flush();
         ASSERT_TRUE(csv.good());
-    } // Drop every observation alias before final exclusive model retirement.
-    ASSERT_NO_THROW(lifetime.finish());
-    std::ofstream retirement(output / "retirement.csv");
-    ASSERT_TRUE(retirement.is_open());
-    retirement << "cell,runner_retired,model_retired,prefix_removed,retired_gpu_generations\n"
-        << modelParityCase().testName() << ",1,1,1," << lifetime.retiredDeviceCount() << '\n';
-    retirement.flush();
-    ASSERT_TRUE(retirement.good());
+    }, [&] {
+        // Fatal assertions return from the observation callback, after dropping
+        // its aliases. They must not bypass final retirement or its receipt.
+        ASSERT_NO_THROW(lifetime.finish());
+        std::ofstream retirement(output / "retirement.csv");
+        ASSERT_TRUE(retirement.is_open());
+        retirement << "cell,runner_retired,model_retired,prefix_removed,retired_gpu_generations\n"
+            << modelParityCase().testName() << ",1,1,1," << lifetime.retiredDeviceCount() << '\n';
+        retirement.flush();
+        ASSERT_TRUE(retirement.good());
+    });
 }
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpNgramAdmission, Qwen4ExpNgramAdmissionTest,

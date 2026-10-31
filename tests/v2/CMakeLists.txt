@@ -28314,6 +28314,17 @@ add_v2_test(V2_Integration_Qwen4ExpPLELifecycle
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives> --gtest_filter=PLELifecycle.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Lifecycle;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_Qwen4ExpPLEPipelineIngress
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=PLELifecycle.PipelineEntrySnapshotReplaysResetEmptyAndPartialRows:PLELifecycle.PriorRejectsMissingAndForeignProducerBeforeMutation
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Pipeline;Replay;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_NativePipelineMTPModelRoots
+    COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+        --gtest_filter=Test__PipelineForwardEdges.MTPForwardsEncloseEveryRootAndLeaf
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;Pipeline;Capture;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_QwenSparseCandidateCopyCounterAdmission
     V2_Integration_QwenSparseRetainedCPU
@@ -28324,6 +28335,8 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_QwenSparseCountedProjectionAdmission
     V2_Integration_Qwen4ExpPLERetained
     V2_Integration_Qwen4ExpPLELifecycle
+    V2_Integration_Qwen4ExpPLEPipelineIngress
+    V2_Integration_NativePipelineMTPModelRoots
 )
 
 # Dense0 input expansion retains the original device-owned token count.
@@ -29607,7 +29620,15 @@ target_sources(v2_test_model_parity_definition PRIVATE
     unit/parity/Test__Qwen4ExpNgramAdmissionCases.cpp
     unit/parity/Test__Qwen4ExpSourceAdmissionCases.cpp
     unit/planning/Test__Qwen4ExpSourceAdmissionMTPEvidence.cpp
-    unit/parity/Test__Qwen4ExpSourceAdmissionCI.cpp)
+    unit/parity/Test__Qwen4ExpSourceAdmissionCI.cpp
+    unit/parity/Test__Qwen4ExpSourceAdmissionRetirement.cpp)
+add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionRetirement
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionRetirement.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Admission;Lifecycle;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpSourceAdmissionRetirement)
 add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionCIMetadata
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=Qwen4ExpSourceAdmissionCI.*
@@ -29615,6 +29636,13 @@ add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionCIMetadata
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpSourceAdmissionCIMetadata)
+add_v2_test(V2_Integration_Qwen4ExpROCmReplicatedCapacityPrerequisites
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCI.ROCmReplicatedFull15RequiresItsAuthoredPhysicalClass:Qwen4ExpSourceAdmissionCases.ROCmReplicatedCapacityControlsRetainAllOriginalOwners:Qwen4ExpSourceAdmissionCases.CapacityDiagnosticRequiresItsAuthoredBoundary
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;ROCm;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpROCmReplicatedCapacityPrerequisites)
 add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionDeclarations
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=Qwen4ExpSourceAdmissionCases.*

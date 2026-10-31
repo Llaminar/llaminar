@@ -114,3 +114,50 @@ TEST(Qwen4ExpSourceAdmissionCI, LargeCardClassAppliesOnlyToOriginalFull15CUDAFix
             qwen4ExpExpandSourceAdmissionMTP(qwen4ExpRejectedSourceAdmissionCases())))
         EXPECT_FALSE(cell.minimum_cuda_total_memory_bytes);
 }
+
+/** @test A physical ROCm prerequisite preserves the original six runtime requests and every fitting control. */
+TEST(Qwen4ExpSourceAdmissionCI, ROCmReplicatedFull15RequiresItsAuthoredPhysicalClass)
+{
+    const auto original = qwen4ExpExpandSourceAdmissionMTP(qwen4ExpROCm4OverlayPolicyProductionCases());
+    const auto projected = qwen4ExpROCm4OverlayPolicySourceAdmissionParameters(original);
+    ASSERT_EQ(projected.size(), 12u);
+    std::size_t larger = 0;
+    for (std::size_t i = 0; i < original.size(); ++i)
+    {
+        const auto &cell = projected[i];
+        std::ostringstream before, after, metadata;
+        llaminar2::test::parity::PrintTo(original[i], &before);
+        llaminar2::test::parity::PrintTo(static_cast<const ModelParityCase &>(cell), &after);
+        EXPECT_EQ(before.str(), after.str());
+        EXPECT_EQ(cell.topology.expert_overlay_plan, original[i].topology.expert_overlay_plan);
+        EXPECT_FALSE(cell.minimum_cuda_total_memory_bytes);
+        EXPECT_FALSE(cell.gpu_memory_cap_mb);
+        EXPECT_FALSE(cell.capacity_boundary);
+        PrintTo(cell, &metadata);
+        const bool replicated = cell.topology.expert_overlay_plan->continuation_domain_spec.effectiveDensePolicy() ==
+            llaminar2::DenseParallelPolicy::PrefillTensorParallelDecodeReplicated;
+        EXPECT_EQ(cell.minimum_rocm_total_memory_bytes.has_value(), replicated && cell.mtp != ModelParityMTP::Off);
+        if (cell.minimum_rocm_total_memory_bytes)
+        {
+            ++larger;
+            EXPECT_EQ(*cell.minimum_rocm_total_memory_bytes, std::size_t{48} * 1024 * 1024 * 1024);
+            EXPECT_EQ(cell.retained_mtp_draft_capacity, 15);
+            EXPECT_NE(metadata.str().find("\"minimum_rocm_total_memory_bytes\":51539607552"), std::string::npos);
+        }
+    }
+    EXPECT_EQ(larger, 6u);
+    for (const auto &cell : qwen4ExpSourceAdmissionParameters(qwen4ExpROCm4ReplicatedCapacityRejectionCases()))
+    {
+        EXPECT_FALSE(cell.minimum_cuda_total_memory_bytes);
+        EXPECT_FALSE(cell.minimum_rocm_total_memory_bytes);
+        EXPECT_EQ(cell.gpu_memory_cap_mb, 32768u);
+        EXPECT_EQ(cell.capacity_boundary, Qwen4ExpSourceCapacityBoundary::RoutedExpertResidency);
+        std::ostringstream metadata;
+        PrintTo(cell, &metadata);
+        EXPECT_NE(metadata.str().find("\"capacity_boundary\":\"routed-expert-residency\""), std::string::npos);
+    }
+    auto foreign = original;
+    for (auto &cell : foreign)
+        cell.topology.participants.front().address = llaminar2::GlobalDeviceAddress::cuda(0);
+    EXPECT_THROW(qwen4ExpROCm4OverlayPolicySourceAdmissionParameters(foreign), std::invalid_argument);
+}

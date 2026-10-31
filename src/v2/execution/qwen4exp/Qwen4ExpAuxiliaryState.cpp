@@ -467,9 +467,18 @@ Qwen4ExpAuxiliaryState::PLEVerifierPrior Qwen4ExpAuxiliaryState::appendVerifierP
  const auto&history=ple(sequence);
  require(sequence==0&&history.verifier&&rows.capacity>0&&rows.capacity<=history.verifier->rowCapacity,
   "QFN grouped PLE prior requires admitted single-request verifier storage");
- require(!prefix.empty()&&!dependencies.empty(),"QFN PLE prior requires exact native producer dependencies");
+ // A PLE-only pipeline participant begins with this snapshot. The canonical
+ // pipeline composer encloses every model root with metadata/activation edges
+ // after this fragment is built. Do not invent an earlier local producer, or
+ // permit an omitted edge once another model node has already been declared.
+ require(!prefix.empty()&&(!dependencies.empty()||graph.size()==0),
+  "QFN PLE prior requires an empty graph entry or exact native producer dependencies");
  const auto name=prefix+"transaction_prior";require(!graph.getNode(name),"QFN PLE prior producer name collides");
- for(const auto&dependency:dependencies)require(graph.getNode(dependency),"QFN PLE prior is missing an actual producer");
+ for(const auto&dependency:dependencies) {
+  const auto*producer=graph.getNode(dependency);
+  require(producer&&producer->stage&&producer->stage->device()==params_.device,
+   "QFN PLE prior is missing its actual same-participant producer");
+ }
  auto stage=std::make_unique<Qwen4ExpPLERetainedStage>(pleVerifierParams(params_.device,history,rows,
   std::move(candidateTokens),candidateNormalized,Qwen4ExpPLERetainedStage::Operation::SnapshotPrior));
  graph.addNode(name,std::move(stage),params_.device);for(const auto&dependency:dependencies)graph.addDependency(name,dependency);

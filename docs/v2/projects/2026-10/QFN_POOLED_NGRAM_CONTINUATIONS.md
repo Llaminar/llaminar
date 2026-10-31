@@ -2,17 +2,28 @@
 
 Implementation contract, updated 2026-10-31. Distributed tiering is not implemented or qualified. The single-GPU adaptive path now uses separate pooled owner, coordinator and source components; its focused source-admission and model-free preflight gates pass. This note records the remaining implementation and testing work; source admission alone does not qualify inference.
 
-The next [source/fill implementation plan](QFN_POOLED_SOURCE_FILL_PLAN.md)
-is reviewed and in private implementation. It retains one actual provider,
-adds exactly priced owner receive spans, and protects seal receipts, packet
-reuse and terminal metadata lifetime. It does not yet qualify distributed
-publication, reading, cancellation or native transport.
+The [source/fill component](QFN_POOLED_SOURCE_FILL_PLAN.md) has private CPU
+replay and full-target compiler evidence through real fill outcomes. It retains
+one provider and exact owner receive spans. The mixed-local Pin/Free/Victim
+adapter now has frozen host-component evidence; neither component is installed. The next
+[completion plan](QFN_POOLED_COMPLETION_PLAN.md) wires actual publication,
+reads, release and retirement, beginning with publication through Ready.
+Native captured execution and complete distributed admission remain open.
 
-The private participant factories currently cover all-remote owner cohorts;
-the installed local path covers one owner. A mixed local/remote cohort also
-needs direct local pin/free/victim edges with actual producer and receipt
-dependencies. This is required for the usual TP2 arrangement before its
-source/fill component can be qualified; local completion cannot be assumed.
+The isolated integration tree combines all-remote and mixed local/remote
+owner components. Direct local Pin/Free/Victim edges retain actual producer
+and receipt dependencies without a self-channel. Source/publication, reads
+and retirement are being completed in parallel. The installed path still
+covers one owner; host-component passes do not qualify distributed capture.
+
+The existing memory composer now has a private multi-owner overload, charging
+each physical GPU separately and the coordinator/source once through PMA.
+Focused tests cover 1/2/4/8 owners, unequal/C0 capacity, mixed backend metadata,
+query buckets through M2048, exact fit and one-byte-short rejection. The
+original single-owner composer agrees in 120 metadata combinations. Directed
+transport still supplies its own BOM; planner/factory eligibility stays guarded.
+Evidence: `/tmp/qfn-ngram-cohort-proof-r1/`,
+`/tmp/qfn-pooled-mixed-local-r2/`, `/tmp/qfn-ngram-rollout-r1/`.
 
 ## Existing target and installed boundary
 

@@ -128,7 +128,21 @@ public:
         int sequence_;Qwen4ExpStageRows rows_;Qwen4ExpIntBinding tokens_;Qwen4ExpFloatBinding convolution_;
         ImmutableVerifierPrior capability_;
     };
-    /** @brief Snapshot dedicated original tails before the first verifier hash/convolution consumer. */
+    /**
+     * @brief Snapshot original tails before the first verifier hash/convolution consumer.
+     * @param graph Participant-local model fragment receiving the actual snapshot producer.
+     * @param prefix Unique semantic prefix for the transaction's producer.
+     * @param sequence Admitted single-request history index.
+     * @param rows Original verifier capacity and native live-row owner.
+     * @param candidateTokens Original candidate token rows for this transaction.
+     * @param candidateNormalized Admitted normalized candidate bank retained by the transaction.
+     * @param dependencies Exact local producers; empty only when this is the fragment's first node.
+     * @return Move-only prior capability consumed by retained candidate publication.
+     * @throws std::invalid_argument For missing, foreign or omitted non-entry producers.
+     * @note PipelineForwardGraphEdges attaches native metadata and activation
+     * dependencies to all model roots after construction. A pipeline entry
+     * therefore remains a real snapshot root, without a dummy readiness stage.
+     */
     PLEVerifierPrior appendVerifierPLEPrior(ComputeGraph&graph,const std::string&prefix,int sequence,
         Qwen4ExpStageRows rows,Qwen4ExpIntInput candidateTokens,Qwen4ExpFloatBinding candidateNormalized,
         const std::vector<std::string>&dependencies)const;

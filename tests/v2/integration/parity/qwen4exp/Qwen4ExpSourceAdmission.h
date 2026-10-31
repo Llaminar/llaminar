@@ -773,8 +773,10 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell)
  * @brief Prove explicit physical capacity rejection without claiming unsupported execution.
  * @param cell Exact larger request retaining the same head/expert/MTP declarations.
  * @param gpu_memory_cap_mb Authored public ceiling; applied before any capacity planning.
+ * @param boundary Exact production physical-admission boundary required by this control.
  */
-inline void admitQwen4ExpSourceCapacityRejected(const ModelParityCase &cell, std::size_t gpu_memory_cap_mb)
+inline void admitQwen4ExpSourceCapacityRejected(const ModelParityCase &cell, std::size_t gpu_memory_cap_mb,
+    Qwen4ExpSourceCapacityBoundary boundary)
 {
     withQwen4ExpSourceAdmission(cell, [&](int, const OrchestrationConfig &config,
         const OrchestrationConfig &, Qwen4ExpSourceAdmissionLifetime &lifetime,
@@ -785,9 +787,7 @@ inline void admitQwen4ExpSourceCapacityRejected(const ModelParityCase &cell, std
         ASSERT_FALSE(runner.initialize());
         ASSERT_FALSE(runner.isInitialized());
         const auto &error = runner.lastError();
-        ASSERT_NE(error.find("Explicit fixed head native ranges exceed complete frozen PMA capacity"), std::string::npos) << error;
-        ASSERT_NE(error.find("immutable_table_storage="), std::string::npos) << error;
-        ASSERT_NE(error.find("deficit_bytes="), std::string::npos) << error;
+        ASSERT_TRUE(qwen4ExpSourceCapacityDiagnosticMatches(boundary, error)) << error;
         ASSERT_FALSE(runner.modelContextReuseContract().has_value());
         ASSERT_TRUE(runner.getSnapshotKeys().empty());
         std::ofstream diagnostic(output / "capacity-diagnostic.txt");
@@ -797,8 +797,9 @@ inline void admitQwen4ExpSourceCapacityRejected(const ModelParityCase &cell, std
         ASSERT_TRUE(diagnostic.good());
         std::ofstream receipt(output / "capacity-rejection.csv");
         ASSERT_TRUE(receipt.is_open());
-        receipt << "cell,initialized,capacity_rejected,gpu_memory_cap_mb,numerical_inference_executed\n"
-            << cell.testName() << ",0,1," << gpu_memory_cap_mb << ",0\n";
+        receipt << "cell,initialized,capacity_rejected,gpu_memory_cap_mb,numerical_inference_executed,capacity_boundary\n"
+            << cell.testName() << ",0,1," << gpu_memory_cap_mb << ",0,"
+            << qwen4ExpSourceCapacityBoundaryName(boundary) << '\n';
         receipt.flush();
         ASSERT_TRUE(receipt.good());
     }, gpu_memory_cap_mb);

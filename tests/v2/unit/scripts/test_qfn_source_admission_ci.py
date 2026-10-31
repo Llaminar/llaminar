@@ -116,6 +116,82 @@ class QFNSourceAdmissionCI(unittest.TestCase):
         self.assertTrue(all(row['qualification'] == 'hardware-ineligible-unqualified'
                             for row in unavailable.values()))
 
+    def test_rocm_physical_class_checks_every_participant_without_hiding_controls(self):
+        from run_qfn_source_admission import valid_unqualified
+        minimum = 48 * 1024**3
+        off = {**parameter('rocm', 0), 'mpi_ranks': 1, 'participants': [
+            {'rank': 0, 'backend': 'rocm', 'ordinal': i, 'numa_node': -1} for i in range(4)]}
+        active = {**off, 'mtp_enabled': True, 'retained_mtp_draft_capacity': 15}
+        positive = {**active, 'minimum_rocm_total_memory_bytes': minimum}
+        negative = {**active, 'gpu_memory_cap_mb': 32768, 'capacity_boundary': 'routed-expert-residency'}
+        records = {'off': off, 'negative': negative, 'large': positive}
+        observed = {'qfn_source_hardware_schema': 2, 'scope': 'local-host-all-ranks', 'devices': [
+            {'backend': 'rocm', 'ordinal': i, 'numa_node': -1, 'total_memory_bytes': minimum} for i in range(4)]}
+        observed['devices'].append({'backend': 'rocm', 'ordinal': 7, 'numa_node': -1, 'total_memory_bytes': 192 * 1024**3})
+        observed['devices'].append({'backend': 'cuda', 'ordinal': 0, 'numa_node': -1, 'total_memory_bytes': 24 * 1024**3})
+        for ordinal in range(4):
+            changed = copy.deepcopy(observed)
+            changed['devices'][ordinal]['total_memory_bytes'] = 32 * 1024**3
+            selected, unqualified = select(records, changed)
+            self.assertEqual(selected, ['off', 'negative'])
+            self.assertTrue(valid_unqualified(unqualified['large']))
+            insufficient = unqualified['large']['insufficient']
+            self.assertEqual(len(insufficient), 1)
+            self.assertEqual(insufficient[0]['participant']['ordinal'], ordinal)
+            for bad in (None, 0, -1, True, '48GiB'):
+                changed['devices'][ordinal]['total_memory_bytes'] = bad
+                with self.subTest(ordinal=ordinal, bad=bad), self.assertRaises(ValueError):
+                    select(records, changed)
+        selected, unqualified = select(records, observed)
+        self.assertEqual(selected, list(records))
+        self.assertFalse(unqualified)
+        for malformed in ({**positive, 'minimum_rocm_total_memory_bytes': True},
+                          {**positive, 'mtp_enabled': False},
+                          {**positive, 'retained_mtp_draft_capacity': 3},
+                          {**positive, 'gpu_memory_cap_mb': 32768},
+                          {**parameter(), 'mtp_enabled': True, 'retained_mtp_draft_capacity': 15,
+                           'minimum_rocm_total_memory_bytes': minimum}):
+            with self.subTest(record=malformed), self.assertRaises(ValueError):
+                select({'mandatory': off, 'malformed': malformed}, observed)
+
+    def test_capacity_boundary_is_bound_to_the_exact_negative_receipt(self):
+        record = {**parameter('rocm', 0), 'mtp_enabled': True, 'retained_mtp_draft_capacity': 15,
+                  'gpu_memory_cap_mb': 32768, 'capacity_boundary': 'routed-expert-residency'}
+        def document(value, method='RejectCapacitySourceAdmission'):
+            return {'testsuites': [{'name': 'Source', 'testsuite': [
+                {'name': method + '/Opaque', 'value_param': json.dumps(value)}]}]}
+        self.assertIn('Source.RejectCapacitySourceAdmission/Opaque', source_parameters(document(record)))
+        without_boundary = {key: value for key, value in record.items() if key != 'capacity_boundary'}
+        with self.assertRaises(ValueError):
+            source_parameters(document(without_boundary))
+        for boundary in (None, '', 'unsupported-policy', 'RoutedExpertResidency'):
+            with self.subTest(boundary=boundary), self.assertRaises(ValueError):
+                source_parameters(document({**record, 'capacity_boundary': boundary}))
+        with self.assertRaises(ValueError):
+            source_parameters(document({**parameter(), 'capacity_boundary': 'routed-expert-residency'},
+                                       'FullSourceAdmission'))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directories = []
+            for rank in range(record['mpi_ranks']):
+                directory = root / f'source-admission/Opaque/rank-{rank}'
+                directory.mkdir(parents=True)
+                directories.append(directory)
+                (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+                (directory / 'capacity-diagnostic.txt').write_text('actual explicit routed expert capacity diagnostic')
+                (directory / 'capacity-rejection.csv').write_text(
+                    'cell,initialized,capacity_rejected,gpu_memory_cap_mb,numerical_inference_executed,capacity_boundary\n'
+                    'Opaque,0,1,32768,0,routed-expert-residency\n')
+            validate_retirement(root, record, contract=SourceAdmissionContract.CAPACITY_REJECTION)
+            with self.assertRaises(ValueError):
+                validate_retirement(root, without_boundary, contract=SourceAdmissionContract.CAPACITY_REJECTION)
+            receipt = directories[-1] / 'capacity-rejection.csv'
+            original = receipt.read_text()
+            for wrong in ('fixed-head-table', '', 'unsupported-policy'):
+                receipt.write_text(original.replace('routed-expert-residency', wrong))
+                with self.subTest(wrong=wrong), self.assertRaises(ValueError):
+                    validate_retirement(root, record, contract=SourceAdmissionContract.CAPACITY_REJECTION)
+
     def test_source_serialization_does_not_consume_numerical_schema(self):
         name = 'CandidateSourceAdmission/Opaque'
         document = {'testsuites': [{'name': 'Source', 'testsuite': [
@@ -419,7 +495,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
         def document(method, record):
             return {'testsuites': [{'name': 'Source', 'testsuite': [{
                 'name': method + '/Opaque', 'value_param': json.dumps(record)}]}]}
-        record = {**parameter(), 'gpu_memory_cap_mb': 13312}
+        record = {**parameter(), 'gpu_memory_cap_mb': 13312, 'capacity_boundary': 'fixed-head-table'}
         exact = 'Source.RejectCapacitySourceAdmission/Opaque'
         self.assertEqual(source_contract(exact), SourceAdmissionContract.CAPACITY_REJECTION)
         self.assertEqual(source_parameters(document('RejectCapacitySourceAdmission', record)), {exact: record})
@@ -436,7 +512,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
                 source_parameters(document('FullSourceAdmission', {**parameter(), **changed}))
 
     def test_capacity_receipt_cannot_masquerade_as_structural_rejection_or_positive(self):
-        record = {**parameter(), 'gpu_memory_cap_mb': 13312}
+        record = {**parameter(), 'gpu_memory_cap_mb': 13312, 'capacity_boundary': 'fixed-head-table'}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for rank in range(record['mpi_ranks']):
@@ -444,7 +520,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
                 directory.mkdir(parents=True)
                 (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
                 (directory / 'capacity-diagnostic.txt').write_text('canonical native capacity rejection')
-                (directory / 'capacity-rejection.csv').write_text('cell,initialized,capacity_rejected,gpu_memory_cap_mb,numerical_inference_executed\nOpaque,0,1,13312,0\n')
+                (directory / 'capacity-rejection.csv').write_text('cell,initialized,capacity_rejected,gpu_memory_cap_mb,numerical_inference_executed,capacity_boundary\nOpaque,0,1,13312,0,fixed-head-table\n')
             validate_retirement(root, record, contract=SourceAdmissionContract.CAPACITY_REJECTION)
             for wrong in (SourceAdmissionContract.POSITIVE, SourceAdmissionContract.UNSUPPORTED_REJECTION):
                 with self.subTest(wrong=wrong), self.assertRaises(FileNotFoundError):

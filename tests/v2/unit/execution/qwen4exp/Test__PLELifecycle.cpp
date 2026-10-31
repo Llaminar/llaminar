@@ -22,7 +22,8 @@ namespace {
 /** @brief Explicit already-materialized input/normalization producer in a device-free graph. */
 class ReadyStage final:public IComputeStage {
 public:
- ReadyStage():IComputeStage(DeviceId::cpu()){}
+ /** @brief Keep a declared producer identity; foreign-device instances are negative controls only. */
+ explicit ReadyStage(DeviceId device=DeviceId::cpu()):IComputeStage(device){}
  /** @brief Fixture inputs are initialized before this graph executes. */
  bool execute(IDeviceContext*)override{return true;}
  ComputeStageType type()const override{return ComputeStageType::COPY;}
@@ -65,10 +66,94 @@ struct Fixture {
  void execute(ComputeGraph&g){for(const auto&name:g.getExecutionOrder())ASSERT_TRUE(g.getNode(name)->stage->execute(&context));}
  /** @brief Existing canonical CPU publisher is the sole accepted-state mutation boundary. */
  MTPSpecStatePublicationResult publish(ComputeGraph&g,int accepted){MTPSpecStepPlanBatch p;p.ok=true;p.request_count=1;p.steps.push_back({.request_index=0,.draft_count=15,.accepted_count=accepted});const int row=accepted?accepted-1:-1;auto stages=g.getExecutionStages();return publishAcceptedMTPSpecStateFromVerifierRows(p,&row,stages,DeviceId::cpu(),nullptr,true);}
- /** @brief Snapshot then retain through the typed owner capability and real graph dependencies. */
- void compose(ComputeGraph&g){g.addNode("tokens_ready",std::make_unique<ReadyStage>());auto prior=owner->appendVerifierPLEPrior(g,"ple_",0,rows(),tokenInput(),{normalized,BufferId::QFN_PLE_NORMALIZED},{"tokens_ready"});EXPECT_EQ(prior.tokens().buffer,BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY);g.addNode("conv_norm",std::make_unique<ReadyStage>());g.addDependency("conv_norm",prior.snapshotProducer());owner->appendVerifierPLERetain(g,"ple_",std::move(prior),tokenInput(),{normalized,BufferId::QFN_PLE_NORMALIZED},{"conv_norm"});
- EXPECT_THROW((void)prior.snapshotProducer(),std::logic_error);}
+ /** @brief Distinguish an existing local producer from a participant's first model operation. */
+ enum class Entry { LocalProducer, PipelineIngress };
+ /** @brief Snapshot then retain through the real capability, preserving a pipeline fragment's root. */
+ void compose(ComputeGraph &graph, Entry entry=Entry::LocalProducer)
+ {
+  std::vector<std::string> dependencies;
+  if(entry==Entry::LocalProducer) {
+   graph.addNode("tokens_ready",std::make_unique<ReadyStage>());
+   dependencies={"tokens_ready"};
+  }
+  auto prior=owner->appendVerifierPLEPrior(graph,"ple_",0,rows(),tokenInput(),
+   {normalized,BufferId::QFN_PLE_NORMALIZED},dependencies);
+  EXPECT_EQ(prior.tokens().buffer,BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY);
+  graph.addNode("conv_norm",std::make_unique<ReadyStage>());
+  graph.addDependency("conv_norm",prior.snapshotProducer());
+  owner->appendVerifierPLERetain(graph,"ple_",std::move(prior),tokenInput(),
+   {normalized,BufferId::QFN_PLE_NORMALIZED},{"conv_norm"});
+  EXPECT_THROW((void)prior.snapshotProducer(),std::logic_error);
+ }
 };
+}
+/**
+ * @test A PLE-only pipeline fragment starts at its actual snapshot and replays exact live rows.
+ *
+ * The pipeline owner encloses graph roots after model construction. The model
+ * fragment must therefore preserve this real snapshot as its root, without a
+ * fabricated readiness node. CPU replay checks the same snapshot/retention
+ * implementation across reset, empty work and shrinking then growing batches.
+ */
+TEST(PLELifecycle, PipelineEntrySnapshotReplaysResetEmptyAndPartialRows)
+{
+ llaminar::v2::ThreadCountGuard threads(1);
+ Fixture fixture;ComputeGraph graph;
+ ASSERT_NO_THROW(fixture.compose(graph,Fixture::Entry::PipelineIngress));
+ ASSERT_EQ(graph.getRootNodes(),std::vector<std::string>{"ple_transaction_prior"});
+ ASSERT_EQ(graph.size(),3u);
+ EXPECT_EQ(graph.getNode("conv_norm")->dependencies,std::vector<std::string>{"ple_transaction_prior"});
+ for(int replay=0;replay<3;++replay)for(int live:{16,3,0,1,12}) {
+  SCOPED_TRACE(::testing::Message()<<"replay="<<replay<<", live="<<live);
+  fixture.live=live;
+  const std::array<int,2> acceptedTokens{
+   static_cast<const int*>(fixture.ordinaryTokens.raw_data())[0],
+   static_cast<const int*>(fixture.ordinaryTokens.raw_data())[1]};
+  const std::vector<float> acceptedConvolution(fixture.ordinaryConv.data(),
+   fixture.ordinaryConv.data()+9*Fixture::C);
+  std::fill_n(static_cast<int*>(fixture.retainedTokens.raw_mutable_data()),Fixture::M,-777);
+  std::fill_n(fixture.retainedNorm.mutable_data(),Fixture::M*Fixture::C,-777.0f);
+  fixture.execute(graph);
+  if(live) {
+   EXPECT_EQ(std::memcmp(fixture.priorTokens.raw_data(),acceptedTokens.data(),8),0);
+   EXPECT_EQ(std::memcmp(fixture.priorConv.raw_data(),acceptedConvolution.data(),9*Fixture::C*4),0);
+  }
+  for(int row=0;row<Fixture::M;++row) {
+   EXPECT_EQ(static_cast<const int*>(fixture.retainedTokens.raw_data())[row],
+    row<live?fixture.tokens[row]:-777);
+   for(int channel=0;channel<Fixture::C;++channel)
+    EXPECT_EQ(fixture.retainedNorm.data()[row*Fixture::C+channel],
+     row<live?fixture.normalized.data()[row*Fixture::C+channel]:-777.0f);
+  }
+  const auto *bytes=static_cast<const std::uint64_t*>(fixture.copyBytes.raw_data());
+  EXPECT_EQ(bytes[0],live?8u+9u*Fixture::C*4u:0u);
+  EXPECT_EQ(bytes[1],std::uint64_t(live)*(1+Fixture::C)*4u);
+  const auto result=fixture.publish(graph,std::min(live,2));
+  ASSERT_TRUE(result.ok)<<result.error;
+  fixture.owner->reset({0,2,0,1},nullptr);
+ }
+}
+
+/** @test An empty dependency list is valid only at graph entry; named producers remain exact. */
+TEST(PLELifecycle, PriorRejectsMissingAndForeignProducerBeforeMutation)
+{
+ Fixture fixture;
+ for(const auto foreign:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)}) {
+  ComputeGraph graph;
+  graph.addNode("producer",std::make_unique<ReadyStage>(foreign),foreign);
+  const auto append=[&](const std::vector<std::string>&dependencies) {
+   return fixture.owner->appendVerifierPLEPrior(graph,"ple_",0,fixture.rows(),fixture.tokenInput(),
+    {fixture.normalized,BufferId::QFN_PLE_NORMALIZED},dependencies);
+  };
+  EXPECT_THROW(append({}),std::invalid_argument);
+  EXPECT_THROW(append({"missing"}),std::invalid_argument);
+  EXPECT_EQ(graph.size(),1u);
+  if(foreign==DeviceId::cpu())EXPECT_NO_THROW(append({"producer"}));
+  else {
+   EXPECT_THROW(append({"producer"}),std::invalid_argument);
+   EXPECT_EQ(graph.size(),1u);
+  }
+ }
 }
 /** @test Alias-isolation negative control: direct ordinary/reset writes cannot touch dedicated prior bytes.
  * This deliberately bypasses production transaction sequencing to probe physical

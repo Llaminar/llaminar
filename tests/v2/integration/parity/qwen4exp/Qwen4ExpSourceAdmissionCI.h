@@ -32,10 +32,13 @@ struct Qwen4ExpSourceAdmissionCase : ModelParityCase
     Qwen4ExpSourceAdmissionCase(const ModelParityCase &cell) : ModelParityCase(cell) {}
     /** @param probe Separately authored capacity-only request and its public cap. */
     Qwen4ExpSourceAdmissionCase(const Qwen4ExpSourceCapacityAdmissionCase &probe)
-        : ModelParityCase(probe.cell), gpu_memory_cap_mb(probe.gpu_memory_cap_mb) {}
+        : ModelParityCase(probe.cell), gpu_memory_cap_mb(probe.gpu_memory_cap_mb),
+          capacity_boundary(probe.boundary) {}
     /** Provisioning prerequisite only; never an allocation or free-capacity estimate. */
     std::optional<std::size_t> minimum_cuda_total_memory_bytes;
+    std::optional<std::size_t> minimum_rocm_total_memory_bytes; ///< Authored ROCm physical test class.
     std::optional<std::size_t> gpu_memory_cap_mb; ///< Authored public cap; absent on ordinary source cases.
+    std::optional<Qwen4ExpSourceCapacityBoundary> capacity_boundary; ///< Exact negative-control boundary.
 };
 
 /** @brief Project existing cells to a distinct printer without another expander. */
@@ -77,6 +80,33 @@ inline std::vector<Qwen4ExpSourceAdmissionCase> qwen4ExpFixedHeadSourceAdmission
     return result;
 }
 
+/**
+ * @brief Require the authored 48GiB ROCm class only for full15 replicated decode.
+ * @param cells Original four-ROCm policy family, including unchanged TP and Off controls.
+ * @return Identical runtime configurations; only six positives gain a physical prerequisite.
+ * @note The measured complete M64 request exceeds 36GB per device. This conservative
+ * provisioning class is independent of free bytes and never changes PMA pricing.
+ */
+inline std::vector<Qwen4ExpSourceAdmissionCase> qwen4ExpROCm4OverlayPolicySourceAdmissionParameters(
+    const std::vector<ModelParityCase> &cells)
+{
+    auto result = qwen4ExpSourceAdmissionParameters(cells);
+    for (auto &cell : result)
+    {
+        const auto &plan = cell.topology.expert_overlay_plan;
+        if (cell.mtp == ModelParityMTP::Off || cell.retained_mtp_draft_capacity != 15 || !plan ||
+            plan->continuation_domain_spec.effectiveDensePolicy() !=
+                DenseParallelPolicy::PrefillTensorParallelDecodeReplicated)
+            continue;
+        if (cell.topology.participants.size() != 4u ||
+            !std::all_of(cell.topology.participants.begin(), cell.topology.participants.end(),
+                [](const auto &participant) { return participant.address.isROCm(); }))
+            throw std::invalid_argument("ROCm policy provisioning requires its original four GPU participants");
+        cell.minimum_rocm_total_memory_bytes = std::size_t{48} * 1024 * 1024 * 1024;
+    }
+    return result;
+}
+
 /** @brief Preserve a typed capacity probe without changing its underlying model policy. */
 inline std::vector<Qwen4ExpSourceAdmissionCase> qwen4ExpSourceAdmissionParameters(
     const std::vector<Qwen4ExpSourceCapacityAdmissionCase> &cells)
@@ -91,8 +121,12 @@ inline void PrintTo(const Qwen4ExpSourceAdmissionCase &cell, std::ostream *out)
          << modelParityJsonString(cell.testName());
     if (cell.minimum_cuda_total_memory_bytes)
         *out << ",\"minimum_cuda_total_memory_bytes\":" << *cell.minimum_cuda_total_memory_bytes;
+    if (cell.minimum_rocm_total_memory_bytes)
+        *out << ",\"minimum_rocm_total_memory_bytes\":" << *cell.minimum_rocm_total_memory_bytes;
     if (cell.gpu_memory_cap_mb)
         *out << ",\"gpu_memory_cap_mb\":" << *cell.gpu_memory_cap_mb;
+    if (cell.capacity_boundary)
+        *out << ",\"capacity_boundary\":" << modelParityJsonString(qwen4ExpSourceCapacityBoundaryName(*cell.capacity_boundary));
     *out << ",\"mtp_enabled\":" << (cell.mtp != ModelParityMTP::Off ? "true" : "false")
          << ",\"retained_mtp_draft_capacity\":" << cell.retained_mtp_draft_capacity;
     *out << ",\"mpi_ranks\":" << cell.topology.mpi_ranks << ",\"participants\":[";
