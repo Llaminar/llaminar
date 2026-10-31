@@ -24,8 +24,12 @@
  *
  * Compiled by hipcc. Only includes HIP headers + HipDeviceGuard.
  * Linkage to host C++ is via extern "C" wrapper functions.
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
 
+#include "kernels/rocm/common/ROCmSignedDot4.h"
+#include "kernels/rocm/moe/ROCmMoEWaveReduction.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -13280,125 +13284,9 @@ namespace
                (candidate_value == best_value && candidate_id < best_id);
     }
 
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
-#define LLAMINAR_ROCM_MOE_GFX906_DPP 1
-#endif
-
-#if defined(LLAMINAR_ROCM_MOE_GFX906_DPP)
-#define LLAMINAR_ROCM_MOE_DPP_F32(name, barrier, dpp_ctrl, vop_instr)       \
-    __device__ __forceinline__ float name(float x)                          \
-    {                                                                       \
-        float r;                                                            \
-        asm volatile(                                                       \
-            barrier                                                         \
-            vop_instr " %0, %1, %1 " dpp_ctrl " row_mask:0xf bank_mask:0xf" \
-            : "=v"(r)                                                       \
-            : "v"(x)                                                        \
-            : "memory");                                                    \
-        return r;                                                           \
-    }
-
-    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_add_xor1_f32, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_add_f32_dpp")
-    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_add_xor2_f32, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_add_f32_dpp")
-    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_add_xor8_f32, "s_nop 1\n", "row_ror:8", "v_add_f32_dpp")
-    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_max_xor1_f32, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_max_f32_dpp")
-    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_max_xor2_f32, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_max_f32_dpp")
-    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_max_xor8_f32, "s_nop 1\n", "row_ror:8", "v_max_f32_dpp")
-
-#undef LLAMINAR_ROCM_MOE_DPP_F32
-
-    template <int off>
-    __device__ __forceinline__ int rocm_moe_dpp_xfer_xor_i32(int x)
-    {
-        int d;
-        if constexpr (off == 1)
-        {
-            asm volatile("s_nop 4\n"
-                         "v_mov_b32_dpp %0, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"
-                         : "=v"(d)
-                         : "v"(x)
-                         : "memory");
-        }
-        else if constexpr (off == 2)
-        {
-            asm volatile("s_nop 4\n"
-                         "v_mov_b32_dpp %0, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf"
-                         : "=v"(d)
-                         : "v"(x)
-                         : "memory");
-        }
-        else if constexpr (off == 4)
-        {
-            asm volatile("v_mov_b32 %0, %1\n"
-                         "s_nop 1\n"
-                         "v_mov_b32_dpp %0, %1 row_shl:4 row_mask:0xf bank_mask:0x5\n"
-                         "v_mov_b32_dpp %0, %1 row_shr:4 row_mask:0xf bank_mask:0xa\n"
-                         : "=v"(d)
-                         : "v"(x)
-                         : "memory");
-        }
-        else if constexpr (off == 8)
-        {
-            asm volatile("s_nop 4\n"
-                         "v_mov_b32_dpp %0, %1 row_ror:8 row_mask:0xf bank_mask:0xf"
-                         : "=v"(d)
-                         : "v"(x)
-                         : "memory");
-        }
-        else
-        {
-            static_assert(off == 16, "unsupported xor offset");
-            asm volatile("ds_swizzle_b32 %0, %1 offset:swizzle(SWAP,16)\n"
-                         "s_waitcnt lgkmcnt(0)\n"
-                         : "=v"(d)
-                         : "v"(x)
-                         : "memory");
-        }
-        return d;
-    }
-
-    __device__ __forceinline__ float rocm_moe_dpp_xfer_xor4_f32(float x)
-    {
-        return __int_as_float(rocm_moe_dpp_xfer_xor_i32<4>(__float_as_int(x)));
-    }
-
-    __device__ __forceinline__ float rocm_moe_dpp_xfer_xor16_f32(float x)
-    {
-        return __int_as_float(rocm_moe_dpp_xfer_xor_i32<16>(__float_as_int(x)));
-    }
-#endif
-
-    __device__ __forceinline__ float rocm_moe_wave_reduce_sum_f32(float x)
-    {
-#if defined(LLAMINAR_ROCM_MOE_GFX906_DPP)
-        x = rocm_moe_dpp_add_xor1_f32(x);
-        x = rocm_moe_dpp_add_xor2_f32(x);
-        x += rocm_moe_dpp_xfer_xor4_f32(x);
-        x = rocm_moe_dpp_add_xor8_f32(x);
-        x += rocm_moe_dpp_xfer_xor16_f32(x);
-        x += __shfl_xor(x, 32);
-#else
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            x += __shfl_down(x, offset);
-#endif
-        return x;
-    }
-
-    __device__ __forceinline__ float rocm_moe_wave_reduce_max_f32(float x)
-    {
-#if defined(LLAMINAR_ROCM_MOE_GFX906_DPP)
-        x = rocm_moe_dpp_max_xor1_f32(x);
-        x = rocm_moe_dpp_max_xor2_f32(x);
-        x = fmaxf(x, rocm_moe_dpp_xfer_xor4_f32(x));
-        x = rocm_moe_dpp_max_xor8_f32(x);
-        x = fmaxf(x, rocm_moe_dpp_xfer_xor16_f32(x));
-        x = fmaxf(x, __shfl_xor(x, 32));
-#else
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            x = fmaxf(x, __shfl_down(x, offset));
-#endif
-        return x;
-    }
+    // Both router logits and softmax consume one production arithmetic authority.
+    using llaminar2::rocm::moe_wave_contract::rocm_moe_wave_reduce_sum_f32;
+    using llaminar2::rocm::moe_wave_contract::rocm_moe_wave_reduce_max_f32;
 
     __device__ void moe_select_topk_probabilities_block(
         float *__restrict__ expert_probs,
@@ -13894,7 +13782,7 @@ __global__ void rocm_moe_gate_logits_single_token_q8_weights_kernel(
         #pragma unroll
         for (int group = 0; group < 8; ++group)
         {
-            block_acc = __builtin_amdgcn_sdot4(h4[group], w4[group], block_acc, false);
+            block_acc = ::llaminar2::rocm_integer_contract::signedDot4(h4[group], w4[group], block_acc);
         }
         sum += static_cast<float>(block_acc) * hidden_scales[block_idx] * gate_scales[scale_idx];
     }
@@ -14055,7 +13943,7 @@ void rocm_moe_gate_logits_q8_grouped_verifier_kernel(
             #pragma unroll
             for (int group = 0; group < 8; ++group)
             {
-                block_acc = __builtin_amdgcn_sdot4(h4[group], w_values[group], block_acc, false);
+                block_acc = ::llaminar2::rocm_integer_contract::signedDot4(h4[group], w_values[group], block_acc);
             }
             sums[local_row] +=
                 static_cast<float>(block_acc) * row_scales[block_idx] * gate_scale;

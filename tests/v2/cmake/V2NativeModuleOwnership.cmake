@@ -1,0 +1,36 @@
+# @file V2NativeModuleOwnership.cmake
+# @brief Give each production backend module one link owner in native tests.
+include_guard(GLOBAL)
+
+function(v2_link_native_test_core TARGET_NAME BACKEND_TARGET)
+    if(NOT BACKEND_TARGET STREQUAL "cuda_backend" AND NOT BACKEND_TARGET STREQUAL "rocm_backend")
+        message(FATAL_ERROR "Native test requires an exact CUDA or ROCm backend target")
+    endif()
+    if(NOT TARGET llaminar2_core OR NOT TARGET "${BACKEND_TARGET}")
+        message(FATAL_ERROR "Native test requires its configured core and backend targets")
+    endif()
+    foreach(_extra IN LISTS ARGN)
+        if(TARGET "${_extra}")
+            get_target_property(_alias "${_extra}" ALIASED_TARGET)
+            if(_alias)
+                set(_extra "${_alias}")
+            endif()
+        endif()
+        if(_extra STREQUAL "cuda_backend" OR _extra STREQUAL "rocm_backend")
+            message(FATAL_ERROR "Native test extras must not repeat a native backend archive")
+        endif()
+    endforeach()
+    get_target_property(_core_type llaminar2_core TYPE)
+    if(_core_type STREQUAL "SHARED_LIBRARY")
+        # Core already owns the complete backend RDC/fatbinary registration.
+        target_link_libraries_with_groups(${TARGET_NAME} llaminar2_core ${ARGN})
+        set_property(TARGET ${TARGET_NAME} PROPERTY V2_NATIVE_MODULE_OWNER llaminar2_core)
+    elseif(_core_type STREQUAL "STATIC_LIBRARY")
+        # Preserve registration-only objects when the executable owns the backend.
+        target_link_libraries_with_groups(${TARGET_NAME} llaminar2_core
+            -Wl,--whole-archive ${BACKEND_TARGET} -Wl,--no-whole-archive ${ARGN})
+        set_property(TARGET ${TARGET_NAME} PROPERTY V2_NATIVE_MODULE_OWNER ${BACKEND_TARGET})
+    else()
+        message(FATAL_ERROR "Native test core must be a shared or static library")
+    endif()
+endfunction()

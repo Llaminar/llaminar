@@ -8,6 +8,8 @@
  * Route counters prove shared quantization and persistent projection streams;
  * repeated native replay proves their output bytes and untouched capacity.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "../../utils/GDNProjectionCaptureHarness.h"
 #include "../../utils/GDNQKVBundleTestHarness.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -43,16 +45,14 @@ namespace
         {
             context = std::make_unique<CUDADeviceContext>(device, device.ordinal);
             factory = [device](void *stream) {
-                return std::make_unique<CUDAGraphCapture>(
-                    static_cast<cudaStream_t>(stream), device.ordinal);
+                return GPUDeviceContextPool::instance().retainContext(device)->createGraphCapture(stream);
             };
         }
 #else
         {
             context = std::make_unique<ROCmDeviceContext>(device, device.ordinal);
             factory = [device](void *stream) {
-                return std::make_unique<HIPGraphCapture>(
-                    static_cast<hipStream_t>(stream), device.ordinal);
+                return GPUDeviceContextPool::instance().retainContext(device)->createGraphCapture(stream);
             };
         }
 #endif
@@ -141,11 +141,11 @@ static void exerciseQFNFullFP16(DeviceId device)
 #ifdef LLAMINAR_GDN_CAPTURE_CUDA
         CUDADeviceContext context(device, device.ordinal);
         GDNProjectionGraphFactory factory = [device](void *stream)
-        { return std::make_unique<CUDAGraphCapture>(static_cast<cudaStream_t>(stream), device.ordinal); };
+        { return GPUDeviceContextPool::instance().retainContext(device)->createGraphCapture(stream); };
 #else
         ROCmDeviceContext context(device, device.ordinal);
         GDNProjectionGraphFactory factory = [device](void *stream)
-        { return std::make_unique<HIPGraphCapture>(static_cast<hipStream_t>(stream), device.ordinal); };
+        { return GPUDeviceContextPool::instance().retainContext(device)->createGraphCapture(stream); };
 #endif
         const auto &formats = quantizedVerifierFormats();
         const auto q8 = std::find_if(formats.begin(), formats.end(),
@@ -201,11 +201,16 @@ TEST(GDNMixedProjectionCapture, ROCmHalfAlphaBetaAllFormats)
 /** @brief Initialize the process and route counters before native graph tests. */
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided = 0;
     if (MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided) != MPI_SUCCESS)
         return 1;
     if (provided < MPI_THREAD_MULTIPLE)
     {
+        llaminar2::GPUDeviceProcessLifetime::retireActive();
         MPI_Finalize();
         return 1;
     }
@@ -213,6 +218,7 @@ int main(int argc, char **argv)
     mutableDebugEnv().reload();
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }

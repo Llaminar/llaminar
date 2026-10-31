@@ -7,12 +7,15 @@
  * CPU-only cluster ranks need no NVIDIA driver to load this full-backend binary.
  * Pinned materialization counters expose accidental inference-time allocation;
  * they are observations, never a second admission or live-memory ledger.
+ * Immutable physical facts are admitted once; context reset changes native
+ * resource generations without querying or republishing that inventory.
  *
  * @author David Sanftenberg
  */
 
 #include "CUDABackend.h"
 #include "CUDADriverApi.h"
+#include "CUDAHardwareMetadata.h"
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -493,12 +496,8 @@ namespace llaminar2
     CUDABackend::CUDABackend()
         : device_count_(0)
     {
-        cudaError_t err = cudaGetDeviceCount(&device_count_);
-        if (err != cudaSuccess)
-        {
-            device_count_ = 0;
-            // Log warning but don't throw - allow CPU-only execution
-        }
+        initializeCUDAHardwareMetadata();
+        device_count_ = static_cast<int>(cudaHardwareMetadata().size());
         if (device_count_ > 0)
             (void)CUDADriverApi::instance(); // Resolve once, before any capture/reset.
         penalty_buffers_.resize(
@@ -1251,14 +1250,7 @@ namespace llaminar2
             return "Invalid Device";
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return "Unknown Device";
-        }
-
-        return std::string(prop.name);
+        return cudaHardwareMetadata().at(device_id).name;
     }
 
     size_t CUDABackend::deviceMemoryTotal(int device_id) const
@@ -1268,14 +1260,7 @@ namespace llaminar2
             return 0;
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return 0;
-        }
-
-        return prop.totalGlobalMem;
+        return cudaHardwareMetadata().at(device_id).total_memory;
     }
 
     size_t CUDABackend::deviceMemoryFree(int device_id) const
@@ -1798,15 +1783,9 @@ namespace llaminar2
             return false;
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return false;
-        }
-
         // BF16 support requires compute capability >= 8.0 (Ampere and later)
-        int compute_capability = prop.major * 10 + prop.minor;
+        const auto &hardware = cudaHardwareMetadata().at(device_id);
+        const int compute_capability = hardware.sm_major * 10 + hardware.sm_minor;
         return compute_capability >= 80;
     }
 
@@ -1817,15 +1796,9 @@ namespace llaminar2
             return false;
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return false;
-        }
-
         // FP16 support requires compute capability >= 5.3 (Maxwell and later)
-        int compute_capability = prop.major * 10 + prop.minor;
+        const auto &hardware = cudaHardwareMetadata().at(device_id);
+        const int compute_capability = hardware.sm_major * 10 + hardware.sm_minor;
         return compute_capability >= 53;
     }
 
@@ -1836,15 +1809,9 @@ namespace llaminar2
             return false;
         }
 
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-        if (err != cudaSuccess)
-        {
-            return false;
-        }
-
         // INT8 support requires compute capability >= 6.1 (Pascal and later)
-        int compute_capability = prop.major * 10 + prop.minor;
+        const auto &hardware = cudaHardwareMetadata().at(device_id);
+        const int compute_capability = hardware.sm_major * 10 + hardware.sm_minor;
         return compute_capability >= 61;
     }
 

@@ -9,11 +9,14 @@
  * backend observations a second physical-memory admission authority.
  *
  * @author David Sanftenberg
+ * Immutable hardware identity is admitted once; these queries never reopen
+ * a context or confuse physical facts with runtime-resource generations.
  */
 
 #include "ROCmBackend.h"
 #include "../DeviceId.h"
 #include "ROCmRuntimeStartup.h"
+#include "ROCmHardwareMetadata.h"
 #include "HipDeviceGuard.h"
 #include "HIPGraphTimelineKernels.h"
 #include "../../utils/Logger.h"
@@ -456,12 +459,8 @@ namespace llaminar2
         : device_count_(0)
     {
         requireROCmRuntimeStartup();
-        hipError_t err = hipGetDeviceCount(&device_count_);
-        if (err != hipSuccess)
-        {
-            device_count_ = 0;
-            // Log warning but don't throw - allow CPU-only execution
-        }
+        initializeROCmHardwareMetadata();
+        device_count_ = static_cast<int>(rocmHardwareMetadata().size());
         penalty_buffers_.resize(
             static_cast<size_t>(std::max(device_count_, 0)));
         runtime_generations_.assign(
@@ -5031,14 +5030,7 @@ namespace llaminar2
             return "Invalid Device";
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return "Unknown Device";
-        }
-
-        return std::string(prop.name);
+        return rocmHardwareMetadata().at(device_id).name;
     }
 
     size_t ROCmBackend::deviceMemoryTotal(int device_id) const
@@ -5048,14 +5040,7 @@ namespace llaminar2
             return 0;
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return 0;
-        }
-
-        return prop.totalGlobalMem;
+        return rocmHardwareMetadata().at(device_id).total_memory;
     }
 
     size_t ROCmBackend::deviceMemoryFree(int device_id) const
@@ -5394,7 +5379,6 @@ namespace llaminar2
                                 std::to_string(device_id) + ": " +
                                 hipGetErrorString(error);
             (void)hipGetLastError();
-            HipDeviceGuard::resetTracking();
             return result;
         }
 
@@ -5424,12 +5408,11 @@ namespace llaminar2
         }
 
         /*
-         * The retired device must remain absent from HipDeviceGuard's
-         * thread-local identity. Forcing a device or querying memory here
+         * No host device-selection shadow remains to invalidate. Forcing
+         * a device or querying memory here
          * would initialize the successor context and consume the capacity
          * that retirement is meant to expose to the next model admission.
          */
-        HipDeviceGuard::resetTracking();
 
         /*
          * AMD HIP's deprecated primary-context APIs intentionally cannot
@@ -5466,26 +5449,9 @@ namespace llaminar2
             return false;
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return false;
-        }
-
-        // BF16 support on AMD GPUs:
-        // - MI200 series (gfx90a): Full BF16 support
-        // - MI100 (gfx908): Limited BF16 support
-        // GCN architecture ID (gcnArch) is deprecated in newer ROCm versions
-        // Use compute capability via prop.major/minor or architecture string
-
-        // Conservative check: Assume MI200+ (gfx90a and later) for full BF16
-        // This is a heuristic - may need refinement based on actual hardware
-        std::string arch_name(prop.gcnArchName);
-        return (arch_name.find("gfx90a") != std::string::npos ||
-                arch_name.find("gfx940") != std::string::npos ||
-                arch_name.find("gfx941") != std::string::npos ||
-                arch_name.find("gfx942") != std::string::npos);
+        // Cached compatibility answer retains the existing public API semantics;
+        // it does not qualify an instruction, wave geometry or matrix variant.
+        return rocmHardwareMetadata().at(device_id).legacy_precision.bf16;
     }
 
     bool ROCmBackend::supportsFP16(int device_id) const
@@ -5495,19 +5461,9 @@ namespace llaminar2
             return false;
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return false;
-        }
-
-        // FP16 support widely available on AMD GPUs (Vega and later)
-        // gfx900 (Vega 10) and later all support FP16
-        std::string arch_name(prop.gcnArchName);
-        return (arch_name.find("gfx9") != std::string::npos ||
-                arch_name.find("gfx10") != std::string::npos ||
-                arch_name.find("gfx11") != std::string::npos);
+        // Cached compatibility answer retains the existing public API semantics;
+        // it does not qualify an instruction, wave geometry or matrix variant.
+        return rocmHardwareMetadata().at(device_id).legacy_precision.fp16;
     }
 
     bool ROCmBackend::supportsINT8(int device_id) const
@@ -5517,19 +5473,9 @@ namespace llaminar2
             return false;
         }
 
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            return false;
-        }
-
-        // INT8 support widely available on modern AMD GPUs
-        // Conservatively assume gfx9 and later (Vega+)
-        std::string arch_name(prop.gcnArchName);
-        return (arch_name.find("gfx9") != std::string::npos ||
-                arch_name.find("gfx10") != std::string::npos ||
-                arch_name.find("gfx11") != std::string::npos);
+        // Cached compatibility answer retains the existing public API semantics;
+        // it does not qualify an instruction, wave geometry or matrix variant.
+        return rocmHardwareMetadata().at(device_id).legacy_precision.int8;
     }
 
     // ====================================================================
@@ -5650,14 +5596,9 @@ namespace llaminar2
         if (device_id < 0 || device_id >= device_count_)
             return false;
 
-        HipDeviceSaveRestore device_guard;
-        int supported = 0;
-        return hipSetDevice(device_id) == hipSuccess &&
-               hipDeviceGetAttribute(
-                   &supported,
-                   hipDeviceAttributeCanUseStreamWaitValue,
-                   device_id) == hipSuccess &&
-               supported != 0;
+        // This is a process-stable device/runtime primitive capability, not a
+        // loaded-function resource or mutable stream/context observation.
+        return rocmHardwareMetadata().at(device_id).can_use_stream_wait_value;
     }
 
     void *ROCmBackend::allocateStreamTimelineSignal32(int device_id)
@@ -6028,7 +5969,6 @@ namespace llaminar2
             return false;
         *timeout_ticks = 0;
         hipFuncAttributes attributes{};
-        int clock_khz = 0;
         if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferAcquireKernel)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<true>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<false>)) != hipSuccess ||
@@ -6036,12 +5976,12 @@ namespace llaminar2
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferFusedKernel<false>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchFusedKernel)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchAcquireKernel)) != hipSuccess ||
-            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchCopyPublishKernel)) != hipSuccess ||
-            hipDeviceGetAttribute(&clock_khz, hipDeviceAttributeWallClockRate, device_id) != hipSuccess || clock_khz <= 0)
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchCopyPublishKernel)) != hipSuccess)
             return false;
         // wall_clock64 uses this fixed-rate clock. Shader clockRate is a
         // maximum and cannot define a wall deadline under power management.
-        *timeout_ticks = static_cast<std::uint64_t>(clock_khz) * static_cast<std::uint64_t>(timeout_ms);
+        *timeout_ticks = rocmServiceWallClockRateKHz(rocmHardwareMetadata().at(device_id)) *
+            static_cast<std::uint64_t>(timeout_ms);
         return prepareMappedHostCopyKernels(device_id);
     }
 
@@ -6883,22 +6823,12 @@ namespace llaminar2
             return false;
         }
 
-        // We need to iterate agents to find GPU agents
-        // This is complex - for now, we'll use hipGetDeviceProperties to get the agent
-
-        hipDeviceProp_t prop;
-        hipError_t err = hipGetDeviceProperties(&prop, device_id);
-        if (err != hipSuccess)
-        {
-            dlclose(hsa_handle);
-            return false;
-        }
-
-        // The gcnArchName contains arch info but not the HSA agent handle directly
-        // For proper implementation, we'd need to iterate HSA agents
+        // This API does not own a live HSA-agent resolver. Its diagnostic
+        // identity still comes from the immutable physical inventory.
+        const auto &prop = rocmHardwareMetadata().at(device_id);
 
         LOG_INFO("[ROCmBackend::getHsaAgent] Device " << device_id << ": " << prop.name
-                                                      << ", arch=" << prop.gcnArchName);
+                                                      << ", arch=" << prop.isa_target);
 
         dlclose(hsa_handle);
 

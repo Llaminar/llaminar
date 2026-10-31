@@ -1,0 +1,34 @@
+--- a/src/misc/shmutils.cc
++++ b/src/misc/shmutils.cc
+@@ -34,7 +34,8 @@
+   handle->shmSize = shmSize;
+   handle->realShmSize = realShmSize;
+   handle->refcount = (hptr != NULL) ? (int*)(hptr + shmSize) : NULL;
+-  if (create) {
++  // No name is owned when the creator never opened a new file.
++  if (create && fd >= 0) {
+     int slen = strlen(shmPath);
+     handle->shmPath = (char*)malloc(slen + 1);
+     memcpy(handle->shmPath, shmPath, slen + 1);
+@@ -75,7 +76,7 @@
+         goto fail;
+       }
+     } else {
+-      SYSCHECKGOTO(fd = open(shmPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR), "open", ret, fail);
++      SYSCHECKGOTO(fd = open(shmPath, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR), "open", ret, fail);
+     }
+ 
+   retry_fallocate:
+@@ -146,7 +147,11 @@
+   if (tmphandle) {
+     if (tmphandle->fd >= 0) {
+       close(tmphandle->fd);
+-      if (tmphandle->shmPath != NULL && tmphandle->refcount != NULL && *tmphandle->refcount > 0) {
++      // Successful creator open owns the name even when sizing or mmap
++      // failed before the shared refcount could exist. Attachments have no
++      // owned path; a published zero count already retired the name.
++      if (tmphandle->shmPath != NULL &&
++          (tmphandle->refcount == NULL || *tmphandle->refcount > 0)) {
+         if (unlink(tmphandle->shmPath) != 0) {
+           WARN("unlink shared memory %s failed, error: %s (%d)", tmphandle->shmPath, strerror(errno), errno);
+           ret = ncclSystemError;

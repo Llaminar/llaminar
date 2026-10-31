@@ -20,6 +20,7 @@
  */
 
 #include "RCCLCoordinator.h"
+#include "backends/NativeDeviceBinding.h"
 #include "../NativeReduceScatterContract.h"
 #include "../NativeCollectiveRowsContract.h"
 #include "../../utils/Logger.h"
@@ -40,7 +41,7 @@ namespace llaminar2
 {
 
 #ifdef HAVE_RCCL
-    static hipError_t trackedHipSetDevice(int device_ordinal)
+    static hipError_t selectHipDevice(int device_ordinal)
     {
         return static_cast<hipError_t>(HipDeviceGuard::forceSetDevice(device_ordinal));
     }
@@ -377,7 +378,7 @@ namespace llaminar2
                     return;
                 }
                 device_results[rank] =
-                    trackedHipSetDevice(device_ordinals_[rank]);
+                    selectHipDevice(device_ordinals_[rank]);
                 if (device_results[rank] != hipSuccess)
                 {
                     abort_results[rank] = rccl::ncclUnhandledCudaError;
@@ -507,7 +508,7 @@ namespace llaminar2
             {
                 continue; // Already created
             }
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[RCCLCoordinator] setComputeStreams: hipSetDevice failed for device "
@@ -645,7 +646,7 @@ namespace llaminar2
         // Step 1: Create per-device streams and events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed for device ") +
@@ -742,7 +743,7 @@ namespace llaminar2
                 LOG_ERROR("[RCCLCoordinator] Retirement has a foreign endpoint rank " << rank);
                 std::terminate();
             }
-            require_hip(trackedHipSetDevice(device_ordinals_[rank]), "device selection", rank);
+            require_hip(selectHipDevice(device_ordinals_[rank]), "device selection", rank);
         };
 
         // Step 1: Synchronize all streams before destroying any resources.
@@ -973,7 +974,7 @@ namespace llaminar2
 
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1145,7 +1146,7 @@ namespace llaminar2
 
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1194,7 +1195,7 @@ namespace llaminar2
             const auto &sideband = sidebands[sideband_idx];
             for (int i = 0; i < num_devices_; ++i)
             {
-                hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+                hipError_t err = selectHipDevice(device_ordinals_[i]);
                 if (err != hipSuccess)
                 {
                     last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1372,7 +1373,7 @@ namespace llaminar2
             for (int i = 0; i < num_devices_; ++i)
             {
                 const hipError_t set_device =
-                    trackedHipSetDevice(
+                    selectHipDevice(
                         device_ordinals_[static_cast<size_t>(i)]);
                 if (set_device != hipSuccess)
                 {
@@ -1496,7 +1497,7 @@ namespace llaminar2
         hipError_t err;
 
         // 1. Set device context
-        err = trackedHipSetDevice(ordinal);
+        err = selectHipDevice(ordinal);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1588,19 +1589,16 @@ namespace llaminar2
         rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
         hipStream_t caller_stream = static_cast<hipStream_t>(stream);
 
-        // Fast path: skip hipSetDevice if this thread already has the right device.
-        // In LOCAL TP decode, each worker thread always targets the same device,
-        // so after the first call the branch is always taken (~1-3μs saved per call).
-        static thread_local int tl_last_hip_device = -1;
-        if (tl_last_hip_device != ordinal)
+        // Observe actual thread state; another collective or runtime call may have changed it.
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return hipGetDevice(observed); },
+            [](int selected) { return selectHipDevice(selected); });
+        if (!binding.succeeded())
         {
-            hipError_t err = trackedHipSetDevice(ordinal);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
-                return false;
-            }
-            tl_last_hip_device = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "hipGetDevice failed: " : "hipSetDevice failed: ") +
+                hipGetErrorString(static_cast<hipError_t>(binding.native_status));
+            return false;
         }
 
         // 2. Launch allreduce directly on the caller's stream.
@@ -1698,17 +1696,15 @@ namespace llaminar2
             static_cast<rccl::ncclComm_t>(comms_[device_idx]);
         const auto caller_stream = static_cast<hipStream_t>(stream);
 
-        static thread_local int tl_last_hip_device_for_reduce = -1;
-        if (tl_last_hip_device_for_reduce != ordinal)
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return hipGetDevice(observed); },
+            [](int selected) { return selectHipDevice(selected); });
+        if (!binding.succeeded())
         {
-            const hipError_t err = trackedHipSetDevice(ordinal);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed: ") +
-                              hipGetErrorString(err);
-                return false;
-            }
-            tl_last_hip_device_for_reduce = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "hipGetDevice failed: " : "hipSetDevice failed: ") +
+                hipGetErrorString(static_cast<hipError_t>(binding.native_status));
+            return false;
         }
 
         const rccl::ncclResult_t result = rccl::ncclReduce(
@@ -1756,7 +1752,7 @@ namespace llaminar2
         }
         // Another operation may change this host thread's current GPU between
         // graph recordings. Select the actual owner; never cache that assumption.
-        const auto selected = trackedHipSetDevice(device_ordinals_[participant]);
+        const auto selected = selectHipDevice(device_ordinals_[participant]);
         if (selected != hipSuccess)
         {
             last_error_ = std::string("RCCL live-row device selection failed: ") + hipGetErrorString(selected);
@@ -1808,7 +1804,7 @@ namespace llaminar2
         // Never cache an assumed current device here: another operation on
         // this host thread may have selected a different participant since the
         // last capture. Replay has no host-side device-selection work.
-        const auto selected = trackedHipSetDevice(device_ordinals_[device_idx]);
+        const auto selected = selectHipDevice(device_ordinals_[device_idx]);
         if (selected != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice before reduce-scatter failed: ") + hipGetErrorString(selected);
@@ -1883,16 +1879,15 @@ namespace llaminar2
         rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
         hipStream_t caller_stream = static_cast<hipStream_t>(stream);
 
-        static thread_local int tl_last_hip_device_for_allgather = -1;
-        if (tl_last_hip_device_for_allgather != ordinal)
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return hipGetDevice(observed); },
+            [](int selected) { return selectHipDevice(selected); });
+        if (!binding.succeeded())
         {
-            hipError_t err = trackedHipSetDevice(ordinal);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
-                return false;
-            }
-            tl_last_hip_device_for_allgather = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "hipGetDevice failed: " : "hipSetDevice failed: ") +
+                hipGetErrorString(static_cast<hipError_t>(binding.native_status));
+            return false;
         }
 
         if (debugEnv().tp_collective_contract_trace)
@@ -2006,16 +2001,15 @@ namespace llaminar2
         rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
         hipStream_t caller_stream = static_cast<hipStream_t>(stream);
 
-        static thread_local int tl_last_hip_device_for_broadcast = -1;
-        if (tl_last_hip_device_for_broadcast != ordinal)
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return hipGetDevice(observed); },
+            [](int selected) { return selectHipDevice(selected); });
+        if (!binding.succeeded())
         {
-            hipError_t err = trackedHipSetDevice(ordinal);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
-                return false;
-            }
-            tl_last_hip_device_for_broadcast = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "hipGetDevice failed: " : "hipSetDevice failed: ") +
+                hipGetErrorString(static_cast<hipError_t>(binding.native_status));
+            return false;
         }
 
         if (debugEnv().tp_collective_contract_trace)
@@ -2092,16 +2086,15 @@ namespace llaminar2
         rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
         hipStream_t caller_stream = static_cast<hipStream_t>(stream);
 
-        static thread_local int tl_last_hip_device_for_grouped_p2p = -1;
-        if (tl_last_hip_device_for_grouped_p2p != ordinal)
+        const auto binding = bindNativeDevice(ordinal,
+            [](int *observed) { return hipGetDevice(observed); },
+            [](int selected) { return selectHipDevice(selected); });
+        if (!binding.succeeded())
         {
-            hipError_t err = trackedHipSetDevice(ordinal);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
-                return false;
-            }
-            tl_last_hip_device_for_grouped_p2p = ordinal;
+            last_error_ = std::string(binding.step == NativeDeviceBindingStep::CurrentDeviceQuery
+                ? "hipGetDevice failed: " : "hipSetDevice failed: ") +
+                hipGetErrorString(static_cast<hipError_t>(binding.native_status));
+            return false;
         }
 
         if (debugEnv().tp_collective_contract_trace)
@@ -2247,7 +2240,7 @@ namespace llaminar2
 
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2464,7 +2457,7 @@ namespace llaminar2
 
         return submitAndWait([&]()
                              {
-        hipError_t err = trackedHipSetDevice(device_ordinals_[device_idx]);
+        hipError_t err = selectHipDevice(device_ordinals_[device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2521,7 +2514,7 @@ namespace llaminar2
 #ifdef HAVE_RCCL
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2557,7 +2550,7 @@ namespace llaminar2
         // host thread. The host returns immediately after these API calls.
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed in doInsertComputeStreamDeps: ") +
@@ -2621,7 +2614,7 @@ namespace llaminar2
         {
             return submitAndWait([&]()
                                  {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
+            hipError_t err = selectHipDevice(device_ordinals_[src_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2718,7 +2711,7 @@ namespace llaminar2
                 return false;
             }
 
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed before ") +
@@ -2773,7 +2766,7 @@ namespace llaminar2
         // Issue allreduce for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2839,7 +2832,7 @@ namespace llaminar2
         // Record completion events for all devices
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -2883,7 +2876,7 @@ namespace llaminar2
         // Issue allgather for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2916,7 +2909,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -2959,7 +2952,7 @@ namespace llaminar2
         // Issue broadcast for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2993,7 +2986,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -3037,7 +3030,7 @@ namespace llaminar2
         // Issue reduce-scatter for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -3071,7 +3064,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -3111,7 +3104,7 @@ namespace llaminar2
         }
 
         // Issue send from source device
-        hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
+        hipError_t err = selectHipDevice(device_ordinals_[src_device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice (src) failed: ") + hipGetErrorString(err);
@@ -3132,7 +3125,7 @@ namespace llaminar2
         }
 
         // Issue recv on destination device
-        err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
+        err = selectHipDevice(device_ordinals_[dst_device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice (dst) failed: ") + hipGetErrorString(err);
@@ -3163,7 +3156,7 @@ namespace llaminar2
         if (wait_for_completion)
         {
             // Synchronize both streams to ensure copy is complete
-            err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
+            err = selectHipDevice(device_ordinals_[src_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice (sync src) failed: ") + hipGetErrorString(err);
@@ -3176,7 +3169,7 @@ namespace llaminar2
                 return false;
             }
 
-            err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
+            err = selectHipDevice(device_ordinals_[dst_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice (sync dst) failed: ") + hipGetErrorString(err);
@@ -3191,7 +3184,7 @@ namespace llaminar2
         }
 
         // Record completion events (for both sync and async paths)
-        err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
+        err = selectHipDevice(device_ordinals_[src_device_idx]);
         if (err == hipSuccess)
         {
             hipError_t evt_err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[src_device_idx]), src_stream);
@@ -3200,7 +3193,7 @@ namespace llaminar2
                 LOG_WARN("[RCCLCoordinator] hipEventRecord (src) failed: " << hipGetErrorString(evt_err));
             }
         }
-        err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
+        err = selectHipDevice(device_ordinals_[dst_device_idx]);
         if (err == hipSuccess)
         {
             hipError_t evt_err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[dst_device_idx]), dst_stream);

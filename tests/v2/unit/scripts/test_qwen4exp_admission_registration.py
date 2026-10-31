@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_qwen4exp_admission_registration.py
+#  @brief Check canonical admission declarations and process ownership without model execution.
 """Execute QFN source admission registration in Integration and Release.
 
 The real target selector, registration helper and QFN declaration run in a
@@ -68,6 +70,7 @@ set(HAVE_ROCM {"ON" if rocm else "OFF"})
 set(V2_TEST_SOCKETS 2)
 set(V2_TEST_CORES_PER_SOCKET 2)
 set(V2_PARITY_MODEL_QWEN_FLASH_NEXT {source_list})
+include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")
 include("{SELECTOR.as_posix()}")
 {target}
 {registration_source()}

@@ -265,6 +265,9 @@ namespace llaminar2
             return "QWEN4EXP_QSA_RETAIN_CANDIDATES";
         case ComputeStageType::QWEN4EXP_QSA_COMMIT_PARTIAL:
             return "QWEN4EXP_QSA_COMMIT_PARTIAL";
+        case ComputeStageType::QWEN4EXP_POOLED_NATIVE_PHASE:
+            return "QWEN4EXP_POOLED_NATIVE_PHASE";
+        case ComputeStageType::QWEN4EXP_POOLED_SOURCE_PHASE:return "QWEN4EXP_POOLED_SOURCE_PHASE";
         case ComputeStageType::QWEN4EXP_NGRAM_LOOKUP:
             return "QWEN4EXP_NGRAM_LOOKUP";
         case ComputeStageType::QWEN4EXP_QSA_PREPARE_REPLAY:

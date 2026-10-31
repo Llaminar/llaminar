@@ -21,7 +21,8 @@ namespace llaminar2
      * Performs, in order:
      *   1. GlobalBackendRouter::shutdown()  — releases MPI communicators
      *   2. KernelFactory::clearCache()      — releases GPU pipeline lifetime owners
-     *   3. MPI_Finalize()
+     *   3. GPUDeviceProcessLifetime::retireActive() — closes GPU admission and retires workers
+     *   4. MPI_Finalize()
      *
      * Safe to call even if GlobalBackendRouter was never initialized.
      * Idempotent with respect to MPI (checks MPI_Finalized before calling).

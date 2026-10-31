@@ -14,6 +14,7 @@
 #pragma once
 
 #include "../IWorkerGPUContext.h"
+#include "../GPUDeviceProcessLifetime.h"
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
@@ -61,7 +62,7 @@ namespace llaminar2
      * - Stream/event/handle accessors must only be called from within submitted work
      * - deviceOrdinal(), deviceName(), isInitialized() are thread-safe (read-only)
      */
-    class AMDDeviceContext : public IWorkerGPUContext
+    class AMDDeviceContext : public IWorkerGPUContext, private GPUProjectionResourceOperations
     {
     public:
         /**
@@ -118,6 +119,15 @@ namespace llaminar2
             GPUAuxiliaryStreamSchedulingClass scheduling_class,
             bool *created = nullptr) override;
         void resetAuxiliaryStreams() override;
+        /** @copydoc IWorkerGPUContext::prepareProjectionResources */
+        void prepareProjectionResources() override;
+        /** @copydoc IWorkerGPUContext::acquireProjectionSubmission */
+        [[nodiscard]] GPUProjectionSubmission acquireProjectionSubmission(
+            void *root, GPUProjectionSubmissionKind kind, bool native_capturing = false) override;
+        /** @copydoc IWorkerGPUContext::assertProjectionResourcesRetirable */
+        void assertProjectionResourcesRetirable() override;
+        /** @copydoc IWorkerGPUContext::beginProjectionResourcesRetirement */
+        void beginProjectionResourcesRetirement() override;
 
         // =========================================================================
         // IWorkerGPUContext Interface - Event Access (worker-thread-only)
@@ -176,6 +186,17 @@ namespace llaminar2
         bool isDeviceGraphCaptureActive() const override { return capture_active_.load(std::memory_order_acquire); }
 
     private:
+        /** Declared first so native admission retires last, after worker cleanup and all resource members. */
+        GPUDeviceProcessLifetime::NativeContextLease process_lifetime_lease_;
+        GPUProjectionResources projection_resources_{this, GPUProjectionStreamCount::Four}; ///< Original four-stream/five-event context population.
+        /** @copydoc GPUProjectionResourceOperations::createProjectionStream */
+        void *createProjectionStream() override;
+        /** @copydoc GPUProjectionResourceOperations::createProjectionEvent */
+        void *createProjectionEvent() override;
+        /** @copydoc GPUProjectionResourceOperations::destroyProjectionStream */
+        bool destroyProjectionStream(void *stream) noexcept override;
+        /** @copydoc GPUProjectionResourceOperations::destroyProjectionEvent */
+        bool destroyProjectionEvent(void *event) noexcept override;
         // =========================================================================
         // Worker Thread Management
         // =========================================================================

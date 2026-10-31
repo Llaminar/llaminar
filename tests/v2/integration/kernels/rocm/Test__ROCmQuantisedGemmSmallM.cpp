@@ -1,6 +1,7 @@
 /**
  * @file Test__ROCmQuantisedGemmSmallM.cpp
  * @brief ROCm small-M arithmetic and persistent fused-workspace regressions.
+ * Concurrent captures retain the exact worker context through native graph teardown.
  *
  * Verifier tests use the public serial decode byte oracle. Fused fixtures
  * declare the same simultaneous projection workspace as production stages;
@@ -2888,13 +2889,13 @@ namespace
         };
 
 #ifdef HAVE_ROCM
-        std::unique_ptr<HIPGraphCapture> captured_graph;
+        std::unique_ptr<IGPUGraphCapture> captured_graph;
         if (graph_capture)
         {
             ASSERT_TRUE(launch_fused_group());
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-            captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+            captured_graph = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream);
             ScopedBackendGraphCapture capture_transaction(
                 *captured_graph,
                 "runFusedQKVSmallMMatchesSeparate");
@@ -3045,13 +3046,13 @@ namespace
         }
 
 #ifdef HAVE_ROCM
-        std::unique_ptr<HIPGraphCapture> captured_graph;
+        std::unique_ptr<IGPUGraphCapture> captured_graph;
         if (graph_capture)
         {
             ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-            captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+            captured_graph = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream);
             ScopedBackendGraphCapture capture_transaction(
                 *captured_graph,
                 "runFusedProjectionGroupSmallMMatchesReference");
@@ -3221,10 +3222,10 @@ namespace
         };
 
 #ifdef HAVE_ROCM
-        std::unique_ptr<HIPGraphCapture> captured_graph;
+        std::unique_ptr<IGPUGraphCapture> captured_graph;
         if (graph_capture)
         {
-            captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+            captured_graph = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream);
             ScopedBackendGraphCapture capture_transaction(
                 *captured_graph,
                 "runMixedProjectionGroupSmallMMatchesSeparate");
@@ -6471,7 +6472,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
         input_a.get(), projections_a, M, K, nullptr, workspace.get()));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    auto captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+    auto captured_graph = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream);
     {
         ScopedBackendGraphCapture capture_transaction(
             *captured_graph,
@@ -6580,7 +6581,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
     {
         int device = -1;
         hipStream_t stream = nullptr;
-        std::unique_ptr<HIPGraphCapture> captured_graph;
+        std::unique_ptr<IGPUGraphCapture> captured_graph;
         std::array<std::unique_ptr<Q4_0Tensor>, 3> weights;
         std::array<ROCmPackedWeights, 3> packed;
         std::array<std::unique_ptr<ROCmQuantisedGemmKernel>, 3> kernels;
@@ -6709,9 +6710,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
                 return;
             }
             capture_start.arrive_and_wait();
-            participant.captured_graph = std::make_unique<HIPGraphCapture>(
-                participant.stream,
-                device);
+            participant.captured_graph = GPUDeviceContextPool::instance().retainAMDContext(device)->createGraphCapture(participant.stream);
             ScopedBackendGraphCapture capture_transaction(
                 *participant.captured_graph,
                 "ConcurrentTwoDeviceGraphCaptureQ40Qwen2TP2QKVM9MatchesSeparate");

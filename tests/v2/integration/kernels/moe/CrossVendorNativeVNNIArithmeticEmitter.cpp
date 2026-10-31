@@ -16,6 +16,7 @@
  * as raw uint16 metadata, with all unused high bits zero.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -978,6 +979,8 @@ namespace llaminar2::test
  */
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     if (argc == 2 && std::string_view(argv[1]) == "--list-formats")
     {
         llaminar2::test::listFormats();

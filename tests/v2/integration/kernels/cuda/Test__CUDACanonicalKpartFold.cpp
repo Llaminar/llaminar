@@ -11,6 +11,7 @@
  * IQ4_XS physical24 uses independently authored original half bases/raw6
  * coefficients and retains source4 arithmetic policy in captured comparisons.
  */
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
 
@@ -302,6 +303,9 @@ std::map<int, int> formats()
 /** @brief All formats/epilogues, repeated captured rows, and ragged arithmetic boundaries. */
 TEST(CUDACanonicalKpartFold, CapturedAllCodebooksRowsAndEpilogues)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     checked(cudaSetDevice(0));
     ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned());
     for (const auto &[codebook, bytes] : formats())
@@ -321,6 +325,9 @@ TEST(CUDACanonicalKpartFold, CapturedAllCodebooksRowsAndEpilogues)
 /** @brief Native CTA limits and output aliasing must work for every physical codebook. */
 TEST(CUDACanonicalKpartFold, CapturedCapacityAndInPlacePublication)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     checked(cudaSetDevice(0));
     ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned());
     for (const auto &[codebook, bytes] : formats())
@@ -336,6 +343,9 @@ TEST(CUDACanonicalKpartFold, CapturedCapacityAndInPlacePublication)
 /** @brief Rejected metadata/stream/device contracts must not enqueue any work. */
 TEST(CUDACanonicalKpartFold, RejectsInvalidBindingsBeforeSubmission)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     checked(cudaSetDevice(0));
     Storage<int8_t> a(32);
     Storage<uint8_t> p(32);

@@ -7,6 +7,8 @@
  * This keeps GPUDeviceContextPool in llaminar2_core without GPU dependencies.
  * Typed and named lookups share the same registered-factory authority. Device-
  * free tests can register explicit contexts; absent factories still fail hard.
+ * Retained context owners close lookup-to-submission races without holding the
+ * pool mutex while another thread owns the native capture interval.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -74,6 +76,9 @@ namespace llaminar2
     // =============================================================================
 
     IWorkerGPUContext &GPUDeviceContextPool::getNvidiaContext(int device_ordinal)
+    { return *retainNvidiaContext(device_ordinal); }
+
+    std::shared_ptr<IWorkerGPUContext> GPUDeviceContextPool::retainNvidiaContext(int device_ordinal)
     {
 #ifdef HAVE_CUDA
         // Auto-register factory if not yet registered (same pattern as getContext(DeviceId))
@@ -113,14 +118,13 @@ namespace llaminar2
         auto it = nvidia_contexts_.find(device_ordinal);
         if (it != nvidia_contexts_.end())
         {
-            return *it->second;
+            return it->second;
         }
 
         // Create new context via factory (lazy initialization)
         LOG_DEBUG("[GPUDeviceContextPool] Creating NvidiaDeviceContext for device " << device_ordinal);
 
         auto context = nvidia_factory_(device_ordinal);
-        IWorkerGPUContext &ctx_ref = *context;
         nvidia_contexts_[device_ordinal] = std::move(context);
         if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
         {
@@ -130,10 +134,15 @@ namespace llaminar2
         }
         nvidia_generations_[device_ordinal] = next_generation_++;
 
-        return ctx_ref;
+        auto owner = nvidia_contexts_.at(device_ordinal);
+        owner->bindProjectionContextOwner(owner);
+        return owner;
     }
 
     IWorkerGPUContext &GPUDeviceContextPool::getAMDContext(int device_ordinal)
+    { return *retainAMDContext(device_ordinal); }
+
+    std::shared_ptr<IWorkerGPUContext> GPUDeviceContextPool::retainAMDContext(int device_ordinal)
     {
 #ifdef HAVE_ROCM
         // Auto-register factory if not yet registered (same pattern as getContext(DeviceId))
@@ -173,14 +182,13 @@ namespace llaminar2
         auto it = amd_contexts_.find(device_ordinal);
         if (it != amd_contexts_.end())
         {
-            return *it->second;
+            return it->second;
         }
 
         // Create new context via factory (lazy initialization)
         LOG_DEBUG("[GPUDeviceContextPool] Creating AMDDeviceContext for device " << device_ordinal);
 
         auto context = amd_factory_(device_ordinal);
-        IWorkerGPUContext &ctx_ref = *context;
         amd_contexts_[device_ordinal] = std::move(context);
         if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
         {
@@ -190,7 +198,16 @@ namespace llaminar2
         }
         amd_generations_[device_ordinal] = next_generation_++;
 
-        return ctx_ref;
+        auto owner = amd_contexts_.at(device_ordinal);
+        owner->bindProjectionContextOwner(owner);
+        return owner;
+    }
+
+    std::shared_ptr<IWorkerGPUContext> GPUDeviceContextPool::retainContext(const DeviceId &device)
+    {
+        if (device.is_cuda()) return retainNvidiaContext(device.gpu_ordinal());
+        if (device.is_rocm()) return retainAMDContext(device.gpu_ordinal());
+        throw std::invalid_argument("Retained worker context requires an exact GPU device");
     }
 
     IWorkerGPUContext &GPUDeviceContextPool::getContext(const std::string &device_type, int device_ordinal)
@@ -283,6 +300,19 @@ namespace llaminar2
                     "[GPUDeviceContextPool] Shutdown cannot overlap an exclusive runtime-generation retirement");
             }
 
+            for (const auto &[ordinal, context] : nvidia_contexts_)
+                if (context.use_count() != 1) throw std::logic_error("Cannot shut down a retained CUDA context");
+            for (const auto &[ordinal, context] : amd_contexts_)
+                if (context.use_count() != 1) throw std::logic_error("Cannot shut down a retained ROCm context");
+            // Validate the complete set before closing any generation acquisition.
+            for (auto &[ordinal, context] : nvidia_contexts_)
+                context->assertProjectionResourcesRetirable();
+            for (auto &[ordinal, context] : amd_contexts_)
+                context->assertProjectionResourcesRetirable();
+            for (auto &[ordinal, context] : nvidia_contexts_)
+                context->beginProjectionResourcesRetirement();
+            for (auto &[ordinal, context] : amd_contexts_)
+                context->beginProjectionResourcesRetirement();
             nvidia_count = nvidia_contexts_.size();
             amd_count = amd_contexts_.size();
             retired_nvidia_contexts.swap(nvidia_contexts_);
@@ -319,7 +349,7 @@ namespace llaminar2
                 "[GPUDeviceContextPool] Exclusive generation retirement requires an exact GPU device");
         }
 
-        std::unique_ptr<IWorkerGPUContext> retired_context;
+        std::shared_ptr<IWorkerGPUContext> retired_context;
         std::uint64_t retired_generation = 0u;
         const int ordinal = device.gpu_ordinal();
 
@@ -364,6 +394,15 @@ namespace llaminar2
                     device.toString());
             }
 
+            if (context_it->second.use_count() != 1)
+            {
+                retiring.erase(ordinal);
+                throw std::logic_error("Cannot retire a GPU context with a retained capture or submission owner");
+            }
+            // Check before removing authority: a live capture must leave the exact
+            // context discoverable and its generation intact on rejection.
+            try { context_it->second->beginProjectionResourcesRetirement(); }
+            catch (...) { retiring.erase(ordinal); throw; }
             retired_generation = generation_it->second;
             retired_context = std::move(context_it->second);
             contexts.erase(context_it);

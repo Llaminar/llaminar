@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and install matching rocBLAS/Tensile device kernels for MI50/MI60.
+# Build and install matching rocBLAS/Tensile device kernels for the selected shipping devices.
 #
 # ROCm Core SDK does not publish a gfx906 kernel pack. This is a real source
 # build of the pinned rocBLAS and paired Tensile, not a foreign-code-object
@@ -13,7 +13,14 @@ blas_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${blas_script_dir}/rocm-release.env"
 blas_sdk_root="${ROCM_PATH:-${LLAMINAR_ROCM_SDK_PREFIX}}"
 blas_prefix="${ROCBLAS_INSTALL_PREFIX:-${blas_sdk_root}}"
-blas_targets="${ROCBLAS_GPU_TARGETS:-gfx906:xnack-}"
+blas_targets="${ROCBLAS_GPU_TARGETS:-${LLAMINAR_ROCM_GPU_TARGETS}}"
+# The MI50 library needs its explicit XNACK mode; other targets retain native ISA.
+IFS=';' read -r -a blas_requested_targets <<< "${blas_targets}"
+blas_targets=""
+for blas_target in "${blas_requested_targets[@]}"; do
+    [[ "${blas_target}" != gfx906 ]] || blas_target=gfx906:xnack-
+    blas_targets+="${blas_targets:+;}${blas_target}"
+done
 blas_marker="${blas_prefix}/share/llaminar/rocblas-source.txt"
 blas_library_tree="${blas_prefix}/lib/rocblas/library"
 blas_library="${blas_prefix}/lib/librocblas.so"
@@ -29,8 +36,15 @@ fi
 blas_identity="${LLAMINAR_ROCM_VERSION}:${LLAMINAR_ROCM_DEB_VERSION}:${LLAMINAR_ROCM_LIBRARIES_REVISION}:${blas_targets}"
 blas_artifact_digest() {
     [[ -f "${blas_library}" && -d "${blas_library_tree}" ]] || return 1
-    find "${blas_library_tree}" -type f \( -name '*gfx906*.co' -o -name '*gfx906*.hsaco' \) -print -quit | grep -q . || return 1
-    find "${blas_library_tree}" -type f -name '*gfx906*.dat' -print -quit | grep -q . || return 1
+    local blas_target blas_arch
+    local -a blas_target_list
+    IFS=';' read -r -a blas_target_list <<< "${blas_targets}"
+    for blas_target in "${blas_target_list[@]}"; do
+        blas_arch="${blas_target%%:*}"
+        [[ "${blas_arch}" =~ ^gfx[0-9a-z]+$ ]] || return 1
+        find "${blas_library_tree}" -type f \( -name "*${blas_arch}*.co" -o -name "*${blas_arch}*.hsaco" \) -print -quit | grep -q . || return 1
+        find "${blas_library_tree}" -type f -name "*${blas_arch}*.dat" -print -quit | grep -q . || return 1
+    done
     (
         cd -- "${blas_prefix}"
         sha256sum lib/librocblas.so
@@ -85,9 +99,8 @@ cmake --install "${blas_work}/build"
 # All scalar precisions have generated libraries in this full build; it is not
 # a tiny FP32-only fixture. Require actual device binaries and dispatch data for
 # the mandatory shipping architecture before writing a successful receipt.
-if ! find "${blas_library_tree}" -type f \( -name '*gfx906*.co' -o -name '*gfx906*.hsaco' \) -print -quit | grep -q . ||
-   ! find "${blas_library_tree}" -type f -name '*gfx906*.dat' -print -quit | grep -q .; then
-    echo "rocBLAS build did not install gfx906 kernels and dispatch metadata" >&2
+if ! blas_artifact_digest >/dev/null; then
+    echo "rocBLAS build did not install every selected target's kernels and dispatch metadata: ${blas_targets}" >&2
     exit 1
 fi
 install -d "${blas_prefix}/share/llaminar" "${blas_prefix}/share/licenses/llaminar-rocblas"

@@ -16,6 +16,7 @@
  * Register-capped logical64-row policies must traverse their physical32-row
  * Z tiles, including partial final tiles; replay also poisons consumed partials.
  */
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
 
@@ -298,6 +299,9 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
 /** @brief Prove register-bounded row ownership and K partitions on every codebook. */
 TEST(CUDANativeVNNIWide, CapturedGroupedRegisterBoundsMatchSerialAllFormats)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     int count = 0;
     checked(cudaGetDeviceCount(&count));
     ASSERT_GT(count, 0);
@@ -338,6 +342,9 @@ TEST(CUDANativeVNNIWide, CapturedGroupedRegisterBoundsMatchSerialAllFormats)
  */
 TEST(CUDANativeVNNIWide, CapturedGroupedPhysicalRowCursorMatchesSerial)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     int count = 0;
     checked(cudaGetDeviceCount(&count));
     ASSERT_GT(count, 0);
@@ -362,6 +369,9 @@ TEST(CUDANativeVNNIWide, CapturedGroupedPhysicalRowCursorMatchesSerial)
 /** @brief Sweep every physical codebook and every compiled WIDE output geometry. */
 TEST(CUDANativeVNNIWide, CapturedAllCodebooksAndTileTailsMatchSinglePartition)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     int count = 0;
     ASSERT_EQ(cudaGetDeviceCount(&count), cudaSuccess);
     ASSERT_GT(count, 0) << "explicit CUDA integration requires a device";

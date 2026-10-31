@@ -12,6 +12,8 @@
  * @date January 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include <mpi.h>
@@ -664,50 +666,19 @@ namespace
 
 } // anonymous namespace
 
-#include <csignal>
-
-static volatile sig_atomic_t g_any_assertion_failed = 0;
-
-static void cleanup_crash_handler(int sig)
-{
-    if (!g_any_assertion_failed)
-        _exit(0);
-    struct sigaction sa = {};
-    sa.sa_handler = SIG_DFL;
-    sigaction(sig, &sa, nullptr);
-    raise(sig);
-}
-
-static void install_crash_handlers()
-{
-    struct sigaction sa = {};
-    sa.sa_handler = cleanup_crash_handler;
-    sa.sa_flags = 0;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGSEGV, &sa, nullptr);
-}
-
-class AssertionTracker : public ::testing::EmptyTestEventListener
-{
-    void OnTestPartResult(const ::testing::TestPartResult &result) override
-    {
-        if (result.failed())
-            g_any_assertion_failed = 1;
-    }
-};
-
 int main(int argc, char **argv)
 {
-    install_crash_handlers();
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
 
     int provided = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
 
     ::testing::InitGoogleTest(&argc, argv);
-    ::testing::UnitTest::GetInstance()->listeners().Append(new AssertionTracker);
     int result = RUN_ALL_TESTS();
 
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     _exit(result);
 }

@@ -38,8 +38,11 @@
  * @see ROCmQuantisedGemmKernel_INT8_VNNI.hip for INT8 VNNI GEMM (V3/V7)
  * @see ROCmGemvKernel_native_VNNI.hip for native-VNNI GEMV (M=1 decode)
  * @see docs/v2/projects/2026-03/NATIVE_VNNI_GEMM_DESIGN.md for architecture design document
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
 
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
@@ -723,8 +726,8 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     #pragma unroll
                     for (int nn = 0; nn < columns; ++nn)
-                        low_dot[mm][nn] = __builtin_amdgcn_sdot4(
-                            a_reg[mm], b_reg[nn], low_dot[mm][nn], false);
+                        low_dot[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4(
+                            a_reg[mm], b_reg[nn], low_dot[mm][nn]);
             }
             #pragma clang loop unroll_count(2)
             for (int g = 4; g < 8; ++g)
@@ -742,8 +745,8 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     #pragma unroll
                     for (int nn = 0; nn < columns; ++nn)
-                        high_dot[mm][nn] = __builtin_amdgcn_sdot4(
-                            a_reg[mm], b_reg[nn], high_dot[mm][nn], false);
+                        high_dot[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4(
+                            a_reg[mm], b_reg[nn], high_dot[mm][nn]);
             }
 
             #pragma unroll
@@ -780,11 +783,10 @@ __device__ __forceinline__ void accumulate_block_gemm(
                         for (int group = 0; group < 4; ++group)
                         {
                             const int kg0 = bp * 8 + group * 2;
-                            sums[group] = __builtin_amdgcn_sdot4(
+                            sums[group] = ::llaminar2::rocm_integer_contract::signedDot4(
                                 a_buf[(kg0 + 1) * M_TILE + m_base + mm], ones,
-                                __builtin_amdgcn_sdot4(
-                                    a_buf[kg0 * M_TILE + m_base + mm], ones, 0, false),
-                                false);
+                                ::llaminar2::rocm_integer_contract::signedDot4(
+                                    a_buf[kg0 * M_TILE + m_base + mm], ones, 0));
                         }
                         const uint16_t qh = iq1_m_qh_buf[sn];
                         acc[mm][column] = rocm_native_vnni_commit_iq1_m_block(
@@ -844,8 +846,8 @@ __device__ __forceinline__ void accumulate_block_gemm(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     #pragma unroll
                     for (int nn = 0; nn < columns; ++nn)
-                        block_acc[mm][nn] = __builtin_amdgcn_sdot4(
-                            a_reg[mm], b_reg[nn], block_acc[mm][nn], false);
+                        block_acc[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4(
+                            a_reg[mm], b_reg[nn], block_acc[mm][nn]);
             }
             // The canonical helper rounds the scaled dot and minimum correction
             // before one ordered accumulator publication. Read cooperative sum_a
@@ -904,8 +906,8 @@ __device__ __forceinline__ void accumulate_block_gemm(
             for (int mm = 0; mm < M_PER_THREAD; ++mm) \
                 _Pragma("unroll") \
                 for (int nn = 0; nn < N_PER_THREAD; ++nn) \
-                    block_acc[mm][nn] = __builtin_amdgcn_sdot4( \
-                        a_reg[mm], b_reg[nn], block_acc[mm][nn], false); \
+                    block_acc[mm][nn] = ::llaminar2::rocm_integer_contract::signedDot4( \
+                        a_reg[mm], b_reg[nn], block_acc[mm][nn]); \
         }
         if constexpr (UNROLL_G == 0) {
             for (int g = 0; g < 8; ++g) NVNNI_PATTERN_S_G_BODY
@@ -1344,14 +1346,14 @@ void native_vnni_gemm_kernel(
         if constexpr (Traits::needs_cooperative_sum_a) {
             // Cooperative sum_a: this thread's 4 k-groups = 1 block-half
             const int bhi = a_kg / 4;
-            int32_t sa = __builtin_amdgcn_sdot4(
-                static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
-            sa = __builtin_amdgcn_sdot4(
-                static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
-            sa = __builtin_amdgcn_sdot4(
-                static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
-            sa = __builtin_amdgcn_sdot4(
-                static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+            int32_t sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0);
+            sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa);
+            sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa);
+            sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa);
             sum_a_lds[0][bhi * M_TILE + mi] = sa;
         }
     }
@@ -1451,14 +1453,14 @@ void native_vnni_gemm_kernel(
                 a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
                 if constexpr (Traits::needs_cooperative_sum_a) {
                     const int bhi = a_kg / 4;
-                    int32_t sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                    int32_t sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa);
                     sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
                 }
             }
@@ -1548,14 +1550,14 @@ void native_vnni_gemm_kernel(
                 a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
                 if constexpr (Traits::needs_cooperative_sum_a) {
                     const int bhi = a_kg / 4;
-                    int32_t sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                    int32_t sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa);
                     sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
                 }
             }
@@ -1673,14 +1675,14 @@ void native_vnni_gemm_kernel(
                 a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
                 if constexpr (Traits::needs_cooperative_sum_a) {
                     const int bhi = a_kg / 4;
-                    int32_t sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                    int32_t sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa);
                     sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
                 }
             }
@@ -1770,14 +1772,14 @@ void native_vnni_gemm_kernel(
                 a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
                 if constexpr (Traits::needs_cooperative_sum_a) {
                     const int bhi = a_kg / 4;
-                    int32_t sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
-                    sa = __builtin_amdgcn_sdot4(
-                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                    int32_t sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa);
+                    sa = ::llaminar2::rocm_integer_contract::signedDot4(
+                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa);
                     sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
                 }
             }
@@ -2068,9 +2070,9 @@ void streaming_lm_head_kernel(
             if (m_safe || gm < M) {
                 #pragma unroll
                 for (int kg = 0; kg < 8; ++kg)
-                    s = __builtin_amdgcn_sdot4(
+                    s = ::llaminar2::rocm_integer_contract::signedDot4(
                         a_global[static_cast<int64_t>(gm) * a_row_stride + block * 8 + kg],
-                        static_cast<int32_t>(0x01010101), s, false);
+                        static_cast<int32_t>(0x01010101), s);
             }
             sum_a_shared[item] = s;
         }
@@ -2106,15 +2108,13 @@ void streaming_lm_head_kernel(
                 const int kg1 = kg0 + 1;
                 const int64_t row_base =
                     static_cast<int64_t>(gm) * a_row_stride;
-                sum = __builtin_amdgcn_sdot4(
+                sum = ::llaminar2::rocm_integer_contract::signedDot4(
                     a_global[row_base + kg1],
                     kPackedOnes,
-                    __builtin_amdgcn_sdot4(
+                    ::llaminar2::rocm_integer_contract::signedDot4(
                         a_global[row_base + kg0],
                         kPackedOnes,
-                        0,
-                        false),
-                    false);
+                        0));
             }
             sum_a_shared[item] = sum;
         }
@@ -2215,9 +2215,9 @@ void streaming_lm_head_kernel(
                     const int gm = block_m_origin + mm;
                     const int32_t a_val = (block_rows_complete || gm < block_m_limit)
                         ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                    temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
-                    temp_sum[mm] = __builtin_amdgcn_sdot4(
-                        a_val, static_cast<int32_t>(0x01010101), temp_sum[mm], false);
+                    temp_acc[mm] = ::llaminar2::rocm_integer_contract::signedDot4(a_val, b_val, temp_acc[mm]);
+                    temp_sum[mm] = ::llaminar2::rocm_integer_contract::signedDot4(
+                        a_val, static_cast<int32_t>(0x01010101), temp_sum[mm]);
                 }
             }
             const float slo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
@@ -2246,9 +2246,9 @@ void streaming_lm_head_kernel(
                     const int gm = block_m_origin + mm;
                     const int32_t a_val = (block_rows_complete || gm < block_m_limit)
                         ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                    temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
-                    temp_sum[mm] = __builtin_amdgcn_sdot4(
-                        a_val, static_cast<int32_t>(0x01010101), temp_sum[mm], false);
+                    temp_acc[mm] = ::llaminar2::rocm_integer_contract::signedDot4(a_val, b_val, temp_acc[mm]);
+                    temp_sum[mm] = ::llaminar2::rocm_integer_contract::signedDot4(
+                        a_val, static_cast<int32_t>(0x01010101), temp_sum[mm]);
                 }
             }
             const float shi = __half2float(*reinterpret_cast<const __half*>(&aux_bits));
@@ -2294,8 +2294,8 @@ void streaming_lm_head_kernel(
                             const int mm = row_base + row;
                             const int32_t a_val = a_global[
                                 static_cast<int64_t>(block_m_origin + mm) * a_row_stride + a_kg_idx];
-                            low_dot[row] = __builtin_amdgcn_sdot4(
-                                a_val, b_val, low_dot[row], false);
+                            low_dot[row] = ::llaminar2::rocm_integer_contract::signedDot4(
+                                a_val, b_val, low_dot[row]);
                         }
                     }
                 }
@@ -2313,8 +2313,8 @@ void streaming_lm_head_kernel(
                             const int gm = block_m_origin + mm;
                             const int32_t a_val = (gm < block_m_limit)
                                 ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                            low_dot[row] = __builtin_amdgcn_sdot4(
-                                a_val, b_val, low_dot[row], false);
+                            low_dot[row] = ::llaminar2::rocm_integer_contract::signedDot4(
+                                a_val, b_val, low_dot[row]);
                         }
                     }
                 }
@@ -2332,8 +2332,8 @@ void streaming_lm_head_kernel(
                             const int mm = row_base + row;
                             const int32_t a_val = a_global[
                                 static_cast<int64_t>(block_m_origin + mm) * a_row_stride + a_kg_idx];
-                            high_dot[row] = __builtin_amdgcn_sdot4(
-                                a_val, b_val, high_dot[row], false);
+                            high_dot[row] = ::llaminar2::rocm_integer_contract::signedDot4(
+                                a_val, b_val, high_dot[row]);
                         }
                     }
                 }
@@ -2351,8 +2351,8 @@ void streaming_lm_head_kernel(
                             const int gm = block_m_origin + mm;
                             const int32_t a_val = (gm < block_m_limit)
                                 ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                            high_dot[row] = __builtin_amdgcn_sdot4(
-                                a_val, b_val, high_dot[row], false);
+                            high_dot[row] = ::llaminar2::rocm_integer_contract::signedDot4(
+                                a_val, b_val, high_dot[row]);
                         }
                     }
                 }
@@ -2434,7 +2434,7 @@ void streaming_lm_head_kernel(
                     {
                         const int32_t a_val = a_global[
                             static_cast<int64_t>(block_m_origin + mm) * a_row_stride + a_kg_idx];
-                        block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
+                        block_acc[mm] = ::llaminar2::rocm_integer_contract::signedDot4(a_val, b_val, block_acc[mm]);
                     }
                 }
             }
@@ -2451,7 +2451,7 @@ void streaming_lm_head_kernel(
                         const int gm = block_m_origin + mm;
                         const int32_t a_val = (gm < block_m_limit)
                             ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                        block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
+                        block_acc[mm] = ::llaminar2::rocm_integer_contract::signedDot4(a_val, b_val, block_acc[mm]);
                     }
                 }
             }
@@ -2490,8 +2490,8 @@ void streaming_lm_head_kernel(
                     {
                         const int32_t a_val = a_global[
                             static_cast<int64_t>(block_m_origin + mm) * a_row_stride + a_kg_idx];
-                        block_acc[mm] = __builtin_amdgcn_sdot4(
-                            a_val, b_val, block_acc[mm], false);
+                        block_acc[mm] = ::llaminar2::rocm_integer_contract::signedDot4(
+                            a_val, b_val, block_acc[mm]);
                     }
                 }
             }
@@ -2508,8 +2508,8 @@ void streaming_lm_head_kernel(
                         const int gm = block_m_origin + mm;
                         const int32_t a_val = (gm < block_m_limit)
                             ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                        block_acc[mm] = __builtin_amdgcn_sdot4(
-                            a_val, b_val, block_acc[mm], false);
+                        block_acc[mm] = ::llaminar2::rocm_integer_contract::signedDot4(
+                            a_val, b_val, block_acc[mm]);
                     }
                 }
             }

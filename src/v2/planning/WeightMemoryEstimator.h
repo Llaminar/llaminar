@@ -20,6 +20,8 @@ namespace llaminar2
 {
 
     struct ModelMemoryProfile;
+    class PreparedWeightPhysicalUses;
+    enum class PreparedWeightUseIntent;
     class MoEExpertProjectionOwnership;
 
     /**
@@ -227,6 +229,27 @@ namespace llaminar2
             WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal
         );
 
+        /**
+         * @brief Price creators while retaining exact typed aliases in one model/device scope.
+         * @param uses Original-profile/device-bound logical-to-physical compiler.
+         * @param intent Primary creator publication or subsequent alias-or-create use.
+         * @param profile Same immutable original model inventory bound to uses.
+         * @param device Same exact participant bound to uses.
+         * @param shard_index This use's local TP coordinate.
+         * @param total_shards This use's TP degree (one for a full replica).
+         * @param first_layer First included layer.
+         * @param last_layer Last included layer, or -1 for all.
+         * @param residency Actual full/continuation/expert-only residency.
+         * @param tensor_parallel_assignment Actual local TP assignment when present.
+         * @param components Exact global component uses.
+         * @return Canonical byte inventory of required creators; aliases add no physical bytes.
+         */
+        static WeightEstimate estimatePhysical(PreparedWeightPhysicalUses &uses, PreparedWeightUseIntent intent,
+            const ModelMemoryProfile &profile, DeviceId device, int shard_index, int total_shards,
+            int first_layer, int last_layer, const DeviceWeightResidency &residency,
+            const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment,
+            WeightComponentScope components);
+
         /// Bytes per weight element for native (GGUF on-disk) format.
         static float getNativeBytesPerWeight(const std::string &quant_type);
 
@@ -238,6 +261,14 @@ namespace llaminar2
 
         /// Bytes per weight element after CPU VNNI packing.
         static float getCPUPackedBytesPerWeight(const std::string &quant_type);
+
+    private:
+        /** @brief One canonical pricing body shared by logical and physical-use entrypoints. */
+        static WeightEstimate estimateImpl(const ModelMemoryProfile &profile, DeviceId device,
+            int shard_index, int total_shards, int first_layer, int last_layer,
+            const DeviceWeightResidency &residency,
+            const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment,
+            WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent);
 
     };
 

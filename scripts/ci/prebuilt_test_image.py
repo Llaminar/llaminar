@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file prebuilt_test_image.py
+#  @brief Seal the exact installed test executables and native runtime modules.
 """Seal the build inventory before stripping a Docker test runner's duplicates.
 
 An installed test-runner image cannot incrementally rebuild: compiler-only
@@ -22,6 +24,11 @@ from run_production_parity_campaigns import (
     discover_production_parity_unit_tests,
     _as_string_list, _property_map,
 )
+
+# Native MPI discovers this project-owned module through the helper's sibling
+# component directory. It is part of the installed runtime even though its
+# vendor-mandated filename does not start with the ordinary executable prefix.
+RUNTIME_FILE_PREFIXES = ("v2_", "llaminar_", "libllaminar", "mca_schizo_llaminar")
 
 
 def inventory(build: Path) -> dict:
@@ -51,10 +58,10 @@ def inventory(build: Path) -> dict:
             raise ValueError(f"installed test executable is missing: {name}: CTest omitted command")
         for argument in test.get("command", []):
             path = Path(argument)
-            if path.is_relative_to(build) and path.name.startswith(("v2_", "llaminar_")) and not path.is_file():
+            if path.is_relative_to(build) and path.name.startswith(RUNTIME_FILE_PREFIXES) and not path.is_file():
                 raise ValueError(f"installed test executable is missing: {name}: {path}")
     for path in build.rglob("*"):
-        if path.is_file() and path.name.startswith(("v2_", "llaminar_", "libllaminar")):
+        if path.is_file() and path.name.startswith(RUNTIME_FILE_PREFIXES):
             files.append(path)
     return {"build_dir": str(build), "tests": tests,
             "files": {str(path.relative_to(build)): {"bytes": path.stat().st_size,

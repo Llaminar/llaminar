@@ -8,6 +8,8 @@
  * the sole caller of the protocol.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "integration/parity/ParityCellLifecycle.h"
 
 #include <gtest/gtest.h>
@@ -162,6 +164,10 @@ namespace llaminar2::test::parity
 /** @brief Initialize/finalize MPI around the real communicator integration. */
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided = MPI_THREAD_SINGLE;
     if (MPI_Init_thread(
             &argc,
@@ -175,6 +181,7 @@ int main(int argc, char **argv)
 
     ::testing::InitGoogleTest(&argc, argv);
     const int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     if (MPI_Finalize() != MPI_SUCCESS)
         return 3;
     return result;

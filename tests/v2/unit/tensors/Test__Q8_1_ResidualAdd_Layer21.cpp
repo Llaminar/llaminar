@@ -15,8 +15,12 @@
  * 3. Regression testing for any future changes to q8_1_add_q8_1
  *
  * @author David Sanftenberg
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include <cmath>
 #include <algorithm>
@@ -319,6 +323,8 @@ namespace llaminar2::test
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

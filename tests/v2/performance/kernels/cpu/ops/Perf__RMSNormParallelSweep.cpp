@@ -20,6 +20,7 @@
  * @date 2025-12-05
  */
 
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
@@ -425,6 +426,9 @@ TEST_F(RMSNormParallelSweep, MinElemsSweep)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+
     MPI_Init(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();

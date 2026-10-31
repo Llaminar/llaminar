@@ -26,8 +26,12 @@
  * @note Standalone HIP file — does not link against the production kernel.
  *       Grid tables are copied to __constant__ memory independently.
  * @note Requires ROCm device (MI50/MI60 gfx906 target).
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -1704,6 +1708,8 @@ std::vector<StrategyEntry> getStrategies()
 // =============================================================================
 int main(int argc, char** argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     // Check for ROCm device
     int device_count = 0;
     hipError_t err = hipGetDeviceCount(&device_count);

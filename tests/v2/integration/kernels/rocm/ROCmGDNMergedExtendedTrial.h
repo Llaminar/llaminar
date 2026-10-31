@@ -287,20 +287,44 @@ inline void parity(Cell& cell)
 }
 
 
-/** @test Exact merged/deinterleaved recurrence over request holes and tail columns.
- * @details Positive DV admission and native tail geometry are exercised directly; this
- * fixture does not select a production execution policy.
- * This is an explicit integration test, never a device-free Unit test.
+/**
+ * @brief Own one key/value-width slice of the complete merged-coordinate replay.
+ * @details Each native test retains every M1..16 geometry, normalization policy
+ * and dirty replay state for its widths. Independent CTest registrations give
+ * each bounded slice the existing watchdog rather than timing out an aggregate
+ * of 261 independent native lifetimes under host scheduling contention.
  */
-TEST(Test__ROCmGDNPaddedRealLength, MergedExtendedGeometryBytes)
+class Test__ROCmGDNMergedCoordinates
+    : public ::testing::TestWithParam<std::pair<int,int>> {};
+
+/** @test Exact merged/deinterleaved recurrence over request holes and tail columns.
+ * @details Positive DV admission and native tail geometry are exercised directly;
+ * this fixture does not select a production execution policy. Every case still
+ * captures and inspects the complete native DAG and checks all four replay states.
+ */
+TEST_P(Test__ROCmGDNMergedCoordinates, Bytes)
 {
     ASSERT_TRUE(hasROCm());checkHip(hipSetDevice(0),"GDN extended device");
-    for(int m=1;m<=16;++m)for(int dk:{64,128})for(int dv:{64,65,128,129})for(bool norm:{false,true}){
+    const auto [dk,dv]=GetParam();
+    for(int m=1;m<=16;++m)for(bool norm:{false,true}){
         const int offset=norm?5:-5;
         SCOPED_TRACE(::testing::Message()<<"M="<<m<<" R=3 DK="<<dk<<" DV="<<dv<<" norm="<<norm<<" offset="<<offset);
         gdn_merged_extended::Cell cell(m,3,dk,dv,norm,offset);
         gdn_merged_extended::parity(cell);
     }
+}
+
+INSTANTIATE_TEST_SUITE_P(Widths,Test__ROCmGDNMergedCoordinates,
+    ::testing::Values(std::pair{64,64},std::pair{64,65},std::pair{64,128},std::pair{64,129},
+                      std::pair{128,64},std::pair{128,65},std::pair{128,128},std::pair{128,129}),
+    [](const ::testing::TestParamInfo<std::pair<int,int>>& info){
+        return "DK"+std::to_string(info.param.first)+"DV"+std::to_string(info.param.second);
+    });
+
+/** @test Retain independent native replay for the signed modular-offset boundaries. */
+TEST(Test__ROCmGDNPaddedRealLength, MergedModularOffsetsBytes)
+{
+    ASSERT_TRUE(hasROCm());checkHip(hipSetDevice(0),"GDN modular-offset device");
     for(int offset:{0,1,-1,std::numeric_limits<int>::min(),std::numeric_limits<int>::max()}){
         SCOPED_TRACE(offset);gdn_merged_extended::Cell cell(3,3,128,65,true,offset);
         gdn_merged_extended::parity(cell);

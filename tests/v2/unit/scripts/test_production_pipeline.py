@@ -1661,10 +1661,12 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                     frozenset(("Integration", "ProductionTestPreflight")),
                     None,
                     parity.PreflightExecutionLane.HOST,
+                    ctest_index=2,
                 )
                 with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
                      patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
                      patch.object(prebuilt_test_image, "validate") as validate, \
+                     patch.object(parity, "_validate_preflight_index_selection") as preview, \
                      patch.object(parity, "_run_process", return_value=0) as execute:
                     self.assertEqual(prerequisites_runner.main(argv), 0)
                 commands = [call.args[0] for call in execute.call_args_list]
@@ -1678,7 +1680,8 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                                                   parity.PRODUCTION_TEST_PREFLIGHT_BUILD_TARGET])
                 unit, preflight = commands[-2:]
                 self.assertEqual(unit[unit.index("-R") + 1], "^V2_Unit_")
-                self.assertEqual(preflight[preflight.index("-R") + 1], "^(V2_Integration_B)$")
+                self.assertEqual(preview.call_args.args[2], ("V2_Integration_B",))
+                self.assertFalse(Path(preflight[preflight.index("-I") + 1]).exists())
                 for command in (unit, preflight):
                     self.assertIn("--output-log", command)
                     self.assertIn("--output-junit", command)
@@ -1728,6 +1731,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                 frozenset(("Integration", "ProductionTestPreflight")),
                 None,
                 parity.PreflightExecutionLane.HOST,
+                ctest_index=2,
             )
             with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
                  patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
@@ -4378,7 +4382,7 @@ class InfrastructureTests(unittest.TestCase):
                 f'amdrocm-profiler-base{pins["LLAMINAR_ROCM_SERIES"]}={pins["LLAMINAR_ROCM_DEB_VERSION"]}'])
 
     def test_rocm_blas_kernels_are_built_and_shipped_with_the_matching_dso(self):
-        """Both ISA lanes inherit one source-built gfx906 BLAS artifact closure.
+        """Both ISA lanes inherit one source-built shipping-target BLAS artifact closure.
 
         A host-only package or a kernel tree copied without its DSO is not a
         supported MI50 BLAS implementation. The runtime must not download a
@@ -4389,10 +4393,10 @@ class InfrastructureTests(unittest.TestCase):
         runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1].split(
             "FROM runtime AS test-runner", 1)[0]
         installer = (ROOT / "scripts/docker/install-rocm.sh").read_text()
-        blas = (ROOT / "scripts/docker/install-rocblas-gfx906.sh").read_text()
-        self.assertIn("scripts/docker/install-rocblas-gfx906.sh", toolchain)
-        self.assertIn('bash "${rocm_script_dir}/install-rocblas-gfx906.sh"', installer)
-        self.assertIn('blas_targets="${ROCBLAS_GPU_TARGETS:-gfx906:xnack-}"', blas)
+        blas = (ROOT / "scripts/docker/install-rocblas.sh").read_text()
+        self.assertIn("scripts/docker/install-rocblas.sh", toolchain)
+        self.assertIn('bash "${rocm_script_dir}/install-rocblas.sh"', installer)
+        self.assertIn('blas_targets="${ROCBLAS_GPU_TARGETS:-${LLAMINAR_ROCM_GPU_TARGETS}}"', blas)
         self.assertIn("ROCm/rocm-libraries/tar.gz/${LLAMINAR_ROCM_LIBRARIES_REVISION}", blas)
         self.assertIn('Tensile_TEST_LOCAL_PATH="${blas_work}/libraries/shared/tensile"', blas)
         self.assertIn('cmake --build "${blas_work}/build" --parallel', blas)
@@ -4401,8 +4405,8 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('cp -L "${ROCM_PATH}/lib/librocblas.so" /src/runtime-rocblas/lib/librocblas.so.5', dockerfile)
         self.assertIn('cp -r "${ROCM_PATH}/lib/rocblas/library" /src/runtime-rocblas/lib/rocblas/', dockerfile)
         self.assertIn("COPY --from=builder /src/runtime-rocblas/ /opt/rocm-sdk/", runtime)
-        self.assertNotIn("install-rocblas-gfx906.sh", runtime)
-        for script in ("install-rocm.sh", "install-rocm-runtime.sh", "install-rocblas-gfx906.sh"):
+        self.assertNotIn("install-rocblas.sh", runtime)
+        for script in ("install-rocm.sh", "install-rocm-runtime.sh", "install-rocblas.sh"):
             self.assertNotIn("archlinux.org", (ROOT / "scripts/docker" / script).read_text())
         pins = rocm_release_pins()
         self.assertIn(f'ROCM_PATH={pins["LLAMINAR_ROCM_ACTIVE_PREFIX"]}', runtime)
@@ -4442,7 +4446,7 @@ class InfrastructureTests(unittest.TestCase):
             def run_installer():
                 """Run the actual isolated receipt verifier, not a Python copy."""
                 return subprocess.run(
-                    ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                    ["bash", str(ROOT / "scripts/docker/install-rocblas.sh")],
                     env={**os.environ, "ROCM_PATH": str(sdk),
                          "ROCBLAS_INSTALL_PREFIX": str(output), "ROCBLAS_GPU_TARGETS": "gfx906:xnack-"},
                     capture_output=True, text=True, timeout=10)
@@ -4465,7 +4469,7 @@ class InfrastructureTests(unittest.TestCase):
             for targets in ("gfx908", "gfx906:xnack-;gfx908"):
                 with self.subTest(targets=targets):
                     result = subprocess.run(
-                        ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                        ["bash", str(ROOT / "scripts/docker/install-rocblas.sh")],
                         env={**os.environ, "ROCM_PATH": str(sdk),
                              "ROCBLAS_INSTALL_PREFIX": str(output), "ROCBLAS_GPU_TARGETS": targets},
                         capture_output=True, text=True, timeout=10)
@@ -4483,7 +4487,7 @@ class InfrastructureTests(unittest.TestCase):
                         (sdk / ".info/version").write_text(version + "\n")
                     output = Path(directory) / "output"
                     result = subprocess.run(
-                        ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                        ["bash", str(ROOT / "scripts/docker/install-rocblas.sh")],
                         env={**os.environ, "ROCM_PATH": str(sdk), "ROCBLAS_INSTALL_PREFIX": str(output)},
                         capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 1, result.stderr)
@@ -4732,12 +4736,14 @@ class InfrastructureTests(unittest.TestCase):
             frozenset(("Integration", "ProductionTestPreflight")),
             None,
             parity.PreflightExecutionLane.HOST,
+            ctest_index=2,
         )
         with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
              patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
              patch.object(parity.os, "sched_getaffinity", return_value=set(range(8))), \
              patch.object(prebuilt_test_image, "validate") as validate, \
-             patch.object(parity, "_run_process", return_value=0) as execute:
+             patch.object(parity, "_validate_preflight_index_selection") as preview, \
+                     patch.object(parity, "_run_process", return_value=0) as execute:
             status, _, tests = parity.run_production_test_preflight(Path("build"), None, Path("receipt"))
         self.assertEqual(status, 0)
         self.assertEqual(len(tests), 2)
@@ -4746,7 +4752,8 @@ class InfrastructureTests(unittest.TestCase):
         commands = [call.args[0] for call in execute.call_args_list]
         self.assertTrue(all(cmd[0] == "ctest" and "--no-tests=error" in cmd for cmd in commands))
         self.assertIn("^V2_Unit_", commands[0])
-        self.assertIn("^(V2_Integration_B)$", commands[1])
+        self.assertEqual(preview.call_args.args[2], ("V2_Integration_B",))
+        self.assertFalse(Path(commands[1][commands[1].index("-I") + 1]).exists())
         # The full device-free Unit namespace consumes available CPU capacity;
         # the typed preflight host lane is deliberately serial so it cannot
         # race device/mixed-rank maintenance work.

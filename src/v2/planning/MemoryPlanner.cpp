@@ -9,10 +9,13 @@
  * independently retained graph family has one per participating layer.
  * CPU serial storage declarations survive admission and runtime projection.
  * Per-layer CPU packet roots retain their own exact backing allocation claims.
+ * Prepared logical weight uses share a creator only through the same original
+ * source/representation contract used by runtime adoption.
  */
 
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "planning/MemoryPlanner.h"
+#include "planning/PreparedWeightPhysicalUses.h"
 #include "memory/CPUSerialExpertStorageLayout.h"
 #include "memory/CPUGroupedMoEStorageLayout.h"
 #include "memory/CPURouterQ8StorageLayout.h"
@@ -1161,13 +1164,16 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                                             : WeightComponentScope::Intermediate);
 
         // Weight estimation
-        auto weight_est = WeightMemoryEstimator::estimate(
-            profile, cfg.device,
-            cfg.shard_index, cfg.total_shards,
-            cfg.first_layer, weight_last_layer,
-            cfg.weight_residency,
-            cfg.tensor_parallel_assignment,
-            weight_components);
+        // Only the declared replicated set needs a cross-use compilation.
+        // Ordinary single-view planning keeps its existing canonical pricing.
+        std::optional<PreparedWeightPhysicalUses> physical_weight_uses;
+        if (replicated_dense_decode) physical_weight_uses.emplace(profile, cfg.device, weight_components);
+        auto weight_est = physical_weight_uses
+            ? WeightMemoryEstimator::estimatePhysical(*physical_weight_uses, PreparedWeightUseIntent::PublishCreator,
+                profile, cfg.device, cfg.shard_index, cfg.total_shards, cfg.first_layer, weight_last_layer,
+                cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components)
+            : WeightMemoryEstimator::estimate(profile, cfg.device, cfg.shard_index, cfg.total_shards,
+                cfg.first_layer, weight_last_layer, cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components);
         primary_weight_bytes = weight_est.device_bytes;
 
         for (std::size_t set_index = 0;
@@ -1226,7 +1232,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 }
 
                 const auto sidecar_estimate =
-                    WeightMemoryEstimator::estimate(
+                    WeightMemoryEstimator::estimatePhysical(
+                        *physical_weight_uses, PreparedWeightUseIntent::ReuseExistingOrCreate,
                         profile,
                         cfg.device,
                         /*shard_index=*/0,

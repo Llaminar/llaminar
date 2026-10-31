@@ -53,6 +53,7 @@
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
 #include "backends/rocm/HIPGraphCapture.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
@@ -586,7 +587,8 @@ namespace
             << "Packed IQ3_S native-VNNI GDN padded prefill warmup failed";
         ASSERT_TRUE(waitForROCmTestBoundary(stream_));
 
-        HIPGraphCapture capture(stream_, 0);
+        auto capture_owner = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream_);
+        auto &capture = *capture_owner;
         ScopedBackendGraphCapture capture_transaction(
             capture,
             "NativeVNNIGEMMTest.IQ3S_GDNPaddedPrefillFusedProjectionGraphCaptures");

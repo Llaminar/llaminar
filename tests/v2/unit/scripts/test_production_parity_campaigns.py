@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_production_parity_campaigns.py
+#  @brief Test discovery, native process retirement, staging and scheduling without devices.
 """Device-free production campaign discovery, staging and watchdog contracts.
 
 Synthetic artifacts cover the canonical matrix without loading models. Deadline
@@ -42,6 +44,15 @@ def load_campaign_module(name: str):
 
 
 campaigns = load_campaign_module("production_parity_campaigns")
+
+
+def native_mpi_helper_target() -> str:
+    """Import the build-owned process helper into a metadata-only CMake fixture.
+
+    The installed runner carries this CPU-only executable, so these Unit tests
+    need neither a compiler nor another implementation of the launch policy.
+    """
+    return f'include("{REPO_ROOT}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")\n'
 
 
 def production_parity_sources_without_typed_expansion(repo_root: Path) -> list[str]:
@@ -295,7 +306,7 @@ class EmptyGTestGateTests(unittest.TestCase):
             (root / "CMakeLists.txt").write_text(
                 "cmake_minimum_required(VERSION 3.20)\nproject(EmptyGTestGate NONE)\n"
                 "enable_testing()\nset(V2_TEST_CORES_PER_SOCKET 1)\nset(V2_TEST_SOCKETS 1)\n"
-                + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
+                + native_mpi_helper_target() + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
             )
             configured = subprocess.run(
                 ["cmake", "-S", str(root), "-B", str(root / "build")],
@@ -315,6 +326,20 @@ class EmptyGTestGateTests(unittest.TestCase):
 
 class DeviceInventoryGateTests(unittest.TestCase):
     """Prove CMake startup ownership reaches the actual preflight scheduler."""
+
+    def test_owned_mpi_application_words_do_not_change_rank_geometry(self) -> None:
+        """Only the delimited native launcher prefix owns rank count."""
+        command = ["/build/llaminar_mpi_session", "--session-base", "/build/sessions", "--",
+                   "mpirun", "-np", "2", "--", "program", "mpirun", "-np", "99"]
+        self.assertEqual(campaigns._preflight_mpi_ranks("owned", command), 2)
+        command[4:] = ["python3", "probe.py", "--mpirun", "/usr/bin/mpirun"]
+        self.assertIsNone(campaigns._preflight_mpi_ranks("script", command))
+
+    def test_owned_mpi_missing_application_boundary_fails(self) -> None:
+        command = ["/build/llaminar_mpi_session", "--session-base", "/build/sessions", "--",
+                   "mpirun", "-np", "2", "program"]
+        with self.assertRaisesRegex(RuntimeError, "application boundary"):
+            campaigns._preflight_mpi_ranks("owned", command)
 
     def configure_scope(self, directory: Path, scope: str, labels: str,
                         environment: str = "") -> subprocess.CompletedProcess:
@@ -340,7 +365,7 @@ class DeviceInventoryGateTests(unittest.TestCase):
             "add_executable(inventory_probe IMPORTED)\n"
             f'set_target_properties(inventory_probe PROPERTIES IMPORTED_LOCATION "{sys.executable}" '
             f'V2_TEST_DEVICE_SCOPE "{scope}")\n'
-            + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
+            + native_mpi_helper_target() + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
         )
         return subprocess.run(
             ["cmake", "-S", str(directory), "-B", str(directory / "build")],
@@ -501,8 +526,9 @@ def preflight_registrations(
             labels=frozenset(("V2", "Integration", campaigns.PRODUCTION_TEST_PREFLIGHT_LABEL)),
             mpi_ranks=None,
             lane=lane,
+            ctest_index=index,
         )
-        for name in names
+        for index, name in enumerate(names, start=1)
     )
 
 
@@ -529,7 +555,234 @@ def unit_ctest_document(*names: str) -> str:
     )
 
 
+class PreflightIndexSelectionTests(unittest.TestCase):
+    """Real CTest numeric selection, excluded sentinels and owned selector lifetime."""
+
+    def write_inventory(self, build: Path, names: list[tuple[str, bool]]) -> None:
+        """Write native CTest registrations; excluded/model commands fail if executed."""
+        build.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for name, admitted in names:
+            command = [sys.executable, str(build / "record.py"), str(build / "executed.jsonl"), name,
+                       "0" if admitted or name.startswith("V2_Unit_") else "97"]
+            lines.append("add_test(" + " ".join(json.dumps(value) for value in [name, *command]) + ")")
+            labels = ("V2;Integration;ProductionTestPreflight" if admitted else
+                      "V2;Unit" if name.startswith("V2_Unit_") else "V2;FullModel")
+            lines.append("set_tests_properties(" + json.dumps(name) +
+                         ' PROPERTIES LABELS ' + json.dumps(labels) + ' TIMEOUT 5)')
+        (build / "CTestTestfile.cmake").write_text("\n".join(lines) + "\n")
+        (build / "record.py").write_text(
+            "import json,sys\nfrom pathlib import Path\n"
+            "with Path(sys.argv[1]).open('a') as output: output.write(json.dumps(sys.argv[2])+'\\n')\n"
+            "raise SystemExit(int(sys.argv[3]))\n")
+
+    def selected_names(self, build: Path, selector: Path) -> tuple[str, ...]:
+        """Read CTest's exact native selection without a regex or label projection."""
+        result = subprocess.run(["ctest", "--test-dir", str(build), "--show-only=json-v1", "-I", str(selector)],
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return tuple(test["name"] for test in json.loads(result.stdout)["tests"])
+
+    def test_large_literal_inventory_and_original_regex_negative(self) -> None:
+        """A >128KiB name inventory selects exactly through the actual legacy -I ABI."""
+        with tempfile.TemporaryDirectory(prefix="llaminar-index-large-") as directory:
+            build = Path(directory)
+            rows = [("V2_Model_FirstSentinel", False)]
+            for index in range(1200):
+                name = ("V2_Integration_" if index % 3 else "V2_Model_") + f"{index:04d}_" + "literal" * 25 + ".[x](y)+?"
+                rows.append((name, index % 3 != 0))
+            self.assertGreater(sum(len(name.encode()) for name, _ in rows), 128 * 1024)
+            self.write_inventory(build, rows)
+            records = campaigns.discover_production_test_preflight_registrations(build)
+            expected = {name for name, admitted in rows if admitted}
+            self.assertEqual({record.name for record in records}, expected)
+            indices = {name: index for index, (name, _) in enumerate(rows, start=1)}
+            self.assertTrue(all(record.ctest_index == indices[record.name] for record in records))
+            with campaigns._preflight_index_selection(build, records, tuple(sorted(expected))) as selector:
+                self.assertEqual(set(self.selected_names(build, selector)), expected)
+                self.assertTrue(selector.read_text().startswith("1,0,1,"))
+            self.assertFalse(selector.exists())
+            # Execute only two actual children; any interspersed excluded/model
+            # selection records a sentinel and exits97 rather than silently passing.
+            tiny = (records[0].name, records[-1].name)
+            with campaigns._preflight_index_selection(build, records, tiny) as selector:
+                result = subprocess.run(["ctest", "--test-dir", str(build), "--no-tests=error", "-I", str(selector)],
+                                        capture_output=True, text=True, check=False, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.selected_names(build, selector), tiny)
+            executed = [json.loads(line) for line in (build / "executed.jsonl").read_text().splitlines()]
+            self.assertEqual(executed, list(tiny))
+            # Literal old production helper, retained only as this negative oracle.
+            # Bound its argv below Linux's single-argument128KiB limit so CTest's
+            # own regex compiler, rather than execve, demonstrates the defect.
+            def literal_old_preflight_name_regex(names):
+                if not names:
+                    raise ValueError("preflight CTest selector requires at least one test")
+                if len(set(names)) != len(names):
+                    raise ValueError("preflight CTest selector contains duplicate tests")
+                return "^(" + "|".join(re.escape(name) for name in names) + ")$"
+            old = literal_old_preflight_name_regex(tuple(record.name for record in records[:400]))
+            self.assertLess(len(old.encode()), 128 * 1024)
+            broken = subprocess.run(["ctest", "--test-dir", str(build), "--no-tests=error", "-R", old],
+                                    capture_output=True, text=True, check=False, timeout=10)
+            self.assertIn("RegularExpression::compile(): Expression too big", broken.stdout + broken.stderr)
+            self.assertNotEqual(broken.returncode, 0)
+            self.assertEqual([json.loads(line) for line in (build / "executed.jsonl").read_text().splitlines()], list(tiny))
+
+    def test_unfiltered_native_order_survives_alphabetical_receipt_order(self) -> None:
+        """Interspersed foreign rows count toward indices, while receipts stay name-sorted."""
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            self.write_inventory(build, [("V2_Model_One", False), ("V2_Integration_Zeta", True),
+                                         ("V2_Model_Two", False), ("V2_Integration_Alpha", True)])
+            records = campaigns.discover_production_test_preflight_registrations(build)
+            self.assertEqual([(record.name, record.ctest_index) for record in records],
+                             [("V2_Integration_Alpha", 4), ("V2_Integration_Zeta", 2)])
+            with campaigns._preflight_index_selection(build, records, (records[0].name, records[1].name)) as selector:
+                self.assertEqual(selector.read_text(), "1,0,1,2,4\n")
+                self.assertEqual(set(self.selected_names(build, selector)), {record.name for record in records})
+
+    def test_empty_duplicate_foreign_and_invalid_indices_reject(self) -> None:
+        """Invalid index sets cannot become CTest's implicit all-tests/default range."""
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            self.write_inventory(build, [("V2_Model_Excluded", False), ("V2_Integration_A", True), ("V2_Integration_B", True)])
+            records = campaigns.discover_production_test_preflight_registrations(build)
+            for names in [(), (records[0].name, records[0].name), ("V2_Integration_Foreign",)]:
+                with self.subTest(names=names), self.assertRaises(ValueError):
+                    with campaigns._preflight_index_selection(build, records, names):
+                        self.fail("invalid names admitted")
+            from dataclasses import replace
+            for index in [0, -1, True, False, 1.5, "2", None]:
+                with self.subTest(index=index), self.assertRaises(ValueError):
+                    replace(records[0], ctest_index=index)
+            with self.assertRaisesRegex(RuntimeError, "duplicate CTest index"):
+                with campaigns._preflight_index_selection(build, (records[0], replace(records[1], ctest_index=records[0].ctest_index)),
+                                                          (records[0].name, records[1].name)):
+                    self.fail("duplicate native index admitted")
+            for index in [1, 100000]:
+                with self.subTest(index=index), self.assertRaisesRegex(RuntimeError, "stale or foreign"):
+                    with campaigns._preflight_index_selection(build, (replace(records[0], ctest_index=index),), (records[0].name,)):
+                        self.fail("foreign native index admitted")
+            self.assertFalse((build / "executed.jsonl").exists())
+
+    def test_changed_inventory_rejects_stale_indices_before_execution(self) -> None:
+        """A once-valid index shifted onto a model sentinel cannot execute it."""
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            rows = [("V2_Model_First", False), ("V2_Integration_A", True)]
+            self.write_inventory(build, rows)
+            stale = campaigns.discover_production_test_preflight_registrations(build)
+            self.write_inventory(build, [("V2_Model_Added", False), *rows])
+            with self.assertRaisesRegex(RuntimeError, "stale or foreign"):
+                with campaigns._preflight_index_selection(build, stale, (stale[0].name,)):
+                    self.fail("stale index admitted")
+            current = campaigns.discover_production_test_preflight_registrations(build)
+            self.assertEqual(current[0].ctest_index, 3)
+            with campaigns._preflight_index_selection(build, current, (current[0].name,)) as selector:
+                self.assertEqual(self.selected_names(build, selector), (current[0].name,))
+            self.assertFalse((build / "executed.jsonl").exists())
+
+    def test_selector_cleanup_on_validation_and_child_failure(self) -> None:
+        """Temporary ownership spans child use and retires even when validation/launch fails."""
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            self.write_inventory(build, [("V2_Integration_A", True)])
+            records = campaigns.discover_production_test_preflight_registrations(build)
+            with self.assertRaisesRegex(OSError, "child failure"):
+                with campaigns._preflight_index_selection(build, records, (records[0].name,)) as selector:
+                    self.assertTrue(selector.exists())
+                    raise OSError("child failure")
+            self.assertFalse(selector.parent.exists())
+            observed = []
+            def reject(_build, path, _names):
+                observed.append(path)
+                self.assertTrue(path.exists())
+                raise OSError("preview failure")
+            with mock.patch.object(campaigns, "_validate_preflight_index_selection", side_effect=reject):
+                with self.assertRaisesRegex(OSError, "preview failure"):
+                    with campaigns._preflight_index_selection(build, records, (records[0].name,)):
+                        self.fail("preview failure admitted")
+            self.assertTrue(all(not path.parent.exists() for path in observed))
+
+    def test_parallel_child_launch_failure_retires_before_selector_cleanup(self) -> None:
+        """Both files survive actual parallel-helper retirement on its second Popen failure."""
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            self.write_inventory(build, [("V2_Integration_CUDA", True), ("V2_Integration_ROCm", True)])
+            discovered = campaigns.discover_production_test_preflight_registrations(build)
+            records = (replace(discovered[0], lane=campaigns.PreflightExecutionLane.CUDA_SOCKET),
+                       replace(discovered[1], lane=campaigns.PreflightExecutionLane.ROCM_SOCKET))
+            paths = []
+            first = mock.Mock()
+            first.poll.return_value = None
+            def launch(command, **_kwargs):
+                selector = Path(command[command.index("-I") + 1])
+                paths.append(selector)
+                self.assertTrue(all(path.exists() for path in paths))
+                if len(paths) == 2:
+                    raise OSError("second child launch failed")
+                return first
+            def retire(process):
+                self.assertIs(process, first)
+                self.assertEqual(len(paths), 2)
+                self.assertTrue(all(path.exists() for path in paths))
+                first.poll.return_value = -15
+                first.returncode = -15
+            with (mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_Fake",)),
+                  mock.patch.object(campaigns, "discover_production_test_preflight_registrations", return_value=records),
+                  mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=("0", "1")),
+                  mock.patch.object(campaigns, "_run_process", return_value=0),
+                  mock.patch.object(campaigns.subprocess, "Popen", side_effect=launch),
+                  mock.patch.object(campaigns, "_terminate_process_group", side_effect=retire) as retirement):
+                # Numeric preview is independently exercised against real CTest;
+                # keep Popen injection scoped to the actual two-child launcher.
+                with mock.patch.object(campaigns, "_validate_preflight_index_selection"):
+                    with self.assertRaisesRegex(OSError, "second child launch failed"):
+                        campaigns.run_production_test_preflight(build, None)
+                retirement.assert_called_once_with(first)
+            self.assertTrue(all(not path.parent.exists() for path in paths))
+
+    def test_actual_post_build_inventory_is_rediscovered(self) -> None:
+        """A real tiny CMake build replaces/renumbers tests before the gate selects indices."""
+        import shutil
+        with tempfile.TemporaryDirectory(prefix="llaminar-index-rebuild-") as directory:
+            root = Path(directory)
+            build = root / "build"
+            root.joinpath("CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\nproject(SelectorRebuild NONE)\nenable_testing()\n"
+                "add_custom_target(v2_unit_gate COMMAND ${CMAKE_COMMAND} -E copy " +
+                json.dumps(str(root / "new-tests.cmake")) + " ${CMAKE_BINARY_DIR}/CTestTestfile.cmake)\n"
+                "add_custom_target(v2_production_test_preflight_gate)\n")
+            result = subprocess.run(["cmake", "-G", "Ninja", "-DCMAKE_MAKE_PROGRAM=" + shutil.which("ninja"),
+                                     "-S", str(root), "-B", str(build)], capture_output=True, text=True, check=False, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.write_inventory(build, [("V2_Model_Inserted", False), ("V2_Unit_Actual", False),
+                                         ("V2_Model_Excluded", False), ("V2_Integration_New", True), ("V2_Integration_Added", True)])
+            (root / "new-tests.cmake").write_text((build / "CTestTestfile.cmake").read_text())
+            self.write_inventory(build, [("V2_Unit_Actual", False), ("V2_Integration_Old", True), ("V2_Model_Excluded", False)])
+            with mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None):
+                code, _, names = campaigns.run_production_test_preflight(build, 20)
+            self.assertEqual(code, 0)
+            self.assertEqual(names, ("V2_Unit_Actual", "V2_Integration_Added", "V2_Integration_New"))
+            executed = [json.loads(line) for line in (build / "executed.jsonl").read_text().splitlines()]
+            self.assertEqual(set(executed), set(names))
+            self.assertEqual(len(executed), len(names))
+
+
 class ProductionParityCampaignTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """Mock CTest preview only for scheduler tests with fabricated registrations."""
+        self.selected_names = {}
+        self.selector_contents = {}
+        def observe(_build, selector, names):
+            self.selected_names[str(selector)] = names
+            self.selector_contents[str(selector)] = selector.read_text()
+        preview = mock.patch.object(campaigns, "_validate_preflight_index_selection", side_effect=observe)
+        preview.start()
+        self.addCleanup(preview.stop)
+
     def test_qfn_campaign_requires_query_program_observer_domain(self) -> None:
         """Actual discovery admission authenticates explicit CTest filter overrides."""
         test = json.loads(ctest_document("V2_Campaign_CPU_FP16"))["tests"][0]
@@ -798,43 +1051,6 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ],
         )
 
-    def test_preflight_ctest_selector_uses_portable_group_syntax(self) -> None:
-        """Run the generated lane selector through CTest's actual regex engine."""
-
-        selector = campaigns._preflight_name_regex(
-            ("V2_Integration_Alpha", "V2_Integration_Beta")
-        )
-        self.assertEqual(
-            selector,
-            "^(V2_Integration_Alpha|V2_Integration_Beta)$",
-        )
-        self.assertNotIn("(?:", selector)
-        with tempfile.TemporaryDirectory(prefix="llaminar-preflight-selector-") as directory:
-            root = Path(directory)
-            (root / "CMakeLists.txt").write_text(
-                "cmake_minimum_required(VERSION 3.20)\n"
-                "project(PreflightSelector NONE)\n"
-                "enable_testing()\n"
-                "add_test(NAME V2_Integration_Alpha COMMAND ${CMAKE_COMMAND} -E true)\n"
-                "add_test(NAME V2_Integration_Beta COMMAND ${CMAKE_COMMAND} -E true)\n",
-                encoding="utf-8",
-            )
-            configured = subprocess.run(
-                ["cmake", "-S", str(root), "-B", str(root / "build")],
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
-            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
-            selected = subprocess.run(
-                ["ctest", "--test-dir", str(root / "build"), "--no-tests=error", "-R", selector],
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
-            self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
-            self.assertIn("2/2", selected.stdout)
-
     def test_prefix_restore_schema_names_the_actual_seed_authority(self) -> None:
         """The cached seed epoch is distinct from the old serial oracle epoch."""
         header = campaigns.REQUIRED_CSV_HEADERS["prefix_restore.csv"]
@@ -955,10 +1171,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
         command = run.call_args.args[0]
         self.assertIn("--show-only=json-v1", command)
-        self.assertIn(
-            f"^{campaigns.PRODUCTION_TEST_PREFLIGHT_LABEL}$",
-            command,
-        )
+        self.assertNotIn("-L", command)  # Native indices belong to the unfiltered inventory.
 
     @mock.patch.object(campaigns.subprocess, "run")
     def test_preflight_inventory_rejects_model_fixture_dependency(
@@ -997,7 +1210,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(lane, expected_lane)
                 self.assertEqual(ranks, int(command[2]) if command[:2] == ["/usr/bin/mpirun", "-np"] else None)
-            registrations.append(campaigns.PreflightRegistration(name, labels, ranks, lane))
+            registrations.append(campaigns.PreflightRegistration(name, labels, ranks, lane, ctest_index=len(registrations) + 1))
         plan = campaigns.preflight_execution_plan(registrations)
         self.assertEqual(plan[campaigns.PreflightExecutionLane.CUDA_SOCKET], ("cuda",))
         self.assertEqual(plan[campaigns.PreflightExecutionLane.ROCM_SOCKET], ("rocm",))
@@ -1023,7 +1236,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
         lanes = campaigns.PreflightExecutionLane
         registrations = tuple(
             campaigns.PreflightRegistration(
-                "V2_Integration_" + lane.value, frozenset(("Integration",)), None, lane
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), None, lane,
+                ctest_index=list(lanes).index(lane) + 2,
             )
             for lane in lanes
         )
@@ -1047,15 +1261,14 @@ class ProductionParityCampaignTest(unittest.TestCase):
             self.assertEqual(code, 8)
             self.assertEqual(execute.call_count, 6)
             selectors = [
-                call.args[0][call.args[0].index("-R") + 1]
-                for call in execute.call_args_list[1:]
+                call.args[0][call.args[0].index("-I") + 1]
+                for call in execute.call_args_list[2:]
             ]
-            self.assertEqual(len(selectors), 5)
+            self.assertEqual(len(selectors), 4)
             for lane in lanes:
-                self.assertTrue(any(
-                    re.search(selector, "V2_Integration_" + lane.value)
-                    for selector in selectors
-                ))
+                self.assertIn(("V2_Integration_" + lane.value,),
+                              [self.selected_names[selector] for selector in selectors])
+            self.assertTrue(all(not Path(selector).exists() for selector in selectors))
             report = json.loads((artifact / "prerequisites.json").read_text())
             self.assertEqual(report["preflight_return_code"], 8)
             self.assertEqual(report["preflight_tests"], list(inventory))
@@ -1066,7 +1279,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
         lanes = campaigns.PreflightExecutionLane
         registrations = tuple(
             campaigns.PreflightRegistration(
-                "V2_Integration_" + lane.value, frozenset(("Integration",)), 1, lane
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), 1, lane,
+                ctest_index=list(lanes).index(lane) + 2,
             )
             for lane in lanes
         )
@@ -1091,7 +1305,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             code, _, _ = campaigns.run_production_test_preflight(Path("build"), None)
             self.assertEqual(code, 8)
             self.assertEqual(execute.call_count, 4)
-            self.assertIn("V2_Integration_exclusive", execute.call_args_list[-1].args[0][-1])
+            self.assertEqual(self.selected_names[execute.call_args_list[-1].args[0][-1]], ("V2_Integration_exclusive",))
 
     def test_preflight_build_and_infrastructure_failures_do_not_admit_later_lanes(self) -> None:
         """An8 build failure is never reinterpreted as completed CTest work."""
@@ -1117,7 +1331,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
         lanes = campaigns.PreflightExecutionLane
         registrations = tuple(
             campaigns.PreflightRegistration(
-                "V2_Integration_" + lane.value, frozenset(("Integration",)), 1, lane
+                "V2_Integration_" + lane.value, frozenset(("Integration",)), 1, lane,
+                ctest_index=list(lanes).index(lane) + 2,
             )
             for lane in lanes
         )
@@ -1209,18 +1424,22 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns.PreflightRegistration(
                 "V2_Integration_Host", frozenset(("Integration",)), 1,
                 campaigns.PreflightExecutionLane.HOST,
+                ctest_index=2,
             ),
             campaigns.PreflightRegistration(
                 "V2_Integration_CUDA", frozenset(("Integration", "CUDA")), 1,
                 campaigns.PreflightExecutionLane.CUDA_SOCKET,
+                ctest_index=3,
             ),
             campaigns.PreflightRegistration(
                 "V2_Integration_ROCm", frozenset(("Integration", "ROCm")), 1,
                 campaigns.PreflightExecutionLane.ROCM_SOCKET,
+                ctest_index=4,
             ),
             campaigns.PreflightRegistration(
                 "V2_Integration_Mixed", frozenset(("Integration", "CUDA", "ROCm")), 1,
                 campaigns.PreflightExecutionLane.EXCLUSIVE,
+                ctest_index=5,
             ),
         ),
     )
@@ -1256,8 +1475,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
         })
         self.assertEqual(commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][:3], ["taskset", "--cpu-list", "0-27,56-83"])
         self.assertEqual(commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][:3], ["taskset", "--cpu-list", "28-55,84-111"])
-        self.assertIn("V2_Integration_CUDA", commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][-1])
-        self.assertIn("V2_Integration_ROCm", commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][-1])
+        self.assertEqual(self.selected_names[commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][-1]], ("V2_Integration_CUDA",))
+        self.assertEqual(self.selected_names[commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][-1]], ("V2_Integration_ROCm",))
+        self.assertTrue(all(not Path(command[-1]).exists() for command in commands.values()))
 
     @mock.patch.object(campaigns, "_run_process", return_value=0)
     @mock.patch.object(
@@ -1301,8 +1521,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn("--parallel", unit_command)
         self.assertIn("--no-tests=error", unit_command)
         self.assertIn(f"^{campaigns.PRODUCTION_PARITY_UNIT_PREFIX}", unit_command)
-        self.assertIn("-R", command)
-        self.assertRegex(command[command.index("-R") + 1], "ParityCellLifecycle_MPI1")
+        self.assertIn("-I", command)
+        self.assertEqual(self.selected_names[command[command.index("-I") + 1]], ("V2_Integration_ParityCellLifecycle_MPI1",))
+        self.assertFalse(Path(command[command.index("-I") + 1]).exists())
 
     def test_preflight_receipt_uses_registrations_after_build_regeneration(self) -> None:
         """A build-triggered CMake refresh must not certify a stale inventory."""
@@ -3119,7 +3340,8 @@ time.sleep(30)
         self.assertNotIn("LLAMINAR_SKIP_ROCM_STARTUP=1", hybrid_campaign)
         self.assertIn("NCCL", hybrid_campaign)
         self.assertIn("RCCL", hybrid_campaign)
-        self.assertIn("HSA_OVERRIDE_GFX_VERSION=9.0.6", hybrid_campaign)
+        self.assertNotIn("HSA_OVERRIDE_GFX_VERSION=9.0.6", hybrid_campaign)
+        self.assertIn('ENVIRONMENT_MODIFICATION "HSA_OVERRIDE_GFX_VERSION=unset:"', hybrid_campaign)
         self.assertIn(
             f'TIMEOUT "{campaigns.REGISTERED_TIMEOUT_SECONDS:g}"',
             registration,

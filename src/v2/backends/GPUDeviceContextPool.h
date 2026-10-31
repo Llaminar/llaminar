@@ -3,6 +3,8 @@
  * @brief Singleton pool managing all GPU device contexts
  *
  * Provides lazy initialization and thread-safe access to GPU device contexts.
+ * Exact context borrows retain capture/submission owners across lookup and lock
+ * acquisition. Retirement rejects those owners before removing a generation.
  * Contexts are created on first access and persist until an explicit exclusive
  * generation retirement, pool shutdown, or process exit.
  *
@@ -251,6 +253,18 @@ namespace llaminar2
          * that backend is compiled in.
          */
         IWorkerGPUContext &getContext(const DeviceId &device);
+        /**
+         * @brief Retain one exact context across lookup, submission acquisition and capture.
+         *
+         * Retirement rejects this borrow before removing the generation. No pool
+         * mutex is held while a caller waits for its context's submission lock.
+         */
+        [[nodiscard]] std::shared_ptr<IWorkerGPUContext> retainContext(const DeviceId &device);
+        /** @brief Atomically initialize or retain the exact CUDA context owner. */
+        [[nodiscard]] std::shared_ptr<IWorkerGPUContext> retainNvidiaContext(int ordinal);
+        /** @brief Atomically initialize or retain the exact ROCm context owner. */
+        [[nodiscard]] std::shared_ptr<IWorkerGPUContext> retainAMDContext(int ordinal);
+
 
         // =========================================================================
         // Availability Queries (thread-safe)
@@ -365,8 +379,8 @@ namespace llaminar2
 
         // Device contexts - keyed by device ordinal
         // Using IWorkerGPUContext for full type erasure (no CUDA/HIP deps in header)
-        std::unordered_map<int, std::unique_ptr<IWorkerGPUContext>> nvidia_contexts_;
-        std::unordered_map<int, std::unique_ptr<IWorkerGPUContext>> amd_contexts_;
+        std::unordered_map<int, std::shared_ptr<IWorkerGPUContext>> nvidia_contexts_;
+        std::unordered_map<int, std::shared_ptr<IWorkerGPUContext>> amd_contexts_;
 
         // Generation IDs distinguish a fresh context from address reuse.
         std::unordered_map<int, std::uint64_t> nvidia_generations_;

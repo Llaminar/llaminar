@@ -8,7 +8,11 @@
  * must not multiply cluster capacity, and repeated reads must reuse the exact
  * context-owned publication. The registered CUDA and ROCm lanes exercise real
  * drivers separately; no model, synthetic capacity or inference is involved.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "app/commands/CommandMPI.h"
 #include "config/OrchestrationConfig.h"
 #include "utils/MPIBootstrap.h"
@@ -21,6 +25,8 @@ using namespace llaminar2;
 /** @brief Enter production command discovery and collectively check its observation. */
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     if (!MPIBootstrap::detectMPIEnvironment().is_mpi_process)
         throw std::runtime_error("Accelerator inventory proof requires its registered MPI launch");
     OrchestrationConfig request;

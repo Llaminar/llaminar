@@ -335,21 +335,10 @@ namespace llaminar2
          * The DL (Data-Level) kernels use 4-way INT8 dot product instructions.
          * Future: DeviceGemmXdl for gfx908+ (MFMA instructions).
          */
-        struct ConcurrentPrefillPool;
 
         class ROCmQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
-            /**
-             * @brief Release all per-device shared ConcurrentPrefillPool singletons.
-             *
-             * The pool holds HIP streams, events, and scratch/scatter buffers shared
-             * across kernel instances on the same device. It must be released when
-             * KernelFactory::clearCache() is invoked to avoid leaking static state
-             * (and to release GPU memory) between test runs or orchestrator resets.
-             */
-            static void clearSharedPrefillPools();
-
             /**
              * @brief Construct kernel for quantized weight tensor (legacy lazy conversion)
              *
@@ -530,9 +519,9 @@ namespace llaminar2
             bool supports_fused_projection() const override { return true; }
 
             /**
-             * @brief Create the shared HIP projection stream/event pool before capture.
+             * @brief Prepare this exact worker context's projection stream/event owner before capture.
              *
-             * The pool is device-scoped and persistent. Calling this method is
+             * The owner is context-scoped and persistent. Calling this method is
              * idempotent; entering it during an active graph capture is rejected.
              */
             bool prepareFusedProjectionGraphCapture(
@@ -953,16 +942,11 @@ namespace llaminar2
                 return GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED;
             }
 
-            // TEMP_C_FP32 / TEMP_A_FP32 remain shared across ROCm GEMM kernels.
-            // Concurrent execution paths use their own pool scratch, while serial
-            // paths do not overlap the temp buffers.
+            // TEMP_C_FP32 / TEMP_A_FP32 remain shared across serial kernels.
+            // Concurrent projections use disjoint graph-admitted workspace slices.
 
-            // GPU stream for graph capture (nullptr = default stream)
+            // Exact non-null stream must be bound before an arithmetic submission.
             void *gpu_stream_ = nullptr;
-
-            // Concurrent prefill pool is now a per-device shared singleton
-            // (see getSharedPrefillPool in ROCmQuantisedGemmKernel.cpp) to avoid
-            // allocating duplicate scratch/scatter buffers per kernel instance.
 
             // PIMPL for implementation (avoids backend headers in this header)
             struct Impl;

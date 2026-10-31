@@ -83,6 +83,23 @@ namespace llaminar2
     struct DeviceGraphOrchestratorLiveStateTestAccess
     {
         /**
+         * @brief Seed the actual production context cache with a hardware-free test owner.
+         * @param owner Actual orchestrator whose getDeviceContext cache is exercised.
+         * @param device Exact backend/ordinal key, not a native device admission.
+         * @param context Borrowed-behavior mock transferred into the production unique owner.
+         * @return Stable pointer owned by that actual cache.
+         * @throws std::invalid_argument On missing/mismatched identity or duplicate injection.
+         */
+        static IDeviceContext *injectDeviceContext(
+            DeviceGraphOrchestrator &owner, DeviceId device, std::unique_ptr<IDeviceContext> context)
+        {
+            if (!context || context->deviceId() != device || owner.device_contexts_.contains(device))
+                throw std::invalid_argument("Unit context injection requires one exact unique device identity");
+            auto *result = context.get();
+            owner.device_contexts_.emplace(device, std::move(context));
+            return result;
+        }
+        /**
          * @brief Invoke the actual production grouped workspace input constructor.
          * @param ordinary Existing ordinary/prefill metadata declaration.
          * @param owner Existing immutable generation request/row authority.
@@ -2133,23 +2150,51 @@ TEST_F(Test__DeviceGraphOrchestrator, GetDeviceContextLazyCreation)
     EXPECT_EQ(ctx1, ctx2);
 }
 
+/** @test Actual cached contexts retain distinct backend/ordinal identity without GPU startup. */
 TEST_F(Test__DeviceGraphOrchestrator, GetDeviceContextMultipleDevices)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
-
-    // Get context for device 0 (may fail without DeviceManager init)
-    IDeviceContext *ctx0 = orchestrator->getDeviceContext(DeviceId::cpu());
-    if (ctx0 == nullptr)
+    /** @brief Observe actual unique-cache destruction, never a native context factory. */
+    class CountedContext final : public llaminar2::testing::MockDeviceContext
     {
-        GTEST_SKIP() << "DeviceContext creation not available in this environment";
-    }
-
-    // Device 1 might not exist, which is fine
-    IDeviceContext *ctx1 = orchestrator->getDeviceContext(DeviceId::cuda(0));
-    if (ctx1 != nullptr)
+    public:
+        /** @brief Retain the exact authored identity and caller-owned destruction counter. */
+        CountedContext(DeviceId device, ComputeBackendType backend, int &destroyed)
+            : MockDeviceContext(device, backend), destroyed_(destroyed) {}
+        /** @brief Record exactly one release by the actual orchestrator cache owner. */
+        ~CountedContext() override { ++destroyed_; }
+    private:
+        int &destroyed_;
+    };
+    const std::vector<std::pair<DeviceId, ComputeBackendType>> identities{
+        {DeviceId::cpu(), ComputeBackendType::CPU},
+        {DeviceId::cuda(0), ComputeBackendType::GPU_CUDA},
+        {DeviceId::rocm(0), ComputeBackendType::GPU_ROCM},
+        {DeviceId::cuda(7), ComputeBackendType::GPU_CUDA},
+        {DeviceId::cuda(8), ComputeBackendType::GPU_CUDA},
+        {DeviceId::rocm(127), ComputeBackendType::GPU_ROCM}};
+    std::vector<int> destroyed(identities.size(), 0);
     {
-        EXPECT_NE(ctx0, ctx1);
+        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+        std::vector<IDeviceContext *> injected;
+        for (size_t index = 0; index < identities.size(); ++index)
+        {
+            const auto &[device, backend] = identities[index];
+            injected.push_back(DeviceGraphOrchestratorLiveStateTestAccess::injectDeviceContext(
+                *orchestrator, device, std::make_unique<CountedContext>(device, backend, destroyed[index])));
+        }
+        for (int replay = 0; replay < 20; ++replay)
+            for (size_t index = 0; index < identities.size(); ++index)
+            {
+                const auto &[device, backend] = identities[index];
+                auto *actual = orchestrator->getDeviceContext(device);
+                ASSERT_EQ(actual, injected[index]);
+                EXPECT_EQ(actual->deviceId(), device);
+                EXPECT_EQ(actual->backendType(), backend);
+                EXPECT_EQ(destroyed[index], 0);
+                for (size_t other = 0; other < index; ++other) EXPECT_NE(actual, injected[other]);
+            }
     }
+    for (int count : destroyed) EXPECT_EQ(count, 1);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, InvalidateExecutionCachesClearsDeviceContexts)

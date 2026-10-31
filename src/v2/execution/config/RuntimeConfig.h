@@ -2393,7 +2393,7 @@ namespace llaminar2
             {
                 LOG_INFO("AUTO activation precision: ROCm device supports FP16 → selecting FP16");
                 LOG_INFO("  Device: " << device.name);
-                LOG_INFO("  Expected: 50% memory bandwidth, matrix core acceleration");
+                LOG_INFO("  Activation storage: FP16; kernel arithmetic is selected per operation");
                 return ActivationPrecision::FP16;
             }
             else if (device.supports_bf16)

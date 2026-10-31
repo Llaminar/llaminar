@@ -41,6 +41,7 @@
 #include "kernels/common/NativeVNNIDispatchCache.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "backends/BackendManager.h"
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/PrefillGraphBucketDefaults.h"
@@ -208,7 +209,6 @@ inline constexpr uint8_t trainedPolicyCodebook()
 // =====================================================================
 struct CUDAGemvContext_
 {
-    int sm_count = 0;
     int device_id = -1;
 
     // KPAR two-phase reduction partials buffer
@@ -216,17 +216,17 @@ struct CUDAGemvContext_
     size_t kpar_capacity = 0; // in floats
 };
 
-static int querySmCount(CUDAGemvContext_ *ctx)
+/**
+ * @brief Borrow the admitted participant's physical SM count without a second cache.
+ * @param ctx Prepared projection owner whose ordinal is exact, not a default device.
+ * @return The immutable hardware count used by the unchanged serial partition policy.
+ * @throws std::invalid_argument On an absent projection owner.
+ */
+static int querySmCount(const CUDAGemvContext_ *ctx)
 {
-    if (ctx->sm_count > 0)
-        return ctx->sm_count;
-
-    cudaDeviceGetAttribute(&ctx->sm_count,
-                           cudaDevAttrMultiProcessorCount,
-                           ctx->device_id);
-    if (ctx->sm_count <= 0)
-        ctx->sm_count = 82;
-    return ctx->sm_count;
+    if (!ctx)
+        throw std::invalid_argument("CUDA GEMV requires its prepared device owner");
+    return llaminar2::cudaHardwareMetadata().at(ctx->device_id).sm_count;
 }
 
 static float *getKparPartials(CUDAGemvContext_ *ctx, size_t num_floats)

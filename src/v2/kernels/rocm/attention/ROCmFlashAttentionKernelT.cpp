@@ -12,8 +12,12 @@
  * Target Architecture: AMD MI50 (gfx906 / Vega 20)
  *
  * @author David Sanftenberg
+ * Device-specific launch plans bind immutable admitted CU/LDS limits before
+ * capture; hardware identity never depends on a live runtime-generation cache.
+ * Decode envelopes borrow that same inventory without a separate ordinal cache.
  */
 
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/attention/AttentionHeadMapping.h"
 #include "ROCmFlashAttentionKernelT.h"
 #include "ROCmFlashAttentionLaunchPolicy.h"
@@ -28,8 +32,6 @@
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <cstring>
 #include <stdexcept>
 
@@ -344,30 +346,8 @@ namespace llaminar2
         fa2_policy::ROCmFA2PhysicalDeviceProperties
         queryROCmFlashAttentionDeviceProperties(int device_idx)
         {
-            hipDeviceProp_t properties{};
-            const hipError_t status =
-                hipGetDeviceProperties(&properties, device_idx);
-            if (status != hipSuccess)
-            {
-                throw std::runtime_error(
-                    "ROCm FA2 could not query immutable device properties for "
-                    "device " +
-                    std::to_string(device_idx) + ": " +
-                    hipGetErrorString(status));
-            }
-            if (properties.multiProcessorCount <= 0 ||
-                properties.sharedMemPerBlock == 0)
-            {
-                throw std::runtime_error(
-                    "ROCm FA2 received invalid immutable device properties for "
-                    "device " +
-                    std::to_string(device_idx));
-            }
-
-            return {
-                .compute_unit_count = properties.multiProcessorCount,
-                .lds_capacity_bytes = properties.sharedMemPerBlock,
-            };
+            return fa2_policy::bindROCmFA2Hardware(
+                rocmHardwareMetadata().at(device_idx));
         }
 
         /**
@@ -495,6 +475,13 @@ namespace llaminar2
          * limiter. The physical envelope is rounded upward to a power of two
          * so the device policy can select 1/2/4/8/16/32 active split planes
          * without recapturing the graph.
+         * @param kv_capacity Positive admitted physical KV row capacity.
+         * @param n_heads Positive participant-local query-head count.
+         * @param device_idx Exact ordinal in the immutable admitted inventory.
+         * @return The unchanged power-of-two envelope for these CU/shape inputs.
+         * @throws std::invalid_argument On invalid geometry or unsupported CTA limits.
+         * @throws std::out_of_range If the ordinal is absent from the admitted inventory.
+         * @throws std::logic_error If physical hardware has not been admitted.
          */
         static int selectFlashDecodeSplitEnvelope(
             int kv_capacity,
@@ -509,41 +496,14 @@ namespace llaminar2
                     "explicit device ordinal");
             }
 
+            // The same admitted binding serves prefill and decode. Authenticate
+            // even a one-split request before any topology can be published;
+            // physical CU facts never acquire a second cache or a driver query.
+            const int num_cus =
+                queryROCmFlashAttentionDeviceProperties(device_idx).compute_unit_count;
+
             if (kv_capacity <= 64)
                 return 1;
-
-            constexpr size_t kMaxCachedDevices = 64;
-            if (static_cast<size_t>(device_idx) >= kMaxCachedDevices)
-            {
-                throw std::out_of_range(
-                    "[ROCmFlashAttentionKernelT] Device ordinal exceeds the "
-                    "fixed launch-property cache");
-            }
-
-            static std::array<std::atomic<int>, kMaxCachedDevices> cu_cache{};
-            int num_cus =
-                cu_cache[static_cast<size_t>(device_idx)].load(
-                    std::memory_order_relaxed);
-            if (num_cus == 0)
-            {
-                const hipError_t status = hipDeviceGetAttribute(
-                    &num_cus,
-                    hipDeviceAttributeMultiprocessorCount,
-                    device_idx);
-                if (status != hipSuccess || num_cus <= 0)
-                {
-                    throw std::runtime_error(
-                        "[ROCmFlashAttentionKernelT] Cannot construct a stable "
-                        "decode launch envelope because HIP did not publish a "
-                        "positive CU count for device " +
-                        std::to_string(device_idx) +
-                        " (status=" +
-                        std::to_string(static_cast<int>(status)) + ")");
-                }
-                cu_cache[static_cast<size_t>(device_idx)].store(
-                    num_cus,
-                    std::memory_order_relaxed);
-            }
 
             const int occupancy_splits =
                 (TARGET_RESIDENT_BLOCKS_PER_CU * num_cus + n_heads - 1) /

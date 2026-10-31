@@ -112,17 +112,51 @@ existing private callback-double tests must be replaced by the real PMA
 Preparing state before it qualifies this integration boundary. Full communicator,
 channel, proxy, recording and graph ownership remains subsequent work.
 
-Opaque driver resources remain a separate, unqualified integration boundary.
-The current CUDA `prepareNativeExecutionContextStorage` probes stack growth and
-restores it before requesting a measured lease; the current
-`claimMeasuredRuntimeContextStorage` creates a separate authority. Neither is a
-pre-creation certificate for new SDK streams, events, mempools or capture
-resources. The exact-root transition does not extend or certify that route.
-The selected SDK source must enumerate those creation sites and lifetimes.
-Any prepared backend handle it borrows needs a real retained owner and original
-admission proof; a numeric context ID or handle is insufficient. Newly created
-resources cannot be relabeled as pre-existing occupancy. Resolve that backend
-contract before qualifying the complete native program.
+The user approved typed, certified limits for opaque driver resources on
+2026-10-30. This is a bounded exception for private runtime storage whose native
+API exposes no pre-creation physical size; every explicit SDK/model/transport
+buffer retains its exact source declaration. Implementation and native
+qualification of this boundary are still outstanding.
+
+The backend contributes named opaque-pool obligations to the **same PMA** before
+optional placement. A contract authenticates the selected driver/runtime
+closure, architecture, resource family, complete permitted inventory and
+concurrency. It states an empirically certified upper bound, never an exact
+per-handle allocation or an anonymous reserve. Missing certification, changed
+identity/shape, or an observed bound violation fails admission; there is no
+automatic allowance growth or alternate execution policy.
+
+Ownership belongs to the actual retained context/pool, not a graph or stream
+whose creation happened to grow it. Borrowed handles retain that original owner
+and its admission. Distinct contexts do not share a charge without a real shared
+pool owner. A destroyed child handle does not prove pool retirement; failed
+cleanup keeps both ownership and the PMA obligation. Creation for this session
+must never be relabeled as baseline occupancy. Setup-only memory observations
+support certification and violation detection, not a second live ledger.
+
+The implementation sequence is:
+
+1. Enumerate the actual selected SDK creation sites and immutable resource
+   program; carry the same descriptors through preparation and consumption.
+2. Bind those descriptors to backend-owned retained context/pool lifetimes and
+   version/architecture-specific certificates. Price exact and opaque obligations
+   together before optional experts/ngrams, then seal the existing PMA once.
+3. Materialize only within that authenticated inventory. Keep claims through
+   cancellation, failed setup, alias lifetime and failed native retirement.
+4. Replace `claimMeasuredRuntimeContextStorage`, which currently constructs a
+   separate authority, and its reversible-growth caller. Remove that old route
+   when the shared-owner replacement is qualified; do not retain both policies.
+
+The existing `GPUGraphMemoryContract` supplies retained-family geometry and
+native tests to extend. Its current constants alone do not certify another
+driver, streams/events, or the complete SDK context. The new tests must cover
+joint maximum inventories, cold/warm/repeated lifetimes, partial setup failure,
+and real context retirement on both backends. Fast replay must reject missing,
+foreign, duplicate and stale declarations; verify unchanged admission after
+failure, shared-pool single charging, simultaneous families and failed cleanup;
+and prove no allowance growth. Register both replay and native contract proofs
+explicitly in production preflight. Real QFN source cells then consume those
+same original observations and final authority before broader matrix testing.
 
 Focused regressions must be explicit in Unit and `ProductionTestPreflight`:
 

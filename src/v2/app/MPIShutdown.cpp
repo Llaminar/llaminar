@@ -1,11 +1,14 @@
 /**
  * @file MPIShutdown.cpp
  * @brief Centralized MPI shutdown implementation.
+ * GPU admission closes and worker/native resources retire while MPI and vendor
+ * runtimes are still live; later process-scope destruction is idempotent.
  */
 
 #include "app/MPIShutdown.h"
 #include "collective/BackendRouter.h"
 #include "kernels/KernelFactory.h"
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "utils/Logger.h"
 
 #include <mpi.h>
@@ -33,7 +36,11 @@ namespace llaminar2
         //    Clearing here prevents delayed destruction during static cleanup.
         llaminar::v2::kernels::KernelFactory::clearCache();
 
-        // 3. Now safe to finalize MPI
+        // 3. Retire exact native workers after model/cache owners, while their
+        // dependency runtimes and MPI are still live. No static teardown callback.
+        GPUDeviceProcessLifetime::retireActive();
+
+        // 4. Now safe to finalize MPI
         MPI_Finalize();
     }
 

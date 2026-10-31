@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include "backends/cuda/CUDAGraphCapture.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
@@ -183,7 +184,7 @@ static void proveDeviceCountedRows(
         TransferEngine::requireDeviceInput(input.get(), device, stream);
         const auto rows = DeviceRowRange::deviceCounted(
             M, static_cast<const int32_t *>(count->gpu_data_ptr()));
-        auto graph = std::make_unique<CUDAGraphCapture>(stream, 0);
+        auto graph = GPUDeviceContextPool::instance().getNvidiaContext(0).createGraphCapture(stream);
         {
             ScopedVerifierRowCandidate candidate(probe ? probe->grouped_rows : 0);
             auto arithmetic = kernel->beginVerifierDecodeEquivalentScope(rows);

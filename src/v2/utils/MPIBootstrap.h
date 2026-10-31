@@ -155,7 +155,7 @@ namespace llaminar2
         /**
          * @brief Self-launch via mpirun
          *
-         * Replaces current process with mpirun invocation.
+         * Replaces this managed child with exact mpirun argv beneath its original ancestor owner.
          * This function does not return on success.
          *
          * @param argc Original argc
@@ -163,7 +163,7 @@ namespace llaminar2
          * @param config Launch configuration
          * @param topology CPU topology
          * @param arguments Existing frontends filter launch flags; typed wrappers may retain them.
-         * @return -1 on failure (exec failed)
+         * @return -1 on failure (owned mpirun exec failed)
          */
         static int selfLaunchMPI(int argc, char *argv[],
                                  const MPILaunchConfig &config,

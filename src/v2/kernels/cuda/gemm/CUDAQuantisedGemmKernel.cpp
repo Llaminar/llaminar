@@ -15,6 +15,11 @@
  * 3. Handles tensor type introspection in multiply_tensor()
  * 4. Manages lazy weight conversion to INT8 + scales
  *
+ * Concurrent stream/event resources belong to the exact worker context. A
+ * typed host lease spans complete eager fork/join submission or the entire
+ * native capture, and retained context ownership prevents lookup/retirement
+ * races. No per-kernel/global ordinal resource pool owns these native handles.
+ *
  * Concurrent projections borrow disjoint aligned slices of the admitted
  * workspace envelope. A merged graph-family capacity need not be divisible by
  * a particular stage's fan-out, so slice offsets are computed in element
@@ -53,6 +58,7 @@
 #include "backends/BackendManager.h"
 #include "backends/DeviceId.h"       // DeviceId
 #include "backends/GPUDeviceContextPool.h"
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
 #include "tensors/TensorSlice.h"     // TensorSlice - for unwrapping sliced biases
 #include "tensors/BlockStructures.h" // Q8_1Block
@@ -69,6 +75,7 @@
 #include "utils/PrefillGraphBucketDefaults.h"
 
 #include <cuda_runtime.h>
+#include <optional>
 
 #include <stdexcept>
 #include <array>
@@ -104,10 +111,6 @@ namespace llaminar2
             // Fused SwiGLU + blockwise quantization (from CUDAFusedOpsKernels.cu)
 
             // Concurrent prefill stream/event helpers (from CUDAQuantisedGemmKernel_CUTLASS.cu)
-            bool cudaQuantGemm_createStream(void **out_stream, int cuda_device_id);
-            void cudaQuantGemm_destroyStream(void *stream);
-            bool cudaQuantGemm_createEvent(void **out_event, int cuda_device_id);
-            void cudaQuantGemm_destroyEvent(void *event);
             bool cudaQuantGemm_recordEvent(void *event, void *stream);
             bool cudaQuantGemm_streamWaitEvent(void *stream, void *event);
 
@@ -499,57 +502,6 @@ namespace llaminar2
             int previous_ = 0;
         };
 
-        struct CUDAConcurrentPrefillPool
-        {
-            static constexpr int MAX_STREAMS = 8;
-
-            void *streams[MAX_STREAMS] = {};
-            void *completion[MAX_STREAMS] = {};
-            void *quant_ready = nullptr;
-            int count = 0;
-            int device_id = -1;
-            bool initialized = false;
-
-            void init(int dev_id, int num_streams)
-            {
-                if (initialized)
-                    return;
-                (void)num_streams;
-                device_id = dev_id;
-                // Create the full stream/event set during eager setup so a
-                // later graph capture never has to grow the pool.
-                count = MAX_STREAMS;
-                for (int i = 0; i < count; ++i)
-                {
-                    cudaQuantGemm_createStream(&streams[i], dev_id);
-                    cudaQuantGemm_createEvent(&completion[i], dev_id);
-                }
-                cudaQuantGemm_createEvent(&quant_ready, dev_id);
-                initialized = true;
-                LOG_DEBUG("[CUDAConcurrentPrefillPool] Initialized " << count
-                                                                     << " streams on device " << dev_id);
-            }
-
-            void destroy()
-            {
-                if (!initialized)
-                    return;
-                for (int i = 0; i < count; ++i)
-                {
-                    cudaQuantGemm_destroyStream(streams[i]);
-                    streams[i] = nullptr;
-                    cudaQuantGemm_destroyEvent(completion[i]);
-                    completion[i] = nullptr;
-                }
-                cudaQuantGemm_destroyEvent(quant_ready);
-                quant_ready = nullptr;
-                initialized = false;
-                count = 0;
-            }
-
-            ~CUDAConcurrentPrefillPool() { destroy(); }
-        };
-
         // =====================================================================
         // PIMPL implementation struct
         // =====================================================================
@@ -663,6 +615,7 @@ namespace llaminar2
                 int n = 0;
                 int k = 0;
                 int cuda_device_id = 0;
+                std::optional<NativeVNNIWorkspaceHardware> planning_hardware; // Null means runtime inventory binding, never unknown physical facts.
                 int bk256_mode = 0;
                 int canonical_kpart_mode = 0;
                 int exact_overlay_enabled = 1;
@@ -677,6 +630,7 @@ namespace llaminar2
                            n == other.n &&
                            k == other.k &&
                            cuda_device_id == other.cuda_device_id &&
+                           planning_hardware == other.planning_hardware &&
                            bk256_mode == other.bk256_mode &&
                            canonical_kpart_mode == other.canonical_kpart_mode &&
                            exact_overlay_enabled == other.exact_overlay_enabled &&
@@ -700,6 +654,14 @@ namespace llaminar2
                     mix(static_cast<size_t>(key.n));
                     mix(static_cast<size_t>(key.k));
                     mix(static_cast<size_t>(key.cuda_device_id));
+                    mix(key.planning_hardware.has_value());
+                    if (key.planning_hardware)
+                    {
+                        mix(static_cast<size_t>(key.planning_hardware->deviceOrdinal()));
+                        mix(key.planning_hardware->observedSMCount().has_value());
+                        if (key.planning_hardware->observedSMCount())
+                            mix(static_cast<size_t>(*key.planning_hardware->observedSMCount()));
+                    }
                     mix(static_cast<size_t>(key.bk256_mode));
                     mix(static_cast<size_t>(key.canonical_kpart_mode));
                     mix(static_cast<size_t>(key.exact_overlay_enabled));
@@ -732,7 +694,8 @@ namespace llaminar2
                 int max_m,
                 int n,
                 int k,
-                int cuda_device_id)
+                int cuda_device_id,
+                std::optional<NativeVNNIWorkspaceHardware> hardware)
             {
                 int force_tile = -1;
                 cudaNativeVNNIPrefill_getForceTile(&force_tile);
@@ -745,6 +708,7 @@ namespace llaminar2
                     .n = n,
                     .k = k,
                     .cuda_device_id = cuda_device_id,
+                    .planning_hardware = hardware,
                     .bk256_mode = cudaNativeVNNIPrefill_getBK256Mode(),
                     .canonical_kpart_mode =
                         cudaNativeVNNIPrefill_getCanonicalKPartitionMode() ? 1 : 0,
@@ -765,16 +729,12 @@ namespace llaminar2
                 size_t canonical_kpart_partials_bytes = 0;
                 int planned_k_partitions = 1;
                 int planned_rows = 0;
-                if (!cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
-                        codebook_id,
-                        arithmetic_policy_codebook_id,
-                        max_m,
-                        n,
-                        k,
-                        cuda_device_id,
-                        &canonical_kpart_partials_bytes,
-                        &planned_k_partitions,
-                        &planned_rows))
+                const bool complete = hardware
+                    ? nativeVNNIPrefillWorkspaceEnvelopeForHardware(codebook_id, arithmetic_policy_codebook_id,
+                        max_m, n, k, *hardware, &canonical_kpart_partials_bytes, &planned_k_partitions, &planned_rows)
+                    : cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(codebook_id, arithmetic_policy_codebook_id,
+                        max_m, n, k, cuda_device_id, &canonical_kpart_partials_bytes, &planned_k_partitions, &planned_rows);
+                if (!complete)
                 {
                     throw std::runtime_error(
                         "[CUDAQuantisedGemmKernel] NativeVNNI prefill "
@@ -1315,12 +1275,9 @@ namespace llaminar2
         CUDAQuantisedGemmKernel::~CUDAQuantisedGemmKernel() = default;
 
         // ---------------------------------------------------------------------
-        // Shared per-device prefill stream pool.
-        //
-        // Multiple kernels on the same CUDA device share a single pool so that
-        // we don't allocate duplicate scratch buffers / streams per kernel
-        // instance. KernelFactory::clearCache() invokes
-        // clearSharedPrefillPools() to release these between test runs.
+        // Exact worker-context resources are prepared cold and leased across
+        // complete eager fork/join submission or whole native capture intervals.
+        // Worker generation retirement owns their destruction.
         // ---------------------------------------------------------------------
         namespace
         {
@@ -1349,40 +1306,16 @@ namespace llaminar2
                     stream);
             }
 
-            std::mutex &sharedPrefillPoolsMutex()
+            /** @brief Borrow exact context resources for a complete fork/join interval. */
+            GPUProjectionSubmission acquireCUDAPrefillSubmission(
+                int ordinal, void *root)
             {
-                static std::mutex m;
-                return m;
-            }
-
-            std::unordered_map<int, std::unique_ptr<CUDAConcurrentPrefillPool>> &sharedPrefillPools()
-            {
-                static std::unordered_map<int, std::unique_ptr<CUDAConcurrentPrefillPool>> pools;
-                return pools;
-            }
-
-            CUDAConcurrentPrefillPool &getSharedCUDAPrefillPool(int cuda_device_id)
-            {
-                std::lock_guard<std::mutex> lk(sharedPrefillPoolsMutex());
-                auto &pools = sharedPrefillPools();
-                auto it = pools.find(cuda_device_id);
-                if (it == pools.end())
-                {
-                    it = pools.emplace(cuda_device_id, std::make_unique<CUDAConcurrentPrefillPool>()).first;
-                }
-                if (!it->second->initialized)
-                {
-                    if (isGraphCaptureActive())
-                    {
-                        throw std::runtime_error(
-                            "[ConcurrentGemm] Capture began before the CUDA projection "
-                            "stream/event pool was initialized");
-                    }
-                    it->second->init(
-                        cuda_device_id,
-                        CUDAConcurrentPrefillPool::MAX_STREAMS);
-                }
-                return *it->second;
+                cudaStreamCaptureStatus status{};
+                if (!root || cudaStreamIsCapturing(static_cast<cudaStream_t>(root), &status) != cudaSuccess)
+                    throw std::runtime_error("Cannot authenticate CUDA projection root capture status");
+                auto owner = GPUDeviceContextPool::instance().retainNvidiaContext(ordinal);
+                return owner->acquireProjectionSubmission(root, GPUProjectionSubmissionKind::Eager,
+                        status != cudaStreamCaptureStatusNone);
             }
         } // namespace
 
@@ -1390,12 +1323,6 @@ namespace llaminar2
         {
             return ensureNativeVNNIIQGridTablesInitialized(11, device_ordinal,
                 "Expert tier cold setup");
-        }
-
-        void CUDAQuantisedGemmKernel::clearSharedPrefillPools()
-        {
-            std::lock_guard<std::mutex> lk(sharedPrefillPoolsMutex());
-            sharedPrefillPools().clear();
         }
 
         bool CUDAQuantisedGemmKernel::prepareFusedProjectionGraphCapture(
@@ -1414,8 +1341,9 @@ namespace llaminar2
                 return false;
             }
 
-            auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
-            return pool.initialized && pool.count > 0;
+            GPUDeviceContextPool::instance().retainNvidiaContext(cuda_device_id_)
+                ->prepareProjectionResources();
+            return true;
         }
 
         void CUDAQuantisedGemmKernel::resetDynamicState()
@@ -2835,27 +2763,19 @@ namespace llaminar2
                 std::vector<VerifierScratchSlot> scratch_slots;
                 std::vector<VerifierProjectionPlan> projection_plans(
                     bindings.size());
-                CUDAConcurrentPrefillPool *verifier_pool = nullptr;
+                std::optional<GPUProjectionSubmission> verifier_submission;
+                const GPUProjectionResourceView *verifier_pool = nullptr;
 
                 if (debugEnv().gemm.cuda_concurrent_decode &&
                     bindings.size() >= 2)
                 {
-                    auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
+                    verifier_submission.emplace(acquireCUDAPrefillSubmission(cuda_device_id_, execution_stream));
+                    const auto &pool = verifier_submission->resources();
                     verifier_pool = &pool;
                     const int active_streams = std::min(
                         static_cast<int>(bindings.size()), pool.count);
 
-                    int sm_count = 0;
-                    const cudaError_t sm_status = cudaDeviceGetAttribute(
-                        &sm_count,
-                        cudaDevAttrMultiProcessorCount,
-                        cuda_device_id_);
-                    if (sm_status != cudaSuccess || sm_count <= 0)
-                    {
-                        throw std::runtime_error(
-                            "[GroupedVerifier] Cannot resolve the physical SM "
-                            "count required by the canonical reduction policy");
-                    }
+                    const int sm_count = cudaHardwareMetadata().at(cuda_device_id_).sm_count;
 
                     bool complete_plan = true;
                     for (size_t pi = 0; pi < bindings.size(); ++pi)
@@ -3228,7 +3148,8 @@ namespace llaminar2
                         " concurrent projections with workspace-backed INT32 accumulators; got " +
                         std::to_string(num_proj));
                 }
-                auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
+                auto projection_submission = acquireCUDAPrefillSubmission(cuda_device_id_, execution_stream);
+                const auto &pool = projection_submission.resources();
 
                 /*
                  * The projection streams fork from `execution_stream` by
@@ -3292,7 +3213,8 @@ namespace llaminar2
                 }
 
                 // Record event after quantization completes on main stream
-                cudaQuantGemm_recordEvent(pool.quant_ready, execution_stream);
+                if (!cudaQuantGemm_recordEvent(pool.quant_ready, execution_stream))
+                    throw std::runtime_error("CUDA projection fork publication failed");
 
                 for (int pi = 0; pi < num_proj; ++pi)
                 {
@@ -3436,11 +3358,13 @@ namespace llaminar2
                     // stream_idx already computed above for scratch allocation
 
                     // This stream waits for quantization to complete
-                    cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.quant_ready);
+                    if (!cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.quant_ready))
+                        throw std::runtime_error("CUDA projection stream dependency publication failed");
 
                     // If reusing a stream, wait for its previous work
                     if (pi >= pool.count)
-                        cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.completion[stream_idx]);
+                        if (!cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.completion[stream_idx]))
+                        throw std::runtime_error("CUDA projection stream dependency publication failed");
 
                     LOG_TRACE("[ConcurrentPrefill] Projection " << pi
                                                                 << " (" << (proj.name ? proj.name : "?")
@@ -3466,13 +3390,15 @@ namespace llaminar2
                             " — cannot continue inference");
                     }
 
-                    cudaQuantGemm_recordEvent(pool.completion[stream_idx], pool.streams[stream_idx]);
+                    if (!cudaQuantGemm_recordEvent(pool.completion[stream_idx], pool.streams[stream_idx]))
+                        throw std::runtime_error("CUDA projection completion publication failed");
                 }
 
                 // All projections dispatched — main stream waits for completion
                 for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                 {
-                    cudaQuantGemm_streamWaitEvent(execution_stream, pool.completion[si]);
+                    if (!cudaQuantGemm_streamWaitEvent(execution_stream, pool.completion[si]))
+                        throw std::runtime_error("CUDA projection stream dependency publication failed");
                 }
                 /*
                  * This counter is the executable proof that an integration
@@ -4828,8 +4754,11 @@ namespace llaminar2
             quantized_gemm_workspace::appendFusedProjectionRequirements(requirements, m, projection_columns, k);
         }
 
-        WorkspaceRequirements quantized_gemm_workspace::projectionRequirements(
-            int m, int n, int k, int device_ordinal, std::optional<NativeCodebooks> native)
+        /** @brief Compose one shared runtime/planning BOM; bound facts never consult global metadata. */
+        static WorkspaceRequirements projectionRequirementsForHardwareBinding(
+            int m, int n, int k, int device_ordinal,
+            std::optional<quantized_gemm_workspace::NativeCodebooks> native,
+            std::optional<NativeVNNIWorkspaceHardware> hardware)
         {
             if (m <= 0 || n <= 0 || k <= 0 || device_ordinal < 0 ||
                 m > std::numeric_limits<int>::max() - 127 || k > std::numeric_limits<int>::max() - 31)
@@ -4898,7 +4827,7 @@ namespace llaminar2
                         m,
                         n,
                         k,
-                        device_ordinal);
+                        device_ordinal, hardware);
                 const size_t prefill_scratch_slots =
                     concurrentPrefillScratchSlotsForM(m);
 
@@ -4965,6 +4894,19 @@ namespace llaminar2
                       << ", temp_c_fp32=" << (temp_c_fp32_bytes / 1024) << "KB");
 
             return reqs;
+        }
+
+        WorkspaceRequirements quantized_gemm_workspace::projectionRequirements(
+            int m, int n, int k, int device_ordinal, std::optional<NativeCodebooks> native)
+        {
+            return projectionRequirementsForHardwareBinding(m, n, k, device_ordinal, native, std::nullopt);
+        }
+
+        WorkspaceRequirements quantized_gemm_workspace::projectionRequirements(
+            int m, int n, int k, const NativeVNNIWorkspaceHardware &hardware,
+            std::optional<NativeCodebooks> native)
+        {
+            return projectionRequirementsForHardwareBinding(m, n, k, hardware.deviceOrdinal(), native, hardware);
         }
 
         void quantized_gemm_workspace::appendFusedProjectionRequirements(

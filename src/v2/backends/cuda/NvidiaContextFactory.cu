@@ -2,10 +2,12 @@
  * @file NvidiaContextFactory.cu
  * @brief CUDA factory registration for GPUDeviceContextPool
  *
- * This file registers the NVIDIA device context factory with the
- * GPUDeviceContextPool during static initialization. This allows
+ * This file explicitly registers the NVIDIA device context factory with the
+ * GPUDeviceContextPool after immutable physical inventory admission. This allows
  * GPUDeviceContextPool (which lives in llaminar2_core) to create
  * NvidiaDeviceContext instances without directly depending on CUDA headers.
+ * Cold discovery retains a short process-lifetime borrow before any native
+ * query, so terminal retirement cannot race factory setup before a worker exists.
  *
  * NOTE: The static initializer is intentionally a no-op to avoid ~500-800ms
  * CUDA enumeration during process startup (before main). Registration is
@@ -18,7 +20,8 @@
 
 #include "NvidiaDeviceContext.h"
 #include "../GPUDeviceContextPool.h"
-#include "../GPUEnumeration.h"
+#include "CUDAHardwareMetadata.h"
+#include "../GPUDeviceProcessLifetime.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include <memory>
@@ -67,8 +70,9 @@ namespace llaminar2
             if (pool.hasNvidiaSupport())
                 return; // Already registered
 
-            auto devices = cuda_enumeration::enumerate_cuda_devices();
-            int device_count = static_cast<int>(devices.size());
+            const auto discovery_lifetime = GPUDeviceProcessLifetime::acquireNativeContext();
+            initializeCUDAHardwareMetadata();
+            const int device_count = static_cast<int>(cudaHardwareMetadata().size());
 
             if (device_count > 0)
             {
@@ -113,16 +117,13 @@ namespace llaminar2
     // Explicit registration (called when static init is unreliable)
     // =========================================================================
 
+    /**
+     * @brief Register the exact admitted CUDA visibility after explicit startup.
+     * @throws Discovery or inventory validation errors without hiding failed admission.
+     */
     void ensureNvidiaFactoryRegistered()
     {
-        try
-        {
-            doRegisterNvidiaFactory();
-        }
-        catch (const std::exception &e)
-        {
-            LOG_WARN("[NvidiaContextFactory] Explicit registration failed: " << e.what());
-        }
+        doRegisterNvidiaFactory();
     }
 
 } // namespace llaminar2

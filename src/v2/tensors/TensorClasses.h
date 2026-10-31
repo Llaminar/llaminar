@@ -119,6 +119,7 @@
 
 namespace llaminar2
 {
+    namespace qwen4exp::detail { class PooledNativeRootStorage; }
     // Forward declaration for backend dependency injection
     class IBackend;
 
@@ -2043,6 +2044,9 @@ namespace llaminar2
         }
 
     protected:
+        // Native root materialization authenticates the exact backend that owns its allocation.
+        friend class qwen4exp::detail::PooledNativeRootStorage;
+
         // Injected backend for testing (non-owning). When non-null, resolveBackend()
         // returns this instead of looking up the global CUDA/ROCm backend.
         IBackend *injected_backend_ = nullptr;
@@ -3302,6 +3306,7 @@ namespace llaminar2
 
     private:
         friend class AdaptiveImmutableLookupRootStorage;
+        friend class qwen4exp::detail::PooledNativeRootStorage;
         /** @brief Private setup-only construction without a transient host mirror. */
         struct DeviceOnlyStorageTag final {};
         /** @brief Source-owned PMA root factory alone supplies this checked GPU-only constructor. */

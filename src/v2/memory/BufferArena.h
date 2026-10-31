@@ -167,9 +167,22 @@ namespace llaminar2
         bool registerExternalBuffer(BufferId id, ITensor *tensor);
 
         /**
+         * @brief Register one canonical external root with its original shared physical owner retained by this arena.
+         * @param id Unused canonical arena role.
+         * @param tensor Original nonempty canonical root, including an aliasing pointer to its actual PMA owner.
+         * @return False for absent/noncanonical roots, invalid roles or an existing registration, without mutating the slot.
+         * @note This retains ownership only; it creates no allocation or PMA claim. Metadata validation precedes commit.
+         * Retained roots cannot be rebound, and remain alive through final arena destruction even after stages retire.
+         * Their metadata is projected from canonical tensor coherence/device before commit; no second live authority is created.
+         */
+        bool registerExternalBuffer(BufferId id, std::shared_ptr<TensorBase> tensor);
+
+
+        /**
          * @brief Bind or replace an externally-owned scratch/output buffer.
          *
-         * Unlike registerExternalBuffer(), this may be called at runtime for
+         * Retained shared external roots reject this operation, including same-pointer binds.
+         * Unlike raw registerExternalBuffer(), this may be called at runtime for
          * dynamic-shape activations such as all-position verifier logits. The
          * buffer slot must not be arena-owned. Rebinding resets coherence to
          * UNINITIALIZED so the next stage write establishes authority through
@@ -368,11 +381,11 @@ namespace llaminar2
         ITensor *getTensor(BufferId id) const;
 
         /**
-         * @brief Get shared ownership of an arena-owned tensor.
+         * @brief Get original shared ownership of an arena-owned or retained external root.
          *
          * Returns the shared_ptr for arena-owned buffers, enabling callers
          * (e.g., InferenceState) to hold a reference beyond the arena's
-         * lifetime. Returns nullptr for external (non-owned) buffers.
+         * lifetime. Returns nullptr for raw external registrations without retained ownership.
          *
          * @param id Buffer to query
          * @return shared_ptr<TensorBase>, or nullptr if not arena-owned
@@ -406,7 +419,8 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Get the current coherence state of a buffer.
+         * @brief Get current arena history, or a canonical tensor projection for a retained external root.
+         * @return Compatibility metadata only; transfer/publication decisions remain with the tensor/TransferEngine.
          */
         CoherenceState getCoherenceState(BufferId id) const;
 
@@ -455,6 +469,7 @@ namespace llaminar2
             // Ownership
             std::shared_ptr<TensorBase> owned_tensor; ///< Arena-owned
             ITensor *external_tensor = nullptr;       ///< Externally owned
+            std::shared_ptr<TensorBase> retained_external; ///< Original external physical owner; no second allocation/claim.
 
             // Registration info (for deferred allocation)
             size_t rows = 0;

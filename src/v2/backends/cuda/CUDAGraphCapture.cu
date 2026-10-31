@@ -27,6 +27,7 @@
 #ifdef HAVE_CUDA
 
 #include "CUDAGraphCapture.h"
+#include "NvidiaDeviceContext.h"
 #include "CUDADriverApi.h"
 #include "CUDABackend.h"
 #include "../BackendManager.h"
@@ -1840,6 +1841,29 @@ namespace llaminar2
         (void)CUDADriverApi::instance();
     }
 
+    CUDAGraphCapture::CUDAGraphCapture(
+        cudaStream_t stream, int device_ordinal, NvidiaDeviceContext &owner)
+        : CUDAGraphCapture(stream, device_ordinal)
+    {
+        if (owner.deviceOrdinal() != device_ordinal)
+            throw std::invalid_argument("CUDA capture requires its exact worker device owner");
+        projection_context_lifetime_ = owner.retainProjectionContextOwner();
+        projection_owner_ = &owner;
+    }
+
+    void CUDAGraphCapture::releaseNativeCaptureSubmission()
+    {
+        cudaStreamCaptureStatus status{};
+        if (cudaStreamIsCapturing(stream_, &status) != cudaSuccess ||
+            status != cudaStreamCaptureStatusNone)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Cannot prove native capture retired before projection resource release");
+            std::terminate();
+        }
+        native_capture_active_ = false;
+        projection_submission_.reset();
+    }
+
     CUDAGraphCapture::~CUDAGraphCapture() { reset(); }
 
     CUDAGraphCapture::CUDAGraphCapture(CUDAGraphCapture &&other) noexcept
@@ -1851,6 +1875,15 @@ namespace llaminar2
           ordered_timeline_timing_pending_(
               other.ordered_timeline_timing_pending_)
     {
+        projection_owner_ = other.projection_owner_;
+        projection_context_lifetime_ = std::move(other.projection_context_lifetime_);
+        native_capture_active_ = std::exchange(other.native_capture_active_, false);
+        if (other.projection_submission_)
+        {
+            projection_submission_.emplace(std::move(*other.projection_submission_));
+            other.projection_submission_.reset();
+        }
+        other.projection_owner_ = nullptr;
         timeline_recording_ = std::move(other.timeline_recording_);
         recording_role_ = other.recording_role_;
         fragment_state_ = other.fragment_state_;
@@ -1881,6 +1914,15 @@ namespace llaminar2
                 std::move(other.ordered_timeline_timing_events_);
             ordered_timeline_timing_pending_ =
                 other.ordered_timeline_timing_pending_;
+            projection_owner_ = other.projection_owner_;
+            projection_context_lifetime_ = std::move(other.projection_context_lifetime_);
+            native_capture_active_ = std::exchange(other.native_capture_active_, false);
+            if (other.projection_submission_)
+            {
+                projection_submission_.emplace(std::move(*other.projection_submission_));
+                other.projection_submission_.reset();
+            }
+            other.projection_owner_ = nullptr;
             timeline_recording_ = std::move(other.timeline_recording_);
             recording_role_ = other.recording_role_;
             fragment_state_ = other.fragment_state_;
@@ -1929,6 +1971,13 @@ namespace llaminar2
         if (recording_role_ == RecordingRole::Fragment && !timeline_recording_)
             return false;
 
+        if (native_capture_active_)
+            throw std::logic_error("CUDA native capture cannot begin twice");
+        std::optional<GPUProjectionSubmission> submission;
+        if (projection_owner_)
+            submission.emplace(projection_owner_->acquireProjectionSubmission(
+                stream_, GPUProjectionSubmissionKind::Capture));
+
         if (timeline_recording_)
         {
             if (recording_role_ != RecordingRole::Fragment ||
@@ -1950,6 +1999,8 @@ namespace llaminar2
                           << cudaGetErrorString(error));
                 return false;
             }
+            native_capture_active_ = true;
+            if (submission) projection_submission_.emplace(std::move(*submission));
             fragment_state_ = FragmentState::Recording;
             timeline_recording_->state = OrderedTimelineRecording::State::Recording;
             return true;
@@ -1977,11 +2028,14 @@ namespace llaminar2
             LOG_ERROR("[CUDAGraphCapture] cudaStreamBeginCapture failed: " << cudaGetErrorString(err));
             return false;
         }
+        native_capture_active_ = true;
+        if (submission) projection_submission_.emplace(std::move(*submission));
         return true;
     }
 
     bool CUDAGraphCapture::endCapture()
     {
+        if (!native_capture_active_) return false;
         if (!activateOwner("endCapture"))
             return false;
         if (recording_role_ == RecordingRole::Fragment && !timeline_recording_)
@@ -2005,6 +2059,7 @@ namespace llaminar2
             else if (error == cudaSuccess)
                 error = cudaErrorInvalidValue;
             const auto end_error = cudaStreamEndCapture(stream_, &captured);
+            releaseNativeCaptureSubmission();
             if (error == cudaSuccess)
                 error = end_error;
             if (error != cudaSuccess || captured != graph_)
@@ -2043,6 +2098,7 @@ namespace llaminar2
         }
 
         cudaError_t err = cudaStreamEndCapture(stream_, &graph_);
+        releaseNativeCaptureSubmission();
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDAGraphCapture] cudaStreamEndCapture failed: " << cudaGetErrorString(err));
@@ -2404,7 +2460,9 @@ namespace llaminar2
             timeline_recording_ = std::move(recording);
             graph_ = timeline_recording_->graph;
         }
-        auto fragment = std::make_unique<CUDAGraphCapture>(stream_, device_ordinal_);
+        auto fragment = projection_owner_
+            ? std::make_unique<CUDAGraphCapture>(stream_, device_ordinal_, *projection_owner_)
+            : std::make_unique<CUDAGraphCapture>(stream_, device_ordinal_);
         fragment->timeline_recording_ = timeline_recording_;
         fragment->recording_role_ = RecordingRole::Fragment;
         fragment->graph_ = graph_;
@@ -3633,6 +3691,13 @@ namespace llaminar2
 
     void CUDAGraphCapture::reset()
     {
+        if (native_capture_active_)
+        {
+            // Invalidated capture still must leave native capture before its
+            // side streams may be used by a different submission owner.
+            (void)endCapture();
+            if (native_capture_active_) std::terminate();
+        }
         if ((exec_ || graph_) && device_ordinal_ >= 0)
         {
             CUDA_WARN_IF_FAIL(cudaSetDevice(device_ordinal_));

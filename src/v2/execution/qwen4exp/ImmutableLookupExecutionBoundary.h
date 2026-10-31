@@ -15,6 +15,7 @@
 #include "Qwen4ExpPreparedStorage.h"
 #include "execution/mtp/DeviceGenerationControlBinding.h"
 #include "kernels/qwen4exp/AdaptiveLookupPreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableSourceKernels.h"
 #include "loaders/AdaptiveImmutableLookupRootStorage.h"
 #include "tensors/Tensors.h"
 #include <atomic>
@@ -61,6 +62,29 @@ public:
     static std::shared_ptr<ImmutableLookupExecutionBoundary>
     createAdaptive(std::shared_ptr<ImmutableLookupService> service, AdaptiveImmutableRowCacheNativePlan plan,
                    std::shared_ptr<const AdaptiveImmutableLookupRootStorage> roots, void *setupStream);
+    /**
+     * @brief Bind one real provider/channel to its existing pooled owner/coordinator roots and retained graph boundary.
+     * @param service Actual already-admitted subordinate RAM/SSD source worker.
+     * @param geometry Exact original source/accepted-owner/coordinator staging declaration.
+     * @param owner Same original actual slot/grant owner.
+     * @param coordinator Same independent policy/coalescing owner.
+     * @param authority Original PMA that admitted all source, channel and native roots.
+     * @param setupStream Exact ordinary setup stream, retained even through partial initialization failure.
+     * @return Mutually exclusive pooled source arm, without a serving/topology capability advertisement.
+     * @note Missing directed owner edges fail before materialization; the first executable slice is one local edge.
+     */
+    static std::shared_ptr<ImmutableLookupExecutionBoundary> createPooled(std::shared_ptr<ImmutableLookupService> service,
+        PooledImmutableSourceGeometry geometry,std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,
+        std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> authority,
+        void* setupStream);
+    /** @return Whether this original storage boundary owns the real pooled source arm. */
+    bool isPooled()const noexcept{return pooled_.has_value();}
+    /** @brief Bind only the original canonical request controller before any pooled source phase is recorded. */
+    void bindPooledGenerationControl(DeviceGenerationControlBinding control);
+    /** @return Same strong original source packet storage; ordinary/adaptive arms reject this operation. */
+    const std::shared_ptr<PooledImmutableSourcePreparedStorage>& pooledStorage()const;
+    /** @return Actual retained provider-native code bundle; no test source producer can substitute. */
+    const IPooledImmutableSourceKernels& pooledKernels()const;
     /** @return Whether the declared transport is the checked protocol2 native
      * cache component. */
     bool isAdaptive() const noexcept
@@ -164,9 +188,20 @@ private:
      * alternative. */
     ImmutableLookupExecutionBoundary(std::shared_ptr<ImmutableLookupService> service,
                                      std::shared_ptr<TensorBase> protocol, Adaptive adaptive);
+    /** @brief Source packet roots only; physical cache state remains with the original pooled owners. */
+    struct Pooled final {
+        std::shared_ptr<PooledImmutableSourcePreparedStorage> storage;
+        std::unique_ptr<IPooledImmutableSourceKernels> kernels;
+        std::optional<DeviceGenerationControlBinding> control;
+        std::shared_ptr<ImmutableLookupSubmissionRetirement> setupRetirement; ///< Retires before the original storage/code/source owners.
+    };
+    /** @brief Only the closed real-provider factory constructs the pooled arm. */
+    ImmutableLookupExecutionBoundary(std::shared_ptr<ImmutableLookupService> service,
+        std::shared_ptr<TensorBase> protocol,Pooled pooled);
     DeviceId device_;
     std::optional<ImmutableLookupService::Binding> binding_;
     std::optional<Adaptive> adaptive_;
+    std::optional<Pooled> pooled_;
     std::unique_ptr<IImmutableLookupKernels> kernels_;
     std::shared_ptr<TensorBase> protocol_; ///< Sole retained physical protocol owner, never a second allocation.
     std::unique_ptr<Qwen4ExpPreparedStorage> protocolSeal_; ///< Existing canonical seal authenticates the tensor allocator backend as well as pointer metadata.

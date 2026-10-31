@@ -405,6 +405,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # exact pre-created event. Successful admission/capture/terminal paths
         # and normal setup publication remain nonblocking.
         ("src/v2/execution/qwen4exp/ImmutableLookupExecutionBoundary.cpp", "retireImmutableLookupSubmissionOwner", "backend_event", 1),
+        # The pooled root holder similarly drains only failed/last-owner setup
+        # before allocation borrowers, tensors and original PMA claims retire.
+        # Native phase enqueue, capture preparation and healthy replay never wait.
+        ("src/v2/kernels/qwen4exp/PooledImmutableNativeStorage.cpp", "retirePooledNativeSetupOwner", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::synchronizeDevices", "backend_device", 2),
         ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::synchronizeDevices", "rank_device", 1),
         ("src/v2/execution/moe/DeviceMoEOverlayEpochArena.cpp", "DeviceMoEOverlayEpochArena::DeviceMoEOverlayEpochArena", "worker_stream", 1),
@@ -421,7 +425,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu", "CUDARingKVCache<Precision>::initializeBatchedEntryPointerTables", "backend_sync_copy", 2),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::CUDARingKVCacheTQ", "raw_stream", 1),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::publishBatchedEntryTables", "backend_sync_copy", 3),
-        ("src/v2/kernels/cuda/kvcache/CUDATurboQuantKernels.cu", "cuda_tq_upload_rope_freqs", "raw_stream", 1),
         ("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp", "ROCmQuantisedGemmKernel::ensureWeightsConverted", "raw_stream", 1),
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp", "ROCmRingKVCache<Precision>::allocate_pool", "raw_stream", 1),
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp", "ROCmRingKVCache<Precision>::initializeBatchedEntryPointerTables", "backend_sync_copy", 2),

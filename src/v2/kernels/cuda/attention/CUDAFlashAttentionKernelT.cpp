@@ -17,6 +17,7 @@
 #include "kernels/attention/AttentionHeadMapping.h"
 #include "CUDAFlashAttentionKernelT.h"
 #include "CUDAFlashAttentionLaunchPolicy.h"
+#include "CUDAFlashAttentionHardware.h"
 #include "../../../backends/cuda/CUDAGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -275,15 +276,8 @@ namespace llaminar2
             const attention::AttentionPrefillCaptureGeometry &geometry,
             int device_idx)
         {
-            cudaDeviceProp properties{};
-            const cudaError_t status =
-                cudaGetDeviceProperties(&properties, device_idx);
-            if (status != cudaSuccess)
-            {
-                LOG_ERROR("[CUDAFlashAttentionKernelT] Failed to query CUDA prefill capture geometry for device "
-                          << device_idx << ": " << cudaGetErrorString(status));
-                return {};
-            }
+            const auto physical = fa2_policy::bindCUDAFA2Hardware(
+                cudaHardwareMetadata().at(device_idx));
 
             return fa2_policy::selectFA2PrefillParallelPlan({
                 .batch_size = geometry.batch_size,
@@ -291,7 +285,7 @@ namespace llaminar2
                 .local_query_heads = geometry.local_query_heads,
                 .head_dim = geometry.head_dim,
                 .kv_capacity = geometry.kv_capacity,
-                .sm_count = properties.multiProcessorCount,
+                .sm_count = physical.sm_count,
                 .requested_axis =
                     geometry.execution_policy.prefill_parallel_axis,
                 .visible_kv_heads = geometry.visible_kv_heads,
@@ -387,52 +381,8 @@ namespace llaminar2
             int n_heads,
             int device_idx)
         {
-            if (kv_capacity <= 1 || n_heads <= 0)
-                return 1;
-
-            // Get SM count (cached per device via static array)
-            static int sm_count_cache[8] = {0};
-            int num_sms = sm_count_cache[device_idx & 7];
-            if (num_sms == 0)
-            {
-                const cudaError_t status = cudaDeviceGetAttribute(
-                    &num_sms,
-                    cudaDevAttrMultiProcessorCount,
-                    device_idx);
-                if (status != cudaSuccess || num_sms <= 0)
-                {
-                    throw std::runtime_error(
-                        "[CUDAFlashAttentionKernelT] Cannot construct a stable "
-                        "decode launch envelope because CUDA did not publish a "
-                        "positive SM count for device " +
-                        std::to_string(device_idx) +
-                        " (status=" +
-                        std::to_string(static_cast<int>(status)) + ")");
-                }
-                sm_count_cache[device_idx & 7] = num_sms;
-            }
-
-            // Max concurrent blocks from register pressure (61 regs → 4 blocks/SM)
-            constexpr int MAX_BLOCKS_PER_SM = 4;
-            int max_concurrent = MAX_BLOCKS_PER_SM * num_sms;
-
-            // Floor division: stay at or below capacity to avoid tail-wave inefficiency
-            int desired_splits = max_concurrent / n_heads;
-
-            // Clamp: each split needs enough work (MIN_KV_PER_SPLIT positions)
-            int max_splits_by_kv = kv_capacity / MIN_KV_PER_SPLIT;
-            if (max_splits_by_kv < 1)
-                max_splits_by_kv = 1;
-
-            int num_splits = desired_splits;
-            if (num_splits > max_splits_by_kv)
-                num_splits = max_splits_by_kv;
-            if (num_splits > MAX_NUM_SPLITS)
-                num_splits = MAX_NUM_SPLITS;
-            if (num_splits < 1)
-                num_splits = 1;
-
-            return num_splits;
+            return fa2_policy::selectCUDAFlashDecodeSplitEnvelope(
+                cudaHardwareMetadata().at(device_idx), kv_capacity, n_heads);
         }
 
         static int sanitizeSmallDecodeQueryRows(int query_rows)

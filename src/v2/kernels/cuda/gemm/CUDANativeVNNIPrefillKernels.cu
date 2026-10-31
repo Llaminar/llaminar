@@ -37,6 +37,8 @@
 #include "CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/common/WorkspaceOverwriteContract.h"
+#include "backends/cuda/CUDAHardwareMetadata.h"
+#include "CUDANativeVNNIWorkspaceHardware.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -66,7 +68,6 @@ extern "C" bool cudaNativeVNNIGemvTuned_supportsCodebook(
 // =========================================================================
 struct CUDAPrefillContext_
 {
-    int sm_count = 0;
     int device_id = -1;
     float *workspace_canonical_kpart_partials = nullptr;
     size_t workspace_canonical_kpart_partials_size = 0;
@@ -106,16 +107,17 @@ static inline void recordLastLaunchSelection(
     g_last_launch_selection.staging = staging;
 }
 
-static int querySmCount(CUDAPrefillContext_ *ctx)
+/**
+ * @brief Borrow physical SM geometry from the one admitted CUDA inventory.
+ * @param ctx Prepared or planning-only context with its exact participant ordinal.
+ * @return Real physical count; query failure cannot manufacture an 82-SM device.
+ * @throws std::invalid_argument On an absent projection owner.
+ */
+static int querySmCount(const CUDAPrefillContext_ *ctx)
 {
-    if (ctx->sm_count > 0)
-        return ctx->sm_count;
-    cudaDeviceGetAttribute(&ctx->sm_count,
-                           cudaDevAttrMultiProcessorCount,
-                           ctx->device_id);
-    if (ctx->sm_count <= 0)
-        ctx->sm_count = 82;
-    return ctx->sm_count;
+    if (!ctx)
+        throw std::invalid_argument("CUDA prefill requires its prepared device owner");
+    return llaminar2::cudaHardwareMetadata().at(ctx->device_id).sm_count;
 }
 
 namespace
@@ -918,20 +920,17 @@ namespace
         int rows,
         int N,
         int K,
-        int cuda_device_id,
+        int sm_count,
         size_t *canonical_kpart_partials_bytes,
         int *planned_k_partitions)
     {
-        CUDAPrefillContext_ temp_ctx;
-        temp_ctx.device_id = cuda_device_id;
-
         int uses_ordered_reducer = 0;
         int k_partitions = 0;
         if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
                 codebook_id,
                 N,
                 K,
-                querySmCount(&temp_ctx),
+                sm_count,
                 &uses_ordered_reducer,
                 &k_partitions) ||
             uses_ordered_reducer == 0 || k_partitions <= 1)
@@ -1197,20 +1196,18 @@ namespace
     }
 
     /**
-     * @brief Query the selected device without a mutable cross-device cache.
+     * @brief Read the selected device's admitted architecture without another query.
      * @param device_id CUDA ordinal whose prefill capability is being admitted.
-     * @return True only for a successfully queried Ampere-or-newer device.
+     * @return True only for an admitted Ampere-or-newer device.
      *
      * Parallel participant capture can inspect different ordinals at once.
      * Caching an ordinal and result in separate statics races their publication.
-     * This setup-time runtime query adds no node or work to captured replay.
+     * Physical facts instead share the immutable startup authority; this family
+     * predicate is independent of its prepared operand and arithmetic policy.
      */
     bool isAmperePlus(int device_id)
     {
-        int major = 0;
-        return cudaDeviceGetAttribute(
-            &major, cudaDevAttrComputeCapabilityMajor, device_id) == cudaSuccess &&
-            major >= 8;
+        return llaminar2::cudaHardwareMetadata().at(device_id).sm_major >= 8;
     }
 
     /** Map a compile-time output geometry back to its stable policy ID. */
@@ -2463,7 +2460,7 @@ extern "C"
             M,
             N,
             K,
-            cuda_device_id,
+            llaminar2::cudaHardwareMetadata().at(cuda_device_id).sm_count,
             canonical_kpart_partials_bytes,
             planned_k_partitions);
     }
@@ -2490,13 +2487,14 @@ extern "C"
     }
 
     /** @brief Plan the maximum workspace for an explicit arithmetic policy. */
-    bool cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
+    static bool workspaceEnvelopeWithHardwareBinding(
         uint8_t codebook_id,
         uint8_t arithmetic_policy_codebook_id,
         int max_M,
         int N,
         int K,
         int cuda_device_id,
+        const llaminar2::cuda::NativeVNNIWorkspaceHardware *hardware,
         size_t *canonical_kpart_partials_bytes,
         int *planned_k_partitions,
         int *planned_rows)
@@ -2562,7 +2560,7 @@ extern "C"
                 canonical_rows,
                 N,
                 K,
-                cuda_device_id,
+                hardware ? hardware->smCount() : llaminar2::cudaHardwareMetadata().at(cuda_device_id).sm_count,
                 canonical_kpart_partials_bytes,
                 planned_k_partitions))
         {
@@ -2571,6 +2569,15 @@ extern "C"
         if (planned_rows)
             *planned_rows = canonical_rows;
         return true;
+    }
+
+    /** @brief Runtime ABI binds the admitted participant only when installed policy consumes its SM count. */
+    bool cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
+        uint8_t codebook_id, uint8_t arithmetic_policy_codebook_id, int max_M, int N, int K,
+        int cuda_device_id, size_t *bytes, int *partitions, int *rows)
+    {
+        return workspaceEnvelopeWithHardwareBinding(codebook_id, arithmetic_policy_codebook_id,
+            max_M, N, K, cuda_device_id, nullptr, bytes, partitions, rows);
     }
 
     /** @brief Plan a self-describing matrix whose policy equals its decoder. */
@@ -2596,6 +2603,15 @@ extern "C"
             planned_rows);
     }
 } // extern "C"
+
+bool llaminar2::cuda::nativeVNNIPrefillWorkspaceEnvelopeForHardware(
+    std::uint8_t codebook, std::uint8_t arithmetic_codebook, int max_rows, int n, int k,
+    const NativeVNNIWorkspaceHardware &hardware, std::size_t *bytes, int *partitions, int *rows)
+{
+    return workspaceEnvelopeWithHardwareBinding(codebook, arithmetic_codebook, max_rows, n, k,
+        hardware.deviceOrdinal(), &hardware, bytes, partitions, rows);
+}
+
 
 // Profitability gate removed: NativeVNNI is now the only CUDA GEMM path.
 // TC/CUTLASS expanded fallback has been sunset. All codebooks always use

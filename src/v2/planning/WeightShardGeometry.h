@@ -48,6 +48,9 @@ namespace llaminar2
         std::optional<WeightShardMatrix> matrix_;
     };
 
+    /** @brief Original source identity is distinct from equal logical matrix dimensions. */
+    enum class WeightSourceStorageView { WholeOriginal, DeclaredSlice };
+
     /**
      * @brief Participant-bound compiler that resolves schema rules once, not per tensor.
      *
@@ -92,6 +95,15 @@ namespace llaminar2
          */
         WeightShardGeometry resolve(const TensorSizeInfo &tensor,
             const MoEExpertProjectionOwnership &ownership, size_t owned_experts) const;
+        /**
+         * @brief Project the actual schema's source-loading declaration, not just shape equality.
+         * @param tensor Original source whose TP policy is being resolved.
+         * @return Whole original source for an unsharded/replicated view, otherwise a declared slice.
+         *
+         * A full coordinate range under a slicing policy may still carry
+         * presliced runtime metadata and cannot donate a full-source alias.
+         */
+        WeightSourceStorageView sourceStorageView(const TensorSizeInfo &tensor) const;
     private:
         const ModelMemoryProfile &profile_;
         int shard_index_, total_shards_;

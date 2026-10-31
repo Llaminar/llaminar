@@ -8,6 +8,7 @@
  * remain distinct physical consumers of one logical source tensor.
  */
 #include "planning/WeightMemoryEstimator.h"
+#include "planning/PreparedWeightPhysicalUses.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/WeightShardGeometry.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
@@ -381,6 +382,33 @@ namespace llaminar2
             &tensor_parallel_assignment,
         WeightComponentScope components)
     {
+        return estimateImpl(profile, device, shard_index, total_shards, first_layer, last_layer, residency,
+            tensor_parallel_assignment, components, nullptr, PreparedWeightUseIntent::PublishCreator);
+    }
+
+    WeightEstimate WeightMemoryEstimator::estimatePhysical(PreparedWeightPhysicalUses &uses,
+        PreparedWeightUseIntent intent, const ModelMemoryProfile &profile, DeviceId device,
+        int shard_index, int total_shards, int first_layer, int last_layer,
+        const DeviceWeightResidency &residency,
+        const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment, WeightComponentScope components)
+    {
+        uses.requireScope(profile, device, components);
+        return estimateImpl(profile, device, shard_index, total_shards, first_layer, last_layer, residency,
+            tensor_parallel_assignment, components, &uses, intent);
+    }
+
+    WeightEstimate WeightMemoryEstimator::estimateImpl(
+        const ModelMemoryProfile &profile,
+        DeviceId device,
+        int shard_index,
+        int total_shards,
+        int first_layer,
+        int last_layer,
+        const DeviceWeightResidency &residency,
+        const std::optional<DeviceShardingAssignment>
+            &tensor_parallel_assignment,
+        WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent)
+    {
         if (total_shards <= 0 || shard_index < 0 ||
             shard_index >= total_shards)
         {
@@ -558,6 +586,14 @@ namespace llaminar2
                 float bytes_per_weight = getCPUPackedBytesPerWeight(t.quant_type);
                 device_size = static_cast<size_t>(
                     static_cast<float>(selected_elements) * bytes_per_weight);
+            }
+            if (uses && std::holds_alternative<PreparedWeightPhysicalAlias>(
+                    uses->record(profile, device, t, geometry, geometry_resolver.sourceStorageView(t), intent)))
+            {
+                // The actual prepared store retains the earlier root and its
+                // original owner. Native source inventory stays descriptive;
+                // this logical use requires no second persistent allocation.
+                return;
             }
             if (device.is_gpu() && isEmbeddingTensor(t.name) &&
                 !isQuantizedFormat(t.quant_type))

@@ -1,3 +1,13 @@
+/**
+ * @file Test__Qwen36_ROCm_SingleDevice_PrefixMTP_Parity.cpp
+ * @brief Native MPI fixture with an explicit process-entry backing owner.
+ *
+ * The executable enters the shared ancestor session before parsing arguments,
+ * starting test environments, or initializing MPI. Direct binary runs retain
+ * their actual descendants and runtime backing through terminal retirement.
+ */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "Qwen36DenseParityTestBase.h"
 
 #include "backends/GPUDeviceContextPool.h"
@@ -28,6 +38,10 @@ namespace
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
@@ -41,7 +55,7 @@ int main(int argc, char **argv)
     }
 
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
 
     MPI_Finalize();
     std::cout.flush();

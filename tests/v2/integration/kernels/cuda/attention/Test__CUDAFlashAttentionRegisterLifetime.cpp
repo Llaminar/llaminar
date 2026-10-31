@@ -13,6 +13,7 @@
  * replay against eager bytes. Buffers are persistent for each captured replay
  * and no timing gate lives here.
  */
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
@@ -137,6 +138,7 @@ TEST(CUDAFlashAttentionRegisterLifetime,
   int devices = 0;
   checked(cudaGetDeviceCount(&devices));
   ASSERT_GT(devices, 0);
+  llaminar2::initializeCUDAHardwareMetadata();
   checked(cudaSetDevice(0));
   LaunchPolicy policy;
   const auto stream = policy.stream;
@@ -239,6 +241,7 @@ TEST(CUDAFlashAttentionRegisterLifetime,
   int devices = 0;
   checked(cudaGetDeviceCount(&devices));
   ASSERT_GT(devices, 0);
+  llaminar2::initializeCUDAHardwareMetadata();
   checked(cudaSetDevice(0));
   int shared_limit = 0;
   checked(cudaDeviceGetAttribute(&shared_limit,

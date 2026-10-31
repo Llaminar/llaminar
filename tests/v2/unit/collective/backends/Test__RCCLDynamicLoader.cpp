@@ -36,8 +36,7 @@ namespace llaminar2::test
         ASSERT_FALSE(rccl_dynamic::isLoaded());
         EXPECT_FALSE(rccl_dynamic::load(""));
         EXPECT_FALSE(rccl_dynamic::isLoaded());
-        EXPECT_NE(std::string(rccl_dynamic::getLastError()).find("No RCCL library configured"),
-                  std::string::npos);
+        EXPECT_STREQ(rccl_dynamic::getLastError(), "Explicit RCCL library path is empty");
         rccl_dynamic::unload();
     }
 

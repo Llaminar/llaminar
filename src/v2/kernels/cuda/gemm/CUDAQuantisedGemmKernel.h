@@ -101,22 +101,12 @@ namespace llaminar2
          * - CUTLASS Tensor Core: 50-90 TFLOPS on RTX 3090
          * - Activation quantization: Per-row symmetric, fused with GEMM launch
          */
-        struct CUDAConcurrentPrefillPool; // Forward declaration (definition in .cpp)
 
         class CUDAQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
             struct Impl; // Forward declaration for PIMPL (definition in .cpp)
 
-            /**
-             * @brief Release all per-device shared CUDAConcurrentPrefillPool
-             *        singletons (CUDA streams, events, and scratch buffers).
-             *
-             * The pool is shared across kernel instances on the same device, so it
-             * must be torn down when KernelFactory::clearCache() runs to avoid
-             * leaking static state between test runs / orchestrator resets.
-             */
-            static void clearSharedPrefillPools();
 
             /**
              * @brief Release input-dependent CUDA execution contexts.

@@ -3,7 +3,7 @@
  * @brief ROCm/HIP factory registration for GPUDeviceContextPool
  *
  * This file registers the AMD device context factory with the
- * GPUDeviceContextPool during static initialization. This allows
+ * GPUDeviceContextPool at explicit startup after immutable inventory admission. This allows
  * GPUDeviceContextPool (which lives in llaminar2_core) to create
  * AMDDeviceContext instances without directly depending on HIP headers.
  *
@@ -11,6 +11,8 @@
  * linker when this TU is in a static library and no symbols are referenced.
  * The public function ensureAMDFactoryRegistered() provides an explicit
  * registration path that also forces the linker to include this TU.
+ * Cold discovery retains a short process-lifetime borrow before native queries;
+ * it cannot race terminal retirement before the first worker owns its own lease.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -18,7 +20,8 @@
 
 #include "AMDDeviceContext.h"
 #include "../GPUDeviceContextPool.h"
-#include "../GPUEnumeration.h"
+#include "ROCmHardwareMetadata.h"
+#include "../GPUDeviceProcessLifetime.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include <memory>
@@ -67,8 +70,9 @@ namespace llaminar2
             if (pool.hasAMDSupport())
                 return; // Already registered
 
-            auto devices = rocm_enumeration::enumerate_rocm_devices();
-            int device_count = static_cast<int>(devices.size());
+            const auto discovery_lifetime = GPUDeviceProcessLifetime::acquireNativeContext();
+            initializeROCmHardwareMetadata();
+            const int device_count = static_cast<int>(rocmHardwareMetadata().size());
 
             if (device_count > 0)
             {
@@ -115,16 +119,13 @@ namespace llaminar2
     // Explicit registration (called when static init is unreliable)
     // =========================================================================
 
+    /**
+     * @brief Register exact admitted ROCm visibility at the enabled startup boundary.
+     * @throws Discovery, lifecycle or inventory errors without hiding failed admission.
+     */
     void ensureAMDFactoryRegistered()
     {
-        try
-        {
-            doRegisterAMDFactory();
-        }
-        catch (const std::exception &e)
-        {
-            LOG_WARN("[AMDContextFactory] Explicit registration failed: " << e.what());
-        }
+        doRegisterAMDFactory();
     }
 
 } // namespace llaminar2

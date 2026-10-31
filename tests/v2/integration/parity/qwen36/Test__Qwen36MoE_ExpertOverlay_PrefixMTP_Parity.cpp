@@ -12,6 +12,8 @@
  * prefix-restore test later trims that prompt.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "Qwen36MoEParityTestBase.h"
 
 #include "backends/GPUDeviceContextPool.h"
@@ -2436,6 +2438,10 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MPIWorldUsesSingleProcessLockAuthori
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     const std::string parity_lock_path = parityProcessLockPath(argc, argv);
     int provided = MPI_THREAD_SINGLE;
     if (MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided) !=
@@ -2485,6 +2491,7 @@ int main(int argc, char **argv)
                 << "Failed to acquire Qwen36 MoE ExpertOverlay parity lock: "
                 << parity_lock_error << std::endl;
         }
+        llaminar2::GPUDeviceProcessLifetime::retireActive();
         MPI_Finalize();
         return 1;
     }
@@ -2495,7 +2502,7 @@ int main(int argc, char **argv)
     int result = RUN_ALL_TESTS();
 
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
 
     /* MPI_Finalize is collective, so rank zero cannot release the world lock
      * while a peer still owns backend resources from this test command. */

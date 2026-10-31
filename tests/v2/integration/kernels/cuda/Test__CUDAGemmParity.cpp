@@ -34,6 +34,7 @@
  * @date January 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "tensors/IQQuantTables.h"
 #include "transfer/TransferEngine.h"
@@ -2185,7 +2186,8 @@ protected:
             {
                 SCOPED_TRACE("half=" + std::to_string(half) + " K=" + std::to_string(K) + " M=" + std::to_string(M));
                 TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
-                CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+                auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
                 /** @brief Replay must join before its retained graph is destroyed. */
                 struct ReplayRetire
                 {
@@ -3847,7 +3849,8 @@ TEST_F(Test__CUDAGemmParity, Q4_0_CanonicalKpartGraphReplaySurvivesKernelDynamic
     TransferEngine::requireDeviceInput(&A_tensor,gpu_device_,stream);
     TransferEngine::requireDeviceOutput(&C_tensor,gpu_device_,stream);
     {
-    CUDAGraphCapture graph(stream,gpu_device_.ordinal);
+    auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
     {
         ScopedBackendGraphCapture recording(graph,"canonical K-partition reset fixture");
         ASSERT_TRUE(recording.begin());
@@ -4422,7 +4425,8 @@ TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExa
         // consumer stream before capture; an upload or prior replay may have
         // published a new completion-event generation since the last arm.
         TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
-        CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+        auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
         /** @brief Join replay/DMA before the retained graph is destroyed. */
         struct ReplayRetirement
         {
@@ -5471,7 +5475,8 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
         TransferEngine::requireDeviceOutput(output, gpu_device_, stream);
     // Route counters below must be authored by this capture, not its warmup.
     PerfStatsCollector::reset();
-    CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+    auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
     /** @brief Join submitted replay before the retained graph object retires. */
     struct GdnReplayRetirement
     {
@@ -5744,7 +5749,8 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysi
         TransferEngine::requireDeviceOutput(output, gpu_device_, stream);
     // Route counters below must be authored by this capture, not its warmup.
     PerfStatsCollector::reset();
-    CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+    auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
     /** @brief Join submitted replay before the retained graph object retires. */
     struct GdnReplayRetirement
     {
@@ -12053,7 +12059,8 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
         // consumer stream before capture; an upload or prior replay may have
         // published a new completion-event generation since the last arm.
         TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
-        CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+        auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
         /** @brief Join replay/DMA before the retained graph is destroyed. */
         struct ReplayRetirement
         {
@@ -12165,6 +12172,8 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

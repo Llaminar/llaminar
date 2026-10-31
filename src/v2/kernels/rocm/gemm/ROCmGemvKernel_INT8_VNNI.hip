@@ -18,8 +18,11 @@
  *
  * @see ROCmGemvKernel.hip for shared constants and GemvBatchArgs
  * @see ROCmGemvKernel_native_VNNI.hip for native-VNNI 4-bit kernels
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
 
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
@@ -304,8 +307,8 @@ __device__ __forceinline__ void gemv_int8_accumulate_act_block(
         if constexpr (CPT == 2)
         {
             const int2 b_pair = *reinterpret_cast<const int2*>(b_row + kg * b_stride);
-            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-            acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+            acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, acc[0]);
+            acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, acc[1]);
         }
         else
         {
@@ -313,7 +316,7 @@ __device__ __forceinline__ void gemv_int8_accumulate_act_block(
             for (int c = 0; c < CPT; ++c)
             {
                 const int32_t b_packed = *(b_row + kg * b_stride + c);
-                acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
             }
         }
     }
@@ -475,7 +478,7 @@ __global__ void gemv_int8_int8_vnni_kernel(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + n) * 4);
 
         // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
-        acc = __builtin_amdgcn_sdot4(a_packed, b_packed, acc, false);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc);
     }
 
     d_C_int32[n] = acc;
@@ -533,10 +536,10 @@ __global__ void gemm_int8_int8_vnni_prefill_kernel_t(
             {
                 const uint4 b_pack4 = *reinterpret_cast<const uint4*>(
                     d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3]);
             }
             else
             {
@@ -548,7 +551,7 @@ __global__ void gemm_int8_int8_vnni_prefill_kernel_t(
                     {
                         const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                             d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                     }
                 }
             }
@@ -559,8 +562,8 @@ __global__ void gemm_int8_int8_vnni_prefill_kernel_t(
             {
                 const uint2 b_pack2 = *reinterpret_cast<const uint2*>(
                     d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1]);
             }
             else
             {
@@ -572,7 +575,7 @@ __global__ void gemm_int8_int8_vnni_prefill_kernel_t(
                     {
                         const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                             d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                     }
                 }
             }
@@ -581,7 +584,7 @@ __global__ void gemm_int8_int8_vnni_prefill_kernel_t(
         {
             const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                 d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+            acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[0]);
         }
     }
 
@@ -682,10 +685,10 @@ __global__ void gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
             {
                 const uint4 b_pack4 = *reinterpret_cast<const uint4*>(
                     d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3]);
             }
             else
             {
@@ -697,7 +700,7 @@ __global__ void gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                     {
                         const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                             d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                     }
                 }
             }
@@ -708,8 +711,8 @@ __global__ void gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
             {
                 const uint2 b_pack2 = *reinterpret_cast<const uint2*>(
                     d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1]);
             }
             else
             {
@@ -721,7 +724,7 @@ __global__ void gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
                     {
                         const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                             d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                     }
                 }
             }
@@ -730,7 +733,7 @@ __global__ void gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
         {
             const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                 d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
-            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+            acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[0]);
         }
     }
 
@@ -823,7 +826,7 @@ __global__ void gemm_payload_v2_i8_prefill_kernel(
             #pragma unroll
             for (int g = 0; g < 8; ++g)
             {
-                acc = __builtin_amdgcn_sdot4(a4[g], payload_i32[g], acc, false);
+                acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], payload_i32[g], acc);
             }
         }
 
@@ -882,14 +885,14 @@ __global__ void gemm_payload_v2_i8_prefill_kernel_direct(
         const uint4 packed0 = *reinterpret_cast<const uint4*>(d_payload + linear * 32u);
         const uint4 packed1 = *reinterpret_cast<const uint4*>(d_payload + linear * 32u + 16u);
 
-        acc = __builtin_amdgcn_sdot4(a4[0], static_cast<int32_t>(packed0.x), acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[1], static_cast<int32_t>(packed0.y), acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[2], static_cast<int32_t>(packed0.z), acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[3], static_cast<int32_t>(packed0.w), acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[4], static_cast<int32_t>(packed1.x), acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[5], static_cast<int32_t>(packed1.y), acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[6], static_cast<int32_t>(packed1.z), acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[7], static_cast<int32_t>(packed1.w), acc, false);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[0], static_cast<int32_t>(packed0.x), acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[1], static_cast<int32_t>(packed0.y), acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[2], static_cast<int32_t>(packed0.z), acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[3], static_cast<int32_t>(packed0.w), acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[4], static_cast<int32_t>(packed1.x), acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[5], static_cast<int32_t>(packed1.y), acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[6], static_cast<int32_t>(packed1.z), acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[7], static_cast<int32_t>(packed1.w), acc);
     }
 
     const int64_t out_idx = static_cast<int64_t>(m) * N + n;
@@ -958,10 +961,10 @@ __global__ void gemm_payload_v2_i8_prefill_kernel_t(
                 for (int g = 0; g < 8; ++g)
                 {
                     const int32_t a = a4[g];
-                    acc[0] = __builtin_amdgcn_sdot4(a, payload_i32_0[g], acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a, payload_i32_1[g], acc[1], false);
-                    acc[2] = __builtin_amdgcn_sdot4(a, payload_i32_2[g], acc[2], false);
-                    acc[3] = __builtin_amdgcn_sdot4(a, payload_i32_3[g], acc[3], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a, payload_i32_0[g], acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a, payload_i32_1[g], acc[1]);
+                    acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a, payload_i32_2[g], acc[2]);
+                    acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a, payload_i32_3[g], acc[3]);
                 }
             }
             else
@@ -977,7 +980,7 @@ __global__ void gemm_payload_v2_i8_prefill_kernel_t(
                         #pragma unroll
                         for (int g = 0; g < 8; ++g)
                         {
-                            acc[c] = __builtin_amdgcn_sdot4(a4[g], payload_i32[g], acc[c], false);
+                            acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], payload_i32[g], acc[c]);
                         }
                     }
                 }
@@ -992,8 +995,8 @@ __global__ void gemm_payload_v2_i8_prefill_kernel_t(
                 for (int g = 0; g < 8; ++g)
                 {
                     const int32_t a = a4[g];
-                    acc[0] = __builtin_amdgcn_sdot4(a, payload_i32_0[g], acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a, payload_i32_1[g], acc[1], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a, payload_i32_0[g], acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a, payload_i32_1[g], acc[1]);
                 }
             }
             else
@@ -1009,7 +1012,7 @@ __global__ void gemm_payload_v2_i8_prefill_kernel_t(
                         #pragma unroll
                         for (int g = 0; g < 8; ++g)
                         {
-                            acc[c] = __builtin_amdgcn_sdot4(a4[g], payload_i32[g], acc[c], false);
+                            acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], payload_i32[g], acc[c]);
                         }
                     }
                 }
@@ -1020,7 +1023,7 @@ __global__ void gemm_payload_v2_i8_prefill_kernel_t(
             #pragma unroll
             for (int g = 0; g < 8; ++g)
             {
-                acc[0] = __builtin_amdgcn_sdot4(a4[g], payload_i32_0[g], acc[0], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], payload_i32_0[g], acc[0]);
             }
         }
     }
@@ -1117,10 +1120,10 @@ __global__ void gemv_int8_int8_wide_vnni_kernel_t(
             if (full_cols)
             {
                 const int4 b = *reinterpret_cast<const int4*>(b_row);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.x, acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.y, acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.z, acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.w, acc[3]);
             }
             else
             {
@@ -1130,7 +1133,7 @@ __global__ void gemv_int8_int8_wide_vnni_kernel_t(
                     if (n_base + c < N)
                     {
                         const int32_t b = *(b_row + c);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                     }
                 }
             }
@@ -1140,8 +1143,8 @@ __global__ void gemv_int8_int8_wide_vnni_kernel_t(
             if (full_cols)
             {
                 const int2 b = *reinterpret_cast<const int2*>(b_row);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.x, acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.y, acc[1]);
             }
             else
             {
@@ -1151,7 +1154,7 @@ __global__ void gemv_int8_int8_wide_vnni_kernel_t(
                     if (n_base + c < N)
                     {
                         const int32_t b = *(b_row + c);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                     }
                 }
             }
@@ -1164,7 +1167,7 @@ __global__ void gemv_int8_int8_wide_vnni_kernel_t(
                 if (n_base + c < N)
                 {
                     const int32_t b = *(b_row + c);
-                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                    acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                 }
             }
         }
@@ -1206,8 +1209,8 @@ __global__ void gemv_int8_int8_wide2_vnni_kernel(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n2 + 1)) * 4);
 
         // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
-        acc0 = __builtin_amdgcn_sdot4(a_packed, p0, acc0, false);
-        acc1 = __builtin_amdgcn_sdot4(a_packed, p1, acc1, false);
+        acc0 = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, p0, acc0);
+        acc1 = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, p1, acc1);
     }
 
     d_C_int32[n2 + 0] = acc0;
@@ -1249,7 +1252,7 @@ __global__ void gemv_int8_int8_square_vnni_kernel(
                 d_B_int8_vnni + (static_cast<size_t>(global_kg) * N + n) * 4);
 
             // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
-            acc = __builtin_amdgcn_sdot4(a_packed, b_packed, acc, false);
+            acc = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc);
         }
         __syncthreads();
     }
@@ -1289,7 +1292,7 @@ __global__ void gemv_int8_int8_vnni_blockwise_scaled_kernel(
             const int kg = kg_base + kgi;
             const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
             const int32_t b_packed = *(b_row + kg * b_stride);
-            block_acc = __builtin_amdgcn_sdot4(a_packed, b_packed, block_acc, false);
+            block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, block_acc);
         }
         fp_acc += static_cast<float>(block_acc) * d_scales_A_blockwise[act_block];
     }
@@ -1353,10 +1356,10 @@ __global__ void gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t(
                 if (full_cols)
                 {
                     const int4 b = *reinterpret_cast<const int4*>(b_pack_row);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
-                    acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, acc[2], false);
-                    acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, acc[3], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.x, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.y, acc[1]);
+                    acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.z, acc[2]);
+                    acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.w, acc[3]);
                 }
                 else
                 {
@@ -1366,7 +1369,7 @@ __global__ void gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t(
                         if (n_base + c < N)
                         {
                             const int32_t b = *(b_pack_row + c);
-                            acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                            acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                         }
                     }
                 }
@@ -1376,8 +1379,8 @@ __global__ void gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t(
                 if (full_cols)
                 {
                     const int2 b = *reinterpret_cast<const int2*>(b_pack_row);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.x, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.y, acc[1]);
                 }
                 else
                 {
@@ -1387,7 +1390,7 @@ __global__ void gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t(
                         if (n_base + c < N)
                         {
                             const int32_t b = *(b_pack_row + c);
-                            acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                            acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                         }
                     }
                 }
@@ -1400,7 +1403,7 @@ __global__ void gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t(
                     if (n_base + c < N)
                     {
                         const int32_t b = *(b_pack_row + c);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                     }
                 }
             }
@@ -1484,7 +1487,7 @@ __global__ void gemv_int8_int8_square_vnni_blockwise_scaled_kernel(
                 const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + local_k_byte + kgi * 4);
                 const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                     d_B_int8_vnni + (static_cast<size_t>(k_group_base + kgi) * N + n) * 4);
-                block_acc = __builtin_amdgcn_sdot4(a_packed, b_packed, block_acc, false);
+                block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, block_acc);
             }
 
             fp_acc += static_cast<float>(block_acc) * d_scales_A_blockwise[act_block_base + tile_block];
@@ -1621,10 +1624,10 @@ __global__ void gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t(
                 if (full_cols)
                 {
                     const int4 b = *reinterpret_cast<const int4*>(b_pack_row);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
-                    acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, acc[2], false);
-                    acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, acc[3], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.x, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.y, acc[1]);
+                    acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.z, acc[2]);
+                    acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.w, acc[3]);
                 }
                 else
                 {
@@ -1634,7 +1637,7 @@ __global__ void gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t(
                         if (n_base + c < N)
                         {
                             const int32_t b = *(b_pack_row + c);
-                            acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                            acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                         }
                     }
                 }
@@ -1644,8 +1647,8 @@ __global__ void gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t(
                 if (full_cols)
                 {
                     const int2 b = *reinterpret_cast<const int2*>(b_pack_row);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, acc[1], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.x, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.y, acc[1]);
                 }
                 else
                 {
@@ -1655,7 +1658,7 @@ __global__ void gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t(
                         if (n_base + c < N)
                         {
                             const int32_t b = *(b_pack_row + c);
-                            acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                            acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                         }
                     }
                 }
@@ -1668,7 +1671,7 @@ __global__ void gemv_int8_int8_wide_batched_vnni_blockwise_scaled_kernel_t(
                     if (n_base + c < N)
                     {
                         const int32_t b = *(b_pack_row + c);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, acc[c]);
                     }
                 }
             }
@@ -1753,7 +1756,7 @@ __global__ void gemv_int8_int8_square_batched_vnni_blockwise_scaled_kernel(
                 const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + local_k_byte + kgi * 4);
                 const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                     d_B_int8_vnni + (static_cast<size_t>(k_group_base + kgi) * args.N[batch] + n) * 4);
-                block_acc = __builtin_amdgcn_sdot4(a_packed, b_packed, block_acc, false);
+                block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, block_acc);
             }
 
             fp_acc += static_cast<float>(block_acc) * d_scales_A_blockwise[act_block_base + tile_block];
@@ -1841,8 +1844,8 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_kernel_t(
                 // so int2 alignment is guaranteed for N divisible by 2.
                 const int2 b_pair = *reinterpret_cast<const int2*>(
                     b_row + kg * b_stride);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, acc[1]);
             }
             else
             {
@@ -1850,7 +1853,7 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_kernel_t(
                 for (int c = 0; c < CPT; ++c)
                 {
                     const int32_t b_packed = *(b_row + kg * b_stride + c);
-                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                 }
             }
         }
@@ -1936,8 +1939,8 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_blockwise_scaled_kernel_t(
                 if constexpr (CPT == 2)
                 {
                     const int2 b_pair = *reinterpret_cast<const int2*>(b_row + (kg_base + kgi) * b_stride);
-                    block_acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, block_acc[0], false);
-                    block_acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, block_acc[1], false);
+                    block_acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, block_acc[0]);
+                    block_acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, block_acc[1]);
                 }
                 else
                 {
@@ -1945,7 +1948,7 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_blockwise_scaled_kernel_t(
                     for (int c = 0; c < CPT; ++c)
                     {
                         const int32_t b_packed = *(b_row + (kg_base + kgi) * b_stride + c);
-                        block_acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, block_acc[c], false);
+                        block_acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, block_acc[c]);
                     }
                 }
             }
@@ -2210,18 +2213,18 @@ void gemv_int8_int8_lds_kreduce_kernel_t(
                 // 8-byte vectorized load: two adjacent VNNI columns
                 const int2 b_pair = *reinterpret_cast<const int2*>(
                     b_row + kg * b_stride);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, acc[1]);
             }
             else // CPT == 4
             {
                 // 16-byte vectorized load: four adjacent VNNI columns
                 const int4 b_pack = *reinterpret_cast<const int4*>(
                     b_row + kg * b_stride);
-                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pack.x, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pack.y, acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_pack.z, acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_pack.w, acc[3], false);
+                acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pack.x, acc[0]);
+                acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pack.y, acc[1]);
+                acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pack.z, acc[2]);
+                acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pack.w, acc[3]);
             }
         }
     }
@@ -2581,10 +2584,10 @@ void gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t(
                 if (full_cols)
                 {
                     const int4 b = *reinterpret_cast<const int4*>(b_pack_row);
-                    block_acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, block_acc[0], false);
-                    block_acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, block_acc[1], false);
-                    block_acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, block_acc[2], false);
-                    block_acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, block_acc[3], false);
+                    block_acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.x, block_acc[0]);
+                    block_acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.y, block_acc[1]);
+                    block_acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.z, block_acc[2]);
+                    block_acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.w, block_acc[3]);
                 }
                 else
                 {
@@ -2594,7 +2597,7 @@ void gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t(
                         if (n_base + c < N)
                         {
                             const int32_t b = *(b_pack_row + c);
-                            block_acc[c] = __builtin_amdgcn_sdot4(a_packed, b, block_acc[c], false);
+                            block_acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b, block_acc[c]);
                         }
                     }
                 }
@@ -2754,16 +2757,16 @@ void gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t(
                 if (full_cols)
                 {
                     const int4 b0 = *reinterpret_cast<const int4*>(b_row + (kg_base0 + kgi) * b_stride);
-                    acc0[0] = __builtin_amdgcn_sdot4(a0, b0.x, acc0[0], false);
-                    acc0[1] = __builtin_amdgcn_sdot4(a0, b0.y, acc0[1], false);
-                    acc0[2] = __builtin_amdgcn_sdot4(a0, b0.z, acc0[2], false);
-                    acc0[3] = __builtin_amdgcn_sdot4(a0, b0.w, acc0[3], false);
+                    acc0[0] = ::llaminar2::rocm_integer_contract::signedDot4(a0, b0.x, acc0[0]);
+                    acc0[1] = ::llaminar2::rocm_integer_contract::signedDot4(a0, b0.y, acc0[1]);
+                    acc0[2] = ::llaminar2::rocm_integer_contract::signedDot4(a0, b0.z, acc0[2]);
+                    acc0[3] = ::llaminar2::rocm_integer_contract::signedDot4(a0, b0.w, acc0[3]);
 
                     const int4 b1 = *reinterpret_cast<const int4*>(b_row + (kg_base1 + kgi) * b_stride);
-                    acc1[0] = __builtin_amdgcn_sdot4(a1, b1.x, acc1[0], false);
-                    acc1[1] = __builtin_amdgcn_sdot4(a1, b1.y, acc1[1], false);
-                    acc1[2] = __builtin_amdgcn_sdot4(a1, b1.z, acc1[2], false);
-                    acc1[3] = __builtin_amdgcn_sdot4(a1, b1.w, acc1[3], false);
+                    acc1[0] = ::llaminar2::rocm_integer_contract::signedDot4(a1, b1.x, acc1[0]);
+                    acc1[1] = ::llaminar2::rocm_integer_contract::signedDot4(a1, b1.y, acc1[1]);
+                    acc1[2] = ::llaminar2::rocm_integer_contract::signedDot4(a1, b1.z, acc1[2]);
+                    acc1[3] = ::llaminar2::rocm_integer_contract::signedDot4(a1, b1.w, acc1[3]);
                 }
                 else
                 {
@@ -2773,9 +2776,9 @@ void gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t(
                         if (n_base + c < N)
                         {
                             const int32_t bv0 = *(b_row + (kg_base0 + kgi) * b_stride + c);
-                            acc0[c] = __builtin_amdgcn_sdot4(a0, bv0, acc0[c], false);
+                            acc0[c] = ::llaminar2::rocm_integer_contract::signedDot4(a0, bv0, acc0[c]);
                             const int32_t bv1 = *(b_row + (kg_base1 + kgi) * b_stride + c);
-                            acc1[c] = __builtin_amdgcn_sdot4(a1, bv1, acc1[c], false);
+                            acc1[c] = ::llaminar2::rocm_integer_contract::signedDot4(a1, bv1, acc1[c]);
                         }
                     }
                 }
@@ -2806,10 +2809,10 @@ void gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t(
                 if (full_cols)
                 {
                     const int4 b = *reinterpret_cast<const int4*>(b_row + (kg_base + kgi) * b_stride);
-                    block_acc[0] = __builtin_amdgcn_sdot4(a_packed, b.x, block_acc[0], false);
-                    block_acc[1] = __builtin_amdgcn_sdot4(a_packed, b.y, block_acc[1], false);
-                    block_acc[2] = __builtin_amdgcn_sdot4(a_packed, b.z, block_acc[2], false);
-                    block_acc[3] = __builtin_amdgcn_sdot4(a_packed, b.w, block_acc[3], false);
+                    block_acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.x, block_acc[0]);
+                    block_acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.y, block_acc[1]);
+                    block_acc[2] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.z, block_acc[2]);
+                    block_acc[3] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b.w, block_acc[3]);
                 }
                 else
                 {
@@ -2819,7 +2822,7 @@ void gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t(
                         if (n_base + c < N)
                         {
                             const int32_t bv = *(b_row + (kg_base + kgi) * b_stride + c);
-                            block_acc[c] = __builtin_amdgcn_sdot4(a_packed, bv, block_acc[c], false);
+                            block_acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, bv, block_acc[c]);
                         }
                     }
                 }
@@ -2971,13 +2974,13 @@ void gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t(
             {
                 const int32_t a0 = *reinterpret_cast<const int32_t*>(d_A_int8 + (kg_base0 + kgi) * 4);
                 const int2 b0 = *reinterpret_cast<const int2*>(b_row + (kg_base0 + kgi) * b_stride);
-                acc0[0] = __builtin_amdgcn_sdot4(a0, b0.x, acc0[0], false);
-                acc0[1] = __builtin_amdgcn_sdot4(a0, b0.y, acc0[1], false);
+                acc0[0] = ::llaminar2::rocm_integer_contract::signedDot4(a0, b0.x, acc0[0]);
+                acc0[1] = ::llaminar2::rocm_integer_contract::signedDot4(a0, b0.y, acc0[1]);
 
                 const int32_t a1 = *reinterpret_cast<const int32_t*>(d_A_int8 + (kg_base1 + kgi) * 4);
                 const int2 b1 = *reinterpret_cast<const int2*>(b_row + (kg_base1 + kgi) * b_stride);
-                acc1[0] = __builtin_amdgcn_sdot4(a1, b1.x, acc1[0], false);
-                acc1[1] = __builtin_amdgcn_sdot4(a1, b1.y, acc1[1], false);
+                acc1[0] = ::llaminar2::rocm_integer_contract::signedDot4(a1, b1.x, acc1[0]);
+                acc1[1] = ::llaminar2::rocm_integer_contract::signedDot4(a1, b1.y, acc1[1]);
             }
 
             const float scale0 = d_scales_A_blockwise[act_block];
@@ -3167,8 +3170,8 @@ __global__ void gemv_fused_fp32_int8_vnni_kernel_t(
                 {
                     const int2 b_pair = *reinterpret_cast<const int2*>(
                         b_row + (kg_offset + tkg) * b_stride);
-                    tile_acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, tile_acc[0], false);
-                    tile_acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, tile_acc[1], false);
+                    tile_acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, tile_acc[0]);
+                    tile_acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, tile_acc[1]);
                 }
                 else
                 {
@@ -3176,7 +3179,7 @@ __global__ void gemv_fused_fp32_int8_vnni_kernel_t(
                     for (int c = 0; c < CPT; ++c)
                     {
                         const int32_t b_packed = *(b_row + (kg_offset + tkg) * b_stride + c);
-                        tile_acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, tile_acc[c], false);
+                        tile_acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, tile_acc[c]);
                     }
                 }
             }
@@ -3324,8 +3327,8 @@ __global__ void gemv_fused_scatter_int8_vnni_kernel_t(
                 {
                     const int2 b_pair = *reinterpret_cast<const int2*>(
                         b_row + (kg_offset + tkg) * b_stride);
-                    tile_acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, tile_acc[0], false);
-                    tile_acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, tile_acc[1], false);
+                    tile_acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, tile_acc[0]);
+                    tile_acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, tile_acc[1]);
                 }
                 else
                 {
@@ -3333,7 +3336,7 @@ __global__ void gemv_fused_scatter_int8_vnni_kernel_t(
                     for (int c = 0; c < CPT; ++c)
                     {
                         const int32_t b_packed = *(b_row + (kg_offset + tkg) * b_stride + c);
-                        tile_acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, tile_acc[c], false);
+                        tile_acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, tile_acc[c]);
                     }
                 }
             }
@@ -3518,8 +3521,8 @@ __global__ void gemv_fused_scatter_selfreduce_int8_vnni_kernel_t(
                 {
                     const int2 b_pair = *reinterpret_cast<const int2*>(
                         b_row + (kg_offset + tkg) * b_stride);
-                    tile_acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, tile_acc[0], false);
-                    tile_acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, tile_acc[1], false);
+                    tile_acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, tile_acc[0]);
+                    tile_acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, tile_acc[1]);
                 }
                 else
                 {
@@ -3527,7 +3530,7 @@ __global__ void gemv_fused_scatter_selfreduce_int8_vnni_kernel_t(
                     for (int c = 0; c < CPT; ++c)
                     {
                         const int32_t b_packed = *(b_row + (kg_offset + tkg) * b_stride + c);
-                        tile_acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, tile_acc[c], false);
+                        tile_acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, tile_acc[c]);
                     }
                 }
             }
@@ -3662,8 +3665,8 @@ __global__ void gemv_int8_direct_vnni_kernel_t(
                 {
                     const int2 b_pair = *reinterpret_cast<const int2*>(
                         b_row + kg * b_stride);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, acc[1]);
                 }
                 else
                 {
@@ -3671,7 +3674,7 @@ __global__ void gemv_int8_direct_vnni_kernel_t(
                     for (int c = 0; c < CPT; ++c)
                     {
                         const int32_t b_packed = *(b_row + kg * b_stride + c);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                     }
                 }
             }
@@ -3779,8 +3782,8 @@ __global__ void gemv_int8_scatter_vnni_kernel_t(
                 {
                     const int2 b_pair = *reinterpret_cast<const int2*>(
                         b_row + kg * b_stride);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, acc[1]);
                 }
                 else
                 {
@@ -3788,7 +3791,7 @@ __global__ void gemv_int8_scatter_vnni_kernel_t(
                     for (int c = 0; c < CPT; ++c)
                     {
                         const int32_t b_packed = *(b_row + kg * b_stride + c);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                     }
                 }
             }
@@ -3890,8 +3893,8 @@ __global__ void gemv_int8_scatter_selfreduce_vnni_kernel_t(
                 {
                     const int2 b_pair = *reinterpret_cast<const int2*>(
                         b_row + kg * b_stride);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, acc[1]);
                 }
                 else
                 {
@@ -3899,7 +3902,7 @@ __global__ void gemv_int8_scatter_selfreduce_vnni_kernel_t(
                     for (int c = 0; c < CPT; ++c)
                     {
                         const int32_t b_packed = *(b_row + kg * b_stride + c);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                     }
                 }
             }
@@ -4056,8 +4059,8 @@ __global__ void gemv_int8_scatter_batched_vnni_kernel_t(
                 {
                     const int2 b_pair = *reinterpret_cast<const int2*>(
                         b_row + kg * b_stride);
-                    acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
-                    acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+                    acc[0] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.x, acc[0]);
+                    acc[1] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_pair.y, acc[1]);
                 }
                 else
                 {
@@ -4065,7 +4068,7 @@ __global__ void gemv_int8_scatter_batched_vnni_kernel_t(
                     for (int c = 0; c < CPT; ++c)
                     {
                         const int32_t b_packed = *(b_row + kg * b_stride + c);
-                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                        acc[c] = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, acc[c]);
                     }
                 }
             }

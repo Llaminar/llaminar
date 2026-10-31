@@ -11,6 +11,9 @@
  * immutable: the measured native-half M512 XOR tile keeps scores in registers
  * while preserving the same canonical FP32 arithmetic and KV state bytes.
  *
+ * Cached physical CU/LDS limits bind planning and the actual launch selector
+ * before capture; neither may replace the physical limit with a chip default. The installed
+ * ordered wave64 program remains distinct from hardware native-wave preference.
  * Live K/V length is deliberately absent from every policy input. HIP graph
  * replay reads that value from device-owned attention parameters. A context
  * graph therefore remains valid as a request grows, restores a prefix, or
@@ -20,6 +23,8 @@
 #pragma once
 
 #include "../../attention/AttentionExecutionPolicy.h"
+#include "kernels/common/ROCmCompiledWaveContract.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include "../../../tensors/TensorType.h"
 
 #include <cstddef>
@@ -31,8 +36,8 @@ namespace llaminar2::rocm::fa2_policy
     /** Threads in the MI50 prefill CTA. */
     inline constexpr int kROCmFA2ThreadsPerBlock = 256;
 
-    /** Threads in one gfx906 wavefront. */
-    inline constexpr int kROCmFA2WavefrontSize = 64;
+    /** Compiled ordered-reduction program width; independent of native hardware preference. */
+    inline constexpr int kROCmFA2WavefrontSize = static_cast<int>(rocmOrderedWaveWidth);
 
     /**
      * @brief Select the physical K/V buffers for an exact compiled tile.
@@ -113,6 +118,23 @@ namespace llaminar2::rocm::fa2_policy
         int compute_unit_count = 0; ///< CUs visible on the selected HIP device.
         std::size_t lds_capacity_bytes = 0; ///< LDS bytes available per workgroup.
     };
+
+    /**
+     * @brief Bind admitted physical limits to the installed fixed-wave FA2 program.
+     * @param hardware Immutable visible-device record, independent of context generation.
+     * @return Exact CU/LDS inputs used to choose the pre-capture launch variant.
+     * @throws std::invalid_argument If this hardware cannot launch the installed CTA.
+     */
+    [[nodiscard]] inline ROCmFA2PhysicalDeviceProperties bindROCmFA2Hardware(
+        const ROCmDeviceHardware &hardware)
+    {
+        if (hardware.maximum_threads_per_block < kROCmFA2ThreadsPerBlock ||
+            hardware.compute_units <= 0 || hardware.lds_per_block == 0)
+            throw std::invalid_argument("ROCm FA2 hardware cannot launch the compiled ordered CTA");
+        return {.compute_unit_count = hardware.compute_units,
+                .lds_capacity_bytes = hardware.lds_per_block};
+    }
+
 
     /** Immutable visibility facts that select an ordinary query implementation. */
     using ROCmFA2VisibilityPolicy = attention::AttentionVisibilityPolicy;
@@ -440,6 +462,32 @@ namespace llaminar2::rocm::fa2_policy
             }
         }
         return winner;
+    }
+
+    /**
+     * @brief Select an existing compiled tile from admitted physical LDS limits.
+     * @param hardware Exact immutable participant record admitted before capture.
+     * @param head_dim Width of one attention head.
+     * @param explicit_kv_rows Exact diagnostic tile width, or zero for selection.
+     * @param schedule Physical query/context schedule, including its K/V lifetime.
+     * @param score_storage Existing compiled shared/register score layout.
+     * @return The same canonical tile selection used by planning, or an invalid tile.
+     * @throws std::invalid_argument If the admitted hardware cannot launch this CTA.
+     *
+     * This host-only launch binding owns no hardware query or resource cache.
+     * Context transactions and their guarded direct launch share the physical
+     * limit while selecting their own existing schedule-specific storage layout.
+     */
+    [[nodiscard]] inline ROCmFA2TilePlan selectROCmFA2TileForHardware(
+        const ROCmDeviceHardware &hardware,
+        int head_dim,
+        int explicit_kv_rows = 0,
+        ROCmFA2PrefillPhysicalMode schedule = ROCmFA2PrefillPhysicalMode::QuerySequence,
+        ROCmFA2ScoreStorage score_storage = ROCmFA2ScoreStorage::SharedMatrix)
+    {
+        const auto physical = bindROCmFA2Hardware(hardware);
+        return selectROCmFA2Tile(head_dim, physical.lds_capacity_bytes,
+                                explicit_kv_rows, schedule, score_storage);
     }
 
     /** Return the participant-local direct query grid cardinality. */

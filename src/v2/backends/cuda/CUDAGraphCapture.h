@@ -3,7 +3,10 @@
  * @brief CUDA ownership, composition, replay, and metadata inspection for native graphs.
  *
  * The capture owns CUDA graph and executable handles but borrows one exact,
- * non-default execution stream. It also exposes read-only recursive kernel
+ * non-default execution stream. Context-factory captures retain their exact
+ * context through graph lifetime and lease its projection streams across the
+ * complete native recording interval. Standalone captures cannot borrow that
+ * shared resource set. It also exposes read-only recursive kernel
  * inventory so orchestration diagnostics can attribute captured production work
  * without replaying a second path or involving device memory.
  */
@@ -13,6 +16,8 @@
 #ifdef HAVE_CUDA
 
 #include "../IGPUGraphCapture.h"
+#include "../IWorkerGPUContext.h"
+#include <optional>
 #include <cuda_runtime.h>
 
 #include <array>
@@ -23,6 +28,7 @@
 
 namespace llaminar2
 {
+    class NvidiaDeviceContext;
 
     /**
      * @brief Splice one mapped 64-bit wait into an active CUDA stream capture.
@@ -297,11 +303,15 @@ namespace llaminar2
     class CUDAGraphCapture : public IGPUGraphCapture
     {
     public:
+        /// @brief Standalone native capture; shared projection borrowing is rejected.
         /// @param stream The explicit CUDA stream to capture on. Must remain
         ///               valid for the lifetime of this object.
         /// @param device_ordinal CUDA device that owns @p stream and every graph
         ///                       resource composed into this capture.
         CUDAGraphCapture(cudaStream_t stream, int device_ordinal);
+        /** @brief Bind shared projection submission to this exact worker context. */
+        CUDAGraphCapture(cudaStream_t stream, int device_ordinal, NvidiaDeviceContext &owner);
+
         ~CUDAGraphCapture() override;
 
         // Move-only (graph handles are not copyable)
@@ -395,6 +405,13 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+        /** Native capture, not software stage guards, owns shared side streams. */
+        NvidiaDeviceContext *projection_owner_ = nullptr;
+        std::shared_ptr<IWorkerGPUContext> projection_context_lifetime_;
+        std::optional<GPUProjectionSubmission> projection_submission_;
+        bool native_capture_active_ = false;
+        /** @brief Prove native capture closed before releasing shared resources. */
+        void releaseNativeCaptureSubmission();
         /** @brief Shared native definition; fragments cannot outlive its storage. */
         struct OrderedTimelineRecording;
         /** @brief Distinguish executable owners from non-executable recording views. */

@@ -8,6 +8,7 @@
  * the only join; no stage, token or retained transaction synchronizes the host.
  */
 #include "ImmutableLookupExecutionBoundary.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "../local_execution/graph/GraphCaptureGuard.h"
 #include "../../loaders/ModelLoader.h"
 #include "../../backends/BackendManager.h"
@@ -30,6 +31,16 @@ ImmutableLookupDeviceState *protocolState(const std::shared_ptr<TensorBase> &own
         !owner->gpu_data_ptr() || reinterpret_cast<std::uintptr_t>(owner->gpu_data_ptr())%alignof(ImmutableLookupDeviceState))
         throw std::invalid_argument("Immutable lookup requires its exact retained INT32/64B native protocol owner");
     return static_cast<ImmutableLookupDeviceState *>(owner->gpu_data_ptr());
+}
+/** @return Original exact INT8 source-native state; a subrange is never mistaken for an allocator extent. */
+ImmutableLookupDeviceState* pooledProtocolState(const PooledImmutableSourcePreparedStorage& storage,DeviceId device){
+    const auto root=storage.roots().native;const auto& offsets=storage.geometry().parameters().offsets;
+    if(device!=storage.geometry().allocator().device || !root || root->native_type()!=TensorType::INT8 || root->is_view() ||
+       root->transferStorageOwner()!=root.get() || root->size_bytes()!=offsets.native_bytes || root->numel()!=offsets.native_bytes ||
+       root->current_device()!=device || !root->gpu_data_ptr() || offsets.protocol ||
+       reinterpret_cast<std::uintptr_t>(root->gpu_data_ptr())%alignof(ImmutableLookupDeviceState))
+        throw std::invalid_argument("Pooled source boundary lost its original exact INT8 native root");
+    return static_cast<ImmutableLookupDeviceState*>(root->gpu_data_ptr());
 }
 /**
  * @brief Complete the original setup frontier before its last physical owner is released.
@@ -66,9 +77,10 @@ class ImmutableLookupSubmissionRetirement final
                                         std::shared_ptr<ImmutableLookupService> service,
                                         std::shared_ptr<AdaptiveLookupPreparedStorage> storage,
                                         std::shared_ptr<const AdaptiveImmutableLookupRootStorage> roots,
-                                        std::shared_ptr<TensorBase> protocol)
+                                        std::shared_ptr<TensorBase> protocol,
+                                        std::shared_ptr<PooledImmutableSourcePreparedStorage> pooled = {})
         : device_(device), stream_(stream), backend_(getBackendFor(device)), service_(std::move(service)),
-          storage_(std::move(storage)), roots_(std::move(roots)), protocol_(std::move(protocol))
+          storage_(std::move(storage)), roots_(std::move(roots)), protocol_(std::move(protocol)),pooled_(std::move(pooled))
     {
         if (!backend_ || !(event_ = backend_->createEvent(device.ordinal)))
             throw std::runtime_error("Immutable lookup could not create its submission-retirement event");
@@ -132,6 +144,7 @@ class ImmutableLookupSubmissionRetirement final
     std::shared_ptr<const AdaptiveImmutableLookupRootStorage> roots_;
     std::shared_ptr<TensorBase>
         protocol_; ///< Original ordinary/adaptive protocol owner, never replacement bytes.
+    std::shared_ptr<PooledImmutableSourcePreparedStorage> pooled_; ///< Original source roots through partial setup/admission retirement.
 };
 
 std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBoundary::create(
@@ -182,7 +195,8 @@ ImmutableLookupExecutionBoundary::ImmutableLookupExecutionBoundary(
           reinterpret_cast<std::uintptr_t>(generation_), reinterpret_cast<std::uintptr_t>(backend_),
           static_cast<std::uintptr_t>(runtimeGeneration_), static_cast<std::uintptr_t>(device.type),
           static_cast<std::uintptr_t>(device.ordinal),
-          static_cast<std::uintptr_t>(sizeof(ImmutableLookupDeviceState))})
+          static_cast<std::uintptr_t>(sizeof(ImmutableLookupDeviceState)),
+          static_cast<std::uintptr_t>(kImmutableLookupAcknowledgementVersion)})
     {
         identity_ ^= word;
         identity_ *= 1099511628211ULL;
@@ -253,6 +267,53 @@ ImmutableLookupExecutionBoundary::ImmutableLookupExecutionBoundary(
     protocolSeal_ = std::make_unique<Qwen4ExpPreparedStorage>(device_, roots);
     protocolSeal_->seal();
     identity_ = adaptive_->kernels->captureIdentity(*adaptive_->storage);
+}
+
+std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBoundary::createPooled(
+    std::shared_ptr<ImmutableLookupService> service,PooledImmutableSourceGeometry geometry,
+    std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
+    std::shared_ptr<PhysicalMemoryAuthority> authority,void* stream){
+    if(isGraphCaptureActive() || !service || !authority || !stream || reinterpret_cast<std::uintptr_t>(stream)<=2)
+        throw std::invalid_argument("Pooled source boundary requires its real admitted worker and exact ordinary setup stream");
+    const auto device=geometry.allocator().device;auto source=service->bindSubordinate(device);
+    auto storage=source.preparePooled(geometry,std::move(owner),std::move(coordinator),std::move(authority),stream);
+    std::unique_ptr<IPooledImmutableSourceKernels> kernels;
+#ifdef HAVE_CUDA
+    if(device.is_cuda())kernels=createCUDAPooledImmutableSourceKernels(geometry,source);
+#endif
+#ifdef HAVE_ROCM
+    if(device.is_rocm())kernels=createROCmPooledImmutableSourceKernels(geometry,source);
+#endif
+    if(!kernels)throw std::invalid_argument("Pooled source native backend was not compiled");
+    auto protocol=storage->roots().native;
+    // Retain the actual backing and an event before the first initialization
+    // enqueue. Failed factory/constructor paths drain only their own producer.
+    auto retirement=std::make_shared<ImmutableLookupSubmissionRetirement>(device,stream,service,nullptr,nullptr,protocol,storage);
+    kernels->initialize(*storage,stream);retirement->recordCompletion();
+    Pooled pooled{std::move(storage),std::move(kernels),std::nullopt,std::move(retirement)};
+    return std::shared_ptr<ImmutableLookupExecutionBoundary>(new ImmutableLookupExecutionBoundary(std::move(service),std::move(protocol),std::move(pooled)));
+}
+ImmutableLookupExecutionBoundary::ImmutableLookupExecutionBoundary(std::shared_ptr<ImmutableLookupService> service,
+    std::shared_ptr<TensorBase> protocol,Pooled pooled)
+    :service_(std::move(service)),device_(pooled.storage->geometry().allocator().device),pooled_(std::move(pooled)),
+     protocol_(std::move(protocol)),backend_(getBackendFor(device_)),state_(pooledProtocolState(*pooled_->storage,device_)),
+     generation_(&state_->admissionGeneration){
+    runtimeGeneration_=backend_?backend_->deviceRuntimeGeneration(device_.ordinal):0;
+    if(!runtimeGeneration_)throw std::invalid_argument("Pooled source boundary requires its live original native runtime");
+    const std::array<TensorBase*,1> roots{protocol_.get()};protocolSeal_=std::make_unique<Qwen4ExpPreparedStorage>(device_,roots);protocolSeal_->seal();
+    identity_=pooled_->kernels->captureIdentity(*pooled_->storage);
+}
+const std::shared_ptr<PooledImmutableSourcePreparedStorage>& ImmutableLookupExecutionBoundary::pooledStorage()const{
+    if(!pooled_)throw std::logic_error("Storage boundary has no real pooled provider arm");requireProtocolOwner();return pooled_->storage;
+}
+const IPooledImmutableSourceKernels& ImmutableLookupExecutionBoundary::pooledKernels()const{
+    (void)pooledStorage();return *pooled_->kernels;
+}
+void ImmutableLookupExecutionBoundary::bindPooledGenerationControl(DeviceGenerationControlBinding control){
+    (void)pooledStorage();control.requireFor(device());
+    if(pooled_->control && pooled_->control->captureIdentity()!=control.captureIdentity())
+        throw std::invalid_argument("Pooled source boundary cannot replace its original canonical controller");
+    pooled_->control=control;
 }
 
 const ImmutableLookupDeviceView &ImmutableLookupExecutionBoundary::channel() const
@@ -355,7 +416,10 @@ void ImmutableLookupExecutionBoundary::requireProtocolOwner() const
             throw std::logic_error("Adaptive boundary source/plan/prepared "
                                    "identity changed after setup");
     }
-    if(protocolState(protocol_,device())!=state_ || getBackendFor(device())!=backend_ ||
+    if(pooled_ && (protocol_!=pooled_->storage->roots().native ||
+       pooled_->kernels->captureIdentity(*pooled_->storage)!=identity_))
+        throw std::logic_error("Pooled source original roots/provider/code identity changed after setup");
+    if((pooled_?pooledProtocolState(*pooled_->storage,device()):protocolState(protocol_,device()))!=state_ || getBackendFor(device())!=backend_ ||
         backend_->deviceRuntimeGeneration(device().ordinal)!=runtimeGeneration_)
         throw std::logic_error("Immutable lookup protocol owner/storage/backend generation changed after setup");
 }
@@ -374,20 +438,29 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
     const auto interval=intervalGeneration_+1;
     intervalStart_=service_->stats();terminal_.reset();
     service_->requireHealthy();
-    if (adaptive_)
+    if (adaptive_ || pooled_)
     {
         // Authenticate the original file/provider once at this ordinary request
         // boundary. Binding performs no gather, policy touch, sequence change
         // or GPU-value observation; all-hit captured transactions still do U0.
         const auto source = service_->bindSubordinate(device_);
-        if (source.captureIdentity() != adaptive_->kernels->source().captureIdentity())
+        if (source.captureIdentity() != (pooled_?pooled_->kernels->source().captureIdentity():adaptive_->kernels->source().captureIdentity()))
             throw std::logic_error("Adaptive admission replaced its original source channel");
     }
     ticket_=service_->arm(interval);
-    if (!adaptive_)
+    if (!adaptive_ && !pooled_)
         admissionRetirement_->beginSubmission(stream);
     try {
-        if (adaptive_)
+        if (pooled_) {
+            pooled_->storage->acquireSetup(stream);
+            for(const auto roots:{pooled_->storage->roots(),pooled_->storage->owner()->roots(),pooled_->storage->coordinator()->roots()})
+                for(const auto& root:{roots.cache,roots.frame,roots.native})if(root)
+                    TransferEngine::requireDeviceInput(root.get(),device(),stream);
+            pooled_->setupRetirement->beginSubmission(stream);
+            pooled_->kernels->admit(*pooled_->storage,ticket_.generation,ticket_.invocation,stream);
+            pooled_->setupRetirement->recordCompletion();
+        }
+        else if (adaptive_)
         {
             // Initialization or the prior frame is the actual producer of
             // cache/frame metadata. Join those canonical events before a new
@@ -407,7 +480,7 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
         // exact stream/event before RequireReadyBytes joins any capture frontier.
         // The adaptive component publishes this same original root itself.
         // Ordinary protocol kernels retain their existing boundary publication.
-        if (!adaptive_)
+        if (!adaptive_ && !pooled_)
         {
             TransferEngine::publishDeviceWrite(protocol_.get(), device(), stream);
             admissionRetirement_->recordCompletion();
@@ -417,7 +490,9 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
         // Retire both original initialization and this exact failed producer
         // before source/root references or the already-armed worker can unwind.
         // Successful admissions and all captured transactions never wait here.
-        if (adaptive_)
+        if (pooled_)
+            pooled_->setupRetirement->retireFailedAdmission(stream);
+        else if (adaptive_)
             adaptive_->setupRetirement->retireFailedAdmission(stream);
         else
             admissionRetirement_->retireFailedAdmission(stream);
@@ -450,7 +525,16 @@ void ImmutableLookupExecutionBoundary::requireArmedForLaunch() const
 void ImmutableLookupExecutionBoundary::recordTerminalClose(void *stream,const int *healthy,const int *complete) const
 {
     requireProtocolOwner();
-    if (adaptive_)
+    if (pooled_) {
+        if(!pooled_->control)throw std::invalid_argument("Pooled source terminal requires its original canonical controller");
+        if(!healthy && !complete)pooled_->kernels->closeForReset(*pooled_->storage,*pooled_->control,stream);
+        else {
+            if(healthy!=pooled_->control->healthy() || complete!=pooled_->control->row()+sampling_math::kDeviceGenerationControlRequestComplete)
+                throw std::invalid_argument("Pooled terminal predicates must be the original canonical controller");
+            pooled_->kernels->closeWhenTerminal(*pooled_->storage,*pooled_->control,stream);
+        }
+    }
+    else if (adaptive_)
     {
         if (!healthy && !complete)
             adaptive_->kernels->close(*adaptive_->storage, stream);
@@ -474,8 +558,8 @@ void ImmutableLookupExecutionBoundary::awaitTerminal()
     if(!armed_.load(std::memory_order_acquire))throw std::logic_error("Immutable lookup terminal has no armed storage interval");
     const bool success=service_->await(ticket_);ticket_={};
     terminal_=RetainedStorageTerminalObservation::between(intervalGeneration_,service_->mode(),intervalStart_,service_->stats());
-    if (adaptive_)
-        terminal_->transport = RetainedStorageTransport::AdaptiveSubordinate;
+    if (adaptive_ || pooled_)
+        terminal_->transport = pooled_?RetainedStorageTransport::PooledSubordinate:RetainedStorageTransport::AdaptiveSubordinate;
     armed_.store(false,std::memory_order_release);
     if(!success)throw std::runtime_error("Immutable lookup retained-generation storage failed: "+service_->lastFailure());
 }

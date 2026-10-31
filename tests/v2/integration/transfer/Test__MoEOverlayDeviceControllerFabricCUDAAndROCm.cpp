@@ -9,6 +9,9 @@
  * prove byte visibility in both directions without a device/stream synchronize.
  * Restoration regressions seed accumulated placement drift, then require every
  * captured repair wave to respect the same per-layer capacity as optimization.
+ * Paired mock ranks deliver real startup declaration/ACK packets through an
+ * explicit replay link; production file authentication and exact live extents
+ * remain authoritative before either native backend registers its mapping.
  */
 
 #include "backends/BackendManager.h"
@@ -29,6 +32,7 @@
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "mocks/MockMPIContext.h"
+#include "fixtures/mpi/OwnedSharedBackingReplay.h"
 #include "mocks/MockMPITopology.h"
 #include "utils/ScopedGPUStream.h"
 
@@ -57,10 +61,18 @@ namespace llaminar2::test
 {
     namespace
     {
-        /** @return A same-node mock context carrying the shared run namespace. */
-        std::shared_ptr<MockMPIContext> context(int rank)
+        /**
+         * @brief Bind a same-node endpoint to its pair-owned real startup packet link.
+         * @param rank Synthetic endpoint rank.
+         * @param startup_link Shared packet delivery retained by both endpoints.
+         * @return Topology-authenticated context for the real declaration/ACK protocol.
+         */
+        std::shared_ptr<MockMPIContext> context(
+            int rank,
+            const std::shared_ptr<OwnedSharedBackingReplayLink> &startup_link)
         {
-            auto result = std::make_shared<MockMPIContext>(rank, 2);
+            auto result = std::make_shared<OwnedSharedBackingReplayContext>(rank, 2);
+            result->bind(startup_link);
             result->set_topology(
                 MockMPITopology::createSimple(
                     rank, /*world_size=*/2, /*ranks_per_node=*/2));
@@ -3387,10 +3399,11 @@ namespace llaminar2::test
             ControllerFabricPair result;
             std::exception_ptr cuda_error;
             std::exception_ptr rocm_error;
+            const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
             const auto config = [&](int rank)
             {
                 return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                    .mpi_ctx = context(rank),
+                    .mpi_ctx = context(rank, startup_link),
                     .topology = resolved_topology,
                     .num_layers = policy_input.num_layers,
                     .num_experts = policy_input.num_experts,
@@ -4527,10 +4540,11 @@ namespace llaminar2::test
         std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
         std::exception_ptr cuda_error;
         std::exception_ptr rocm_error;
+        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         const auto fabric_config = [&](int rank)
         {
             return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank),
+                .mpi_ctx = context(rank, startup_link),
                 .topology = resolved_topology,
                 .num_layers = policy_input.num_layers,
                 .num_experts = policy_input.num_experts,
@@ -5343,10 +5357,11 @@ namespace llaminar2::test
         std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
         std::exception_ptr cuda_error;
         std::exception_ptr rocm_error;
+        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         const auto fabric_config = [&](int rank)
         {
             return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank),
+                .mpi_ctx = context(rank, startup_link),
                 .topology = resolved_topology,
                 .num_layers = policy_input.num_layers,
                 .num_experts = policy_input.num_experts,
@@ -5529,10 +5544,11 @@ namespace llaminar2::test
         std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
         std::exception_ptr cuda_error;
         std::exception_ptr rocm_error;
+        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         const auto fabric_config = [&](int rank)
         {
             return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank),
+                .mpi_ctx = context(rank, startup_link),
                 .topology = resolved_topology,
                 .num_layers = policy_input.num_layers,
                 .num_experts = policy_input.num_experts,
@@ -5756,10 +5772,11 @@ namespace llaminar2::test
         std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
         std::exception_ptr cuda_error;
         std::exception_ptr rocm_error;
+        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         const auto fabric_config = [&](int rank)
         {
             return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank),
+                .mpi_ctx = context(rank, startup_link),
                 .topology = resolved_topology,
                 .num_layers = policy_input.num_layers,
                 .num_experts = policy_input.num_experts,
@@ -6130,6 +6147,7 @@ namespace llaminar2::test
             GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
         }
 
+        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         const auto resolved_topology = topology();
         std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_rank;
         std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
@@ -6142,7 +6160,7 @@ namespace llaminar2::test
                                          cuda_rank = std::make_unique<
                                              MoEOverlayNodeLocalDeviceControllerFabric>(
                                              MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                                                 .mpi_ctx = context(0),
+                                                 .mpi_ctx = context(0, startup_link),
                                                  .topology = resolved_topology,
                                                  .num_layers = 2u,
                                                  .num_experts = 16u,
@@ -6162,7 +6180,7 @@ namespace llaminar2::test
                                          rocm_rank = std::make_unique<
                                              MoEOverlayNodeLocalDeviceControllerFabric>(
                                              MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                                                 .mpi_ctx = context(1),
+                                                 .mpi_ctx = context(1, startup_link),
                                                  .topology = resolved_topology,
                                                  .num_layers = 2u,
                                                  .num_experts = 16u,
@@ -6534,8 +6552,9 @@ namespace llaminar2::test
         }
 
         const auto resolved_topology = topology();
-        const auto cuda_context = context(0);
-        const auto rocm_context = context(1);
+        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
+        const auto cuda_context = context(0, startup_link);
+        const auto rocm_context = context(1, startup_link);
         std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_fabric;
         std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_fabric;
         std::exception_ptr cuda_error;
@@ -6707,10 +6726,11 @@ namespace llaminar2::test
         std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_fabric;
         std::exception_ptr cuda_error;
         std::exception_ptr rocm_error;
+        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         const auto make_config = [&](int rank)
         {
             return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank),
+                .mpi_ctx = context(rank, startup_link),
                 .topology = resolved_topology,
                 .num_layers = 2u,
                 .num_experts = 16u,

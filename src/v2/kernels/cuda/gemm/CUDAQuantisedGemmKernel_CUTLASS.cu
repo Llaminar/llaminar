@@ -6,7 +6,7 @@
  * - Blockwise activation quantization (FP32→INT8 per-block-of-32)
  * - Setup-time packed-weight upload through the canonical CUDA backend
  * - Device copy utilities
- * - Stream/event management
+ * - Checked record/wait publication on exact context-owned stream/event handles
  *
  * The CUTLASS INT8 GEMM, row-wise quantization, output scaling, and
  * blockwise dp4a GEMM kernels have been removed — NativeVNNI is now
@@ -550,38 +550,9 @@ extern "C"
 
     // ── Concurrent prefill stream/event helpers ─────────────────────────────
 
-    bool cudaQuantGemm_createStream(void **out_stream, int cuda_device_id)
-    {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-        cudaStream_t s;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-        *out_stream = static_cast<void *>(s);
-        return true;
-    }
-
-    void cudaQuantGemm_destroyStream(void *stream)
-    {
-        if (stream)
-            cudaStreamDestroy(static_cast<cudaStream_t>(stream));
-    }
-
-    bool cudaQuantGemm_createEvent(void **out_event, int cuda_device_id)
-    {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-        cudaEvent_t e;
-        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
-        *out_event = static_cast<void *>(e);
-        return true;
-    }
-
-    void cudaQuantGemm_destroyEvent(void *event)
-    {
-        if (event)
-            cudaEventDestroy(static_cast<cudaEvent_t>(event));
-    }
-
     bool cudaQuantGemm_recordEvent(void *event, void *stream)
     {
+        if (!event || !stream) return false;
         CUDA_CHECK(cudaEventRecord(
             static_cast<cudaEvent_t>(event),
             static_cast<cudaStream_t>(stream)));
@@ -590,6 +561,7 @@ extern "C"
 
     bool cudaQuantGemm_streamWaitEvent(void *stream, void *event)
     {
+        if (!event || !stream) return false;
         CUDA_CHECK(cudaStreamWaitEvent(
             static_cast<cudaStream_t>(stream),
             static_cast<cudaEvent_t>(event), 0));

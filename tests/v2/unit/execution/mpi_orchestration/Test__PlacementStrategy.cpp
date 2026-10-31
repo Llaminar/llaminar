@@ -3,8 +3,12 @@
  * @brief Unit tests for PlacementStrategy and PlacementPlan
  * @author David Sanftenberg
  * @date December 2025
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 
 #include "execution/mpi_orchestration/PlacementPlan.h"
@@ -795,6 +799,8 @@ TEST(Test__LegacyAliases, GPUFirstStrategyAlias)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

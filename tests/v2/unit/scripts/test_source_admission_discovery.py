@@ -109,7 +109,9 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                 for backend in ("CUDA", "ROCm"):
                     self.assertEqual(environment[f"LLAMINAR_SKIP_{backend.upper()}_STARTUP"],
                                      "0" if backend in backends else "1")
-                self.assertEqual("HSA_OVERRIDE_GFX_VERSION" in environment, "ROCm" in backends)
+                self.assertNotIn("HSA_OVERRIDE_GFX_VERSION", environment)
+                if "ROCm" in backends:
+                    self.assertIn("HSA_OVERRIDE_GFX_VERSION=unset:", props["ENVIRONMENT_MODIFICATION"])
                 self.assertNotIn("LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN", environment)
                 self.assertEqual(test["command"][test["command"].index("-np") + 1], str(world))
                 self.assertEqual(test["command"][-1],

@@ -31,6 +31,8 @@
  * Projection work admission is copied independently of arithmetic dispatch.
  * Borrowed original request intervals guard native operand/partial/output
  * accesses; physical matrix strides and each row's reduction order stay fixed.
+ * Context-owned projection resources are borrowed for a complete eager fork/join
+ * or the enclosing whole HIP capture; no global ordinal resource pool survives.
  */
 
 #include "kernels/common/ProjectionWorkLaunch.h"
@@ -40,6 +42,8 @@
 #include "ROCmQuantisedGemmKernel.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "backends/rocm/AMDDeviceContext.h"
 #include "ROCmDenseProductionPrefillOverlay.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "ROCmQuantisedGemmWorkspaceContract.h"
@@ -80,7 +84,6 @@
 #include <array>
 #include <mutex>
 #include <set>
-#include <unordered_map>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -1035,127 +1038,47 @@ namespace llaminar2
         // (packNativeVNNI, packWeightsToROCm_Q8_0_fast, packWeightsToROCm)
         // =====================================================================
 
-        // =================================================================
-        // ConcurrentPrefillPool: lightweight stream/event pool for
-        // overlapping fused GEMM projections during prefill (M>1).
-        //
-        // Device scratch is never owned by this pool. Native-VNNI prefill does
-        // not need accumulator scratch, and concurrent decode takes disjoint
-        // slices from the graph-planned batched scatter workspace.
-        // =================================================================
-        struct ConcurrentPrefillPool
+        /** @brief Borrow typed HIP handles without adding another native resource owner. */
+        struct HIPProjectionResourceView
         {
-            static constexpr int MAX_STREAMS =
-                ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS;
-
-            hipStream_t streams[MAX_STREAMS] = {};
-            hipEvent_t completion[MAX_STREAMS] = {};
+            static_assert(static_cast<int>(GPUProjectionStreamCount::Four) == ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS);
+            std::array<hipStream_t, ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS> streams{};
+            std::array<hipEvent_t, ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS> completion{};
             hipEvent_t quant_ready = nullptr;
-            int count = 0;
-            int device_id = -1;
-            bool initialized = false;
-
-            void init(int dev_id, int num_streams)
-            {
-                if (initialized)
-                    return;
-                device_id = dev_id;
-                count = std::min(num_streams, MAX_STREAMS);
-                (void)hipSetDevice(dev_id);
-                for (int i = 0; i < count; ++i)
-                {
-                    (void)hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking);
-                    (void)hipEventCreateWithFlags(&completion[i], hipEventDisableTiming);
-                }
-                (void)hipEventCreateWithFlags(&quant_ready, hipEventDisableTiming);
-                initialized = true;
-                LOG_DEBUG("[ConcurrentPrefillPool] Initialized " << count
-                                                                 << " streams on device " << dev_id);
-            }
-
-            void destroy()
-            {
-                if (!initialized)
-                    return;
-                (void)hipSetDevice(device_id);
-                for (int i = 0; i < count; ++i)
-                {
-                    if (streams[i])
-                    {
-                        (void)hipStreamDestroy(streams[i]);
-                        streams[i] = nullptr;
-                    }
-                    if (completion[i])
-                    {
-                        (void)hipEventDestroy(completion[i]);
-                        completion[i] = nullptr;
-                    }
-                }
-                if (quant_ready)
-                {
-                    (void)hipEventDestroy(quant_ready);
-                    quant_ready = nullptr;
-                }
-                initialized = false;
-                count = 0;
-            }
-
-            ~ConcurrentPrefillPool() { destroy(); }
+            const int count = ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS;
         };
-
-        // =====================================================================
-        // Per-device shared ConcurrentPrefillPool singleton.
-        //
-        // Previously each ROCmQuantisedGemmKernel instance owned its own pool,
-        // which for a 64-layer model meant ~80 separate pools each with its own
-        // stream/event resources. The pool is purely ordering infrastructure,
-        // so a single shared per-device instance is sufficient.
-        // =====================================================================
-        static std::mutex &sharedPrefillPoolMutex()
+        /**
+         * @brief Project only a live shared lease's exact handles into HIP native types.
+         * @param resources Complete resource view borrowed from a live submission.
+         * @return Non-owning typed handles with the unchanged fixed stream population.
+         */
+        static HIPProjectionResourceView hipProjectionView(const GPUProjectionResourceView &resources)
         {
-            static std::mutex m;
-            return m;
-        }
-
-        static std::unordered_map<int, std::unique_ptr<ConcurrentPrefillPool>> &sharedPrefillPools()
-        {
-            static std::unordered_map<int, std::unique_ptr<ConcurrentPrefillPool>> pools;
-            return pools;
-        }
-
-        static ConcurrentPrefillPool &getSharedPrefillPool(int device_id, int requested_streams)
-        {
-            std::lock_guard<std::mutex> lock(sharedPrefillPoolMutex());
-            auto &pools = sharedPrefillPools();
-            auto it = pools.find(device_id);
-            if (it == pools.end())
+            if (resources.count != ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS)
+                throw std::logic_error("HIP projection resource population disagrees with the admitted workspace contract");
+            HIPProjectionResourceView native;
+            for (int index = 0; index < resources.count; ++index)
             {
-                if (isGraphCaptureActive())
-                {
-                    throw std::runtime_error(
-                        "[ConcurrentGemm] Capture began before the ROCm projection "
-                        "stream/event pool was initialized");
-                }
-                auto pool = std::make_unique<ConcurrentPrefillPool>();
-                // Initialize with MAX_STREAMS so the pool can serve any
-                // caller's concurrency request without re-initialization.
-                pool->init(device_id, ConcurrentPrefillPool::MAX_STREAMS);
-                it = pools.emplace(device_id, std::move(pool)).first;
+                native.streams[index] = static_cast<hipStream_t>(resources.streams[index]);
+                native.completion[index] = static_cast<hipEvent_t>(resources.completion[index]);
             }
-            (void)requested_streams; // preserved for API compat
-            return *it->second;
+            native.quant_ready = static_cast<hipEvent_t>(resources.quant_ready);
+            return native;
         }
-
-        // =====================================================================
-        // Constructor / Destructor
-        // =====================================================================
-
-        void ROCmQuantisedGemmKernel::clearSharedPrefillPools()
+        /**
+         * @brief Own the complete eager fork/join or borrow its enclosing exact native capture.
+         * @param ordinal Exact worker-context device. @param root Non-null parent stream.
+         * @return Move-only interval lease retaining exclusion for the complete caller scope.
+         * @throws For failed stream observation, missing preparation or incompatible capture ownership.
+         */
+        static GPUProjectionSubmission acquireHIPProjectionSubmission(int ordinal, void *root)
         {
-            std::lock_guard<std::mutex> lock(sharedPrefillPoolMutex());
-            auto &pools = sharedPrefillPools();
-            // Pool destructor releases only stream/event infrastructure.
-            pools.clear();
+            hipStreamCaptureStatus status{};
+            if (!root || hipStreamIsCapturing(static_cast<hipStream_t>(root), &status) != hipSuccess)
+                throw std::runtime_error("HIP projection submission requires an authenticated exact stream");
+            auto context = GPUDeviceContextPool::instance().retainAMDContext(ordinal);
+            return context->acquireProjectionSubmission(
+                root, GPUProjectionSubmissionKind::Eager, status != hipStreamCaptureStatusNone);
         }
 
         bool ROCmQuantisedGemmKernel::prepareFusedProjectionGraphCapture(
@@ -1174,10 +1097,8 @@ namespace llaminar2
                 return false;
             }
 
-            auto &pool = getSharedPrefillPool(
-                rocm_device_id_,
-                static_cast<int>(projection_count));
-            return pool.initialized && pool.count > 0;
+            GPUDeviceContextPool::instance().retainAMDContext(rocm_device_id_)->prepareProjectionResources();
+            return true;
         }
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id)
@@ -4051,7 +3972,8 @@ namespace llaminar2
                 if (concurrent_eligible)
                 {
                     const int num_proj = static_cast<int>(projections.size());
-                    auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
+                    auto submission = acquireHIPProjectionSubmission(rocm_device_id_, gpu_stream_);
+                    const auto pool = hipProjectionView(submission.resources());
 
                     join_projection_biases_to_root("ConcurrentPrefill");
 
@@ -4281,7 +4203,8 @@ namespace llaminar2
                 if (decode_concurrent_eligible)
                 {
                     const int num_proj = static_cast<int>(projections.size());
-                    auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
+                    auto submission = acquireHIPProjectionSubmission(rocm_device_id_, gpu_stream_);
+                    const auto pool = hipProjectionView(submission.resources());
                     join_projection_biases_to_root("ConcurrentDecode");
                     const std::string batched_partial_name =
                         scatterPartialBatchedBufferName();

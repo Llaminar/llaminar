@@ -9,7 +9,12 @@
  * real PMA/sample catalog. The real RuntimeInitPhase, compiler, admission, MPI
  * split and runner dry-run execute. Synthetic decision costs do not claim model
  * performance. No accelerator/model is loaded, and MPI belongs to the frontend.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "app/RuntimeInitPhase.h"
 #include "planning/PlanningKernelServiceCatalog.h"
 #include "utils/MPIBootstrap.h"
@@ -41,6 +46,10 @@ namespace
 /** @brief Exercise automatic subset selection through the actual command initialization. */
 int main(int argc, char **argv)
 {
+    // Ownership starts before this frontend creates MPI or runtime state.
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try
     {
         Scenario scenario = Scenario::DefaultSelection;

@@ -269,6 +269,24 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
                 with temporary:
                     self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
 
+    def test_pooled_setup_wait_cannot_escape_into_native_phase_or_capture(self) -> None:
+        """Only final/failed setup retirement can wait once on its original event."""
+        allowance, = (entry for entry in ALLOWANCES if entry.caller == "retirePooledNativeSetupOwner")
+        self.assertEqual((allowance.category, allowance.kind, allowance.count), ("lifecycle", "backend_event", 1))
+        fixture_allowance = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (
+            ("retirePooledNativeSetupOwner", 1, True),
+            ("retirePooledNativeSetupOwner", 2, False),
+            ("initialize", 1, False),
+            ("enqueue", 1, False),
+            ("prepareGraphLaunch", 1, False),
+            ("acquireSetup", 1, False),
+        ):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(f"void {caller}() {{" + "backend.waitForEvent(event, ordinal);" * count + "}")
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
+
     def test_immutable_submission_owner_wait_cannot_escape_into_serving(self) -> None:
         """One failed-submission/last-owner event never permits normal serving waits."""
         allowance, = (

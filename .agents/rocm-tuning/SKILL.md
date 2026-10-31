@@ -1,15 +1,17 @@
 ---
 name: rocm-tuning
-description: Profile and tune Llaminar V2 ROCm/HIP kernels on AMD Instinct GPUs (gfx906 MI50/MI60), including INT8 VNNI GEMM/GEMV, sampling, grouped verification, and graph-captured inference. Use rocprof per-dispatch timing/counters plus LLVM ISA analysis to diagnose occupancy, vectorization, VGPR pressure, spills, divergence, LDS conflicts, and throughput while retaining byte-exact production behavior.
+description: Profile and tune Llaminar V2 ROCm/HIP kernels across native AMD GPU targets, including INT8 VNNI GEMM/GEMV, sampling, grouped verification, and graph-captured inference. Use rocprof per-dispatch timing/counters plus LLVM ISA analysis to diagnose occupancy, vectorization, VGPR pressure, spills, divergence, LDS conflicts, and throughput while retaining byte-exact production behavior.
 ---
 
-# ROCm / HIP Kernel Profiling & Tuning (Llaminar V2, gfx906)
+# ROCm / HIP Kernel Profiling & Tuning (Llaminar V2)
 
 ## Purpose
 
-A repeatable, evidence-driven workflow for tuning Llaminar V2 HIP INT8 GEMM/GEMV kernels
-on AMD Instinct MI50/MI60 (gfx906), distilled from the multi-session effort that produced
-the V7 native kernel matching/beating AMD's Composable Kernel (CK) on N-heavy LLM shapes.
+A repeatable workflow for tuning Llaminar V2 HIP kernels across native AMD GPU
+targets. The labeled gfx906 sections retain measured MI50/MI60 NativeVNNI/CK
+reference evidence; their occupancy limits and winning launch geometry do not
+qualify another architecture. Use the actual device and loaded code object for
+each candidate.
 
 It combines four evidence sources:
 
@@ -31,6 +33,35 @@ For isolated kernel work, follow the shared
 It is the canonical correctness/timing method: retain the production graph and
 inputs, prove dirty reuse, then collect events and separate profiler evidence.
 Use the ROCm procedures below for exact-dispatch counters and ISA inspection.
+
+## Native target and program admission
+
+Use the SDK selected by `ROCM_PATH` and the complete architecture set owned by
+`cmake/ROCmArchitectures.cmake` and `scripts/docker/rocm-release.env`. Do not
+infer shipping targets from the locally visible card. Remove
+`HSA_OVERRIDE_GFX_VERSION` from the environment before discovery, profiling or
+qualification; ISA spoofing cannot qualify another card's implementation.
+Authenticate device UUID/PCI, exact native ISA, selected SDK and loaded code
+object with each record. Select profiler tools and metrics for that actual
+architecture instead of applying gfx906 counter groups or occupancy formulas.
+
+`ROCmHardwareMetadata` owns immutable visible-device facts admitted once at
+explicit ROCm startup. Physical native-wave preference is distinct from the
+compiled kernel wave contract. Existing ordered kernels require actual wave64
+compilation; compiler feature predicates choose exact native instructions.
+Bind launch variants from cached CU/LDS/thread limits during preparation, with
+no property queries or host variant decisions during captured replay. Keep
+loaded function resources keyed by program/runtime generation rather than
+refreshing physical metadata on reset. Legacy precision booleans do not qualify
+an MMA implementation. See
+[targets and dispatch](../../docs/v2/projects/2026-10/ROCM_KERNEL_TARGETS_AND_DISPATCH.md)
+for the installed ownership and future prefill variant contracts.
+
+Compile the full declared target set with the mandatory spill guard, then run
+native retained replay and the applicable all-format/parity gates on each
+available architecture. Hardware that is absent stays explicitly unqualified.
+New wave policies or MMA prefill require their own implemented precision,
+layout, shape, resource, capture and numerical contracts before installation.
 
 ## Production hot-path invariants
 
@@ -176,7 +207,11 @@ comparisons.
 
 ---
 
-## Step 0: Architecture facts you must keep in mind (gfx906)
+## Step 0: Measured gfx906 MI50 reference
+
+This reference describes the measured MI50 configuration. Read actual CU/LDS
+limits from the immutable hardware inventory and compiler resource metadata;
+do not transplant these counts or occupancy thresholds to RDNA or other cards.
 
 | Parameter | Value | Why it matters |
 |-----------|-------|----------------|
@@ -189,7 +224,7 @@ comparisons.
 | Wavefront | 64 threads | One instruction = 64 lanes |
 | `v_dot4_i32_i8` | 1/cycle/lane | gfx906's VNNI (`vpdpbusd` equivalent) |
 
-**Occupancy ladder:** 1-64 VGPRs → 4 waves; 65-84 → 3; 85-128 → **2 (the sweet spot for
+**Measured gfx906 occupancy ladder:** 1-64 VGPRs → 4 waves; 65-84 → 3; 85-128 → **2 (the sweet spot for
 M128×N128 INT8 GEMM, matches CK)**; 129-256 → 1 (catastrophic — no latency hiding).
 Below 2 waves nothing else matters; going from 2 waves to "perfect scheduling" gave
 **zero** measurable gain on this workload.
@@ -199,11 +234,15 @@ Below 2 waves nothing else matters; going from 2 waves to "perfect scheduling" g
 ## Step 1: Build the dispatch-comparison benchmark
 
 ```bash
-cmake -B build_v2_release -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_ROCM=ON
+unset HSA_OVERRIDE_GFX_VERSION
+cmake -B build_v2_release -S src/v2 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DHAVE_ROCM=ON -DROCM_PATH=/opt/rocm-sdk \
+  -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
 cmake --build build_v2_release --target v2_perf_rocm_prefill_dispatch_comparison --parallel
 ```
 
-This binary instantiates **all native variants (V1-V7) and CK in one executable**, which
+The gfx906 reference benchmark instantiates **native variants (V1-V7) and CK in one executable**, which
 is exactly what makes comparative disassembly and A/B benchmarking fast.
 
 ---
@@ -221,7 +260,7 @@ cat results.stats.csv | column -t -s,
 ```
 
 `results.stats.csv` gives the real GPU kernel time, excluding host overhead and PCIe.
-This is the metric that exposed the "19% wallclock gap" as a mere **6.6% real kernel gap**
+In the gfx906 reference, this exposed the "19% wallclock gap" as a **6.6% real kernel gap**
 vs CK. Rank kernels by per-dispatch GPU time; that is your optimization target list.
 
 > ⚠️ If two variants have nearly identical wallclock but you suspect a kernel difference,
@@ -283,7 +322,9 @@ candidate. Leave them unset to profile the installed capture-time policy.
 ## Step 3: ISA deep-dive (occupancy + scheduling)
 
 `rocprof` tells you *which* kernel is slow; the LLVM toolchain tells you *why*. HIP
-executables embed gfx906 code objects as ELF bundle sections.
+executables can contain several target code objects. Extract the actual native
+agent's loaded object and verify its target, wave width and resource metadata.
+The following extraction and resource examples are specifically gfx906.
 
 ```bash
 BINARY=build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison
@@ -312,7 +353,9 @@ and static ISA must always describe the same compiled candidate.
 
 ### Read the metadata FIRST
 
-The VGPR/SGPR/LDS line decides occupancy before you read a single instruction:
+For the gfx906 reference, inspect VGPR/SGPR/LDS before reading instructions.
+These thresholds are target-specific; use the other target's actual allocation
+and occupancy evidence rather than this table:
 
 | Symptom in metadata | Diagnosis | Fix |
 |---------------------|-----------|-----|
@@ -352,13 +395,15 @@ What to read for:
 
 ---
 
-## Step 4: The seven latency-hiding levers (in priority order)
+## Step 4: gfx906 reference tuning sequence
 
-Apply these to the targeted kernel; the first two are mandatory, the rest are refinements.
+Use these measured gfx906 techniques as candidate hypotheses. Qualify launch
+bounds, buffering and occupancy independently on each new target.
 
-1. **`__launch_bounds__(threads, min_waves)` — non-negotiable.** The 2nd arg caps VGPRs
-   (256/min_waves). Omitting it let V4 use 256 VGPRs + spills → 1 wave → slower than V1.
-   1→2 waves is often a 3-5× swing, not 2×.
+1. **Target-appropriate launch bounds.** Inspect the selected compiler's final
+   allocation and actual occupancy. In the gfx906 reference, unbounded V4 used
+   256 VGPRs plus spills, leaving one wave and losing to V1. Do not assume that
+   the same bound or register threshold is economical on another architecture.
 2. **LDS double-buffering.** Ping-pong even/odd buffers: compute buf[cur] while loading
    buf[nxt], one `__syncthreads()` between. Kills the serial load→barrier→compute cycle.
 3. **Inner-loop unroll control.** `#pragma unroll` → VGPR explosion (V4). Prefer
@@ -526,7 +571,6 @@ LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 \
 LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q4_K \
 LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=Qwen36_GDN_TimeProjection \
 LLAMINAR_ROCM_NVNNI_DECODE_CSV=/tmp/decode.csv \
-HSA_OVERRIDE_GFX_VERSION=9.0.6 \
 ./build_v2_release/tests/v2/v2_perf_native_vnni_throughput \
   --gtest_filter='NativeVNNIPerfTest.TrainerCsv_CodebookTagged'
 
@@ -535,7 +579,6 @@ LLAMINAR_ROCM_NVNNI_SWEEP_FORMATS=Q4_K \
 LLAMINAR_ROCM_NVNNI_SWEEP_SHAPES=Qwen36_GDN_TimeProjection \
 LLAMINAR_ROCM_NVNNI_SWEEP_M=600 \
 LLAMINAR_ROCM_NVNNI_SWEEP_CSV=/tmp/prefill.csv \
-HSA_OVERRIDE_GFX_VERSION=9.0.6 \
 ./build_v2_release/tests/v2/v2_perf_native_vnni_sweep \
   --gtest_filter='NativeVNNISweepTest.TrainerCsv_CodebookTagged'
 
@@ -555,7 +598,7 @@ After updating checked-in tables, rerun focused ROCm coverage:
 
 ---
 
-## Key lessons (hard-won)
+## gfx906 reference findings
 
 1. **Profile before optimizing.** `rocprof` revealed the real 6.6% gap hidden under a
    misleading 19% wallclock gap — without it you optimize the wrong thing for days.
@@ -581,7 +624,7 @@ rocprof --stats --timestamp on \
   ./build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison \
   --gtest_filter="*WideTileVariantComparison*" && cat results.stats.csv | column -t -s,
 
-# ISA: extract → metadata (occupancy) → disassemble → find kernels
+# gfx906-only ISA example; extract the actual loaded target for other cards
 BINARY=build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison
 llvm-objcopy --dump-section='__CLANG_OFFLOAD_BUNDLE__hipv4-amdgcn-amd-amdhsa--gfx906=/tmp/co.elf' "$BINARY" /dev/null
 llvm-readelf --notes /tmp/co.elf 2>/dev/null | awk '/\.name:/{n=$2}/\.vgpr_count:/{v=$2}/\.sgpr_count:/{s=$2}/\.group_segment_fixed_size:/{l=$2}/\.wavefront_size:/{printf "%-60s VGPR=%-4s SGPR=%-4s LDS=%s\n",substr(n,1,60),v,s,l}'

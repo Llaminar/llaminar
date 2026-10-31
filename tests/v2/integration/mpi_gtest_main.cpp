@@ -10,6 +10,8 @@
  * destruction.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
 
@@ -18,6 +20,10 @@
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided = MPI_THREAD_SINGLE;
     const int init_result = MPI_Init_thread(
         &argc,
@@ -36,7 +42,7 @@ int main(int argc, char **argv)
     /* Match production parity teardown: context workers and any collective
      * communicator owners must be joined while MPI and GPU runtimes are live. */
     llaminar2::GlobalBackendRouter::shutdown();
-    llaminar2::GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
 
     // Finalize MPI
     if (MPI_Finalize() != MPI_SUCCESS)

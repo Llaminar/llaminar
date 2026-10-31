@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 #include "GpuPreparedGemmHarness.h"
+#include "InactiveOutputPoison.h"
 #include "loaders/PreparedHalfWeights.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "QuantizedVerifierFormats.h"
@@ -306,9 +307,11 @@ namespace llaminar2::test
                     const auto live = expected[index][i].size();
                     ASSERT_EQ(std::memcmp(actual[i].data(), expected[index][i].data(),
                         live * sizeof(float)), 0) << names[i];
-                    for (size_t row = live; row < actual[i].size(); ++row)
-                        ASSERT_EQ(std::bit_cast<uint32_t>(actual[i][row]), 0xffffffffu)
-                            << names[i] << " wrote inactive output element " << row;
+                    const auto mismatch = findInactiveOutputPoisonMismatch(actual[i], live);
+                    ASSERT_FALSE(mismatch.has_value())
+                        << names[i] << " wrote inactive output element " << mismatch->element_index
+                        << " byte " << mismatch->byte_in_element
+                        << " actual bits " << mismatch->actual_bits;
                 }
             }
         }

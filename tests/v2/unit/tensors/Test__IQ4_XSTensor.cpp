@@ -16,8 +16,12 @@
  * - scales_h: Upper 2 bits of all 8 scales (16 bits total, 2 bits each)
  * - qs[128]: Quantized values (16 bytes per sub-block × 8 sub-blocks)
  * Total: 2 + 4 + 2 + 128 = 136 bytes per block
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
@@ -628,6 +632,8 @@ TEST_F(IQ4_XSSIMDTest, IINT8Unpackable_Interface)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

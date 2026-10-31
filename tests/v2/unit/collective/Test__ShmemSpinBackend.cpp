@@ -21,8 +21,13 @@
  * The separately selected ShmemSpinEconomyMPITest suite measures the latency
  * distribution against MPI. CTest registers it as Perf, never as Unit or
  * production preflight: competing compilation or tests invalidate its timing.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <algorithm>
@@ -32,6 +37,7 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <immintrin.h>
 #include <numeric>
 #include <sys/mman.h>
@@ -888,13 +894,13 @@ TEST_F(ShmemSpinMPITest, BasicAllreduce2048)
 
 TEST_F(ShmemSpinMPITest, SharedMemoryNameUnlinkedAfterInitialize)
 {
-    const std::string name = backend_->shmName();
+    const std::string name = backend_->backingPath();
     ASSERT_FALSE(name.empty());
 
     errno = 0;
-    int fd = shm_open(name.c_str(), O_RDWR, 0);
-    EXPECT_EQ(fd, -1) << "ShmemSpinBackend should unlink its POSIX shm name after all ranks map it";
-    EXPECT_EQ(errno, ENOENT) << "Unexpected shm_open errno for unlinked name " << name;
+    int fd = ::open(name.c_str(), O_RDWR | O_NOFOLLOW);
+    EXPECT_EQ(fd, -1) << "ShmemSpinBackend should unlink its exact owned backing name after all ranks map it";
+    EXPECT_EQ(errno, ENOENT) << "Unexpected open errno for unlinked backing " << name;
     if (fd >= 0)
         close(fd);
 }
@@ -918,14 +924,14 @@ TEST(Test__ShmemSpinBackend, ReinitializeUsesFreshSharedMemoryName)
 
     auto first = create_backend();
     ASSERT_TRUE(first->initialize(group)) << first->lastError();
-    const std::string first_name = first->shmName();
+    const std::string first_name = first->backingPath();
     ASSERT_FALSE(first_name.empty());
     first->shutdown();
     MPI_Barrier(MPI_COMM_WORLD);
 
     auto second = create_backend();
     ASSERT_TRUE(second->initialize(group)) << second->lastError();
-    const std::string second_name = second->shmName();
+    const std::string second_name = second->backingPath();
     ASSERT_FALSE(second_name.empty());
     EXPECT_NE(second_name, first_name)
         << "Reinitializing the same domain must not reuse a deterministic shm name";
@@ -933,48 +939,30 @@ TEST(Test__ShmemSpinBackend, ReinitializeUsesFreshSharedMemoryName)
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
-TEST(Test__ShmemSpinBackend, LegacyDeterministicNameDoesNotBlockInitialization)
+TEST(Test__ShmemSpinBackend, RootContainedArenaPreservesLiveNeighbor)
 {
-    const int rank = mpiRank();
-    const int size = mpiSize();
-    if (size < 2)
-    {
-        GTEST_SKIP() << "Requires MPI_PROCS >= 2";
-    }
-
-    const int domain_id = 424201;
-    const std::string legacy_name = "/llaminar_shmem_ar_" + std::to_string(domain_id);
-
-    if (rank == 0)
-    {
-        shm_unlink(legacy_name.c_str());
-        int fd = shm_open(legacy_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
-        ASSERT_GE(fd, 0) << "Failed to create stale legacy shm object: " << strerror(errno);
-        ASSERT_EQ(ftruncate(fd, 4096), 0) << "Failed to size stale legacy shm object: " << strerror(errno);
-        close(fd);
+    const int rank=mpiRank(),size=mpiSize();
+    if(size<2)GTEST_SKIP()<<"Requires MPI_PROCS >= 2";
+    auto directory=MPISessionOwner::sharedDirectory();
+    ASSERT_TRUE(directory)<<"Actual owner required for shared backing";
+    MPISessionOwner::SharedFile neighbor;
+    if(rank==0) {
+        neighbor=directory->createExclusive("shmem-live-neighbor");
+        ASSERT_EQ(::ftruncate(neighbor.descriptor(),4096),0);
     }
     MPI_Barrier(MPI_COMM_WORLD);
-
-    auto upi = std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD, nullptr);
-    ShmemSpinBackend backend(domain_id, rank, std::move(upi));
-    DeviceGroup group = makeCpuDeviceGroup(size);
-    ASSERT_TRUE(backend.initialize(group)) << backend.lastError();
-    EXPECT_NE(backend.shmName(), legacy_name)
-        << "Backend should use a fresh per-run name instead of the legacy deterministic name";
-
-    float value = static_cast<float>(rank + 1);
-    ASSERT_TRUE(backend.allreduce(&value, 1, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_FLOAT_EQ(value, static_cast<float>(size * (size + 1)) / 2.0f);
-
+    auto upi=std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD,nullptr);
+    ShmemSpinBackend backend(424201,rank,std::move(upi));
+    ASSERT_TRUE(backend.initialize(makeCpuDeviceGroup(size)))<<backend.lastError();
+    EXPECT_NE(backend.backingPath(),directory->path()+"/shmem-live-neighbor");
+    float value=static_cast<float>(rank+1);
+    ASSERT_TRUE(backend.allreduce(&value,1,CollectiveDataType::FLOAT32,CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_FLOAT_EQ(value,static_cast<float>(size*(size+1))/2.0f);
     backend.shutdown();
     MPI_Barrier(MPI_COMM_WORLD);
-
-    if (rank == 0)
-    {
-        errno = 0;
-        int unlink_result = shm_unlink(legacy_name.c_str());
-        EXPECT_TRUE(unlink_result == 0 || errno == ENOENT)
-            << "Failed to cleanup stale legacy shm object: " << strerror(errno);
+    if(rank==0) {
+        EXPECT_NO_THROW(neighbor.requireExtent(4096));
+        EXPECT_TRUE(std::filesystem::exists(neighbor.path()));
     }
     MPI_Barrier(MPI_COMM_WORLD);
 }
@@ -1943,9 +1931,14 @@ TEST_F(ShmemSpinMPITest, SynchronizeWorks)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     MPI_Init(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }

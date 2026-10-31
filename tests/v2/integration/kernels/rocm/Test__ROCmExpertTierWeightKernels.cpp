@@ -883,7 +883,8 @@ namespace llaminar2
                     projections.emplace_back(prepared.kernel,mapped?mapped_outputs[i].get():outputs[i].get(),N,i%2?&bias_slice:nullptr,"slot_wave");
                 const auto observe=[&](bool grouped)
                 {
-                    HIPGraphCapture graph(stream.native(),0);
+                    auto graph_owner = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream.opaque());
+                    auto &graph = *graph_owner;
                     struct Join
                     {
                         TestHIPStream &stream;

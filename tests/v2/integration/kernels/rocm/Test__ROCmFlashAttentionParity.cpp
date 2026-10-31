@@ -24,13 +24,23 @@
  *   M=1 decode route. Cosine, relative-L2, and max-absolute error are printed
  *   only to make the first drift easy to diagnose.
  *
- * Target Hardware: AMD MI50 (gfx906 / Vega 20)
+ * Real source graphs install one production rank-plan memory authority before
+ * materialization. Native economy uses actual occupancy and zero scratch,
+ * independent of architecture-specific register allocation.
+ *
+ * Target Hardware: native ROCm targets with their compiled wave64 programs
  *
  * @author Llaminar Team
  * @date January 2026
  */
 
 #include "../ReplicatedGQADirectGuardProof.h"
+#include "ROCmFlashAttentionFixtureAdmission.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "planning/ClusterInventoryGatherer.h"
+#include "planning/PlanningModelMetadata.h"
+#include "loaders/WeightManager.h"
+#include "backends/BackendManager.h"
 #include <gtest/gtest.h>
 
 #include "tensors/Tensors.h"
@@ -603,9 +613,11 @@ protected:
     hipStream_t test_stream_ = nullptr;
 #endif
 
+    /** @brief Admit immutable launch facts before direct HIP setup or capture. */
     void SetUp() override
     {
 #ifdef HAVE_ROCM
+        llaminar2::initializeROCmHardwareMetadata();
         ASSERT_EQ(hipSetDevice(0), hipSuccess) << "Failed to set active ROCm device to 0";
         ASSERT_EQ(
             hipStreamCreateWithFlags(&test_stream_, hipStreamNonBlocking),
@@ -5698,6 +5710,77 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeQ81KV_Qwen2ScaleStress)
     EXPECT_LE(l2_error, 0.05);
 }
 
+namespace
+{
+    /**
+     * @brief Create the fixture source only after ordinary physical admission.
+     * @param context Real source context whose WeightManager retains the sole authority.
+     * @param device Exact CPU/GPU source participant.
+     * @param stage Actual half-open interval and terminal role consumed by the factory.
+     * @return Source runner with only the three inspected layer-three snapshots selected.
+     */
+    std::unique_ptr<IInferenceRunner> createAdmittedAttentionSource(
+        const std::shared_ptr<ModelContext> &context, DeviceId device,
+        const FactoryPPStageConfig &stage)
+    {
+        const auto profile = ModelMemoryProfile::fromLoader(context->concreteLoader());
+        const auto observed = gatherClusterInventory(nullptr);
+        if (!observed || observed->ranks.empty())
+            throw std::runtime_error("Attention fixture has no production rank hardware observation");
+        // This direct factory fixture does not enter public MPI startup. Admit
+        // the observed CPU NUMA domain explicitly before any source workspace
+        // binds; GPU sources retain the same host-side startup authority.
+        initCPUBackend(observed->ranks.front().cpu.numa_node);
+        RankExecutionPlan plan;
+        plan.rank = observed->ranks.front().rank;
+        plan.first_layer = stage.first_layer;
+        plan.last_layer = stage.last_layer - 1;
+        plan.has_embedding = stage.has_embedding;
+        plan.has_lm_head = stage.has_lm_head;
+        plan.primary_device = GlobalDeviceAddress::fromLocalDeviceId(device);
+        auto runtime = InferenceRunnerConfig::fromRuntime(plan.runtime);
+        // Keep the factory's original default request/context configuration;
+        // planning and materialization consume this same runtime projection.
+        std::optional<GPUWeightLoadMemoryGeometry> upload;
+        std::optional<std::vector<int>> buckets;
+        if (device.is_gpu())
+        {
+            if (!debugEnv().execution.gpu_graphs)
+                throw std::runtime_error("Attention source requires the production captured GPU program");
+            upload = resolveGPUWeightLoadMemoryGeometry(maximumGGUFTensorPayloadBytes(context->model()),
+                configuredGPUWeightLoadMemoryPolicy());
+            if (debugEnv().execution.prefill_graph_buckets)
+                buckets = debugEnv().execution.prefill_graph_bucket_sizes;
+        }
+        auto authority = llaminar2::test::rocm_attention_fixture::admit(
+            profile, plan, observed->ranks.front(), upload, buckets);
+        context->concreteWeightManager()->installPhysicalMemoryAuthority(authority);
+        auto runner = createPPStageRunner(context, device, stage, runtime);
+        if (!runner)
+            throw std::runtime_error("Admitted attention source factory returned no runner");
+        runner->setSnapshotCaptureFilter(llaminar2::test::rocm_attention_fixture::snapshotFilter());
+        if (device.is_gpu())
+        {
+            // Snapshot topology must exist before the canonical serving-family
+            // setup collects descriptors and binds each captured manifest. A
+            // first forward is request replay, not a substitute for that setup.
+            runner->enableSnapshotCapture();
+            const auto &execution = debugEnv().execution;
+            const int admitted_rows = runtime.activation_seq_len > 0
+                ? runtime.activation_seq_len
+                : resolveActivationBufferSeqLen(runtime.max_seq_len, device);
+            const ServingGraphFamilyMaterializationPlan family{
+                .prefill_bucket_rows = rawPrefillGraphBucketsForResidentCapacity(
+                    execution.prefill_graph_bucket_sizes, admitted_rows, execution.prefill_graph_min_seq),
+                .prefill_pad_token_id = execution.prefill_graph_pad_token_id,
+                .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial};
+            if (!family.valid() || !runner->materializeServingGraphFamilyWithoutLaunch(family))
+                throw std::runtime_error("Attention source could not materialize its admitted captured snapshot family");
+        }
+        return runner;
+    }
+}
+
 TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3ContextParity)
 {
     if (!hasROCm())
@@ -5721,7 +5804,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3ContextParity)
     config.has_lm_head = false;
     ASSERT_TRUE(config.isValid());
 
-    auto cpu_runner = createPPStageRunner(prefix_ctx, DeviceId::cpu(), config);
+    auto cpu_runner = createAdmittedAttentionSource(prefix_ctx, DeviceId::cpu(), config);
     ASSERT_NE(cpu_runner, nullptr);
     cpu_runner->enableSnapshotCapture();
 
@@ -5828,10 +5911,11 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivit
     /*
      * CPU PP fragments legally publish their terminal hidden state, so the CPU
      * snapshot source stops after layer four and does not introduce an LM-head
-     * GEMV dependency. A standalone GPU forward has a stricter public boundary:
-     * it must publish graph-declared logits. The ROCm graph therefore owns the
-     * terminal norm and LM head. Both graphs execute identical embedding and
-     * layer-0..4 prefixes, which is the only region sampled by this test.
+     * GEMV dependency. The GPU source is a genuine full-model terminal graph:
+     * ordinary production admission binds terminal weight ownership to the real
+     * model's final layer. An artificial early prefix plus LM head would describe
+     * a different ownership topology. Both execute the identical first four
+     * layers, and only their original layer-three Q/K/V snapshots are compared.
      */
     auto cpu_stage_ctx =
         ModelContext::createForPPStage(
@@ -5840,11 +5924,13 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivit
             /*last_layer=*/4,
             /*has_embedding=*/true,
             /*has_lm_head=*/false);
+    ASSERT_NE(cpu_stage_ctx, nullptr);
+    const int model_layers = static_cast<int>(cpu_stage_ctx->concreteLoader().blockCount());
     auto rocm_stage_ctx =
         ModelContext::createForPPStage(
             TEST_MODEL_PATH,
             /*first_layer=*/0,
-            /*last_layer=*/4,
+            /*last_layer=*/model_layers,
             /*has_embedding=*/true,
             /*has_lm_head=*/true);
     ASSERT_NE(cpu_stage_ctx, nullptr);
@@ -5858,13 +5944,14 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivit
     ASSERT_TRUE(cpu_config.isValid());
 
     FactoryPPStageConfig rocm_config = cpu_config;
+    rocm_config.last_layer = model_layers;
     rocm_config.has_lm_head = true;
     ASSERT_TRUE(rocm_config.isValid());
 
     auto cpu_runner =
-        createPPStageRunner(cpu_stage_ctx, DeviceId::cpu(), cpu_config);
+        createAdmittedAttentionSource(cpu_stage_ctx, DeviceId::cpu(), cpu_config);
     auto rocm_runner =
-        createPPStageRunner(rocm_stage_ctx, DeviceId::rocm(0), rocm_config);
+        createAdmittedAttentionSource(rocm_stage_ctx, DeviceId::rocm(0), rocm_config);
     ASSERT_NE(cpu_runner, nullptr);
     ASSERT_NE(rocm_runner, nullptr);
 
@@ -7282,11 +7369,23 @@ TEST_F(Test__ROCmFlashAttentionParity, RegisterScoreCapturedLifecycleIsCanonical
         hipFuncAttributes attributes{};
         ASSERT_EQ(hipFuncGetAttributes(&attributes, native.func), hipSuccess);
         EXPECT_EQ(attributes.localSizeBytes, 0U);
-        EXPECT_LE(attributes.numRegs, 64);
+        // Register counts have different allocation economics across native
+        // targets. The actual function's occupancy and zero scratch below are
+        // the portable economy contract; retain observed counts for diagnosis.
+        SCOPED_TRACE("native registers=" + std::to_string(attributes.numRegs));
+        EXPECT_GT(attributes.numRegs, 0);
         int resident = 0;
         ASSERT_EQ(hipOccupancyMaxActiveBlocksPerMultiprocessor(
             &resident, native.func, 256, native.sharedMemBytes), hipSuccess);
         EXPECT_GE(resident, 4);
+        std::cout << "Register-score native resources: rows=" << rows
+                  << " query_heads=" << geometry.query << " kv_heads=" << geometry.kv
+                  << " query_head_start=" << geometry.start << " kv_capacity=" << capacity
+                  << " registers=" << attributes.numRegs
+                  << " scratch_bytes=" << attributes.localSizeBytes
+                  << " lds_bytes=" << native.sharedMemBytes
+                  << " threads=" << native.blockDim.x
+                  << " resident_blocks=" << resident << std::endl;
         ASSERT_EQ(hipGraphGetNodes(context_graph.graph, nullptr, &node_count), hipSuccess);
         ASSERT_EQ(node_count, 3U);
         std::vector<float> actual(output_elements), expected(output_elements), replay(output_elements);

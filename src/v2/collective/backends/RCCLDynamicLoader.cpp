@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace llaminar2
 {
@@ -31,6 +32,8 @@ namespace llaminar2
         {
             std::mutex g_mutex;
             void *g_library_handle = nullptr;
+            // Selection identity and resolved callbacks retire together.
+            std::string g_library_path;
             std::string g_last_error;
 
             // Function pointer types (same signatures as NCCL)
@@ -154,20 +157,18 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Resolve the configured RCCL dependency once without substitution.
-         * @param library_path Explicit diagnostic dependency, or null to use
-         *        CMake's selected RCCL_LIBRARY. An invalid path fails as given.
-         * @return True only when the selected DSO and required symbols load.
+         * @brief Resolve and retain the exact selected RCCL dependency.
+         * @param library_path Explicit nonempty diagnostic dependency, or null for
+         *        CMake's selected RCCL_LIBRARY. No alternate path is attempted.
+         * @return True for the same retained path or successful required-symbol
+         *         resolution; false for invalid/different selection or load failure.
+         * Empty explicit paths reject before cached-handle reuse. The mutex owns
+         * selection and callback publication together; optional-symbol policy is
+         * unchanged. A different selection requires retiring the current handle.
          */
         bool load(const char *library_path)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-
-            if (g_library_handle)
-            {
-                // Already loaded
-                return true;
-            }
 
             // A search list can silently select packaged GPU code that differs
             // from the dependency admitted by the build. In particular, moving
@@ -179,10 +180,28 @@ namespace llaminar2
 #endif
             if (!path || !*path)
             {
-                g_last_error = "No RCCL library configured; set RCCL_LIBRARY when configuring the build";
+                g_last_error = library_path ? "Explicit RCCL library path is empty" :
+                    "No RCCL library configured; set RCCL_LIBRARY when configuring the build";
                 LOG_ERROR("RCCL Dynamic Loader: " << g_last_error);
                 return false;
             }
+
+            if (g_library_handle)
+            {
+                if (g_library_path != path)
+                {
+                    g_last_error = "RCCL is already loaded from '" + g_library_path +
+                        "'; requested different library '" + path + "'";
+                    LOG_ERROR("RCCL Dynamic Loader: " << g_last_error);
+                    return false;
+                }
+                return true;
+            }
+
+            // Acquire the path identity before opening; successful publication
+            // moves this storage without allocating after symbol resolution.
+            std::string admitted_path(path);
+            path = admitted_path.c_str();
 
             // Clear any previous dlerror
             dlerror();
@@ -246,17 +265,25 @@ namespace llaminar2
                 return false;
             }
 
+            g_library_path = std::move(admitted_path);
             LOG_INFO("RCCL Dynamic Loader: All required symbols loaded successfully");
             return true;
         }
 
+        /**
+         * @brief Withdraw callbacks and selection before retiring the native DSO.
+         * The caller must retire native operations first. Under the existing
+         * mutex, all callback and path state is cleared even after failed loading;
+         * a later successful load establishes a new exact selection lifetime.
+         */
         void unload()
         {
             std::lock_guard<std::mutex> lock(g_mutex);
 
+            clearResolvedSymbols();
+            g_library_path.clear();
             if (g_library_handle)
             {
-                clearResolvedSymbols();
                 dlclose(g_library_handle);
                 g_library_handle = nullptr;
                 LOG_DEBUG("RCCL Dynamic Loader: Library unloaded");

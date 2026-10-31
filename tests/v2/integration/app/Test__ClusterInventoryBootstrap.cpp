@@ -14,7 +14,12 @@
  * endpoint actions retain that same immutable membership projection.
  * No model or accelerator is opened.
  * This proves a real multi-process node, not a remote-network deployment.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/RuntimeInitPhase.h"
 #include "app/modes/ServerRankMembership.h"
@@ -268,6 +273,7 @@ namespace
                       << " workers=" << omp_get_max_threads()
                       << " affinity=" << detail << std::endl;
         }
+        llaminar2::GPUDeviceProcessLifetime::retireActive();
         MPI_Finalize();
         return passed ? 0 : 1;
     }
@@ -276,6 +282,10 @@ namespace
 /** @brief Launch through a real hostfile or execute one initialized child. */
 int main(int argc, char **argv)
 {
+    // Ownership starts before this frontend creates MPI or runtime state.
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try
     {
         if (argc > 1) return probe(argc, argv);

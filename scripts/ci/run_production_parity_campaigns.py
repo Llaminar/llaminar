@@ -73,9 +73,10 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from model_kld_history_replay import HANDOFF_FIELDS, prepare_history_replay
+from mpi_session_retirement import owned_session_bases, retirement_scope
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -816,21 +817,41 @@ class PreflightRegistration:
         mpi_ranks: Explicit ``mpirun -np`` width, or ``None`` if no MPI
             launcher was declared. Only a width of one can enter a socket lane.
         lane: Typed scheduling ownership derived from the checked registration.
+        ctest_index: Positive 1-based position in the UNFILTERED CTest JSON inventory.
+            Labels and alphabetical receipt order never change this native index.
     """
 
     name: str
     labels: frozenset[str]
     mpi_ranks: int | None
     lane: PreflightExecutionLane
+    ctest_index: int
+
+    def __post_init__(self) -> None:
+        """Reject malformed indices before CTest can interpret a range/default selection."""
+        if type(self.ctest_index) is not int or self.ctest_index <= 0:
+            raise ValueError("preflight CTest index must be a positive integer")
 
 
 def _preflight_mpi_ranks(name: str, command: list[str]) -> int | None:
     """Extract one explicit MPI width without guessing a launcher contract."""
 
+    if command and Path(command[0]).name == "llaminar_mpi_session":
+        if len(command) < 5 or command[1] != "--session-base" or command[3] != "--":
+            raise RuntimeError(f"preflight process owner has malformed argv: {name}")
+        command = command[4:]
+        # A Python diagnostic may accept an mpirun pathname as data. Only the
+        # actual wrapped native launcher declares this test's rank geometry.
+        if Path(command[0]).name not in {"mpirun", "mpiexec"}:
+            return None
+        if "--" not in command:
+            raise RuntimeError(f"preflight MPI launcher lacks application boundary: {name}")
+        command = command[:command.index("--")]
+
     launchers = [
         index
         for index, argument in enumerate(command)
-        if Path(argument).name == "mpirun"
+        if Path(argument).name in {"mpirun", "mpiexec"}
     ]
     if not launchers:
         return None
@@ -914,8 +935,6 @@ def discover_production_test_preflight_registrations(
             "--test-dir",
             str(build_dir),
             "--show-only=json-v1",
-            "-L",
-            f"^{PRODUCTION_TEST_PREFLIGHT_LABEL}$",
         ],
         check=False,
         capture_output=True,
@@ -929,7 +948,9 @@ def discover_production_test_preflight_registrations(
 
     document = json.loads(completed.stdout)
     registrations: list[PreflightRegistration] = []
-    for test in document.get("tests", []):
+    # CTest -I addresses the complete native inventory. Filtering before this
+    # enumeration would silently redirect indices into excluded/model tests.
+    for ctest_index, test in enumerate(document.get("tests", []), start=1):
         name = str(test.get("name", ""))
         properties = _property_map(test)
         labels = frozenset(_as_string_list(properties.get("LABELS", [])))
@@ -971,7 +992,7 @@ def discover_production_test_preflight_registrations(
             command,
             _as_string_list(properties.get("RESOURCE_LOCK", [])),
         )
-        registrations.append(PreflightRegistration(name, labels, ranks, lane))
+        registrations.append(PreflightRegistration(name, labels, ranks, lane, ctest_index))
 
     registrations.sort(key=lambda registration: registration.name)
     names = tuple(registration.name for registration in registrations)
@@ -993,11 +1014,15 @@ def preflight_execution_plan(
 
     plan = {lane: [] for lane in PreflightExecutionLane}
     seen: set[str] = set()
+    indices: set[int] = set()
     for registration in registrations:
         if not isinstance(registration, PreflightRegistration):
             raise TypeError("preflight execution plan requires typed registrations")
         if registration.name in seen:
             raise RuntimeError(f"preflight execution plan has duplicate test: {registration.name}")
+        if registration.ctest_index in indices:
+            raise RuntimeError(f"preflight execution plan has duplicate CTest index: {registration.ctest_index}")
+        indices.add(registration.ctest_index)
         seen.add(registration.name)
         plan[registration.lane].append(registration.name)
     return {lane: tuple(sorted(names)) for lane, names in plan.items()}
@@ -3345,10 +3370,12 @@ def _run_process(
             )
         return 130
 
-    environment = None
+    # The registered native workload must observe real hardware ISA identity,
+    # including when a developer shell inherited an old homogeneous-host spoof.
+    environment = os.environ.copy()
     if environment_overrides:
-        environment = os.environ.copy()
         environment.update(environment_overrides)
+    environment.pop("HSA_OVERRIDE_GFX_VERSION", None)
     process = subprocess.Popen(
         command,
         start_new_session=True,
@@ -3504,24 +3531,51 @@ def _run_process(
             pass
 
 
-def _preflight_name_regex(names: tuple[str, ...]) -> str:
-    """Produce one portable exact CTest selector from trusted names.
+def _validate_preflight_index_selection(
+    build_dir: Path, selector: Path, names: tuple[str, ...],
+) -> None:
+    """Authenticate native indices against CTest before launching any selected tests.
 
-    CTest's legacy regex engine accepts ordinary grouping but not Python's
-    non-capturing group extension, so this must remain syntax compatible with
-    the CTest versions supported by the installed runner image.
+    A rebuilt or externally changed inventory can shift a valid integer onto a
+    model/excluded sentinel. CTest's own numeric-selection preview must return
+    exactly the intended names; no name regex or newer CTest option is involved.
     """
+    result = subprocess.run(
+        ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1", "-I", str(selector)],
+        check=False, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("CTest preflight index validation failed:\n" + (result.stderr or result.stdout))
+    selected = tuple(test.get("name") for test in json.loads(result.stdout).get("tests", []))
+    if len(selected) != len(names) or set(selected) != set(names):
+        raise RuntimeError("stale or foreign preflight CTest indices do not select the exact intended names")
 
-    if not names:
-        raise ValueError("preflight CTest selector requires at least one test")
-    if len(set(names)) != len(names):
-        raise ValueError("preflight CTest selector contains duplicate tests")
-    # CTest uses the legacy POSIX-like ``kwsys`` regular-expression engine,
-    # not Python's ``re`` engine. It supports a normal grouping expression but
-    # not Python's ``(?:...)`` non-capturing extension; using the latter makes
-    # the entire lane select zero tests at runtime. Capturing is immaterial to
-    # selection, so use the portable spelling required by every supported CTest.
-    return "^(" + "|".join(re.escape(name) for name in names) + ")$"
+
+@contextmanager
+def _preflight_index_selection(
+    build_dir: Path, registrations: tuple[PreflightRegistration, ...], names: tuple[str, ...],
+) -> Iterator[Path]:
+    """Own one portable CTest numeric-selector file through every child using it.
+
+    The historical -I file grammar starts with start,end,stride. The empty range
+    1,0,1 selects nothing; only the following explicit positive indices execute.
+    This avoids both CTest's regex-size limit and the newer --tests-from-file ABI.
+    ExitStack at the gate retains both socket selectors until every parallel
+    child has exited/retired, including exceptions and infrastructure failures.
+    """
+    if not names or len(set(names)) != len(names):
+        raise ValueError("preflight CTest index selector needs nonempty unique names")
+    preflight_execution_plan(registrations)  # Also rejects duplicate native indices.
+    by_name = {registration.name: registration for registration in registrations}
+    try:
+        indices = tuple(by_name[name].ctest_index for name in names)
+    except KeyError as error:
+        raise ValueError("foreign preflight name is absent from the current CTest inventory") from error
+    with tempfile.TemporaryDirectory(prefix="llaminar-preflight-indices-") as directory:
+        selector = Path(directory) / "selection.txt"
+        selector.write_text("1,0,1," + ",".join(str(index) for index in sorted(indices)) + "\n", encoding="utf-8")
+        _validate_preflight_index_selection(build_dir, selector, names)
+        yield selector
 
 
 def _preflight_test_phase_completed(return_code: int) -> bool:
@@ -3734,6 +3788,18 @@ def run_production_test_preflight(
     # full affinity mask on every supported CTest version, not a fixed worker
     # cap. CMake's per-test PROCESSORS weights still own physical-core budgets.
     test_parallelism = str(len(os.sched_getaffinity(0)))
+    native_session_bases: dict[str, Path] = {}
+    if any("ProcessOwned" in registration.labels for registration in integration_registrations):
+        inventory = subprocess.run(
+            ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1"],
+            check=True, text=True, capture_output=True)
+        native_session_bases = owned_session_bases(json.loads(inventory.stdout))
+
+    def process_scope(names: tuple[str, ...]):
+        """Keep this lane closed until its original native owners remove backing."""
+        return retirement_scope(native_session_bases[name] for name in names
+                                if name in native_session_bases)
+
     def evidence_arguments(phase: str) -> list[str]:
         """Retain CTest's own complete evidence beyond Docker console delivery."""
         if artifact_directory is None:
@@ -3760,7 +3826,8 @@ def run_production_test_preflight(
         flush=True,
     )
     unit_started = time.monotonic()
-    return_code = _run_process(unit_command, remaining_timeout())
+    with process_scope(unit_tests):
+        return_code = _run_process(unit_command, remaining_timeout())
     unit_elapsed = time.monotonic() - unit_started
     print(
         "[production-parity] unit_test_status="
@@ -3780,167 +3847,171 @@ def run_production_test_preflight(
 
     unit_return_code = return_code
 
-    execution_plan = preflight_execution_plan(integration_registrations)
-    planned_names = tuple(
-        name
-        for lane in PreflightExecutionLane
-        for name in execution_plan[lane]
-    )
-    if set(planned_names) != set(integration_tests) or len(planned_names) != len(integration_tests):
-        raise RuntimeError("preflight execution plan does not cover its exact CTest inventory")
-
-    def integration_command(
-        lane: PreflightExecutionLane,
-        names: tuple[str, ...],
-        cpu_set: str | None = None,
-    ) -> list[str]:
-        """Build one sealed CTest lane command with optional CPU-package affinity."""
-
-        command = [
-            "ctest",
-            "--test-dir",
-            str(build_dir),
-            "--output-on-failure",
-            # The lane owns its device/resource class serially.  This prevents
-            # manually registered tests without Integration_Serial from racing
-            # their backend peers after the historical global lock is split.
-            "--parallel",
-            "1",
-            "--no-tests=error",
-            "-R",
-            _preflight_name_regex(names),
-            *evidence_arguments(f"integration-{lane.value}"),
-        ]
-        return (["taskset", "--cpu-list", cpu_set, *command]
-                if cpu_set is not None else command)
-
-    def run_integration_lane(
-        lane: PreflightExecutionLane,
-        names: tuple[str, ...],
-        cpu_set: str | None = None,
-    ) -> tuple[int, float]:
-        """Run one exclusive lane and publish a compact timing transition."""
-
-        if not names:
-            return 0, 0.0
-        print(
-            "[production-parity] integration_preflight_lane_status=RUNNING "
-            f"lane={lane.value} test_count={len(names)} "
-            f"cpu_package={'bound' if cpu_set is not None else 'unbound'}",
-            flush=True,
+    with ExitStack() as selector_owners:
+        execution_plan = preflight_execution_plan(integration_registrations)
+        planned_names = tuple(
+            name
+            for lane in PreflightExecutionLane
+            for name in execution_plan[lane]
         )
-        lane_started = time.monotonic()
-        lane_return_code = _run_process(
-            integration_command(lane, names, cpu_set),
-            remaining_timeout(),
-        )
-        lane_elapsed = time.monotonic() - lane_started
-        print(
-            "[production-parity] integration_preflight_lane_status="
-            f"{'PASS' if lane_return_code == 0 else 'FAIL'} lane={lane.value} "
-            f"test_count={len(names)} elapsed_seconds={lane_elapsed:.3f}",
-            flush=True,
-        )
-        return lane_return_code, lane_elapsed
+        if set(planned_names) != set(integration_tests) or len(planned_names) != len(integration_tests):
+            raise RuntimeError("preflight execution plan does not cover its exact CTest inventory")
 
-    print(
-        "[production-parity] integration_preflight_status=RUNNING "
-        f"test_count={len(integration_tests)} "
-        f"host_test_count={len(execution_plan[PreflightExecutionLane.HOST])} "
-        f"cuda_socket_test_count={len(execution_plan[PreflightExecutionLane.CUDA_SOCKET])} "
-        f"rocm_socket_test_count={len(execution_plan[PreflightExecutionLane.ROCM_SOCKET])} "
-        f"exclusive_test_count={len(execution_plan[PreflightExecutionLane.EXCLUSIVE])}",
-        flush=True,
-    )
-    integration_started = time.monotonic()
-    return_code, _ = run_integration_lane(
-        PreflightExecutionLane.HOST,
-        execution_plan[PreflightExecutionLane.HOST],
-    )
-    if _preflight_test_phase_completed(return_code):
-        cuda_names = execution_plan[PreflightExecutionLane.CUDA_SOCKET]
-        rocm_names = execution_plan[PreflightExecutionLane.ROCM_SOCKET]
-        cpu_sets = preflight_accelerator_cpu_sets()
-        if cuda_names and rocm_names and cpu_sets is not None:
-            cuda_command = integration_command(
-                PreflightExecutionLane.CUDA_SOCKET,
-                cuda_names,
-                cpu_sets[0],
-            )
-            rocm_command = integration_command(
-                PreflightExecutionLane.ROCM_SOCKET,
-                rocm_names,
-                cpu_sets[1],
-            )
+        def integration_command(
+            lane: PreflightExecutionLane,
+            names: tuple[str, ...],
+            cpu_set: str | None = None,
+        ) -> list[str]:
+            """Build one sealed CTest lane command with optional CPU-package affinity."""
+
+            command = [
+                "ctest",
+                "--test-dir",
+                str(build_dir),
+                "--output-on-failure",
+                # The lane owns its device/resource class serially.  This prevents
+                # manually registered tests without Integration_Serial from racing
+                # their backend peers after the historical global lock is split.
+                "--parallel",
+                "1",
+                "--no-tests=error",
+                "-I",
+                str(selector_owners.enter_context(_preflight_index_selection(
+                    build_dir, integration_registrations, names))),
+                *evidence_arguments(f"integration-{lane.value}"),
+            ]
+            return (["taskset", "--cpu-list", cpu_set, *command]
+                    if cpu_set is not None else command)
+
+        def run_integration_lane(
+            lane: PreflightExecutionLane,
+            names: tuple[str, ...],
+            cpu_set: str | None = None,
+        ) -> tuple[int, float]:
+            """Run one exclusive lane and publish a compact timing transition."""
+
+            if not names:
+                return 0, 0.0
             print(
                 "[production-parity] integration_preflight_lane_status=RUNNING "
-                f"lane={PreflightExecutionLane.CUDA_SOCKET.value} "
-                f"test_count={len(cuda_names)} cpu_package=bound",
+                f"lane={lane.value} test_count={len(names)} "
+                f"cpu_package={'bound' if cpu_set is not None else 'unbound'}",
                 flush=True,
             )
+            lane_started = time.monotonic()
+            with process_scope(names):
+                lane_return_code = _run_process(
+                    integration_command(lane, names, cpu_set),
+                    remaining_timeout(),
+                )
+            lane_elapsed = time.monotonic() - lane_started
             print(
-                "[production-parity] integration_preflight_lane_status=RUNNING "
-                f"lane={PreflightExecutionLane.ROCM_SOCKET.value} "
-                f"test_count={len(rocm_names)} cpu_package=bound",
+                "[production-parity] integration_preflight_lane_status="
+                f"{'PASS' if lane_return_code == 0 else 'FAIL'} lane={lane.value} "
+                f"test_count={len(names)} elapsed_seconds={lane_elapsed:.3f}",
                 flush=True,
             )
-            parallel_started = time.monotonic()
-            parallel_results = _run_preflight_parallel_processes(
-                {
-                    PreflightExecutionLane.CUDA_SOCKET: cuda_command,
-                    PreflightExecutionLane.ROCM_SOCKET: rocm_command,
-                },
-                remaining_timeout(),
-            )
-            parallel_elapsed = time.monotonic() - parallel_started
-            for lane in (
-                PreflightExecutionLane.CUDA_SOCKET,
-                PreflightExecutionLane.ROCM_SOCKET,
-            ):
-                lane_return_code = parallel_results[lane]
+            return lane_return_code, lane_elapsed
+
+        print(
+            "[production-parity] integration_preflight_status=RUNNING "
+            f"test_count={len(integration_tests)} "
+            f"host_test_count={len(execution_plan[PreflightExecutionLane.HOST])} "
+            f"cuda_socket_test_count={len(execution_plan[PreflightExecutionLane.CUDA_SOCKET])} "
+            f"rocm_socket_test_count={len(execution_plan[PreflightExecutionLane.ROCM_SOCKET])} "
+            f"exclusive_test_count={len(execution_plan[PreflightExecutionLane.EXCLUSIVE])}",
+            flush=True,
+        )
+        integration_started = time.monotonic()
+        return_code, _ = run_integration_lane(
+            PreflightExecutionLane.HOST,
+            execution_plan[PreflightExecutionLane.HOST],
+        )
+        if _preflight_test_phase_completed(return_code):
+            cuda_names = execution_plan[PreflightExecutionLane.CUDA_SOCKET]
+            rocm_names = execution_plan[PreflightExecutionLane.ROCM_SOCKET]
+            cpu_sets = preflight_accelerator_cpu_sets()
+            if cuda_names and rocm_names and cpu_sets is not None:
+                cuda_command = integration_command(
+                    PreflightExecutionLane.CUDA_SOCKET,
+                    cuda_names,
+                    cpu_sets[0],
+                )
+                rocm_command = integration_command(
+                    PreflightExecutionLane.ROCM_SOCKET,
+                    rocm_names,
+                    cpu_sets[1],
+                )
                 print(
-                    "[production-parity] integration_preflight_lane_status="
-                    f"{'PASS' if lane_return_code == 0 else 'FAIL'} lane={lane.value} "
-                    f"test_count={len(execution_plan[lane])} "
-                    f"elapsed_seconds={parallel_elapsed:.3f}",
+                    "[production-parity] integration_preflight_lane_status=RUNNING "
+                    f"lane={PreflightExecutionLane.CUDA_SOCKET.value} "
+                    f"test_count={len(cuda_names)} cpu_package=bound",
                     flush=True,
                 )
-            for lane_code in parallel_results.values():
-                return_code = _preflight_merge_test_phase_return_codes(return_code, lane_code)
-        else:
-            # A one-package host cannot safely give two MPI launchers
-            # disjoint worker capacity. The complete typed plan is still
-            # executed; only its CUDA/ROCm overlap is unavailable.
-            for lane in (
-                PreflightExecutionLane.CUDA_SOCKET,
-                PreflightExecutionLane.ROCM_SOCKET,
-            ):
-                lane_code, _ = run_integration_lane(lane, execution_plan[lane])
-                return_code = _preflight_merge_test_phase_return_codes(return_code, lane_code)
-                if not _preflight_test_phase_completed(lane_code):
-                    break
-    if _preflight_test_phase_completed(return_code):
-        exclusive_code, _ = run_integration_lane(
-            PreflightExecutionLane.EXCLUSIVE,
-            execution_plan[PreflightExecutionLane.EXCLUSIVE],
+                print(
+                    "[production-parity] integration_preflight_lane_status=RUNNING "
+                    f"lane={PreflightExecutionLane.ROCM_SOCKET.value} "
+                    f"test_count={len(rocm_names)} cpu_package=bound",
+                    flush=True,
+                )
+                parallel_started = time.monotonic()
+                with process_scope(cuda_names + rocm_names):
+                    parallel_results = _run_preflight_parallel_processes(
+                        {
+                            PreflightExecutionLane.CUDA_SOCKET: cuda_command,
+                            PreflightExecutionLane.ROCM_SOCKET: rocm_command,
+                        },
+                        remaining_timeout(),
+                    )
+                parallel_elapsed = time.monotonic() - parallel_started
+                for lane in (
+                    PreflightExecutionLane.CUDA_SOCKET,
+                    PreflightExecutionLane.ROCM_SOCKET,
+                ):
+                    lane_return_code = parallel_results[lane]
+                    print(
+                        "[production-parity] integration_preflight_lane_status="
+                        f"{'PASS' if lane_return_code == 0 else 'FAIL'} lane={lane.value} "
+                        f"test_count={len(execution_plan[lane])} "
+                        f"elapsed_seconds={parallel_elapsed:.3f}",
+                        flush=True,
+                    )
+                for lane_code in parallel_results.values():
+                    return_code = _preflight_merge_test_phase_return_codes(return_code, lane_code)
+            else:
+                # A one-package host cannot safely give two MPI launchers
+                # disjoint worker capacity. The complete typed plan is still
+                # executed; only its CUDA/ROCm overlap is unavailable.
+                for lane in (
+                    PreflightExecutionLane.CUDA_SOCKET,
+                    PreflightExecutionLane.ROCM_SOCKET,
+                ):
+                    lane_code, _ = run_integration_lane(lane, execution_plan[lane])
+                    return_code = _preflight_merge_test_phase_return_codes(return_code, lane_code)
+                    if not _preflight_test_phase_completed(lane_code):
+                        break
+        if _preflight_test_phase_completed(return_code):
+            exclusive_code, _ = run_integration_lane(
+                PreflightExecutionLane.EXCLUSIVE,
+                execution_plan[PreflightExecutionLane.EXCLUSIVE],
+            )
+            return_code = _preflight_merge_test_phase_return_codes(return_code, exclusive_code)
+        integration_elapsed = time.monotonic() - integration_started
+        elapsed = time.monotonic() - started
+        print(
+            "[production-parity] integration_preflight_status="
+            f"{'PASS' if return_code == 0 else 'FAIL'} "
+            f"test_count={len(integration_tests)} elapsed_seconds={integration_elapsed:.3f}",
+            flush=True,
         )
-        return_code = _preflight_merge_test_phase_return_codes(return_code, exclusive_code)
-    integration_elapsed = time.monotonic() - integration_started
-    elapsed = time.monotonic() - started
-    print(
-        "[production-parity] integration_preflight_status="
-        f"{'PASS' if return_code == 0 else 'FAIL'} "
-        f"test_count={len(integration_tests)} elapsed_seconds={integration_elapsed:.3f}",
-        flush=True,
-    )
-    return_code = _preflight_merge_test_phase_return_codes(unit_return_code, return_code)
-    print(
-        "[production-parity] preflight_status="
-        f"{'PASS' if return_code == 0 else 'FAIL'} "
-        f"test_count={len(tests)} elapsed_seconds={elapsed:.3f}",
-        flush=True,
-    )
-    return complete(return_code, elapsed)
+        return_code = _preflight_merge_test_phase_return_codes(unit_return_code, return_code)
+        print(
+            "[production-parity] preflight_status="
+            f"{'PASS' if return_code == 0 else 'FAIL'} "
+            f"test_count={len(tests)} elapsed_seconds={elapsed:.3f}",
+            flush=True,
+        )
+        return complete(return_code, elapsed)
 
 
 def reuse_unchanged_production_test_preflight(

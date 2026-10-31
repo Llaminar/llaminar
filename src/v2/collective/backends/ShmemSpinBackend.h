@@ -25,6 +25,7 @@
 
 #include "../ICollectiveBackend.h"
 #include "UPIBackend.h"
+#include "utils/MPISessionOwner.h"
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -37,7 +38,7 @@ namespace llaminar2
     /**
      * @brief Shared-memory layout for N-rank spin-wait allreduce
      *
-     * Dynamically sized based on rank count. Mapped via POSIX shared memory.
+     * Dynamically sized based on rank count. Mapped from an exact file inside the original process-owned shared directory.
      * Layout (all cache-line aligned):
      *   [0, 64)                          → Header (num_ranks)
      *   [64, 64 + N*64)                  → N × EpochSlot (one per rank)
@@ -241,8 +242,8 @@ namespace llaminar2
         /// Get this rank's epoch counter value
         uint64_t currentEpoch() const { return my_epoch_; }
 
-        /// Get the POSIX shared-memory name used by this initialized backend.
-        const std::string &shmName() const { return shm_name_; }
+        /// Return the exact diagnostic path of this original root-contained backing.
+        const std::string &backingPath() const { return shared_file_.descriptor()>=0 ? shared_file_.path() : shm_name_; }
 
         /**
          * @brief Return whether an allreduce uses the native shared-memory path.
@@ -326,11 +327,11 @@ namespace llaminar2
         int num_ranks_ = 0;                  ///< Total ranks (set during initialize)
         uint64_t my_epoch_ = 0;
 
-        std::string shm_name_;               ///< POSIX shm name generated per initialize() call
-        int shm_fd_ = -1;                    ///< File descriptor for shared memory
+        std::string shm_name_;               ///< Exact root-relative basename published during setup
+        MPISessionOwner::SharedFile shared_file_;
+        std::optional<MPISessionOwner::SharedDirectory> shared_directory_;
         size_t arena_size_ = 0;              ///< Mapped size in bytes (for munmap)
         ShmemSpinArena *arena_ = nullptr;     ///< Mapped shared-memory arena
-        bool shm_unlinked_ = false;           ///< Whether rank 0 has unlinked shm_name_
 
         std::unique_ptr<UPICollectiveBackend> general_backend_; ///< UPI implementation for other collective semantics
         std::atomic<bool> abort_requested_{false};       ///< Local abort requested for this backend

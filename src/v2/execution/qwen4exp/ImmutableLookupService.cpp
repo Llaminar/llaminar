@@ -7,9 +7,13 @@
  * are read. Completion publishes native rows before the release word, and an
  * acknowledgement is mandatory before any response reuse. Failed lanes remain
  * failed, retaining precise I/O diagnostics instead of changing storage modes.
+ * GPU source abort, CPU cancellation and complete-parent close have disjoint
+ * writers. Exact-ticket I/O abort accounting occurs after the actual worker
+ * joins so publication racing its retirement cannot disappear from the ledger.
  */
 #include "kernels/qwen4exp/AdaptiveLookupPreparedStorage.h"
 #include "ImmutableLookupService.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <algorithm>
 #include <atomic>
@@ -168,10 +172,10 @@ void ImmutableLookupHostProcessor::complete(const ImmutableLookupRequest &reques
     }
 }
 
-ImmutableLookupPoll ImmutableLookupHostProcessor::poll(std::uint64_t generation)
+ImmutableLookupPoll ImmutableLookupHostProcessor::poll(std::uint64_t generation,std::uint64_t invocation)
 {
     if(generation==0)throw std::invalid_argument("Immutable lookup admission generation must be positive");
-    if(layout_.subordinate() && cancelled_ && cancelled_->load(std::memory_order_acquire))
+    if(layout_.subordinate() && ((cancelled_ && cancelled_->load(std::memory_order_acquire)) || sourceAbortRequested(generation,invocation)))
     {
         lastStatus_=ImmutableLookupStatus::Cancelled;
         lastFailure_="Subordinate source ingress was cancelled";
@@ -260,7 +264,7 @@ ImmutableLookupPoll ImmutableLookupHostProcessor::poll(std::uint64_t generation)
                       std::to_string(static_cast<std::uint64_t>(status));
     // Cancellation may race this check. A GPU consumer must still validate its
     // live admission/reservation before publication; CPU cannot enforce that edge.
-    if(layout_.subordinate() && cancelled_ && cancelled_->load(std::memory_order_acquire))
+    if(layout_.subordinate() && ((cancelled_ && cancelled_->load(std::memory_order_acquire)) || sourceAbortRequested(generation,invocation)))
     {
         status=ImmutableLookupStatus::Cancelled;
         lastFailure_="Subordinate source read cancelled before response publication";
@@ -407,6 +411,7 @@ std::shared_ptr<AdaptiveLookupPreparedStorage> ImmutableLookupService::declareAd
     // This mutex serializes declarations only; no file operation, native upload,
     // physical claim or live GPU state is performed while holding it.
     std::lock_guard lock(adaptive_setup_);
+    if(pooled_storage_)throw std::invalid_argument("Original source channel already belongs to the pooled source arm");
     if (adaptive_storage_)
     {
         if (adaptive_storage_->plan_ != plan || adaptive_storage_->cache_ != cache ||
@@ -419,6 +424,59 @@ std::shared_ptr<AdaptiveLookupPreparedStorage> ImmutableLookupService::declareAd
     adaptive_storage_ = std::shared_ptr<AdaptiveLookupPreparedStorage>(
         new AdaptiveLookupPreparedStorage(plan, std::move(cache), std::move(frame), std::move(protocol)));
     return adaptive_storage_;
+}
+const ImmutableRowTableSource& ImmutableSubordinateLookupBinding::source()const{
+    if(!owner_)throw std::logic_error("Subordinate source binding has lost its original service");
+    return owner_->table_->source();
+}
+void ImmutableSubordinateLookupBinding::requireFor(const PooledImmutableSourceGeometry& geometry)const{
+    const auto& p=geometry.parameters();
+    if(!owner_ || !owner_->backing_->layout.subordinate() || geometry.allocator().device!=device_ ||
+        geometry.allocator().world_rank!=owner_->memory_->worldRank() || !owner_->backing_->mapped->hasDevice(device_))
+        throw std::invalid_argument("Pooled source binding has foreign provider/channel/rank/device ownership");
+    const auto requester=owner_->table_->subordinateRequester();const auto& actual=owner_->table_->source();const auto& layout=owner_->backing_->layout;
+    if(!requester || *requester!=geometry.allocator() || actual.rows!=p.coordinator.policy.sourceRows() || actual.row_elements!=p.row_elements ||
+        ggufToTensorType(actual.format)!=p.format || actual.rowBytes()!=p.owner.row_bytes || layout.protocol()!=kImmutableLookupSubordinateProtocol ||
+        layout.maximumIds()!=p.coordinator.policy.maximumUnique() || layout.rowBytes()!=p.owner.row_bytes ||
+        owner_->backing_->tableId!=view_.base.table || p.owner.table!=view_.base.table || p.coordinator.table!=view_.base.table ||
+        p.owner.source_storage_generation!=storageGeneration() || p.coordinator.source_storage_generation!=storageGeneration())
+        throw std::invalid_argument("Pooled source native fields do not match the real protocol2 provider and original source generation");
+    auto* base=static_cast<std::byte*>(owner_->backing_->mapped->deviceAlias(device_));
+    if(view_.base.request!=reinterpret_cast<ImmutableLookupRequest*>(base+layout.requestOffset()) ||
+        view_.base.completion!=reinterpret_cast<ImmutableLookupCompletion*>(base+layout.completionOffset()) ||
+        view_.base.acknowledgement!=reinterpret_cast<ImmutableLookupAcknowledgement*>(base+layout.acknowledgementOffset()) ||
+        view_.base.ids!=reinterpret_cast<std::int64_t*>(base+layout.idsOffset()) || view_.base.nativeRows!=base+layout.payloadOffset() ||
+        view_.base.maximumIds!=layout.maximumIds() || view_.base.rowBytes!=layout.rowBytes() ||
+        view_.intents!=reinterpret_cast<ImmutableRowSubordinateIntent*>(base+layout.intentsOffset()) ||
+        view_.acknowledgements!=reinterpret_cast<ImmutableRowInvalidationAcknowledgement*>(base+layout.invalidationsOffset()))
+        throw std::invalid_argument("Pooled source original mapped aliases changed after binding");
+}
+std::shared_ptr<PooledImmutableSourcePreparedStorage> ImmutableSubordinateLookupBinding::preparePooled(
+    const PooledImmutableSourceGeometry& geometry,std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,
+    std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream)const{
+    requireFor(geometry);
+    return owner_->declarePooledSourceStorage(*this,geometry,std::move(owner),std::move(coordinator),std::move(memory),stream);
+}
+std::shared_ptr<PooledImmutableSourcePreparedStorage> ImmutableLookupService::declarePooledSourceStorage(
+    const ImmutableSubordinateLookupBinding& binding,const PooledImmutableSourceGeometry& geometry,
+    std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
+    std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream){
+    if(isGraphCaptureActive())throw std::logic_error("Pooled source registration must be materialized before capture");
+    binding.requireFor(geometry);requireHealthy();
+    if(!memory || memory.get()!=memory_.get() || !owner || !coordinator)
+        throw std::invalid_argument("Pooled source registration requires its actual original PMA and native authorities");
+    table_->authenticateSource();
+    // Cold declaration is serialized once. No model state or host policy shadow
+    // is consulted; failure never publishes partial roots into this service.
+    std::lock_guard lock(adaptive_setup_);
+    if(adaptive_storage_)throw std::invalid_argument("Original source channel already belongs to the single-GPU adaptive arm");
+    if(pooled_storage_){
+        if(pooled_storage_->geometry().parameters().identity!=geometry.parameters().identity || pooled_storage_->owner()!=owner || pooled_storage_->coordinator()!=coordinator)
+            throw std::invalid_argument("Pooled source cannot replace its original native source/accepted-owner/coordinator registration");
+        pooled_storage_->captureIdentity();return pooled_storage_;
+    }
+    auto storage=PooledImmutableSourcePreparedStorage::materialize(geometry,std::move(owner),std::move(coordinator),std::move(memory),stream);
+    pooled_storage_=std::move(storage);return pooled_storage_;
 }
 void ImmutableSubordinateLookupBinding::requireFor(const AdaptiveNativeParameters &p) const
 {
@@ -475,7 +533,7 @@ std::uint64_t ImmutableSubordinateLookupBinding::captureIdentity() const noexcep
         h ^= n;
         h *= 1099511628211ULL;
     };
-    mix(2);
+    mix(2);mix(kImmutableLookupAcknowledgementVersion);
     mix(reinterpret_cast<std::uintptr_t>(owner_.get()));
     mix(static_cast<std::uint64_t>(device_.type));
     mix(static_cast<std::uint64_t>(device_.ordinal));
@@ -519,10 +577,17 @@ bool ImmutableLookupService::await(Ticket ticket)
         backing_->mapped->mutableHostData(backing_->layout.acknowledgementOffset()));
     const bool missingClose=acquire(ack->closedGeneration)!=generation_;
     if(missingClose)(void)cancel(ticket);
-    const bool result=worker_.await({ticket.invocation});
+    const bool workerResult=worker_.await({ticket.invocation});
     std::lock_guard lock(lifecycle_);
+    // The complete source parent has retired before await. Only mapped I/O
+    // metadata is inspected here; a publication racing CPU retirement is still
+    // counted once by this ticket's unique terminal transition.
+    const bool aborted=processor_.observeTerminalAbort(ticket.generation,ticket.invocation);
+    const bool result=workerResult && !aborted;
+    if(aborted)fatalStatus_.store(ImmutableLookupStatus::Cancelled,std::memory_order_release);
     // The worker is retired before touching its diagnostic string.
-    if(missingClose)serviceFailure_="Immutable lookup GPU terminal did not publish its explicit service close";
+    if(aborted)serviceFailure_="Immutable lookup GPU source aborted its exact admitted I/O invocation";
+    else if(missingClose)serviceFailure_="Immutable lookup GPU terminal did not publish its explicit service close";
     outstanding_={};state_=result?Lifecycle::Idle:Lifecycle::Failed;
     return result;
 }
@@ -550,6 +615,24 @@ bool ImmutableLookupService::cancel(Ticket ticket)
     release(ack->cancelledGeneration,ticket.generation);
     release(ack->cancelledInvocation,ticket.invocation);
     cancelled_.store(true,std::memory_order_release);
+    return true;
+}
+
+bool ImmutableLookupHostProcessor::sourceAbortRequested(std::uint64_t generation,std::uint64_t invocation) const noexcept
+{
+    if(!invocation)return false; // Unticketed direct processor tests cannot acquire a worker abort.
+    auto *ack=reinterpret_cast<ImmutableLookupAcknowledgement *>(channel_.data()+layout_.acknowledgementOffset());
+    const auto abortInvocation=acquire(ack->abortInvocation);
+    const auto abortGeneration=acquire(ack->abortGeneration);
+    return ImmutableLookupProtocol::matchesInvocation(abortInvocation,abortGeneration,generation,invocation);
+}
+
+bool ImmutableLookupHostProcessor::observeTerminalAbort(std::uint64_t generation,std::uint64_t invocation)
+{
+    if(!sourceAbortRequested(generation,invocation))return false;
+    stats_.terminalBytes+=2*sizeof(std::uint64_t);
+    if(lastStatus_==ImmutableLookupStatus::Success)lastStatus_=ImmutableLookupStatus::Cancelled;
+    if(lastFailure_.empty())lastFailure_="GPU source aborted its exact admitted I/O invocation";
     return true;
 }
 
@@ -587,7 +670,7 @@ bool ImmutableLookupService::run(void *context)
     {
         while(!self.cancelled_.load(std::memory_order_acquire))
         {
-            (void)self.processor_.poll(admitted.generation);
+            (void)self.processor_.poll(admitted.generation,admitted.invocation);
             if(self.processor_.lastStatus()!=ImmutableLookupStatus::Success)
             {
                 self.fatalStatus_.store(self.processor_.lastStatus(),std::memory_order_release);

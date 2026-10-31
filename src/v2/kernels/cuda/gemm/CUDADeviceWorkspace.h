@@ -24,7 +24,7 @@ extern "C"
     // Opaque handles — .cu files define the concrete structs.
     // =====================================================================
 
-    /** Per-device GEMV workspace (KPAR partials, SM count cache). */
+    /** Per-device GEMV workspace; physical facts belong to CUDAHardwareMetadata. */
     typedef struct CUDAGemvContext_ CUDAGemvContext;
 
     /** Per-weight row-major transpose (ROWPAR acceleration). */

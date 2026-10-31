@@ -10,7 +10,12 @@
  * initialized the same rank-local CPU backend required by serving. The same
  * executable also proves the explicit local-only command lifecycle, which must
  * not skip that ownership transition merely because it does not initialize MPI.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "app/commands/PlanCommand.h"
 #include "backends/BackendManager.h"
 #include "config/OrchestrationConfigDocument.h"
@@ -77,6 +82,10 @@ namespace
 /** @brief Invoke the real plan frontend, then authenticate its complete apply document. */
 int main(int argc, char **argv)
 {
+    // Ownership starts before this frontend creates MPI or runtime state.
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try
     {
         const bool local_only = argc == 2 && std::string{argv[1]} == "--local";

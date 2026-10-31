@@ -14,6 +14,7 @@
 #pragma once
 
 #include "../IWorkerGPUContext.h"
+#include "../GPUDeviceProcessLifetime.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -61,7 +62,7 @@ namespace llaminar2
      * - Stream/event/handle accessors must only be called from within submitted work
      * - deviceOrdinal(), deviceName(), isInitialized() are thread-safe (read-only)
      */
-    class NvidiaDeviceContext : public IWorkerGPUContext
+    class NvidiaDeviceContext : public IWorkerGPUContext, private GPUProjectionResourceOperations
     {
     public:
         /**
@@ -118,6 +119,16 @@ namespace llaminar2
             GPUAuxiliaryStreamSchedulingClass scheduling_class,
             bool *created = nullptr) override;
         void resetAuxiliaryStreams() override;
+        /** @copydoc IWorkerGPUContext::prepareProjectionResources */
+        void prepareProjectionResources() override;
+        /** @copydoc IWorkerGPUContext::acquireProjectionSubmission */
+        [[nodiscard]] GPUProjectionSubmission acquireProjectionSubmission(
+            void *root, GPUProjectionSubmissionKind kind, bool native_capturing = false) override;
+        /** @copydoc IWorkerGPUContext::assertProjectionResourcesRetirable */
+        void assertProjectionResourcesRetirable() override;
+        /** @copydoc IWorkerGPUContext::beginProjectionResourcesRetirement */
+        void beginProjectionResourcesRetirement() override;
+
 
         // =========================================================================
         // IWorkerGPUContext Interface - Event Access (worker-thread-only)
@@ -172,6 +183,8 @@ namespace llaminar2
         bool debugSynchronize() override;
 
     private:
+        /** Declared first so native admission retires last, after worker cleanup and all resource members. */
+        GPUDeviceProcessLifetime::NativeContextLease process_lifetime_lease_;
         // =========================================================================
         // Worker Thread Management
         // =========================================================================
@@ -218,6 +231,16 @@ namespace llaminar2
         // GPU State (owned by worker thread)
         // =========================================================================
 
+        /** Exact context-owned resources; opaque storage remains PMA-admitted. */
+        GPUProjectionResources projection_resources_{this, GPUProjectionStreamCount::Eight};
+        /** @copydoc GPUProjectionResourceOperations::createProjectionStream */
+        void *createProjectionStream() override;
+        /** @copydoc GPUProjectionResourceOperations::createProjectionEvent */
+        void *createProjectionEvent() override;
+        /** @copydoc GPUProjectionResourceOperations::destroyProjectionStream */
+        bool destroyProjectionStream(void *stream) noexcept override;
+        /** @copydoc GPUProjectionResourceOperations::destroyProjectionEvent */
+        bool destroyProjectionEvent(void *event) noexcept override;
         cudaStream_t default_stream_ = nullptr;
         std::unordered_map<std::string, cudaStream_t> auxiliary_streams_;
         /** Immutable scheduling class paired with every named stream. */

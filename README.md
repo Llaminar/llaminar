@@ -28,7 +28,7 @@ The current builds target the following hardware:
 |---|---|
 | x86-64 CPUs | Separate AVX512-VNNI and AVX2 images |
 | NVIDIA GPUs | CUDA `sm86`, initially tested on RTX 3090 |
-| AMD GPUs | ROCm `gfx906`, including the Instinct MI50 |
+| AMD GPUs | ROCm `gfx906` (Instinct MI50) and `gfx1100` (Radeon RX 7900 XTX) |
 
 You can combine supported CPUs and GPUs in the same deployment, including
 NVIDIA and AMD cards together. The [recipes below](#e2e-tested-auto-recipes)
@@ -1021,6 +1021,47 @@ prepares VMs, transfers the image and model, runs the remote tests, and manages
 the VMs afterward.
 
 </details>
+
+### MPI runtime files
+
+Llaminar enters its process owner before MPI or model startup. The same owner
+retains temporary runtime files and shared-memory backing until the application,
+MPI launcher and their local daemon children have exited. Each run uses fresh
+private directories, so a reused PID cannot reopen another run's files.
+
+If you launch MPI yourself, keep that launcher's ownership explicit:
+
+```bash
+llaminar_mpi_session --session-base /tmp -- mpirun -np 2 -- llaminar2 describe
+```
+
+The inner `--` separates native MPI options from application arguments. The
+owner sets runtime file locations; MPI `--tmpdir`, location MCA overrides and
+exports of those location variables conflict with that ownership and are
+rejected. Native `mca_base_env_list` exports are also unsupported in this owned
+launch contract; use `-x` for non-location variables. Application arguments after
+the native `--` remain untouched. A bare external `mpirun` remains responsible for its own job files;
+an application rank never deletes its parent launcher's files or live peers.
+Install the matching `llaminar_mpi_session` helper beside Llaminar on each host,
+with its `llaminar_mpi_components/mca_schizo_llaminar.so` asset. Owned launches
+require this native component built for the selected OpenMPI 4.1.6 ABI. Its
+native fork hook publishes each daemon's own temporary/shared roots to that
+daemon's ranks; ranks authenticate this publication before MPI initialization.
+OpenMPI's default component selection remains intact. An explicit SCHIZO
+selector must include `llaminar` (or avoid excluding it); replacing the owned
+component search path or disabling dynamic components is rejected.
+
+Project shared-memory creators (ShmemSpin and the two node-local MoE channels)
+use regular mmap files inside the authenticated owner directory. Participants
+validate the creator's original file identity and exact extent before mapping.
+These creators reject an unowned external MPI launch; use the wrapper above.
+Native communication-library file lifetimes remain part of their separately
+qualified SDK closure.
+
+The guardian also handles abrupt application or launcher exits. If the guardian
+itself is killed, it cannot certify retirement, so its original private roots
+remain for explicit recovery. New runs use different roots; no startup scans or
+deletes unrelated files in `/tmp` or `/dev/shm`.
 
 ## Benchmarks
 

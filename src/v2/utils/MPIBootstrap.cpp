@@ -9,11 +9,16 @@
  * Portable diagnostic environment is explicitly exported by name: remote SSH
  * ranks do not inherit the launcher's ordinary environment. Rank/device-local
  * placement and cloud credentials must never cross that boundary implicitly.
+ * The shared CPU-only session helper retains launch ownership through exact
+ * process retirement. Remote daemons get host-local owners before MPI creates
+ * their runtime files. This child can exec exact mpirun while its retained
+ * ancestor still owns cleanup after every rank and daemon actually retires.
  *
  * @author David Sanftenberg
  */
 
 #include "MPIBootstrap.h"
+#include "MPISessionOwner.h"
 #include "Logger.h"
 #include "DebugEnv.h"
 #include <fstream>
@@ -68,6 +73,14 @@ namespace llaminar2
                     command.emplace_back(name);
                 }
             }
+        }
+
+        /** @return One shell word for OpenMPI's explicitly shell-parsed remote launch agent. */
+        std::string remoteShellWord(const std::string &word)
+        {
+            std::string result = "'";
+            for (char character : word) result += character == '\'' ? "'\\''" : std::string(1, character);
+            return result + "'";
         }
 
         /** @brief Configure launcher-only hwloc discovery before execing MPI. */
@@ -575,6 +588,12 @@ namespace llaminar2
         {
             cmd.push_back("--hostfile");
             cmd.push_back(config.hostfile);
+            // Daemons initialize PMIx before an app rank exists. Each remote
+            // host must create and retire its own roots, never inherit a path
+            // that exists only in the launcher's filesystem namespace.
+            cmd.push_back("--launch-agent");
+            cmd.push_back(remoteShellWord(MPISessionOwner::launcherExecutable().string()) +
+                          " --mpi-daemon --session-base /tmp -- orted");
         }
 
         const int pe_threads = config.omp_threads_per_rank > 0
@@ -648,8 +667,10 @@ namespace llaminar2
 
         appendDiagnosticEnvironment(cmd);
 
-        // Add original program and its arguments
-        // argv[0] is the program path
+        // MPI owns this explicit option/application delimiter. The shared
+        // session owner validates only that prefix, never opaque app flags.
+        cmd.push_back("--");
+        // argv[0] and every application argument retain their original meaning.
         cmd.push_back(argv[0]);
 
         // Copy original arguments according to the application parser ownership.
@@ -704,12 +725,11 @@ namespace llaminar2
         // Build command
         auto cmd = buildMPIRunCommand(argc, argv, config, topology, arguments);
 
-        // Convert to C-style array for execvp
+        MPISessionOwner::requireProcessOwner();
+        // The main-entry ancestor already owns this complete process subtree.
+        // Replacing this child with mpirun keeps one owner for all its ranks.
         std::vector<char *> c_argv;
-        for (auto &s : cmd)
-        {
-            c_argv.push_back(&s[0]);
-        }
+        for (auto &s : cmd) c_argv.push_back(s.data());
         c_argv.push_back(nullptr);
 
         // Log what we're executing
@@ -730,11 +750,13 @@ namespace llaminar2
         }
         LOG_DEBUG("[MPIBootstrap] Launching: " << cmd_str.str());
 
-        // Replace current process with mpirun
+        // The helper stays alive until mpirun, local peers and daemon children
+        // have actually retired, then removes only its original private roots.
+        MPISessionOwner::retireStartupLoansForMPILaunch();
         execvp("mpirun", c_argv.data());
 
         // If we get here, exec failed
-        LOG_ERROR("[MPIBootstrap] Failed to exec mpirun: " << strerror(errno));
+        LOG_ERROR("[MPIBootstrap] Failed to exec owned mpirun: " << strerror(errno));
         return -1;
     }
 

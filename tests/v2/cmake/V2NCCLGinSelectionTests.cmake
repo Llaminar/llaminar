@@ -19,11 +19,17 @@ if(HAVE_CUDA AND HAVE_NCCL AND NOT V2_PERF_TESTS_ONLY)
             "${V2_NCCL_GIN_INSTALLED_PROOF}" "${V2_NCCL_GIN_PROOF}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${V2_NCCL_GIN_INSTALLED_RECEIPT}" "${V2_NCCL_GIN_RECEIPT}"
-        DEPENDS "${V2_NCCL_GIN_SCRIPT}"
+        DEPENDS "${REPO_ROOT}/scripts/docker/shared-file-lifecycle/proof.py"
+            "${REPO_ROOT}/scripts/docker/shared-file-lifecycle/probe.cpp"
+            "${REPO_ROOT}/scripts/docker/patches/nccl-partial-file-cleanup.patch"
+            "${V2_NCCL_GIN_SCRIPT}"
             "${REPO_ROOT}/scripts/docker/nccl-gin-selection/probe.cpp"
             "${REPO_ROOT}/scripts/docker/patches/nccl-capture-reentry.patch"
             "${REPO_ROOT}/scripts/docker/patches/nccl-device-live-rows.patch"
             "${REPO_ROOT}/scripts/docker/patches/nccl-gin-auto-selection.patch"
+            "${REPO_ROOT}/scripts/docker/patches/nccl-created-thread-ownership.patch"
+            "${REPO_ROOT}/scripts/docker/nccl-thread-lifetime/proof.py"
+            "${REPO_ROOT}/scripts/docker/nccl-thread-lifetime/probe.cpp"
             "${V2_NCCL_GIN_INSTALLED_PROOF}" "${V2_NCCL_GIN_INSTALLED_RECEIPT}" "${NCCL_LIBRARY}"
         VERBATIM)
     add_custom_target(v2_nccl_gin_selection_proof

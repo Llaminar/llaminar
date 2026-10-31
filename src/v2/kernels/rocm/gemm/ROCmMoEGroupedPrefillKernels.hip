@@ -40,8 +40,11 @@
  *
  * @see ROCmGemvKernel_native_VNNI.hip for decode grouped kernels (M=1)
  * @see ROCmNativeVNNIGemmShardImpl.hip.inc for non-grouped prefill GEMM
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
 
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <hip/hip_runtime.h>
 #include "kernels/common/MoEGroupedDirectory.h"
 #include <hip/hip_fp16.h>
@@ -826,10 +829,10 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         int32_t acc_hi = 0;
 #pragma unroll
         for (int g = 0; g < 4; ++g)
-            acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
+            acc_lo = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_lo);
 #pragma unroll
         for (int g = 4; g < 8; ++g)
-            acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
+            acc_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_hi);
 
         const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
             scale_base[linear], min_base[linear]);
@@ -842,12 +845,12 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             int32_t sum_a_hi = 0;
 #pragma unroll
             for (int g = 0; g < 4; ++g)
-                sum_a_lo = __builtin_amdgcn_sdot4(
-                    a4[g], ones, sum_a_lo, false);
+                sum_a_lo = ::llaminar2::rocm_integer_contract::signedDot4(
+                    a4[g], ones, sum_a_lo);
 #pragma unroll
             for (int g = 4; g < 8; ++g)
-                sum_a_hi = __builtin_amdgcn_sdot4(
-                    a4[g], ones, sum_a_hi, false);
+                sum_a_hi = ::llaminar2::rocm_integer_contract::signedDot4(
+                    a4[g], ones, sum_a_hi);
 
             const uint32_t emin_packed = emin_base[linear];
             const uint16_t emin_lo_bits =
@@ -878,18 +881,18 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             const uint8_t qh0 = payload[4];
             const uint8_t qh1 = payload[5];
 
-            const int32_t sum_a_g0 = __builtin_amdgcn_sdot4(
+            const int32_t sum_a_g0 = ::llaminar2::rocm_integer_contract::signedDot4(
                 a4[1], ones,
-                __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-            const int32_t sum_a_g1 = __builtin_amdgcn_sdot4(
+                ::llaminar2::rocm_integer_contract::signedDot4(a4[0], ones, 0));
+            const int32_t sum_a_g1 = ::llaminar2::rocm_integer_contract::signedDot4(
                 a4[3], ones,
-                __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-            const int32_t sum_a_g2 = __builtin_amdgcn_sdot4(
+                ::llaminar2::rocm_integer_contract::signedDot4(a4[2], ones, 0));
+            const int32_t sum_a_g2 = ::llaminar2::rocm_integer_contract::signedDot4(
                 a4[5], ones,
-                __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-            const int32_t sum_a_g3 = __builtin_amdgcn_sdot4(
+                ::llaminar2::rocm_integer_contract::signedDot4(a4[4], ones, 0));
+            const int32_t sum_a_g3 = ::llaminar2::rocm_integer_contract::signedDot4(
                 a4[7], ones,
-                __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+                ::llaminar2::rocm_integer_contract::signedDot4(a4[6], ones, 0));
 
             const float delta0 =
                 (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
@@ -932,7 +935,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         int32_t dot = 0;
 #pragma unroll
         for (int g = 0; g < 8; ++g)
-            dot = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], dot, false);
+            dot = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], dot);
 
         const uint16_t scale_bits = scale_base[linear];
         // Physical24 also admits an IQ4_NL gate/up partner. Resolve the
@@ -953,7 +956,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             int32_t sum_a = 0;
 #pragma unroll
             for (int g = 0; g < 8; ++g)
-                sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+                sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
 
             const uint16_t min_bits = min_base[linear];
             const float block_m =
@@ -1179,14 +1182,14 @@ moe_prefill_prepare_dual_scale_block_terms(
 #pragma unroll
     for (int group = 0; group < 4; ++group)
     {
-        terms.low_dot = __builtin_amdgcn_sdot4(
-            a4[group], packed_groups[group], terms.low_dot, false);
+        terms.low_dot = ::llaminar2::rocm_integer_contract::signedDot4(
+            a4[group], packed_groups[group], terms.low_dot);
     }
 #pragma unroll
     for (int group = 4; group < 8; ++group)
     {
-        terms.high_dot = __builtin_amdgcn_sdot4(
-            a4[group], packed_groups[group], terms.high_dot, false);
+        terms.high_dot = ::llaminar2::rocm_integer_contract::signedDot4(
+            a4[group], packed_groups[group], terms.high_dot);
     }
 
     const uint16_t* low_scales =

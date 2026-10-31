@@ -11,7 +11,12 @@
  * after all tests cannot exercise the early-finalization edge. It loads no
  * model and initializes no accelerator. CTest supplies the ordinary 30-second
  * protocol bound; no idle-rank command loop or production callback is added.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "utils/MPIContext.h"
 #include "app/AppContext.h"
 #include <cstdio>
@@ -62,6 +67,10 @@ namespace
  */
 int main(int argc, char **argv)
 {
+    // Ownership starts before this frontend creates MPI or runtime state.
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     RetirementObserver observer;
     // The real application aggregate, not a hand-written reset sequence, owns
     // the finalizer. Its observer stays alive until after that scope retires.

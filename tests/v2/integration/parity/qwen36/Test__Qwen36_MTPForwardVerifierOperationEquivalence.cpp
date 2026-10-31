@@ -20,6 +20,8 @@
  * CPU drift back into this row-level oracle, independently of sampler draws.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "Qwen36MoEParityTestBase.h"
 #include "../ModelParityGenerationWorkload.h"
 
@@ -870,6 +872,10 @@ TEST(
 /** @brief Install standalone-test runtime services before constructing runners. */
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided = MPI_THREAD_SINGLE;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     // The application normally installs this allocation backend during runtime
@@ -880,7 +886,7 @@ int main(int argc, char **argv)
     const int result = RUN_ALL_TESTS();
 
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
 
     MPI_Finalize();
     std::cout.flush();

@@ -69,9 +69,10 @@ public:
     std::optional<CpuAdaptiveImmutableRowCache::Pin> borrowSubordinateResponseRow(std::size_t responseRow);
     /** @brief Process at most one newly published exact row request.
      * @param generation Current API-admission generation, independent of model execution decisions.
+     * @param invocation Actual retained-worker dispatch, or zero for an unticketed direct processor diagnostic.
      * @return Pending without touching payload, or Completed after release-publishing a response.
      */
-    ImmutableLookupPoll poll(std::uint64_t generation);
+    ImmutableLookupPoll poll(std::uint64_t generation,std::uint64_t invocation=0);
     /** @brief Verify that the GPU terminal closed after acknowledging every serviced response.
      * @param generation Exact API-admission generation being drained.
      * @return True after its explicit device close, false while it remains open.
@@ -95,6 +96,16 @@ private:
      * @note This does not release channel/frame backing or independently held reader pins.
      */
     void retireInvocation(std::uint64_t generation,std::uint64_t invocation) noexcept;
+    /** @return A matching GPU-owned I/O abort after acquiring invocation before its generation body.
+     * @param generation Exact admitted service interval. @param invocation Actual worker dispatch, zero only for direct processor diagnostics.
+     */
+    bool sourceAbortRequested(std::uint64_t generation,std::uint64_t invocation) const noexcept;
+    /** @brief Account a GPU abort once after this exact worker joins, including publication racing retirement.
+     * @param generation Original joined admission. @param invocation Original joined dispatch ticket.
+     * @return Whether that original GPU I/O abort was published; no model/controller state is observed.
+     * @note Service await owns the unique Serving-to-terminal transition and cannot call this twice for one ticket.
+     */
+    bool observeTerminalAbort(std::uint64_t generation,std::uint64_t invocation);
     /** @brief Immutable identity of one actual acquire; it neither keeps a mutable-frame reference nor promises borrowed bytes. */
     class SubordinateReadBorrow final {
         friend class ImmutableLookupHostProcessor;
@@ -224,6 +235,11 @@ private:
     declareAdaptiveStorage(const ImmutableSubordinateLookupBinding &binding,
                            const AdaptiveImmutableRowCacheNativePlan &plan, std::shared_ptr<TensorBase> cache,
                            std::shared_ptr<TensorBase> frame, std::shared_ptr<TensorBase> protocol);
+    /** @brief Create/reuse one actual pooled source registration; mutually exclusive with the existing single-GPU adaptive arm. */
+    std::shared_ptr<PooledImmutableSourcePreparedStorage> declarePooledSourceStorage(const ImmutableSubordinateLookupBinding& binding,
+        const PooledImmutableSourceGeometry& geometry,std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,
+        std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream);
+    std::shared_ptr<PooledImmutableSourcePreparedStorage> pooled_storage_; ///< Roots only; never retains service/binding and creates no ownership cycle.
     std::mutex adaptive_setup_; ///< Setup metadata publication only, independent of live device state.
     std::shared_ptr<AdaptiveLookupPreparedStorage>
         adaptive_storage_; ///< Strong until the source channel retires.

@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
@@ -516,42 +517,93 @@ TEST_F(Test__KernelFactoryOps, CreateEmbedding_Q8_1_CPU)
 #ifdef HAVE_ROCM
 TEST_F(Test__KernelFactoryOps, CreateEmbedding_FP32_ROCm)
 {
+    const DeviceId owner = DeviceId::rocm(0);
     auto tensor = TestTensorFactory::createFP32Random({32, 64});
     auto kernel = KernelFactory::createEmbedding(
-        static_cast<const FP32Tensor *>(tensor.get()), DeviceType::ROCm);
+        static_cast<const FP32Tensor *>(tensor.get()), owner.type, owner.ordinal);
     ASSERT_NE(kernel, nullptr);
-    EXPECT_TRUE(kernel->supports_device(0)); // ROCm device 0
+    EXPECT_TRUE(kernel->supports_device(owner.ordinal));
+    EXPECT_FALSE(kernel->supports_device(-1));
+    EXPECT_FALSE(kernel->supports_device(owner.ordinal + 1));
+    // Foreign-owner rejection happens before stream lookup or native work.
+    EXPECT_THROW(kernel->apply_tensor(nullptr, nullptr, 1, 64, nullptr, nullptr,
+        owner.ordinal + 1), std::invalid_argument);
 }
 
 TEST_F(Test__KernelFactoryOps, CreateEmbedding_BF16_ROCm)
 {
+    const DeviceId owner = DeviceId::rocm(7);
     auto tensor = TestTensorFactory::createBF16Random({32, 64});
     auto kernel = KernelFactory::createEmbedding(
-        static_cast<const BF16Tensor *>(tensor.get()), DeviceType::ROCm);
+        static_cast<const BF16Tensor *>(tensor.get()), owner.type, owner.ordinal);
     ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(owner.ordinal));
+    EXPECT_FALSE(kernel->supports_device(-1));
+    EXPECT_FALSE(kernel->supports_device(owner.ordinal + 1));
+    // Foreign-owner rejection happens before stream lookup or native work.
+    EXPECT_THROW(kernel->apply_tensor(nullptr, nullptr, 1, 64, nullptr, nullptr,
+        owner.ordinal + 1), std::invalid_argument);
 }
 
 TEST_F(Test__KernelFactoryOps, CreateEmbedding_FP16_ROCm)
 {
+    const DeviceId owner = DeviceId::rocm(8);
     auto tensor = TestTensorFactory::createFP16Random({32, 64});
     auto kernel = KernelFactory::createEmbedding(
-        static_cast<const FP16Tensor *>(tensor.get()), DeviceType::ROCm);
+        static_cast<const FP16Tensor *>(tensor.get()), owner.type, owner.ordinal);
     ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(owner.ordinal));
+    EXPECT_FALSE(kernel->supports_device(-1));
+    EXPECT_FALSE(kernel->supports_device(owner.ordinal + 1));
+    // Foreign-owner rejection happens before stream lookup or native work.
+    EXPECT_THROW(kernel->apply_tensor(nullptr, nullptr, 1, 64, nullptr, nullptr,
+        owner.ordinal + 1), std::invalid_argument);
 }
 
 TEST_F(Test__KernelFactoryOps, CreateEmbedding_Q8_1_ROCm)
 {
+    const DeviceId owner = DeviceId::rocm(64);
     auto tensor = TestTensorFactory::createQ8_1Random({32, 64});
     auto kernel = KernelFactory::createEmbedding(
-        static_cast<const Q8_1Tensor *>(tensor.get()), DeviceType::ROCm);
+        static_cast<const Q8_1Tensor *>(tensor.get()), owner.type, owner.ordinal);
     ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(owner.ordinal));
+    EXPECT_FALSE(kernel->supports_device(-1));
+    EXPECT_FALSE(kernel->supports_device(owner.ordinal + 1));
+    // Foreign-owner rejection happens before stream lookup or native work.
+    EXPECT_THROW(kernel->apply_tensor(nullptr, nullptr, 1, 64, nullptr, nullptr,
+        owner.ordinal + 1), std::invalid_argument);
 }
 
 TEST_F(Test__KernelFactoryOps, CreateEmbedding_GenericDispatch_FP32_ROCm)
 {
+    const DeviceId owner = DeviceId::rocm(127);
     auto tensor = TestTensorFactory::createFP32Random({32, 64});
-    auto kernel = KernelFactory::createEmbedding(tensor.get(), DeviceType::ROCm);
+    auto kernel = KernelFactory::createEmbedding(tensor.get(), owner.type, owner.ordinal);
     ASSERT_NE(kernel, nullptr);
+    EXPECT_TRUE(kernel->supports_device(owner.ordinal));
+    EXPECT_FALSE(kernel->supports_device(-1));
+    EXPECT_FALSE(kernel->supports_device(owner.ordinal + 1));
+    // Foreign-owner rejection happens before stream lookup or native work.
+    EXPECT_THROW(kernel->apply_tensor(nullptr, nullptr, 1, 64, nullptr, nullptr,
+        owner.ordinal + 1), std::invalid_argument);
+}
+/** @test Missing owners remain invalid for every actual ROCm factory overload. */
+TEST_F(Test__KernelFactoryOps, CreateEmbedding_ROCmRequiresExplicitImmutableOwner)
+{
+    auto fp32 = TestTensorFactory::createFP32Random({32, 64});
+    auto bf16 = TestTensorFactory::createBF16Random({32, 64});
+    auto fp16 = TestTensorFactory::createFP16Random({32, 64});
+    auto q8 = TestTensorFactory::createQ8_1Random({32, 64});
+    EXPECT_THROW(KernelFactory::createEmbedding(static_cast<const FP32Tensor *>(fp32.get()),
+        DeviceType::ROCm), std::invalid_argument);
+    EXPECT_THROW(KernelFactory::createEmbedding(static_cast<const BF16Tensor *>(bf16.get()),
+        DeviceType::ROCm), std::invalid_argument);
+    EXPECT_THROW(KernelFactory::createEmbedding(static_cast<const FP16Tensor *>(fp16.get()),
+        DeviceType::ROCm), std::invalid_argument);
+    EXPECT_THROW(KernelFactory::createEmbedding(static_cast<const Q8_1Tensor *>(q8.get()),
+        DeviceType::ROCm), std::invalid_argument);
+    EXPECT_THROW(KernelFactory::createEmbedding(fp32.get(), DeviceType::ROCm), std::invalid_argument);
 }
 #endif // HAVE_ROCM
 

@@ -5,7 +5,11 @@
  * Four immutable metadata waves exercise exact large IDs, different GPU vendors,
  * real versus estimated bytes and a final transaction after the HTTP cutoff.
  * No backend is initialized and no payload, model or accelerator is accessed.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "ControllerMovementFixture.h"
 #include "app/modes/MoEMovementTransportJson.h"
 #include <cstdlib>
@@ -14,6 +18,8 @@
 /** @brief Emit production counter/terminal projections of device-free fixture metadata. */
 int main()
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     using namespace llaminar2;
     ::setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
     ::unsetenv("LLAMINAR_PERF_STATS_FILTER");

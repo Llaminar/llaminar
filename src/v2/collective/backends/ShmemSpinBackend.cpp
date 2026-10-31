@@ -3,13 +3,14 @@
  * @brief Shared-memory spin-wait collective backend implementation
  *
  * Fast-path allreduce for N-rank intra-node CPU tensor parallelism.
- * Uses POSIX shared memory + atomic epoch counters + AVX-512 reduction.
+ * Uses process-owned shared mmap files, atomic epoch counters and AVX-512 reduction.
  *
  * @author David Sanftenberg
  * @date April 2026
  */
 
 #include "ShmemSpinBackend.h"
+#include "utils/MPISessionSharedDirectory.h"
 #include "../CollectiveTimeoutPolicy.h"
 #include "../../utils/Assertions.h"
 #include "../../utils/CPUFeatures.h"
@@ -17,6 +18,7 @@
 #include "../../utils/Logger.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -28,7 +30,8 @@
 #include <mpi.h>
 #include <omp.h>
 #include <sstream>
-#include <sys/mman.h> // shm_open, mmap, munmap, shm_unlink
+#include <system_error>
+#include <sys/mman.h> // mmap, munmap
 #include <unistd.h>   // ftruncate, close
 
 namespace llaminar2
@@ -52,7 +55,7 @@ namespace llaminar2
             const uint64_t sequence = g_shmem_name_counter.fetch_add(1, std::memory_order_relaxed) + 1;
 
             std::ostringstream name;
-            name << "/llaminar_shmem_ar_u" << static_cast<unsigned long>(getuid())
+            name << "llaminar_shmem_ar_u" << static_cast<unsigned long>(getuid())
                  << "_d" << domain_id
                  << "_p" << static_cast<unsigned long>(getpid())
                  << "_t" << static_cast<unsigned long long>(now)
@@ -162,7 +165,7 @@ namespace llaminar2
             }
         }
 
-        // Set up shared memory (requires working fallback for barriers)
+        // Set up shared memory (requires its actual construction communicator)
         if (!setupSharedMemory())
         {
             LOG_ERROR("ShmemSpinBackend::initialize - Failed to set up shared memory");
@@ -222,7 +225,7 @@ namespace llaminar2
         // Rank 0 creates a fresh per-run segment with O_EXCL, broadcasts the
         // generated name, then unlinks it after every rank has mapped it. The
         // mapping stays alive through open file descriptors, while the name is
-        // removed from /dev/shm so failed or later runs cannot collide with it.
+        // removed after attachment; pre-unlink failures remain under the existing guardian root.
 
         arena_size_ = ShmemSpinArena::compute_size(num_ranks_);
 
@@ -234,6 +237,11 @@ namespace llaminar2
         }
 
         MPI_Comm comm = general_backend_->domainComm();
+        try {
+            shared_directory_=discoverMPISharedDirectory(comm);
+            if(!shared_directory_)throw std::runtime_error("Owned shared backing requires llaminar_mpi_session around external mpirun");
+        } catch(const std::exception &error) { last_error_=error.what();return false; }
+        MPISessionOwner::SharedIdentity creator_identity{};
         int create_success = 1;
         int name_len = 0;
 
@@ -242,34 +250,29 @@ namespace llaminar2
             for (int attempt = 0; attempt < kMaxCreateAttempts; ++attempt)
             {
                 shm_name_ = makeUniqueShmemName(domain_id_);
-                shm_unlinked_ = false;
 
-                shm_fd_ = shm_open(shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
-                if (shm_fd_ >= 0)
+                try {
+                    shared_file_=shared_directory_->createExclusive(shm_name_);
+                    creator_identity=shared_file_.identity();
                     break;
-
-                if (errno == EEXIST)
-                    continue;
-
-                last_error_ = "shm_open(create) failed for " + shm_name_ + ": " + std::string(strerror(errno));
-                break;
+                } catch(const std::system_error &error) {
+                    if(error.code().value()==EEXIST)continue;
+                    last_error_=error.what();break;
+                } catch(const std::exception &error) { last_error_=error.what();break; }
             }
 
-            if (shm_fd_ < 0)
+            if (shared_file_.descriptor() < 0)
             {
                 if (last_error_.empty())
-                    last_error_ = "shm_open(create) exhausted unique-name attempts";
+                    last_error_ = "owned shared file create exhausted unique-name attempts";
                 LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
                 create_success = 0;
             }
-            else if (ftruncate(shm_fd_, static_cast<off_t>(arena_size_)) != 0)
+            else if (ftruncate(shared_file_.descriptor(), static_cast<off_t>(arena_size_)) != 0)
             {
                 last_error_ = "ftruncate failed for " + shm_name_ + ": " + std::string(strerror(errno));
                 LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
-                close(shm_fd_);
-                shm_fd_ = -1;
-                shm_unlink(shm_name_.c_str());
-                shm_unlinked_ = true;
+                shared_file_={};
                 create_success = 0;
             }
 
@@ -298,30 +301,44 @@ namespace llaminar2
             shm_name_.assign(static_cast<size_t>(name_len), '\0');
         }
         MPI_Bcast(shm_name_.data(), name_len, MPI_CHAR, 0, comm);
+        std::array<std::uint64_t,4> creator={creator_identity.device,creator_identity.inode,creator_identity.uid,arena_size_};
+        if(MPI_Bcast(creator.data(),creator.size(),MPI_UINT64_T,0,comm)!=MPI_SUCCESS) {
+            last_error_="Cannot publish original shared arena identity/extent";teardownSharedMemory();return false;
+        }
+        creator_identity={creator[0],creator[1],creator[2]};
 
         if (my_rank_ != 0)
         {
-            shm_fd_ = shm_open(shm_name_.c_str(), O_RDWR, 0);
-            if (shm_fd_ < 0)
+            try {
+                if(creator[3]!=arena_size_)throw std::runtime_error("Shared arena creator extent disagrees with participants");
+                shared_file_=shared_directory_->openExisting(shm_name_,creator_identity,creator[3]);
+            } catch(const std::exception &error) { last_error_=error.what();shared_file_={}; }
+            if (shared_file_.descriptor() < 0)
             {
-                last_error_ = "shm_open(open) failed for " + shm_name_ + ": " + std::string(strerror(errno));
+                if(last_error_.empty())last_error_ = "owned shared file open failed for " + shm_name_;
                 LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
             }
         }
 
+        int authenticated=shared_file_.descriptor()>=0?1:0,all_authenticated=0;
+        if(authenticated)try { shared_file_.requireExtent(arena_size_); }
+            catch(const std::exception &error) {last_error_=error.what();authenticated=0;}
+        if(MPI_Allreduce(&authenticated,&all_authenticated,1,MPI_INT,MPI_MIN,comm)!=MPI_SUCCESS || !all_authenticated) {
+            if(last_error_.empty())last_error_="A peer rejected original shared arena identity/extent";
+            teardownSharedMemory();return false;
+        }
         void *ptr = MAP_FAILED;
-        if (shm_fd_ >= 0)
+        if (shared_file_.descriptor() >= 0)
         {
             ptr = mmap(nullptr, arena_size_,
                        PROT_READ | PROT_WRITE, MAP_SHARED,
-                       shm_fd_, 0);
+                       shared_file_.descriptor(), 0);
 
             if (ptr == MAP_FAILED)
             {
                 last_error_ = "mmap failed for " + shm_name_ + ": " + std::string(strerror(errno));
                 LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
-                close(shm_fd_);
-                shm_fd_ = -1;
+                shared_file_={};
             }
             else
             {
@@ -381,23 +398,19 @@ namespace llaminar2
         /* `initialize()` promises that the public name is gone on return, not
          * merely that every participant has mapped the segment.  Without the
          * publication below, a non-root rank can leave this method while rank
-         * zero is still between the preceding barrier and `shm_unlink()`.  A
+         * zero is still between the preceding barrier and `typed unlink()`.  A
          * root-authored broadcast is the exact construction edge: observing a
          * successful value proves that unlink already completed, while all
          * open descriptors and mappings continue to own the anonymous object. */
         int unlink_success = 1;
         if (my_rank_ == 0)
         {
-            if (shm_unlink(shm_name_.c_str()) == 0 || errno == ENOENT)
-            {
-                shm_unlinked_ = true;
-            }
-            else
-            {
+            try { shared_file_.unlink(); }
+            catch(const std::exception &error) {
                 unlink_success = 0;
                 last_error_ =
-                    "shm_unlink failed after every rank mapped " +
-                    shm_name_ + ": " + std::string(strerror(errno));
+                    "owned shared name unlink failed after every rank mapped " +
+                    shm_name_ + ": " + error.what();
             }
         }
         if (MPI_Bcast(&unlink_success, 1, MPI_INT, 0, comm) != MPI_SUCCESS)
@@ -436,27 +449,11 @@ namespace llaminar2
             arena_ = nullptr;
         }
 
-        if (shm_fd_ >= 0)
-        {
-            close(shm_fd_);
-            shm_fd_ = -1;
-        }
-
-        // Rank 0 normally unlinks immediately after all ranks map the segment.
-        // Retry here only for failures that occurred before that point.
-        if (my_rank_ == 0 && !shm_name_.empty() && !shm_unlinked_)
-        {
-            if (shm_unlink(shm_name_.c_str()) == 0 || errno == ENOENT)
-            {
-                shm_unlinked_ = true;
-            }
-            else
-            {
-                LOG_WARN("ShmemSpinBackend::teardownSharedMemory - shm_unlink(" << shm_name_
-                                                                                 << ") failed: " << strerror(errno));
-            }
-        }
-
+        // The typed file owns its descriptor and validates exact name/inode
+        // before creator cleanup. A replaced entry is retained for the ancestor,
+        // never deleted as though it were the original arena.
+        shared_file_={};
+        shared_directory_.reset();
         shm_name_.clear();
     }
 

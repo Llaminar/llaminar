@@ -3,8 +3,12 @@
  * @brief Unit tests for WeightPlacementMap (Tensor-Level Device Placement - Phase 2)
  *
  * Tests block-level and MoE-specific device placement methods added for MoE readiness.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "loaders/WeightPlacementMap.h"
 #include "backends/DeviceId.h"
 #include "execution/mpi_orchestration/PlacementPlan.h"
@@ -546,6 +550,8 @@ TEST_F(WeightPlacementMapTest, DeviceId_ToStringIncludesOrdinal)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

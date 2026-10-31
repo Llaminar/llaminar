@@ -431,6 +431,8 @@ namespace llaminar2
         QWEN4EXP_QSA_RETAIN_CANDIDATES,
         QWEN4EXP_QSA_SNAPSHOT_PRIOR,
         QWEN4EXP_NGRAM_LOOKUP,
+        QWEN4EXP_POOLED_NATIVE_PHASE, ///< Participant-local pooled metadata/copy operation with explicit boundaries.
+        QWEN4EXP_POOLED_SOURCE_PHASE, ///< Actual provider request/acquire/private-copy/original-order consumer.
         QWEN4EXP_QSA_PREPARE_REPLAY,
 
         // GDN (Gated Delta Network) stages

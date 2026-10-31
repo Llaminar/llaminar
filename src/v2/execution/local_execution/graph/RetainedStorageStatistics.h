@@ -79,8 +79,9 @@ inline void accumulateHostImmutableRowWork(RetainedStorageCounters &totals,HostI
 enum class RetainedStorageTransport : std::uint8_t
 {
     MappedChannel,      ///< Ordinary host-provider requests with no GPU cache.
-    AdaptiveSubordinate ///< CPU protocol2 source work beneath one GPU-owned
-                        ///< native cache.
+    AdaptiveSubordinate, ///< CPU protocol2 source work beneath one GPU-owned
+                         ///< native cache.
+    PooledSubordinate ///< Same actual provider ABI beneath explicit pooled native owner/coordinator phases.
 };
 /** @brief One completed storage interval, safe to publish without GPU observation. */
 struct RetainedStorageTerminalObservation

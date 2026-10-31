@@ -307,4 +307,44 @@ TEST(AdaptiveImmutableRowCacheOps, CancellationAtSourceFrontiersPreservesReadyRo
         f.expectInvariants();
     }
 }
+
+/** @brief Production Operations delegates identical physical transitions for narrow and wide source keys. */
+TEST(AdaptiveImmutableRowCacheOps, SharedPhysicalLeafPreservesGenerationPinAndCancellationTransitions)
+{
+    const auto replay = []<class Slot>() {
+        ActualMetadata<Slot> f(2);
+        auto actual = f.operations();
+        ASSERT_TRUE(actual.begin(2));
+        ASSERT_TRUE(actual.beginPolicy(1));
+        const auto reserved = actual.observe(7);
+        ASSERT_NE(reserved.slot, a::None);
+        EXPECT_EQ(actual.find(7), a::None);
+        const auto duplicate = actual.observe(7, reserved);
+        EXPECT_EQ(duplicate.slot, reserved.slot);
+        EXPECT_EQ(duplicate.generation, reserved.generation);
+        EXPECT_EQ(f.owner.next_slot_generation, 1u);
+        ASSERT_TRUE(actual.prepare());
+        f.validateResponse(1);
+        ASSERT_TRUE(actual.makeReady(reserved));
+        EXPECT_EQ(actual.find(7), reserved.slot);
+        EXPECT_TRUE(a::PhysicalSlot<Slot>::pinned(f.slots[reserved.slot]));
+        ASSERT_TRUE(actual.release(reserved));
+        EXPECT_FALSE(a::PhysicalSlot<Slot>::pinned(f.slots[reserved.slot]));
+        ASSERT_TRUE(actual.finish());
+        f.expectInvariants();
+        // A later frame must retain the same original physical generation.
+        ASSERT_TRUE(actual.begin(1));
+        ASSERT_TRUE(actual.pinInitial(reserved.slot, reserved.generation));
+        ASSERT_TRUE(actual.beginPolicy(1));
+        const auto hit = actual.observe(7, reserved);
+        ASSERT_TRUE(actual.prepare());
+        f.validateResponse(0);
+        ASSERT_TRUE(actual.release(hit));
+        ASSERT_TRUE(actual.finish());
+        EXPECT_EQ(f.slots[reserved.slot].generation, reserved.generation);
+        f.expectInvariants();
+    };
+    replay.template operator()<a::Slot32>();
+    replay.template operator()<a::Slot64>();
+}
 } // namespace llaminar2::test

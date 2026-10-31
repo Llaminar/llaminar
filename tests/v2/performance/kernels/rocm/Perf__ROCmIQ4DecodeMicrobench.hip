@@ -1,3 +1,12 @@
+/**
+ * @file Perf__ROCmIQ4DecodeMicrobench.hip
+ * @brief Native IQ4 decoding timing with the production signed integer contract.
+ *
+ * Packed codebook values retain their original lane ownership and arithmetic.
+ * The compiler selects the native signed dot4 encoding without changing the
+ * benchmark's decomposition, accumulation order or timing boundaries.
+ */
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <gtest/gtest.h>
 #include <vector>
 #include <random>
@@ -27,7 +36,7 @@ namespace
         #pragma unroll
         for (int g = 0; g < 8; ++g)
         {
-            acc = __builtin_amdgcn_sdot4(a4[g], w8[g], acc, false);
+            acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], w8[g], acc);
         }
         return acc;
     }
@@ -328,7 +337,7 @@ namespace
         for (int g = 0; g < 8; ++g)
         {
             const int32_t w = decode_q4_group_to_packed_i8(payload16, g, r);
-            acc = __builtin_amdgcn_sdot4(a4[g], w, acc, false);
+            acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], w, acc);
         }
         out[tid] = acc;
     }
@@ -377,7 +386,7 @@ namespace
         for (int g = 0; g < 8; ++g)
         {
             const int32_t w = decode_q4_group_to_packed_i8_with_lut64(payload16, g, lut_lo, lut_hi);
-            acc = __builtin_amdgcn_sdot4(a4[g], w, acc, false);
+            acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], w, acc);
         }
 
         out[tid] = acc;
@@ -396,13 +405,13 @@ namespace
         for (int g = 0; g < 4; ++g)
         {
             const int32_t w = decode_q4_group_to_packed_i8(payload16, g, r);
-            acc = __builtin_amdgcn_sdot4(a4[g], w, acc, false);
+            acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], w, acc);
         }
         #pragma unroll
         for (int g = 4; g < 8; ++g)
         {
             const int32_t w = decode_q4_group_to_packed_i8(payload16, g, r);
-            acc = __builtin_amdgcn_sdot4(a4[g], w, acc, false);
+            acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], w, acc);
         }
         out[tid] = acc;
     }
@@ -453,20 +462,20 @@ namespace
         int32_t w_high = 0;
 
         decode_q4_low_high_pair_to_packed_i8_with_lut64(q0, q1, q2, q3, lut_lo, lut_hi, w_low, w_high);
-        acc = __builtin_amdgcn_sdot4(a4[0], w_low, acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[4], w_high, acc, false);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[0], w_low, acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[4], w_high, acc);
 
         decode_q4_low_high_pair_to_packed_i8_with_lut64(q4, q5, q6, q7, lut_lo, lut_hi, w_low, w_high);
-        acc = __builtin_amdgcn_sdot4(a4[1], w_low, acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[5], w_high, acc, false);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[1], w_low, acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[5], w_high, acc);
 
         decode_q4_low_high_pair_to_packed_i8_with_lut64(q8, q9, q10, q11, lut_lo, lut_hi, w_low, w_high);
-        acc = __builtin_amdgcn_sdot4(a4[2], w_low, acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[6], w_high, acc, false);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[2], w_low, acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[6], w_high, acc);
 
         decode_q4_low_high_pair_to_packed_i8_with_lut64(q12, q13, q14, q15, lut_lo, lut_hi, w_low, w_high);
-        acc = __builtin_amdgcn_sdot4(a4[3], w_low, acc, false);
-        acc = __builtin_amdgcn_sdot4(a4[7], w_high, acc, false);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[3], w_low, acc);
+        acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[7], w_high, acc);
 
         out[tid] = acc;
     }

@@ -11,6 +11,8 @@
  * other's symbols, causing NVIDIA code to call AMD's RCCL or vice versa.
  * Dependency selection belongs to CMake's RCCL_LIBRARY; runtime loading never
  * searches for a substitute if that configured installation is unavailable.
+ * The selected path remains owned with its callbacks until explicit unload;
+ * a live handle cannot certify a different or empty requested selection.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -28,10 +30,14 @@ namespace llaminar2
     namespace rccl_dynamic
     {
         /**
-         * @brief Load RCCL library dynamically with isolated symbols
+         * @brief Load the exact selected RCCL dependency with isolated symbols.
          * @param library_path Explicit diagnostic DSO path, or nullptr for the
          *        exact RCCL_LIBRARY selected by CMake. No alternate DSO is tried.
-         * @return true if loaded successfully
+         * @return True for the same retained path or complete required-symbol
+         *         admission; false for invalid/different selection or load failure.
+         * Empty explicit paths always reject, including after successful loading.
+         * Repeated identical selection retains the handle; different paths reject
+         * until unload retires both selection identity and borrowed callbacks.
          *
          * The library is loaded with RTLD_NOW | RTLD_LOCAL to:
          * - RTLD_NOW: Resolve all symbols immediately (fail fast on missing symbols)
@@ -40,7 +46,9 @@ namespace llaminar2
         bool load(const char *library_path = nullptr);
 
         /**
-         * @brief Unload RCCL library
+         * @brief Retire the selected path and all callbacks before closing its DSO.
+         * Native operations must have retired before this call. Callback clearing
+         * preserves failed-partial-load safety; a later load can bind a new path.
          */
         void unload();
 

@@ -468,10 +468,14 @@ build-tree discovery and belongs to `ProductionTestPreflight`.
 CUDA builds use the canonical capture-reentry NCCL dependency installed by
 `scripts/docker/install-nccl.sh` in both development and release images.
 Outside those images, run `sudo bash scripts/docker/install-nccl.sh` before
-configuring. The runtime deliberately loads its distinct SONAME, not the
-distribution NCCL package, because retained parent recording requires the
-corrected stream-membership lifecycle. Do not substitute a system library to
-make dependency discovery pass.
+configuring. The runtime loads the exact NCCL library selected by CMake, with
+the dependency's distinct SONAME. Retained parent recording requires its
+corrected stream-membership lifecycle. Do not substitute a system library or
+search for another installation after dependency admission.
+`V2_Integration_NCCLConfiguredLibrary_*` replays the actual loader's configured,
+explicit and missing path behavior without loading a runtime. Its original-code
+control authenticates the former bare-SONAME search so dependency qualification
+cannot certify one library while inference loads another.
 The same installer repairs native GIN auto selection when a successful probe
 finds no compatible devices. `V2_Integration_NCCLGinSelection` belongs to
 production preflight: the dependency builder replays the actual selector and
@@ -484,6 +488,29 @@ a local build. Container builders and Release images install the same source-
 built RCCL at the same stable path; moving a checkout must not change the DSO.
 Its project-patched source/ABI pin is separate from the SDK release pin; compile
 it against the selected SDK and prove its native capture/storage contracts.
+Both loaders retain their exact selection until unload and withdraw resolved
+callbacks before closing a partially admitted library.
+`V2_Integration_NCCLPartialAdmission` and
+`V2_Integration_RCCLRetainedLibraryIdentity` replay the actual loader bodies
+and their original failures in preflight without loading a GPU runtime.
+
+Native NCCL/RCCL asynchronous groups retain successful thread creation separately
+from worker execution state. Partial creation failure signals the existing abort
+state, joins every created worker, and only then destroys jobs or their storage.
+A failed join is fatal before cleanup; returning an error is insufficient because
+some native callers deliberately ignore abort results. The dependency builders
+replay the actual native bodies and original-code negative controls.
+`V2_Integration_NCCLThreadLifetime` and
+`V2_Integration_RCCLThreadLifetimeReplay` authenticate the source/DSO-bound
+results in production preflight without SDKs or accelerators. These host-lifetime
+proofs complement actual communicator, capture and admission tests.
+
+Apply the canonical RCCL patch chain through
+`scripts/docker/apply-rccl-capture-patch.sh`. It validates the entire transition
+in a temporary index before updating source, so overlapping patch context cannot
+leave a partially updated tree. Fresh sources, the explicitly supported prior
+chain and the complete current chain are accepted; repeated application preserves
+unchanged file mtimes. `V2_Integration_RCCLPatchChain` guards this contract.
 
 For gfx906, `scripts/docker/install-rocblas-gfx906.sh` compiles matching rocBLAS
 and Tensile sources, including the full floating-format kernel inventory.
@@ -492,6 +519,15 @@ runtime closure. Both CPU ISA images copy that closure from the builder; never
 graft another release's kernel pack into a newer DSO or ship only the host
 library. `V2_Integration_ROCmBLASKernelPackaging` belongs to preflight, alongside
 the functional floating-format BLAS/expert tests.
+
+NCCL and RCCL shared-file creators acquire fresh names exclusively and retire
+partial file creations before returning failure. Their complete native host
+translation-unit replays and literal original controls run in the dependency
+builder. `V2_Integration_NCCLSharedFileLifecycle` and
+`V2_Integration_RCCLSharedFileLifecycle` authenticate the resulting
+source/compiler/DSO-bound evidence in production preflight without an SDK or
+GPU. These proofs cover named-file partial creation, not failed GPU registration
+or complete communicator retirement.
 
 RCCL protocol defaults are communicator-local values. Do not cache thread limits
 or publish partially initialized protocol arrays across communicator lifetimes.
@@ -898,6 +934,18 @@ execution are not admitted by this implementation. Compare the same model,
 topology, precision, MTP, movement and request policy before claiming a benefit.
 
 ### Cluster launch and shared runtime policy
+
+Executable entrypoints enter `MPISessionOwner` before MPI/runtime setup. Its
+CPU-only sibling `llaminar_mpi_session` owns the actual descendant process tree
+and fresh temporary/shared-memory roots through final retirement. Never delete
+MPI files at `MPI_Finalize`, scan another job's files, or infer retirement from
+a numeric PID or an empty process group. External MPI parents retain their own
+job ownership; explicit native launches use the same helper and MPI's `--`
+application delimiter. Canonical `add_v2_test` registrations use this owner,
+including `NO_MPI` jobs; cancellation must finish native retirement before the
+next campaign lane. Keep the matching sibling helper and native component in
+runtime/test installation and register changed lifetime behavior in
+`ProductionTestPreflight`.
 
 The executable normally bootstraps MPI and installs rank, NUMA, OpenMP, and
 BLAS placement. Do not use `--no-mpi-bootstrap` for ordinary execution; it is

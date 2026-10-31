@@ -94,7 +94,7 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
         echo "Skipping CUDA installation"; \
     fi
 
-# The shared ROCm installer builds matching gfx906 BLAS and the repaired HIP
+# The shared ROCm installer builds matching shipping-target BLAS and the repaired HIP
 # runtime from the pinned release sources, exactly like the shipping builder.
 RUN if [ "$INSTALL_ROCM" = "true" ]; then \
         MODE=full /tmp/install-scripts/install-rocm.sh; \

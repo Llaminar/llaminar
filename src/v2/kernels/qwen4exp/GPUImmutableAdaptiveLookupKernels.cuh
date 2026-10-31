@@ -8,6 +8,7 @@
  * handshake. Acquired native bytes and ACKs are copied privately before mapped
  * retirement, and current admission/reservation is checked again before Ready.
  * This component adds no serving selector, topology or physical byte ledger.
+ * Factory setup borrows the admitted physical clock for the unchanged deadline.
  */
 #pragma once
 #if defined(QFN_ADAPTIVE_CUDA)
@@ -22,6 +23,7 @@
 #define QFN_ADAPTIVE_FACTORY createCUDAImmutableAdaptiveLookupKernels
 #else
 #include <hip/hip_runtime.h>
+#include "ImmutableLookupHardwareBinding.h"
 #include <hip/hip_fp16.h>
 #define QFN_ADAPTIVE_STREAM hipStream_t
 #define QFN_ADAPTIVE_ERROR hipGetLastError
@@ -1078,12 +1080,9 @@ QFN_ADAPTIVE_FACTORY(AdaptiveImmutableRowCacheNativePlan plan, ImmutableSubordin
     if (!p.device.is_cuda() || !prepareNativeEmbeddingTablesCUDA(p.device.ordinal, p.format, tables))
         throw std::invalid_argument("Adaptive CUDA source/device/codebook mismatch");
 #else
-    int rate = 0;
-    if (!p.device.is_rocm() || !prepareNativeEmbeddingTablesROCm(p.device.ordinal, p.format, tables) ||
-        hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, p.device.ordinal) != hipSuccess ||
-        rate <= 0)
+    if (!p.device.is_rocm() || !prepareNativeEmbeddingTablesROCm(p.device.ordinal, p.format, tables))
         throw std::invalid_argument("Adaptive HIP source/device/codebook/wall-clock mismatch");
-    timeout = static_cast<std::uint64_t>(rate) * 30'000;
+    timeout = rocmImmutableLookupTimeoutTicks(rocmHardwareMetadata().at(p.device.ordinal));
 #endif
     using namespace QFN_ADAPTIVE_NAMESPACE;
     switch (p.format)

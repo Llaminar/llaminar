@@ -20,6 +20,8 @@
  * participant sources; they never publish whole-expert or overlay aliases.
  * Each sharding operation retains an immutable TP assignment while parallel
  * participant construction may atomically republish the shared manager owner.
+ * Preparation role classification shares the exact identity contract consumed
+ * by physical creator/alias lowering; schema fallback retains its existing role.
  * CPU participant rank qualifies each cached shard independently of its shared
  * host storage DeviceId; ordinary/GPU cache access retains device identity.
  *
@@ -27,6 +29,7 @@
  */
 
 #include "WeightManager.h"
+#include "loaders/PreparedWeightIdentityContract.h"
 #include "WeightSlicer.h"
 #include "MoEExpertSourceView.h"
 #include "MmapRegion.h"
@@ -297,67 +300,6 @@ namespace llaminar2
             return out.str();
         }
 
-        bool isDeclaredGemmRole(WeightRole role)
-        {
-            if (isFlashNextProjectionRole(role)) return true;
-            if (isImmutableFP32WeightRole(role) || role == WeightRole::ImmutableRowTable) return false;
-            switch (role)
-            {
-            case WeightRole::LMHead:
-            case WeightRole::AttentionQ:
-            case WeightRole::AttentionK:
-            case WeightRole::AttentionV:
-            case WeightRole::AttentionWO:
-            case WeightRole::FusedQKV:
-            case WeightRole::GDNProjection:
-            case WeightRole::GDNAlphaBetaProjection:
-            case WeightRole::FFNGate:
-            case WeightRole::FFNUp:
-            case WeightRole::FFNDown:
-            case WeightRole::MoEExpertGate:
-            case WeightRole::MoEExpertUp:
-            case WeightRole::MoEExpertDown:
-            case WeightRole::SharedExpertGate:
-            case WeightRole::SharedExpertUp:
-            case WeightRole::SharedExpertDown:
-                return true;
-            case WeightRole::Embedding:
-            case WeightRole::OutputNorm:
-            case WeightRole::GDNSsmParam:
-            case WeightRole::MoERouter:
-            case WeightRole::SharedExpertInputGate:
-            case WeightRole::Norm:
-            case WeightRole::Bias:
-            case WeightRole::Other:
-            case WeightRole::ImmutableRowTable:
-            case WeightRole::HyperConnectionProjection:
-            case WeightRole::HyperConnectionNorm:
-            case WeightRole::SparseIndexerProjection:
-            case WeightRole::SparseIndexerNorm:
-            case WeightRole::PerLayerEmbeddingProjection:
-            case WeightRole::PerLayerEmbeddingNorm:
-            case WeightRole::PerLayerEmbeddingConvolution:
-            case WeightRole::PredictorProjection:
-                return false;
-            }
-            return false;
-        }
-
-        bool preparedKindDeclaresGemm(
-            const std::optional<PreparedWeightRef> &prepared,
-            DeviceId device)
-        {
-            if (!prepared.has_value() || prepared->device != device)
-                return false;
-            if (device.is_cpu())
-                return prepared->kind == PreparedWeightKind::CpuPackedGemm;
-            if (device.is_cuda())
-                return prepared->kind == PreparedWeightKind::CudaInt8PackedGemm;
-            if (device.is_rocm())
-                return prepared->kind == PreparedWeightKind::RocmInt8PackedGemm;
-            return false;
-        }
-
         bool bindingTargetsDevice(const WeightBinding &binding, DeviceId device)
         {
             return binding.residency.home_device == device ||
@@ -399,39 +341,10 @@ namespace llaminar2
             DeviceId device,
             bool include_expert_jobs)
         {
-            if (!bindingTargetsDevice(binding, device))
-                return false;
-            if (!binding.tensor || binding.tensor->shape().size() != 2)
-                return false;
-            if (isImmutableFP32WeightRole(binding.identity.role) ||
-                binding.identity.role == WeightRole::ImmutableRowTable ||
-                binding.identity.role == WeightRole::Embedding ||
-                binding.identity.role == WeightRole::OutputNorm ||
-                binding.identity.role == WeightRole::GDNSsmParam ||
-                binding.identity.role == WeightRole::MoERouter ||
-                binding.identity.role == WeightRole::SharedExpertInputGate ||
-                binding.identity.role == WeightRole::Norm ||
-                binding.identity.role == WeightRole::Bias)
-            {
-                return false;
-            }
-            if (!include_expert_jobs && isRoutedExpertBinding(binding))
-                return false;
-
-            /*
-             * Frozen bindings are the declarative graph contract. An explicit
-             * GEMM role or backend-typed prepared reference is sufficient to
-             * classify the binding even when a lightweight unit/model context
-             * does not retain the source schema object. Known non-GEMM roles
-             * were rejected above, so a stale prepared hint cannot reinterpret
-             * a norm, bias, router, or recurrent parameter as GEMM.
-             */
-            if (preparedKindDeclaresGemm(binding.prepared, device) ||
-                (device.is_gpu() &&
-                 isDeclaredGemmRole(binding.identity.role)))
-            {
-                return true;
-            }
+            const auto classification = PreparedWeightIdentityContract::classify(binding, device,
+                include_expert_jobs ? PreparedExpertJobs::Included : PreparedExpertJobs::Excluded);
+            if (classification == PreparedGemmClassification::Rejected) return false;
+            if (classification == PreparedGemmClassification::Gemm) return true;
 
             try
             {

@@ -9,6 +9,8 @@
  * remain on device and inactive input/output/scratch bytes are untouched.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
 #pragma once
 #if defined(Q8_RESIDUAL_CUDA)
@@ -24,6 +26,7 @@
 #define Q8R_ERROR_TEXT cudaGetErrorString
 #define Q8R_SHFL(x,o) __shfl_xor_sync(0xffffffffu,x,o,32)
 #else
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "kernels/rocm/ops/ROCmSwiGLUDecodeEquivalentMath.h"
@@ -61,7 +64,7 @@ __device__ __forceinline__ int dot4(int a,int b,int c) {
 #if defined(Q8_RESIDUAL_CUDA)
  return __dp4a(a,b,c);
 #else
- return __builtin_amdgcn_sdot4(a,b,c,false);
+ return ::llaminar2::rocm_integer_contract::signedDot4(a,b,c);
 #endif
 }
 /** @brief Derive the exact standalone/grouped/prefill HC-up blockwise scale.

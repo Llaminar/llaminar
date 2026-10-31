@@ -284,6 +284,12 @@ namespace llaminar2
             sharding_ = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
     }
 
+    WeightSourceStorageView WeightShardGeometryResolver::sourceStorageView(const TensorSizeInfo &tensor) const
+    {
+        return total_shards_ == 1 || sharding_->getModeAndDimension(tensor.name).first == WeightShardingMode::Replicate
+            ? WeightSourceStorageView::WholeOriginal : WeightSourceStorageView::DeclaredSlice;
+    }
+
     WeightShardGeometry WeightShardGeometryResolver::resolve(
         const TensorSizeInfo &tensor,
         const MoEExpertProjectionOwnership &ownership, size_t owned_experts) const

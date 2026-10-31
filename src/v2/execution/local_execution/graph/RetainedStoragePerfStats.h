@@ -74,9 +74,11 @@ public:
             observation.counters.windowMisses||observation.counters.windowEvictions))
             throw std::invalid_argument("RAM lookup evidence cannot claim mapping-window work");
         if (observation.transport != RetainedStorageTransport::MappedChannel &&
-            observation.transport != RetainedStorageTransport::AdaptiveSubordinate)
+            observation.transport != RetainedStorageTransport::AdaptiveSubordinate &&
+            observation.transport != RetainedStorageTransport::PooledSubordinate)
             throw std::invalid_argument("Retained storage evidence has an unknown executed transport");
-        if (observation.transport == RetainedStorageTransport::AdaptiveSubordinate &&
+        if ((observation.transport == RetainedStorageTransport::AdaptiveSubordinate ||
+             observation.transport == RetainedStorageTransport::PooledSubordinate) &&
             observation.mode != HostImmutableRowMode::AdaptiveRAMSSD)
             throw std::invalid_argument("Subordinate source work requires its "
                                         "actual adaptive host owner");
@@ -84,9 +86,8 @@ public:
         if(!PerfStatsCollector::isDomainEnabled("immutable_lookup"))return;
         const PerfStatsCollector::Tags tags{
             {"storage", std::string(hostImmutableRowModeName(observation.mode))},
-            {"transport", observation.transport == RetainedStorageTransport::AdaptiveSubordinate
-                              ? "adaptive_subordinate"
-                              : "mapped_channel"}};
+            {"transport", observation.transport == RetainedStorageTransport::AdaptiveSubordinate?"adaptive_subordinate":
+                observation.transport == RetainedStorageTransport::PooledSubordinate?"pooled_subordinate":"mapped_channel"}};
         const auto record=[&](const char *name,std::uint64_t value)
         {
             PerfStatsCollector::addCounterWithSequence("immutable_lookup",name,static_cast<double>(value),

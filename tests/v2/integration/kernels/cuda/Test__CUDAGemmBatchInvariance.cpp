@@ -15,6 +15,8 @@
  * optimized path; there is no alternate deterministic prefill implementation.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 
 #include "tensors/Tensors.h"
@@ -22,6 +24,8 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "backends/ComputeBackend.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "backends/IGPUGraphCapture.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -2425,11 +2429,12 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         {std::move(stage_plan)},
         "CUDA concurrent QKV bias regression");
 
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t graph_exec = nullptr;
-    ASSERT_EQ(
-        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
-        cudaSuccess);
+    // The exact worker generation owns shared projection side streams for
+    // the whole native capture, not only each multiply_fused_tensor call.
+    auto capture_owner = GPUDeviceContextPool::instance().retainNvidiaContext(gpu_device_.ordinal);
+    auto graph = capture_owner->createGraphCapture(root_stream);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_TRUE(graph->beginCapture());
     bool capture_body_ok = false;
     std::string capture_error;
     try
@@ -2445,16 +2450,13 @@ TEST_F(Test__CUDAGemmBatchInvariance,
     {
         capture_error = error.what();
     }
-    const cudaError_t capture_end = cudaStreamEndCapture(stream, &graph);
+    const bool capture_end = graph->endCapture();
     ASSERT_TRUE(capture_error.empty()) << capture_error;
     ASSERT_TRUE(capture_body_ok);
-    ASSERT_EQ(capture_end, cudaSuccess);
-    ASSERT_NE(graph, nullptr);
-    ASSERT_EQ(
-        cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
-        cudaSuccess);
-    ASSERT_NE(graph_exec, nullptr);
-    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_TRUE(capture_end);
+    ASSERT_TRUE(graph->instantiate());
+    ASSERT_TRUE(graph->hasExecutable());
+    ASSERT_TRUE(graph->launchOnStream(root_stream));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     std::vector<float> actual_q(expected_q.size());
@@ -2478,8 +2480,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
     expectBitwiseEqual(actual_k, expected_k, "captured concurrent K bias");
     expectBitwiseEqual(actual_v, expected_v, "captured concurrent V bias");
 
-    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
-    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    graph.reset(); // Retire captured workspace pointers before unbinding their owner.
     cleanupSharedWorkspace({q_kernel, k_kernel, v_kernel});
     llaminar::v2::kernels::KernelFactory::clearCacheFor(wq.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(wk.get());
@@ -2714,9 +2715,12 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         };
         GraphCaptureDependencyLedger ledger(
             gpu_device_, stream, {std::move(stage_plan)}, "merged workspace regression");
-        cudaGraph_t graph = nullptr;
-        cudaGraphExec_t executable = nullptr;
-        ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+        // Retain the actual context from lookup through native capture and
+        // every dirty replay; standalone capture cannot own its shared streams.
+        auto capture_owner = GPUDeviceContextPool::instance().retainNvidiaContext(gpu_device_.ordinal);
+        auto graph = capture_owner->createGraphCapture(stream);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_TRUE(graph->beginCapture());
         bool recorded = false;
         std::string error;
         try
@@ -2731,17 +2735,18 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         {
             error = failure.what();
         }
-        const auto capture_end = cudaStreamEndCapture(stream, &graph);
+        const bool capture_end = graph->endCapture();
         ASSERT_TRUE(error.empty()) << error;
         ASSERT_TRUE(recorded);
-        ASSERT_EQ(capture_end, cudaSuccess);
-        ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+        ASSERT_TRUE(capture_end);
+        ASSERT_TRUE(graph->instantiate());
+        ASSERT_TRUE(graph->hasExecutable());
         for (int replay = 0; replay < 20; ++replay)
         {
             for (size_t i = 0; i < outputs.size(); ++i)
                 ASSERT_EQ(cudaMemsetAsync(outputs[i]->gpu_data_ptr(), 0xff,
                     columns[i] * sizeof(float), stream), cudaSuccess);
-            ASSERT_EQ(cudaGraphLaunch(executable, stream), cudaSuccess);
+            ASSERT_TRUE(graph->launchOnStream(stream));
             for (size_t i = 0; i < outputs.size(); ++i)
             {
                 std::vector<float> actual(columns[i]);
@@ -2751,8 +2756,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
                 expectBitwiseEqual(actual, expected[i], format.label);
             }
         }
-        ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
-        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+        graph.reset(); // Captured pointers retire before shared workspace/cache cleanup.
         cleanupSharedWorkspace(kernels);
         for (auto &weight : weights)
             llaminar::v2::kernels::KernelFactory::clearCacheFor(weight.get());
@@ -2788,10 +2792,15 @@ TEST_F(Test__CUDAGemmBatchInvariance,
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }

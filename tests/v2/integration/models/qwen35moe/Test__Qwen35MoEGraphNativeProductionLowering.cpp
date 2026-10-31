@@ -48,6 +48,7 @@
 #include "mocks/MockLocalTPContext.h"
 #include "mocks/MockComputeStage.h"
 #include "mocks/MockMPIContext.h"
+#include "fixtures/mpi/OwnedSharedBackingReplay.h"
 #include "mocks/MockMPITopology.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/Tensors.h"
@@ -1984,15 +1985,20 @@ namespace llaminar2::test
         plan->authority_execution =
             MoEOverlayAuthorityExecutionKind::DeviceResident;
         const auto owner_map = MoEExpertOwnerMap::build(*plan);
+        // Deliver actual startup packets between both logical ranks; the plain
+        // mock completes receives without bytes and cannot authenticate a file.
+        auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         auto overlay_mpi =
-            std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/2);
+            std::make_shared<OwnedSharedBackingReplayContext>(/*rank=*/0, /*world_size=*/2);
+        overlay_mpi->bind(startup_link);
         overlay_mpi->set_topology(
             MockMPITopology::createSimple(
                 /*rank=*/0,
                 /*world_size=*/2,
                 /*ranks_per_node=*/2));
         auto peer_mpi =
-            std::make_shared<MockMPIContext>(/*rank=*/1, /*world_size=*/2);
+            std::make_shared<OwnedSharedBackingReplayContext>(/*rank=*/1, /*world_size=*/2);
+        peer_mpi->bind(startup_link);
         peer_mpi->set_topology(
             MockMPITopology::createSimple(
                 /*rank=*/1,
@@ -2647,8 +2653,12 @@ namespace llaminar2::test
         constexpr int kMTPSourceLayer = 1;
         auto plan = makeDistributedLocalTPContinuationPlan(
             /*layer_count=*/kMTPSourceLayer + 1);
+        // Deliver actual startup packets between both logical ranks; the plain
+        // mock completes receives without bytes and cannot authenticate a file.
+        auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         auto overlay_mpi =
-            std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/2);
+            std::make_shared<OwnedSharedBackingReplayContext>(/*rank=*/0, /*world_size=*/2);
+        overlay_mpi->bind(startup_link);
         overlay_mpi->set_topology(
             MockMPITopology::createSimple(
                 /*rank=*/0,
@@ -2771,7 +2781,8 @@ namespace llaminar2::test
          * every returned byte.
          */
         auto peer_mpi =
-            std::make_shared<MockMPIContext>(/*rank=*/1, /*world_size=*/2);
+            std::make_shared<OwnedSharedBackingReplayContext>(/*rank=*/1, /*world_size=*/2);
+        peer_mpi->bind(startup_link);
         peer_mpi->set_topology(
             MockMPITopology::createSimple(
                 /*rank=*/1,

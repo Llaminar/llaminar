@@ -4,12 +4,13 @@
  *
  * These tests model two MPI ranks in one process while retaining distinct
  * topology and transport objects. They prove that same-node rank pairs exchange
- * dispatch and return payloads through the same POSIX shared pages without one
- * MPI operation, and that cross-node pairs can never construct that transport.
+ * dispatch and return payloads through the same owned shared pages after the
+ * required startup MPI publication, without ordinary payload MPI operations, and that cross-node pairs can never construct that transport.
  */
 
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "mocks/MockMPIContext.h"
+#include "fixtures/mpi/OwnedSharedBackingReplay.h"
 #include "mocks/MockMPITopology.h"
 
 #include <gtest/gtest.h>
@@ -46,7 +47,7 @@ namespace
         int rank,
         int ranks_per_node)
     {
-        auto context = std::make_shared<MockMPIContext>(rank, 2);
+        auto context = std::make_shared<OwnedSharedBackingReplayContext>(rank, 2);
         context->set_topology(
             MockMPITopology::createSimple(rank, 2, ranks_per_node));
         return context;
@@ -72,6 +73,9 @@ namespace
         std::shared_ptr<MockMPIContext> context,
         const std::string &identity)
     {
+        auto startup=std::dynamic_pointer_cast<OwnedSharedBackingReplayContext>(context);
+        if(!startup)throw std::logic_error("Node-local replay needs explicit startup delivery");
+        startup->bind(ownedSharedBackingReplayLink(identity));
         return MoEOverlayRankBatchTransportConfig{
             .mpi_ctx = std::move(context),
             .source_world_rank = 0,
@@ -320,6 +324,12 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
         std::rethrow_exception(source_error);
     if (target_error)
         std::rethrow_exception(target_error);
+    EXPECT_EQ(source_context->isend_call_count(),3u);
+    EXPECT_EQ(source_context->irecv_call_count(),1u);
+    EXPECT_EQ(target_context->isend_call_count(),1u);
+    EXPECT_EQ(target_context->irecv_call_count(),3u);
+    source_context->reset_call_counts();
+    target_context->reset_call_counts();
     ASSERT_EQ(source->kind(),
               MoEOverlayRankBatchTransportKind::NodeLocalSharedRows);
     ASSERT_EQ(target->kind(),
@@ -657,6 +667,12 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
         std::rethrow_exception(source_error);
     if (target_error)
         std::rethrow_exception(target_error);
+    EXPECT_EQ(source_context->isend_call_count(),3u);
+    EXPECT_EQ(source_context->irecv_call_count(),1u);
+    EXPECT_EQ(target_context->isend_call_count(),1u);
+    EXPECT_EQ(target_context->irecv_call_count(),3u);
+    source_context->reset_call_counts();
+    target_context->reset_call_counts();
     auto *const source_channel = dynamic_cast<
         IMoEOverlayMappedActivationTransport *>(source.get());
     auto *const target_channel = dynamic_cast<

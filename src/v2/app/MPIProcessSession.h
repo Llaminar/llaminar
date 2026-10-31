@@ -23,7 +23,7 @@ namespace llaminar2
          * @param argv Argument vector MPI may modify.
          * @return The only scope responsible for this process's MPI shutdown.
          * @throws std::runtime_error if initialization/thread support fails.
-         * @throws std::logic_error if MPI already has a process owner or ended.
+         * @throws std::logic_error if startup ownership is missing, MPI already has an owner, or ended.
          */
         [[nodiscard]] static MPIProcessSession initialize(int &argc, char **&argv);
         /** @brief Transfer finalization responsibility without touching MPI. */

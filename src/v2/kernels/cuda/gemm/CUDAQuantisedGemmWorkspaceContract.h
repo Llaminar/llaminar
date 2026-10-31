@@ -5,11 +5,13 @@
  * Prepared engines and source-backed planning samples call the same named-buffer
  * composition. Geometry is independent of weight addresses. Native prefill
  * dispatch remains device-specific, so callers query on the actual device's
- * worker; this is not a device-free estimate for an unobserved remote GPU.
+ * worker, or planners supply the same exact typed inventory facts. Neither path
+ * invents a physical device or reads native properties during byte composition.
  */
 #pragma once
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "CUDANativeVNNIWorkspaceHardware.h"
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -34,6 +36,16 @@ namespace llaminar2::cuda::quantized_gemm_workspace
      */
     WorkspaceRequirements projectionRequirements(int m, int n, int k, int device_ordinal,
         std::optional<NativeCodebooks> native);
+
+    /**
+     * @brief Declare the same exact scratch from an explicit rank inventory observation.
+     * @param m Maximum rows. @param n Output width. @param k Input width.
+     * @param hardware Checked physical owner/SM facts from the planning request.
+     * @param native Original execution/arithmetic codebook binding.
+     * @return The production named-buffer BOM without consulting runtime globals.
+     */
+    WorkspaceRequirements projectionRequirements(int m, int n, int k,
+        const NativeVNNIWorkspaceHardware &hardware, std::optional<NativeCodebooks> native);
 
     /** @brief Add disjoint verifier partials for simultaneously executing projections. */
     void appendFusedProjectionRequirements(WorkspaceRequirements &requirements, int m,

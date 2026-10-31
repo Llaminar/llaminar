@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "AdaptiveImmutableRowCacheState.h"
+#include "AdaptiveImmutablePhysicalSlot.h"
 #include <limits>
 namespace llaminar2::qwen4exp::adaptive_lookup
 {
@@ -21,7 +22,7 @@ public:
     /** @return Original state bits, independent of region/pin flags. */
     QFN_ADAPTIVE_HD static SlotState state(const Slot &s)
     {
-        return static_cast<SlotState>(s.flags & StateMask);
+        return PhysicalSlot<Slot>::state(s);
     }
     /** @return Full logical list membership, including pending Reserved rows. */
     QFN_ADAPTIVE_HD static Stream stream(const Slot &s)
@@ -31,7 +32,7 @@ public:
     /** @return Whether this frame retains the row's native backing. */
     QFN_ADAPTIVE_HD static bool pinned(const Slot &s)
     {
-        return (s.flags & FramePin) != 0;
+        return PhysicalSlot<Slot>::pinned(s);
     }
     /** @return Canonical integer avalanche hash shared with the CPU cache equation. */
     QFN_ADAPTIVE_HD static std::uint64_t hash(std::uint64_t n)
@@ -47,9 +48,7 @@ public:
     {
         if (i < v_.capacity)
         {
-            v_.slots[i] = Slot{};
-            v_.slots[i].previous = v_.slots[i].next = None;
-            v_.slots[i].flags = static_cast<std::uint32_t>(Stream::None) << 2;
+            PhysicalSlot<Slot>::initialize(v_.slots[i]);
         }
     }
     /** @brief Initialize one pre-admitted directory node during setup only. */
@@ -138,7 +137,7 @@ public:
         auto &s = v_.slots[slot];
         if (state(s) != SlotState::Ready || s.generation != generation || pinned(s))
             return fail(Status::Invariant);
-        s.flags |= FramePin;
+        PhysicalSlot<Slot>::pin(s);
         ++v_.frame->held_pins;
         return true;
     }
@@ -248,12 +247,7 @@ public:
         else
             ++o.filled;
         const auto generation = ++o.next_slot_generation;
-        s = Slot{};
-        s.row = static_cast<decltype(s.row)>(row);
-        s.generation = generation;
-        s.touched = o.logical_clock;
-        s.previous = s.next = None;
-        s.flags = static_cast<std::uint32_t>(SlotState::Reserved) | FramePin;
+        PhysicalSlot<Slot>::reserve(s, row, generation, o.logical_clock);
         if (!append(slot, Stream::NewProbation))
             return {};
         ++v_.frame->held_pins;
@@ -279,10 +273,10 @@ public:
             return fail(Status::Invariant);
         if (v_.frame->promotions == 0xffffffffU)
             return fail(Status::Exhausted);
-        s.flags = (s.flags & ~StateMask) | static_cast<std::uint32_t>(SlotState::Ready);
+        PhysicalSlot<Slot>::ready(s);
         if (!insert(d.slot))
         {
-            s.flags = (s.flags & ~StateMask) | static_cast<std::uint32_t>(SlotState::Reserved);
+            PhysicalSlot<Slot>::reserved(s);
             return false;
         }
         ++v_.frame->promotions;
@@ -303,13 +297,11 @@ public:
         {
             if (!unlink(d.slot))
                 return false;
-            s.flags = static_cast<std::uint32_t>(Stream::None) << 2;
-            s.previous = v_.owner->slot_free;
-            s.next = None;
+            PhysicalSlot<Slot>::recycle(s, v_.owner->slot_free);
             v_.owner->slot_free = d.slot;
         }
         else if (state(s) == SlotState::Ready)
-            s.flags &= ~FramePin;
+            PhysicalSlot<Slot>::unpin(s);
         else
             return fail(Status::Invariant);
         --v_.frame->held_pins;

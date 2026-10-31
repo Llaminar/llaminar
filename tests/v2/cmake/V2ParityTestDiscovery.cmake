@@ -194,11 +194,6 @@ set(_env_vars
     "OMPI_MCA_btl_openib_allow_ib=1"
 )
 
-# Add ROCm env if labels mention ROCm
-if("${LABELS}" MATCHES "ROCm")
-    list(APPEND _env_vars "HSA_OVERRIDE_GFX_VERSION=9.0.6")
-endif()
-
 # Graph-native parity is only meaningful when the captured production graph
 # path is admitted.  Keep the full KV context capacity independent from the
 # resident activation bucket: runtime planning chooses the largest fitting
@@ -433,10 +428,6 @@ foreach(_full_name IN LISTS _all_tests)
 
     set(_test_env_vars ${_env_vars})
     if(_focused_source_admission)
-        list(FIND _focused_backend_signature ROCm _focused_rocm_index)
-        if(_focused_rocm_index EQUAL -1)
-            list(FILTER _test_env_vars EXCLUDE REGEX "^HSA_OVERRIDE_GFX_VERSION=")
-        endif()
         if(_focused_backend_signature STREQUAL "CPU")
             list(APPEND _test_env_vars "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
         else()
@@ -473,6 +464,9 @@ foreach(_full_name IN LISTS _all_tests)
     endif()
     string(APPEND _output "    LABELS \"${_labels_joined}\"\n")
     string(APPEND _output "    ENVIRONMENT \"${_env_joined}\"\n")
+    if("${_labels_joined}" MATCHES "ROCm")
+        string(APPEND _output "    ENVIRONMENT_MODIFICATION \"HSA_OVERRIDE_GFX_VERSION=unset:\"\n")
+    endif()
     string(APPEND _output "    WORKING_DIRECTORY \"${WORKING_DIR}\"\n")
     string(APPEND _output "    PROCESSORS 4\n")
     set(_focused_timeout "${TIMEOUT}")
@@ -685,12 +679,6 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     string(JOIN ";" _labels_joined ${_campaign_labels})
 
     set(_campaign_env_vars ${_env_vars})
-    # HSA compatibility is similarly scoped to campaigns that actually own a
-    # ROCm participant; it must not leak topology assumptions into CUDA/CPU.
-    if(NOT "${_backend_signature}" MATCHES "ROCm")
-        list(FILTER _campaign_env_vars EXCLUDE REGEX
-            "^HSA_OVERRIDE_GFX_VERSION=")
-    endif()
     # Integration tests default to DEBUG, but a complete real-weight campaign
     # emits canonical CSV/PerfStats evidence and must not benchmark synchronous
     # debug-log traffic.  A focused reproduction can still run at DEBUG.
@@ -702,6 +690,9 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
     string(APPEND _output "    LABELS \"${_labels_joined}\"\n")
     string(APPEND _output "    ENVIRONMENT \"${_env_joined}\"\n")
+    if("${_labels_joined}" MATCHES "ROCm")
+        string(APPEND _output "    ENVIRONMENT_MODIFICATION \"HSA_OVERRIDE_GFX_VERSION=unset:\"\n")
+    endif()
     string(APPEND _output "    REQUIRED_FILES \"${_campaign_model_files}\"\n")
     string(APPEND _output "    WORKING_DIRECTORY \"${WORKING_DIR}\"\n")
     string(APPEND _output "    PROCESSORS 4\n")

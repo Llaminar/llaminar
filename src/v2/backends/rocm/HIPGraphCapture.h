@@ -5,6 +5,8 @@
  * The capture borrows one exact HIP stream and owns its graph/executable
  * handles. Read-only recursive kernel inspection mirrors the CUDA contract so
  * graph-level performance diagnostics remain backend-symmetric.
+ * Projection exclusion covers the complete native recording interval, including
+ * error/abort termination; a per-launch token cannot outlive forked stream membership.
  */
 
 #pragma once
@@ -12,10 +14,13 @@
 #ifdef HAVE_ROCM
 
 #include "../IGPUGraphCapture.h"
+#include "../GPUProjectionSubmission.h"
 #include <hip/hip_runtime.h>
+#include <optional>
 
 namespace llaminar2
 {
+    class AMDDeviceContext;
 
     /// HIP Graph capture/replay implementation for AMD ROCm GPUs.
     ///
@@ -27,7 +32,11 @@ namespace llaminar2
         /// @param stream The HIP stream to capture on. Must remain valid for the
         ///               lifetime of this object.
         /// @param device_ordinal Immutable ROCm device owning the stream/graph.
+        /// @note Standalone recording does not borrow a pooled projection owner;
+        ///       concurrent projection capture requires the exact-owner overload.
         HIPGraphCapture(hipStream_t stream, int device_ordinal);
+        /** @brief Bind native capture to the exact worker generation, retained through graph teardown. */
+        HIPGraphCapture(hipStream_t stream, int device_ordinal, AMDDeviceContext &owner);
         ~HIPGraphCapture() override;
 
         // Move-only (graph handles are not copyable)
@@ -47,7 +56,10 @@ namespace llaminar2
         {
             if (graph_ || exec_)
                 return nullptr;
-            return std::make_unique<HIPGraphCapture>(stream_, device_ordinal_);
+            auto fragment = projection_owner_
+                ? std::make_unique<HIPGraphCapture>(stream_, device_ordinal_, *projection_owner_)
+                : std::make_unique<HIPGraphCapture>(stream_, device_ordinal_);
+            return fragment;
         }
         bool buildOrderedTimelineTransaction(
             std::span<const GPUOrderedTimelineStep> ordered_steps,
@@ -88,6 +100,13 @@ namespace llaminar2
     private:
         /** @brief Select the immutable HIP owner before a runtime operation. */
         bool activateOwner(const char *operation) const noexcept;
+        /**
+         * @brief End native recording before releasing side-stream exclusion.
+         * @param captured_graph Receives the native recording or null for an invalidated capture.
+         * @return Native end status after proving that no capture membership remains.
+         * @note Unproved termination is fatal because another parent must never reuse live side handles.
+         */
+        hipError_t endNativeCapture(hipGraph_t *captured_graph);
 
         /** @brief One persistent event pair embedded around a timeline step. */
         struct OrderedTimelineTimingEvents
@@ -106,6 +125,10 @@ namespace llaminar2
         int device_ordinal_ = -1;             ///< Immutable HIP resource owner.
         hipGraph_t graph_ = nullptr;          ///< Captured graph (owned)
         hipGraphExec_t exec_ = nullptr;       ///< Instantiated executable (owned)
+        AMDDeviceContext *projection_owner_ = nullptr; ///< Exact retained generation or explicit standalone borrower.
+        std::shared_ptr<IWorkerGPUContext> projection_context_lifetime_; ///< Retained through native graph teardown, including replay.
+        std::optional<GPUProjectionSubmission> projection_submission_; ///< Whole native capture interval.
+        bool native_capture_active_ = false; ///< Only native end may retire this interval.
         size_t node_count_ = 0;               ///< Cached node count from last capture
         std::size_t resident_memory_bytes_ = 0u; ///< Setup-observed opaque driver VRAM.
         std::vector<OrderedTimelineTimingEvents>

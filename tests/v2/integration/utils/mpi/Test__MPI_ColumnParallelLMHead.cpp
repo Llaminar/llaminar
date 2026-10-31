@@ -12,8 +12,13 @@
  * 4. AllGatherStageIntegration - Verify AllGather collects distributed logits
  *
  * @author David Sanftenberg
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <memory>
@@ -564,6 +569,10 @@ TEST_F(Test__MPI_ColumnParallelLMHead, AllGatherOutputConsistency)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     // Initialize MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
@@ -575,6 +584,7 @@ int main(int argc, char **argv)
     int result = RUN_ALL_TESTS();
 
     // Finalize MPI
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
 
     return result;

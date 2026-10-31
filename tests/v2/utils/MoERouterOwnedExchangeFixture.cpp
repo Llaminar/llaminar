@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <memory>
 #include <stdexcept>
 #include <unordered_set>
@@ -342,6 +343,34 @@ void proveMoERouterOwnedExchange(DeviceId first, int participants, int capacity,
                 require(p.graphs[0]->launch() && p.graphs[1]->launch(), "Router retained transaction");
             });
         }
+        // Terminal diagnostics retain each source's actual compact packet and
+        // independent full oracle. A receiver-local oracle alone conflates a
+        // heterogeneous arithmetic difference with transfer/publication damage.
+        struct SourceObservation
+        {
+            std::array<std::vector<float>, 2> oracle;
+            std::vector<MoERouterSelectedRoute> packet;
+        };
+        std::vector<SourceObservation> source_observations(participants);
+        for (int source = 0; source < participants; ++source)
+        {
+            auto &p = *owners[source];
+            auto &observation = source_observations[source];
+            p.worker->submitAndWait([&] {
+                const auto span = DeviceRowPartition::balanced(source, participants).resolveFor(capacity, live);
+                observation.packet.resize(std::size_t(span.count) * top_k);
+                for (int column = 0; column < 2; ++column)
+                {
+                    observation.oracle[column].resize(route_count);
+                    p.read(observation.oracle[column].data(), column ? p.oracle_weights : p.oracle_indices,
+                        route_count * sizeof(float));
+                }
+                if (!observation.packet.empty())
+                    p.read(observation.packet.data(), p.packet->gpu_data_ptr(),
+                        observation.packet.size() * sizeof(MoERouterSelectedRoute));
+                require(p.worker->synchronizeStreamChecked(p.stream), "Router source diagnostics completion");
+            });
+        }
         for (int member = 0; member < participants; ++member)
         {
             auto &p = *owners[member];
@@ -352,7 +381,35 @@ void proveMoERouterOwnedExchange(DeviceId first, int participants, int capacity,
                     p.read(actual.data(), column ? p.publication.weights : p.publication.indices, actual.size() * 4);
                     p.read(expected.data(), column ? p.oracle_weights : p.oracle_indices, expected.size() * 4);
                     require(p.worker->synchronizeStreamChecked(p.stream), "Router route observation");
-                    require(actual == expected, "Router exchange changed a selected ID/probability bit or inactive suffix");
+                    if (actual != expected)
+                    {
+                        std::size_t index = 0;
+                        while (index < actual.size() && actual[index] == expected[index]) ++index;
+                        const int row = int(index / top_k);
+                        const int source = DeviceRowPartition::balanced(member, participants).ownerFor(capacity, live, row);
+                        std::ostringstream detail;
+                        detail << "Router exchange changed a selected ID/probability bit or inactive suffix"
+                            << " receiver=" << p.device.toString() << " receiver_member=" << member
+                            << " replay=" << replay << " live=" << live << " capacity=" << capacity
+                            << " width=" << width << " experts=" << experts
+                            << " row=" << row << " slot=" << index % top_k
+                            << " column=" << (column ? "weight" : "expert")
+                            << " actual=0x" << std::hex << actual[index]
+                            << " receiver_oracle=0x" << expected[index] << std::dec;
+                        if (source >= 0)
+                        {
+                            const auto span = DeviceRowPartition::balanced(source, participants).resolveFor(capacity, live);
+                            const auto &observation = source_observations[source];
+                            const auto &route = observation.packet[(row - span.first) * top_k + index % top_k];
+                            detail << " source=" << owners[source]->device.toString() << " source_member=" << source
+                                << " source_oracle=0x" << std::hex
+                                << std::bit_cast<std::uint32_t>(observation.oracle[column][index])
+                                << " source_packet=0x"
+                                << std::bit_cast<std::uint32_t>(column ? route.weight : route.expert);
+                        }
+                        else detail << " source=inactive_suffix";
+                        throw std::runtime_error(detail.str());
+                    }
                 }
                 std::vector<uint64_t> extents(participants);
                 std::vector<uint8_t> received(p.peers->size_bytes()), local(p.packet->size_bytes());

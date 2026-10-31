@@ -225,6 +225,14 @@ namespace llaminar2
         QFN_QSA_TRANSACTION_PRIOR_TRAFFIC, ///< Native required metadata bytes and actual live original-tail payload bytes.
         QFN_NGRAM_ADAPTIVE_CACHE, ///< Original model-owned optional native slots and directory/policy metadata.
         QFN_NGRAM_ADAPTIVE_FRAME, ///< Original mandatory single-inflight native work frame, including zero-slot mode.
+        QFN_POOLED_OWNER_CACHE, ///< Exact optional physical owner cache; C0 has no allocation.
+        QFN_POOLED_OWNER_FRAME, ///< Original owner frame and both immutable accepted wave banks.
+        QFN_POOLED_OWNER_NATIVE, ///< Native owner directed reply/header staging.
+        QFN_POOLED_COORDINATOR_POLICY, ///< Independent coordinator sole policy/directory authority.
+        QFN_POOLED_COORDINATOR_FRAME, ///< Independent coordinator original coalescing frame.
+        QFN_POOLED_COORDINATOR_NATIVE, ///< Native coordinator exact directed plans and radix offsets.
+        QFN_POOLED_SOURCE_FRAME, ///< Real provider private response/ACK/original-grant packet banks.
+        QFN_POOLED_SOURCE_NATIVE, ///< Existing source protocol, exact invocation and source outcome.
         GDN_PREPARED_QK, ///< Scalar producer-normalized Q/K; transient activation, not recurrent state.
         _COUNT ///< Sentinel – must be last
     };
@@ -540,6 +548,20 @@ namespace llaminar2
         case BufferId::QFN_PLE_TRANSACTION_COPY_BYTES: return "QFN_PLE_TRANSACTION_COPY_BYTES";
         case BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY: return "QFN_PLE_PRIOR_TOKEN_HISTORY";
         case BufferId::QFN_PLE_PRIOR_CONV_HISTORY: return "QFN_PLE_PRIOR_CONV_HISTORY";
+        case BufferId::QFN_POOLED_OWNER_CACHE:
+            return "QFN_POOLED_OWNER_CACHE";
+        case BufferId::QFN_POOLED_OWNER_FRAME:
+            return "QFN_POOLED_OWNER_FRAME";
+        case BufferId::QFN_POOLED_OWNER_NATIVE:
+            return "QFN_POOLED_OWNER_NATIVE";
+        case BufferId::QFN_POOLED_COORDINATOR_POLICY:
+            return "QFN_POOLED_COORDINATOR_POLICY";
+        case BufferId::QFN_POOLED_COORDINATOR_FRAME:
+            return "QFN_POOLED_COORDINATOR_FRAME";
+        case BufferId::QFN_POOLED_COORDINATOR_NATIVE:
+            return "QFN_POOLED_COORDINATOR_NATIVE";
+        case BufferId::QFN_POOLED_SOURCE_FRAME:return "QFN_POOLED_SOURCE_FRAME";
+        case BufferId::QFN_POOLED_SOURCE_NATIVE:return "QFN_POOLED_SOURCE_NATIVE";
         case BufferId::GDN_PREPARED_QK: return "GDN_PREPARED_QK";
         case BufferId::_COUNT:
             return "_COUNT";

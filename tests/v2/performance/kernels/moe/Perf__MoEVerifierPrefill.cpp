@@ -1,3 +1,4 @@
+#include "backends/GPUDeviceContextPool.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
 
@@ -1984,7 +1985,8 @@ namespace
             reference_candidate.schedule);
         llaminar2::PerfStatsCollector::reset();
         {
-            llaminar2::CUDAGraphCapture graph(stream, device_ordinal);
+            auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
             llaminar2::ScopedBackendGraphCapture capture(
                 graph,
                 "CUDA production MoE reference capture");
@@ -2084,7 +2086,8 @@ namespace
                 candidate.down_columns,
                 candidate.schedule);
             llaminar2::PerfStatsCollector::reset();
-            llaminar2::CUDAGraphCapture graph(stream, device_ordinal);
+            auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
             llaminar2::ScopedBackendGraphCapture capture(
                 graph,
                 "CUDA production MoE candidate capture");
@@ -2476,7 +2479,8 @@ namespace
          * a benchmark launch throws, preventing one failed cell from leaving
          * the CUDA stream in capture mode and poisoning every later cell.
          */
-        llaminar2::CUDAGraphCapture graph(stream, /*device_ordinal=*/0);
+        auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(0).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
         {
             llaminar2::ScopedBackendGraphCapture capture_transaction(
                 graph,
@@ -2732,7 +2736,8 @@ namespace
         const double eager_ms = timeCudaEvents(stream, iterations, run_grouped);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-        llaminar2::CUDAGraphCapture graph(stream, /*device_ordinal=*/0);
+        auto graph_owner = llaminar2::GPUDeviceContextPool::instance().getNvidiaContext(0).createGraphCapture(stream);
+        auto &graph = dynamic_cast<llaminar2::CUDAGraphCapture &>(*graph_owner);
         {
             llaminar2::ScopedBackendGraphCapture capture_transaction(
                 graph,

@@ -85,6 +85,8 @@
 #include <thread>
 #include <vector>
 #include <string_view>
+#include <sstream>
+#include <iomanip>
 
 namespace llaminar2::test
 {
@@ -442,6 +444,16 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
         auto route_columns = tensor(capacity * top_k * local_columns);
         auto columns = tensor(capacity * local_columns), gathered = tensor(capacity * width), output = tensor(capacity * width);
         auto expected = tensor(capacity * width);
+        // Persistent terminal-only diagnostic destinations use the actual
+        // packet layout and never alias production capture storage.
+        const MoEGroupedIntermediateLayout diagnostic_maximum{
+            maximum_layout.encoding, maximum_layout.columns,
+            maximum_layout.route_capacity, 1};
+        auto diagnostic_candidate = tensor(diagnostic_maximum.packetBytes() / sizeof(float));
+        auto diagnostic_reference = tensor(diagnostic_maximum.packetBytes() / sizeof(float));
+        auto diagnostic_owners = TestTensorFactory::createINT32({std::size_t(capacity * top_k)});
+        require(diagnostic_owners->ensureOnDevice(device, stream), "projection diagnostic owner admission");
+
         const bool shared_columns = config.output == ProjectionOutputProof::SharedColumnCompletion;
         const bool shared_full_sum = config.output == ProjectionOutputProof::SharedFullRowsOverlap;
         const bool has_shared = shared_columns || shared_full_sum;
@@ -1091,9 +1103,156 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     "projection native/assembled terminal snapshot changed complete-row semantics");
                 for (std::size_t i = 0; i < actual.size(); ++i)
                     if (!std::isfinite(actual[i]) || std::bit_cast<uint32_t>(actual[i]) != std::bit_cast<uint32_t>(reference[i]))
-                        throw std::runtime_error(format.name + " projection byte mismatch rows=" + std::to_string(rows) +
-                            " replay=" + std::to_string(replay) + " element=" + std::to_string(i) +
-                            " actual=" + std::to_string(actual[i]) + " expected=" + std::to_string(reference[i]));
+                    {
+                        // Keep the receiver-local complete-expert oracle exact.
+                        // Column and gate/up provenance separate mixed-program
+                        // arithmetic from an incorrect transport/assembly owner.
+                        const auto actual_bits = std::bit_cast<std::uint32_t>(actual[i]);
+                        const auto expected_bits = std::bit_cast<std::uint32_t>(reference[i]);
+                        const auto ordered = [](std::uint32_t bits) -> std::uint32_t {
+                            return bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+                        };
+                        const auto a_order = ordered(actual_bits), e_order = ordered(expected_bits);
+                        const auto ulps = a_order > e_order ? std::uint64_t(a_order) - e_order
+                                                           : std::uint64_t(e_order) - a_order;
+                        const bool payload = i < std::size_t(rows) * width;
+                        const int row = payload ? int(i / width) : -1;
+                        const int column = payload ? int(i % width) : -1;
+                        const int down_owner = payload ? column / local_columns : -1;
+                        std::ostringstream detail;
+                        detail << format.name << " projection byte mismatch"
+                            << " receiver=" << device.toString() << " receiver_member=" << participant
+                            << " reference_device=" << device.toString()
+                            << " rows=" << rows << " live=" << live << " replay=" << replay
+                            << " element=" << i << " row=" << row << " column=" << column
+                            << " width=" << width << " intermediate=" << intermediate
+                            << " experts=" << experts << " top_k=" << top_k
+                            << " demand=" << int(demand) << " epoch=" << epoch
+                            << " actual=" << std::setprecision(std::numeric_limits<float>::max_digits10) << actual[i]
+                            << " expected=" << reference[i]
+                            << " actual_bits=0x" << std::hex << actual_bits
+                            << " expected_bits=0x" << expected_bits << std::dec;
+                        if (std::isfinite(actual[i]) && std::isfinite(reference[i])) detail << " ulp_distance=" << ulps;
+                        else detail << " ulp_distance=nonfinite";
+                        if (down_owner >= 0)
+                            detail << " down_owner_member=" << down_owner
+                                << " down_owner_device=" << tp.devices().at(down_owner).toString()
+                                << " down_local_column=" << column % local_columns;
+                        else detail << " region=guard_suffix";
+                        if (payload && row < live)
+                        {
+                            detail << " gate_up_routes=[";
+                            for (int slot = 0; slot < top_k; ++slot)
+                            {
+                                const auto route = row * top_k + slot;
+                                if (slot) detail << ',';
+                                detail << "slot:" << slot << "/expert_bits:0x" << std::hex
+                                    << std::bit_cast<std::uint32_t>(ids[route]) << "/weight_bits:0x"
+                                    << std::bit_cast<std::uint32_t>(probabilities[route]) << std::dec;
+                                const float expert_value = ids[route];
+                                if (!std::isfinite(expert_value) || expert_value < 0.f ||
+                                    expert_value >= experts || std::trunc(expert_value) != expert_value)
+                                {
+                                    detail << "/owner:inactive_or_invalid";
+                                    continue;
+                                }
+                                const int expert = static_cast<int>(expert_value);
+                                // This is the fixture's unchanged placement trace.
+                                const auto *initial = initial_owners.ownerFor(0, expert);
+                                if (replay == 0 && !initial)
+                                {
+                                    detail << "/owner:missing_initial_assignment";
+                                    continue;
+                                }
+                                const int owner = replay == 0 ? initial->owner_participant
+                                    : replay % 4 == 3 ? 0 : (expert + replay) % participants;
+                                detail << "/expert:" << expert << "/member:" << owner;
+                                if (owner >= 0 && std::size_t(owner) < tp.devices().size())
+                                    detail << "/device:" << tp.devices()[owner].toString();
+                                else detail << "/device:invalid_owner";
+                            }
+                            detail << ']';
+                        }
+                        // ImportDown has regrouped all original routes before
+                        // consuming the exchanged representation. Observe that
+                        // retained representation and the full oracle through
+                        // the public bit-copy exporter, with one complete local
+                        // diagnostic member. This does not rerun gate/up/down.
+                        const MoEGroupedIntermediateLayout diagnostic_layout{
+                            maximum_layout.encoding, maximum_layout.columns,
+                            static_cast<std::uint32_t>(rows * top_k), 1};
+                        std::vector<std::int32_t> complete_owners(rows * top_k, -1);
+                        bool diagnostic_routes_valid = true;
+                        for (int route = 0; route < rows * top_k; ++route)
+                        {
+                            const float expert = ids[route];
+                            const bool valid_expert = std::isfinite(expert) && expert >= 0.f &&
+                                expert < experts && std::trunc(expert) == expert;
+                            if (route < live * top_k && valid_expert) complete_owners[route] = 0;
+                            else if (expert != -1.f) diagnostic_routes_valid = false;
+                        }
+                        if (!diagnostic_routes_valid)
+                            detail << " retained_intermediate=not_observed_invalid_route_inputs";
+                        else try
+                        {
+                            require(backend->hostToDeviceOnStream(diagnostic_owners->gpu_data_ptr(), complete_owners.data(),
+                                complete_owners.size() * sizeof(std::int32_t), device.ordinal, stream),
+                                "projection terminal diagnostic grouping upload");
+                            const auto *complete_owner_device = static_cast<const std::int32_t *>(diagnostic_owners->gpu_data_ptr());
+                            require(kernel_owner->kernel && kernel_owner->kernel->exportGroupedPrefillIntermediates(
+                                    diagnostic_layout, complete_owner_device, diagnostic_candidate.get(), 0) &&
+                                oracle->exportGroupedPrefillIntermediates(
+                                    diagnostic_layout, complete_owner_device, diagnostic_reference.get(), 0),
+                                "projection terminal retained-intermediate export");
+                            std::vector<std::uint32_t> candidate_words(diagnostic_layout.packetBytes() / sizeof(std::uint32_t));
+                            std::vector<std::uint32_t> reference_words(candidate_words.size());
+                            require(backend->deviceToHostOnStream(candidate_words.data(), diagnostic_candidate->gpu_data_ptr(),
+                                    diagnostic_layout.packetBytes(), device.ordinal, stream) &&
+                                backend->deviceToHostOnStream(reference_words.data(), diagnostic_reference->gpu_data_ptr(),
+                                    diagnostic_layout.packetBytes(), device.ordinal, stream) &&
+                                gpu.synchronizeStreamChecked(stream), "projection retained-intermediate observation");
+                            const auto mismatch = std::mismatch(candidate_words.begin(), candidate_words.end(), reference_words.begin());
+                            if (mismatch.first == candidate_words.end())
+                                detail << " retained_intermediate=byte_identical stage_suspect=down_or_fold_or_assembly";
+                            else
+                            {
+                                const auto word = std::size_t(mismatch.first - candidate_words.begin());
+                                // This is the dense exporter ABI: payload only,
+                                // no compact route-ID header or packet padding.
+                                const auto route_words = diagnostic_layout.routeWords();
+                                const auto value_words = diagnostic_layout.valueWords();
+                                const auto scale_words = diagnostic_layout.scaleWords();
+                                if (route_words == 0 || route_words != value_words + scale_words ||
+                                    candidate_words.size() != std::size_t(diagnostic_layout.route_capacity) * route_words)
+                                    detail << " retained_intermediate=invalid_dense_packet_geometry";
+                                else
+                                {
+                                    const auto route = word / route_words;
+                                    const auto component = word % route_words;
+                                    if (route >= diagnostic_layout.route_capacity || route >= ids.size() ||
+                                        component >= value_words + scale_words)
+                                        detail << " retained_intermediate=invalid_dense_packet_coordinate";
+                                    else
+                                        detail << " retained_intermediate=differs stage_suspect=gate_up_q8_or_exchange_import"
+                                            << " intermediate_route=" << route
+                                            << " intermediate_expert_bits=0x" << std::hex
+                                            << std::bit_cast<std::uint32_t>(ids[route]) << std::dec
+                                            << " intermediate_component=" << (component < value_words ? "value_word" : "scale")
+                                            << " intermediate_component_index=" << (component < value_words
+                                                ? component : component - value_words)
+                                            << " intermediate_actual_bits=0x" << std::hex << *mismatch.first
+                                            << " intermediate_reference_bits=0x" << *mismatch.second << std::dec;
+                                }
+                            }
+                        }
+                        catch (const std::exception &observation_error)
+                        {
+                            // Diagnostic failure never replaces the original
+                            // exact-output mismatch and its provenance.
+                            detail << " retained_intermediate_observation_error=" << observation_error.what();
+                        }
+                        throw std::runtime_error(detail.str());
+                    }
                 if (live > 0)
                     require(std::any_of(reference.begin(), reference.begin() + live * width,
                         [](float value) { return value != 0.f; }), "projection math requires a nonzero live-row witness");

@@ -8,6 +8,7 @@
  */
 
 #include "MoEOverlayNodeLocalRankBatchTransport.h"
+#include "MoEOverlaySharedBackingStartup.h"
 #include "MoEOverlayRankBatchTelemetry.h"
 
 #include "backends/BackendManager.h"
@@ -19,6 +20,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -199,7 +201,7 @@ namespace llaminar2
             uint64_t channel_hash)
         {
             std::ostringstream stream;
-            stream << "/llaminar_moe_zc_" << std::hex
+            stream << "llaminar_moe_zc_" << std::hex
                    << node_namespace << '_' << channel_hash;
             return stream.str();
         }
@@ -878,7 +880,11 @@ namespace llaminar2
                     "Node-local MoE channel runtime geometry disagrees with its admitted mapping layout");
             }
             layout_ = config.activation_layout;
-            mapOrCreate(config);
+            try { mapOrCreate(config); }
+            catch(...) {
+                if(base_) { ::munmap(base_,layout_.mapping_bytes);base_=nullptr; }
+                throw;
+            }
         }
 
         ~Mapping()
@@ -888,11 +894,6 @@ namespace llaminar2
                 ::munmap(base_, layout_.mapping_bytes);
                 base_ = nullptr;
             }
-            if (fd_ >= 0)
-            {
-                ::close(fd_);
-                fd_ = -1;
-            }
         }
 
         Mapping(const Mapping &) = delete;
@@ -900,7 +901,7 @@ namespace llaminar2
 
         size_t bytes() const noexcept { return layout_.mapping_bytes; }
         void *baseAddress() const noexcept { return base_; }
-        const std::string &name() const noexcept { return shm_name_; }
+        const std::string &name() const { return file_.path(); }
         SharedPublication &dispatchPublication() const noexcept
         {
             return *dispatch_publication_;
@@ -1119,11 +1120,9 @@ namespace llaminar2
 
         void unlinkName() noexcept
         {
-            if (!shm_name_.empty() &&
-                ::shm_unlink(shm_name_.c_str()) != 0 && errno != ENOENT)
-            {
-                LOG_WARN("MoE shared activation channel could not unlink "
-                         << shm_name_ << ": " << std::strerror(errno));
+            try { if(file_.descriptor()>=0)file_.unlink(); }
+            catch(const std::exception &error) {
+                LOG_WARN("MoE owned shared activation name retained for ancestor cleanup: "<<error.what());
             }
         }
 
@@ -1320,89 +1319,25 @@ namespace llaminar2
         /** @brief Create/map and validate the exact POSIX shared-channel ABI. */
         void mapOrCreate(const MoEOverlayRankBatchTransportConfig &config)
         {
-            bool creator = false;
-            const bool designated_creator =
-                config.mpi_ctx->rank() == config.source_world_rank;
-            const auto deadline =
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(
-                    collective_timeout_policy::kDefaultCollectiveTimeoutMs);
-            if (designated_creator)
-            {
-                fd_ = ::shm_open(
-                    shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
-                if (fd_ < 0)
-                {
-                    throw std::runtime_error(
-                        "MoE shared activation source could not create its run-scoped mapping: " +
-                        std::string(std::strerror(errno)));
-                }
-                creator = true;
-                if (::ftruncate(
-                        fd_,
-                        static_cast<off_t>(layout_.mapping_bytes)) != 0)
-                {
-                    const std::string detail = std::strerror(errno);
-                    ::close(fd_);
-                    fd_ = -1;
-                    ::shm_unlink(shm_name_.c_str());
-                    throw std::runtime_error(
-                        "MoE shared activation channel ftruncate failed: " +
-                        detail);
-                }
-            }
-            else
-            {
-                do
-                {
-                    fd_ = ::shm_open(shm_name_.c_str(), O_RDWR, 0);
-                    if (fd_ >= 0)
-                        break;
-                    if (errno != ENOENT)
-                    {
-                        throw std::runtime_error(
-                            "MoE shared activation target could not open the source-owned mapping: " +
-                            std::string(std::strerror(errno)));
-                    }
-                    if (std::chrono::steady_clock::now() >= deadline)
-                    {
-                        throw std::runtime_error(
-                            "MoE shared activation channel timed out waiting for its source-owned mapping");
-                    }
-                    cpuRelax();
-                } while (true);
-            }
-            if (fd_ < 0)
-            {
-                throw std::runtime_error(
-                    "MoE shared activation channel shm_open failed for " +
-                    shm_name_ + ": " + std::strerror(errno));
-            }
-
-            struct stat status{};
-            while (::fstat(fd_, &status) == 0 &&
-                   static_cast<size_t>(status.st_size) <
-                       layout_.mapping_bytes)
-            {
-                if (std::chrono::steady_clock::now() >= deadline)
-                    throw std::runtime_error(
-                        "MoE shared activation channel timed out waiting for mapping size");
-                cpuRelax();
-            }
-            if (status.st_size < 0 ||
-                static_cast<size_t>(status.st_size) !=
-                    layout_.mapping_bytes)
-            {
-                throw std::runtime_error(
-                    "MoE shared activation channel mapping size disagrees across ranks");
-            }
-
+            const bool creator=config.mpi_ctx->rank()==config.source_world_rank;
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(
+                collective_timeout_policy::kDefaultCollectiveTimeoutMs);
+            const std::array<int,2> participants{std::min(config.source_world_rank,config.target_world_rank),
+                std::max(config.source_world_rank,config.target_world_rank)};
+            file_=establishMoEOverlaySharedBacking(*config.mpi_ctx,{
+                .kind=MoEOverlaySharedBackingKind::ActivationRows,
+                .node_namespace=config.mpi_ctx->topology()->node_shared_memory_namespace(),
+                .generation=config.transaction_topology.workspace_generation,
+                .fingerprint_low=config.transaction_topology.topology_fingerprint_low,
+                .fingerprint_high=config.transaction_topology.topology_fingerprint_high},
+                config.source_world_rank,participants,shm_name_,layout_.mapping_bytes);
+            file_.requireExtent(layout_.mapping_bytes);
             base_ = ::mmap(
                 nullptr,
                 layout_.mapping_bytes,
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED,
-                fd_,
+                file_.descriptor(),
                 0);
             if (base_ == MAP_FAILED)
             {
@@ -1537,7 +1472,7 @@ namespace llaminar2
         MoEOverlayNodeLocalActivationLayout layout_;
         uint64_t channel_hash_ = 0;
         std::string shm_name_;
-        int fd_ = -1;
+        MPISessionOwner::SharedFile file_;
         void *base_ = nullptr;
         SharedChannelHeader *header_ = nullptr;
         SharedPublication *dispatch_publication_ = nullptr;

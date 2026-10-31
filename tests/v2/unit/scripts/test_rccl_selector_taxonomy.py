@@ -80,9 +80,19 @@ class SelectorProofTests(unittest.TestCase):
         patch = 'rccl-collective-selector-taxonomy.patch'
         self.assertIn(patch, (ROOT / 'Dockerfile').read_text())
         self.assertIn(patch, (ROOT / 'scripts/docker/apply-rccl-capture-patch.sh').read_text())
-        self.assertIn('-selector-${rccl_selector_patch_sha}-protocol-',
+        # The whole ordered pin remains mandatory: adding shared-file and thread repairs must
+        # not disconnect selector, protocol or small-AllGather source identities.
+        self.assertIn(
+            '${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}'
+            '-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}'
+            '-shm-${rccl_shm_patch_sha}-selector-${rccl_selector_patch_sha}-thread-${rccl_thread_patch_sha}'
+            '-protocol-${rccl_protocol_patch_sha}-smallag-${rccl_small_allgather_patch_sha}',
             (ROOT / 'Dockerfile').read_text())
-        self.assertIn('-selector-${RCCL_SELECTOR_PATCH_HASH}-protocol-',
+        self.assertIn(
+            '${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}'
+            '-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}'
+            '-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}'
+            '-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}',
             (ROOT / 'src/v2/CMakeLists.txt').read_text())
         self.assertIn(patch, (ROOT / 'src/v2/CMakeLists.txt').read_text())
 

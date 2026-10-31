@@ -9,7 +9,11 @@
  * Retained graphs, reversed physical participant order, changing inputs, guard
  * tails and both retirement orders exercise the optimized native path. Native
  * allocations/readbacks belong only to this bounded infrastructure fixture.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 
@@ -335,6 +339,8 @@ namespace
 /** @brief Admit the explicit no-P2P storage contract before native runtime setup. */
 int main(int argc, char** argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     if (setenv("NCCL_P2P_DISABLE", "1", 1) != 0) return 2;
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

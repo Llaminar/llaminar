@@ -41,7 +41,7 @@ Options:
                            Use packaged RCCL from the ROCm apt repository.
       --rccl-gpu-targets LIST
                            RCCL GPU_TARGETS for source builds. Default:
-                           Dockerfile default (gfx906).
+                           canonical shipping targets in rocm-release.env.
       --rocm-runtime-gpu-targets LIST
                            Prune ROCm runtime kernel payloads to these gfx
                            targets (comma/semicolon/space-separated). Default:

@@ -48,8 +48,11 @@
  * Projection work admission is copied independently of arithmetic dispatch.
  * Borrowed original request intervals guard native operand/partial/output
  * accesses; physical matrix strides and each row's reduction order stay fixed.
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
 
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -1359,10 +1362,10 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 int32_t acc_lo = 0, acc_hi = 0;
                 #pragma unroll
                 for (int g = 0; g < 4; ++g)
-                    acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
+                    acc_lo = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_lo);
                 #pragma unroll
                 for (int g = 4; g < 8; ++g)
-                    acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
+                    acc_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_hi);
 
                 const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
                     scale_bits, d_block_mins[linear]);
@@ -1374,10 +1377,10 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     int32_t sum_a_lo = 0, sum_a_hi = 0;
                     #pragma unroll
                     for (int g = 0; g < 4; ++g)
-                        sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
+                        sum_a_lo = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a_lo);
                     #pragma unroll
                     for (int g = 4; g < 8; ++g)
-                        sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
+                        sum_a_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a_hi);
 
                     // Q2_K: per-sub-block emin correction
                     constexpr float min_lo = 0.0f;
@@ -1409,14 +1412,14 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     const uint8_t qh0 = payload[4], qh1 = payload[5];
 
                     // Per-group sum of activation bytes (8 int8 elements per group)
-                    int32_t sa_g0 = __builtin_amdgcn_sdot4(a4[1], ones,
-                                    __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-                    int32_t sa_g1 = __builtin_amdgcn_sdot4(a4[3], ones,
-                                    __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-                    int32_t sa_g2 = __builtin_amdgcn_sdot4(a4[5], ones,
-                                    __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-                    int32_t sa_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
-                                    __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+                    int32_t sa_g0 = ::llaminar2::rocm_integer_contract::signedDot4(a4[1], ones,
+                                    ::llaminar2::rocm_integer_contract::signedDot4(a4[0], ones, 0));
+                    int32_t sa_g1 = ::llaminar2::rocm_integer_contract::signedDot4(a4[3], ones,
+                                    ::llaminar2::rocm_integer_contract::signedDot4(a4[2], ones, 0));
+                    int32_t sa_g2 = ::llaminar2::rocm_integer_contract::signedDot4(a4[5], ones,
+                                    ::llaminar2::rocm_integer_contract::signedDot4(a4[4], ones, 0));
+                    int32_t sa_g3 = ::llaminar2::rocm_integer_contract::signedDot4(a4[7], ones,
+                                    ::llaminar2::rocm_integer_contract::signedDot4(a4[6], ones, 0));
 
                     const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                     const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
@@ -1455,7 +1458,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 int32_t block_acc = 0;
                 #pragma unroll
                 for (int g = 0; g < 8; ++g)
-                    block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
+                    block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], block_acc);
 
                 const float block_d = rocm_native_vnni_load_single_weight_scale<FMT>(
                     scale_bits, (FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ4_XS_SOURCE) ? d_block_mins[linear] : uint16_t{0});
@@ -1567,10 +1570,10 @@ __global__ void gemv_native_vnni_kernel_t(
                     constexpr int32_t ones = 0x01010101;
                     #pragma unroll
                     for (int g = 0; g < 8; ++g)
-                        sum_a_0 = __builtin_amdgcn_sdot4(a4_0[g], ones, sum_a_0, false);
+                        sum_a_0 = ::llaminar2::rocm_integer_contract::signedDot4(a4_0[g], ones, sum_a_0);
                     #pragma unroll
                     for (int g = 0; g < 8; ++g)
-                        sum_a_1 = __builtin_amdgcn_sdot4(a4_1[g], ones, sum_a_1, false);
+                        sum_a_1 = ::llaminar2::rocm_integer_contract::signedDot4(a4_1[g], ones, sum_a_1);
                 }
 
                 // Decode + accumulate both blocks (compiler sees both sets of
@@ -1596,7 +1599,7 @@ __global__ void gemv_native_vnni_kernel_t(
                     constexpr int32_t ones = 0x01010101;
                     #pragma unroll
                     for (int g = 0; g < 8; ++g)
-                        sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+                        sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
                 }
                 iq_decode_accumulate_block<CPT, FMT, false>(
                     a4, sum_a, d_payload, d_block_scales, d_block_mins,
@@ -1624,7 +1627,7 @@ __global__ void gemv_native_vnni_kernel_t(
                 constexpr int32_t ones = 0x01010101;  // {1, 1, 1, 1} as packed INT8
                 #pragma unroll
                 for (int g = 0; g < 8; ++g)
-                    sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+                    sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
             }
 
             #pragma unroll
@@ -2061,10 +2064,10 @@ __global__ void gemv_native_vnni_kernel_t(
                         int32_t acc_lo = 0, acc_hi = 0;
                         #pragma unroll
                         for (int g = 0; g < 4; ++g)
-                            acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
+                            acc_lo = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_lo);
                         #pragma unroll
                         for (int g = 4; g < 8; ++g)
-                            acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
+                            acc_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_hi);
 
                         const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
                             scale_bits, d_block_mins[linear]);
@@ -2079,10 +2082,10 @@ __global__ void gemv_native_vnni_kernel_t(
                             int32_t sum_a_lo = 0, sum_a_hi = 0;
                             #pragma unroll
                             for (int g = 0; g < 4; ++g)
-                                sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
+                                sum_a_lo = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a_lo);
                             #pragma unroll
                             for (int g = 4; g < 8; ++g)
-                                sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
+                                sum_a_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a_hi);
 
                             float min_lo, min_hi;
                             if constexpr (Traits::needs_emin_array) {
@@ -2119,14 +2122,14 @@ __global__ void gemv_native_vnni_kernel_t(
                             constexpr int32_t ones = 0x01010101;
                             const uint8_t qh0 = payload[4], qh1 = payload[5];
 
-                            int32_t sa_g0 = __builtin_amdgcn_sdot4(a4[1], ones,
-                                            __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-                            int32_t sa_g1 = __builtin_amdgcn_sdot4(a4[3], ones,
-                                            __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-                            int32_t sa_g2 = __builtin_amdgcn_sdot4(a4[5], ones,
-                                            __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-                            int32_t sa_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
-                                            __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+                            int32_t sa_g0 = ::llaminar2::rocm_integer_contract::signedDot4(a4[1], ones,
+                                            ::llaminar2::rocm_integer_contract::signedDot4(a4[0], ones, 0));
+                            int32_t sa_g1 = ::llaminar2::rocm_integer_contract::signedDot4(a4[3], ones,
+                                            ::llaminar2::rocm_integer_contract::signedDot4(a4[2], ones, 0));
+                            int32_t sa_g2 = ::llaminar2::rocm_integer_contract::signedDot4(a4[5], ones,
+                                            ::llaminar2::rocm_integer_contract::signedDot4(a4[4], ones, 0));
+                            int32_t sa_g3 = ::llaminar2::rocm_integer_contract::signedDot4(a4[7], ones,
+                                            ::llaminar2::rocm_integer_contract::signedDot4(a4[6], ones, 0));
 
                             const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                             const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
@@ -2166,7 +2169,7 @@ __global__ void gemv_native_vnni_kernel_t(
                         int32_t block_acc = 0;
                         #pragma unroll
                         for (int g = 0; g < 8; ++g)
-                            block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
+                            block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], block_acc);
 
                         const float block_d = rocm_native_vnni_load_single_weight_scale<FMT>(
                             scale_bits, (FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ4_XS_SOURCE) ?
@@ -4760,7 +4763,7 @@ __device__ __forceinline__ int32_t native_vnni_activation_sum_a(
         constexpr int32_t ones = 0x01010101;
         #pragma unroll
         for (int g = 0; g < 8; ++g)
-            sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+            sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
     }
     return sum_a;
 }
@@ -4795,10 +4798,10 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
         int32_t acc_hi = 0;
         #pragma unroll
         for (int g = 0; g < 4; ++g)
-            acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
+            acc_lo = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_lo);
         #pragma unroll
         for (int g = 4; g < 8; ++g)
-            acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
+            acc_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_hi);
 
         const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
             scale_base[linear], min_base[linear]);
@@ -4814,10 +4817,10 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
             int32_t sum_a_hi = 0;
             #pragma unroll
             for (int g = 0; g < 4; ++g)
-                sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
+                sum_a_lo = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a_lo);
             #pragma unroll
             for (int g = 4; g < 8; ++g)
-                sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
+                sum_a_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a_hi);
 
             float min_lo;
             float min_hi;
@@ -4854,14 +4857,14 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
             const uint8_t qh0 = payload[4];
             const uint8_t qh1 = payload[5];
 
-            const int32_t sa_g0 = __builtin_amdgcn_sdot4(
-                a4[1], ones, __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-            const int32_t sa_g1 = __builtin_amdgcn_sdot4(
-                a4[3], ones, __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-            const int32_t sa_g2 = __builtin_amdgcn_sdot4(
-                a4[5], ones, __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-            const int32_t sa_g3 = __builtin_amdgcn_sdot4(
-                a4[7], ones, __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+            const int32_t sa_g0 = ::llaminar2::rocm_integer_contract::signedDot4(
+                a4[1], ones, ::llaminar2::rocm_integer_contract::signedDot4(a4[0], ones, 0));
+            const int32_t sa_g1 = ::llaminar2::rocm_integer_contract::signedDot4(
+                a4[3], ones, ::llaminar2::rocm_integer_contract::signedDot4(a4[2], ones, 0));
+            const int32_t sa_g2 = ::llaminar2::rocm_integer_contract::signedDot4(
+                a4[5], ones, ::llaminar2::rocm_integer_contract::signedDot4(a4[4], ones, 0));
+            const int32_t sa_g3 = ::llaminar2::rocm_integer_contract::signedDot4(
+                a4[7], ones, ::llaminar2::rocm_integer_contract::signedDot4(a4[6], ones, 0));
 
             const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
             const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
@@ -4900,7 +4903,7 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
         int32_t block_acc = 0;
         #pragma unroll
         for (int g = 0; g < 8; ++g)
-            block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
+            block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], block_acc);
 
         const uint16_t scale_bits = scale_base[linear];
         const float block_d = rocm_native_vnni_load_single_weight_scale<FMT>(
@@ -5550,7 +5553,7 @@ __global__ void gemv_iq_lds_kernel_t(
                 constexpr int32_t ones = 0x01010101;
                 #pragma unroll
                 for (int g = 0; g < 8; ++g)
-                    sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+                    sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
             }
 
             iq_decode_accumulate_block<1, FMT, true>(

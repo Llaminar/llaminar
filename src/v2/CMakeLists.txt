@@ -325,7 +325,8 @@ if(HAVE_ROCM)
         endif()
     endif()
     
-    # Enable HIP language for ROCm compilation
+    # Resolve targets before HIP compiler discovery; never overwrite caller intent.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ROCmArchitectures.cmake")
     enable_language(HIP)
     # Compiler relocation discovers device bitcode relative to its executable,
     # but its implicit HIP header search may still name the legacy /opt/rocm.
@@ -355,11 +356,6 @@ if(HAVE_ROCM)
     message(STATUS "V2: HIP Version: ${hip_VERSION}")
     message(STATUS "V2: hipcc: ${HIP_HIPCC_EXECUTABLE}")
     
-    # ROCm compile flags - only architectures supporting DL (Deep Learning) instructions
-    # CK requires specific arch macros: gfx906, gfx908, gfx90a (MI50/MI100/MI200)
-    # NOT supported: gfx900 (no DL), gfx940 (CK expects gfx942), gfx1030/gfx1100 (RDNA)
-    # Currently targeting only gfx906 (MI50) for faster compilation
-    set(CMAKE_HIP_ARCHITECTURES "gfx906")
     # Note: hipcc's -parallel-jobs conflicts with CMake's --parallel, so we rely
     # on CMake's build parallelism instead (multiple hipcc processes in parallel)
 endif()
@@ -491,6 +487,7 @@ if(HAVE_CUDA)
     add_library(cuda_backend STATIC 
         backends/cuda/CUDADriverApi.cpp
         backends/cuda/CUDABackend.cu
+        backends/cuda/CUDAHardwareMetadata.cu
         backends/cuda/CUDATensorValidation.cu
         backends/cuda/NvidiaDeviceContext.cu
         backends/cuda/NvidiaContextFactory.cu
@@ -657,6 +654,10 @@ if(HAVE_CUDA)
         # with RTLD_LOCAL. No consumer includes nccl.h; exporting the vendor's
         # include directory would leak its conflicting global names to RCCL.
         target_compile_definitions(cuda_backend PUBLIC HAVE_NCCL)
+        # The runtime must consume the exact library authenticated by dependency
+        # admission; a second SONAME search could select an older installation.
+        set_property(SOURCE collective/backends/NCCLDynamicLoader.cpp APPEND
+            PROPERTY COMPILE_DEFINITIONS "LLAMINAR_NCCL_LIBRARY_PATH=\"${NCCL_LIBRARY}\"")
         # Link dl for dlopen/dlsym
         target_link_libraries(cuda_backend PUBLIC ${CMAKE_DL_LIBS})
         message(STATUS "V2: NCCL will be loaded dynamically (dlopen) from cuda_backend for symbol isolation")
@@ -756,6 +757,7 @@ if(HAVE_ROCM)
     # Note: ROCmWorkerImpl.cpp provides rocm_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(rocm_backend STATIC 
         backends/rocm/ROCmRuntimeStartup.cpp
+        backends/rocm/ROCmHardwareMetadata.cpp
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/rocm/AMDDeviceContext.cpp
@@ -909,25 +911,6 @@ if(HAVE_ROCM)
     set(RCCL_ONLY_FUNCS "" CACHE STRING
         "Optional RCCL ONLY_FUNCS generator pattern for nested source builds")
     
-    # Auto-detect GPU architecture for RCCL build
-    # Default to gfx906 (MI50/MI60) which is known to be broken in packaged RCCL
-    if(NOT DEFINED RCCL_GPU_TARGETS)
-        # Try to detect from rocminfo
-        execute_process(
-            COMMAND bash -c "rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-z]+' | head -1"
-            OUTPUT_VARIABLE DETECTED_GPU_TARGET
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(DETECTED_GPU_TARGET)
-            set(RCCL_GPU_TARGETS "${DETECTED_GPU_TARGET}")
-            message(STATUS "V2: Auto-detected GPU target for RCCL: ${RCCL_GPU_TARGETS}")
-        else()
-            set(RCCL_GPU_TARGETS "gfx906")
-            message(STATUS "V2: Using default GPU target for RCCL: ${RCCL_GPU_TARGETS}")
-        endif()
-    endif()
-    
     if(NOT EXISTS "${REPO_ROOT}/external")
         file(MAKE_DIRECTORY "${REPO_ROOT}/external")
     endif()
@@ -997,11 +980,18 @@ if(HAVE_ROCM)
     file(SHA256 "${RCCL_CAPTURE_PATCH_FILE}" RCCL_CAPTURE_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-device-live-rows.patch" RCCL_ROWS_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-native-host-storage.patch" RCCL_HOST_STORAGE_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-partial-file-cleanup.patch" RCCL_SHM_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-created-thread-lifetime.patch" RCCL_THREAD_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-communicator-protocol-defaults.patch" RCCL_PROTOCOL_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-collective-selector-taxonomy.patch" RCCL_SELECTOR_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-small-allgather-ll-policy.patch" RCCL_SMALL_ALLGATHER_PATCH_HASH)
-    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")
     
+    # A changed requested target set requires new actual device binaries even
+    # when the pinned patched source is unchanged.
+    string(SHA256 RCCL_TARGET_POLICY_HASH "${RCCL_GPU_TARGETS}")
+    string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}-")
+
     # Check if RCCL build is up-to-date
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
     
@@ -1029,6 +1019,9 @@ if(HAVE_ROCM)
         endif()
         message(STATUS "V2: NOTE: This may take 30-60+ minutes on first build")
 
+        # Preserve the entire target list as one subprocess argument. HIP's
+        # derived GPU_BUILD_TARGETS cache must change with GPU_TARGETS on reuse.
+        string(REPLACE ";" "\\;" RCCL_GPU_TARGETS_ARGUMENT "${RCCL_GPU_TARGETS}")
         set(RCCL_CONFIG_ARGS
             -B "${RCCL_BUILD_DIR}"
             -S "${RCCL_EXTERNAL_DIR}"
@@ -1040,7 +1033,8 @@ if(HAVE_ROCM)
             -DCMAKE_CXX_COMPILER=${RCCL_CXX_COMPILER}
             -DCMAKE_PREFIX_PATH=${ROCM_PATH}
             -DROCM_PATH=${ROCM_PATH}
-            -DGPU_TARGETS=${RCCL_GPU_TARGETS}
+            "-DGPU_TARGETS=${RCCL_GPU_TARGETS_ARGUMENT}"
+            "-DGPU_BUILD_TARGETS=${RCCL_GPU_TARGETS_ARGUMENT}"
             -DBUILD_TESTS=OFF
         )
         if(RCCL_ONLY_FUNCS)
@@ -1492,6 +1486,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/CPUBackend.cpp
     # GPUDeviceContextPool is backend-agnostic (uses factory functions registered by cuda_backend/rocm_backend)
     backends/GPUDeviceContextPool.cpp
+    backends/GPUDeviceProcessLifetime.cpp
     # GPUDeviceWorker is backend-agnostic (uses forward-declared cuda_worker/rocm_worker namespaces)
     backends/GPUDeviceWorker.cpp
     # Execution framework (hierarchical work distribution)
@@ -1782,6 +1777,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Memory planning (pre-flight VRAM/RAM budget estimation)
     planning/ClusterInventoryGatherer.cpp
     planning/ModelMemoryProfile.cpp
+    planning/PreparedWeightPhysicalUses.cpp
     planning/WeightMemoryEstimator.cpp
     planning/WeightShardGeometry.cpp
     planning/PlanningForwardWeightWork.cpp
@@ -1882,6 +1878,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     loaders/DeviceOrchestrator.cpp
     loaders/LayerWeightStreamer.cpp
     loaders/WeightStreamerFactory.cpp
+    loaders/PreparedWeightIdentityContract.cpp
     loaders/PreparedWeightStore.cpp
     loaders/WeightLoadProgressAggregator.cpp
     loaders/WeightLifecycleTrace.cpp
@@ -2414,9 +2411,71 @@ if(USE_ONEDNN AND ONEDNN_FOUND)
     message(STATUS "V2: Linked OneDNN for INT8/BF16 GEMM acceleration")
 endif()
 
+# MPI launch ownership is deliberately independent of model and device startup.
+# The same small implementation owns production launcher and CTest lifetimes;
+# its standalone frontend must never link the accelerator-bearing core.
+find_package(Threads REQUIRED)
+# The module extends the selected native MPI launch hook. Resolve both native
+# libraries from that MPI closure, never an unrelated SDK or generic PATH.
+set(LLAMINAR_NATIVE_MPI_LIBRARY_DIRS "")
+foreach(LLAMINAR_MPI_LIBRARY IN LISTS MPI_CXX_LIBRARIES)
+    if(IS_ABSOLUTE "${LLAMINAR_MPI_LIBRARY}")
+        get_filename_component(LLAMINAR_MPI_LIBRARY_DIR "${LLAMINAR_MPI_LIBRARY}" DIRECTORY)
+        get_filename_component(LLAMINAR_MPI_REAL_LIBRARY "${LLAMINAR_MPI_LIBRARY}" REALPATH)
+        get_filename_component(LLAMINAR_MPI_REAL_LIBRARY_DIR "${LLAMINAR_MPI_REAL_LIBRARY}" DIRECTORY)
+        list(APPEND LLAMINAR_NATIVE_MPI_LIBRARY_DIRS
+            "${LLAMINAR_MPI_LIBRARY_DIR}" "${LLAMINAR_MPI_REAL_LIBRARY_DIR}")
+    endif()
+endforeach()
+list(REMOVE_DUPLICATES LLAMINAR_NATIVE_MPI_LIBRARY_DIRS)
+find_library(LLAMINAR_MPI_ORTE_LIBRARY NAMES open-rte
+    PATHS ${LLAMINAR_NATIVE_MPI_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
+find_library(LLAMINAR_MPI_OPAL_LIBRARY NAMES open-pal
+    PATHS ${LLAMINAR_NATIVE_MPI_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
+add_library(llaminar_mpi_schizo MODULE utils/NativeMPISessionSchizo.cpp)
+target_compile_features(llaminar_mpi_schizo PRIVATE cxx_std_17)
+target_include_directories(llaminar_mpi_schizo PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${MPI_CXX_INCLUDE_DIRS})
+target_link_libraries(llaminar_mpi_schizo PRIVATE
+    "${LLAMINAR_MPI_ORTE_LIBRARY}" "${LLAMINAR_MPI_OPAL_LIBRARY}")
+set_target_properties(llaminar_mpi_schizo PROPERTIES
+    PREFIX "" OUTPUT_NAME mca_schizo_llaminar
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/llaminar_mpi_components")
+add_library(llaminar_mpi_session_owner STATIC utils/MPISessionOwner.cpp)
+target_compile_features(llaminar_mpi_session_owner PRIVATE cxx_std_20)
+set_target_properties(llaminar_mpi_session_owner PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(llaminar_mpi_session_owner PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(llaminar_mpi_session_owner PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(llaminar2_core PRIVATE llaminar_mpi_session_owner)
+add_executable(llaminar_mpi_session tools/MPISessionLauncher.cpp)
+target_link_libraries(llaminar_mpi_session PRIVATE llaminar_mpi_session_owner)
+add_dependencies(llaminar_mpi_session llaminar_mpi_schizo)
+add_dependencies(llaminar2_core llaminar_mpi_session)
+if(LLAMINAR_BUILD_TESTS)
+    # Standalone test frontends enter the same owner before MPI initialization.
+    # Keep the exact built helper beside those executables too; no PATH lookup
+    # or copied implementation may select a different ownership policy.
+    add_custom_command(TARGET llaminar_mpi_session POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/tests/v2"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:llaminar_mpi_session>"
+            "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_session"
+        BYPRODUCTS "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_session"
+        VERBATIM)
+    add_custom_command(TARGET llaminar_mpi_schizo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_components"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:llaminar_mpi_schizo>"
+            "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_components/$<TARGET_FILE_NAME:llaminar_mpi_schizo>"
+        BYPRODUCTS "${CMAKE_BINARY_DIR}/tests/v2/llaminar_mpi_components/mca_schizo_llaminar.so"
+        VERBATIM)
+endif()
+
 # Main executable
 add_executable(llaminar2 Main.cpp)
 target_link_libraries(llaminar2 llaminar2_core)
+add_dependencies(llaminar2 llaminar_mpi_session)
 
 # Metadata-only decoding belongs to the same runtime image as the server under
 # test. It authenticates OpenCode output without model execution or another
@@ -2461,7 +2520,8 @@ endif()
 # TODO: Intel MKL backend - not yet implemented
 
 # Install targets
-install(TARGETS llaminar2 llaminar2_core llaminar_native_tool_evidence_decoder llaminar_model_kld_canary
+install(TARGETS llaminar_mpi_schizo LIBRARY DESTINATION bin/llaminar_mpi_components)
+install(TARGETS llaminar2 llaminar2_core llaminar_mpi_session llaminar_native_tool_evidence_decoder llaminar_model_kld_canary
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
@@ -2500,3 +2560,44 @@ if(HAVE_CUDA AND USE_ONNX_HEURISTIC)
         message(WARNING "CUDA GEMM Pipeline file not found: ${PIPELINE_FILE}")
     endif()
 endif()
+
+# Source-owned pooled physical protocol only; no runtime mode or transport capability.
+target_sources(llaminar2_core PRIVATE kernels/qwen4exp/PooledImmutablePhysicalOwnerGeometry.cpp)
+
+# One source-owned shared policy/coalescing protocol; no serving selector or native transport.
+target_sources(llaminar2_core PRIVATE kernels/qwen4exp/PooledImmutableCoordinatorGeometry.cpp)
+
+# Native pooled phases remain participant-local prerequisites; this adds no serving mode.
+target_sources(llaminar2_core PRIVATE
+    kernels/qwen4exp/PooledImmutableNativePlan.cpp
+    kernels/qwen4exp/PooledImmutableNativeStorage.cpp
+    kernels/qwen4exp/PooledImmutableNativeOperands.cpp
+    kernels/qwen4exp/PooledImmutableNativeKernels.cpp
+    execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.cpp)
+if(HAVE_CUDA)
+    target_sources(cuda_backend PRIVATE kernels/cuda/qwen4exp/CUDAPooledImmutableNativeKernels.cu)
+endif()
+if(HAVE_ROCM)
+    set_source_files_properties(kernels/rocm/qwen4exp/ROCmPooledImmutableNativeKernels.hip PROPERTIES LANGUAGE HIP)
+    target_sources(rocm_backend PRIVATE kernels/rocm/qwen4exp/ROCmPooledImmutableNativeKernels.hip)
+endif()
+
+# Real pooled source storage stays in the existing retained service/boundary ownership.
+target_sources(llaminar2_core PRIVATE
+    kernels/qwen4exp/PooledImmutableSourceGeometry.cpp
+    kernels/qwen4exp/PooledImmutableSourcePreparedStorage.cpp
+    kernels/qwen4exp/PooledImmutableSourceKernels.cpp
+    execution/compute_stages/stages/qwen4exp/PooledImmutableSourcePhaseStage.cpp
+    execution/qwen4exp/PooledImmutableLocalLookupGraph.cpp)
+if(HAVE_CUDA)
+    target_sources(cuda_backend PRIVATE kernels/cuda/qwen4exp/CUDAPooledImmutableSourceKernels.cu)
+endif()
+if(HAVE_ROCM)
+    set_source_files_properties(kernels/rocm/qwen4exp/ROCmPooledImmutableSourceKernels.hip PROPERTIES LANGUAGE HIP)
+    target_sources(rocm_backend PRIVATE kernels/rocm/qwen4exp/ROCmPooledImmutableSourceKernels.hip)
+endif()
+
+# Startup-only original shared-file publication; the process owner library stays MPI-free.
+target_sources(llaminar2_core PRIVATE
+    utils/MPISessionSharedDirectory.cpp
+    execution/moe/MoEOverlaySharedBackingStartup.cpp)

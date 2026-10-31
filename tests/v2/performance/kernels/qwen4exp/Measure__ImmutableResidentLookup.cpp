@@ -10,6 +10,7 @@
  * cache-resident live working set: both extents are reported without claiming
  * cold-DRAM bandwidth. This executable is diagnostic, never an inference path.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "kernels/qwen4exp/ImmutableResidentLookupKernels.h"
 #include "kernels/qwen4exp/ImmutableLookupKernels.h"
 #include "backends/BackendManager.h"
@@ -340,6 +341,8 @@ void measure(const Options &option)
  */
 int main(int argc,char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try{measure(options(argc,argv));return 0;}
     catch(const std::exception &error){std::cerr<<"FATAL "<<error.what()<<'\n';return 1;}
 }

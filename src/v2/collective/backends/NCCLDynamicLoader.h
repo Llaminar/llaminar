@@ -2,7 +2,8 @@
  * @file NCCLDynamicLoader.h
  * @brief Dynamic loader for NCCL library using dlopen/dlsym
  *
- * This module loads NCCL at runtime using dlopen with RTLD_LOCAL to isolate
+ * This module loads the exact CMake-selected dependency, or an explicit path,
+ * at runtime using dlopen with RTLD_LOCAL to isolate
  * NCCL symbols from RCCL. Both libraries export identical symbol names
  * (ncclAllReduce, ncclCommInitRank, etc.), and using RTLD_LOCAL prevents
  * symbol conflicts in the global namespace.
@@ -26,20 +27,25 @@ namespace llaminar2
     namespace nccl_dynamic
     {
         /**
-         * @brief Load NCCL library dynamically with isolated symbols
-         * @param library_path Exact explicit library, or nullptr for the
-         *        installed libllaminar_nccl.so.2 capture-reentry implementation.
-         *        A failed load never selects a different library.
-         * @return true if loaded successfully
-         *
-         * The library is loaded with RTLD_NOW | RTLD_LOCAL to:
-         * - RTLD_NOW: Resolve all symbols immediately (fail fast on missing symbols)
-         * - RTLD_LOCAL: Keep symbols in local namespace (avoid conflicts with RCCL)
+         * @brief Load the exact configured NCCL dependency with isolated symbols.
+         * @param library_path Explicit nonempty library path, or nullptr for the
+         *        LLAMINAR_NCCL_LIBRARY/NCCL_LIBRARY path selected by CMake.
+         * @return True if the same path is already loaded or all mandatory
+         *         entrypoints resolve; false for invalid/different selection or failure.
+         * Empty explicit input always rejects. A failed selection never searches
+         * another path or bare SONAME. RTLD_NOW resolves symbols immediately;
+         * RTLD_LOCAL keeps the addresses separate from RCCL. Repeated valid calls
+         * with the identical path retain the dependency; a different path rejects
+         * until unload() retires both its selection identity and entrypoints.
          */
         bool load(const char *library_path = nullptr);
 
         /**
-         * @brief Unload NCCL library
+         * @brief Retire the selected library and withdraw all borrowed entrypoints.
+         * Resolved callbacks are cleared before dlclose, including after partial
+         * load failure. Later wrappers return unavailable instead of calling an
+         * address whose library lifetime has ended. The existing mutex protects
+         * selection/retirement; native operations must retire before this call.
          */
         void unload();
 

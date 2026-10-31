@@ -9,6 +9,7 @@
  */
 
 #include "MoEOverlayNodeLocalDeviceControllerFabric.h"
+#include "MoEOverlaySharedBackingStartup.h"
 
 #include "MoEOverlayEconomyProfileComposer.h"
 #include "MoEOverlayServiceTelemetryPublication.h"
@@ -18,6 +19,7 @@
 #include "interfaces/IMPITopology.h"
 #include "transfer/TransferEngine.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/Logger.h"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -202,7 +204,7 @@ namespace llaminar2
             std::uint32_t num_layers)
         {
             std::ostringstream name;
-            name << "/llaminar_moectrl_" << std::hex << std::setw(16)
+            name << "llaminar_moectrl_" << std::hex << std::setw(16)
                  << std::setfill('0') << node_namespace << '_'
                  << std::setw(16) << topology_fingerprint
                  << "_layers_" << first_model_layer << '_' << num_layers;
@@ -261,11 +263,9 @@ namespace llaminar2
         {
             if (base && base != MAP_FAILED && bytes != 0u)
                 (void)::munmap(base, bytes);
-            if (fd >= 0)
-                (void)::close(fd);
         }
 
-        int fd = -1;
+        MPISessionOwner::SharedFile file;
         void *base = nullptr;
         std::size_t bytes = 0u;
     };
@@ -978,8 +978,6 @@ namespace llaminar2
                 MoEOverlayDeviceControllerFabricSetupError::MappingFailure);
             mapped_region_.reset();
             mapping_lifetime_.reset();
-            if (creator_)
-                (void)::shm_unlink(channel_name_.c_str());
             throw;
         }
     }
@@ -989,8 +987,8 @@ namespace llaminar2
     {
         // POSIX unlink only removes the name; every already-open mapping stays
         // valid until its process-local driver registrations are released.
-        if (creator_ && !channel_name_.empty())
-            (void)::shm_unlink(channel_name_.c_str());
+        if(creator_ && mapping_lifetime_)try {mapping_lifetime_->file.unlink();}
+        catch(const std::exception &error) {LOG_WARN("MoE owned device fabric name retained for ancestor cleanup: "<<error.what());}
         mapped_region_.reset();
         mapping_lifetime_.reset();
     }
@@ -999,102 +997,19 @@ namespace llaminar2
     {
         const int local_rank = config_.mpi_ctx->rank();
         creator_ = local_rank == config_.topology->leader_world_rank;
-        int fd = -1;
-        if (creator_)
-        {
-            fd = ::shm_open(
-                channel_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
-            if (fd < 0)
-            {
-                throw std::runtime_error(
-                    "device controller fabric creator could not create " +
-                    channel_name_ + ": " + std::strerror(errno));
-            }
-            if (::ftruncate(fd, static_cast<off_t>(layout_.mapping_bytes)) != 0)
-            {
-                const std::string detail = std::strerror(errno);
-                (void)::close(fd);
-                (void)::shm_unlink(channel_name_.c_str());
-                throw std::runtime_error(
-                    "device controller fabric ftruncate failed: " + detail);
-            }
-        }
-        else
-        {
-            const auto deadline = std::chrono::steady_clock::now() +
-                                  kSetupTimeout;
-            do
-            {
-                fd = ::shm_open(channel_name_.c_str(), O_RDWR, 0);
-                if (fd >= 0)
-                    break;
-                if (errno != ENOENT)
-                {
-                    throw std::runtime_error(
-                        "device controller fabric follower could not open " +
-                        channel_name_ + ": " + std::strerror(errno));
-                }
-                std::this_thread::yield();
-            } while (std::chrono::steady_clock::now() < deadline);
-            if (fd < 0)
-            {
-                throw std::runtime_error(
-                    "device controller fabric timed out waiting for its leader mapping");
-            }
-        }
-
-        struct stat status{};
-        const auto size_deadline = std::chrono::steady_clock::now() +
-                                   kSetupTimeout;
-        for (;;)
-        {
-            if (::fstat(fd, &status) != 0)
-            {
-                const std::string detail = std::strerror(errno);
-                (void)::close(fd);
-                throw std::runtime_error(
-                    "device controller fabric fstat failed: " + detail);
-            }
-            if (status.st_size >= 0 &&
-                static_cast<std::size_t>(status.st_size) >=
-                    layout_.mapping_bytes)
-            {
-                break;
-            }
-            if (std::chrono::steady_clock::now() >= size_deadline)
-            {
-                (void)::close(fd);
-                throw std::runtime_error(
-                    "device controller fabric timed out waiting for mapping size");
-            }
-            std::this_thread::yield();
-        }
-        if (status.st_size < 0 ||
-            static_cast<std::size_t>(status.st_size) != layout_.mapping_bytes)
-        {
-            (void)::close(fd);
-            throw std::runtime_error(
-                "device controller fabric mapping size disagrees across ranks");
-        }
-
-        void *const base = ::mmap(
-            nullptr,
-            layout_.mapping_bytes,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            fd,
-            0);
-        if (base == MAP_FAILED)
-        {
-            const std::string detail = std::strerror(errno);
-            (void)::close(fd);
-            throw std::runtime_error(
-                "device controller fabric mmap failed: " + detail);
-        }
-        mapping_lifetime_ = std::make_shared<MappingLifetime>();
-        mapping_lifetime_->fd = fd;
-        mapping_lifetime_->base = base;
-        mapping_lifetime_->bytes = layout_.mapping_bytes;
+        auto lifetime=std::make_shared<MappingLifetime>();
+        lifetime->file=establishMoEOverlaySharedBacking(*config_.mpi_ctx,{
+            .kind=MoEOverlaySharedBackingKind::DeviceControllerFabric,
+            .node_namespace=config_.mpi_ctx->topology()->node_shared_memory_namespace(),
+            .generation=config_.initial_durable_epoch,
+            .fingerprint_low=config_.topology->topology_fingerprint,
+            .fingerprint_high=static_cast<std::uint64_t>(static_cast<std::uint32_t>(config_.first_model_layer))<<32u | config_.num_layers},
+            config_.topology->leader_world_rank,participating_world_ranks_,channel_name_,layout_.mapping_bytes);
+        lifetime->file.requireExtent(layout_.mapping_bytes);
+        void *const base=::mmap(nullptr,layout_.mapping_bytes,PROT_READ|PROT_WRITE,MAP_SHARED,lifetime->file.descriptor(),0);
+        if(base==MAP_FAILED)throw std::runtime_error("device controller fabric mmap failed: "+std::string(std::strerror(errno)));
+        lifetime->base=base;lifetime->bytes=layout_.mapping_bytes;
+        mapping_lifetime_=std::move(lifetime);
 
 #if defined(MADV_HUGEPAGE)
         // Group regions remain page isolated even when the kernel chooses a

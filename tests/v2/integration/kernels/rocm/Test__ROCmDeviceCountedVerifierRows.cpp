@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 
 #include "backends/rocm/HIPGraphCapture.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
@@ -187,7 +188,7 @@ static void proveDeviceCountedRows(
         TransferEngine::requireDeviceInput(input.get(), device, stream);
         const auto rows = DeviceRowRange::deviceCounted(
             M, static_cast<const int32_t *>(count->gpu_data_ptr()));
-        auto graph = std::make_unique<HIPGraphCapture>(stream, 0);
+        auto graph = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream);
         {
             auto arithmetic = kernel->beginVerifierDecodeEquivalentScope(rows);
             ScopedBackendGraphCapture capture(*graph, "device_counted_verifier_rows");

@@ -1,0 +1,267 @@
+--- a/src/group.cc
++++ b/src/group.cc
+@@ -1,3 +1,10 @@
++/**
++ * @file group.cc
++ * @brief Native launch failure joins all created workers before any group cleanup.
++ * Creation/join receipts belong to the actual native job; worker entry cannot
++ * erase them. Existing native abort flags release missing-member waits before
++ * joins, and failed joins preserve every cleanup owner without retry.
++ */
+ /*************************************************************************
+  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -79,9 +86,24 @@
+   return arg;
+ }
+ 
++/**
++ * @brief Join an actual native thread before destroying its source job metadata.
++ * @param job Live native job whose successful create still owns its thread.
++ * @return Native job result after successful join. Join failure is fatal before owner release.
++ */
+ ncclResult_t ncclAsyncJobComplete(struct ncclAsyncJob* job) {
+   ncclResult_t ret;
+-  PTHREADCHECK(pthread_join(job->thread, NULL), "pthread_join");
++  if (ncclLlaminarLoadThreadOwnership(job) == ncclNativeThreadOwnership::JoinFailed) {
++    WARN("Failed native thread join cannot be retried");
++    std::abort();
++  }
++  const int joined = pthread_join(job->thread, NULL);
++  if (joined != 0) {
++    ncclLlaminarStoreThreadOwnership(job, ncclNativeThreadOwnership::JoinFailed);
++    WARN("Failed native job join; job and allocation owners retained: %s", strerror(joined));
++    std::abort();
++  }
++  ncclLlaminarStoreThreadOwnership(job, ncclNativeThreadOwnership::Joined);
+   if (job->result != ncclSuccess) {
+     WARN("ncclAsyncJobComplete: job %p failed, job error %d", job, job->result);
+   }
+@@ -337,7 +359,64 @@
+   return;
+ }
+ 
++/**
++ * @brief Abort incomplete preparation and join every actually created native worker.
++ * @param jobs Actual intrusive queue retaining every job/container through cleanup.
++ * @post Every successful create has completed its actual join before normal return.
++ * Join failure terminates before any owner is released or retried.
++ * Successful pthread_create does not prove worker entry. Every created thread is
++ * joined before any undo, communicator cleanup or job destructor, even when a
++ * later create fails. Workers never write the separate creation/join receipt.
++ */
++static void ncclLlaminarAbortAndJoinCreatedJobs(
++    ncclIntruQueue<ncclAsyncJob, &ncclAsyncJob::next>* jobs) {
++  bool hasCreated = false;
++  for (auto* job = ncclIntruQueueHead(jobs); job; job = job->next) {
++    const auto state = ncclLlaminarLoadThreadOwnership(job);
++    hasCreated |= state == ncclNativeThreadOwnership::Created;
++    if (state == ncclNativeThreadOwnership::JoinFailed) {
++      WARN("Previously failed native join cannot be retried or release ownership");
++      std::abort();
++    }
++  }
++  if (!hasCreated)
++    return;
++  // An unstarted sibling may never reach the native barrier. Existing abort
++  // flags stop actual workers before joining; no extra protocol is introduced.
++  for (auto* job = ncclIntruQueueHead(jobs); job; job = job->next) {
++    if (!job->destroyFlag) {
++      __atomic_store_n(job->abortFlag, 1, __ATOMIC_RELEASE);
++      __atomic_store_n(job->abortFlagDev, 1, __ATOMIC_RELEASE);
++      if (job->childAbortFlag) {
++        __atomic_store_n(job->childAbortFlag, 1, __ATOMIC_RELEASE);
++        __atomic_store_n(job->childAbortFlagDev, 1, __ATOMIC_RELEASE);
++      }
++    }
++  }
++  for (auto* job = ncclIntruQueueHead(jobs); job; job = job->next) {
++    if (ncclLlaminarLoadThreadOwnership(job) != ncclNativeThreadOwnership::Created)
++      continue;
++    const int error = pthread_join(job->thread, nullptr);
++    if (error != 0) {
++      ncclLlaminarStoreThreadOwnership(job, ncclNativeThreadOwnership::JoinFailed);
++      WARN("Failed native setup join; all cleanup owners retained: %s", strerror(error));
++      std::abort();
++    }
++    ncclLlaminarStoreThreadOwnership(job, ncclNativeThreadOwnership::Joined);
++    job->state = ncclGroupJobJoined;
++  }
++  return;
++}
++
++/**
++ * @brief Retire failed group state only after every created native worker joins.
++ * @param groupCommHeadPtr Actual communicator task lists owned by this group.
++ * @param asyncJobsPtr Actual queued jobs; their metadata remains live through all joins.
++ * @param error Original failure published through native asynchronous error handling.
++ * Failed joins terminate before communicator mutation, undo or metadata destruction.
++ */
+ static void groupCleanup(struct ncclComm** groupCommHeadPtr, struct ncclIntruQueue<struct ncclAsyncJob, &ncclAsyncJob::next>* asyncJobsPtr, ncclResult_t error) {
++  ncclLlaminarAbortAndJoinCreatedJobs(asyncJobsPtr);
+   struct ncclComm* comm;
+   for (int type = 0; type < ncclGroupTaskTypeNum; ++type) {
+     comm = groupCommHeadPtr[type];
+@@ -396,6 +475,12 @@
+   return;
+ }
+ 
++/**
++ * @brief Launch native jobs and preserve each successful create until actual join.
++ * @param asyncJobsMain Source queue retaining both created and unstarted job metadata.
++ * @param groupAbortFlag Existing group abort observation consumed by native progress.
++ * @return Native job/create error after all successful creates join. Join failure is fatal.
++ */
+ static ncclResult_t asyncJobLaunch(struct ncclIntruQueue<struct ncclAsyncJob, &ncclAsyncJob::next> *asyncJobsMain, volatile bool *groupAbortFlag) {
+   ncclResult_t ret = ncclSuccess;
+   bool jobsDone = false;
+@@ -411,6 +496,7 @@
+     }
+     do {
+       PTHREADCHECKGOTO(pthread_create(&job->thread, nullptr, ncclAsyncJobMain, job), "pthread_create", ret, fail);
++      ncclLlaminarStoreThreadOwnership(job, ncclNativeThreadOwnership::Created);
+       job = job->next;
+     } while (job != nullptr);
+ 
+@@ -425,8 +511,10 @@
+           int err;
+           if ((err = pthread_join(job->thread, nullptr)) != 0) {
+             WARN("Error waiting for pthread_join: %s", strerror(err));
+-            ret = ncclSystemError;
++            ncclLlaminarStoreThreadOwnership(job, ncclNativeThreadOwnership::JoinFailed);
++            std::abort();
+           }
++          ncclLlaminarStoreThreadOwnership(job, ncclNativeThreadOwnership::Joined);
+           job->state = ncclGroupJobJoined;
+           if (job->result != ncclSuccess && ret == ncclSuccess) {
+             ret = job->result;
+@@ -458,6 +546,8 @@
+ exit:
+   return ret;
+ fail:
++  // Complete every successful create before the caller can enter groupCleanup.
++  ncclLlaminarAbortAndJoinCreatedJobs(asyncJobsMain);
+   goto exit;
+ }
+ 
+@@ -643,6 +733,11 @@
+   return groupLaunch(job_ /* estimatedTime = NULL */);
+ }
+ 
++/**
++ * @brief Finish the native group, retaining nonblocking thread ownership on its real job.
++ * @param simInfo Optional existing simulation output; native execution policy is unchanged.
++ * @return Native completion or in-progress/error state, with failed workers owned through join.
++ */
+ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
+   ncclResult_t ret = ncclSuccess;
+   ncclSimInfo_t internalSimInfo = NCCL_SIM_INFO_INITIALIZER;
+@@ -734,6 +829,7 @@
+ 
+       groupJob->base.func = groupLaunchNonBlocking;
+       PTHREADCHECKGOTO(pthread_create(&groupJob->base.thread, NULL, ncclAsyncJobMain, (void*)&groupJob->base), "pthread_create", ret, fail);
++      ncclLlaminarStoreThreadOwnership(&groupJob->base, ncclNativeThreadOwnership::Created);
+       groupJob->nonBlockingInit = true;
+       ret = ncclInProgress;
+     } else {
+@@ -764,12 +860,21 @@
+   goto exit;
+ }
+ 
++/**
++ * @brief Join the shared nonblocking group before releasing its final native reference.
++ * @param groupJob Existing shared group owner, or null when no group was launched.
++ * @return Native job result after successful join. Join failure terminates with owners retained.
++ */
+ ncclResult_t ncclGroupJobComplete(struct ncclGroupJob* groupJob) {
+   ncclResult_t ret = ncclSuccess;
+   if (groupJob && groupJob->nonBlockingInit) {
+     if (!__atomic_exchange_n(&groupJob->joined, true, __ATOMIC_ACQ_REL)) {
+       ret = ncclAsyncJobComplete(&groupJob->base);
+     }
++    if (ncclLlaminarLoadThreadOwnership(&groupJob->base) == ncclNativeThreadOwnership::JoinFailed) {
++      WARN("Failed group thread join forbids ownership release or retry");
++      std::abort();
++    }
+     if (ncclAtomicRefCountDecrement(&groupJob->groupRefCount) == 0) {
+       free(groupJob);
+     }
+@@ -777,12 +882,21 @@
+   return ret;
+ }
+ 
++/**
++ * @brief Publish native abort and join before releasing shared group ownership.
++ * @param groupJob Existing shared group owner, or null when no group was launched.
++ * @return Success after actual join; join failure terminates before ownership release or retry.
++ */
+ ncclResult_t ncclGroupJobAbort(struct ncclGroupJob* groupJob) {
+   if (groupJob && groupJob->nonBlockingInit) {
+     if (!__atomic_exchange_n(&groupJob->joined, true, __ATOMIC_ACQ_REL)) {
+       __atomic_store_n(&groupJob->abortFlag, true, __ATOMIC_RELAXED);
+       ncclAsyncJobComplete(&groupJob->base);
+     }
++    if (ncclLlaminarLoadThreadOwnership(&groupJob->base) == ncclNativeThreadOwnership::JoinFailed) {
++      WARN("Failed group thread join forbids ownership release or retry");
++      std::abort();
++    }
+     if (ncclAtomicRefCountDecrement(&groupJob->groupRefCount) == 0) {
+       free(groupJob);
+     }
+--- a/src/include/group.h
++++ b/src/include/group.h
+@@ -1,3 +1,9 @@
++/**
++ * @file group.h
++ * @brief Native grouped jobs retain successful thread creation until actual join.
++ * Thread ownership is distinct from worker entry/completion: a later create
++ * failure must abort and join created workers before any native cleanup.
++ */
+ /*************************************************************************
+  * Copyright (c) 2015-2017, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -29,6 +35,14 @@
+   ncclGroupJobJoined  = 2,
+ } ncclGroupJobState_t;
+ 
++/**
++ * @brief Successful native thread ownership, independent of worker entry observation.
++ * Only the creator and actual joiner write this field. Worker completion can
++ * precede pthread_create's return and must never overwrite a creator receipt.
++ */
++enum class ncclNativeThreadOwnership : uint8_t { Uncreated, Created, Joined, JoinFailed };
++
++/** @brief Native intrusive job owns successful creation until its actual join completes. */
+ struct ncclAsyncJob {
+   struct ncclAsyncJob* next;
+   pthread_t thread;
+@@ -44,7 +58,29 @@
+   ncclComm_t comm;
+   int destroyFlag;
+   bool isThreadMain;
++  /** @brief Actual creator/joiner-owned pthread obligation, independent of worker entry. */
++  ncclNativeThreadOwnership nativeThreadOwnership;
+ };
++
++/**
++ * @brief Read the creator/joiner receipt with a compiler-portable typed atomic.
++ * @param job Actual live native job owner, retained independently of worker entry.
++ * @return Current creation/join obligation; no worker-completion state is inferred.
++ */
++inline ncclNativeThreadOwnership ncclLlaminarLoadThreadOwnership(const ncclAsyncJob* job) noexcept {
++  ncclNativeThreadOwnership value;
++  __atomic_load(&job->nativeThreadOwnership, &value, __ATOMIC_ACQUIRE);
++  return value;
++}
++/**
++ * @brief Publish actual successful creation/join or permanent join failure.
++ * @param job Actual source-owned job; workers never call this mutation boundary.
++ * @param value Creator/joiner transition established by the corresponding native API.
++ */
++inline void ncclLlaminarStoreThreadOwnership(ncclAsyncJob* job,
++                                            ncclNativeThreadOwnership value) noexcept {
++  __atomic_store(&job->nativeThreadOwnership, &value, __ATOMIC_RELEASE);
++}
+ 
+ ncclResult_t ncclAsyncLaunch(
+   struct ncclAsyncJob* job,

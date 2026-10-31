@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "GPUProjectionSubmission.h"
+
 #include "IGPUGraphCapture.h"
 #include "GPUBlasSubmission.h"
 #include <cstddef>
@@ -550,6 +552,37 @@ namespace llaminar2
             return GPUBlasSubmission(blas_submission_mutex_, blasHandle(), blasLtHandle());
         }
 
+        /**
+         * @brief Retain the bound pool generation or explicitly borrow a standalone context.
+         *
+         * A directly constructed context has no pool generation: its caller must
+         * outlive every capture and lease. This never looks up a replacement by
+         * ordinal. A bound but expired pool owner is always a fatal state error.
+         */
+        [[nodiscard]] std::shared_ptr<IWorkerGPUContext> retainProjectionContextOwner()
+        {
+            auto owner = projection_pool_owner_.lock();
+            if (projection_pool_bound_ && !owner)
+                throw std::logic_error("Projection context owner has already retired");
+            return owner;
+        }
+
+        /** @brief Cold-publish this exact context's complete fork/join resources. */
+        virtual void prepareProjectionResources()
+        { throw std::logic_error("This context does not implement concurrent projection resources"); }
+
+        /** @brief Lease an entire native capture or eager fork/join submission. */
+        [[nodiscard]] virtual GPUProjectionSubmission acquireProjectionSubmission(
+            void *root, GPUProjectionSubmissionKind kind, bool native_capturing = false)
+        {
+            (void)root; (void)kind; (void)native_capturing;
+            throw std::logic_error("This context does not implement concurrent projection submission");
+        }
+        /** @brief Validate liveness before removing a worker context generation. */
+        virtual void assertProjectionResourcesRetirable() {}
+        /** @brief Close projection acquisition before exclusive context retirement. */
+        virtual void beginProjectionResourcesRetirement() {}
+
         // =========================================================================
         // Collective Communicator (set by collective backend during initialization)
         // =========================================================================
@@ -728,9 +761,29 @@ namespace llaminar2
         virtual bool isDeviceGraphCaptureActive() const { return false; }
 
     protected:
+        /** @brief Bind this context's exact owner once, before publishing a lease. */
+        void retainProjectionSubmission(GPUProjectionSubmission &submission)
+        {
+            if (!submission.owner_ || submission.context_owner_bound_ ||
+                submission.owner_->context_identity_ != this)
+                throw std::logic_error("Projection submission lifetime requires its exact context owner");
+            submission.context_owner_ = retainProjectionContextOwner();
+            submission.context_owner_bound_ = true;
+        }
         IWorkerGPUContext() = default;
 
     private:
+        friend class GPUDeviceContextPool;
+        /** @brief Bind only the exact existing pool owner; never reacquire by ordinal. */
+        void bindProjectionContextOwner(const std::shared_ptr<IWorkerGPUContext> &owner)
+        {
+            if (owner.get() != this || projection_pool_bound_)
+                throw std::logic_error("Projection owner binding requires one exact context identity");
+            projection_pool_owner_ = owner;
+            projection_pool_bound_ = true;
+        }
+        std::weak_ptr<IWorkerGPUContext> projection_pool_owner_;
+        bool projection_pool_bound_ = false;
         std::mutex blas_submission_mutex_; ///< Host API state, not a GPU execution barrier.
     };
 

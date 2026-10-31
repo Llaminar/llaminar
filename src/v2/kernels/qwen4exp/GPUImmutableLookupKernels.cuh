@@ -7,6 +7,7 @@
  * no grid of spin blocks can occupy the whole GPU. Every mapped payload writer
  * fences before the final system-release publication. Response cache-volatile
  * loads precede acknowledgement, then decoding reads private GPU scratch.
+ * Setup binds the unchanged backend deadline from the admitted physical clock.
  */
 #pragma once
 #if defined(QFN_LOOKUP_CUDA)
@@ -21,6 +22,7 @@
 #define QFN_LOOKUP_NAMESPACE cuda_lookup
 #else
 #include <hip/hip_runtime.h>
+#include "ImmutableLookupHardwareBinding.h"
 #include <hip/hip_fp16.h>
 #define QFN_LOOKUP_STREAM hipStream_t
 #define QFN_LOOKUP_ERROR hipGetLastError
@@ -280,11 +282,9 @@ std::unique_ptr<IImmutableLookupKernels> QFN_LOOKUP_FACTORY(DeviceId device,Tens
     if(!device.is_cuda()||!prepareNativeEmbeddingTablesCUDA(device.ordinal,format,tables))
         throw std::runtime_error("Immutable lookup CUDA setup could not authenticate exact endpoint/codebooks");
 #else
-    int rate=0;
-    if(!device.is_rocm()||!prepareNativeEmbeddingTablesROCm(device.ordinal,format,tables)||
-       hipDeviceGetAttribute(&rate,hipDeviceAttributeWallClockRate,device.ordinal)!=hipSuccess||rate<=0)
+    if(!device.is_rocm()||!prepareNativeEmbeddingTablesROCm(device.ordinal,format,tables))
         throw std::runtime_error("Immutable lookup ROCm setup could not authenticate endpoint/codebooks/wall clock");
-    timeout=static_cast<std::uint64_t>(rate)*30'000;
+    timeout=rocmImmutableLookupTimeoutTicks(rocmHardwareMetadata().at(device.ordinal));
 #endif
     using namespace QFN_LOOKUP_NAMESPACE;
     switch(format)

@@ -32,10 +32,12 @@
 #include <omp.h>
 
 #ifdef HAVE_CUDA
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
 #endif
 
 #ifdef HAVE_ROCM
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
 #endif
 
@@ -1072,6 +1074,9 @@ namespace
 #ifdef HAVE_ROCM
     TEST_F(Test__AttentionComputeStage, ROCmWorkspaceRequirementsCoverStageShapeAndGroupedVerifierRows)
     {
+        // Native descriptor planning consumes the same admitted physical facts
+        // as production startup; keep this out of the device-free SetUp path.
+        initializeROCmHardwareMetadata();
         expectPrefillWorkspaceFamilyCoverage(DeviceId::rocm(0), mpi_ctx_);
         TensorFactory factory(mpi_ctx_);
 
@@ -1171,6 +1176,9 @@ namespace
 #ifdef HAVE_CUDA
     TEST_F(Test__AttentionComputeStage, CUDAWorkspaceRequirementsCoverStageShapeAndGroupedVerifierRows)
     {
+        // Native descriptor planning consumes the same admitted physical facts
+        // as production startup; keep this out of the device-free SetUp path.
+        initializeCUDAHardwareMetadata();
         expectPrefillWorkspaceFamilyCoverage(DeviceId::cuda(0), mpi_ctx_);
         TensorFactory factory(mpi_ctx_);
 

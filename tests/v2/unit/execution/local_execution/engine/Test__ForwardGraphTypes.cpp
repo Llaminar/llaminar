@@ -2819,9 +2819,10 @@ TEST(Test__GraphSegmentCache, FirstCaptureInvokesBoundaryAfterEventHandoff)
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "main_decode";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -2894,9 +2895,10 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "diagnostically_unrelated_helper";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3022,12 +3024,13 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.perf_context = "retained_parent_unit";
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "retained_parent_unit";
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3192,12 +3195,13 @@ TEST(Test__GraphSegmentCache,
         {
             ++snapshot_callback_calls;
         });
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.perf_context = "retained_parent_setup_materialization_unit";
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "retained_parent_setup_materialization_unit";
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3393,11 +3397,12 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
-    DeviceGraphExecutor::GraphSegmentCache cache;
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3570,12 +3575,13 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.perf_context = "segmented_root_setup_materialization_unit";
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "segmented_root_setup_materialization_unit";
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3717,9 +3723,10 @@ TEST(Test__GraphSegmentCache,
             ++snapshot_callback_calls;
         });
 
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "segmented_manual_snapshot_authority_unit";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -3921,9 +3928,10 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "role_asymmetric_decode";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -4071,9 +4079,10 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "launch_dependency_lifecycle";
-    FakeReplayGPUContext gpu_ctx;
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {
@@ -5279,6 +5288,8 @@ TEST(Test__GraphSegmentCache,
             AllowHeterogeneousBoundarySegmentation);
     EXPECT_TRUE(policy.defer_final_sync);
 
+    // The cache retires borrowed stream/event resources before its owner dies.
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
     DeviceGraphCaptureController::buildCapturePlan(
         graph,
@@ -5323,7 +5334,6 @@ TEST(Test__GraphSegmentCache,
      */
     PerfStatsCollector::reset();
     cache.perf_context = "heterogeneous_ticket_event_terminal_unit";
-    FakeReplayGPUContext gpu_ctx;
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx, DeviceId::cuda(0)));
     std::vector<FakeReplayGraphCapture *> captures;
     for (auto &segment : cache.segments)
@@ -5994,12 +6004,13 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.perf_context = "heterogeneous_ticket_launch_dependency";
+    // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
         /*asynchronous_submission=*/false,
         /*create_graph_only_captures=*/true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "heterogeneous_ticket_launch_dependency";
     executor.setWorkerGPUContextResolver(
         [&](DeviceId device) -> IWorkerGPUContext *
         {

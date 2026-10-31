@@ -868,6 +868,16 @@ The public MPI bootstrap propagates explicitly requested diagnostic settings
 to remote ranks. Use rank-qualified PerfStats output paths (`{rank}`) available
 on each host; plain output paths remain authority-rank-only. This propagation
 does not export provider credentials or launcher-local device/CPU placement.
+Production entrypoints and canonical process-owned test children share the CPU-only
+`llaminar_mpi_session` process owner. It keeps each run's private temporary and
+shared-memory directories until its actual launcher, ranks and local daemon
+descendants retire. CTest sends TERM on timeout and grants the native owner's
+30-second retirement plus five-second forced-exit drain; the timeout remains a
+failed test. Campaign transitions passively require the declared owned roots to
+be absent, including after cancellation. They never clean another job's files
+or replace a missing retirement witness with a process-group check. The
+installed image contains the matching helper and native component beside each executable. External
+MPI launchers and remote infrastructure retain their own outer ownership.
 Model and image staging uses an atomic SSH/rsync upload to one owned
 CPU peer, then distributes it concurrently to other peers over the leased
 private network. A short-lived, SSH-owned source serves only that artifact to

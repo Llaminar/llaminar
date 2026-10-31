@@ -8,6 +8,8 @@
  * identity: several ranks may legitimately observe the same accelerator.
  *
  * @author David Sanftenberg
+ * Physical identity and limits share the admitted process inventory; live free
+ * memory and context-retirement observations remain runtime-owned discovery.
  */
 
 #include <hip/hip_runtime.h>
@@ -22,6 +24,7 @@
 #include "DeviceUUID.h"
 #include "DevicePCIAddress.h"
 #include "rocm/ROCmRuntimeStartup.h"
+#include "rocm/ROCmHardwareMetadata.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -37,14 +40,8 @@ namespace llaminar2
 
             LOG_DEBUG("[ROCm] enumerate_rocm_devices() called");
 
-            int device_count = 0;
-            hipError_t err = hipGetDeviceCount(&device_count);
-
-            if (err != hipSuccess)
-            {
-                LOG_DEBUG("[ROCm] hipGetDeviceCount failed: " << hipGetErrorString(err));
-                return devices;
-            }
+            initializeROCmHardwareMetadata();
+            const int device_count = static_cast<int>(rocmHardwareMetadata().size());
 
             if (device_count == 0)
             {
@@ -79,29 +76,23 @@ namespace llaminar2
 
             for (int i = 0; i < device_count; ++i)
             {
-                hipDeviceProp_t prop;
-                if (hipGetDeviceProperties(&prop, i) != hipSuccess)
-                {
-                    continue;
-                }
+                const auto &prop = rocmHardwareMetadata().at(i);
 
                 ComputeDevice dev;
                 dev.type = ComputeBackendType::GPU_ROCM;
                 dev.device_id = i;
-                dev.uuid = formatDeviceUUID(prop.uuid.bytes);
+                dev.uuid = formatDeviceUUID(std::span<const char, 16>{
+                    reinterpret_cast<const char *>(prop.uuid.data()), 16});
                 // Preserve the driver's full endpoint, including PCI function.
                 // Reconstructing from ordinal or link bottleneck loses identity.
-                char pci_address[32]{};
-                if (hipDeviceGetPCIBusId(pci_address, sizeof(pci_address), i) != hipSuccess)
-                    throw std::runtime_error("HIP discovery could not read the native PCI endpoint");
-                dev.pci_bus_address = DevicePCIAddress::parse(pci_address).toString();
-                dev.compute_units = prop.multiProcessorCount;
-                dev.last_level_cache_bytes = prop.l2CacheSize > 0 ? static_cast<size_t>(prop.l2CacheSize) : 0;
-                dev.total_memory_bytes = prop.totalGlobalMem;
+                dev.pci_bus_address = prop.pci_address;
+                dev.compute_units = prop.compute_units;
+                dev.last_level_cache_bytes = prop.last_level_cache > 0 ? static_cast<size_t>(prop.last_level_cache) : 0;
+                dev.total_memory_bytes = prop.total_memory;
 
                 // Parse gcnArchName for architecture info
                 // Format: "gfx906:sramecc+:xnack-" or similar
-                std::string arch_name = prop.gcnArchName;
+                std::string arch_name = prop.isa_target;
                 std::string gfx_name;
 
                 // Extract gfx number (e.g., "gfx906" -> "906")
@@ -172,7 +163,7 @@ namespace llaminar2
 
                 // Read PCIe link information from sysfs
                 dev.pcie = pcie_enumeration::read_pcie_link_info(
-                    prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+                    prop.pci_domain, prop.pci_bus, prop.pci_device);
 
                 devices.push_back(dev);
             }
@@ -205,16 +196,13 @@ namespace llaminar2
         /** @return Observed PCIe NUMA affinity, or -1 when sysfs has no locality. */
         int get_rocm_device_numa_node(int device_id)
         {
-            hipDeviceProp_t prop;
-            if (hipGetDeviceProperties(&prop, device_id) != hipSuccess)
-            {
-                return -1;
-            }
+            initializeROCmHardwareMetadata();
+            const auto &prop = rocmHardwareMetadata().at(device_id);
 
             // Read from sysfs using PCI location
             char path[256];
-            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.0/numa_node",
-                     prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node",
+                     prop.pci_address.c_str());
 
             FILE *f = fopen(path, "r");
             if (!f)

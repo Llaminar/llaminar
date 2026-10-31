@@ -36,6 +36,7 @@
 #include <sstream>
 
 #include "collective/LocalTPContext.h"
+#include "backends/NativeDeviceBinding.h"
 #include "execution/compute_stages/stages/GDNLinkedLiveStateGeometry.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "collective/ICollectiveBackend.h"
@@ -769,17 +770,44 @@ TEST_F(Test__LocalTPContext, GDNLinkedReassemblyWrappersFailFastOnDeviceBindAndC
                               "hipLaunchKernelGGL");
 }
 
-TEST_F(Test__LocalTPContext, RCCLCoordinatorKeepsHipDeviceGuardTrackingInSync)
+/** @test Every direct collective authenticates actual native state instead of remembering a per-kind device. */
+TEST_F(Test__LocalTPContext, RCCLCoordinatorBindsActualCurrentDeviceWithoutShadow)
 {
     const std::string source = readTextFile(LLAMINAR_RCCL_COORDINATOR_SOURCE);
     ASSERT_FALSE(source.empty());
+    for (const char *method : {"allreduceSingleDeviceOnStream", "reduceSingleDeviceOnStream",
+                              "allgatherSingleDeviceOnStream", "broadcastSingleDeviceOnStream",
+                              "groupedP2PSingleDeviceOnStream"})
+    {
+        SCOPED_TRACE(method);
+        const std::string signature = std::string("bool RCCLCoordinator::") + method + "(";
+        const auto begin = source.find(signature);
+        ASSERT_NE(begin, std::string::npos);
+        const auto end = source.find("\n    bool RCCLCoordinator::", begin + signature.size());
+        const auto body = source.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        EXPECT_NE(body.find("bindNativeDevice(ordinal,"), std::string::npos);
+        EXPECT_NE(body.find("hipGetDevice(observed)"), std::string::npos);
+        EXPECT_EQ(body.find("thread_local"), std::string::npos)
+            << "A prior call of this collective kind cannot authenticate ambient native device state.";
+    }
+    EXPECT_EQ(source.find("trackedHipSetDevice("), std::string::npos);
+    EXPECT_EQ(source.find("tl_last_hip_device"), std::string::npos);
 
-    EXPECT_NE(source.find("trackedHipSetDevice("), std::string::npos);
-    EXPECT_NE(source.find("HipDeviceGuard::forceSetDevice(device_ordinal)"), std::string::npos);
-    EXPECT_EQ(source.find("hipSetDevice("), std::string::npos)
-        << "RCCL coordinator runs direct grouped collectives on worker threads; "
-           "raw hipSetDevice leaves HipDeviceGuard's thread-local cache stale and "
-           "can make the next kernel launch use a stream from the wrong device.";
+    // Exercise the same actual checked helper here; the explicit pure original-
+    // body controls and native backend replays additionally guard its real adapters.
+    int actual_device = 0;
+    const auto bind = [&](int ordinal) {
+        return bindNativeDevice(ordinal,
+            [&](int *current) { *current = actual_device; return 0; },
+            [&](int selected) { actual_device = selected; return 0; });
+    };
+    ASSERT_TRUE(bind(0).succeeded());
+    ASSERT_TRUE(bind(1).succeeded());
+    ASSERT_TRUE(bind(0).succeeded());
+    EXPECT_EQ(actual_device, 0);
+    actual_device = 1; // An external native selection must invalidate no host shadow.
+    ASSERT_TRUE(bind(0).succeeded());
+    EXPECT_EQ(actual_device, 0);
 }
 
 TEST_F(Test__LocalTPContext, WorkerGpuCheckedEventHelpersBindContextDevice)

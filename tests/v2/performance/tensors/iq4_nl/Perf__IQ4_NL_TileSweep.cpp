@@ -16,6 +16,7 @@
  * @author David Sanftenberg
  */
 
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <chrono>
@@ -472,6 +473,9 @@ TEST_F(IQ4_NL_TileSweep, ComprehensiveSweep)
 // Main function
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
 

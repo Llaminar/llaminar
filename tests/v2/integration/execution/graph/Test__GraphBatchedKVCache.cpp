@@ -10,8 +10,13 @@
  * - Per-sequence cache isolation (modifications to seq[i] don't affect seq[j])
  *
  * This is Phase 3 of the Graph Batching Implementation Plan.
+ *
+ * The custom entry owns one lexical native GPU lifetime without probing a
+ * device. Native workers/caches retire before process exit and MPI finalization.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <memory>
 #include <vector>
@@ -1274,6 +1279,10 @@ TEST_F(GraphBatchedKVCacheTest, KVCacheGatherStage_Q81Cache_GathersQuantizedOutp
 // Main entry point for MPI tests
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     // Initialize MPI before Google Test
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
@@ -1282,6 +1291,7 @@ int main(int argc, char **argv)
 
     int result = RUN_ALL_TESTS();
 
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     return result;
 }

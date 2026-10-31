@@ -27,6 +27,7 @@
  * after all timed/verification work completes; no extra native readback,
  * launch, precision policy, source conversion or model execution is introduced.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "recorded/RecordedHeadRequest.h"
 #include "recorded/RecordedGDNRequest.h"
 #include "cpu/CPUQ8ResidualPreparedMeasurement.h"
@@ -1037,6 +1038,8 @@ void measure(const MeasureOptions &o) {
 /** @brief Dispatch only an explicit CPU/native request; no backend
  * initialization precedes parsing. */
 int main(int argc, char **argv) {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
   try {
     for (int index=1;index<argc;++index)
       if (std::string_view(argv[index]).starts_with("--gtest_filter=")) {

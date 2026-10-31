@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_optional_gpu_preflight_registration.py
+#  @brief Execute device-free native topology registration with the real process-owner target.
 """Execute optional-GPU CMake registration in Integration and Release modes.
 
 The real helper and native topology loops run in a language-free CMake project
@@ -35,7 +37,8 @@ def registration_source() -> str:
     start = source.index('foreach(device_count IN ITEMS 4 8)',
                          source.index('# Independent PP stages preserve'))
     end = source.index('# Test: device-owned ExpertOverlay epoch publication', start)
-    return '\n'.join((helper, rccl, native, source[start:end]))
+    owner = f'include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")'
+    return '\n'.join((owner, helper, rccl, native, source[start:end]))
 
 
 class OptionalGPUPreflightRegistration(unittest.TestCase):
@@ -180,6 +183,7 @@ add_executable(v2_integration_moe_projection_pipeline IMPORTED GLOBAL)
 set_target_properties(v2_integration_moe_projection_pipeline PROPERTIES IMPORTED_LOCATION "${CMAKE_COMMAND}")
 '''
                 prefix += 'set(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS ' + policy + ')\n'
+                prefix += f'include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")\n'
                 (root / 'CMakeLists.txt').write_text(prefix + source[helper_start:helper_end] + '\n' + registration)
                 ninja = shutil.which('ninja')
                 self.assertIsNotNone(ninja)

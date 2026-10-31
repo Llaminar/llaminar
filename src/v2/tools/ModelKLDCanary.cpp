@@ -11,7 +11,11 @@
  * Both use the production host-logit consumer without arithmetic interposition.
  * Frozen workload and artifact paths are explicit tool arguments, independent
  * of a workspace mount. Both backends use the same observer and phase schedule.
+ * A lexical entry owner retires native workers before vendor exit callbacks;
+ * MPI shutdown closes that same owner before finalizing communicator state.
  */
+#include "utils/MPISessionOwner.h"
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "app/RuntimeInitPhase.h"
 #include "app/MPIBootstrapPhase.h"
 #include "ModelKLDQFNContract.h"
@@ -442,6 +446,9 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
 /** @brief Execute the exact production runner with fixed token histories. */
 int main(int argc, char **argv)
 {
+    // Ownership starts before this frontend creates MPI or runtime state.
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_lifetime;
     json result={{"complete",false},{"passed",false},{"diagnostic_only",true},{"cases",json::array()}};
     std::filesystem::path output;
     try

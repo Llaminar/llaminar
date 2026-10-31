@@ -17,6 +17,9 @@
  * strides in both backend directions. Early replay also leaves the old admission and return timelines
  * live while the new source graph is queued: both fused and forked paths must
  * wait for the next generation, and explicit abort must drain that wait.
+ * Paired mock ranks deliver real startup declaration/ACK packets through an
+ * explicit replay link; production file authentication and exact live extents
+ * remain authoritative before either native backend registers its mapping.
  */
 
 #include <gtest/gtest.h>
@@ -37,6 +40,7 @@
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "mocks/MockMPIContext.h"
+#include "fixtures/mpi/OwnedSharedBackingReplay.h"
 #include "mocks/MockMPITopology.h"
 #include "memory/BufferArena.h"
 #include "tensors/Tensors.h"
@@ -230,10 +234,16 @@ namespace
         return false;
     }
 
-    /** @return One rank context proving that both synthetic ranks share a node. */
-    std::shared_ptr<MockMPIContext> makeContext(int rank)
+    /**
+     * @brief Bind same-node endpoints through their immutable transport channel.
+     * @param rank Synthetic endpoint rank.
+     * @param identity Existing exact channel identity shared by the pair.
+     * @return Context delivering the real startup declaration and live-byte ACK.
+     */
+    std::shared_ptr<MockMPIContext> makeContext(int rank, const std::string &identity)
     {
-        auto context = std::make_shared<MockMPIContext>(rank, 2);
+        auto context = std::make_shared<OwnedSharedBackingReplayContext>(rank, 2);
+        context->bind(ownedSharedBackingReplayLink(identity));
         context->set_topology(MockMPITopology::createSimple(
             rank, /*world_size=*/2, /*ranks_per_node=*/2));
         return context;
@@ -278,7 +288,7 @@ namespace
         constexpr std::size_t entries =
             static_cast<std::size_t>(Rows * kTopK);
         return {
-            .mpi_ctx = makeContext(local_rank),
+            .mpi_ctx = makeContext(local_rank, identity),
             .source_world_rank = 0,
             .target_world_rank = 1,
             .workspace = makeWireWorkspace<Rows, Width>(),

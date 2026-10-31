@@ -28,6 +28,8 @@ namespace llaminar2::qwen4exp
 inline constexpr std::uint64_t kImmutableLookupProtocol = 0x51464e4c4f4f4b01ULL;
 /** @brief Explicit subordinate live-intent/invalidation-ACK ABI, never inferred from storage mode. */
 inline constexpr std::uint64_t kImmutableLookupSubordinateProtocol = 0x51464e4c4f4f4b02ULL;
+/** @brief Exact acknowledgement ownership schema, included in retained source capture identity. */
+inline constexpr std::uint64_t kImmutableLookupAcknowledgementVersion = 2;
 /** @brief CPU storage/protocol terminal status, independent of inference state. */
 enum class ImmutableLookupStatus : std::uint64_t
 {
@@ -69,11 +71,14 @@ struct alignas(64) ImmutableLookupCompletion
     std::uint64_t protocol = kImmutableLookupProtocol;
     std::uint64_t protocolComplement = ~kImmutableLookupProtocol;
 };
-/** @brief Disjoint GPU response/terminal and CPU cancellation/worker-retirement publications.
+/** @brief Disjoint GPU response/terminal/abort and CPU cancellation/worker-retirement publications.
  * @details CPU publications name both the API admission and the actual retained
  * worker invocation. The invocation word is released last; an acquired matching
  * pair proves only that worker's retirement, never successful payload delivery
- * or graph/reader retirement. The backing remains owned by retained bindings.
+ * or graph/reader retirement. GPU abort has its own generation/body and
+ * invocation/release pair; CPU never writes those words. It stops I/O only and
+ * never closes a parent or claims payload consumption. Original backing stays
+ * owned by retained bindings through final graph and reader retirement.
  */
 struct alignas(64) ImmutableLookupAcknowledgement
 {
@@ -81,7 +86,7 @@ struct alignas(64) ImmutableLookupAcknowledgement
     std::uint64_t closedGeneration = 0; ///< Release only at the complete generation graph's terminal.
     std::uint64_t cancelledGeneration = 0, cancelledInvocation = 0;
     std::uint64_t retiredGeneration = 0, retiredInvocation = 0;
-    std::uint64_t reserved[2]{};
+    std::uint64_t abortGeneration = 0, abortInvocation = 0; ///< GPU-only exact I/O abort; invocation releases its generation body.
 };
 /** @brief Private GPU-owned slot state, retained unchanged across request resets.
  * @details issuedSequence never resets while the mapped channel is retained.

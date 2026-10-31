@@ -25,6 +25,8 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <sstream>
+#include <bit>
 #include <map>
 using namespace llaminar2;
 
@@ -252,6 +254,31 @@ void prove(DeviceId first, int degree)
                 require(p.graphs[0]->launch() && p.graphs[1]->launch(), "Router pipeline replay");
             });
         }
+        // Terminal diagnostics retain each source's actual compact packet and
+        // independent full oracle. A receiver-local oracle alone conflates a
+        // heterogeneous arithmetic difference with transfer/publication damage.
+        struct SourceObservation
+        {
+            std::array<std::vector<float>, 2> oracle;
+            std::vector<MoERouterSelectedRoute> packet;
+        };
+        std::vector<SourceObservation> source_observations(degree);
+        for (int source = 0; source < degree; ++source)
+        {
+            auto &p = *owners[source];
+            auto &observation = source_observations[source];
+            p.worker->submitAndWait([&] {
+                const auto span = DeviceRowPartition::balanced(source, degree).resolveFor(capacity, live);
+                observation.packet.resize(std::size_t(span.count) * top_k);
+                observation.oracle[0] = p.read(p.expected_ids->gpu_data_ptr(), capacity * top_k);
+                observation.oracle[1] = p.read(p.expected_weights->gpu_data_ptr(), capacity * top_k);
+                if (!observation.packet.empty())
+                    require(p.backend->deviceToHostOnStream(observation.packet.data(), p.packet->gpu_data_ptr(),
+                        observation.packet.size() * sizeof(MoERouterSelectedRoute), p.device.ordinal, p.stream),
+                        "Router source packet diagnostic readback");
+                require(p.worker->synchronizeStreamChecked(p.stream), "Router source diagnostics completion");
+            });
+        }
         for (int member = 0; member < degree; ++member)
         {
             auto &p = *owners[member];
@@ -260,7 +287,36 @@ void prove(DeviceId first, int degree)
                 {
                     const auto actual = p.read(pair.first->gpu_data_ptr(), capacity * top_k);
                     const auto expected = p.read(pair.second->gpu_data_ptr(), capacity * top_k);
-                    require(std::memcmp(actual.data(), expected.data(), actual.size() * 4) == 0, "Router pipeline selected bits drifted");
+                    if (std::memcmp(actual.data(), expected.data(), actual.size() * 4) != 0)
+                    {
+                        const int column = pair.first == p.weights ? 1 : 0;
+                        std::size_t index = 0;
+                        while (index < actual.size() && std::bit_cast<std::uint32_t>(actual[index]) == std::bit_cast<std::uint32_t>(expected[index])) ++index;
+                        const int row = int(index / top_k);
+                        const int source = DeviceRowPartition::balanced(member, degree).ownerFor(capacity, live, row);
+                        std::ostringstream detail;
+                        detail << "Router pipeline selected bits drifted"
+                            << " receiver=" << p.device.toString() << " receiver_member=" << member
+                            << " replay=" << iteration << " live=" << live << " capacity=" << capacity
+                            << " width=" << width << " experts=" << experts
+                            << " row=" << row << " slot=" << index % top_k
+                            << " column=" << (column ? "weight" : "expert")
+                            << " actual=0x" << std::hex << std::bit_cast<std::uint32_t>(actual[index])
+                            << " receiver_oracle=0x" << std::bit_cast<std::uint32_t>(expected[index]) << std::dec;
+                        if (source >= 0)
+                        {
+                            const auto span = DeviceRowPartition::balanced(source, degree).resolveFor(capacity, live);
+                            const auto &observation = source_observations[source];
+                            const auto &route = observation.packet[(row - span.first) * top_k + index % top_k];
+                            detail << " source=" << owners[source]->device.toString() << " source_member=" << source
+                                << " source_oracle=0x" << std::hex
+                                << std::bit_cast<std::uint32_t>(observation.oracle[column][index])
+                                << " source_packet=0x"
+                                << std::bit_cast<std::uint32_t>(column ? route.weight : route.expert);
+                        }
+                        else detail << " source=inactive_suffix";
+                        throw std::runtime_error(detail.str());
+                    }
                 }
                 const auto owner = DeviceRowPartition::balanced(member, degree);
                 const auto owned = owner.resolveFor(capacity, live);

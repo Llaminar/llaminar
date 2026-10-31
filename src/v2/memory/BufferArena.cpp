@@ -5,7 +5,9 @@
  * CPU roots claim the allocator-rounded physical extent before construction.
  * The common typed tensor declaration projects and materializes the same
  * physical root. Its actual aligned backing owns the allocation lease, including
- * when native views retain that backing beyond the arena lifetime.
+ * when native views retain that backing beyond the arena lifetime. Retained
+ * external roots project coherence from their canonical tensor; arena history
+ * never becomes a second live authority for externally published GPU bytes.
  */
 
 #include "BufferArena.h"
@@ -35,6 +37,36 @@
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        /**
+         * @brief Project retained-root metadata without maintaining another live coherence state.
+         * @param tensor Original canonical external root; these are metadata queries, never GPU probes.
+         * @return A compatibility view. SYNCED/MAPPED have a valid host copy; exact transfer decisions still use the tensor state.
+         * @throws std::invalid_argument For invalid canonical state or device authority without an actual GPU identity.
+         */
+        CoherenceState retainedRootCoherence(const TensorBase &tensor)
+        {
+            switch (tensor.coherenceState())
+            {
+            case TensorCoherenceState::HOST_ONLY:
+            case TensorCoherenceState::HOST_AUTHORITATIVE:
+            case TensorCoherenceState::SYNCED:
+            case TensorCoherenceState::MAPPED:
+                return {.authority=CoherenceState::HOST};
+            case TensorCoherenceState::DEVICE_AUTHORITATIVE:
+            {
+                const auto device=tensor.current_device();
+                if(!device || !device->is_gpu() || !device->is_valid())
+                    throw std::invalid_argument("Retained external device authority requires its original GPU identity");
+                return {.authority=CoherenceState::DEVICE,.authoritative_device=*device};
+            }
+            default:
+                throw std::invalid_argument("Retained external root has an invalid canonical coherence state");
+            }
+        }
+    }
 
     // =========================================================================
     // Internal helpers
@@ -209,6 +241,30 @@ namespace llaminar2
         return true;
     }
 
+    bool BufferArena::registerExternalBuffer(BufferId id, std::shared_ptr<TensorBase> tensor)
+    {
+        const auto index = static_cast<size_t>(id);
+        if (index >= kBufferCount || buffers_[index].registered || !tensor || tensor->is_view() ||
+            tensor->transferStorageOwner() != tensor.get() || !tensor->size_bytes())
+            return false;
+        // No slot is published until every potentially throwing metadata read
+        // completes. A failed registration cannot leave a dangling raw root.
+        const auto rows = tensor->rows();
+        const auto cols = tensor->cols();
+        const auto coherence=retainedRootCoherence(*tensor);
+        const auto current=tensor->current_device();
+        const auto home=current && current->is_valid()?*current:DeviceId::cpu();
+        auto &entry = buffers_[index];
+        entry.retained_external = std::move(tensor);
+        entry.external_tensor = entry.retained_external.get();
+        entry.rows = rows;
+        entry.cols = cols;
+        entry.coherence = coherence; // Initial metadata only; live retained-root views always project the tensor.
+        entry.home_device = home;
+        entry.registered = true;
+        return true;
+    }
+
     bool BufferArena::bindExternalBuffer(BufferId id, ITensor *tensor)
     {
         auto idx = static_cast<size_t>(id);
@@ -216,6 +272,11 @@ namespace llaminar2
             return false;
 
         auto &b = buffers_[idx];
+        if (b.retained_external)
+        {
+            LOG_WARN("BufferArena: cannot rebind retained original external root " << bufferIdName(id));
+            return false;
+        }
         if (b.owned_tensor || (b.registered && !b.external_tensor))
         {
             LOG_WARN("BufferArena: cannot bind external tensor over arena-owned buffer "
@@ -877,24 +938,46 @@ namespace llaminar2
     bool BufferArena::prepareForRead(BufferId id, DeviceId target, void *stream)
     {
         auto &b = buf(id);
+        if(b.retained_external)
+        {
+            auto projection=retainedRootCoherence(*b.retained_external);
+            return CoherenceTracker::prepareForRead(b.tensorBase(),projection,target,stream);
+        }
         return CoherenceTracker::prepareForRead(b.tensorBase(), b.coherence, target, stream);
     }
 
     bool BufferArena::prepareForWrite(BufferId id, DeviceId target, void *stream)
     {
         auto &b = buf(id);
+        if(b.retained_external)
+        {
+            auto projection=retainedRootCoherence(*b.retained_external);
+            return CoherenceTracker::prepareForWrite(b.tensorBase(),projection,target,stream);
+        }
         return CoherenceTracker::prepareForWrite(b.tensorBase(), b.coherence, target, stream);
     }
 
     void BufferArena::markWritten(BufferId id, DeviceId device, void *stream)
     {
         auto &b = buf(id);
+        if(b.retained_external)
+        {
+            auto projection=retainedRootCoherence(*b.retained_external);
+            CoherenceTracker::markWrittenWithEvent(b.tensorBase(),projection,device,stream);
+            return;
+        }
         CoherenceTracker::markWrittenWithEvent(b.tensorBase(), b.coherence, device, stream);
     }
 
     void BufferArena::markWrittenFlagsOnly(BufferId id, DeviceId device)
     {
         auto &b = buf(id);
+        if(b.retained_external)
+        {
+            auto projection=retainedRootCoherence(*b.retained_external);
+            CoherenceTracker::markWrittenFlagsOnly(b.tensorBase(),projection,device);
+            return;
+        }
         CoherenceTracker::markWrittenFlagsOnly(b.tensorBase(), b.coherence, device);
     }
 
@@ -1040,7 +1123,8 @@ namespace llaminar2
     {
         if (!isRegistered(id))
             return nullptr;
-        return buf(id).owned_tensor; // nullptr for external buffers
+        const auto &entry = buf(id);
+        return entry.owned_tensor ? entry.owned_tensor : entry.retained_external;
     }
 
     void *BufferArena::getDevicePtr(BufferId id, DeviceId target) const
@@ -1077,7 +1161,8 @@ namespace llaminar2
 
     CoherenceState BufferArena::getCoherenceState(BufferId id) const
     {
-        return buf(id).coherence;
+        const auto &entry=buf(id);
+        return entry.retained_external?retainedRootCoherence(*entry.retained_external):entry.coherence;
     }
 
     bool BufferArena::isRegistered(BufferId id) const

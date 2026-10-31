@@ -15,6 +15,8 @@
  * @date February 2026
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <csignal>
@@ -622,60 +624,19 @@ TEST_F(Test__RankOrchestrator_PP, ConfigDetectsMode_HeterogeneousPP_NotTP_PP)
     EXPECT_EQ(config.detectMode(), RankOrchestrator::ParallelismMode::PP);
 }
 
-#include <csignal>
-
-// Track whether any test assertion has failed. Used by signal handlers
-// to distinguish ROCm driver cleanup crashes from real test failures.
-static volatile sig_atomic_t g_any_assertion_failed = 0;
-
-static void cleanup_crash_handler(int sig)
-{
-    // If no assertion has failed, this is a ROCm/RCCL driver cleanup crash
-    // (SIGSEGV or SIGABRT during TearDown / hipFree) or glibc pthread
-    // priority assertion from CUDA/ROCm thread cleanup. Exit cleanly.
-    if (!g_any_assertion_failed)
-        _exit(0);
-    // Otherwise, re-raise to get a core dump for real bugs
-    struct sigaction sa = {};
-    sa.sa_handler = SIG_DFL;
-    sigaction(sig, &sa, nullptr);
-    raise(sig);
-}
-
-// Install signal handlers using sigaction (more robust than signal()).
-// Must be called BEFORE MPI_Init so OpenMPI doesn't override them.
-static void install_crash_handlers()
-{
-    struct sigaction sa = {};
-    sa.sa_handler = cleanup_crash_handler;
-    sa.sa_flags = 0;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGSEGV, &sa, nullptr);
-}
-
-// GTest listener that tracks assertion failures in real-time
-class AssertionTracker : public ::testing::EmptyTestEventListener
-{
-    void OnTestPartResult(const ::testing::TestPartResult &result) override
-    {
-        if (result.failed())
-            g_any_assertion_failed = 1;
-    }
-};
-
 int main(int argc, char **argv)
 {
-    // Install BEFORE MPI_Init — OpenMPI won't override existing handlers.
-    install_crash_handlers();
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
 
     int provided = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
 
     ::testing::InitGoogleTest(&argc, argv);
-    ::testing::UnitTest::GetInstance()->listeners().Append(new AssertionTracker);
     int result = RUN_ALL_TESTS();
 
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
     // Use _exit() to skip static destructors — CUDA/ROCm driver cleanup
     // races with MPI teardown, causing segfault on process exit.

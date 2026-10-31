@@ -1,3 +1,12 @@
+/**
+ * @file Test__Qwen35MoE_LongContext_Parity.cpp
+ * @brief Core-linked GPU-capable test entrypoint with explicit process retirement.
+ *
+ * The real child owns native worker admission in its main frame and retires
+ * context owners before MPI finalization or process-exit callbacks can run.
+ */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
@@ -1286,13 +1295,17 @@ TEST_F(Qwen35MoELongContextParityTest, CPUVsROCmLogitsSweep)
 
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
     const int result = RUN_ALL_TESTS();
 
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     MPI_Finalize();
 
     std::cout.flush();

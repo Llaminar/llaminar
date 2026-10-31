@@ -1297,7 +1297,9 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
                 projection_rows,
                 shape.output_columns,
                 shape.input_columns,
-                geometry.device.ordinal,
+                geometry.device_compute_units != 0
+                    ? cuda::NativeVNNIWorkspaceHardware::checked(geometry.device.ordinal, geometry.device_compute_units)
+                    : cuda::NativeVNNIWorkspaceHardware::withoutSMObservation(geometry.device.ordinal),
                 nativeCodebooks(tensor)));
     }
 
@@ -1312,7 +1314,9 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
                 terminal_rows,
                 shape.output_columns,
                 shape.input_columns,
-                geometry.device.ordinal,
+                geometry.device_compute_units != 0
+                    ? cuda::NativeVNNIWorkspaceHardware::checked(geometry.device.ordinal, geometry.device_compute_units)
+                    : cuda::NativeVNNIWorkspaceHardware::withoutSMObservation(geometry.device.ordinal),
                 nativeCodebooks(terminal)));
     }
 

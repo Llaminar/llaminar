@@ -1,9 +1,17 @@
 /**
  * @file Main.cpp
- * @brief Llaminar v2 entry point
+ * @brief Llaminar entrypoint with process-owned MPI runtime files.
+ *
+ * Enter the shared ancestor owner before AppLifecycle or any runtime state.
+ * That owner stays alive after this child becomes mpirun, and cleans only its
+ * private roots after all local processes and singleton daemons retire.
+ * One lexical GPU scope closes native admission and joins workers before MPI
+ * finalization or frontend exit; native cleanup never depends on static order.
  */
 
+#include "utils/MPISessionOwner.h"
 #include "app/AppLifecycle.h"
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "utils/DebugEnv.h"
 #include <cstdlib>
 #include <unistd.h>
@@ -11,8 +19,19 @@
 
 int main(int argc, char *argv[])
 {
-    llaminar2::AppLifecycle app;
-    int result = app.run(argc, argv);
+    // Ownership starts before this frontend creates MPI or runtime state.
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv)) return *terminal;
+    int result = 0;
+    {
+        llaminar2::GPUDeviceProcessLifetime gpu_lifetime;
+        {
+            llaminar2::AppLifecycle app;
+            result = app.run(argc, argv);
+        }
+        // Explicitly retire before the existing _exit policy can bypass C++
+        // destructors. MPI-backed modes already retire at mpiShutdown().
+        gpu_lifetime.retire();
+    }
 
     // Flush output streams before exit
     std::cout.flush();

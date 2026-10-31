@@ -7,8 +7,11 @@
  * and unchanged native weight words once per32-row tile. Independent integer
  * block dots feed the canonical K32 FP32 contribution/fold and one final sum.
  * No private arrays spill to global memory or output-sized partials are needed.
+ * Native signed INT8 dot products share the exact unsaturated arithmetic
+ * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
 #pragma once
+#include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "kernels/common/Q8ResidualCorrection.h"
 #include "kernels/common/DeviceNativeVNNIContributionContract.h"
 namespace llaminar2::rocm_q8_residual {
@@ -72,8 +75,8 @@ __global__ __launch_bounds__(256,2) void projectGrouped(GPUQ8ResidualCorrectionA
    for(int row=0;row<4;++row) {
 #pragma unroll
     for(int column=0;column<2;++column) {
-     dot0[row][column]=__builtin_amdgcn_sdot4(p[row],w[column],dot0[row][column],false);
-     dot1[row][column]=__builtin_amdgcn_sdot4(r[row],w[column],dot1[row][column],false);
+     dot0[row][column]=::llaminar2::rocm_integer_contract::signedDot4(p[row],w[column],dot0[row][column]);
+     dot1[row][column]=::llaminar2::rocm_integer_contract::signedDot4(r[row],w[column],dot1[row][column]);
     }
    }
   }
@@ -157,8 +160,8 @@ __global__ __launch_bounds__(256, 2) void projectNativeGrouped(GPUQ8ResidualCorr
                 residual[word][threadIdx.x] = q;
                 if constexpr (Traits::is_asymmetric || Traits::is_dual_scale_asym || Traits::is_iq1_m)
                 {
-                    sp[word / 2] = __builtin_amdgcn_sdot4(p, 0x01010101, sp[word / 2], false);
-                    sq[word / 2] = __builtin_amdgcn_sdot4(q, 0x01010101, sq[word / 2], false);
+                    sp[word / 2] = ::llaminar2::rocm_integer_contract::signedDot4(p, 0x01010101, sp[word / 2]);
+                    sq[word / 2] = ::llaminar2::rocm_integer_contract::signedDot4(q, 0x01010101, sq[word / 2]);
                 }
             }
             if constexpr (Traits::is_asymmetric || Traits::is_dual_scale_asym || Traits::is_iq1_m)
@@ -218,9 +221,9 @@ __global__ __launch_bounds__(256, 2) void projectNativeGrouped(GPUQ8ResidualCorr
                 for (int column = 0; column < 2; ++column)
                 {
                     dot0[half][row][column] =
-                        __builtin_amdgcn_sdot4(p[row], w[column], dot0[half][row][column], false);
+                        ::llaminar2::rocm_integer_contract::signedDot4(p[row], w[column], dot0[half][row][column]);
                     dot1[half][row][column] =
-                        __builtin_amdgcn_sdot4(q[row], w[column], dot1[half][row][column], false);
+                        ::llaminar2::rocm_integer_contract::signedDot4(q[row], w[column], dot1[half][row][column]);
                 }
             }
         }

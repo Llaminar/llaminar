@@ -6,8 +6,8 @@
  * Provides CUDA kernels for:
  * - TQ8/TQ4 quantization (FP32 → TQ block, for KV cache append)
  * - TQ8/TQ4 dequantization (TQ block → FP32, for KV cache read)
- * - Fused dequant + RoPE (dequant to FP32 with rotary position encoding)
- * - Ring buffer linearize with dequant + RoPE fusion
+ * - Ring buffer linearize with dequant + RoPE fusion using explicit kernel policy
+ *   arguments, so retained graphs do not share mutable module-global RoPE state
  *
  * Codebooks (TQ4_CENTROIDS, TQ8_CENTROIDS) are stored in __constant__ memory
  * for fast cache-resident access.
@@ -222,41 +222,6 @@ namespace llaminar2
         cudaStream_t stream);
 
     // =========================================================================
-    // TQ8 Dequantize: TQ8Block → FP32 (for K cache read)
-    // =========================================================================
-
-    /**
-     * @brief Dequantize TQ8 blocks to FP32 with optional RoPE.
-     *
-     * For each block:
-     *   1. Centroid lookup (uint8 → float via codebook)
-     *   2. Divide by √D
-     *   3. Inverse rotation Πᵀ
-     *   4. Scale by norm
-     *   5. (Optional) Apply RoPE: cos/sin rotation at position `pos`
-     *
-     * @param d_tq8_blocks Input TQ8 blocks: [count * n_kv_heads] blocks
-     * @param d_rotations_t Transposed rotation matrices: [n_kv_heads * head_dim * head_dim]
-     * @param d_output     FP32 output: [count, n_kv_heads * head_dim]
-     * @param count        Number of positions to dequantize
-     * @param n_kv_heads   Number of KV heads
-     * @param head_dim     Head dimension
-     * @param rope_theta   RoPE base frequency (0 = no RoPE)
-     * @param position_start Starting position for RoPE (ring buffer position offset)
-     * @param max_seq_len  Ring buffer capacity (for position wrapping)
-     * @param tail         Ring buffer tail (oldest token position)
-     * @param stream       CUDA stream
-     */
-    extern "C" bool cuda_tq8_dequantize_fp32(
-        const void *d_tq8_blocks,
-        const float *d_rotations_t,
-        float *d_output,
-        int count, int n_kv_heads, int head_dim,
-        float rope_theta, int position_start,
-        int max_seq_len, int tail,
-        cudaStream_t stream);
-
-    // =========================================================================
     // TQ4 Dequantize: TQ4Block → FP32 (for V cache read)
     // =========================================================================
 
@@ -362,93 +327,6 @@ namespace llaminar2
         int position_start,
         int rope_dim,
         TurboQuantKVMode mode,
-        cudaStream_t stream);
-
-    // =========================================================================
-    // Batched Incremental Dequant (all layers in 2 kernel launches)
-    // =========================================================================
-
-    /**
-     * @brief Per-layer parameters for batched incremental dequant.
-     *
-     * Each element describes one layer's incremental dequant work:
-     * a single new position that needs dequantization.
-     */
-    struct IncrementalDequantParam
-    {
-        const uint8_t *cache;  ///< TQ cache (K or V) for this layer
-        __half *output;        ///< FP16 scratch output for this layer
-        const float *rotation; ///< Rotation Π for this layer [n_kv_heads * D * D]
-        int ring_pos;          ///< Ring buffer position of the new entry
-        int out_offset;        ///< Output offset: (count-1) * kv_dim
-        int rope_position;     ///< Position for RoPE (0 if no RoPE)
-    };
-
-    /**
-     * @brief Batched incremental dequant: process 1 new position for ALL layers.
-     *
-     * During decode, each layer has exactly 1 new position. Instead of
-     * 2×n_layers separate kernel launches, this function launches 2 kernels
-     * (TQ8 for K + TQ4 for V) with grid.y = n_layers.
-     *
-     * @param d_K_params   Device array of n_layers IncrementalDequantParam for K (TQ8)
-     * @param d_V_params   Device array of n_layers IncrementalDequantParam for V (TQ4)
-     * @param n_layers     Number of layers
-     * @param n_kv_heads   Number of KV heads
-     * @param head_dim     Head dimension (64 or 128)
-     * @param rope_theta   RoPE base (0 = no RoPE, applied to K only)
-     * @param stream       CUDA stream
-     */
-    extern "C" bool cuda_tq_batch_incremental_dequant_fp16(
-        const IncrementalDequantParam *d_K_params,
-        const IncrementalDequantParam *d_V_params,
-        int n_layers, int n_kv_heads, int head_dim,
-        float rope_theta,
-        cudaStream_t stream);
-
-    /**
-     * @brief Fused single-position incremental dequant: K (TQ8) + V (TQ4)
-     *        in one kernel launch per layer. Halves launch overhead vs separate calls.
-     *
-     * @param d_K_out          FP16 K output (scratch buffer)
-     * @param d_V_out          FP16 V output (scratch buffer)
-     * @param d_K_cache        TQ8 K cache for this layer/seq
-     * @param d_V_cache        TQ4 V cache for this layer/seq
-     * @param d_K_rotation     K rotation matrix Π (D×D per head, row-major)
-     * @param d_V_rotation     V rotation matrix Π (D×D per head, row-major)
-     * @param ring_pos         Ring buffer position of the new token
-     * @param out_offset_elems Element offset into scratch (position × kv_dim)
-     * @param n_kv_heads       Number of KV heads
-     * @param head_dim         Head dimension (64 or 128)
-     * @param rope_theta       RoPE base (0 = no RoPE, applied to K only)
-     * @param rope_position    Absolute position for RoPE
-     * @param stream           CUDA stream
-     */
-    extern "C" bool cuda_tq_incremental_single_fp16(
-        __half *d_K_out, __half *d_V_out,
-        const void *d_K_cache, const void *d_V_cache,
-        const float *d_K_rotation, const float *d_V_rotation,
-        int ring_pos, int out_offset_elems,
-        int n_kv_heads, int head_dim,
-        float rope_theta, int rope_position,
-        cudaStream_t stream);
-
-    /**
-     * @brief Graph-capturable incremental dequant driven by device ring state.
-     *
-     * Outputs are base pointers. The fused kernel reads the cache's canonical
-     * post-append head/count and derives its compressed source row, scratch
-     * destination row, and optional RoPE position in-register. No host-owned
-     * dequant parameter mailbox is uploaded between graph replays.
-     */
-    extern "C" bool cuda_tq_incremental_single_fp16_dynamic(
-        __half *d_K_base, __half *d_V_base,
-        const void *d_K_cache, const void *d_V_cache,
-        const float *d_K_rotation, const float *d_V_rotation,
-        const int *d_ring_head, const int *d_cached_count,
-        int max_seq_len, int kv_dim, int position_start,
-        int n_kv_heads, int head_dim,
-        float rope_theta,
         cudaStream_t stream);
 
     // =========================================================================

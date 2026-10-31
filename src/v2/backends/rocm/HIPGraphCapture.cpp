@@ -16,11 +16,14 @@
  * Expected registry misses belong only to their inspection query: inspection
  * rejects pre-existing HIP errors and consumes its own precise module probe miss
  * before resolving resources, leaving genuine query/launch failures observable.
+ * A context-owned projection lease encloses native begin/end, including abort,
+ * so another parent cannot reuse forked streams before HIP releases membership.
  */
 
 #ifdef HAVE_ROCM
 
 #include "HIPGraphCapture.h"
+#include "AMDDeviceContext.h"
 #include "../NativeParallelGraphBranch.h"
 #include "../NativeGraphDependencyReduction.h"
 #include "HIPGraphTimelineKernels.h"
@@ -842,9 +845,22 @@ namespace llaminar2
 
     HIPGraphCapture::~HIPGraphCapture() { reset(); }
 
+    HIPGraphCapture::HIPGraphCapture(hipStream_t stream, int device_ordinal, AMDDeviceContext &owner)
+        : HIPGraphCapture(stream, device_ordinal)
+    {
+        if (owner.deviceOrdinal() != device_ordinal)
+            throw std::invalid_argument("HIP capture requires its exact worker device owner");
+        projection_context_lifetime_ = owner.retainProjectionContextOwner();
+        projection_owner_ = &owner;
+    }
+
     HIPGraphCapture::HIPGraphCapture(HIPGraphCapture &&other) noexcept
         : stream_(other.stream_), device_ordinal_(other.device_ordinal_),
           graph_(other.graph_), exec_(other.exec_),
+          projection_owner_(std::exchange(other.projection_owner_, nullptr)),
+          projection_context_lifetime_(std::move(other.projection_context_lifetime_)),
+          projection_submission_(std::move(other.projection_submission_)),
+          native_capture_active_(std::exchange(other.native_capture_active_, false)),
           node_count_(other.node_count_),
           resident_memory_bytes_(other.resident_memory_bytes_),
           ordered_timeline_timing_events_(
@@ -859,6 +875,7 @@ namespace llaminar2
         other.node_count_ = 0;
         other.resident_memory_bytes_ = 0u;
         other.ordered_timeline_timing_pending_ = false;
+        other.projection_submission_.reset();
     }
 
     HIPGraphCapture &HIPGraphCapture::operator=(HIPGraphCapture &&other) noexcept
@@ -870,6 +887,12 @@ namespace llaminar2
             device_ordinal_ = other.device_ordinal_;
             graph_ = other.graph_;
             exec_ = other.exec_;
+            projection_owner_ = std::exchange(other.projection_owner_, nullptr);
+            projection_context_lifetime_ = std::move(other.projection_context_lifetime_);
+            if (other.projection_submission_)
+                projection_submission_.emplace(std::move(*other.projection_submission_));
+            other.projection_submission_.reset();
+            native_capture_active_ = std::exchange(other.native_capture_active_, false);
             node_count_ = other.node_count_;
             resident_memory_bytes_ = other.resident_memory_bytes_;
             ordered_timeline_timing_events_ =
@@ -912,6 +935,8 @@ namespace llaminar2
 
     bool HIPGraphCapture::beginCapture()
     {
+        if (native_capture_active_)
+            throw std::logic_error("HIP graph capture already owns a live native recording interval");
         if (!activateOwner("beginCapture"))
             return false;
         // Destroy any previous graph (but keep exec_ for tryUpdate)
@@ -930,27 +955,53 @@ namespace llaminar2
             destroyOrderedTimelineTimingEvents();
         }
 
+        if (projection_owner_)
+            projection_submission_.emplace(projection_owner_->acquireProjectionSubmission(
+                static_cast<void *>(stream_), GPUProjectionSubmissionKind::Capture));
         hipError_t err = hipStreamBeginCapture(stream_, hipStreamCaptureModeRelaxed);
         if (err != hipSuccess)
         {
             LOG_ERROR("[HIPGraphCapture] hipStreamBeginCapture failed: " << hipGetErrorString(err));
+            projection_submission_.reset();
             return false;
         }
+        native_capture_active_ = true;
         return true;
+    }
+
+    hipError_t HIPGraphCapture::endNativeCapture(hipGraph_t *captured_graph)
+    {
+        const auto error = hipStreamEndCapture(stream_, captured_graph);
+        if (error != hipSuccess)
+        {
+            hipStreamCaptureStatus status{};
+            if (hipStreamIsCapturing(stream_, &status) != hipSuccess || status != hipStreamCaptureStatusNone)
+            {
+                LOG_ERROR("[HIPGraphCapture] Native capture termination is unproved; refusing to release projection resources");
+                std::terminate();
+            }
+        }
+        native_capture_active_ = false;
+        projection_submission_.reset();
+        return error;
     }
 
     bool HIPGraphCapture::endCapture()
     {
+        if (!native_capture_active_)
+            return false;
         if (!activateOwner("endCapture"))
             return false;
         const auto end_capture_begin = std::chrono::steady_clock::now();
-        hipError_t err = hipStreamEndCapture(stream_, &graph_);
+        hipError_t err = endNativeCapture(&graph_);
         const auto end_capture_elapsed =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - end_capture_begin);
         if (err != hipSuccess)
         {
             LOG_ERROR("[HIPGraphCapture] hipStreamEndCapture failed: " << hipGetErrorString(err));
+            if (graph_ && hipGraphDestroy(graph_) != hipSuccess)
+                std::terminate();
             graph_ = nullptr;
             return false;
         }
@@ -1592,6 +1643,14 @@ namespace llaminar2
 
     void HIPGraphCapture::reset()
     {
+        if (native_capture_active_)
+        {
+            if (!activateOwner("abortCapture")) std::terminate();
+            hipGraph_t abandoned = nullptr;
+            (void)endNativeCapture(&abandoned);
+            if (abandoned && hipGraphDestroy(abandoned) != hipSuccess)
+                std::terminate();
+        }
         if ((exec_ || graph_) && !activateOwner("reset"))
         {
             LOG_ERROR("[HIPGraphCapture] Cannot release graph resources without their immutable ROCm owner");

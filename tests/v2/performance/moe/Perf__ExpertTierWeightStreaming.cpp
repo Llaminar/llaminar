@@ -18,6 +18,7 @@
  * non-default stream.
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "tensors/TensorClasses.h"
 #include "tensors/VnniPackContext.h"
@@ -1488,6 +1489,9 @@ namespace llaminar2
                 if (argument == "--help" || argument == "-h")
                 {
                     printUsage(std::cout, argv[0]);
+                    // Help terminates before native setup. std::exit skips
+                    // main's stack, so close its process owner explicitly.
+                    llaminar2::GPUDeviceProcessLifetime::retireActive();
                     std::exit(0);
                 }
                 if (argument == "--single-launch")
@@ -1856,6 +1860,8 @@ namespace llaminar2
 /** Standalone Release benchmark entry point. */
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     try
     {
         return llaminar2::run(argc, argv);

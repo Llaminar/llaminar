@@ -1,6 +1,9 @@
 /**
  * @file NUMATopology.cpp
- * @brief NUMA topology detection implementation
+ * @brief NUMA topology detection with GPU identity borrowed from the physical inventory.
+ *
+ * Native GPU discovery is owned by the backend's explicit startup authority;
+ * NUMA placement resolves that admitted PCI identity through the host topology.
  * @author David Sanftenberg
  * @date 2025-10-31
  */
@@ -20,7 +23,7 @@
 // GPU headers - CANNOT include both CUDA and HIP in same translation unit (type conflicts)
 // When both are enabled, use extern declarations from GPUEnumeration.h instead
 #if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
-#include <cuda_runtime.h>
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #endif
 
 #if defined(HAVE_ROCM) && !defined(HAVE_CUDA)
@@ -389,17 +392,14 @@ namespace llaminar2
     std::string NUMATopology::getCUDAPCIBusID(int cuda_device_id)
     {
 #if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, cuda_device_id) == cudaSuccess)
-        {
-            // Format: domain:bus:device.function
-            char bus_id[32];
-            snprintf(bus_id, sizeof(bus_id), "%04x:%02x:%02x.0",
-                     prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
-            return std::string(bus_id);
-        }
-#endif
+        // NUMA discovery is an explicit startup boundary. Preserve the actual
+        // complete BDF; a PCI function must not be fabricated from an ordinal.
+        initializeCUDAHardwareMetadata();
+        return cudaHardwareMetadata().at(cuda_device_id).pci_address;
+#else
+        (void)cuda_device_id;
         return "";
+#endif
     }
 
     int NUMATopology::detectGPUViaSysfs(const std::string &pci_bus_id)

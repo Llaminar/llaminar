@@ -12,6 +12,8 @@
  * Both retain real serving preparation/capture and
  * stop before inference; neither is numerical or performance evidence.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "Qwen4ExpParityTestBase.h"
 #include "Qwen4ExpNgramAdmissionCases.h"
 #include "Qwen4ExpSourceAdmission.h"
@@ -494,6 +496,10 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpNgramAdmission, Qwen4ExpNgramAdmissionTest,
 /** @brief Preserve the canonical MPI lifecycle and retire backend authorities before process exit. */
 int main(int argc, char **argv)
 {
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     int provided = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     if (provided < MPI_THREAD_MULTIPLE) MPI_Abort(MPI_COMM_WORLD, 1);
@@ -510,7 +516,7 @@ int main(int argc, char **argv)
         result = RUN_ALL_TESTS();
     }
     GlobalBackendRouter::shutdown();
-    GPUDeviceContextPool::instance().shutdown();
+    llaminar2::GPUDeviceProcessLifetime::retireActive();
     if (MPI_Finalize() != MPI_SUCCESS) result = 3;
     std::cout.flush();
     std::cerr.flush();

@@ -4,7 +4,7 @@
 # MODE=build supplies the compiler and headers for HIP/RCCL/BLAS builds;
 # MODE=full additionally supplies the developer debugger/profiler tools;
 # MODE=runtime installs only host libraries. No mode installs a kernel driver.
-# The compiler modes build the repaired HIP runtime and matching gfx906 BLAS
+# The compiler modes build the repaired HIP runtime and matching shipping-target BLAS
 # kernels. Runtime images copy those exact artifacts from their tested builder;
 # they must never graft kernels from another distribution or release.
 set -euo pipefail
@@ -66,7 +66,7 @@ export LD_LIBRARY_PATH="${ROCM_PATH}/lib:${ROCM_PATH}/lib/llvm/lib${LD_LIBRARY_P
 
 if [[ "${MODE}" != runtime ]]; then
     bash "${rocm_script_dir}/install-hip-graph-runtime.sh"
-    bash "${rocm_script_dir}/install-rocblas-gfx906.sh"
+    bash "${rocm_script_dir}/install-rocblas.sh"
 fi
 
 # The caller owns unrelated packages; never autoremove them during SDK setup.

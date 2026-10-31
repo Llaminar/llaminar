@@ -18,6 +18,7 @@
  * corrections: zero weight scales and unit minima must yield the exact row sum,
  * including padded tiles, odd K halves, and every staging schedule.
  */
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include "kernels/cuda/gemm/CUDANativeVNNIPrefillDiagnostics.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "tensors/NativeVnniFormatInfo.h"
@@ -422,6 +423,9 @@ void verifyCodebook()
 /** @brief Shared correction producers retain signed range and padded-slot ownership. */
 TEST(CUDANativeVNNIPrefillStaging, SharedActivationCorrectionsMatchExactRowSums)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     check(cudaSetDevice(0));
     constexpr int m = 129, n = 129, k = 1056;
     const int blocks = n * (k / 32);
@@ -518,6 +522,9 @@ TEST(CUDANativeVNNIPrefillStaging, SharedActivationCorrectionsMatchExactRowSums)
 /** @brief Device switches cannot reuse another CUDA context's function opt-in. */
 TEST(CUDANativeVNNIPrefillStaging, BK256CapturedLaunchOwnsEveryDeviceContext)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     int count = 0;
     check(cudaGetDeviceCount(&count));
     ASSERT_GT(count, 0);
@@ -539,6 +546,9 @@ TEST(CUDANativeVNNIPrefillStaging, BK256CapturedLaunchOwnsEveryDeviceContext)
 /** @brief Concurrent participants cannot race a shared capability/opt-in cache. */
 TEST(CUDANativeVNNIPrefillStaging, BK256ConcurrentCapturedParticipants)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     int count = 0;
     check(cudaGetDeviceCount(&count));
     ASSERT_GT(count, 0);
@@ -567,6 +577,9 @@ TEST(CUDANativeVNNIPrefillStaging, BK256ConcurrentCapturedParticipants)
 /** @brief Prove every admitted nibble-payload candidate in retained graphs. */
 TEST(CUDANativeVNNIPrefillStaging, CapturedCandidatesMatchRegisterDecode)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     int count=0;
     ASSERT_EQ(cudaGetDeviceCount(&count),cudaSuccess);
     ASSERT_GT(count,0);
@@ -581,6 +594,9 @@ TEST(CUDANativeVNNIPrefillStaging, CapturedCandidatesMatchRegisterDecode)
 /** @brief Every staged tile preserves full output/partials over retained replay. */
 TEST(CUDANativeVNNIPrefillStaging, AllStagedTilesMatchRegisterDecode)
 {
+    // This standalone native fixture bypasses backend/DeviceManager startup.
+    // Admit physical facts explicitly before any production planner or capture.
+    llaminar2::initializeCUDAHardwareMetadata();
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     auto verify = []<int CB>() {
         for (int tile : {0, 2, 3, 4, 5})

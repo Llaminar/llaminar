@@ -8,6 +8,7 @@
  * No proof factory, substitute provider, device startup or table hash is used.
  */
 #include "execution/qwen4exp/ImmutableLookupService.h"
+#include "kernels/qwen4exp/PooledImmutableSourceOps.h"
 #include <gtest/gtest.h>
 #include "../../../mocks/MockBackend.h"
 #include <chrono>
@@ -477,6 +478,11 @@ struct ServiceLane {
             std::this_thread::yield();
         }
     }
+    /** @brief Simulate the GPU's separate exact I/O abort release, never CPU cancellation or graph close. */
+    void abort(ImmutableLookupService::Ticket ticket){
+        std::atomic_ref(ack().abortGeneration).store(ticket.generation,std::memory_order_release);
+        std::atomic_ref(ack().abortInvocation).store(ticket.invocation,std::memory_order_release);
+    }
     /** @brief Simulate complete consumer retirement and graph terminal, never before actual completion. */
     void close(std::uint64_t sequence,std::uint64_t generation) {
         std::atomic_ref(ack().consumedSequence).store(sequence,std::memory_order_release);
@@ -522,6 +528,54 @@ TEST(ImmutableLookupSubordinate, WorkerCancelBeforePublicationAndBeforePollRetir
         lane.binding.reset();EXPECT_EQ(lane.backend.frees,1u);
         EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
             PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+}
+
+/** @test An actual failed completion published between source polls remains acquired after exact worker retirement.
+ * @note The first load is genuinely sampled before publishing the request/cancellation. The existing
+ * worker alone authors completion/retirement. This replays the production GPU acquisition helper's
+ * exact late-publication order, including the no-completion cancellation control, without a GPU.
+ */
+TEST(ImmutableLookupSubordinate, WorkerRetirementReacquiresOriginalFailureCompletion) {
+    namespace source=llaminar2::qwen4exp::pooled_source;
+    for(const auto slots:{0u,2u})for(const bool noCompletion:{false,true}) {
+        ServiceLane lane(slots);const auto ticket=lane.service->arm(7);
+        if(!noCompletion)ASSERT_EQ(::ftruncate(lane.file.fd,0),0);
+        struct Publications {
+            ServiceLane& lane;ImmutableLookupService::Ticket ticket;bool noCompletion;unsigned reads=0;
+            std::vector<char> trace;
+            /** @brief Sample the real publication, then force the actual worker into the intervening retired state. */
+            std::uint64_t completion(){
+                trace.push_back('C');const auto publication=std::atomic_ref(lane.completion().publication).load(std::memory_order_acquire);
+                if(reads++==0){
+                    EXPECT_EQ(publication,0u);
+                    if(noCompletion)EXPECT_TRUE(lane.service->cancel(ticket));
+                    else {const std::array<std::int64_t,2> ids{11,12};const std::array<Intent,2> intents{};lane.publish(1,ticket.generation,ids,intents);}
+                    ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+                }
+                return publication;
+            }
+            /** @return The original worker's actual acquired generation/invocation retirement pair. */
+            bool retirement(){
+                trace.push_back('R');const auto invocation=std::atomic_ref(lane.ack().retiredInvocation).load(std::memory_order_acquire);
+                const auto generation=std::atomic_ref(lane.ack().retiredGeneration).load(std::memory_order_acquire);
+                return ImmutableLookupProtocol::matchesInvocation(invocation,generation,ticket.generation,ticket.invocation);
+            }
+        } publications{lane,ticket,noCompletion};
+        const auto observation=source::acquireResponsePublication(publications,1);
+        EXPECT_EQ(publications.trace,(std::vector<char>{'C','R','C'}));
+        EXPECT_EQ(observation,noCompletion?source::ResponsePublication::WorkerRetired:source::ResponsePublication::Completion);
+        EXPECT_EQ(lane.ack().consumedSequence,0u); // Neither the helper nor worker fabricates consumption.
+        if(!noCompletion){
+            EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::StorageFailure));
+            EXPECT_EQ(ImmutableLookupProtocol::validateCompletion(lane.completion(),1,1,ticket.generation,
+                lane.binding->deviceView().base.table,2,lane.layout.rowBytes(),lane.layout.protocol()),ImmutableLookupStatus::StorageFailure);
+            lane.close(1,ticket.generation); // Authenticated failed envelope permits true consumption.
+        }
+        EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        EXPECT_EQ(lane.service->stats().terminalBytes,noCompletion?32u:16u);
+        if(noCompletion)EXPECT_EQ(lane.ack().consumedSequence,0u);
     }
 }
 
@@ -604,7 +658,8 @@ TEST(ImmutableLookupSubordinate, WorkerFailedPartialPayloadRetainsOriginalIntent
         /** @brief Restore process-wide GTest policy. */
         ~DeathStyle(){GTEST_FLAG_SET(death_test_style,previous);}
     } deathStyle;
-    ASSERT_EXIT(([] {
+    for(const bool abortAfterPrefix:{false,true}) {
+    ASSERT_EXIT(([abortAfterPrefix] {
         ServiceLane lane(0,0);
         const std::array<std::int64_t,1> first{0};const std::array<Intent,1> read{};
         const auto warm=lane.service->arm(1);lane.publish(1,1,first,read);
@@ -638,12 +693,15 @@ TEST(ImmutableLookupSubordinate, WorkerFailedPartialPayloadRetainsOriginalIntent
             EXPECT_EQ(view.acknowledgements[i].destination_grant,0xa5a5a5a5a5a5a5a5ULL);
             EXPECT_EQ(view.intents[i].destination_grant,intents[i].destination_grant);
         }
+        if(abortAfterPrefix)lane.abort(ticket); // Original failed payload prefix exists; no successful ACK is invented.
         lane.close(2,2);EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_EQ(lane.service->stats().terminalBytes,abortAfterPrefix?56u:40u);
         EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
         lane.service.reset();lane.provider.reset();EXPECT_EQ(lane.backend.frees,0u);
         lane.binding.reset();EXPECT_EQ(lane.backend.frees,1u);
         ::_exit(::testing::Test::HasFailure()?1:0);
     }()),::testing::ExitedWithCode(0),"");
+    }
 }
 
 /** @test Late cancellation before await cannot publish uncounted metadata after the actual CPU worker retires. */
@@ -664,4 +722,51 @@ TEST(ImmutableLookupSubordinate, WorkerLateCancelBeforeAwaitRejectsWithoutPublic
     EXPECT_TRUE(lane.service->cancel(next));ServiceLane::wait(lane.ack().retiredInvocation,next.invocation);
     EXPECT_FALSE(lane.service->cancel(next));EXPECT_FALSE(lane.service->await(next));
     EXPECT_EQ(lane.service->stats().terminalBytes,7*sizeof(std::uint64_t));
+}
+
+/** @test A GPU abort before request publication retires only the actual worker and preserves captured backing. */
+TEST(ImmutableLookupSubordinate, WorkerSourceAbortBeforePublicationRetiresWithoutConsumed){
+    static_assert(sizeof(ImmutableLookupAcknowledgement)==64);
+    for(const auto slots:{0u,2u}){
+        ServiceLane lane(slots);const auto ticket=lane.service->arm(17);lane.abort(ticket);
+        ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+        const std::array<std::int64_t,1> ids{3};const std::array<Intent,1> read{};
+        lane.publish(1,ticket.generation,ids,read); // Deterministic publication after actual retirement.
+        EXPECT_EQ(lane.completion().publication,0u);EXPECT_EQ(lane.ack().consumedSequence,0u);EXPECT_EQ(lane.ack().closedGeneration,0u);
+        EXPECT_EQ(lane.ack().cancelledInvocation,0u);EXPECT_FALSE(lane.service->await(ticket));
+        EXPECT_EQ(lane.service->stats().terminalBytes,32u);EXPECT_EQ(lane.service->stats().requests,0u);
+        EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        lane.service.reset();lane.provider.reset();EXPECT_EQ(lane.backend.frees,0u);
+        lane.binding.reset();EXPECT_EQ(lane.backend.frees,1u);
+        EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+}
+
+/** @test Stale generation, partial pair and previous dispatch cannot abort a later acquired request. */
+TEST(ImmutableLookupSubordinate, WorkerSourceAbortRejectsStalePartialAndPreviousInvocation){
+    ServiceLane lane;ImmutableLookupService::Ticket previous{};
+    for(std::uint64_t generation=1;generation<=4;++generation){
+        const auto ticket=lane.service->arm(generation);
+        if(previous.valid())lane.abort(previous);
+        std::atomic_ref(lane.ack().abortGeneration).store(generation,std::memory_order_release); // Old/zero publication does not acquire this body.
+        const std::array<std::int64_t,1> ids{static_cast<std::int64_t>(generation+2)};const std::array<Intent,1> read{};
+        lane.publish(generation,generation,ids,read);ServiceLane::wait(lane.completion().publication,generation);
+        lane.abort({generation+1,ticket.invocation}); // Correct invocation with wrong generation remains foreign.
+        lane.close(generation,generation);EXPECT_TRUE(lane.service->await(ticket));
+        EXPECT_EQ(lane.ack().cancelledInvocation,0u);EXPECT_EQ(lane.service->stats().terminalBytes,generation*24u);
+        previous=ticket;
+    }
+}
+
+/** @test A distinct GPU abort racing CPU retirement is accounted after join once, never as fake payload consumption. */
+TEST(ImmutableLookupSubordinate, WorkerLateSourceAbortBeforeAwaitCountsExactMessageOnce){
+    ServiceLane lane;const auto ticket=lane.service->arm(1);
+    const std::array<std::int64_t,1> ids{3};const std::array<Intent,1> read{};
+    lane.publish(1,1,ids,read);ServiceLane::wait(lane.completion().publication,1);
+    lane.close(1,1);ServiceLane::wait(lane.ack().retiredInvocation,ticket.invocation);
+    lane.abort(ticket);EXPECT_FALSE(lane.service->await(ticket));
+    EXPECT_EQ(lane.service->stats().terminalBytes,40u);EXPECT_EQ(lane.service->stats().nativeBytes,lane.layout.rowBytes());
+    EXPECT_EQ(lane.ack().cancelledInvocation,0u);EXPECT_EQ(lane.ack().consumedSequence,1u);
+    EXPECT_THROW((void)lane.service->await(ticket),std::logic_error);
+    EXPECT_EQ(lane.service->stats().terminalBytes,40u);
 }

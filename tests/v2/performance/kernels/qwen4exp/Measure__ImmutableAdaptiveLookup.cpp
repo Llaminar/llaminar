@@ -8,6 +8,7 @@
  * are outside timing. This is sized component evidence, never automatic tier
  * selection, a serving admission certificate or GPU-only decode bandwidth.
  */
+#include "backends/GPUDeviceProcessLifetime.h"
 #include "fixtures/qwen4exp/AdaptiveLookupNativeComponent.h"
 #include "kernels/qwen4exp/ImmutableLookupKernels.h"
 #include <charconv>
@@ -93,4 +94,6 @@ void measure(const Options &o){
 /** @brief Run one explicit component variant; errors never select another storage path.
  * @param argc Argument count. @param argv Explicit harness selections.
  * @return Zero only after byte validation, actual source receipts and complete timing succeed. */
-int main(int argc,char **argv){try{measure(options(argc,argv));return 0;}catch(const std::exception &e){std::cerr<<"ADAPTIVE_COMPONENT_ERROR "<<e.what()<<'\n';return 1;}}
+int main(int argc,char **argv){
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+try{measure(options(argc,argv));return 0;}catch(const std::exception &e){std::cerr<<"ADAPTIVE_COMPONENT_ERROR "<<e.what()<<'\n';return 1;}}

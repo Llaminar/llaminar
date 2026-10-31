@@ -2,8 +2,9 @@
  * @file NCCLDynamicLoader.cpp
  * @brief Implementation of dynamic NCCL loader using dlopen/dlsym
  *
- * Uses dlopen with RTLD_LOCAL to load NCCL into an isolated symbol namespace,
- * preventing conflicts with RCCL which exports identical symbol names.
+ * Loads exactly CMake's selected NCCL dependency, or an explicit diagnostic
+ * path, with RTLD_LOCAL so RCCL's identically named symbols remain isolated.
+ * An absent/empty selection or failed load never triggers runtime rediscovery.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -16,6 +17,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace llaminar2
 {
@@ -60,6 +62,9 @@ namespace llaminar2
 
             std::mutex g_mutex;
             void *g_library_handle = nullptr;
+            // The exact admitted selection belongs to the same lifetime as its
+            // resolved callbacks. A handle cannot certify another path.
+            std::string g_library_path;
             std::string g_last_error;
 
             // Function pointer types
@@ -128,6 +133,37 @@ namespace llaminar2
             ncclGroupStart_t fp_ncclGroupStart = nullptr;
             ncclGroupEnd_t fp_ncclGroupEnd = nullptr;
 
+            /**
+             * @brief Withdraw every borrowed callback before its DSO can retire.
+             * The caller holds g_mutex. Failed partial resolution must leave the
+             * same unavailable state as unload, including the live-row extensions.
+             */
+            void clearResolvedSymbols() noexcept
+            {
+                fp_ncclGetVersion = nullptr;
+                fp_ncclGetUniqueId = nullptr;
+                fp_ncclCommInitRank = nullptr;
+                fp_ncclCommInitRankConfig = nullptr;
+                fp_ncclCommDestroy = nullptr;
+                fp_ncclCommAbort = nullptr;
+                fp_ncclCommCount = nullptr;
+                fp_ncclCommCuDevice = nullptr;
+                fp_ncclCommUserRank = nullptr;
+                fp_ncclGetErrorString = nullptr;
+                fp_ncclAllReduce = nullptr;
+                fp_ncclBroadcast = nullptr;
+                fp_ncclReduce = nullptr;
+                fp_ncclAllGather = nullptr;
+                fp_ncclReduceScatter = nullptr;
+                fp_device_rows_gather = nullptr;
+                fp_device_rows_reduce = nullptr;
+                fp_device_rows_scatter = nullptr;
+                fp_ncclSend = nullptr;
+                fp_ncclRecv = nullptr;
+                fp_ncclGroupStart = nullptr;
+                fp_ncclGroupEnd = nullptr;
+            }
+
             // Helper to load a symbol
             template <typename T>
             bool loadSymbol(T &func_ptr, const char *name)
@@ -148,26 +184,48 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Load the canonical capture-reentry NCCL once with local symbols.
-         * @param library_path Explicit test/deployment library, or null for the
-         *        installed canonical SONAME. Failure never selects another DSO.
-         * @return Whether all required NCCL entrypoints were resolved.
+         * @brief Resolve the exact selected NCCL dependency without substitution.
+         * @param library_path Explicit nonempty diagnostic/deployment path, or null
+         *        for CMake's selected LLAMINAR_NCCL_LIBRARY/NCCL_LIBRARY path.
+         * @return True when the same selection is already loaded or every required
+         *         symbol resolves; false for an invalid/different selection or failure.
+         * Empty explicit input is invalid even if an earlier load succeeded. A
+         * failed load never searches another directory or bare SONAME. The mutex
+         * protects the existing single dependency and its resolved entrypoints.
          */
         bool load(const char *library_path)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
 
+            const char *path = library_path;
+#ifdef LLAMINAR_NCCL_LIBRARY_PATH
+            if (!path)
+                path = LLAMINAR_NCCL_LIBRARY_PATH;
+#endif
+            if (!path || !*path)
+            {
+                g_last_error = library_path ? "Explicit NCCL library path is empty" :
+                    "No NCCL library configured; set LLAMINAR_NCCL_LIBRARY when configuring the build";
+                LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
+                return false;
+            }
+
             if (g_library_handle)
             {
-                // Already loaded
+                if (g_library_path != path)
+                {
+                    g_last_error = "NCCL is already loaded from '" + g_library_path +
+                        "'; requested different library '" + path + "'";
+                    LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
+                    return false;
+                }
                 return true;
             }
 
-            // The distinct SONAME is deliberate: an unpatched system library
-            // fails when a retained parent resumes capture with the same ID.
-            // Resolve exactly one dependency; never hide a missing installation
-            // by loading the incompatible distribution package instead.
-            const char *path = library_path ? library_path : "libllaminar_nccl.so.2";
+            // Allocate the owned identity before opening the DSO; publication
+            // after symbol resolution is a nonthrowing string move.
+            std::string admitted_path(path);
+            path = admitted_path.c_str();
 
             // Clear any previous dlerror
             dlerror();
@@ -184,7 +242,7 @@ namespace llaminar2
 
             if (!g_library_handle)
             {
-                g_last_error = std::string("Failed to load canonical NCCL library: ") + path;
+                g_last_error = std::string("Failed to load configured NCCL library: ") + path;
                 LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
                 return false;
             }
@@ -217,12 +275,14 @@ namespace llaminar2
             if (!success)
             {
                 LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
+                clearResolvedSymbols();
                 dlclose(g_library_handle);
                 g_library_handle = nullptr;
                 return false;
             }
 
-            LOG_INFO("NCCL Dynamic Loader: All " << 19 << " symbols loaded successfully");
+            g_library_path = std::move(admitted_path);
+            LOG_INFO("NCCL Dynamic Loader: All required symbols loaded successfully");
             return true;
         }
 
@@ -230,35 +290,12 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> lock(g_mutex);
 
+            clearResolvedSymbols();
+            g_library_path.clear();
             if (g_library_handle)
             {
                 dlclose(g_library_handle);
                 g_library_handle = nullptr;
-
-                // Clear function pointers
-                fp_ncclGetVersion = nullptr;
-                fp_ncclGetUniqueId = nullptr;
-                fp_ncclCommInitRank = nullptr;
-                fp_ncclCommInitRankConfig = nullptr;
-                fp_ncclCommDestroy = nullptr;
-                fp_ncclCommAbort = nullptr;
-                fp_ncclCommCount = nullptr;
-                fp_ncclCommCuDevice = nullptr;
-                fp_ncclCommUserRank = nullptr;
-                fp_ncclGetErrorString = nullptr;
-                fp_ncclAllReduce = nullptr;
-                fp_ncclBroadcast = nullptr;
-                fp_ncclReduce = nullptr;
-                fp_ncclAllGather = nullptr;
-                fp_ncclReduceScatter = nullptr;
-                fp_device_rows_gather = nullptr;
-                fp_device_rows_reduce = nullptr;
-                fp_device_rows_scatter = nullptr;
-                fp_ncclSend = nullptr;
-                fp_ncclRecv = nullptr;
-                fp_ncclGroupStart = nullptr;
-                fp_ncclGroupEnd = nullptr;
-
                 LOG_DEBUG("NCCL Dynamic Loader: Library unloaded");
             }
         }

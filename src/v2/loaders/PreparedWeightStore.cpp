@@ -1,4 +1,5 @@
 #include "PreparedWeightStore.h"
+#include "loaders/PreparedWeightIdentityContract.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "GPUVramPreflight.h"
 #include "transfer/TransferEngine.h"
@@ -19,6 +20,8 @@
  * cleanup by resetting dynamic kernel state while preserving long-lived packed
  * weights. Real kernel registration also authenticates the sealed floating
  * operand policy before publishing tensor state or an adoptable prepared ref.
+ * Adoption and physical weight-plan lowering share one representation identity
+ * contract, including normalized intervals and original projection control blocks.
  * CPU packed preparation binds final allocator-rounded storage directly to the
  * persistent owner; borrowed floating sources create no second storage claim.
  */
@@ -117,90 +120,14 @@ namespace llaminar2
                    stored.cols_per_expert == requested.cols_per_expert;
         }
 
-        bool isEmptySlice(const WeightSliceSpec &slice)
+        /** @brief Compare the shared production identity after existing store/source checks. */
+        bool compatiblePreparedAdoptionBinding(const WeightBinding &stored, const WeightBinding &requested)
         {
-            return slice.source_rows == 0 &&
-                   slice.source_cols == 0 &&
-                   slice.row_start == 0 &&
-                   slice.row_count == 0 &&
-                   slice.col_start == 0 &&
-                   slice.col_count == 0 &&
-                   slice.expert_start == 0 &&
-                   slice.expert_count == 0 &&
-                   slice.expert_ids.empty() &&
-                   !slice.inner_is_presliced;
+            const auto a = PreparedWeightIdentityContract::fromBinding(stored);
+            const auto b = PreparedWeightIdentityContract::fromBinding(requested);
+            return a && b && a->compatible(*b);
         }
 
-        bool isFullTensorSlice(const WeightSliceSpec &slice, const TensorBase *tensor)
-        {
-            if (!tensor || tensor->shape().size() < 2)
-                return false;
-            const auto &shape = tensor->shape();
-            return slice.row_start == 0 &&
-                   slice.col_start == 0 &&
-                   slice.expert_start == 0 &&
-                   slice.expert_count == 0 &&
-                   slice.expert_ids.empty() &&
-                   !slice.inner_is_presliced &&
-                   slice.row_count == shape[0] &&
-                   slice.col_count == shape[1] &&
-                   (slice.source_rows == 0 || slice.source_rows == shape[0]) &&
-                   (slice.source_cols == 0 || slice.source_cols == shape[1]);
-        }
-
-        bool sameWeightSliceForAdoption(
-            const WeightSliceSpec &stored,
-            const TensorBase *stored_tensor,
-            const WeightSliceSpec &requested,
-            const TensorBase *requested_tensor)
-        {
-            const bool stored_empty = isEmptySlice(stored);
-            const bool requested_empty = isEmptySlice(requested);
-            if (stored_empty && requested_empty)
-                return true;
-            if (stored_empty)
-                return isFullTensorSlice(requested, requested_tensor);
-            if (requested_empty)
-                return isFullTensorSlice(stored, stored_tensor);
-
-            return stored.source_rows == requested.source_rows &&
-                   stored.source_cols == requested.source_cols &&
-                   stored.row_start == requested.row_start &&
-                   stored.row_count == requested.row_count &&
-                   stored.col_start == requested.col_start &&
-                   stored.col_count == requested.col_count &&
-                   stored.expert_start == requested.expert_start &&
-                   stored.expert_count == requested.expert_count &&
-                   stored.expert_ids == requested.expert_ids &&
-                   stored.inner_is_presliced == requested.inner_is_presliced;
-        }
-
-        bool compatiblePreparedAdoptionBinding(
-            const WeightBinding &stored,
-            const WeightBinding &requested)
-        {
-            if (!stored.tensor || !requested.tensor ||
-                stored.projection_ownership != requested.projection_ownership)
-                return false;
-            // Static source views are affine to the original compact parent,
-            // including its real control block. Shape-equal borrowed pointers
-            // cannot replace that source lifetime during prepared adoption.
-            if (stored.projection_ownership &&
-                (stored.projection_source_owner != requested.projection_source_owner ||
-                 stored.projection_source_owner.owner_before(requested.projection_source_owner) ||
-                 requested.projection_source_owner.owner_before(stored.projection_source_owner)))
-                return false;
-            if (stored.tensor->shape() != requested.tensor->shape())
-                return false;
-            if (stored.tensor->native_type() != requested.tensor->native_type() ||
-                stored.floating_operand_precision != requested.floating_operand_precision)
-                return false;
-            return sameWeightSliceForAdoption(
-                stored.slice,
-                stored.tensor,
-                requested.slice,
-                requested.tensor);
-        }
     }
 
     PreparedWeightStore::PreparedWeightStore(ModelContextId model_id)

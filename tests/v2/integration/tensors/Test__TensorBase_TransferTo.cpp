@@ -9,6 +9,7 @@
  * - Multi-hop transfers
  */
 
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
 #include "v2/tensors/TensorClasses.h"
@@ -375,6 +376,8 @@ TEST_F(Test__TensorBase_TransferTo, MultiHop_CUDA_ROCm_CUDA)
 
 int main(int argc, char **argv)
 {
+    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
+
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

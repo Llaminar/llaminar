@@ -320,3 +320,18 @@ TEST(Test__MPIBootstrap, ObserverCanonicalIntentIncludesNestedAcceleratorDeclara
     config.domain_definitions.push_back(DomainDefinition::parse("compute=rocm:0;scope=rank_local;backend=rccl"));
     EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config), BootstrapDeviceIntent::Accelerator);
 }
+
+/** @brief Native MPI options end before any opaque application argument is inspected. */
+TEST(Test__MPIBootstrap, NativeOptionBoundaryPreservesOpaqueRuntimeNamedApplicationArguments)
+{
+    using namespace llaminar2;
+    char binary[]="frontend", option[]="--tmpdir", value[]="application-owned-value";
+    char *argv[]={binary,option,value};
+    const auto command=MPIBootstrap::buildMPIRunCommand(3,argv,{},{});
+    const auto application=std::find(command.begin(),command.end(),"frontend");
+    ASSERT_NE(application,command.end());
+    ASSERT_NE(application,command.begin());
+    EXPECT_EQ(*(application-1),"--");
+    EXPECT_EQ((std::vector<std::string>(application,command.end())),
+              (std::vector<std::string>{binary,option,value}));
+}

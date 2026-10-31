@@ -5,10 +5,13 @@
  * Initial thread support is agreed before creating any communicator owners.
  * Thereafter normal C++ scope order retires request handlers, runners and MPI
  * contexts before the existing infrastructure shutdown boundary is entered.
- * No idle-rank loop, model-state mirror or inference-time collective is added.
+ * The executable entrypoint must already own an ancestor session lifetime,
+ * including any singleton daemon MPI creates. Initialization never restarts
+ * its caller; missing ownership fails before native MPI state is created.
  */
 #include "app/MPIProcessSession.h"
 #include "app/MPIShutdown.h"
+#include "utils/MPISessionOwner.h"
 #include <mpi.h>
 #include <stdexcept>
 #include <utility>
@@ -17,6 +20,7 @@ namespace llaminar2
 {
     MPIProcessSession MPIProcessSession::initialize(int &argc, char **&argv)
     {
+        MPISessionOwner::requireProcessOwner();
         int initialized = 0, finalized = 0;
         if (MPI_Initialized(&initialized) != MPI_SUCCESS || MPI_Finalized(&finalized) != MPI_SUCCESS)
             throw std::runtime_error("Cannot inspect process MPI lifecycle");
