@@ -1,6 +1,6 @@
 # QFN source-admission matrix
 
-Updated 2026-10-31. **Size limit: 15,000 UTF-8 bytes.** This is a bounded status
+Updated 2026-11-01. **Size limit: 15,000 UTF-8 bytes.** This is a bounded status
 and coverage dashboard; detailed logs remain in linked local evidence.
 
 ## Contract
@@ -28,13 +28,13 @@ summarize them.
 | Main | 20 | CPU; CUDA/CPU and ROCm/CPU ExpertOverlay; mixed-vendor PP; RAM/mmap |
 | Host-adaptive | 20 | Same existing compositions; zero and positive RAM cache over SSD |
 | Fixed-head table shards | 64 | CUDA/ROCm TP2/4/8 plus CPU experts, reversed TP2; RAM controls and VRAM shards; Static/Dynamic, ordinal/random |
-| GPU-adaptive | 4 | CUDA/ROCm GPU1 plus CPU experts; zero and positive VRAM/RAM caches over SSD |
+| GPU-adaptive | 16 | CUDA/ROCm GPU1 plus CPU experts; zero/positive VRAM/RAM over SSD; Static/Dynamic × ordinal/random |
 | All-GPU ROCm TP4 | 1 | Internally sharded experts; RAM ngrams |
 | ROCm TP4 policy controls | 3 | Existing dense and routed compute policy alternatives |
 | New CPU NUMA | 8 | TP2/PP2; RAM, mmap, host-adaptive zero and positive cache |
-| **Supported-intent positive** | **120** | Declaration is not native qualification |
+| **Supported-intent positive** | **132** | Declaration is not native qualification |
 | Composed candidates | 20 | Four original GPU compositions and additive CUDA2→CPU2 15/33 layers; four host-table policies |
-| **Total positive obligations** | **140** | No reference-directory dependency |
+| **Total positive obligations** | **152** | No reference-directory dependency |
 
 New compositions: CPU NUMA0+1 TP2; CPU0→CPU1 PP2; ROCm4 as
 PP(TP2, TP2); CUDA2→CPU2 as PP(TP2, TP2); ROCm2→CPU2 in that same composition;
@@ -53,12 +53,16 @@ slice publication is unimplemented. These tests require that exact rejection,
 with no changed expert policy, device count or storage tier. Table-head
 sharding and internal expert sharding are distinct axes.
 
-The 155 original seeds expand over **Off, fixed1, fixed3, and Dynamic**. Two
-additional four-policy CUDA TP2 families plus six ROCm replicated-decode capacity controls bring the total to **634**:
-496 supported-intent positives, 80 composed candidates and 58 rejection controls.
+The 167 seeds expand over **Off, fixed1, fixed3, and Dynamic**. Two
+additional four-policy CUDA TP2 families plus six ROCm replicated-decode capacity controls bring the total to **682**:
+544 supported-intent positives, 80 composed candidates and 58 rejection controls.
 The added families cover four-expert VRAM with retained MTP capacity3 and
 eight-expert admission under an explicit 13GiB public GPU cap. Original names,
-sources and full15 identities remain unchanged. Discovery authenticates all 634 identities. Active cells retain depth15
+sources and full15 identities remain unchanged. Four additional opposite-vendor
+ordinary controls retain depth15 with MTP Off, bringing discovery to **686**
+identities. These cover both CUDA/ROCm compute directions and zero/positive
+VRAM/RAM caches over SSD; they do not claim active multi-device MTP support.
+Active cells retain depth15
 except the explicit depth3 CUDA family. Both use the original R1 predictor;
 Dynamic keeps automatic initial depth, default controller cadence and the
 production speculative verifier.
@@ -76,11 +80,16 @@ Sources: [typed extensions](../../../../tests/v2/integration/parity/qwen4exp/Qwe
 
 ## Current qualification
 
-**The complete source matrix is not qualified.**
+**The complete source matrix is not qualified.** The 64 GPU-adaptive cells
+(including 48 new policy/MTP cases) await current-source native qualification.
+The four opposite-vendor ordinary controls pass source admission in r65;
+inference qualification and full current Unit/preflight remain pending.
+
+Construction: [templates](QFN_FORWARD_GRAPH_TEMPLATE_PREPARATION.md) cut MTP setup **2.08× ROCm TP4 / 3.63× CUDA TP2**; four native replays pass.
 
 | Scope | Evidence and result |
 |---|---|
-| Last complete prerequisites | Current PLE/capacity slice: **3,267 passes, zero failures, 29 unchanged hardware-unqualified**. Unit855/855; source/runtime unchanged, drivers clean, 2,989 owned session bases empty. [Evidence](QFN_PLE_PIPELINE_ADMISSION_REPAIRS.md). |
+| Last complete prerequisites | Previous PLE/capacity slice: **3,267 passes, zero failures, 29 unchanged hardware-unqualified**. Unit855/855; source/runtime unchanged, drivers clean, 2,989 owned session bases empty. [Evidence](QFN_PLE_PIPELINE_ADMISSION_REPAIRS.md). |
 | Current native slices | **CUDA16/CPU32 and ROCm16/CPU32: 32 host-tier/MTP identities pass**. RAM retains r10/r20; mmap and zero/positive host-adaptive cache pass 12/12 per backend in r23/r24. Full48/active retained15, retirement, prefix cleanup and driver checks pass on each recorded runtime. |
 | Rechecked failures | **6/6 pass in r26**: mixed CUDA/ROCm/CPU PP fixed3/Dynamic; ROCm TP4 random dynamic expert placement with sharded VRAM ngrams fixed1/fixed3; CPU NUMA PP2 host-adaptive fixed1/fixed3. Original full48/retained15 policies, retirement, empty session bases and driver checks pass. |
 | CUDA TP2 placement sweep | **16/16 pass in r27**: eight GPU experts, RAM ngrams, Static/Dynamic × ordinal/random × all four MTP modes. Original full48/active retained15, exact retirement, empty sessions and clean driver window. `source-admission-cuda-tp2-ram-policies-r27/`. |
@@ -88,21 +97,19 @@ Sources: [typed extensions](../../../../tests/v2/integration/parity/qwen4exp/Qwe
 | CPU/NUMA/mixed placement | **40/43 pass in r29**. [All three PLE-only PP failures are repaired](QFN_PLE_PIPELINE_ADMISSION_REPAIRS.md): **3/3 pass in r31** with original full15, cleanup and clean driver evidence. Focused entry/replay and failure-retirement controls pass. `source-admission-cpu-numa-mixed-placement-r29/`, `source-admission-ple-pipeline-mtp-recheck-r31/`. |
 | Prepared physical roots | r19 shares the runtime's exact identity predicate with planning, removing replicated-decode sidecar double charges. The original CUDA16/CPU32 capacity failure is resolved by r20 native evidence. ROCm24/24 retains a 317,565,660-byte active-capacity deficit and separate native-domain composition work. |
 | CUDA capacity controls | Four-expert VRAM retained3 positives and eight-expert 13GiB-cap rejections pass 8/8 with exact MTP/cap evidence and retirement. `source-admission-cuda-capacity-controls-r5/`. |
-| CUDA15/CPU33 | **16/16 native pass**: four storage policies × all four MTP modes; retirement and driver checks pass. `source-admission-cuda-cpu15-full15-r12/`. |
-| Retained coverage | 634 declared, 484 eligible, 150 hardware-unqualified. r32: **197 historical passes**, 4 eligible failures, 283 unexecuted. Not current-binary certification. `/tmp/qfn-source-admission-coverage-r32-r1/`. |
-| Native repairs | [NCCL init](QFN_NCCL_GIN_INITIALIZATION.md), [I/O retirement](QFN_IMMUTABLE_WORKER_RETIREMENT.md) and [PMA preparation/permits](QFN_NATIVE_ADMISSION_PREPARATION.md) have focused evidence. Opaque-resource implementation and native retirement propagation remain open. |
+| Earlier coverage | Historical partial results: `/tmp/qfn-source-admission-coverage-r33-r1/`. These do not certify the current binary. |
+| Native repairs | [Review](QFN_NATIVE_RESOURCE_ALLOWANCE_REVIEW_2026-11-01.md): r65 passes **4/4 opposite-vendor source controls**, final retirement and driver checks; 25 focused checks pass. Real inference, balancing, active MTP and full gate remain open. |
 | GPU targets / ownership | SM80/86/89/90 and gfx906/gfx1100 compile; startup/exit/capture pass 20 repeats. Eight mixed-ISA defects fixed. Model qualification open; MMA deferred. [Status](ROCM_KERNEL_TARGETS_AND_DISPATCH.md). |
-| Pooled local provider | **16/16 original CUDA/ROCm source cases pass**: zero/positive VRAM+RAM caches over SSD × Off/fixed1/fixed3/Dynamic, all 48 layers and active retained15. **62 focused replays pass**, including XTX and 23 GGUF formats. Driver and retirement checks pass. [Cold-admission proof](QFN_POOLED_LOOKUP_COLD_ADMISSION.md). Distributed placement remains unqualified. |
+| Pooled local provider | Earlier binary: **16/16 original CUDA/ROCm source cases pass**: zero/positive VRAM+RAM caches over SSD × Off/fixed1/fixed3/Dynamic, all 48 layers and active retained15. **62 focused replays pass**, including XTX and 23 GGUF formats. Driver and retirement checks pass. [Cold-admission proof](QFN_POOLED_LOOKUP_COLD_ADMISSION.md). Distributed placement remains unqualified. |
 
 Native evidence directories above are under
 `parity-results/qwen-flash-next/` unless an absolute path is given. Earlier
 MTP and automatic-placement receipts remain independent earlier evidence;
 they do not certify the expanded matrix.
 
-[Composed capacity replay](QFN_COMPOSED_CAPACITY_REPLAY_20261029.md) records
-earlier deficits; CUDA16/CPU32 RAM now passes unchanged. An explicit ROCm25/23
-split fits the recorded metadata budget, but has no installed case or native
-qualification; new native transport storage must also fit before admission.
+[Composed capacity replay](QFN_COMPOSED_CAPACITY_REPLAY_20261029.md) retains
+earlier deficits and the unqualified ROCm25/23 proposal. CUDA16/CPU32 RAM passes
+unchanged; future compositions must also admit their native transport storage.
 
 Physical provisioning is independent of current free memory. Original active/full15
 CUDA TP2 eight-expert VRAM positives require 32GiB cards; the six replicated-decode
@@ -111,8 +118,8 @@ and precise capacity-rejection controls. See [exact BOMs and provisioning](../..
 
 The requested [pooled tiering extension](QFN_POOLED_NGRAM_CONTINUATIONS.md)
 keeps ngram ownership independent of continuation topology, including cross-vendor
-CPU/CUDA/ROCm. Current GPU-adaptive storage only supports a single GPU; TP/PP and
-distributed tiering are implementation work, not an installed capability.
+CPU/CUDA/ROCm. Explicit storage-owner declarations and BOMs are integrated;
+directed channels, recurring remote transactions and TP/PP execution remain open.
 
 | Area | Installed contract / regression evidence |
 |---|---|
@@ -166,17 +173,15 @@ Temporary prefix directories must be absent after final retirement.
 
 ## Remaining obligations
 
-1. Complete preflight for the PLE/retirement/provisioning slice; focused native controls pass.
-   CUDA/ROCm16→CPU32 now pass all host-table tiers and MTP modes.
-2. Implement pooled publication, row delivery and retirement in parallel with
-   admission testing. Integrate through the [shared completion plan](QFN_POOLED_COMPLETION_PLAN.md);
-   distributed serving remains unqualified until native capture passes.
-3. Run remaining locally available placement/ownership/MTP cases. The six
+1. Qualify joined pooled publication/read/retirement on GPUs: **27 host registrations,
+   3,882 case executions and six-architecture compilation pass**.
+   [Completion plan](QFN_POOLED_COMPLETION_PLAN.md); distributed serving remains unqualified.
+2. Run remaining locally available placement/ownership/MTP cases. The six
    implemented-topology historical failures now pass; broader coverage is open.
-4. Resolve native ROCm PP(TP2, TP2) composition and active capacity failures.
+3. Resolve native ROCm PP(TP2, TP2) composition and active capacity failures.
    Qualify CPU-tail placements outside CUDA16/32, ROCm16/32 and CUDA15/33
    families; preserve authored full15 positives. CUDA4/8 and ROCm8
    remain unqualified on this CUDA2/ROCm4/two-NUMA host.
-5. Qualify the active MTP product across table sharding/adaptive tiers and
+4. Qualify the active MTP product across table sharding/adaptive tiers and
    composed graphs. Numerical/controller execution remains separate; existing
    paired-source MTP execution admissions remain intact.

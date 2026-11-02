@@ -18,9 +18,18 @@
  * @date February 2026
  */
 
+#include "../NativeContextRuntimePolicy.h"
+#include <dlfcn.h>
 #include "AMDDeviceContext.h"
+#include "../NativeContextPreparation.h"
+#include <mutex>
 #include "../GPUDeviceContextPool.h"
 #include "ROCmHardwareMetadata.h"
+#include "../DeviceUUID.h"
+#include <span>
+#include <fstream>
+#include <sstream>
+#include <sys/utsname.h>
 #include "../GPUDeviceProcessLifetime.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
@@ -28,6 +37,49 @@
 
 namespace llaminar2
 {
+    NativeContextBirthKey PreparedGPUContextFactory::rocmBirthKey(int ordinal)
+    {
+        // Original immutable startup snapshot only; HIP_INIT's separate global
+        // population must not be mistaken for newly owned selected-worker bytes.
+        const auto& inventory=rocmHardwareMetadata();const auto& hardware=inventory.at(ordinal);
+        auto key=commonBirthKey(DeviceId::rocm(ordinal));
+        key.compute_units=hardware.compute_units;key.native_wave_width=hardware.native_wave_width;
+        key.runtime_policy_sha256=NativeContextRuntimePolicy::original(DeviceType::ROCm).identity();
+        key.physical_uuid=formatDeviceUUID(std::span<const char,16>{reinterpret_cast<const char*>(hardware.uuid.data()),16});
+        key.architecture=hardware.isa_target;key.visible_device_count=inventory.size();std::string visibility;
+        for(std::size_t i=0;i<inventory.size();++i){const auto& record=inventory.at(static_cast<int>(i));
+            visibility+=formatDeviceUUID(std::span<const char,16>{reinterpret_cast<const char*>(record.uuid.data()),16})+";";}
+        key.visibility_identity=digestIdentity(visibility+":"+NativeContextRuntimePolicy::original(DeviceType::ROCm).liveIdentity());
+        int runtime=0;if(hipRuntimeGetVersion(&runtime)!=hipSuccess || runtime<=0)
+            throw std::runtime_error("Selected ROCm worker lacks its actual runtime identity");
+        const auto read=[](const char* path){std::ifstream file(path);std::ostringstream text;text<<file.rdbuf();
+            if(!file || text.str().empty())throw std::runtime_error("Selected ROCm worker lacks original kernel-driver source identity");return text.str();};
+        struct utsname kernel{};if(uname(&kernel)!=0)throw std::runtime_error("Selected ROCm worker lacks kernel release identity");
+        key.runtime_version=std::to_string(runtime);key.driver_version=read("/sys/module/amdgpu/version")+":"+kernel.release;
+        key.driver_sha256=digestIdentity(key.driver_version+":"+read("/sys/module/amdgpu/srcversion"));
+        key.hsa_sha256=libraryClosureIdentity(dlsym(RTLD_DEFAULT,"hsa_init"));
+        key.runtime_sha256=libraryIdentity(reinterpret_cast<const void*>(&hipRuntimeGetVersion));
+        key.backend_sha256=digestIdentity(libraryIdentity(reinterpret_cast<const void*>(&hipblasCreate))+":"+
+            libraryIdentity(reinterpret_cast<const void*>(&hipblasLtCreate)));
+        key.requireComplete();return key;
+    }
+    PreparedGPUContextObjectGeometry PreparedGPUContextFactory::rocmObjectGeometry()
+    {return {sizeof(AMDDeviceContext),alignof(AMDDeviceContext)};}
+    std::shared_ptr<IWorkerGPUContext> PreparedGPUContextFactory::rocm(int ordinal,std::shared_ptr<PreparedGPUWorkerStack> stack)
+    {
+        if(!stack)throw std::invalid_argument("Prepared original worker needs its source-owned stack");
+        auto* storage=stack->contextObjectStorage(sizeof(AMDDeviceContext),alignof(AMDDeviceContext));
+        auto* worker=new(storage) AMDDeviceContext(ordinal,stack);
+        return std::shared_ptr<IWorkerGPUContext>(worker,[stack=std::move(stack)](IWorkerGPUContext* base){
+            std::destroy_at(static_cast<AMDDeviceContext*>(base));
+        });
+    }
+    /** @brief Pure creator registration; original constructor owns native initialization after source claims. */
+    void ensureAMDPreparedFactoryRegistered()
+    {
+        static std::once_flag registered;
+        std::call_once(registered,[]{GPUDeviceContextPool::instance().registerPreparedFactory(DeviceType::ROCm,PreparedGPUContextFactory::rocm);});
+    }
     namespace
     {
 

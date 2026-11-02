@@ -8,6 +8,7 @@
  */
 #include "PooledImmutableNativePlan.h"
 #include <limits>
+#include <algorithm>
 #include <stdexcept>
 namespace llaminar2::qwen4exp {
 namespace {
@@ -78,17 +79,27 @@ PhysicalMemoryPlan bom(PhysicalMemoryAllocatorIdentity allocator,std::size_t byt
     PhysicalMemoryPlanBuilder builder;builder.add(observed,PhysicalMemoryOwner::ImmutableLookupStaging,bytes);return builder.build();
 }
 /** @return One canonical owner layout shared by pre-source BOM declaration and actual native materialization. */
-n::OwnerOffsets ownerOffsets(std::uint32_t slots,std::uint32_t maximumUnique){
+n::OwnerOffsets ownerOffsets(std::uint32_t slots,std::uint32_t maximumUnique,std::size_t rowBytes,bool remote){
     n::OwnerOffsets offsets{};
     offsets.reply_capacity=std::min(slots,maximumUnique);
     std::size_t end=0;
     append(end,offsets.progress,sizeof(n::OwnerProgress));append(end,offsets.header,64);
     append(end,offsets.replies,times(offsets.reply_capacity,sizeof(adaptive_lookup::pooled::Grant)));
+    // The actual remote consumer needs a persistent immutable Invocation and
+    // a separate incoming byte scalar. Existing append/alignment is the sole
+    // layout/BOM authority; no transport subtotal or padded wire count exists.
+    if(remote){
+        append(end,offsets.ingress,sizeof(n::OwnerIngress));
+        // Terminal source outcome outlives header reuse for seal/fill/publication.
+        append(end,offsets.source_outcome,sizeof(n::SourceFrontier));
+        append(end,offsets.source_fills,times(offsets.reply_capacity,sizeof(n::Fill)));
+        append(end,offsets.source_payload,times(offsets.reply_capacity,rowBytes));
+    }
     offsets.bytes=align(end);
     return offsets;
 }
 /** @return One canonical coordinator layout; source identity affects capture, never physical byte geometry. */
-n::CoordinatorOffsets coordinatorOffsets(adaptive_lookup::pooled::CoordinatorParameters policy){
+n::CoordinatorOffsets coordinatorOffsets(adaptive_lookup::pooled::CoordinatorParameters policy,bool remote){
     n::CoordinatorOffsets offsets{};std::size_t end=0;
     const auto k=policy.maximumUnique(),p=policy.participants();
     offsets.reply_capacity=std::min(k,policy.entries());
@@ -104,6 +115,24 @@ n::CoordinatorOffsets coordinatorOffsets(adaptive_lookup::pooled::CoordinatorPar
     append(end,offsets.victim_headers,times(p,sizeof(n::VictimPlanHeader)));
     append(end,offsets.victim_slices,times(p,sizeof(n::DirectedSlice)));
     append(end,offsets.sorted_releases,times(offsets.reply_capacity,sizeof(adaptive_lookup::pooled::ReleaseReceipt)));
+    // The original pin_commands bank is a phase union: all command sends finish
+    // before serial Grant/ReleaseReceipt receives may reuse its prefix. Only a
+    // distinct incoming count and full ordered metadata frontier are missing.
+    // The frontier's maximum is the actual Ready/Retired/Publish header56; its
+    // phase's exact record size, never this allocation extent, goes on the wire.
+    static_assert(sizeof(adaptive_lookup::pooled::ReleaseReceipt)<=sizeof(adaptive_lookup::pooled::OwnerCommand));
+    static_assert(sizeof(adaptive_lookup::pooled::PinHeader)<=sizeof(adaptive_lookup::pooled::PublishHeader));
+    static_assert(sizeof(n::Availability)<=sizeof(adaptive_lookup::pooled::PublishHeader));
+    static_assert(sizeof(adaptive_lookup::pooled::FreeAllocationReceipt)<=sizeof(adaptive_lookup::pooled::PublishHeader));
+    if(remote){
+        const auto frontierBytes=times(p,sizeof(adaptive_lookup::pooled::PublishHeader));
+        static_assert(sizeof(adaptive_lookup::pooled::PublishHeader)%alignof(std::uint64_t)==0);
+        append(end,offsets.ingress_frontier,plus(frontierBytes,offsets.reply_capacity?sizeof(std::uint64_t):0));
+        // One appended ingress region contains the actual typed array followed
+        // by its independent scalar. Internal64-byte alignment is not another
+        // bank or a wire extent; the scalar needs only its native8-byte alignment.
+        if(offsets.reply_capacity)offsets.ingress_count=plus(offsets.ingress_frontier,frontierBytes);
+    }
     offsets.bytes=align(end);
     return offsets;
 }
@@ -127,12 +156,12 @@ PooledImmutableOwnerNativePlan PooledImmutableOwnerNativePlan::fromGeometry(
     require(physical,coordinator,table,generation);
     if(coordinate>=physical.owners().size())throw std::out_of_range("Pooled native owner coordinate is not declared");
     const auto& owner=physical.owners()[coordinate];
-    const auto offsets=ownerOffsets(owner.slots,physical.maximumUniqueRows());
+    const auto offsets=ownerOffsets(owner.slots,physical.maximumUniqueRows(),physical.rowBytes(),owner.allocator!=physical.coordinator());
     auto identity=common(physical,table,generation);
     identity.mix(0);identity.mix(coordinate);identity.mix(coordinator.parameters().maximumOriginal());
     identity.ownerCache(owner.cache);identity.ownerFrame(owner.frame);
     identity.mix(offsets.progress);identity.mix(offsets.header);identity.mix(offsets.replies);
-    identity.mix(offsets.reply_capacity);identity.mix(offsets.bytes);
+    identity.mix(offsets.reply_capacity);identity.mix(offsets.ingress);identity.mix(offsets.source_outcome);identity.mix(offsets.source_fills);identity.mix(offsets.source_payload);identity.mix(offsets.bytes);
     return {{physical.ownerParameters(coordinate),owner.cache,owner.frame,offsets,owner.allocator.device,
         coordinator.parameters().maximumOriginal(),physical.rowBytes(),physical.slotStride(),table,generation,identity.value()},owner.allocator};
 }
@@ -143,7 +172,8 @@ PooledImmutableCoordinatorNativePlan PooledImmutableCoordinatorNativePlan::fromG
     std::uint64_t table,std::uint64_t generation)
 {
     require(physical,coordinator,table,generation);
-    const auto policy=coordinator.parameters();const auto offsets=coordinatorOffsets(policy);
+    const auto policy=coordinator.parameters();
+    const auto offsets=coordinatorOffsets(policy,std::any_of(physical.owners().begin(),physical.owners().end(),[&](const auto& o){return o.allocator!=physical.coordinator();}));
     auto identity=common(physical,table,generation);
     identity.mix(1);identity.mix(policy.entries());identity.mix(policy.maximumOriginal());identity.mix(policy.maximumUnique());
     identity.mix(policy.participants());identity.mix(policy.laneWidth());identity.mix(policy.protectedLimit());identity.mix(policy.agingAccesses());
@@ -154,7 +184,7 @@ PooledImmutableCoordinatorNativePlan PooledImmutableCoordinatorNativePlan::fromG
     identity.mix(f.owners);identity.mix(f.bytes);
     identity.mix(offsets.invocation);identity.mix(offsets.pin_commands);identity.mix(offsets.pin_slices);
     identity.mix(offsets.reply_capacity);identity.mix(offsets.pin_cursors);identity.mix(offsets.radix_offsets);identity.mix(offsets.radix_blocks);identity.mix(offsets.availability);identity.mix(offsets.free_headers);identity.mix(offsets.free_slices);identity.mix(offsets.victim_headers);
-    identity.mix(offsets.victim_slices);identity.mix(offsets.sorted_releases);identity.mix(offsets.bytes);
+    identity.mix(offsets.victim_slices);identity.mix(offsets.sorted_releases);identity.mix(offsets.ingress_count);identity.mix(offsets.ingress_frontier);identity.mix(offsets.bytes);
     for(const auto owner:coordinator.owners()){identity.mix(owner.first_entry);identity.mix(owner.slots);}
     // Source staging may be declared before transport exists, so retain the
     // exact expected native owner identity here instead of inferring physical
@@ -176,17 +206,21 @@ void PooledImmutableCoordinatorNativePlan::requireOwnerPlan(const PooledImmutabl
        original_owners_[coordinate].native_identity!=owner.parameters().identity)
         throw std::invalid_argument("Pooled source owner is not the original native coordinator cohort member");
 }
+void PooledImmutableCoordinatorNativePlan::requireOriginalCohort(const PooledImmutablePhysicalOwnerGeometry& physical,
+    const PooledImmutableCoordinatorGeometry& coordinator){requireGeometry(physical,coordinator);}
 PhysicalMemoryPlan PooledImmutableCoordinatorNativePlan::mandatoryBOM(PhysicalMemoryResource observed)const
 {return bom(allocator_,parameters_.native.bytes,observed);}
 n::OwnerOffsets PooledImmutableOwnerNativePlan::rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate){
     requireGeometry(physical,coordinator);
     if(coordinate>=physical.owners().size())throw std::out_of_range("Native owner root coordinate is not declared");
-    return ownerOffsets(physical.owners()[coordinate].slots,physical.maximumUniqueRows());
+    return ownerOffsets(physical.owners()[coordinate].slots,physical.maximumUniqueRows(),physical.rowBytes(),
+        physical.owners()[coordinate].allocator!=physical.coordinator());
 }
 n::CoordinatorOffsets PooledImmutableCoordinatorNativePlan::rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator){
-    requireGeometry(physical,coordinator);return coordinatorOffsets(coordinator.parameters());
+    requireGeometry(physical,coordinator);return coordinatorOffsets(coordinator.parameters(),
+        std::any_of(physical.owners().begin(),physical.owners().end(),[&](const auto& o){return o.allocator!=physical.coordinator();}));
 }
 PhysicalMemoryPlan PooledImmutableOwnerNativePlan::mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,PhysicalMemoryResource observed){
@@ -197,6 +231,22 @@ PhysicalMemoryPlan PooledImmutableOwnerNativePlan::mandatoryBOM(const PooledImmu
 PhysicalMemoryPlan PooledImmutableCoordinatorNativePlan::mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,PhysicalMemoryResource observed){
     return bom(physical.coordinator(),rootOffsets(physical,coordinator).bytes,observed);
+}
+
+NativeOrderingEventProgram PooledImmutableOwnerNativePlan::orderingProgram(
+    const PooledImmutablePhysicalOwnerGeometry& physical,const PooledImmutableCoordinatorGeometry& coordinator,
+    std::uint32_t coordinate){
+    const auto native=rootOffsets(physical,coordinator,coordinate);
+    const auto& owner=physical.owners()[coordinate];
+    const auto program=NativeOrderingEventProgram::pooledOwner(owner.cache.bytes!=0);
+    program.requireRootBytes({owner.cache.bytes,owner.frame.bytes,native.bytes});return program;
+}
+NativeOrderingEventProgram PooledImmutableCoordinatorNativePlan::orderingProgram(
+    const PooledImmutablePhysicalOwnerGeometry& physical,const PooledImmutableCoordinatorGeometry& coordinator){
+    const auto native=rootOffsets(physical,coordinator);
+    const auto cache=coordinator.policyOffsets();const auto frame=coordinator.frameOffsets();
+    const auto program=NativeOrderingEventProgram::pooledCoordinator(cache.bytes!=0);
+    program.requireRootBytes({cache.bytes,frame.bytes,native.bytes});return program;
 }
 
 }

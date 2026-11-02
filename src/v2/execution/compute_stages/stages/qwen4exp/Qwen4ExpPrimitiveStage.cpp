@@ -215,6 +215,11 @@ Qwen4ExpPrimitiveStage::Qwen4ExpPrimitiveStage(Params params)
         }
     }, params_.operation);
     validateAliases();
+    if(std::holds_alternative<NgramHash>(params_.operation)){
+        std::vector<TensorBase*> roots;
+        for(const auto& operand:operands_)roots.push_back(operand.tensor);
+        hash_prepared_.emplace(device(),roots);
+    }
     kernels_ = llaminar::v2::kernels::KernelFactory::createQwen4Exp(params_.device_id);
 }
 
@@ -238,7 +243,15 @@ void Qwen4ExpPrimitiveStage::validateAliases() const
             for (const auto &weight : weights_)
                 require(output.tensor != weight.tensor,
                         "Qwen4Exp stage output must never overwrite an immutable model weight");
+}
 
+bool Qwen4ExpPrimitiveStage::prepareGraphLaunch(IDeviceContext* context,void* stream)
+{
+    if(!context || context->deviceId()!=device() || (device().is_gpu() && !stream))
+        throw std::invalid_argument("QFN primitive preparation requires its exact participant and explicit GPU stream");
+    if(stream)setGPUStream(stream);
+    if(hash_prepared_)hash_prepared_->seal();
+    return true;
 }
 
 template <typename T, TensorType Type>
@@ -270,6 +283,7 @@ bool Qwen4ExpPrimitiveStage::execute(IDeviceContext *context)
 {
     if (!context || context->deviceId() != device())
         throw std::invalid_argument("Qwen4Exp stage requires the matching participant execution context");
+    if(hash_prepared_){if(device().is_cpu())hash_prepared_->seal();hash_prepared_->validate();}
     void *stream = nullptr;
     if (device().is_gpu())
     {
@@ -331,6 +345,28 @@ bool Qwen4ExpPrimitiveStage::execute(IDeviceContext *context)
 
 uint64_t Qwen4ExpPrimitiveStage::graphCaptureVariantSignature() const
 {
+    if(const auto* hash=std::get_if<NgramHash>(&params_.operation)){
+        hash_prepared_->validateIfSealed();
+        // Early publication borrows accepted history and current tokens before
+        // trunk work; every immutable native binding and hash scalar is identity.
+        std::uint64_t value=1469598103934665603ULL;
+        const auto mix=[&](std::uint64_t word){value^=word;value*=1099511628211ULL;};
+        const auto binding=[&](const auto& b){mix(reinterpret_cast<std::uintptr_t>(b.tensor));
+            mix(static_cast<std::uint64_t>(b.buffer));mix(b.byteOffset);mix(b.tensor->size_bytes());};
+        const auto input=[&](const Qwen4ExpIntInput& i){mix(i.value.index());
+            if(const auto* b=std::get_if<Qwen4ExpIntBinding>(&i.value))binding(*b);
+            else{const auto& native=std::get<Qwen4ExpNativeIntInput>(i.value);
+                mix(static_cast<std::uint64_t>(native.owner.type));mix(native.owner.ordinal);
+                mix(reinterpret_cast<std::uintptr_t>(native.data));mix(native.capacity);}};
+        mix(1);mix(static_cast<std::uint64_t>(device().type));mix(device().ordinal);
+        mix(params_.rows.capacity);mix(params_.rows.liveRows.has_value());
+        if(params_.rows.liveRows)input(*params_.rows.liveRows);
+        input(hash->tokens);binding(hash->priorTokens);binding(hash->outputWords);
+        for(auto word:hash->policy.multipliers)mix(word);
+        for(auto word:hash->policy.moduli)mix(word);
+        for(auto word:hash->policy.offsets)mix(word);
+        mix(hash->policy.eosToken);return value?value:1;
+    }
     const auto *norm = std::get_if<BranchRMSNorm>(&params_.operation);
     if (!norm) return 0;
     return (norm->diagnostic_input_publication == DiagnosticInputPublication::MTPTerminalHidden ? uint64_t{1} : 0) |

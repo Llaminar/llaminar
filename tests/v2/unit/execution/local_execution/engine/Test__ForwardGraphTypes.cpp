@@ -9,6 +9,8 @@
  */
 
 #include <gtest/gtest.h>
+#include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -51,7 +53,14 @@ using namespace llaminar2;
 TEST(Test__RetainedParentTicketServiceWorker,
      PrearmsOneInvocationAndReusesThePersistentThread)
 {
-    RetainedParentTicketServiceWorker worker;
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([]{
+    {
+    auto fixture=llaminar2::test::RetainedHostServiceFixture::recorded(RetainedHostServiceRole::ExecutorParentTicket,{0,DeviceId::cuda(0)});
+    const PhysicalMemoryResource cpu{0,DeviceId::cpu(),128u<<20,128u<<20};
+    auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(fixture.bom(cpu)),0);
+    auto owner=PreparedRetainedHostService::materialize(fixture.take(memory));
+    auto& worker=owner->worker();
     struct BlockingTask
     {
         std::atomic<bool> entered{false};
@@ -99,6 +108,10 @@ TEST(Test__RetainedParentTicketServiceWorker,
     EXPECT_FALSE(worker.await(second_ticket));
     EXPECT_EQ(second_invocation, 1);
     EXPECT_TRUE(worker.idle());
+    }
+    GPUDeviceProcessLifetime::retireActive();
+    std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
 
 namespace
@@ -164,6 +177,7 @@ namespace
         bool requiresGraphCaptureSegmentBoundaryBefore() const override { return segment_boundary_before_; }
         bool requiresGraphCaptureSegmentBoundaryAfter() const override { return segment_boundary_after_; }
         bool isManualGraphBoundary() const override { return manual_boundary_; }
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return collective_authority_;}
         ManualGraphBoundaryScheduling
         manualGraphBoundaryScheduling() const noexcept override
         {
@@ -182,6 +196,7 @@ namespace
         }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
+        CollectiveGraphCaptureAuthority collective_authority_=CollectiveGraphCaptureAuthority::RuntimeBackend;
         int execute_calls_ = 0;
         int abort_publications_ = 0;
 
@@ -1311,6 +1326,39 @@ TEST(Test__ForwardGraphSignature,
     EXPECT_NE(
         ForwardGraphSignatureHash{}(first),
         ForwardGraphSignatureHash{}(rebound));
+}
+
+/** @brief Replayed canonical-logit bindings cannot select a graph with another destination. */
+TEST(Test__ForwardGraphSignature, MTPCanonicalLogitsBindingReplayRejectsStaleIdentity)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        ForwardGraphSignature original{
+            .seq_len = 1,
+            .batch_size = 1,
+            .device = device,
+            .execution_role = ForwardExecutionRole::MTPCondition,
+            .decode = true};
+        auto published = original;
+        published.mtp_main_terminal_logits_capture_identity = UINT64_C(0x1234);
+        auto rebound = published;
+        rebound.mtp_main_terminal_logits_capture_identity = UINT64_C(0x5678);
+        std::unordered_map<ForwardGraphSignature, int, ForwardGraphSignatureHash> retained;
+        retained.emplace(original, 0);
+        retained.emplace(published, 1);
+        retained.emplace(rebound, 2);
+        ASSERT_EQ(retained.size(), 3u);
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            EXPECT_EQ(retained.at(original), 0);
+            EXPECT_EQ(retained.at(published), 1);
+            EXPECT_EQ(retained.at(rebound), 2);
+        }
+        // Retirement of the old binding cannot evict or authorize the rebound graph.
+        EXPECT_EQ(retained.erase(published), 1u);
+        EXPECT_FALSE(retained.contains(published));
+        EXPECT_EQ(retained.at(rebound), 2);
+    }
 }
 
 /** @brief A different frozen pipeline transport cannot alias an old prefill executable. */
@@ -3346,9 +3394,14 @@ TEST(Test__GraphSegmentCache,
  * synchronizing either stream. The sealed replay plan preserves that service
  * program so steady replay repeats the same lifecycle.
  */
-TEST(Test__GraphSegmentCache,
-     RetainedParentServicesCertifiedManualTicketAfterSingleLaunch)
+/** @brief Explicit recorded controller replay versus installed original-source eligibility. */
+enum class HostTicketFixtureOrigin {Recorded,InstalledOriginal};
+/** @brief Run the unchanged actual retained-parent/manual-ticket consumer with the selected original worker declaration. */
+void runRetainedParentManualTicket(HostTicketFixtureOrigin origin)
 {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(([origin]{
+    {
     ComputeGraph graph;
     addFakeSegmentStage(
         graph, "producer", true, false, ComputeStageType::COPY, false,
@@ -3394,9 +3447,18 @@ TEST(Test__GraphSegmentCache,
         graph.getNode("cpu_service")->stage.get());
     ASSERT_NE(service, nullptr);
 
+    // The executor consumes the same predeclared CPU0 owner as production.
+    auto workerFixture=origin==HostTicketFixtureOrigin::InstalledOriginal
+        ?llaminar2::test::RetainedHostServiceFixture::original(RetainedHostServiceRole::ExecutorParentTicket,{0,DeviceId::cuda(0)})
+        :llaminar2::test::RetainedHostServiceFixture::recorded(RetainedHostServiceRole::ExecutorParentTicket,{0,DeviceId::cuda(0)});
+    const PhysicalMemoryResource cpu{0,DeviceId::cpu(),128u<<20,128u<<20};
+    auto memory=std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(workerFixture.bom(cpu)),0);
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    executor.setRetainedParentTicketServiceWorker(
+        PreparedRetainedHostService::materialize(workerFixture.take(memory)),memory);
     // The cache retires borrowed stream/event resources before its owner dies.
     FakeReplayGPUContext gpu_ctx(
         /*device_ordinal=*/0,
@@ -3471,7 +3533,20 @@ TEST(Test__GraphSegmentCache,
     EXPECT_EQ(composer_calls, 1u);
     EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
     EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    }
+    GPUDeviceProcessLifetime::retireActive();
+    std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
+TEST(Test__GraphSegmentCache, RetainedParentServicesCertifiedManualTicketAfterSingleLaunch){
+    runRetainedParentManualTicket(HostTicketFixtureOrigin::Recorded);
+}
+#ifdef LLAMINAR_HOST_SERVICE_ORIGINAL_CONSUMERS
+TEST(Test__GraphSegmentCache, OriginalInstalledRetainedParentServicesManualTicket){
+    runRetainedParentManualTicket(HostTicketFixtureOrigin::InstalledOriginal);
+}
+#endif
+
 
 /** @brief An ordinary host boundary cannot masquerade as concurrent service. */
 TEST(Test__GraphSegmentCache,
@@ -7943,4 +8018,74 @@ TEST(Test__RetainedMultiDeviceExecutionPlan,
     EXPECT_NE(error.find("topology"), std::string::npos) << error;
     EXPECT_EQ(first_ptr->execute_calls_, 0)
         << "Generation rejection must happen before a borrowed node is used.";
+}
+
+/** @test Existing CPU ticket cutpoints remain48 while native endpoint collectives stay in their original captured units. */
+TEST(Test__GraphSegmentCache, NativeTransfersPreserveFortyEightCPUServiceCutpoints){
+ ComputeGraph graph;std::string previous;
+ const auto append=[&](const std::string& name){if(!previous.empty())graph.addDependency(name,previous);previous=name;};
+ for(unsigned i=0;i<48;++i){
+  const auto cut="cpu_cut_"+std::to_string(i),service="cpu_service_"+std::to_string(i),native="native_endpoint_"+std::to_string(i);
+  addFakeSegmentStage(graph,cut,true,false,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cuda(0));append(cut);
+  graph.setHeterogeneousTicketUnitContract(cut,GraphHeterogeneousTicketUnitContract{.identity=cut});
+  addFakeSegmentStage(graph,service,false,true,ComputeStageType::MOE_LOCAL_EXPERT,false,false,false,nullptr,DeviceId::cpu(),false,
+      ManualGraphBoundaryScheduling::ConcurrentTicketService,ConcurrentManualFailureRole::DeviceIngressPublisher);append(service);
+  addFakeSegmentStage(graph,native,true,false,ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER,false,false,false,nullptr,DeviceId::cuda(0));append(native);
+  dynamic_cast<FakeSegmentStage*>(graph.getNode(native)->stage.get())->collective_authority_=CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+ }
+ addFakeSegmentStage(graph,"terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cuda(0));append("terminal");graph.setTerminalNode("terminal");
+ graph.setHeterogeneousTicketUnitContract("terminal",GraphHeterogeneousTicketUnitContract{.identity="terminal",.disposition=GraphHeterogeneousTicketUnitDisposition::TransactionTerminal});
+ graph.setNativeCaptureEnvelope(GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction);
+ const auto collectives=graph.collectiveNodeNames();ASSERT_EQ(collectives.size(),48u);EXPECT_FALSE(graph.requiresCollectiveRuntimeCapture(&collectives));
+ DeviceGraphExecutor::GraphSegmentCache cache;
+ ASSERT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false,DeviceGraphExecutor::GraphReplayPlanPolicy::RequireRetainedParentWithConcurrentTicketService));
+ unsigned manual=0,native=0;std::vector<std::string> logicalServices;
+ for(const auto& segment:cache.segments){if(!segment.capturable){++manual;logicalServices.insert(logicalServices.end(),segment.stage_names.begin(),segment.stage_names.end());}for(const auto& name:segment.stage_names){const auto* stage=graph.getNode(name)->stage.get();
+  if(stage->isParticipantLocalCapturedTransfer()){EXPECT_TRUE(segment.capturable);EXPECT_TRUE(stage->isCollectiveStage());++native;}
+ }}
+ // The original retained-parent lowering packs the48 authenticated CPU
+ // services into ONE physical worker program, preserving their logical order.
+ std::vector<std::string> expectedServices;for(unsigned i=0;i<48;++i)expectedServices.push_back("cpu_service_"+std::to_string(i));
+ EXPECT_EQ(manual,1u);EXPECT_EQ(logicalServices,expectedServices);EXPECT_EQ(native,48u);
+ EXPECT_EQ(cache.runtime_collective_capture_requirement,DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::NotRequired);
+ DeviceGraphExecutor::GraphSegmentCache moved(std::move(cache));EXPECT_EQ(moved.runtime_collective_capture_requirement,DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::NotRequired);
+ moved.reset();EXPECT_EQ(moved.runtime_collective_capture_requirement,DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::Required);
+}
+/** @test Native transport authority never promotes an unready stage; ordinary runtime collectives keep their backend capability AND. */
+TEST(Test__GraphSegmentCache, NativeTransferAuthorityKeepsReadinessAndRuntimeCollectiveGuards){
+ for(const bool runtimeReady:{false,true}){
+  ComputeGraph graph;addFakeSegmentStage(graph,"runtime",true,false,ComputeStageType::ALLREDUCE,false,false,false,nullptr,DeviceId::cuda(0));const auto collectives=graph.collectiveNodeNames();
+  DeviceGraphExecutor::GraphSegmentCache cache;
+  if(runtimeReady){EXPECT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,true));ASSERT_EQ(cache.segments.size(),1u);EXPECT_TRUE(cache.segments[0].capturable);}
+  else EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false),std::runtime_error);
+  EXPECT_EQ(cache.runtime_collective_capture_requirement,DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::Required);
+ }
+ for(const bool ready:{false,true}){
+  ComputeGraph graph;addFakeSegmentStage(graph,"native",ready,false,ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER,false,false,false,nullptr,DeviceId::cuda(0));
+  auto* stage=dynamic_cast<FakeSegmentStage*>(graph.getNode("native")->stage.get());stage->collective_authority_=CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+  const auto nativeSignature=DeviceGraphCaptureController::computeCaptureVariantSignature(graph);stage->collective_authority_=CollectiveGraphCaptureAuthority::RuntimeBackend;
+  EXPECT_NE(nativeSignature,DeviceGraphCaptureController::computeCaptureVariantSignature(graph));stage->collective_authority_=CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+  const auto collectives=graph.collectiveNodeNames();DeviceGraphExecutor::GraphSegmentCache cache;
+  if(ready){EXPECT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false));ASSERT_EQ(cache.segments.size(),1u);EXPECT_TRUE(cache.segments[0].capturable);}
+  else EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false),std::invalid_argument);
+ }
+}
+
+/** @test Actual replay uses frozen native-transport plan metadata and defers its terminal without runtime collective support or a new graph scan. */
+TEST(Test__GraphSegmentCache, NativeTransferReplayRetainsCaptureStreamTerminalAuthority){
+ ComputeGraph graph;addFakeSegmentStage(graph,"native",true,false,ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER,false,false,false,nullptr,DeviceId::cuda(0));
+ dynamic_cast<FakeSegmentStage*>(graph.getNode("native")->stage.get())->collective_authority_=CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+ // Cache borrows the worker during terminal observation and stream teardown.
+ // The worker must outlive the cache even when an assertion returns early.
+ FakeReplayGPUContext worker;
+ const auto collectives=graph.collectiveNodeNames();DeviceGraphExecutor::GraphSegmentCache cache;
+ DeviceGraphCaptureController::buildCapturePlan(graph,cache,&collectives,true,false);
+ ASSERT_TRUE(cache.ensureCaptureStream(&worker,DeviceId::cuda(0),false));ASSERT_EQ(cache.segments.size(),1u);
+ cache.segments[0].capture=std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+ llaminar2::testing::MockDeviceContext context(DeviceId::cuda(0),ComputeBackendType::GPU_CUDA);
+ DeviceGraphCaptureController::ReplayHooks hooks{.cohere_inputs=nullptr,.execute_node=nullptr,.prepare_snapshot_manifest=[](){return true;},.record_snapshot_copies=[](ComputeNode&,void*){return true;},.post_launch=[](DeviceGraphExecutor::GraphSegment&,void*){}};
+ const auto result=DeviceGraphCaptureController::executeReplayPhase(graph,cache,&context,&worker,true,false,1,hooks,false,true);
+ ASSERT_TRUE(result.success);EXPECT_EQ(worker.synchronize_stream_checked_calls_,0);EXPECT_EQ(worker.synchronize_stream_calls_,0);EXPECT_EQ(worker.events_synchronized_,0);
+ cache.reset(); // Retire the exact deferred terminal while its original worker is still live.
+ EXPECT_EQ(worker.events_created_,worker.events_destroyed_);EXPECT_EQ(worker.destroy_stream_calls_,1);
 }

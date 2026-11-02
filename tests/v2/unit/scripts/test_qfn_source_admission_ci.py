@@ -14,10 +14,10 @@ import unittest
 from contextlib import nullcontext
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / 'scripts/ci'))
-from run_qfn_source_admission import (SourceAdmissionContract, source_contract, SourceCaseFailure, authenticate_membership, gather_selected, run_case, registrations, select, source_parameters,
-                                      validate_outcome, validate_retirement, cleanup_prefixes)
+from run_qfn_source_admission import (SOURCE_ADMISSION_REPORT_SCHEMA, SourceAdmissionContract, source_contract, SourceCaseFailure, authenticate_membership, gather_selected, run_case, registrations, select, source_parameters,
+                                      validate_outcome, source_artifact_directory, validate_runner_retirement, validate_retirement, validate_native_retirement, cleanup_prefixes)
 from qfn_source_admission_image import validate_report, validate_binding
-from production_artifacts import digest
+from production_artifacts import digest, artifact_identity_path
 import run_develop_image_gate as gate
 import qfn_source_admission_image as image_gate
 
@@ -30,6 +30,18 @@ def parameter(backend='cpu', ordinal=0, numa_node=0):
                              for rank in range(2)]}
 
 
+
+def native_completion(root, rank, *, result=0, token='a'*32):
+    """Record only synthetic terminal protocol inputs; no resource is materialized."""
+    (root / 'native-lifetime-invocation.json').write_text(json.dumps({
+        'schema': 1, 'invocation': 'a'*32, 'cell': 'Opaque', 'mpi_ranks': 2}))
+    directory = root / 'native-process-retirement'
+    directory.mkdir(exist_ok=True)
+    (directory / f'rank-{rank}.csv').write_text(
+        'schema,invocation,rank,pid,test_result,native_lifetime_retired\n'
+        f'1,{token},{rank},123,{result},1\n')
+
+
 def hardware():
     """Return sparse actual identities, including CUDA3 but no CUDA0 or CPU NUMA1."""
     return {'qfn_source_hardware_schema': 2, 'scope': 'local-host-all-ranks', 'devices': [
@@ -39,6 +51,42 @@ def hardware():
 
 class QFNSourceAdmissionCI(unittest.TestCase):
     """Missing, foreign and stale evidence must fail rather than reduce coverage."""
+
+    def test_declared_storage_requires_its_hardware_without_inventing_compute_domains(self):
+        record = parameter('cuda', 3)
+        record['storage_participants'] = [
+            {'rank': 0, 'backend': 'cuda', 'ordinal': 3, 'numa_node': 0},
+            {'rank': 0, 'backend': 'rocm', 'ordinal': 1, 'numa_node': 0}]
+        record['storage_coordinator'] = record['storage_participants'][0].copy()
+        control = parameter()
+        selected, unavailable = select({'control': control, 'cohort': record}, hardware())
+        self.assertEqual(selected, ['control'])
+        self.assertEqual(unavailable['cohort']['missing'][0]['role'], 'storage')
+        self.assertEqual(unavailable['cohort']['missing'][0]['backend'], 'rocm')
+        observed = hardware()
+        observed['devices'].append({'backend': 'rocm', 'ordinal': 1, 'numa_node': 0})
+        before = copy.deepcopy(record['participants'])
+        selected, unavailable = select({'cohort': record}, observed)
+        self.assertEqual(selected, ['cohort'])
+        self.assertFalse(unavailable)
+        self.assertEqual(record['participants'], before)
+        self.assertEqual(len(record['participants']), 2)
+
+    def test_declared_storage_rejects_unused_duplicate_foreign_and_missing_coordinator(self):
+        record = parameter('cuda', 3)
+        owner = {'rank': 0, 'backend': 'cuda', 'ordinal': 3, 'numa_node': 0}
+        record.update(storage_participants=[owner], storage_coordinator=owner.copy())
+        for transform in (
+                lambda r: r.pop('storage_coordinator'),
+                lambda r: r['storage_participants'].append(owner.copy()),
+                lambda r: r['storage_participants'][0].update(rank=2),
+                lambda r: r['storage_coordinator'].update(ordinal=9),
+                lambda r: r['storage_participants'][0].update(backend='cpu'),
+                lambda r: r.update(storage_participants='cuda:3')):
+            bad = copy.deepcopy(record)
+            transform(bad)
+            with self.assertRaises(ValueError):
+                select({'bad': bad}, hardware())
 
     def test_explicit_large_card_class_only_filters_its_authored_positive(self):
         minimum = 32 * 1024**3
@@ -96,11 +144,11 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             'required_total_memory_bytes': 32 * 1024**3, 'observed_total_memory_bytes': 24 * 1024**3}]}
         self.assertTrue(valid_unqualified(small))
         self.assertFalse(valid_unqualified({**small, 'insufficient': []}))
-        report = {'schema': 1, 'complete': True, 'passed': False, 'all_resources_retired': True,
+        report = {'schema': SOURCE_ADMISSION_REPORT_SCHEMA, 'complete': True, 'passed': False, 'all_resources_retired': True,
                   'selected_cases': ['Source.FullSourceAdmission/Large'], 'selected': 1, 'discovered': 2,
                   'hardware_ineligible': 1, 'attempted': 1, 'passed_cells': 0, 'failed_cells': 1,
                   'unexecuted_selected': 0, 'inventory_digest': 'inventory', 'hardware_digest': 'hardware',
-                  'results': {'Source.FullSourceAdmission/Large': {'passed': False, 'retirement_proved': True,
+                  'results': {'Source.FullSourceAdmission/Large': {'passed': False, 'retirement_proved': True, 'runner_retirement_proved': True,
                       'qualification': 'failed-source-contract', 'contract': 'positive-source-admission', 'error': 'PMA regression'}},
                   'unqualified': {'Small': small}}
         validate_report(report, require_pass=False)
@@ -178,6 +226,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
                 directory.mkdir(parents=True)
                 directories.append(directory)
                 (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+                native_completion(root, rank)
                 (directory / 'capacity-diagnostic.txt').write_text('actual explicit routed expert capacity diagnostic')
                 (directory / 'capacity-rejection.csv').write_text(
                     'cell,initialized,capacity_rejected,gpu_memory_cap_mb,numerical_inference_executed,capacity_boundary\n'
@@ -217,11 +266,11 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             select({'exact': parameter('rocm', 8)}, hardware())
 
     def test_candidate_failure_and_image_mismatch_are_not_passes(self):
-        report = {'schema': 1, 'complete': True, 'passed': True, 'all_resources_retired': True,
+        report = {'schema': SOURCE_ADMISSION_REPORT_SCHEMA, 'complete': True, 'passed': True, 'all_resources_retired': True,
                   'selected_cases': ['Source.CandidateSourceAdmission/Opaque'], 'selected': 1, 'discovered': 2, 'hardware_ineligible': 1,
                   'attempted': 1, 'passed_cells': 1, 'failed_cells': 0, 'unexecuted_selected': 0,
                   'inventory_digest': 'inventory', 'hardware_digest': 'hardware',
-                  'results': {'Source.CandidateSourceAdmission/Opaque': {'passed': True, 'retirement_proved': True, 'qualification': 'native-source-admission', 'contract': 'positive-source-admission'}},
+                  'results': {'Source.CandidateSourceAdmission/Opaque': {'passed': True, 'retirement_proved': True, 'runner_retirement_proved': True, 'qualification': 'native-source-admission', 'contract': 'positive-source-admission'}},
                   'unqualified': {'Absent': {'qualification': 'hardware-ineligible-unqualified', 'missing': [{}]}}}
         validate_report(report)
         for change in ({'results': {}}, {'selected': 2}, {'discovered': 1}, {'passed': False},
@@ -266,6 +315,56 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             self.assertFalse(cache.exists())
             self.assertEqual(retained.read_text(), 'evidence')
 
+    def test_long_source_identity_retirement_and_nested_neighbor_cleanup(self):
+        identity = 'Qwen38FlashNext_UDQ4KXL_CUDA0_CPU0_ExpertOverlay_GpuExperts8_R15_NgramAdaptiveVRAMRAMSSD_DeclaredOwners_R0CUDA0C64B1048576_R0ROCm0C64B1048576_CoordinatorR0CUDA0_G0_B0_A65536_P3of4_H64_B1048576_A65536_P3of4_W65536_N1024_Static_Ordinal_ActFP32_KVFP16_MTPDepth1'
+        record = parameter(); record['id'] = identity
+        selected, unavailable = select({'long': record}, hardware())
+        self.assertEqual(selected, ['long']); self.assertFalse(unavailable)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for logical in (identity, identity + 'neighbor', 'Short'):
+                for rank in range(2):
+                    directory = root / 'source-admission' / artifact_identity_path(logical) / f'rank-{rank}'
+                    (directory / 'prefix-cache').mkdir(parents=True)
+                    (directory / 'prefix-cache/disposable').write_text('cache')
+                    (directory / 'retirement.csv').write_text(
+                        'cell,runner_retired,model_retired,prefix_removed\n' + logical + ',1,1,1\n')
+                    (directory / 'admission.csv').write_text('retained evidence')
+            cleanup_prefixes(root)
+            validate_runner_retirement(root, record)
+            for logical in (identity, identity + 'neighbor', 'Short'):
+                directory = root / 'source-admission' / artifact_identity_path(logical) / 'rank-0'
+                self.assertFalse((directory / 'prefix-cache').exists())
+                self.assertEqual((directory / 'admission.csv').read_text(), 'retained evidence')
+            self.assertNotEqual(artifact_identity_path(identity), artifact_identity_path(identity + 'neighbor'))
+
+    def test_source_artifact_cleanup_rejects_nested_symlinks_and_malformed_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / 'outside'; outside.mkdir()
+            owned = root / 'source-admission'; owned.mkdir()
+            (owned / 'link').symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                cleanup_prefixes(root)
+            (owned / 'link').unlink()
+            record = parameter(); record['id'] = 'Alias'
+            (owned / 'Alias').symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                validate_runner_retirement(root, record)
+            (owned / 'Alias').unlink()
+            malformed = owned / 'long-identities/not-a-chunk/artifacts/rank-0/prefix-cache'
+            malformed.mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, 'malformed'):
+                cleanup_prefixes(root)
+            self.assertTrue(malformed.exists())
+        for rank in (-1, True, False, '0', 0.5, None):
+            with self.assertRaisesRegex(ValueError, 'rank'):
+                source_artifact_directory(Path('/unused'), 'Original', rank)
+        for identity in ('../escape', '..', 'bad\\path', 'bad/name'):
+            record = parameter(); record['id'] = identity
+            with self.assertRaises(ValueError):
+                select({'invalid': record}, hardware())
+
     def test_exact_ctest_world_and_foreign_membership_are_rejected(self):
         authenticate_membership({'exact': {'mpi_ranks': 2}}, {'exact': parameter()})
         with self.assertRaisesRegex(ValueError, 'MPI launch'):
@@ -304,6 +403,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
                 directory = root / f'source-admission/Opaque/rank-{rank}'
                 directory.mkdir(parents=True)
                 (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+                native_completion(root, rank)
                 (directory / 'admission.csv').write_text('cell,layers,initialized,snapshots_enabled,numerical_inference_executed\nOpaque,48,1,0,0\n')
                 (directory / 'admission_memory.txt').write_text('actual PMA attestation')
                 (directory / 'mtp-setup.csv').write_text('cell,active,retained_depth,controller_execution_proved\nOpaque,0,0,0\n')
@@ -440,11 +540,11 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             http.assert_not_called()
 
     def test_retirement_proof_is_independent_of_complete_red_contracts(self):
-        report = {'schema': 1, 'complete': True, 'passed': False, 'all_resources_retired': True,
+        report = {'schema': SOURCE_ADMISSION_REPORT_SCHEMA, 'complete': True, 'passed': False, 'all_resources_retired': True,
                   'selected_cases': ['Source.CandidateSourceAdmission/Opaque'], 'selected': 1, 'discovered': 1, 'hardware_ineligible': 0,
                   'attempted': 1, 'passed_cells': 0, 'failed_cells': 1, 'unexecuted_selected': 0,
                   'inventory_digest': 'inventory', 'hardware_digest': 'hardware', 'unqualified': {},
-                  'results': {'Source.CandidateSourceAdmission/Opaque': {'passed': False, 'retirement_proved': True,
+                  'results': {'Source.CandidateSourceAdmission/Opaque': {'passed': False, 'retirement_proved': True, 'runner_retirement_proved': True,
                       'qualification': 'failed-source-contract', 'contract': 'positive-source-admission', 'error': 'defect'}}}
         validate_report(report, require_pass=False)
         with self.assertRaises(ValueError):
@@ -519,6 +619,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
                 directory = root / f'source-admission/Opaque/rank-{rank}'
                 directory.mkdir(parents=True)
                 (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+                native_completion(root, rank)
                 (directory / 'capacity-diagnostic.txt').write_text('canonical native capacity rejection')
                 (directory / 'capacity-rejection.csv').write_text('cell,initialized,capacity_rejected,gpu_memory_cap_mb,numerical_inference_executed,capacity_boundary\nOpaque,0,1,13312,0,fixed-head-table\n')
             validate_retirement(root, record, contract=SourceAdmissionContract.CAPACITY_REJECTION)
@@ -549,6 +650,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
                 directory = root / f'source-admission/Opaque/rank-{rank}'
                 directory.mkdir(parents=True)
                 (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+                native_completion(root, rank)
                 (directory / 'admission.csv').write_text('cell,layers,initialized,snapshots_enabled,numerical_inference_executed\nOpaque,48,1,0,0\n')
                 (directory / 'admission_memory.txt').write_text('native PMA attestation')
                 (directory / 'mtp-setup.csv').write_text('cell,active,retained_depth,controller_execution_proved\nOpaque,1,3,0\n')
@@ -575,11 +677,11 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             changed['properties'] = [{'name': key, 'value': value} for key, value in {**props, 'LABELS': labels}.items()]
             with self.assertRaisesRegex(ValueError, 'CONTRACT_LABELS'):
                 registrations({'tests': [changed]})
-        report = {'schema': 1, 'complete': True, 'passed': True, 'all_resources_retired': True,
+        report = {'schema': SOURCE_ADMISSION_REPORT_SCHEMA, 'complete': True, 'passed': True, 'all_resources_retired': True,
                   'selected_cases': [exact], 'selected': 1, 'discovered': 1, 'hardware_ineligible': 0,
                   'attempted': 1, 'passed_cells': 1, 'failed_cells': 0, 'unexecuted_selected': 0,
                   'inventory_digest': 'inventory', 'hardware_digest': 'hardware', 'unqualified': {},
-                  'results': {exact: {'passed': True, 'retirement_proved': True,
+                  'results': {exact: {'passed': True, 'retirement_proved': True, 'runner_retirement_proved': True,
                       'qualification': 'native-source-admission', 'contract': 'expected-capacity-rejection'}}}
         validate_report(report)
         for wrong in ('expected-native-rejection', 'positive-source-admission'):
@@ -626,6 +728,102 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             changed['properties'] = [{'name': key, 'value': value} for key, value in {**props, **change}.items()]
             with self.subTest(change=change), self.assertRaises(ValueError):
                 registrations({'tests': [changed]})
+
+    def test_old_runner_only_report_schema_cannot_certify_final_native_retirement(self):
+        report = {'schema': 1, 'complete': True, 'passed': True, 'all_resources_retired': True,
+                  'selected_cases': ['Source.FullSourceAdmission/Opaque'], 'selected': 1, 'discovered': 1,
+                  'hardware_ineligible': 0, 'attempted': 1, 'passed_cells': 1, 'failed_cells': 0,
+                  'unexecuted_selected': 0, 'inventory_digest': 'inventory', 'hardware_digest': 'hardware',
+                  'unqualified': {}, 'results': {'Source.FullSourceAdmission/Opaque': {
+                      'passed': True, 'retirement_proved': True, 'runner_retirement_proved': True,
+                      'qualification': 'native-source-admission', 'contract': 'positive-source-admission'}}}
+        with self.assertRaises(ValueError):validate_report(report)
+        report['schema'] = SOURCE_ADMISSION_REPORT_SCHEMA
+        validate_report(report)
+        report['results']['Source.FullSourceAdmission/Opaque']['runner_retirement_proved'] = False
+        with self.assertRaises(ValueError):validate_report(report)
+
+    def test_canonical_matrix_custom_main_owns_terminal_publication_before_mpi_finalize(self):
+        # This exact executable owns a custom main; core_gtest_main is not linked.
+        root = Path(__file__).resolve().parents[4]
+        cmake = (root / 'tests/v2/CMakeLists.txt').read_text()
+        target = cmake.split('add_executable(v2_integration_parity_qwen4exp_production_matrix', 1)[1].split(')', 1)[0]
+        self.assertIn('integration/parity/qwen4exp/Test__Qwen4Exp_Production_Parity.cpp', target)
+        self.assertNotIn('core_gtest_main', target)
+        source = (root / 'tests/v2/integration/parity/qwen4exp/Test__Qwen4Exp_Production_Parity.cpp').read_text()
+        main = source[source.index('int main(int argc, char **argv)'):]
+        sequence = ['NativeLifetimeCompletion::fromEnvironment()',
+                    'runWithNativeLifetimeCompletion<llaminar2::GPUDeviceProcessLifetime>(',
+                    'MPI_Init_thread(', 'RUN_ALL_TESTS()', 'GlobalBackendRouter::shutdown()',
+                    'GPUDeviceProcessLifetime::retireActive()', 'return result;',
+                    'completion->publish(result)', 'MPI_Finalize()', '_exit(result)']
+        for token in sequence:
+            self.assertIn(token, main, f"Canonical custom main lost native terminal wiring: {token}")
+        positions = [main.index(token) for token in sequence]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('exportQwen4ExpSourceHardware', main)
+        self.assertIn('result = 2', main) # Inventory failure still has its original non-GTest status.
+
+    def test_native_terminal_invocation_rejects_stale_directory_before_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / 'native-process-retirement').mkdir()
+            with patch('run_qfn_source_admission.subprocess.run') as launch:
+                with self.assertRaises(FileExistsError):
+                    run_case({'test': 'exact'}, parameter(), output, output, {}, output, 0, 'Source.FullSourceAdmission/Opaque')
+                launch.assert_not_called()
+
+    def test_runner_receipt_before_abort_is_not_final_native_retirement(self):
+        from types import SimpleNamespace
+        for completed in (False, True):
+            with self.subTest(completed=completed), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                def child(*_args, env, **_kwargs):
+                    (output / 'cell-0000.xml').write_text('<testsuites><testsuite><testcase><failure message="Failed"/></testcase></testsuite></testsuites>')
+                    artifact = Path(env['LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT'])
+                    for rank in range(2):
+                        directory = artifact / f'source-admission/Opaque/rank-{rank}'
+                        directory.mkdir(parents=True)
+                        (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+                        if completed:
+                            root = Path(env['LLAMINAR_SOURCE_ADMISSION_PROCESS_RECEIPT_ROOT'])
+                            token = env['LLAMINAR_SOURCE_ADMISSION_PROCESS_INVOCATION']
+                            (root / f'rank-{rank}.csv').write_text('schema,invocation,rank,pid,test_result,native_lifetime_retired\n'+f'1,{token},{rank},123,1,1\n')
+                    return SimpleNamespace(returncode=8) # CTest code is identical for failed assertions and aborts.
+                exact = 'Source.FullSourceAdmission/Opaque'
+                report = {'selected': 1, 'results': {}}
+                with patch('run_qfn_source_admission.subprocess.run', side_effect=child):
+                    gather_selected([exact], {exact: parameter()}, {exact: {'test': 'exact'}}, output, output, {}, report)
+                outcome = report['results'][exact]
+                self.assertFalse(outcome['passed'])
+                self.assertTrue(outcome['runner_retirement_proved'])
+                self.assertEqual(outcome['retirement_proved'], completed)
+                self.assertEqual(report['all_resources_retired'], completed)
+
+    def test_terminal_retirement_rejects_missing_malformed_and_foreign_rank_or_invocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for rank in range(2):
+                directory = root / f'source-admission/Opaque/rank-{rank}'
+                directory.mkdir(parents=True)
+                (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+                native_completion(root, rank, result=1)
+            validate_native_retirement(root, parameter()) # Assertion failure is compatible with clean native teardown.
+            receipt = root / 'native-process-retirement/rank-1.csv'
+            original = receipt.read_text()
+            for altered in ('', original.replace('a'*32, 'b'*32), original.replace(',1,123,', ',0,123,'),
+                            original.replace(',123,', ',0,'), original.replace(',1,1\n', ',2,1\n'),
+                            original.replace(',1,1\n', ',1,0\n'), original+original.splitlines(True)[1]):
+                with self.subTest(altered=altered):
+                    receipt.write_text(altered)
+                    with self.assertRaises(ValueError):validate_native_retirement(root, parameter())
+            receipt.unlink()
+            with self.assertRaises(FileNotFoundError):validate_native_retirement(root, parameter())
+            receipt.write_text(original)
+            manifest=root / 'native-lifetime-invocation.json'
+            for malformed in ('[]', '{', '{}'):
+                manifest.write_text(malformed)
+                with self.assertRaises(ValueError):validate_native_retirement(root, parameter())
 
 
 if __name__ == '__main__':

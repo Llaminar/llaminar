@@ -24,6 +24,7 @@
 #include "../../utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
+#include <exception>
 
 namespace llaminar2
 {
@@ -72,6 +73,9 @@ namespace llaminar2
     // ============================================================================
 
     NvidiaDeviceContext::NvidiaDeviceContext(int device_ordinal)
+        : NvidiaDeviceContext(device_ordinal,{}) {}
+
+    NvidiaDeviceContext::NvidiaDeviceContext(int device_ordinal,std::shared_ptr<PreparedGPUWorkerStack> prepared_stack)
         : process_lifetime_lease_(GPUDeviceProcessLifetime::acquireNativeContext()),
           device_ordinal_(device_ordinal)
     {
@@ -93,7 +97,10 @@ namespace llaminar2
                 // partition, not its creator's first OpenMP place. Restore
                 // the creator before waiting or executing any caller work.
                 const ScopedOpenMPPartitionAffinity control_affinity;
-                worker_thread_ = std::thread(&NvidiaDeviceContext::workerLoop, this);
+                if(prepared_stack)
+                    worker_thread_.start(std::move(prepared_stack),[](void* self){
+                        static_cast<NvidiaDeviceContext*>(self)->workerLoop();},this);
+                else worker_thread_ = std::thread(&NvidiaDeviceContext::workerLoop, this);
             }
 
             // Wait for worker to signal it's ready (or failed)
@@ -736,23 +743,25 @@ namespace llaminar2
         return static_cast<void *>(event);
     }
 
+    /**
+     * @brief Destroy an original event or fail fatally before its opaque commitment can retire.
+     * @param event Original native event; null denotes no created resource.
+     * @note A failed native cleanup is not evidence of physical retirement.
+     */
     void NvidiaDeviceContext::destroyEvent(void *event)
     {
-        if (event == nullptr)
+        if (!event) return;
+        if (const auto error = cudaSetDevice(device_ordinal_); error != cudaSuccess)
         {
-            return;
+            LOG_ERROR("[NvidiaDeviceContext::destroyEvent] Original event device selection failed, status=" << error);
+            std::terminate();
         }
-
-        cudaError_t set_err = cudaSetDevice(device_ordinal_);
-        if (set_err != cudaSuccess)
+        const auto cuda_event = reinterpret_cast<cudaEvent_t>(event);
+        if (const auto error = cudaEventDestroy(cuda_event); error != cudaSuccess)
         {
-            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
-                                                             << ") failed in destroyEvent: " << cudaGetErrorString(set_err));
-            return;
+            LOG_ERROR("[NvidiaDeviceContext::destroyEvent] Native event destruction failed; ownership cannot retire, status=" << error);
+            std::terminate();
         }
-
-        cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
-        CUDA_CHECK_VOID(cudaEventDestroy(cuda_event));
     }
 
     void NvidiaDeviceContext::recordEvent(void *event, void *stream)

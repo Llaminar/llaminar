@@ -12,6 +12,7 @@
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/local_execution/graph/IGraphExecutor.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include "utils/Sha256.h"
@@ -34,7 +35,7 @@
 namespace llaminar2::accuracy
 {
 /** @brief Existing supported public-runner execution surfaces; no serving selector. */
-enum class QFNObservationSurface { CPU, GPUCPUOverlay, CPUTailPipeline, ROCmLocalTP4 };
+enum class QFNObservationSurface { CPU, GPUCPUOverlay, CPUTailPipeline, HomogeneousLocalTP, GPUCPULocalTP };
 
 /** @brief Reject invalid diagnostic input without device work or partial output. */
 inline void requireQFN(bool condition, const char *message)
@@ -164,7 +165,7 @@ private:
 /**
  * @brief Classify the actual already-admitted rank plan, without constructing one.
  * @param plan Existing production runner's original rank-local plan.
- * @return Supported host-logit/forced-row surface, requiring later owner proof.
+ * @return Physical host-logit/forced-row shape only; actual prepared expert ownership refines LocalTP before graph certification.
  * @throws std::invalid_argument For cross-rank or unsupported physical execution.
  */
 inline QFNObservationSurface qfnObservationSurface(const RankExecutionPlan &plan)
@@ -190,19 +191,61 @@ inline QFNObservationSurface qfnObservationSurface(const RankExecutionPlan &plan
     }
     if (plan.usesLocalTP())
     {
-        requireQFN(plan.local_tp_devices.size() == 4, "QFN observer supports only explicit homogeneous four-ROCm LocalTP");
+        requireQFN(plan.local_tp_devices.size()==2 || plan.local_tp_devices.size()==4 || plan.local_tp_devices.size()==8,
+                   "QFN observer requires an explicit homogeneous GPU LocalTP degree 2/4/8");
+        const auto backend=plan.local_tp_devices.front().device_type;
+        requireQFN(backend==DeviceType::CUDA || backend==DeviceType::ROCm,"QFN LocalTP requires actual GPU compute participants");
         std::set<DeviceId> devices;
         for (const auto &address : plan.local_tp_devices)
-            requireQFN(address.isLocal() && address.device_type == DeviceType::ROCm &&
+            requireQFN(address.isLocal() && address.device_type == backend &&
                        devices.insert(address.toLocalDeviceId()).second,
                        "QFN observer LocalTP has foreign, mixed or duplicate physical devices");
-        return QFNObservationSurface::ROCmLocalTP4;
+        requireQFN(plan.primary_device.isLocal() &&
+            std::find(plan.local_tp_devices.begin(),plan.local_tp_devices.end(),plan.primary_device)!=plan.local_tp_devices.end(),
+            "QFN LocalTP primary is outside its original physical cohort");
+        return QFNObservationSurface::HomogeneousLocalTP;
     }
     requireQFN(plan.primary_device.isLocal(), "QFN observer requires local physical ownership");
     if (plan.primary_device.device_type == DeviceType::CPU) return QFNObservationSurface::CPU;
     requireQFN(plan.primary_device.device_type == DeviceType::CUDA || plan.primary_device.device_type == DeviceType::ROCm,
                "QFN observer unsupported primary backend");
     return QFNObservationSurface::GPUCPUOverlay;
+}
+
+/**
+ * @brief Select graph topology from actual nonempty prepared expert ownership, never unused declarations.
+ * @param physical Original validated homogeneous TP compute devices.
+ * @param prepared Original admitted and validated routed expert plan.
+ * @pre Caller retains and authenticates the actual prepared/store/PMA owner before this projection.
+ * @return Heterogeneous TP only when an actually selected expert tier owns CPU work.
+ * @throws std::invalid_argument For invalid selected tier/domain or foreign expert GPU/address.
+ */
+inline QFNObservationSurface qfnPreparedLocalTPSurface(const RankExecutionPlan& physical,
+    const MoERoutedExpertPlacementPlan& prepared)
+{
+    requireQFN(qfnObservationSurface(physical)==QFNObservationSurface::HomogeneousLocalTP,
+        "QFN prepared TP classification requires original homogeneous compute membership");
+    bool cpu=false;
+    std::set<std::string> selected;
+    for(const auto& layer:prepared.placements)for(const auto tier:layer.routed_expert_tier){
+        requireQFN(tier>=0 && std::size_t(tier)<prepared.routed_tiers.size(),"QFN prepared TP has an invalid selected expert tier");
+        selected.insert(prepared.routed_tiers[tier].domain);
+    }
+    requireQFN(!selected.empty(),"QFN prepared TP has no original selected experts");
+    for(const auto& name:selected){
+        const auto domain=std::find_if(prepared.domains.begin(),prepared.domains.end(),[&](const auto& value){return value.name==name;});
+        requireQFN(domain!=prepared.domains.end()&&!domain->participants.empty(),"QFN selected expert tier has no original domain");
+        std::set<DeviceId> unique;
+        for(const auto& address:domain->participants){
+            requireQFN(address.isLocal()&&unique.insert(address.toLocalDeviceId()).second,"QFN expert domain has foreign or duplicate ownership");
+            if(address.device_type==DeviceType::CPU){cpu=true;continue;}
+            requireQFN(std::any_of(physical.local_tp_devices.begin(),physical.local_tp_devices.end(),[&](const auto& member){
+                    return member.toLocalDeviceId()==address.toLocalDeviceId();
+                }),
+                "QFN expert GPU is outside its original compute cohort");
+        }
+    }
+    return cpu?QFNObservationSurface::GPUCPULocalTP:QFNObservationSurface::HomogeneousLocalTP;
 }
 
 /**
@@ -227,7 +270,7 @@ inline std::string qfnMetadataDigest(const nlohmann::json &value)
  *
  * The caller must first authenticate the CPU expert domain or exact CPU-tail
  * pipeline that makes a heterogeneous contract legitimate. A requested label
- * alone cannot grant segmentation. Homogeneous TP4 retains per-device strict
+ * alone cannot grant segmentation. Homogeneous GPU LocalTP retains per-device strict
  * canonical capture/replay requirements. CPU and CPU-tail surfaces additionally
  * require successful nonempty runtime graph completions in both observed phases,
  * never optional profiling totals or cache-hit/submission counters. Host records
@@ -268,7 +311,7 @@ inline void qfnRequireGraphPathRecords(const std::vector<PerfStatRecord> &record
     }
     const auto topology = surface == QFNObservationSurface::CPU
         ? ProductionParityExecutionTopology::CPUOnly
-        : surface == QFNObservationSurface::ROCmLocalTP4
+        : surface == QFNObservationSurface::HomogeneousLocalTP
             ? ProductionParityExecutionTopology::HomogeneousGPU
             : ProductionParityExecutionTopology::HeterogeneousAccelerator;
     const auto contract = resolveProductionParityGraphContract(topology, true, !gpu_devices.empty());
@@ -291,11 +334,11 @@ inline void qfnRequireGraphPathRecords(const std::vector<PerfStatRecord> &record
         requireQFN(prefill && (parityForwardGraphHasDecodePhase(local, "replay") ||
                               productionParityHasRetainedParentDecodeReplay(local)),
                    "QFN observer lacks actual per-device prefill/decode replay");
-        if (surface == QFNObservationSurface::ROCmLocalTP4)
+        if (surface == QFNObservationSurface::HomogeneousLocalTP)
         {
             const auto homogeneous = collectProductionParityEvidence(local, true, topology, contract, false, 0.0, 4500.0);
             requireQFN(certifyProductionParityGraphExecution(homogeneous) == ProductionParityGraphCertification::Certified,
-                       "QFN TP4 requires each original GPU's unsegmented captured path");
+                       "QFN homogeneous LocalTP requires each original GPU's unsegmented captured path");
         }
     }
 }
@@ -347,8 +390,9 @@ inline nlohmann::json qfnRequireOriginalSourceStat(const nlohmann::json &descrip
 }
 
 /**
- * @brief Validate only original ordinary TP4 host-publication records.
+ * @brief Validate only original ordinary LocalTP host-publication records.
  * @param records Passive sampling snapshot authored by the actual rank owner.
+ * @param participants Exact original admitted TP compute extent.
  * @return Bounded cumulative successful one-row publication count.
  * @throws std::invalid_argument For changed operation, extent or counter schema.
  *
@@ -356,8 +400,9 @@ inline nlohmann::json qfnRequireOriginalSourceStat(const nlohmann::json &descrip
  * The larger 8192 bound also permits a before/after window without arithmetic
  * wrap. This helper neither manufactures a record nor probes live GPU state.
  */
-inline std::uint64_t qfnTPHostPublicationCount(std::span<const PerfStatRecord> records)
+inline std::uint64_t qfnTPHostPublicationCount(std::span<const PerfStatRecord> records,std::size_t participants)
 {
+    requireQFN(participants==2||participants==4||participants==8,"QFN host publication requires original TP degree 2/4/8");
     std::uint64_t count = 0;
     for (const auto &record : records)
     {
@@ -369,10 +414,10 @@ inline std::uint64_t qfnTPHostPublicationCount(std::span<const PerfStatRecord> r
         requireQFN(record.domain == "sampling" && record.kind == PerfStatRecord::Kind::Counter &&
                    record.device == "rank" && record.phase == "decode" &&
                    tag("operation") == "advanceOrdinaryMainConditionFromDeviceResidentLogicalState" &&
-                   tag("participants") == "4" && tag("rows") == "1" &&
+                   tag("participants") == std::to_string(participants) && tag("rows") == "1" &&
                    record.value == static_cast<double>(record.count) && record.count <= 8192 &&
                    count <= 8192 - record.count,
-                   "QFN TP4 host publication receipt has wrong original operation/extent");
+                   "QFN LocalTP host publication receipt has wrong original operation/extent");
         count += record.count;
     }
     return count;

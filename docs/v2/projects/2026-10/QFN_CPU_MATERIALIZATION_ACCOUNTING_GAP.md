@@ -1,6 +1,6 @@
 # QFN CPU materialization accounting repair
 
-2026-10-29. Size limit: 15,000 UTF-8 bytes. Scope: the live allocation seams exposed while qualifying source
+2026-10-29. Scope: the live allocation seams exposed while qualifying source
 admission. This is a repair plan, not a certificate or a replacement memory ledger.
 
 The bounded strategic repair is integrated. The full Unit suite passes **789/789**.

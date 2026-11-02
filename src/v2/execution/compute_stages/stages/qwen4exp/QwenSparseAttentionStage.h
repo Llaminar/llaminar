@@ -183,6 +183,8 @@ public:
     bool restoreVerifierStateCaptureRows(const int *rows,int requestCount,void *stream) override;
     /** @brief Publish one GPU-owned accepted flat row without readback or conversion storage. */
     bool restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int> row_view,void *stream) override;
+    /** @brief Exact original arena producers consumed by accepted-state publication. */
+    std::span<const BufferBinding> verifierStatePublicationInputs() const noexcept override;
     /** @brief Accepted QSA publication writes only the persistent raw partial-key bank. */
     std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept override;
 
@@ -234,6 +236,7 @@ private:
     RequestRowOrigins retainedOrigins() const;
     /** @brief Enqueue one validated native tail splice and publish its exact output event. */
     bool publishRetained(const int *flatRow,void *stream);
+    std::array<BufferBinding, 2> acceptedPublicationInputs_{}; ///< Exact retained-state read frontier.
     std::array<BufferBinding, 1> acceptedPublicationOutputs_{}; ///< Immutable cold accepted-state declaration.
     std::array<CPUVerifierStateRestoreDestination,1> cpuPublicationWrites_{}; ///< CPU-only immutable planning span.
     Params params_;

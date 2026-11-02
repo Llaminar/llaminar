@@ -9,6 +9,7 @@
 #pragma once
 #include "ProductionParityModelPath.h"
 #include "loaders/ModelContextConfig.h"
+#include "execution/config/RuntimeConfig.h"
 #include "loaders/SharedPredictorGGUFSource.h"
 #include <memory>
 #include <utility>
@@ -55,6 +56,19 @@ inline std::string parityPredictorIdentity(
 {
     return source ? "|predictor_bytes=" + std::to_string(source->path().size()) +
         ":" + source->path() : std::string{};
+}
+/**
+ * @brief Match the runner's predictor storage policy independently of execution.
+ * @param policy Original authored MTP execution and retained graph capacity.
+ * @return Active materialization for retained capacity, including disabled MTP.
+ *
+ * This selects weights only; it does not claim any speculative controller ran.
+ */
+inline SharedPredictorMaterialization parityPredictorMaterialization(
+    const MTPRuntimeConfig &policy) noexcept
+{
+    return retainsMTPGraphCapacity(policy) ? SharedPredictorMaterialization::Active
+                                         : SharedPredictorMaterialization::Inactive;
 }
 /**
  * @brief Build the actual loader contract before ModelContext materialization.

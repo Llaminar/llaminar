@@ -1,0 +1,343 @@
+/** @file Test__NativeSourceFinalRetirement.cpp
+ * @brief Actual source/pool/PMA and TransferEngine retirement of admitted failed and successful owners.
+ * Only native backend results are doubled; source-owned mapped stack/object,
+ * mixed storage endpoints, reset ordering and original physical lifetime execute.
+ */
+#include "fixtures/backends/NativeContextPreparationReplayAccess.h"
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "mocks/MockWorkerGPUContext.h"
+#include "mocks/MockBackend.h"
+#include "transfer/TransferEngine.h"
+#include "execution/runner/OrchestrationRunner.h"
+#include "execution/runner/ModelContextRetirement.h"
+#include "tools/ModelKLDQFNOwner.h"
+#include "integration/parity/qwen4exp/Qwen4ExpParityTestBase.h"
+#include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
+#include "backends/BackendManager.h"
+#include "loaders/ModelContext.h"
+#include "execution/local_execution/device/ReusableExecutionWorkspace.h"
+#include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionObservation.h"
+#include "mocks/MockMPIContext.h"
+#include <gtest/gtest.h>
+namespace llaminar2 {
+/** @brief Existing resolved-admission friend replays the exact admitted, not-inference-ready boundary without a model. */
+class OrchestrationRunnerResolvedAdmissionTestAccess {
+public:
+ /** @brief Replay the complete post-init ownership shape with actual model/workspace/source objects. */
+ static void exportedSource(OrchestrationRunner& runner,const std::shared_ptr<NativeContextPreparation>& source,
+     const std::shared_ptr<ModelContext>& model,const std::shared_ptr<ReusableExecutionWorkspaceRegistry>& workspace,
+     const std::shared_ptr<ModelContextReuseAuthority>& authority){
+  runner.plan_.runtime.native_context_preparation=source;runner.physical_memory_authority_=source->memory();
+  runner.model_ctx_=model;runner.reusable_execution_workspaces_=workspace;runner.model_context_reuse_authority_=authority;
+  runner.initialization_lifecycle_.publish(OrchestrationInitializationLifecycle::Completion::Inference);
+ }
+ /** @brief Withdraw only a deliberately injected foreign authority after the negative invariant test. */
+ static void discardForeignAuthority(OrchestrationRunner& runner){runner.model_context_reuse_authority_.reset();}
+ static void failedSource(OrchestrationRunner& runner,const std::shared_ptr<NativeContextPreparation>& source,bool createdHere){
+  runner.plan_.runtime.native_context_preparation=source;
+  if(createdHere)runner.created_native_context_source_=source;
+  runner.initialization_lifecycle_.publish(OrchestrationInitializationLifecycle::Completion::Admission);
+ }
+};
+}
+namespace llaminar2::test { namespace {
+/** @brief Observations only; canonical byte accounting stays in original PMA. */
+struct Trace {unsigned destroyed=0,resets=0;bool allDestroyed=true;};
+Trace* active=nullptr;
+/** @brief Actual mapped original worker storage and prepared thread, with no SDK call. */
+class Worker final:public testing::MockWorkerGPUContext {
+public:
+ Worker(int n,std::shared_ptr<PreparedGPUWorkerStack> root):MockWorkerGPUContext(n){thread_.start(std::move(root),[](void*){},nullptr);}
+ ~Worker()override{thread_.join();++active->destroyed;}
+private:PreparedGPUWorkerThread thread_;
+};
+/** @brief Native boundary double; actual TransferEngine authenticates the complete receipt. */
+class Backend final:public MockBackend {
+public:
+ explicit Backend(DeviceType type):MockBackend(type){}
+ std::size_t live=0;std::uint64_t generation=1;
+ DeviceAllocationAccounting deviceAllocationAccounting(int)const override{return {.supported=true,.active_allocations=live,.active_bytes=live*64};}
+ std::size_t deviceMemoryFree(int)const override{return 32u<<20;}
+ DeviceRuntimeGenerationRetirementResult retireExclusiveDeviceRuntimeGeneration(const DeviceRuntimeGenerationRetirementRequest&)override{
+  active->allDestroyed &= active->destroyed==2;++active->resets;
+  DeviceRuntimeGenerationRetirementResult v;v.supported=v.success=v.reset_invoked=true;
+  v.retired_generation=generation++;v.successor_generation=generation;v.post_reset_state=DeviceRuntimePostResetState::Quiescent;v.driver_free_bytes_before=32u<<20;return v;
+ }
+};
+Backend *cuda=nullptr,*rocm=nullptr;
+/** @return Only exact recorded native backends; no live SDK discovery. */
+IBackend* resolve(DeviceId d){return d.is_cuda()?cuda:rocm;}
+/** @return Actual original source admitted on its same PMA, with two declared native endpoints. */
+std::shared_ptr<NativeContextPreparation> prepare(const std::array<DeviceId,2>& devices,NativePhysicalLifetime lifetime){
+ using A=NativeContextPreparationReplayAccess;
+ for(const auto d:devices)A::seed(d,[d](auto root){return A::construct<Worker>(std::move(root),d.ordinal);});
+ const std::array observed{PhysicalMemoryResource{0,DeviceId::cpu(),128u<<20,128u<<20},PhysicalMemoryResource{0,devices[0],64u<<20,64u<<20},PhysicalMemoryResource{0,devices[1],64u<<20,64u<<20}};
+ auto source=A::source<Worker>(devices,observed,lifetime);
+ for(const auto d:devices){auto original=source->acquire(d);EXPECT_EQ(original.memory(),source->memory());}
+ source->freezeForPlanning();source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(source->mandatoryBOM()));return source;
+}
+/** @return Original ledger commitments, never independently inferred capacity. */
+std::size_t opaque(const std::shared_ptr<PhysicalMemoryAuthority>& m){std::size_t n=0;for(const auto& r:m->rankAttestation())n+=r.opaque_runtime_committed_bytes;return n;}
+}
+TEST(NativeSourceFinalRetirement, AdmittedMixedSourceRetiresStorageOnlyBirthAndRepeatsSafely){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;TransferEngine transfers(resolve);
+ const std::array devices{DeviceId::cuda(201),DeviceId::rocm(201)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);const auto m=source->memory();
+ // This is the original process-teardown failure after an admitted, non-ready runner.
+ EXPECT_THROW(GPUDeviceContextPool::instance().shutdown(),std::logic_error);
+ EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);
+ NativeContextPreparationReplayAccess::retireReleased(source,transfers);
+ EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);EXPECT_TRUE(t.allDestroyed);EXPECT_EQ(opaque(m),0u);
+ for(const auto d:devices)EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingPreparedContext(d,m),std::logic_error);
+ NativeContextPreparationReplayAccess::retireReleased(source,transfers);EXPECT_EQ(t.resets,2u);
+ EXPECT_NO_THROW(GPUDeviceContextPool::instance().shutdown());
+}
+TEST(NativeSourceFinalRetirement, LiveModelAllocationAndBorrowedWorkerRejectBeforeReset){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;TransferEngine transfers(resolve);
+ const std::array devices{DeviceId::cuda(202),DeviceId::rocm(202)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ c.live=1;EXPECT_THROW(NativeContextPreparationReplayAccess::retireReleased(source,transfers),std::runtime_error);
+ EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);c.live=0;
+ {auto borrowed=source->acquire(devices[0]);EXPECT_THROW(NativeContextPreparationReplayAccess::retireReleased(source,transfers),std::logic_error);
+  EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);EXPECT_EQ(borrowed.memory(),source->memory());}
+ NativeContextPreparationReplayAccess::retireReleased(source,transfers);EXPECT_EQ(t.resets,2u);
+}
+TEST(NativeSourceFinalRetirement, FailedAdmittedInitializationPreservesOriginalProcessObligation){
+ GTEST_FLAG_SET(death_test_style,"threadsafe");
+ ASSERT_EXIT(([]{
+  Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;TransferEngine transfers(resolve);
+  const std::array devices{DeviceId::cuda(203),DeviceId::rocm(203)};auto source=prepare(devices,NativePhysicalLifetime::ProcessRuntime);const auto m=source->memory();const auto committed=opaque(m);EXPECT_GT(committed,0u);
+  NativeContextPreparationReplayAccess::retireReleased(source,transfers);EXPECT_EQ(t.resets,2u);EXPECT_EQ(t.destroyed,2u);EXPECT_TRUE(t.allDestroyed);EXPECT_EQ(opaque(m),committed);
+  for(const auto d:devices)EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingPreparedContext(d,m),std::logic_error);
+  source.reset();GPUDeviceProcessLifetime::retireActive();EXPECT_EQ(opaque(m),committed);
+  std::_Exit(::testing::Test::HasFailure()?2:0);
+ }()),::testing::ExitedWithCode(0),"");
+}
+/** @test The actual runner shutdown must retire an admitted fresh failed initialization; direct source-only replay cannot replace this. */
+TEST(NativeSourceFinalRetirement, ActualRunnerFailedInitializationRetiresItsOriginalMixedSource){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+ const std::array devices{DeviceId::cuda(204),DeviceId::rocm(204)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ {
+  OrchestrationRunner runner(OrchestrationConfig{},nullptr);
+  OrchestrationRunnerResolvedAdmissionTestAccess::failedSource(runner,source,true);
+  EXPECT_NO_THROW(runner.shutdown());
+  EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);EXPECT_TRUE(t.allDestroyed);
+  for(const auto d:devices)EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingPreparedContext(d,source->memory()),std::logic_error);
+  EXPECT_NO_THROW(runner.shutdown());EXPECT_EQ(t.resets,2u);
+ }
+}
+/** @test A failed runner borrowing an existing admitted source cannot retire its external owner's workers. */
+TEST(NativeSourceFinalRetirement, ActualRunnerBorrowedSourceRemainsWithItsOriginalOwner){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;TransferEngine transfers(resolve);
+ const std::array devices{DeviceId::cuda(205),DeviceId::rocm(205)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ {
+  OrchestrationRunner runner(OrchestrationConfig{},nullptr);
+  OrchestrationRunnerResolvedAdmissionTestAccess::failedSource(runner,source,false);
+  EXPECT_NO_THROW(runner.shutdown());EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);
+  for(const auto d:devices){auto stillOwned=source->acquire(d);EXPECT_EQ(stillOwned.memory(),source->memory());}
+ }
+ EXPECT_EQ(t.resets,0u);NativeContextPreparationReplayAccess::retireReleased(source,transfers);EXPECT_EQ(t.resets,2u);
+}
+
+/** @brief Actual runner teardown from the recorded successful-init ownership shape. */
+void exportedRunnerShutdown(bool observationFailure,bool successor)
+{
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;TransferEngine transfers(resolve);
+ const std::array devices{DeviceId::cuda(207),DeviceId::rocm(207)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ auto model=ModelContext::createForTesting("recorded-exported-source.gguf",std::make_shared<MockMPIContext>(),1,true);
+ model->bindNativeContextPreparation(source);
+ auto workspace=std::make_shared<ReusableExecutionWorkspaceRegistry>();auto authority=std::make_shared<ModelContextReuseAuthority>();
+ {
+  auto runner=std::make_unique<OrchestrationRunner>(OrchestrationConfig{},nullptr);
+  OrchestrationRunnerResolvedAdmissionTestAccess::exportedSource(*runner,source,model,workspace,authority);
+  ASSERT_TRUE(runner->isInitialized());
+  if(observationFailure){
+   EXPECT_THROW(parity::qwen4exp::observeQwen4ExpAdmissionThenRetire(
+    []{throw std::runtime_error("recorded post-initialization observation failure");},[&]{runner->shutdown();}),std::runtime_error);
+  }else EXPECT_NO_THROW(runner->shutdown());
+  EXPECT_FALSE(runner->isInitialized());EXPECT_EQ(authority->state(),ModelContextReuseAuthority::State::Reusable);
+  EXPECT_EQ(runner->executionPlan().runtime.native_context_preparation,nullptr);
+  EXPECT_EQ(model->nativeContextPreparation(),source);EXPECT_EQ(model->nativeContextPreparation()->memory(),source->memory());
+  EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);
+  if(successor){std::string error;ASSERT_TRUE(authority->acquireRunnerExclusive(&error))<<error;}
+  EXPECT_NO_THROW(runner->shutdown());runner.reset();
+  EXPECT_EQ(authority->state(),successor?ModelContextReuseAuthority::State::RunnerExclusive:ModelContextReuseAuthority::State::Reusable);
+  EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);
+ }
+ model.reset();workspace.reset();NativeContextPreparationReplayAccess::retireReleased(source,transfers);
+ EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);EXPECT_TRUE(t.allDestroyed);
+}
+/** @test Final exported model retirement resets every original source participant, including storage-only workers. */
+TEST(NativeSourceFinalRetirement,ExportedContractRetiresOriginalStorageOnlySourceBirths){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+ const std::array devices{DeviceId::cuda(209),DeviceId::rocm(209)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ ModelContextReuseContract contract;
+ contract.context=ModelContext::createForTesting("recorded-final-source.gguf",std::make_shared<MockMPIContext>(),1,true);
+ contract.context->bindNativeContextPreparation(source);
+ contract.physical_memory_authority=source->memory();
+ contract.reusable_execution_workspaces=std::make_shared<ReusableExecutionWorkspaceRegistry>();
+ contract.reuse_authority=std::make_shared<ModelContextReuseAuthority>();std::string error;
+ ASSERT_TRUE(contract.reuse_authority->beginSealing(&error));ASSERT_TRUE(contract.reuse_authority->publishReusable({},&error));
+ // No prepared-weight rows exist in this recorded final model. Both original
+ // workers therefore expose the residual-birth path, not a fabricated weight BOM.
+ // Same address with a foreign control block cannot authorize source cleanup.
+ const auto originalMemory=contract.physical_memory_authority;
+ contract.physical_memory_authority=std::shared_ptr<PhysicalMemoryAuthority>(originalMemory.get(),[](auto*){});
+ EXPECT_THROW((void)retireExclusiveModelContextReuseContract(contract),std::logic_error);
+ EXPECT_TRUE(contract.context);EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);
+ contract.physical_memory_authority=originalMemory;
+ EXPECT_NO_THROW((void)retireExclusiveModelContextReuseContract(contract));
+ EXPECT_THROW((void)retireExclusiveModelContextReuseContract(contract),std::invalid_argument);
+ EXPECT_FALSE(contract.context);EXPECT_FALSE(contract.physical_memory_authority);
+ EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);EXPECT_TRUE(t.allDestroyed);
+ for(const auto d:devices)EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingPreparedContext(d,source->memory()),std::logic_error);
+ EXPECT_NO_THROW(GPUDeviceContextPool::instance().shutdown());
+}
+
+/** @brief Only export readiness is recorded; observer, actual runner shutdown and final source reset execute production bodies. */
+class RecordedObserverRunner final:public OrchestrationRunner {
+public:
+ RecordedObserverRunner():OrchestrationRunner(OrchestrationConfig{},nullptr){}
+ ModelContextReuseContract exported;
+ unsigned* exports=nullptr;
+ bool failShutdown=false;
+ void shutdown()override {if(failShutdown)throw std::runtime_error("recorded terminal failure");OrchestrationRunner::shutdown();}
+ std::optional<ModelContextReuseContract> modelContextReuseContract()const override {++*exports;return exported;}
+};
+/** @brief Exercise the actual QFN fixture observation and teardown edges without running SetUp/model work. */
+class RecordedQFNFixture final : public parity::qwen4exp::Qwen4ExpConfigDrivenParityTest<RecordedQFNFixture> {
+public:
+ RecordedQFNFixture(){
+  cell_=parity::expandModelParityDefinition(parity::qwen4exp::qwen4ExpProductionDefinition(
+      parity::qwen4exp::Qwen4ExpParityTopology::CPU)).front();view_=cell_.toTestConfig();
+ }
+ const parity::TestConfig& getTestConfig()const{return view_;}
+ const parity::ModelParityCase& modelParityCase()const{return cell_;}
+ /** @brief Transfer the same original recorded runner into its real fixture owner. */
+ void attach(std::unique_ptr<IOrchestrationRunner> runner){orch_runner_=std::move(runner);}
+ /** @return The actual fixture's original, once-exported observation contract. */
+ const ModelContextReuseContract& observe(){return qfnObservationOwner();}
+ /** @brief Invoke the same virtual retirement edge called by parity TearDown. */
+ void finish(){retireOwnedParityRunners();}
+ /** @brief Keep an old-body negative control physically clean after its assertions fail. */
+ void finishRemainingTestOwner(){accuracy::retireQFNFinalOwner(orch_runner_,qfn_observation_owner_);}
+private:
+ void TestBody()override{}
+ parity::ModelParityCase cell_;parity::TestConfig view_;
+};
+/** @brief Replay actual QFN fixture export retention through success or observer failure. */
+void replayQFNFixtureFinalOwner(bool failObservation){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+ const std::array devices{DeviceId::cuda(210),DeviceId::rocm(210)};
+ auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ auto actual=std::make_unique<RecordedObserverRunner>();unsigned exports=0;actual->exports=&exports;
+ auto model=ModelContext::createForTesting("recorded-qfn-fixture-source.gguf",std::make_shared<MockMPIContext>(),1,true);
+ model->bindNativeContextPreparation(source);
+ auto workspace=std::make_shared<ReusableExecutionWorkspaceRegistry>();auto authority=std::make_shared<ModelContextReuseAuthority>();
+ OrchestrationRunnerResolvedAdmissionTestAccess::exportedSource(*actual,source,model,workspace,authority);
+ actual->exported.context=model;actual->exported.reusable_execution_workspaces=workspace;
+ actual->exported.reuse_authority=authority;actual->exported.physical_memory_authority=source->memory();
+ model.reset();workspace.reset();authority.reset();
+ RecordedQFNFixture fixture;fixture.attach(std::move(actual));
+ try {
+  const auto& first=fixture.observe();const auto& second=fixture.observe();
+  EXPECT_EQ(&first,&second);EXPECT_EQ(first.context->nativeContextPreparation(),source);
+  EXPECT_EQ(first.physical_memory_authority,source->memory());EXPECT_EQ(exports,1u);EXPECT_EQ(t.resets,0u);
+  if(failObservation)throw std::runtime_error("original fixture observation failure");
+ }catch(const std::runtime_error& error){EXPECT_TRUE(failObservation);EXPECT_STREQ(error.what(),"original fixture observation failure");}
+ EXPECT_NO_THROW(fixture.finish());
+ EXPECT_EQ(exports,1u);EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);EXPECT_TRUE(t.allDestroyed);
+ // If the old fixture only dropped its runner, this same genuine final export
+ // remains available to clean the test's own source after the failed oracle.
+ EXPECT_NO_THROW(fixture.finishRemainingTestOwner());
+ EXPECT_EQ(t.resets,2u);EXPECT_NO_THROW(GPUDeviceContextPool::instance().shutdown());
+}
+/** @test The actual parity fixture retains one observation export until original model/source retirement. */
+TEST(NativeSourceFinalRetirement,QFNParityFixtureSuccessRetiresOriginalObservationOwner){replayQFNFixtureFinalOwner(false);}
+/** @test A failed observation still crosses actual fixture runner and same-source final retirement. */
+TEST(NativeSourceFinalRetirement,QFNParityFixtureFailureRetiresOriginalObservationOwner){replayQFNFixtureFinalOwner(true);}
+
+/** @brief Replay the actual frontend owner scope through success or a failure before the first history. */
+void replayObserverFinalOwner(bool failBeforeHistory,bool cleanupFailure=false){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+ const std::array devices{DeviceId::cuda(210),DeviceId::rocm(210)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ auto actual=std::make_unique<RecordedObserverRunner>();auto* recorded=actual.get();unsigned exports=0;actual->exports=&exports;unsigned expectedExports=1;
+ auto model=ModelContext::createForTesting("recorded-observer-source.gguf",std::make_shared<MockMPIContext>(),1,true);model->bindNativeContextPreparation(source);
+ auto workspace=std::make_shared<ReusableExecutionWorkspaceRegistry>();auto authority=std::make_shared<ModelContextReuseAuthority>();
+ OrchestrationRunnerResolvedAdmissionTestAccess::exportedSource(*actual,source,model,workspace,authority);
+ actual->exported.context=model;actual->exported.reusable_execution_workspaces=workspace;
+ actual->exported.reuse_authority=authority;actual->exported.physical_memory_authority=source->memory();
+ model.reset();workspace.reset();authority.reset();
+ std::unique_ptr<IOrchestrationRunner> runner=std::move(actual);unsigned histories=0;
+ const auto observe=[&](const ModelContextReuseContract& owner){
+  EXPECT_EQ(owner.context->nativeContextPreparation(),source);EXPECT_EQ(owner.physical_memory_authority,source->memory());
+  EXPECT_EQ(t.resets,0u);EXPECT_EQ(exports,expectedExports);
+  if(failBeforeHistory)throw std::runtime_error("original failure before first history");
+  // The callback borrows this same model through each history/reset observation;
+  // it cannot retire or replace the runner's model between observations.
+  const auto* original=owner.context.get();
+  for(unsigned i=0;i<3;++i){EXPECT_EQ(owner.context.get(),original);++histories;}
+ };
+ if(cleanupFailure){
+  recorded->failShutdown=true;
+  ::testing::internal::CaptureStderr();
+  try{accuracy::observeQFNWithFinalOwner(runner,observe);FAIL()<<"Missing terminal failure";}
+  catch(const std::runtime_error& error){EXPECT_STREQ(error.what(),"original failure before first history; QFN final retirement failed: recorded terminal failure");}
+  const auto diagnostic=::testing::internal::GetCapturedStderr();
+  EXPECT_NE(diagnostic.find("QFN observation failed before final retirement: original failure before first history"),std::string::npos);
+  EXPECT_TRUE(runner);EXPECT_EQ(t.resets,0u);recorded->failShutdown=false;expectedExports=2;
+ }
+ if(failBeforeHistory){try{accuracy::observeQFNWithFinalOwner(runner,observe);FAIL()<<"Missing observer failure";}
+  catch(const std::runtime_error& error){EXPECT_STREQ(error.what(),"original failure before first history");}}
+ else EXPECT_NO_THROW(accuracy::observeQFNWithFinalOwner(runner,observe));
+ EXPECT_EQ(histories,failBeforeHistory?0u:3u);EXPECT_EQ(exports,expectedExports);EXPECT_FALSE(runner);
+ EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);EXPECT_TRUE(t.allDestroyed);
+ EXPECT_THROW(accuracy::observeQFNWithFinalOwner(runner,observe),std::invalid_argument);EXPECT_EQ(t.resets,2u);
+ EXPECT_NO_THROW(GPUDeviceContextPool::instance().shutdown());
+}
+/** @test A retained-capacity predictor remains materialized even while execution is disabled. */
+TEST(NativeSourceFinalRetirement,QFNObserverOffCapacitySelectsOriginalPredictorMaterialization){
+ MTPRuntimeConfig off;off.enabled=false;off.draft_tokens=0;off.graph_capacity_draft_tokens=0;
+ EXPECT_EQ(accuracy::qfnPredictorMaterialization(off),SharedPredictorMaterialization::Inactive);
+ off.graph_capacity_draft_tokens=15;
+ EXPECT_EQ(accuracy::qfnPredictorMaterialization(off),SharedPredictorMaterialization::Active);
+}
+/** @test Successful repeated-history observation retains one export and resets both original native participants. */
+TEST(NativeSourceFinalRetirement,QFNObserverSuccessRetiresSoleOriginalOwner){replayObserverFinalOwner(false);}
+/** @test Pre-history failure preserves its primary exception and still retires the same complete original source. */
+TEST(NativeSourceFinalRetirement,QFNObserverBeforeHistoryFailureRetiresSoleOriginalOwner){replayObserverFinalOwner(true);}
+/** @test Cleanup failure cannot overwrite the primary observation diagnostic or claim successful retirement. */
+TEST(NativeSourceFinalRetirement,QFNObserverPrimaryAndTerminalFailuresRemainExplicit){replayObserverFinalOwner(true,true);}
+
+/** @test Explicit completed shutdown followed by destruction cannot re-enter reuse sealing. */
+TEST(NativeSourceFinalRetirement,ActualRunnerExportedSourceShutdownThenDestructorIsIdempotent){exportedRunnerShutdown(false,false);}
+/** @test The real source observer's post-init failure retires once, preserving external model ownership. */
+TEST(NativeSourceFinalRetirement,ActualRunnerPostInitializationFailureThenDestructorRetiresOnce){exportedRunnerShutdown(true,false);}
+/** @test A retired exporter must not seal the SAME authority after a successor acquired it. */
+TEST(NativeSourceFinalRetirement,RetiredRunnerCannotSealSuccessorActiveReuseAuthority){exportedRunnerShutdown(false,true);}
+/** @test A genuinely live owner with a foreign reusable authority still fails the existing invariant. */
+TEST(NativeSourceFinalRetirement,LiveRunnerForeignReusableAuthorityStillRejectsShutdown){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;TransferEngine transfers(resolve);
+ const std::array devices{DeviceId::cuda(208),DeviceId::rocm(208)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ auto model=ModelContext::createForTesting("recorded-foreign-source.gguf",std::make_shared<MockMPIContext>(),1,true);model->bindNativeContextPreparation(source);
+ auto workspace=std::make_shared<ReusableExecutionWorkspaceRegistry>();auto foreign=std::make_shared<ModelContextReuseAuthority>();std::string error;
+ ASSERT_TRUE(foreign->beginSealing(&error));ASSERT_TRUE(foreign->publishReusable({},&error));
+ {
+  OrchestrationRunner runner(OrchestrationConfig{},nullptr);OrchestrationRunnerResolvedAdmissionTestAccess::exportedSource(runner,source,model,workspace,foreign);
+  // The native retirement boundary is noexcept: this genuine ownership
+  // violation must terminate the child, leaving the parent's owners intact.
+  EXPECT_DEATH(runner.shutdown(),"Prepared context sealing does not own its reuse authority");
+  EXPECT_EQ(foreign->state(),ModelContextReuseAuthority::State::Reusable);
+  EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);
+  // The invalid reference was injected only by this closed fixture. Remove it
+  // for cleanup; production keeps rejecting that genuine ownership violation.
+  OrchestrationRunnerResolvedAdmissionTestAccess::discardForeignAuthority(runner);EXPECT_NO_THROW(runner.shutdown());
+ }
+ model.reset();workspace.reset();NativeContextPreparationReplayAccess::retireReleased(source,transfers);EXPECT_EQ(t.resets,2u);
+}
+
+}
+
+// This isolated model-free target supplies only the native backend boundary;
+// original runner/source/pool/TransferEngine implementations remain unchanged.
+namespace llaminar2 {
+IBackend* getBackendFor(DeviceId device){return device.is_cpu()?getCPUBackend():test::resolve(device);}
+}

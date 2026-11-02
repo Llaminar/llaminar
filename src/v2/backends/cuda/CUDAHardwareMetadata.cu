@@ -7,6 +7,7 @@
  * All records validate before publication. Free-capacity and loaded-function
  * observations retain their distinct admission and runtime-generation owners.
  */
+#include "../NativeContextRuntimePolicy.h"
 #include "CUDAHardwareMetadata.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "utils/DebugEnv.h"
@@ -31,6 +32,7 @@ namespace llaminar2
          */
         std::vector<CUDADeviceHardware> readHardware()
         {
+            (void)NativeContextRuntimePolicy::original(DeviceType::CUDA).identity();
             // Bind terminal process exclusion before the first native query.
             // Only this once-source borrows lifecycle; published reads stay pure.
             const auto discovery_lifetime = GPUDeviceProcessLifetime::acquireNativeContext();

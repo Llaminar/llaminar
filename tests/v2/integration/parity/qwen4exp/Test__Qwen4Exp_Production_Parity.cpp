@@ -13,6 +13,7 @@
  * stop before inference; neither is numerical or performance evidence.
  */
 #include "backends/GPUDeviceProcessLifetime.h"
+#include "integration/NativeLifetimeCompletion.h"
 #include "utils/MPISessionOwner.h"
 #include "Qwen4ExpParityTestBase.h"
 #include "Qwen4ExpNgramAdmissionCases.h"
@@ -47,6 +48,61 @@ class Qwen4ExpMainParityTest
 
 /** @test Every published numerical boundary and actual selected native row path. */
 TEST_P(Qwen4ExpMainParityTest, ProductionParity) { runQwen4ExpProductionParityCampaign(); }
+
+/** @brief Functional byte replay uses the existing active cases, without another matrix producer. */
+class Qwen4ExpMTPExactReplayTest
+    : public Qwen4ExpConfigDrivenParityTest<Qwen4ExpMTPExactReplayTest>, public ModelParityCaseParameter {
+protected:
+    /** @return Native byte proof; existing reference headers size snapshots, without download/scoring. */
+    MTPParityProofPurpose mtpParityProofPurpose() const noexcept override
+    {
+        return MTPParityProofPurpose::NativeExactReplay;
+    }
+    /**
+     * @return The predeclared native-functional history, independent of numerical rows.
+     *
+     * Keep the original prompt and greedy policy. Thirty-two prefix rows are
+     * fixed before execution; a fully rejecting history still fails rather
+     * than extending the window or changing its inputs to obtain acceptance.
+     */
+    int nativeMTPFunctionalHistoryRows() const noexcept override
+    {
+        return 32;
+    }
+    /** @brief Reference generation would violate this fixture's existing-header-only contract. */
+    bool regeneratePyTorchSnapshots() override
+    {
+        ADD_FAILURE() << "MTPExactReplay cannot generate reference snapshots";
+        return false;
+    }
+};
+
+/** @test Original native condition/verifier inputs, snapshots and reset/reuse, without HF acceptance. */
+TEST_P(Qwen4ExpMTPExactReplayTest, MTPExactReplay) { runQwen4ExpMTPExactReplay(); }
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorMTPRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpOppositeVendorMTPRetained15Cases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
+
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2StaticRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpConsumerLocalTP2NativeExactCases(ModelParityExpertOverlayPolicy{})),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2DynamicOrdinalRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpConsumerLocalTP2NativeExactCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2DynamicRandomRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpConsumerLocalTP2NativeExactCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic})),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+// Active native exact proof remains the original fixture. Expert movement
+// requirements are retained independently from predictor depth/controller policy.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorDynamicOrdinalRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpOppositeVendorDynamicExpertMTPRetained15Cases(RoutedExpertOwnerOrder::Ordinal)),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorDynamicRandomRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpOppositeVendorDynamicExpertMTPRetained15Cases(RoutedExpertOwnerOrder::Random)),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
 
 /**
  * @test Admit and materialize the exact production cell before numerical work.
@@ -189,6 +245,40 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpGPUAdaptive, Qwen4ExpMainParityTest,
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpGPUAdaptive", qwen4ExpGPUAdaptiveProductionCases())),
     [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
 
+// Explicit opposite-vendor STORAGE owners; compute remains one GPU+CPU ExpertOverlay.
+// Retained15 is inactive ordinary storage, not active MTP qualification.
+// Same canonical runtime/export cells own frozen-history accuracy, real expert
+// movement and matched economic proof; registration never implies a passing run.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2StaticRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpConsumerLocalTP2StaticRetained15",qwen4ExpConsumerLocalTP2ExecutionCases(ModelParityExpertOverlayPolicy{}))),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2DynamicOrdinalRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpConsumerLocalTP2DynamicOrdinalRetained15",qwen4ExpConsumerLocalTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}))),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2DynamicRandomRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpConsumerLocalTP2DynamicRandomRetained15",qwen4ExpConsumerLocalTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic}))),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorOrdinaryRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpOppositeVendorOrdinaryRetained15",qwen4ExpOppositeVendorOrdinaryRetained15Cases())),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
+
+// Active policies share the original source/placement and Off serial controls.
+// Numerical acceptance still requires frozen-history panels; these declarations
+// also provide the original typed runtime export for real generation diagnostics.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorMTPRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpOppositeVendorMTPRetained15",qwen4ExpOppositeVendorMTPRetained15Cases())),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
+
+// Separate DynamicOrdinal/Random families preserve the original static16 and
+// reuse the same numerical/movement checks and lossless runtime exporter.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorDynamicOrdinalRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpOppositeVendorDynamicOrdinalRetained15",qwen4ExpOppositeVendorDynamicExpertRetained15Cases(RoutedExpertOwnerOrder::Ordinal))),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorDynamicRandomRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpOppositeVendorDynamicRandomRetained15",qwen4ExpOppositeVendorDynamicExpertRetained15Cases(RoutedExpertOwnerOrder::Random))),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
+
 // One exact all-routed-experts GPU TP4 request; real admission/numerical gates
 // remain mandatory. RAM PLE is independent host storage, not CPU expert offload.
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpFullROCmTP4, Qwen4ExpMainParityTest,
@@ -229,7 +319,20 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpFixedHeadSourceAdmission, Qwen4ExpSourceAdmissi
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpGPUAdaptiveSourceAdmission, Qwen4ExpSourceAdmissionTest,
-    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpGPUAdaptiveProductionCases()))),
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpGPUAdaptiveSourceAdmissionSeeds()))),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
+
+// Concurrent consumer-local channels retain the original four-policy source setup product.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2AdaptiveSourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpConsumerLocalTP2AdaptiveSourceAdmissionSeeds()))),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorOrdinaryRetained15SourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpOppositeVendorOrdinaryRetained15Cases())),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorMTPRetained15SourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpOppositeVendorMTPRetained15Cases())),
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpFullROCmTP4SourceAdmission, Qwen4ExpSourceAdmissionTest,
@@ -362,7 +465,7 @@ TEST_P(Qwen4ExpNgramAdmissionTest, FullSourceAdmission)
     const auto base = artifact_root ? std::filesystem::path(artifact_root)
         : std::filesystem::current_path() / "parity-results" / "qwen-flash-next";
     ASSERT_TRUE(base.is_absolute()) << "Admission artifact root must be absolute";
-    const auto output = base / "source-admission" / modelParityCase().testName() / ("rank-" + std::to_string(rank));
+    const auto output = base / "source-admission" / artifactIdentityPath(modelParityCase().testName()) / ("rank-" + std::to_string(rank));
     // This cell owns only its generated child. No gold directory is resolved,
     // read, generated or removed, including when no reference pack is installed.
     ASSERT_NO_THROW(prepareQwen4ExpAdmissionEvidenceDirectory(output));
@@ -506,25 +609,32 @@ int main(int argc, char **argv)
 {
     if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
         return *terminal;
-    llaminar2::GPUDeviceProcessLifetime gpu_process_lifetime;
-
-    int provided = 0;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    if (provided < MPI_THREAD_MULTIPLE) MPI_Abort(MPI_COMM_WORLD, 1);
-    int result = 0;
-    constexpr std::string_view inventory_option = "--qfn-source-hardware-inventory=";
-    if (argc == 2 && std::string_view(argv[1]).starts_with(inventory_option))
-    {
-        try { exportQwen4ExpSourceHardware(std::string_view(argv[1]).substr(inventory_option.size())); }
-        catch (const std::exception &error) { std::cerr << error.what() << '\n'; result = 2; }
-    }
-    else
-    {
-        ::testing::InitGoogleTest(&argc, argv);
-        result = RUN_ALL_TESTS();
-    }
-    GlobalBackendRouter::shutdown();
-    llaminar2::GPUDeviceProcessLifetime::retireActive();
+    const auto completion = llaminar2::test::NativeLifetimeCompletion::fromEnvironment();
+    // The custom matrix entry owns MPI and its original native retirement.
+    // Close the lexical GPU owner and publish before MPI finalization/_exit;
+    // the explicit retireActive call keeps the established backend ordering.
+    int result = llaminar2::test::runWithNativeLifetimeCompletion<llaminar2::GPUDeviceProcessLifetime>(
+        [&] {
+            int provided = 0;
+            MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+            if (provided < MPI_THREAD_MULTIPLE) MPI_Abort(MPI_COMM_WORLD, 1);
+            int result = 0;
+            constexpr std::string_view inventory_option = "--qfn-source-hardware-inventory=";
+            if (argc == 2 && std::string_view(argv[1]).starts_with(inventory_option))
+            {
+                try { exportQwen4ExpSourceHardware(std::string_view(argv[1]).substr(inventory_option.size())); }
+                catch (const std::exception &error) { std::cerr << error.what() << '\n'; result = 2; }
+            }
+            else
+            {
+                ::testing::InitGoogleTest(&argc, argv);
+                result = RUN_ALL_TESTS();
+            }
+            GlobalBackendRouter::shutdown();
+            llaminar2::GPUDeviceProcessLifetime::retireActive();
+            return result;
+        },
+        [&](int result) { if (completion) completion->publish(result); });
     if (MPI_Finalize() != MPI_SUCCESS) result = 3;
     std::cout.flush();
     std::cerr.flush();

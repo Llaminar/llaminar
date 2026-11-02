@@ -120,6 +120,15 @@ def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=Non
     try:
         env=dict(PATH=os.environ['PATH'],OMP_NUM_THREADS=str(physical_workers()),OMP_PLACES='cores',OMP_PROC_BIND='false',
                  OPENBLAS_NUM_THREADS='1',LLAMINAR_LOG_LEVEL='INFO',LLAMINAR_PERF_STATS_FILTER=FILTER)
+        if image is None:
+            # Local logical ordinals belong to the caller's explicit visibility
+            # selection. HOME also owns public runtime path defaults. Preserve
+            # empty selections too; never infer host devices
+            # or inherit loader/preload/ISA-spoofing settings from the parent.
+            for key in ('ROCR_VISIBLE_DEVICES','HIP_VISIBLE_DEVICES','CUDA_VISIBLE_DEVICES',
+                        'GPU_DEVICE_ORDINAL','HWLOC_COMPONENTS','HOME'):
+                if key in os.environ:
+                    env[key]=os.environ[key]
         if adapter is not None:
             env.update(adapter.environment)
             env['LD_LIBRARY_PATH']=str(args.binary.parent)

@@ -24,6 +24,8 @@
 #include "utils/NUMATopology.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../../utils/PlanningHostServiceFixture.h"
+#include "../../fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <map>
@@ -977,12 +979,21 @@ TEST(AutomaticOrchestrationCandidates, QueryConsumerSourceUsesCanonicalAssignmen
             const MoEOverlayInferenceGraphFamilyIdentity family{.graph_family_generation=1,.main_layer_count=48,
                 .mtp_source_layers={},.max_graph_rows=32,.max_decode_rows=1,.max_request_count=1,.max_mtp_draft_depth=0};
             const std::vector<int> buckets{1,8,32};
-            const auto input=buildMoEOverlayMemoryPlanInputs({.model=source.metadata().memoryProfile(),.rank_plan=plan,
+            auto input=buildMoEOverlayMemoryPlanInputs({.model=source.metadata().memoryProfile(),.rank_plan=plan,
                 .config=compiled.config(),.inventory=proposal.membership.inventory(),.execution=*compiled.overlayExecution(),
                 .capacity_policy=policy,.retained_mtp=plan.runtime.mtp,.graph_family=family,
                 .prefill={.bucket_rows=buckets,.minimum_sequence_rows=1,.maximum_cached_buckets=16},
                 .gpu_weight_load={.maximum_source_bytes=4096}},32);
+            // RAM lookup on a GPU declares a CPU service. Supply the same typed
+            // fixture evidence as admission tests, without probing the host runtime.
+            input.local_capacity.retained_host_services=test::planningHostServiceProjection();
+            // Each real RAM-lookup consumer also owns its boundary ordering
+            // event. Price those exact authored endpoints through the sealed
+            // recorded source; this metadata replay creates no GPU workers.
+            input.local_capacity.native_ordering_events=
+                test::NativeOrderingEventGroupReplayAccess::projection(members);
             const auto fixed=MoEOverlayLocalCapacityPlanner::plan(input.local_capacity);
+            ASSERT_NE(fixed.physical_memory_admission,nullptr);
             const auto &bom=fixed.device_inputs;
             // An overlay may append expert-only physical owners; locate each exact continuation device.
             for(const auto &expected:actual.assignments())
@@ -990,6 +1001,10 @@ TEST(AutomaticOrchestrationCandidates, QueryConsumerSourceUsesCanonicalAssignmen
                 const auto found=std::find_if(bom.begin(),bom.end(),[&](const auto &entry)
                     {return entry.device==expected.device && entry.tensor_parallel_assignment.has_value();});
                 ASSERT_NE(found,bom.end());const auto &local=*found->tensor_parallel_assignment;
+                const auto *physical=fixed.physical_memory_admission->plan().find({0,expected.device});
+                ASSERT_NE(physical,nullptr);
+                EXPECT_GT(physical->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u)
+                    << "Original RAM consumer lost its recorded mandatory event contribution";
                 EXPECT_EQ(local.head_start,expected.head_start);EXPECT_EQ(local.head_count,expected.head_count);
                 EXPECT_EQ(local.kv_head_start,expected.kv_head_start);EXPECT_EQ(local.kv_head_count,expected.kv_head_count);
             }

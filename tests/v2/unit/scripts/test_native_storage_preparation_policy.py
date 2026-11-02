@@ -19,4 +19,60 @@ class NativePreparationPolicy(unittest.TestCase):
         self.assertEqual(scan_source("src/v2/models/Example.cpp",source),[])
     def test_planner_may_consume_immutable_geometry_without_opening_authority(self):
         self.assertEqual(scan_source("src/v2/planning/MemoryPlanner.cpp","void add(const NativeMandatoryStorageDeclarations& geometry){plan.add(geometry.mandatoryBOM());}"),[])
+    def test_original_worker_owners_retain_bindings_without_raw_authority(self):
+        for name in ("NativeContextPreparation", "PreparedGPUWorkerThread"):
+            for suffix in ("h", "cpp"):
+                path=f"src/v2/backends/{name}.{suffix}"
+                with self.subTest(path=path):
+                    self.assertEqual(scan_source(path,"std::shared_ptr<NativeStoragePreparationPmaBinding> source;"),[])
+                    self.assertTrue(scan_source(path,"auto epoch=beginPreparationEpoch(rank);"))
+        self.assertTrue(scan_source("src/v2/backends/OtherWorker.cpp","NativeStoragePreparationPmaBinding source;"))
+    def test_process_owners_only_retain_original_source(self):
+        from check_native_storage_preparation_policy import PROCESS_RETENTION_OWNERS
+        for path in PROCESS_RETENTION_OWNERS:
+            with self.subTest(path=path):
+                for source in ("class NativeStoragePreparationPmaBinding;",
+                               "std::shared_ptr<NativeStoragePreparationPmaBinding> source;",
+                               "void retain(const std::shared_ptr<NativeStoragePreparationPmaBinding>& source);"):
+                    self.assertEqual(scan_source(path,source),[])
+                for source in ("auto source=std::make_shared<NativeStoragePreparationPmaBinding>(resources,rank);",
+                               "auto source=new NativeStoragePreparationPmaBinding(resources,rank);",
+                               "NativeStoragePreparationPmaBinding* source;",
+                               "using Binding=NativeStoragePreparationPmaBinding;",
+                               "std::shared_ptr<NativeStoragePmaBinding> adopted;",
+                               "PhysicalMemoryNativeSetupEpoch epoch;",
+                               "auto epoch=beginPreparationEpoch(rank);"):
+                    self.assertTrue(scan_source(path,source))
+        self.assertTrue(scan_source("src/v2/backends/OtherProcessLifetime.cpp",
+                                   "std::shared_ptr<NativeStoragePreparationPmaBinding> source;"))
+    def test_new_native_replay_access_cannot_escape_into_production(self):
+        from check_native_storage_preparation_policy import REPLAY_DECLARATIONS
+        for name, owners in REPLAY_DECLARATIONS.items():
+            for path in owners:
+                with self.subTest(name=name,path=path):
+                    self.assertEqual(scan_source(path,f"namespace test {{ struct {name}; }} friend struct test::{name};"),[])
+                    for body in (f"test::{name}::create();",f"struct {name} {{ void bypass(); }};",f"using Access=test::{name};"):
+                        self.assertTrue(scan_source(path,body))
+            self.assertTrue(scan_source("src/v2/execution/Other.cpp",f"friend struct test::{name};"))
+    def test_original_event_observation_is_declaration_only_in_exact_native_owners(self):
+        """The diagnostic bridge cannot become a production constructor/caller escape."""
+        from check_native_storage_preparation_policy import REPLAY_DECLARATIONS
+        name="NativeContextSourceLifecycleDiagnosticAccess"
+        self.assertEqual(REPLAY_DECLARATIONS[name], {"src/v2/backends/cuda/NvidiaDeviceContext.h", "src/v2/backends/rocm/AMDDeviceContext.h"})
+        for path in REPLAY_DECLARATIONS[name]:
+            self.assertEqual(scan_source(path,f"namespace test {{struct {name};}} friend struct test::{name};"),[])
+            for body in (f"struct {name} {{ void construct(); }};", f"test::{name}::orderingEvents(permit);", f"using Access=test::{name};"):
+                self.assertTrue(scan_source(path,body))
+        self.assertTrue(scan_source("src/v2/backends/Other.cpp",f"friend struct test::{name};"))
+    def test_native_replay_literals_and_comments_are_not_calls(self):
+        source='// NativeContextPreparationReplayAccess::create()\nconst char* s=R"x(NativeContextBirthDiagnosticAccess::worker())x";'
+        self.assertEqual(scan_source("src/v2/execution/Other.cpp",source),[])
+    def test_host_service_bridges_are_exact_declarations_only(self):
+        from check_native_storage_preparation_policy import REPLAY_DECLARATIONS
+        for name in ("RetainedHostServiceReplayAccess", "RetainedHostServiceCalibrationAccess"):
+            for path in REPLAY_DECLARATIONS[name]:
+                self.assertEqual(scan_source(path,f"namespace test {{struct {name};}} friend struct test::{name};"),[])
+                for body in (f"struct {name} {{ void construct(); }};", f"test::{name}::program(role);", f"using Access=test::{name};"):
+                    self.assertTrue(scan_source(path,body))
+            self.assertTrue(scan_source("src/v2/execution/Other.cpp",f"friend struct test::{name};"))
 if __name__=="__main__":unittest.main()

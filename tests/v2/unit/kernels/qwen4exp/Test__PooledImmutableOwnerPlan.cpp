@@ -15,6 +15,7 @@
 #include <memory>
 #include <cstring>
 #include <vector>
+#include <set>
 namespace llaminar2::test {
 namespace {
 namespace a = qwen4exp::adaptive_lookup;
@@ -129,6 +130,44 @@ template<class Owners> p::Grant warmOwner(Owners &g,std::size_t index,std::uint6
 p::AllocationDecision freeDecision(std::uint64_t row=7,std::uint32_t unique=4){
     return {row,unique,p::CommandKind::ReserveFree,{},p::CommandOrdinal{1}};
 }
+}
+/** @brief Independent ordered-set oracle covers exact dispatch boundaries and dirty tails. */
+TEST(PooledImmutableOwnerPlan, SmallIdentityReplayIndependentOracleAndSentinel)
+{
+    for(unsigned count:{0u,1u,2u,16u,63u,64u,65u,128u})
+    for(unsigned bytes:{4u,8u})for(unsigned defect=0;defect<5;++defect)
+    for(auto policy:{p::DuplicateIdentityPolicy::AllValues,p::DuplicateIdentityPolicy::IgnoreUnassignedSlot}){
+        std::array<std::uint64_t,132> first{},second{};
+        std::array<std::uint32_t,256> bins;bins.fill(0xa5a5a5a5);
+        first.fill(0xdeadbeefcafefeedULL);second=first;
+        for(unsigned i=0;i<count;++i)first[i]=(bytes==8?std::uint64_t{i}<<32:0)+i+1;
+        if(count>1){
+            if(defect==1)first[count-1]=first[0];
+            if(defect==2)first[count/2]=first[0];
+            if(defect==3)first[0]=first[count-1]=a::None;
+            if(defect==4 && bytes==8)first[count-1]=first[0]+(std::uint64_t{1}<<32);
+        }
+        std::set<std::uint64_t> oracle;bool expected=true;
+        for(unsigned i=0;i<count;++i)
+            if(!(policy==p::DuplicateIdentityPolicy::IgnoreUnassignedSlot && first[i]==a::None))expected=oracle.insert(first[i]).second&&expected;
+        EXPECT_EQ(p::exactDistinctIdentities(first.data(),second.data(),bins.data(),count,bytes,policy),expected)<<count<<"/"<<bytes<<"/"<<defect;
+        for(unsigned i=count;i<first.size();++i){EXPECT_EQ(first[i],0xdeadbeefcafefeedULL);EXPECT_EQ(second[i],0xdeadbeefcafefeedULL);}
+        if(count<=p::SmallIdentityLimit)for(auto bin:bins)EXPECT_EQ(bin,0xa5a5a5a5);
+    }
+}
+/** @brief Actual free-plan slot sentinels may repeat while row/unique aliases reject before mutation. */
+TEST(PooledImmutableOwnerPlan, SmallIdentityReplayActualFreePlanAndDirtyScratch)
+{
+    for(unsigned defect=0;defect<3;++defect){
+        Group g;auto& owner=*g.owners[1];ASSERT_TRUE(owner.allocation().acquire(g.interval));
+        std::array<p::AllocationDecision,2> decisions{freeDecision(17,0),freeDecision(19,1)};decisions[1].ordinal.value=2;
+        if(defect==1)decisions[1].row=decisions[0].row;
+        if(defect==2)decisions[1].unique=decisions[0].unique;
+        owner.keys_b.fill(0xfeed);owner.radix_counts.fill(0xa5);
+        EXPECT_EQ(owner.allocation().accept(p::FreeAllocationPlan{owner.plan.lease,decisions.data(),2}),defect==0);
+        for(auto key:owner.keys_b)EXPECT_EQ(key,0xfeed);for(auto bin:owner.radix_counts)EXPECT_EQ(bin,0xa5);
+        EXPECT_EQ(owner.control.filled,0u);EXPECT_EQ(owner.frame.reservations,0u);
+    }
 }
 TEST(PooledImmutableOwnerPlan, IndependentMixedVendorStorageAndC0CoordinatorHaveExactGeometry){
     Group g;
@@ -447,6 +486,14 @@ TEST(PooledImmutableOwnerPlan, PriorWaveRowCannotBeAllocatedAgainUnderAnotherUni
     Group g;const auto warm=warmOwner(g,1,7);auto &owner=*g.owners[1];ASSERT_NO_THROW(freeFrontier(g,true));
     const auto prior=owner.grants[0];
     const p::AllocationDecision duplicate{prior.row,4,p::CommandKind::ReserveVictim,{warm.row,warm.generation,warm.owner,warm.slot},{2}};
+    EXPECT_FALSE(owner.allocation().accept(p::VictimAllocationPlan{owner.plan.lease,&duplicate,1}));
+    EXPECT_EQ(owner.plan.count,1u);EXPECT_EQ(owner.slots[warm.slot].row,7u);
+    EXPECT_EQ(owner.grants[0].generation,prior.generation);
+}
+TEST(PooledImmutableOwnerPlan, SmallIdentityReplayPriorWaveUniqueCollision){
+    Group g;const auto warm=warmOwner(g,1,7);auto &owner=*g.owners[1];ASSERT_NO_THROW(freeFrontier(g,true));
+    const auto prior=owner.grants[0];
+    const p::AllocationDecision duplicate{prior.row+100,prior.unique,p::CommandKind::ReserveVictim,{warm.row,warm.generation,warm.owner,warm.slot},{2}};
     EXPECT_FALSE(owner.allocation().accept(p::VictimAllocationPlan{owner.plan.lease,&duplicate,1}));
     EXPECT_EQ(owner.plan.count,1u);EXPECT_EQ(owner.slots[warm.slot].row,7u);
     EXPECT_EQ(owner.grants[0].generation,prior.generation);

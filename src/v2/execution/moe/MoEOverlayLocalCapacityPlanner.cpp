@@ -18,6 +18,7 @@
  */
 
 #include "MoEOverlayLocalCapacityPlanner.h"
+#include "backends/NativeContextPreparation.h"
 #include "utils/DebugEnv.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "planning/TensorParallelSourceDeclaration.h"
@@ -562,6 +563,7 @@ namespace llaminar2
                 const auto [total_bytes, available_bytes] =
                     inventoryMemory(inventory, device);
                 DevicePlanConfig config;
+                config.native_ordering_events=input.native_ordering_events;
                 config.world_rank = rank_plan.rank;
                 config.device = device;
                 // Concrete attention policy is resolved once after this input is fully authored.
@@ -974,9 +976,37 @@ namespace llaminar2
                     {
                         config.ngram_tp_topology=immutableRowTableTPTopology(profile,rank_plan);
                         config.ngram_execution_policy=rank_plan.runtime.ngram_table_policy;
+                        config.ngram_lookup_schedule=rank_plan.runtime.ngram_lookup_schedule;
                         config.ngram_host_placement=ImmutableRowTableHostPlacement::fromObservedNUMANode(rank_plan.numa_node);
                         config.ngram_table_placement=rank_plan.runtime.ngram_table_placement;
                     }
+            }
+            // CPU service demand belongs to this same fixed-owner transaction,
+            // before expert quotas or lowest-priority table placement. Reused
+            // runtime plans retain their original declaration session unchanged.
+            if (rank_plan.runtime.retained_host_services) {
+                if (rank_plan.runtime.retained_host_services->worldRank() != rank_plan.rank)
+                    throw std::logic_error("ExpertOverlay CPU services crossed original rank authority");
+                for (auto& config : configs)
+                    config.retained_host_services = rank_plan.runtime.retained_host_services;
+            } else {
+                if (!input.cluster_inventory)
+                    throw std::invalid_argument("ExpertOverlay CPU services require the original cluster topology");
+                (void)MemoryPlanner::declareRetainedHostServices(profile, configs, rank_plan.rank,
+                    &overlay_plan, *input.cluster_inventory, input.retained_host_services);
+            }
+            // This SAME fixed-owner assembly precedes the ORIGINAL global expert
+            // quota resolver. Native birth must never spend a post-quota slack estimate.
+            for(auto& config:configs){
+                config.native_context_preparation=rank_plan.runtime.native_context_preparation;
+                if(!config.native_context_preparation)continue;
+                const auto& source=config.native_context_preparation;
+                if(source->memory()->worldRank()!=rank_plan.rank)throw std::logic_error("ExpertOverlay source crossed original rank authority");
+                if(config.device.is_gpu()){
+                    const auto& original=source->originalResource(config.device);
+                    config.device_total_bytes=original.total_bytes;config.device_free_bytes=original.admission_available_bytes;
+                }
+                if(config.associated_host_memory)config.associated_host_memory=source->originalResource(DeviceId::cpu());
             }
             return {.device_inputs = std::move(configs), .resource_devices = std::move(resource_devices),
                 .endpoint_devices = std::move(endpoint_devices), .activation_channel_plan = std::move(activation_channel_plan)};
@@ -1156,6 +1186,26 @@ namespace llaminar2
                 prepared.push_back(prepareFixedOwners(inputs[index], transfers.empty()
                     ? std::nullopt : std::optional(transfers[index])));
                 configs.push_back(std::move(prepared.back().device_inputs));
+            }
+            // Every pipeline stage binds services through one parent ModelContext.
+            // Preserve an already shared session. Otherwise merge distinct authored
+            // sessions before pricing; duplicate instance keys are an invalid
+            // topology, never permission to coalesce independent worker storage.
+            std::vector<std::shared_ptr<const RetainedHostServiceDeclarations>> sessions;
+            for (const auto& group : configs) for (const auto& config : group) {
+                if (!config.retained_host_services)
+                    throw std::logic_error("Fixed-owner group omitted original CPU service declarations");
+                if (std::find(sessions.begin(), sessions.end(), config.retained_host_services) == sessions.end())
+                    sessions.push_back(config.retained_host_services);
+            }
+            if (sessions.size() > 1) {
+                RetainedHostServiceDeclarations::Builder combined(inputs.front().rank_plan->rank);
+                for (const auto& session : sessions)
+                    for (const auto key : session->instances())
+                        combined.add(key, session->program(key));
+                const auto shared = std::move(combined).freeze();
+                for (auto& group : configs) for (auto& config : group)
+                    config.retained_host_services = shared;
             }
             auto fixed = MemoryPlanner::planGroups(*inputs.front().model_profile, configs);
             std::vector<MoEOverlayLocalCapacityPlannerResult> result;

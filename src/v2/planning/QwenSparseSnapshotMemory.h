@@ -2,7 +2,9 @@
  * @file QwenSparseSnapshotMemory.h
  * @brief Selected main-QSA native state and authored metadata in the existing snapshot BOM.
  *
- * Live reference pool rows cannot price a captured full-capacity state slot.
+ * Live reference pool rows cannot price a captured full-capacity state slot;
+ * raw indexer GEMM outputs also retain source-owned payloads when packs do not
+ * publish that distinct checkpoint.
  * This pure projection uses the same source shapes and layout as real stage
  * descriptors. Only PMA owns reservation, materialization and release.
  */
@@ -20,6 +22,7 @@ namespace llaminar2
 /** @brief Disjoint additional components, without repricing ordinary token payloads. */
 struct QwenSparseSnapshotMemory
 {
+    /** Native pooled-state and raw-query payloads absent from the reference envelope. */
     std::size_t native_state_payload_bytes = 0;
     std::size_t authored_metadata_bytes = 0;
     /** @return Checked total contribution to the single GraphSnapshotArena owner. */
@@ -42,7 +45,8 @@ inline std::size_t qwenSparseSnapshotMultiply(std::size_t a, std::size_t b)
  * @param requests Actual request capacity; tokenRows is per request, not flattened twice.
  * @param tokenRows Maximum physical token rows in an admitted ordinary graph.
  * @param owners Existing retained forward arena inventory, never a token-derived multiplier.
- * @param selected Frozen source-output selection authenticated against reference headers.
+ * @param selected Frozen source-output selection; raw queries use native geometry,
+ *        while other roles authenticate their existing reference headers.
  * @return Native pooled payload plus source-authored metadata/slot padding exactly once.
  *
  * Token query/selection payload remains in the caller's reference envelope.
@@ -102,9 +106,12 @@ inline QwenSparseSnapshotMemory qwenSparseSnapshotMemory(
             shape.geometry.requests=1;
         }
         const auto layout = snapshotStorageLayout(shape.storageShape());
-        if (source.replacesReferencePayload())
+        // Raw GEMM is an independent native producer absent from older packs.
+        // Its flattened source shape owns its payload exactly once per arena;
+        // prepared-query files are never used as a substitute raw shape.
+        if (source.replacesReferencePayload() || source.role() == GraphSnapshotSourceRole::QwenSparseRawQuery)
             result.native_state_payload_bytes = snapshot_storage_detail::add(result.native_state_payload_bytes,
-                qwenSparseSnapshotMultiply(layout.payload_storage_bytes, instances));
+                qwenSparseSnapshotMultiply(layout.payload_storage_bytes, metadataInstances));
         // Relative payload-to-header padding and absolute slot alignment are
         // both physical bytes. The bound is per actual selected descriptor;
         // it does not spend unrelated payload slack on missing headers.

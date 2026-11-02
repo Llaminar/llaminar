@@ -12,6 +12,7 @@
 #pragma once
 #include "../../IComputeStage.h"
 #include "../RMSNormStage.h"
+#include "../../../qwen4exp/Qwen4ExpPreparedStorage.h"
 #include "../../StageParamsBase.h"
 #include "../../../../kernels/qwen4exp/Qwen4ExpKernels.h"
 #include "../../../../tensors/TensorType.h"
@@ -226,6 +227,17 @@ public:
      * @throws std::logic_error If GPU preparation/stream ownership is missing.
      */
     bool execute(IDeviceContext *context) override;
+    /**
+     * @brief Seal hash arena roots before capture without allocating or publishing values.
+     * @param context Exact owning execution participant.
+     * @param stream Explicit GPU preparation stream, or null for CPU storage.
+     * @return True after the original prepared root/runtime seal is valid.
+     * @throws std::exception On a foreign context, null GPU stream or stale/unprepared storage.
+     */
+    bool prepareGraphLaunch(IDeviceContext *context,void* stream) override;
+    /** @brief Hash storage preparation belongs to capture admission, never a token replay. */
+    GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+    { return hash_prepared_?GraphLaunchPreparationPolicy::CaptureOnly:GraphLaunchPreparationPolicy::None; }
     /** @brief Return the semantic operation tag without inspecting live device state. */
     ComputeStageType type() const override;
     /** @brief Distinguish an additional captured diagnostic input view from ordinary normalization. */
@@ -305,6 +317,7 @@ private:
     /** @brief Resolve execution-owner accepted prefix without host device-state access. */
     qwen4exp::AcceptedPrefix acceptedPrefix(const Qwen4ExpStageAcceptance &acceptance) const;
 
+    std::optional<Qwen4ExpPreparedStorage> hash_prepared_; ///< Hash-only immutable arena/runtime seal, not request state.
     Params params_; ///< Immutable operation identity, including pointers and policy scalars.
     std::vector<Operand> operands_; ///< Complete constructor-created contract/dump views.
     std::vector<WeightOperand> weights_; ///< Frozen model weights published through the raw-weight contract.

@@ -1619,6 +1619,8 @@ namespace llaminar2
          */
         std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
             physical_memory_admission_;
+        /** Original source created by this runner before model publication; borrowed/exported sources are never adopted here. */
+        std::shared_ptr<NativeContextPreparation> created_native_context_source_;
         /** Rank-bound admission and live-allocation authority. */
         std::shared_ptr<PhysicalMemoryAuthority>
             physical_memory_authority_;

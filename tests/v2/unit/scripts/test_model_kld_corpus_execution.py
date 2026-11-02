@@ -38,6 +38,49 @@ def fixture(root):
 class CorpusExecutionTests(unittest.TestCase):
     """Actual adapter boundaries and the one original process lifecycle."""
 
+    def test_physical_observation_includes_storage_only_without_changing_compute(self):
+        for local, remote in (('CUDA', 'ROCm'), ('ROCm', 'CUDA')):
+            configuration = {'device_for_this_rank': dict(device_type=local, device_ordinal=0),
+                             'domain_definitions': [{'devices': [dict(device_type='CPU', device_ordinal=0)]}]}
+            endpoint = lambda backend: dict(world_rank=0, backend=backend, ordinal=0)
+            placement = dict(mode='DeclaredRankLocal', owners=[dict(participant=endpoint(local)),
+                             dict(participant=endpoint(remote))], coordinator=endpoint(local))
+            configuration['ngram_table_policy'] = dict(gpu_adaptive=dict(placement=placement))
+            config = dict(configuration=configuration)
+            before = copy.deepcopy(config)
+            self.assertEqual(adapter.physical_devices(config), ['cpu:0', 'cuda:0', 'rocm:0'])
+            self.assertEqual(config, before)
+            # Repeated references across source/owner/coordinator roles observe
+            # one physical device; they never turn storage into compute.
+            placement['owners'].append(dict(participant=endpoint(remote)))
+            self.assertEqual(adapter.physical_devices(config), ['cpu:0', 'cuda:0', 'rocm:0'])
+            placement.update(mode='ConsumerLocal', owners=[], coordinator=None)
+            self.assertEqual(adapter.physical_devices(config), ['cpu:0', local.lower()+':0'])
+
+    def test_physical_storage_observation_rejects_malformed_or_nonlocal_endpoints(self):
+        original = dict(configuration=dict(device_for_this_rank=dict(device_type='CUDA', device_ordinal=0),
+            ngram_table_policy=dict(gpu_adaptive=dict(placement=dict(mode='DeclaredRankLocal',
+                owners=[dict(participant=dict(world_rank=0, backend='ROCm', ordinal=0))],
+                coordinator=dict(world_rank=0, backend='CUDA', ordinal=0))))))
+        bad_endpoints = [None, {}, dict(world_rank=1, backend='ROCm', ordinal=0),
+            dict(world_rank=-1, backend='ROCm', ordinal=0), dict(world_rank=False, backend='ROCm', ordinal=0),
+            dict(world_rank=0, backend='CPU', ordinal=0), dict(world_rank=0, backend='Metal', ordinal=0),
+            dict(world_rank=0, backend={}, ordinal=0),
+            dict(world_rank=0, backend='ROCm', ordinal=-1), dict(world_rank=0, backend='ROCm', ordinal=True),
+            dict(world_rank=0, backend='ROCm', ordinal=0, extra=1)]
+        for endpoint in bad_endpoints:
+            for role in ('owner', 'coordinator'):
+                config = copy.deepcopy(original)
+                placement = config['configuration']['ngram_table_policy']['gpu_adaptive']['placement']
+                if role == 'owner': placement['owners'][0]['participant'] = endpoint
+                else: placement['coordinator'] = endpoint
+                with self.subTest(endpoint=endpoint, role=role), self.assertRaises(ValueError):
+                    adapter.physical_devices(config)
+        for owners in (None, {}, [None], [{}]):
+            config = copy.deepcopy(original)
+            config['configuration']['ngram_table_policy']['gpu_adaptive']['placement']['owners'] = owners
+            with self.assertRaises(ValueError): adapter.physical_devices(config)
+
     def test_selection_is_corpus_owned_and_rejects_unknown_duplicate(self):
         with tempfile.TemporaryDirectory() as temp:
             c,t=fixture(Path(temp))

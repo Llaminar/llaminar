@@ -13,12 +13,21 @@
 
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
+#include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
+#include "fixtures/backends/NativeContextPreparationReplayAccess.h"
+#include "backends/NativeContextRuntimePolicy.h"
+#include <atomic>
+#include <latch>
+#include <thread>
+#include <dlfcn.h>
+#include "mocks/MockWorkerGPUContext.h"
 #include "memory/CPUCompactPacketStorageLayout.h"
 #include "planning/ServingSnapshotArenaInventory.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "loaders/ImmutableRowTable.h"
 #include "planning/PlanningModelMetadata.h"
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "memory/CPUGroupedMoEStorageLayout.h"
@@ -57,6 +66,23 @@ using namespace llaminar2;
 
 namespace
 {
+/** @brief Recorded constructor on its original mapped object extent; no SDK API executes. */
+class SourcePlanningWorker final:public llaminar2::testing::MockWorkerGPUContext {
+public:SourcePlanningWorker(int ordinal,std::shared_ptr<PreparedGPUWorkerStack>):MockWorkerGPUContext(ordinal){}
+};
+/** @brief Retire only the actual original recorded population through its existing reset observer. */
+class PlanningSourceRetirement final {
+public:
+    PlanningSourceRetirement(std::shared_ptr<NativeContextPreparation> source,std::span<const DeviceId> devices)
+        :source_(std::move(source)),devices_(devices.begin(),devices.end()){}
+    ~PlanningSourceRetirement(){
+        for(const auto device:devices_){auto scope=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
+            test::NativeContextPreparationReplayAccess::physicalReset(scope);}
+        if(source_->memory()->phase()==PhysicalMemoryAuthorityPhase::Preparing)source_->retireUnadmitted();
+    }
+private:std::shared_ptr<NativeContextPreparation> source_;std::vector<DeviceId> devices_;
+};
+
 
     ModelMemoryProfile createTestProfile()
     {
@@ -3737,20 +3763,58 @@ TEST(Test__MemoryPlanner, NgramStorageHasOneExactHostOwnerAcrossGpuParticipants)
     first.device_total_bytes = 64ull << 30; first.device_free_bytes = 60ull << 30;
     first.max_seq_len = 64;
     first.associated_host_memory = PhysicalMemoryResource{
-        .world_rank = 0, .device = DeviceId{DeviceType::CPU,1}, .total_bytes = 128ull << 30,
+        .world_rank = 0, .device = DeviceId::cpu(), .total_bytes = 128ull << 30,
         .admission_available_bytes = 120ull << 30};
+    // One original CPU0 observation owns native and table storage. NUMA1 is
+    // preserved separately as execution locality, not invented extra capacity.
+    first.ngram_host_placement=ImmutableRowTableHostPlacement::onNode(1);
+    const std::array nativeDevices{DeviceId::cuda(0),DeviceId::rocm(0)};
+    const std::array nativeObserved{*first.associated_host_memory,
+        PhysicalMemoryResource{0,nativeDevices[0],first.device_total_bytes,first.device_free_bytes},
+        PhysicalMemoryResource{0,nativeDevices[1],first.device_total_bytes,first.device_free_bytes}};
+    using SourceAccess=test::NativeContextPreparationReplayAccess;
+    for(const auto device:nativeDevices)SourceAccess::seed(device,[device](std::shared_ptr<PreparedGPUWorkerStack> root){
+        return SourceAccess::construct<SourcePlanningWorker>(std::move(root),device.gpu_ordinal());});
+    auto nativeSource=SourceAccess::source<SourcePlanningWorker>(nativeDevices,nativeObserved);
+    PlanningSourceRetirement retirement(nativeSource,nativeDevices);
+    for(const auto device:nativeDevices){auto original=nativeSource->acquire(device);}
+    nativeSource->freezeForPlanning();
+    first.native_context_preparation=nativeSource;
+    first.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(nativeDevices);
+    first.retained_host_services=test::planningHostServiceDeclarations(0,std::array{
+        RetainedHostServiceInstance{0,nativeDevices[0],RetainedHostServiceRole::ImmutableLookupIO},
+        RetainedHostServiceInstance{0,nativeDevices[1],RetainedHostServiceRole::ImmutableLookupIO}});
     auto second = first; second.device = DeviceId::rocm(0);
     const std::vector<std::vector<DevicePlanConfig>> groups{{first,second}};
-    const auto baseline = MemoryPlanner::plan(profile, groups.front());
-    const auto input = MemoryPlanner::immutableRowTablePlacementInput(profile,groups,*first.associated_host_memory);
-    const auto modes = MemoryPlanner::immutableRowTableModeContributions(profile,groups,{});
+    const auto input = MemoryPlanner::immutableRowTablePlacementInput(profile,groups,*first.associated_host_memory,first.ngram_host_placement);
+    EXPECT_EQ(input.hostPlacement(),ImmutableRowTableHostPlacement::onNode(1));
+    auto invented=first;invented.associated_host_memory->device=DeviceId{DeviceType::CPU,1};
+    invented.ngram_execution_policy=ImmutableRowTablePolicy{ImmutableRowStoragePreference::RAM,65536,3};
+    try{(void)MemoryPlanner::plan(profile,{invented});FAIL()<<"Invented physical CPU1 bank accepted with an actual source";}
+    catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("canonical CPU0"),std::string::npos);}
+    std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> final;
     for (const auto requested : {ImmutableRowStoragePreference::RAM,ImmutableRowStoragePreference::MemoryMapped})
     {
-        const auto selected=ImmutableRowTablePlacementPlanner::select({requested,65536,3},input,baseline.physicalPlan(),modes);
+        // The actual request freezes hosted execution before the lowest-priority
+        // table placement. It must not add the worker as a late mode surcharge.
+        const ImmutableRowTablePolicy policy{requested,65536,3};
+        first.ngram_execution_policy=second.ngram_execution_policy=policy;
+        first.ngram_table_placement.reset();second.ngram_table_placement.reset();
+        const std::vector<std::vector<DevicePlanConfig>> originalGroups{{first,second}};
+        const auto baseline=MemoryPlanner::plan(profile,originalGroups.front());
+        const auto admission=MemoryPlanner::immutableRowTableAdmissionRequest(
+            profile,policy,originalGroups,{},first.ngram_host_placement);
+        ASSERT_TRUE(admission.has_value());
+        const auto selected=ImmutableRowTablePlacementPlanner::select(*admission,baseline.physicalPlan());
         first.ngram_table_placement=selected.placement;second.ngram_table_placement=selected.placement;
         const auto plan=MemoryPlanner::plan(profile,{first,second});
-        const auto *host=plan.physicalPlan().find({0,DeviceId{DeviceType::CPU,1}});
+        const auto *host=plan.physicalPlan().find({0,DeviceId::cpu()});
         ASSERT_NE(host,nullptr);
+        EXPECT_GT(host->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);
+        EXPECT_EQ(host->resource().total_bytes,nativeObserved[0].total_bytes);
+        EXPECT_EQ(selected.placement->hostPlacement(),ImmutableRowTableHostPlacement::onNode(1));
+        EXPECT_EQ(plan.physicalPlan().find({0,DeviceId{DeviceType::CPU,1}}),nullptr);
+        final=std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.physicalPlan());
         EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ImmutableTableStorage),
             ImmutableRowTable::physicalBytesForNativeExtent(profile.flash_next->ple_table_native_bytes,
                 selected.placement->storagePolicy()));
@@ -3767,8 +3831,47 @@ TEST(Test__MemoryPlanner, NgramStorageHasOneExactHostOwnerAcrossGpuParticipants)
             EXPECT_EQ(actual->bytes(PhysicalMemoryOwner::PrimaryModelWeights),prior->bytes(PhysicalMemoryOwner::PrimaryModelWeights));
         }
     }
+    const auto originalMemory=nativeSource->memory();nativeSource->admitFinal(final);
+    EXPECT_EQ(nativeSource->memory(),originalMemory);EXPECT_EQ(originalMemory->admission(),final);
 }
 
+
+/** @test NUMA1 is retained as locality while an independent CPU1 physical budget is rejected. */
+TEST(Test__MemoryPlanner, NgramRejectsInventedCPU1PhysicalHostAllocator){
+    const PhysicalMemoryResource host{0,DeviceId::cpu(),128u<<20,120u<<20};
+    const std::array consumers{PhysicalMemoryResource{0,DeviceId::cuda(0),64u<<20,60u<<20}};
+    const auto extent=ImmutableRowTableExtent::fromNative(GGUFTensorType::F32,1024,16);
+    const auto placement=ImmutableRowTableHostPlacement::onNode(1);
+    const auto valid=ImmutableRowTablePlacementInput::forConsumers(extent,host,consumers,placement);
+    EXPECT_EQ(valid.host().device,DeviceId::cpu());EXPECT_EQ(valid.hostPlacement(),placement);
+    auto invented=host;invented.device=DeviceId{DeviceType::CPU,1};
+    try{(void)ImmutableRowTablePlacementInput::forConsumers(extent,invented,consumers,placement);FAIL()<<"Invented CPU1 physical host accepted";}
+    catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("canonical CPU0"),std::string::npos);}
+}
+
+/** @test Only the named lookup ordering contribution can join hosted mode costs; higher-priority ownership remains frozen. */
+TEST(Test__MemoryPlanner, NgramOrderingModeCostsRejectContextWeightAndKVOwners){
+    const PhysicalMemoryResource host{0,DeviceId::cpu(),8u<<20,8u<<20},gpu{0,DeviceId::cuda(0),4u<<20,4u<<20};
+    const std::array consumers{gpu};
+    const auto input=ImmutableRowTablePlacementInput::forConsumers(ImmutableRowTableExtent::fromNative(GGUFTensorType::F32,1024,16),host,consumers);
+    const std::array devices{gpu.device};const auto projection=test::NativeOrderingEventGroupReplayAccess::projection(devices);
+    const auto ordering=projection.bom(NativeOrderingEventProgram::lookupSubmissionRetirement(),host,gpu);
+    const ImmutableRowTablePolicy policy{ImmutableRowStoragePreference::RAM,65536,2};
+    ImmutableRowTableModeContributions modes{std::nullopt,ordering,ordering};
+    PhysicalMemoryPlanBuilder fixed;fixed.add(host,PhysicalMemoryOwner::PrimaryModelWeights,1u);fixed.add(gpu,PhysicalMemoryOwner::PrimaryModelWeights,1u);const auto base=fixed.build();
+    const auto admitted=ImmutableRowTablePlacementPlanner::select(policy,input,base,modes);
+    EXPECT_GT(admitted.physical_plan.find({0,host.device})->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);
+    EXPECT_GT(admitted.physical_plan.find({0,gpu.device})->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);
+    for(const auto owner:{PhysicalMemoryOwner::NativeExecutionContext,PhysicalMemoryOwner::PrimaryModelWeights,PhysicalMemoryOwner::KVCache}){
+        PhysicalMemoryPlanBuilder mixed(ordering);mixed.add(gpu,owner,1u);auto bad=modes;bad.ram=mixed.build();
+        try{(void)ImmutableRowTablePlacementPlanner::select(policy,input,base,bad);FAIL()<<"Higher-priority owner entered lookup mode";}
+        catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("higher-priority"),std::string::npos);}
+    }
+    const std::array cpuConsumers{host};
+    const auto cpuOnly=ImmutableRowTablePlacementInput::forConsumers(input.extent(),host,cpuConsumers);
+    PhysicalMemoryPlanBuilder phantom;phantom.add(host,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,1u);
+    EXPECT_THROW(ImmutableRowTablePlacementPlanner::select(policy,cpuOnly,base, {std::nullopt,phantom.build(),phantom.build()}),std::invalid_argument);
+}
 
 /** @test Final table admission derives one frozen host and rejects missing or conflicting owners. */
 TEST(Test__MemoryPlanner, NgramFinalHostComesFromActualConsumerInputs)
@@ -3786,6 +3889,11 @@ TEST(Test__MemoryPlanner, NgramFinalHostComesFromActualConsumerInputs)
     first.device_total_bytes = first.device_free_bytes = 64ull << 30;
     first.associated_host_memory = PhysicalMemoryResource{
         2, DeviceId::cpu(), 128ull << 30, 120ull << 30};
+    const std::array originalDevices{DeviceId::cuda(0),DeviceId::rocm(1)};
+    first.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
+    first.retained_host_services=test::planningHostServiceDeclarations(2,std::array{
+        RetainedHostServiceInstance{2,originalDevices[0],RetainedHostServiceRole::ImmutableLookupIO},
+        RetainedHostServiceInstance{2,originalDevices[1],RetainedHostServiceRole::ImmutableLookupIO}});
     auto second = first;
     second.device = DeviceId::rocm(1);
     auto expert = first;
@@ -3847,6 +3955,8 @@ TEST(Test__MemoryPlanner, NgramVRAMEligibilityUsesEachOriginalUploadGeometry)
     const auto wide=resolveGPUWeightLoadMemoryGeometry(row+4096,{.staging_stream_count=1,.staging_budget_bytes=4096});
     first.ordinary_weight_load_geometry=wide;
     first.weight_load_staging={wide.staging_bytes,wide.host_staging_bytes};
+    const std::array originalDevices{DeviceId::cuda(0),DeviceId::rocm(1)};
+    first.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
     auto second=first;second.device=DeviceId::rocm(1);
     const auto other=resolveGPUWeightLoadMemoryGeometry(row+8192,{.staging_stream_count=2,.staging_budget_bytes=8192});
     second.ordinary_weight_load_geometry=other;
@@ -3861,16 +3971,17 @@ TEST(Test__MemoryPlanner, NgramVRAMEligibilityUsesEachOriginalUploadGeometry)
     EXPECT_EQ(placement_input.consumers().size(),2u);
     const auto bindings=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
     ASSERT_EQ(bindings.size(),2u);
-    EXPECT_TRUE(MemoryPlanner::immutableRowTableModeContributions(profile,groups,bindings).vram);
-    EXPECT_FALSE(MemoryPlanner::immutableRowTableModeContributions(profile,groups,{}).vram);
+    const ImmutableRowTablePolicy resident{ImmutableRowStoragePreference::VRAM,65536,3};
+    EXPECT_TRUE(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,bindings).vram);
+    EXPECT_FALSE(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,{}).vram);
     ASSERT_GT(row,1u);
     const auto narrow=resolveGPUWeightLoadMemoryGeometry(row-1,{.staging_stream_count=1,.staging_budget_bytes=0});
     groups.front()[1].ordinary_weight_load_geometry=narrow;
     groups.front()[1].weight_load_staging={narrow.staging_bytes,narrow.host_staging_bytes};
-    EXPECT_FALSE(MemoryPlanner::immutableRowTableModeContributions(profile,groups,
+    EXPECT_FALSE(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,
         MemoryPlanner::immutableRowTableUploadBindings(profile,groups)).vram);
     auto foreign=bindings;foreign.front().consumer.device=DeviceId::cuda(7);
-    EXPECT_THROW(MemoryPlanner::immutableRowTableModeContributions(profile,groups,foreign),std::invalid_argument);
+    EXPECT_THROW(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,foreign),std::invalid_argument);
 }
 
 /** @test Native and hosted PP participants price one sampler-free parent per admitted query program. */
@@ -4076,7 +4187,9 @@ TEST(Test__MemoryPlanner, ReplicatedDecodeIncludesActualGDNHandoffWorkspace)
                                            std::pair{1, 512}, std::pair{2, 1}})
             {
                 auto cfg = overlayDeviceConfig(first);
-                cfg.world_rank = -1;
+                const std::array originalDevices{first};
+                cfg.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
+                cfg.world_rank = 0;
                 cfg.device_total_bytes = cfg.device_free_bytes = 1ull << 40;
                 cfg.total_shards = degree;
                 cfg.local_tp_backend = backend;
@@ -4089,9 +4202,11 @@ TEST(Test__MemoryPlanner, ReplicatedDecodeIncludesActualGDNHandoffWorkspace)
                 cfg.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(
                     profile.expert_count, std::vector<int>(static_cast<size_t>(profile.n_layers), 0));
                 cfg.ngram_execution_policy = ImmutableRowTablePolicy{ImmutableRowStoragePreference::RAM, 65536, 1024};
+                cfg.retained_host_services=test::planningHostServiceDeclarations(0,std::array{
+                    RetainedHostServiceInstance{0,first,RetainedHostServiceRole::ImmutableLookupIO}});
                 cfg.ngram_host_placement = ImmutableRowTableHostPlacement::fromObservedNUMANode(0);
                 cfg.associated_host_memory = PhysicalMemoryResource{
-                    .world_rank = -1, .device = DeviceId::cpu(),
+                    .world_rank = 0, .device = DeviceId::cpu(),
                     .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
                 const auto find = [&](const MemoryPlan &plan) -> const DeviceMemoryPlan * {
                     for (const auto &device : plan.devices)
@@ -4877,4 +4992,92 @@ TEST(Test__MemoryPlanner, MTPReplicaRoutedAuthorityReplaysTerminalAndRetainedSet
     auto bad = overlayDeviceConfig(DeviceId::cuda(0));
     bad.mtp_routed_expert_weight_authority = static_cast<MTPRoutedExpertWeightAuthority>(99);
     EXPECT_THROW((void)MemoryPlanner::plan(profile, {bad}), std::invalid_argument);
+}
+
+/** @test Original native obligations enter actual fixed planning once before optional capacity, surviving same-state final admission. */
+TEST(Test__MemoryPlanner, OriginalNativeSourceMandatoryBeforeQuotaAndSamePMAReplay){
+    using Access=llaminar2::test::NativeContextPreparationReplayAccess;
+    const auto device=DeviceId::cuda(87);
+    Access::seed(device,[](std::shared_ptr<PreparedGPUWorkerStack> root){return Access::construct<SourcePlanningWorker>(std::move(root),87);});
+    auto source=Access::source<SourcePlanningWorker>(device,4ull<<30);const auto original=source->memory();
+    {auto worker=source->acquire(device);EXPECT_EQ(worker.memory(),original);}
+    source->freezeForPlanning();const auto declaration=source->mandatoryBOM();
+    DevicePlanConfig cfg;cfg.world_rank=0;cfg.device=device;cfg.device_total_bytes=cfg.device_free_bytes=4ull<<30;
+    cfg.device_compute_units=80;cfg.max_seq_len=64;cfg.activation_seq_len=1;cfg.first_layer=0;cfg.last_layer=23;
+    const auto profile=createTestProfile();const auto base=MemoryPlanner::plan(profile,{cfg}).physicalPlan();
+    cfg.native_context_preparation=source;
+    const auto complete=MemoryPlanner::plan(profile,{cfg}).physicalPlan();ASSERT_TRUE(complete.fits());
+    auto foreign=cfg;foreign.device=DeviceId::cuda(86);
+    EXPECT_THROW((void)MemoryPlanner::plan(profile,{foreign}),std::invalid_argument);
+    for(const auto& native:declaration.resources()){
+        const auto* before=base.find(PhysicalMemoryAllocatorIdentity{native.resource().world_rank,native.resource().device});const auto* after=complete.find(PhysicalMemoryAllocatorIdentity{native.resource().world_rank,native.resource().device});ASSERT_NE(after,nullptr);
+        for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i){const auto owner=PhysicalMemoryBOM::ownerAt(i);
+            EXPECT_EQ(after->bytes(owner),(before?before->bytes(owner):0u)+native.bytes(owner));}
+    }
+    auto certificate=std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(complete);
+    source->admitFinal(certificate);EXPECT_EQ(source->memory(),original);EXPECT_EQ(original->admission(),certificate);
+    EXPECT_EQ(original->phase(),PhysicalMemoryAuthorityPhase::Admitted);
+    EXPECT_EQ(source->mandatoryBOM().totalBytes(),declaration.totalBytes());
+    EXPECT_THROW(source->retireUnadmitted(),std::logic_error);
+    auto scope=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);Access::physicalReset(scope);
+}
+
+/** @test A setup failure before worker creation retires only its own empty population, repeatedly without native calls. */
+TEST(Test__MemoryPlanner, OriginalNativeSourceUninstalledFailureCleanupReplay){
+    using Access=llaminar2::test::NativeContextPreparationReplayAccess;
+    const auto device=DeviceId::cuda(85);
+    auto source=Access::source<SourcePlanningWorker>(device,4ull<<30);
+    EXPECT_EQ(source->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
+    EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingPreparedContext(device,source->memory()),std::logic_error);
+    EXPECT_NO_THROW(source->retireUnadmitted());
+    EXPECT_NO_THROW(source->retireUnadmitted());
+    EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingPreparedContext(device,source->memory()),std::logic_error);
+}
+
+/** @test A runtime-policy mutation cannot certify an already initialized native population. */
+TEST(Test__MemoryPlanner, OriginalNativeRuntimePolicyMutationReplay){
+    for(const auto& [backend,name]:std::array{
+        std::pair{DeviceType::CUDA,"CUBLAS_WORKSPACE_CONFIG"},
+        std::pair{DeviceType::CUDA,"CUBLASLT_LOG_LEVEL"},
+        std::pair{DeviceType::ROCm,"ROC_AQL_QUEUE_SIZE"},
+        std::pair{DeviceType::ROCm,"ROCBLAS_LAYER"},
+        std::pair{DeviceType::ROCm,"HIPBLAS_LOG_LEVEL"},
+        std::pair{DeviceType::ROCm,"HIPBLASLT_TENSILE_LIBPATH"},
+        std::pair{DeviceType::ROCm,"HSA_ENABLE_SDMA"}}){
+        SCOPED_TRACE(name);const auto& policy=NativeContextRuntimePolicy::original(backend);const auto before=policy.identity();
+        const auto* previous=std::getenv(name);const std::optional<std::string> saved=previous?std::optional<std::string>(previous):std::nullopt;
+        const auto changed=saved.value_or("")+"-changed-after-original-startup";
+        ASSERT_EQ(::setenv(name,changed.c_str(),1),0);EXPECT_THROW((void)policy.identity(),std::logic_error);
+        if(saved)ASSERT_EQ(::setenv(name,saved->c_str(),1),0);else ASSERT_EQ(::unsetenv(name),0);
+        EXPECT_EQ(policy.identity(),before);
+    }
+}
+/** @test Exact already-loaded provider closure remains stable and rejects missing symbols, without loading a native runtime. */
+TEST(Test__MemoryPlanner, OriginalNativeLoadedClosureReplay){
+    using Access=llaminar2::test::NativeContextPreparationReplayAccess;
+    const auto first=Access::loadedClosure(reinterpret_cast<const void*>(&::getpid));
+    EXPECT_EQ(first.size(),64u);
+    EXPECT_EQ(Access::loadedClosure(reinterpret_cast<const void*>(&::getpid)),first);
+    EXPECT_THROW((void)Access::loadedClosure(nullptr),std::runtime_error);
+}
+
+/** @test Loader-owned closure snapshot tolerates unrelated concurrent module loads and unloads. */
+TEST(Test__MemoryPlanner, OriginalNativeLoadedClosureConcurrentModuleReplay){
+    using Access=llaminar2::test::NativeContextPreparationReplayAccess;
+    const auto first=Access::loadedClosure(reinterpret_cast<const void*>(&::getpid));
+    std::atomic<std::size_t> completed=0;std::atomic<bool> failed=false;
+    std::latch first_attempt(1);
+    std::jthread loader([&](std::stop_token stop){while(!stop.stop_requested()){
+        auto* module=::dlopen(LLAMINAR_NATIVE_CLOSURE_REPLAY_MODULE,RTLD_NOW|RTLD_LOCAL);
+        if(!module){failed=true;if(completed.load()==0)first_attempt.count_down();break;}
+        auto* function=::dlsym(module,"llaminarNativeClosureReplayValue");
+        if(!function || reinterpret_cast<int(*)()>(function)()!=17)failed=true;
+        if(::dlclose(module)!=0)failed=true;
+        if(completed.fetch_add(1)==0)first_attempt.count_down();
+    }});
+    // Require actual loader work before timing-independent assertions, even
+    // when a busy CI worker delays the new thread's first scheduling slice.
+    first_attempt.wait();
+    for(int iteration=0;iteration<20;++iteration)EXPECT_EQ(Access::loadedClosure(reinterpret_cast<const void*>(&::getpid)),first);
+    loader.request_stop();loader.join();EXPECT_FALSE(failed);EXPECT_GT(completed.load(),0u);
 }

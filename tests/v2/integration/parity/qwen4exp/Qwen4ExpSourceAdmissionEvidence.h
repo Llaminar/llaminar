@@ -15,6 +15,7 @@
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
+#include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/PreparedWeightStore.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
@@ -45,6 +46,25 @@
 
 namespace llaminar2::test::parity::qwen4exp
 {
+
+/** @brief Require actual loader consumption before observing prepared worker identity.
+ * @param source Original source retained by the real ModelContext; absence is fatal.
+ * @param consumed Original permits retained only after native owner/coordinator initialization.
+ * @return Actual retained witness; no context acquisition, discovery or allocation occurs.
+ * @throws std::logic_error For absent, unused, substituted or separately owned source preparation.
+ * @note A prebound source alone formerly looked sufficient. This same predicate
+ * is consumed by canonical GPU-adaptive source admission and its device-free negative replay.
+ */
+inline const ::llaminar2::qwen4exp::PreparedImmutableSourceWorkers& requireQwen4ExpConsumedPreparedSource(
+    const std::shared_ptr<NativeContextPreparation>& source,
+    const std::optional<::llaminar2::qwen4exp::PreparedImmutableSourceWorkers>& consumed)
+{
+    if(!source)throw std::logic_error("Canonical GPU-adaptive admission has no original native source preparation");
+    if(!consumed)throw std::logic_error("Original native source was prebound but not consumed by actual lookup materialization");
+    if(consumed->source()!=source || consumed->source().owner_before(source) || source.owner_before(consumed->source()))
+        throw std::logic_error("Actual lookup materialization substituted its original native source owner");
+    return *consumed;
+}
 
 /** @brief One planned serving leaf; expert-only allocation resources are absent. */
 struct Qwen4ExpMTPSourceServingParticipant

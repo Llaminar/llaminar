@@ -207,6 +207,8 @@ namespace llaminar2
             return "retired_execution_topology";
         case DeviceMemoryReclamationIntent::ExclusiveModelRetirement:
             return "exclusive_model_retirement";
+        case DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement:
+            return "exclusive_native_context_retirement";
         }
         return "unknown";
     }
@@ -267,6 +269,27 @@ namespace llaminar2
                 "Exclusive model retirement requires one exact GPU and a positive, representable allocation BOM");
         }
 
+        return beginExclusiveRetirement(retention,
+            DeviceMemoryReclamationIntent::ExclusiveModelRetirement);
+    }
+
+    ExclusiveModelRetirementTicket
+    TransferEngine::beginExclusiveNativeContextRetirement(DeviceId device) const
+    {
+        if (!device.is_gpu())
+            throw std::invalid_argument("Native context retirement requires one exact GPU");
+        return beginExclusiveRetirement({.device=device},
+            DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement);
+    }
+
+    ExclusiveModelRetirementTicket
+    TransferEngine::beginExclusiveRetirement(
+        const ModelDeviceMemoryRetention &retention,
+        DeviceMemoryReclamationIntent intent) const
+    {
+        if (isGraphCaptureActive())
+            throw std::logic_error("Exclusive retirement cannot enter graph capture");
+
         IBackend *const backend = resolveBackend(retention.device);
         if (!backend)
         {
@@ -287,6 +310,13 @@ namespace llaminar2
                      : accounting.diagnostic));
         }
         const size_t expected = retention.totalBytes();
+        if (intent == DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement &&
+            (accounting.active_allocations != 0u || accounting.active_bytes != 0u))
+        {
+            throw std::runtime_error(
+                "Native context retirement requires an empty canonical tensor allocation ledger for " +
+                retention.device.toString());
+        }
         if (accounting.active_bytes < expected)
         {
             std::ostringstream error;
@@ -307,7 +337,7 @@ namespace llaminar2
             "[DeviceMemoryReclamation] begin device="
             << retention.device.toString()
             << " intent="
-            << to_string(DeviceMemoryReclamationIntent::ExclusiveModelRetirement)
+            << to_string(intent)
             << " driver_free_before_owner_release=" << baseline
             << " prepared_weight_bytes=" << retention.prepared_weight_bytes
             << " reusable_workspace_bytes="
@@ -320,6 +350,7 @@ namespace llaminar2
             << " canonical_active_bytes=" << accounting.active_bytes);
         return ExclusiveModelRetirementTicket(
             retention,
+            intent,
             baseline,
             accounting.active_allocations,
             accounting.active_bytes);
@@ -512,8 +543,7 @@ namespace llaminar2
              * a fresh generation only to trim it again. */
             DeviceMemoryReclamationReceipt receipt{
                 .device = device,
-                .intent =
-                    DeviceMemoryReclamationIntent::ExclusiveModelRetirement,
+                .intent = ticket.intent_,
                 .expected_retired_bytes = expected_retired_bytes,
                 .driver_free_bytes_before_owner_release =
                     ticket.driver_free_bytes_before_owner_release_,
@@ -550,6 +580,11 @@ namespace llaminar2
                     << receipt.canonical_allocation_bytes_before_runtime_reset;
                 throw std::runtime_error(error.str());
             }
+            // The exact original native handles have retired, and the existing
+            // physical reset receipt above has passed every canonical check.
+            // Discharge only original moved PMA tokens; never resample capacity
+            // or manufacture another allocation ledger at this boundary.
+            context_retirements[index].retireNativeObligationsAfterValidatedReset();
             receipt.retired_context_generation =
                 context_receipt.retired_generation;
             receipt.runtime_reset_invoked = runtime_receipt.reset_invoked;

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <vector>
 #include <stdexcept>
 
 namespace llaminar2
@@ -293,6 +294,55 @@ namespace llaminar2
                 {"node_id", std::to_string(inventory.node_id)},
                 {"backend", deviceTypeToString(device.type)}, {"physical_id", physical_id},
                 {"pci_bus_address", pci_bus_address}};
+    }
+
+    /**
+     * @brief Observe exact selected CPU endpoints independently of the GPU primary NUMA.
+     * @param device Already-selected execution participant.
+     * @param inventory Original communicator-owned physical rank observation.
+     * @param plan Original admitted rank plan.
+     * @param config Frozen resolved configuration, including overlay domain ownership.
+     * @param world_size Original execution communicator size.
+     * @return One GPU/ordinary record, or deduplicated original overlay CPU NUMA records.
+     * @throws std::invalid_argument For unselected, unresolved or conflicting ownership.
+     *
+     * This startup-only projection never resolves a physical NUMA from a GPU or
+     * guesses CPU zero. Every endpoint still passes the existing inventory guard.
+     */
+    inline std::vector<PerfStatsCollector::Tags> serverExecutionParticipantRecords(
+        DeviceId device, const RankInventory &inventory, const RankExecutionPlan &plan,
+        const OrchestrationConfig &config, int world_size)
+    {
+        const auto selected = serverExecutionParticipants(plan, config, world_size);
+        if (inventory.rank != plan.rank || !selected.contains(device))
+            throw std::invalid_argument("Server participant observation is not owned by this selected rank");
+        if (!device.is_cpu() || !config.moe_routed_expert_plan ||
+            !config.moe_routed_expert_plan->usesExpertOverlayAuthority())
+            return {serverExecutionParticipantTags(device, inventory, plan.numa_node)};
+        const auto overlay = resolveMoEExpertOverlayExecutionPlan(config.moe_routed_expert_plan,
+            MoEExpertOverlayExecutionPlanResolverOptions{
+                .current_world_rank = plan.rank, .world_size = world_size});
+        const auto &local = overlay.currentRankPlan();
+        std::set<int> endpoints;
+        for (const auto &domain : overlay.domains)
+        {
+            if (!local.ownsDomain(domain.name)) continue;
+            for (const auto &participant : domain.participants)
+            {
+                if (!participant.world_rank_known || participant.world_rank != plan.rank ||
+                    !participant.address.isCPU() || participant.address.toLocalDeviceId() != device)
+                    continue;
+                if (participant.address.numa_node < 0)
+                    throw std::invalid_argument("Server overlay CPU participant lacks resolved NUMA ownership");
+                endpoints.insert(participant.address.numa_node);
+            }
+        }
+        if (endpoints.empty())
+            throw std::invalid_argument("Server overlay CPU participant lacks its original selected endpoint");
+        std::vector<PerfStatsCollector::Tags> records;
+        for (const auto numa : endpoints)
+            records.push_back(serverExecutionParticipantTags(device, inventory, numa));
+        return records;
     }
 
     /**

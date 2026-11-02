@@ -27,11 +27,21 @@ public:
      */
     PooledImmutableSourcePhaseStage(BufferArena& arena,std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary,
         qwen4exp::PooledSourceAction action,DeviceGenerationControlBinding control,
-        std::optional<qwen4exp::PooledNativeTensorSpan> output=std::nullopt);
+        std::optional<qwen4exp::PooledNativeTensorSpan> output=std::nullopt,
+        std::uint32_t owner=qwen4exp::adaptive_lookup::None);
     /** @brief Seal ordinary prepared output, retain its original allocation lease and join exact setup events. */
     bool prepareGraphLaunch(IDeviceContext*,void*)override;
     /** @brief Enqueue one fixed source phase on the executor's exact stream and publish its original writers. */
     bool execute(IDeviceContext*)override;
+    /** @return Exact immutable original phase/owner/control identity for subsequent cold graph insertion validation. */
+    bool matchesOriginal(const qwen4exp::ImmutableLookupExecutionBoundary* boundary,qwen4exp::PooledSourceAction action,
+        std::uint32_t owner,const DeviceGenerationControlBinding& control)const {
+        return boundary_.get()==boundary && action_==action && owner_==owner && control_.captureIdentity()==control.captureIdentity();
+    }
+    /** @return Exact original reader output root/role/range; used by terminal cold insertion. */
+    bool matchesReadOutput(const qwen4exp::PooledNativeTensorSpan& output)const noexcept {
+        return output_ && output_->root==output.root && output_->buffer==output.buffer && output_->offset==output.offset && output_->bytes==output.bytes;
+    }
     /** @return Setup event joins occur once for retained recording; request reset never changes topology. */
     GraphLaunchPreparationPolicy graphLaunchPreparationPolicy()const override{return GraphLaunchPreparationPolicy::CaptureOnly;}
     /** @return Stable complete declarations; installed physical seals reject address/runtime drift on later queries. */
@@ -57,6 +67,7 @@ private:
     BufferArena* arena_;
     std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary_;
     qwen4exp::PooledSourceAction action_;
+    std::uint32_t owner_; ///< Immutable addressed source phase; part of graph identity.
     DeviceGenerationControlBinding control_;
     std::optional<qwen4exp::PooledNativeTensorSpan> output_;
     std::optional<Qwen4ExpPreparedStorage> prepared_;

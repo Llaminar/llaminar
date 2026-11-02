@@ -6,7 +6,9 @@
  * and PMA transaction. Sparse GGUF extents have no loaded payload. Publication
  * must retain the exact sealed table owner without rewriting request policies.
  */
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/OrchestrationCandidateAdmission.h"
+#include "fixtures/planning/RecordedNgramOrdering.h"
 #include "config/OrchestrationConfigParser.h"
 #include "loaders/ResolvedImmutableRowTablePlacement.h"
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
@@ -72,9 +74,11 @@ TEST(MoEPipelineNgramPublication, PublishesExactPlacementWithTheAdmittedRows)
         {
             SCOPED_TRACE(::testing::Message() << first_stage << '/' << int(preference));
             const auto candidate = publicationCandidate(source, preference, first_stage);
-            const auto admitted = AdmittedOrchestrationCandidate::admit(candidate, source,
-                {.prefill_bucket_rows = {1, 32}, .minimum_prefill_sequence_rows = 1,
-                 .maximum_cached_prefill_buckets = 8});
+            OrchestrationCandidateMemoryPolicy policy{.prefill_bucket_rows={1,32},.minimum_prefill_sequence_rows=1,.maximum_cached_prefill_buckets=8};
+            const std::array originalDevices{DeviceId::cuda(0),DeviceId::rocm(0)};
+            policy.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
+            policy.retained_host_services=test::planningHostServiceBudgets(1);
+            const auto admitted = AdmittedOrchestrationCandidate::admit(candidate,source,policy);
             ASSERT_TRUE(admitted.pipelineMemory());
             const auto &pipeline = *admitted.pipelineMemory();
             const auto &sealed = pipeline.rankPlan().runtime;
@@ -84,17 +88,23 @@ TEST(MoEPipelineNgramPublication, PublishesExactPlacementWithTheAdmittedRows)
             current.resident_graph_rows = 0;
             current.moe_routed_prefill.overlay_segment_rows = 1;
             current.ngram_table_placement.reset();
+            current.retained_host_services.reset();
             pipeline.publishRuntimeCapacity(current);
             EXPECT_EQ(current.resident_graph_rows, sealed.resident_graph_rows);
             EXPECT_EQ(current.moe_routed_prefill.overlay_segment_rows,
                 sealed.moe_routed_prefill.overlay_segment_rows);
             ASSERT_EQ(current.ngram_table_placement, sealed.ngram_table_placement);
+            ASSERT_TRUE(sealed.retained_host_services);
+            EXPECT_EQ(current.retained_host_services, sealed.retained_host_services);
             ASSERT_EQ(current.ngram_table_placement->consumers().size(), 1u);
             EXPECT_EQ(current.ngram_table_placement->consumers().front().device,
                 first_stage ? DeviceId::cuda(0) : DeviceId(DeviceType::ROCm, 0));
             for (const auto &stage : pipeline.stages())
             {
                 EXPECT_EQ(stage.rankPlan().runtime.ngram_table_placement, current.ngram_table_placement);
+                EXPECT_EQ(stage.rankPlan().runtime.retained_host_services, current.retained_host_services);
+                for (const auto& device : stage.devicePlans())
+                    EXPECT_EQ(device.retained_host_services, current.retained_host_services);
                 EXPECT_EQ(stage.capacity()->physical_memory_admission, pipeline.physicalAdmission());
             }
             // Repeated setup publication retains the same immutable identity.

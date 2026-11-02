@@ -88,6 +88,16 @@ namespace llaminar2
         }
     }
 
+    /** @brief Frozen continuation descriptor, never live placement/residency state. */
+    struct QwenRoutedContinuationTopology
+    {
+        int tier_index = -1;
+        const RoutedExpertDomain *domain = nullptr;
+        int graph_local_participant = -1;
+        bool captured_continuation_device = false;
+        bool captured_local_tp = false;
+    };
+
     /**
      * @brief Qwen 3.5 MoE graph builder
      *
@@ -97,6 +107,35 @@ namespace llaminar2
      */
     class Qwen35MoEGraph : public Qwen35Graph
     {
+        /**
+         * @brief Original immutable routed source used by all layer/family expansions.
+         * @details Equal canonical setup maps alias the existing admitted residency
+         * metadata owner. If initial preferred placement differs, retain the one
+         * canonical map the old graph path required, replacing its former per-stage
+         * copies under the same graph metadata lifetime. This is never a live map.
+         */
+        struct RoutedForwardRecipe
+        {
+            DeviceId source_device;
+            DeviceId effective_device;
+            std::shared_ptr<const MoEExpertOverlayRuntimePlan> runtime;
+            std::shared_ptr<const MoERoutedExpertPlacementPlan> source;
+            std::shared_ptr<const MoEExpertOwnerMap> owners;
+            QwenRoutedContinuationTopology continuation;
+            bool reused_original_owners = false;
+        };
+        PreparedGraphTemplate<RoutedForwardRecipe> routed_forward_template_;
+        std::uint64_t canonical_owner_map_build_attempts_ = 0;
+        std::uint64_t continuation_resolution_attempts_ = 0;
+        std::uint64_t original_owner_map_reuses_ = 0;
+        std::uint64_t routed_layer_specialization_attempts_ = 0;
+        /** @brief Prepare routed metadata independently of later weight/store publication. */
+        const RoutedForwardRecipe &prepareRoutedForwardRecipe(DeviceId device);
+        /** @brief Borrow the original routed recipe, preparing it once on cold entry. */
+        const RoutedForwardRecipe &routedForwardRecipe(DeviceId device);
+        /** @brief Const queries may only borrow a previously published routed recipe. */
+        const RoutedForwardRecipe &routedForwardRecipe(DeviceId device) const;
+
         /** Metadata-sealed arena replacement, present only for the explicit projection mode. */
         std::optional<MoEProjectionArenaGeometry> projection_arena_;
 
@@ -122,6 +161,12 @@ namespace llaminar2
         // =====================================================================
 
         std::string architectureName() const override { return "qwen35moe"; }
+
+        /** @copydoc QwenGraphBase::prepareForwardGraphTemplate */
+        void prepareForwardGraphTemplate(DeviceId device) override;
+        /** @copydoc QwenGraphBase::forwardGraphTemplateStats */
+        [[nodiscard]] PreparedGraphTemplateStats forwardGraphTemplateStats() const override;
+
 
         /**
          * @brief Inject the source context before schema resolution or graph construction.

@@ -10,6 +10,7 @@ rewritten into another source tier. Broad optional downloads are suppressed only
 after every selected REQUIRED_FILES input has been validated.
 """
 from __future__ import annotations
+
 import argparse
 import csv
 from enum import Enum
@@ -19,11 +20,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import secrets
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from production_artifacts import digest, write_json
+from production_artifacts import artifact_identity_path, digest, write_json
 
+SOURCE_ADMISSION_REPORT_SCHEMA = 2  # Runner cleanup plus terminal native lifetime proof.
 PREFIX = 'V2_Integration_Parity_Qwen4Exp_Production_'
 class SourceAdmissionContract(str, Enum):
     """Disjoint native proof obligations; capacity is not structural support."""
@@ -123,7 +126,7 @@ def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
                 or record.get('qfn_source_admission_schema') != 2 or type(ranks) is not int or ranks <= 0
                 or not isinstance(record.get('id'), str) or not record['id']
                 or Path(record['id']).name != record['id'] or record['id'] in ('.', '..')
-                or len(record['id'].encode()) >= 256
+                or any(c in record['id'] for c in '/\\:*?"<>|\x00')
                 or not isinstance(participants, list) or not participants):
             raise ValueError('missing or stale typed source-admission metadata')
         minimums = provisioning_requirements(record)
@@ -146,6 +149,29 @@ def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
                 if total < minimum:
                     insufficient.append({'participant': participant,
                         'required_total_memory_bytes': minimum, 'observed_total_memory_bytes': total})
+        # Storage participants are hardware requirements, never additional
+        # compute/expert domains. Shared compute/storage endpoints are legal;
+        # duplicates inside either independently declared role are not.
+        storage = record.get('storage_participants', [])
+        coordinator = record.get('storage_coordinator')
+        if not isinstance(storage, list) or (bool(storage) != (coordinator is not None)):
+            raise ValueError('incomplete typed source storage participant/coordinator metadata')
+        storage_declared = set()
+        for participant in storage:
+            if not isinstance(participant, dict):
+                raise ValueError('invalid typed source storage participant')
+            rank = participant.get('rank')
+            address = identity(participant)
+            if type(rank) is not int or not 0 <= rank < ranks or address[0] not in ('cuda', 'rocm') or (rank, address) in storage_declared:
+                raise ValueError('invalid or duplicate typed source storage participant')
+            storage_declared.add((rank, address))
+            if address not in available:
+                missing.append({**participant, 'role': 'storage'})
+        if storage:
+            if not isinstance(coordinator, dict) or (coordinator.get('rank'), identity(coordinator)) not in storage_declared:
+                raise ValueError('source storage coordinator is absent from its declared owner population')
+            if (coordinator['rank'], identity(coordinator)) not in declared:
+                raise ValueError('source storage coordinator is not an actual compute consumer')
         if {rank for rank, _ in declared} != set(range(ranks)):
             raise ValueError('typed source participants do not cover the declared world')
         if missing:
@@ -264,16 +290,63 @@ def validate_outcome(xml: Path, log: str) -> None:
         raise ValueError('source admission did not execute exactly one passing, non-skipped CTest')
 
 
-def validate_native_retirement(root: Path, record: dict) -> None:
-    """Require every rank's fresh native retirement independently of contract success."""
+def source_artifact_directory(root: Path, identity: str, rank: int) -> Path:
+    """Resolve one original source leaf without accepting traversal or symlink aliases."""
+    if type(rank) is not int or rank < 0:
+        raise ValueError('invalid source artifact rank')
+    if (not isinstance(identity, str) or not identity or identity in ('.', '..')
+            or any(c in identity for c in '/\\:*?"<>|\x00')):
+        raise ValueError('invalid source artifact identity')
+    directory = root / 'source-admission' / artifact_identity_path(identity) / f'rank-{rank}'
+    current = root
+    for component in directory.relative_to(root).parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError('foreign symlink in source artifact identity')
+    if not directory.resolve().is_relative_to(root.resolve()):
+        raise ValueError('foreign source artifact directory')
+    return directory
+
+
+def validate_runner_retirement(root: Path, record: dict) -> None:
+    """Validate per-runner/model/prefix cleanup, before global native teardown."""
     for rank in range(record['mpi_ranks']):
-        directory = root / 'source-admission' / record['id'] / f'rank-{rank}'
+        directory = source_artifact_directory(root, record['id'], rank)
         with (directory / 'retirement.csv').open() as stream:
             rows = list(csv.DictReader(stream))
         if (len(rows) != 1 or rows[0].get('cell') != record['id']
                 or any(rows[0].get(key) != '1' for key in ('runner_retired', 'model_retired', 'prefix_removed'))
                 or (directory / 'prefix-cache').exists()):
-            raise ValueError('missing or incomplete source final retirement')
+            raise ValueError('missing or incomplete source runner retirement')
+
+
+def validate_native_retirement(root: Path, record: dict) -> None:
+    """Require runner cleanup AND post-GPU-lifetime completion, independently of assertions.
+
+    The runner CSV precedes process lifetime teardown and cannot prove that
+    teardown returned. The canonical child publishes the separate terminal
+    receipt only after its actual GPUDeviceProcessLifetime destructor completes.
+    """
+    validate_runner_retirement(root, record)
+    invocation = json.loads((root / 'native-lifetime-invocation.json').read_text())
+    if not isinstance(invocation, dict):
+        raise ValueError('missing source native lifetime invocation object')
+    token = invocation.get('invocation')
+    if (invocation.get('schema') != 1 or type(invocation.get('schema')) is not int
+            or invocation.get('cell') != record['id']
+            or type(invocation.get('mpi_ranks')) is not int or invocation.get('mpi_ranks') != record['mpi_ranks']
+            or not isinstance(token, str) or re.fullmatch(r'[0-9a-f]{32}', token) is None):
+        raise ValueError('missing or foreign source native lifetime invocation')
+    for rank in range(record['mpi_ranks']):
+        with (root / 'native-process-retirement' / f'rank-{rank}.csv').open() as stream:
+            terminal = list(csv.DictReader(stream))
+        if (len(terminal) != 1 or terminal[0].get('schema') != '1'
+                or terminal[0].get('invocation') != token or terminal[0].get('rank') != str(rank)
+                or terminal[0].get('native_lifetime_retired') != '1'
+                or terminal[0].get('test_result') not in ('0', '1')
+                or not isinstance(terminal[0].get('pid'), str)
+                or not terminal[0]['pid'].isdecimal() or int(terminal[0]['pid']) <= 0):
+            raise ValueError('missing or incomplete source process native lifetime retirement')
 
 
 def validate_retirement(root: Path, record: dict, *, contract: SourceAdmissionContract) -> None:
@@ -282,7 +355,7 @@ def validate_retirement(root: Path, record: dict, *, contract: SourceAdmissionCo
         raise ValueError('source retirement requires an explicit typed contract')
     validate_native_retirement(root, record)
     for rank in range(record['mpi_ranks']):
-        directory = root / 'source-admission' / record['id'] / f'rank-{rank}'
+        directory = source_artifact_directory(root, record['id'], rank)
         receipt = directory / {
             SourceAdmissionContract.POSITIVE: 'admission.csv',
             SourceAdmissionContract.UNSUPPORTED_REJECTION: 'rejection.csv',
@@ -330,17 +403,48 @@ def validate_retirement(root: Path, record: dict, *, contract: SourceAdmissionCo
 
 def cleanup_prefixes(root: Path) -> None:
     """Retire only disposable caches within this invocation's private evidence root."""
-    for path in root.glob('source-admission/*/rank-*/prefix-cache'):
-        if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
-            raise ValueError('foreign symlink in source prefix cleanup')
-        shutil.rmtree(path)
+    owned = root / 'source-admission'
+    if owned.is_symlink():
+        raise ValueError('foreign symlink in source prefix cleanup')
+    if not owned.exists():
+        return
+    # Walk without following links, rejecting every symlink before selecting
+    # only original rank-owned disposable cache leaves. Evidence neighbors stay.
+    for directory, dirs, files in os.walk(owned, followlinks=False):
+        parent = Path(directory)
+        for name in files:
+            if (parent / name).is_symlink():
+                raise ValueError('foreign symlink in source prefix cleanup')
+        for name in list(dirs):
+            path = parent / name
+            if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+                raise ValueError('foreign symlink in source prefix cleanup')
+            if name == 'prefix-cache' and re.fullmatch(r'rank-[0-9]+', parent.name):
+                identity = parent.parent.relative_to(owned)
+                parts = identity.parts
+                if parts and parts[0] == 'long-identities':
+                    if len(parts) < 3 or parts[-1] != 'artifacts' or any(
+                            not chunk.startswith('c') or not chunk[1:] or len(os.fsencode(chunk[1:])) > 240
+                            for chunk in parts[1:-1]):
+                        raise ValueError('malformed source artifact identity in cleanup')
+                    logical = ''.join(chunk[1:] for chunk in parts[1:-1])
+                elif len(parts) == 1:
+                    logical = parts[0]
+                else:
+                    raise ValueError('malformed source artifact identity in cleanup')
+                if Path(artifact_identity_path(logical)) != identity:
+                    raise ValueError('noncanonical source artifact identity in cleanup')
+                shutil.rmtree(path)
+                dirs.remove(name)
+
 
 
 class SourceCaseFailure(RuntimeError):
     """One executed selected contract failed; gather subsequent ordinary cases."""
-    def __init__(self, message: str, *, retirement_proved: bool = False):
+    def __init__(self, message: str, *, retirement_proved: bool = False, runner_retirement_proved: bool = False):
         super().__init__(message)
         self.retirement_proved = retirement_proved
+        self.runner_retirement_proved = runner_retirement_proved or retirement_proved
 
 
 
@@ -349,12 +453,19 @@ def run_case(entry: dict, record: dict, output: Path, build: Path, environment: 
     """Execute one registered contract; launch errors remain terminal infrastructure failures."""
     xml = output / f'cell-{index:04d}.xml'
     log_path = output / f'cell-{index:04d}.log'
+    invocation = secrets.token_hex(16)
+    write_json(artifact / 'native-lifetime-invocation.json', {'schema': 1,
+        'invocation': invocation, 'cell': record['id'], 'mpi_ranks': record['mpi_ranks']})
+    terminal_root = artifact / 'native-process-retirement'
+    terminal_root.mkdir()  # A fresh per-invocation root rejects stale terminal evidence.
     with log_path.open('w') as log:
         result = subprocess.run(['ctest', '--test-dir', str(build), '--output-on-failure',
             '--no-tests=error', '--fixture-exclude-any', '.*', '--output-junit', str(xml),
             '-R', '^' + re.escape(entry['test']) + '$'],
             env={**environment, 'LLAMINAR_SKIP_MODEL_DOWNLOAD': '1',
-                 'LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT': str(artifact)},
+                 'LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT': str(artifact),
+                 'LLAMINAR_SOURCE_ADMISSION_PROCESS_RECEIPT_ROOT': str(terminal_root),
+                 'LLAMINAR_SOURCE_ADMISSION_PROCESS_INVOCATION': invocation},
             stdout=log, stderr=subprocess.STDOUT)
     try:
         cases = ET.parse(xml).getroot().findall('.//testcase')
@@ -365,11 +476,17 @@ def run_case(entry: dict, record: dict, output: Path, build: Path, environment: 
     if any(re.search(r'timeout|timed out', failure.get('message', ''), re.I)
            for failure in cases[0].findall('failure')):
         raise RuntimeError('source CTest timeout is a terminal infrastructure failure')
+    runner_retired = False
+    try:
+        validate_runner_retirement(artifact, record)
+        runner_retired = True
+    except (ValueError, FileNotFoundError):
+        pass
     retired = False
     try:
         validate_native_retirement(artifact, record)
         retired = True
-    except (ValueError, FileNotFoundError):
+    except (ValueError, FileNotFoundError, json.JSONDecodeError):
         pass  # Unknown native retirement is recorded, never promoted to proof.
     try:
         if result.returncode:
@@ -377,7 +494,7 @@ def run_case(entry: dict, record: dict, output: Path, build: Path, environment: 
         validate_outcome(xml, log_path.read_text())
         validate_retirement(artifact, record, contract=source_contract(exact))
     except (ValueError, FileNotFoundError, ET.ParseError) as error:
-        raise SourceCaseFailure(str(error), retirement_proved=retired) from error
+        raise SourceCaseFailure(str(error), retirement_proved=retired, runner_retirement_proved=runner_retired) from error
     return retired
 
 
@@ -402,13 +519,14 @@ def gather_selected(selected: list, records: dict, registered: dict, output: Pat
         print(f'[qfn-source-admission] {index + 1}/{len(selected)} {exact}', flush=True)
         artifact = output / f'evidence-{index:04d}'
         artifact.mkdir()
-        outcome = {'passed': False, 'retirement_proved': False, 'qualification': 'failed-source-contract', 'evidence': artifact.name,
+        outcome = {'passed': False, 'retirement_proved': False, 'runner_retirement_proved': False, 'qualification': 'failed-source-contract', 'evidence': artifact.name,
                    'contract': source_contract(exact).value}
         try:
             retired = run_case(registered[exact], records[exact], output, build, environment, artifact, index, exact)
-            outcome.update(passed=True, retirement_proved=retired, qualification='native-source-admission')
+            outcome.update(passed=True, retirement_proved=retired, runner_retirement_proved=True, qualification='native-source-admission')
         except SourceCaseFailure as error:
-            outcome.update(error=str(error), retirement_proved=error.retirement_proved)
+            outcome.update(error=str(error), retirement_proved=error.retirement_proved,
+                           runner_retirement_proved=error.runner_retirement_proved)
         finally:
             report['results'][exact] = outcome
             # Cleanup failures are infrastructure failures: retain the report,
@@ -432,7 +550,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
-    report = {'schema': 1, 'complete': False, 'passed': False, 'results': {}, 'all_resources_retired': False}
+    report = {'schema': SOURCE_ADMISSION_REPORT_SCHEMA, 'complete': False, 'passed': False, 'results': {}, 'all_resources_retired': False}
     report_path = args.output / 'source-admission.json'
     write_json(report_path, report)
     try:

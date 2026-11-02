@@ -8,7 +8,10 @@
  * payload copies are separate parallel producers between validation and Ready.
  */
 #pragma once
+#include <cstdlib>
+#include <type_traits>
 #include "PooledImmutableNativeTypes.h"
+#include "PooledImmutableExactIdentity.h"
 #include "PooledImmutableCoordinatorOps.h"
 namespace llaminar2::qwen4exp::pooled_native
 {
@@ -62,12 +65,26 @@ template<class Slot> QFN_ADAPTIVE_HD bool fail(const OwnerArgs& a,Status why=Sta
     progress(a).reply_bytes=0;
     return false;
 }
+/** @return Closed actual producer kind, independent of equal serialized layouts or mutable owner state. */
+template<class Header> QFN_ADAPTIVE_HD constexpr OwnerHeaderKind headerKind()
+{
+    if constexpr(std::is_same_v<Header,p::PinHeader>)return OwnerHeaderKind::Pin;
+    else if constexpr(std::is_same_v<Header,Availability>)return OwnerHeaderKind::Availability;
+    else if constexpr(std::is_same_v<Header,p::FreeAllocationReceipt>)return OwnerHeaderKind::FreeReceipt;
+    else if constexpr(std::is_same_v<Header,p::VictimAllocationReceipt>)return OwnerHeaderKind::VictimReceipt;
+    else if constexpr(std::is_same_v<Header,OwnerSourceSealReceipt>)return OwnerHeaderKind::SourceSeal;
+    else if constexpr(std::is_same_v<Header,p::PublishHeader>)return OwnerHeaderKind::Publish;
+    else if constexpr(std::is_same_v<Header,p::ReadyHeader>)return OwnerHeaderKind::Ready;
+    else if constexpr(std::is_same_v<Header,p::RetiredHeader>)return OwnerHeaderKind::Retired;
+    else if constexpr(std::is_same_v<Header,PublicationAcquiredHeader>)return OwnerHeaderKind::PublicationAcquired;
+    else {static_assert(!std::is_same_v<Header,Header>,"Unknown pooled typed header producer");}
+}
 /** @brief Write only sizeof(Header) live bytes; the rest of the admitted 64-byte header slot remains unused. */
 template<class Header> QFN_ADAPTIVE_HD void header(const OwnerArgs& a,const Header& value)
 {
     static_assert(sizeof(Header)<=64);
     *at<Header>(a.native,a.plan.native.header)=value;
-    progress(a).header_bytes=sizeof(Header);
+    progress(a).header_bytes=sizeof(Header);progress(a).header_kind=headerKind<Header>();
 }
 /** @return Actual acquired original invocation is compatible before any owner mutation. */
 template<class Slot> QFN_ADAPTIVE_HD bool current(const OwnerArgs& a,bool beginning=false)
@@ -135,11 +152,15 @@ QFN_ADAPTIVE_HD inline p::Grant originalGrant(const OwnerArgs& a,std::uint32_t i
     return index<pins?at<p::Grant>(a.frame,a.plan.frame.initial_pins)[index]:grants(a)[index-pins];
 }
 /**
- * @brief Validate the complete actual pin batch before issuing even its first physical pin.
- * @note Integer radix duplicate checks are O(live commands); row/unique/slot
- * aliases cannot turn a later rejection into an unreported acquired prefix.
+ * @brief Validate original pin fields before issuing even the first physical pin.
+ * @tparam Slot Original physical slot encoding.
+ * @param a Same exclusive owner and original invocation.
+ * @param commands Authenticated original command span.
+ * @param count Exact live prefix length.
+ * @return False with original failure before any physical pin changes.
+ * @note Exact identity validation follows these immutable field checks before commit.
  */
-template<class Slot> QFN_ADAPTIVE_HD bool validatePins(const OwnerArgs& a,const p::OwnerCommand* commands,std::uint32_t count)
+template<class Slot> QFN_ADAPTIVE_HD bool validatePinFields(const OwnerArgs& a,const p::OwnerCommand* commands,std::uint32_t count)
 {
     auto v=ownerView<Slot>(a);
     if(v.frame->phase!=p::OwnerPhase::Pinning || v.frame->initial_pin_count || v.frame->held_pins)return fail<Slot>(a);
@@ -156,22 +177,26 @@ template<class Slot> QFN_ADAPTIVE_HD bool validatePins(const OwnerArgs& a,const 
             adaptive_lookup::PhysicalSlot<Slot>::pinned(slot))return fail<Slot>(a);
         ordinal=c.ordinal.value;
     }
+    return true;
+}
+/** @brief Scalar reference validation of fields and all three exact identity domains.
+ * @tparam Slot Original physical slot encoding.
+ * @param a Original exclusive owner and invocation.
+ * @param commands Authenticated original live command span.
+ * @param count Exact live prefix length.
+ * @return True only after all original fields and duplicate checks pass.
+ */
+template<class Slot> QFN_ADAPTIVE_HD bool validatePins(const OwnerArgs& a,const p::OwnerCommand* commands,std::uint32_t count)
+{
+    if(!validatePinFields<Slot>(a,commands,count))return false;
     if(!count)return true;
     auto* first=at<std::uint64_t>(a.frame,a.plan.frame.validation_a);
     auto* second=at<std::uint64_t>(a.frame,a.plan.frame.validation_b);
     auto* bins=at<std::uint32_t>(a.frame,a.plan.frame.validation_counts);
     for(unsigned key=0;key<3;++key){
         for(std::uint32_t i=0;i<count;++i)first[i]=key==0?commands[i].target.row:key==1?commands[i].target.unique:commands[i].target.slot;
-        auto* input=first;auto* output=second;
-        for(unsigned pass=0;pass<(key?4u:8u);++pass){
-            for(unsigned bin=0;bin<256;++bin)bins[bin]=0;
-            for(std::uint32_t i=0;i<count;++i)++bins[(input[i]>>(pass*8))&255];
-            std::uint32_t cursor=0;
-            for(unsigned bin=0;bin<256;++bin){const auto size=bins[bin];bins[bin]=cursor;cursor+=size;}
-            for(std::uint32_t i=0;i<count;++i)output[bins[(input[i]>>(pass*8))&255]++]=input[i];
-            auto* swap=input;input=output;output=swap;
-        }
-        for(std::uint32_t i=1;i<count;++i)if(input[i]==input[i-1])return fail<Slot>(a);
+        if(!p::exactDistinctIdentities(first,second,bins,count,key?4u:8u,
+            p::DuplicateIdentityPolicy::AllValues))return fail<Slot>(a);
     }
     return true;
 }
@@ -189,15 +214,143 @@ template<class Slot> QFN_ADAPTIVE_HD bool sealOwner(const OwnerArgs& a)
     if(!p::OwnerOperations<Slot>(ownerView<Slot>(a)).initialize())return fail<Slot>(a);
     progress(a).setup_identity=a.plan.identity;progress(a).initialized=2;return true;
 }
-/** @brief Run one ordered native owner metadata operation; payload copy publication is a separate exact event edge. */
-template<OwnerAction Action,class Slot> QFN_ADAPTIVE_HD bool owner(const OwnerArgs& a)
+/** @brief Read-specific helpers share this actual dispatcher; definitions live in ReadOps. */
+QFN_ADAPTIVE_HD inline void resetHitRead(const OwnerArgs&);
+template<class Slot> QFN_ADAPTIVE_HD bool validateHitRead(const OwnerArgs&);
+template<class Slot> QFN_ADAPTIVE_HD bool beginHitRead(const OwnerArgs&);
+/**
+ * @brief Seal exact nominal metadata for one actual remote wire reader without resetting its original witness.
+ * @return True only after validating the actual original producer, interval/window/coordinate and invocation.
+ * @note Wire leaves execute this before ordinary output reset. Failure invalidates the wire tag and output
+ * witness; native submission traps before a transfer can consume stale bytes. No row/pin state is repaired.
+ */
+template<class Header,class Slot> QFN_ADAPTIVE_HD bool publicationWire(const OwnerArgs& a)
 {
+    static_assert(sizeof(Header)==56);
+    auto& output=progress(a);const auto& actual=*at<Header>(a.native,a.plan.native.header);const auto& frame=*ownerView<Slot>(a).frame;
+    const bool valid=a.input.condition==SourceCondition::Always && !a.input.outcome && !a.input.records &&
+        !a.input.record_bytes && !a.input.frontier && !a.input.payload && !a.input.payload_bytes &&
+        current<Slot>(a) && output.header_bytes==sizeof(Header) && output.header_kind==headerKind<Header>() &&
+        same(actual.interval,frame.interval) && same(actual.source,frame.source) &&
+        actual.owner==a.plan.owner.coordinate() && static_cast<std::uint32_t>(actual.status)<=static_cast<std::uint32_t>(Status::Cancelled);
+    if(!valid){
+        *at<OwnerHeaderKind>(a.native,a.plan.native.header+56)=OwnerHeaderKind::None;
+        output.header_bytes=0;output.header_kind=OwnerHeaderKind::None;return fail<Slot>(a);
+    }
+    *at<OwnerHeaderKind>(a.native,a.plan.native.header+56)=output.header_kind;
+    return true;
+}
+/** @brief Decode the original pin command span before any keys or physical slots are touched.
+ * @tparam Slot Original physical slot encoding.
+ * @param a Same authenticated owner and original producer operands.
+ * @param commands Output exact original compact/directed live span.
+ * @param count Output original bounded live command count.
+ * @return False with the original sticky error on malformed ownership or extent.
+ */
+template<class Slot> QFN_ADAPTIVE_HD bool pinCommandSpan(const OwnerArgs& a,const p::OwnerCommand*& commands,std::uint32_t& count)
+{
+    if(ownerView<Slot>(a).frame->phase!=p::OwnerPhase::Pinning)return fail<Slot>(a);
+    count=0;
+    commands=static_cast<const p::OwnerCommand*>(a.input.records);
+    if(a.input.record_layout==RecordLayout::DirectedCommandBank) {
+        if(!a.plan.native.reply_capacity || !commands || a.input.record_bytes || !a.input.allocation_slice ||
+            a.input.record_origin || !a.input.record_capacity)return fail<Slot>(a);
+        const auto slice=*a.input.allocation_slice;
+        if(slice.byte_offset>a.input.record_capacity || slice.live_bytes>a.input.record_capacity-slice.byte_offset ||
+            slice.byte_offset%sizeof(p::OwnerCommand) || slice.live_bytes%sizeof(p::OwnerCommand) ||
+            slice.live_bytes/sizeof(p::OwnerCommand)>a.plan.native.reply_capacity ||
+            slice.live_bytes/sizeof(p::OwnerCommand)>a.input.invocation->unique_rows)return fail<Slot>(a);
+        count=static_cast<std::uint32_t>(slice.live_bytes/sizeof(p::OwnerCommand));
+        commands=reinterpret_cast<const p::OwnerCommand*>(reinterpret_cast<const std::byte*>(commands)+slice.byte_offset);
+    }else {
+        if(a.input.record_layout!=RecordLayout::Compact || a.input.allocation_slice || a.input.record_origin || a.input.record_capacity ||
+            (a.plan.native.reply_capacity?!recordCount<p::OwnerCommand>(a,count):(a.input.records || a.input.record_bytes)))return fail<Slot>(a);
+    }
+    return true;
+}
+/** @brief Commit a completely validated pin batch in original command order.
+ * @tparam Slot Original physical slot encoding.
+ * @param a Same exclusive owner used during immutable validation.
+ * @param commands Original validated command prefix.
+ * @param count Validated original command count.
+ * @return Original ordered pin publication result.
+ * @note Internal native implementation only; GPU validation and commit share one CTA invocation.
+ */
+template<class Slot> QFN_ADAPTIVE_HD bool commitPins(const OwnerArgs& a,const p::OwnerCommand* commands,std::uint32_t count)
+{
+    for(std::uint32_t i=0;i<count;++i){
+        const auto& c=commands[i];const auto& g=c.target;
+        if(c.kind!=p::CommandKind::PinInitial || c.reserved || !same(g.interval,a.input.invocation->interval) ||
+            g.unique>=a.input.invocation->unique_rows || c.requested_row!=g.row ||
+            p::OwnerOperations<Slot>(ownerView<Slot>(a)).pinInitial(g.interval,{g.row,g.generation,g.owner,g.slot},g.unique,c.ordinal).kind!=p::GrantKind::Read)
+            return fail<Slot>(a);
+    }
+    progress(a).reply_bytes=std::uint64_t{ownerView<Slot>(a).frame->initial_pin_count}*sizeof(p::Grant);return true;
+}
+/** @brief Decode and authenticate the actual original allocation plan publication.
+ * @tparam Action Original Free/Victim acceptance role.
+ * @tparam Slot Original physical slot encoding.
+ * @param a Same original invocation, transport span and owner roots.
+ * @param lease Output original owner lease.
+ * @param decisions Output exact original live decision span.
+ * @param count Output original bounded live extent.
+ * @return False with sticky original failure before any allocation plan mutation.
+ */
+template<OwnerAction Action,class Slot> QFN_ADAPTIVE_HD bool allocationDecisionSpan(const OwnerArgs& a,
+    p::AvailabilityLease& lease,const p::AllocationDecision*& decisions,std::uint32_t& count)
+{
+    const auto* h=static_cast<const std::conditional_t<Action==OwnerAction::AcceptFree,FreePlanHeader,VictimPlanHeader>*>(a.input.frontier);
+    if(!h || h->version!=Version || h->status!=Status::Success || h->decision_bytes%sizeof(p::AllocationDecision) ||
+        h->decision_bytes/sizeof(p::AllocationDecision)>a.plan.native.reply_capacity ||
+        (h->decision_bytes && !a.input.records))return fail<Slot>(a);
+    count=static_cast<std::uint32_t>(h->decision_bytes/sizeof(p::AllocationDecision));
+    const auto* records=static_cast<const std::byte*>(a.input.records);
+    if(a.input.record_layout==RecordLayout::DirectedAllocationBank) {
+        const auto* slice=a.input.allocation_slice;
+        const auto capacity=std::uint64_t{a.plan.owner.maximumUnique()}*sizeof(p::AllocationDecision);
+        if(!slice || !records || a.input.record_capacity!=capacity || slice->live_bytes!=h->decision_bytes ||
+           slice->byte_offset<a.input.record_origin || slice->byte_offset-a.input.record_origin>capacity ||
+           slice->live_bytes>capacity-(slice->byte_offset-a.input.record_origin) ||
+           (slice->byte_offset-a.input.record_origin)%sizeof(p::AllocationDecision))return fail<Slot>(a);
+        records+=slice->byte_offset-a.input.record_origin;
+    }else if(a.input.record_layout==RecordLayout::TransportedAllocationPrefix) {
+        // The public binding retains a separate original transport count.
+        // Validate that publication before plan.accept can reserve or copy
+        // any decision. C0 has neither a count message nor payload pointer.
+        if(a.input.allocation_slice || a.input.record_origin || a.input.record_capacity ||
+           (a.plan.native.reply_capacity ? (!a.input.record_bytes ||
+               reinterpret_cast<std::uintptr_t>(a.input.record_bytes)%alignof(std::uint64_t) ||
+               *a.input.record_bytes!=h->decision_bytes) :
+               (a.input.record_bytes || a.input.records || h->decision_bytes)) ||
+           (records && reinterpret_cast<std::uintptr_t>(records)%alignof(p::AllocationDecision)))return fail<Slot>(a);
+    }else if(a.input.record_layout!=RecordLayout::Compact || a.input.allocation_slice || a.input.record_origin || a.input.record_capacity)
+        return fail<Slot>(a);
+    decisions=reinterpret_cast<const p::AllocationDecision*>(records);
+    for(std::uint32_t i=0;i<count;++i)if(decisions[i].unique>=a.input.invocation->unique_rows)return fail<Slot>(a);
+    lease=h->lease;
+    return true;
+}
+/** @brief Run one ordered native owner metadata operation; payload copy publication is a separate exact event edge. */
+template<OwnerAction Action,class Slot> QFN_ADAPTIVE_HD bool ownerOperation(const OwnerArgs& a)
+{
+    if constexpr(Action==OwnerAction::PublishWire)return publicationWire<p::PublishHeader,Slot>(a);
+    if constexpr(Action==OwnerAction::ReadyWire)return publicationWire<p::ReadyHeader,Slot>(a);
+    if constexpr(Action==OwnerAction::PublicationAcquiredWire)return publicationWire<PublicationAcquiredHeader,Slot>(a);
+    if constexpr(Action==OwnerAction::RetiredWire){
+        const auto& frame=*ownerView<Slot>(a).frame;
+        if(frame.phase!=p::OwnerPhase::Idle || frame.held_pins || frame.reservations || allocationFrame(a).phase!=p::AllocationPhase::Idle){
+            progress(a).header_bytes=0;progress(a).header_kind=OwnerHeaderKind::None;
+            *at<OwnerHeaderKind>(a.native,a.plan.native.header+56)=OwnerHeaderKind::None;return fail<Slot>(a);
+        }
+        return publicationWire<p::RetiredHeader,Slot>(a);
+    }
     auto view=ownerView<Slot>(a);
     auto physical=p::OwnerOperations<Slot>(view);
     auto plan=allocation<Slot>(a);
     auto& state=allocationFrame(a);
     auto& output=progress(a);
-    output.header_bytes=0;
+    output.header_bytes=0;output.header_kind=OwnerHeaderKind::None;
+    if constexpr(Action==OwnerAction::ReadRows)return beginHitRead<Slot>(a);
     if(!current<Slot>(a,Action==OwnerAction::Begin))return false;
     const auto gate=sourceGate(a.input.condition,a.input.outcome,a.input.invocation->interval,a.plan.table,view.frame->source);
     if(gate==SourceGate::Invalid)return fail<Slot>(a,Status::SourceFailure);
@@ -211,19 +364,11 @@ template<OwnerAction Action,class Slot> QFN_ADAPTIVE_HD bool owner(const OwnerAr
     else if constexpr(Action==OwnerAction::Pin)
     {
         output.reply_bytes=0;
-        if(view.frame->phase!=p::OwnerPhase::Pinning)return fail<Slot>(a);
         std::uint32_t count=0;
-        if(a.plan.native.reply_capacity?!recordCount<p::OwnerCommand>(a,count):(a.input.records || a.input.record_bytes))return fail<Slot>(a);
-        const auto* commands=static_cast<const p::OwnerCommand*>(a.input.records);
+        const p::OwnerCommand* commands=nullptr;
+        if(!pinCommandSpan<Slot>(a,commands,count))return false;
         if(!validatePins<Slot>(a,commands,count))return false;
-        for(std::uint32_t i=0;i<count;++i){
-            const auto& c=commands[i];const auto& g=c.target;
-            if(c.kind!=p::CommandKind::PinInitial || c.reserved || !same(g.interval,a.input.invocation->interval) ||
-                g.unique>=a.input.invocation->unique_rows || c.requested_row!=g.row ||
-                physical.pinInitial(g.interval,{g.row,g.generation,g.owner,g.slot},g.unique,c.ordinal).kind!=p::GrantKind::Read)
-                return fail<Slot>(a);
-        }
-        output.reply_bytes=std::uint64_t{view.frame->initial_pin_count}*sizeof(p::Grant);return true;
+        return commitPins<Slot>(a,commands,count);
     }
     else if constexpr(Action==OwnerAction::SealPins)
     {header(a,physical.sealPins(a.input.invocation->interval));return view.frame->status==Status::Success;}
@@ -236,26 +381,12 @@ template<OwnerAction Action,class Slot> QFN_ADAPTIVE_HD bool owner(const OwnerAr
     }
     else if constexpr(Action==OwnerAction::AcceptFree || Action==OwnerAction::AcceptVictim)
     {
-        const auto* h=static_cast<const std::conditional_t<Action==OwnerAction::AcceptFree,FreePlanHeader,VictimPlanHeader>*>(a.input.frontier);
-        if(!h || h->version!=Version || h->status!=Status::Success || h->decision_bytes%sizeof(p::AllocationDecision) ||
-            h->decision_bytes/sizeof(p::AllocationDecision)>a.plan.native.reply_capacity ||
-            (h->decision_bytes && !a.input.records))return fail<Slot>(a);
-        const auto count=static_cast<std::uint32_t>(h->decision_bytes/sizeof(p::AllocationDecision));
-        const auto* records=static_cast<const std::byte*>(a.input.records);
-        if(a.input.record_layout==RecordLayout::DirectedAllocationBank) {
-            const auto* slice=a.input.allocation_slice;
-            const auto capacity=std::uint64_t{a.plan.owner.maximumUnique()}*sizeof(p::AllocationDecision);
-            if(!slice || !records || a.input.record_capacity!=capacity || slice->live_bytes!=h->decision_bytes ||
-               slice->byte_offset<a.input.record_origin || slice->byte_offset-a.input.record_origin>capacity ||
-               slice->live_bytes>capacity-(slice->byte_offset-a.input.record_origin) ||
-               (slice->byte_offset-a.input.record_origin)%sizeof(p::AllocationDecision))return fail<Slot>(a);
-            records+=slice->byte_offset-a.input.record_origin;
-        }else if(a.input.record_layout!=RecordLayout::Compact || a.input.allocation_slice || a.input.record_origin || a.input.record_capacity)
-            return fail<Slot>(a);
-        const auto* decisions=reinterpret_cast<const p::AllocationDecision*>(records);
-        for(std::uint32_t i=0;i<count;++i)if(decisions[i].unique>=a.input.invocation->unique_rows)return fail<Slot>(a);
-        if constexpr(Action==OwnerAction::AcceptFree)return plan.accept(p::FreeAllocationPlan{h->lease,decisions,count});
-        else return plan.accept(p::VictimAllocationPlan{h->lease,decisions,count});
+        p::AvailabilityLease lease{};
+        const p::AllocationDecision* decisions=nullptr;
+        std::uint32_t count=0;
+        if(!allocationDecisionSpan<Action,Slot>(a,lease,decisions,count))return false;
+        if constexpr(Action==OwnerAction::AcceptFree)return plan.accept(p::FreeAllocationPlan{lease,decisions,count});
+        else return plan.accept(p::VictimAllocationPlan{lease,decisions,count});
     }
     else if constexpr(Action==OwnerAction::ExecuteFree || Action==OwnerAction::ExecuteVictim)
     {
@@ -313,6 +444,22 @@ template<OwnerAction Action,class Slot> QFN_ADAPTIVE_HD bool owner(const OwnerAr
     }
     else if constexpr(Action==OwnerAction::ReadyReceipt)
     {const auto h=physical.readyHeader(a.input.invocation->interval);header(a,h);return h.status==Status::Success;}
+    else if constexpr(Action==OwnerAction::AcquireReaderRetirement)
+    {
+        const auto* gate=static_cast<const ReadersRetiredGate*>(a.input.frontier);
+        if(!gate || gate->kind!=static_cast<std::uint32_t>(OwnerHeaderKind::ReadersRetired) || gate->version!=Version ||
+           !same(gate->interval,a.input.invocation->interval) || !a.plan.native.source_outcome)return fail<Slot>(a,Status::SourceFailure);
+        const SourceFrontier actual{gate->interval,gate->source,gate->disposition,gate->status,Version};
+        if(sourceGate(actual.status==Status::Success?SourceCondition::AfterSuccess:SourceCondition::AfterFailure,
+               &actual,view.frame->interval,a.plan.table,actual.source)!=SourceGate::Run)return fail<Slot>(a,Status::SourceFailure);
+        const bool unsealed=gate->status!=Status::Success && same(view.frame->source,p::SourceWindow{}) &&
+            view.frame->phase==p::OwnerPhase::Draining && view.frame->status==Status::Cancelled && state.phase==p::AllocationPhase::Cancelled;
+        if(!same(view.frame->source,gate->source) && !unsealed)return fail<Slot>(a,Status::SourceFailure);
+        if(gate->status==Status::Success && (view.frame->phase!=p::OwnerPhase::Publishable ||
+            view.frame->status!=Status::Success || view.frame->reservations || state.phase!=p::AllocationPhase::SourceSealed))
+            return fail<Slot>(a,Status::SourceFailure);
+        *at<SourceFrontier>(a.native,a.plan.native.source_outcome)=actual;return true;
+    }
     else if constexpr(Action==OwnerAction::Release)
     {
         const auto total=view.frame->initial_pin_count+state.count;
@@ -352,12 +499,137 @@ template<OwnerAction Action,class Slot> QFN_ADAPTIVE_HD bool owner(const OwnerAr
         if constexpr(Action==OwnerAction::CancelVictim)header(a,plan.victimReceipt());
         return view.frame->status==Status::Cancelled;
     }
+    else if constexpr(Action==OwnerAction::DrainSourceFailure)
+    {
+        // This fixed cancellation action reads the actual physical seal phase.
+        // It never fabricates a common window to make pre/post-seal owners agree.
+        const auto* h=source<Slot>(a,true);if(!h || h->disposition==SourceDisposition::Published)return fail<Slot>(a,Status::SourceFailure);
+        const bool sealed=state.phase==p::AllocationPhase::SourceSealed;
+        if(h->status==Status::Success && view.frame->status==Status::Success){
+            if(!sealed || !same(view.frame->source,h->source))return fail<Slot>(a,Status::SourceFailure);
+            return true;
+        }
+        if(sealed){
+            if(!same(view.frame->source,h->source))return fail<Slot>(a,Status::SourceFailure);
+            return ownerOperation<OwnerAction::CancelSource,Slot>(a);
+        }
+        const auto absent=p::SourceWindow{};
+        if(!same(view.frame->source,absent) || (state.phase!=p::AllocationPhase::Executed &&
+            state.phase!=p::AllocationPhase::FreeFrontier && state.phase!=p::AllocationPhase::Cancelled))return fail<Slot>(a,Status::SourceFailure);
+        const bool drained=ownerOperation<OwnerAction::CancelVictim,Slot>(a);
+        // Original first error is sticky even when physical cancellation succeeded.
+        if(state.phase==p::AllocationPhase::Cancelled)output.retirement=p::SourceRetirement::Unpublished;
+        return drained;
+    }
     else if constexpr(Action==OwnerAction::Retire)
     {
         if(output.retirement==p::SourceRetirement::Unknown)return fail<Slot>(a,Status::SourceFailure);
         const bool ok=plan.retire(output.retirement,view.frame->source);
         header(a,physical.retiredHeader(a.input.invocation->interval));return ok;
     }
+}
+/**
+ * @brief Publish an actual seal outcome even when the attempted operation returned early.
+ * @param a Original sealed root addresses and invocation, never a copied host state.
+ * @param succeeded Actual production operation result, not a caller supplied success observation.
+ * @note All input fields are read before replacing the reusable header; input may be that header.
+ */
+template<class Slot> QFN_ADAPTIVE_HD void sourceSealOutcome(const OwnerArgs& a,bool succeeded)
+{
+    const auto& frame=*ownerView<Slot>(a).frame;const auto& allocation=allocationFrame(a);
+    const auto* input=static_cast<const SourceFrontier*>(a.input.frontier);
+    const bool valid=succeeded && input && a.input.invocation && input->version==Version &&
+        input->status==Status::Success && frame.status==Status::Success &&
+        frame.phase==p::OwnerPhase::Filling && allocation.phase==p::AllocationPhase::SourceSealed &&
+        allocation.count==frame.reservations && allocation.count<=a.plan.native.reply_capacity &&
+        same(frame.interval,a.input.invocation->interval) && same(frame.interval,allocation.lease.interval) &&
+        same(frame.source,input->source) && same(frame.interval,input->interval);
+    const auto status=valid?Status::Success:(frame.status!=Status::Success?frame.status:(succeeded && input && input->status!=Status::Success?input->status:Status::InvalidPhase));
+    const OwnerSourceSealReceipt receipt{frame.interval,frame.source,a.plan.owner.coordinate(),status,Version};
+    header(a,receipt);
+}
+/**
+ * @brief Produce a guaranteed typed fill-validation handoff after every actual operation result.
+ * @param a Original owner roots; source outcome lives separately from this reusable output header.
+ * @param succeeded Actual operation return, including current/gate/parser/copy failures.
+ * @note A skipped or failed operation must never leave SourceFrontier bytes masquerading as PublishHeader.
+ */
+template<class Slot> QFN_ADAPTIVE_HD void fillValidationOutcome(const OwnerArgs& a,bool succeeded)
+{
+    const auto& frame=*ownerView<Slot>(a).frame;const auto& allocation=allocationFrame(a);
+    const auto gate=a.input.invocation?sourceGate(a.input.condition,a.input.outcome,a.input.invocation->interval,a.plan.table,frame.source):SourceGate::Invalid;
+    const bool valid=succeeded && gate==SourceGate::Run && a.input.invocation &&
+        frame.status==Status::Success && frame.phase==p::OwnerPhase::FillValidated &&
+        allocation.phase==p::AllocationPhase::SourceSealed && progress(a).delivery==Delivery::Copied &&
+        same(frame.interval,a.input.invocation->interval) && same(frame.interval,allocation.lease.interval) &&
+        allocation.count==frame.reservations && allocation.count<=a.plan.native.reply_capacity;
+    const auto status=valid?Status::Success:(frame.status!=Status::Success?frame.status:(gate==SourceGate::Skip?a.input.outcome->status:Status::SourceFailure));
+    header(a,p::PublishHeader{frame.interval,frame.source,a.plan.owner.coordinate(),status});
+}
+/**
+ * @brief Author actual completed publication acquisition, not a transport send acknowledgment.
+ * @return True only after the original ALL-owner frontier was accepted into this physical owner phase.
+ * @note Error status can come from the original acquired source gate while physical frame remains Success.
+ */
+template<class Slot> QFN_ADAPTIVE_HD bool publicationAcquiredOutcome(const OwnerArgs& a,bool succeeded)
+{
+    const auto& frame=*ownerView<Slot>(a).frame;const auto& allocation=allocationFrame(a);
+    const auto gate=a.input.invocation?sourceGate(a.input.condition,a.input.outcome,a.input.invocation->interval,a.plan.table,frame.source):SourceGate::Invalid;
+    const bool valid=succeeded && gate==SourceGate::Run && a.input.invocation && frame.status==Status::Success &&
+        frame.phase==p::OwnerPhase::Publishable && allocation.phase==p::AllocationPhase::SourceSealed &&
+        allocation.count<=a.plan.native.reply_capacity && frame.reservations==allocation.count &&
+        frame.initial_pin_count<=a.plan.native.reply_capacity-allocation.count &&
+        frame.held_pins==frame.initial_pin_count+allocation.count &&
+        same(frame.interval,a.input.invocation->interval) && same(frame.interval,allocation.lease.interval);
+    const auto status=valid?Status::Success:(frame.status!=Status::Success?frame.status:
+        (gate==SourceGate::Skip?a.input.outcome->status:Status::SourceFailure));
+    header(a,PublicationAcquiredHeader{frame.interval,frame.source,a.plan.owner.coordinate(),status});return valid;
+}
+/**
+ * @brief Always publish the actual nominal Ready outcome; an ignored bool cannot leave old Publish bytes usable.
+ * @param a Original physical/native roots and exact invocation/source gate.
+ * @param succeeded Result of the actual ReadyReceipt operation, including early rejection or skipped gate.
+ * @return True only when the real active owner and every original held grant are physically readable.
+ * @note Source cancellation can be authoritative while the physical owner still reports Success.
+ * The error receipt preserves that acquired gate; it never invents physical cancellation or releases pins.
+ * Calling the typed header producer also authors its nominal publication-kind witness after mixed11 rebase.
+ */
+template<class Slot> QFN_ADAPTIVE_HD bool readyOutcome(const OwnerArgs& a,bool succeeded)
+{
+    const auto view=ownerView<Slot>(a);const auto& frame=*view.frame;const auto& allocation=allocationFrame(a);
+    const auto gate=a.input.invocation?sourceGate(a.input.condition,a.input.outcome,a.input.invocation->interval,a.plan.table,frame.source):SourceGate::Invalid;
+    bool valid=succeeded && gate==SourceGate::Run && a.input.invocation && frame.status==Status::Success &&
+        frame.phase==p::OwnerPhase::Publishable && !frame.reservations &&
+        allocation.phase==p::AllocationPhase::SourceSealed && allocation.count<=a.plan.native.reply_capacity &&
+        same(frame.interval,a.input.invocation->interval) && same(frame.interval,allocation.lease.interval) &&
+        frame.initial_pin_count<=a.plan.native.reply_capacity-allocation.count &&
+        frame.held_pins==frame.initial_pin_count+allocation.count;
+    if(valid){
+        const auto physical=p::OwnerOperations<Slot>(view);
+        for(std::uint32_t i=0;i<frame.held_pins;++i)
+            if(!physical.readable(frame.interval,originalGrant(a,i)))valid=false;
+    }
+    const auto status=valid?Status::Success:(frame.status!=Status::Success?frame.status:
+        (gate==SourceGate::Skip?a.input.outcome->status:Status::SourceFailure));
+    header(a,p::ReadyHeader{frame.interval,frame.source,a.plan.owner.coordinate(),status});
+    return valid;
+}
+/**
+ * @brief Execute the actual native operation and its inseparable typed outcome producer.
+ * @note GPU adapters may discard the bool; seal/fill receipts therefore cannot depend on host launch interpretation.
+ */
+template<OwnerAction Action,class Slot> QFN_ADAPTIVE_HD bool owner(const OwnerArgs& a)
+{
+    const bool succeeded=ownerOperation<Action,Slot>(a);
+    if constexpr(Action==OwnerAction::SealSource)sourceSealOutcome<Slot>(a,succeeded);
+    if constexpr(Action==OwnerAction::ValidateFills)fillValidationOutcome<Slot>(a,succeeded);
+    if constexpr(Action==OwnerAction::ReadyReceipt)return readyOutcome<Slot>(a,succeeded);
+    if constexpr(Action==OwnerAction::AcquirePublication)return publicationAcquiredOutcome<Slot>(a,succeeded);
+    if constexpr(Action==OwnerAction::DrainSourceFailure){
+        const auto& actual=*ownerView<Slot>(a).frame;
+        if(actual.phase==p::OwnerPhase::FillValidated || actual.status!=Status::Success)fillValidationOutcome<Slot>(a,succeeded);
+    }
+    return succeeded;
 }
 /** @brief Mark payload-copy completion only after every actual native writer's ordered launch has retired. */
 template<class Slot> QFN_ADAPTIVE_HD bool copied(const OwnerArgs& a)
@@ -436,7 +708,8 @@ template<class Record> QFN_ADAPTIVE_HD bool recordCount(const CoordinatorArgs& a
     if(!a.plan.native.reply_capacity){count=0;return !a.input.records && !a.input.record_bytes;}
     if(!a.input.record_bytes)return false;
     const auto bytes=*a.input.record_bytes;
-    if(bytes%sizeof(Record) || bytes/sizeof(Record)>a.plan.native.reply_capacity)return false;
+    const auto capacity=a.input.local_owner==adaptive_lookup::None?a.plan.native.reply_capacity:a.input.local_reply_capacity;
+    if(capacity>a.plan.native.reply_capacity || bytes%sizeof(Record) || bytes/sizeof(Record)>capacity)return false;
     count=static_cast<std::uint32_t>(bytes/sizeof(Record));
     return (!count || a.input.records) && count<=coordinatorView(a).frame->unique_rows;
 }
@@ -508,6 +781,61 @@ QFN_ADAPTIVE_HD inline bool sortedReleases(const CoordinatorArgs& a,std::uint32_
         at<p::ReleaseReceipt>(a.native,a.plan.native.sorted_releases)[i]=receipts[static_cast<std::uint32_t>(input[i].row)];
     return true;
 }
+/**
+ * @brief Import one actual same-device owner publication into its original ordered cohort slot.
+ * @tparam Action Exact nominal producer/consumer wire type frozen in capture.
+ * @param a Original coordinator roots and the retained actual local header/count producers.
+ * @return False for invalid identity/extent before any destination write. The native
+ * phase makes that failure fatal, so stale destination bytes cannot be fanned out.
+ * A valid observed error receipt is copied unchanged; it never becomes success.
+ */
+template<CoordinatorAction Action> QFN_ADAPTIVE_HD bool importLocalFrontier(const CoordinatorArgs& a)
+{
+    static_assert(localFrontierImport(Action));
+    const auto owner=a.input.local_owner;const auto v=coordinatorView(a);
+    if(a.plan.policy.participants()<2 || !a.plan.native.ingress_frontier ||
+        a.plan.native.ingress_frontier>a.plan.native.bytes ||
+        std::uint64_t{a.plan.policy.participants()}*localFrontierBytes(Action)>a.plan.native.bytes-a.plan.native.ingress_frontier ||
+        owner>=a.plan.policy.participants() || !a.input.frontier || !a.input.record_bytes || !a.input.local_control || !a.input.local_allocation || !a.input.local_header_kind ||
+        *a.input.record_bytes!=localFrontierBytes(Action) || !v.frame->interval.table ||
+        v.frame->interval.table!=a.plan.table || !v.frame->interval.admission || !v.frame->interval.sequence)
+        return fail(a);
+    constexpr auto kind=Action==CoordinatorAction::ImportLocalPinHeader?OwnerHeaderKind::Pin:
+        Action==CoordinatorAction::ImportLocalAvailability?OwnerHeaderKind::Availability:
+        Action==CoordinatorAction::ImportLocalFreeReceipt?OwnerHeaderKind::FreeReceipt:OwnerHeaderKind::VictimReceipt;
+    if(*a.input.local_header_kind!=kind)return fail(a);
+    using Header=std::conditional_t<Action==CoordinatorAction::ImportLocalPinHeader,p::PinHeader,
+        std::conditional_t<Action==CoordinatorAction::ImportLocalAvailability,Availability,
+        std::conditional_t<Action==CoordinatorAction::ImportLocalFreeReceipt,p::FreeAllocationReceipt,p::VictimAllocationReceipt>>>;
+    const auto& h=*static_cast<const Header*>(a.input.frontier);
+    if(static_cast<std::uint32_t>(h.status)>static_cast<std::uint32_t>(Status::Cancelled) ||
+        !same(a.input.local_control->interval,v.frame->interval) || a.input.local_control->status!=h.status)return fail(a);
+    if(h.status==Status::Success){
+        constexpr auto expected=Action==CoordinatorAction::ImportLocalPinHeader?p::LookupPhase::Pinning:
+            Action==CoordinatorAction::ImportLocalAvailability?p::LookupPhase::Availability:
+            Action==CoordinatorAction::ImportLocalFreeReceipt?p::LookupPhase::FreePlanned:p::LookupPhase::VictimPlanned;
+        if(v.frame->phase!=expected)return fail(a);
+        if constexpr(Action==CoordinatorAction::ImportLocalPinHeader){
+            if(a.input.local_control->phase!=p::OwnerPhase::PinsSealed)return fail(a);
+        }else if constexpr(Action==CoordinatorAction::ImportLocalAvailability){
+            if(a.input.local_control->phase!=p::OwnerPhase::AvailabilityLeased || a.input.local_allocation->phase!=p::AllocationPhase::Leased)return fail(a);
+        }else{
+            constexpr auto wave=Action==CoordinatorAction::ImportLocalFreeReceipt?p::AllocationWave::Free:p::AllocationWave::Victim;
+            if(a.input.local_control->phase!=p::OwnerPhase::PlanReady || a.input.local_allocation->phase!=p::AllocationPhase::Executed || a.input.local_allocation->wave!=wave)return fail(a);
+        }
+    }
+    if constexpr(Action==CoordinatorAction::ImportLocalPinHeader){
+        if(h.owner!=owner || !same(h.interval,v.frame->interval))return fail(a);
+    }else{
+        if(h.lease.owner!=owner || !same(h.lease.interval,v.frame->interval) || h.lease.free_slots>v.owners[owner].slots)return fail(a);
+        if constexpr(Action==CoordinatorAction::ImportLocalAvailability){if(h.version!=Version)return fail(a);}
+        else if(h.granted>v.owners[owner].slots)return fail(a);
+    }
+    // Destination already belongs to this coordinator's exact admitted frontier;
+    // the original owner header remains a read-only input, not a second ledger.
+    at<Header>(a.native,a.plan.native.ingress_frontier)[owner]=h;
+    return true;
+}
 /** @brief Execute one ordered coordinator metadata phase; Begin's independent data work is a fixed cooperative bundle. */
 template<CoordinatorAction Action> QFN_ADAPTIVE_HD bool coordinator(const CoordinatorArgs& a)
 {
@@ -516,7 +844,8 @@ template<CoordinatorAction Action> QFN_ADAPTIVE_HD bool coordinator(const Coordi
     if(gate==SourceGate::Invalid)return fail(a,Status::SourceFailure);
     if(gate==SourceGate::Skip)return true;
     auto v=coordinatorView(a);auto op=p::CoordinatorOperations(v);const auto participants=a.plan.policy.participants();
-    if constexpr(Action==CoordinatorAction::PinCommands)
+    if constexpr(localFrontierImport(Action))return importLocalFrontier<Action>(a);
+    else if constexpr(Action==CoordinatorAction::PinCommands)
     {
         if(!phase(a,p::LookupPhase::Pinning))return false;
         auto* slices=at<DirectedSlice>(a.native,a.plan.native.pin_slices);
@@ -586,4 +915,25 @@ template<CoordinatorAction Action> QFN_ADAPTIVE_HD bool coordinator(const Coordi
     else if constexpr(Action==CoordinatorAction::Finish)
     {return op.finish(static_cast<const p::RetiredHeader*>(a.input.frontier),participants);}
 }
+/**
+ * @brief Submit one actual coordinator phase and stop before any continuation on an invalid local publication.
+ * @tparam Action Immutable native operation captured by the original phase stage.
+ * @param a Original checked roots and producer inputs; no device value reaches the host.
+ * @note Host replay uses the identical fatal policy. A valid error receipt is
+ * still imported unchanged; invalid identity never becomes an owner observation.
+ */
+template<CoordinatorAction Action> QFN_ADAPTIVE_HD void submitCoordinator(const CoordinatorArgs& a)
+{
+    const bool valid=coordinator<Action>(a);
+    if constexpr(localFrontierImport(Action))if(!valid){
+#if defined(__CUDA_ARCH__)
+        asm volatile("trap;");
+#elif defined(__HIP_DEVICE_COMPILE__)
+        __builtin_trap();
+#else
+        std::abort();
+#endif
+    }
+}
+
 }

@@ -254,7 +254,7 @@ namespace llaminar2
         v.addRule({
             .id = "ngram-storage-policy",
             .description = "Requested ngram storage/distribution has a checked explicit arm and bounded mapping policy",
-            .fix_hint = "Use replicated storage, explicit single-GPU/R1 full-main gpu-adaptive-vram-ram-ssd with local CPU source, or VRAM fixed-head-sharded on homogeneous rank-local TP2/4/8; Auto remains replicated VRAM/RAM/mmap",
+            .fix_hint = "Use replicated storage, explicit full-main gpu-adaptive-vram-ram-ssd with one GPU/R1 or homogeneous ConsumerLocal TP2 and local CPU source, or VRAM fixed-head-sharded on homogeneous rank-local TP2/4/8; Auto remains replicated VRAM/RAM/mmap",
             .applies = [](const OrchestrationConfig &) { return true; },
             .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
             {

@@ -6,6 +6,7 @@
  * parent/subreaper relationship. It releases only its fresh private directories
  * after waitpid proves all children retired, including singleton MPI daemons.
  * Actual frontend entrypoints enter this ancestor before runtime initialization.
+ * Missing roots retire only through original-FD zero-link proof after consumer exit.
  * No PID-name matching, shared /tmp sweep, model state or accelerator API is used.
  */
 #ifndef _GNU_SOURCE
@@ -31,6 +32,7 @@
 #include <poll.h>
 #include <spawn.h>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <string_view>
@@ -196,6 +198,7 @@ namespace
         } catch (...) { ::closedir(entries); throw; }
         if (::closedir(entries) != 0) fail("cannot close owned directory enumeration");
     }
+    struct Roots;
     /** @brief One fresh private directory, authenticated again before cleanup. */
     struct Directory {
         std::filesystem::path path;
@@ -224,7 +227,7 @@ namespace
         /** @brief Unpublished construction failure has no runtime consumers. */
         ~Directory() {
             if (lifetime == Lifetime::Unpublished && directory.value >= 0 && parent.value >= 0) {
-                try { retire(); } catch (const std::exception &error) { std::fprintf(stderr,"%s\n",error.what()); }
+                try { retireUnpublished(); } catch (const std::exception &error) { std::fprintf(stderr,"%s\n",error.what()); }
             }
         }
         /** @brief Publish the original directory once, before any child can consume it. */
@@ -234,20 +237,82 @@ namespace
                 throw std::logic_error("MPI session directory publication has no unpublished owner");
             lifetime = Lifetime::Published;
         }
-        /** @brief Retire the original root once; failed physical cleanup stays retained. */
-        void retire()
+        /**
+         * @brief Retire constructor-owned storage before any consumer publication.
+         * @throws std::logic_error If this root was published or previously failed.
+         * @throws std::runtime_error If original descriptor/name validation or cleanup fails.
+         * @details A retired root is idempotent. A live published root must instead
+         * consume its original joint owner's actual child-retirement receipt.
+         */
+        void retireUnpublished()
+        {
+            if (lifetime == Lifetime::Retired) return;
+            if (lifetime != Lifetime::Unpublished)
+                throw std::logic_error("Published MPI session root requires its original child-retirement receipt");
+            retireAuthenticated();
+        }
+    private:
+        friend struct Roots;
+        /**
+         * @brief Retire a published directory after its original joint owner consumes proof.
+         * @pre Roots::retire has consumed a receipt for this exact stable owner.
+         * @throws std::logic_error If this directory has never been published.
+         * @throws std::runtime_error If original identity validation or physical cleanup fails.
+         * @details Private access prevents callers from stamping a reaped frontier.
+         */
+        void retireReaped()
+        {
+            if (lifetime == Lifetime::Unpublished)
+                throw std::logic_error("Unpublished MPI root requires construction cleanup");
+            retireAuthenticated();
+        }
+        /**
+         * @brief Validate original held/name identities before physical cleanup.
+         * @pre The checked unpublished or receipt-consuming owner path has closed consumers.
+         * @throws std::runtime_error For any identity/syscall failure or a prior failed cleanup.
+         * @details Only an absent name and matching zero-link original FD avoid pathname
+         * deletion. Every other exceptional exit retains the original failed obligation;
+         * no partially completed filesystem cleanup is replayed from the top.
+         */
+        void retireAuthenticated()
         {
             if (lifetime == Lifetime::Retired) return;
             if (lifetime == Lifetime::Failed)
                 throw std::runtime_error("MPI session directory cleanup previously failed; backing retained: " + path.string());
-            // Any exceptional exit retains the original obligation. Never
-            // replay a partially completed filesystem operation from the top.
             lifetime = Lifetime::Failed;
-            struct stat current{};
-            if (::fstatat(parent.value, path.filename().c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0 ||
-                current.st_ino != identity.st_ino || current.st_dev != identity.st_dev ||
-                current.st_uid != identity.st_uid || !S_ISDIR(current.st_mode))
-                throw std::runtime_error("MPI session root identity changed; backing retained: " + path.string());
+            struct stat held{}, named{};
+            const int held_result = ::fstat(directory.value, &held);
+            const int held_error = held_result == 0 ? 0 : errno;
+            const int name_result = ::fstatat(parent.value, path.filename().c_str(), &named, AT_SYMLINK_NOFOLLOW);
+            const int name_error = name_result == 0 ? 0 : errno;
+            const auto same = [&](const struct stat &value) {
+                return value.st_ino == identity.st_ino && value.st_dev == identity.st_dev &&
+                       value.st_uid == identity.st_uid && S_ISDIR(value.st_mode);
+            };
+            const auto reject = [&](const char *reason) {
+                std::ostringstream diagnostic;
+                diagnostic << "MPI session root identity changed; backing retained: " << path.string()
+                    << "; reason=" << reason << "; name_errno=" << name_error
+                    << " (" << std::strerror(name_error) << "); held_errno=" << held_error
+                    << " (" << std::strerror(held_error) << ")"
+                    << "; expected=" << identity.st_dev << ':' << identity.st_ino << ':' << identity.st_uid
+                    << "; held=" << held.st_dev << ':' << held.st_ino << ':' << held.st_uid
+                    << "; held_mode=" << held.st_mode << "; held_nlink=" << held.st_nlink
+                    << "; named=" << named.st_dev << ':' << named.st_ino << ':' << named.st_uid
+                    << "; named_mode=" << named.st_mode;
+                throw std::runtime_error(diagnostic.str());
+            };
+            if (held_result != 0 || !same(held)) reject("held original directory mismatch");
+            if (name_result != 0) {
+                if (name_error == ENOENT && held.st_nlink == 0) {
+                    // The original inode is gone and has no consumers. Do not
+                    // rediscover/delete a successor through the old pathname.
+                    lifetime = Lifetime::Retired;
+                    return;
+                }
+                reject("original name unavailable without zero-link proof");
+            }
+            if (!same(named)) reject("named directory mismatch");
             removeContents(directory.value);
             if (::unlinkat(parent.value, path.filename().c_str(), AT_REMOVEDIR) != 0) fail("cannot remove retired session root");
             lifetime = Lifetime::Retired;
@@ -267,8 +332,72 @@ namespace
             }
 
         }
-        /** @brief Cleanup only after all actual consumers have retired. */
-        void retire() { shared.retire(); temporary.retire(); }
+        /** @brief Move-only original-owner receipt; only a real ECHILD observation constructs it. */
+        class RetirementReceipt final {
+            friend struct Roots;
+            const Roots *owner_;
+            /**
+             * @brief Bind the actual ECHILD observation to its original nonmovable owner.
+             * @param owner Stable joint owner whose original waitpid observed no children.
+             * @details Only Roots::observeChildren may issue this private authorization.
+             */
+            explicit RetirementReceipt(const Roots *owner) : owner_(owner) {}
+        public:
+            RetirementReceipt(const RetirementReceipt &) = delete;
+            RetirementReceipt &operator=(const RetirementReceipt &) = delete;
+            /**
+             * @brief Transfer the sole cleanup authorization without allocating.
+             * @param other Original receipt, disarmed by this metadata-only move.
+             * @details The moved-from token cannot authorize either owner again.
+             */
+            RetirementReceipt(RetirementReceipt &&other) noexcept : owner_(std::exchange(other.owner_, nullptr)) {}
+            RetirementReceipt &operator=(RetirementReceipt &&) = delete;
+        };
+        /** @brief Facts from one original waitpid call; no child-state mirror is retained. */
+        struct ChildObservation {
+            pid_t child = 0;
+            int status = 0;
+            int error = 0;
+            std::optional<RetirementReceipt> retired;
+        };
+        /**
+         * @brief Observe/reap through the guardian's original waitpid authority.
+         * @return Exact child/status/errno facts; a move-only receipt exists only on ECHILD.
+         * @details This is the existing nonblocking reap operation, not a second
+         * process registry. Zero means a live child remains. The single-threaded
+         * guardian consumes returned proof directly without spawning more work.
+         */
+        ChildObservation observeChildren() const
+        {
+            ChildObservation observation;
+            observation.child = ::waitpid(-1, &observation.status, WNOHANG);
+            observation.error = observation.child < 0 ? errno : 0;
+            if (observation.child < 0 && observation.error == ECHILD)
+                observation.retired.emplace(RetirementReceipt(this));
+            return observation;
+        }
+        /**
+         * @brief Close joint construction failure without authorizing published consumers.
+         * @throws std::logic_error If either root has already been published.
+         * @throws std::runtime_error If original identity/physical cleanup cannot be proven.
+         */
+        void retireUnpublished() { shared.retireUnpublished(); temporary.retireUnpublished(); }
+        /**
+         * @brief Consume the actual original-owner receipt before published cleanup.
+         * @param receipt Move-only proof issued by this owner's waitpid/ECHILD observation.
+         * @throws std::logic_error For a wrong-owner/consumed receipt or unpublished root.
+         * @throws std::runtime_error If original root validation or physical cleanup fails.
+         * @details Invalid receipts change neither owner. A valid receipt is consumed
+         * once before shared-then-temporary cleanup; each directory's existing
+         * failed/retired state retains the physical obligation on an error.
+         */
+        void retire(RetirementReceipt &&receipt)
+        {
+            if (receipt.owner_ != this)
+                throw std::logic_error("MPI root retirement receipt belongs to another owner or was consumed");
+            receipt.owner_ = nullptr;
+            shared.retireReaped(); temporary.retireReaped();
+        }
         /** @return Immutable original directory identities for the owning process. */
         Packet ready() const {
             Packet p{.kind = Kind::Ready};
@@ -280,6 +409,8 @@ namespace
             return p;
         }
     };
+    /** @brief Original command status plus its sole actual child-retirement proof. */
+    struct RetiredCommand { int status; Roots::RetirementReceipt receipt; };
     /** @brief One canonical native executable classification shared by every owner boundary. */
     enum class NativeProgram { Application, Launcher, Daemon };
     /** @return Native role for supported public aliases and their canonical installed names. */
@@ -533,7 +664,7 @@ namespace
         if (!children.eof()) throw std::runtime_error("Cannot inspect exact guardian-owned children");
     }
     /** @brief Wait/reap the actual owned subtree; never delete while a descendant remains. */
-    int runCommand(const std::vector<std::string> &command, int control, int parent_pidfd, const Roots &roots, const std::filesystem::path &executable)
+    RetiredCommand runCommand(const std::vector<std::string> &command, int control, int parent_pidfd, const Roots &roots, const std::filesystem::path &executable)
     {
         if (::prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) fail("cannot retain daemon child ownership");
         const auto paths=roots.ready();
@@ -564,14 +695,19 @@ namespace
         std::map<pid_t,int> sent;
         std::optional<std::chrono::steady_clock::time_point> stopping, killed;
         for (;;) {
-            int status = 0;
-            pid_t child;
-            while ((child = ::waitpid(-1, &status, WNOHANG)) > 0) {
-                sent.erase(child);
-                if (!command_done && child == launched) { command_done = true; command_status = statusCode(status); }
+            std::optional<Roots::ChildObservation> observed;
+            for (;;) {
+                observed.emplace(roots.observeChildren());
+                if (observed->child <= 0) break;
+                sent.erase(observed->child);
+                if (!command_done && observed->child == launched) {
+                    command_done = true; command_status = statusCode(observed->status);
+                }
             }
-            if (child < 0 && errno == ECHILD) return command_status;
-            if (child < 0 && errno != EINTR) fail("cannot certify child process retirement");
+            if (observed->retired) return {command_status, std::move(*observed->retired)};
+            if (observed->child < 0 && observed->error != EINTR) {
+                errno = observed->error; fail("cannot certify child process retirement");
+            }
             if (command_done && !stopping) stopping = std::chrono::steady_clock::now();
             pollfd events[] = {{parent_alive ? control : -1, POLLIN|POLLHUP, 0}, {parent_alive ? parent_pidfd : -1, POLLIN, 0}, {signals.descriptor.value, POLLIN, 0}};
             if (::poll(events, 3, 50) < 0 && errno != EINTR) fail("cannot await owned launcher");
@@ -627,23 +763,28 @@ namespace
             sendPacket(control, paths);
             roots.temporary.publish(); roots.shared.publish();
             published = true;
-            const int result = runCommand(command, control, exact_parent.value, roots, executable);
-            roots.retire();
+            auto retired = runCommand(command, control, exact_parent.value, roots, executable);
+            roots.retire(std::move(retired.receipt));
             // A killed owner has closed the channel; cleanup still succeeds independently.
-            Packet done{.kind=Kind::Done, .value=result};
+            Packet done{.kind=Kind::Done, .value=retired.status};
             const auto sent = ::send(control, &done, sizeof(done), MSG_NOSIGNAL);
             if (sent < 0 && errno != EPIPE && errno != ECONNRESET) fail("cannot publish retired session");
-            return result;
+            return retired.status;
         } catch (const std::exception &error) {
             // Preserve the first error. Cleanup of a later root must not hide
             // it by attempting to rediscover a root already physically retired.
             std::fprintf(stderr,"%s\n",error.what());
-            int status = 0;
-            if (!published || (!command.empty() && ::waitpid(-1, &status, WNOHANG) < 0 && errno == ECHILD)) {
-                try { roots.retire(); }
-                catch (const std::exception &cleanup_error) {
-                    std::fprintf(stderr,"MPI session cleanup remains incomplete: %s\n",cleanup_error.what());
-                }
+            const auto cleanup = [&] {
+                if (!published) { roots.retireUnpublished(); return true; }
+                if (command.empty()) return false;
+                auto observed = roots.observeChildren();
+                if (!observed.retired) return false;
+                roots.retire(std::move(*observed.retired));
+                return true;
+            };
+            try { if (cleanup()) return 125; }
+            catch (const std::exception &cleanup_error) {
+                std::fprintf(stderr,"MPI session cleanup remains incomplete: %s\n",cleanup_error.what());
                 return 125;
             }
             std::fprintf(stderr, "MPI backing retained at %s and %s\n",

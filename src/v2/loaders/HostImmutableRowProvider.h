@@ -54,6 +54,8 @@ public:
     static std::shared_ptr<HostImmutableRowProvider> fromSubordinateAdaptiveCache(std::unique_ptr<CpuAdaptiveImmutableRowCache> cache);
     /** @return Declared subordinate GPU requester; absent means ordinary independent host ownership. */
     std::optional<PhysicalMemoryAllocatorIdentity> subordinateRequester() const noexcept;
+    /** @return Complete original GPU consumer population, independent of CPU cache ownership. */
+    std::span<const PhysicalMemoryAllocatorIdentity> subordinateRequesters() const noexcept;
     /** @brief Release the actual owner only after the final retained provider handle retires. */
     ~HostImmutableRowProvider() = default;
     HostImmutableRowProvider(const HostImmutableRowProvider &) = delete;
@@ -94,7 +96,7 @@ public:
 private:
     friend class qwen4exp::ImmutableLookupHostProcessor;
     /** @brief Bind one actual acquired-request processor to the retained cache authority. */
-    void bindSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel);
+    void bindSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel,DeviceId requester=DeviceId::invalid());
     /** @brief Retire the sole channel without freeing old pinned reader backing. */
     void retireSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel) noexcept;
     /** @brief Mint a private capability only after the existing processor validates its actual frame. */

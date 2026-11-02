@@ -9,6 +9,7 @@
  * arithmetic remains covered by the existing
  * all-codebook MoEOverlayCapacityResolver suite downstream of this adapter.
  */
+#include "../../fixtures/planning/RecordedHostServicePlanning.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "config/OrchestrationConfig.h"
@@ -17,6 +18,7 @@
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
 #include "loaders/ModelLoader.h"
 #include "planning/PlanningModelMetadata.h"
+#include "fixtures/planning/RecordedNgramOrdering.h"
 #include <gtest/gtest.h>
 #include <limits>
 
@@ -341,7 +343,7 @@ namespace llaminar2
         host_input.host_demand_memory.reset();
         try
         {
-            (void)MoEOverlayLocalCapacityPlanner::plan(host_input);
+            (void)test::planWithRecordedHostServices(host_input);
             FAIL() << "Movable host capacity accepted missing routing evidence";
         }
         catch (const std::invalid_argument &error)
@@ -356,7 +358,7 @@ namespace llaminar2
             auto input = buildMoEOverlayMemoryPlanInputs(device.request(), 32).local_capacity;
             ASSERT_FALSE(input.host_demand_memory);
             input.host_demand_memory = evidence;
-            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
         }
     }
 
@@ -608,7 +610,7 @@ namespace llaminar2
         request.pipeline_stage = FactoryPPStageConfig{.first_layer = 47, .last_layer = 48,
             .has_embedding = false, .has_lm_head = true};
         const auto inputs = buildMoEOverlayMemoryPlanInputs(request, 8);
-        const auto fixed = MoEOverlayLocalCapacityPlanner::plan(inputs.local_capacity);
+        const auto fixed = test::planWithRecordedHostServices(inputs.local_capacity);
         ASSERT_EQ(fixed.device_inputs.size(), 1u);
         const auto &residency = fixed.device_inputs.front().weight_residency;
         // The fixed contribution excludes every routed expert while retaining
@@ -710,8 +712,9 @@ namespace llaminar2
                         if (backend != DeviceType::CPU && interval == std::pair{0,0})
                             request.snapshot_capacity = {.per_accelerator_bytes = 8192,
                                 .effective_kv = GraphSnapshotMemoryCapacity::EffectiveKV{}};
-                        const auto inputs=buildMoEOverlayMemoryPlanInputs(request,512);
-                        const auto fixed=MoEOverlayLocalCapacityPlanner::plan(inputs.local_capacity);
+                        auto inputs=buildMoEOverlayMemoryPlanInputs(request,512);
+                        inputs.local_capacity.native_ordering_events=test::recordedNgramOrdering(f.rank.primary_device.toLocalDeviceId());
+                        const auto fixed=test::planWithRecordedHostServices(inputs.local_capacity);
                         ASSERT_NE(fixed.physical_memory_admission,nullptr);
                         const auto exact=MemoryPlanner::plan(profile,fixed.device_inputs);
                         size_t host_tier=0,archive=0;

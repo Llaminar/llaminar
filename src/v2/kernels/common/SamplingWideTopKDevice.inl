@@ -12,6 +12,7 @@
 #pragma once
 
 #include "SamplingMath.h"
+#include "SamplingPenaltyRead.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -134,10 +135,11 @@ namespace llaminar2::sampling_wide
      * list. Large K therefore never needs a partially active hardware wave or
      * more than 32 KiB of dynamic shared memory on either backend.
      */
-    template <int Width>
+    template <int Width, bool WithHistory = false>
     __global__ __launch_bounds__(Width, 4) void partials(
         const float *data, int vocabulary, int row_stride, int k, int partitions,
-        float *partial_values, int *partial_indices, const int *active_rows)
+        float *partial_values, int *partial_indices, const int *active_rows,
+        sampling_math::PenaltyLogitRead history)
     {
         const int row = static_cast<int>(blockIdx.y);
         const int live = active_rows ? *active_rows : static_cast<int>(gridDim.y);
@@ -158,7 +160,8 @@ namespace llaminar2::sampling_wide
             const float *input = data + static_cast<std::size_t>(row) * row_stride;
             for (int token = begin + lane; token < end; token += kLaneLists)
             {
-                const Candidate candidate{input[token], token};
+                const Candidate candidate{sampling_math::historyLogit<WithHistory>(
+                    input[token], token, row, history), token};
                 if (count == k && !better(candidate, {values[k - 1], indices[k - 1]}))
                     continue;
                 int position = count < k ? count : k - 1;

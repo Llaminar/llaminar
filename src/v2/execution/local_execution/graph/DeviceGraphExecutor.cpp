@@ -20,6 +20,8 @@
 #include "snapshots/SnapshotStorageLayout.h"
 #include "../../../snapshots/SnapshotSemanticObservation.h"
 #include "DeviceGraphExecutor.h"
+#include "RetainedHostServiceProgram.h"
+#include "RetainedParentTicketServiceWorker.h"
 #include "RetainedParentTicketServiceWorker.h"
 #include "StageVerifier.h"
 #include "DeviceGraphCaptureController.h"
@@ -863,6 +865,23 @@ namespace llaminar2
     DeviceGraphExecutor &DeviceGraphExecutor::operator=(
         DeviceGraphExecutor &&) noexcept = default;
 
+    void DeviceGraphExecutor::setRetainedParentTicketServiceWorker(std::unique_ptr<PreparedRetainedHostService> worker,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
+    {
+        if(retained_parent_ticket_service_worker_ || !worker ||
+           worker->program().role()!=RetainedHostServiceRole::ExecutorParentTicket || !worker->worker().idle() ||
+           worker->memory().get()!=memory.get()||worker->memory().owner_before(memory)||memory.owner_before(worker->memory()))
+            throw std::logic_error("Executor requires one original unused admitted ticket-service owner");
+        retained_parent_ticket_service_worker_=std::move(worker);
+    }
+
+    bool DeviceGraphExecutor::hasRetainedParentTicketServiceWorker()const noexcept{return bool(retained_parent_ticket_service_worker_);}
+    void DeviceGraphExecutor::requireRetainedParentTicketServiceProgram(const RetainedHostServiceProgram& program,const std::shared_ptr<PhysicalMemoryAuthority>& memory)const
+    {
+        if(!retained_parent_ticket_service_worker_||retained_parent_ticket_service_worker_->program().identity()!=program.identity()||
+           retained_parent_ticket_service_worker_->memory().get()!=memory.get()||retained_parent_ticket_service_worker_->memory().owner_before(memory)||memory.owner_before(retained_parent_ticket_service_worker_->memory()))
+            throw std::logic_error("Executor CPU service lost original immutable declaration/PMA");
+    }
+
     void DeviceGraphExecutor::setGraphSnapshotMemoryReservation(
         std::shared_ptr<PhysicalMemoryOwnerReservation> reservation)
     {
@@ -896,7 +915,7 @@ namespace llaminar2
     bool DeviceGraphExecutor::execute(ComputeGraph &graph, IDeviceContext *ctx)
     {
         graph.requireExecutable();
-        if(graph.retainedStorageBoundary())
+        if(graph.retainedStorageBoundary() || graph.readAheadBranch())
             throw std::logic_error("Immutable storage graph cannot enter eager execution; retain its complete native parent");
         if (!ctx)
         {
@@ -1399,7 +1418,8 @@ namespace llaminar2
             if (!node || !node->stage)
                 continue;
 
-            node->stage->setGPUStream(producer_stream);
+            void *const snapshot_stream=graph.executionStreamForNode(name,producer_stream);
+            node->stage->setGPUStream(snapshot_stream);
 
             DeviceId target_device = node->device.is_valid() ? node->device : node->stage->device();
             if (!target_device.is_valid())
@@ -1408,7 +1428,7 @@ namespace llaminar2
             if (!prepareGraphSnapshotCopies(
                     *node,
                     target_device,
-                    producer_stream,
+                    snapshot_stream,
                     manifest))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Failed to prepare graph snapshots for stage '"
@@ -3053,6 +3073,8 @@ namespace llaminar2
         GraphSnapshotManifest *snapshot_manifest)
     {
         graph.requireExecutable();
+        if(graph.readAheadBranch() && !currentGraphCaptureDependencyLedger())
+            throw std::logic_error("Read-ahead requires the complete native captured event DAG; eager stage replay is forbidden");
         // Set GPU device once for the entire pass
         DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
@@ -3332,7 +3354,7 @@ namespace llaminar2
          * Diagnostic attribution shares that success boundary, but owns only
          * native topology metadata; the canonical stage still owns all work.
          */
-        ScopedGraphCaptureStage capture_stage(node.stage.get());
+        ScopedGraphCaptureStage capture_stage(node.stage.get(),node.stage->gpuStream());
         std::optional<NativeGraphStageAnnotationScope> annotation;
         const auto annotation_observer = nativeGraphStageAnnotationObserver();
         const DeviceId stage_device = node.device.is_valid() ? node.device : node.stage->device();

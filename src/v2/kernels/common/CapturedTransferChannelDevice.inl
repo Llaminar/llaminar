@@ -9,7 +9,8 @@
  * to become resident. CTA barriers and an acquire/release completion chain
  * carry all writers to one system-release publisher. Exact streams and private
  * phase claims protect replay
- * without host observation, allocation or additional physical cursor bytes.
+ * without host observation or allocation. The cursor retains the acquired
+ * source offset alongside its exact message until payload publication.
  */
 
 /** @return Fresh peer descriptor word after its release epoch has been acquired. */
@@ -91,8 +92,9 @@ __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelD
     // The graph orders the count writer before acquire. Snapshot once: a
     // producer waiting for the previous acknowledgement must not change the
     // extent of the transaction it is trying to publish.
-    const std::uint64_t producer_bytes = binding.extent_source == CapturedTransferExtentSource::ProducerDevice
-        ? *binding.device_extent : 0;
+    const auto source_slice = binding.source_slice ? *binding.source_slice : CapturedTransferSourceSlice{};
+    const std::uint64_t producer_bytes = binding.source_slice ? source_slice.live_bytes :
+        binding.extent_source == CapturedTransferExtentSource::ProducerDevice ? *binding.device_extent : 0;
     const auto started = capturedTransferWallClock();
     for (;;)
     {
@@ -106,10 +108,11 @@ __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelD
         }
         const auto decision = CapturedTransferChannelProtocol::acquire(
             binding.role, binding.expected, actual, cursor, observed, binding.message,
-            binding.extent_source, producer_bytes);
+            binding.extent_source, producer_bytes, source_slice.byte_offset, binding.source_span_bytes, binding.source_offset_origin);
         if (decision.ready())
         {
             binding.cursor->acquired_message = cursor.acquired_message;
+            binding.cursor->acquired_source_offset = cursor.acquired_source_offset;
             // Only this acquired invocation can initialize the completion
             // cohort. All copy blocks follow this write through the stream
             // dependency or the single-block barrier.
@@ -177,6 +180,7 @@ __device__ __forceinline__ void capturedTransferPublish(CapturedTransferChannelD
     mappedSystemRelease64(&owned->epoch, publication.epoch);
     binding.cursor->completed_epoch = cursor.completed_epoch;
     binding.cursor->acquired_message = {};
+    binding.cursor->acquired_source_offset = 0;
     __threadfence();
     atomicExch(phase, static_cast<unsigned int>(CapturedTransferPhase::Idle));
 }
@@ -214,6 +218,16 @@ __device__ __forceinline__ void capturedTransferCopyAndPublish(
         if (threadIdx.x == 0) capturedTransferFail(binding, CapturedTransferStatus::MessageMismatch);
         return;
     }
+    const auto source_offset = binding.cursor->acquired_source_offset;
+    if (binding.source_slice ? source_offset > binding.source_span_bytes || bytes > binding.source_span_bytes - source_offset
+        : source_offset != 0)
+    {
+        if (threadIdx.x == 0) capturedTransferFail(binding, CapturedTransferStatus::InvalidBinding);
+        return;
+    }
+    // Only producers have a source slice. Acquire retained this offset before
+    // any wait; copy never reloads a later descriptor or sends its source span.
+    source = static_cast<const std::uint8_t *>(source) + source_offset;
     if constexpr (VectorAligned)
         mappedHostCopyVectorBody(static_cast<uint4 *>(destination), static_cast<const uint4 *>(source), bytes, copy_block, copy_blocks);
     else

@@ -16,10 +16,11 @@
 namespace llaminar2 {class CapturedDeviceStorageLease;}
 namespace llaminar2::qwen4exp
 {
+class PooledImmutableOwnerPreparedStorage;
 /** @brief Closed role set; owner and coordinator schemas reject unused, missing or substituted operands. */
 enum class PooledNativeOperand : std::uint32_t
 {
-    Invocation,Records,RecordBytes,Frontier,Payload,PayloadBytes,Ids,Admission,OriginalCount,Source,Outcome,AllocationSlice,Count
+    Invocation,Records,RecordBytes,Frontier,Payload,PayloadBytes,Ids,Admission,OriginalCount,Source,Outcome,AllocationSlice,OwnerControl,AllocationControl,HeaderKind,Count
 };
 inline constexpr auto PooledNativeOperandCount=static_cast<std::size_t>(PooledNativeOperand::Count);
 /** @brief Original canonical root plus immutable bounded subrange and exact graph role. */
@@ -55,11 +56,15 @@ public:
      * @param plan Original checked native geometry.
      * @param spans Exact schema-owned canonical roots and subranges.
      * @param condition Fixed captured source branch; its actual outcome is a retained producer operand.
-     * @param records Compact acquired records, or an exact same-device directed allocation-bank view with its actual slice producer.
+     * @param records Explicit local Compact, original same-device DirectedAllocationBank,
+     * or TransportedAllocationPrefix with the original separate acquired UInt64 count.
+     * @param localCoordinator Original same-allocator coordinator plan, required only for DirectedCommandBank.
+     * The transported allocation consumer checks count/header equality before reservation mutation.
      */
     PooledImmutableOwnerOperands(pooled_native::OwnerAction action,const PooledImmutableOwnerNativePlan& plan,
         PooledNativeOperandSpans spans,pooled_native::SourceCondition condition=pooled_native::SourceCondition::Always,
-        pooled_native::RecordLayout records=pooled_native::RecordLayout::Compact);
+        pooled_native::RecordLayout records=pooled_native::RecordLayout::Compact,
+        std::optional<PooledImmutableCoordinatorNativePlan> localCoordinator=std::nullopt);
     /** @brief Seal existing prepared addresses outside capture; allocate and publish no bytes. */
     void seal();
     /** @brief Reject changed role/type/extent/device/backend/runtime or operation before native submission. */
@@ -74,6 +79,10 @@ public:
     std::uint64_t captureIdentity()const;
     /** @return Original exact input roles for declarative graph contracts. */
     const PooledNativeOperandSpans& spans()const noexcept{return spans_;}
+    /** @return Capture-frozen device branch policy; never a live controller observation. */
+    pooled_native::SourceCondition sourceCondition()const noexcept{return condition_;}
+    /** @return Original record addressing/count ABI used by the actual native launcher. */
+    pooled_native::RecordLayout recordLayout()const noexcept{return records_;}
 private:
     friend class IPooledImmutableNativeKernels;
     /** @return Only sealed native coordinates; no live count is dereferenced here. */
@@ -83,6 +92,7 @@ private:
     pooled_native::OwnerAction action_;
     pooled_native::SourceCondition condition_;
     pooled_native::RecordLayout records_;
+    std::uint64_t local_coordinator_identity_=0; ///< Exact local command-bank producer geometry; absent for every other layout.
     pooled_native::OwnerParameters plan_;
     PooledNativeOperandSchema schema_;
     PooledNativeOperandSpans spans_;
@@ -100,10 +110,12 @@ public:
      * @param original_rows Complete unsliced counted query prefix; no mutable count is copied to the host.
      * @param spans Exact schema-owned canonical original/acquired producer roots.
      * @param condition Fixed captured source branch; only source publication/cancellation may be conditional.
+     * @param localOwner Actual original prepared local metadata/Grant producer; absent for remote and unrelated operations.
      */
     PooledImmutableCoordinatorOperands(pooled_native::CoordinatorAction action,const PooledImmutableCoordinatorNativePlan& plan,
         std::optional<pooled_native::OriginalRows> original_rows,PooledNativeOperandSpans spans,
-        pooled_native::SourceCondition condition=pooled_native::SourceCondition::Always);
+        pooled_native::SourceCondition condition=pooled_native::SourceCondition::Always,
+        std::shared_ptr<PooledImmutableOwnerPreparedStorage> localOwner={});
     /** @brief Seal already-prepared addresses and actual count-owner identity before capture. */
     void seal();
     /** @brief Reject operation/geometry/root/count/runtime drift before recording native work. */
@@ -130,6 +142,10 @@ private:
     pooled_native::SourceCondition condition_;
     pooled_native::CoordinatorParameters plan_;
     std::optional<pooled_native::OriginalRows> rows_;
+    std::shared_ptr<PooledImmutableOwnerPreparedStorage> local_owner_; ///< Original local metadata producer; never a copied receipt owner.
+    std::uint64_t local_owner_identity_=0;
+    std::uint32_t local_coordinate_=adaptive_lookup::None;
+    std::uint32_t local_reply_capacity_=0;
     PooledNativeOperandSchema schema_;
     PooledNativeOperandSpans spans_;
     std::optional<Qwen4ExpPreparedStorage> prepared_;

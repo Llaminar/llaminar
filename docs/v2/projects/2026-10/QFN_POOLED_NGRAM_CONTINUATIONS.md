@@ -1,29 +1,87 @@
 # QFN pooled ngrams across continuation topologies
 
-Implementation contract, updated 2026-10-31. Distributed tiering is not implemented or qualified. The single-GPU adaptive path now uses separate pooled owner, coordinator and source components; its focused source-admission and model-free preflight gates pass. This note records the remaining implementation and testing work; source admission alone does not qualify inference.
+Implementation contract, updated 2026-11-01. The isolated integration tree implements ordinary rank-local cross-vendor storage behind a singleton GPU continuation and CPU expert domain. All four static-expert, MTP-Off retained15 source controls pass loading and final retirement in r65. The four corresponding frozen-history panels now pass their required groups, actual captured inference, exact reset and final retirement; see the [panel result and explicit numerical-policy decision](QFN_POOLED_NGRAM_PANEL_2026-11-01.md). Dynamic balancing, active MTP, performance and complete preflight remain unqualified for this new path. This note records the complete target; source admission alone does not qualify inference.
 
-The [source/fill component](QFN_POOLED_SOURCE_FILL_PLAN.md) has private CPU
-replay and full-target compiler evidence through real fill outcomes. It retains
-one provider and exact owner receive spans. The mixed-local Pin/Free/Victim
-adapter now has frozen host-component evidence; neither component is installed. The next
-[completion plan](QFN_POOLED_COMPLETION_PLAN.md) wires actual publication,
-reads, release and retirement, beginning with publication through Ready.
-Native captured execution and complete distributed admission remain open.
+The isolated integration tree includes the [source/fill component](QFN_POOLED_SOURCE_FILL_PLAN.md),
+mixed-local Pin/Free/Victim, publication/acquisition/Ready, original-order hit
+delivery, and terminal release/retirement bodies. Twelve focused host checks
+pass 3,329 case executions; original worker and graph producers are exercised
+with device API doubles. CUDA SM80/86/89/90 and HIP gfx906/gfx1100 leaf
+compilation passes the canonical spill guard. This is component evidence,
+not native capture or serving qualification.
+[Completion plan](QFN_POOLED_COMPLETION_PLAN.md).
+
+Two subsequent focused corrections also pass in the joined tree: public remote
+row packing rejects local owners without an ingress/payload family, while the
+original local read remains valid; zero-slot release import ignores inactive
+serial count storage and still requires actual physical retirement. Both have
+original-code failing controls and explicit production-preflight regressions.
+Evidence: `/tmp/qfn-ngram-read-schema-joined-r1/` and
+`/tmp/qfn-ngram-terminal-c0-joined-r1/`.
 
 The isolated integration tree combines all-remote and mixed local/remote
-owner components. Direct local Pin/Free/Victim edges retain actual producer
-and receipt dependencies without a self-channel. Source/publication, reads
-and retirement are being completed in parallel. The installed path still
-covers one owner; host-component passes do not qualify distributed capture.
+owner components. Direct local edges retain actual producer and receipt
+dependencies without a self-channel. The reader retains private source misses
+and transfers only live hit rows; a single remote owner is covered independently
+of the coordinator. Terminal graph wiring preserves the actual last-reader
+edge before releasing pins. The ordinary cross-vendor path retains original
+remote native programs and passes full source admission. Host-component and
+source passes alone do not qualify serving, active MTP or multi-consumer capture.
 
 The existing memory composer now has a private multi-owner overload, charging
 each physical GPU separately and the coordinator/source once through PMA.
 Focused tests cover 1/2/4/8 owners, unequal/C0 capacity, mixed backend metadata,
 query buckets through M2048, exact fit and one-byte-short rejection. The
-original single-owner composer agrees in 120 metadata combinations. Directed
+original single-owner composer agrees in 120 metadata combinations, including
+the merged publication version; all four production consumers compile. Directed
 transport still supplies its own BOM; planner/factory eligibility stays guarded.
 Evidence: `/tmp/qfn-ngram-cohort-proof-r1/`,
-`/tmp/qfn-pooled-mixed-local-r2/`, `/tmp/qfn-ngram-rollout-r1/`.
+`/tmp/qfn-ngram-terminal-joined-proof-r1/`,
+`/tmp/qfn-ngram-read-terminal-device-compile-r1/`, `/tmp/qfn-ngram-rollout-r1/`.
+
+## User-visible completion criteria
+
+The end goal is fast, numerically qualified QFN inference on the available CPU,
+CUDA and ROCm hardware, including composed topologies and flexible ngram tiers.
+Admission accounting is supporting infrastructure. A successful load does not
+qualify a configuration for users, and another accounting refinement is not a
+substitute for running the admitted configuration.
+
+Use the existing canonical typed matrix as the configuration authority. For each
+configuration being qualified, keep these results distinct and traceable to its
+exact model, topology, placement, arithmetic and runtime policy:
+
+| Check | Required evidence |
+|---|---|
+| Loading | Real model admission, declared compute/storage owners, fit or an intentional capacity rejection, bounded resources and complete cleanup. |
+| Serving | Actual public inference, captured execution, repeated requests, reset and prefix restoration; ngram hits, misses, promotions and evictions where selected. |
+| Numerical accuracy | Frozen-history panels with separate prefill/decode mean KL, top-1 agreement and top-5 overlap; retain exact-history layer/stage replay for diagnosis. |
+| Dynamic experts | Actual migration decisions, published owner generations and live transfer extents, with outputs and resources correct during lookup work. Merely enabling the option is insufficient. |
+| MTP | Off, fixed1, fixed3 and Dynamic execution; observe proposed/accepted work and depth decisions, and preserve serial/grouped byte equivalence and reset behavior. Retained graph capacity is not proof of MTP execution. |
+| Performance | Matched Release prefill/decode and complete-request timings, plus lookup latency and movement/communication costs. Compare the relevant dashboard baseline and the best existing supported placement under identical workload intent. |
+
+Static and dynamic expert balancing are independent of the four MTP policies;
+the canonical functional matrix must exercise their supported combinations.
+Performance measurements must also expose the cost and benefit of both features,
+including contention with ngram read-ahead and tier movement. Select defaults
+from the fastest accurate measured policy for that topology, not from an isolated
+kernel result or from adding devices alone. Keep slower explicit configurations
+usable and accurately described when they provide capacity or placement value.
+
+Run cheap policy/admission and focused replay coverage broadly; use the existing
+model, generation, numerical and benchmark projections for their respective
+proofs. Every configuration advertised as qualified needs the applicable real
+execution and accuracy evidence. Missing hardware, unimplemented combinations,
+and unmeasured performance remain explicit gaps in the dashboard. Do not turn
+them into successful skips or add a separate manually maintained topology list.
+
+The current four opposite-vendor ordinary controls are a bridge to this work:
+they use static experts and MTP Off with retained capacity15. Their source,
+inference and required frozen-history groups now pass. The next user-prioritized
+slice is active fixed1, fixed3 and Dynamic MTP on the same execution path,
+followed by dynamic balancing, Release economy and the remaining consumer/domain combinations. A scoped
+recorder cleanup may remove duplicate setup; a graph-builder rewrite is outside
+this slice.
 
 ## Existing target and installed boundary
 
@@ -93,6 +151,25 @@ in that same PMA state. Its exact SDK declarations must precede optional fill;
 the plan is approved implementation work, not current native qualification.
 
 Prove simultaneous graphs' concurrency explicitly. One serial family may borrow max-sized frame banks; concurrent consumers require exclusive frames and safe shared cache pin/generation protocol. Accepted allocation plans survive cancellation until all grants, fills and ACKs retire. Host source worker and network/device channel closures drain accepted operations before source/cache roots disappear. Reuse authenticates source files/ranges, owner/coordinator mappings, policy, capacities, graph generations and native transport identity. Faults poison the exact frame and fail fatally; no silent alternate tier or topology outside the declared policy.
+
+### Dynamic expert balancing is part of continuation acceptance
+
+QFN continuation domains retain the existing Qwen35MoE/Qwen 3.6 MoE dynamic
+expert-balancing implementation. Reuse its controller, movement journal, owner
+generations, quotas and publication ordering; ngram placement must not replace
+them with fixed expert ownership or an independent accounting/transport path.
+Expert movement and hot-ngram promotion remain distinct typed operations on the
+same admitted physical resources, with only their actual live payloads sent.
+
+For every supported homogeneous and cross-vendor continuation policy, include
+an execution case that observes real expert movement while serving ngram hits,
+misses and promotions. Assert the original movement records/generations and
+quotas, source and destination byte extents, correct outputs and bounded memory.
+Cover reset, skewed ownership, empty participants and cancellation with both
+movement and lookup work outstanding. Exercise Off, fixed1, fixed3 and Dynamic
+MTP through the normal generation policy. Source admission, no-movement runs
+and resource-owner replays alone cannot certify this requirement; unsupported
+execution combinations remain explicitly unqualified.
 
 ### Implementable sequence toward the complete feature
 

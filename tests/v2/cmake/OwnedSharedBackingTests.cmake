@@ -1,3 +1,10 @@
+# These declarations own only functional targets and registrations. Release
+# intentionally excludes them through V2TestTargetSelection/add_v2_test; return
+# before attaching target properties or labels to omitted owners.
+if(V2_PERF_TESTS_ONLY)
+    return()
+endif()
+
 # Original-root shared file ownership and startup replay registration.
 # All native work here is CPU MPI; no model or accelerator is initialized.
 set(_owned_shared_cpu_env
@@ -104,3 +111,36 @@ endforeach()
 set_property(TEST V2_Integration_MPIRetirementDiagnostics APPEND PROPERTY LABELS ProductionTestPreflight)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MPIRetirementCursorReplay V2_Integration_MPIRetirementDiagnostics)
+
+# Actual original-FD root retirement beyond unpublished/ECHILD frontiers.
+# The body TU includes production source; it neither links the engine nor initializes MPI.
+add_executable(v2_test_mpi_root_retirement_body unit/utils/Test__MPIRootRetirementBody.cpp)
+target_include_directories(v2_test_mpi_root_retirement_body PRIVATE ${REPO_ROOT}/src/v2)
+target_compile_features(v2_test_mpi_root_retirement_body PRIVATE cxx_std_20)
+target_link_libraries(v2_test_mpi_root_retirement_body PRIVATE GTest::gtest_main ${CMAKE_DL_LIBS})
+foreach(_root_suite Unit Integration)
+    add_v2_test(V2_${_root_suite}_MPIRootRetirementBody
+        COMMAND $<TARGET_FILE:v2_test_mpi_root_retirement_body> --gtest_repeat=20
+        LABELS "V2;${_root_suite};CPU;DeviceFree;MPI;Lifecycle;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+endforeach()
+set_property(TEST V2_Integration_MPIRootRetirementBody APPEND PROPERTY LABELS ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIRootRetirementBody)
+add_v2_test(V2_Unit_MPIRootRetirementHelper
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_session_lifecycle.py
+        --helper $<TARGET_FILE:llaminar_mpi_session> --probe $<TARGET_FILE:v2_mpi_session_probe>
+        --mpirun ${MPIEXEC_EXECUTABLE} --case root_retirement
+    LABELS "V2;Unit;CPU;DeviceFree;MPI;Lifecycle;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+foreach(_root_case root_unlink root_identity)
+    foreach(_root_shard RANGE 0 3)
+        set(_root_test V2_Integration_MPIRootRetirement_${_root_case}_Shard${_root_shard})
+        add_v2_test(${_root_test}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_session_lifecycle.py
+                --helper $<TARGET_FILE:llaminar_mpi_session> --probe $<TARGET_FILE:v2_mpi_session_probe>
+                --mpirun ${MPIEXEC_EXECUTABLE} --case ${_root_case} --repeat 5
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Replay;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_root_test})
+    endforeach()
+endforeach()

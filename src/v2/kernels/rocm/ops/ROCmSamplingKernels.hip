@@ -987,7 +987,7 @@ __global__ void rocm_topk_topp_distribution_from_partials_f32_kernel(
  * lane make vocabulary reads coalesced while keeping all candidates in VGPRs
  * for the repeated deterministic maximum selections.
  */
-template <int K_CAP>
+template <int K_CAP, bool WithHistory = false>
 __global__ __launch_bounds__(TOPK_BATCHED_COOPERATIVE_THREADS, 2)
 void rocm_topk_cooperative_partials_batched_f32_kernel(
     const float *__restrict__ data,
@@ -997,7 +997,8 @@ void rocm_topk_cooperative_partials_batched_f32_kernel(
     int partial_blocks,
     float *__restrict__ partial_values,
     int *__restrict__ partial_indices,
-    const int *__restrict__ active_rows_device)
+    const int *__restrict__ active_rows_device,
+    llaminar2::sampling_math::PenaltyLogitRead history)
 {
     const int row = blockIdx.y;
     const int active_rows =
@@ -1027,7 +1028,9 @@ void rocm_topk_cooperative_partials_batched_f32_kernel(
             item * TOPK_BATCHED_COOPERATIVE_THREADS;
         const int index = block_start + offset;
         const bool valid = index < block_end;
-        local_values[item] = valid ? row_data[index] : -FLT_MAX;
+        local_values[item] = valid
+            ? llaminar2::sampling_math::historyLogit<WithHistory>(row_data[index], index, row, history)
+            : -FLT_MAX;
         local_indices[item] = valid ? index : -1;
     }
 
@@ -1219,7 +1222,7 @@ void rocm_topk_topp_distribution_sorted_partials_batched_f32_kernel(
     }
 }
 
-template <int K_CAP>
+template <int K_CAP, bool WithHistory = false>
 __global__ void rocm_topk_smallk_partials_batched_f32_kernel(
     const float *__restrict__ data,
     int n,
@@ -1228,7 +1231,8 @@ __global__ void rocm_topk_smallk_partials_batched_f32_kernel(
     int partial_blocks,
     float *__restrict__ partial_values,
     int *__restrict__ partial_indices,
-    const int *__restrict__ active_rows_device)
+    const int *__restrict__ active_rows_device,
+    llaminar2::sampling_math::PenaltyLogitRead history)
 {
     if (k > K_CAP)
         return;
@@ -1274,7 +1278,8 @@ __global__ void rocm_topk_smallk_partials_batched_f32_kernel(
 
     for (int i = block_start + tid; i < block_end; i += num_threads)
     {
-        const float val = row_data[i];
+        const float val = llaminar2::sampling_math::historyLogit<WithHistory>(
+            row_data[i], i, row, history);
         if (local_count >= k &&
             !topkCandidateBetter(val, i, local_vals[k - 1], local_idxs[k - 1]))
             continue;
@@ -5406,7 +5411,11 @@ bool rocmOps_topk_topp_distribution_f32(
     return true;
 }
 
-bool rocmOps_topk_topp_distributions_f32(
+} // extern "C"
+
+/** @brief Shared selection/normalization dispatch; history changes only candidate reads. */
+template <bool WithHistory>
+static bool rocmTopKDistributionsImpl(
     const float *data,
     int row_count,
     int n,
@@ -5422,7 +5431,8 @@ bool rocmOps_topk_topp_distributions_f32(
     int scratch_capacity,
     const int *active_rows,
     int device_idx,
-    void *stream)
+    void *stream,
+    llaminar2::sampling_math::PenaltyLogitRead history)
 {
     if (row_count <= 0 || n <= 0 || row_stride < n ||
         k <= 0 || k > TOPK_MAX_K || out_stride < k ||
@@ -5443,10 +5453,10 @@ bool rocmOps_topk_topp_distributions_f32(
             return false;
         // All 64 lanes participate even though sixteen own private LDS lists.
         // That preserves valid wave shuffles with a bounded 32-KiB list bank.
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(llaminar2::sampling_wide::partials<64>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(llaminar2::sampling_wide::partials<64, WithHistory>),
             dim3(geometry->partial_blocks, row_count), dim3(64), geometry->shared_bytes,
             static_cast<hipStream_t>(stream), data, n, row_stride, k,
-            geometry->partial_blocks, scratch_values, scratch_indices, active_rows);
+            geometry->partial_blocks, scratch_values, scratch_indices, active_rows, history);
         if (hipGetLastError() != hipSuccess)
             return false;
         hipLaunchKernelGGL(HIP_KERNEL_NAME(llaminar2::sampling_wide::distributions<64>),
@@ -5483,40 +5493,40 @@ bool rocmOps_topk_topp_distributions_f32(
             if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
             {
                 hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(rocm_topk_cooperative_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
+                    HIP_KERNEL_NAME(rocm_topk_cooperative_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP, WithHistory>),
                     partial_grid,
                     dim3(TOPK_BATCHED_COOPERATIVE_THREADS),
                     0,
                     static_cast<hipStream_t>(stream),
                     data, n, row_stride, k, partial_blocks,
-                    scratch_values, scratch_indices, active_rows);
+                    scratch_values, scratch_indices, active_rows, history);
             }
             else if (use_cooperative_selector)
             {
                 hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(rocm_topk_cooperative_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>),
+                    HIP_KERNEL_NAME(rocm_topk_cooperative_partials_batched_f32_kernel<TOPK_SMALL_K_CAP, WithHistory>),
                     partial_grid,
                     dim3(TOPK_BATCHED_COOPERATIVE_THREADS),
                     0,
                     static_cast<hipStream_t>(stream),
                     data, n, row_stride, k, partial_blocks,
-                    scratch_values, scratch_indices, active_rows);
+                    scratch_values, scratch_indices, active_rows, history);
             }
             else if (k <= TOPK_MEDIUM_K_CAP)
             {
                 hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
+                    HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP, WithHistory>),
                     partial_grid, dim3(threads), smem_size, static_cast<hipStream_t>(stream),
                     data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices,
-                    active_rows);
+                    active_rows, history);
             }
             else
             {
                 hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>),
+                    HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP, WithHistory>),
                     partial_grid, dim3(threads), smem_size, static_cast<hipStream_t>(stream),
                     data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices,
-                    active_rows);
+                    active_rows, history);
             }
 
             hipError_t err = hipGetLastError();
@@ -5611,6 +5621,62 @@ bool rocmOps_topk_topp_distributions_f32(
     return false;
 }
 
+extern "C"
+{
+bool rocmOps_topk_topp_distributions_f32(
+    const float *data,
+    int row_count,
+    int n,
+    int row_stride,
+    int k,
+    float top_p,
+    float temperature,
+    int *out_token_ids,
+    int out_stride,
+    float *out_probs,
+    float *scratch_values,
+    int *scratch_indices,
+    int scratch_capacity,
+    const int *active_rows,
+    int device_idx,
+    void *stream)
+{
+    return rocmTopKDistributionsImpl<false>(
+        data, row_count, n, row_stride, k, top_p, temperature,
+        out_token_ids, out_stride, out_probs, scratch_values, scratch_indices,
+        scratch_capacity, active_rows, device_idx, stream, {});
+}
+
+/** @brief Read-only row selection with original durable/speculative history. */
+bool rocmOps_topk_topp_distributions_f32_with_history(
+    const float *data,
+    int row_count,
+    int n,
+    int row_stride,
+    int k,
+    float top_p,
+    float temperature,
+    int *out_token_ids,
+    int out_stride,
+    float *out_probs,
+    float *scratch_values,
+    int *scratch_indices,
+    int scratch_capacity,
+    const int *active_rows,
+    const int *counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    const int *tokens,
+    int device_idx,
+    void *stream)
+{
+    if (!counts || !policy)
+        return false;
+    return rocmTopKDistributionsImpl<true>(
+        data, row_count, n, row_stride, k, top_p, temperature,
+        out_token_ids, out_stride, out_probs, scratch_values, scratch_indices,
+        scratch_capacity, active_rows, device_idx, stream, {counts, policy, tokens});
+}
+
 bool rocmOps_topk_topp_processed_logits_f32(
     const float *data,
     int row_count,
@@ -5669,7 +5735,7 @@ bool rocmOps_topk_topp_processed_logits_f32(
                     HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>),
                     partial_grid, dim3(threads), smem_size, static_cast<hipStream_t>(stream),
                     data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices,
-                    nullptr);
+                    nullptr, llaminar2::sampling_math::PenaltyLogitRead{});
             }
             else
             {
@@ -5677,7 +5743,7 @@ bool rocmOps_topk_topp_processed_logits_f32(
                     HIP_KERNEL_NAME(rocm_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>),
                     partial_grid, dim3(threads), smem_size, static_cast<hipStream_t>(stream),
                     data, n, row_stride, k, partial_blocks, scratch_values, scratch_indices,
-                    nullptr);
+                    nullptr, llaminar2::sampling_math::PenaltyLogitRead{});
             }
 
             hipError_t err = hipGetLastError();

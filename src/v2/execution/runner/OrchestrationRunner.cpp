@@ -44,6 +44,7 @@
  * CPU serial storage declarations survive admission and runtime projection.
  */
 
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/moe/MoEOverlayRowCandidateFinalization.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "planning/TensorParallelSourceDeclaration.h"
@@ -137,6 +138,7 @@
 #include "../../planning/ModelMemoryProfile.h"
 #include "../../planning/ActivationBufferSizing.h"
 #include "../../planning/RankMemoryPlanInputs.h"
+#include "../../backends/NativeContextPreparation.h"
 #include "../../planning/MoEOverlayPlanningInputs.h"
 #include "../../planning/MoEOverlayMemoryPlanInputs.h"
 #include "../../backends/DeviceAddressAdapter.h"
@@ -3195,7 +3197,7 @@ namespace llaminar2
     {
         const bool was_inference_ready = initialization_lifecycle_.readyForInference();
         const bool has_live_resources =
-            runner_ || model_ctx_ || local_tp_ctx_ || local_pp_ctx_ ||
+            created_native_context_source_ || plan_.runtime.native_context_preparation || runner_ || model_ctx_ || local_tp_ctx_ || local_pp_ctx_ ||
             moe_overlay_inference_transaction_coordinator_ ||
             moe_overlay_inference_transaction_follower_ ||
             moe_overlay_rank_batch_transport_registry_ ||
@@ -3397,6 +3399,17 @@ namespace llaminar2
             model_ctx_ && reusable_workspace_complete &&
             model_ctx_.use_count() == 1u &&
             reusable_execution_workspaces_.use_count() == 1u;
+        // A failed fresh initialization has no ready model-retention contract.
+        // Keep its exact original source alive until every partial owner below
+        // is gone. Successful exclusive teardown instead borrows the final
+        // model owner's source, including storage-only native participants.
+        const bool exclusive_failed_source = !was_inference_ready &&
+            !exports_reusable_model_context && created_native_context_source_ &&
+            (!model_ctx_ || model_ctx_.use_count()==1u) &&
+            (!reusable_execution_workspaces_ || reusable_execution_workspaces_.use_count()==1u);
+        auto final_native_source = retires_exclusive_model_context
+            ? model_ctx_->nativeContextPreparation()
+            : (exclusive_failed_source ? created_native_context_source_ : nullptr);
         const bool needs_retention_seal =
             exports_reusable_model_context ||
             retires_exclusive_model_context;
@@ -3497,6 +3510,43 @@ namespace llaminar2
             }
         }
 
+        if(final_native_source &&
+            (exclusive_failed_source || model_context_reuse_seal_succeeded_)){
+            // All graphs, weights and execution buffers must be gone before
+            // native-only zero-allocation validation. Existing positive model
+            // BOM retirement above remains authoritative; this final source
+            // pass covers residual storage-only births as well as failed setup.
+            reusable_execution_workspaces_.reset();
+            final_native_source->retireReleasedContexts();
+            if(plan_.runtime.native_context_preparation==final_native_source)
+                plan_.runtime.native_context_preparation.reset();
+            if(created_native_context_source_==final_native_source)
+                created_native_context_source_.reset();
+        }
+
+        // Quota/planner failure may precede ModelContext publication entirely.
+        // Retire only this original Preparing source's installed births after
+        // all possible runner/model owners have gone. The source-owned final
+        // cleanup above also handles admitted fresh failures. Borrowed/exported
+        // admitted contexts retain their existing model-retirement/reuse path.
+        if (plan_.runtime.native_context_preparation &&
+            plan_.runtime.native_context_preparation->memory()->phase() ==
+                PhysicalMemoryAuthorityPhase::Preparing)
+        {
+            plan_.runtime.native_context_preparation->retireUnadmitted();
+            if(created_native_context_source_==plan_.runtime.native_context_preparation)
+                created_native_context_source_.reset();
+            plan_.runtime.native_context_preparation.reset();
+        }
+
+        // Exported/shared ModelContext and reuse-contract owners keep the SAME
+        // source/PMA. Relinquish this retired runner's plan borrow as well as its
+        // creation handle: otherwise a destructor's second shutdown mistakes
+        // that borrow for live runner state and tries to seal a Reusable (or
+        // successor-owned) authority again. Actual source retirement above is
+        // unchanged; dropping a borrow never retires the external model owner.
+        plan_.runtime.native_context_preparation.reset();
+        created_native_context_source_.reset();
         mtp_depth_policy_scope_geometry_ = {};
         mtp_depth_policy_scope_generic_reason_ = "model_free";
         initialization_lifecycle_.retire();
@@ -17424,6 +17474,20 @@ namespace llaminar2
                                                       : PrefixRuntimeStateSnapshot{};
         snapshot.initialized = initialization_lifecycle_.readyForInference();
         snapshot.prefill_logits_ready = prefill_logits_ready_;
+        if (capture_policy.capture_device_logical_state && snapshot.resident_condition &&
+            ready_mtp_condition_ && ready_mtp_condition_->isDeviceResidentOnly())
+        {
+            const auto current = runner_->deviceResidentLogicalSequenceState();
+            const auto &observed = *snapshot.resident_condition;
+            if (!ready_mtp_condition_->valid() ||
+                !samplingParamsEqual(ready_mtp_condition_->sampling_params, active_sampling_params_) ||
+                !ready_mtp_condition_->resident_state->sameMailboxAs(current) ||
+                observed.device != current.device ||
+                observed.publication_generation != current.publication_generation ||
+                observed.live_state_epoch != current.live_state_epoch)
+                throw std::logic_error("Continuation diagnostics rejected a stale or foreign original ready condition");
+            snapshot.resident_condition->response_disposition = ready_mtp_condition_->response_disposition;
+        }
         /*
          * The heterogeneous controller's mapped durable word is the only
          * movement authority for this regime. The narrow epoch accessor also
@@ -18393,6 +18457,7 @@ namespace llaminar2
             moe_expert_overlay_memory_admission_ =
                 retained_expert_overlay_memory_admission_;
             plan_.runtime.cpu_serial_expert_storage = moe_expert_overlay_memory_admission_->cpu_serial_expert_storage;
+            plan_.runtime.retained_host_services=retained_prepared_weight_plan_->runtime.retained_host_services;
             physical_memory_admission_ =
                 moe_expert_overlay_memory_admission_
                     ->physical_memory_admission;
@@ -18640,6 +18705,7 @@ namespace llaminar2
                 std::size_t selected_model_graph_identity_count = 0u;
                 int selected_prefill_segment_rows = 0;
                 std::string last_capacity_error;
+                const auto host_service_projection=RetainedHostServiceBudgetProjection::original();
                 for (const int candidate_rows : graph_row_candidates)
                 {
                     const int candidate_resident_rows =
@@ -18657,6 +18723,7 @@ namespace llaminar2
                         // while another rank enters its budget collective.
                         auto inputs = buildMoEOverlayMemoryPlanInputs(
                             memory_request, candidate_resident_rows);
+                        inputs.local_capacity.retained_host_services=host_service_projection;
                         auto capacity = MoEOverlayLocalCapacityPlanner::plan(inputs.local_capacity);
                         local_candidate.emplace(LocalCapacityCandidate{
                             std::move(inputs), std::move(capacity)});
@@ -18845,6 +18912,11 @@ namespace llaminar2
                 selected_capacity->cpu_serial_expert_storage =
                     MemoryPlanner::cpuSerialExpertStorageAdmissions(selected_local_capacity->device_inputs);
                 plan_.runtime.cpu_serial_expert_storage = selected_capacity->cpu_serial_expert_storage;
+                if(selected_local_capacity->device_inputs.empty())throw std::logic_error("Selected CPU service admission lost its original device inputs");
+                plan_.runtime.retained_host_services=selected_local_capacity->device_inputs.front().retained_host_services;
+                if(!plan_.runtime.retained_host_services)throw std::logic_error("Selected CPU service admission lost its original declaration");
+                for(const auto& input:selected_local_capacity->device_inputs)
+                    if(input.retained_host_services!=plan_.runtime.retained_host_services)throw std::logic_error("Selected CPU service admission mixed declaration sessions");
                 const auto &capacity = *selected_capacity;
                 moe_expert_overlay_memory_admission_ =
                     std::make_shared<const MoEOverlayResolvedCapacityPlan>(
@@ -19044,7 +19116,8 @@ namespace llaminar2
                          .maximum_source_bytes = maximumGGUFTensorPayloadBytes(model_ctx_->concreteLoader().getModel())},
                      .snapshot_capacity = snapshot_capture_setup_.enabled()
                          ? snapshot_capture_setup_.memory_capacity : GraphSnapshotMemoryCapacity{},
-                     .model_graph_topology_variant_count = snapshot_capture_setup_.retainedModelGraphTopologyVariantCount()}));
+                     .model_graph_topology_variant_count = snapshot_capture_setup_.retainedModelGraphTopologyVariantCount(),
+                     .retained_host_services = RetainedHostServiceBudgetProjection::original()}));
                 moe_pipeline_prepared_plan_ = MoEPipelinePreparedPlan::create(std::move(admission), model_ctx_);
             }
             const auto &admission = *moe_pipeline_prepared_plan_->admission();
@@ -21910,6 +21983,59 @@ namespace llaminar2
                 unique_gpus.push_back(device);
             }
 
+            if(plan_.runtime.ngram_table_policy.isGPUAdaptive()){
+                const auto computeWorkerCount=unique_gpus.size();
+                const auto storageParticipants=plan_.runtime.ngram_table_policy.gpu_adaptive.placement.declaredParticipants();
+                // Storage endpoints are mandatory source-worker births, not
+                // extra compute/expert participants. Preserve authored ordering
+                // while deduplicating coordinator/consumer aliases exactly.
+                for(const auto& endpoint:storageParticipants){
+                    if(endpoint.world_rank!=world_rank || !endpoint.device().is_gpu())
+                        throw std::invalid_argument("Declared immutable source worker must be an exact rank-local native GPU");
+                    if(std::find(unique_gpus.begin(),unique_gpus.end(),endpoint.device())==unique_gpus.end())
+                        unique_gpus.push_back(endpoint.device());
+                }
+                // Immutable inventory startup is a separately measured baseline.
+                // These ORIGINAL observations precede selected worker birth; no
+                // later free-memory sample may adopt that birth after growth.
+                auto source=plan_.runtime.native_context_preparation;
+                if(!source && model_ctx_)source=model_ctx_->nativeContextPreparation();
+                if(!source){
+                    if(unique_gpus.empty())throw std::invalid_argument("GPU adaptive source has no selected native participants");
+                    const auto& observed=cluster_inventory_.ranks.at(static_cast<std::size_t>(world_rank));
+                    std::vector<PhysicalMemoryResource> resources;
+                    resources.push_back({world_rank,DeviceId::cpu(),observed.cpu.memory_bytes?observed.cpu.memory_bytes:observed.cpu_memory_bytes,
+                        PhysicalMemoryAuthority::admissionCapacity(observed.cpu.free_memory_bytes,config_.memoryLimitBytes(DeviceType::CPU))});
+                    for(const auto device:unique_gpus){
+                        const auto found=std::find_if(observed.gpus.begin(),observed.gpus.end(),[&](const auto& gpu){return gpu.type==device.type && gpu.local_device_id==device.ordinal;});
+                        if(found==observed.gpus.end())throw std::invalid_argument("Selected source worker is absent from original rank inventory");
+                        resources.push_back({world_rank,device,found->memory_bytes,
+                            PhysicalMemoryAuthority::admissionCapacity(found->free_memory_bytes,config_.memoryLimitBytes(device.type))});
+                    }
+                    source=NativeContextPreparation::create(resources,world_rank,unique_gpus);
+                    try {
+                        std::vector<PreparedGPUContextUsePermit> creation;
+                        for(const auto device:unique_gpus)creation.push_back(source->acquire(device));
+                        source->freezeForPlanning();
+                    }catch(...){
+                        // Actual created/failed births only. Foreign legacy workers
+                        // must never be reset merely because this source rejected them.
+                        source->retireUnadmitted();throw;
+                    }
+                    created_native_context_source_=source;
+                    plan_.runtime.native_context_preparation=source;
+                }else{
+                    if(source->memory()->worldRank()!=world_rank)throw std::logic_error("Source worker plan crossed original physical ranks");
+                    for(const auto device:unique_gpus){source->requireSelectedDevice(device);
+                        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,source->memory());
+                        if(original.device()!=device)throw std::logic_error("Original source worker device identity changed");}
+                    plan_.runtime.native_context_preparation=source;
+                }
+                PerfStatsCollector::addCounter("native_context_source","original_prequota_source",1.0,"model_setup",{},
+                    {{"selected_workers",std::to_string(unique_gpus.size())},{"compute_workers",std::to_string(computeWorkerCount)},{"declared_storage_workers",std::to_string(storageParticipants.size())},{"runtime_startup_population","separate_baseline"},{"purpose",std::string(purpose)}});
+                return true;
+            }
+
             /*
              * Finish every lazy backend/context allocation before observing
              * any participant. Sampling one GPU while another context is
@@ -21999,6 +22125,15 @@ namespace llaminar2
         try
         {
             const int current_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            if(plan_.runtime.native_context_preparation){
+                const auto& source=plan_.runtime.native_context_preparation;
+                source->admitFinal(physical_memory_admission_);
+                if(physical_memory_authority_ && physical_memory_authority_!=source->memory())
+                    throw std::logic_error("Canonical publication cannot replace original source PMA");
+                physical_memory_authority_=source->memory();
+                if(!model_ctx_->nativeContextPreparation())model_ctx_->bindNativeContextPreparation(source);
+                else if(model_ctx_->nativeContextPreparation()!=source)throw std::logic_error("Model source differs from original native admission");
+            }
             if (!physical_memory_authority_)
             {
                 physical_memory_authority_ = std::make_shared<
@@ -22041,6 +22176,11 @@ namespace llaminar2
         {
             LOG_WARN("[MemoryPlanner] No model context — skipping memory validation");
             return true;
+        }
+
+        if(plan_.runtime.ngram_table_policy.isGPUAdaptive() && !plan_.runtime.native_context_preparation){
+            if(!refreshRankLocalGPUCapacityObservations(rankLocalGPUExecutionDevices(plan_,config_.moe_routed_expert_plan,
+                moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_),"source_prequota_birth"))return false;
         }
 
         if (snapshot_capture_setup_.enabled() &&
@@ -22216,6 +22356,17 @@ namespace llaminar2
             .max_gpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CUDA),
             .max_cpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CPU),
         });
+
+        // CPU threads are not needed to observe GPUs. Only immutable role/BOM
+        // declarations precede quotas; actual CPU0 map/object/pthread birth is
+        // normal final-Admitted materialization before source/graph capture.
+        if(!plan_.runtime.retained_host_services)
+            plan_.runtime.retained_host_services=MemoryPlanner::declareRetainedHostServices(profile,device_configs,plan_.rank,
+                config_.moe_routed_expert_plan.get(),(moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_).get());
+        else {
+            if(plan_.runtime.retained_host_services->worldRank()!=plan_.rank)throw std::logic_error("Runner CPU declarations crossed physical ranks");
+            for(auto& cfg:device_configs)cfg.retained_host_services=plan_.runtime.retained_host_services;
+        }
 
         const auto retained_table=imported_model_context_reuse_authority_
             ? model_ctx_->resolvedImmutableRowTablePlacement() : nullptr;

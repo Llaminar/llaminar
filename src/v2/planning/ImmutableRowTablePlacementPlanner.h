@@ -10,6 +10,7 @@
  * are canonical BOMs authored by their existing owners.
  */
 #pragma once
+#include "backends/NativeOrderingEventBudgetProjection.h"
 #include "loaders/ResolvedImmutableRowTablePlacement.h"
 #include "planning/ImmutableRowTableExecutionProvision.h"
 #include <memory>
@@ -19,6 +20,8 @@
 #include <utility>
 namespace llaminar2
 {
+class RetainedHostServiceDeclarations;
+
 /** @brief Authenticated source extent and observed rank-local PLE consumer resources. */
 class ImmutableRowTablePlacementInput final
 {
@@ -35,6 +38,28 @@ public:
     static ImmutableRowTablePlacementInput forConsumers(ImmutableRowTableExtent extent,
         PhysicalMemoryResource host, std::span<const PhysicalMemoryResource> consumers,
         ImmutableRowTableHostPlacement host_placement = ImmutableRowTableHostPlacement::taskPolicy());
+    /**
+     * @brief Bind declared storage participants to their original immutable observations.
+     * @param requested Exact lossless explicit owner/coordinator request.
+     * @param original_resources Original selected source-worker observations; no fresh probes or fake graph configs.
+     * @return Same consumer inventory with separately authenticated source-storage resources.
+     * @throws std::invalid_argument For absent, foreign, conflicting or unselected observations.
+     */
+    ImmutableRowTablePlacementInput withGPUCacheResources(const ImmutableRowTablePolicy &requested,
+        std::span<const PhysicalMemoryResource> original_resources) const;
+    /** @return Exact owner/coordinator observations; ConsumerLocal returns its original consumers. */
+    std::span<const PhysicalMemoryResource> gpuResources() const noexcept
+    { return gpu_resources_.empty()?std::span<const PhysicalMemoryResource>{consumers_}:std::span<const PhysicalMemoryResource>{gpu_resources_}; }
+    /**
+     * @brief Build one candidate with explicitly ordered per-owner admitted slot counts.
+     * @param requested Original checked request, including per-owner optional ceilings.
+     * @param gpu_slots One count per declared owner, never a shared capacity balance.
+     * @param host_slots Independently admitted subordinate RAM slots.
+     * @param maximum_live_ids Original fixed ID envelope.
+     * @return Checked layout preserving consumers and every C0 owner.
+     */
+    ImmutableRowTableLayoutGeometry gpuAdaptiveLayout(const ImmutableRowTablePolicy &requested,
+        std::span<const std::size_t> gpu_slots,std::size_t host_slots,std::size_t maximum_live_ids) const;
     /** @return Immutable locality policy; never interpreted as an allocator ordinal. */
     const ImmutableRowTableHostPlacement &hostPlacement() const noexcept { return host_placement_; }
     /** @return Original source geometry; no payload read is performed. */
@@ -81,6 +106,8 @@ private:
     ImmutableRowTableExtent extent_;
     PhysicalMemoryResource host_;
     std::vector<PhysicalMemoryResource> consumers_;
+    std::optional<AdaptiveGPUCachePlacementRequest> gpu_placement_; ///< Exact declaration authenticated against original observations.
+    std::vector<PhysicalMemoryResource> gpu_resources_; ///< Source participants never become graph consumers.
 };
 /**
  * @brief Exact incremental mode costs, excluding table storage itself.
@@ -105,6 +132,12 @@ struct ImmutableRowTableAdmissionRequest
     ImmutableRowTableModeContributions contributions;
     /** Source-authored execution already present in the pre-quota base; null only for direct incremental selector inputs. */
     std::shared_ptr<const ImmutableRowTableExecutionProvision> execution_provision;
+    /** Same sealed local certificate source for mandatory floor and every optional candidate.
+     * It is not serialized; the receiver authenticates its own installed source.
+     */
+    NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
+    /** Rank-local declaration only, not serialized; wire carries checked source class identities and typed BOM. */
+    std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
 };
 /** @brief One selected concrete placement and its complete PMA candidate. */
 struct ImmutableRowTablePlacementSelection

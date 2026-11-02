@@ -343,10 +343,13 @@ TEST(QwenSparseSnapshotState, AuthoredQueryMetadataUsesActualDescriptorCounts)
         const std::array prepared{GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseQuery)};
         const auto rawBytes=qwenSparseSnapshotMemory(model,48,0,47,8192,requests,rows,owners,raw);
         const auto preparedBytes=qwenSparseSnapshotMemory(model,48,0,47,8192,requests,rows,owners,prepared);
-        EXPECT_EQ(rawBytes.native_state_payload_bytes,0u);EXPECT_EQ(preparedBytes.native_state_payload_bytes,0u);
+        EXPECT_EQ(rawBytes.native_state_payload_bytes,
+            owners*std::size_t(requests)*rows*512u*sizeof(float));
+        EXPECT_EQ(preparedBytes.native_state_payload_bytes,0u);
         // Each slot has 8-byte authored alignment. FP32[*,512] needs no internal
         // padding; the existing layout contributor explicitly bounds at most7
-        // bytes of preceding-slot alignment. No query payload is charged twice.
+        // bytes of preceding-slot alignment. The native raw payload is charged
+        // once here; any optional raw reference header contributes no payload.
         EXPECT_EQ(rawBytes.authored_metadata_bytes,owners*(16u+48u*requests+7u));
         EXPECT_EQ(preparedBytes.authored_metadata_bytes,owners*requests*(16u+48u+7u));
         std::size_t end=4,payload=4;

@@ -152,6 +152,39 @@ TEST(ModelParityDiagnosticBenchmark, ActualCUDAAndROCmStaticEightAdaptiveRoundTr
     EXPECT_EQ(cells, 4);
 }
 
+TEST(ModelParityDiagnosticBenchmark, DeclaredOppositeVendorOwnersAndDisabledRetainedCapacityRoundTrip)
+{
+    const auto &cells = qwen4exp::qwen4ExpOppositeVendorOrdinaryRetained15Cases();
+    ASSERT_EQ(cells.size(), 4u);
+    for (const auto &cell : cells)
+    {
+        SCOPED_TRACE(cell.testName());
+        const auto expected = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+        ASSERT_FALSE(expected.mtp.enabled);
+        ASSERT_EQ(expected.mtp.graph_capacity_draft_tokens, 15);
+        ASSERT_EQ(expected.ngram_table_policy.gpu_adaptive.placement.mode,
+                  AdaptiveGPUCachePlacementMode::DeclaredRankLocal);
+        requireDeclaredRoundTrip(cell);
+        std::ostringstream text;
+        PrintTo(cell, &text);
+        const auto record = nlohmann::json::parse(text.str());
+        const auto args = record.at("diagnostic_benchmark").at("args").get<std::vector<std::string>>();
+        EXPECT_EQ(args, modelParityDiagnosticBenchmarkArguments(cell));
+        EXPECT_EQ(std::count(args.begin(), args.end(), "--ngram-gpu-cache-placement"), 1);
+        EXPECT_EQ(std::count(args.begin(), args.end(), "--mtp-graph-capacity-draft-tokens"), 1);
+        for (const auto &declared : {args, modelParityServerArguments(cell)})
+        {
+            const auto actual = parseDiagnostic(declared);
+            EXPECT_EQ(actual.ngram_table_policy, expected.ngram_table_policy);
+            EXPECT_EQ(actual.shared_predictor, expected.shared_predictor);
+            EXPECT_FALSE(actual.mtp.enabled);
+            EXPECT_EQ(actual.mtp.graph_capacity_draft_tokens, 15);
+        }
+        // A declared diagnostic must not manufacture automatic benchmark eligibility.
+        EXPECT_THROW(modelParityBenchmarkArguments(cell), std::invalid_argument);
+    }
+}
+
 TEST(ModelParityDiagnosticBenchmark, DiscoveryRemainsExplicitlyUncertified)
 {
     for (const auto &cell : qwen4exp::qwen4ExpGPUAdaptiveProductionCases())
@@ -184,6 +217,8 @@ TEST(ModelParityDiagnosticBenchmark, OriginalCertifiedAutomaticPolicyStaysSepara
                 model_parity_runtime_detail::BenchmarkPlacement::AutomaticProduction));
             EXPECT_EQ(std::count(automatic.begin(), automatic.end(), "--auto"), 1);
             EXPECT_EQ(std::count(automatic.begin(), automatic.end(), "--pp-stage"), 0);
+            EXPECT_EQ(std::count(automatic.begin(), automatic.end(), "--ngram-gpu-cache-placement"), 0);
+            EXPECT_EQ(std::count(automatic.begin(), automatic.end(), "--mtp-graph-capacity-draft-tokens"), 0);
             const auto diagnostic = modelParityDiagnosticBenchmarkArguments(cell);
             EXPECT_EQ(std::count(diagnostic.begin(), diagnostic.end(), "--auto"), 0);
             EXPECT_EQ(std::count(diagnostic.begin(), diagnostic.end(), "--mpi-procs"), 1);

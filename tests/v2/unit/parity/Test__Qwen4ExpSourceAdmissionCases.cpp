@@ -16,6 +16,8 @@
 #include "integration/parity/ModelParityRuntimeExport.h"
 #include "integration/parity/ParityHardwareRequirements.h"
 #include "config/ConfigValidator.h"
+#include "fixtures/backends/NativeContextPreparationReplayAccess.h"
+#include "mocks/MockWorkerGPUContext.h"
 #include "config/OrchestrationConfigParser.h"
 
 #include <gtest/gtest.h>
@@ -1237,7 +1239,7 @@ TEST(Qwen4ExpSourceAdmissionCases, FullSourceMatrixHasTotalFourPolicyMTPDimensio
 {
     const std::array families{
         &qwen4ExpProductionCases(), &qwen4ExpHostAdaptiveProductionCases(),
-        &qwen4ExpFixedHeadProductionCases(), &qwen4ExpGPUAdaptiveProductionCases(),
+        &qwen4ExpFixedHeadProductionCases(), &qwen4ExpGPUAdaptiveSourceAdmissionSeeds(),
         &qwen4ExpFullROCmTP4ProductionCases(), &qwen4ExpROCm4OverlayPolicyProductionCases(),
         &qwen4ExpExtendedSourceAdmissionCases(), &qwen4ExpComposedCandidateSourceAdmissionCases(),
         &qwen4ExpRejectedSourceAdmissionCases(), &qwen4ExpNgramAdmissionCases(),
@@ -1331,10 +1333,10 @@ TEST(Qwen4ExpSourceAdmissionCases, FullSourceMatrixHasTotalFourPolicyMTPDimensio
             EXPECT_EQ(observed, policies);
         }
     }
-    EXPECT_EQ(seeds, 155u);
-    EXPECT_EQ(off, 155u);
-    EXPECT_EQ(active, 465u);
-    EXPECT_EQ(names.size(), 620u);
+    EXPECT_EQ(seeds, 167u);
+    EXPECT_EQ(off, 167u);
+    EXPECT_EQ(active, 501u);
+    EXPECT_EQ(names.size(), 668u);
 }
 
 /** @test Missing paired sources and invalid dimension inputs fail without any source I/O. */
@@ -1401,3 +1403,116 @@ TEST(Qwen4ExpSourceAdmissionCases, SourceMTPProjectionPreservesLegacyDiagnosticA
 }
 
 } // namespace llaminar2::test::parity::qwen4exp
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Canonical source admission cannot treat missing source birth as an observation. */
+TEST(Qwen4ExpSourceAdmissionCases, ConsumedNativeSourceRejectsAbsentOriginalPreparation)
+{
+    const std::optional<::llaminar2::qwen4exp::PreparedImmutableSourceWorkers> unused;
+    EXPECT_THROW((void)requireQwen4ExpConsumedPreparedSource(nullptr,unused),std::logic_error);
+}
+/** @test A real ModelContext retaining a real recorded source is not proof its lookup used it.
+ * No worker is acquired/created: this exact early false-positive boundary must
+ * reject before the canonical observer can inspect any original native handles.
+ */
+TEST(Qwen4ExpSourceAdmissionCases, ConsumedNativeSourceRejectsPreboundUnusedOriginalAuthority)
+{
+    for(const auto device:{DeviceId::cuda(88),DeviceId::rocm(88)}){
+        auto context=ModelContext::createForTesting("recorded-unused-source.gguf",nullptr,48,false);
+        const auto source=::llaminar2::test::NativeContextPreparationReplayAccess::source<::llaminar2::testing::MockWorkerGPUContext>(device);
+        context->bindNativeContextPreparation(source);
+        const auto bound=context->nativeContextPreparation();
+        ASSERT_EQ(bound,source); // Bound-only control would incorrectly pass.
+        const std::optional<::llaminar2::qwen4exp::PreparedImmutableSourceWorkers> unused;
+        try{(void)requireQwen4ExpConsumedPreparedSource(bound,unused);FAIL()<<"Unused source certified actual lookup consumption";}
+        catch(const std::logic_error& error){EXPECT_NE(std::string(error.what()).find("prebound but not consumed"),std::string::npos);}
+    }
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Source-only expansion retains every original GPU/tier/expert/MTP axis without adding topology. */
+TEST(Qwen4ExpSourceAdmissionCases, GPUAdaptiveSourceHasTotalExpertPolicyAndMTPProduct)
+{
+    const auto& seeds=qwen4ExpGPUAdaptiveSourceAdmissionSeeds();
+    ASSERT_EQ(seeds.size(),16u);
+    const auto cells=qwen4ExpExpandSourceAdmissionMTP(seeds);
+    ASSERT_EQ(cells.size(),64u);
+    using Axis=std::tuple<DeviceType,bool,ModelParityExpertMovement,RoutedExpertOwnerOrder,ModelParityMTP>;
+    std::set<Axis> axes;std::set<std::string> names;
+    for(const auto& cell:cells){
+        SCOPED_TRACE(cell.testName());ASSERT_TRUE(cell.expert_overlay);ASSERT_TRUE(cell.ngram_table_policy);
+        ASSERT_TRUE(cell.ngram_table_policy->isGPUAdaptive());
+        ASSERT_TRUE(cell.topology.expert_overlay_plan);const auto& plan=*cell.topology.expert_overlay_plan;
+        ASSERT_EQ(plan.domains.size(),2u);ASSERT_EQ(plan.routed_tiers.size(),2u);
+        const auto continuation=std::find_if(plan.domains.begin(),plan.domains.end(),[&](const auto& domain){return domain.name==plan.continuation_domain;});
+        ASSERT_NE(continuation,plan.domains.end());ASSERT_EQ(continuation->participants.size(),1u);
+        const auto compute=continuation->participants.front();EXPECT_TRUE(compute.isCUDA() || compute.isROCm());
+        EXPECT_EQ(compute.device_ordinal,0);EXPECT_EQ(plan.domains.back().participants,(std::vector{GlobalDeviceAddress::cpu(0)}));
+        EXPECT_EQ(plan.routed_tiers.front().max_experts_per_layer,8u);
+        EXPECT_EQ(cell.topology.participants.size(),2u);EXPECT_EQ(cell.topology.mpi_ranks,1);
+        EXPECT_EQ(cell.topology.kind,ModelParityTopologyKind::RankLocalMultiDomain);
+        const auto& request=cell.ngram_table_policy->gpu_adaptive;
+        const bool bounded=request.maximum_gpu_cache_rows!=0;
+        EXPECT_EQ(request.maximum_gpu_cache_rows,bounded?64u:0u);
+        EXPECT_EQ(request.gpu_cache_physical_byte_limit,bounded?1u<<20:0u);
+        EXPECT_EQ(request.host.maximum_cache_rows,bounded?64u:0u);
+        EXPECT_EQ(request.host.cache_physical_byte_limit,bounded?1u<<20:0u);
+        EXPECT_TRUE(axes.emplace(compute.device_type,bounded,cell.expert_overlay->movement,cell.expert_overlay->owner_order,cell.mtp).second);
+        EXPECT_TRUE(names.insert(cell.testName()).second);EXPECT_LT(cell.testName().size(),256u);
+        EXPECT_EQ(cell.model.transformer_layers,48);EXPECT_EQ(cell.model.model_path,kMainModelPath);
+        const auto config=qwen4ExpSourceAdmissionConfig(cell,cell.model.model_path,0);
+        const auto original=std::find_if(seeds.begin(),seeds.end(),[&](const auto& seed){
+            return seed.topology.test_id==cell.topology.test_id && seed.expert_overlay==cell.expert_overlay && seed.ngram_table_policy==cell.ngram_table_policy;
+        });
+        ASSERT_NE(original,seeds.end());
+        const auto authored=original->makeOrchestrationConfig(original->model.model_path,0);
+        // Reuse the canonical all-fields policy equality: MTP/source expansion
+        // cannot replace the original Qwen MoE maintenance/transfer policy.
+        EXPECT_NO_THROW(requireQwen4ExpSourceMaintenancePolicy(authored.moe_rebalance,config.moe_rebalance));
+        ASSERT_TRUE(config.moe_routed_expert_plan);
+        EXPECT_EQ(config.routed_expert_owner_order,cell.expert_overlay->owner_order);
+        EXPECT_EQ(config.moe_routed_expert_plan->residency_policy,
+            cell.expert_overlay->movement==ModelParityExpertMovement::Dynamic?RoutedExpertResidencyPolicy::RoutedTierRebalanced:RoutedExpertResidencyPolicy::StaticById);
+        EXPECT_EQ(config.mtp.enabled,cell.mtp!=ModelParityMTP::Off);
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,cell.mtp==ModelParityMTP::Off?0:15);
+    }
+    EXPECT_EQ(axes.size(),64u);EXPECT_EQ(names.size(),64u);
+}
+/** @test Original16 source identities and all4 numerical cases remain byte-identical declarations. */
+TEST(Qwen4ExpSourceAdmissionCases, GPUAdaptiveSourcePreservesOriginalSixteenAndNumericalFour)
+{
+    const auto& numerical=qwen4ExpGPUAdaptiveProductionCases();ASSERT_EQ(numerical.size(),4u);
+    std::vector<std::string> before;
+    for(const auto& cell:numerical){std::ostringstream json;::llaminar2::test::parity::PrintTo(cell,&json);before.push_back(json.str());}
+    const auto legacy=qwen4ExpExpandSourceAdmissionMTP(numerical);
+    const auto expanded=qwen4ExpExpandSourceAdmissionMTP(qwen4ExpGPUAdaptiveSourceAdmissionSeeds());
+    ASSERT_EQ(legacy.size(),16u);ASSERT_EQ(expanded.size(),64u);
+    std::size_t preserved=0;
+    for(const auto& original:legacy){
+        const auto actual=std::find_if(expanded.begin(),expanded.end(),[&](const auto& cell){return cell.testName()==original.testName();});
+        ASSERT_NE(actual,expanded.end());std::ostringstream oldJson,newJson;
+        ::llaminar2::test::parity::PrintTo(original,&oldJson);::llaminar2::test::parity::PrintTo(*actual,&newJson);
+        EXPECT_EQ(oldJson.str(),newJson.str());++preserved;
+    }
+    EXPECT_EQ(expanded.size()-preserved,48u);
+    ASSERT_EQ(qwen4ExpGPUAdaptiveProductionCases().size(),before.size());
+    for(std::size_t i=0;i<before.size();++i){std::ostringstream after;::llaminar2::test::parity::PrintTo(qwen4ExpGPUAdaptiveProductionCases()[i],&after);EXPECT_EQ(before[i],after.str());}
+}
+/** @test Dynamic MTP depth and required physical expert movement are independent source intents. */
+TEST(Qwen4ExpSourceAdmissionCases, GPUAdaptiveDynamicDepthDoesNotCertifyPhysicalExpertMovement)
+{
+    const auto cells=qwen4ExpExpandSourceAdmissionMTP(qwen4ExpGPUAdaptiveSourceAdmissionSeeds());
+    std::size_t movement=0,dynamicDepth=0,both=0;
+    for(const auto& cell:cells){
+        const bool physical=cell.expert_overlay->movement==ModelParityExpertMovement::Dynamic;
+        EXPECT_EQ(cell.requiresPhysicalExpertMovement(),physical);
+        const auto config=qwen4ExpSourceAdmissionConfig(cell,cell.model.model_path,0);
+        // Source configuration retains the real policy. Numerical movement
+        // journal/exercise observations remain a separate inference gate.
+        if(physical){++movement;EXPECT_EQ(config.moe_rebalance.mode,MoERebalanceRuntimeMode::Dynamic);}
+        if(cell.mtp==ModelParityMTP::DynamicDepth){++dynamicDepth;EXPECT_EQ(config.mtp.depth_policy.initial_depth,0);if(physical)++both;}
+    }
+    EXPECT_EQ(movement,32u);EXPECT_EQ(dynamicDepth,16u);EXPECT_EQ(both,8u);
+}
+}

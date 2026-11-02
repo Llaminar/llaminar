@@ -25,6 +25,7 @@
 #include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/MemoryPlan.h"
 #include "planning/MemoryPlanner.h"
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "planning/ModelMemoryProfile.h"
 
 #include <cstddef>
@@ -143,6 +144,10 @@ namespace llaminar2
             gpu_weight_load;
         /** Exact global routed interval, including only this owner's retained sidecars. */
         MoEOverlayInferenceGraphFamilyIdentity graph_family;
+        /** Original sealed ordering-program source, copied onto real participant DevicePlanConfigs before BOM construction. */
+        NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
+        /** Original local or discovery-receipt source; empty evidence cannot authorize a service. */
+        RetainedHostServiceBudgetProjection retained_host_services=RetainedHostServiceBudgetProjection::installed({});
     };
 
     /** @brief Rank-local fixed BOM plus the exact graph-row shape it priced. */

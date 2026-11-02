@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "planning/AutomaticOrchestrationCandidates.h"
+#include "planning/PlanningHostServiceEvidence.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "planning/MemoryPlanner.h"
@@ -33,6 +34,10 @@ namespace llaminar2
         int minimum_prefill_sequence_rows = 0;
         int maximum_cached_prefill_buckets = 0;
         GPUWeightLoadMemoryPolicy weight_load;
+        /** Same immutable event-program source through actual lowering; production selects installed rows. */
+        NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
+        /** Original discovery-rank classes; candidate membership alone renumbers consumers. */
+        PlanningHostServiceBudgets retained_host_services;
 
         /** @return The production startup policy; no workload or memory estimate is invented. */
         static OrchestrationCandidateMemoryPolicy fromStartup();

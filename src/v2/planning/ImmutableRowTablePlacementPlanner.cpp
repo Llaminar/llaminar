@@ -1,3 +1,4 @@
+#include "execution/qwen4exp/PooledImmutableRetainedParticipantBudget.h"
 /**
  * @file ImmutableRowTablePlacementPlanner.cpp
  * @brief Select a concrete native-table candidate using only canonical PMA fit decisions.
@@ -7,6 +8,7 @@
  * evaluate one candidate only; Automatic selection ends before materialization.
  */
 #include "ImmutableRowTablePlacementPlanner.h"
+#include "ImmutableRowTableHostAuthority.h"
 #include "loaders/ImmutableRowTable.h"
 #include "models/qwen4exp/Qwen4ExpFixedHeadShards.h"
 #include "loaders/CpuAdaptiveImmutableRowCache.h"
@@ -27,7 +29,8 @@ PhysicalMemoryAllocatorIdentity identity(const PhysicalMemoryResource &r) { retu
 bool modeOwner(PhysicalMemoryOwner owner)
 {
     return owner == PhysicalMemoryOwner::ActivationArena || owner == PhysicalMemoryOwner::ImmutableLookupStaging ||
-        owner == PhysicalMemoryOwner::NativeGraphExecutable || owner == PhysicalMemoryOwner::WeightLoadStaging;
+        owner == PhysicalMemoryOwner::NativeGraphExecutable || owner == PhysicalMemoryOwner::WeightLoadStaging ||
+        owner == PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent;
 }
 /** @brief Reject mixed higher-priority charges and unrelated/foreign candidate resources. */
 void validateContribution(const PhysicalMemoryPlan &plan, ImmutableRowStorage storage,
@@ -50,6 +53,10 @@ void validateContribution(const PhysicalMemoryPlan &plan, ImmutableRowStorage st
                 (owner==PhysicalMemoryOwner::ActivationArena && !consumer) ||
                 (owner==PhysicalMemoryOwner::NativeGraphExecutable && (!consumer || !id.device.is_gpu()))))
                 throw std::invalid_argument("Ngram mode owner is charged to an incompatible physical resource");
+            if(owner==PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent && bom.bytes(owner) &&
+               ((!host && (!consumer || !id.device.is_gpu())) ||
+                std::none_of(input.consumers().begin(),input.consumers().end(),[](const auto& r){return r.device.is_gpu();})))
+                throw std::invalid_argument("Native lookup ordering contribution requires its canonical host or actual GPU consumer");
             if (storage == ImmutableRowStorage::VRAM && bom.bytes(owner) &&
                 owner != PhysicalMemoryOwner::WeightLoadStaging)
                 throw std::invalid_argument("Resident ngram candidate must not retain hosted lookup arena/channel/executable costs");
@@ -64,8 +71,9 @@ ImmutableRowTablePlacementInput ImmutableRowTablePlacementInput::forConsumers(
     ImmutableRowTableExtent extent, PhysicalMemoryResource host, std::span<const PhysicalMemoryResource> consumers,
     ImmutableRowTableHostPlacement host_placement)
 {
-    if (!host.valid() || host.world_rank < 0 || !host.device.is_cpu() || consumers.empty())
-        throw std::invalid_argument("Ngram admission requires an exact rank-local host resource and actual PLE consumers");
+    requireCanonicalImmutableHostObservation(host);
+    if(consumers.empty())
+        throw std::invalid_argument("Ngram admission requires actual PLE consumers");
     std::vector<PhysicalMemoryResource> ordered(consumers.begin(), consumers.end());
     for (const auto &r : ordered)
         if (!r.valid() || r.world_rank != host.world_rank)
@@ -82,6 +90,41 @@ ImmutableRowTablePlacementInput ImmutableRowTablePlacementInput::forConsumers(
         observations.add(r, PhysicalMemoryOwner::ImmutableTableStorage, 0u);
     (void)observations.build();
     return ImmutableRowTablePlacementInput(extent, host, std::move(ordered), host_placement);
+}
+ImmutableRowTablePlacementInput ImmutableRowTablePlacementInput::withGPUCacheResources(
+    const ImmutableRowTablePolicy &requested,std::span<const PhysicalMemoryResource> originals) const
+{
+    requested.validate();auto result=*this;result.gpu_resources_.clear();result.gpu_placement_.reset();
+    if(!requested.isGPUAdaptive())throw std::invalid_argument("GPU storage observations require explicit GPU adaptive policy");
+    const auto &placement=requested.gpu_adaptive.placement;
+    if(placement.mode==AdaptiveGPUCachePlacementMode::ConsumerLocal)
+    {
+        if(originals.size()!=consumers_.size())throw std::invalid_argument("ConsumerLocal storage resources must equal actual consumer observations");
+        PhysicalMemoryPlanBuilder observations;
+        for(const auto &consumer:consumers_)observations.add(consumer,PhysicalMemoryOwner::ImmutableTableStorage,0u);
+        for(const auto &r:originals)
+        {
+            if(std::none_of(consumers_.begin(),consumers_.end(),[&](const auto &c){return identity(c)==identity(r);}))
+                throw std::invalid_argument("ConsumerLocal storage cannot invent a remote resource");
+            observations.add(r,PhysicalMemoryOwner::ImmutableTableStorage,0u);
+        }
+        (void)observations.build();return result;
+    }
+    if(consumers_.size()!=1 || !consumers_.front().device.is_gpu() ||
+        identity(consumers_.front())!=PhysicalMemoryAllocatorIdentity{placement.coordinator->world_rank,placement.coordinator->device()})
+        throw std::invalid_argument("Declared GPU cache coordinator must equal the sole actual PLE consumer; independent compute coordination is unimplemented");
+    PhysicalMemoryPlanBuilder observations;observations.add(host_,PhysicalMemoryOwner::ImmutableTableStorage,0u);
+    for(const auto &consumer:consumers_)observations.add(consumer,PhysicalMemoryOwner::ImmutableTableStorage,0u);
+    for(const auto &participant:placement.declaredParticipants())
+    {
+        if(participant.world_rank!=host_.world_rank)throw std::invalid_argument("GPU cache participant crossed original rank authority");
+        const auto matches=[&](const auto &r){return identity(r)==PhysicalMemoryAllocatorIdentity{participant.world_rank,participant.device()};};
+        const auto found=std::find_if(originals.begin(),originals.end(),matches);
+        if(found==originals.end() || !found->valid())throw std::invalid_argument("Declared GPU cache participant lacks its original selected source-worker observation");
+        for(const auto &r:originals)if(matches(r))observations.add(r,PhysicalMemoryOwner::ImmutableTableStorage,0u);
+        observations.add(*found,PhysicalMemoryOwner::ImmutableTableStorage,0u);result.gpu_resources_.push_back(*found);
+    }
+    (void)observations.build();result.gpu_placement_=placement;return result;
 }
 bool ImmutableRowTablePlacementInput::permitsVRAM() const noexcept
 {
@@ -104,20 +147,48 @@ ImmutableRowTableLayoutGeometry ImmutableRowTablePlacementInput::hostAdaptiveLay
 ImmutableRowTableLayoutGeometry ImmutableRowTablePlacementInput::gpuAdaptiveLayout(
     const ImmutableRowTablePolicy &requested,std::size_t gpu_slots,std::size_t host_slots,std::size_t maximum_live_ids) const
 {
+    if(requested.gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+    {
+        if(gpu_slots)throw std::invalid_argument("Declared GPU owners require explicit per-owner slot counts");
+        const std::vector<std::size_t> zero(requested.gpu_adaptive.placement.owners.size(),0);
+        return gpuAdaptiveLayout(requested,zero,host_slots,maximum_live_ids);
+    }
+    const std::vector<std::size_t> slots(consumers_.size(), gpu_slots);
+    return gpuAdaptiveLayout(requested,slots,host_slots,maximum_live_ids);
+}
+ImmutableRowTableLayoutGeometry ImmutableRowTablePlacementInput::gpuAdaptiveLayout(
+    const ImmutableRowTablePolicy &requested,std::span<const std::size_t> gpu_slots,std::size_t host_slots,std::size_t maximum_live_ids) const
+{
     requested.validate();
-    if(!requested.isGPUAdaptive() || consumers_.size()!=1 || !consumers_.front().device.is_gpu() ||
-        gpu_slots>requested.gpu_adaptive.maximum_gpu_cache_rows || host_slots>requested.gpu_adaptive.host.maximum_cache_rows ||
-        gpu_slots>extent_.rows() || host_slots>extent_.rows() || !maximum_live_ids || maximum_live_ids%16 ||
-        maximum_live_ids>0x7fffffffULL)
-        throw std::invalid_argument("GPU adaptive layout requires one exact local GPU and bounded original source/ID capacities");
-    const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
+    const auto &g=requested.gpu_adaptive;const auto &placement=g.placement;
+    const bool declared=placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+    if(!requested.isGPUAdaptive() || consumers_.empty() || (declared && consumers_.size()!=1) ||
+        std::any_of(consumers_.begin(), consumers_.end(), [](const auto& consumer) { return !consumer.device.is_gpu(); }) ||
+        gpu_slots.size()!=(declared?placement.owners.size():consumers_.size()) || host_slots>g.host.maximum_cache_rows ||
+        host_slots>extent_.rows() || !maximum_live_ids || maximum_live_ids%16 || maximum_live_ids>0x7fffffffULL)
+        throw std::invalid_argument("GPU adaptive layout requires exact GPU consumers and bounded original owner/source/ID capacities");
     const auto requester=identity(consumers_.front());
+    if(declared && (!gpu_placement_ || *gpu_placement_!=placement || gpu_resources_.empty() || requester!=PhysicalMemoryAllocatorIdentity{placement.coordinator->world_rank,placement.coordinator->device()}))
+        throw std::invalid_argument("Declared GPU layout requires authenticated original storage resources and exact consumer coordinator");
+    std::vector<ImmutableRowTableLayoutOwner> owners;
+    for(std::size_t i=0;i<gpu_slots.size();++i)
+    {
+        const auto maximum=declared?placement.owners[i].maximum_cache_rows:g.maximum_gpu_cache_rows;
+        if(gpu_slots[i]>maximum || gpu_slots[i]>extent_.rows())throw std::invalid_argument("GPU cache owner slots exceed original source/request bounds");
+        const auto allocator=declared?PhysicalMemoryAllocatorIdentity{placement.owners[i].participant.world_rank,placement.owners[i].participant.device()}:identity(consumers_[i]);
+        owners.push_back({{allocator,ImmutableRowStorage::VRAM},0,gpu_slots[i],std::nullopt});
+    }
+    owners.push_back({{identity(host_),ImmutableRowStorage::RAM},0,host_slots,std::nullopt,host_placement_});
+    const bool active=std::any_of(gpu_slots.begin(),gpu_slots.end(),[](auto n){return n!=0;});
+    const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
+    std::vector<PhysicalMemoryAllocatorIdentity> consumers;
+    for (const auto& consumer : consumers_) consumers.push_back(identity(consumer));
+    const bool independent = !declared && consumers.size() > 1;
     return ImmutableRowTableLayoutGeometry::checked(extent_,ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
-        {{{requester,ImmutableRowStorage::VRAM},0,gpu_slots,std::nullopt},
-         {{identity(host_),ImmutableRowStorage::RAM},0,host_slots,std::nullopt,host_placement_}},
-        {requester},{},{{identity(host_),ImmutableRowTableStoragePolicy::forStorage(
+        std::move(owners),std::move(consumers),{},{{identity(host_),ImmutableRowTableStoragePolicy::forStorage(
             ImmutableRowStorage::MemoryMapped,requested.window_bytes,requested.window_count)}},{},
-        gpu_slots?std::optional{requester}:std::nullopt,maximum_live_ids);
+        !independent && active?std::optional{requester}:std::nullopt,maximum_live_ids,
+        independent ? ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal : ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator);
 }
 std::size_t immutableRowTableMaximumLiveIds(int ordinary_rows,int batch,std::size_t heads,
     int verifier_rows,int retained_rows)
@@ -198,15 +269,27 @@ void ImmutableRowTableExecutionProvision::require(const ImmutableRowTablePolicy 
             throw std::invalid_argument("Final ngram execution provision omitted an actual consumer");
     if(requested.isGPUAdaptive())
     {
-        if(input.consumers().size()!=1 || !input.consumers().front().device.is_gpu() || source_.ple_heads!=16)
-            throw std::invalid_argument("GPU adaptive admission requires one exact local GPU PLE domain");
-        for(const auto &c:consumers_)
-            if(c.shards!=1 || c.batch!=1 || c.first_layer!=0 || c.last_layer!=47 ||
-                !c.resource.sameAllocator(input.consumers().front()))
-                throw std::invalid_argument("GPU adaptive provision supports only full-main unsharded single-GPU execution");
+        const bool grouped = requested.gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal &&
+            input.consumers().size() > 1;
+        if((input.consumers().size()!=1 && !grouped) || source_.ple_heads!=16 ||
+            std::any_of(input.consumers().begin(), input.consumers().end(), [&](const auto& c) {
+                return !c.device.is_gpu() || c.device.type != input.consumers().front().device.type;
+            }))
+            throw std::invalid_argument("GPU adaptive admission requires singleton or exact homogeneous ConsumerLocal compute provenance");
+        std::vector<bool> coordinates(input.consumers().size(), false);
+        for(const auto &c:consumers_) {
+            if(c.shards!=static_cast<int>(grouped?input.consumers().size():1) || c.batch!=1 || c.first_layer!=0 || c.last_layer!=47 ||
+                (grouped && (c.tp_topology!=ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal ||
+                    c.tp_coordinate<0 || static_cast<std::size_t>(c.tp_coordinate)>=coordinates.size() || coordinates[c.tp_coordinate])))
+                throw std::invalid_argument("GPU adaptive provision lost its actual full-main consumer coordinate");
+            if (grouped) coordinates[c.tp_coordinate] = true;
+        }
+        if (grouped && std::find(coordinates.begin(), coordinates.end(), false) != coordinates.end())
+            throw std::invalid_argument("GPU adaptive provision omitted an original TP coordinate");
     }
     if(requested.isFixedHeadSharded())(void)fixedHeadPlacement(input);
-    else for(const auto &consumer:consumers_)
+    else if (!(requested.isGPUAdaptive() && requested.gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::ConsumerLocal && input.consumers().size()>1))
+      for(const auto &consumer:consumers_)
         if(consumer.tp_coordinate!=-1 || consumer.tp_topology!=ImmutableRowTableTPTopology::None)
             throw std::invalid_argument("Replicated provision cannot carry fixed head topology");
     if(const auto mismatch=base.requiredFootprintMismatch(required_base_))
@@ -261,19 +344,49 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
         const ImmutableRowTableSource source{.rows=metadata.ple_table_rows,.row_elements=metadata.ple_row_elements,
             .format=static_cast<GGUFTensorType>(metadata.ple_table_gguf_type)};
         const auto maximum=request.execution_provision->maximumLiveIds();
-        const auto candidate=[&](std::size_t gpu_slots,std::size_t host_slots) {
+        const bool grouped = requested.gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal && input.consumers().size() > 1;
+        std::optional<AdaptiveImmutableLookupGeometry> remote_floor;
+        if (!grouped) remote_floor.emplace(AdaptiveImmutableLookupGeometry::fromLayout(
+            input.gpuAdaptiveLayout(requested,0,0,maximum),source,requested.gpu_adaptive));
+        const auto* originalNativeHost=request.execution_provision->requiredBase().find({input.host().world_rank,DeviceId::cpu()});
+        const auto nativeHost=originalNativeHost?originalNativeHost->resource():input.host();
+        const auto candidate=[&](std::span<const std::size_t> gpu_slots,std::size_t host_slots) {
             const auto layout=input.gpuAdaptiveLayout(requested,gpu_slots,host_slots,maximum);
-            const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,source,requested.gpu_adaptive);
+            std::optional<AdaptiveImmutableLookupGeometry> geometry;
+            if (!grouped) geometry.emplace(AdaptiveImmutableLookupGeometry::fromLayout(layout,source,requested.gpu_adaptive));
             PhysicalMemoryPlanBuilder plan(higher_priority);
             plan.add(input.host(),PhysicalMemoryOwner::ImmutableTableStorage,0u);
             for(const auto &consumer:input.consumers())plan.add(consumer,PhysicalMemoryOwner::ImmutableTableStorage,0u);
-            const auto optional=geometry.slotDependentBOM(input.consumers().front(),input.host());
+            const auto optional=grouped ? AdaptiveImmutableLookupGeometry::consumerLocalSlotDependentBOM(
+                layout,source,requested.gpu_adaptive,input.gpuResources(),input.host(),request.native_ordering_events)
+                : geometry->slotDependentBOMWithOrderingProjection(input.gpuResources(),input.host(),request.native_ordering_events);
             for(const auto &bom:optional.resources())plan.add(bom);
-            const bool ceilings=geometry.gpuSlotDependentBytes()<=requested.gpu_adaptive.gpu_cache_physical_byte_limit &&
-                geometry.host().storageBytes()<=requested.gpu_adaptive.host.cache_physical_byte_limit;
+            if (!grouped) {
+                const auto remote=qwen4exp::PooledImmutableRetainedParticipantBudget::slotDependentBOM(
+                    *geometry,*remote_floor,nativeHost,input.gpuResources(),request.native_ordering_events);
+                for(const auto& line:remote.resources())plan.add(line);
+            }
+            const auto hostGeometry = grouped ? AdaptiveImmutableLookupGeometry::sharedHostGeometry(layout,requested.gpu_adaptive) : geometry->host();
+            bool ceilings=hostGeometry.storageBytes()<=requested.gpu_adaptive.host.cache_physical_byte_limit;
+            const auto &declaration=requested.gpu_adaptive.placement;
+            for(const auto &device:input.gpuResources())
+            {
+                std::size_t limit=requested.gpu_adaptive.gpu_cache_physical_byte_limit;
+                if(declaration.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+                {
+                    limit=0;
+                    for(const auto &owner:declaration.owners)if(identity(device)==PhysicalMemoryAllocatorIdentity{owner.participant.world_rank,owner.participant.device()})
+                        limit=owner.cache_physical_byte_limit;
+                }
+                const auto bytes = grouped ? AdaptiveImmutableLookupGeometry::forRequester(layout,source,requested.gpu_adaptive,
+                    identity(device)).gpuSlotDependentBytes(identity(device)) : geometry->gpuSlotDependentBytes(identity(device));
+                ceilings=ceilings && bytes<=limit;
+            }
             return std::pair{ceilings,plan.build()};
         };
-        const auto zero=candidate(0,0);
+        const auto &declaration=requested.gpu_adaptive.placement;
+        std::vector<std::size_t> gpu(declaration.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal?declaration.owners.size():input.consumers().size(),0);
+        const auto zero=candidate(gpu,0);
         if(!zero.first || !zero.second.fits())
             throw PhysicalMemoryCapacityExhausted("GPU adaptive mandatory original frame/source/channel does not fit frozen PMA");
         // GPU then RAM priorities are explicit policy; each monotone candidate
@@ -288,8 +401,14 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
             }
             return low;
         };
-        const auto gpu=solve(requested.gpu_adaptive.maximum_gpu_cache_rows,[&](std::size_t rows) {
-            const auto next=candidate(rows,0);return next.first && next.second.fits(); });
+        for(std::size_t owner=0;owner<gpu.size();++owner)
+        {
+            const auto ceiling=declaration.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal?
+                declaration.owners[owner].maximum_cache_rows:requested.gpu_adaptive.maximum_gpu_cache_rows;
+            gpu[owner]=solve(ceiling,[&](std::size_t rows) {
+                auto proposed=gpu;proposed[owner]=rows;const auto next=candidate(proposed,0);
+                return next.first && next.second.fits(); });
+        }
         const auto ram=solve(requested.gpu_adaptive.host.maximum_cache_rows,[&](std::size_t rows) {
             const auto next=candidate(gpu,rows);return next.first && next.second.fits(); });
         auto complete=candidate(gpu,ram).second;

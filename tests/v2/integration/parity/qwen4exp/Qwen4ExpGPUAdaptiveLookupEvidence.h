@@ -10,6 +10,7 @@
  */
 #pragma once
 #include "Qwen4ExpLookupRecordEvidence.h"
+#include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "execution/qwen4exp/ImmutableLookupProtocol.h"
 #include "loaders/CpuSubordinateImmutableRowRead.h"
 #include "kernels/qwen4exp/QwenAdaptiveTerminalCounters.h"
@@ -177,7 +178,10 @@ inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidenc
     if(!intervals || intervals!=source_counts.front() || requests>device.calls || failures || batches!=requests ||
         ids!=device.source_rows || native!=device.source_bytes || native!=multiply(ids,row_bytes) ||
         id_bytes!=multiply(ids,sizeof(std::int64_t)) || metadata!=expected_metadata ||
-        acks!=multiply(requests,sizeof(std::uint64_t)) || terminal!=multiply(intervals,sizeof(std::uint64_t)) ||
+        // Successful service completion publishes the GPU close generation and
+        // the CPU worker's retired generation/invocation pair. Direct processor
+        // close-only observations do not certify a retired serving interval.
+        acks!=multiply(requests,sizeof(std::uint64_t)) || terminal!=multiply(intervals,3*sizeof(std::uint64_t)) ||
         // Same per-live-row bounds enforced by accumulateHostImmutableRowWork;
         // source cache events cannot be justified by admitted frame capacity.
         partition!=ids || duplicates || admissions>ids || rejections>ids || all_pinned>ids || evictions>admissions ||
@@ -185,5 +189,49 @@ inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidenc
         (!ram_slots && (ram_rows || admissions || evictions)))
         throw std::invalid_argument("GPU adaptive compact source/cache evidence disagrees with exact live native work");
     return {device,source};
+}
+/**
+ * @brief Validate each original requester exactly once without duplicating shared source observations.
+ * @param records Unmodified terminal records, including every actual channel.
+ * @param layout Original resolved plural or singleton placement.
+ * @param source Original native table metadata, without payload reads.
+ * @param request Original GPU/shared RAM policy.
+ * @return Independent channel totals in the original consumer order.
+ * @throws std::invalid_argument For foreign/duplicate consumers, missing channels or invalid compact byte equations.
+ *
+ * CPU source work is published by its original processor channel and tagged
+ * with that requester. Partition those records once; never copy the shared
+ * provider's cumulative statistics into each device's evidence.
+ */
+inline std::vector<Qwen4ExpGPUAdaptiveLookupEvidence> requireQwen4ExpGPUAdaptiveCohortEvidence(
+    std::span<const PerfStatRecord> records, const ImmutableRowTableLayoutGeometry& layout,
+    const ImmutableRowTableSource& source, const AdaptiveVRAMRAMSSDRequest& request)
+{
+    const auto& consumers = layout.consumers();
+    if (consumers.empty()) throw std::invalid_argument("GPU adaptive evidence has no original consumers");
+    std::vector<std::vector<PerfStatRecord>> channels(consumers.size());
+    for (std::size_t i = 0; i < consumers.size(); ++i) {
+        if (!consumers[i].device.is_gpu() ||
+            std::find(consumers.begin(), consumers.begin() + i, consumers[i]) != consumers.begin() + i)
+            throw std::invalid_argument("GPU adaptive evidence repeats or changes its original consumer");
+    }
+    for (const auto& record : records) {
+        if (record.domain != "immutable_lookup") continue;
+        const auto consumer = std::find_if(consumers.begin(), consumers.end(), [&](const auto& candidate) {
+            return record.device == candidate.device.toString();
+        });
+        if (consumer == consumers.end()) throw std::invalid_argument("GPU adaptive evidence contains a foreign channel");
+        channels[static_cast<std::size_t>(consumer - consumers.begin())].push_back(record);
+    }
+    std::vector<Qwen4ExpGPUAdaptiveLookupEvidence> result;
+    for (std::size_t i = 0; i < consumers.size(); ++i) {
+        const auto geometry = layout.adaptiveGPUDomain() == ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
+            ? AdaptiveImmutableLookupGeometry::forRequester(layout, source, request, consumers[i])
+            : AdaptiveImmutableLookupGeometry::fromLayout(layout, source, request);
+        result.push_back(requireQwen4ExpGPUAdaptiveLookupEvidence(channels[i], consumers[i].device,
+            layout.extent().rowBytes(), layout.maximumInflightRows(),
+            geometry.physical().owners().front().slots, geometry.host().slots()));
+    }
+    return result;
 }
 } // namespace llaminar2::test::parity::qwen4exp

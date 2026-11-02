@@ -223,6 +223,119 @@ TEST(ImmutableRowTable, EveryNativeFormatPreservesBytesInBothModes)
     }
 }
 
+/** @test Metadata participates in checked pricing even when mapped pages alone fit size_t. */
+TEST(ImmutableRowTable, IndexedWindowMetadataOverflowRejectsBeforeAllocation)
+{
+    const auto native_page = ::sysconf(_SC_PAGESIZE);
+    ASSERT_GT(native_page, 0);
+    const auto page = static_cast<std::size_t>(native_page);
+    const auto one = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, page, 1);
+    const auto slot_bytes = ImmutableRowTable::physicalBytesForNativeExtent(1, one);
+    ASSERT_GT(slot_bytes, page);
+    const auto maximum = std::numeric_limits<std::size_t>::max();
+    const auto safe_count = maximum / slot_bytes;
+    ASSERT_GT(safe_count, 0u);
+    const auto safe = ImmutableRowTableStoragePolicy::forStorage(
+        ImmutableRowStorage::MemoryMapped, page, safe_count);
+    EXPECT_EQ(ImmutableRowTable::physicalBytesForNativeExtent(1, safe), safe_count * slot_bytes);
+    // Both policies pass page-only geometry validation. The second fails only
+    // when the sole physical authority includes slot links and bucket heads.
+    const auto overflowing = ImmutableRowTableStoragePolicy::forStorage(
+        ImmutableRowStorage::MemoryMapped, page, safe_count + 1);
+    EXPECT_THROW((void)ImmutableRowTable::physicalBytesForNativeExtent(1, overflowing), std::invalid_argument);
+    const auto page_only_limit = ImmutableRowTableStoragePolicy::forStorage(
+        ImmutableRowStorage::MemoryMapped, page, maximum / page);
+    EXPECT_THROW((void)ImmutableRowTable::physicalBytesForNativeExtent(1, page_only_limit), std::invalid_argument);
+    EXPECT_THROW((void)ImmutableRowTable::physicalBytesForNativeExtent(0, one), std::invalid_argument);
+}
+
+/**
+ * @test Replay exact LRU observations through empty, singleton, collision and full directories.
+ * @details The independent timestamp oracle models the previous ascending-slot
+ * tie break. Distinct windows separated by capacity deliberately share one hash
+ * bucket; eviction of its head, middle and tail must not lose another mapping.
+ * Every gather authenticates the source and copies original bytes. Exact PMA
+ * admission remains held through all replacements and releases with the owner.
+ */
+TEST(ImmutableRowTable, IndexedWindowDirectoryReplaysExactLruAndPhysicalOwnership)
+{
+    const auto native_page = ::sysconf(_SC_PAGESIZE);
+    ASSERT_GT(native_page, 0);
+    const auto page = static_cast<std::size_t>(native_page);
+    for (const std::size_t capacity : {1u, 2u, 3u, 8u, 1024u})
+    {
+        SCOPED_TRACE(capacity);
+        const auto rows = (3 * capacity + 1) * page / 4;
+        RowFile file(4, rows);
+        auto src = source(file, rows, GGUFTensorType::F32, 1);
+        src.file_offset = 0;
+        const auto policy = ImmutableRowTableStoragePolicy::forStorage(
+            ImmutableRowStorage::MemoryMapped, page, capacity);
+        const auto planned = ImmutableRowTable::physicalBytes(src, policy);
+        ASSERT_GT(planned, page * capacity);
+        EXPECT_EQ(planned, ImmutableRowTable::physicalBytesForNativeExtent(src.tensorBytes(), policy));
+        auto memory = authority(planned);
+        {
+            ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,
+                ImmutableRowTableHostPlacement::taskPolicy());
+            std::vector<std::size_t> keys(capacity, std::numeric_limits<std::size_t>::max());
+            std::vector<std::size_t> touched(capacity, 0);
+            std::size_t clock = 0, hits = 0, misses = 0, evictions = 0;
+            // First fill every slot, then revisit collisions and mix distributed
+            // keys. Repeating this trace exercises replacement after warm reuse.
+            std::vector<std::size_t> trace;
+            for (std::size_t key = 0; key < capacity; ++key)
+                trace.push_back(key);
+            const std::array collisions{std::size_t{0}, capacity, 2 * capacity,
+                std::size_t{0}, 3 * capacity, capacity, 2 * capacity, 3 * capacity};
+            trace.insert(trace.end(), collisions.begin(), collisions.end());
+            std::uint32_t random = 0x71b573a9;
+            for (std::size_t i = 0; i < 3 * capacity; ++i)
+            {
+                random = random * 1664525u + 1013904223u;
+                trace.push_back(random % (3 * capacity + 1));
+            }
+            std::array<std::byte, 4> output{};
+            for (int replay = 0; replay < 3; ++replay)
+                for (const auto key : trace)
+                {
+                    auto found = std::find(keys.begin(), keys.end(), key);
+                    if (found != keys.end())
+                        ++hits;
+                    else
+                    {
+                        ++misses;
+                        const auto victim = std::min_element(touched.begin(), touched.end()) - touched.begin();
+                        if (touched[victim])
+                            ++evictions;
+                        found = keys.begin() + victim;
+                        *found = key;
+                    }
+                    touched[found - keys.begin()] = ++clock;
+                    const std::array<std::int64_t, 1> ids{static_cast<std::int64_t>(key * page / 4)};
+                    const auto observation = table.gather(ids, output);
+                    EXPECT_EQ(std::memcmp(output.data(), file.bytes.data() + key * page, output.size()), 0);
+                    const auto stats = table.stats();
+                    EXPECT_EQ(stats.window_hits, hits);
+                    EXPECT_EQ(stats.window_misses, misses);
+                    EXPECT_EQ(stats.window_evictions, evictions);
+                    EXPECT_EQ(stats.requests, clock);
+                    EXPECT_EQ(stats.source_metadata_checks, clock);
+                    EXPECT_EQ(stats.mapped_virtual_bytes, std::min(misses, capacity) * page);
+                    EXPECT_EQ(stats.physical_budget_bytes, planned);
+                    EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ImmutableTableStorage,
+                        PhysicalMemoryMaterializationKind::NewAllocation), planned);
+                    EXPECT_EQ(observation.windowHits + observation.windowMisses, 1u);
+                }
+        }
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ImmutableTableStorage,
+            PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        // A budget lacking even one metadata byte cannot materialize the owner.
+        EXPECT_THROW((ImmutableRowTable(src, policy, DeviceId::cpu(), authority(planned - 1),
+            ImmutableRowTableHostPlacement::taskPolicy())), std::exception);
+    }
+}
+
 TEST(ImmutableRowTable, MmapCrossWindowRowsAndLruEvictionStayBounded)
 {
     RowFile file(90, 500);

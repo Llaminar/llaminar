@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "GPUFlatGraphStructure.h"
 #include "GPUGraphMemoryContract.h"
 
 #include <cstddef>
@@ -984,6 +985,25 @@ namespace llaminar2
             return false;
         }
 
+    public:
+        /**
+         * @brief Inspect one sealed flat definition in original caller-owned bounded scratch.
+         * @param limits Source-authored geometry/kind envelope declared before admission.
+         * @param scratch Original CPU0/PMA storage; no per-node allocation is permitted.
+         * @param observed Receives a complete default-edge DAG census only on success.
+         * @param error Optional precise first failure, cleared on success.
+         * @return False for unsupported backends, native kinds, edge data or incomplete metadata.
+         * @note Cold setup only: no instantiate, launch, transfer, device-memory query or synchronization.
+         */
+        virtual bool inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,
+            std::span<std::byte> scratch,GPUFlatGraphStructure& observed,std::string* error=nullptr)const
+        {
+            (void)limits;(void)scratch;observed={};
+            if(error)*error="GPU backend has no complete flat structural inspection";
+            return false;
+        }
+
+    protected:
         IGPUGraphCapture() = default;
         // Non-copyable
         IGPUGraphCapture(const IGPUGraphCapture &) = delete;

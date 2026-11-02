@@ -6,8 +6,11 @@
  * CUDA/HIP allocator. Root padding is explicitly materialized and charged;
  * subrange 64-byte alignment is not used as an approximate physical estimate.
  * Backend allocation borrowers and prepared runtime seals authenticate reuse.
+ * A closed ordering-program commitment precedes root allocation and survives
+ * the explicit setup event plus every lazy canonical Tensor publication event.
  */
 #include "PooledImmutableNativeRootStorage.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <stdexcept>
 namespace llaminar2::qwen4exp::detail
@@ -31,13 +34,30 @@ void PooledNativeRootStorage::requireStream(void* stream)
 }
 std::shared_ptr<PooledNativeRootStorage> PooledNativeRootStorage::create(
     PhysicalMemoryAllocatorIdentity allocator,std::array<std::size_t,3> bytes,std::uint64_t identity,
-    std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream)
+    std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,NativeOrderingEventProgram ordering_program)
 {
     requireStream(stream);
+    ordering_program.requireRootBytes(bytes);
     if(isGraphCaptureActive() || !identity || !memory || allocator.world_rank!=memory->worldRank() ||
         !allocator.device.is_gpu() || !allocator.device.is_valid() || !bytes[1] || !bytes[2])
         throw std::invalid_argument("Pooled native roots require exact admitted rank/GPU geometry before capture");
-    auto result=std::shared_ptr<PooledNativeRootStorage>(new PooledNativeRootStorage(allocator,bytes,identity,std::move(memory)));
+    const auto original=GPUDeviceContextPool::instance().retainExistingContextProvenance(allocator.device);
+    auto group=NativeOrderingEventGroup::claim(memory,original,ordering_program);
+    return createWithOrderingGroup(allocator,bytes,identity,std::move(memory),stream,ordering_program,std::move(group));
+}
+std::shared_ptr<PooledNativeRootStorage> PooledNativeRootStorage::createWithOrderingGroup(
+    PhysicalMemoryAllocatorIdentity allocator,std::array<std::size_t,3> bytes,std::uint64_t identity,
+    std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,NativeOrderingEventProgram ordering_program,
+    std::unique_ptr<NativeOrderingEventGroup> group)
+{
+    requireStream(stream);ordering_program.requireRootBytes(bytes);
+    if(isGraphCaptureActive() || !identity || !memory || allocator.world_rank!=memory->worldRank() ||
+       !allocator.device.is_gpu() || !allocator.device.is_valid() || !group)
+        throw std::invalid_argument("Pooled native root materialization requires its original sealed ordering claim");
+    const auto original=GPUDeviceContextPool::instance().retainExistingContextProvenance(allocator.device);
+    group->requireOriginal(memory,original,ordering_program);
+    auto result=std::shared_ptr<PooledNativeRootStorage>(new PooledNativeRootStorage(allocator,bytes,identity,std::move(memory),ordering_program));
+    result->ordering_group_=std::move(group);
     std::vector<TensorBase*> roots;roots.reserve(3);
     for(std::size_t i=0;i<3;++i){
         if(!bytes[i])continue;
@@ -64,7 +84,15 @@ PooledNativeRootStorage::~PooledNativeRootStorage()noexcept
     if(setup_event_){
         if(setup_stream_)retirePooledNativeSetupOwner(*backend_,allocator_.device,setup_event_,setup_stream_,setup_recorded_);
         backend_->destroyEvent(setup_event_,allocator_.device.ordinal);
+        setup_event_=nullptr;
     }
+    // Tensor destructors own the canonical lazy publication event destroys.
+    // Drop native borrowers first, then complete the group only after every
+    // existing handle is gone; allocation claims remain original members.
+    captured_={};
+    prepared_.reset();
+    for(auto& root:tensors_)root.reset();
+    if(ordering_group_)ordering_group_->completeNativeHandles();
 }
 PooledImmutableNativeRoots PooledNativeRootStorage::roots()const
 {
@@ -74,8 +102,9 @@ PooledImmutableNativeRoots PooledNativeRootStorage::roots()const
 }
 void PooledNativeRootStorage::require()const
 {
-    if(!memory_ || memory_->worldRank()!=allocator_.world_rank || !prepared_)
+    if(!memory_ || memory_->worldRank()!=allocator_.world_rank || !prepared_ || !ordering_group_)
         throw std::logic_error("Pooled native roots lost their original authority or prepared declaration");
+    ordering_program_.requireRootBytes(bytes_);
     prepared_->validate();
     for(std::size_t i=0;i<3;++i){
         if(!bytes_[i]){
@@ -109,6 +138,7 @@ std::uint64_t PooledNativeRootStorage::identity()const
     require();std::uint64_t value=1469598103934665603ULL;
     const auto mix=[&](std::uint64_t x){value=(value^x)*1099511628211ULL;};
     mix(pooled_native::Version);mix(geometry_);mix(reinterpret_cast<std::uintptr_t>(memory_.get()));
+    mix(static_cast<std::uint64_t>(ordering_program_.kind()));mix(ordering_program_.nonemptyRootMask());
     mix(allocator_.world_rank);mix(static_cast<std::uint64_t>(allocator_.device.type));mix(allocator_.device.ordinal);
     for(const auto bytes:bytes_)mix(bytes);mix(prepared_->preparedIdentity());return value?value:1;
 }
@@ -119,6 +149,7 @@ void PooledNativeRootStorage::initialize(DeviceType backend,void* stream,const s
     if(isGraphCaptureActive() || setup_!=Setup::Declared || backend!=allocator_.device.type)
         throw std::logic_error("Pooled native metadata setup is once-only, outside capture, on its exact backend");
     require();setup_=Setup::Failed;
+    ordering_group_->beginNativeAttempt();
     setup_event_=backend_->createEvent(allocator_.device.ordinal);
     if(!setup_event_)throw std::runtime_error("Pooled native setup could not retain its producer event");
     // The exact event and stream exist before the first metadata submission.
@@ -152,8 +183,16 @@ namespace llaminar2::qwen4exp {
 std::shared_ptr<PooledImmutableOwnerPreparedStorage> PooledImmutableOwnerPreparedStorage::create(
     PooledImmutableOwnerNativePlan plan,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream)
 {
+    return createImpl(std::move(plan),std::move(memory),stream,{});
+}
+std::shared_ptr<PooledImmutableOwnerPreparedStorage> PooledImmutableOwnerPreparedStorage::createImpl(
+    PooledImmutableOwnerNativePlan plan,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,
+    std::unique_ptr<NativeOrderingEventGroup> group)
+{
     const auto& p=plan.parameters();
-    auto roots=detail::PooledNativeRootStorage::create(plan.allocator(),{p.cache.bytes,p.frame.bytes,p.native.bytes},p.identity,std::move(memory),stream);
+    auto roots=group ? detail::PooledNativeRootStorage::createWithOrderingGroup(plan.allocator(),
+        {p.cache.bytes,p.frame.bytes,p.native.bytes},p.identity,std::move(memory),stream,plan.orderingProgram(),std::move(group))
+        : detail::PooledNativeRootStorage::create(plan.allocator(),{p.cache.bytes,p.frame.bytes,p.native.bytes},p.identity,std::move(memory),stream,plan.orderingProgram());
     return std::shared_ptr<PooledImmutableOwnerPreparedStorage>(new PooledImmutableOwnerPreparedStorage(std::move(plan),std::move(roots)));
 }
 PooledImmutableNativeRoots PooledImmutableOwnerPreparedStorage::roots()const{return roots_->roots();}
@@ -164,8 +203,16 @@ void PooledImmutableOwnerPreparedStorage::acquireSetup(void* stream)const{roots_
 std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> PooledImmutableCoordinatorPreparedStorage::create(
     PooledImmutableCoordinatorNativePlan plan,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream)
 {
+    return createImpl(std::move(plan),std::move(memory),stream,{});
+}
+std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> PooledImmutableCoordinatorPreparedStorage::createImpl(
+    PooledImmutableCoordinatorNativePlan plan,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,
+    std::unique_ptr<NativeOrderingEventGroup> group)
+{
     const auto& p=plan.parameters();
-    auto roots=detail::PooledNativeRootStorage::create(plan.allocator(),{p.cache.bytes,p.frame.bytes,p.native.bytes},p.identity,std::move(memory),stream);
+    auto roots=group ? detail::PooledNativeRootStorage::createWithOrderingGroup(plan.allocator(),
+        {p.cache.bytes,p.frame.bytes,p.native.bytes},p.identity,std::move(memory),stream,plan.orderingProgram(),std::move(group))
+        : detail::PooledNativeRootStorage::create(plan.allocator(),{p.cache.bytes,p.frame.bytes,p.native.bytes},p.identity,std::move(memory),stream,plan.orderingProgram());
     return std::shared_ptr<PooledImmutableCoordinatorPreparedStorage>(new PooledImmutableCoordinatorPreparedStorage(std::move(plan),std::move(roots)));
 }
 PooledImmutableNativeRoots PooledImmutableCoordinatorPreparedStorage::roots()const{return roots_->roots();}

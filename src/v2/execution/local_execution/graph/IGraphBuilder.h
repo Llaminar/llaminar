@@ -24,6 +24,7 @@
 #include "../../../kernels/common/DeviceGenerationInitialization.h"
 #include "HostPipelineActivationRows.h"
 #include "GraphSchema.h"
+#include "PreparedGraphTemplate.h"
 #include "GraphResolver.h"
 #include "../../../models/GraphTypes.h"
 #include "../../../backends/DeviceId.h"
@@ -253,6 +254,31 @@ namespace llaminar2
         {
             return purpose == Purpose::RuntimeExecution &&
                    validForRequestCount(request_count);
+        }
+    };
+
+    /**
+     * @brief Existing canonical vocabulary rows written by a scalar MTP main graph.
+     *
+     * Full and local request-zero destinations remain arena-owned. Other batch
+     * participants keep their original all-position consumers. The graph chooses the
+     * actual LM-head surface; its immutable identity includes both candidates,
+     * their physical strides and the original workspace generation.
+     */
+    struct MTPMainTerminalLogitsGraphBinding
+    {
+        TensorBase *full = nullptr; ///< Canonical full-vocabulary destination.
+        TensorBase *local = nullptr; ///< Canonical local-vocabulary destination.
+        int full_columns = 0; ///< Live owned full vocabulary, excluding padding.
+        int local_columns = 0; ///< Live owned local shard, excluding padding.
+        int request_count = 0; ///< Original graph request population; canonical storage remains request zero.
+        uint64_t capture_identity = 0; ///< Exact original binding identity.
+        bool declaration_only = false; ///< Workspace sizing cannot execute.
+        /** @brief Validate metadata without accessing device storage. */
+        [[nodiscard]] bool validForRequestCount(int count) const noexcept
+        {
+            return full && full_columns > 0 && request_count == count && count > 0 &&
+                capture_identity != 0 && (!local || local_columns > 0);
         }
     };
 
@@ -499,21 +525,6 @@ namespace llaminar2
                    storage_surface ==
                        ForwardLogitsStorageSurface::AllPositionLocal;
         }
-    };
-
-    /**
-     * @brief Mathematical phase selected for one concrete forward graph.
-     *
-     * Row count is not a phase discriminator. A short user prompt can have the
-     * same M as a grouped MTP verifier, while request-batched decode can have
-     * M greater than one. Carrying the phase beside @ref ForwardExecutionRole
-     * makes weight layout, collective, recurrent-state, and workspace policy
-     * declarative instead of inferring them from shape.
-     */
-    enum class ForwardExecutionPhase : uint8_t
-    {
-        Prefill, ///< Prompt ingestion using the configured prefill topology.
-        Decode,  ///< Serial or grouped decode-equivalent execution.
     };
 
     /**
@@ -805,6 +816,9 @@ namespace llaminar2
         std::optional<MTPMainTerminalHiddenGraphBinding>
             mtp_main_terminal_hidden;
 
+        /** Canonical raw logits publication, including shifted condition bridges. */
+        std::optional<MTPMainTerminalLogitsGraphBinding> mtp_main_terminal_logits;
+
         /**
          * @brief Optional captured materialization of one admitted prefill chunk.
          *
@@ -1050,6 +1064,16 @@ namespace llaminar2
         virtual void bindStorageMemoryAuthority(std::shared_ptr<PhysicalMemoryAuthority> authority)
         { (void)authority; }
 
+        /** @brief Bind one admitted executor-owned read-ahead family before graph construction.
+         * @param resources Original exact-device/parent stream owner; no model execution state.
+         * @details Unsupported builders reject a requested owner. Implementations
+         * must reject replacing a bound family; serialized graph variants retain
+         * the same original shared owner and cannot create a hidden stream cache.
+         */
+        virtual void bindReadAheadNativeResources(std::shared_ptr<ReadAheadNativeResourceFamily> resources)
+        {if(resources)throw std::logic_error("Graph builder has no selected read-ahead construction policy");}
+
+
         /**
          * @brief Attach model-specific retained state before cache admission or prefix layout queries.
          * @param cache The canonical participant cache, after its role and arena are bound.
@@ -1064,6 +1088,18 @@ namespace llaminar2
         // =====================================================================
         // Core Graph Building Methods
         // =====================================================================
+
+        /**
+         * @brief Prepare immutable graph-construction source views before family expansion.
+         * @param device Original participant whose exact graphs will be specialized.
+         * @details Builders with no immutable preparation have no recipe to publish.
+         * This hook changes neither invocation state nor native graph-cache identity.
+         */
+        virtual void prepareForwardGraphTemplate(DeviceId device) { (void)device; }
+
+        /** @return Actual cold preparation/specialization observations for this builder. */
+        [[nodiscard]] virtual PreparedGraphTemplateStats forwardGraphTemplateStats() const
+        { return {}; }
 
         /**
          * @brief Build complete forward graph

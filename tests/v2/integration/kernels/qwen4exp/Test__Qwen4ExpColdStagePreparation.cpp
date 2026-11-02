@@ -5,6 +5,8 @@
  * Arena tensors initially own only host storage. The ordinary executor must
  * materialize exact declared output owners before storage sealing and capture;
  * tests never pre-upload output roots or substitute a setup allocation path.
+ * The hash replay also changes tokens, accepted history and live rows while
+ * retaining the original executable, prepared addresses and capture identity.
  */
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPrimitiveStage.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLERetainedStage.h"
@@ -15,10 +17,12 @@
 #include "backends/IWorkerGPUContext.h"
 #include "../../../utils/GraphArenaTestHarness.h"
 #include "transfer/TransferEngine.h"
+#include "kernels/KernelFactory.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <unordered_set>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
@@ -73,6 +77,84 @@ void provePrimitive(DeviceId device){
    for(int row=0;row<m;++row)for(int branch=0;branch<4;++branch)EXPECT_EQ(std::memcmp(actual.data()+(row*4+branch)*h,input->data()+row*h,h*4),0);});
  }).get();
 }
+/**
+ * @brief Seal a genuinely cold hash output through the production executor and replay changing input data.
+ * @param device Exact CUDA or ROCm participant selected by its native registration.
+ *
+ * The first full replay establishes every output byte without pre-uploading the
+ * write-only result. Later partial/empty replays poison that same storage at the
+ * explicit test-ingress boundary. Changed tokens, accepted history and live
+ * count must affect output without rebinding roots or reconstructing the graph.
+ */
+void proveHash(DeviceId device)
+{
+    auto *backend = getBackendFor(device);
+    if (!backend || backend->deviceCount() <= device.ordinal)
+        GTEST_SKIP() << "Requested backend unavailable";
+    auto context = IDeviceContext::create(device, 1);
+    auto &worker = GPUDeviceContextPool::instance().getContext(device);
+    auto cpu = llaminar::v2::kernels::KernelFactory::createQwen4Exp(DeviceId::cpu());
+    worker.submitAsync([&] {
+        constexpr int capacity = 4;
+        constexpr std::array<int, 4> liveRows{capacity, 1, 0, 3};
+        constexpr auto poison = std::bit_cast<std::int64_t>(std::uint64_t{0xa5a5a5a5a5a5a5a5});
+        test::GraphArenaTestHarness arena;
+        const auto integer = [&](BufferId id, std::size_t count) {
+            return arena.createPersistentTensor<INT32Tensor>(id, std::vector<std::size_t>{count});
+        };
+        auto *tokens = integer(BufferId::REQUEST_TOKEN_IDS, capacity);
+        auto *history = integer(BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY, 2);
+        auto *count = integer(BufferId::QFN_PLE_TRANSACTION_LIVE, 1);
+        auto *ids = integer(BufferId::QFN_NGRAM_ROW_IDS, capacity * 32);
+        qwen4exp::NgramHashPolicy policy;
+        policy.multipliers = {3, 5, 7};
+        for (unsigned head = 0; head < 16; ++head) {
+            policy.moduli[head] = 17;
+            policy.offsets[head] = (std::uint64_t{1} << 33) + head * 64;
+        }
+        std::array<std::int32_t, capacity> tokenValues{};
+        std::array<std::int32_t, 2> priorValues{};
+        const auto setHostInputs = [&](std::size_t replay) {
+            for (int row = 0; row < capacity; ++row)
+                tokenValues[row] = row == 2 ? static_cast<std::int32_t>(policy.eosToken)
+                                           : static_cast<std::int32_t>(17 + row + 31 * replay);
+            priorValues = {static_cast<std::int32_t>(7 + replay), static_cast<std::int32_t>(11 + replay)};
+            std::copy(tokenValues.begin(), tokenValues.end(), static_cast<std::int32_t *>(tokens->raw_mutable_data()));
+            std::copy(priorValues.begin(), priorValues.end(), static_cast<std::int32_t *>(history->raw_mutable_data()));
+            *static_cast<std::int32_t *>(count->raw_mutable_data()) = liveRows[replay];
+        };
+        setHostInputs(0);
+        using Stage = Qwen4ExpPrimitiveStage;
+        using Int = Qwen4ExpIntBinding;
+        auto stage = std::make_unique<Stage>(Stage::Params{
+            .device_id = device,
+            .rows = {capacity, Int(*count, BufferId::QFN_PLE_TRANSACTION_LIVE)},
+            .operation = Stage::NgramHash{
+                Int(*tokens, BufferId::REQUEST_TOKEN_IDS),
+                Int(*history, BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY),
+                Int(*ids, BufferId::QFN_NGRAM_ROW_IDS), policy}});
+        ASSERT_NE(stage->graphCaptureVariantSignature(), 0u);
+        EXPECT_EQ(stage->graphLaunchPreparationPolicy(), GraphLaunchPreparationPolicy::CaptureOnly);
+        std::size_t replay = 0;
+        coldGraph(device, *context, worker, arena, std::move(stage), {tokens, history, count, ids},
+            [&](void *stream) {
+                ASSERT_LT(replay, liveRows.size());
+                std::vector<std::int64_t> expected(capacity * 16, poison);
+                cpu->ngramHash({{capacity, &liveRows[replay]}, tokenValues.data(), priorValues.data(),
+                    expected.data(), policy}, nullptr);
+                EXPECT_EQ(observe<std::int64_t>(*backend, device, stream, *ids), expected);
+                if (++replay == liveRows.size()) return;
+                setHostInputs(replay);
+                for (auto *input : {tokens, history, count})
+                    TransferEngine::prepareDeviceInput(input, device, stream);
+                // Explicit fixture ingress poisons existing output bytes only.
+                // It neither reallocates the sealed root nor runs in capture.
+                require(backend->memset(ids->gpu_data_ptr(), 0xa5, ids->size_bytes(), device.ordinal, stream),
+                    "Hash replay output poison failed");
+            });
+        EXPECT_EQ(replay, liveRows.size());
+    }).get();
+}
 /** @brief Snapshot and retention separately materialize every cold output before their physical seals. */
 void provePLE(DeviceId device,Qwen4ExpPLERetainedStage::Operation operation){
  auto*backend=getBackendFor(device);if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested backend unavailable";
@@ -115,11 +197,13 @@ void provePLE(DeviceId device,Qwen4ExpPLERetainedStage::Operation operation){
 }
 #ifdef HAVE_CUDA
 TEST(Qwen4ExpColdStagePreparation, CUDAPrimitive){provePrimitive(DeviceId::cuda(0));}
+TEST(Qwen4ExpColdStagePreparation, CUDANgramHash){proveHash(DeviceId::cuda(0));}
 TEST(Qwen4ExpColdStagePreparation, CUDAPLESnapshot){provePLE(DeviceId::cuda(0),Qwen4ExpPLERetainedStage::Operation::SnapshotPrior);}
 TEST(Qwen4ExpColdStagePreparation, CUDAPLERetain){provePLE(DeviceId::cuda(0),Qwen4ExpPLERetainedStage::Operation::RetainCandidates);}
 #endif
 #ifdef HAVE_ROCM
 TEST(Qwen4ExpColdStagePreparation, ROCmPrimitive){provePrimitive(DeviceId::rocm(0));}
+TEST(Qwen4ExpColdStagePreparation, ROCmNgramHash){proveHash(DeviceId::rocm(0));}
 TEST(Qwen4ExpColdStagePreparation, ROCmPLESnapshot){provePLE(DeviceId::rocm(0),Qwen4ExpPLERetainedStage::Operation::SnapshotPrior);}
 TEST(Qwen4ExpColdStagePreparation, ROCmPLERetain){provePLE(DeviceId::rocm(0),Qwen4ExpPLERetainedStage::Operation::RetainCandidates);}
 #endif

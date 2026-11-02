@@ -10,9 +10,23 @@
  */
 #pragma once
 #include <utility>
+#include <memory>
+#include <string>
 
 namespace llaminar2
 {
+    class PhysicalMemoryAuthority;
+    class PreparedRetainedHostService;
+    class RetainedHostServiceProcessObligation;
+    class NativeStoragePreparationPmaBinding;
+    class PhysicalMemoryOpaqueRuntimeCommitment;
+    class NativeContextOpaqueContract;
+    class PreparedGPUContextBirth;
+    class NativeContextPreparation;
+    struct DeviceId;
+    struct NativeContextRetirementSlotState;
+    class NativeContextRetirementOwner;
+    class NativeContextRetirementSlot;
     /**
      * @brief Own native GPU admission until one terminal process retirement.
      *
@@ -71,6 +85,33 @@ namespace llaminar2
          */
         static void retireActive() noexcept;
     private:
+        friend class PreparedRetainedHostService;
+        friend class RetainedHostServiceUseToken;
+        friend struct RetainedHostServiceInstanceState;
+        /** @brief Authenticate original CPU authority before any reservation or mapping. */
+        static void requireOriginalHostServiceAuthority(const std::shared_ptr<PhysicalMemoryAuthority>&);
+        /** @brief Retain original CPU libc/TLS reservation immediately before actual pthread attempt. */
+        static void retainHostServiceRoot(const std::shared_ptr<RetainedHostServiceProcessObligation>&);
+        /** @brief Close one actual CPU thread use after join/unmap; opaque tokens remain retained. */
+        static void completeHostServiceUse(const std::shared_ptr<RetainedHostServiceProcessObligation>&)noexcept;
+        friend class PreparedGPUContextBirth;
+        friend class NativeContextPreparation;
+        /** @brief Atomically retain original Preparing owners and arm the actual opaque commitment.
+         * All bookkeeping allocation precedes beginNative; no native API executes here.
+         */
+        static void retainPreparingOpaqueRoot(const std::shared_ptr<NativeStoragePreparationPmaBinding>&,
+            const std::shared_ptr<PhysicalMemoryOpaqueRuntimeCommitment>&,const NativeContextOpaqueContract&);
+        /** @brief Reject a fresh independent source before any exact mapping or native creator. */
+        static void requireOriginalProcessAuthority(DeviceId,const std::shared_ptr<PhysicalMemoryAuthority>&);
+        friend class NativeContextRetirementSlot;
+        friend class NativeContextRetirementOwner;
+        /** @brief Publish original tokens before native creation; never released at lexical cleanup. */
+        static void retainProcessRoot(const std::shared_ptr<NativeContextRetirementSlotState>&);
+        /** @brief Borrow one serialized, same-authority certified process population. */
+        static std::shared_ptr<NativeContextRetirementSlotState> borrowProcessRoot(
+            const std::shared_ptr<PhysicalMemoryAuthority>&,DeviceId,const std::string&,const std::string&);
+        /** @brief Mark a completed reset's process population available for the next generation. */
+        static void finishProcessUse(const std::shared_ptr<NativeContextRetirementSlotState>&)noexcept;
         /** @brief Perform one shared terminal transition for the exact lexical owner. */
         static void retireOwner(const GPUDeviceProcessLifetime *expected) noexcept;
         /** @brief Discharge one exact native worker admission after cleanup. */

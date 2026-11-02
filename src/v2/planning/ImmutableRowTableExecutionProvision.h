@@ -14,6 +14,8 @@
 #include "planning/PhysicalMemoryAuthority.h"
 #include "loaders/ResolvedImmutableRowTablePlacement.h"
 #include <utility>
+#include <optional>
+#include "execution/local_execution/graph/RetainedHostServiceProgram.h"
 #include <tuple>
 #include <vector>
 namespace llaminar2 {
@@ -37,8 +39,14 @@ struct ImmutableRowTableExecutionConsumer final {
     int rows, batch, context, local_heads, first_layer, last_layer, shards;
     int mtp_rows, retained_mtp_rows, request_capacity;
     ActivationGraphMemoryGeometry activation; ///< Exact common arena geometry, independently priced at wire decode.
-    int tp_coordinate = -1; ///< Original communicator coordinate; absent for replicated requests.
+    int tp_coordinate = -1; ///< Original compute communicator coordinate; absent for unsharded execution.
     ImmutableRowTableTPTopology tp_topology = ImmutableRowTableTPTopology::None;
+    std::string host_service_resource_identity; ///< Portable qualified CPU program class; no host pointer crosses wire.
+    std::string host_service_live_identity; ///< Original sender declaration identity, authenticated again by local materialization.
+    std::optional<RetainedHostServiceResourceDeclaration> host_service_declaration; ///< Exact original CPU service shape/demand, absent for non-service consumers.
+    int query_head_start = 0; ///< Original authored query-head coordinate; never inferred from participant order.
+    int kv_head_start = 0; ///< Original authored KV-head coordinate, including valid GQA replication.
+    int assigned_kv_heads = 0; ///< Exact authored TP assignment width; zero only when no assignment existed.
     /**
      * @brief Compare immutable source geometry without consulting live execution state.
      * @param other Another source-authored temporal consumer observation.
@@ -49,7 +57,9 @@ struct ImmutableRowTableExecutionConsumer final {
             context==other.context && local_heads==other.local_heads && first_layer==other.first_layer &&
             last_layer==other.last_layer && shards==other.shards && mtp_rows==other.mtp_rows &&
             retained_mtp_rows==other.retained_mtp_rows && request_capacity==other.request_capacity &&
-            sameActivation(activation,other.activation) && tp_coordinate==other.tp_coordinate && tp_topology==other.tp_topology;
+            query_head_start==other.query_head_start && kv_head_start==other.kv_head_start && assigned_kv_heads==other.assigned_kv_heads &&
+            sameActivation(activation,other.activation) && tp_coordinate==other.tp_coordinate && tp_topology==other.tp_topology &&
+            host_service_resource_identity==other.host_service_resource_identity && host_service_live_identity==other.host_service_live_identity && host_service_declaration==other.host_service_declaration;
     }
 private:
     /** @return All immutable activation geometry; never a count value or allocation address. */

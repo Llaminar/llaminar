@@ -8,12 +8,16 @@
  * Sampler recordings borrow arena storage; their parent retires first. HIP
  * retains one complete transaction, never a host-submitted list of model stages.
  */
+#include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include "DeviceGraphOrchestrator.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
 #include "PipelineForwardGraphEdges.h"
 #include "backends/BackendManager.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
+#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/mtp/DeviceGenerationGraphProgram.h"
@@ -23,6 +27,43 @@
 
 namespace llaminar2
 {
+namespace {
+/** @brief Submit one request-boundary native storage mutation to its original worker.
+ * The caller retains coordination and terminal service joins. Local boundaries
+ * without remote participants preserve their existing explicit native contract.
+ * @param boundary Existing immutable I/O owner, never a replacement cohort.
+ * @param memory Original DGO admitted authority and ownership control block.
+ * @param device Exact source participant, independent from remote storage owners.
+ * @param publication Existing request admission check or reset close publication only.
+ * @throws std::invalid_argument For foreign original device/authority.
+ * @throws std::logic_error For stale provenance or failed worker entry.
+ * @note submitAndWait joins host enqueue completion, never GPU execution.
+ * Whole-request event waits and CPU I/O joins remain with the caller.
+ */
+template<class Publication>
+void submitRetainedStoragePublication(const std::shared_ptr<IRetainedGraphStorageBoundary>& boundary,
+    const std::shared_ptr<PhysicalMemoryAuthority>& memory,DeviceId device,Publication&& publication)
+{
+    const auto original=boundary->retainedParticipantSource();
+    if(!original){publication();return;}
+    const auto expected=original->memory();
+    if(device!=boundary->device() || original->device()!=device || !memory ||
+       memory.get()!=expected.get() || memory.owner_before(expected) || expected.owner_before(memory) ||
+       memory->phase()!=PhysicalMemoryAuthorityPhase::Admitted)
+        throw std::invalid_argument("Retained storage publication requires the original participant/PMA control block");
+    const auto current=GPUDeviceContextPool::instance().retainExistingContextProvenance(device);
+    original->requireWorker(current.worker());
+    if(original->generation()!=current.generation())
+        throw std::logic_error("Retained storage publication has a stale original source generation");
+    const auto& worker=original->worker();
+    const auto publish=[&]{
+        if(!worker->ownsCurrentThread())throw std::logic_error("Retained storage publication did not enter its original worker");
+        publication();
+    };
+    if(worker->ownsCurrentThread())publish();
+    else worker->submitAndWait(publish);
+}
+}
 std::size_t DeviceGraphOrchestrator::sparseQueryProgramCount() const
 {
     if (!graph_builder_ || !graph_builder_->config().flash_next) return 1u;
@@ -76,6 +117,57 @@ std::optional<ForwardGraphSignature> &DeviceGraphOrchestrator::pairedVerifierFor
     return cache.paired_forward_signatures[sparseQueryExecutionProgramIndex(sparseQueryGraphProgram())];
 }
 
+std::pair<std::shared_ptr<IRetainedGraphStorageBoundary>,std::uint64_t>
+DeviceGraphOrchestrator::retainedStorageSourceAdmission() const
+{
+    const auto declared=graph_builder_?graph_builder_->retainedStorageBoundary(state_.device_id):nullptr;
+    if(retained_storage_boundary_&&declared!=retained_storage_boundary_)
+        throw std::logic_error("Original storage admission declaration changed");
+    return {declared,session_epoch_};
+}
+
+bool DeviceGraphOrchestrator::finishGroupedDeviceResidentGeneration(DeviceGenerationTerminalResult* result)
+{
+    const auto boundary=std::dynamic_pointer_cast<qwen4exp::ImmutableLookupExecutionBoundary>(retained_storage_boundary_);
+    if(!boundary||!boundary->requiresSourceGroupAdmission())
+        throw std::logic_error("Grouped terminal materialization requires its original grouped source boundary");
+    return finishDeviceResidentGenerationImpl(result,RetainedStorageTerminalPhase::PublishOnly);
+}
+void DeviceGraphOrchestrator::awaitGroupedRetainedStorageTerminal()
+{
+    const auto boundary=std::dynamic_pointer_cast<qwen4exp::ImmutableLookupExecutionBoundary>(retained_storage_boundary_);
+    if(!boundary||!boundary->requiresSourceGroupAdmission())
+        throw std::logic_error("Grouped terminal await requires its original grouped source boundary");
+    if(!boundary->hasActiveInterval()){
+        retained_storage_reset_close_prepared_=false;
+        return;
+    }
+    try{awaitRetainedStorageTerminal();}
+    catch(...){
+        if(!boundary->hasActiveInterval())retained_storage_reset_close_prepared_=false;
+        throw;
+    }
+    retained_storage_reset_close_prepared_=false;
+}
+
+void DeviceGraphOrchestrator::prepareGroupedRetainedStorageReset(const InferenceStateResetRequest& request)
+{
+    const auto [declared,epoch]=retainedStorageSourceAdmission();
+    (void)epoch;
+    const auto boundary=std::dynamic_pointer_cast<qwen4exp::ImmutableLookupExecutionBoundary>(declared);
+    if(!boundary||!boundary->requiresSourceGroupAdmission()||!boundary->hasActiveInterval())return;
+    auto* backend=getBackendFor(state_.device_id);
+    if(!backend||!backend->setDevice(state_.device_id.ordinal))
+        throw std::runtime_error("Original grouped reset could not activate its exact GPU");
+    // Preserve the original reset order. This drains only already-published
+    // maintenance diagnostics; the later reset sees the same owner retired.
+    drainCompletedDeviceMoERebalanceMaintenanceDiagnostics("request_reset",
+        request.reason?request.reason:"request-boundary");
+    auto* stream=explicitGPUStreamForOperation("requestStateResetTransaction");
+    if(!joinPriorDeviceWorkForRequestStateReset(stream,"grouped-source-terminal",RetainedStorageTerminalPhase::PublishOnly))
+        throw std::runtime_error("Original grouped reset could not join prior GPU producers");
+}
+
 void DeviceGraphOrchestrator::prepareRetainedStorageBinding()
 {
     const auto declared=graph_builder_?graph_builder_->retainedStorageBoundary(state_.device_id):nullptr;
@@ -93,7 +185,15 @@ void DeviceGraphOrchestrator::prepareRetainedStorageBinding()
 bool DeviceGraphOrchestrator::beginRetainedStorageAdmission(void *stream)
 {
     prepareRetainedStorageBinding();
-    if(retained_storage_boundary_)retained_storage_boundary_->beginAdmission(session_epoch_,stream);
+    if(retained_storage_boundary_){
+        // Separate normal prefill/forward entries can revisit this admission.
+        // The boundary's same-epoch check prevents a second arm/native admit,
+        // but this wrapper still joins one host enqueue task on each entry.
+        // Retained token/transaction replay bypasses this normal-forward prelude.
+        const auto boundary=retained_storage_boundary_;
+        submitRetainedStoragePublication(boundary,physical_memory_authority_,state_.device_id,
+            [&]{boundary->beginAdmission(session_epoch_,stream);});
+    }
     return true;
 }
 
@@ -136,9 +236,18 @@ void DeviceGraphOrchestrator::releaseRetainedStorageGenerationTopology() noexcep
     retained_storage_terminal_fragment_={};
     retained_storage_terminal_capture_.reset();
 }
-void DeviceGraphOrchestrator::retireRetainedStorageForRequestReset(void *stream)
+void DeviceGraphOrchestrator::retireRetainedStorageForRequestReset(void *stream,RetainedStorageTerminalPhase phase)
 {
     if(!retained_storage_boundary_ || !retained_storage_boundary_->hasActiveInterval())return;
+    // Terminal aggregation can query other participant workers and join the
+    // CPU I/O service. Keep that whole-request obligation off the source worker.
+    if(const auto original=retained_storage_boundary_->retainedParticipantSource();
+       original && original->worker()->ownsCurrentThread())
+        throw std::logic_error("Retained storage request retirement requires its off-worker terminal coordinator");
+    if(retained_storage_reset_close_prepared_){
+        if(phase==RetainedStorageTerminalPhase::PublishAndAwait){awaitRetainedStorageTerminal();retained_storage_reset_close_prepared_=false;}
+        return;
+    }
     auto *backend=getBackendFor(state_.device_id);
     if(!state_.device_id.is_gpu() || !backend || !stream ||
         reinterpret_cast<std::uintptr_t>(stream)<=2 || !device_generation_terminal_host_ready_event_)
@@ -149,7 +258,9 @@ void DeviceGraphOrchestrator::retireRetainedStorageForRequestReset(void *stream)
     // The DGO's request API owns this event exclusively: response observation
     // and reset cannot overlap. Reusing it creates no new allocation or transfer.
     // Do not requireHealthy here: a failed storage worker still owes its join.
-    retained_storage_boundary_->recordTerminalClose(stream);
+    const auto boundary=retained_storage_boundary_;
+    submitRetainedStoragePublication(boundary,physical_memory_authority_,state_.device_id,
+        [&]{boundary->recordTerminalClose(stream);});
     PerfStatsCollector::addCounter("immutable_lookup","reset_terminal_closes",1.0,
         "request_reset",state_.device_id.toString());
     if(!backend->recordEvent(device_generation_terminal_host_ready_event_.get(),state_.device_id.ordinal,stream) ||
@@ -160,7 +271,8 @@ void DeviceGraphOrchestrator::retireRetainedStorageForRequestReset(void *stream)
     // to observe. No token, stage or retained-transaction boundary waits here.
     PerfStatsCollector::addCounter("immutable_lookup","reset_terminal_waits",1.0,
         "request_reset",state_.device_id.toString());
-    awaitRetainedStorageTerminal();
+    retained_storage_reset_close_prepared_=true;
+    if(phase==RetainedStorageTerminalPhase::PublishAndAwait){awaitRetainedStorageTerminal();retained_storage_reset_close_prepared_=false;}
 }
 void DeviceGraphOrchestrator::awaitRetainedStorageTerminal()
 {
@@ -307,6 +419,34 @@ DeviceGraphOrchestrator::materializeOrdinaryGenerationForward(
     return OrdinaryGenerationForward{*forward, *signature};
 }
 
+bool DeviceGraphOrchestrator::bindRetainedStorageSubmissionStream(
+    const std::shared_ptr<void>& stream, std::string* error)
+{
+    const auto fail = [&](const char* reason) {
+        if (error) *error = reason;
+        LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
+        return false;
+    };
+    if (!graph_builder_)
+        return fail("Retained storage parent binding requires its original graph builder");
+    const auto boundary = graph_builder_->retainedStorageBoundary(state_.device_id);
+    if (!boundary) return true;
+    auto original = boundary->retainedParticipantSource();
+    if (!original) return true;
+    const auto& config = graph_builder_->config();
+    const auto& execution = config.moe.expert_overlay_execution_plan;
+    if (!execution || execution->generationExecutionDomain()!=DeviceGenerationExecutionDomain::HostedBoundary ||
+        !execution->ownsContinuationGraph() || execution->world_size!=1 ||
+        !config.pp_contexts.empty() || config.pp_layer_offset!=0 ||
+        (config.total_n_layers>0 && config.n_layers!=config.total_n_layers) ||
+        original->device()!=state_.device_id || original->memory().get()!=physical_memory_authority_.get() ||
+        original->memory().owner_before(physical_memory_authority_) ||
+        physical_memory_authority_.owner_before(original->memory()))
+        return fail("Recurring remote lookup requires its original same-PMA hosted ExpertOverlay parent");
+    boundary->bindSourceSubmissionStream(RetainedGraphParticipantParentStream(std::move(*original),stream));
+    return true;
+}
+
 bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     DeviceGenerationSamplingMode sampling_mode, std::string *error,
     OrdinaryGenerationComposition composition)
@@ -390,11 +530,36 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     if (!generation || !backend || !loop.stream || !loop.capture || loop.launched ||
         execution == DeviceGenerationExecutionPolicy::Unsupported)
         return fail("Ordinary generation has no idle, admitted native graph owner");
-    auto &context = GPUDeviceContextPool::instance().getContext(state_.device_id);
+    const bool resident_read_ahead = graph_builder_ &&
+        graph_builder_->config().ngram_lookup_schedule ==
+            GraphConfig::NgramLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate;
+    auto retained_read_ahead_worker = resident_read_ahead
+        ? GPUDeviceContextPool::instance().retainExistingContext(state_.device_id)
+        : std::shared_ptr<IWorkerGPUContext>{};
+    if (resident_read_ahead && !retained_read_ahead_worker)
+        return fail("Resident read-ahead requires its already admitted original worker");
+    auto &context = retained_read_ahead_worker ? *retained_read_ahead_worker
+        : GPUDeviceContextPool::instance().getContext(state_.device_id);
     void *const stream = loop.stream.get();
+    if (resident_read_ahead)
+    {
+        const auto& original = graph_builder_->config().ngram_read_ahead_resources;
+        if (!original)
+            graph_builder_->bindReadAheadNativeResources(ReadAheadNativeResourceFamily::materialize(
+                physical_memory_authority_, retained_read_ahead_worker, state_.device_id, stream));
+        else if (original->device() != state_.device_id || original->primaryStream() != stream)
+            return fail("Resident read-ahead source factory changed its original admitted device/primary stream");
+    }
     auto &logical = device_resident_logical_sequence_state_storage_;
     if (!logical.validFor(1))
         return fail("Ordinary generation has no persistent logical frontier");
+
+    // This authority retains the actual controller-owned stream independently
+    // of every child recording stream. No new native resource is created.
+    if (const auto boundary=graph_builder_->retainedStorageBoundary(state_.device_id);
+        boundary && boundary->retainedParticipantSource() && (!hosted || !expert_overlay || pipeline_tail))
+        return fail("Recurring remote lookup requires its original same-PMA hosted ExpertOverlay parent");
+    if (!bindRetainedStorageSubmissionStream(loop.stream, error)) return false;
 
     const auto retention = (pipeline_tail || !expert_overlay)
         ? OrdinaryForwardRetentionKind::NativeComposable : ordinaryForwardRetentionKind();
@@ -408,6 +573,24 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         hosted_overlay != static_cast<bool>(hosted_forward) ||
         (!hosted_overlay && !native_forward))
         return fail("Ordinary generation export differs from its explicit native/hosted composition");
+    const auto read_ahead = native_forward ? native_forward->read_ahead_resources
+        : hosted_forward ? hosted_forward->read_ahead_resources : nullptr;
+    if(resident_read_ahead != static_cast<bool>(read_ahead))
+        return fail("Selected resident read-ahead lost or forged its original retained forward resource owner");
+    if (read_ahead)
+    {
+        // The native parent or authenticated whole-request ticket cursor owns
+        // this family across every retained forward and maintenance fragment.
+        // Hosted exports must name their actual complete retained composition;
+        // an ordinary segmented replay cannot acquire this resource lifetime.
+        if (read_ahead->device() != state_.device_id ||
+            read_ahead->primaryStream() != stream || !device_generation_state_ready_.event ||
+            (hosted_forward && (!hosted_forward->composed_parent || hosted_forward->segmented ||
+                                hosted_forward->replay_unit_count != 1u ||
+                                hosted_forward->device != state_.device_id)))
+            return fail("Ordinary read-ahead requires its exact complete retained forward and whole-request primary/event");
+        read_ahead->bindTerminal(device_generation_state_ready_.event);
+    }
     std::string detail;
     const bool owns_maintenance =
         usesParticipantLocalDeviceMoERebalanceController();
@@ -466,6 +649,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
 
     if (loop.valid && loop.workspace_generation == generation &&
         loop.ordinary_sampling_identity == params && loop.ordinary_forward_identity == signature &&
+        loop.read_ahead_resources == read_ahead &&
         loop.ordinary_composition == composition &&
         loop.ordinary_maintenance_capture == maintenance_capture &&
         loop.ordinary_maintenance_due == maintenance_due &&
@@ -612,6 +796,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
             {.name = "ordinary_resident_forward", .capture = native_forward->capture});
     loop.ordinary_sampling_identity = params;
     loop.ordinary_forward_identity = signature;
+    loop.read_ahead_resources = read_ahead;
     loop.ordinary_composition = composition;
     loop.ordinary_maintenance_capture = maintenance_capture;
     loop.ordinary_maintenance_due = maintenance_due;

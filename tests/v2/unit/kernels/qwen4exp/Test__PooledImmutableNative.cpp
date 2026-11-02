@@ -6,11 +6,15 @@
  * fixture supplies decoded transport/source observations, and its CPU payload
  * producer does not certify GPU copy, native capture, transport or serving.
  */
+#include "fixtures/qwen4exp/PooledImmutableNativeReplayBytes.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOps.h"
 #include "kernels/qwen4exp/PooledImmutableNativePlan.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOperands.h"
 #include "kernels/qwen4exp/PooledImmutableSourceOps.h"
+#include "kernels/qwen4exp/PooledImmutableRetirementOps.h"
+#include "kernels/qwen4exp/PooledImmutablePublicationOps.h"
 #include "kernels/common/SamplingMath.h"
+#include "../../../fixtures/qwen4exp/original_PooledImmutableSourceOwner.inc"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/ModelLoader.h"
 #include <gtest/gtest.h>
@@ -40,10 +44,11 @@ struct Bytes {
  * @brief Declare arbitrary owner order with an independent coordinator and CPU consumer.
  * @param capacities Exact slots per original owner, including C0.
  * @param replacement Optional recorded physical-cohort corruption at one coordinate.
+ * @param maximumUnique Exact admitted identity scratch/live-row bound.
  * @return Checked declarations only, without device discovery or allocation.
  */
 q::PooledImmutablePhysicalOwnerGeometry declared(std::span<const std::uint32_t> capacities,
-    std::optional<std::pair<std::size_t,PhysicalMemoryAllocatorIdentity>> replacement=std::nullopt)
+    std::optional<std::pair<std::size_t,PhysicalMemoryAllocatorIdentity>> replacement=std::nullopt,std::uint32_t maximumUnique=16)
 {
     std::vector<PhysicalMemoryAllocatorIdentity> order;
     std::vector<ImmutableRowTableLayoutOwner> owners;
@@ -60,7 +65,7 @@ q::PooledImmutablePhysicalOwnerGeometry declared(std::span<const std::uint32_t> 
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,owners,
         {{102,DeviceId::cpu()},coordinator},{},
         {{{103,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},
-        {},positive?std::optional(coordinator):std::nullopt,16);
+        {},positive?std::optional(coordinator):std::nullopt,maximumUnique);
     return q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,order,coordinator);
 }
 /** @brief One actual native owner parser with immutable original bank geometry. */
@@ -89,8 +94,10 @@ struct Pool {
     n::CoordinatorArgs args;
     std::vector<std::unique_ptr<Owner>> owners;
     std::uint64_t source_sequence=0;
-    explicit Pool(std::span<const std::uint32_t> capacities,std::uint32_t maximumOriginal=64,a::Policy policy={65536,1,2}):
-        physical(declared(capacities)),geometry(q::PooledImmutableCoordinatorGeometry::fromOwners(physical,policy,maximumOriginal)),
+    std::optional<std::uint32_t> direct_pin_owner;
+    std::uint64_t observed_direct_pin_bytes=0,observed_direct_pin_offset=0;
+    explicit Pool(std::span<const std::uint32_t> capacities,std::uint32_t maximumOriginal=64,a::Policy policy={65536,1,2},std::optional<std::size_t> local=std::nullopt,std::uint32_t maximumUnique=16):
+        physical(declared(capacities,local?std::optional(std::pair{*local,PhysicalMemoryAllocatorIdentity{101,DeviceId::rocm(11)}}):std::nullopt,maximumUnique)),geometry(q::PooledImmutableCoordinatorGeometry::fromOwners(physical,policy,maximumOriginal)),
         plan(q::PooledImmutableCoordinatorNativePlan::fromGeometry(physical,geometry,701,17)),
         cache(plan.parameters().cache.bytes),frame(plan.parameters().frame.bytes),native(plan.parameters().native.bytes),
         args{plan.parameters(),cache.data(),frame.data(),native.data(),{}}
@@ -133,19 +140,143 @@ struct Pool {
     }
     template<class H> std::vector<H> headers(){std::vector<H> result;for(auto& owner:owners)result.push_back(owner->header<H>());return result;}
     /** @brief Common Begin is the CPU coalescing oracle; GPU Begin's cooperative producer is tested separately natively. */
-    void begin(std::span<const std::uint64_t> original,std::uint64_t admission=1){
+    void begin(std::span<const std::uint64_t> original,std::uint64_t admission=1,bool receivedIngress=false,bool replyIngress=false,std::function<void()> beforeReceivedSeal={}){
         require(p::CoordinatorOperations(view()).begin(admission,original.data(),original.size()));n::invocation(args);
-        for(auto& owner:owners){owner->args.input={invocation(),nullptr,nullptr,nullptr,nullptr,nullptr};require(owner->run<n::OwnerAction::Begin>());}
+        for(auto& owner:owners){
+            const auto* received=invocation();
+            if(receivedIngress){
+                if(!owner->args.plan.native.ingress)throw std::logic_error("remote fixture requires original ingress declaration");
+                auto* ingress=n::at<n::OwnerIngress>(owner->args.native,owner->args.plan.native.ingress);
+                std::memcpy(&ingress->invocation,invocation(),sizeof(n::Invocation));received=&ingress->invocation;
+            }
+            owner->args.input={received,nullptr,nullptr,nullptr,nullptr,nullptr};require(owner->run<n::OwnerAction::Begin>());
+        }
         run<n::CoordinatorAction::PinCommands>();
         for(std::size_t i=0;i<owners.size();++i){
             auto& x=owners[i]->args;const auto slice=n::at<n::DirectedSlice>(args.native,args.plan.native.pin_slices)[i];
             x.input.records=x.plan.native.reply_capacity?n::at<p::OwnerCommand>(args.native,args.plan.native.pin_commands)+slice.byte_offset/sizeof(p::OwnerCommand):nullptr;
             x.input.record_bytes=x.plan.native.reply_capacity?&slice.live_bytes:nullptr;
-            require(owners[i]->run<n::OwnerAction::Pin>());x.input.records=nullptr;x.input.record_bytes=nullptr;
+            if(receivedIngress){
+                auto* ingress=n::at<n::OwnerIngress>(x.native,x.plan.native.ingress);
+                if(slice.live_bytes>std::uint64_t{x.plan.native.reply_capacity}*sizeof(p::OwnerCommand))throw std::logic_error("oversized decoded pin wire");
+                if(slice.live_bytes)std::memcpy(x.frame+x.plan.frame.commands,x.input.records,slice.live_bytes);
+                ingress->record_bytes=slice.live_bytes;
+                x.input.records=x.plan.native.reply_capacity?x.frame+x.plan.frame.commands:nullptr;
+                x.input.record_bytes=x.plan.native.reply_capacity?&ingress->record_bytes:nullptr;
+                n::progress(x).reply_bytes=~std::uint64_t{0};
+                require(owners[i]->run<n::OwnerAction::Pin>());
+                if(ingress->record_bytes!=slice.live_bytes || std::memcmp(&ingress->invocation,invocation(),sizeof(n::Invocation)))
+                    throw std::logic_error("immutable invocation/incoming count overwritten by outgoing publication");
+            }else{
+                if(direct_pin_owner && i==*direct_pin_owner && x.plan.native.reply_capacity){
+                    x.input.records=args.native+args.plan.native.pin_commands;x.input.record_bytes=nullptr;
+                    x.input.allocation_slice=n::at<n::DirectedSlice>(args.native,args.plan.native.pin_slices)+i;
+                    x.input.record_layout=n::RecordLayout::DirectedCommandBank;x.input.record_origin=0;
+                    x.input.record_capacity=std::uint64_t{args.plan.native.reply_capacity}*sizeof(p::OwnerCommand);
+                    observed_direct_pin_bytes=std::max(observed_direct_pin_bytes,slice.live_bytes);
+                    observed_direct_pin_offset=std::max(observed_direct_pin_offset,slice.byte_offset);
+                }
+                require(owners[i]->run<n::OwnerAction::Pin>());
+            }
+            x.input.records=nullptr;x.input.record_bytes=nullptr;x.input.allocation_slice=nullptr;
+            x.input.record_layout=n::RecordLayout::Compact;x.input.record_origin=x.input.record_capacity=0;
         }
-        grants<n::CoordinatorAction::AcquirePins>(true);all<n::OwnerAction::SealPins>();const auto pins=headers<p::PinHeader>();
-        args.input.frontier=pins.data();run<n::CoordinatorAction::SealPins>();args.input={};
-        for(auto& owner:owners){owner->args.input.frontier=pins.data();require(owner->run<n::OwnerAction::AcquirePins>());owner->args.input.frontier=nullptr;}
+        if(replyIngress){
+            // All actual Pin command readers above have finished before this
+            // source bank's first receive overwrite, as the graph lifetime
+            // helper enforces for asynchronous native participant endpoints.
+            auto* wire=args.native+args.plan.native.pin_commands;
+            auto* frontier=n::at<p::PinHeader>(args.native,args.plan.native.ingress_frontier);
+            for(std::size_t i=0;i<owners.size();++i){auto& owner=*owners[i];auto& x=owner.args;
+                const auto bytes=n::progress(x).reply_bytes;
+                if(bytes>std::uint64_t{x.plan.native.reply_capacity}*sizeof(p::Grant))throw std::logic_error("invalid original Pin reply extent");
+                // Decode the existing GPU publishReplies observation from its
+                // actual immutable initial-pin producer; GPU publication itself
+                // remains a separate native gate, not a CPU-copy certificate.
+                if(x.plan.native.reply_capacity){
+                    if(bytes)std::memcpy(x.native+x.plan.native.replies,x.frame+x.plan.frame.initial_pins,bytes);
+                    if(bytes)std::memcpy(wire,x.native+x.plan.native.replies,bytes);
+                    auto* count=n::at<std::uint64_t>(args.native,args.plan.native.ingress_count);*count=bytes;
+                    args.input.records=wire;args.input.record_bytes=count;run<n::CoordinatorAction::AcquirePins>();args.input={};
+                }else if(bytes)throw std::logic_error("C0 published a fake Grant payload");
+                require(owner.run<n::OwnerAction::SealPins>());
+                std::memcpy(frontier+i,x.native+x.plan.native.header,sizeof(p::PinHeader));
+            }
+            if(beforeReceivedSeal)beforeReceivedSeal();
+            args.input.frontier=frontier;run<n::CoordinatorAction::SealPins>();args.input={};
+            for(auto& owner:owners){auto& x=owner->args;
+                std::memcpy(x.frame+x.plan.frame.pin_headers,frontier,owners.size()*sizeof(p::PinHeader));
+                x.input.frontier=x.frame+x.plan.frame.pin_headers;require(owner->run<n::OwnerAction::AcquirePins>());x.input.frontier=nullptr;}
+        }else{
+            grants<n::CoordinatorAction::AcquirePins>(true);all<n::OwnerAction::SealPins>();const auto pins=headers<p::PinHeader>();
+            args.input.frontier=pins.data();run<n::CoordinatorAction::SealPins>();args.input={};
+            for(auto& owner:owners){owner->args.input.frontier=pins.data();require(owner->run<n::OwnerAction::AcquirePins>());owner->args.input.frontier=nullptr;}
+        }
+    }
+    /** @brief Decode only exact original free-wave wire messages into their actual phase-reused banks.
+     * The fixture observes parser operands, not GPU transport/capture/storage qualification. */
+    std::vector<std::pair<uint64_t,uint64_t>> receivedFree(
+        std::function<void()> beforePlan={},std::function<void(size_t)> beforeAccept={},
+        bool cancel=false,std::function<void()> beforeComplete={}){
+        auto* frontier=args.native+args.plan.native.ingress_frontier;
+        all<n::OwnerAction::Availability>();
+        for(size_t i=0;i<owners.size();++i)std::memcpy(frontier+i*sizeof(n::Availability),owners[i]->args.native+owners[i]->args.plan.native.header,sizeof(n::Availability));
+        if(beforePlan)beforePlan();args.input.frontier=frontier;run<n::CoordinatorAction::PlanFree>();args.input={};
+        std::vector<std::pair<uint64_t,uint64_t>> extents;
+        // Actual graph sends all original plan headers/slices before serial
+        // Grant reception; this decoded fixture first acquires every plan too.
+        for(size_t i=0;i<owners.size();++i){auto& x=owners[i]->args;const auto slice=n::at<n::DirectedSlice>(args.native,args.plan.native.free_slices)[i];
+            const auto* header=n::at<n::FreePlanHeader>(args.native,args.plan.native.free_headers)+i;
+            if(slice.byte_offset<args.plan.frame.decisions || slice.byte_offset-args.plan.frame.decisions>uint64_t{args.plan.policy.maximumUnique()}*sizeof(p::AllocationDecision) ||
+               slice.live_bytes>uint64_t{x.plan.native.reply_capacity}*sizeof(p::AllocationDecision) || slice.live_bytes!=header->decision_bytes)throw std::logic_error("invalid decoded original free slice");
+            std::memcpy(x.native+x.plan.native.header,header,sizeof(n::FreePlanHeader));
+            if(slice.live_bytes)std::memcpy(x.frame+x.plan.frame.commands,args.frame+slice.byte_offset,slice.live_bytes);
+            if(x.plan.native.reply_capacity)*n::at<uint64_t>(x.native,x.plan.native.ingress+offsetof(n::OwnerIngress,record_bytes))=slice.live_bytes;
+            extents.push_back({slice.live_bytes,0});
+        }
+        for(size_t i=0;i<owners.size();++i){auto& owner=*owners[i];auto& x=owner.args;
+            x.input.frontier=x.native+x.plan.native.header;x.input.records=x.plan.native.reply_capacity?x.frame+x.plan.frame.commands:nullptr;
+            x.input.record_bytes=x.plan.native.reply_capacity?n::at<uint64_t>(x.native,x.plan.native.ingress+offsetof(n::OwnerIngress,record_bytes)):nullptr;
+            x.input.record_layout=n::RecordLayout::TransportedAllocationPrefix;if(beforeAccept)beforeAccept(i);
+            require(owner.run<n::OwnerAction::AcceptFree>());x.input.records=nullptr;x.input.record_bytes=nullptr;x.input.frontier=nullptr;x.input.record_layout=n::RecordLayout::Compact;
+            if(cancel)require(owner.run<n::OwnerAction::CancelFree>());else require(owner.run<n::OwnerAction::ExecuteFree>());
+            const auto bytes=n::progress(x).reply_bytes;extents[i].second=bytes;
+            if(bytes%sizeof(p::Grant) || bytes>uint64_t{x.plan.native.reply_capacity}*sizeof(p::Grant))throw std::logic_error("invalid decoded original free Grant prefix");
+            // Exact output selection of the native publishReplies producer;
+            // CPU memcpy supplies decoded acquisition, not a GPU kernel proof.
+            if(bytes)std::memcpy(x.native+x.plan.native.replies,n::grants(x)+n::allocationFrame(x).wave_offset,bytes);
+            if(x.plan.native.reply_capacity){if(bytes)std::memcpy(args.native+args.plan.native.pin_commands,x.native+x.plan.native.replies,bytes);
+                auto* incoming=n::at<uint64_t>(args.native,args.plan.native.ingress_count);*incoming=bytes;args.input.records=args.native+args.plan.native.pin_commands;args.input.record_bytes=incoming;run<n::CoordinatorAction::AcquireFree>();args.input={};
+            }else if(bytes)throw std::logic_error("C0 free owner invented a Grant message");
+            if(!cancel)require(owner.run<n::OwnerAction::FreeReceipt>());
+            std::memcpy(frontier+i*sizeof(p::FreeAllocationReceipt),x.native+x.plan.native.header,sizeof(p::FreeAllocationReceipt));
+        }
+        if(beforeComplete)beforeComplete();args.input.frontier=frontier;run<n::CoordinatorAction::CompleteFree>();args.input={};
+        // CancelFree is terminal/Draining and must never enter ordinary
+        // AcquireFree, which authorizes a subsequent victim wave. CompleteFree
+        // still acquires all exact cancellation receipts before real release.
+        if(!cancel)for(auto& owner:owners){auto& x=owner->args;std::memcpy(x.frame+x.plan.frame.free_headers,frontier,owners.size()*sizeof(p::FreeAllocationReceipt));x.input.frontier=x.frame+x.plan.frame.free_headers;require(owner->run<n::OwnerAction::AcquireFree>());x.input.frontier=nullptr;}
+        return extents;
+    }
+    /** @brief Acquire original victim suffixes and current-wave Grant prefixes in the existing banks only. */
+    std::vector<std::pair<uint64_t,uint64_t>> receivedVictims(std::function<void(size_t)> beforeAccept={},bool cancel=false,std::function<void()> beforeComplete={},bool cancelBeforeAccept=false){
+        const auto freeCount=view().frame->free_planned;std::vector<std::byte> freePrefix(args.frame+args.plan.frame.decisions,args.frame+args.plan.frame.decisions+uint64_t{freeCount}*sizeof(p::AllocationDecision));
+        std::vector<std::vector<std::byte>> accepted,granted,frontiers;
+        for(auto& owner:owners){auto& x=owner->args;const auto count=n::allocationFrame(x).count;accepted.emplace_back(x.frame+x.plan.frame.accepted_plan,x.frame+x.plan.frame.accepted_plan+uint64_t{count}*sizeof(p::AllocationDecision));granted.emplace_back(reinterpret_cast<std::byte*>(n::grants(x)),reinterpret_cast<std::byte*>(n::grants(x)+count));frontiers.emplace_back(x.frame+x.plan.frame.free_headers,x.frame+x.plan.frame.free_headers+owners.size()*sizeof(p::FreeAllocationReceipt));}
+        run<n::CoordinatorAction::PlanVictims>();
+        if(!freePrefix.empty() && std::memcmp(freePrefix.data(),args.frame+args.plan.frame.decisions,freePrefix.size()))throw std::logic_error("Victim planner overwrote original free decisions");
+        std::vector<std::pair<uint64_t,uint64_t>> extents;auto* received=args.native+args.plan.native.ingress_frontier;
+        for(size_t i=0;i<owners.size();++i){auto& x=owners[i]->args;const auto slice=n::at<n::DirectedSlice>(args.native,args.plan.native.victim_slices)[i];const auto* h=n::at<n::VictimPlanHeader>(args.native,args.plan.native.victim_headers)+i;const auto origin=args.plan.frame.decisions;const auto span=uint64_t{args.plan.policy.maximumUnique()}*sizeof(p::AllocationDecision);
+            if(slice.byte_offset<origin || slice.byte_offset-origin>span || slice.live_bytes>span-(slice.byte_offset-origin) || slice.live_bytes>uint64_t{x.plan.native.reply_capacity}*sizeof(p::AllocationDecision) || slice.live_bytes!=h->decision_bytes)throw std::logic_error("Malformed original victim suffix descriptor");
+            std::memcpy(x.native+x.plan.native.header,h,sizeof(n::VictimPlanHeader));if(slice.live_bytes)std::memcpy(x.frame+x.plan.frame.commands,args.frame+slice.byte_offset,slice.live_bytes);if(x.plan.native.reply_capacity)*n::at<uint64_t>(x.native,x.plan.native.ingress+offsetof(n::OwnerIngress,record_bytes))=slice.live_bytes;extents.push_back({slice.live_bytes,0});
+        }
+        for(size_t i=0;i<owners.size();++i){auto& owner=*owners[i];auto& x=owner.args;x.input.frontier=x.native+x.plan.native.header;x.input.records=x.plan.native.reply_capacity?x.frame+x.plan.frame.commands:nullptr;x.input.record_bytes=x.plan.native.reply_capacity?n::at<uint64_t>(x.native,x.plan.native.ingress+offsetof(n::OwnerIngress,record_bytes)):nullptr;x.input.record_layout=n::RecordLayout::TransportedAllocationPrefix;if(beforeAccept)beforeAccept(i);if(!cancelBeforeAccept)require(owner.run<n::OwnerAction::AcceptVictim>());x.input.records=nullptr;x.input.record_bytes=nullptr;x.input.frontier=nullptr;x.input.record_layout=n::RecordLayout::Compact;
+            if(cancel)require(owner.run<n::OwnerAction::CancelVictim>());else require(owner.run<n::OwnerAction::ExecuteVictim>());const auto bytes=n::progress(x).reply_bytes;extents[i].second=bytes;if(bytes%sizeof(p::Grant) || bytes>uint64_t{x.plan.native.reply_capacity}*sizeof(p::Grant))throw std::logic_error("Malformed current-wave victim Grant prefix");if(bytes)std::memcpy(x.native+x.plan.native.replies,n::grants(x)+n::allocationFrame(x).wave_offset,bytes);
+            if(x.plan.native.reply_capacity){if(bytes)std::memcpy(args.native+args.plan.native.pin_commands,x.native+x.plan.native.replies,bytes);auto* count=n::at<uint64_t>(args.native,args.plan.native.ingress_count);*count=bytes;args.input.records=args.native+args.plan.native.pin_commands;args.input.record_bytes=count;run<n::CoordinatorAction::AcquireVictims>();args.input={};}else if(bytes)throw std::logic_error("C0 invented a victim Grant message");
+            if(!cancel)require(owner.run<n::OwnerAction::VictimReceipt>());std::memcpy(received+i*sizeof(p::VictimAllocationReceipt),x.native+x.plan.native.header,sizeof(p::VictimAllocationReceipt));
+            if((!accepted[i].empty() && std::memcmp(accepted[i].data(),x.frame+x.plan.frame.accepted_plan,accepted[i].size())) || (!granted[i].empty() && std::memcmp(granted[i].data(),n::grants(x),granted[i].size())) || std::memcmp(frontiers[i].data(),x.frame+x.plan.frame.free_headers,frontiers[i].size()))throw std::logic_error("Victim execution changed original free prefix/frontier");
+        }
+        if(beforeComplete)beforeComplete();args.input.frontier=received;run<n::CoordinatorAction::CompleteVictims>();args.input={};return extents;
     }
     /** @brief Direct plans, actual wave execution/grants, and complete ALL-owner completion frontiers. */
     template<bool Victims> void wave(bool directed=false){
@@ -245,7 +376,7 @@ TEST(PooledImmutableNative, C0EmptyAndLargeToSmallUseExactLiveCountsAndRetainIde
     EXPECT_EQ(pool.plan.parameters().identity,identity);
         for(auto& owner:pool.owners)if(!owner->args.plan.owner.capacity()){
             EXPECT_EQ(owner->args.cache,nullptr);
-    EXPECT_EQ(owner->args.plan.native.bytes,128u);
+    EXPECT_EQ(owner->args.plan.native.bytes,256u); // Invocation/count64 plus retained terminal source outcome64.
     EXPECT_EQ(owner->args.plan.native.reply_capacity,0u);}
     }
 }
@@ -262,7 +393,7 @@ TEST(PooledImmutableNative, GlobalUnusedFreeQuotaForbidsNativeVictimPlan)
 }
 TEST(PooledImmutableNative, LateMalformedOrDuplicatePinCannotAcquireAnUnreportedPrefix)
 {
-    for(unsigned defect=0;defect<3;++defect){
+    for(unsigned defect=0;defect<5;++defect){
         Pool pool(std::array{2u});
     ASSERT_NO_THROW(pool.complete(std::array<std::uint64_t,2>{101,102}));
         auto& owner=*pool.owners[0];auto& x=owner.args;
@@ -275,6 +406,8 @@ TEST(PooledImmutableNative, LateMalformedOrDuplicatePinCannotAcquireAnUnreported
         if(defect==0)++commands[1].target.generation;
         if(defect==1){commands[1].target=commands[0].target;commands[1].requested_row=commands[0].requested_row;}
         if(defect==2)commands[1].ordinal=commands[0].ordinal;
+        if(defect==3)commands[1].target.unique=commands[0].target.unique;
+        if(defect==4)commands[1].target.slot=commands[0].target.slot;
         const std::uint64_t bytes=sizeof(commands);x.input.records=commands.data();x.input.record_bytes=&bytes;
         EXPECT_FALSE(owner.run<n::OwnerAction::Pin>());
     EXPECT_EQ(n::ownerView<a::Slot64>(x).frame->held_pins,0u);
@@ -300,7 +433,9 @@ TEST(PooledImmutableNative, ExactDeclaredNativeGeometryAndClosedC0InputSchemas)
 {
     Pool pool(std::array{1u,0u,2u,0u,1u});
     for(auto& owner:pool.owners){const auto& plan=owner->args.plan;
-    EXPECT_EQ(plan.native.bytes,128+64*plan.native.reply_capacity);
+    const std::array<size_t,3> actualRemoteExtents{256,576,768};
+        ASSERT_LT(plan.native.reply_capacity,actualRemoteExtents.size());
+        EXPECT_EQ(plan.native.bytes,actualRemoteExtents[plan.native.reply_capacity]);
         const auto pin=q::pooledNativeSchema(n::OwnerAction::Pin,plan),fill=q::pooledNativeSchema(n::OwnerAction::ApplySourceDelivery,plan);
         EXPECT_EQ(pin[static_cast<unsigned>(q::PooledNativeOperand::Records)].bytes,plan.native.reply_capacity*sizeof(p::OwnerCommand));
         EXPECT_EQ(fill[static_cast<unsigned>(q::PooledNativeOperand::Payload)].bytes,plan.native.reply_capacity*plan.row_bytes);
@@ -691,7 +826,9 @@ TEST(PooledImmutableNative, SourceOwnerCohortIdentityRejectsForeignAllocatorAndR
             SCOPED_TRACE(::testing::Message()<<"participants="<<participants<<" owner="<<coordinate);
             const auto actual=q::PooledImmutableOwnerNativePlan::fromGeometry(original,policy,coordinate,701,17);
             EXPECT_NO_THROW(coordinator.requireOwnerPlan(actual));
-            EXPECT_NO_THROW(q::PooledImmutableSourceGeometry::fromPlans(actual,coordinator,descriptor));
+            std::vector<q::PooledImmutableOwnerNativePlan> cohort;for(std::uint32_t i=0;i<participants;++i)cohort.push_back(q::PooledImmutableOwnerNativePlan::fromGeometry(original,policy,i,701,17));
+            EXPECT_NO_THROW(q::PooledImmutableSourceGeometry::fromPlans(cohort,coordinator,descriptor));
+            if(participants>1)EXPECT_THROW(q::PooledImmutableSourceGeometry::fromPlans(actual,coordinator,descriptor),std::invalid_argument);
             const auto allocator=actual.allocator();
             const std::array replacements{
                 PhysicalMemoryAllocatorIdentity{allocator.world_rank+1000,allocator.device},
@@ -745,7 +882,8 @@ TEST(PooledImmutableNative, ActualSourceCompletionAndPartialAcknowledgementsPres
             EXPECT_EQ(intents[i].intent,source::reserved(unique.phase)?ImmutableRowReadIntent::ReadAndInvalidate:ImmutableRowReadIntent::Read);
             EXPECT_EQ(intents[i].destination_grant,source::reserved(unique.phase)?unique.grant.destination_token:0u);
         }
-        pool.args.input.source=&source::frontier(args);ASSERT_NO_THROW(pool.run<n::CoordinatorAction::SealSource>());pool.args.input={};
+        pool.args.input.source=&source::frontier(args);
+        ASSERT_NO_THROW(pool.run<n::CoordinatorAction::SealSource>());pool.args.input={};
         args.owner.input.frontier=&source::frontier(args);ASSERT_TRUE((n::owner<n::OwnerAction::SealSource,a::Slot64>(args.owner)));
         auto& io=source::protocol(args);io.issuedSequence=source::frontier(args).source.sequence;
         q::ImmutableLookupCompletion completion;completion.publication=io.issuedSequence;completion.sequenceComplement=~completion.publication;
@@ -768,7 +906,8 @@ TEST(PooledImmutableNative, ActualSourceCompletionAndPartialAcknowledgementsPres
         if(corrupt>=0)actual[corrupt].destination_grant=actual[corrupt].destination_grant+73;
         std::vector<std::byte> previous(count*sizeof(n::Fill));
         if(!previous.empty())std::memcpy(previous.data(),args.frame+parameters.offsets.fills,previous.size());
-        EXPECT_EQ(source::prepareDelivery(args),corrupt<0);
+        EXPECT_EQ(source::validateResponse(args),corrupt<0);
+        if(corrupt<0)EXPECT_TRUE(source::prepareDelivery(args,0));
         const auto bytes=*n::at<std::uint64_t>(args.native,parameters.offsets.record_bytes);
         EXPECT_EQ(bytes,corrupt<0?count*sizeof(n::Fill):0u);
         if(corrupt>=0){
@@ -814,7 +953,8 @@ TEST(PooledImmutableNative, RejectedSourcePlanSealsFailureWithoutInventingRetire
         EXPECT_EQ(source::frontier(args).disposition,n::SourceDisposition::Published);
         EXPECT_EQ(source::frontier(args).status,a::Status::SourceFailure);
         EXPECT_EQ(io.issuedSequence,0u);EXPECT_EQ(io.consumedSequence,0u); // No completion or request publication is invented.
-        pool.args.input.source=&source::frontier(args);ASSERT_NO_THROW(pool.run<n::CoordinatorAction::SealSource>());pool.args.input={};
+        pool.args.input.source=&source::frontier(args);
+        ASSERT_NO_THROW(pool.run<n::CoordinatorAction::SealSource>());pool.args.input={};
         args.owner.input.frontier=&source::frontier(args);ASSERT_TRUE((n::owner<n::OwnerAction::SealSource,a::Slot64>(args.owner)));
         EXPECT_EQ(n::sourceGate(n::SourceCondition::AfterFailure,&source::frontier(args),pool.view().frame->interval,701,pool.view().frame->source),n::SourceGate::Invalid);
         if(count)EXPECT_EQ(std::memcmp(original.data(),n::grants(args.owner),count*sizeof(p::Grant)),0);
@@ -928,4 +1068,1276 @@ TEST(PooledImmutableNative, BeforeReadyCancellationPreservesConsumedWitnessAndRe
         }
     }
 }
+}
+
+namespace llaminar2::test {
+/** @brief Replay original remote ingress roles through actual Pin parsers, then the full existing retirement protocol. */
+TEST(PooledImmutableNative, RemoteIngressKeepsInvocationAndIncomingCountAcrossPinAndShrinkingReplay)
+{
+    for(const auto participants:{1u,2u,4u,8u}){
+        std::vector<std::uint32_t> capacities(participants,3u);if(participants>1)capacities[1]=0;
+        Pool pool(capacities);const auto identity=pool.plan.parameters().identity;
+        ASSERT_NO_THROW(pool.complete(std::array<std::uint64_t,3>{101,102,103}));
+        for(const auto rows:{std::vector<std::uint64_t>{101,102,103,101},std::vector<std::uint64_t>{101},std::vector<std::uint64_t>{},std::vector<std::uint64_t>{101,102}}){
+            ASSERT_NO_THROW(pool.begin(rows,2,true));
+            ASSERT_NO_THROW(pool.wave<false>());
+            ASSERT_NO_THROW(pool.wave<true>());
+            ASSERT_NO_THROW(pool.finish());
+            EXPECT_EQ(pool.view().frame->phase,p::LookupPhase::Idle);EXPECT_EQ(pool.plan.parameters().identity,identity);
+        }
+    }
+}
+
+/** @brief Actual parsers consume each original owner return and complete ALL-owner frontier across repeated partial/empty requests. */
+TEST(PooledImmutableNative, SharedPinReplyIngressReplaysOrderedC0EmptyAndShrinkingFrames)
+{
+    for(unsigned participants:{1u,2u,4u,8u})for(bool allEmpty:{false,true}){
+        std::vector<std::uint32_t> capacities(participants,allEmpty?0u:3u);if(participants>1)capacities[1]=0;
+        Pool pool(capacities);
+        ASSERT_NO_THROW(pool.complete(std::array<std::uint64_t,3>{101,102,103}));
+        const auto identity=pool.plan.parameters().identity;
+        for(const auto rows:{std::vector<std::uint64_t>{101,102,103,101,103},std::vector<std::uint64_t>{101},std::vector<std::uint64_t>{},std::vector<std::uint64_t>{101,102}}){
+            ASSERT_NO_THROW(pool.begin(rows,2,true,true));
+            ASSERT_EQ(pool.view().frame->phase,p::LookupPhase::Availability);
+            const auto* frontier=n::at<p::PinHeader>(pool.args.native,pool.args.plan.native.ingress_frontier);
+            for(size_t i=0;i<pool.owners.size();++i){const auto& x=pool.owners[i]->args;
+                EXPECT_EQ(frontier[i].owner,i);EXPECT_EQ(frontier[i].status,a::Status::Success);
+                EXPECT_EQ(std::memcmp(x.frame+x.plan.frame.pin_headers,frontier,participants*sizeof(p::PinHeader)),0);
+                EXPECT_LE(n::progress(x).reply_bytes,std::uint64_t{x.plan.native.reply_capacity}*sizeof(p::Grant));
+                if(!x.plan.native.reply_capacity)EXPECT_EQ(n::progress(x).reply_bytes,0u);
+            }
+            ASSERT_NO_THROW(pool.wave<false>());
+            ASSERT_NO_THROW(pool.wave<true>());
+            ASSERT_NO_THROW(pool.finish());
+            EXPECT_EQ(pool.plan.parameters().identity,identity);EXPECT_EQ(pool.view().frame->phase,p::LookupPhase::Idle);
+        }
+    }
+}
+/** @brief Missing/stale owner headers cannot become a complete frontier or advance into allocation. */
+TEST(PooledImmutableNative, SharedPinReplyIngressRejectsStaleAndPartialOriginalFrontiers)
+{
+    for(unsigned defect:{0u,1u}){
+        Pool pool(std::array{2u,1u});
+        ASSERT_NO_THROW(pool.complete(std::array<std::uint64_t,2>{101,102}));
+        EXPECT_THROW(pool.begin(std::array<std::uint64_t,2>{101,102},2,true,true,[&]{
+            auto* frontier=n::at<p::PinHeader>(pool.args.native,pool.args.plan.native.ingress_frontier);
+            if(defect==0)--frontier[1].interval.sequence;else frontier[1]=frontier[0];
+        }),std::logic_error);
+        EXPECT_NE(pool.view().frame->phase,p::LookupPhase::Availability);EXPECT_NE(pool.view().frame->status,a::Status::Success);
+    }
+}
+TEST(PooledImmutableNative, SharedPinReplyBankReusesExactCancellationReceiptsWithoutOverwritingObservations)
+{
+    Pool pool(std::array{2u,0u,2u});
+    ASSERT_NO_THROW(pool.begin(std::array<std::uint64_t,3>{101,102,103},1,true,true));
+    ASSERT_NO_THROW(pool.all<n::OwnerAction::Availability>());
+    const auto available=pool.headers<n::Availability>();pool.args.input.frontier=available.data();
+    ASSERT_NO_THROW(pool.run<n::CoordinatorAction::PlanFree>());pool.args.input={};
+    for(std::size_t i=0;i<pool.owners.size();++i){auto& owner=*pool.owners[i];auto& x=owner.args;
+        const auto slice=n::at<n::DirectedSlice>(pool.args.native,pool.args.plan.native.free_slices)[i];
+        x.input.frontier=n::at<n::FreePlanHeader>(pool.args.native,pool.args.plan.native.free_headers)+i;
+        x.input.records=x.plan.native.reply_capacity?pool.args.frame+slice.byte_offset:nullptr;
+        ASSERT_TRUE(owner.run<n::OwnerAction::AcceptFree>());
+        x.input.records=nullptr;x.input.frontier=nullptr;
+        ASSERT_TRUE(owner.run<n::OwnerAction::CancelFree>());
+        EXPECT_EQ(n::progress(x).reply_bytes,std::uint64_t{n::allocationFrame(x).count}*sizeof(p::Grant));
+    }
+    ASSERT_NO_THROW(pool.grants<n::CoordinatorAction::AcquireFree>());
+    const auto complete=pool.headers<p::FreeAllocationReceipt>();pool.args.input.frontier=complete.data();
+    ASSERT_NO_THROW(pool.run<n::CoordinatorAction::CompleteFree>());pool.args.input={};
+    ASSERT_NO_THROW(pool.all<n::OwnerAction::Release>());
+    std::vector<p::ReleaseReceipt> releases;
+    for(auto& owner:pool.owners){auto& x=owner->args;const auto count=n::progress(x).released;
+        const auto* receipts=n::at<p::ReleaseReceipt>(x.frame,x.plan.frame.release_receipts);releases.insert(releases.end(),receipts,receipts+count);}
+    std::reverse(releases.begin(),releases.end());const auto original=releases;
+    const n::SourceFrontier source{pool.view().frame->interval,{},n::SourceDisposition::Unpublished,a::Status::Success,n::Version};
+    const std::uint64_t bytes=releases.size()*sizeof(p::ReleaseReceipt);
+    auto* received=pool.args.native+pool.args.plan.native.pin_commands;
+    auto* count=n::at<std::uint64_t>(pool.args.native,pool.args.plan.native.ingress_count);
+    std::memcpy(received,releases.data(),bytes);*count=bytes;pool.args.input={received,count,nullptr,&source};
+    ASSERT_NO_THROW(pool.run<n::CoordinatorAction::Cancel>());pool.args.input={};
+    EXPECT_EQ(std::memcmp(original.data(),received,bytes),0);
+    EXPECT_EQ(*count,bytes);
+    ASSERT_NO_THROW(pool.all<n::OwnerAction::Retire>());
+    const auto retired=pool.headers<p::RetiredHeader>();pool.args.input.frontier=retired.data();
+    ASSERT_NO_THROW(pool.run<n::CoordinatorAction::Finish>());
+}
+
+}
+
+namespace llaminar2::test {
+/** @brief Actual source parsers consume exact original free-wave banks across C0/empty/shrinking/reset replays. */
+TEST(PooledImmutableNative, ReceivedFreeWaveUsesOriginalCountsAndCompleteFrontiersAcrossReplay)
+{
+    for(unsigned participants:{1u,2u,4u,8u})for(bool allC0:{false,true}){
+        std::vector<uint32_t> capacities(participants,allC0?0u:3u);if(participants>1)capacities[0]=0;
+        Pool pool(capacities);uint64_t admission=10;
+        for(const auto rows:{std::vector<uint64_t>{101,102,101,103},std::vector<uint64_t>{101},std::vector<uint64_t>{},std::vector<uint64_t>{105,106}}){
+            ASSERT_NO_THROW(pool.begin(rows,admission++,true,true));std::vector<std::pair<uint64_t,uint64_t>> extents;
+        ASSERT_NO_THROW(extents=pool.receivedFree());
+        ASSERT_EQ(extents.size(),participants);
+            for(size_t i=0;i<extents.size();++i){const auto& x=pool.owners[i]->args;
+        EXPECT_LE(extents[i].first,uint64_t{x.plan.native.reply_capacity}*sizeof(p::AllocationDecision));
+        EXPECT_LE(extents[i].second,uint64_t{x.plan.native.reply_capacity}*sizeof(p::Grant));if(!capacities[i])EXPECT_EQ(extents[i],(std::pair<uint64_t,uint64_t>{0,0}));if(rows.empty())EXPECT_EQ(extents[i],(std::pair<uint64_t,uint64_t>{0,0}));}
+            ASSERT_NO_THROW(pool.wave<true>(true));
+        ASSERT_NO_THROW(pool.finish());
+        }
+    }
+}
+/** @brief Count/header mismatch, stale leases, partial bytes and over-capacity records fail before reservation mutation. */
+TEST(PooledImmutableNative, ReceivedFreeWaveRejectsMalformedTransportBeforeReservation)
+{
+    for(unsigned defect=0;defect<10;++defect){Pool pool(std::array{3u,0u});
+        ASSERT_NO_THROW(pool.begin(std::array<uint64_t,2>{101,102},1,true,true));
+        p::AllocationFrame before{};std::vector<std::byte> cache;bool observed=false;
+        EXPECT_THROW(pool.receivedFree({},[&](size_t i){if(i)return;auto& x=pool.owners[0]->args;auto* h=n::at<n::FreePlanHeader>(x.native,x.plan.native.header);auto* count=n::at<uint64_t>(x.native,x.plan.native.ingress+offsetof(n::OwnerIngress,record_bytes));before=n::allocationFrame(x);cache.assign(x.cache,x.cache+x.plan.cache.bytes);observed=true;
+            if(defect==0)*count=0;
+            if(defect==1)*count=h->decision_bytes+sizeof(p::AllocationDecision);
+            if(defect==2){h->decision_bytes=1;*count=1;}
+            if(defect==3){h->decision_bytes=uint64_t{x.plan.native.reply_capacity+1}*sizeof(p::AllocationDecision);*count=h->decision_bytes;}
+            if(defect==4)++h->lease.interval.sequence;
+            if(defect==5)x.input.record_bytes=nullptr;
+            if(defect==6){h->decision_bytes=0;*count=sizeof(p::AllocationDecision);}
+            if(defect==7)x.input.records=static_cast<const std::byte*>(x.input.records)+1;
+            if(defect==8)++h->version;
+            if(defect==9)x.input.record_bytes=reinterpret_cast<const uint64_t*>(reinterpret_cast<const std::byte*>(x.input.record_bytes)+1);
+        }),std::logic_error)<<defect;
+        ASSERT_TRUE(observed);const auto& x=pool.owners[0]->args;const auto& after=n::allocationFrame(x);
+        EXPECT_EQ(after.phase,before.phase);
+        EXPECT_EQ(after.count,before.count);
+        EXPECT_EQ(after.wave_count,before.wave_count);
+        EXPECT_EQ(after.free_count,before.free_count);
+        EXPECT_EQ(std::memcmp(cache.data(),x.cache,cache.size()),0)<<defect;
+    }
+}
+/** @brief Missing/stale original owner frontiers cannot authorize free planning or completion. */
+TEST(PooledImmutableNative, ReceivedFreeWaveRejectsStaleAvailabilityAndPartialCompletion)
+{
+    for(unsigned defect=0;defect<3;++defect){Pool pool(std::array{2u,0u,2u});
+        ASSERT_NO_THROW(pool.begin(std::array<uint64_t,2>{101,102},1,true,true));
+        EXPECT_THROW(pool.receivedFree([&]{if(defect==0)++n::at<n::Availability>(pool.args.native,pool.args.plan.native.ingress_frontier)[1].lease.interval.sequence;}, {}, false,[&]{if(defect==1)n::at<p::FreeAllocationReceipt>(pool.args.native,pool.args.plan.native.ingress_frontier)[2]={};if(defect==2)++n::at<p::FreeAllocationReceipt>(pool.args.native,pool.args.plan.native.ingress_frontier)[0].lease.interval.sequence;}),std::logic_error)<<defect;
+    }
+}
+/** @brief Actual CancelFree drains accepted remote plans and permits unchanged request topology reuse after retirement. */
+TEST(PooledImmutableNative, ReceivedFreeWaveCancellationReusesOriginalReceiptAndCountBanks)
+{
+    Pool pool(std::array{2u,0u,2u});
+    for(uint64_t admission=1;admission<=3;++admission){ASSERT_NO_THROW(pool.begin(std::array<uint64_t,3>{101,102,103},admission,true,true));
+        ASSERT_NO_THROW(pool.receivedFree({}, {}, true));
+        ASSERT_NO_THROW(pool.all<n::OwnerAction::Release>());std::vector<p::ReleaseReceipt> releases;
+        for(auto& owner:pool.owners){auto& x=owner->args;const auto count=n::progress(x).released;const auto* source=n::at<p::ReleaseReceipt>(x.frame,x.plan.frame.release_receipts);releases.insert(releases.end(),source,source+count);}
+        const uint64_t bytes=releases.size()*sizeof(p::ReleaseReceipt);if(bytes)std::memcpy(pool.args.native+pool.args.plan.native.pin_commands,releases.data(),bytes);
+        if(pool.args.plan.native.reply_capacity)*n::at<uint64_t>(pool.args.native,pool.args.plan.native.ingress_count)=bytes;
+        const n::SourceFrontier source{pool.view().frame->interval,{},n::SourceDisposition::Unpublished,a::Status::Success,n::Version};pool.args.input={pool.args.plan.native.reply_capacity?pool.args.native+pool.args.plan.native.pin_commands:nullptr,pool.args.plan.native.reply_capacity?n::at<uint64_t>(pool.args.native,pool.args.plan.native.ingress_count):nullptr,nullptr,&source};
+        ASSERT_NO_THROW(pool.run<n::CoordinatorAction::Cancel>());pool.args.input={};
+        ASSERT_NO_THROW(pool.all<n::OwnerAction::Retire>());
+        const auto retired=pool.headers<p::RetiredHeader>();pool.args.input.frontier=retired.data();
+        ASSERT_NO_THROW(pool.run<n::CoordinatorAction::Finish>());pool.args.input={};
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @brief Actual second-wave prefix origins and current-wave replies preserve every original free plan/grant. */
+TEST(PooledImmutableNative, ReceivedVictimWaveKeepsNonzeroSuffixAndCurrentWaveGrants)
+{
+    Pool pool(std::array{2u,0u,2u});
+    ASSERT_NO_THROW(pool.complete(std::array<uint64_t,2>{101,102}));const std::array<uint64_t,14> rows{700,701,900,900,900,900,900,900,900,900,900,900,900,900};
+    ASSERT_NO_THROW(pool.begin(rows,2,true,true));
+    ASSERT_NO_THROW(pool.receivedFree());
+    ASSERT_EQ(pool.view().frame->free_planned,2u);std::vector<std::pair<uint64_t,uint64_t>> extents;
+    ASSERT_NO_THROW(extents=pool.receivedVictims());
+    ASSERT_EQ(pool.view().frame->victim_planned,1u);uint64_t decisions=0,replies=0;
+    for(size_t i=0;i<pool.owners.size();++i){const auto slice=n::at<n::DirectedSlice>(pool.args.native,pool.args.plan.native.victim_slices)[i];
+    EXPECT_GE(slice.byte_offset,pool.args.plan.frame.decisions+2*sizeof(p::AllocationDecision));decisions+=extents[i].first;replies+=extents[i].second;}
+    EXPECT_EQ(decisions,sizeof(p::AllocationDecision));
+    EXPECT_EQ(replies,sizeof(p::Grant));
+    ASSERT_NO_THROW(pool.finish());
+    for(uint64_t request=3;request<7;++request){ASSERT_NO_THROW(pool.begin(request%2?std::vector<uint64_t>{900}:std::vector<uint64_t>{},request,true,true));
+    ASSERT_NO_THROW(pool.receivedFree());
+    ASSERT_NO_THROW(pool.receivedVictims());
+    ASSERT_NO_THROW(pool.finish());}
+}
+/** @brief Complete C0/empty/unequal cohorts retain exact byte publications and no owner receipt fanout across reset. */
+TEST(PooledImmutableNative, ReceivedVictimWaveCohortsC0EmptyShrinkingAndUnusedFree)
+{
+    for(unsigned participants:{1u,2u,4u,8u})for(bool c0:{false,true}){std::vector<uint32_t> capacity(participants,c0?0u:3u);if(participants>1)capacity[0]=0;Pool pool(capacity);uint64_t request=1;
+        for(const auto rows:{std::vector<uint64_t>{31,32,31},std::vector<uint64_t>{33},std::vector<uint64_t>{},std::vector<uint64_t>{31,32}}){ASSERT_NO_THROW(pool.begin(rows,request++,true,true));
+    ASSERT_NO_THROW(pool.receivedFree());std::vector<std::pair<uint64_t,uint64_t>> extents;
+    ASSERT_NO_THROW(extents=pool.receivedVictims());for(size_t i=0;i<capacity.size();++i)if(!capacity[i])EXPECT_EQ(extents[i],(std::pair<uint64_t,uint64_t>{0,0}));
+    ASSERT_NO_THROW(pool.finish());}
+    }
+    Pool unused(std::array{4u,0u});
+    ASSERT_NO_THROW(unused.begin(std::array<uint64_t,1>{31},1,true,true));
+    ASSERT_NO_THROW(unused.receivedFree());
+    EXPECT_FALSE(unused.view().frame->free_exhausted);
+    ASSERT_NO_THROW(unused.receivedVictims());
+    EXPECT_EQ(unused.view().frame->victim_planned,0u);
+    ASSERT_NO_THROW(unused.finish());
+}
+/** @brief Invalid count/header/alignment/stale lease cannot mutate actual slots or append accepted victim records. */
+TEST(PooledImmutableNative, ReceivedVictimWaveRejectsMalformedBeforeReservation)
+{
+    for(unsigned defect=0;defect<9;++defect){Pool pool(std::array{2u,0u,2u});
+    ASSERT_NO_THROW(pool.complete(std::array<uint64_t,2>{101,102}));const std::array<uint64_t,14> rows{700,701,900,900,900,900,900,900,900,900,900,900,900,900};
+    ASSERT_NO_THROW(pool.begin(rows,2,true,true));
+    ASSERT_NO_THROW(pool.receivedFree());p::AllocationFrame before{};std::vector<std::byte> cache;size_t observed=~size_t{0};
+    EXPECT_THROW(pool.receivedVictims([&](size_t i){auto& x=pool.owners[i]->args;auto* h=n::at<n::VictimPlanHeader>(x.native,x.plan.native.header);if(!h->decision_bytes)return;auto* count=n::at<uint64_t>(x.native,x.plan.native.ingress+48);observed=i;before=n::allocationFrame(x);cache.assign(x.cache,x.cache+x.plan.cache.bytes);
+            if(defect==0)*count=0;if(defect==1)*count=h->decision_bytes+48;if(defect==2){h->decision_bytes=1;*count=1;}if(defect==3){h->decision_bytes=uint64_t{x.plan.native.reply_capacity+1}*48;*count=h->decision_bytes;}if(defect==4)++h->lease.interval.sequence;if(defect==5)x.input.record_bytes=nullptr;if(defect==6)x.input.records=static_cast<const std::byte*>(x.input.records)+1;if(defect==7)++h->version;if(defect==8)x.input.record_bytes=reinterpret_cast<const uint64_t*>(reinterpret_cast<const std::byte*>(x.input.record_bytes)+1);
+        }),std::logic_error)<<defect;
+    ASSERT_NE(observed,~size_t{0});const auto& x=pool.owners[observed]->args;
+    EXPECT_EQ(n::allocationFrame(x).count,before.count);
+    EXPECT_EQ(n::allocationFrame(x).phase,before.phase);
+    EXPECT_EQ(std::memcmp(cache.data(),x.cache,cache.size()),0);
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @brief Accepted and unaccepted actual victim cancellation preserves prior grants and retires the complete original receipt set. */
+TEST(PooledImmutableNative, ReceivedVictimWaveCancellationDrainsAcceptedAndUnacceptedPlansAcrossReset)
+{
+    for(bool beforeAccept:{false,true}){Pool pool(std::array{2u,0u,2u});
+        ASSERT_NO_THROW(pool.complete(std::array<uint64_t,2>{101,102}));
+        for(uint64_t request=2;request<5;++request){const std::array<uint64_t,14> rows{700,701,900,900,900,900,900,900,900,900,900,900,900,900};
+            ASSERT_NO_THROW(pool.begin(rows,request,true,true));
+            ASSERT_NO_THROW(pool.receivedFree());
+            ASSERT_NO_THROW(pool.receivedVictims({},true,{},beforeAccept));
+            ASSERT_NO_THROW(pool.all<n::OwnerAction::Release>());std::vector<p::ReleaseReceipt> releases;
+            for(auto& owner:pool.owners){auto& x=owner->args;const auto count=n::progress(x).released;const auto* source=n::at<p::ReleaseReceipt>(x.frame,x.plan.frame.release_receipts);releases.insert(releases.end(),source,source+count);}
+            const uint64_t bytes=releases.size()*sizeof(p::ReleaseReceipt);if(bytes)std::memcpy(pool.args.native+pool.args.plan.native.pin_commands,releases.data(),bytes);if(pool.args.plan.native.reply_capacity)*n::at<uint64_t>(pool.args.native,pool.args.plan.native.ingress_count)=bytes;
+            const n::SourceFrontier source{pool.view().frame->interval,{},n::SourceDisposition::Unpublished,a::Status::Success,n::Version};pool.args.input={pool.args.plan.native.reply_capacity?pool.args.native+pool.args.plan.native.pin_commands:nullptr,pool.args.plan.native.reply_capacity?n::at<uint64_t>(pool.args.native,pool.args.plan.native.ingress_count):nullptr,nullptr,&source};
+            ASSERT_NO_THROW(pool.run<n::CoordinatorAction::Cancel>());pool.args.input={};
+            ASSERT_NO_THROW(pool.all<n::OwnerAction::Retire>());const auto retired=pool.headers<p::RetiredHeader>();pool.args.input.frontier=retired.data();
+            ASSERT_NO_THROW(pool.run<n::CoordinatorAction::Finish>());pool.args.input={};
+        }
+    }
+}
+}
+namespace llaminar2::test {
+/** @brief CompleteVictims requires the exact ALL-owner actual receipt set including C0 before policy publication. */
+TEST(PooledImmutableNative, ReceivedVictimWaveRejectsStaleOrMissingCompletionIncludingC0)
+{
+    for(unsigned defect=0;defect<2;++defect){Pool pool(std::array{2u,0u,2u});
+        ASSERT_NO_THROW(pool.complete(std::array<uint64_t,2>{101,102}));
+        const std::array<uint64_t,14> rows{700,701,900,900,900,900,900,900,900,900,900,900,900,900};
+        ASSERT_NO_THROW(pool.begin(rows,2,true,true));
+        ASSERT_NO_THROW(pool.receivedFree());
+        EXPECT_THROW(pool.receivedVictims({},false,[&]{auto* receipts=n::at<p::VictimAllocationReceipt>(pool.args.native,pool.args.plan.native.ingress_frontier);if(defect==0)++receipts[0].lease.interval.sequence;else receipts[1]={};}),std::logic_error);
+    }
+}
+}
+
+namespace llaminar2::test {
+namespace {
+/** @brief Decoded original source protocol fixture; no provider or native storage capability is minted. */
+struct DistributedSourceReplay {
+    Pool pool;
+    q::PooledImmutableSourceGeometry geometry;
+    Bytes frame,native;
+    std::vector<int64_t> ids;
+    std::vector<ImmutableRowSubordinateIntent> intents;
+    std::vector<ImmutableRowInvalidationAcknowledgement> mappedAcks;
+    int healthy=1,error=0;
+    q::pooled_source::DeviceArgs args;
+    /** @brief Derive complete original cohort metadata, never one representative owner as authority. */
+    static q::PooledImmutableSourceGeometry sourceGeometry(Pool& pool){
+        std::vector<q::PooledImmutableOwnerNativePlan> owners;for(const auto& owner:pool.owners)owners.push_back(owner->plan);
+        const ImmutableRowTableSource descriptor{.path="decoded_source_replay",.tensor_name="per_layer_token_embd.weight",.file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+        return q::PooledImmutableSourceGeometry::fromPlans(owners,pool.plan,descriptor);
+    }
+    explicit DistributedSourceReplay(const std::vector<uint32_t>& capacities,std::optional<std::size_t> local=std::nullopt):pool(capacities,64,{65536,1,2},local),geometry(sourceGeometry(pool)),frame(geometry.parameters().offsets.frame_bytes),native(geometry.parameters().offsets.native_bytes),ids(16),intents(16),mappedAcks(16),args{geometry.parameters(),{geometry.parameters().owner,nullptr,nullptr,nullptr,{}},pool.args,frame.data(),native.data(),{{nullptr,nullptr,nullptr,ids.data(),nullptr,701,16,90},intents.data(),mappedAcks.data()},&healthy,&error}{
+        std::memset(native.data(),0,geometry.parameters().offsets.native_bytes);q::pooled_source::protocol(args).admissionGeneration=17;q::pooled_source::invocation(args)=23;
+    }
+    /** @brief Execute the actual original two allocation waves and global source plan before any acquired source response. */
+    void plan(std::span<const uint64_t> rows){pool.begin(rows);pool.wave<false>();pool.wave<true>();Pool::require(q::pooled_source::planRequest(args));pool.args.input.source=&q::pooled_source::frontier(args);pool.run<n::CoordinatorAction::SealSource>();pool.args.input={};}
+    /** @brief Seal actual owners and acquire the resulting typed64 records, not copies of the source input. */
+    void seals(){for(size_t i=0;i<pool.owners.size();++i){auto& owner=*pool.owners[i];owner.args.input.frontier=&q::pooled_source::frontier(args);Pool::require(owner.run<n::OwnerAction::SealSource>());Pool::require(q::pooled_source::acquireSeal(args,owner.header<n::OwnerSourceSealReceipt>(),i));}}
+    /** @brief Supply an acquired decoded envelope/private native bytes with poison outside the actual M-row extent. */
+    void response(){namespace source=q::pooled_source;auto& io=source::protocol(args);
+        // A genuine all-hit/empty request issues no new source sequence. Preserve the
+        // actual consumed history so the original no-request protocol can validate it.
+        if(io.idCount)io.issuedSequence=source::frontier(args).source.sequence;
+        io.nativeBytes=io.idCount*90;
+        auto* acks=n::at<ImmutableRowInvalidationAcknowledgement>(args.frame,args.plan.offsets.invalidations);for(size_t row=0;row<io.idCount;++row){acks[row].destination_grant=intents[row].destination_grant;for(size_t byte=0;byte<90;++byte)args.frame[args.plan.offsets.responses+row*90+byte]=std::byte((ids[row]+byte)%251);}
+        source::stage(args)=source::ResponseStage::Acquired;Pool::require(source::validateResponse(args));}
+};
+}
+/** @brief Original acquired grants drive1/2/4/8-owner Fill/payload prefixes, including C0/source-only and unchanged accepted banks. */
+TEST(PooledImmutableNative, DistributedSourceFillActualGrantPacketsAndTypedOutcomes){namespace source=q::pooled_source;
+    for(uint32_t participants:{1u,2u,4u,8u})for(bool empty:{false,true}){std::vector<uint32_t> capacities;for(uint32_t i=0;i<participants;++i)capacities.push_back(empty || i%3==0?0:2);DistributedSourceReplay c(capacities);const std::array<uint64_t,8> rows{700,701,900,901,700,901,902,903};
+        ASSERT_NO_THROW(c.plan(rows));
+        ASSERT_NO_THROW(c.seals());
+        ASSERT_NO_THROW(c.response());
+        EXPECT_EQ(source::progress(c.args).seals,participants);uint64_t delivered=0;
+        for(uint32_t owner=0;owner<participants;++owner){auto& own=c.pool.owners[owner]->args;const auto count=n::allocationFrame(own).count;std::vector<p::Grant> original(n::grants(own),n::grants(own)+count);ASSERT_TRUE(source::prepareDelivery(c.args,owner));const auto* fills=n::at<n::Fill>(c.args.frame,c.args.plan.offsets.fills);
+            EXPECT_EQ(*n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes),count*sizeof(n::Fill));EXPECT_EQ(*n::at<uint64_t>(c.args.native,c.args.plan.offsets.payload_bytes),count*90u);for(uint32_t at=0;at<count;++at){EXPECT_TRUE(n::same(fills[at].original,original[at]));const auto* row=source::deliveryRow(c.args,at);for(size_t byte=0;byte<90;++byte)EXPECT_EQ(row[byte],std::byte((original[at].row+byte)%251));}
+            delivered+=count;if(count)EXPECT_EQ(std::memcmp(original.data(),n::grants(own),count*sizeof(p::Grant)),0);
+        }
+        EXPECT_LE(delivered,source::protocol(c.args).idCount);EXPECT_EQ(source::progress(c.args).packets,participants);if(empty)EXPECT_EQ(delivered,0u);
+    }
+}
+/** @brief An attempted failed seal cannot echo Success, and later source publication cannot accept it. */
+TEST(PooledImmutableNative, DistributedSourceFillFailedAttemptedSealProducesActualFailureReceipt){namespace source=q::pooled_source;
+    for(unsigned defect=0;defect<3;++defect){DistributedSourceReplay c(std::vector{2u,0u});
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,3>{700,701,900}));auto& own=c.pool.owners[0]->args;own.input.frontier=&source::frontier(c.args);ASSERT_EQ(source::frontier(c.args).status,a::Status::Success);
+        if(defect==0)n::allocationFrame(own).phase=p::AllocationPhase::Accepted;
+        if(defect==1)n::ownerView<a::Slot64>(own).frame->status=a::Status::SourceFailure;
+        if(defect==2){auto* input=n::at<n::Invocation>(c.pool.args.native,c.pool.args.plan.native.invocation);++input->interval.sequence;}
+        EXPECT_FALSE((n::owner<n::OwnerAction::SealSource,a::Slot64>(own)));const auto receipt=c.pool.owners[0]->header<n::OwnerSourceSealReceipt>();EXPECT_NE(receipt.status,a::Status::Success);EXPECT_EQ(n::progress(own).header_bytes,64u);EXPECT_FALSE(source::acquireSeal(c.args,receipt,0));EXPECT_NE(source::frontier(c.args).status,a::Status::Success);EXPECT_EQ(source::stage(c.args),source::ResponseStage::Rejected);EXPECT_EQ(source::protocol(c.args).issuedSequence,0u);
+    }
+}
+/** @brief Parser/copy/gate failure always publishes typed56, while the dedicated terminal64 remains authoritative. */
+TEST(PooledImmutableNative, DistributedSourceFillFailureHeaderNeverAliasesTerminalOutcome){namespace source=q::pooled_source;
+    for(unsigned defect=0;defect<4;++defect){DistributedSourceReplay c(std::vector{2u});
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,2>{700,701}));
+        ASSERT_NO_THROW(c.seals());
+        ASSERT_NO_THROW(c.response());ASSERT_TRUE(source::prepareDelivery(c.args,0));auto& own=c.pool.owners[0]->args;auto outcome=source::frontier(c.args);outcome.disposition=n::SourceDisposition::Consumed;
+        *n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome)=outcome;const auto saved=outcome;own.input.frontier=n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome);own.input.outcome=static_cast<const n::SourceFrontier*>(own.input.frontier);own.input.condition=n::SourceCondition::AfterSuccess;
+        own.input.records=n::at<n::Fill>(c.args.frame,c.args.plan.offsets.fills);own.input.record_bytes=n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes);own.input.payload=c.args.frame+c.args.plan.offsets.payload;own.input.payload_bytes=n::at<uint64_t>(c.args.native,c.args.plan.offsets.payload_bytes);
+        if(defect==0)++*const_cast<uint64_t*>(own.input.record_bytes);
+        if(defect==1)++n::at<n::Fill>(c.args.frame,c.args.plan.offsets.fills)[0].acknowledgement.destination_token;
+        if(defect<2)EXPECT_FALSE((n::owner<n::OwnerAction::ApplySourceDelivery,a::Slot64>(own)));
+        if(defect==2){ASSERT_TRUE((n::owner<n::OwnerAction::ApplySourceDelivery,a::Slot64>(own)));/* recorded missing copy completion */}
+        if(defect==3){auto* active=n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome);active->status=a::Status::Cancelled;}
+        (void)n::owner<n::OwnerAction::ValidateFills,a::Slot64>(own);const auto receipt=c.pool.owners[0]->header<p::PublishHeader>();EXPECT_EQ(n::progress(own).header_bytes,56u);EXPECT_NE(receipt.status,a::Status::Success);EXPECT_EQ(receipt.owner,0u);const auto* retained=n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome);EXPECT_TRUE(n::same(retained->source,saved.source));EXPECT_EQ(retained->version,n::Version);EXPECT_EQ(retained->disposition,n::SourceDisposition::Consumed);
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @brief Authenticated private-copy failures drain every later zero-count packet and still consume the real response. */
+TEST(PooledImmutableNative, DistributedSourceFillPacketFailureDrainsZeroMetadataAndRetiresActualResponse){namespace source=q::pooled_source;
+    for(unsigned defect=0;defect<3;++defect){DistributedSourceReplay c(std::vector{2u,0u,2u});
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,5>{700,701,900,901,902}));
+        ASSERT_NO_THROW(c.seals());
+        ASSERT_NO_THROW(c.response());
+        if(defect==0){source::stage(c.args)=source::ResponseStage::Acquired;++n::at<ImmutableRowInvalidationAcknowledgement>(c.args.frame,c.args.plan.offsets.invalidations)[0].destination_grant;EXPECT_FALSE(source::validateResponse(c.args));}
+        if(defect==1)EXPECT_FALSE(source::prepareDelivery(c.args,2));
+        if(defect<2){EXPECT_EQ(source::stage(c.args),source::ResponseStage::Private);for(uint32_t owner=0;owner<3;++owner){EXPECT_FALSE(source::prepareDelivery(c.args,owner));EXPECT_EQ(*n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes),0u);EXPECT_EQ(*n::at<uint64_t>(c.args.native,c.args.plan.offsets.payload_bytes),0u);}}
+        // Missing successful packet progress is an error, never an excuse to skip actual source-reader retirement.
+        EXPECT_EQ(source::retirementDecision(c.args),source::ResponseRetirement::Consume);
+        EXPECT_NE(source::frontier(c.args).status,a::Status::Success);
+        ASSERT_TRUE(source::retireConsumed(c.args));EXPECT_EQ(source::frontier(c.args).disposition,n::SourceDisposition::Consumed);EXPECT_EQ(source::protocol(c.args).consumedSequence,source::protocol(c.args).issuedSequence);
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @brief Private-copy rejection cannot mint Consumed for another original source generation, interval or table. */
+TEST(PooledImmutableNative, DistributedSourceFillRetirementRejectsForeignOriginalIdentity){namespace source=q::pooled_source;
+    for(unsigned defect=0;defect<5;++defect){DistributedSourceReplay c(std::vector{2u,0u});
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,3>{700,701,900}));
+        ASSERT_NO_THROW(c.seals());
+        ASSERT_NO_THROW(c.response());
+        auto& outcome=source::frontier(c.args);
+        if(defect==0)++outcome.source.generation;
+        if(defect==1)++outcome.interval.sequence;
+        if(defect==2)++outcome.source.table;
+        if(defect==3)++outcome.version;
+        if(defect==4)++source::protocol(c.args).admissionGeneration;
+        source::stage(c.args)=source::ResponseStage::Acquired;EXPECT_FALSE(source::validateResponse(c.args));
+        EXPECT_EQ(source::retirementDecision(c.args),source::ResponseRetirement::Invalid);EXPECT_FALSE(source::retireConsumed(c.args));EXPECT_EQ(source::protocol(c.args).consumedSequence,0u);EXPECT_EQ(outcome.disposition,n::SourceDisposition::Published);
+    }
+}
+/** @brief The one shared source BOM rejects same-cardinality but foreign per-owner slot geometry before materialization. */
+TEST(PooledImmutableNative, DistributedSourceFillPreSourceFactoryUsesOriginalCohortSlotMap){
+    const auto original=declared(std::array{1u,3u});const auto foreign=declared(std::array{3u,1u});const auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(original,{65536,1,2},64);
+    const ImmutableRowTableSource descriptor{.path="decoded_source_replay",.tensor_name="per_layer_token_embd.weight",.file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+    EXPECT_NO_THROW(q::PooledImmutableSourceGeometry::rootOffsets(original,policy,descriptor));
+    EXPECT_THROW(q::PooledImmutableSourceGeometry::rootOffsets(foreign,policy,descriptor),std::invalid_argument);
+}
+/** @brief Actual owner publication is copied to its existing original cohort slot, including C0. */
+TEST(PooledImmutableNative, MixedLocalImportsOriginalPinPublicationAndRejectsPoisonedIdentityBeforeWrite)
+{
+    for(const auto participants:{2u,4u,8u})for(std::uint32_t local=0;local<participants;++local)
+    for(unsigned mutation=0;mutation<6;++mutation){
+        std::vector<std::uint32_t> capacities(participants);for(std::uint32_t i=0;i<participants;++i)capacities[i]=i%2?0:3;
+        Pool pool(capacities);ASSERT_TRUE(p::CoordinatorOperations(pool.view()).begin(1,static_cast<const std::uint64_t*>(nullptr),0));n::invocation(pool.args);
+        auto& owner=*pool.owners[local];owner.args.input.invocation=pool.invocation();
+        ASSERT_TRUE(owner.run<n::OwnerAction::Begin>());const std::uint64_t emptyCommands=0;
+        owner.args.input.record_bytes=owner.args.plan.native.reply_capacity?&emptyCommands:nullptr;
+        ASSERT_TRUE(owner.run<n::OwnerAction::Pin>());owner.args.input.record_bytes=nullptr;
+        ASSERT_TRUE(owner.run<n::OwnerAction::SealPins>());
+        auto* source=n::at<p::PinHeader>(owner.args.native,owner.args.plan.native.header);
+        const auto original=*source;auto* destination=n::at<p::PinHeader>(pool.args.native,pool.args.plan.native.ingress_frontier)+local;
+        std::memset(destination,0xa5,sizeof(*destination));std::array<std::byte,sizeof(p::PinHeader)> poisoned{};
+        std::memcpy(poisoned.data(),destination,poisoned.size());
+        pool.args.input.frontier=source;pool.args.input.record_bytes=&n::progress(owner.args).header_bytes;
+        pool.args.input.local_owner=local;pool.args.input.local_reply_capacity=owner.args.plan.native.reply_capacity;
+        pool.args.input.local_control=n::ownerView<a::Slot64>(owner.args).frame;pool.args.input.local_allocation=&n::allocationFrame(owner.args);pool.args.input.local_header_kind=&n::progress(owner.args).header_kind;
+        if(mutation==1)++source->interval.admission;
+        if(mutation==2)source->owner=(local+1)%participants;
+        if(mutation==3)--n::progress(owner.args).header_bytes;
+        if(mutation==4)source->status=static_cast<a::Status>(99);
+        if(mutation==5)n::progress(owner.args).header_kind=n::OwnerHeaderKind::FreeReceipt;
+        const bool imported=n::coordinator<n::CoordinatorAction::ImportLocalPinHeader>(pool.args);
+        if(!mutation){ASSERT_TRUE(imported);EXPECT_EQ(std::memcmp(destination,&original,sizeof(original)),0);}
+        else {
+            EXPECT_FALSE(imported);EXPECT_EQ(std::memcmp(destination,poisoned.data(),poisoned.size()),0);EXPECT_NE(pool.view().frame->status,a::Status::Success);
+        }
+    }
+}
+/** @brief Invalid command slicing rejects before the original physical pin mutation. */
+TEST(PooledImmutableNative, MixedLocalDirectedCommandSliceRejectsBoundsBeforePhysicalMutation)
+{
+    for(const auto participants:{2u,4u,8u})for(std::uint32_t local=0;local<participants;++local)
+    for(unsigned mutation=0;mutation<4;++mutation){
+        std::vector<std::uint32_t> capacities(participants,3);Pool pool(capacities);
+        ASSERT_TRUE(p::CoordinatorOperations(pool.view()).begin(1,static_cast<const std::uint64_t*>(nullptr),0));n::invocation(pool.args);
+        auto& owner=*pool.owners[local];owner.args.input.invocation=pool.invocation();ASSERT_TRUE(owner.run<n::OwnerAction::Begin>());
+        n::DirectedSlice slice{};const auto span=std::uint64_t{pool.args.plan.native.reply_capacity}*sizeof(p::OwnerCommand);
+        owner.args.input.records=pool.args.native+pool.args.plan.native.pin_commands;
+        owner.args.input.record_layout=n::RecordLayout::DirectedCommandBank;owner.args.input.allocation_slice=&slice;
+        owner.args.input.record_capacity=span;
+        if(mutation==1)slice.byte_offset=1;
+        if(mutation==2)slice.byte_offset=span+sizeof(p::OwnerCommand);
+        if(mutation==3)slice.live_bytes=span+sizeof(p::OwnerCommand);
+        const auto before=n::ownerView<a::Slot64>(owner.args).frame->held_pins;
+        EXPECT_EQ(owner.run<n::OwnerAction::Pin>(),mutation==0);EXPECT_EQ(n::ownerView<a::Slot64>(owner.args).frame->held_pins,before);
+        EXPECT_EQ(n::progress(owner.args).reply_bytes,0u);
+    }
+}
+
+/** @brief Every nominal local receipt comes from its actual owner phase and actual producer controls. */
+TEST(PooledImmutableNative, MixedLocalAvailabilityFreeVictimImportsUseActualNominalProducers)
+{
+    for(const auto participants:{2u,4u,8u})for(bool empty:{false,true}){
+        Pool pool(std::vector<std::uint32_t>(participants,empty?0:3));
+            ASSERT_NO_THROW(pool.begin({}));
+        const auto imported=[&]<n::CoordinatorAction Action>(std::size_t coordinate){
+            auto& owner=*pool.owners[coordinate];pool.args.input={};pool.args.input.frontier=owner.args.native+owner.args.plan.native.header;
+            pool.args.input.record_bytes=&n::progress(owner.args).header_bytes;pool.args.input.local_owner=coordinate;
+            pool.args.input.local_reply_capacity=owner.args.plan.native.reply_capacity;pool.args.input.local_control=n::ownerView<a::Slot64>(owner.args).frame;
+            pool.args.input.local_allocation=&n::allocationFrame(owner.args);pool.args.input.local_header_kind=&n::progress(owner.args).header_kind;
+            EXPECT_TRUE(n::coordinator<Action>(pool.args));pool.args.input={};
+        };
+        ASSERT_NO_THROW(pool.all<n::OwnerAction::Availability>());
+        for(std::size_t i=0;i<participants;++i)imported.template operator()<n::CoordinatorAction::ImportLocalAvailability>(i);
+        pool.args.input.frontier=pool.args.native+pool.args.plan.native.ingress_frontier;
+            ASSERT_NO_THROW(pool.run<n::CoordinatorAction::PlanFree>());pool.args.input={};
+        for(std::size_t i=0;i<participants;++i){auto& owner=*pool.owners[i];owner.args.input.frontier=n::at<n::FreePlanHeader>(pool.args.native,pool.args.plan.native.free_headers)+i;
+            ASSERT_TRUE(owner.run<n::OwnerAction::AcceptFree>());owner.args.input.frontier=nullptr;
+            ASSERT_TRUE(owner.run<n::OwnerAction::ExecuteFree>());
+            ASSERT_TRUE(owner.run<n::OwnerAction::FreeReceipt>());
+            imported.template operator()<n::CoordinatorAction::ImportLocalFreeReceipt>(i);
+        }
+        pool.args.input.frontier=pool.args.native+pool.args.plan.native.ingress_frontier;
+            ASSERT_NO_THROW(pool.run<n::CoordinatorAction::CompleteFree>());pool.args.input={};
+        for(auto& owner:pool.owners){owner->args.input.frontier=pool.args.native+pool.args.plan.native.ingress_frontier;
+            ASSERT_TRUE(owner->run<n::OwnerAction::AcquireFree>());owner->args.input.frontier=nullptr;}
+        ASSERT_NO_THROW(pool.run<n::CoordinatorAction::PlanVictims>());
+        for(std::size_t i=0;i<participants;++i){auto& owner=*pool.owners[i];owner.args.input.frontier=n::at<n::VictimPlanHeader>(pool.args.native,pool.args.plan.native.victim_headers)+i;
+            ASSERT_TRUE(owner.run<n::OwnerAction::AcceptVictim>());owner.args.input.frontier=nullptr;
+            ASSERT_TRUE(owner.run<n::OwnerAction::ExecuteVictim>());
+            ASSERT_TRUE(owner.run<n::OwnerAction::VictimReceipt>());
+            imported.template operator()<n::CoordinatorAction::ImportLocalVictimReceipt>(i);
+        }
+        pool.args.input.frontier=pool.args.native+pool.args.plan.native.ingress_frontier;
+            ASSERT_NO_THROW(pool.run<n::CoordinatorAction::CompleteVictims>());pool.args.input={};
+        ASSERT_NO_THROW(pool.finish());
+            EXPECT_EQ(pool.view().frame->phase,p::LookupPhase::Idle);
+    }
+}
+/** @brief Actual original compact P1 path and direct slice reader retain complete byte results across hit/reset/replay. */
+TEST(PooledImmutableNative, MixedLocalDirectedPinMatchesOriginalBytesForP1AndOriginalCohortOrder)
+{
+    for(const auto participants:{1u,2u,4u,8u})for(std::uint32_t local=0;local<participants;++local){
+        SCOPED_TRACE(::testing::Message()<<"participants="<<participants<<" local="<<local);
+        const std::vector<std::uint32_t> capacities(participants,3);Pool original(capacities),candidate(capacities);candidate.direct_pin_owner=local;
+        // Each admitted query has at most the original K distinct rows. Two
+        // disjoint warm families can fill a P8 cache larger than one K bucket.
+        for(unsigned family=0;family<2;++family){std::vector<std::uint64_t> warm;
+            for(std::uint64_t i=0;i<original.args.plan.policy.maximumUnique();++i)warm.push_back(0x100000000ULL+100+family*64+i);
+            for(unsigned replay=0;replay<4;++replay){
+                SCOPED_TRACE(::testing::Message()<<"family="<<family<<" warm="<<replay<<" K="<<warm.size());
+                ASSERT_NO_THROW(original.complete(warm));
+                ASSERT_NO_THROW(candidate.complete(warm));
+            }
+        }
+        std::vector<std::uint64_t> hits;
+        for(auto& owner:original.owners){auto view=n::ownerView<a::Slot64>(owner->args);for(std::uint32_t i=0;i<owner->args.plan.owner.capacity();++i)
+            if(a::PhysicalSlot<a::Slot64>::state(view.slots[i])==a::SlotState::Ready){hits.push_back(view.slots[i].row);break;}}
+        ASSERT_FALSE(hits.empty());
+        for(unsigned replay=0;replay<4;++replay){const std::vector<std::uint64_t> request=replay==0 || replay==3?hits:replay==1?std::vector<std::uint64_t>{hits.front()}:std::vector<std::uint64_t>{};
+            ASSERT_NO_THROW(original.complete(request,replay==3?2:1));
+            ASSERT_NO_THROW(candidate.complete(request,replay==3?2:1));
+            EXPECT_EQ(std::memcmp(original.args.cache,candidate.args.cache,original.args.plan.cache.bytes),0);
+            EXPECT_EQ(std::memcmp(original.args.frame,candidate.args.frame,original.args.plan.frame.bytes),0);
+            for(std::size_t i=0;i<participants;++i){const auto& a=original.owners[i]->args;const auto& b=candidate.owners[i]->args;
+                EXPECT_EQ(std::memcmp(a.cache,b.cache,a.plan.cache.bytes),0);
+            EXPECT_EQ(std::memcmp(a.frame,b.frame,a.plan.frame.bytes),0);
+            EXPECT_EQ(std::memcmp(a.native,b.native,a.plan.native.bytes),0);}
+        }
+        EXPECT_GT(candidate.observed_direct_pin_bytes,0u);
+        if(local)EXPECT_GT(candidate.observed_direct_pin_offset,0u);
+    }
+}
+
+/** @brief A real observed owner error stays an error in the complete local frontier. */
+TEST(PooledImmutableNative, MixedLocalActualErrorReceiptNeverBecomesSuccess)
+{
+    Pool pool(std::array{3u,0u});
+        ASSERT_TRUE(p::CoordinatorOperations(pool.view()).begin(1,static_cast<const std::uint64_t*>(nullptr),0));n::invocation(pool.args);
+    for(auto& owner:pool.owners){owner->args.input.invocation=pool.invocation();
+        ASSERT_TRUE(owner->run<n::OwnerAction::Begin>());
+        const std::uint64_t zero=0;owner->args.input.record_bytes=owner->args.plan.native.reply_capacity?&zero:nullptr;
+        ASSERT_TRUE(owner->run<n::OwnerAction::Pin>());owner->args.input.record_bytes=nullptr;
+        ASSERT_TRUE(owner->run<n::OwnerAction::SealPins>());}
+    ASSERT_FALSE(pool.owners.front()->run<n::OwnerAction::SealPins>());
+    for(std::size_t i=0;i<pool.owners.size();++i){auto& owner=*pool.owners[i];pool.args.input={};pool.args.input.frontier=owner.args.native+owner.args.plan.native.header;
+        pool.args.input.record_bytes=&n::progress(owner.args).header_bytes;pool.args.input.local_owner=i;pool.args.input.local_reply_capacity=owner.args.plan.native.reply_capacity;
+        pool.args.input.local_control=n::ownerView<a::Slot64>(owner.args).frame;pool.args.input.local_allocation=&n::allocationFrame(owner.args);pool.args.input.local_header_kind=&n::progress(owner.args).header_kind;
+        ASSERT_TRUE(n::coordinator<n::CoordinatorAction::ImportLocalPinHeader>(pool.args));}
+    const auto* frontier=n::at<p::PinHeader>(pool.args.native,pool.args.plan.native.ingress_frontier);
+    EXPECT_EQ(frontier[0].status,a::Status::InvalidPhase);pool.args.input={};pool.args.input.frontier=frontier;
+    EXPECT_FALSE(n::coordinator<n::CoordinatorAction::SealPins>(pool.args));
+        EXPECT_NE(pool.view().frame->phase,p::LookupPhase::Availability);
+    auto& untouched=*pool.owners.back();untouched.args.input.frontier=frontier;
+        EXPECT_FALSE(untouched.run<n::OwnerAction::AcquirePins>());
+    EXPECT_NE(n::ownerView<a::Slot64>(untouched.args).frame->phase,p::OwnerPhase::Reserving);
+}
+/** @brief Identical40B layouts cannot turn an actual Free producer into a successful Victim publication. */
+TEST(PooledImmutableNative, MixedLocalWrongNominalAllocationProducerRejectsBeforeFrontierWrite)
+{
+    for(bool cancelled:{false,true}){
+    SCOPED_TRACE(cancelled);
+    Pool pool(std::array{3u,0u});
+        ASSERT_NO_THROW(pool.begin({}));
+        ASSERT_NO_THROW(pool.all<n::OwnerAction::Availability>());
+    const auto availability=pool.headers<n::Availability>();pool.args.input.frontier=availability.data();
+        ASSERT_NO_THROW(pool.run<n::CoordinatorAction::PlanFree>());pool.args.input={};
+    for(std::size_t i=0;i<pool.owners.size();++i){auto& owner=*pool.owners[i];owner.args.input.frontier=n::at<n::FreePlanHeader>(pool.args.native,pool.args.plan.native.free_headers)+i;
+        ASSERT_TRUE(owner.run<n::OwnerAction::AcceptFree>());owner.args.input.frontier=nullptr;
+        ASSERT_TRUE(owner.run<n::OwnerAction::ExecuteFree>());
+        if(cancelled && i==0)ASSERT_TRUE(owner.run<n::OwnerAction::CancelFree>());
+        ASSERT_TRUE(owner.run<n::OwnerAction::FreeReceipt>());}
+    const auto receipts=pool.headers<p::FreeAllocationReceipt>();pool.args.input.frontier=receipts.data();
+        ASSERT_NO_THROW(pool.run<n::CoordinatorAction::CompleteFree>());pool.args.input={};
+    ASSERT_NO_THROW(pool.run<n::CoordinatorAction::PlanVictims>());
+    auto& owner=*pool.owners.front();
+        ASSERT_EQ(n::allocationFrame(owner.args).wave,p::AllocationWave::Free);
+    ASSERT_EQ(n::allocationFrame(owner.args).phase,cancelled?p::AllocationPhase::Cancelled:p::AllocationPhase::Executed);
+    auto* destination=pool.args.native+pool.args.plan.native.ingress_frontier;std::array<std::byte,sizeof(p::VictimAllocationReceipt)> poison{};poison.fill(std::byte{0xa5});std::memcpy(destination,poison.data(),poison.size());
+    pool.args.input.frontier=owner.args.native+owner.args.plan.native.header;pool.args.input.record_bytes=&n::progress(owner.args).header_bytes;
+    pool.args.input.local_owner=0;pool.args.input.local_reply_capacity=owner.args.plan.native.reply_capacity;
+    pool.args.input.local_control=n::ownerView<a::Slot64>(owner.args).frame;pool.args.input.local_allocation=&n::allocationFrame(owner.args);pool.args.input.local_header_kind=&n::progress(owner.args).header_kind;
+    EXPECT_FALSE(n::coordinator<n::CoordinatorAction::ImportLocalVictimReceipt>(pool.args));
+        EXPECT_EQ(std::memcmp(destination,poison.data(),poison.size()),0);
+    ASSERT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalVictimReceipt>(pool.args),"");
+    }
+}
+
+/** @brief A real new Begin invalidates both original publication operands before stale header bytes can escape. */
+TEST(PooledImmutableNative, MixedLocalResetInvalidatesOriginalHeaderKindAndExtent)
+{
+    for(const auto participants:{2u,4u,8u})for(std::uint32_t local=0;local<participants;++local){
+        Pool pool(std::vector<std::uint32_t>(participants,3));
+        ASSERT_NO_THROW(pool.complete({}));
+        auto& owner=*pool.owners[local];
+        ASSERT_EQ(n::progress(owner.args).header_kind,n::OwnerHeaderKind::Retired);
+        ASSERT_EQ(n::progress(owner.args).header_bytes,sizeof(p::RetiredHeader));
+        ASSERT_TRUE(p::CoordinatorOperations(pool.view()).begin(2,static_cast<const std::uint64_t*>(nullptr),0));n::invocation(pool.args);
+        owner.args.input.invocation=pool.invocation();
+        ASSERT_TRUE(owner.run<n::OwnerAction::Begin>());
+        EXPECT_EQ(n::progress(owner.args).header_kind,n::OwnerHeaderKind::None);
+        EXPECT_EQ(n::progress(owner.args).header_bytes,0u);
+        auto* destination=pool.args.native+pool.args.plan.native.ingress_frontier+std::size_t{local}*sizeof(p::PinHeader);
+        std::array<std::byte,sizeof(p::PinHeader)> poison{};poison.fill(std::byte{0xa5});std::memcpy(destination,poison.data(),poison.size());
+        pool.args.input.frontier=owner.args.native+owner.args.plan.native.header;pool.args.input.record_bytes=&n::progress(owner.args).header_bytes;
+        pool.args.input.local_owner=local;pool.args.input.local_reply_capacity=owner.args.plan.native.reply_capacity;
+        pool.args.input.local_control=n::ownerView<a::Slot64>(owner.args).frame;pool.args.input.local_allocation=&n::allocationFrame(owner.args);
+        pool.args.input.local_header_kind=&n::progress(owner.args).header_kind;
+        EXPECT_FALSE(n::coordinator<n::CoordinatorAction::ImportLocalPinHeader>(pool.args));
+        EXPECT_EQ(std::memcmp(destination,poison.data(),poison.size()),0);
+    }
+}
+
+/** @brief Every actual import template stops native continuation for an invalid publication. */
+TEST(PooledImmutableNative, MixedLocalEveryImportSubmissionRejectsMissingActualPublication)
+{
+    Pool pool(std::array{3u,0u});
+    EXPECT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalPinHeader>(pool.args),"");
+    EXPECT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalAvailability>(pool.args),"");
+    EXPECT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalFreeReceipt>(pool.args),"");
+    EXPECT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalVictimReceipt>(pool.args),"");
+}
+
+}
+
+namespace llaminar2::test {
+/** @brief Mixed actual pre/post-seal cancellation drains original ownership without fabricating a shared SourceWindow. */
+TEST(PooledImmutableNative, DistributedSourceFillMixedSealFailureWaitsForExactWorkerThenDrainsActualPhases){namespace source=q::pooled_source;
+    DistributedSourceReplay c(std::vector{2u,2u});
+    ASSERT_NO_THROW(c.plan(std::array<uint64_t,3>{700,701,900}));
+    auto& sealed=*c.pool.owners[0];auto& cancelled=*c.pool.owners[1];sealed.args.input.frontier=&source::frontier(c.args);ASSERT_TRUE(sealed.run<n::OwnerAction::SealSource>());ASSERT_TRUE(source::acquireSeal(c.args,sealed.header<n::OwnerSourceSealReceipt>(),0));
+    ASSERT_TRUE(cancelled.run<n::OwnerAction::CancelVictim>());cancelled.args.input.frontier=&source::frontier(c.args);EXPECT_FALSE(cancelled.run<n::OwnerAction::SealSource>());const auto receipt=cancelled.header<n::OwnerSourceSealReceipt>();EXPECT_EQ(receipt.status,a::Status::Cancelled);EXPECT_EQ(receipt.source.table,0u);EXPECT_FALSE(source::acquireSeal(c.args,receipt,1));
+    struct RecordedWorker {uint64_t ticket=0,generation=0,completed=0;uint64_t retiredInvocation(){return ticket;}uint64_t retiredGeneration(){return generation;}uint64_t completion(){return completed;}} witness;
+    EXPECT_FALSE(source::retireAborted(c.args,witness));witness.ticket=23;witness.generation=18;EXPECT_FALSE(source::retireAborted(c.args,witness));witness.ticket=22;witness.generation=17;EXPECT_FALSE(source::retireAborted(c.args,witness));EXPECT_EQ(source::frontier(c.args).disposition,n::SourceDisposition::Published);witness.ticket=23;ASSERT_TRUE(source::retireAborted(c.args,witness));EXPECT_EQ(source::frontier(c.args).disposition,n::SourceDisposition::Aborted);EXPECT_EQ(source::protocol(c.args).issuedSequence,0u);EXPECT_EQ(source::protocol(c.args).consumedSequence,0u);
+    for(size_t i=0;i<c.pool.owners.size();++i){auto& owner=*c.pool.owners[i];const auto count=n::allocationFrame(owner.args).count;const std::vector<p::Grant> original(n::grants(owner.args),n::grants(owner.args)+count);owner.args.input.frontier=&source::frontier(c.args);owner.args.input.condition=n::SourceCondition::Always;owner.args.input.outcome=nullptr;ASSERT_TRUE(owner.run<n::OwnerAction::DrainSourceFailure>());EXPECT_EQ(n::ownerView<a::Slot64>(owner.args).frame->phase,p::OwnerPhase::Draining);EXPECT_EQ(n::progress(owner.args).retirement,i?p::SourceRetirement::Unpublished:p::SourceRetirement::Aborted);EXPECT_EQ(n::ownerView<a::Slot64>(owner.args).frame->source.table,i?0u:701u);EXPECT_EQ(owner.header<p::PublishHeader>().status,a::Status::Cancelled);if(count)EXPECT_EQ(std::memcmp(original.data(),n::grants(owner.args),count*sizeof(p::Grant)),0);owner.args.input={c.pool.invocation(),nullptr,nullptr,nullptr,nullptr,nullptr};ASSERT_TRUE(owner.run<n::OwnerAction::Release>());ASSERT_TRUE(owner.run<n::OwnerAction::Retire>());EXPECT_EQ(n::ownerView<a::Slot64>(owner.args).frame->held_pins,0u);EXPECT_EQ(n::ownerView<a::Slot64>(owner.args).frame->reservations,0u);}
+    // Global mixed-source retirement/Finish composition is item6, not fabricated by this owner-fill component.
+}
+}
+
+namespace llaminar2::test {
+/** @brief Frozen actual r5 operation bodies causally lack the guaranteed receipts; current wrapper closes both ignored-bool failures. */
+TEST(PooledImmutableNative, DistributedSourceFillOriginalOperationCausalControls){namespace source=q::pooled_source;
+    {DistributedSourceReplay c(std::vector{2u});ASSERT_NO_THROW(c.plan(std::array<uint64_t,2>{7,9}));auto& own=c.pool.owners[0]->args;own.input.frontier=&source::frontier(c.args);n::allocationFrame(own).phase=p::AllocationPhase::Accepted;
+        EXPECT_FALSE((n::originalSourceOutcomeOwner<n::OwnerAction::SealSource,a::Slot64>(own)));EXPECT_EQ(n::progress(own).header_bytes,0u);EXPECT_EQ(source::frontier(c.args).status,a::Status::Success); // Blind echo would still claim success.
+        EXPECT_FALSE((n::owner<n::OwnerAction::SealSource,a::Slot64>(own)));EXPECT_EQ(n::progress(own).header_bytes,sizeof(n::OwnerSourceSealReceipt));EXPECT_NE(c.pool.owners[0]->header<n::OwnerSourceSealReceipt>().status,a::Status::Success);}
+    {DistributedSourceReplay c(std::vector{2u});ASSERT_NO_THROW(c.plan(std::array<uint64_t,2>{7,9}));
+        ASSERT_NO_THROW(c.seals());auto& own=c.pool.owners[0]->args;auto terminal=source::frontier(c.args);terminal.disposition=n::SourceDisposition::Consumed;*n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome)=terminal;*n::at<n::SourceFrontier>(own.native,own.plan.native.header)=terminal;own.input.frontier=nullptr;own.input.condition=n::SourceCondition::AfterSuccess;own.input.outcome=n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome);
+        EXPECT_FALSE((n::originalSourceOutcomeOwner<n::OwnerAction::ValidateFills,a::Slot64>(own)));EXPECT_EQ(n::progress(own).header_bytes,0u);EXPECT_EQ(std::memcmp(own.native+own.plan.native.header,&terminal,sizeof(terminal)),0); // Old early return leaves64-byte terminal header in place.
+        EXPECT_FALSE((n::owner<n::OwnerAction::ValidateFills,a::Slot64>(own)));EXPECT_EQ(n::progress(own).header_bytes,sizeof(p::PublishHeader));EXPECT_NE(c.pool.owners[0]->header<p::PublishHeader>().status,a::Status::Success);EXPECT_EQ(std::memcmp(own.native+own.plan.native.source_outcome,&terminal,sizeof(terminal)),0);}
+}
+}
+
+namespace llaminar2::test {
+/**
+ * @brief Common parser-only local-last packaging retains its final packet across Consumed and actual Apply/copyComplete.
+ * This is deliberately not mixed-local graph qualification: the earlier-wave
+ * participant-local adapter is separately guarded and not constructed here.
+ */
+TEST(PooledImmutableNative, DistributedSourceFillCommonLocalLastPacketSurvivesConsumedThroughActualCopy){namespace source=q::pooled_source;
+    for(uint32_t participants:{1u,2u,4u,8u})for(uint32_t local:{0u,participants/2,participants-1}){std::vector<uint32_t> capacities(participants,2);DistributedSourceReplay c(capacities,local);
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,6>{7,9,3,5,7,11}));
+        ASSERT_NO_THROW(c.seals());
+        ASSERT_NO_THROW(c.response());
+        EXPECT_EQ(c.args.plan.local_owner,local);std::vector<std::vector<p::Grant>> accepted;for(const auto& owner:c.pool.owners){const auto count=n::allocationFrame(owner->args).count;accepted.emplace_back(n::grants(owner->args),n::grants(owner->args)+count);}
+        std::vector<uint32_t> order;for(uint32_t ordinal=0;ordinal<participants;++ordinal){const auto owner=source::packetOwner(c.args,ordinal);order.push_back(owner);ASSERT_TRUE(source::prepareDelivery(c.args,owner));auto* payload=c.args.frame+c.args.plan.offsets.payload;const auto count=*n::at<uint64_t>(c.args.native,c.args.plan.offsets.payload_bytes)/90;for(uint64_t row=0;row<count;++row)std::memcpy(payload+row*90,source::deliveryRow(c.args,row),90);}
+        EXPECT_EQ(order.back(),local);std::vector<uint32_t> remote;for(uint32_t owner=0;owner<participants;++owner)if(owner!=local)remote.push_back(owner);EXPECT_TRUE(std::equal(remote.begin(),remote.end(),order.begin()));auto& own=c.pool.owners[local]->args;const auto bytes=*n::at<uint64_t>(c.args.native,c.args.plan.offsets.payload_bytes),records=*n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes);std::vector<std::byte> retained(c.args.frame+c.args.plan.offsets.payload,c.args.frame+c.args.plan.offsets.payload+bytes);
+        ASSERT_TRUE(source::retireConsumed(c.args));EXPECT_EQ(std::memcmp(retained.data(),c.args.frame+c.args.plan.offsets.payload,bytes),0);own.input.frontier=&source::frontier(c.args);own.input.outcome=&source::frontier(c.args);own.input.condition=n::SourceCondition::AfterSuccess;own.input.records=c.args.frame+c.args.plan.offsets.fills;own.input.record_bytes=n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes);own.input.payload=c.args.frame+c.args.plan.offsets.payload;own.input.payload_bytes=n::at<uint64_t>(c.args.native,c.args.plan.offsets.payload_bytes);ASSERT_TRUE((n::owner<n::OwnerAction::ApplySourceDelivery,a::Slot64>(own)));const auto* fills=n::at<n::Fill>(c.args.frame,c.args.plan.offsets.fills);for(uint64_t row=0;row<records/sizeof(n::Fill);++row)std::memcpy(own.cache+own.plan.cache.payload+fills[row].original.slot*own.plan.slot_stride,own.input.payload+row*90,90);ASSERT_TRUE(n::copied<a::Slot64>(own));ASSERT_TRUE((n::owner<n::OwnerAction::ValidateFills,a::Slot64>(own)));EXPECT_EQ(c.pool.owners[local]->header<p::PublishHeader>().status,a::Status::Success);
+        for(size_t owner=0;owner<participants;++owner)if(!accepted[owner].empty())EXPECT_EQ(std::memcmp(accepted[owner].data(),n::grants(c.pool.owners[owner]->args),accepted[owner].size()*sizeof(p::Grant)),0);
+    }
+}
+}
+
+namespace llaminar2::test {
+namespace {
+/**
+ * @brief Replay actual r6 producers through copied fills before the new publication successor.
+ * Exact native bytes and wire acquisitions are decoded CPU observations only;
+ * no provider, Tensor device storage, transport, capture or native runtime is certified.
+ */
+void publicationFilled(DistributedSourceReplay& c,std::span<const uint64_t> rows){namespace source=q::pooled_source;
+    c.plan(rows);c.seals();c.response();
+    for(uint32_t i=0;i<c.pool.owners.size();++i){Pool::require(source::prepareDelivery(c.args,i));auto& own=c.pool.owners[i]->args;const auto records=*n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes),bytes=*n::at<uint64_t>(c.args.native,c.args.plan.offsets.payload_bytes);auto* payload=c.args.frame+c.args.plan.offsets.payload;for(uint64_t row=0;row<records/sizeof(n::Fill);++row)std::memcpy(payload+row*90,source::deliveryRow(c.args,row),90);if(records)std::memcpy(own.native+own.plan.native.source_fills,c.args.frame+c.args.plan.offsets.fills,records);if(bytes)std::memcpy(own.native+own.plan.native.source_payload,payload,bytes);auto* input=n::at<n::OwnerIngress>(own.native,own.plan.native.ingress);input->record_bytes=records;input->payload_bytes=bytes;}
+    Pool::require(source::retireConsumed(c.args));
+    for(auto& original:c.pool.owners){auto& own=original->args;auto* outcome=n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome);*outcome=source::frontier(c.args);auto* input=n::at<n::OwnerIngress>(own.native,own.plan.native.ingress);own.input.frontier=outcome;own.input.outcome=outcome;own.input.condition=n::SourceCondition::AfterSuccess;own.input.records=own.plan.native.reply_capacity?own.native+own.plan.native.source_fills:nullptr;own.input.record_bytes=own.plan.native.reply_capacity?&input->record_bytes:nullptr;own.input.payload=own.plan.native.reply_capacity?own.native+own.plan.native.source_payload:nullptr;own.input.payload_bytes=own.plan.native.reply_capacity?&input->payload_bytes:nullptr;Pool::require((n::owner<n::OwnerAction::ApplySourceDelivery,a::Slot64>(own)));const auto* fills=n::at<n::Fill>(own.native,own.plan.native.source_fills);for(uint64_t row=0;row<input->record_bytes/sizeof(n::Fill);++row)std::memcpy(own.cache+own.plan.cache.payload+fills[row].original.slot*own.plan.slot_stride,own.input.payload+row*90,90);Pool::require(n::copied<a::Slot64>(own));Pool::require((n::owner<n::OwnerAction::ValidateFills,a::Slot64>(own)));}
+}
+/** @brief Acquire the actual ALL-owner fill frontier; keep each original source outcome after header reuse. */
+void publicationAcquire(DistributedSourceReplay& c){const auto publish=c.pool.headers<p::PublishHeader>();for(auto& original:c.pool.owners){auto& own=original->args;const auto* invocation=own.input.invocation;own.input={invocation,nullptr,nullptr,publish.data(),nullptr,nullptr,n::SourceCondition::AfterSuccess,n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome)};Pool::require((n::owner<n::OwnerAction::AcquirePublication,a::Slot64>(own)));own.input.frontier=nullptr;}}
+/** @brief Actual Ready producers over original physical pins/reservations; no fixed-size header echo is supplied. */
+void publicationReady(DistributedSourceReplay& c){for(auto& original:c.pool.owners){Pool::require((n::owner<n::OwnerAction::MakeReady,a::Slot64>(original->args)));Pool::require((n::owner<n::OwnerAction::ReadyReceipt,a::Slot64>(original->args)));}}
+}
+/** @brief Exact original all-owner publication succeeds for1/2/4/8 including C0/empty without releasing pins or private responses. */
+TEST(PooledImmutableNative, PublicationReadyActualConsensusKeepsOriginalReadersAndGrants){namespace source=q::pooled_source;
+    for(uint32_t participants:{1u,2u,4u,8u})for(bool empty:{false,true}){std::vector<uint32_t> capacities;for(uint32_t i=0;i<participants;++i)capacities.push_back(empty || i%3==0?0:2);DistributedSourceReplay c(capacities);const std::array<uint64_t,8> rows{700,701,900,901,700,901,902,903};
+        ASSERT_NO_THROW(publicationFilled(c,empty?std::span<const uint64_t>{}:std::span<const uint64_t>{rows}));
+        std::vector<std::byte> privateRows(c.args.frame+c.args.plan.offsets.responses,c.args.frame+c.args.plan.offsets.responses+source::protocol(c.args).nativeBytes);std::vector<uint32_t> pins;for(const auto& own:c.pool.owners)pins.push_back(n::ownerView<a::Slot64>(own->args).frame->held_pins);
+        ASSERT_NO_THROW(publicationAcquire(c));
+        ASSERT_TRUE(source::beforeReady(c.args));
+        ASSERT_NO_THROW(publicationReady(c));const auto ready=c.pool.headers<p::ReadyHeader>();
+        ASSERT_TRUE(source::acquireReadyConsensus(c.args,ready.data(),ready.size()));EXPECT_EQ(source::stage(c.args),source::ResponseStage::Consumed);EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Source);c.pool.args.input.frontier=ready.data();c.pool.args.input.source=&source::frontier(c.args);
+        ASSERT_NO_THROW(c.pool.run<n::CoordinatorAction::Publish>());EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Ready);EXPECT_EQ(std::memcmp(privateRows.data(),c.args.frame+c.args.plan.offsets.responses,privateRows.size()),0);for(size_t i=0;i<c.pool.owners.size();++i){const auto& own=c.pool.owners[i]->args;EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->held_pins,pins[i]);EXPECT_EQ(n::progress(own).header_bytes,56u);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->reservations,0u);}
+    }
+}
+/** @brief Gate cancellation publishes a real Ready error even while physical owner status remainsSuccess; r6 old body leaves stale Publish56. */
+TEST(PooledImmutableNative, PublicationReadyCancelledGateOverwritesActualOldPublishHeader){namespace source=q::pooled_source;DistributedSourceReplay c(std::vector{2u});
+    ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,2>{7,9}));
+    ASSERT_NO_THROW(publicationAcquire(c));auto& own=c.pool.owners[0]->args;auto* outcome=n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome);outcome->status=a::Status::Cancelled;const auto prior=c.pool.owners[0]->header<p::PublishHeader>();ASSERT_EQ(prior.status,a::Status::Success);
+    EXPECT_TRUE((n::ownerOperation<n::OwnerAction::ReadyReceipt,a::Slot64>(own)));EXPECT_EQ(n::progress(own).header_bytes,0u);EXPECT_EQ(std::memcmp(own.native+own.plan.native.header,&prior,sizeof(prior)),0);
+    EXPECT_FALSE((n::owner<n::OwnerAction::ReadyReceipt,a::Slot64>(own)));EXPECT_EQ(n::progress(own).header_bytes,56u);EXPECT_EQ(c.pool.owners[0]->header<p::ReadyHeader>().status,a::Status::Cancelled);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->status,a::Status::Success);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->reservations,2u);EXPECT_EQ(source::stage(c.args),source::ResponseStage::Consumed);
+}
+/** @brief Lost physical readability cannot be certified by layout/phase alone even when old readyHeader reportsSuccess. */
+TEST(PooledImmutableNative, PublicationReadyRevalidatesEveryOriginalPhysicalPin){DistributedSourceReplay c(std::vector{2u});
+    ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,2>{7,9}));
+    ASSERT_NO_THROW(publicationAcquire(c));
+    ASSERT_NO_THROW(publicationReady(c));auto& own=c.pool.owners[0]->args;const auto grant=n::grants(own)[0];a::PhysicalSlot<a::Slot64>::unpin(n::ownerView<a::Slot64>(own).slots[grant.slot]);EXPECT_TRUE((n::ownerOperation<n::OwnerAction::ReadyReceipt,a::Slot64>(own)));EXPECT_EQ(c.pool.owners[0]->header<p::ReadyHeader>().status,a::Status::Success);
+    EXPECT_FALSE((n::owner<n::OwnerAction::ReadyReceipt,a::Slot64>(own)));EXPECT_EQ(c.pool.owners[0]->header<p::ReadyHeader>().status,a::Status::SourceFailure);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->held_pins,2u); // No invented release repairs the invalid trace.
+}
+/** @brief Foreign/partial/malformed Ready observations cannot publish or retire an original frame; acquired source errors remain sticky. */
+TEST(PooledImmutableNative, PublicationReadyConsensusRejectsIncompleteAndForeignBeforeCommit){namespace source=q::pooled_source;
+    for(unsigned defect=0;defect<9;++defect){DistributedSourceReplay c(std::vector{1u,0u,2u});
+        ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,3>{7,9,11}));
+        ASSERT_NO_THROW(publicationAcquire(c));
+        ASSERT_NO_THROW(publicationReady(c));auto headers=c.pool.headers<p::ReadyHeader>();auto count=static_cast<uint32_t>(headers.size());
+        if(defect==0)--count;if(defect==1)++headers[1].owner;if(defect==2)++headers[1].interval.sequence;if(defect==3)++headers[1].source.generation;if(defect==4)headers[1].status=a::Status::Cancelled;if(defect==5)++source::frontier(c.args).version;if(defect==6)++source::protocol(c.args).admissionGeneration;if(defect==7){source::frontier(c.args).status=a::Status::Cancelled;}if(defect==8){source::stage(c.args)=source::ResponseStage::ReadersComplete;}
+        const auto consumed=source::protocol(c.args).consumedSequence;EXPECT_FALSE(source::acquireReadyConsensus(c.args,headers.data(),count));EXPECT_NE(source::frontier(c.args).status,a::Status::Success);if(defect==7)EXPECT_EQ(source::frontier(c.args).status,a::Status::Cancelled);EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Source);EXPECT_EQ(c.pool.view().frame->status,a::Status::Success);EXPECT_EQ(source::protocol(c.args).consumedSequence,consumed);
+    }
+}
+}
+
+namespace llaminar2::test {
+namespace {
+/** @brief Only decoded transport copies the exact live60 bytes; native root padding is deliberately not supplied. */
+template<class Header,n::OwnerAction Action>void publicationImport(DistributedSourceReplay& c,uint32_t owner){auto& a=c.pool.owners[owner]->args;const auto* invocation=a.input.invocation;a.input={invocation,nullptr,nullptr,nullptr,nullptr,nullptr};Pool::require((n::owner<Action,a::Slot64>(a)));std::memcpy(c.args.native+c.args.plan.offsets.seal_receipt,a.native+a.plan.native.header,n::NominalHeaderWireBytes);Pool::require(q::pooled_source::importPublicationWire<Header>(c.args,owner));}
+}
+/** @brief Actual nominal producers fit60 live bytes in original64-byte banks, with source readers/pins retained across consensus. */
+TEST(PooledImmutableNative, PublicationReadyNominalWireUsesOriginalWitnessAndExact60){namespace source=q::pooled_source;
+    static_assert(n::NominalHeaderWireBytes==60 && sizeof(n::NominalHeaderWire<p::PublishHeader>)==64);
+    static_assert(sizeof(n::OwnerProgress)==64 && offsetof(n::OwnerProgress,header_kind)==48);
+    for(uint32_t participants:{1u,2u,4u,8u}){std::vector<uint32_t> capacities(participants,2);capacities[0]=0;DistributedSourceReplay c(capacities);
+        ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,4>{7,9,11,7}));
+        for(uint32_t owner=0;owner<participants;++owner){auto& a=c.pool.owners[owner]->args;*n::at<uint32_t>(a.native,a.plan.native.header+60)=0xdecafbad;ASSERT_EQ(n::progress(a).header_kind,n::OwnerHeaderKind::Publish);
+            ASSERT_NO_THROW((publicationImport<p::PublishHeader,n::OwnerAction::PublishWire>(c,owner)));EXPECT_EQ(*n::at<uint32_t>(a.native,a.plan.native.header+60),0xdecafbadu);EXPECT_EQ(n::progress(a).header_kind,n::OwnerHeaderKind::Publish);EXPECT_EQ(n::progress(a).header_bytes,56u);}
+        ASSERT_TRUE(source::acquirePublicationConsensus<p::PublishHeader>(c.args));
+        ASSERT_NO_THROW(publicationAcquire(c));for(uint32_t owner=0;owner<participants;++owner){ASSERT_EQ(n::progress(c.pool.owners[owner]->args).header_kind,n::OwnerHeaderKind::PublicationAcquired);
+            ASSERT_NO_THROW((publicationImport<n::PublicationAcquiredHeader,n::OwnerAction::PublicationAcquiredWire>(c,owner)));}
+        ASSERT_TRUE(source::acquirePublicationConsensus<n::PublicationAcquiredHeader>(c.args));ASSERT_TRUE(source::beforeReady(c.args));
+        ASSERT_NO_THROW(publicationReady(c));for(uint32_t owner=0;owner<participants;++owner){
+            ASSERT_NO_THROW((publicationImport<p::ReadyHeader,n::OwnerAction::ReadyWire>(c,owner)));}
+        ASSERT_TRUE(source::acquirePublicationConsensus<p::ReadyHeader>(c.args));const auto* ready=n::at<p::ReadyHeader>(c.pool.args.native,c.pool.args.plan.native.ingress_frontier);ASSERT_TRUE(source::acquireReadyConsensus(c.args,ready,participants));EXPECT_EQ(source::stage(c.args),source::ResponseStage::Consumed);EXPECT_EQ(source::progress(c.args).publication_headers,participants);EXPECT_EQ(source::progress(c.args).publication_acquired,participants);EXPECT_EQ(source::progress(c.args).ready_headers,participants);
+        c.pool.args.input.frontier=ready;c.pool.args.input.source=&source::frontier(c.args);
+        ASSERT_NO_THROW(c.pool.run<n::CoordinatorAction::Publish>());EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Ready);
+    }
+}
+/** @brief The ordinary reset-before-pack body destroys the original witness; new wire projections execute before that reset and invalidate errors. */
+TEST(PooledImmutableNative, PublicationReadyWireRejectsResetWrongRoleStaleAndPartialProducer){
+    for(unsigned defect=0;defect<6;++defect){DistributedSourceReplay c(std::vector{2u});
+        ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,2>{7,9}));auto& own=c.pool.owners[0]->args;const auto* invocation=own.input.invocation;own.input={invocation,nullptr,nullptr,nullptr,nullptr,nullptr};
+        *n::at<n::OwnerHeaderKind>(own.native,own.plan.native.header+56)=n::OwnerHeaderKind::Ready;
+        if(defect==0){n::progress(own).header_bytes=0;n::progress(own).header_kind=n::OwnerHeaderKind::None;} // Exact ordinary operation reset, before original witness acquisition.
+        if(defect==1)n::progress(own).header_kind=n::OwnerHeaderKind::Ready;
+        if(defect==2)--n::progress(own).header_bytes;
+        if(defect==3)++n::at<p::PublishHeader>(own.native,own.plan.native.header)->interval.sequence;
+        if(defect==4)++n::at<p::PublishHeader>(own.native,own.plan.native.header)->source.generation;
+        if(defect==5)own.input.condition=n::SourceCondition::AfterSuccess;
+        EXPECT_FALSE((n::owner<n::OwnerAction::PublishWire,a::Slot64>(own)));EXPECT_EQ(n::progress(own).header_kind,n::OwnerHeaderKind::None);EXPECT_EQ(n::progress(own).header_bytes,0u);EXPECT_EQ(*n::at<n::OwnerHeaderKind>(own.native,own.plan.native.header+56),n::OwnerHeaderKind::None);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->held_pins,2u);
+    }
+}
+/** @brief Equal56-byte layouts alone let the original wire parser publish before physical Ready; real nominal imports reject that causal trace. */
+TEST(PooledImmutableNative, PublicationReadyNominalKindRejectsOriginalLayoutOnlyFalseReady){namespace source=q::pooled_source;
+    {DistributedSourceReplay original(std::vector{2u});ASSERT_NO_THROW(publicationFilled(original,std::array<uint64_t,2>{7,9}));const auto publish=original.pool.headers<p::PublishHeader>();static_assert(sizeof(p::PublishHeader)==sizeof(p::ReadyHeader));std::vector<p::ReadyHeader> decoded(publish.size());std::memcpy(decoded.data(),publish.data(),publish.size()*sizeof(p::PublishHeader));EXPECT_TRUE(p::CoordinatorOperations(original.pool.view()).publish(decoded.data(),decoded.size(),p::SourceRetirement::Consumed,source::frontier(original.args).source));EXPECT_EQ(original.pool.view().frame->phase,p::LookupPhase::Ready);EXPECT_EQ(n::ownerView<a::Slot64>(original.pool.owners[0]->args).frame->reservations,2u);}
+    {DistributedSourceReplay candidate(std::vector{2u});ASSERT_NO_THROW(publicationFilled(candidate,std::array<uint64_t,2>{7,9}));auto& own=candidate.pool.owners[0]->args;
+        ASSERT_NO_THROW((publicationImport<p::PublishHeader,n::OwnerAction::PublishWire>(candidate,0)));std::array<std::byte,60> oldPublish;std::memcpy(oldPublish.data(),candidate.args.native+candidate.args.plan.offsets.seal_receipt,oldPublish.size());
+        ASSERT_NO_THROW(publicationAcquire(candidate));
+        ASSERT_NO_THROW((publicationImport<n::PublicationAcquiredHeader,n::OwnerAction::PublicationAcquiredWire>(candidate,0)));ASSERT_EQ(source::progress(candidate.args).publication_headers,1u);ASSERT_EQ(source::progress(candidate.args).publication_acquired,1u);std::memcpy(candidate.args.native+candidate.args.plan.offsets.seal_receipt,oldPublish.data(),oldPublish.size());EXPECT_FALSE(source::importPublicationWire<p::ReadyHeader>(candidate.args,0));EXPECT_EQ(source::progress(candidate.args).ready_headers,0u);EXPECT_EQ(candidate.pool.view().frame->phase,p::LookupPhase::Source);EXPECT_EQ(candidate.pool.view().frame->status,a::Status::Success);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->reservations,2u);}
+}
+/** @brief Publication acquisition acknowledgment is actual compute completion; cancelled gate emits its real error kind without inventing state. */
+TEST(PooledImmutableNative, PublicationReadyAcquiredReceiptHasActualGateAndPhase){DistributedSourceReplay c(std::vector{2u});
+    ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,2>{7,9}));auto& own=c.pool.owners[0]->args;const auto* input=own.input.invocation;auto* outcome=n::at<n::SourceFrontier>(own.native,own.plan.native.source_outcome);outcome->status=a::Status::Cancelled;const auto publish=c.pool.headers<p::PublishHeader>();own.input={input,nullptr,nullptr,publish.data(),nullptr,nullptr,n::SourceCondition::AfterSuccess,outcome};
+    EXPECT_FALSE((n::owner<n::OwnerAction::AcquirePublication,a::Slot64>(own)));EXPECT_EQ(n::progress(own).header_kind,n::OwnerHeaderKind::PublicationAcquired);EXPECT_EQ(c.pool.owners[0]->header<n::PublicationAcquiredHeader>().status,a::Status::Cancelled);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->status,a::Status::Success);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->phase,p::OwnerPhase::FillValidated);EXPECT_EQ(n::ownerView<a::Slot64>(own).frame->held_pins,2u);
+}
+}
+
+namespace llaminar2::test {
+/** @brief Direct-local metadata uses actual original owner root/kind/byte publication, while remote members retain exact60 envelopes. */
+TEST(PooledImmutableNative, PublicationReadyLocalOriginalNominalWitnessAcrossCohorts){namespace source=q::pooled_source;for(size_t count:{2u,4u,8u})for(uint32_t local=0;local<count;++local){DistributedSourceReplay c(std::vector<uint32_t>(count,2));
+    ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,4>{7,9,11,13}));
+    c.args.plan.local_owner=local;c.args.owner=c.pool.owners[local]->args;
+    for(uint32_t i=0;i<count;++i){if(i==local)ASSERT_TRUE(source::importLocalPublication<p::PublishHeader>(c.args,i));else ASSERT_NO_THROW((publicationImport<p::PublishHeader,n::OwnerAction::PublishWire>(c,i)));}
+    ASSERT_TRUE(source::acquirePublicationConsensus<p::PublishHeader>(c.args));
+    ASSERT_NO_THROW(publicationAcquire(c));
+    for(uint32_t i=0;i<count;++i){if(i==local)ASSERT_TRUE(source::importLocalPublication<n::PublicationAcquiredHeader>(c.args,i));else ASSERT_NO_THROW((publicationImport<n::PublicationAcquiredHeader,n::OwnerAction::PublicationAcquiredWire>(c,i)));}
+    ASSERT_TRUE(source::acquirePublicationConsensus<n::PublicationAcquiredHeader>(c.args));
+    ASSERT_NO_THROW(publicationReady(c));
+    for(uint32_t i=0;i<count;++i){if(i==local)ASSERT_TRUE(source::importLocalPublication<p::ReadyHeader>(c.args,i));else ASSERT_NO_THROW((publicationImport<p::ReadyHeader,n::OwnerAction::ReadyWire>(c,i)));}
+    ASSERT_TRUE(source::acquirePublicationConsensus<p::ReadyHeader>(c.args));
+    EXPECT_EQ(source::stage(c.args),source::ResponseStage::Consumed);EXPECT_EQ(source::progress(c.args).ready_headers,count);
+}}
+/** @brief Equal-layout stale/partial/wrong nominal local records reject before the original ordered slot/cursor changes. */
+TEST(PooledImmutableNative, PublicationReadyLocalRejectsWrongOriginalProducerBeforeImport){namespace source=q::pooled_source;for(unsigned defect=0;defect<6;++defect){DistributedSourceReplay c(std::vector<uint32_t>{2,0});
+    ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,2>{7,9}));
+    c.args.plan.local_owner=0;c.args.owner=c.pool.owners[0]->args;auto& own=c.args.owner;
+    if(defect==0)n::progress(own).header_kind=n::OwnerHeaderKind::Ready;
+    if(defect==1)n::progress(own).header_bytes=55;
+    if(defect==2)n::at<p::PublishHeader>(own.native,own.plan.native.header)->interval.sequence++;
+    if(defect==3)n::at<p::PublishHeader>(own.native,own.plan.native.header)->source.generation++;
+    if(defect==4)n::allocationFrame(own).phase=p::AllocationPhase::Idle;
+    if(defect==5)c.args.owner=c.pool.owners[1]->args;
+    const auto before=*n::at<p::PublishHeader>(c.args.coordinator.native,c.args.coordinator.plan.native.ingress_frontier);
+    EXPECT_FALSE(source::importLocalPublication<p::PublishHeader>(c.args,0));EXPECT_EQ(source::progress(c.args).publication_headers,0u);EXPECT_EQ(std::memcmp(&before,n::at<p::PublishHeader>(c.args.coordinator.native,c.args.coordinator.plan.native.ingress_frontier),sizeof(before)),0);
+}}
+}
+
+namespace llaminar2::test {
+/** @brief Failed unsealed owners may truthfully retain an old window; error metadata drains without granting it source authority. */
+TEST(PooledImmutableNative, PublicationReadyFailedOwnerOldWindowDrainsOnlyErrorMetadata){namespace source=q::pooled_source;for(bool local:{false,true}){DistributedSourceReplay c(std::vector<uint32_t>{2,0});
+    ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,2>{7,9}));
+    auto& own=c.pool.owners[0]->args;auto& frame=*n::ownerView<a::Slot64>(own).frame;const auto original=source::frontier(c.args).source;frame.source.generation++;frame.status=a::Status::SourceFailure;n::header(own,p::PublishHeader{frame.interval,frame.source,0,a::Status::SourceFailure});
+    if(local){c.args.plan.local_owner=0;c.args.owner=own;EXPECT_FALSE(source::importLocalPublication<p::PublishHeader>(c.args,0));}else{const auto* invocation=own.input.invocation;own.input={invocation,nullptr,nullptr,nullptr,nullptr,nullptr};ASSERT_TRUE((n::owner<n::OwnerAction::PublishWire,a::Slot64>(own)));std::memcpy(c.args.native+c.args.plan.offsets.seal_receipt,own.native+own.plan.native.header,n::NominalHeaderWireBytes);EXPECT_FALSE(source::importPublicationWire<p::PublishHeader>(c.args,0));}
+    EXPECT_EQ(source::progress(c.args).publication_headers,1u);EXPECT_EQ(source::stage(c.args),source::ResponseStage::Consumed);EXPECT_TRUE(n::same(source::frontier(c.args).source,original));EXPECT_NE(source::frontier(c.args).status,a::Status::Success);EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Source);
+}}
+}
+
+namespace llaminar2::test {
+/**
+ * @brief Actual mixed sealed/unsealed cancellation reconciles only complete original release evidence.
+ * @note Decoded original worker retirement drives the real response state machine; no source
+ * window is added to an unsealed owner and no pin count is inferred from coordinator policy.
+ */
+TEST(PooledImmutableNative, TerminalMixedCancelledRetirementRequiresCompleteOriginalReleaseSet)
+{
+    namespace source=q::pooled_source;
+    for(uint32_t participants:{2u,4u,8u})for(uint32_t unsealed:{0u,participants/2,participants-1})
+    for(bool empty:{false,true})for(unsigned corruption=0;corruption<8;++corruption){
+        std::vector<uint32_t> capacities(participants,empty?0u:2u);
+        DistributedSourceReplay c(capacities);
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,3>{700,701,900}));
+        for(uint32_t coordinate=0;coordinate<participants;++coordinate){
+            auto& owner=*c.pool.owners[coordinate];owner.args.input.frontier=&source::frontier(c.args);
+            if(coordinate==unsealed){
+                ASSERT_TRUE(owner.run<n::OwnerAction::CancelVictim>());
+                EXPECT_FALSE(owner.run<n::OwnerAction::SealSource>());
+            }else{
+                ASSERT_TRUE(owner.run<n::OwnerAction::SealSource>());
+                // The first failure remains sticky; later actual receipts still identify real physical windows.
+                const auto actual=owner.header<n::OwnerSourceSealReceipt>();
+                EXPECT_EQ(actual.source.table,701u);
+            }
+        }
+        for(uint32_t coordinate=0;coordinate<participants;++coordinate){
+            const bool acquired=source::acquireSeal(c.args,c.pool.owners[coordinate]->header<n::OwnerSourceSealReceipt>(),coordinate);
+            EXPECT_EQ(acquired,coordinate<unsealed);
+        }
+        struct OriginalWorkerRetirement {
+            uint64_t retiredInvocation(){return 23;} uint64_t retiredGeneration(){return 17;}
+            uint64_t completion(){return 0;}
+        } worker;
+        ASSERT_TRUE(source::retireAborted(c.args,worker));
+        std::vector<p::ReleaseReceipt> releases;
+        for(auto& pointer:c.pool.owners){auto& owner=*pointer;auto& args=owner.args;
+            args.input.frontier=&source::frontier(c.args);args.input.condition=n::SourceCondition::Always;args.input.outcome=nullptr;
+            ASSERT_TRUE(owner.run<n::OwnerAction::DrainSourceFailure>());
+            args.input={c.pool.invocation(),nullptr,nullptr,nullptr,nullptr,nullptr};
+            ASSERT_TRUE(owner.run<n::OwnerAction::Release>());
+            const auto count=n::progress(args).release_bytes/sizeof(p::ReleaseReceipt);
+            const auto* original=n::at<p::ReleaseReceipt>(args.frame,args.plan.frame.release_receipts);
+            releases.insert(releases.end(),original,original+count);
+            EXPECT_EQ(n::ownerView<a::Slot64>(args).frame->held_pins,0u);
+            EXPECT_EQ(n::ownerView<a::Slot64>(args).frame->reservations,0u);
+        }
+        const bool corruptRelease=corruption==1 && !releases.empty();
+        if(corruptRelease)releases.pop_back();
+        const uint64_t bytes=releases.size()*sizeof(p::ReleaseReceipt);
+        const auto& outcome=source::frontier(c.args);
+        c.pool.args.input={releases.empty()?nullptr:releases.data(),c.pool.args.plan.native.reply_capacity?&bytes:nullptr,nullptr,&outcome,n::SourceCondition::AfterFailure,&outcome};
+        const bool cancelled=corruption==7?false:n::coordinator<n::CoordinatorAction::Cancel>(c.pool.args);
+        EXPECT_EQ(cancelled,!corruptRelease && corruption!=7);c.pool.args.input={};
+        for(auto& owner:c.pool.owners)ASSERT_TRUE(owner->run<n::OwnerAction::Retire>());
+        auto retired=c.pool.headers<p::RetiredHeader>();
+        EXPECT_EQ(retired[unsealed].source.table,0u);EXPECT_EQ(retired[unsealed].status,a::Status::Cancelled);
+        if(corruption==2)retired[unsealed].source.sequence=1; // Not an all-zero absent window.
+        if(corruption==3)retired[unsealed].status=a::Status::Success; // Cannot recast failed unsealed work as success.
+        if(corruption==4)++retired[unsealed].interval.admission;
+        if(corruption==5)retired[unsealed].owner=(unsealed+1)%participants;
+        if(corruption==6)++retired[(unsealed+1)%participants].source.sequence;
+        c.pool.args.input.frontier=retired.data();
+        const bool finished=n::coordinator<n::CoordinatorAction::Finish>(c.pool.args);
+        EXPECT_EQ(finished,!corruptRelease && (corruption==0 || corruption==1));
+        EXPECT_EQ(c.pool.view().frame->phase==p::LookupPhase::Idle,finished);
+        if(finished){
+            c.pool.args.input={};
+            ASSERT_NO_THROW(c.pool.complete(std::array<uint64_t,1>{99},2));
+            EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Idle);
+        }
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @brief Authentic cancelled allocation-wave completion cannot substitute for complete release reconciliation. */
+TEST(PooledImmutableNative, TerminalCancelledWaveAloneNeverAuthorizesFinish)
+{
+    for(bool empty:{false,true}){
+        Pool pool(std::vector<uint32_t>{empty?0u:2u,0u});
+        ASSERT_NO_THROW(pool.begin(std::array<uint64_t,2>{701,702}));
+        ASSERT_NO_THROW(pool.receivedFree({},{},true));
+        EXPECT_TRUE(pool.view().frame->cancelled_completion);
+        EXPECT_EQ(pool.view().frame->status,a::Status::Success);
+        EXPECT_EQ(pool.view().frame->phase,p::LookupPhase::FreeCompleted);
+        ASSERT_NO_THROW(pool.all<n::OwnerAction::Release>());
+        ASSERT_NO_THROW(pool.all<n::OwnerAction::Retire>());
+        const auto retired=pool.headers<p::RetiredHeader>();pool.args.input.frontier=retired.data();
+        EXPECT_FALSE(n::coordinator<n::CoordinatorAction::Finish>(pool.args));
+        EXPECT_NE(pool.view().frame->phase,p::LookupPhase::Idle);
+    }
+}
+/**
+ * @brief Actual Release72 parsers phase-reuse the serial Fill bank and preserve original physical counters.
+ * @note The recorded input ReadersComplete state represents the separately authenticated output/read-drain
+ * graph frontier. This device-free parser replay does not certify that upstream graph or a GPU completion.
+ */
+TEST(PooledImmutableNative, TerminalReleaseAggregationUsesExactOriginalPacketsAndRejectsBeforeAppend)
+{
+    namespace source=q::pooled_source;
+    for(uint32_t participants:{2u,4u,8u})for(bool empty:{false,true})for(unsigned defect=0;defect<9;++defect){
+        DistributedSourceReplay c(std::vector<uint32_t>(participants,empty?0u:2u));
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,6>{701,702,703,704,705,706}));
+        ASSERT_NO_THROW(c.seals());
+        struct OriginalWorkerRetirement {uint64_t retiredInvocation(){return 23;}uint64_t retiredGeneration(){return 17;}uint64_t completion(){return 0;}} worker;
+        ASSERT_TRUE(source::retireAborted(c.args,worker));
+        uint64_t total=0;
+        for(auto& pointer:c.pool.owners){auto& owner=*pointer;auto& args=owner.args;
+            args.input.frontier=&source::frontier(c.args);args.input.condition=n::SourceCondition::Always;args.input.outcome=nullptr;
+            ASSERT_TRUE(owner.run<n::OwnerAction::DrainSourceFailure>());
+            args.input={c.pool.invocation(),nullptr,nullptr,nullptr,nullptr,nullptr};
+            ASSERT_TRUE(owner.run<n::OwnerAction::Release>());total+=n::progress(args).release_bytes;
+        }
+        const auto priorStage=source::stage(c.args);
+        EXPECT_FALSE(source::planReleases(c.args));EXPECT_EQ(source::stage(c.args),priorStage);
+        source::stage(c.args)=source::ResponseStage::ReadersComplete; // Recorded actual last-reader input, not an invented event/retirement capability.
+        if(defect>=6){
+            if(defect==6)++source::protocol(c.args).admissionGeneration;
+            if(defect==7)++source::frontier(c.args).interval.admission;
+            if(defect==8)++source::frontier(c.args).version;
+            const auto before=source::releasedBytes(c.args);
+            EXPECT_FALSE(source::planReleases(c.args));EXPECT_EQ(source::releasedBytes(c.args),before);
+            EXPECT_EQ(source::stage(c.args),source::ResponseStage::ReadersComplete);continue;
+        }
+        ASSERT_TRUE(source::planReleases(c.args));EXPECT_EQ(source::releasedBytes(c.args),0u);
+        bool rejected=false;
+        for(uint32_t coordinate=0;coordinate<participants;++coordinate){
+            auto& owner=c.pool.owners[coordinate]->args;const auto actual=n::progress(owner).release_bytes;
+            const auto* original=n::at<p::ReleaseReceipt>(owner.frame,owner.plan.frame.release_receipts);
+            auto* received=n::at<p::ReleaseReceipt>(c.args.frame,c.args.plan.offsets.fills);
+            if(actual)std::memcpy(received,original,actual);
+            auto bytes=actual;auto addressed=coordinate;
+            const bool corrupt=coordinate==0 && defect && (defect==1 || actual);
+            if(corrupt){
+                if(defect==1)addressed=1;
+                if(defect==2)--bytes;
+                if(defect==3)++received[0].original.destination_token;
+                if(defect==4)received[0].reserved=1;
+                if(defect==5)received[0].disposition=p::ReleaseDisposition::Failed;
+            }
+            const std::vector<p::ReleaseReceipt> retained(original,original+actual/sizeof(p::ReleaseReceipt));
+            const auto before=source::releasedBytes(c.args);const auto cursor=source::progress(c.args).packets;
+            const bool accepted=source::importReleases(c.args,addressed,actual?received:nullptr,bytes);
+            EXPECT_EQ(accepted,!corrupt);
+            EXPECT_EQ(n::progress(owner).release_bytes,actual);
+            if(actual)EXPECT_EQ(std::memcmp(retained.data(),owner.frame+owner.plan.frame.release_receipts,actual),0);
+            if(corrupt){EXPECT_EQ(source::releasedBytes(c.args),before);EXPECT_EQ(source::progress(c.args).packets,cursor);rejected=true;break;}
+            if(coordinate==0){const auto retainedBytes=source::releasedBytes(c.args);const auto retainedCursor=source::progress(c.args).packets;
+                EXPECT_FALSE(source::planReleases(c.args));EXPECT_EQ(source::releasedBytes(c.args),retainedBytes);EXPECT_EQ(source::progress(c.args).packets,retainedCursor);}
+        }
+        if(rejected)continue;
+        EXPECT_EQ(source::releasedBytes(c.args),total);
+        ASSERT_TRUE(source::reconcileReleases(c.args));
+        EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Draining);
+        EXPECT_EQ(c.pool.view().frame->status,a::Status::Cancelled);
+        EXPECT_EQ(source::stage(c.args),source::ResponseStage::ReleasesComplete);
+        std::array<int32_t,sampling_math::kDeviceGenerationControlCount> control{};c.args.control=control.data();
+        ASSERT_TRUE(source::snapshotReleasedObservation(c.args));
+        ASSERT_NO_THROW(c.pool.all<n::OwnerAction::Retire>());
+        for(uint32_t coordinate=0;coordinate<participants;++coordinate){
+            const auto retired=c.pool.owners[coordinate]->header<p::RetiredHeader>();
+            std::memcpy(c.args.native+c.args.plan.offsets.seal_receipt,&retired,sizeof(retired));
+            *n::at<n::OwnerHeaderKind>(c.args.native,c.args.plan.offsets.seal_receipt+sizeof(retired))=n::OwnerHeaderKind::Retired;
+            ASSERT_TRUE(source::importRemoteRetired(c.args,coordinate));
+        }
+        ASSERT_TRUE(source::finishReleased(c.args));EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Idle);
+        ASSERT_TRUE(source::observeReleased(c.args));
+        q::QwenAdaptiveCounterTotals observed;ASSERT_TRUE(q::readQwenAdaptiveCounters(control.data(),control.size(),observed));
+        EXPECT_EQ(observed.calls,1u);EXPECT_EQ(observed.failed_frames,1u);EXPECT_EQ(observed.completed_live_ids,0u);
+        EXPECT_EQ(observed.promotions,0u);EXPECT_EQ(observed.source_bytes,0u);
+        const auto previous=control;EXPECT_FALSE(source::observeReleased(c.args));EXPECT_EQ(control,previous);
+        EXPECT_EQ(source::stage(c.args),source::ResponseStage::ReadersComplete);
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @brief Actual local Idle/kind/count publication is mandatory before its poisoned full-cohort slot changes. */
+TEST(PooledImmutableNative, TerminalLocalNominalRetirementRejectsPoisonBeforeFrontierWrite)
+{
+    namespace source=q::pooled_source;
+    for(uint32_t participants:{2u,4u,8u})for(uint32_t local=0;local<participants;++local)
+    for(bool empty:{false,true})for(unsigned defect=0;defect<6;++defect){
+        DistributedSourceReplay c(std::vector<uint32_t>(participants,empty?0u:2u),local);
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,3>{701,702,703}));
+        ASSERT_NO_THROW(c.seals());
+        struct OriginalWorkerRetirement {uint64_t retiredInvocation(){return 23;}uint64_t retiredGeneration(){return 17;}uint64_t completion(){return 0;}} worker;
+        ASSERT_TRUE(source::retireAborted(c.args,worker));
+        for(auto& pointer:c.pool.owners){auto& owner=*pointer;owner.args.input.frontier=&source::frontier(c.args);
+            owner.args.input.condition=n::SourceCondition::Always;owner.args.input.outcome=nullptr;
+            ASSERT_TRUE(owner.run<n::OwnerAction::DrainSourceFailure>());
+            owner.args.input={c.pool.invocation(),nullptr,nullptr,nullptr,nullptr,nullptr};
+            ASSERT_TRUE(owner.run<n::OwnerAction::Release>());
+        }
+        source::stage(c.args)=source::ResponseStage::ReadersComplete; // Recorded real last-reader boundary; concrete graph proof is separate.
+        ASSERT_TRUE(source::planReleases(c.args));c.args.owner=c.pool.owners[local]->args;
+        for(uint32_t coordinate=0;coordinate<participants;++coordinate){auto& owner=c.pool.owners[coordinate]->args;
+            if(coordinate==local)ASSERT_TRUE(source::importLocalReleases<a::Slot64>(c.args));
+            else{
+                const auto bytes=n::progress(owner).release_bytes;
+                if(bytes)std::memcpy(c.args.frame+c.args.plan.offsets.fills,owner.frame+owner.plan.frame.release_receipts,bytes);
+                *n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes)=bytes;
+                ASSERT_TRUE(source::importRemoteReleases(c.args,coordinate));
+            }
+        }
+        ASSERT_TRUE(source::reconcileReleases(c.args));
+        ASSERT_NO_THROW(c.pool.all<n::OwnerAction::Retire>());
+        for(uint32_t coordinate=0;coordinate<participants;++coordinate){auto& owner=c.pool.owners[coordinate]->args;
+            if(coordinate==local){
+                auto* slot=n::at<p::RetiredHeader>(c.pool.args.native,c.pool.args.plan.native.ingress_frontier)+coordinate;
+                std::memset(slot,0xa5,sizeof(*slot));std::array<std::byte,sizeof(p::RetiredHeader)> poisoned{};std::memcpy(poisoned.data(),slot,sizeof(*slot));
+                if(defect==1)n::progress(owner).header_kind=n::OwnerHeaderKind::Ready;
+                if(defect==2)n::progress(owner).header_bytes=32;
+                if(defect==3)n::ownerView<a::Slot64>(owner).frame->phase=p::OwnerPhase::Draining;
+                if(defect==4)++n::at<p::RetiredHeader>(owner.native,owner.plan.native.header)->interval.admission;
+                if(defect==5)++n::at<p::RetiredHeader>(owner.native,owner.plan.native.header)->source.sequence;
+                const bool imported=source::importLocalRetired<a::Slot64>(c.args);EXPECT_EQ(imported,defect==0);
+                if(defect){EXPECT_EQ(std::memcmp(slot,poisoned.data(),sizeof(*slot)),0);EXPECT_EQ(source::progress(c.args).seals,coordinate);EXPECT_FALSE(source::finishReleased(c.args));break;}
+            }else{
+                const auto record=c.pool.owners[coordinate]->header<p::RetiredHeader>();
+                std::memcpy(c.args.native+c.args.plan.offsets.seal_receipt,&record,sizeof(record));
+                *n::at<n::OwnerHeaderKind>(c.args.native,c.args.plan.offsets.seal_receipt+sizeof(record))=n::progress(owner).header_kind;
+                ASSERT_TRUE(source::importRemoteRetired(c.args,coordinate));
+            }
+        }
+        if(!defect){ASSERT_TRUE(source::finishReleased(c.args));EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Idle);}
+    }
+}
+}
+
+namespace llaminar2::test {
+/**
+ * @brief A single independently located owner uses actual source/Ready and exact remote terminal parsing.
+ * @note ReadersComplete is the recorded real output boundary for this common replay;
+ * original source planning/response/consumption and physical Ready are executed, never assigned.
+ */
+TEST(PooledImmutableNative, TerminalP1RemoteActualReadyReleaseRetireFinishAcrossReset)
+{
+    namespace source=q::pooled_source;
+    for(uint32_t capacity:{0u,2u}){
+        DistributedSourceReplay c(std::vector<uint32_t>{capacity});
+        ASSERT_EQ(c.args.plan.coordinator.policy.participants(),1u);
+        ASSERT_EQ(c.args.plan.local_owner,a::None);
+        ASSERT_NE(c.pool.owners[0]->plan.allocator(),c.pool.plan.allocator());
+        std::array<int32_t,sampling_math::kDeviceGenerationControlCount> controller{};c.args.control=controller.data();
+        const std::array<std::vector<uint64_t>,4> requests{{{701,702,703,701},{701},{},{0x100000003ULL}}};
+        uint64_t completed=0,sourceBytes=0;
+        for(size_t request=0;request<requests.size();++request){
+            ASSERT_NO_THROW(publicationFilled(c,requests[request]));
+            ASSERT_NO_THROW(publicationAcquire(c));
+            ASSERT_TRUE(source::beforeReady(c.args));
+            ASSERT_NO_THROW(publicationReady(c));
+            const auto ready=c.pool.headers<p::ReadyHeader>();
+            ASSERT_TRUE(source::acquireReadyConsensus(c.args,ready.data(),ready.size()));
+            c.pool.args.input.frontier=ready.data();c.pool.args.input.source=&source::frontier(c.args);
+            ASSERT_NO_THROW(c.pool.run<n::CoordinatorAction::Publish>());c.pool.args.input={};
+            ASSERT_EQ(c.pool.view().frame->phase,p::LookupPhase::Ready);
+            auto& owner=*c.pool.owners[0];auto& args=owner.args;
+            ASSERT_TRUE(owner.run<n::OwnerAction::Release>());
+            const auto bytes=n::progress(args).release_bytes;
+            const std::vector<std::byte> retained(args.frame+args.plan.frame.release_receipts,args.frame+args.plan.frame.release_receipts+bytes);
+            sourceBytes+=source::protocol(c.args).nativeBytes;completed+=requests[request].size();
+            source::stage(c.args)=source::ResponseStage::ReadersComplete;
+            ASSERT_TRUE(source::planReleases(c.args));
+            if(bytes)std::memcpy(c.args.frame+c.args.plan.offsets.fills,retained.data(),bytes);
+            *n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes)=bytes;
+            ASSERT_TRUE(source::importRemoteReleases(c.args,0));EXPECT_EQ(source::releasedBytes(c.args),bytes);
+            ASSERT_TRUE(source::reconcileReleases(c.args));EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Ready);
+            ASSERT_TRUE(source::snapshotReleasedObservation(c.args));
+            ASSERT_TRUE(owner.run<n::OwnerAction::Retire>());
+            const auto retired=owner.header<p::RetiredHeader>();EXPECT_EQ(retired.status,a::Status::Success);
+            std::memcpy(c.args.native+c.args.plan.offsets.seal_receipt,&retired,sizeof(retired));
+            *n::at<n::OwnerHeaderKind>(c.args.native,c.args.plan.offsets.seal_receipt+sizeof(retired))=n::progress(args).header_kind;
+            ASSERT_TRUE(source::importRemoteRetired(c.args,0));
+            ASSERT_TRUE(source::finishReleased(c.args));
+            ASSERT_TRUE(source::observeReleased(c.args));
+            EXPECT_EQ(n::ownerView<a::Slot64>(args).frame->held_pins,0u);EXPECT_EQ(n::ownerView<a::Slot64>(args).frame->reservations,0u);
+            if(bytes)EXPECT_EQ(std::memcmp(retained.data(),args.frame+args.plan.frame.release_receipts,bytes),0);
+            q::QwenAdaptiveCounterTotals actual;ASSERT_TRUE(q::readQwenAdaptiveCounters(controller.data(),controller.size(),actual));
+            EXPECT_EQ(actual.calls,request+1);EXPECT_EQ(actual.completed_live_ids,completed);EXPECT_EQ(actual.source_bytes,sourceBytes);EXPECT_EQ(actual.failed_frames,0u);
+            EXPECT_EQ(source::stage(c.args),source::ResponseStage::ReadersComplete);EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Idle);
+        }
+    }
+}
+/** @brief Original same-device P1 remains on its original local path; remote P1 unsealed failures retire truthfully. */
+TEST(PooledImmutableNative, TerminalP1RemoteCancellationAndOriginalLocalBoundary)
+{
+    namespace source=q::pooled_source;
+    for(bool local:{false,true})for(uint32_t capacity:{0u,2u}){
+        DistributedSourceReplay c(std::vector<uint32_t>{capacity},local?std::optional<size_t>{0}:std::nullopt);
+        EXPECT_EQ(c.args.plan.local_owner,local?0u:a::None);
+        ASSERT_NO_THROW(c.plan(std::array<uint64_t,2>{701,702}));auto& owner=*c.pool.owners[0];
+        ASSERT_TRUE(owner.run<n::OwnerAction::CancelVictim>());owner.args.input.frontier=&source::frontier(c.args);
+        EXPECT_FALSE(owner.run<n::OwnerAction::SealSource>());EXPECT_FALSE(source::acquireSeal(c.args,owner.header<n::OwnerSourceSealReceipt>(),0));
+        struct Worker {uint64_t retiredInvocation(){return 23;}uint64_t retiredGeneration(){return 17;}uint64_t completion(){return 0;}} worker;
+        ASSERT_TRUE(source::retireAborted(c.args,worker));owner.args.input.frontier=&source::frontier(c.args);owner.args.input.condition=n::SourceCondition::Always;owner.args.input.outcome=nullptr;
+        ASSERT_TRUE(owner.run<n::OwnerAction::DrainSourceFailure>());
+        owner.args.input={c.pool.invocation(),nullptr,nullptr,nullptr,nullptr,nullptr};ASSERT_TRUE(owner.run<n::OwnerAction::Release>());
+        source::stage(c.args)=source::ResponseStage::ReadersComplete;
+        if(local){const auto before=n::progress(owner.args).release_bytes;EXPECT_FALSE(source::planReleases(c.args));EXPECT_EQ(n::progress(owner.args).release_bytes,before);continue;}
+        ASSERT_TRUE(source::planReleases(c.args));const auto bytes=n::progress(owner.args).release_bytes;
+        if(bytes)std::memcpy(c.args.frame+c.args.plan.offsets.fills,owner.args.frame+owner.args.plan.frame.release_receipts,bytes);
+        *n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes)=bytes;ASSERT_TRUE(source::importRemoteReleases(c.args,0));
+        ASSERT_TRUE(source::reconcileReleases(c.args));ASSERT_TRUE(owner.run<n::OwnerAction::Retire>());
+        const auto retired=owner.header<p::RetiredHeader>();EXPECT_EQ(retired.source.table,0u);EXPECT_EQ(retired.status,a::Status::Cancelled);
+        std::memcpy(c.args.native+c.args.plan.offsets.seal_receipt,&retired,sizeof(retired));*n::at<n::OwnerHeaderKind>(c.args.native,c.args.plan.offsets.seal_receipt+sizeof(retired))=n::progress(owner.args).header_kind;
+        ASSERT_TRUE(source::importRemoteRetired(c.args,0));ASSERT_TRUE(source::finishReleased(c.args));EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Idle);
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @brief C0 has no count receive; stale positive/poison words cannot become its payload or contaminate the next owner. */
+TEST(PooledImmutableNative, TerminalC0ReleaseSerialCountPoisonAcrossPositiveAndEmptyReplay)
+{
+    namespace source=q::pooled_source;
+    for(const auto& capacities:std::array<std::vector<uint32_t>,2>{{{2,0,2,0},{0,2,0,2}}}){
+        DistributedSourceReplay c(capacities);std::array<int32_t,sampling_math::kDeviceGenerationControlCount> control{};c.args.control=control.data();
+        const std::array<std::vector<uint64_t>,4> requests{{{701,702,703,704,705,706},{701},{},{0x100000003ULL,701}}};
+        for(size_t ordinal=0;ordinal<requests.size();++ordinal){
+            ASSERT_NO_THROW(publicationFilled(c,requests[ordinal]));
+            ASSERT_NO_THROW(publicationAcquire(c));
+            ASSERT_TRUE(source::beforeReady(c.args));
+            ASSERT_NO_THROW(publicationReady(c));
+            const auto ready=c.pool.headers<p::ReadyHeader>();ASSERT_TRUE(source::acquireReadyConsensus(c.args,ready.data(),ready.size()));
+            c.pool.args.input.frontier=ready.data();c.pool.args.input.source=&source::frontier(c.args);
+            ASSERT_NO_THROW(c.pool.run<n::CoordinatorAction::Publish>());c.pool.args.input={};
+            ASSERT_NO_THROW(c.pool.all<n::OwnerAction::Release>());
+            source::stage(c.args)=source::ResponseStage::ReadersComplete; // Recorded actual output/drain boundary; this is common-parser evidence.
+            ASSERT_TRUE(source::planReleases(c.args));uint64_t aggregate=0;
+            for(uint32_t owner=0;owner<capacities.size();++owner){auto& original=c.pool.owners[owner]->args;const auto bytes=n::progress(original).release_bytes;
+                if(capacities[owner]){
+                    if(bytes)std::memcpy(c.args.frame+c.args.plan.offsets.fills,original.frame+original.plan.frame.release_receipts,bytes);
+                    *n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes)=bytes; // Actual decoded counted receive, including a positive-capacity live0 packet.
+                }else{
+                    EXPECT_EQ(bytes,0u);
+                    *n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes)=~uint64_t{0}; // No C0 endpoint is issued; old serial storage remains inactive.
+                }
+                ASSERT_TRUE(source::importRemoteReleases(c.args,owner))<<"owner="<<owner<<" request="<<ordinal;
+                aggregate+=bytes;EXPECT_EQ(source::releasedBytes(c.args),aggregate);EXPECT_EQ(source::progress(c.args).packets,owner+1);
+                EXPECT_EQ(n::progress(original).release_bytes,bytes);
+            }
+            ASSERT_TRUE(source::reconcileReleases(c.args));ASSERT_TRUE(source::snapshotReleasedObservation(c.args));
+            ASSERT_NO_THROW(c.pool.all<n::OwnerAction::Retire>());
+            for(uint32_t owner=0;owner<capacities.size();++owner){const auto retired=c.pool.owners[owner]->header<p::RetiredHeader>();
+                std::memcpy(c.args.native+c.args.plan.offsets.seal_receipt,&retired,sizeof(retired));*n::at<n::OwnerHeaderKind>(c.args.native,c.args.plan.offsets.seal_receipt+sizeof(retired))=n::progress(c.pool.owners[owner]->args).header_kind;
+                ASSERT_TRUE(source::importRemoteRetired(c.args,owner));
+            }
+            ASSERT_TRUE(source::finishReleased(c.args));ASSERT_TRUE(source::observeReleased(c.args));
+            EXPECT_EQ(c.pool.view().frame->phase,p::LookupPhase::Idle);q::QwenAdaptiveCounterTotals totals;ASSERT_TRUE(q::readQwenAdaptiveCounters(control.data(),control.size(),totals));EXPECT_EQ(totals.calls,ordinal+1);EXPECT_EQ(totals.failed_frames,0u);
+        }
+    }
+}
+/** @brief A geometrically absent payload is not an owner completion: missing C0 Retired60 still blocks Finish. */
+TEST(PooledImmutableNative, TerminalC0ReleaseStillRequiresActualNominalRetiredReceipt)
+{
+    namespace source=q::pooled_source;DistributedSourceReplay c(std::vector<uint32_t>{2,0});
+    ASSERT_NO_THROW(publicationFilled(c,std::array<uint64_t,1>{701}));
+    ASSERT_NO_THROW(publicationAcquire(c));
+    ASSERT_NO_THROW(publicationReady(c));
+    const auto ready=c.pool.headers<p::ReadyHeader>();ASSERT_TRUE(source::acquireReadyConsensus(c.args,ready.data(),ready.size()));
+    c.pool.args.input.frontier=ready.data();c.pool.args.input.source=&source::frontier(c.args);ASSERT_NO_THROW(c.pool.run<n::CoordinatorAction::Publish>());c.pool.args.input={};
+    ASSERT_NO_THROW(c.pool.all<n::OwnerAction::Release>());source::stage(c.args)=source::ResponseStage::ReadersComplete;
+    ASSERT_TRUE(source::planReleases(c.args));
+    for(uint32_t owner=0;owner<2;++owner){auto& original=c.pool.owners[owner]->args;const auto bytes=n::progress(original).release_bytes;if(bytes)std::memcpy(c.args.frame+c.args.plan.offsets.fills,original.frame+original.plan.frame.release_receipts,bytes);*n::at<uint64_t>(c.args.native,c.args.plan.offsets.record_bytes)=bytes;ASSERT_TRUE(source::importRemoteReleases(c.args,owner));}
+    ASSERT_TRUE(source::reconcileReleases(c.args));ASSERT_NO_THROW(c.pool.all<n::OwnerAction::Retire>());
+    const auto retired=c.pool.owners[0]->header<p::RetiredHeader>();std::memcpy(c.args.native+c.args.plan.offsets.seal_receipt,&retired,sizeof(retired));*n::at<n::OwnerHeaderKind>(c.args.native,c.args.plan.offsets.seal_receipt+sizeof(retired))=n::OwnerHeaderKind::Retired;
+    ASSERT_TRUE(source::importRemoteRetired(c.args,0));EXPECT_FALSE(source::finishReleased(c.args));EXPECT_NE(c.pool.view().frame->phase,p::LookupPhase::Idle);EXPECT_EQ(source::progress(c.args).seals,1u);
+}
+}
+
+namespace llaminar2::test {
+/** @brief Reject P and UINT32_MAX before any original geometry indexing, also with a real local coordinate0. */
+TEST(PooledImmutableNative, TerminalC0ReleaseRejectsForeignOwnerBeforeGeometryAccess)
+{
+    namespace source=q::pooled_source;
+    for(uint32_t owner:{2u,UINT32_MAX}){
+        ASSERT_EXIT({
+            DistributedSourceReplay c(std::vector<uint32_t>{2,0},0);
+            auto* extent=n::at<uint64_t>(c.pool.args.native,c.pool.args.plan.native.ingress_count);*extent=0x123456789abcdef0ULL;
+            const auto before=*extent;
+            const bool accepted=source::importRemoteReleases(c.args,owner);
+            std::_Exit(!accepted && *extent==before?0:87);
+        },::testing::ExitedWithCode(0),"");
+    }
+}
+/** @test Retained identity validation remains mandatory in empty Free/Victim waves across reset. */
+TEST(PooledImmutableNative, RetainedIdentityEmptyAllocationWavesReplay)
+{
+    for(const unsigned live:{0u,1u,63u,64u,65u,127u,128u,129u,255u,256u,257u,513u}){
+        Pool pool(std::array{live},std::max(1u,live),a::Policy{65536,1,2},std::nullopt,std::max(1u,live));
+        std::vector<std::uint64_t> rows(live);
+        for(unsigned i=0;i<live;++i)rows[i]=100+i;
+        ASSERT_NO_THROW(pool.complete(rows));
+        for(unsigned replay=0;replay<3;++replay){
+            ASSERT_NO_THROW(pool.begin(rows,replay+2));
+            auto& x=pool.owners.front()->args;
+            EXPECT_EQ(n::ownerView<a::Slot64>(x).frame->initial_pin_count,live);
+            ASSERT_NO_THROW(pool.wave<false>());
+            EXPECT_EQ(n::allocationFrame(x).count,0u);
+            ASSERT_NO_THROW(pool.wave<true>());
+            EXPECT_EQ(n::allocationFrame(x).count,0u);
+            ASSERT_NO_THROW(pool.finish());
+            EXPECT_EQ(n::ownerView<a::Slot64>(x).frame->held_pins,0u);
+            ASSERT_NO_THROW(pool.complete(rows.empty()?std::span<const std::uint64_t>{}:std::span<const std::uint64_t>{rows.data(),1},replay+2));
+            ASSERT_NO_THROW(pool.complete({},replay+2));
+        }
+    }
+}
+/** @test An empty incoming plan still rejects duplicate/foreign retained pins before plan mutation. */
+TEST(PooledImmutableNative, EmptyAllocationRejectsCorruptRetainedIdentityBeforeCommit)
+{
+    for(bool victim:{false,true})for(unsigned defect=0;defect<4;++defect){
+        Pool pool(std::array{128u},128,a::Policy{65536,1,2},std::nullopt,128);
+        std::vector<std::uint64_t> rows(128);for(unsigned i=0;i<128;++i)rows[i]=100+i;
+        ASSERT_NO_THROW(pool.complete(rows));
+        ASSERT_NO_THROW(pool.begin(rows,2));
+        if(victim)ASSERT_NO_THROW(pool.wave<false>());
+        auto& x=pool.owners.front()->args;
+        auto before=n::allocationFrame(x);
+        auto slotBytes=pool.owners.front()->cache;
+        auto corrupt=[&](size_t){
+            before=n::allocationFrame(x);
+            auto* pins=n::ownerView<a::Slot64>(x).initial_pins;
+            if(defect==0)pins[127].row=pins[0].row;
+            if(defect==1)pins[127].unique=pins[0].unique;
+            if(defect==2)++pins[127].owner;
+            if(defect==3)++pins[127].interval.sequence;
+        };
+        if(victim)EXPECT_THROW(pool.receivedVictims(corrupt),std::logic_error);
+        else EXPECT_THROW(pool.receivedFree({},corrupt),std::logic_error);
+        EXPECT_EQ(n::allocationFrame(x).count,before.count);
+        EXPECT_EQ(n::allocationFrame(x).phase,before.phase);
+        EXPECT_EQ(n::ownerView<a::Slot64>(x).frame->held_pins,128u);
+        EXPECT_EQ(n::ownerView<a::Slot64>(x).frame->initial_pin_count,128u);
+        EXPECT_EQ(std::memcmp(pool.owners.front()->cache.data(),slotBytes.data(),slotBytes.blocks.size()*64),0);
+    }
+}
+
+/** @test Recorded scalar inputs retain actual native64-byte alignment and exact logical extents. */
+TEST(PooledImmutableNative, RecordedSnapshotAlignmentAndActualOwnerReplay)
+{
+    static_assert(PooledImmutableNativeReplayBytes::Alignment>=alignof(p::OwnerFrame));
+    static_assert(PooledImmutableNativeReplayBytes::Alignment>=alignof(p::PhysicalOwnerControl));
+    static_assert(PooledImmutableNativeReplayBytes::Alignment>=alignof(n::OwnerProgress));
+    for(const std::size_t count:{0u,1u,63u,64u,65u,129u,1027u}){
+        PooledImmutableNativeReplayBytes bytes(count);
+        EXPECT_EQ(bytes.size(),count);
+        if(count){
+            EXPECT_EQ(reinterpret_cast<std::uintptr_t>(bytes.data())%64,0u);
+            for(std::size_t i=0;i<count;++i)bytes.data()[i]=std::byte(i%251);
+        }else EXPECT_EQ(bytes.data(),nullptr);
+        auto copy=bytes;
+        EXPECT_EQ(copy.size(),count);
+        if(count){EXPECT_EQ(reinterpret_cast<std::uintptr_t>(copy.data())%64,0u);EXPECT_EQ(std::memcmp(copy.data(),bytes.data(),count),0);}
+        PooledImmutableNativeReplayBytes assigned;assigned=copy;
+        auto moved=std::move(assigned);
+        EXPECT_EQ(assigned.size(),0u);EXPECT_EQ(assigned.data(),nullptr);EXPECT_EQ(moved.size(),count);
+        if(count){EXPECT_EQ(reinterpret_cast<std::uintptr_t>(moved.data())%64,0u);EXPECT_EQ(std::memcmp(moved.data(),bytes.data(),count),0);}
+    }
+    Pool pool(std::array{2u});const std::array<std::uint64_t,2> rows{101,102};
+    ASSERT_NO_THROW(pool.complete(rows));
+    ASSERT_NO_THROW(pool.begin(rows,2));
+    const auto& original=pool.owners.front()->args;
+    PooledImmutableNativeReplayBytes cache(original.plan.cache.bytes),frame(original.plan.frame.bytes),native(original.plan.native.bytes);
+    std::memcpy(cache.data(),original.cache,cache.size());std::memcpy(frame.data(),original.frame,frame.size());std::memcpy(native.data(),original.native,native.size());
+    n::OwnerArgs recorded{original.plan,cache.data(),frame.data(),native.data(),original.input};
+    ASSERT_TRUE((n::owner<n::OwnerAction::Availability,a::Slot64>(recorded)));
+    const auto lease=n::allocationFrame(recorded).lease;
+    n::FreePlanHeader header{lease,0,a::Status::Success,n::Version};
+    recorded.input.frontier=&header;recorded.input.records=nullptr;recorded.input.record_bytes=nullptr;
+    ASSERT_TRUE((n::owner<n::OwnerAction::AcceptFree,a::Slot64>(recorded)));
+    EXPECT_EQ(n::allocationFrame(recorded).phase,p::AllocationPhase::Accepted);
+    EXPECT_EQ(n::allocationFrame(recorded).count,0u);
+    EXPECT_EQ(n::ownerView<a::Slot64>(recorded).frame->held_pins,2u);
+    EXPECT_EQ(n::ownerView<a::Slot64>(original).frame->phase,p::OwnerPhase::Reserving);
+}
+
 }

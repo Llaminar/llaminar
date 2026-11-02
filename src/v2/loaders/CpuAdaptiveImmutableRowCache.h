@@ -49,6 +49,9 @@ public:
      */
     static CpuAdaptiveImmutableRowCacheGeometry forSubordinateGPU(const ImmutableRowTableLayoutGeometry &layout,
         PhysicalMemoryAllocatorIdentity host,PhysicalMemoryAllocatorIdentity requester,CpuImmutableRowCachePolicy policy = {});
+    /** @brief Declare one shared source/cache with disjoint outstanding grants for every original GPU consumer. */
+    static CpuAdaptiveImmutableRowCacheGeometry forSubordinateGPUs(const ImmutableRowTableLayoutGeometry &layout,
+        PhysicalMemoryAllocatorIdentity host,CpuImmutableRowCachePolicy policy = {});
     /**
      * @brief Contribute exact source-owned storage and mandatory execution to canonical PMA.
      * @param resource Exact observed host resource from the canonical rank planner.
@@ -88,9 +91,10 @@ private:
     ImmutableRowTableHostPlacement locality_;
     CpuImmutableRowCachePolicy policy_;
     std::optional<PhysicalMemoryAllocatorIdentity> requester_;
+    std::vector<PhysicalMemoryAllocatorIdentity> requesters_;
     std::size_t slots_=0,maximum_live_rows_=0,index_count_=0,sketch_count_=0,request_count_=0,protected_limit_=0;
     std::size_t index_offset_=0,heap_offset_=0,sketch_offset_=0,payload_offset_=0;
-    std::size_t plan_offset_=0,scatter_offset_=0,grant_offset_=0,read_rows_offset_=0;
+    std::size_t plan_offset_=0,scatter_offset_=0,grant_offset_=0,read_rows_offset_=0,channels_offset_=0;
     std::size_t storage_bytes_=0,source_bytes_=0,execution_bytes_=0;
 };
 /**
@@ -208,10 +212,10 @@ private:
     class ReadGrant final {
     public:
         ReadGrant(ReadGrant &&) noexcept = default;
-        ReadGrant &operator=(ReadGrant &&) noexcept = default;
+        ReadGrant &operator=(ReadGrant &&) noexcept;
         ReadGrant(const ReadGrant &)=delete;
         ReadGrant &operator=(const ReadGrant &)=delete;
-        ~ReadGrant()=default;
+        ~ReadGrant();
     private:
         friend class CpuAdaptiveImmutableRowCache;
         friend class HostImmutableRowProvider;
@@ -220,23 +224,27 @@ private:
         ReadGrant(std::shared_ptr<Impl> owner,const qwen4exp::ImmutableLookupHostProcessor *channel,
             std::uint64_t generation,std::uint64_t sequence,std::span<const std::int64_t> ids,
             std::span<const ImmutableRowSubordinateIntent> intents,
-            std::span<ImmutableRowInvalidationAcknowledgement> acknowledgements)
+            std::span<ImmutableRowInvalidationAcknowledgement> acknowledgements,std::size_t channel_index)
             :owner_(std::move(owner)),channel_(channel),generation_(generation),sequence_(sequence),
-             row_count_(ids.size()),ids_(ids),intents_(intents),acknowledgements_(acknowledgements) {}
+             row_count_(ids.size()),channel_index_(channel_index),ids_(ids),intents_(intents),acknowledgements_(acknowledgements) {}
         /** @brief Retain only CPU-owned completed rows after response release; mapped input is mutable after consumption. */
         void complete() noexcept {ids_={};intents_={};acknowledgements_={};}
         std::shared_ptr<Impl> owner_;
         const qwen4exp::ImmutableLookupHostProcessor *channel_;
         std::uint64_t generation_,sequence_;
-        std::size_t row_count_;
+        void release() noexcept; ///< Drop only this completed response's retained cache pins.
+        std::size_t row_count_,channel_index_;
+        mutable std::size_t retained_rows_=0;
         std::span<const std::int64_t> ids_;
         std::span<const ImmutableRowSubordinateIntent> intents_;
         std::span<ImmutableRowInvalidationAcknowledgement> acknowledgements_;
     };
     /** @return Sole declared requester, absent for independently readable CPU domains. */
     std::optional<PhysicalMemoryAllocatorIdentity> subordinateRequester() const noexcept;
+    /** @return Closed original requester population; empty only for independent CPU ownership. */
+    std::span<const PhysicalMemoryAllocatorIdentity> subordinateRequesters() const noexcept;
     /** @brief Bind one actual retained processor once; no independent channel may bypass invalidation. */
-    void bindSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel);
+    void bindSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel,DeviceId requester=DeviceId::invalid());
     /** @brief Retire that binding without waiting; old pins retain physical backing. */
     void retireSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel) noexcept;
     /** @brief Mint a retained read capability only for the actual acquired bound channel frame. */

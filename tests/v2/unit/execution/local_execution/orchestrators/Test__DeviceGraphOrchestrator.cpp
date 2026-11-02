@@ -309,6 +309,51 @@ struct DeviceGraphOrchestratorServingBuffersTestAccess
  */
 struct DeviceGraphOrchestratorPublicationProgramsTestAccess
 {
+    /** @brief Actual no-launch rejection preserves the original mailbox; pending writes still block readers. */
+    static void provePrelaunchFailure(DeviceGraphOrchestrator &owner, DeviceId device)
+    {
+        const auto old_device = owner.state_.device_id;
+        owner.state_.device_id = device;
+        std::array<int32_t,7> rows{};
+        auto &mailbox = owner.device_resident_logical_sequence_state_mailbox_;
+        mailbox.request_count=1;
+        mailbox.target_positions_device=&rows[0];
+        mailbox.target_sequence_lengths_device=&rows[1];
+        mailbox.accepted_state_counts_device=&rows[2];
+        mailbox.next_condition_tokens_device=&rows[3];
+        mailbox.all_drafts_accepted_flags_device=&rows[4];
+        mailbox.stopped_flags_device=&rows[5];
+        mailbox.publication_ok_flags_device=&rows[6];
+        mailbox.producer_stream=rows.data();
+        mailbox.ready_event=std::make_shared<int>(1);
+        mailbox.publication_generation=7;
+        ASSERT_TRUE(mailbox.valid());
+        const auto original_event=mailbox.ready_event;
+        // These are metadata-only borrows: the invalid cache must reject before
+        // any context lookup, tensor dereference, native capture or enqueue.
+        std::string error;
+        EXPECT_FALSE(owner.executeMTPStatePublicationGraph(rows.data(),&error,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch));
+        EXPECT_FALSE(error.empty());
+        EXPECT_FALSE(owner.pending_device_resident_logical_state_writer_.valid());
+        EXPECT_TRUE(mailbox.valid());
+        EXPECT_EQ(mailbox.ready_event,original_event);
+        EXPECT_EQ(mailbox.publication_generation,7u);
+        EXPECT_EQ(mailbox.target_positions_device,&rows[0]);
+        // Unknown/possibly-enqueued writers remain fail closed. This fixture
+        // creates no writes and only exercises the existing admission guard.
+        owner.pending_device_resident_logical_state_writer_.begin(rows.data(),7,"test_pending_writer");
+        bool pending=false;
+        EXPECT_FALSE(owner.waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
+            rows.data(),"test_prelaunch_observer",&pending));
+        EXPECT_TRUE(pending);
+        EXPECT_TRUE(owner.pending_device_resident_logical_state_writer_.valid());
+        EXPECT_EQ(mailbox.publication_generation,7u);
+        owner.pending_device_resident_logical_state_writer_.clear();
+        mailbox.clear();
+        owner.state_.device_id=old_device;
+    }
+
     /** @brief Prove exact-width metadata owners survive arbitrary selection and retire before hooks. */
     static void proveExactWidths(DeviceGraphOrchestrator &owner)
     {
@@ -524,6 +569,31 @@ namespace
         return buffer.str();
     }
 
+    /**
+     * @brief Read the serving-family implementation registered in the core target.
+     * @return The actual compiled family source; absent registration fails closed.
+     *
+     * Source-policy checks follow the physical implementation rather than an
+     * assumed location in the main orchestrator translation unit. The CMake
+     * source inventory must name this file before any policy can be certified.
+     */
+    std::string readServingGraphFamilySourceForTest()
+    {
+        const std::string relative =
+            "execution/local_execution/orchestrators/"
+            "DeviceGraphOrchestratorServingGraphFamily.cpp";
+        const auto inventory = readSourceFileForDeviceGraphOrchestratorTest(
+            "src/v2/CMakeLists.txt");
+        const auto registration = "    " + relative + "\n";
+        const auto found = inventory.find(registration);
+        EXPECT_NE(found, std::string::npos);
+        if (found == std::string::npos)
+            return {};
+        EXPECT_EQ(inventory.find(registration, found + registration.size()),
+                  std::string::npos);
+        return readSourceFileForDeviceGraphOrchestratorTest("src/v2/" + relative);
+    }
+
     bool canReuseCachedFFNGraphForTest(
         const LayerGraphCache &cache,
         int seq_len,
@@ -584,15 +654,13 @@ namespace
         ServingFamilySealsHistoryBearingDecodeBeforeFollowerAdmission)
     {
         const std::string source =
-            readSourceFileForDeviceGraphOrchestratorTest(
-                "src/v2/execution/local_execution/orchestrators/"
-                "DeviceGraphOrchestrator.cpp");
+            readServingGraphFamilySourceForTest();
         ASSERT_FALSE(source.empty());
 
         const size_t begin = source.find(
             "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
         const size_t end = source.find(
-            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            "} // namespace llaminar2",
             begin);
         ASSERT_NE(begin, std::string::npos);
         ASSERT_NE(end, std::string::npos);
@@ -638,9 +706,7 @@ namespace
         ServingFamilyMaterializesCompleteMTPForwardInventoryBeforeSeal)
     {
         const std::string source =
-            readSourceFileForDeviceGraphOrchestratorTest(
-                "src/v2/execution/local_execution/orchestrators/"
-                "DeviceGraphOrchestrator.cpp");
+            readServingGraphFamilySourceForTest();
         ASSERT_FALSE(source.empty());
 
         const size_t helper_begin = source.find(
@@ -670,11 +736,19 @@ namespace
             std::string::npos);
 
         const size_t serving_end = source.find(
-            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            "} // namespace llaminar2",
             serving_begin);
         ASSERT_NE(serving_end, std::string::npos);
         const std::string serving = source.substr(
             serving_begin, serving_end - serving_begin);
+        const size_t template_preparation = serving.find(
+            "graph_builder_->prepareForwardGraphTemplate(state_.device_id)");
+        const size_t workspace_declaration = serving.find(
+            "materializeForwardGraphForShape(");
+        ASSERT_NE(template_preparation, std::string::npos);
+        ASSERT_NE(workspace_declaration, std::string::npos);
+        EXPECT_LT(template_preparation, workspace_declaration)
+            << "Workspace and executable specializations must share one cold recipe.";
         const size_t mtp_family = serving.find(
             "materializeMTPServingForwardExecutablesWithoutLaunch(");
         const size_t sealed = serving.rfind(
@@ -697,15 +771,13 @@ namespace
         EagerHostServingFamilyMaterializesAndSealsWithoutInference)
     {
         const std::string source =
-            readSourceFileForDeviceGraphOrchestratorTest(
-                "src/v2/execution/local_execution/orchestrators/"
-                "DeviceGraphOrchestrator.cpp");
+            readServingGraphFamilySourceForTest();
         ASSERT_FALSE(source.empty());
 
         const size_t begin = source.find(
             "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
         const size_t end = source.find(
-            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            "} // namespace llaminar2",
             begin);
         ASSERT_NE(begin, std::string::npos);
         ASSERT_NE(end, std::string::npos);
@@ -2528,6 +2600,18 @@ TEST_F(Test__DeviceGraphOrchestrator, HostedExactVerifierPublicationOwnersRetain
     DeviceGraphOrchestratorPublicationProgramsTestAccess::proveExactWidths(owner);
 }
 
+/** @test No-launch rejection preserves original publication authority and unknown writes still block readers. */
+TEST_F(Test__DeviceGraphOrchestrator, PublicationPrelaunchFailureKeepsOriginalMailbox)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(test::qwen4MetadataFixture(false), config);
+    config.default_device=DeviceId::cpu();
+    auto builder=std::make_shared<QwenStandardGraph>(config,nullptr);
+    DeviceGraphOrchestrator owner(builder,nullptr);
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+        DeviceGraphOrchestratorPublicationProgramsTestAccess::provePrelaunchFailure(owner,device);
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
@@ -3581,11 +3665,13 @@ TEST_F(Test__DeviceGraphOrchestrator, DeviceHotPrefixTierHasNoRamReplayPath)
             "prefix_backend->deviceCopyAsync("),
         std::string::npos);
 
-    const auto materialize_pos = orchestrator_source.find(
+    const auto serving_source = readServingGraphFamilySourceForTest();
+    ASSERT_FALSE(serving_source.empty());
+    const auto materialize_pos = serving_source.find(
         "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch(");
-    const auto prefix_ready_pos = orchestrator_source.find(
+    const auto prefix_ready_pos = serving_source.find(
         "prefix_cache_ready = ensurePrefixCacheReady()", materialize_pos);
-    const auto graph_materialization_pos = orchestrator_source.find(
+    const auto graph_materialization_pos = serving_source.find(
         "materializeForwardGraphForShape(", materialize_pos);
     ASSERT_NE(materialize_pos, std::string::npos);
     ASSERT_NE(prefix_ready_pos, std::string::npos);

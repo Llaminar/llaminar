@@ -1,52 +1,81 @@
 /**
  * @file PooledImmutableSourcePreparedStorage.cpp
  * @brief Exact physical source staging with no duplicate PMA ledger or host state shadow.
+ *
+ * The same source geometry also declares its closed setup/publication event
+ * program before native materialization; no independent event count is authored.
  */
 #include "PooledImmutableSourcePreparedStorage.h"
 #include "PooledImmutableNativeRootStorage.h"
 #include <stdexcept>
 #include <limits>
 namespace llaminar2::qwen4exp {
+void PooledImmutableSourcePreparedStorage::bindPreparedSourceWorkers(std::shared_ptr<NativeContextPreparation> source,
+    PreparedGPUContextUsePermit coordinator,std::vector<PreparedGPUContextUsePermit> owners){
+    if(prepared_workers_ || !source || owners.size()!=owners_.size())
+        throw std::logic_error("Prepared source worker materialization is missing, duplicate or incomplete");
+    const auto observed=retainedOwnerObservation();const auto& memory=source->memory();
+    if(observed.authority().get()!=memory.get() || observed.authority().owner_before(memory) || memory.owner_before(observed.authority()))
+        throw std::logic_error("Prepared source roots have a foreign original PMA/control block");
+    const auto authenticate=[&](const PreparedGPUContextUsePermit& permit,PhysicalMemoryAllocatorIdentity allocator){
+        if(permit.memory().get()!=memory.get() || permit.memory().owner_before(memory) || memory.owner_before(permit.memory()) ||
+           allocator!=PhysicalMemoryAllocatorIdentity{memory->worldRank(),permit.device()})
+            throw std::logic_error("Materialized native source has a foreign physical worker/authority");
+        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(permit.device(),memory);
+        original.requireWorker(permit.worker());
+        if(original.generation()!=permit.generation())throw std::logic_error("Materialized native source worker generation changed");
+    };
+    authenticate(coordinator,coordinator_->plan().allocator());
+    for(std::size_t i=0;i<owners.size();++i)authenticate(owners[i],owners_[i]->plan().allocator());
+    // The private ModelContext caller reaches here only after all original native
+    // initializers and source materialization completed, never at prebinding.
+    prepared_workers_=PreparedImmutableSourceWorkers(std::move(source),std::move(coordinator),std::move(owners),captureIdentity());
+}
 std::shared_ptr<PooledImmutableSourcePreparedStorage> PooledImmutableSourcePreparedStorage::materialize(
-    PooledImmutableSourceGeometry geometry,std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,
-    std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream)
+    PooledImmutableSourceGeometry geometry,std::vector<std::shared_ptr<PooledImmutableOwnerPreparedStorage>> owners,
+    std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,
+    void* stream,std::unique_ptr<NativeOrderingEventGroup> group)
 {
     const auto& p=geometry.parameters();
-    if(!owner || !coordinator || owner->plan().parameters().identity!=p.owner.identity || coordinator->plan().parameters().identity!=p.coordinator.identity)
-        throw std::invalid_argument("Pooled source cannot replace its original accepted-grant or coordinator roots");
-    // This first production source slice has one exact local delivery edge.
-    // The declaration itself remains independent; absent routed/native edges
-    // are diagnosed before materialization rather than inferred from a cohort.
-    if(p.owner.owner.participants()!=1 || p.owner.owner.coordinate()!=0 || p.owner.device!=p.coordinator.device ||
-        owner->plan().allocator()!=coordinator->plan().allocator())
-        throw std::invalid_argument("Pooled source edge requires the pending explicit directed owner transport; local delivery cannot represent this declared edge");
-    // Equal-shaped certificates are not authority. Authenticate the original
-    // claim owners before source allocation or service registration can publish.
-    owner->requireAuthority(memory);coordinator->requireAuthority(memory);
-    owner->captureIdentity();coordinator->captureIdentity();
-    auto roots=detail::PooledNativeRootStorage::create(geometry.allocator(),{0,p.offsets.frame_bytes,p.offsets.native_bytes},p.identity,std::move(memory),stream);
+    if(!coordinator || owners.size()!=geometry.originalOwners().size() || coordinator->plan().parameters().identity!=p.coordinator.identity)
+        throw std::invalid_argument("Pooled source replaced its original complete coordinator/cohort");
+    for(const auto& owner:owners)if(owner && owner->plan().allocator()!=coordinator->plan().allocator()){
+        const auto a=owner->plan().allocator(),c=coordinator->plan().allocator();
+        if(a.world_rank!=c.world_rank || !a.device.is_gpu() || !c.device.is_gpu() || a.device.type==c.device.type)
+            throw std::invalid_argument("Native/rank source fill requires its qualified admitted native transport/factory; mapped replacement forbidden");
+    }
+    coordinator->requireAuthority(memory);coordinator->captureIdentity();
+    for(std::size_t i=0;i<owners.size();++i){
+        if(!owners[i] || owners[i]->plan().parameters().identity!=geometry.originalOwners()[i].parameters().identity)
+            throw std::invalid_argument("Pooled source replaced original ordered owner roots");
+        coordinator->plan().requireOwnerPlan(owners[i]->plan());owners[i]->requireAuthority(memory);owners[i]->captureIdentity();
+    }
+    auto roots=group ? detail::PooledNativeRootStorage::createWithOrderingGroup(geometry.allocator(),
+        {0,p.offsets.frame_bytes,p.offsets.native_bytes},p.identity,std::move(memory),stream,geometry.orderingProgram(),std::move(group))
+        : detail::PooledNativeRootStorage::create(geometry.allocator(),{0,p.offsets.frame_bytes,p.offsets.native_bytes},p.identity,std::move(memory),stream,geometry.orderingProgram());
     return std::shared_ptr<PooledImmutableSourcePreparedStorage>(new PooledImmutableSourcePreparedStorage(
-        std::move(geometry),std::move(owner),std::move(coordinator),std::move(roots)));
+        std::move(geometry),std::move(owners),std::move(coordinator),std::move(roots)));
 }
 PooledImmutableNativeRoots PooledImmutableSourcePreparedStorage::roots()const{return roots_->roots();}
 void PooledImmutableSourcePreparedStorage::requireFor(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,const ImmutableRowTableSource& source,
     const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const{
-    owner_->requireAuthority(memory);coordinator_->requireAuthority(memory);roots_->requireAuthority(memory);
-    const auto& original=owner_->plan().parameters();
-    const auto owner=PooledImmutableOwnerNativePlan::fromGeometry(physical,coordinator,original.owner.coordinate(),
-        original.table,original.source_storage_generation);
-    const auto policy=PooledImmutableCoordinatorNativePlan::fromGeometry(physical,coordinator,
-        original.table,original.source_storage_generation);
-    const auto expected=PooledImmutableSourceGeometry::fromPlans(owner,policy,source);
-    if(owner.parameters().identity!=original.identity || policy.parameters().identity!=coordinator_->plan().parameters().identity ||
-       expected.parameters().identity!=geometry_.parameters().identity)
-        throw std::logic_error("Pooled source reuse changed original source, policy or physical root declarations");
+    coordinator_->requireAuthority(memory);roots_->requireAuthority(memory);
+    const auto& original=coordinator_->plan().parameters();std::vector<PooledImmutableOwnerNativePlan> declarations;
+    for(std::size_t i=0;i<owners_.size();++i){owners_[i]->requireAuthority(memory);declarations.push_back(PooledImmutableOwnerNativePlan::fromGeometry(physical,coordinator,i,original.table,original.source_storage_generation));
+        if(declarations.back().parameters().identity!=owners_[i]->plan().parameters().identity)throw std::logic_error("Pooled source changed original physical owner declaration");}
+    const auto policy=PooledImmutableCoordinatorNativePlan::fromGeometry(physical,coordinator,original.table,original.source_storage_generation);
+    const auto expected=PooledImmutableSourceGeometry::fromPlans(declarations,policy,source);
+    if(policy.parameters().identity!=original.identity || expected.parameters().identity!=geometry_.parameters().identity)
+        throw std::logic_error("Pooled source changed its original source/policy/cohort");
     captureIdentity();
 }
 ImmutableLookupNativeOwnerObservation PooledImmutableSourcePreparedStorage::retainedOwnerObservation()const{
     const auto source=roots_->retainedOwnerObservation();std::size_t storage=source.tableStorageBytes(),staging=source.lookupStagingBytes();
-    for(const auto& part:{owner_->retainedOwnerObservation(),coordinator_->retainedOwnerObservation()}){
+    std::vector<ImmutableLookupNativeOwnerObservation> parts{coordinator_->retainedOwnerObservation()};
+    if(geometry_.parameters().local_owner!=adaptive_lookup::None)parts.push_back(owner()->retainedOwnerObservation());
+    // Remote roots retain/report their own allocator claims; never fold them into this source allocator.
+    for(const auto& part:parts){
         if(part.authority()!=source.authority() || part.allocator()!=source.allocator())
             throw std::logic_error("Local pooled lease observation has foreign original authorities or allocators");
         if(part.tableStorageBytes()>std::numeric_limits<std::size_t>::max()-storage ||
@@ -57,8 +86,8 @@ ImmutableLookupNativeOwnerObservation PooledImmutableSourcePreparedStorage::reta
     return {source.authority(),source.allocator(),storage,staging};
 }
 std::uint64_t PooledImmutableSourcePreparedStorage::captureIdentity()const{
-    auto value=roots_->identity();value=(value^owner_->captureIdentity())*1099511628211ULL;
+    auto value=roots_->identity();for(const auto& owner:owners_)value=(value^owner->captureIdentity())*1099511628211ULL;
     value=(value^coordinator_->captureIdentity())*1099511628211ULL;return value?value:1;
 }
-void PooledImmutableSourcePreparedStorage::acquireSetup(void* stream)const{owner_->acquireSetup(stream);coordinator_->acquireSetup(stream);roots_->acquire(stream);}
+void PooledImmutableSourcePreparedStorage::acquireSetup(void* stream)const{if(geometry_.parameters().local_owner!=adaptive_lookup::None)owner()->acquireSetup(stream);coordinator_->acquireSetup(stream);roots_->acquire(stream);}
 }

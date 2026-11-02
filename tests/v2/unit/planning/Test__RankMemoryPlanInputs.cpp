@@ -23,6 +23,8 @@
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "config/OrchestrationConfig.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
+#include "fixtures/backends/NativeContextPreparationReplayAccess.h"
+#include "mocks/MockWorkerGPUContext.h"
 #include <gtest/gtest.h>
 #include <limits>
 #include <algorithm>
@@ -32,6 +34,24 @@ using namespace llaminar2;
 
 namespace
 {
+    /** @brief Actual original mapped mock constructor; no native SDK is called. */
+    class ReadAheadPolicyWorker final:public llaminar2::testing::MockWorkerGPUContext {
+    public:
+        /** @brief Preserve the original prepared-stack constructor boundary. */
+        ReadAheadPolicyWorker(int ordinal,std::shared_ptr<PreparedGPUWorkerStack>):MockWorkerGPUContext(ordinal){}
+    };
+    /** @brief Preserve original same-PMA roots until the recorded physical reset observer runs. */
+    struct ReadAheadPolicySourceRetirement final {
+        std::shared_ptr<NativeContextPreparation> source;
+        DeviceId device;
+        /** @brief Retire the exact mock worker generation before abandoning its original Preparing authority. */
+        ~ReadAheadPolicySourceRetirement(){
+            auto reset=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
+            test::NativeContextPreparationReplayAccess::physicalReset(reset);
+            source->retireUnadmitted();
+        }
+    };
+
     /** @brief Complete synthetic metadata and rank observation for BOM assembly. */
     struct Fixture
     {
@@ -1062,4 +1082,85 @@ TEST(RankMemoryPlanInputs, DirectTokenHistoryOwnerFollowsTerminalAcrossOneToEigh
                 << " pipeline=" << pipeline << " participant=" << participant;
         }
     }
+}
+
+/** @test Original selected policy survives planning and factory projection; its
+ * absent native certificate rejects before final physical admission/creation. */
+TEST(RankMemoryPlanInputs, ReadAheadOriginalPolicyRequiresCertifiedBOMBeforeAdmission)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    for(const auto policy : {ImmutableLookupSchedule::ConsumerScheduled,
+                            ImmutableLookupSchedule::EarlyCurrentHostedCandidate,
+                            ImmutableLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate})
+    {
+        RuntimeConfig runtime;
+        runtime.ngram_lookup_schedule=policy;
+        EXPECT_EQ(RankOrchestrator::Config::fromRuntime(runtime).ngram_lookup_schedule,policy);
+        EXPECT_EQ(InferenceRunnerConfig::fromRuntime(runtime).ngram_lookup_schedule,policy);
+    }
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        Fixture fixture(backend, 1);
+        fixture.model=source.metadata().memoryProfile();
+        fixture.plan.last_layer=47;
+        fixture.plan.runtime.mtp.enabled=false;
+        fixture.plan.runtime.ngram_table_policy.storage=ImmutableRowStoragePreference::VRAM;
+        fixture.plan.runtime.ngram_lookup_schedule=ImmutableLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate;
+        auto inputs=buildRankMemoryPlanInputs(fixture.request());
+        ASSERT_EQ(inputs.size(),1u);
+        const auto device=inputs.front().device;
+        ASSERT_TRUE(inputs.front().associated_host_memory);
+        const std::array devices{device};
+        const std::array observations{*inputs.front().associated_host_memory,
+            PhysicalMemoryResource{inputs.front().world_rank,device,inputs.front().device_total_bytes,inputs.front().device_free_bytes}};
+        using SourceAccess=test::NativeContextPreparationReplayAccess;
+        SourceAccess::seed(device,[device](std::shared_ptr<PreparedGPUWorkerStack> stack){
+            return SourceAccess::construct<ReadAheadPolicyWorker>(std::move(stack),device.gpu_ordinal());});
+        auto original=SourceAccess::source<ReadAheadPolicyWorker>(devices,observations);
+        ReadAheadPolicySourceRetirement retirement{original,device};
+        {const auto worker=original->acquire(device);EXPECT_EQ(worker.memory(),original->memory());}
+        original->freezeForPlanning();
+        inputs.front().native_context_preparation=original;
+        const auto originalKey=GPUDeviceContextPool::instance().retainExistingContextProvenance(device).originalBirthKey();
+        ASSERT_NE(originalKey,nullptr);
+        ASSERT_EQ(inputs.size(),1u);
+        EXPECT_EQ(inputs.front().ngram_lookup_schedule,fixture.plan.runtime.ngram_lookup_schedule);
+        EXPECT_EQ(RankOrchestrator::Config::fromRuntime(fixture.plan.runtime).ngram_lookup_schedule,
+                  fixture.plan.runtime.ngram_lookup_schedule);
+        EXPECT_EQ(InferenceRunnerConfig::fromRuntime(fixture.plan.runtime).ngram_lookup_schedule,
+                  fixture.plan.runtime.ngram_lookup_schedule);
+        try
+        {
+            (void)MemoryPlanner::plan(fixture.model,inputs);
+            FAIL()<<"Uncertified resource family reached physical admission";
+        }
+        catch(const std::runtime_error& error)
+        {
+            EXPECT_NE(std::string(error.what()).find("unqualified"),std::string::npos)<<error.what();
+            EXPECT_NE(std::string(error.what()).find("side-stream1-ordering2-v1"),std::string::npos)<<error.what();
+            EXPECT_EQ(original->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
+            EXPECT_EQ(GPUDeviceContextPool::instance().retainExistingContextProvenance(device).originalBirthKey().get(),originalKey.get());
+        }
+    }
+}
+
+/** @test Setup selection freezes once and survives mutable environment reloads and adapters. */
+TEST(RankMemoryPlanInputs, ReadAheadSelectionSnapshotSurvivesDebugMutationAndAdapters)
+{
+    struct Restore {
+        std::optional<ImmutableLookupSchedule> original;
+        ~Restore(){mutableDebugEnv().execution.qfn_ngram_lookup_schedule=original;}
+    } restore{mutableDebugEnv().execution.qfn_ngram_lookup_schedule};
+    mutableDebugEnv().execution.qfn_ngram_lookup_schedule=ImmutableLookupSchedule::EarlyCurrentHostedCandidate;
+    const auto frozen=RuntimeConfig::fromOrchestrationConfig(4096,1,"fp32","fp16");
+    mutableDebugEnv().execution.qfn_ngram_lookup_schedule=ImmutableLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate;
+    const auto resident=RuntimeConfig::fromOrchestrationConfig(4096,1,"fp32","fp16");
+    mutableDebugEnv().execution.qfn_ngram_lookup_schedule.reset();
+    const auto baseline=RuntimeConfig::fromOrchestrationConfig(4096,1,"fp32","fp16");
+    EXPECT_EQ(frozen.ngram_lookup_schedule,ImmutableLookupSchedule::EarlyCurrentHostedCandidate);
+    EXPECT_EQ(resident.ngram_lookup_schedule,ImmutableLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate);
+    EXPECT_EQ(baseline.ngram_lookup_schedule,ImmutableLookupSchedule::ConsumerScheduled);
+    EXPECT_EQ(RankOrchestrator::Config::fromRuntime(frozen).ngram_lookup_schedule,frozen.ngram_lookup_schedule);
+    EXPECT_EQ(InferenceRunnerConfig::fromRuntime(frozen).ngram_lookup_schedule,frozen.ngram_lookup_schedule);
 }

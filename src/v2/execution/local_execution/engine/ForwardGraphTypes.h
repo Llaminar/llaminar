@@ -280,6 +280,7 @@ namespace llaminar2
         ForwardPipelineActivationOwnership pipeline_activation_ownership =
             ForwardPipelineActivationOwnership::ForwardGraph; ///< Exact transport owner, independent of submission intent.
         uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
+        uint64_t mtp_main_terminal_logits_capture_identity = 0; ///< Exact canonical raw-logit publication bindings.
         uint64_t mtp_main_terminal_hidden_capture_identity = 0; ///< Non-zero when main decode publishes its MTP terminal row in-graph.
         bool standard_path = true;
         bool pp_stage_enabled = false;
@@ -341,6 +342,7 @@ namespace llaminar2
                    pipeline_activation_ownership == other.pipeline_activation_ownership &&
                    shifted_mtp_prefill_capture_identity ==
                        other.shifted_mtp_prefill_capture_identity &&
+                   mtp_main_terminal_logits_capture_identity == other.mtp_main_terminal_logits_capture_identity &&
                    mtp_main_terminal_hidden_capture_identity ==
                        other.mtp_main_terminal_hidden_capture_identity &&
                    standard_path == other.standard_path &&
@@ -465,6 +467,8 @@ namespace llaminar2
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(
                       sig.mtp_main_terminal_hidden_capture_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(sig.mtp_main_terminal_logits_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));

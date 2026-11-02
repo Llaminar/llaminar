@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -253,13 +254,11 @@ TEST_P(OrdinaryDeviceGenerationSampling, CapturedSamplesMatchSerialLawAcrossRese
         auto d_processed = allocate(logits.size() * sizeof(float));
         constexpr int history_stride = vocab + 3;
         auto d_history = allocate(requests * history_stride * sizeof(int32_t));
-        auto d_fresh_logits = allocate(logits.size() * sizeof(float));
         auto d_penalties = allocate(sizeof(MTPGreedyPenaltyPolicy));
         ASSERT_TRUE(d_logits && d_scratch_values && d_scratch_indices && d_values && d_indices &&
             d_samples && d_live && d_control && d_response && d_stops && d_seeds && d_processed && d_history &&
-            d_fresh_logits && d_penalties);
+            d_penalties);
         ASSERT_TRUE(backend->hostToDevice(d_logits.get(), logits.data(), logits.size() * sizeof(float), 0, stream));
-        ASSERT_TRUE(backend->hostToDevice(d_fresh_logits.get(), logits.data(), logits.size() * sizeof(float), 0, stream));
         auto *live = static_cast<int32_t *>(d_live.get());
         const OrdinaryGenerationPublication publication{
             .request_count = requests, .sampled_tokens = static_cast<int32_t *>(d_samples.get()),
@@ -330,20 +329,12 @@ TEST_P(OrdinaryDeviceGenerationSampling, CapturedSamplesMatchSerialLawAcrossRese
             }
             auto prefill_graph = context.createGraphCapture(stream);
             ASSERT_TRUE(prefill_graph && prefill_graph->beginCapture());
-            // This fixture substitutes an exact copy for the model's fresh
-            // logits producer. Production forward overwrites its logits on
-            // every transaction; testing reuse of already-penalized logits
-            // would exercise a different, invalid producer contract.
-            if (apply_penalties)
-                ASSERT_TRUE(backend->deviceCopyAsync(d_logits.get(), d_fresh_logits.get(),
-                    logits.size() * sizeof(float), 0, stream));
+            // The captured sampler must preserve the original raw input even
+            // through repeated transactions; no refresh copy masks mutation.
             ASSERT_TRUE(prefill.execute(execution.get()));
             ASSERT_TRUE(prefill_graph->endCapture());
             auto decode_graph = context.createGraphCapture(stream);
             ASSERT_TRUE(decode_graph && decode_graph->beginCapture());
-            if (apply_penalties)
-                ASSERT_TRUE(backend->deviceCopyAsync(d_logits.get(), d_fresh_logits.get(),
-                    logits.size() * sizeof(float), 0, stream));
             ASSERT_TRUE(decode.execute(execution.get()));
             ASSERT_TRUE(decode_graph->endCapture());
             std::vector<GPUGraphKernelNodeInfo> kernels;
@@ -547,6 +538,11 @@ TEST_P(OrdinaryDeviceGenerationSampling, CapturedSamplesMatchSerialLawAcrossRese
                         EXPECT_EQ(actual_live[2 * requests + request], stopped);
                         EXPECT_EQ(actual_live[3 * requests + request], 1);
                     }
+                    std::vector<float> raw_after(logits.size());
+                    ASSERT_TRUE(backend->deviceToHost(raw_after.data(), d_logits.get(),
+                        raw_after.size() * sizeof(float), 0, stream));
+                    EXPECT_EQ(std::memcmp(raw_after.data(), logits.data(), logits.size() * sizeof(float)), 0)
+                        << "Ordinary stochastic/greedy sampling mutated canonical raw logits";
                     EXPECT_EQ(actual_history, initial_history)
                         << "Every emitted token, including EOS, must enter its own history once; padding is untouched";
                 }

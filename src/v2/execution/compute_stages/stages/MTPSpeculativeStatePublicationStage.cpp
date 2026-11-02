@@ -760,12 +760,31 @@ namespace llaminar2
     {
         StageBufferContract contract;
         // Restore hooks run beneath this stage's ledger, not their earlier
-        // verifier stage. Declare only the tensor owners those hooks publish;
+        // verifier stage. Declare the exact retained reads and accepted writes;
         // candidate scratch and raw backend state grant no arena write access.
         for (const auto *stage : params_.verifier_state_stages)
         {
             if (!stage)
                 throw std::logic_error("MTP publication contract contains a null retained-state stage");
+            // Restore kernels consume verifier-produced priors/candidates on a
+            // distinct publication stream. Expose the original tensor frontier
+            // before capture, rather than relying on a transitive stream edge
+            // that the tensor coherence authority has not authenticated.
+            for (const auto &binding : stage->verifierStatePublicationInputs())
+            {
+                if (binding.access != BufferAccess::READ || binding.prepare_write_storage ||
+                    !binding.dtype || !*binding.dtype)
+                    throw std::logic_error("MTP accepted-state input must be a typed preallocated read");
+                const auto existing = std::find_if(contract.inputs.begin(), contract.inputs.end(),
+                    [&](const auto &input) { return input.id == binding.id; });
+                if (existing != contract.inputs.end())
+                {
+                    if (std::strcmp(existing->dtype, binding.dtype) != 0)
+                        throw std::logic_error("MTP accepted-state input has conflicting tensor types");
+                }
+                else
+                    contract.addInput(binding.id, binding.dtype);
+            }
             for (const auto &binding : stage->verifierStatePublicationOutputs())
             {
                 if (binding.access != BufferAccess::WRITE || binding.prepare_write_storage ||

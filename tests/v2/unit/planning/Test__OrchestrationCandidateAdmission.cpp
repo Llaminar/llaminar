@@ -6,6 +6,7 @@
  * admission without allocating model tensors or touching accelerators. Sparse
  * fixture payloads are not numerical model or graph-execution certification.
  */
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
@@ -74,7 +75,7 @@ namespace
     OrchestrationCandidateMemoryPolicy policy()
     {
         return {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
-            .maximum_cached_prefill_buckets = 8};
+            .maximum_cached_prefill_buckets = 8, .retained_host_services = test::planningHostServiceBudgets(1)};
     }
 }
 

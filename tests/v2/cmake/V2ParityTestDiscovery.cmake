@@ -142,7 +142,14 @@ if(NOT PRODUCTION_PERF_STATS_FILTER)
         "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement,immutable_lookup,qsa")
 endif()
 
-# Only source-admission cells consume this explicit source intent. Embedded MTP
+# Immutable lookup reuse is a shared production-fixture invariant, including
+# ordinary numerical cells. Its actual source/remote enqueue counters must not
+# disappear when a target supplies an explicit numerical-domain filter.
+if(NOT PRODUCTION_PERF_STATS_FILTER MATCHES "(^|,)ngram_lookup(,|$)")
+    string(APPEND PRODUCTION_PERF_STATS_FILTER ",ngram_lookup")
+endif()
+
+# Source admission and focused native exact replay share this explicit source intent. Embedded MTP
 # needs no external predictor; Paired MTP must name its own source closure.
 # Do not infer this from a model name or impose paired GGUFs on future embedded MTP.
 if(SOURCE_ADMISSION_MTP_SOURCE_KIND AND
@@ -236,6 +243,10 @@ if(PRODUCTION_ISOLATED_TESTS_SERIALIZED)
 endif()
 
 foreach(_full_name IN LISTS _all_tests)
+    set(_focused_native_exact FALSE)
+    if("${_full_name}" MATCHES "\\.MTPExactReplay/")
+        set(_focused_native_exact TRUE)
+    endif()
     if("${_full_name}" MATCHES "ProductionParity")
         # One CTest campaign owns every precision cell for a backend signature
         # in this executable.  GTest still reports each parameterized cell, but
@@ -353,6 +364,15 @@ foreach(_full_name IN LISTS _all_tests)
     if(NUM_SOCKETS AND _focused_mpi_procs GREATER NUM_SOCKETS)
         list(APPEND _test_mpi_cmd "--oversubscribe")
     endif()
+    if(_focused_native_exact)
+        foreach(_name IN ITEMS LLAMINAR_PRODUCTION_PARITY
+                LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN LLAMINAR_GPU_GRAPHS
+                LLAMINAR_PREFILL_GRAPH_BUCKETS LLAMINAR_PREFILL_GRAPH_REQUIRED
+                LLAMINAR_PERF_STATS_SUMMARY LLAMINAR_PERF_STATS_FILTER
+                LLAMINAR_PRODUCTION_PARITY_DECLARED_MODELS)
+            list(APPEND _test_mpi_cmd "-x" "${_name}")
+        endforeach()
+    endif()
     foreach(_export IN LISTS _graph_native_capture_env)
         # mpirun must explicitly forward graph admission settings to every
         # participant; CTest ENVIRONMENT alone is not reliable for OpenMPI.
@@ -387,17 +407,22 @@ foreach(_full_name IN LISTS _all_tests)
     string(APPEND _output "add_test(\"${_ctest_name}\" ${_cmd_str})\n")
 
     set(_test_labels ${LABELS} ProcessOwned)
-    set(_focused_source_admission FALSE)
+    set(_focused_explicit_inputs FALSE)
     set(_focused_active_mtp FALSE)
     set(_focused_model_files "")
     set(_focused_backend_signature "")
-    if("${_full_name}" MATCHES "\\.(FullSourceAdmission|CandidateSourceAdmission|RejectUnsupportedSourceAdmission|RejectCapacitySourceAdmission)/")
-        set(_focused_source_admission TRUE)
+    if(_focused_native_exact OR "${_full_name}" MATCHES "\\.(FullSourceAdmission|CandidateSourceAdmission|RejectUnsupportedSourceAdmission|RejectCapacitySourceAdmission)/")
+        set(_focused_explicit_inputs TRUE)
         # An admission fixture must not inherit every backend (or reference
         # dependency) named by the binary's numerical matrix. Select only its
         # actual participant signature, as for a numerical campaign above.
         list(REMOVE_ITEM _test_labels CPU CUDA ROCm PyTorch GoldenReference Parity)
-        list(APPEND _test_labels Admission RealModel FullModel)
+        list(APPEND _test_labels RealModel FullModel)
+        if(_focused_native_exact)
+            list(APPEND _test_labels NativeExactReplay Functional MTP ByteExact Snapshots)
+        else()
+            list(APPEND _test_labels Admission)
+        endif()
         if("${_full_name}" MATCHES "\\.RejectCapacitySourceAdmission/")
             list(APPEND _test_labels NegativeAdmission CapacityAdmission)
         elseif("${_full_name}" MATCHES "\\.RejectUnsupportedSourceAdmission/")
@@ -448,7 +473,7 @@ foreach(_full_name IN LISTS _all_tests)
     string(JOIN ";" _labels_joined ${_test_labels})
 
     set(_test_env_vars ${_env_vars})
-    if(_focused_source_admission)
+    if(_focused_explicit_inputs)
         if(_focused_backend_signature STREQUAL "CPU")
             list(APPEND _test_env_vars "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
         else()
@@ -464,7 +489,18 @@ foreach(_full_name IN LISTS _all_tests)
             endif()
         endforeach()
     endif()
-    if(_focused_active_mtp)
+    if(_focused_native_exact)
+        string(JOIN "|" _focused_model_manifest ${_focused_model_files})
+        list(APPEND _test_env_vars
+            "LLAMINAR_PRODUCTION_PARITY=1"
+            "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN=0"
+            "LLAMINAR_GPU_GRAPHS=1"
+            "LLAMINAR_PREFILL_GRAPH_BUCKETS=1"
+            "LLAMINAR_PREFILL_GRAPH_REQUIRED=1"
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=${PRODUCTION_PERF_STATS_FILTER}"
+            "LLAMINAR_PRODUCTION_PARITY_DECLARED_MODELS=${_focused_model_manifest}")
+    elseif(_focused_active_mtp)
         # Serving-plan evidence is observed from the production controller's
         # forward-graph counters. Off cells keep their original environment.
         list(FILTER _test_env_vars EXCLUDE REGEX "^LLAMINAR_PERF_STATS_(SUMMARY|FILTER)=")
@@ -480,8 +516,11 @@ foreach(_full_name IN LISTS _all_tests)
     string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n")
     string(APPEND _output "    TIMEOUT_SIGNAL_NAME SIGTERM\n")
     string(APPEND _output "    TIMEOUT_SIGNAL_GRACE_PERIOD 36\n")
-    string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
-    if(_focused_source_admission)
+    # Exact functional replay consumes only its declared originals and never fetches a reference/model suite.
+    if(NOT _focused_native_exact)
+        string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")
+    endif()
+    if(_focused_explicit_inputs)
         string(JOIN ";" _focused_model_files_joined ${_focused_model_files})
         string(APPEND _output "    REQUIRED_FILES \"${_focused_model_files_joined}\"\n")
     endif()
@@ -493,7 +532,7 @@ foreach(_full_name IN LISTS _all_tests)
     string(APPEND _output "    WORKING_DIRECTORY \"${WORKING_DIR}\"\n")
     string(APPEND _output "    PROCESSORS 4\n")
     set(_focused_timeout "${TIMEOUT}")
-    if(_focused_source_admission)
+    if(_focused_explicit_inputs)
         if(DEFINED SOURCE_ADMISSION_TIMEOUT AND NOT "${SOURCE_ADMISSION_TIMEOUT}" STREQUAL "")
             set(_focused_timeout "${SOURCE_ADMISSION_TIMEOUT}")
         endif()

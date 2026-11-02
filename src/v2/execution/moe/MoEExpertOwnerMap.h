@@ -18,6 +18,7 @@
 #include "backends/GlobalDeviceAddress.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,23 @@ namespace llaminar2
     class MoEExpertOwnerMap
     {
     public:
+        /** @brief Resolve only canonical authored participants before quota/ownership selection.
+         * @param plan Existing routed tier/domain topology, including empty expert endpoints.
+         * @param options Same domain validation used by actual owner-map construction.
+         * @return Stable descriptors with the exact IDs later used by initial/transition maps.
+         * @note This constructs no expert ownership rows and depends on no tier capacities.
+         */
+        static std::vector<MoEExpertOwnerParticipant> declaredParticipants(
+            const MoERoutedExpertPlacementPlan &plan,const MoEExpertOwnerMapBuildOptions &options = {});
+
+        /**
+         * @brief Observe actual cold canonical constructor entries, including failures.
+         * @return Monotonic process-wide count; scoped deltas prove construction
+         * economy without a reset, source mirror or alternate owner authority.
+         * This observation never selects placement or execution policy.
+         */
+        [[nodiscard]] static std::uint64_t initialBuildAttempts() noexcept;
+
         /**
          * @brief Build deterministic ownership for an initial placement.
          * @param plan Valid tiered whole-expert placement plan.

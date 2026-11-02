@@ -239,7 +239,9 @@ namespace llaminar2
             runtime.tp_allreduce_precision_override;
         config.prefix_cache = runtime.prefix_cache;
         config.ngram_table_policy = runtime.ngram_table_policy;
+        config.ngram_lookup_schedule = runtime.ngram_lookup_schedule;
         config.ngram_table_placement = runtime.ngram_table_placement;
+        config.retained_host_services = runtime.retained_host_services;
         config.mtp = runtime.mtp;
         config.routed_expert_compute_policy = runtime.routed_expert_compute_policy;
         config.routed_expert_owner_order =

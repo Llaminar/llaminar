@@ -15,6 +15,8 @@
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "transfer/TransferEngine.h"
+#include "backends/NativeContextPreparation.h"
+#include "loaders/ModelContext.h"
 
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -198,6 +200,15 @@ namespace llaminar2
                      : retention_error));
         }
 
+        // The weight/workspace BOM need not contain storage-only GPU workers.
+        // Retain the original source through final owner destruction so its
+        // remaining births receive the same reset proof as ordinary shutdown.
+        auto final_native_source = contract.context->nativeContextPreparation();
+        if (final_native_source &&
+            (final_native_source->memory().get() != contract.physical_memory_authority.get() ||
+             final_native_source->memory().owner_before(contract.physical_memory_authority) ||
+             contract.physical_memory_authority.owner_before(final_native_source->memory())))
+            throw std::logic_error("Final model source requires its original physical-memory authority");
         PendingExclusiveModelRetirement pending =
             PendingExclusiveModelRetirement::begin(*sealed_retention);
 
@@ -221,7 +232,12 @@ namespace llaminar2
         ::malloc_trim(0);
 #endif
 
-        return pending.complete();
+        // This receipt continues to describe the sealed model-allocation BOM;
+        // residual birth reset is an additional original-source lifetime proof.
+        auto receipt = pending.complete();
+        if (final_native_source)
+            final_native_source->retireReleasedContexts();
+        return receipt;
     }
 
 } // namespace llaminar2

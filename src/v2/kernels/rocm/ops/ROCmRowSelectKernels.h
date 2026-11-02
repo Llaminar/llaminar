@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "../../RowSelectPolicy.h"
 #include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include <cstdint>
@@ -131,7 +132,7 @@ namespace llaminar2::rocm
         int seq_len,
         int d_model,
         int selected_row_count,
-        void *stream);
+        void *stream, RowsSelectPolicy policy = {});
 
     /**
      * @brief Pack one terminal hidden row per padded request from resident lengths.

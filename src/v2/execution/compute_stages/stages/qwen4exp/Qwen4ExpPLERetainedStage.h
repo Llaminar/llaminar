@@ -69,6 +69,8 @@ public:
  bool restoreVerifierStateCaptureRows(const int *rows,int requests,void *stream) override;
  /** @brief Consume one device decision only for a single-request transaction. */
  bool restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int> row_view,void *stream) override;
+ /** @brief Exact original arena producers consumed by accepted-state publication. */
+ std::span<const BufferBinding> verifierStatePublicationInputs() const noexcept override;
  /** @brief Accepted PLE publication writes only token and convolution history banks. */
  std::span<const BufferBinding> verifierStatePublicationOutputs() const noexcept override;
 
@@ -99,6 +101,7 @@ private:
  qwen4exp::PLEPublishAccepted publication(const int*rows,int stride)const;
  /** @brief Execute exact-stream validated publication and publish its output events. */
  bool publish(const int*rows,int requests,int stride,void*stream);
+ std::array<BufferBinding, 5> acceptedPublicationInputs_{}; ///< Exact retained-state read frontier.
  std::array<BufferBinding, 2> acceptedPublicationOutputs_{}; ///< Immutable accepted-history declaration.
  Params params_;qwen4exp::PLETransactionOperations operations_;
  std::vector<Operand>operands_;

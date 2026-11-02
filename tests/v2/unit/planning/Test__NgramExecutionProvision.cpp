@@ -8,6 +8,8 @@
  * Predictor storage ownership survives setup serialization independently of main TP.
  */
 #include "planning/MemoryPlanner.h"
+#include "fixtures/planning/ImmutableRowTableAdmissionWireReplayAccess.h"
+#include "fixtures/planning/RecordedNgramOrdering.h"
 #include "execution/moe/MoEOverlayRowCandidateFinalization.h"
 #include "planning/ImmutableRowTableAdmissionWire.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
@@ -39,7 +41,7 @@ DevicePlanConfig consumer(DeviceType backend,ImmutableRowStoragePreference prefe
     c.device_total_bytes=512ull<<30;c.device_free_bytes=500ull<<30;
     c.associated_host_memory=PhysicalMemoryResource{0,DeviceId::cpu(),512ull<<30,500ull<<30};
     c.max_seq_len=64;c.activation_seq_len=32;c.first_layer=0;c.last_layer=47;
-    c.ngram_execution_policy=ImmutableRowTablePolicy{preference,65536,3};return c;
+    c.ngram_execution_policy=ImmutableRowTablePolicy{preference,65536,3};c.native_ordering_events=test::recordedNgramOrdering(c.device);test::declareRecordedNgramHostServices(c);return c;
 }
 /** @return Exact canonical owner line, with absent owners interpreted as zero. */
 std::size_t bytes(const PhysicalMemoryPlan &plan,PhysicalMemoryAllocatorIdentity id,PhysicalMemoryOwner owner)
@@ -47,7 +49,12 @@ std::size_t bytes(const PhysicalMemoryPlan &plan,PhysicalMemoryAllocatorIdentity
 /** @return Production request preserving the declared exact NUMA policy. */
 ImmutableRowTableAdmissionRequest request(const ModelMemoryProfile &profile,const std::vector<DevicePlanConfig> &configs)
 {
-    const std::vector<std::vector<DevicePlanConfig>> groups{configs};
+    auto originalConfigs=configs;std::vector<DeviceId> originalDevices;
+    for(const auto& cfg:configs)if(cfg.device.is_gpu() && std::find(originalDevices.begin(),originalDevices.end(),cfg.device)==originalDevices.end())originalDevices.push_back(cfg.device);
+    const auto recorded=test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
+    for(auto& cfg:originalConfigs)cfg.native_ordering_events=recorded;
+    test::shareRecordedNgramHostServices(originalConfigs);
+    const std::vector<std::vector<DevicePlanConfig>> groups{originalConfigs};
     auto result=MemoryPlanner::immutableRowTableAdmissionRequest(profile,*configs.front().ngram_execution_policy,
         groups,MemoryPlanner::immutableRowTableUploadBindings(profile,groups),ImmutableRowTableHostPlacement::onNode(3));
     if(!result)throw std::logic_error("Complete source omitted its actual PLE consumer");
@@ -144,10 +151,24 @@ TEST(NgramExecutionProvision, WireRoundTripReauthenticatesSourceGeometryAndExact
         auto c=consumer(backend,ImmutableRowStoragePreference::MemoryMapped);
         const auto frozen=MemoryPlanner::plan(profile,{c}).physicalPlan();const auto q=request(profile,{c});
         const std::array requests{q};const auto wire=serializeImmutableRowTableAdmissionRequests(requests);
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(wire,0),std::invalid_argument);
-        const auto decoded=parseImmutableRowTableAdmissionRequests(wire,0,&profile);ASSERT_EQ(decoded.size(),1u);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,nullptr,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
+        const auto decoded=test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&profile,q.native_ordering_events,q.retained_host_services);ASSERT_EQ(decoded.size(),1u);
         ASSERT_TRUE(decoded.front().execution_provision);
         EXPECT_EQ(decoded.front().execution_provision->consumers(),q.execution_provision->consumers());
+        const auto& service=q.execution_provision->consumers().front();
+        ASSERT_TRUE(service.host_service_declaration);
+        EXPECT_EQ(decoded.front().execution_provision->consumers().front().host_service_declaration,
+                  service.host_service_declaration);
+        std::vector<std::uint8_t> descriptor;
+        const auto& d=*service.host_service_declaration;
+        for(const auto value:{d.stackBytes,d.guardBytes,d.pageBytes,d.objectBytes,d.objectAlignment,d.tlsBytes,d.opaqueBytes})
+            for(unsigned byte=0;byte<8;++byte)descriptor.push_back(std::uint8_t(std::uint64_t(value)>>(byte*8)));
+        const auto encoded=std::search(wire.begin(),wire.end(),descriptor.begin(),descriptor.end());
+        ASSERT_NE(encoded,wire.end());
+        auto forged=wire;
+        forged.at(std::size_t(encoded-wire.begin())+48)^=1; // Coarse opaque budget must be derived, not sender-invented.
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(forged,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
+
         EXPECT_EQ(decoded.front().execution_provision->source(),q.execution_provision->source());
         const auto local=ImmutableRowTablePlacementPlanner::select(q,frozen);
         const auto remote=ImmutableRowTablePlacementPlanner::select(decoded.front(),frozen);
@@ -171,24 +192,24 @@ TEST(NgramExecutionProvision, WireRoundTripReauthenticatesSourceGeometryAndExact
         const auto offset=plan_start+4u+resource_index*record+28u+owner_index*16u;
         ASSERT_LE(offset+8u,underpriced.size());
         for(std::size_t b=0;b<8u;++b)underpriced[offset+b]=static_cast<std::uint8_t>(static_cast<std::uint64_t>(common_arena)>>(8u*b));
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(underpriced,0,&profile),std::invalid_argument);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(underpriced,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         auto foreign=profile;--foreign.flash_next->ple_table_rows;
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(wire,0,&foreign),std::invalid_argument);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&foreign,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         foreign=profile;++foreign.flash_next->residual_gate_rank;
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(wire,0,&foreign),std::invalid_argument);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&foreign,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         auto shrunken=q.execution_provision->consumers();shrunken.front().activation.local_vocab=1;
         auto unpriced=c;unpriced.ngram_execution_policy.reset();
-        EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,
-            shrunken,q.execution_provision->executionPlan(),MemoryPlanner::plan(profile,{unpriced}).physicalPlan()),std::invalid_argument);
+        EXPECT_THROW((void)test::MemoryPlannerOrderingReplayAccess::restore(profile,q.requested,q.input,
+            shrunken,q.execution_provision->executionPlan(),MemoryPlanner::plan(profile,{unpriced}).physicalPlan(),q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         auto geometry=q.execution_provision->consumers();geometry.front().rows=1;
-        EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,
-            geometry,q.execution_provision->executionPlan(),q.execution_provision->requiredBase()),std::invalid_argument);
-        EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,
-            q.execution_provision->consumers(),{},q.execution_provision->requiredBase()),std::invalid_argument);
-        EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,
-            q.execution_provision->consumers(),q.execution_provision->executionPlan(),{}),std::invalid_argument);
-        EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,
-            q.execution_provision->consumers(),q.execution_provision->executionPlan(),q.execution_provision->executionPlan()),std::invalid_argument);
+        EXPECT_THROW((void)test::MemoryPlannerOrderingReplayAccess::restore(profile,q.requested,q.input,
+            geometry,q.execution_provision->executionPlan(),q.execution_provision->requiredBase(),q.native_ordering_events,q.retained_host_services),std::invalid_argument);
+        EXPECT_THROW((void)test::MemoryPlannerOrderingReplayAccess::restore(profile,q.requested,q.input,
+            q.execution_provision->consumers(),{},q.execution_provision->requiredBase(),q.native_ordering_events,q.retained_host_services),std::invalid_argument);
+        EXPECT_THROW((void)test::MemoryPlannerOrderingReplayAccess::restore(profile,q.requested,q.input,
+            q.execution_provision->consumers(),q.execution_provision->executionPlan(),{},q.native_ordering_events,q.retained_host_services),std::invalid_argument);
+        EXPECT_THROW((void)test::MemoryPlannerOrderingReplayAccess::restore(profile,q.requested,q.input,
+            q.execution_provision->consumers(),q.execution_provision->executionPlan(),q.execution_provision->executionPlan(),q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         auto old=c;old.ngram_execution_policy.reset();
         EXPECT_THROW((void)ImmutableRowTablePlacementPlanner::select(decoded.front(),MemoryPlanner::plan(profile,{old}).physicalPlan()),std::invalid_argument);
     }
@@ -343,24 +364,24 @@ TEST(NgramExecutionProvision, AdaptiveWireRoundTripRetainsZeroFullAndRejectsUnpr
         auto c=adaptiveConsumer(DeviceType::CUDA,slots,slots?1u<<20:0u);c.ngram_execution_policy->host_adaptive.policy.aging_accesses=37;
         const auto q=request(profile,{c});const auto frozen=MemoryPlanner::plan(profile,{c}).physicalPlan();
         const std::array values{q};const auto wire=serializeImmutableRowTableAdmissionRequests(values);
-        const auto decoded=parseImmutableRowTableAdmissionRequests(wire,0,&profile);ASSERT_EQ(decoded.size(),1u);
+        const auto decoded=test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&profile,q.native_ordering_events,q.retained_host_services);ASSERT_EQ(decoded.size(),1u);
         EXPECT_EQ(decoded.front().requested,q.requested);EXPECT_EQ(decoded.front().input.hostPlacement(),c.ngram_host_placement);
         EXPECT_EQ(decoded.front().execution_provision->maximumLiveIds(),q.execution_provision->maximumLiveIds());
         const auto local=ImmutableRowTablePlacementPlanner::select(q,frozen);
         const auto remote=ImmutableRowTablePlacementPlanner::select(decoded.front(),frozen);
         EXPECT_EQ(*local.placement,*remote.placement);EXPECT_EQ(local.physical_plan.summary(),remote.physical_plan.summary());
-        for(const auto version:{1u,2u,3u,4u}){auto bad=wire;bad[4]=version;EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(bad,0,&profile),std::invalid_argument);}
+        for(const auto version:{1u,2u,3u,4u}){auto bad=wire;bad[4]=version;EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(bad,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);}
         for(std::size_t length=0;length<wire.size();++length)
-            EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(std::span(wire).first(length),0,&profile),std::invalid_argument)<<length;
-        auto bad=wire;bad.push_back(0);EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(bad,0,&profile),std::invalid_argument);
+            EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(std::span(wire).first(length),0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument)<<length;
+        auto bad=wire;bad.push_back(0);EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(bad,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         bad=wire;bad[16]=static_cast<std::uint8_t>(ImmutableRowStoragePreference::RAM);
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(bad,0,&profile),std::invalid_argument);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(bad,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         // Byte56 is aging_accesses in schema5: zero rejects before any provision is restored.
         bad=wire;for(std::size_t i=56;i<64;++i)bad[i]=0;
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(bad,0,&profile),std::invalid_argument);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(bad,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         auto geometry=q.execution_provision->consumers();++geometry.front().rows;
-        EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,
-            geometry,q.execution_provision->executionPlan(),q.execution_provision->requiredBase()),std::invalid_argument);
+        EXPECT_THROW((void)test::MemoryPlannerOrderingReplayAccess::restore(profile,q.requested,q.input,
+            geometry,q.execution_provision->executionPlan(),q.execution_provision->requiredBase(),q.native_ordering_events,q.retained_host_services),std::invalid_argument);
     }
 }
 
@@ -513,15 +534,15 @@ TEST(NgramExecutionProvision, FixedHeadRequestSelectsOriginalRangesInActualCommu
         EXPECT_THROW(chosen.placement->requireRequestedPolicy(replicated),std::invalid_argument);
         const std::array requests{q};const auto wire=serializeImmutableRowTableAdmissionRequests(requests);
         auto old_wire=wire;old_wire[4]=4;
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(old_wire,0,&profile),std::invalid_argument);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(old_wire,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         auto wrong_policy=wire;wrong_policy[20]=0; // Schema5 distribution word; replicated cannot carry fixed provenance.
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(wrong_policy,0,&profile),std::invalid_argument);
-        const auto parsed=parseImmutableRowTableAdmissionRequests(wire,0,&profile);ASSERT_EQ(parsed.size(),1u);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(wrong_policy,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
+        const auto parsed=test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&profile,q.native_ordering_events,q.retained_host_services);ASSERT_EQ(parsed.size(),1u);
         EXPECT_EQ(parsed.front().requested,q.requested);
         EXPECT_EQ(parsed.front().execution_provision->consumers(),q.execution_provision->consumers());
         EXPECT_EQ(*ImmutableRowTablePlacementPlanner::select(parsed.front(),frozen).placement,*chosen.placement);
         auto foreign=profile;++foreign.flash_next->ple_head_offsets[1];
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(wire,0,&foreign),std::invalid_argument);
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&foreign,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
     }
 }
 /** @test Complete PMA fit alone owns the final fixed table decision; a failed payload cannot shrink higher-priority rows. */
@@ -687,7 +708,12 @@ TEST(NgramExecutionProvision, FixedHeadRejectsForeignTopologyCoordinatesSourceAn
         case 6:c[0].batch_size=2;break;
         case 7:c[0].ngram_execution_policy->storage=ImmutableRowStoragePreference::Automatic;break;
         }
-        EXPECT_THROW((void)request(profile,c),std::invalid_argument)<<failure;
+        if(failure==7){
+            // Both original VRAM participants correctly have no hosted worker.
+            // Changed policy must reject before attempting to price that arm.
+            try{(void)request(profile,c);FAIL()<<"Changed participant policy accepted";}
+            catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("unchanged pre-quota execution policy"),std::string::npos);}
+        }else EXPECT_THROW((void)request(profile,c),std::invalid_argument)<<failure;
     }
     auto missing=good;for(auto &c:missing){c.ordinary_weight_load_geometry.reset();c.weight_load_staging={};}
     EXPECT_THROW((void)ImmutableRowTablePlacementPlanner::select(request(profile,missing),MemoryPlanner::plan(profile,missing).physicalPlan()),std::invalid_argument);
@@ -717,14 +743,14 @@ TEST(NgramExecutionProvision, AttentionPhaseScheduleWireRoundTripRejectsUnknownA
         c.attention_phase_schedule = schedule;
         c.attention_arithmetic = qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals;
         const auto q=request(profile,{c});const std::array requests{q};const auto wire=serializeImmutableRowTableAdmissionRequests(requests);
-        const auto decoded=parseImmutableRowTableAdmissionRequests(wire,0,&profile);
+        const auto decoded=test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&profile,q.native_ordering_events,q.retained_host_services);
         ASSERT_EQ(decoded.size(),1u);ASSERT_TRUE(decoded.front().execution_provision);
         EXPECT_EQ(decoded.front().execution_provision->consumers(),q.execution_provision->consumers());
         const auto& consumers=q.execution_provision->consumers();ASSERT_EQ(consumers.size(),1u);
         const auto& a=consumers.front().activation;EXPECT_EQ(a.attention_phase_schedule,schedule);
         auto prior = wire;
         prior.at(4) = 7;
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(prior, 0, &profile),
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(prior, 0, &profile,q.native_ordering_events,q.retained_host_services),
                      std::invalid_argument);
         std::vector<std::uint8_t> words;
         for(const auto value:{std::uint32_t(a.local_d_ff),std::uint32_t(a.local_n_heads),std::uint32_t(a.local_n_kv_heads),std::uint32_t(a.local_vocab),
@@ -735,7 +761,7 @@ TEST(NgramExecutionProvision, AttentionPhaseScheduleWireRoundTripRejectsUnknownA
         const auto offset=std::size_t(found-wire.begin())+words.size()-4;
         for(const std::uint32_t invalid:{2u,255u,256u,0x7fffffffu}){
             auto bad=wire;for(int byte=0;byte<4;++byte)bad.at(offset+byte)=std::uint8_t(invalid>>(8*byte));
-            try{(void)parseImmutableRowTableAdmissionRequests(bad,0,&profile);FAIL()<<"Unknown schedule accepted";}
+            try{(void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(bad,0,&profile,q.native_ordering_events,q.retained_host_services);FAIL()<<"Unknown schedule accepted";}
             catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("attention phase schedule"),std::string::npos);}
         }
     }
@@ -750,8 +776,8 @@ TEST(NgramExecutionProvision, AttentionPhaseScheduleIsPartOfConsumerAndRestoreId
     changed.front().activation.attention_phase_schedule=Schedule::Prefill8Decode33;
     EXPECT_FALSE(changed.front()==original.front());
     changed.front().activation.attention_phase_schedule=static_cast<Schedule>(255);
-    EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,changed,
-        q.execution_provision->executionPlan(),q.execution_provision->requiredBase()),std::invalid_argument);
+    EXPECT_THROW((void)test::MemoryPlannerOrderingReplayAccess::restore(profile,q.requested,q.input,changed,
+        q.execution_provision->executionPlan(),q.execution_provision->requiredBase(),q.native_ordering_events,q.retained_host_services),std::invalid_argument);
 }
 
 /** @test Predictor ownership is preserved and authenticated by source provision and wire identity. */
@@ -772,18 +798,18 @@ TEST(NgramExecutionProvision, PredictorStorageOwnershipSurvivesWireAndRejectsUnk
         EXPECT_EQ(original.activation.mtp_shifted_kv_head_layout,policy);
         const std::array requests{q};
         const auto wire=serializeImmutableRowTableAdmissionRequests(requests);
-        const auto decoded=parseImmutableRowTableAdmissionRequests(wire,0,&profile);
+        const auto decoded=test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&profile,q.native_ordering_events,q.retained_host_services);
         ASSERT_EQ(decoded.size(),1u);
         EXPECT_EQ(decoded.front().execution_provision->consumers(),q.execution_provision->consumers());
         auto old=wire; old.at(4)=8;
-        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(old,0,&profile),std::invalid_argument);
+        EXPECT_THROW(test::ImmutableRowTableAdmissionWireReplayAccess::parse(old,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
         auto changed=q.execution_provision->consumers();
         changed.front().activation.mtp_shifted_kv_head_layout=policy==MTPShiftedKVHeadLayout::FullModelPerParticipant
             ? MTPShiftedKVHeadLayout::PrimaryTensorParallelShard : MTPShiftedKVHeadLayout::FullModelPerParticipant;
         EXPECT_NE(changed.front(),original);
         changed.front().activation.mtp_shifted_kv_head_layout=static_cast<MTPShiftedKVHeadLayout>(255);
-        EXPECT_THROW(MemoryPlanner::restoreImmutableRowTableExecutionProvision(profile,q.requested,q.input,changed,
-            q.execution_provision->executionPlan(),q.execution_provision->requiredBase()),std::invalid_argument);
+        EXPECT_THROW(test::MemoryPlannerOrderingReplayAccess::restore(profile,q.requested,q.input,changed,
+            q.execution_provision->executionPlan(),q.execution_provision->requiredBase(),q.native_ordering_events,q.retained_host_services),std::invalid_argument);
     }
 }
 
@@ -801,7 +827,7 @@ TEST(NgramExecutionProvision,
     const auto q = request(profile, {c});
     const std::array requests{q};
     const auto wire = serializeImmutableRowTableAdmissionRequests(requests);
-    const auto decoded = parseImmutableRowTableAdmissionRequests(wire, 0, &profile);
+    const auto decoded = test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire, 0, &profile,q.native_ordering_events,q.retained_host_services);
     ASSERT_EQ(decoded.size(), 1u);
     EXPECT_EQ(
         decoded.front().execution_provision->consumers().front().activation.attention_arithmetic,
@@ -828,7 +854,7 @@ TEST(NgramExecutionProvision,
         auto bad = wire;
         for (int byte = 0; byte < 4; ++byte)
             bad.at(offset + byte) = std::uint8_t(invalid >> (byte * 8));
-        EXPECT_THROW((void)parseImmutableRowTableAdmissionRequests(bad, 0, &profile),
+        EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(bad, 0, &profile,q.native_ordering_events,q.retained_host_services),
                      std::invalid_argument);
     }
     auto changed = q.execution_provision->consumers();
@@ -836,12 +862,12 @@ TEST(NgramExecutionProvision,
     changed.front().activation.attention_arithmetic = A::FixedFP32;
     EXPECT_FALSE(changed.front() == original);
     changed.front().activation.attention_arithmetic = static_cast<A>(255);
-    EXPECT_THROW((void)MemoryPlanner::restoreImmutableRowTableExecutionProvision(
+    EXPECT_THROW((void)test::MemoryPlannerOrderingReplayAccess::restore(
                      profile,
                      q.requested,
                      q.input,
                      changed,
                      q.execution_provision->executionPlan(),
-                     q.execution_provision->requiredBase()),
+                     q.execution_provision->requiredBase(),q.native_ordering_events,q.retained_host_services),
                  std::invalid_argument);
 }

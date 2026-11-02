@@ -252,7 +252,7 @@ namespace
     class ReclamationBackendSpy final : public MockBackend
     {
     public:
-        ReclamationBackendSpy() : MockBackend(DeviceType::CUDA) {}
+        explicit ReclamationBackendSpy(DeviceType type=DeviceType::CUDA) : MockBackend(type) {}
 
         /** @brief Return the configured raw backend result and record identity. */
         DeviceMemoryCacheReclamationResult
@@ -326,6 +326,8 @@ namespace
             receipt.diagnostic = runtime_reset_succeeds
                                      ? "injected runtime reset"
                                      : "injected runtime reset failure";
+            receipt.tracked_device_allocations = runtime_tracked_allocations;
+            receipt.tracked_device_allocation_bytes = runtime_tracked_bytes;
             if (runtime_reset_succeeds)
                 ++runtime_generation;
             return receipt;
@@ -349,6 +351,8 @@ namespace
         int calls = 0; ///< Number of public-authority invocations.
         int last_device_id = -1; ///< Exact ordinal forwarded by TransferEngine.
         bool runtime_reset_succeeds = true; ///< Injected reset outcome.
+        size_t runtime_tracked_allocations = 0u; ///< Storage unexpectedly present at reset.
+        size_t runtime_tracked_bytes = 0u; ///< Exact remaining canonical bytes at reset.
         std::uint64_t runtime_generation = 1u; ///< Current fake runtime identity.
         int runtime_reset_calls = 0; ///< Exclusive runtime-reset invocations.
         int last_runtime_reset_device_id = -1; ///< Exact reset ordinal.
@@ -570,6 +574,102 @@ TEST(Test__TransferEngine_Reclamation, RequestFactoriesRejectInvalidOwnership)
         std::invalid_argument);
     EXPECT_EQ(backend.free_memory_calls, 0);
     reclamation_backend_spy = nullptr;
+}
+
+/** @test Native startup cleanup needs no dummy tensor and retains the original reset semantics. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRetirementResetsAndReplays)
+{
+    for (const auto device : {DeviceId::cuda(52), DeviceId::rocm(52)})
+    {
+        ReclamationBackendSpy backend(device.is_cuda()?DeviceType::CUDA:DeviceType::ROCm);
+        backend.allocation_accounting={.supported=true,.active_allocations=0,.active_bytes=0};
+        reclamation_backend_spy=&backend;
+        TransferEngine engine(&resolveReclamationBackend);
+        for (unsigned replay=0;replay<3;++replay)
+        {
+            auto ticket=engine.beginExclusiveNativeContextRetirement(device);
+            EXPECT_EQ(ticket.expectedRetiredBytes(),0u);
+            EXPECT_EQ(ticket.canonicalAllocationsBeforeOwnerRelease(),0u);
+            const auto receipt=engine.completeExclusiveModelRetirement(std::move(ticket));
+            EXPECT_EQ(receipt.device,device);
+            EXPECT_EQ(receipt.intent,DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement);
+            EXPECT_TRUE(receipt.runtime_reset_invoked);
+            EXPECT_EQ(receipt.runtime_post_reset_state,DeviceRuntimePostResetState::Quiescent);
+            EXPECT_EQ(receipt.successor_runtime_generation,receipt.retired_runtime_generation+1);
+            EXPECT_EQ(receipt.expected_retired_bytes,0u);
+            EXPECT_EQ(receipt.canonical_allocations_before_runtime_reset,0u);
+            EXPECT_EQ(receipt.canonical_allocation_bytes_before_runtime_reset,0u);
+            EXPECT_EQ(receipt.driverBytesVisibleSinceOwnerRelease(),0u);
+            EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)),std::logic_error);
+        }
+        EXPECT_EQ(backend.runtime_reset_calls,3);
+        EXPECT_EQ(backend.free_memory_calls,3); // No post-reset query can reactivate a context.
+        EXPECT_EQ(backend.calls,0);
+        reclamation_backend_spy=nullptr;
+    }
+}
+
+/** @test Neither zero bytes nor zero owners alone proves an empty canonical ledger. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRejectsUnknownOrLiveStorage)
+{
+    for (const auto device : {DeviceId::cuda(52),DeviceId::rocm(52)})
+    {
+        ReclamationBackendSpy backend(device.is_cuda()?DeviceType::CUDA:DeviceType::ROCm);
+        reclamation_backend_spy=&backend;
+        TransferEngine engine(&resolveReclamationBackend);
+        for (const auto ledger : {DeviceAllocationAccounting{.supported=false},
+                DeviceAllocationAccounting{.supported=true,.active_allocations=1,.active_bytes=0},
+                DeviceAllocationAccounting{.supported=true,.active_allocations=0,.active_bytes=1},
+                DeviceAllocationAccounting{.supported=true,.active_allocations=1,.active_bytes=64}})
+        {
+            backend.allocation_accounting=ledger;
+            EXPECT_THROW((void)engine.beginExclusiveNativeContextRetirement(device),std::runtime_error);
+        }
+        EXPECT_THROW((void)engine.beginExclusiveNativeContextRetirement(DeviceId::cpu()),std::invalid_argument);
+        EXPECT_THROW((void)engine.beginExclusiveNativeContextRetirement(DeviceId::invalid()),std::invalid_argument);
+        backend.allocation_accounting={.supported=true,.active_allocations=0,.active_bytes=0};
+        {
+            GraphCaptureGuard capture;
+            EXPECT_THROW((void)engine.beginExclusiveNativeContextRetirement(device),std::logic_error);
+        }
+        EXPECT_EQ(backend.free_memory_calls,0);
+        EXPECT_EQ(backend.runtime_reset_calls,0);
+        reclamation_backend_spy=nullptr;
+    }
+}
+
+/** @test An empty start cannot forge a reset receipt or permit a second completion. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRequiresSuccessfulReset)
+{
+    ReclamationBackendSpy backend;
+    backend.allocation_accounting={.supported=true,.active_allocations=0,.active_bytes=0};
+    backend.runtime_reset_succeeds=false;
+    reclamation_backend_spy=&backend;
+    TransferEngine engine(&resolveReclamationBackend);
+    auto ticket=engine.beginExclusiveNativeContextRetirement(DeviceId::cuda(52));
+    EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)),std::runtime_error);
+    EXPECT_FALSE(ticket.valid());
+    EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)),std::logic_error);
+    EXPECT_EQ(backend.runtime_reset_calls,1);
+    reclamation_backend_spy=nullptr;
+}
+
+/** @test Completion still rejects any allocation reported at the reset boundary. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRejectsIncompleteRetirement)
+{
+    for (const auto device : {DeviceId::cuda(52),DeviceId::rocm(52)})
+    {
+        ReclamationBackendSpy backend(device.is_cuda()?DeviceType::CUDA:DeviceType::ROCm);
+        backend.allocation_accounting={.supported=true,.active_allocations=0,.active_bytes=0};
+        backend.runtime_tracked_allocations=1;
+        backend.runtime_tracked_bytes=64;
+        reclamation_backend_spy=&backend;
+        TransferEngine engine(&resolveReclamationBackend);
+        auto ticket=engine.beginExclusiveNativeContextRetirement(device);
+        EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)),std::runtime_error);
+        EXPECT_FALSE(ticket.valid());
+        reclamation_backend_spy=nullptr;
+    }
 }
 
 TEST(Test__TransferEngine_Reclamation, PublicAuthorityReturnsCompleteReceipt)
@@ -2808,16 +2908,12 @@ TEST_F(
             .producer_stage_index = 0,
         }},
     }};
-    GraphCaptureDependencyLedger ledger(
-        DeviceId::cuda(0), capture_stream, std::move(stages), "invalid_order");
-
-    GraphCaptureGuard capture_guard(&ledger);
-    ScopedGraphCaptureStage consumer_scope(&invalid_consumer_stage);
+    // The typed schedule now rejects an impossible dependency at construction,
+    // before capture can begin or any input can be consumed.
     EXPECT_THROW(
-        TransferEngine::requireDeviceInput(
-            tensor.get(), DeviceId::cuda(0), capture_stream),
+        (void)GraphCaptureDependencyLedger(
+            DeviceId::cuda(0), capture_stream, std::move(stages), "invalid_order"),
         std::logic_error);
-    consumer_scope.complete();
 }
 
 TEST_F(

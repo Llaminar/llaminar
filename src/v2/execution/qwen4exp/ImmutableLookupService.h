@@ -11,10 +11,12 @@
  */
 #pragma once
 #include "ImmutableLookupProtocol.h"
+#include "ImmutableLookupServiceGeometry.h"
 #include "kernels/qwen4exp/ImmutableSubordinateLookupBinding.h"
 #include "../../kernels/qwen4exp/ImmutableLookupKernels.h"
 #include "../../loaders/HostImmutableRowProvider.h"
 #include "../local_execution/graph/RetainedParentTicketServiceWorker.h"
+#include "../local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "../local_execution/graph/RetainedStorageStatistics.h"
 #include "../../transfer/TransferEngine.h"
 #include <atomic>
@@ -54,7 +56,7 @@ public:
      */
     ImmutableLookupHostProcessor(HostImmutableRowProvider &table,ImmutableLookupLayout layout,
         std::span<std::byte> channel,std::uint64_t tableId,
-        std::atomic<ImmutableLookupStatus> *fatalStatus=nullptr,const std::atomic<bool> *cancelled=nullptr);
+        std::atomic<ImmutableLookupStatus> *fatalStatus=nullptr,const std::atomic<bool> *cancelled=nullptr,DeviceId requester=DeviceId::invalid());
     /** @brief Retire the sole subordinate ingress; old read pins retain their exact source/PMA backing. */
     ~ImmutableLookupHostProcessor();
     ImmutableLookupHostProcessor(const ImmutableLookupHostProcessor &)=delete;
@@ -152,8 +154,27 @@ public:
     /** @brief Exact admitted I/O interval and actual retained-worker invocation; neither can be substituted. */
     struct Ticket final {
         std::uint64_t generation=0, invocation=0;
+        std::size_t channel=0; ///< Exact original sealed frame; never a GPU progress value.
         /** @return Whether both original identities name a real admission. */
         constexpr bool valid() const noexcept { return generation && invocation; }
+    };
+    /** @brief One actual parent-owned admission of the entire sealed channel population. */
+    class GroupAdmission final {
+    public:
+        GroupAdmission(GroupAdmission&&)=default;
+        GroupAdmission& operator=(GroupAdmission&&) noexcept;
+        ~GroupAdmission() noexcept;
+        /** @return Original monotone I/O interval, independent of the model request epoch. */
+        std::uint64_t generation() const noexcept{return ticket_.generation;}
+        /** @return Whether this handle still retains its original service and real worker dispatch. */
+        bool valid() const noexcept{return owner_&&ticket_.valid();}
+        GroupAdmission(const GroupAdmission&)=delete;
+        GroupAdmission& operator=(const GroupAdmission&)=delete;
+    private:
+        friend class ImmutableLookupService;
+        GroupAdmission(std::shared_ptr<ImmutableLookupService> owner,Ticket ticket):owner_(std::move(owner)),ticket_(ticket){}
+        std::shared_ptr<ImmutableLookupService> owner_;
+        Ticket ticket_;
     };
     /** @brief Strong service/backing lifetime plus one exact native alias address space. */
     class Binding final
@@ -180,13 +201,14 @@ public:
      * @param devices Explicit mapped endpoint set, supplied by graph placement.
      * @param memory Canonical rank-bound physical admission authority.
      * @param hostDevice Exact CPU/NUMA allocator charged for staging.
+     * @param worker One already claimed original I/O role, declared before quota allocation.
      * @param transfers Public mapping authority, retaining its exact backend bindings; setup injection permits device-free worker proofs.
      * @return Shared service whose binding can safely outlive caller teardown.
      */
     static std::shared_ptr<ImmutableLookupService> create(std::shared_ptr<HostImmutableRowProvider> table,
         ImmutableLookupLayout layout,std::span<const DeviceId> devices,
         std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId hostDevice,
-        TransferEngine &transfers=TransferEngine::instance());
+        RetainedHostServiceUseToken worker,TransferEngine &transfers=TransferEngine::instance());
     /** @brief Cancel/retire any outstanding host invocation before owned state is released. */
     ~ImmutableLookupService();
     /** @brief Freeze one exact device alias during setup, retaining this service lifetime. */
@@ -198,6 +220,14 @@ public:
      * @return Exact worker invocation awaited only after the GPU parent terminal.
      */
     Ticket arm(std::uint64_t generation);
+    /** @brief Arm every predeclared channel once from the original complete parent admission. */
+    GroupAdmission armGroup(std::uint64_t generation);
+    /** @return Complete original channel membership, never storage-only cache participants. */
+    std::span<const DeviceId> channelDevices() const noexcept{return geometry_.devices();}
+    /** @brief Transfer a single exact channel ticket without starting independent work. */
+    Ticket adoptGroupChannel(const GroupAdmission& group,DeviceId consumer);
+    /** @brief Join the original group and retire only unadopted tickets; adopted boundaries keep their exact await right. */
+    bool finishGroup(const GroupAdmission& group);
     /** @brief Join one exact completed service interval after native terminal observation. */
     bool await(Ticket ticket);
     /** @brief Cancel only the exact outstanding I/O admission without claiming response consumption.
@@ -208,6 +238,8 @@ public:
     bool cancel(Ticket ticket);
     /** @brief Return terminal I/O statistics; rejected while an invocation is live. */
     ImmutableLookupServiceStats stats() const;
+    /** @return Terminal counters for one actual consumer, not duplicated shared totals. */
+    ImmutableLookupServiceStats stats(DeviceId consumer) const;
     /** @brief Immutable actual table policy; no worker or device observation is performed. */
     HostImmutableRowMode mode() const noexcept{return table_->mode();}
     /**
@@ -226,16 +258,25 @@ private:
     friend struct ImmutableLookupSubordinateTestAccess;
     friend class ImmutableSubordinateLookupBinding; ///< Original source/backing validation and closed setup
                                                     ///< factory.
-    /** @brief Create/reuse this original source channel's exact pooled registration before capture. */
+    /**
+     * @brief Create/reuse this source channel's exact pooled registration before capture.
+     * @param binding Exact original mapped protocol and source identity. @param geometry Checked packet/root geometry.
+     * @param owners Original ordered cache roots. @param coordinator Original policy roots.
+     * @param memory Same final source PMA. @param stream Exact non-default setup producer.
+     * @param group Original sealed source claim, empty for the public installed-selector path.
+     * @return One original service registration; partial failures never publish replacement roots.
+     * @throws std::exception For foreign/cached replacement claims or failed materialization.
+     */
     std::shared_ptr<PooledImmutableSourcePreparedStorage> declarePooledSourceStorage(const ImmutableSubordinateLookupBinding& binding,
-        const PooledImmutableSourceGeometry& geometry,std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,
-        std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream);
-    std::shared_ptr<PooledImmutableSourcePreparedStorage> pooled_storage_; ///< Roots only; never retains service/binding and creates no ownership cycle.
+        const PooledImmutableSourceGeometry& geometry,std::vector<std::shared_ptr<PooledImmutableOwnerPreparedStorage>> owners,
+        std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,std::unique_ptr<NativeOrderingEventGroup> group);
+    std::vector<std::shared_ptr<PooledImmutableSourcePreparedStorage>> pooled_storages_; ///< Roots only; never retains service/binding and creates no ownership cycle.
     std::mutex pooled_setup_; ///< Setup metadata publication only, independent of live device state.
     /** @brief Construct only through PMA-authenticated create(). */
     ImmutableLookupService(std::shared_ptr<HostImmutableRowProvider> table,
-                           std::shared_ptr<ImmutableLookupChannelBacking> backing,
-                           std::shared_ptr<const PhysicalMemoryAuthority> memory);
+                           std::shared_ptr<ImmutableLookupChannelBacking> backing,ImmutableLookupServiceGeometry geometry,
+                           std::shared_ptr<const PhysicalMemoryAuthority> memory,
+                           std::unique_ptr<PreparedRetainedHostService> worker);
     /** @brief Allocation-free retained-worker entry. */
     static bool run(void *context);
     /** @brief Complete host I/O lifecycle; failed channels cannot be silently reused. */
@@ -248,9 +289,26 @@ private:
     std::shared_ptr<const PhysicalMemoryAuthority>
         memory_;                         ///< Exact channel claim authority, never a byte ledger.
     std::atomic<bool> cancelled_{false}; ///< Constructed before and retained beyond its processor binding.
+    ImmutableLookupServiceGeometry geometry_;
     ImmutableLookupHostProcessor processor_;
+    std::vector<std::unique_ptr<ImmutableLookupHostProcessor>> extra_processors_;
+    std::vector<bool> adopted_,retired_;
+    bool joined_=false,joined_result_=false;
+    /** @return The predeclared frame ordinal; rejects storage-only or foreign consumers. */
+    std::size_t channelIndex(DeviceId device) const;
+    /** @return The sole host processor for that disjoint mapped frame. */
+    ImmutableLookupHostProcessor& processor(std::size_t index);
+    const ImmutableLookupHostProcessor& processor(std::size_t index) const;
+    /** @return Shared invocation ticket after dispatching the existing single I/O worker once. */
+    Ticket armImpl(std::uint64_t generation);
+    /** @brief Join/cache the original worker once while holding the whole-terminal mutex. */
+    void joinInvocation(Ticket ticket,bool complete_parent);
+    /** @brief Cancel/join only a still-owned original group; stale RAII handles cannot affect a successor. */
+    void abandonGroup(const GroupAdmission& group) noexcept;
     mutable std::mutex lifecycle_;
-    RetainedParentTicketServiceWorker worker_;
+    std::mutex terminal_join_; ///< Whole-request join only; never held by polling or GPU submission.
+    std::unique_ptr<PreparedRetainedHostService> worker_owner_; ///< Exact admitted stack/object/thread, joined before processor/context destruction.
+    RetainedParentTicketServiceWorker& worker_; ///< Alias of the sole typed owner, never a second worker.
     Ticket outstanding_;
     std::uint64_t generation_=0;
 };

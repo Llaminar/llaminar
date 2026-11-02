@@ -184,7 +184,9 @@ namespace llaminar2
                     .prefill = {.bucket_rows = policy.prefill_bucket_rows,
                         .minimum_sequence_rows = policy.minimum_prefill_sequence_rows,
                         .maximum_cached_buckets = policy.maximum_cached_prefill_buckets},
-                    .gpu_weight_load = {.policy = policy.weight_load, .maximum_source_bytes = weight_load.maximum_source_bytes}}));
+                    .gpu_weight_load = {.policy = policy.weight_load, .maximum_source_bytes = weight_load.maximum_source_bytes},
+                    .native_ordering_events=policy.native_ordering_events,
+                    .retained_host_services=projectPlanningHostServiceBudget(policy.retained_host_services, candidate.membership, 0)}));
             std::vector<DevicePlanConfig> devices;
             for (const auto &stage : pipeline->stages())
                 devices.insert(devices.end(), stage.devicePlans().begin(), stage.devicePlans().end());
@@ -201,7 +203,7 @@ namespace llaminar2
         if (!overlay)
         {
             std::vector<DevicePlanConfig> devices;
-            for (const auto &rank : ranks)
+            for (auto &rank : ranks)
             {
                 auto local = buildRankMemoryPlanInputs({
                     .model = profile, .plan = rank, .inventory = inventory.ranks.at(rank.rank),
@@ -209,6 +211,10 @@ namespace llaminar2
                     .captured_prefill_buckets = policy.prefill_bucket_rows,
                     .max_gpu_memory_bytes = config.memoryLimitBytes(DeviceType::CUDA),
                     .max_cpu_memory_bytes = config.memoryLimitBytes(DeviceType::CPU)});
+                for(auto& cfg:local)cfg.native_ordering_events=policy.native_ordering_events;
+                rank.runtime.retained_host_services = MemoryPlanner::declareRetainedHostServices(
+                    profile, local, rank.rank, nullptr, inventory,
+                    projectPlanningHostServiceBudget(policy.retained_host_services, candidate.membership, rank.rank));
                 devices.insert(devices.end(), std::make_move_iterator(local.begin()), std::make_move_iterator(local.end()));
             }
             const bool gpu = std::any_of(devices.begin(), devices.end(), [](const auto &device) { return device.device.is_gpu(); });
@@ -274,7 +280,7 @@ namespace llaminar2
                 std::vector<int> segments;
                 for (size_t index = 0; index < ranks.size(); ++index)
                 {
-                    const auto inputs = buildMoEOverlayMemoryPlanInputs({
+                    auto inputs = buildMoEOverlayMemoryPlanInputs({
                         .model = profile, .rank_plan = ranks[index], .config = config,
                         .inventory = inventory, .execution = *compiled[index].overlayExecution(),
                         .capacity_policy = capacity_policy, .retained_mtp = mtp, .graph_family = family,
@@ -283,6 +289,9 @@ namespace llaminar2
                             .maximum_cached_buckets = policy.maximum_cached_prefill_buckets},
                         .gpu_weight_load = {.policy = policy.weight_load, .maximum_source_bytes = weight_load.maximum_source_bytes}},
                         candidate_rows);
+                    inputs.local_capacity.native_ordering_events=policy.native_ordering_events;
+                    inputs.local_capacity.retained_host_services = projectPlanningHostServiceBudget(
+                        policy.retained_host_services, candidate.membership, ranks[index].rank);
                     local.push_back(MoEOverlayLocalCapacityPlanner::plan(inputs.local_capacity));
                     segments.push_back(inputs.prefill_segment_rows);
                     budgets.insert(budgets.end(), local.back().physical_budgets.begin(), local.back().physical_budgets.end());
@@ -304,6 +313,8 @@ namespace llaminar2
             throw PhysicalMemoryCapacityExhausted("No complete ExpertOverlay candidate graph fits: " + last_capacity_error);
         for(size_t index=0;index<ranks.size();++index)
         {
+            ranks[index].runtime.retained_host_services = retainedHostServicesFromInputs(
+                selected_local[index].device_inputs, ranks[index].rank);
             ranks[index].runtime.resident_graph_rows=selected_local[index].resident_graph_rows;
             ranks[index].runtime.moe_routed_prefill.overlay_segment_rows=selected_segments[index];
         }

@@ -4187,3 +4187,18 @@ TEST(Test__BenchmarkRunnerCPU, PublicationV3CPUWitnessSeparatesVerifierProgressA
     EXPECT_EQ(publication_events,verifier_events);EXPECT_NE(verifier_output,published_states);
     EXPECT_NE(general_output,verifier_output); // Only this tagged value can author CPU terminal.emitted_tokens.
 }
+
+/** @test Benchmark JSON retains the same complete original resolved configuration, not a sampling-only projection. */
+TEST(Test__BenchmarkRunnerCPU, RuntimeConfigurationUsesOriginalCanonicalSerializer)
+{
+    llaminar2::OrchestrationConfig config;
+    config.model_path="/original/model.gguf";
+    config.mtp.graph_capacity_draft_tokens=15;
+    config.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    config.benchmark_mode=true;
+    const llaminar2::BenchmarkResult result{};
+    const auto document=nlohmann::json::parse(llaminar2::benchmarkResultToJsonString(result,&config));
+    EXPECT_EQ(document.at("runtime_configuration"),
+        nlohmann::json::parse(llaminar2::serializeOrchestrationConfig(config)));
+    EXPECT_FALSE(nlohmann::json::parse(llaminar2::benchmarkResultToJsonString(result)).contains("runtime_configuration"));
+}

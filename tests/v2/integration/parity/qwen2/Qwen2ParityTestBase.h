@@ -769,6 +769,35 @@ namespace llaminar2::test::parity::qwen2
          */
         virtual void applyModelOverrides() {}
 
+        /**
+         * @brief Bind the prompt from its typed proof authority before capture sizing.
+         * Native exact replay retains declared token IDs without opening an HF
+         * pack. Reference numerics imports and requires its authenticated pack.
+         * Both paths configure the original exact prefill capture bucket.
+         */
+        void bindParityPrefillPrompt()
+        {
+            // Exact replay owns its declared native prompt. Only numerical
+            // proofs import the authenticated HF prefill trajectory below.
+            if (mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay)
+            {
+                ASSERT_FALSE(config_.token_ids.empty())
+                    << "Native exact replay requires its declared original prompt tokens";
+                configureExactProductionParityPrefillGraphBucket();
+                return;
+            }
+
+            auto reference_tokens = readPrefillTokensFromMetadata();
+            if (productionParityCampaignEnabled())
+            {
+                ASSERT_FALSE(reference_tokens.empty())
+                    << "Production parity reference metadata has no token_ids";
+            }
+            if (!reference_tokens.empty())
+                config_.token_ids = std::move(reference_tokens);
+            configureExactProductionParityPrefillGraphBucket();
+        }
+
         /** @brief Project the complete numerical contract before model/graph admission. */
         void SetUp() override
         {
@@ -800,15 +829,7 @@ namespace llaminar2::test::parity::qwen2
                 return;
             }
 
-            auto reference_tokens = readPrefillTokensFromMetadata();
-            if (productionParityCampaignEnabled())
-            {
-                ASSERT_FALSE(reference_tokens.empty())
-                    << "Production parity reference metadata has no token_ids";
-            }
-            if (!reference_tokens.empty())
-                config_.token_ids = std::move(reference_tokens);
-            configureExactProductionParityPrefillGraphBucket();
+            bindParityPrefillPrompt();
         }
     };
 

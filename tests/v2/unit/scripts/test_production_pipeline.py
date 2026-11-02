@@ -1752,6 +1752,358 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
 
 
 class BenchmarkPolicyTests(unittest.TestCase):
+    def test_declared_benchmark_requires_exact_green_panel_and_complete_retirement(self):
+        """Declared placement is eligible only after genuine same-policy numerical/terminal proof."""
+        record = {"diagnostic_benchmark": {"schema": 1, "policy": "diagnostic_declared",
+            "certification_eligible": False, "args": ["--ngram-gpu-cache-placement", "consumer-local"]}}
+        workload = dict(schema=1,prompt_unit=" test",prompt_repetitions=512,decode_tokens=256,
+            warmup_iterations=1,measurement_iterations=3)
+        panel = dict(mode="local_fixed_history_diagnostic",complete=True,passed=True,observations_complete=True,
+            cells=[dict(complete=True,passed=True,observations_complete=True,native_retired=True,
+                returncode=0,driver_window_clean=True,reset_byte_equal=True)])
+        self.assertEqual(benchmark.declared_panel_eligibility(panel,"Exact",record,workload),record['diagnostic_benchmark'])
+        for field in ('complete','passed','observations_complete'):
+            bad=copy.deepcopy(panel);bad[field]=False
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,"Exact",record,workload)
+        for field in ('complete','passed','observations_complete','native_retired','driver_window_clean','reset_byte_equal'):
+            bad=copy.deepcopy(panel);bad['cells'][0][field]=False
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,"Exact",record,workload)
+        bad=copy.deepcopy(panel);bad['cells'][0]['returncode']=1
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,"Exact",record,workload)
+        bad=copy.deepcopy(panel);bad['paired_workload']={'exact_cell':'Other','source_export':record}
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,"Exact",record,workload)
+        bad=copy.deepcopy(record);bad['diagnostic_benchmark']['policy']='production_defaults'
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,"Exact",bad,workload)
+        bad=copy.deepcopy(workload);bad['measurement_iterations']=2
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,"Exact",record,bad)
+
+    def test_declared_benchmark_preserves_original_thread_controls_and_strips_loader_environment(self):
+        """The actual declared runner keeps accepted CPU policy while dropping hostile loader/SDK controls."""
+        from types import SimpleNamespace
+        import model_kld_corpus_execution as owner
+        import gpu_driver_diagnostics as driver
+        from model_kld_corpus import metadata_digest
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / 'llaminar2'
+            parser = root / 'llaminar_model_kld_canary'
+            binary.write_text('original Release binary pin')
+            parser.write_text('original Release parser pin')
+            workload = dict(schema=1, prompt_unit=' test', prompt_repetitions=512,
+                decode_tokens=256, warmup_iterations=1, measurement_iterations=3)
+            workload_path = root / 'workload.json'
+            workload_path.write_text(json.dumps(workload))
+            manifest = {'source': {'original': 'source identity'}}
+            topology = {'id': 'original-tp2', 'arithmetic': {'hc_up': 'two_term_q8'},
+                'runtime_config_digest': 'original-runtime'}
+            native_identity = {'executable_sha256': 'original-panel-binary'}
+            actual_owner = {'actual_config': {'configuration': {'n_threads': -1}}}
+            cell = dict(topology_id=topology['id'], complete=True, passed=True,
+                observations_complete=True, native_retired=True, returncode=0,
+                driver_window_clean=True, reset_byte_equal=True,
+                native_identity=native_identity, actual_owner=actual_owner)
+            panel = dict(mode='local_fixed_history_diagnostic', complete=True, passed=True,
+                observations_complete=True, cells=[cell],
+                corpus_manifest_digest=metadata_digest(manifest), binary={'sha256': 'original-panel-binary'})
+            panel_path = root / 'panel.json'
+            panel_path.write_text(json.dumps(panel))
+            cell_directory = root / topology['id']
+            cell_directory.mkdir()
+            (cell_directory / 'described-config.json').write_text('{}')
+            (cell_directory / 'controller.json').write_text(json.dumps(dict(
+                topology_id=topology['id'], complete=True, native_retired=True, passed=True, returncode=0)))
+            (cell_directory / 'native-observation.json').write_text(json.dumps(dict(
+                complete=True, topology_id=topology['id'],
+                corpus_manifest_digest=metadata_digest(manifest), source_digest=metadata_digest(manifest['source']),
+                runtime_config_digest=topology['runtime_config_digest'], arithmetic=topology['arithmetic'],
+                native_identity=native_identity, actual_owner=actual_owner,
+                proofs={name: True for name in owner.corpus_v2.PROOFS})))
+            selection = SimpleNamespace(topology=topology, corpus={'manifest': manifest},
+                documents={'pilot': None}, paths={'benchmark': workload_path})
+            record = {'diagnostic_benchmark': dict(schema=1, policy='diagnostic_declared',
+                certification_eligible=False, args=['--ngram-gpu-cache-placement', 'consumer-local'])}
+            args = argparse.Namespace(diagnostic=True, diagnostic_binary=binary, image=None,
+                e2e_report=None, panel_report=panel_path, corpus_root=root, parser_binary=parser,
+                workload=workload_path, list=False, report=root / 'report.json')
+            supplied = dict(PATH='/original/bin', HOME='/original/home',
+                ROCR_VISIBLE_DEVICES='GPU-original0,GPU-original1', HWLOC_COMPONENTS='-gl,-opencl',
+                OMP_NUM_THREADS='56', OMP_PLACES='cores', OMP_PROC_BIND='false', OPENBLAS_NUM_THREADS='1',
+                LD_LIBRARY_PATH='/foreign/sdk/lib', LD_PRELOAD='/foreign/allocator.so',
+                HSA_OVERRIDE_GFX_VERSION='9.0.6', PYTHONPATH='/foreign/python')
+            with patch.dict(os.environ, supplied, clear=True), \
+                 patch.object(benchmark.e2e, 'release_binary_cpu_isa'), \
+                 patch.object(benchmark, 'declared_inventory', return_value=(('original', 'Exact', record), {})), \
+                 patch.object(owner.PairedCorpusSelection, 'from_export', return_value=selection), \
+                 patch.object(owner, 'validate_described_config'), \
+                 patch.object(driver, 'validate_evidence'), \
+                 patch.object(benchmark, 'declared_source_pins', return_value={}), \
+                 patch.object(benchmark, 'declared_config_identity', side_effect=RuntimeError('actual environment captured')) as capture:
+                with self.assertRaisesRegex(RuntimeError, 'actual environment captured'):
+                    benchmark.run_declared_diagnostic(args)
+            environment = capture.call_args.args[3]
+            for key in ('HOME', 'ROCR_VISIBLE_DEVICES', 'HWLOC_COMPONENTS',
+                        'OMP_NUM_THREADS', 'OMP_PLACES', 'OMP_PROC_BIND', 'OPENBLAS_NUM_THREADS'):
+                self.assertEqual(environment.get(key), supplied[key], key)
+            for key in ('LD_LIBRARY_PATH', 'LD_PRELOAD', 'HSA_OVERRIDE_GFX_VERSION', 'PYTHONPATH'):
+                self.assertNotIn(key, environment)
+            self.assertEqual(environment['LLAMINAR_BENCHMARK_ITERATIONS'], '3')
+            self.assertEqual(environment['LLAMINAR_BENCHMARK_WARMUP_ITERATIONS'], '1')
+            self.assertEqual(environment[owner.SELECTORS['hc_up']], 'two_term_q8')
+
+    def test_declared_benchmark_preserves_retirement_after_validation_failure(self):
+        """Successful guardian retirement survives a later measurement or configuration rejection."""
+        from types import SimpleNamespace
+        import model_kld_corpus_execution as owner
+        import gpu_driver_diagnostics as driver
+        from model_kld_corpus import metadata_digest
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / 'llaminar2'
+            parser = root / 'llaminar_model_kld_canary'
+            binary.write_text('original Release binary pin')
+            parser.write_text('original Release parser pin')
+            workload = dict(schema=1, prompt_unit=' test', prompt_repetitions=512,
+                decode_tokens=256, warmup_iterations=1, measurement_iterations=3)
+            workload_path = root / 'workload.json'
+            workload_path.write_text(json.dumps(workload))
+            manifest = {'source': {'original': 'source identity'}}
+            topology = {'id': 'original-tp2', 'arithmetic': {'hc_up': 'two_term_q8'},
+                'runtime_config_digest': 'original-runtime'}
+            native_identity = {'executable_sha256': 'original-panel-binary'}
+            actual_owner = {'actual_config': {'configuration': {'n_threads': -1}}}
+            cell = dict(topology_id=topology['id'], complete=True, passed=True,
+                observations_complete=True, native_retired=True, returncode=0,
+                driver_window_clean=True, reset_byte_equal=True,
+                native_identity=native_identity, actual_owner=actual_owner)
+            panel = dict(mode='local_fixed_history_diagnostic', complete=True, passed=True,
+                observations_complete=True, cells=[cell],
+                corpus_manifest_digest=metadata_digest(manifest), binary={'sha256': 'original-panel-binary'})
+            panel_path = root / 'panel.json'
+            panel_path.write_text(json.dumps(panel))
+            cell_directory = root / topology['id']
+            cell_directory.mkdir()
+            (cell_directory / 'described-config.json').write_text('{}')
+            (cell_directory / 'controller.json').write_text(json.dumps(dict(
+                topology_id=topology['id'], complete=True, native_retired=True, passed=True, returncode=0)))
+            (cell_directory / 'native-observation.json').write_text(json.dumps(dict(
+                complete=True, topology_id=topology['id'],
+                corpus_manifest_digest=metadata_digest(manifest), source_digest=metadata_digest(manifest['source']),
+                runtime_config_digest=topology['runtime_config_digest'], arithmetic=topology['arithmetic'],
+                native_identity=native_identity, actual_owner=actual_owner,
+                proofs={name: True for name in owner.corpus_v2.PROOFS})))
+            selection = SimpleNamespace(topology=topology, corpus={'manifest': manifest},
+                documents={'pilot': None}, paths={'benchmark': workload_path})
+            record = {'model': 'original.gguf', 'diagnostic_benchmark': dict(schema=1, policy='diagnostic_declared',
+                certification_eligible=False, context_length=4096, args=['--ngram-gpu-cache-placement', 'consumer-local'])}
+            args = argparse.Namespace(diagnostic=True, diagnostic_binary=binary, image=None,
+                e2e_report=None, panel_report=panel_path, corpus_root=root, parser_binary=parser,
+                workload=workload_path, list=False, report=root / 'report.json')
+            helper = root / 'llaminar_mpi_session'
+            helper.write_text('original session helper')
+            helper.chmod(0o700)
+            workload.update(seed=42, temperature=0, top_k=1, top_p=1)
+            workload_path.write_text(json.dumps(workload))
+            for failure_stage in ('measurement', 'configuration'):
+                args.report = root / (failure_stage + '.json')
+                def guardian(command, environment, output):
+                    (output / 'benchmark.json').write_text('{}')
+                with patch.object(benchmark.e2e, 'release_binary_cpu_isa'), \
+                     patch.object(benchmark, 'declared_inventory', return_value=(('original', 'Exact', record), {})), \
+                     patch.object(owner.PairedCorpusSelection, 'from_export', return_value=selection), \
+                     patch.object(owner, 'validate_described_config'), \
+                     patch.object(driver, 'validate_evidence'), \
+                     patch.object(driver, 'begin'), \
+                     patch.object(driver, 'finish', return_value=True) as finish, \
+                     patch.object(benchmark, 'declared_source_pins', return_value={}), \
+                     patch.object(benchmark, 'declared_config_identity', return_value={}), \
+                     patch.object(benchmark, 'run_declared_guardian', side_effect=guardian) as retired, \
+                     patch.object(benchmark, 'validate_measurement', side_effect=(ValueError('measurement rejected') if failure_stage == 'measurement' else None), return_value={}), \
+                     patch.object(benchmark, 'declared_runtime_configuration', side_effect=ValueError('configuration rejected')):
+                    with self.assertRaisesRegex(ValueError, failure_stage + ' rejected'):
+                        benchmark.run_declared_diagnostic(args)
+                result = json.loads(args.report.read_text())
+                self.assertTrue(result['native_retired'])
+                self.assertFalse(result['passed'])
+                self.assertFalse(result['complete'])
+                self.assertTrue(result['driver_window_clean'])
+                self.assertIn(failure_stage + ' rejected', result['error'])
+                retired.assert_called_once()
+                finish.assert_called_once()
+
+    def test_declared_benchmark_preserves_numerical_config_and_measured_tokenizer_count(self):
+        """Exact source/config arithmetic stays bound while prefill tokens come from the real measurement."""
+        from model_kld_corpus import metadata_digest
+        from model_kld_corpus_execution import PairedCorpusSelection
+        with tempfile.TemporaryDirectory() as temporary:
+            model=Path(temporary)/'model.gguf';model.write_bytes(b'original source')
+            other=Path(temporary)/'other.gguf';other.write_bytes(b'foreign source')
+            canonical_config={'configuration':{'model_path':str(model),'prefix_cache':{'enabled':True},
+                'prefill_max_bucket_size':None}}
+            observed_config=copy.deepcopy(canonical_config)
+            observed_config['configuration'].update(prefix_cache={'enabled':False},prefill_max_bucket_size=512)
+            topology={'engine_argv':['--observer'],'expected_config':observed_config,
+                'runtime_config_digest':metadata_digest(observed_config),'arithmetic':{'hc_up':'two_term_q8'}}
+            observed={'schema':'llaminar.model-kld-described-config.v1','engine_argv':['--observer'],
+                'config':observed_config,'runtime_config_digest':metadata_digest(observed_config),
+                'qfn_canonical_intent':{'ngram':'ConsumerLocal','prefill_max_bucket_size':512},
+                'qfn_arithmetic_intent':topology['arithmetic']}
+            canonical={**observed,'engine_argv':['--canonical'],'config':canonical_config,
+                'runtime_config_digest':metadata_digest(canonical_config)}
+            selection=PairedCorpusSelection('Exact',{'model':str(model)}, {},topology,{}, {},{},['--canonical'])
+            with patch.object(benchmark.subprocess,'check_output',return_value=json.dumps(canonical)):
+                self.assertEqual(benchmark.declared_config_identity(selection,observed,Path('/original/parser'),{}),canonical)
+            for field,value in [('config',{'configuration':{'model_path':str(other)}}),
+                    ('qfn_canonical_intent',{'ngram':'replicated'}),('qfn_arithmetic_intent',{'hc_up':'other'})]:
+                bad=copy.deepcopy(canonical);bad[field]=value
+                bad['runtime_config_digest']=metadata_digest(bad['config'])
+                with patch.object(benchmark.subprocess,'check_output',return_value=json.dumps(bad)):
+                    with self.assertRaises(ValueError):benchmark.declared_config_identity(selection,observed,Path('/original/parser'),{})
+        workload=dict(schema=1,prompt_unit=' test',prompt_repetitions=512,decode_tokens=256,
+            warmup_iterations=1,measurement_iterations=3)
+        prompt=benchmark.validate_workload(workload).encode()
+        data=dict(schema='llaminar.benchmark.v1',success=True,prefill_success=True,decode_success=True,
+            prompt={'sha256':hashlib.sha256(prompt).hexdigest(),'bytes':len(prompt)},
+            measurement_iterations=3,warmup_iterations=1,iterations=[dict(tokens={'prefill':513,'decode':256},
+                throughput_tokens_per_sec={'prefill':100,'decode_after_prefill':10}) for _ in range(3)])
+        self.assertEqual(benchmark.validate_measurement(data,workload)['prefill_tokens'],513)
+        data['iterations'][1]['tokens']['decode']=255
+        with self.assertRaises(ValueError):benchmark.validate_measurement(data,workload)
+
+    def test_declared_benchmark_guardian_drains_timeout_and_rejects_partial_retirement(self):
+        """Timeout/error never returns while the original guardian still owns native MPI children."""
+        for outcome in ('success','exit','timeout','cleanup'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                output=Path(temporary);process=Mock()
+                process.poll.return_value=0
+                process.wait.return_value=0 if outcome!='exit' else 1
+                if outcome=='timeout':
+                    process.wait.side_effect=[subprocess.TimeoutExpired('owned',1),0]
+                    process.poll.return_value=None
+                with patch.object(benchmark.subprocess,'Popen',return_value=process) as spawn, \
+                     patch('mpi_session_retirement.require_retired',side_effect=ValueError('unretired session') if outcome=='cleanup' else None) as retired:
+                    command=['original-helper','--session-base',str(output/'mpi-session'),'--','binary']
+                    spawn.side_effect=lambda *args,**kwargs: process if (output/'mpi-session').is_dir() else self.fail('session base absent at spawn')
+                    if outcome=='success':benchmark.run_declared_guardian(command,{'HOME':'/original'},output)
+                    else:
+                        with self.assertRaises((ValueError,subprocess.TimeoutExpired)):
+                            benchmark.run_declared_guardian(command,{'HOME':'/original'},output)
+                    retired.assert_called_once_with([output/'mpi-session'],timeout_seconds=0)
+                    self.assertEqual(spawn.call_args.kwargs['env'],{'HOME':'/original'})
+                    if outcome=='timeout':process.terminate.assert_called_once();self.assertEqual(process.wait.call_args.kwargs['timeout'],36)
+
+    def test_declared_benchmark_compares_accepted_resolved_owner_and_exact_canonical_controls(self):
+        """Real report shape: resolution changes ranks/NUMA/placement while observer controls stay separate."""
+        from model_kld_corpus import metadata_digest
+        canonical={'kind':'llaminar.orchestration-config','schema_version':11,'configuration':{'model_path':'original','prefix_cache':{'enabled':True},'prefill_max_bucket_size':None,
+            'domain_definitions':[{'explicit_ranks':[],'numa_node':-1}],
+            'moe_routed_expert_plan':{'authority_execution':'Unresolved','placements':[]},'n_threads':-1}}
+        accepted=copy.deepcopy(canonical)
+        accepted['configuration'].update(prefix_cache={'enabled':False},prefill_max_bucket_size=512,
+            domain_definitions=[{'explicit_ranks':[0],'numa_node':0}],
+            moe_routed_expert_plan={'authority_execution':'HostResident','placements':[{'layer':0,'tier':0}]})
+        workload=dict(schema=1,prompt_unit=' test',prompt_repetitions=512,decode_tokens=256,
+            warmup_iterations=1,measurement_iterations=3,seed=42,temperature=0,top_k=1,top_p=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            output=Path(temporary)
+            actual=copy.deepcopy(accepted)
+            actual['configuration'].update(prefix_cache={'enabled':True},prefill_max_bucket_size=None,
+                benchmark_mode=True,benchmark_json_output_path=str(output/'benchmark.json'),
+                prompt=benchmark.validate_workload(workload),prompt_was_explicitly_provided=True,
+                n_predict=256,seed=42,temperature=0,top_k=1,top_p=1)
+            def describe(command,**kwargs):
+                self.assertEqual(command[:3],['/original/parser','--describe-config','--'])
+                document=json.loads(Path(command[-1]).read_text())
+                config=document['configuration']
+                intent={key:config[key] for key in ('domain_definitions','moe_routed_expert_plan')}
+                intent.update(prefill_max_bucket_size=config['prefill_max_bucket_size'] or 512,prefill_graph_buckets=[1,512])
+                self.assertEqual(kwargs['env']['LLAMINAR_FORCE_CPU_ONLY_STARTUP'],'1')
+                return json.dumps(dict(schema='llaminar.model-kld-described-config.v1',engine_argv=command[3:],
+                    config=document,runtime_config_digest=metadata_digest(document),qfn_canonical_intent=intent))
+            with patch.object(benchmark.subprocess,'check_output',side_effect=describe):
+                benchmark.declared_runtime_configuration({'runtime_configuration':actual},{'config':canonical},accepted,
+                    workload,output,Path('/original/parser'),{})
+                for mutate in ('placement','prefix','workload','worker'):
+                    wrong=copy.deepcopy(actual)
+                    if mutate=='placement':wrong['configuration']['moe_routed_expert_plan']['placements'][0]['tier']=1
+                    elif mutate=='prefix':wrong['configuration']['prefix_cache']['enabled']=False
+                    elif mutate=='workload':wrong['configuration']['n_predict']=255
+                    else:wrong['configuration']['n_threads']=8
+                    with self.assertRaises(ValueError):benchmark.declared_runtime_configuration({'runtime_configuration':wrong},
+                        {'config':canonical},accepted,workload,output,Path('/original/parser'),{})
+
+    def test_declared_benchmark_pins_all_original_source_stats_before_and_after(self):
+        """Actual original-source identity owner covers four shards and paired predictor without hashing payloads."""
+        from types import SimpleNamespace
+        from model_kld_corpus import identity,unchanged
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);descriptors=[]
+            for index in range(5):
+                path=root/f'source-{index}.gguf';path.write_bytes(b'original')
+                pin=identity(path)
+                descriptors.append(dict(path=str(path),name=path.name,bytes=pin[3],object_identity=json.dumps(
+                    dict(path=pin[0],device=pin[1],inode=pin[2],bytes=pin[3],mtime_ns=pin[4],ctime_ns=pin[5]))))
+            selection=SimpleNamespace(pins={},corpus={'inputs':{},'manifest':{'source':{
+                'shards':descriptors[:4],'shared_predictor':descriptors[4]}}})
+            pins=benchmark.declared_source_pins(selection)
+            self.assertEqual(set(pins),{d['path'] for d in descriptors})
+            unchanged(pins)
+            Path(descriptors[4]['path']).write_bytes(b'changed predictor')
+            with self.assertRaises(ValueError):benchmark.declared_source_pins(selection)
+            with self.assertRaises(ValueError):unchanged(pins)
+
+    def test_declared_benchmark_requires_original_driver_window_evidence(self):
+        """Native exit zero cannot hide driver fault or incomplete canonical observation."""
+        driver=Mock();driver.finish.return_value=True
+        benchmark.finish_declared_driver(driver,Path('/original/output'))
+        driver.finish.assert_called_once();driver.validate_evidence.assert_called_once_with(Path('/original/output'))
+        driver.reset_mock();driver.finish.return_value=False
+        with self.assertRaisesRegex(ValueError,'driver window'):
+            benchmark.finish_declared_driver(driver,Path('/original/output'))
+        driver.finish.assert_called_once();driver.validate_evidence.assert_called_once()
+        driver.reset_mock();driver.finish.return_value=True;driver.validate_evidence.side_effect=ValueError('incomplete driver proof')
+        with self.assertRaisesRegex(ValueError,'incomplete'):
+            benchmark.finish_declared_driver(driver,Path('/original/output'))
+
+    def test_declared_benchmark_uses_pinned_all_manifest_without_release_matrix(self):
+        """Actual canonical discover reads Integration's ALL export; no Release CTest/GTest bootstrap is attempted."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);path=root/'all.json'
+            record={'model_parity_schema':1,'e2e':None,'model':'/original/model.gguf',
+                'shared_predictor':'/original/predictor.gguf','diagnostic_benchmark':{'policy':'diagnostic_declared'}}
+            document={'schema':1,'scope':'all','source_revision':'original-revision','cells':[
+                {'case':'Suite.ProductionParity/Original','campaign':'original-campaign','backends':'CPU_CUDA',
+                 'configuration':record,'model_files':[record['model'],record['shared_predictor']]}]}
+            args=argparse.Namespace(manifest=path,source_revision='original-revision',declared_cell='Suite.ProductionParity/Original')
+            import model_parity_inventory as inventory
+            with patch.object(inventory.parity,'discover_campaigns',side_effect=AssertionError('Release has no matrix')):
+                path.write_text(json.dumps(document))
+                (campaign,exact,actual),pins=benchmark.declared_inventory(args,root/'llaminar2')
+                self.assertEqual(exact,args.declared_cell);self.assertEqual(actual,record)
+                self.assertEqual(set(pins),{str(path.resolve())})
+                # Enter the actual diagnostic owner through discovery, stopping
+                # at original document admission before any native operation.
+                binary=root/'llaminar2';binary.write_text('metadata-only executable pin')
+                parser=root/'llaminar_model_kld_canary';parser.write_text('metadata-only parser pin')
+                args.diagnostic=True;args.diagnostic_binary=binary;args.image=None;args.e2e_report=None
+                args.panel_report=root/'panel.json';args.corpus_root=root;args.parser_binary=parser
+                with patch.object(benchmark.e2e,'release_binary_cpu_isa'), \
+                     patch('model_kld_corpus_execution.PairedCorpusSelection.from_export',side_effect=RuntimeError('actual ALL manifest selected')) as admitted:
+                    with self.assertRaisesRegex(RuntimeError,'actual ALL manifest selected'):
+                        benchmark.run_declared_diagnostic(args)
+                    self.assertEqual(admitted.call_args.args[:2],(args.declared_cell,record))
+                for changed in ({**document,'scope':'e2e'},{**document,'source_revision':'foreign'}):
+                    path.write_text(json.dumps(changed))
+                    with self.assertRaises(ValueError):benchmark.declared_inventory(args,root/'llaminar2')
+                path.write_text(json.dumps(document))
+                with patch('model_kld_corpus.unchanged',side_effect=ValueError('changed manifest')):
+                    with self.assertRaisesRegex(ValueError,'changed manifest'):
+                        benchmark.declared_inventory(args,root/'llaminar2')
+                args.manifest=None
+                with self.assertRaisesRegex(ValueError,'all-cell'):
+                    benchmark.declared_inventory(args,root/'llaminar2')
+                args.manifest=root/'missing.json'
+                with self.assertRaises(FileNotFoundError):benchmark.declared_inventory(args,root/'llaminar2')
+
     def test_cross_revision_image_is_diagnostic_only(self):
         """Historical implementations can be retimed, never silently certified."""
         with tempfile.TemporaryDirectory() as directory:

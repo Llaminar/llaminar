@@ -139,7 +139,20 @@ inline void PrintTo(const Qwen4ExpSourceAdmissionCase &cell, std::ostream *out)
              << ",\"ordinal\":" << address.device_ordinal << ",\"numa_node\":" << address.numa_node << '}';
         first = false;
     }
-    *out << "]}";
+    *out << "]";
+    if(cell.ngram_table_policy && cell.ngram_table_policy->isGPUAdaptive() &&
+       cell.ngram_table_policy->gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+    {
+        const auto& placement=cell.ngram_table_policy->gpu_adaptive.placement;placement.validate();
+        const auto emit=[&](const AdaptiveGPUCacheParticipant& p){
+            *out << "{\"rank\":" << p.world_rank << ",\"backend\":" << modelParityJsonString(p.backend==DeviceType::CUDA?"cuda":"rocm")
+                 << ",\"ordinal\":" << p.ordinal << ",\"numa_node\":0}";
+        };
+        *out << ",\"storage_participants\":[";bool first_storage=true;
+        for(const auto& p:placement.declaredParticipants()){if(!first_storage)*out << ',';emit(p);first_storage=false;}
+        *out << "],\"storage_coordinator\":";emit(*placement.coordinator);
+    }
+    *out << "}";
 }
 
 /** @brief Adapter used exclusively by gold-free source fixtures. */

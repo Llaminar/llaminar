@@ -67,7 +67,7 @@ TEST(ImmutableRowTableAdmissionWire, ForeignVersionTruncationTrailingAndEnumAlia
     EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bad,2),std::invalid_argument);
     bad=valid;bad[16]=0;bad[17]=1; // preference256 must not truncate to Automatic0.
     EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bad,2),std::invalid_argument);
-    bad=valid;bad[160]=255;bad[161]=255; // invalid physical backend must not truncate into a supported type.
+    bad=valid;bad[172]=255;bad[173]=255; // v10 empty placement arm adds12bytes; physical backend must not truncate.
     EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bad,2),std::invalid_argument);
 }
 /** @test A rank without PLE contributes a real empty frame; duplicate rank authority is never merged. */
@@ -111,9 +111,9 @@ TEST(ImmutableRowTableAdmissionWire, LocalityWireRejectsInvalidOrDiscardedPolicy
     {
         auto bytes=valid;
         if(mutation==0)bytes[4]=1; // Previous schema has no locality authority.
-        if(mutation==1)bytes[184]=2; // Unknown locality arm.
-        if(mutation==2)bytes[184]=0; // Task arm cannot retain a bound-node payload.
-        if(mutation==3)for(int i=0;i<4;++i)bytes[188+i]=255; // Unrepresentable node.
+        if(mutation==1)bytes[196]=2; // Unknown locality arm.
+        if(mutation==2)bytes[196]=0; // Task arm cannot retain a bound-node payload.
+        if(mutation==3)for(int i=0;i<4;++i)bytes[200+i]=255; // Unrepresentable node.
         EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bytes,2),std::invalid_argument)<<mutation;
     }
 }

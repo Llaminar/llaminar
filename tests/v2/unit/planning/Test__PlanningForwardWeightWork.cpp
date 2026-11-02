@@ -11,6 +11,7 @@
 #include "planning/PlanningForwardWeightWork.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "../../utils/PlanningGGUFFixture.h"
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "../../utils/QuantizedVerifierFormats.h"
 #include "tensors/NativeVnniFormatInfo.h"
@@ -104,8 +105,11 @@ namespace
     /** @return Complete admission with a deliberately small GPU capture ladder. */
     AdmittedOrchestrationCandidate admit(AutomaticOrchestrationCandidate candidate, const PlanningModelSource &source)
     {
+        OrchestrationCandidateMemoryPolicy policy{
+            .prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 8};
+        policy.retained_host_services = test::planningHostServiceBudgets(2);
         return AdmittedOrchestrationCandidate::admit(std::move(candidate), source,
-            {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 8});
+            policy);
     }
 
     /** @return Semantic operand under any ordinary operation alternative. */

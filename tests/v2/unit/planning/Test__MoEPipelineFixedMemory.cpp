@@ -7,6 +7,7 @@
  * allocated. Shared archive backing must appear once while every actual stage
  * cache and channel endpoint remains represented in the joint fixed BOM.
  */
+#include "../../fixtures/planning/RecordedHostServicePlanning.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/RankMemoryPlanInputs.h"
@@ -227,7 +228,7 @@ TEST(MoEPipelineFixedMemory, NoPeerHostTailRequiresNoRoutingEvidenceAllocation)
             Fixture fixture(stages);
             const auto inputs = fixture.inputs();
             for (const auto &input : inputs) EXPECT_FALSE(input.host_demand_memory);
-            const auto fixed = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs);
+            const auto fixed = test::planPipelineWithRecordedHostServices(fixture.parent, inputs);
             ASSERT_EQ(fixed.size(), stages.size());
             for (const auto &stage : fixed) EXPECT_FALSE(stage.host_demand_memory);
             const auto admitted = fixture.admit(fixed);
@@ -247,7 +248,7 @@ TEST(MoEPipelineFixedMemory, NoPeerHostTailRequiresNoRoutingEvidenceAllocation)
                 .maximum_window_rows = fixture.configs.back().moe_rebalance.max_window_size,
                 .maximum_invocation_rows = 32,
                 .publication = MoEOverlayDemandPublicationScope::ProcessLocal});
-            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, forbidden),
+            EXPECT_THROW((void)test::planPipelineWithRecordedHostServices(fixture.parent, forbidden),
                 std::invalid_argument);
         }
 }
@@ -268,7 +269,7 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                 }
                 Fixture fixture(reverse, width, dense);
                 const auto inputs = fixture.inputs();
-                const auto plans = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs);
+                const auto plans = test::planPipelineWithRecordedHostServices(fixture.parent, inputs);
                 ASSERT_EQ(plans.size(), 2u);
                 PhysicalMemoryPlanBuilder aggregate;
                 for (size_t stage = 0; stage < 2; ++stage)
@@ -339,7 +340,7 @@ TEST(MoEPipelineFixedMemory, RejectsMissingForeignAndOverflowingStageOwnership)
             case 9: inputs[1].resident_graph_rows *= 2; break;
             case 10: inputs[1].activation_channel_row_capacity *= 2; break;
         }
-        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+        EXPECT_THROW((void)test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
     }
 }
 
@@ -350,7 +351,7 @@ TEST(MoEPipelineFixedMemory, SharedHostCapacityMustAdmitAllStageContributions)
     auto &host = fixture.inventory.ranks[0];
     host.cpu.memory_bytes = host.cpu.free_memory_bytes = host.cpu_memory_bytes = 48ULL << 30;
     const auto inputs = fixture.inputs();
-    const auto plans = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs);
+    const auto plans = test::planPipelineWithRecordedHostServices(fixture.parent, inputs);
     ASSERT_EQ(plans.size(), 2u);
     PhysicalMemoryPlanBuilder combined;
     for (const auto &stage : plans)
@@ -421,7 +422,7 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
         {
             SCOPED_TRACE(::testing::Message() << count << '/' << int(first_backend) << '/' << shape);
             Fixture fixture(shapes[shape]);
-            const auto plans = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, fixture.inputs());
+            const auto plans = test::planPipelineWithRecordedHostServices(fixture.parent, fixture.inputs());
             const auto complete = fixture.admit(plans);
             ASSERT_EQ(complete.size(), shapes[shape].size());
             const auto certificate = complete.front().physical_memory_admission;
@@ -474,7 +475,7 @@ TEST_P(MoEPipelineMultiDeviceMemory, AggregateHostBudgetCannotBeReusedByEverySta
     Fixture fixture(stages);
     auto &host = fixture.inventory.ranks[0];
     host.cpu.memory_bytes = host.cpu.free_memory_bytes = host.cpu_memory_bytes = size_t(count - 1) * (16ULL << 30);
-    const auto plans = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, fixture.inputs());
+    const auto plans = test::planPipelineWithRecordedHostServices(fixture.parent, fixture.inputs());
     ASSERT_EQ(plans.size(), size_t(count));
     EXPECT_THROW((void)fixture.admit(plans), PhysicalMemoryCapacityExhausted);
 }
@@ -499,7 +500,7 @@ TEST_P(MoEPipelineMultiDeviceMemory, RejectsForeignMiddleAndTerminalScope)
             case 3: fixture.ranks[count / 2].last_layer++; break;
             case 4: inputs.back().activation_channel_row_capacity++; break;
         }
-        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+        EXPECT_THROW((void)test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
     }
 }
 
@@ -516,13 +517,13 @@ TEST(MoEPipelineFixedMemory, RejectsLostGenerationBoundaryAndWrongParentOwner)
     EXPECT_EQ(inputs[0].generation_parent_role, MTPGenerationParentRole::PipelineFollower);
     EXPECT_EQ(inputs[1].generation_parent_role, MTPGenerationParentRole::Controller);
     inputs[0].generation_domain = DeviceGenerationExecutionDomain::NativeDomain;
-    EXPECT_THROW(MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+    EXPECT_THROW(test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
     inputs = fixture.inputs();
     inputs[0].generation_parent_role = MTPGenerationParentRole::Controller;
-    EXPECT_THROW(MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+    EXPECT_THROW(test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
     inputs = fixture.inputs();
     inputs[1].generation_domain = static_cast<DeviceGenerationExecutionDomain>(255);
-    EXPECT_THROW(MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs), std::invalid_argument);
+    EXPECT_THROW(test::planPipelineWithRecordedHostServices(fixture.parent, inputs), std::invalid_argument);
 }
 
 /** @test Per-device ordinary owners reach PMA without inventing tail children on followers. */
@@ -533,7 +534,7 @@ TEST(MoEPipelineFixedMemory, OrdinaryAuxiliaryBOMFollowsActualContinuationRoleAn
         Fixture fixture(std::vector<StageGeometry>{{DeviceType::CUDA,1},
             {mixed ? DeviceType::ROCm : DeviceType::CUDA,1}});
         const auto inputs = fixture.inputs();
-        const auto fixed = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs);
+        const auto fixed = test::planPipelineWithRecordedHostServices(fixture.parent, inputs);
         ASSERT_EQ(fixed.size(), 2u);
         for (size_t stage = 0; stage < fixed.size(); ++stage)
         {

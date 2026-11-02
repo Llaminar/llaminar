@@ -312,6 +312,24 @@ namespace llaminar2
             void *scratch_indices_device = nullptr,
             int scratch_capacity = 0,
             const void *active_rows_device = nullptr) override;
+        /** @copydoc IBackend::enqueueBuildTopKTopPDistributionsF32WithHistoryDevice */
+        bool enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
+            const void *data_device,
+            int row_count,
+            int n,
+            int row_stride,
+            int top_k,
+            float top_p,
+            float temperature,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            int out_stride,
+            void *out_probs_device,
+            void *scratch_values_device,
+            void *scratch_indices_device,
+            int scratch_capacity,
+            const GenerationPenaltyHistory &history) override;
         bool enqueueBuildTopKTopPProcessedLogitsF32Device(
             const void *data_device,
             int row_count,

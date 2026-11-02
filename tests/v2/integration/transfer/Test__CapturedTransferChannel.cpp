@@ -7,6 +7,10 @@
  * from stale replay. Odd sizes, unaligned regions and guards prove exact extents.
  * All channel, scratch, readback and native graph storage is PMA-admitted.
  * Timings are diagnostic only; production preflight has no performance threshold.
+ * An opt-in Release performance role reuses these exact channels and graphs at
+ * ngram payload sizes. Source-clock timing ends after return consumption; wall
+ * time includes both submissions/completions. Poison, readback and byte checks
+ * stay outside those timers. This floor omits pooled lookup/decoding work.
  */
 #include "transfer/CapturedTransferChannel.h"
 #include "CapturedChannelGraphProof.h"
@@ -22,6 +26,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
 #include <thread>
 #include <vector>
 
@@ -78,6 +83,8 @@ namespace
         size_t replays = 64;
         size_t patterns = 2;
         PeerStorage peer_storage = PeerStorage::PrivateScratch;
+        bool measure_floor = false; ///< Opt-in performance role; functional timing remains unchanged.
+        size_t warmups = 0; ///< Unreported replays on the same original cursor/graph family.
     };
 
     /**
@@ -194,6 +201,16 @@ namespace
             Terminal second_done{second_backend, second, second_backend->createEvent(second.ordinal)};
             ASSERT_NE(first_done.event, nullptr);
             ASSERT_NE(second_done.event, nullptr);
+            // Completion events retain their original protocol role. Timing
+            // belongs to the source clock only, never mixed CUDA/HIP timestamps.
+            Terminal timing_start{first_backend, first,
+                workload.measure_floor ? first_backend->createTimingEvent(first.ordinal) : nullptr};
+            Terminal timing_stop{first_backend, first,
+                workload.measure_floor ? first_backend->createTimingEvent(first.ordinal) : nullptr};
+            if (workload.measure_floor) {
+                ASSERT_NE(timing_start.event, nullptr);
+                ASSERT_NE(timing_stop.event, nullptr);
+            }
 
             // Geometry changes create distinct recordings, while channel epochs
             // continue monotonically across graph-family/request-like boundaries.
@@ -224,8 +241,9 @@ namespace
                             {
                                 ScopedBackendGraphCapture capture(first_worker, *graph, "captured channel round trip source");
                                 require(capture.begin(), "Source capture begin failed");
-                                require(first_backend->memset(returned->mutableDeviceData(), 0xa5,
-                                    buffer_bytes, first.ordinal, first_stream), "Returned guard initialization failed");
+                                if (!workload.measure_floor)
+                                    require(first_backend->memset(returned->mutableDeviceData(), 0xa5,
+                                        buffer_bytes, first.ordinal, first_stream), "Returned guard initialization failed");
                                 transfer.enqueueCapturedTransfer(sends[pattern], first_stream);
                                 transfer.enqueueCapturedTransfer(collect, first_stream);
                                 capture.finish();
@@ -257,12 +275,29 @@ namespace
                         second_graphs[0]->residentMemoryBytes() + second_graphs[1]->residentMemoryBytes(),
                         2 * GPUGraphMemoryContract::reservationBytesPerExecutable(second)));
                     const auto started = std::chrono::steady_clock::now();
-                    for (size_t replay = 0; replay < workload.replays; ++replay)
+                    for (size_t replay = 0; replay < workload.warmups + workload.replays; ++replay)
                     {
                         const auto pattern = replay % workload.patterns;
+                        if (workload.measure_floor) {
+                            // Re-poison every inactive byte before timing. The
+                            // timed retained program contains channel endpoints
+                            // only; immutable source uploads occurred at setup.
+                            first_worker.submitAndWait([&] {
+                                require(first_backend->memset(returned->mutableDeviceData(), 0xa5,
+                                    buffer_bytes, first.ordinal, first_stream), "Floor guard initialization failed");
+                                require(first_backend->recordEvent(first_done.event, first.ordinal, first_stream), "Floor guard completion failed");
+                            });
+                            first_done.await();
+                        }
+                        const auto wall_start = std::chrono::steady_clock::now();
                         const auto submit_first = [&] { first_worker.submitAndWait([&] {
+                            if (workload.measure_floor)
+                                require(first_backend->recordEvent(timing_start.event, first.ordinal, first_stream), "Floor source timing start failed");
                             require(first_graphs[pattern]->launch(), "Source retained launch failed");
-                            transfer.enqueueDeviceToMappedHost(*returned, 0, *readback, 0, buffer_bytes, first, first_stream);
+                            if (workload.measure_floor)
+                                require(first_backend->recordEvent(timing_stop.event, first.ordinal, first_stream), "Floor source timing stop failed");
+                            else
+                                transfer.enqueueDeviceToMappedHost(*returned, 0, *readback, 0, buffer_bytes, first, first_stream);
                             require(first_backend->recordEvent(first_done.event, first.ordinal, first_stream), "Source terminal publication failed");
                         }); };
                         const auto submit_second = [&] { second_worker.submitAndWait([&] {
@@ -271,15 +306,38 @@ namespace
                         }); };
                         // Either endpoint may be queued first. No observed model
                         // state, host copy or terminal wait chooses the peer work.
-                        if (replay % 4 < 2) { submit_first(); submit_second(); }
+                        if (workload.measure_floor) { submit_second(); submit_first(); }
+                        else if (replay % 4 < 2) { submit_first(); submit_second(); }
                         else { submit_second(); submit_first(); }
                         first_done.await();
                         second_done.await();
+                        const auto wall_stop = std::chrono::steady_clock::now();
+                        float event_ms = 0;
+                        if (workload.measure_floor) {
+                            require(first_backend->eventElapsedTimeMs(timing_start.event, timing_stop.event,
+                                first.ordinal, &event_ms) && event_ms > 0, "Floor source event duration unavailable");
+                            // Validation is not part of either timer. Retain the
+                            // original readback owner and join its exact stream.
+                            first_worker.submitAndWait([&] {
+                                transfer.enqueueDeviceToMappedHost(*returned, 0, *readback, 0, buffer_bytes, first, first_stream);
+                                require(first_backend->recordEvent(first_done.event, first.ordinal, first_stream), "Floor readback completion failed");
+                            });
+                            first_done.await();
+                        }
                         const auto *actual = static_cast<const unsigned char *>(readback->mutableHostData());
                         for (size_t i = 0; i < buffer_bytes; ++i)
                             if (actual[i] != (i >= offset && i < offset + bytes ? patternByte(i, pattern) : 0xa5))
                                 FAIL() << first.toString() << " -> " << second.toString() << " replay=" << replay
                                     << " bytes=" << bytes << " offset=" << offset << " first_bad_byte=" << i;
+                        if (workload.measure_floor && replay >= workload.warmups)
+                            std::cout << "NGRAM_CHANNEL_FLOOR_SAMPLE {\"schema\":1,\"source\":\"" << first.toString()
+                                << "\",\"peer\":\"" << second.toString() << "\",\"scope\":\"complete_original_channel_round_trip_without_pool_lookup_or_decoding\""
+                                << ",\"payload_bytes_per_direction\":" << bytes << ",\"logical_wire_payload_bytes\":" << 2 * bytes
+                                << ",\"offset\":" << offset << ",\"sample\":" << replay - workload.warmups
+                                << ",\"trajectory_index\":" << replay << ",\"pattern\":" << pattern
+                                << ",\"source_event_us\":" << std::setprecision(10) << event_ms * 1000.0
+                                << ",\"wall_submit_to_both_complete_us\":" << std::chrono::duration<double, std::micro>(wall_stop-wall_start).count()
+                                << ",\"event_scope\":\"source_send_through_return_consumption_peer_preposted\",\"oracle\":\"exact_live_bytes_and_replaced_inactive_guards_outside_timing\"}\n";
                     }
                     std::cout << "CAPTURED_CHANNEL_ROUND_TRIP first=" << first.toString() << " second=" << second.toString()
                         << " bytes=" << bytes << " offset=" << offset << " replays=" << workload.replays << " verification_wall_ms="
@@ -318,6 +376,31 @@ TEST(CapturedTransferChannelDevices, CUDA_ROCm_RetainedRoundTrip) { roundTrip(De
 TEST(CapturedTransferChannelDevices, ROCm_CUDA_RetainedRoundTrip) { roundTrip(DeviceId::rocm(0), DeviceId::cuda(0)); }
 TEST(CapturedTransferChannelDevices, CUDA_ROCm_RetainedWorkspaceRoundTrip) { workspaceRoundTrip(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(CapturedTransferChannelDevices, ROCm_CUDA_RetainedWorkspaceRoundTrip) { workspaceRoundTrip(DeviceId::rocm(0), DeviceId::cuda(0)); }
+
+/** @test Exact ngram decode physical-channel floor with both original participant captures. */
+TEST(CapturedTransferChannelFloor, CUDA_ROCm_Decode1440) {
+    roundTrip(DeviceId::cuda(0), DeviceId::rocm(0),
+        {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
+         .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.warmups=3});
+}
+/** @test Symmetric original channel floor; no cross-clock event arithmetic. */
+TEST(CapturedTransferChannelFloor, ROCm_CUDA_Decode1440) {
+    roundTrip(DeviceId::rocm(0), DeviceId::cuda(0),
+        {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
+         .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.warmups=3});
+}
+/** @test Exact512token/16head/native90byte payload, without pooled metadata or decoding. */
+TEST(CapturedTransferChannelFloor, CUDA_ROCm_M512737280) {
+    roundTrip(DeviceId::cuda(0), DeviceId::rocm(0),
+        {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
+         .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.warmups=3});
+}
+/** @test Symmetric complete M512 round trip with exact useful payload extent. */
+TEST(CapturedTransferChannelFloor, ROCm_CUDA_M512737280) {
+    roundTrip(DeviceId::rocm(0), DeviceId::cuda(0),
+        {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
+         .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.warmups=3});
+}
 
 /**
  * @test Opt-in single-geometry probe for application-replay/native dispatch profilers.

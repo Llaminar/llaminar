@@ -132,7 +132,7 @@ TEST(ModelKLDQFNContract, OriginalPhysicalShapesAndGPUOnlyPPRejection)
     plan.primary_device=GlobalDeviceAddress::rocm(0);
     EXPECT_EQ(qfnObservationSurface(plan),QFNObservationSurface::GPUCPUOverlay);
     for(int i=0;i<4;++i) plan.local_tp_devices.push_back(GlobalDeviceAddress::rocm(i));
-    EXPECT_EQ(qfnObservationSurface(plan),QFNObservationSurface::ROCmLocalTP4);
+    EXPECT_EQ(qfnObservationSurface(plan),QFNObservationSurface::HomogeneousLocalTP);
     plan.local_tp_devices[3]=plan.local_tp_devices[0];
     EXPECT_THROW((void)qfnObservationSurface(plan),std::invalid_argument);
     plan.local_tp_devices.clear();
@@ -237,7 +237,7 @@ TEST(ModelKLDQFNContract, OriginalTPPublicationSchemaAndBoundedWindow)
     original.count = 34;
     original.value = 34;
     std::vector<PerfStatRecord> records{original};
-    EXPECT_EQ(qfnTPHostPublicationCount(records), 34);
+    EXPECT_EQ(qfnTPHostPublicationCount(records,4), 34);
     for (int control = 0; control < 7; ++control)
     {
         records = {original};
@@ -256,7 +256,7 @@ TEST(ModelKLDQFNContract, OriginalTPPublicationSchemaAndBoundedWindow)
             records.push_back(original);
             break;
         }
-        EXPECT_THROW((void)qfnTPHostPublicationCount(records), std::invalid_argument);
+        EXPECT_THROW((void)qfnTPHostPublicationCount(records,4), std::invalid_argument);
     }
 }
 /** @test Original real file stat binding rejects every field drift and same-size replacement. */
@@ -317,7 +317,9 @@ TEST(ModelKLDQFNContract, CanonicalHeterogeneousPathAndStrictTP4RemainDistinct)
     add("retained_parent_replays", "ROCm:0", "decode");
     add("prefill_graph_phase", "ROCm:0", "prefill", {{"capture_phase", "capture"}});
     EXPECT_NO_THROW(qfnRequireGraphPathRecords(records, QFNObservationSurface::GPUCPUOverlay, {"ROCm:0"}));
-    EXPECT_THROW(qfnRequireGraphPathRecords(records, QFNObservationSurface::ROCmLocalTP4, {"ROCm:0"}), std::invalid_argument);
+    EXPECT_NO_THROW(qfnRequireGraphPathRecords(records, QFNObservationSurface::GPUCPULocalTP, {"ROCm:0"}));
+    EXPECT_THROW(qfnRequireGraphPathRecords(records, QFNObservationSurface::GPUCPULocalTP, {"ROCm:0","ROCm:1"}), std::invalid_argument);
+    EXPECT_THROW(qfnRequireGraphPathRecords(records, QFNObservationSurface::HomogeneousLocalTP, {"ROCm:0"}), std::invalid_argument);
     auto incomplete = records;
     incomplete.erase(incomplete.begin() + 2);
     EXPECT_THROW(qfnRequireGraphPathRecords(incomplete, QFNObservationSurface::GPUCPUOverlay, {"ROCm:0"}), std::invalid_argument);
@@ -329,7 +331,7 @@ TEST(ModelKLDQFNContract, CanonicalHeterogeneousPathAndStrictTP4RemainDistinct)
     add("full_graph_replay_calls", "ROCm:0", "decode");
     add("decode_graph_phase", "ROCm:0", "decode", {{"phase", "replay"}});
     add("prefill_graph_phase", "ROCm:0", "prefill", {{"capture_phase", "capture"}});
-    EXPECT_NO_THROW(qfnRequireGraphPathRecords(records, QFNObservationSurface::ROCmLocalTP4, {"ROCm:0"}));
+    EXPECT_NO_THROW(qfnRequireGraphPathRecords(records, QFNObservationSurface::HomogeneousLocalTP, {"ROCm:0"}));
     EXPECT_THROW(qfnRequireGraphPathRecords(records, QFNObservationSurface::GPUCPUOverlay, {"ROCm:0"}), std::invalid_argument);
 }
 
@@ -467,6 +469,48 @@ TEST(ModelKLDQFNContract, CanonicalIntentProjectionIsSharedAndRejectsChangedMath
     auto foreign = arithmetic;
     foreign["hc_up"] = "foreign";
     EXPECT_THROW(qfnRequireCanonicalIntent(canonical, canonical, foreign), std::invalid_argument);
+}
+
+} // namespace llaminar2::accuracy
+
+namespace llaminar2::accuracy {
+/** @test Shape classification and prepared expert ownership remain separate original authorities. */
+TEST(ModelKLDQFNContract, HomogeneousLocalTPUsesActualDegreeAndSelectedExpertOwnership)
+{
+    for(auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(int degree:{2,4,8}){
+        RankExecutionPlan plan;
+        for(int i=0;i<degree;++i)plan.local_tp_devices.push_back(backend==DeviceType::CUDA?GlobalDeviceAddress::cuda(i):GlobalDeviceAddress::rocm(i));
+        plan.primary_device=plan.local_tp_devices.front();
+        EXPECT_EQ(qfnObservationSurface(plan),QFNObservationSurface::HomogeneousLocalTP);
+        MoERoutedExpertPlacementPlan prepared;
+        RoutedExpertDomain gpu;gpu.name="gpu";gpu.participants=plan.local_tp_devices;
+        RoutedExpertDomain cpu;cpu.name="cpu";cpu.participants={GlobalDeviceAddress::cpu(0)};
+        prepared.domains={gpu,cpu};
+        RoutedExpertTier g;g.domain="gpu";RoutedExpertTier c;c.domain="cpu";
+        prepared.routed_tiers={g,c};prepared.placements.push_back({.layer=0,.routed_expert_tier={0,0}});
+        EXPECT_EQ(qfnPreparedLocalTPSurface(plan,prepared),QFNObservationSurface::HomogeneousLocalTP);
+        prepared.placements[0].routed_expert_tier[1]=1;
+        EXPECT_EQ(qfnPreparedLocalTPSurface(plan,prepared),QFNObservationSurface::GPUCPULocalTP);
+        auto bad=prepared;bad.domains[0].participants.push_back(gpu.participants[0]);
+        EXPECT_THROW(qfnPreparedLocalTPSurface(plan,bad),std::invalid_argument);
+        bad=prepared;bad.domains[0].participants[0]=backend==DeviceType::CUDA?GlobalDeviceAddress::rocm(0):GlobalDeviceAddress::cuda(0);
+        EXPECT_THROW(qfnPreparedLocalTPSurface(plan,bad),std::invalid_argument);
+        auto wrong=plan;wrong.local_tp_devices[1]=wrong.local_tp_devices[0];
+        EXPECT_THROW(qfnObservationSurface(wrong),std::invalid_argument);
+        wrong=plan;wrong.local_tp_devices[1].hostname="foreign.invalid";
+        EXPECT_THROW(qfnObservationSurface(wrong),std::invalid_argument);
+        wrong=plan;wrong.primary_device=GlobalDeviceAddress::cpu(0);
+        EXPECT_THROW(qfnObservationSurface(wrong),std::invalid_argument);
+        wrong=plan;
+        if(degree==2)wrong.local_tp_devices.push_back(backend==DeviceType::CUDA?GlobalDeviceAddress::cuda(2):GlobalDeviceAddress::rocm(2));
+        else wrong.local_tp_devices.resize(3);
+        EXPECT_THROW(qfnObservationSurface(wrong),std::invalid_argument);
+        PerfStatRecord receipt;receipt.domain="sampling";receipt.name="rank_resident_condition_host_logits_publications";
+        receipt.kind=PerfStatRecord::Kind::Counter;receipt.device="rank";receipt.phase="decode";receipt.count=3;receipt.value=3;
+        receipt.tags={{"operation","advanceOrdinaryMainConditionFromDeviceResidentLogicalState"},{"participants",std::to_string(degree)},{"rows","1"}};
+        const std::array records{receipt};EXPECT_EQ(qfnTPHostPublicationCount(records,degree),3);
+        EXPECT_THROW(qfnTPHostPublicationCount(records,degree==2?4:2),std::invalid_argument);
+    }
 }
 
 } // namespace llaminar2::accuracy

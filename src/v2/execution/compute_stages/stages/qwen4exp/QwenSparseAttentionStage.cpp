@@ -205,6 +205,9 @@ QwenSparseAttentionStage::QwenSparseAttentionStage(Params params)
             } else require(!a.keyCosine && !a.keySine,"QSA post-RoPE cache must not declare unused transform planes");
         },
         [&](const RetainCandidates &a) {
+            acceptedPublicationInputs_ = {{
+                {params_.replay.buffer, BufferAccess::READ, "INT32", false},
+                {a.retainedRawKey.buffer, BufferAccess::READ, "FP32", false}}};
             acceptedPublicationOutputs_[0] = {
                 a.priorPartial.buffer, BufferAccess::WRITE, "FP32", false};
             if(a.terminalCounters)a.terminalCounters->requireRequest(device(),a.requestIndex);
@@ -516,6 +519,13 @@ bool QwenSparseAttentionStage::restoreVerifierStateCaptureRows(const int *rows,i
     if(requestCount!=a.requestCount)return false;
     return publishRetained(rows+a.requestIndex,stream);
 }
+std::span<const BufferBinding> QwenSparseAttentionStage::verifierStatePublicationInputs() const noexcept
+{
+    return std::holds_alternative<RetainCandidates>(params_.operation)
+        ? std::span<const BufferBinding>{acceptedPublicationInputs_}
+        : std::span<const BufferBinding>{};
+}
+
 std::span<const BufferBinding> QwenSparseAttentionStage::verifierStatePublicationOutputs() const noexcept
 {
     return std::holds_alternative<RetainCandidates>(params_.operation)

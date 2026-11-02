@@ -11,7 +11,9 @@
 namespace llaminar2::test::pooled_source_fixture {
 namespace n=qwen4exp::pooled_native;
 /** @brief Nominal recorded-boundary operation; unsupported source-only decisions fail the component trace. */
-enum class Action:std::uint32_t {PoisonCache,DeliverPins,DeliverFree,DeliverVictims,SourceHeader,DeliverSource,ReadRows};
+enum class Action:std::uint32_t {PoisonCache,DeliverPins,DeliverFree,DeliverVictims,SourceHeader,DeliverSource,ReadRows,CorruptIdentity};
+/** @brief Immutable rejection trace; only the diagnostic producer may corrupt its selected live input. */
+enum class IdentityFault:std::uint32_t {None,DuplicateRow,DuplicateUnique,DuplicateSlot,ForeignOwner,ForeignInterval};
 /** @brief Exact private persistent diagnostic staging, separately admitted to the fixture PMA. */
 struct IO {
     std::size_t header=0,record_bytes=64,payload_bytes=72,records=128,payload=0,bytes=0;
@@ -24,6 +26,10 @@ struct Args {
     const std::byte* original_source;
     IO offsets;
     std::uint32_t source_rows,maximum_original;
+    IdentityFault identity_fault=IdentityFault::None; ///< Closed fault author, never a serving policy.
+    std::uint32_t identity_position=0; ///< Original live command/grant position to corrupt.
+    bool retained_identity=false; ///< Select retained original grants instead of incoming Pin commands.
+
 };
 /** @brief Submit one diagnostic producer on its exact non-default original CUDA stream. */
 void launchCUDA(Action,const Args&,void*);

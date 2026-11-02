@@ -5,8 +5,8 @@
  * GoogleTest parameter discovery publishes machine-readable metadata without
  * loading weights. Generation regression, tagged E2E and benchmarks consume
  * these records, never test-name fragments or a second model/topology table.
- * Correctness projections retain adversarial policies; benchmark projections
- * retain only cell intent and leave tuning to production defaults.
+ * Declared diagnostics retain original placement and setup capacity; certified
+ * automatic benchmark projections retain intent and production tuning defaults.
  * Arguments remain an argv vector
  * all the way to the existing HTTP harness; they are never shell-evaluated.
  */
@@ -306,6 +306,35 @@ namespace llaminar2::test::parity
         return arguments;
     }
 
+    /**
+     * @brief Preserve storage-only GPU owners in declared runtime projections.
+     * @param cell Original typed policy, independent of compute/expert placement.
+     * @return Lossless public placement argument, or none for a non-GPU-cache cell.
+     * @throws std::invalid_argument For an invalid original placement declaration.
+     */
+    inline std::vector<std::string> modelParityDeclaredNgramPlacementArguments(const ModelParityCase &cell)
+    {
+        if (!cell.ngram_table_policy || !cell.ngram_table_policy->isGPUAdaptive()) return {};
+        const auto &placement = cell.ngram_table_policy->gpu_adaptive.placement;
+        placement.validate();
+        if (placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal)
+            return {"--ngram-gpu-cache-placement", "consumer-local"};
+        const auto endpoint = [](const AdaptiveGPUCacheParticipant &participant) {
+            return std::to_string(participant.world_rank) + ':' +
+                (participant.backend == DeviceType::CUDA ? "cuda" : "rocm") + ':' +
+                std::to_string(participant.ordinal);
+        };
+        std::string value;
+        for (const auto &owner : placement.owners)
+        {
+            if (!value.empty()) value += ',';
+            value += endpoint(owner.participant) + '/' + std::to_string(owner.maximum_cache_rows) +
+                '/' + std::to_string(owner.cache_physical_byte_limit);
+        }
+        value += '@' + endpoint(*placement.coordinator);
+        return {"--ngram-gpu-cache-placement", std::move(value)};
+    }
+
     namespace model_parity_runtime_detail
     {
         /**
@@ -417,6 +446,11 @@ namespace llaminar2::test::parity
         args.insert(args.end(), ngram.begin(), ngram.end());
         if (placement == model_parity_runtime_detail::BenchmarkPlacement::DeclaredDiagnostic)
         {
+            const auto storage_placement = modelParityDeclaredNgramPlacementArguments(cell);
+            args.insert(args.end(), storage_placement.begin(), storage_placement.end());
+            // Disabled execution still retains the cell's original predictor envelope.
+            args.insert(args.end(), {"--mtp-graph-capacity-draft-tokens",
+                                     std::to_string(config.mtp.graph_capacity_draft_tokens)});
             args.insert(args.end(), {"--backend", collectiveBackendTypeToString(config.default_backend)});
             if (!config.tp_allreduce_precision_override.empty())
                 args.insert(args.end(), {"--tp-allreduce-precision", config.tp_allreduce_precision_override});
@@ -522,7 +556,12 @@ namespace llaminar2::test::parity
         add("--kv-cache-precision", config.kv_cache_precision);
         const auto ngram = modelParityNgramStorageArguments(cell);
         args.insert(args.end(), ngram.begin(), ngram.end());
-        if (declared) add("--backend", collectiveBackendTypeToString(config.default_backend));
+        if (declared)
+        {
+            const auto storage_placement = modelParityDeclaredNgramPlacementArguments(cell);
+            args.insert(args.end(), storage_placement.begin(), storage_placement.end());
+            add("--backend", collectiveBackendTypeToString(config.default_backend));
+        }
         if (!config.tp_allreduce_precision_override.empty())
             add("--tp-allreduce-precision", config.tp_allreduce_precision_override);
         args.push_back("--prefix-cache");

@@ -6,6 +6,7 @@
  * The model directory, candidate compiler, memory authority and apply codec
  * are real production components. No tensor payload or accelerator is used.
  */
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/AutomaticOrchestrationPlanner.h"
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "planning/AutomaticPlanningStartup.h"
@@ -69,7 +70,7 @@ namespace
     OrchestrationCandidateMemoryPolicy memory()
     {
         return {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
-            .maximum_cached_prefill_buckets = 8};
+            .maximum_cached_prefill_buckets = 8, .retained_host_services = test::planningHostServiceBudgets(2)};
     }
 
     /** @return Identity of the deliberately smaller, later-observed choice. */

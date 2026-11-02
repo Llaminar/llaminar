@@ -25,6 +25,10 @@ namespace llaminar2
         MoEOverlayGPUWeightLoadCapacityInput gpu_weight_load;
         GraphSnapshotMemoryCapacity snapshot_capacity;
         std::size_t model_graph_topology_variant_count = 1;
+        /** Retain the parent's sealed event-program source in every actual child lowering. */
+        NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
+        /** Same original rank evidence is shared by stage declarations before quota search. */
+        RetainedHostServiceBudgetProjection retained_host_services=RetainedHostServiceBudgetProjection::installed({});
     };
 
     /**

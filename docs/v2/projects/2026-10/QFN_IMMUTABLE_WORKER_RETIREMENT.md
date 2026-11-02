@@ -1,6 +1,6 @@
 # Immutable lookup worker cancellation and retirement
 
-Size limit: 15,000 UTF-8 bytes. Focused defect and qualification record;
+Focused defect and qualification record;
 this does not certify the complete QFN source-admission matrix.
 
 ## Failure and correction

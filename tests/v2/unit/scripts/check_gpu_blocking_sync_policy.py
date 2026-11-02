@@ -362,7 +362,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # model, command, activation, prefill or request-dispatch wait budget.
         ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finishForwardOnly", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics", "worker_stream", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGeneration", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGenerationImpl", "backend_event", 1),
         # Explicit bounded diagnostics first authenticate the ordinary terminal
         # controller, then copy only the populated transaction trace. This one
         # additional terminal wait never belongs to generation or dispatch.

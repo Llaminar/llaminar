@@ -19,6 +19,7 @@
 #include "app/RuntimeInitPhase.h"
 #include "app/MPIBootstrapPhase.h"
 #include "ModelKLDQFNContract.h"
+#include "ModelKLDQFNOwner.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ResolvedImmutableRowTablePlacement.h"
@@ -85,21 +86,23 @@ json saveLogits(IOrchestrationRunner &runner, std::ofstream &output, size_t posi
  * @brief Observe only real prepared/PMA/source owners after original RuntimeInit.
  * @param request Checked frozen diagnostic request, never an allocation authority.
  * @param runner Actual ready production runner; no test factory or owner mirror.
+ * @param original_owner Sole exported contract retained by the complete observer lifetime.
  * @return Passive exact source/config/plan descriptors for the result artifact.
  * @throws std::invalid_argument For changed source, unsupported topology or missing owner proof.
  */
-json authenticateQFN(const accuracy::QFNObserverRequest &request, IOrchestrationRunner &runner)
+json authenticateQFN(const accuracy::QFNObserverRequest &request, IOrchestrationRunner &runner,
+                     const ModelContextReuseContract &original_owner)
 {
     using accuracy::requireQFN;
-    const auto owner = runner.modelContextReuseContract();
-    requireQFN(owner && owner->context && owner->reuse_authority && owner->physical_memory_authority,
+    const auto *owner = &original_owner;
+    requireQFN(owner->context && owner->reuse_authority && owner->physical_memory_authority,
                "QFN observer needs the actual admitted model/prepared/PMA owner");
     auto &model = *owner->context;
     const auto profile = ModelMemoryProfile::fromLoader(model.concreteLoader());
     requireQFN(runner.architecture() == "qwen4exp" && model.architecture() == "qwen4exp" &&
                profile.n_layers == 48 && profile.vocab_size == 248320 && profile.expert_count == 512 &&
                runner.vocabSize() == 248320, "QFN observer actual original source geometry differs");
-    const auto surface = accuracy::qfnObservationSurface(runner.executionPlan());
+    auto surface = accuracy::qfnObservationSurface(runner.executionPlan());
     const auto &expected = request.corpus().at("source");
     requireQFN(model.path() == runner.config().model_path, "QFN original model path differs from actual parsed configuration");
     const auto paths = model.artifactPaths();
@@ -108,8 +111,8 @@ json authenticateQFN(const accuracy::QFNObserverRequest &request, IOrchestration
     {
         requireQFN(model.concreteLoader().ggufPredictorDirectory() &&
                    model.concreteLoader().predictorManifest() &&
-                   model.concreteLoader().predictorMaterialization()==SharedPredictorMaterialization::Inactive,
-                   "QFN MTP-off paired source must remain original authenticated inactive metadata");
+                   model.concreteLoader().predictorMaterialization()==accuracy::qfnPredictorMaterialization(runner.config().mtp),
+                   "QFN paired predictor materialization differs from original retained graph capacity");
         descriptors.push_back(expected.at("shared_predictor"));
     }
     requireQFN(paths.size() == descriptors.size(), "QFN source shard inventory changed");
@@ -177,11 +180,8 @@ json authenticateQFN(const accuracy::QFNObserverRequest &request, IOrchestration
                 for (const auto &address : domain.participants) cpu |= address.device_type == DeviceType::CPU;
             requireQFN(cpu, "QFN observer single-GPU arm requires its original CPU expert capacity domain");
         }
-        if (surface == accuracy::QFNObservationSurface::ROCmLocalTP4)
-            for (const auto &domain : owner->prepared_routed_weight_plan->domains)
-                for (const auto &address : domain.participants)
-                    requireQFN(address.device_type == DeviceType::ROCm,
-                               "QFN observer full-ROCm TP4 cannot borrow a CPU or foreign expert tier");
+        if (surface == accuracy::QFNObservationSurface::HomogeneousLocalTP)
+            surface=accuracy::qfnPreparedLocalTPSurface(runner.executionPlan(),*owner->prepared_routed_weight_plan);
     }
     std::vector<std::filesystem::path> artifacts(paths.begin(),paths.end());
     const auto source_identity=sha256FileSetIdentityHex(artifacts);
@@ -291,7 +291,12 @@ bool qfnResetBytesEqual(const std::filesystem::path &a, const std::filesystem::p
  */
 json requireQFNPath(IOrchestrationRunner &runner, const json &observation)
 {
-    const auto surface = accuracy::qfnObservationSurface(runner.executionPlan());
+    const auto physical=accuracy::qfnObservationSurface(runner.executionPlan());
+    const auto surface=physical==accuracy::QFNObservationSurface::HomogeneousLocalTP
+        ? static_cast<accuracy::QFNObservationSurface>(observation.at("surface").get<int>()):physical;
+    accuracy::requireQFN(physical!=accuracy::QFNObservationSurface::HomogeneousLocalTP ||
+        surface==accuracy::QFNObservationSurface::HomogeneousLocalTP || surface==accuracy::QFNObservationSurface::GPUCPULocalTP,
+        "QFN observed TP path lost original prepared ownership classification");
     std::set<std::string> gpu;
     const auto add = [&](const GlobalDeviceAddress &address) {
         if (address.device_type==DeviceType::CUDA || address.device_type==DeviceType::ROCm)
@@ -326,15 +331,16 @@ json requireQFNPath(IOrchestrationRunner &runner, const json &observation)
 
 /**
  * @brief Read only the ordinary LocalTP host-publication owner's passive records.
+ * @param participants Exact original admitted TP compute extent, independent of expert tier membership.
  * @return Validated cumulative actual one-row publications; no native probe.
  * @throws std::runtime_error If the required sampling family was not collected.
  */
-std::uint64_t qfnTPHostPublications()
+std::uint64_t qfnTPHostPublications(std::size_t participants)
 {
     if (!PerfStatsCollector::isDomainEnabled("sampling"))
-        throw std::runtime_error("QFN TP4 observer requires sampling publication evidence");
+        throw std::runtime_error("QFN LocalTP observer requires sampling publication evidence");
     const auto records = PerfStatsCollector::snapshot({"sampling"});
-    return accuracy::qfnTPHostPublicationCount(records);
+    return accuracy::qfnTPHostPublicationCount(records,participants);
 }
 
 /**
@@ -392,14 +398,15 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
         auto &runner=*context.runner;
         runner.setSkipLogitsGatherDecode(false); runner.setSkipLogitsGatherPrefill(false);
         requireQFN(runner.prepareForInference(),"QFN production preparation failed");
-        result["actual_owner"]=authenticateQFN(request,runner);
+        accuracy::observeQFNWithFinalOwner(context.runner,[&](const ModelContextReuseContract &original_owner) {
+        result["actual_owner"]=authenticateQFN(request,runner,original_owner);
         const auto executable=sha256FileHex("/proc/self/exe");
         requireQFN(bool(executable),"QFN observer cannot authenticate its actual executable");
         result["native_identity"]={{"executable_sha256",*executable},
             {"actual_config_sha256",accuracy::qfnMetadataDigest(result["actual_owner"].at("actual_config"))},
             {"actual_source_descriptor_sha256",result["actual_owner"].at("source_file_set_identity")}};
-        const bool tp4=accuracy::qfnObservationSurface(runner.executionPlan())==accuracy::QFNObservationSurface::ROCmLocalTP4;
-        const auto publication_before=tp4?qfnTPHostPublications():0;
+        const bool local_tp=accuracy::qfnObservationSurface(runner.executionPlan())==accuracy::QFNObservationSurface::HomogeneousLocalTP;
+        const auto publication_before=local_tp?qfnTPHostPublications(runner.executionPlan().local_tp_devices.size()):0;
         std::uint64_t expected_publications=0;
         for(const auto &history:request.corpus().at("histories"))
         {
@@ -415,11 +422,11 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
         replay["id"]=reset.at("replay_id");
         result["reset_case"]=observeQFNHistory(runner,replay,output);
         expected_publications+=replay.at("decode_rows").get<std::uint64_t>();
-        if(tp4)
+        if(local_tp)
         {
-            const auto after=qfnTPHostPublications();
+            const auto after=qfnTPHostPublications(runner.executionPlan().local_tp_devices.size());
             requireQFN(after>=publication_before && after-publication_before==expected_publications,
-                       "QFN TP4 did not publish every original committed row through its actual host gather");
+                       "QFN LocalTP did not publish every original committed row through its actual host gather");
             result["tp_host_publications"]={{"before",publication_before},{"after",after},
                 {"observed_decodes_including_reset",expected_publications}};
         }
@@ -427,8 +434,8 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
                     result["reset_case"].at("logits_file").get<std::string>()),"QFN real request reset changed original logits bytes");
         result["path_records"]=requireQFNPath(runner,result["actual_owner"]);
         // Recheck original admitted source/policies before terminal teardown.
-        requireQFN(authenticateQFN(request,runner)==result["actual_owner"],"QFN original owner/config changed across histories");
-        runner.shutdown(); context.runner.reset();
+        requireQFN(authenticateQFN(request,runner,original_owner)==result["actual_owner"],"QFN original owner/config changed across histories");
+        }); // Final original model/source retirement precedes AppContext MPI destruction.
         requireQFN(PerfStatsCollector::flushFromEnv(),"QFN observer cannot publish original path counters");
         result["proofs"]={{"source_authenticated",true},{"production_path_authenticated",true},
             {"publication_authenticated",true},{"native_retired",true},{"reset_byte_equal",true}};

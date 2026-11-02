@@ -70,18 +70,20 @@ bool OrdinaryGenerationSamplingStage::execute(IDeviceContext *ctx)
             static_cast<size_t>(request) * publication.history.request_stride;
         if (const auto *policy = std::get_if<Stochastic>(&p.policy))
         {
-            // A forward owns fresh logits for this transaction. Consume them
-            // once with the canonical penalty arithmetic; never reapply the
-            // transform to already-processed logits or reconstruct history on
-            // the host. Null verifier tokens means durable history only.
-            if (p.penalties && !p.backend->enqueueApplyMTPPenaltiesToF32RowsDevice(
-                    logits, 1, p.vocab_size, p.logits_row_stride, nullptr,
-                    history, p.penalties, p.device_id.gpu_ordinal(), stream))
-                return false;
-            if (!p.backend->enqueueBuildTopKTopPDistributionF32Device(
-                    logits, p.vocab_size, policy->top_k, policy->top_p, policy->temperature,
-                    p.device_id.gpu_ordinal(), stream, w.indices, w.values,
-                    w.partial_values, w.partial_indices, w.partial_capacity))
+            // Canonical model logits are read-only. Apply durable history while
+            // loading candidates, before the unchanged Top-K/Top-P reduction.
+            const bool built = p.penalties
+                ? p.backend->enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
+                      logits, 1, p.vocab_size, p.logits_row_stride,
+                      policy->top_k, policy->top_p, policy->temperature,
+                      p.device_id.gpu_ordinal(), stream, w.indices, w.capacity, w.values,
+                      w.partial_values, w.partial_indices, w.partial_capacity,
+                      GenerationPenaltyHistory::committed(history, p.penalties))
+                : p.backend->enqueueBuildTopKTopPDistributionF32Device(
+                      logits, p.vocab_size, policy->top_k, policy->top_p, policy->temperature,
+                      p.device_id.gpu_ordinal(), stream, w.indices, w.values,
+                      w.partial_values, w.partial_indices, w.partial_capacity);
+            if (!built)
                 return false;
             // The prefill frontier already names its logits. Decode has just
             // consumed the pending condition, so its logits name position + 1.
@@ -129,8 +131,6 @@ StageBufferContract OrdinaryGenerationSamplingStage::bufferContract() const
     if (params_.penalties)
     {
         contract.addInput(BufferId::MTP_GREEDY_PENALTY_POLICY);
-        if (std::holds_alternative<Stochastic>(params_.policy))
-            contract.addOutput(BufferId::LOGITS);
     }
     if (std::holds_alternative<Stochastic>(params_.policy))
         contract.addInput(BufferId::SAMPLING_REQUEST_SEEDS);

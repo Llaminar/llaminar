@@ -10,6 +10,8 @@
  */
 #pragma once
 #include "PooledImmutablePhysicalOwnerOps.h"
+#include "PooledImmutableExactIdentity.h"
+namespace llaminar2::qwen4exp::pooled_native { template<class Slot> struct CooperativeOwnerValidation; }
 namespace llaminar2::qwen4exp::adaptive_lookup::pooled
 {
 /** @brief Availability authored only after initial reader pins are sealed. */
@@ -113,14 +115,15 @@ public:
     /** @brief Execute only the accepted second wave without minting a frame or resetting physical generations. */
     QFN_ADAPTIVE_HD bool executeVictims() { return executeWave(AllocationWave::Victim); }
 private:
+    template<class> friend struct ::llaminar2::qwen4exp::pooled_native::CooperativeOwnerValidation;
     /**
-     * @brief Validate and retain the entire immutable plan before any physical victim mutation.
+     * @brief Validate original lease, decision fields and physical victims before identity checks or commit.
      * @param lease Exact owner-issued current availability record, not a new capacity request.
      * @param decisions Live directed owner decisions; count is their actual extent.
      * @param count Exact bounded decision count. Free decisions precede victim decisions.
      * @return False on duplicate/stale/foreign or over-lease plans, before changing slots.
      */
-    QFN_ADAPTIVE_HD bool acceptWave(AllocationWave wave, AvailabilityLease lease, const AllocationDecision *decisions, std::uint32_t count)
+    QFN_ADAPTIVE_HD bool validateWave(AllocationWave wave, AvailabilityLease lease, const AllocationDecision *decisions, std::uint32_t count)
     {
         if (!validStorage() || owner_.frame->status != Status::Success ||
             (wave != AllocationWave::Free && wave != AllocationWave::Victim) ||
@@ -154,12 +157,16 @@ private:
 
         }
         if (count && (!scratch_.keys_a || !scratch_.keys_b || !scratch_.radix_counts)) return fail();
-        // Three closed integer keys use a fixed number of radix passes: O(live commands),
-        // independent of physical cache/source capacity and adversarial key collisions.
-        if (!uniqueKeys(decisions, count, 0, 8) || !uniqueKeys(decisions, count, 1, 4) ||
-            !uniqueKeys(decisions, count, 2, 4)) return fail();
-        if (owner_.declaration.capacity() &&
-            count > ~std::uint64_t{0} - owner_.owner->next_slot_generation) return fail();
+        return true;
+    }
+    /** @brief Commit only after the same operation has validated every immutable identity domain.
+     * @param wave Original allocation wave.
+     * @param decisions Validated original live decision bank.
+     * @param count Original validated live extent.
+     * @return True after original-order publication into the existing plan owner.
+     */
+    QFN_ADAPTIVE_HD bool commitWave(AllocationWave wave,const AllocationDecision* decisions,std::uint32_t count)
+    {
         for (std::uint32_t i = 0; i < count; ++i) accepted_[frame_.count + i] = decisions[i];
         frame_.wave_offset = frame_.count;
         frame_.wave_count = count;
@@ -167,6 +174,24 @@ private:
         frame_.wave = wave;
         frame_.phase = AllocationPhase::Accepted;
         return true;
+    }
+    /** @brief Preserve the scalar reference path: all gates and identity domains precede commit.
+     * @param wave Original allocation wave.
+     * @param lease Actual original owner lease.
+     * @param decisions Original live decision bank.
+     * @param count Actual bounded decision count.
+     * @return Original scalar acceptance result, with no physical mutation on rejection.
+     */
+    QFN_ADAPTIVE_HD bool acceptWave(AllocationWave wave,AvailabilityLease lease,const AllocationDecision* decisions,std::uint32_t count)
+    {
+        if(!validateWave(wave,lease,decisions,count))return false;
+        // Three exact keys use bounded small-set comparisons or fixed-pass radix;
+        // every retained pin remains validated, independent of physical capacity.
+        if (!uniqueKeys(decisions, count, 0, 8) || !uniqueKeys(decisions, count, 1, 4) ||
+            !uniqueKeys(decisions, count, 2, 4)) return fail();
+        if (owner_.declaration.capacity() &&
+            count > ~std::uint64_t{0} - owner_.owner->next_slot_generation) return fail();
+        return commitWave(wave,decisions,count);
     }
     /** @brief Drain the accepted immutable plan in bounded command order, even after cancellation intent. */
     QFN_ADAPTIVE_HD bool executeWave(AllocationWave wave)
@@ -363,9 +388,15 @@ private:
                 if (overlap(banks[i], bytes[i], banks[j], bytes[j])) return false;
         return true;
     }
-    /** @brief Validate one integer identity with admitted radix scratch; no slot/pin writes occur. */
-    QFN_ADAPTIVE_HD bool uniqueKeys(const AllocationDecision *decisions, std::uint32_t count,
-                                    unsigned key, unsigned bytes)
+    /** @brief Compose one exact retained/new identity domain in original admitted scratch.
+     * @param decisions Original incoming decision bank.
+     * @param count Actual incoming extent, including zero.
+     * @param key Row, unique or victim-slot identity domain.
+     * @param total Output complete retained/new live prefix length.
+     * @return False on foreign/stale retained grants before any plan or slot mutation.
+     */
+    QFN_ADAPTIVE_HD bool prepareUniqueKeys(const AllocationDecision *decisions, std::uint32_t count,
+                                    unsigned key, std::uint32_t& total)
     {
         const auto pins = key == 2 ? 0u : owner_.frame->initial_pin_count + frame_.count;
         if (pins > owner_.declaration.maximumUnique() - count) return false;
@@ -377,32 +408,26 @@ private:
                 pin.owner != owner_.declaration.coordinate()) return false;
             scratch_.keys_a[i] = key == 0 ? pin.row : pin.unique;
         }
+        total=count+pins;
         if (!count && !pins) return true;
         for (std::uint32_t i = 0; i < count; ++i)
             scratch_.keys_a[pins + i] = key == 0 ? decisions[i].row : key == 1 ? decisions[i].unique :
                 decisions[i].kind == CommandKind::ReserveVictim ? decisions[i].victim.slot : None;
-        count += pins;
-        auto *input = scratch_.keys_a;
-        auto *output = scratch_.keys_b;
-        for (unsigned pass = 0; pass < bytes; ++pass)
-        {
-            for (unsigned bin = 0; bin < 256; ++bin) scratch_.radix_counts[bin] = 0;
-            const auto shift = pass * 8;
-            for (std::uint32_t i = 0; i < count; ++i) ++scratch_.radix_counts[(input[i] >> shift) & 255];
-            std::uint32_t cursor = 0;
-            for (unsigned bin = 0; bin < 256; ++bin)
-            {
-                const auto size = scratch_.radix_counts[bin];
-                scratch_.radix_counts[bin] = cursor;
-                cursor += size;
-            }
-            for (std::uint32_t i = 0; i < count; ++i)
-                output[scratch_.radix_counts[(input[i] >> shift) & 255]++] = input[i];
-            auto *swap = input; input = output; output = swap;
-        }
-        for (std::uint32_t i = 1; i < count; ++i)
-            if (input[i] == input[i - 1] && !(key == 2 && input[i] == None)) return false;
         return true;
+    }
+    /** @brief Scalar duplicate rejection over the exact composed retained/new live prefix.
+     * @param decisions Original incoming decisions.
+     * @param count Actual incoming extent, including zero.
+     * @param key Row, unique or victim-slot identity domain.
+     * @param bytes Original significant key width.
+     * @return True only for an exact duplicate-free composed identity set.
+     */
+    QFN_ADAPTIVE_HD bool uniqueKeys(const AllocationDecision* decisions,std::uint32_t count,unsigned key,unsigned bytes)
+    {
+        std::uint32_t total=0;
+        return prepareUniqueKeys(decisions,count,key,total) &&
+            exactDistinctIdentities(scratch_.keys_a,scratch_.keys_b,scratch_.radix_counts,total,bytes,
+                key==2?DuplicateIdentityPolicy::IgnoreUnassignedSlot:DuplicateIdentityPolicy::AllValues);
     }
     /** @return Exact immutable interval equality, without a source/transport capability claim. */
     QFN_ADAPTIVE_HD static bool same(Interval a, Interval b)

@@ -10,6 +10,7 @@
  * Driver errors reject the
  * whole inventory; they cannot become an invented empty visibility set.
  */
+#include "../NativeContextRuntimePolicy.h"
 #include "ROCmHardwareMetadata.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "ROCmRuntimeStartup.h"
@@ -48,6 +49,7 @@ namespace llaminar2
         /** @return Complete visible HIP records; a genuine no-device result is empty. */
         std::vector<ROCmDeviceHardware> readHardware()
         {
+            (void)NativeContextRuntimePolicy::original(DeviceType::ROCm).identity();
             // Bind terminal process exclusion before the first native query.
             // Only this once-source borrows lifecycle; published reads stay pure.
             const auto discovery_lifetime = GPUDeviceProcessLifetime::acquireNativeContext();

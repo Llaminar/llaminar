@@ -12,8 +12,26 @@ import hashlib
 from enum import Enum
 import json
 import math
+import os
+import re
 from pathlib import Path
 import subprocess
+
+
+def artifact_identity_path(raw_name: str) -> str:
+    """Encode the shared C++ artifact owner's bounded lossless path; preserve short names."""
+    if not isinstance(raw_name, str) or not raw_name or raw_name in ('.', '..') or '\x00' in raw_name:
+        raise ValueError('invalid logical artifact identity')
+    component = re.sub(r'[/\\:*?"<>|]', "_", raw_name)
+    encoded = os.fsencode(component)
+    namespace = "long-identities"
+    if len(encoded) <= 255 and component != namespace:
+        return component
+    # Mirror the writer's byte chunks and terminal leaf. The full legacy
+    # identity remains recoverable; no digest, truncation or second ID table.
+    chunks = ["c" + os.fsdecode(encoded[offset:offset + 240])
+              for offset in range(0, len(encoded), 240)]
+    return "/".join([namespace, *chunks, "artifacts"])
 
 
 class CPUISA(str, Enum):

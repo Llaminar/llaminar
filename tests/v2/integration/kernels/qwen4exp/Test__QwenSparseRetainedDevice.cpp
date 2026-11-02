@@ -77,12 +77,17 @@ void prove(DeviceId device, bool outerLedger = false)
             outerParams.verifier_state_stages.push_back(stage.get());
         MTPSpeculativeStatePublicationStage outer(outerParams);
         auto outerPlan = qfn_outer_publication_test::plan(outer,
-            {{BufferId::QFN_QSA_PARTIAL_KEYS, &partial}});
+            {{BufferId::QFN_QSA_PARTIAL_KEYS, &partial},
+             {BufferId::QFN_QSA_TRANSACTION_PRIOR, &prior},
+             {BufferId::QFN_QSA_CANDIDATE_RAW_KEYS, &retained}});
         if (outerLedger)
         {
+            qfn_outer_publication_test::rejectUnrelatedRead(outer);
             ASSERT_EQ(outerPlan.outputs.size(), 1u);
             // Three request-local hooks share one physical partial-key owner.
-            outerPlan.retained_parent_inputs = {&prior, &retained};
+            ASSERT_EQ(outerPlan.retained_parent_inputs.size(), 2u);
+            EXPECT_THROW(qfn_outer_publication_test::plan(outer,
+                {{BufferId::QFN_QSA_PARTIAL_KEYS, &partial}}), std::logic_error);
             qfn_outer_publication_test::rejectMissingWrites(worker, device, stream, outerPlan, [&] {
                 require(stages.front()->restoreVerifierStateCaptureRowsFromDeviceIndices(
                     std::span(static_cast<const int *>(decisions.gpu_data_ptr()), decisions.numel()), requests, 2, stream),

@@ -26,7 +26,8 @@ DeviceId participant(const std::shared_ptr<qwen4exp::ImmutableLookupExecutionBou
 }
 /** @return Immutable role/root pairs; building this small array never reads a live device value. */
 auto bindings(const qwen4exp::PooledImmutableSourcePreparedStorage& storage){
-    const auto source=storage.roots(),owner=storage.owner()->roots(),coordinator=storage.coordinator()->roots();
+    Roots owner{};if(storage.geometry().parameters().local_owner!=qwen4exp::adaptive_lookup::None)owner=storage.owner()->roots();
+    const auto source=storage.roots(),coordinator=storage.coordinator()->roots();
     return std::array<std::pair<BufferId,std::shared_ptr<TensorBase>>,8>{{
         {BufferId::QFN_POOLED_SOURCE_FRAME,source.frame},{BufferId::QFN_POOLED_SOURCE_NATIVE,source.native},
         {BufferId::QFN_POOLED_OWNER_CACHE,owner.cache},{BufferId::QFN_POOLED_OWNER_FRAME,owner.frame},{BufferId::QFN_POOLED_OWNER_NATIVE,owner.native},
@@ -47,11 +48,18 @@ void bindPooledSourceRoots(BufferArena& arena,const qwen4exp::ImmutableLookupExe
 }
 PooledImmutableSourcePhaseStage::PooledImmutableSourcePhaseStage(BufferArena& arena,
     std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary,qwen4exp::PooledSourceAction action,
-    DeviceGenerationControlBinding control,std::optional<qwen4exp::PooledNativeTensorSpan> output)
-    :IComputeStage(participant(boundary)),arena_(&arena),boundary_(std::move(boundary)),action_(action),control_(control),output_(std::move(output)){
+    DeviceGenerationControlBinding control,std::optional<qwen4exp::PooledNativeTensorSpan> output,std::uint32_t owner)
+    :IComputeStage(participant(boundary)),arena_(&arena),boundary_(std::move(boundary)),action_(action),owner_(owner),control_(control),output_(std::move(output)){
     if(isGraphCaptureActive())throw std::logic_error("Pooled source phase must be declared before capture");
     boundary_->bindPooledGenerationControl(control_);
     const auto& p=boundary_->pooledStorage()->geometry().parameters();
+    const bool addressed=qwen4exp::isPooledSourceAddressed(action_);
+    if(addressed?(owner_>=p.coordinator.policy.participants()):(owner_!=qwen4exp::adaptive_lookup::None))throw std::invalid_argument("Source stage changed original addressed owner");
+    if((qwen4exp::isPooledPublicationImport(action_) || qwen4exp::isPooledPublicationConsensus(action_)) &&
+       (!p.offsets.seal_receipt || !p.coordinator.native.ingress_frontier))throw std::invalid_argument("Publication stage requires its original serial/frontier declarations");
+    if(action_==qwen4exp::PooledSourceAction::BeforeReady &&
+        (p.coordinator.policy.participants()!=1 || p.local_owner==qwen4exp::adaptive_lookup::None))
+        throw std::invalid_argument("Direct BeforeReady requires original local-P1 ordering; distributed publication uses acquired consensus");
     const auto count=std::size_t{p.coordinator.policy.maximumOriginal()}*p.row_elements;
     if(count>std::numeric_limits<std::size_t>::max()/sizeof(float))throw std::overflow_error("Pooled source output extent overflows");
     if(bool(output_)!=(action_==qwen4exp::PooledSourceAction::Read))throw std::invalid_argument("Only the original source reader owns an output span");
@@ -106,16 +114,38 @@ bool PooledImmutableSourcePhaseStage::execute(IDeviceContext* context){
     auto execution=gpuExecution();const auto& storage=*boundary_->pooledStorage();
     for(const auto& [role,root]:bindings(storage))if(root)execution.requirePreparedInput(root.get());
     for(const auto& root:{storage.roots().frame,storage.roots().native})execution.requirePreparedOutput(root.get());
+    if(action_==qwen4exp::PooledSourceAction::PlanReads)execution.requirePreparedOutput(storage.coordinator()->roots().native.get());
+    if(qwen4exp::isPooledRetirementOperation(action_)){
+        if(action_!=qwen4exp::PooledSourceAction::PackReaderRetirement)execution.requirePreparedOutput(storage.coordinator()->roots().native.get());
+        if(action_==qwen4exp::PooledSourceAction::ImportReleases || action_==qwen4exp::PooledSourceAction::ReconcileReleases || action_==qwen4exp::PooledSourceAction::FinishRetired || action_==qwen4exp::PooledSourceAction::SnapshotReleased)execution.requirePreparedOutput(storage.coordinator()->roots().frame.get());
+        if(action_==qwen4exp::PooledSourceAction::ReconcileReleases && storage.coordinator()->roots().cache)execution.requirePreparedOutput(storage.coordinator()->roots().cache.get());
+    }
+
+    if(action_==qwen4exp::PooledSourceAction::ImportReadRows && owner_==storage.geometry().parameters().local_owner){
+        execution.requirePreparedOutput(storage.owner()->roots().frame.get());execution.requirePreparedOutput(storage.owner()->roots().native.get());
+    }
     execution.requirePreparedInput(control_.owner());execution.requirePreparedOutput(control_.owner());
-    qwen4exp::PooledSourceQuery query;
+    if(qwen4exp::isPooledPublicationImport(action_))execution.requirePreparedOutput(storage.coordinator()->roots().native.get());
+    qwen4exp::PooledSourceQuery query;query.owner=owner_;
     if(output_){execution.requirePreparedOutput(output_->root.get());query={reinterpret_cast<float*>(static_cast<std::byte*>(output_->root->gpu_data_ptr())+output_->offset),output_->bytes/sizeof(float)};}
     boundary_->pooledKernels().enqueue(action_,*boundary_->pooledStorage(),control_,query,execution.nativeStream());
     execution.publish(storage.roots().frame.get());execution.publish(storage.roots().native.get());execution.publish(control_.owner());
+    if(qwen4exp::isPooledPublicationImport(action_))execution.publish(storage.coordinator()->roots().native.get());
+    if(action_==qwen4exp::PooledSourceAction::PlanReads)execution.publish(storage.coordinator()->roots().native.get());
+    if(qwen4exp::isPooledRetirementOperation(action_)){
+        if(action_!=qwen4exp::PooledSourceAction::PackReaderRetirement)execution.publish(storage.coordinator()->roots().native.get());
+        if(action_==qwen4exp::PooledSourceAction::ImportReleases || action_==qwen4exp::PooledSourceAction::ReconcileReleases || action_==qwen4exp::PooledSourceAction::FinishRetired || action_==qwen4exp::PooledSourceAction::SnapshotReleased)execution.publish(storage.coordinator()->roots().frame.get());
+        if(action_==qwen4exp::PooledSourceAction::ReconcileReleases && storage.coordinator()->roots().cache)execution.publish(storage.coordinator()->roots().cache.get());
+    }
+
+    if(action_==qwen4exp::PooledSourceAction::ImportReadRows && owner_==storage.geometry().parameters().local_owner){
+        execution.publish(storage.owner()->roots().frame.get());execution.publish(storage.owner()->roots().native.get());
+    }
     if(output_)execution.publish(output_->root.get());return true;
 }
 std::uint64_t PooledImmutableSourcePhaseStage::graphCaptureVariantSignature()const{
     requireDeclarations();std::uint64_t h=1469598103934665603ULL;const auto mix=[&](std::uint64_t word){h=(h^word)*1099511628211ULL;};
-    mix(1);mix(static_cast<unsigned>(action_));mix(boundary_->captureIdentity());mix(control_.captureIdentity());
+    mix(2);mix(owner_);mix(static_cast<unsigned>(action_));mix(boundary_->captureIdentity());mix(control_.captureIdentity());
     mix(boundary_->pooledKernels().captureIdentity(*boundary_->pooledStorage()));
     for(const auto& [role,root]:bindings(*boundary_->pooledStorage())){mix(static_cast<std::uint64_t>(role));mix(reinterpret_cast<std::uintptr_t>(root.get()));}
     if(output_){mix(static_cast<std::uint64_t>(output_->buffer));mix(reinterpret_cast<std::uintptr_t>(output_->root.get()));mix(output_->offset);mix(output_->bytes);mix(static_cast<std::uint64_t>(output_->root->native_type()));mix(output_->root->size_bytes());}
@@ -125,8 +155,16 @@ bool PooledImmutableSourcePhaseStage::supportsBackend(ComputeBackendType backend
     (device().is_cuda() && backend==ComputeBackendType::GPU_CUDA) || (device().is_rocm() && backend==ComputeBackendType::GPU_ROCM);}
 StageBufferContract PooledImmutableSourcePhaseStage::bufferContract()const{
     requireDeclarations();auto contract=StageBufferContract::build();
-    for(const auto& [role,root]:bindings(*boundary_->pooledStorage()))if(root){
-        if(role==BufferId::QFN_POOLED_SOURCE_FRAME || role==BufferId::QFN_POOLED_SOURCE_NATIVE)contract.addPreallocatedInOut(role,"INT8");
+    const auto& storage=*boundary_->pooledStorage();
+    for(const auto& [role,root]:bindings(storage))if(root){
+        if(role==BufferId::QFN_POOLED_SOURCE_FRAME || role==BufferId::QFN_POOLED_SOURCE_NATIVE ||
+           (qwen4exp::isPooledPublicationImport(action_) && role==BufferId::QFN_POOLED_COORDINATOR_NATIVE))contract.addPreallocatedInOut(role,"INT8");
+        else if(action_==qwen4exp::PooledSourceAction::PlanReads && role==BufferId::QFN_POOLED_COORDINATOR_NATIVE)contract.addPreallocatedInOut(role,"INT8");
+        else if(qwen4exp::isPooledRetirementOperation(action_) &&
+            ((role==BufferId::QFN_POOLED_COORDINATOR_NATIVE && action_!=qwen4exp::PooledSourceAction::PackReaderRetirement) ||
+             (role==BufferId::QFN_POOLED_COORDINATOR_FRAME && (action_==qwen4exp::PooledSourceAction::ImportReleases || action_==qwen4exp::PooledSourceAction::ReconcileReleases || action_==qwen4exp::PooledSourceAction::FinishRetired || action_==qwen4exp::PooledSourceAction::SnapshotReleased)) ||
+             (role==BufferId::QFN_POOLED_COORDINATOR_POLICY && action_==qwen4exp::PooledSourceAction::ReconcileReleases)))contract.addPreallocatedInOut(role,"INT8");
+        else if(action_==qwen4exp::PooledSourceAction::ImportReadRows && owner_==storage.geometry().parameters().local_owner && (role==BufferId::QFN_POOLED_OWNER_FRAME || role==BufferId::QFN_POOLED_OWNER_NATIVE))contract.addPreallocatedInOut(role,"INT8");
         else contract.addInput(role,"INT8");
     }
     contract.addPreallocatedInOut(BufferId::MTP_GENERATION_CONTROL,"INT32");

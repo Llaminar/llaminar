@@ -58,6 +58,7 @@ namespace
     ENUM(MoEHotExpertCacheConfig::Kind, VALUE(Percent), VALUE(Count), VALUE(Off))
     ENUM(MoERebalanceRuntimeMode, VALUE(Off), VALUE(Observe), VALUE(Dynamic))
     ENUM(PrefixCacheStorageMode, VALUE(Disabled), VALUE(Ram), VALUE(Device), VALUE(Tiered))
+    ENUM(AdaptiveGPUCachePlacementMode, VALUE(ConsumerLocal), VALUE(DeclaredRankLocal))
     ENUM(ImmutableRowTableDistribution, VALUE(Replicated), VALUE(FixedHeadSharded))
     ENUM(ImmutableRowStoragePreference, VALUE(Automatic), VALUE(VRAM), VALUE(RAM), VALUE(MemoryMapped), VALUE(HostAdaptiveRAMSSD), VALUE(AdaptiveVRAMRAMSSD))
     ENUM(PrefixCacheTerminalStateMode, VALUE(Off), VALUE(Auto), VALUE(Always))
@@ -142,7 +143,16 @@ namespace
 #define MEMBERS(X) X(cache_physical_byte_limit) X(policy)
     RECORD(HostAdaptiveRAMSSDRequest, maximum_cache_rows, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(gpu_cache_physical_byte_limit) X(gpu_policy) X(host)
+#define MEMBERS(X) X(backend) X(ordinal)
+    RECORD(AdaptiveGPUCacheParticipant, world_rank, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(maximum_cache_rows) X(cache_physical_byte_limit)
+    RECORD(AdaptiveGPUCacheOwnerRequest, participant, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(owners) X(coordinator)
+    RECORD(AdaptiveGPUCachePlacementRequest, mode, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(gpu_cache_physical_byte_limit) X(gpu_policy) X(host) X(placement)
     RECORD(AdaptiveVRAMRAMSSDRequest, maximum_gpu_cache_rows, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(window_bytes) X(window_count) X(host_adaptive) X(distribution) X(gpu_adaptive)

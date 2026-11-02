@@ -2,7 +2,7 @@
  * @file ImmutableRowTableAdmissionWire.cpp
  * @brief Authenticate bounded setup-only table candidate metadata with no payload reads.
  *
- * Version9 also retains predictor head ownership beside resolved arithmetic and
+ * Version10 also retains predictor head ownership beside resolved arithmetic and
  * the original attention schedule. Unknown values reject before narrowing; reloadable debug
  * state is never consulted when restoring an admitted remote provision.
  * Sender frames serialize and authenticate within readiness consensus before
@@ -18,7 +18,7 @@ namespace llaminar2
 {
 namespace
 {
-    constexpr std::uint32_t Magic = 0x4e475231u, Version = 9;
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 13;
     /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
     constexpr std::array QfnLayoutWords{
         &Qwen4ExpMemoryGeometry::residual_width,
@@ -73,6 +73,17 @@ std::uint32_t count(std::size_t n)
     if(n>std::numeric_limits<std::uint32_t>::max()) throw std::overflow_error("Ngram admission wire count overflows");
     return static_cast<std::uint32_t>(n);
 }
+/** @brief Encode only an empty or exact SHA256 identity, never a process address or caller limits. */
+void hashIdentity(std::vector<std::uint8_t>& out,const std::string& hash){
+    if(!hash.empty()&&(hash.size()!=64||!std::all_of(hash.begin(),hash.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');})))
+        throw std::invalid_argument("CPU service wire requires an exact immutable source identity");
+    append(out,count(hash.size()));for(const unsigned char c:hash)append(out,static_cast<std::uint8_t>(c));
+}
+/** @return One checked fixed source digest; no native metadata query occurs here. */
+std::string hashIdentity(Reader& in){
+    const auto count=in.read<std::uint32_t>();if((count!=0&&count!=64)||count>in.remaining())throw std::invalid_argument("CPU service wire identity is truncated/invalid");
+    std::string result;result.reserve(count);for(std::uint32_t i=0;i<count;++i){const auto c=in.read<std::uint8_t>();if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))throw std::invalid_argument("CPU service wire digest contains invalid characters");result.push_back(c);}return result;
+}
 /** @return A representable physical capacity, never a truncating conversion. */
 std::size_t size(Reader &reader)
 {
@@ -100,6 +111,20 @@ PhysicalMemoryResource resource(Reader &in,int rank)
     PhysicalMemoryResource r{rank,DeviceId{static_cast<DeviceType>(type),static_cast<int>(ordinal)},size(in),size(in)};
     if(!r.valid()) throw std::invalid_argument("Ngram admission wire contains an invalid physical resource");
     return r;
+}
+/** @brief Preserve one declaration endpoint without inventing capacity observations. */
+void participant(std::vector<std::uint8_t> &out,const AdaptiveGPUCacheParticipant &p)
+{
+    append(out,static_cast<std::uint32_t>(p.world_rank));append(out,static_cast<std::uint32_t>(p.backend));append(out,static_cast<std::uint32_t>(p.ordinal));
+}
+/** @return Exact sender-local storage endpoint, checked before any native API. */
+AdaptiveGPUCacheParticipant participant(Reader &in,int rank)
+{
+    const auto r=in.read<std::uint32_t>(),b=in.read<std::uint32_t>(),o=in.read<std::uint32_t>();
+    if(r!=static_cast<std::uint32_t>(rank) || o>static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+       (b!=static_cast<std::uint32_t>(DeviceType::CUDA) && b!=static_cast<std::uint32_t>(DeviceType::ROCm)))
+        throw std::invalid_argument("GPU cache declaration wire contains a foreign/unknown endpoint");
+    return {rank,static_cast<DeviceType>(b),static_cast<int>(o)};
 }
 /** @brief Encode exact typed owner lines; the canonical builder owns their interpretation. */
 void plan(std::vector<std::uint8_t> &out,const PhysicalMemoryPlan &p)
@@ -157,6 +182,14 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
         append(out,g.gpu_policy.aging_accesses);append(out,g.gpu_policy.protected_numerator);append(out,g.gpu_policy.protected_denominator);
         append(out,g.host.maximum_cache_rows);append(out,static_cast<std::uint64_t>(g.host.cache_physical_byte_limit));
         append(out,g.host.policy.aging_accesses);append(out,g.host.policy.protected_numerator);append(out,g.host.policy.protected_denominator);
+        append(out,static_cast<std::uint32_t>(g.placement.mode));append(out,count(g.placement.owners.size()));
+        for(const auto &owner:g.placement.owners)
+        {
+            participant(out,owner.participant);append(out,owner.maximum_cache_rows);
+            append(out,static_cast<std::uint64_t>(owner.cache_physical_byte_limit));
+        }
+        append(out,static_cast<std::uint32_t>(g.placement.coordinator.has_value()));
+        if(g.placement.coordinator)participant(out,*g.placement.coordinator);
         const auto &e=request.input.extent();append(out,static_cast<std::uint32_t>(e.format()));
         append(out,e.rows());append(out,static_cast<std::uint64_t>(e.rowBytes()));
         resource(out,request.input.host());
@@ -165,6 +198,8 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
         append(out,static_cast<std::uint32_t>(node.value_or(0))); // Reserved zero in task-policy wire arm.
         append(out,count(request.input.consumers().size()));
         for(const auto &consumer:request.input.consumers()) resource(out,consumer);
+        append(out,count(request.input.gpuResources().size()));
+        for(const auto &device:request.input.gpuResources())resource(out,device);
         append(out,static_cast<std::uint32_t>(request.contributions.vram.has_value()));
         if(request.contributions.vram) plan(out,*request.contributions.vram);
         plan(out,request.contributions.ram);plan(out,request.contributions.mmap);
@@ -199,6 +234,11 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
                     throw std::invalid_argument("Ngram wire TP coordinate is out of range");
                 append(out,static_cast<std::uint32_t>(c.tp_coordinate+1));
                 append(out,static_cast<std::uint32_t>(c.tp_topology));
+                if (c.query_head_start < 0 || c.kv_head_start < 0 || c.assigned_kv_heads < 0)
+                    throw std::invalid_argument("Ngram wire head coordinates must be nonnegative");
+                append(out,static_cast<std::uint32_t>(c.query_head_start));
+                append(out,static_cast<std::uint32_t>(c.kv_head_start));
+                append(out,static_cast<std::uint32_t>(c.assigned_kv_heads));
                 const auto &a=c.activation;
                 qwen4exp::validateQwenSparseAttentionArithmetic(a.attention_arithmetic,
                                                                 c.resource.device.type);
@@ -230,6 +270,13 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
                     if(value<0)throw std::invalid_argument("Ngram common activation geometry must be nonnegative");
                     append(out,static_cast<std::uint32_t>(value));
                 }
+                hashIdentity(out,c.host_service_resource_identity);hashIdentity(out,c.host_service_live_identity);
+                const bool service=!c.host_service_resource_identity.empty()||!c.host_service_live_identity.empty();
+                if(service!=c.host_service_declaration.has_value())throw std::invalid_argument("Ngram service declaration presence is inconsistent");
+                append(out,std::uint32_t(c.host_service_declaration.has_value()));
+                if(c.host_service_declaration){const auto& d=*c.host_service_declaration;d.requireValid();
+                    for(const auto value:{d.stackBytes,d.guardBytes,d.pageBytes,d.objectBytes,d.objectAlignment,d.tlsBytes,d.opaqueBytes})append(out,std::uint64_t(value));}
+
             }
             plan(out,p.executionPlan());plan(out,p.requiredBase());
         }
@@ -238,6 +285,12 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
 }
 std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRequests(
     std::span<const std::uint8_t> bytes,int expected_rank,const ModelMemoryProfile *canonical_source)
+{
+    return ImmutableRowTableAdmissionParser::parse(bytes,expected_rank,canonical_source,NativeOrderingEventBudgetProjection::installed());
+}
+std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser::parse(
+    std::span<const std::uint8_t> bytes,int expected_rank,const ModelMemoryProfile *canonical_source,const NativeOrderingEventBudgetProjection& ordering,
+    const std::shared_ptr<const RetainedHostServiceDeclarations>& hostServices)
 {
     Reader in(bytes);
     if(expected_rank<0||in.read<std::uint32_t>()!=Magic||in.read<std::uint32_t>()!=Version||
@@ -268,7 +321,19 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
         g.gpu_policy.protected_denominator=in.read<std::uint32_t>();
         g.host.maximum_cache_rows=in.read<std::uint64_t>();g.host.cache_physical_byte_limit=size(in);
         g.host.policy.aging_accesses=in.read<std::uint64_t>();g.host.policy.protected_numerator=in.read<std::uint32_t>();
-        g.host.policy.protected_denominator=in.read<std::uint32_t>();policy.validate();
+        g.host.policy.protected_denominator=in.read<std::uint32_t>();
+        g.placement.mode=static_cast<AdaptiveGPUCachePlacementMode>(in.read<std::uint32_t>());
+        const auto owner_count=in.read<std::uint32_t>();
+        if(owner_count>in.remaining()/28u)throw std::invalid_argument("GPU owner declaration exceeds its wire frame");
+        for(std::uint32_t i=0;i<owner_count;++i)
+        {
+            const auto p=participant(in,expected_rank);const auto rows=in.read<std::uint64_t>();const auto bytes=size(in);
+            g.placement.owners.push_back({p,rows,bytes});
+        }
+        const auto coordinator=in.read<std::uint32_t>();
+        if(coordinator>1u)throw std::invalid_argument("GPU cache coordinator wire arm is invalid");
+        if(coordinator)g.placement.coordinator=participant(in,expected_rank);
+        policy.validate();
         const auto format=static_cast<GGUFTensorType>(in.read<std::uint32_t>());
         const auto rows=in.read<std::uint64_t>();const auto row_bytes=size(in);
         const auto extent=ImmutableRowTableExtent::fromNative(format,rows,row_bytes);
@@ -283,6 +348,19 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
         std::vector<PhysicalMemoryResource> observed;
         for(std::uint32_t i=0;i<consumers;++i) observed.push_back(resource(in,expected_rank));
         auto input=ImmutableRowTablePlacementInput::forConsumers(extent,host,observed,locality);
+        const auto gpu_count=in.read<std::uint32_t>();
+        if(gpu_count>in.remaining()/28u)throw std::invalid_argument("GPU storage observations exceed wire frame");
+        std::vector<PhysicalMemoryResource> gpu_resources;
+        for(std::uint32_t i=0;i<gpu_count;++i)gpu_resources.push_back(resource(in,expected_rank));
+        if(policy.isGPUAdaptive())input=input.withGPUCacheResources(policy,gpu_resources);
+        else
+        {
+            if(gpu_resources.size()!=observed.size())throw std::invalid_argument("Non-adaptive wire invented storage-only observations");
+            for(std::size_t i=0;i<observed.size();++i)
+                if(gpu_resources[i].world_rank!=observed[i].world_rank || gpu_resources[i].device!=observed[i].device ||
+                   gpu_resources[i].total_bytes!=observed[i].total_bytes || gpu_resources[i].admission_available_bytes!=observed[i].admission_available_bytes)
+                    throw std::invalid_argument("Non-adaptive wire changed original consumer observations");
+        }
         const auto available=in.read<std::uint32_t>();
         if(available>1u) throw std::invalid_argument("Ngram admission wire eligibility is invalid");
         std::optional<PhysicalMemoryPlan> vram;
@@ -311,7 +389,7 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
             if(!canonical_source->flash_next || layout!=*canonical_source->flash_next)
                 throw std::invalid_argument("Ngram wire provision layout disagrees with independent receiver source metadata");
             const auto instances=in.read<std::uint32_t>();
-            if (instances == 0 || instances > in.remaining() / 116u)
+            if (instances == 0 || instances > in.remaining() / 128u)
                 throw std::invalid_argument("Ngram wire provision geometry count exceeds its exact frame");
             std::vector<ImmutableRowTableExecutionConsumer> geometry;
             for(std::uint32_t i=0;i<instances;++i)
@@ -327,6 +405,11 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
                 const auto coordinate=in.read<std::uint32_t>(),topology=in.read<std::uint32_t>();
                 if(coordinate>8 || topology>static_cast<std::uint32_t>(ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal))
                     throw std::invalid_argument("Ngram wire TP provenance is invalid");
+                const auto queryStart = in.read<std::uint32_t>(), kvStart = in.read<std::uint32_t>(), assignedKVHeads = in.read<std::uint32_t>();
+                if (queryStart > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+                    kvStart > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+                    assignedKVHeads > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+                    throw std::invalid_argument("Ngram wire head coordinate exceeds native range");
                 int common[10];
                 for(int &field:common)
                 {
@@ -380,14 +463,23 @@ std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRe
                     .attention_phase_schedule =
                         static_cast<qwen4exp::QwenSparseAttentionPhaseSchedule>(common[7]),
                     .mtp_shifted_kv_head_layout = static_cast<MTPShiftedKVHeadLayout>(common[9])};
+                auto family=hashIdentity(in),live=hashIdentity(in);
+                const auto serviceArm=in.read<std::uint32_t>();if(serviceArm>1)throw std::invalid_argument("Ngram wire service arm is invalid");
+                std::optional<RetainedHostServiceResourceDeclaration> declaration;
+                if(serviceArm){declaration.emplace();auto& d=*declaration;
+                    for(auto* field:{&d.stackBytes,&d.guardBytes,&d.pageBytes,&d.objectBytes,&d.objectAlignment,&d.tlsBytes,&d.opaqueBytes}){
+                        const auto value=in.read<std::uint64_t>();if(value>std::numeric_limits<std::size_t>::max())throw std::invalid_argument("Ngram CPU descriptor extent does not fit");*field=static_cast<std::size_t>(value);}
+                    d.requireValid();}
+                if((!family.empty()||!live.empty())!=bool(declaration))throw std::invalid_argument("Ngram wire CPU descriptor presence is inconsistent");
                 geometry.push_back({r,fields[0],fields[1],fields[2],fields[3],fields[4],fields[5],fields[6],fields[7],fields[8],fields[9],activation,
-                    static_cast<int>(coordinate)-1,static_cast<ImmutableRowTableTPTopology>(topology)});
+                    static_cast<int>(coordinate)-1,static_cast<ImmutableRowTableTPTopology>(topology),std::move(family),std::move(live),declaration,
+                    static_cast<int>(queryStart),static_cast<int>(kvStart),static_cast<int>(assignedKVHeads)});
             }
             auto execution=plan(in,expected_rank),required=plan(in,expected_rank);
-            provision=MemoryPlanner::restoreImmutableRowTableExecutionProvision(*canonical_source,policy,input,
-                std::move(geometry),std::move(execution),std::move(required));
+            provision=MemoryPlanner::restoreImmutableRowTableExecutionProvisionWithOrderingProjection(*canonical_source,policy,input,
+                std::move(geometry),std::move(execution),std::move(required),ordering,hostServices);
         }
-        result.push_back({policy,std::move(input),{std::move(vram),std::move(ram),std::move(mmap)},std::move(provision)});
+        result.push_back({policy,std::move(input),{std::move(vram),std::move(ram),std::move(mmap)},std::move(provision),ordering,hostServices});
     }
     if(in.remaining()) throw std::invalid_argument("Ngram admission wire has trailing bytes");
     return result;
@@ -406,7 +498,8 @@ ImmutableRowTableAdmissionSendFrame ImmutableRowTableAdmissionSendFrame::prepare
     // Decode with independently owned metadata and the actual sender before
     // readiness consensus. This cannot defer a structural failure until peers
     // have entered the first payload collective.
-    (void)parseImmutableRowTableAdmissionRequests(bytes, sender_rank, canonical_source);
+    const auto ordering=requests.empty()?NativeOrderingEventBudgetProjection::installed():requests.front().native_ordering_events;
+    (void)ImmutableRowTableAdmissionParser::parse(bytes,sender_rank,canonical_source,ordering,requests.empty()?nullptr:requests.front().retained_host_services);
     return ImmutableRowTableAdmissionSendFrame(std::move(bytes), sender_rank);
 }
 } // namespace llaminar2

@@ -1880,6 +1880,13 @@ namespace llaminar2
                 "incomplete shifted-MTP prefill binding");
             return false;
         }
+        if (input.mtp_main_terminal_logits &&
+            (input.mtp_main_terminal_logits->declaration_only ||
+             !input.mtp_main_terminal_logits->validForRequestCount(input.batch_size)))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] MTP terminal-logit execution requires original finalized bindings");
+            return false;
+        }
         if (input.mtp_main_terminal_hidden &&
             (!input.mtp_main_terminal_hidden->executableForRequestCount(
                  input.batch_size) ||
@@ -2169,6 +2176,8 @@ namespace llaminar2
                     effective_input.shifted_mtp_prefill
                         ? effective_input.shifted_mtp_prefill->capture_identity
                         : uint64_t{0},
+                .mtp_main_terminal_logits_capture_identity = effective_input.mtp_main_terminal_logits
+                    ? effective_input.mtp_main_terminal_logits->capture_identity : uint64_t{0},
                 .mtp_main_terminal_hidden_capture_identity =
                     effective_input.mtp_main_terminal_hidden
                         ? effective_input.mtp_main_terminal_hidden
@@ -2575,6 +2584,7 @@ namespace llaminar2
         view.stage_count = template_view->stage_count;
         view.captured_node_count = template_view->captured_node_count;
         view.storage_boundary=template_view->storage_boundary;
+        view.read_ahead_resources=template_view->read_ahead_resources;
         return view;
     }
 
@@ -2668,6 +2678,7 @@ namespace llaminar2
         view.workspace_generation = cache.workspace_generation;
         view.capture_variant_signature = cache.segment_cache.capture_variant_signature;
         view.capture_generation = cache.segment_cache.successful_capture_count;
+        view.read_ahead_resources=cache.graph->readAheadBranch()?cache.graph->readAheadBranch()->resources:nullptr;
         const auto &parent_plan =
             cache.segment_cache.retained_composed_parent_replay;
         if (parent_plan.valid())
@@ -3489,6 +3500,7 @@ namespace llaminar2
                         stream_gpu_ctx))
                 {
                     replay_stream = forward_cache.segment_cache.capture_stream;
+                    executor_.bindRetainedParticipantPreparationStream(*forward_cache.graph,forward_cache.segment_cache,stream_gpu_ctx);
                     dynamic_param_stream = replay_stream;
                     heterogeneous_prefill_segmented =
                         !is_decode &&

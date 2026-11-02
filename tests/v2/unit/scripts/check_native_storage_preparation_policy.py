@@ -16,19 +16,68 @@ OWNERS = {"src/v2/collective/LocalTPContext.h", "src/v2/collective/LocalTPContex
           "src/v2/collective/backends/NCCLBackend.h", "src/v2/collective/backends/NCCLBackend.cpp",
           "src/v2/collective/backends/RCCLBackend.h", "src/v2/collective/backends/RCCLBackend.cpp",
           "src/v2/collective/coordinators/NCCLCoordinator.cu", "src/v2/collective/coordinators/RCCLCoordinator.cpp"}
+# These two original worker owners consume the same Preparing PMA callbacks.
+# They may retain bindings, but cannot open raw epochs or mint root permits.
+OWNERS |= {"src/v2/backends/NativeContextPreparation.h", "src/v2/backends/NativeContextPreparation.cpp",
+           "src/v2/backends/PreparedGPUWorkerThread.h", "src/v2/backends/PreparedGPUWorkerThread.cpp"}
+# These physical-lifetime owners retain the SAME original source binding only.
+# They cannot construct a binding, carry another binding kind, or open an epoch.
+PROCESS_RETENTION_OWNERS = {
+    "src/v2/backends/GPUDeviceProcessLifetime.h", "src/v2/backends/GPUDeviceProcessLifetime.cpp",
+    "src/v2/backends/NativeContextRetirement.h", "src/v2/backends/NativeContextRetirement.cpp",
+}
+RETAINED_SOURCE = re.compile(
+    r"\b(?:class\s+|std\s*::\s*shared_ptr\s*<\s*)(NativeStoragePreparationPmaBinding)(?=\s*[;>])")
+REPLAY_DECLARATIONS = {
+    "RetainedHostServiceReplayAccess": {
+        "src/v2/execution/local_execution/graph/RetainedHostServiceProgram.h",
+        "src/v2/execution/local_execution/graph/RetainedHostServiceDeclarations.h"},
+    "RetainedHostServiceCalibrationAccess": {
+        "src/v2/execution/local_execution/graph/RetainedHostServiceProgram.h"},
+    "NativeOrderingEventGroupReplayAccess": {
+        "src/v2/backends/NativeOrderingEventGroup.h", "src/v2/backends/NativeOrderingEventBudgetProjection.h", "src/v2/backends/NativeAuxiliaryResourceCatalog.h"},
+    "NativeContextSourceLifecycleDiagnosticAccess": {"src/v2/backends/cuda/NvidiaDeviceContext.h", "src/v2/backends/rocm/AMDDeviceContext.h"},
+    "NativeContextPreparationReplayAccess": {
+        "src/v2/planning/PhysicalMemoryAuthority.h", "src/v2/backends/NativeContextOpaqueContract.h",
+        "src/v2/backends/NativeContextPreparation.h", "src/v2/backends/PreparedGPUWorkerThread.h",
+        "src/v2/backends/GPUDeviceContextPool.h"},
+    "NativeContextBirthDiagnosticAccess": {
+        "src/v2/collective/NativeStoragePreparationPmaBinding.h",
+        "src/v2/backends/NativeContextPreparation.h", "src/v2/backends/PreparedGPUWorkerThread.h"},
+    "PreparedGPUWorkerThreadReplayAccess": {"src/v2/backends/PreparedGPUWorkerThread.h"},
+    "NativeContextRetirementReplayAccess": {"src/v2/backends/GPUDeviceContextPool.h"},
+    "ReadAheadNativeResourceReplayAccess": {
+        "src/v2/backends/ReadAheadNativeResourceFamily.h",
+        "src/v2/backends/NativeContextRetirement.h",
+        "src/v2/backends/ReadAheadNativeResourceObligation.h"},
+    "ReadAheadNativeParentTerminalReplayAccess": {"src/v2/backends/ReadAheadNativeParentTerminal.h"},
+}
+REPLAY = re.compile(r"\b(?:" + "|".join(REPLAY_DECLARATIONS) + r")\b")
 ENTRY = re.compile(r"\b(?:beginPreparationEpoch|claimPreparation|prepareNativeAdmission|publishNativeAdmission|claimPreparedNative|PhysicalMemoryNativeSetupEpoch|PreparingNativeStorageTag|NativeStoragePreparationReplayAccess)\b")
 BIND = re.compile(r"\b(?:NativeStoragePmaBinding|NativeStoragePreparationPmaBinding|NativeStorageSessionPreparation)\b")
 SUFFIXES = {".h", ".hpp", ".cpp", ".cc", ".cu", ".cuh", ".hip", ".inc"}
 
 def scan_source(path: str, source: str) -> list[str]:
     """Reject source-level bypasses without confusing literals/comments for code."""
-    if not ENTRY.search(source) and not BIND.search(source): return []
+    if not ENTRY.search(source) and not BIND.search(source) and not REPLAY.search(source): return []
     code = executable_source(source)
     failures = []
     if path not in CORE | BINDINGS:
         failures += [f"{path}:{code.count(chr(10),0,m.start())+1}: native root/epoch authority is PMA-infrastructure-only" for m in ENTRY.finditer(code)]
     if path not in CORE | BINDINGS | OWNERS:
-        failures += [f"{path}:{code.count(chr(10),0,m.start())+1}: native binding belongs to its exact SDK/session owner" for m in BIND.finditer(code)]
+        retained = {item.span(1) for item in RETAINED_SOURCE.finditer(code)} if path in PROCESS_RETENTION_OWNERS else set()
+        failures += [f"{path}:{code.count(chr(10),0,m.start())+1}: native binding belongs to its exact SDK/session owner"
+                     for m in BIND.finditer(code) if m.span() not in retained]
+    # Only named forward/friend declarations are production code. Definitions,
+    # aliases and calls through these testing privileges must stay in tests,
+    # including inside otherwise trusted authority headers.
+    for match in REPLAY.finditer(code):
+        name = match.group()
+        declaration = re.compile(r"\b(?:friend\s+)?struct\s+(?:test\s*::\s*)?(" + name + r")\s*;")
+        declared = path in REPLAY_DECLARATIONS[name] and any(
+            item.span(1) == match.span() for item in declaration.finditer(code))
+        if not declared:
+            failures.append(f"{path}:{code.count(chr(10),0,match.start())+1}: native replay/diagnostic access is test-only")
     return failures
 
 def main() -> int:

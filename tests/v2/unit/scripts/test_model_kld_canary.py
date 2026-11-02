@@ -344,6 +344,39 @@ class ModelKLDProductionPathTests(unittest.TestCase):
 
 class ModelKLDLifecycleTests(unittest.TestCase):
     """Failed/unstarted runs retire owned native work before raw-output cleanup."""
+    def test_local_native_subprocess_preserves_only_explicit_device_and_hwloc_selection(self):
+        """The actual local Popen retains selected identities without arbitrary env inheritance."""
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        import tempfile,json
+        import run_model_kld_canaries as runner
+        selected={'ROCR_VISIBLE_DEVICES':'GPU-recorded-mi50-a,GPU-recorded-mi50-b',
+                  'HIP_VISIBLE_DEVICES':'0,1','CUDA_VISIBLE_DEVICES':'',
+                  'GPU_DEVICE_ORDINAL':'0','HWLOC_COMPONENTS':'-gl,-opencl','HOME':'/recorded/user-home'}
+        parent={'PATH':'/usr/bin',**selected,'LD_PRELOAD':'/foreign/preload.so',
+                'LD_LIBRARY_PATH':'/foreign/runtime','HSA_OVERRIDE_GFX_VERSION':'9.0.6',
+                'UNRELATED_PARENT_VALUE':'not-forwarded'}
+        for corpus_v2 in (False,True):
+            with self.subTest(corpus_v2=corpus_v2),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);model=root/'fixture.gguf';model.write_bytes(b'abcd')
+                corpus={'models':{'dense':{'entry':{'model_file':model.name,'model_bytes':4},'workload_path':root/'input.json'}}}
+                args=SimpleNamespace(binary=root/'binary',keep_logits=False)
+                adapter=SimpleNamespace(environment={},devices=['cuda:0','rocm:0'],topology={'id':'recorded'},
+                    prepare=lambda *_:(root/'input.json',['--no-mtp']),backends=['cuda','rocm']) if corpus_v2 else None
+                with patch.dict(runner.os.environ,parent,clear=True),patch.object(runner,'physical_workers',return_value=1), \
+                     patch.object(runner.driver,'begin'),patch.object(runner.driver,'finish',return_value=True), \
+                     patch.object(runner,'retire'),patch.object(runner.subprocess,'Popen',side_effect=RuntimeError('recorded Popen boundary')) as launch:
+                    with self.assertRaisesRegex(RuntimeError,'recorded Popen boundary'):
+                        runner.execute_cell(args,corpus,'dense','cuda',model,root/'cell',None,adapter=adapter)
+                actual=launch.call_args.kwargs['env']
+                for key,value in selected.items():self.assertEqual(actual[key],value)
+                for key in ('LD_PRELOAD','HSA_OVERRIDE_GFX_VERSION','UNRELATED_PARENT_VALUE'):
+                    self.assertNotIn(key,actual)
+                self.assertEqual(actual['LD_LIBRARY_PATH'],str(args.binary.parent))
+                if corpus_v2:
+                    receipt=json.loads((root/'cell/controller.json').read_text())
+                    for key,value in selected.items():self.assertEqual(receipt['environment'][key],value)
+
     def test_created_exited_and_live_container_retirement(self):
         from unittest.mock import patch
         import json

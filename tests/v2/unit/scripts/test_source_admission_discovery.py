@@ -52,7 +52,8 @@ class SourceAdmissionDiscovery(unittest.TestCase):
 
     def discover(self, listing: str, *, sources: bool = True,
                  mtp_source_kind: str = "", predictor_files: tuple[str, ...] = (),
-                 timeout: str | None = "30", source_timeout: str | None = None):
+                 timeout: str | None = "30", source_timeout: str | None = None,
+                 perf_filter: str | None = None):
         """Run canonical discovery and parse the resulting real CTest properties."""
         with tempfile.TemporaryDirectory(prefix="llaminar source admission ") as directory:
             root = Path(directory)
@@ -70,6 +71,8 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                 command.append(f"-DTIMEOUT={timeout}")
             if source_timeout is not None:
                 command.append(f"-DSOURCE_ADMISSION_TIMEOUT={source_timeout}")
+            if perf_filter is not None:
+                command.append(f"-DPRODUCTION_PERF_STATS_FILTER={perf_filter}")
             common = ["/not-loaded/main 0.gguf", "/not-loaded/main 1.gguf"]
             backend_files = {backend: f"/not-loaded/{backend}.gguf"
                              for backend in ("CPU", "CUDA", "ROCm")}
@@ -488,6 +491,63 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                 self.assertIn(long_cell, command[-1])
             else:
                 self.assertEqual(command[command.index("-np") + 1], "1" if "CUDA" in test["name"] else "2")
+
+    def test_native_exact_reuses_original_source_closure_without_fetch_or_reference_labels(self):
+        """Exact functional cells retain real roles/inputs and all consumed counter producers."""
+        listing = ("NativeExact.\n"
+                   "  MTPExactReplay/ROCm0_CPU0_DeclaredOwners_ROCm0_CUDA0_C0_MTPDepth1\n"
+                   "  MTPExactReplay/CUDA0_CPU0_DeclaredOwners_CUDA0_ROCm0_C64_MTPDynamicDepth\n")
+        predictor = "/not-loaded/original paired predictor.gguf"
+        result, tests = self.discover(listing, mtp_source_kind="Paired",
+                                      predictor_files=(predictor,),
+                                      perf_filter="forward_graph,mtp,immutable_lookup")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(tests), 2)
+        for test in tests:
+            props = {item["name"]: item["value"] for item in test["properties"]}
+            self.assertEqual(set(props["LABELS"]) & {"CPU", "CUDA", "ROCm"},
+                             {"CPU", "CUDA", "ROCm"})
+            self.assertTrue({"NativeExactReplay", "Functional", "MTP", "ByteExact", "RealModel"}
+                            <= set(props["LABELS"]))
+            self.assertFalse({"PyTorch", "GoldenReference", "Parity", "Admission",
+                              "ProductionTestPreflight"} & set(props["LABELS"]))
+            self.assertEqual(set(props["REQUIRED_FILES"]), {
+                "/not-loaded/main 0.gguf", "/not-loaded/main 1.gguf",
+                "/not-loaded/CPU.gguf", "/not-loaded/CUDA.gguf", "/not-loaded/ROCm.gguf",
+                predictor})
+            self.assertFalse(props.get("FIXTURES_REQUIRED", []))
+            self.assertEqual(props["RESOURCE_LOCK"], ["Integration_Serial"])
+            self.assertTrue(props["RUN_SERIAL"])
+            environment = dict(item.split("=", 1) for item in props["ENVIRONMENT"])
+            self.assertEqual(environment["LLAMINAR_PRODUCTION_PARITY"], "1")
+            self.assertEqual(environment["LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN"], "0")
+            self.assertEqual(set(environment["LLAMINAR_PRODUCTION_PARITY_DECLARED_MODELS"].split("|")),
+                             set(props["REQUIRED_FILES"]))
+            self.assertEqual(set(environment["LLAMINAR_PERF_STATS_FILTER"].split(",")),
+                             {"forward_graph", "mtp", "immutable_lookup", "ngram_lookup"})
+            for name in ("LLAMINAR_GPU_GRAPHS", "LLAMINAR_PREFILL_GRAPH_BUCKETS",
+                         "LLAMINAR_PREFILL_GRAPH_REQUIRED", "LLAMINAR_PERF_STATS_SUMMARY"):
+                self.assertEqual(environment[name], "1")
+                self.assertIn(name, test["command"])
+            self.assertEqual(environment["LLAMINAR_SKIP_CUDA_STARTUP"], "0")
+            self.assertEqual(environment["LLAMINAR_SKIP_ROCM_STARTUP"], "0")
+
+    def test_native_exact_rejects_missing_paired_inputs_and_numerics_keep_reference_contract(self):
+        """Only exact functional entries lose the fetch fixture; original numerical obligations remain."""
+        exact = "NativeExact.\n  MTPExactReplay/ROCm0_CPU0_CUDA0_MTPDepth3\n"
+        result, tests = self.discover(exact, mtp_source_kind="Paired")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(tests)
+        result, tests = self.discover("Numerical.\n  ProductionParity/ROCm0_CPU0_CUDA0_MTPOff\n",
+                                      perf_filter="forward_graph,mtp,immutable_lookup")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(tests), 1)
+        props = {item["name"]: item["value"] for item in tests[0]["properties"]}
+        self.assertTrue({"PyTorch", "GoldenReference", "Parity"} <= set(props["LABELS"]))
+        self.assertEqual(props["FIXTURES_REQUIRED"], ["V2_Models"])
+        environment = dict(item.split("=", 1) for item in props["ENVIRONMENT"])
+        self.assertIn("ngram_lookup", environment["LLAMINAR_PERF_STATS_FILTER"].split(","))
+        self.assertNotIn("NativeExactReplay", props["LABELS"])
 
     def test_missing_original_discovery_owner_inputs_are_fatal(self):
         """A missing helper/root cannot publish a smaller apparently green discovery."""

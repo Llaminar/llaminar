@@ -687,18 +687,13 @@ namespace llaminar2
                 continue;
             }
 
-            // Skip bootstrap-specific arguments (they're already processed)
+            // Retain --mpi-procs: it is also original application configuration
+            // and must survive the child parser/runtime evidence boundary. An
+            // existing MPI environment prevents recursive self-launch.
+            // Consume only launcher actions already performed by this process.
             if (arg == "--mpi-bootstrap" ||
-                arg.rfind("--mpi-procs=", 0) == 0 ||
                 arg == "--mpi-dry-run")
             {
-                continue;
-            }
-
-            // Handle arguments with separate values
-            if (arg == "--mpi-procs")
-            {
-                ++i; // Skip the value too
                 continue;
             }
 

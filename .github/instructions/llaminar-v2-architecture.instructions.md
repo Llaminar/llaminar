@@ -48,6 +48,13 @@ The graph is participant-local. Cross-device or cross-rank movement is an
 explicit collective or pipeline transfer. A compute stage must not conceal a
 nested multi-device graph.
 
+`DeviceGraphOrchestratorServingGraphFamily.cpp` owns the physical implementation
+of cold serving-family preparation: prefill, ordinary decode, exact MTP variants
+and the ordered reset/seal. These remain methods of the same orchestrator, with
+the same arena, workspace and captured-executable owners. The internal
+`MTPGraphPolicyScopes` implementation is shared by setup and live forwarding;
+file placement introduces no alternate policy or execution owner.
+
 ## 2. Application and configuration
 
 ### 2.1 Application lifecycle
@@ -927,6 +934,16 @@ materialization, and release ledger. Planners contribute typed BOMs, not live
 capacity arithmetic. Opaque native graph pools are admitted as complete retained
 families through `GPUGraphMemoryContract`; an individual pool-growth observation
 is diagnostic evidence, not bytes owned by the graph that triggered it.
+
+Opaque context, lookup-ordering, remote-graph and retained CPU-service resources
+use conservative rounded allowances selected by supported backend and typed
+resource family. Native loader admission owns ABI compatibility. Development
+source/provider fingerprints, historical object sizes and measured population
+counts do not select these allowances. Current stack, guard, object and explicit
+buffer geometry remains exact; rank planning carries that original declaration
+through the existing pricing protocol and validates it again at local binding.
+Declared resource multiplicity contributes to the same PMA plan. Runtime samples
+are health and regression evidence, never byte-exact opaque admission ceilings.
 
 GPU planning samplers separate persistent native execution-context storage
 from executable storage before instantiation. After sealing a CUDA graph,

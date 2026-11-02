@@ -11,6 +11,7 @@
 #include "planning/MoEPipelineMemoryAdmission.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/PlanningHostServiceEvidence.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "loaders/ModelLoader.h"
 #include <algorithm>
@@ -25,6 +26,7 @@ namespace llaminar2
         runtime.ngram_table_placement = rank_plan_.runtime.ngram_table_placement;
         runtime.attention_participants = rank_plan_.runtime.attention_participants;
         runtime.cpu_serial_expert_storage = rank_plan_.runtime.cpu_serial_expert_storage;
+        runtime.retained_host_services = rank_plan_.runtime.retained_host_services;
     }
 
     AdmittedMoEPipelineMemory AdmittedMoEPipelineMemory::admit(
@@ -97,6 +99,8 @@ namespace llaminar2
                         .gpu_weight_load = policy.gpu_weight_load, .snapshot_capacity = policy.snapshot_capacity,
                         .model_graph_topology_variant_count = policy.model_graph_topology_variant_count,
                         .pipeline_stage = child.scope()}, rows);
+                    input.local_capacity.native_ordering_events=policy.native_ordering_events;
+                    input.local_capacity.retained_host_services=policy.retained_host_services;
                     inputs.push_back(std::move(input.local_capacity));
                     segments.push_back(input.prefill_segment_rows);
                 }
@@ -157,9 +161,15 @@ namespace llaminar2
                     stage.rank_plan_.runtime.cpu_serial_expert_storage = capacities[index].cpu_serial_expert_storage;
                     stage.capacity_ = std::make_shared<const MoEOverlayResolvedCapacityPlan>(std::move(capacities[index]));
                     stage.devices_ = std::move(selected_fixed[index].device_inputs);
+                    stage.rank_plan_.runtime.retained_host_services = retainedHostServicesFromInputs(
+                        stage.devices_, stage.rank_plan_.rank);
                     stage.rank_plan_.runtime.resident_graph_rows = selected_fixed[index].resident_graph_rows;
                     stage.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = selected_segments[index];
                 }
+                result.rank_plan_.runtime.retained_host_services = result.stages_.front().rank_plan_.runtime.retained_host_services;
+                for (const auto& stage : result.stages_)
+                    if (stage.rank_plan_.runtime.retained_host_services != result.rank_plan_.runtime.retained_host_services)
+                        throw std::logic_error("Pipeline stages lost their single original CPU service declaration session");
                 result.rank_plan_.runtime.resident_graph_rows = selected_fixed.front().resident_graph_rows;
                 result.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = selected_segments.front();
                 std::vector<DevicePlanConfig> admitted_attention_inputs;

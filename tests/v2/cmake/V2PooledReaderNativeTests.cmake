@@ -1,0 +1,55 @@
+# Actual supported cross-vendor source/reader components; native peer guards remain.
+if(HAVE_CUDA AND HAVE_ROCM)
+    foreach(_pooled_read_direction CUDAConsumerROCmStorage ROCmConsumerCUDAStorage)
+        foreach(_pooled_read_capacity C0 Positive)
+            set(_pooled_read_test "V2_Integration_CrossVendor_PooledImmutable_${_pooled_read_direction}_${_pooled_read_capacity}_ReadAllFormatsReplay")
+            add_v2_test(${_pooled_read_test}
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=PooledImmutableProviderSourceDevice.CrossVendorCaptured${_pooled_read_direction}${_pooled_read_capacity}ReadAllFormats
+                LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;CrossVendor;Ngram;Source;Ownership;TraceReplay;Capture;Component;AllFormats;ByteExact;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "cuda_gpu_0;rocm_gpu_0"
+                ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_pooled_read_test})
+        endforeach()
+    endforeach()
+endif()
+
+# Focused native first-error lifecycle uses the same original real-provider cohort.
+if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
+    foreach(_cold_direction CUDAConsumerROCmStorage ROCmConsumerCUDAStorage)
+        set(_cold_gate "V2_Integration_CrossVendor_PooledImmutable_${_cold_direction}_ColdPrefillFirstErrorReplay")
+        add_v2_test(${_cold_gate}
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=PooledImmutableProviderSourceDevice.CrossVendor${_cold_direction}ColdPrefillFirstError
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;CrossVendor;Ngram;Source;Ownership;TraceReplay;Capture;Component;ByteExact;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "cuda_gpu_0;rocm_gpu_0"
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_cold_gate})
+    endforeach()
+endif()
+
+
+# Each actual topology/capacity trajectory has its own standard timeout. Missing
+# endpoints fail in the selected executable; they never become skipped passes.
+if(HAVE_CUDA AND HAVE_ROCM)
+    foreach(_pooled_topology CUDAConsumer2ROCmOwners CUDAConsumer4ROCmOwners ROCmConsumer2CUDAOwners)
+        if(_pooled_topology STREQUAL "CUDAConsumer2ROCmOwners")
+            set(_pooled_multi_locks "cuda_gpu_0;rocm_gpu_0;rocm_gpu_1")
+        elseif(_pooled_topology STREQUAL "CUDAConsumer4ROCmOwners")
+            set(_pooled_multi_locks "cuda_gpu_0;rocm_gpu_0;rocm_gpu_1;rocm_gpu_2;rocm_gpu_3")
+        else()
+            set(_pooled_multi_locks "rocm_gpu_0;cuda_gpu_0;cuda_gpu_1")
+        endif()
+        foreach(_pooled_capacity Positive MixedC0 AllC0)
+            set(_pooled_multi_test "V2_Integration_CrossVendor_PooledImmutable_${_pooled_topology}_${_pooled_capacity}_Replay")
+            add_v2_test(${_pooled_multi_test}
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=PooledImmutableProviderSourceDevice.CrossVendor${_pooled_topology}${_pooled_capacity}Replay
+                LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;CrossVendor;Ngram;Source;Ownership;TraceReplay;Capture;Component;MultiOwner;ByteExact;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+                RESOURCE_LOCK "${_pooled_multi_locks}"
+                ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_pooled_multi_test})
+        endforeach()
+    endforeach()
+endif()

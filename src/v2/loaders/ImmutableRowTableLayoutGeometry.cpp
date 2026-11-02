@@ -60,7 +60,11 @@ ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::checked(
     std::vector<ImmutableRowTableLayoutOwner> owners,std::vector<PhysicalMemoryAllocatorIdentity> consumers,
     std::vector<ImmutableRowTableFixedRange> ranges,std::vector<ImmutableRowTableSourceService> services,
     std::vector<ImmutableRowTableReplicaGroup> replicas,
-    std::optional<PhysicalMemoryAllocatorIdentity> coordinator,std::uint64_t inflight) {
+    std::optional<PhysicalMemoryAllocatorIdentity> coordinator,std::uint64_t inflight,
+    ImmutableRowTableAdaptiveGPUDomain gpu_domain) {
+    if (gpu_domain != ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator &&
+        gpu_domain != ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal)
+        throw std::invalid_argument("Unknown adaptive GPU domain policy");
     if(residency!=ImmutableRowTableResidency::Fixed && residency!=ImmutableRowTableResidency::Adaptive)
         throw std::invalid_argument("Unknown layout residency policy");
     if(consumers.empty()) throw std::invalid_argument("Lookup domain requires actual consumers");
@@ -107,7 +111,24 @@ ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::checked(
         if(!tiers.contains(ImmutableRowStorage::MemoryMapped))
             throw std::invalid_argument("Adaptive no-SSD primary migration is not representable by this geometry contract");
         if(!ranges.empty()) throw std::invalid_argument("Adaptive pools must not have fixed source-home ranges");
-        if(gpu_slots) {
+        if (gpu_domain == ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal) {
+            if (coordinator || !replicas.empty() || !inflight)
+                throw std::invalid_argument("Consumer-local caches require independent directories and exact request geometry");
+            for (const auto consumer : consumers) {
+                if (!consumer.device.is_gpu())
+                    throw std::invalid_argument("Consumer-local cache requester must be a GPU");
+                const auto owner = std::find_if(owners.begin(), owners.end(), [&](const auto& value) {
+                    return value.key.tier == ImmutableRowStorage::VRAM && value.key.allocator == consumer;
+                });
+                if (owner == owners.end())
+                    throw std::invalid_argument("Consumer-local cache omitted an original physical owner");
+                if (owner->cache_rows) records = add(records, add(owner->cache_rows, inflight));
+            }
+            for (const auto& owner : owners)
+                if (owner.key.tier == ImmutableRowStorage::VRAM &&
+                    std::find(consumers.begin(), consumers.end(), owner.key.allocator) == consumers.end())
+                    throw std::invalid_argument("Consumer-local cache contains a storage-only owner");
+        } else if(gpu_slots) {
             if(!coordinator || !inflight) throw std::invalid_argument("Adaptive GPU pools require exact coordinator and in-flight geometry");
             endpoint(*coordinator);
             const bool member=std::find(consumers.begin(),consumers.end(),*coordinator)!=consumers.end() ||
@@ -133,7 +154,7 @@ ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::checked(
             }
         }
     } else {
-        if(coordinator || inflight || !replicas.empty())
+        if(gpu_domain != ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator || coordinator || inflight || !replicas.empty())
             throw std::invalid_argument("Fixed layout cannot publish adaptive directory or replica-pool policy");
         std::vector<std::uint64_t> occupied(owners.size(),0);
         std::vector<ImmutableRowTableFixedRange> primary;
@@ -168,7 +189,7 @@ ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::checked(
                 throw std::invalid_argument("Fixed native capacity must equal exactly declared primary/replica copies");
     }
     return {extent,tiers,residency,std::move(owners),std::move(consumers),std::move(ranges),std::move(services),
-            std::move(replicas),coordinator,inflight,records};
+            std::move(replicas),coordinator,inflight,records,gpu_domain};
 }
 ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::wholeTier(
     const ImmutableRowTableStoragePolicy &storage,ImmutableRowTableExtent extent,
@@ -196,5 +217,15 @@ ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::wholeTier(
 std::size_t ImmutableRowTableLayoutGeometry::nativePayloadBytes(ImmutableRowTableOwnerKey owner) const {
     for(const auto &entry:owners_) if(entry.key==owner) return payload(add(entry.fixed_rows,entry.cache_rows),extent_);
     throw std::invalid_argument("Native payload query names a foreign layout owner");
+}
+std::optional<PhysicalMemoryAllocatorIdentity> ImmutableRowTableLayoutGeometry::gpuCoordinatorFor(
+    PhysicalMemoryAllocatorIdentity requester) const {
+    if (std::find(consumers_.begin(), consumers_.end(), requester) == consumers_.end())
+        throw std::invalid_argument("GPU directory projection requires an original consumer");
+    if (gpu_domain_ == ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator) return gpu_coordinator_;
+    const auto owner = std::find_if(owners_.begin(), owners_.end(), [&](const auto& value) {
+        return value.key.tier == ImmutableRowStorage::VRAM && value.key.allocator == requester;
+    });
+    return owner != owners_.end() && owner->cache_rows ? std::optional{requester} : std::nullopt;
 }
 } // namespace llaminar2

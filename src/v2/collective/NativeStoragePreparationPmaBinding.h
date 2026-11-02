@@ -15,6 +15,8 @@
 #include <vector>
 namespace llaminar2
 {
+    namespace test {struct NativeContextBirthDiagnosticAccess;}
+
     namespace test
     {
         struct NativeStoragePreparationReplayAccess;
@@ -77,9 +79,9 @@ namespace llaminar2
                 request.owner_identity = request.shared_anchor_identity;
                 if (!NativeStoragePmaBinding::validGeometry(request) ||
                     request.owner_family < llaminarNativeCommMetadataV1 ||
-                    request.owner_family > llaminarNativeDriverContextV1 ||
+                    request.owner_family > llaminarNativeGPUWorkerAllocationV1 ||
                     request.lifetime < llaminarNativeCommLifetimeV1 ||
-                    request.lifetime > llaminarNativeProcessLifetimeV1 ||
+                    request.lifetime > llaminarNativeContextGenerationLifetimeV1 ||
                     (request.phase != llaminarNativeColdProbeV1 &&
                      request.phase != llaminarNativeRetainedSetupV1 &&
                      request.phase != llaminarNativeGraphRecordingHostMetadataV1))
@@ -285,6 +287,12 @@ namespace llaminar2
 
     private:
         friend class NativeStorageSessionPreparation;
+        friend class NativeContextPreparation;
+        friend struct test::NativeContextBirthDiagnosticAccess;
+        friend class PreparedGPUContextBirth;
+        /** @brief Same-state source-owned opaque family commit; no external byte parameters. */
+        std::shared_ptr<PhysicalMemoryOpaqueRuntimeCommitment> reserveContextOpaque(const NativeContextOpaqueContract& contract)
+        { return epoch_.reserveOpaqueContext(contract,memory_); }
         friend struct test::NativeStoragePreparationReplayAccess;
         /**
          * @brief Create the one initially Preparing authority from typed native startup
@@ -327,9 +335,9 @@ namespace llaminar2
             if (binding.transferred_ || request->setup_epoch != binding.epoch_.identity())
                 return llaminarNativeStorageInvalidV1;
             if (request->owner_family < llaminarNativeCommMetadataV1 ||
-                request->owner_family > llaminarNativeDriverContextV1 ||
+                request->owner_family > llaminarNativeGPUWorkerAllocationV1 ||
                 request->lifetime < llaminarNativeCommLifetimeV1 ||
-                request->lifetime > llaminarNativeProcessLifetimeV1 ||
+                request->lifetime > llaminarNativeContextGenerationLifetimeV1 ||
                 (request->phase != llaminarNativeColdProbeV1 &&
                  request->phase != llaminarNativeRetainedSetupV1))
                 return llaminarNativeStorageInvalidV1;

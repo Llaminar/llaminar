@@ -5,9 +5,12 @@
  * These factories project declared metadata, not source/Rank/materialization
  * permissions. They make no capacity choice and maintain no resource balance.
  * Existing frozen owner/coordinator BOMs remain separate inputs to the sole PMA.
+ * Closed initialization programs derive their event population from these same
+ * nonempty roots, rather than accepting independently authored event counts.
  */
 #pragma once
 #include "PooledImmutableNativeTypes.h"
+#include "backends/NativeOrderingEventProgram.h"
 namespace llaminar2::qwen4exp
 {
 /** @brief Closed native owner geometry and only its additional mandatory staging contribution. */
@@ -34,6 +37,19 @@ public:
      * @throws std::exception For incompatible declarations or a foreign coordinate. */
     static pooled_native::OwnerOffsets rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
         const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate);
+    /** @return Closed actual owner setup/publication program from the original optional cache root. */
+    NativeOrderingEventProgram orderingProgram()const noexcept
+    {return NativeOrderingEventProgram::pooledOwner(parameters_.cache.bytes!=0);}
+    /**
+     * @brief Derive the closed event program before source materialization.
+     * @param physical Original ordered physical owner geometry.
+     * @param coordinator Matching complete coalescing policy.
+     * @param coordinate Original owner coordinate, including a zero-slot owner.
+     * @return The runtime factory's same optional/frame/native-root program.
+     * @throws std::exception For incompatible declarations or a foreign coordinate.
+     */
+    static NativeOrderingEventProgram orderingProgram(const PooledImmutablePhysicalOwnerGeometry& physical,
+        const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate);
     /** @return Exact original allocator, independent of coordinator/consumer placement. */
     PhysicalMemoryAllocatorIdentity allocator() const noexcept{return allocator_;}
     /** @return Additional native bytes only; frozen cache/frame bytes are not charged twice. */
@@ -59,6 +75,10 @@ private:
 class PooledImmutableCoordinatorNativePlan final
 {
 public:
+    /** @brief Apply the same exact pre-source physical/policy cohort check as both native root factories. */
+    static void requireOriginalCohort(const PooledImmutablePhysicalOwnerGeometry& physical,
+        const PooledImmutableCoordinatorGeometry& coordinator);
+
     /**
      * @brief Project exact native coordinator roots without owner=consumer or vendor assumptions.
      * @param physical Original checked explicit owner/coordinator order.
@@ -75,6 +95,18 @@ public:
      * @param physical Original ordered physical geometry. @param coordinator Matching policy geometry.
      * @throws std::exception For incompatible declarations. */
     static pooled_native::CoordinatorOffsets rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
+        const PooledImmutableCoordinatorGeometry& coordinator);
+    /** @return Closed actual coordinator setup/publication program from its optional policy root. */
+    NativeOrderingEventProgram orderingProgram()const noexcept
+    {return NativeOrderingEventProgram::pooledCoordinator(parameters_.cache.bytes!=0);}
+    /**
+     * @brief Derive the closed coordinator event program before materialization.
+     * @param physical Original ordered physical owner geometry.
+     * @param coordinator Matching complete coalescing policy and optional policy root.
+     * @return The runtime factory's same optional/frame/native-root program.
+     * @throws std::exception For incompatible complete-cohort declarations.
+     */
+    static NativeOrderingEventProgram orderingProgram(const PooledImmutablePhysicalOwnerGeometry& physical,
         const PooledImmutableCoordinatorGeometry& coordinator);
     /** @return Exact original coordinator allocator. */
     PhysicalMemoryAllocatorIdentity allocator() const noexcept{return allocator_;}

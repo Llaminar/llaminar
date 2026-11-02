@@ -9,19 +9,32 @@
  */
 #pragma once
 #include "PooledImmutableSourceGeometry.h"
-#include "PooledImmutableSourceOps.h"
+#include "PooledImmutableReadOps.h"
 #include <memory>
 namespace llaminar2 {class DeviceGenerationControlBinding;}
 namespace llaminar2::qwen4exp {
 class PooledImmutableSourcePreparedStorage;
 /** @brief Distinct source producers/readers with explicit owner/coordinator graph edges between them. */
-enum class PooledSourceAction:std::uint32_t {Plan,Publish,Acquire,Read,ReadersRetired,ObserveRetired,BeforeReady};
+enum class PooledSourceAction:std::uint32_t {Plan,AcquireSeal,Publish,AcquireResponse,PackOwner,RetireResponse,Read,ReadersRetired,ObserveRetired,BeforeReady,
+    ImportPublication=10,ValidatePublication=11,ImportPublicationAcquired=12,ValidatePublicationAcquired=13,ImportReady=14,ValidateReady=15,PlanReads=16,ImportReadRows=17,SealReads=18,PlanReleases=24,ImportReleases=25,ReconcileReleases=26,ImportRetired=27,FinishRetired=28,PackReaderRetirement=29,SnapshotReleased=30};
+/** @return Nominal fixed owner import; full-frame consensus operations have no addressed owner. */
+constexpr bool isPooledPublicationImport(PooledSourceAction action){return action==PooledSourceAction::ImportPublication || action==PooledSourceAction::ImportPublicationAcquired || action==PooledSourceAction::ImportReady;}
+/** @return Original source publication/acquisition/Ready consensus; these operations retire no private-row reader. */
+constexpr bool isPooledPublicationConsensus(PooledSourceAction action){return action==PooledSourceAction::ValidatePublication || action==PooledSourceAction::ValidatePublicationAcquired || action==PooledSourceAction::ValidateReady;}
+/** @return Fixed original terminal protocol operations; no full-factory capability is advertised. */
+constexpr bool isPooledRetirementOperation(PooledSourceAction action){return action==PooledSourceAction::PlanReleases || action==PooledSourceAction::ImportReleases || action==PooledSourceAction::ReconcileReleases || action==PooledSourceAction::ImportRetired || action==PooledSourceAction::FinishRetired || action==PooledSourceAction::PackReaderRetirement || action==PooledSourceAction::SnapshotReleased;}
+/** @return Exactly the original addressed terminal metadata/receipt imports. */
+constexpr bool isPooledRetirementAddressed(PooledSourceAction action){return action==PooledSourceAction::ImportReleases || action==PooledSourceAction::ImportRetired || action==PooledSourceAction::PackReaderRetirement;}
+/** @return Addressing belongs only to actual fixed captured owner operations. */
+constexpr bool isPooledSourceAddressed(PooledSourceAction action){return isPooledRetirementAddressed(action) || action==PooledSourceAction::AcquireSeal || action==PooledSourceAction::PackOwner || isPooledPublicationImport(action) || action==PooledSourceAction::ImportReadRows;}
 /** @brief Native output already retained/sealed by its actual reusable graph stage. */
 struct PooledSourceQuery {
     float* output=nullptr; ///< Original canonical embedding output, without aliasing native authority.
     std::size_t elements=0; ///< This graph's exact physical FP32 envelope, no larger than the shared source declaration.
+    std::uint32_t owner=adaptive_lookup::None; ///< Immutable coordinate for the exact owner-addressed source operation.
 };
 /** @brief Checked participant-local source code; arbitrary directed owner edges remain explicit transport contracts. */
+class PooledImmutableRetirementAuthority;
 class IPooledImmutableSourceKernels {
 public:
     /** @brief Release only after graph terminal and final source readers; retained source bindings own mapped backing. */
@@ -57,6 +70,16 @@ public:
     /** @brief Explicit event-ordered request reset closes after actual source readers, independent of the generation terminal predicate. */
     void closeForReset(PooledImmutableSourcePreparedStorage& storage,
         const DeviceGenerationControlBinding& control,void* exact_stream)const;
+    /**
+     * @brief Close explicit reset/cancel only under the actual complete retained cohort.
+     * @param storage Original source root owner authenticated by the complete descriptor.
+     * @param control Original canonical controller. @param exact_stream Exact source worker stream.
+     * @param cohort Retained actual Read/output/Retirement source and remote programs.
+     * @note The same native close still validates reader completion, original
+     * coordinator Idle and exact reported ordinal; this does not fabricate drain.
+     */
+    void closeForReset(PooledImmutableSourcePreparedStorage& storage,
+        const DeviceGenerationControlBinding& control,void* exact_stream,const PooledImmutableRetirementAuthority& cohort)const;
     /** @return Complete source/code/root/runtime identity; stages additionally bind exact controller/output roles. */
     std::uint64_t captureIdentity(const PooledImmutableSourcePreparedStorage& storage)const;
 protected:

@@ -10,6 +10,7 @@
  */
 
 #include "ComputeGraph.h"
+#include "../../../backends/ReadAheadNativeResourceFamily.h"
 #include "../../../utils/Logger.h"
 #include <queue>
 #include <algorithm>
@@ -252,6 +253,87 @@ namespace llaminar2
         return *this;
     }
 
+    void ComputeGraph::setReadAheadBranch(GraphReadAheadBranch branch)
+    {
+        if (read_ahead_phase_identity_!=immutableLookupPhaseIdentity(ForwardExecutionPhase::Decode,ImmutableLookupInvocationSchedule::ResidentSideLane) ||
+            read_ahead_branch_ || !branch.resources ||
+            branch.fork_node == branch.producer_node || branch.fork_node == branch.consume_node ||
+            branch.producer_node == branch.consume_node)
+            throw std::invalid_argument("Read-ahead requires one immutable admitted branch");
+        auto *fork=getNode(branch.fork_node), *producer=getNode(branch.producer_node), *consumer=getNode(branch.consume_node);
+        if (!fork || !producer || !consumer || !fork->stage || !producer->stage || !consumer->stage ||
+            producer->dependencies.size()!=1 || producer->dependencies.front()!=branch.fork_node ||
+            std::find(consumer->dependencies.begin(),consumer->dependencies.end(),branch.producer_node)==consumer->dependencies.end())
+            throw std::invalid_argument("Read-ahead requires Hash -> sole gather dependency and explicit Consume dependency");
+        for (auto* node : {fork,producer,consumer})
+            if (node->device != branch.resources->device() || node->stage->isCollectiveStage() || node->stage->isManualGraphBoundary())
+                throw std::invalid_argument("Read-ahead branch must remain on its exact native participant");
+        if (!branch.resources->stream() || !branch.resources->forkEvent() || !branch.resources->joinEvent() ||
+            !branch.resources->primaryStream() || !branch.resources->captureIdentity())
+            throw std::invalid_argument("Read-ahead native resources are incomplete");
+        read_ahead_branch_=std::move(branch);
+        noteTopologyMutation();
+    }
+
+    void ComputeGraph::resolveReadAheadJoin()
+    {
+        if(!read_ahead_branch_)return;
+        auto& branch=*read_ahead_branch_;
+        if(!branch.join_node.empty())return; // Cold plan; replay performs no descriptor allocation.
+        std::vector<ReadAheadJoinFrontier> frontiers;
+        const auto& order=getExecutionOrder();frontiers.reserve(order.size());
+        for(const auto& name:order)
+        {
+            const auto* node=getNode(name);auto kind=ReadAheadJoinFrontier::Kind::Ordinary;
+            if(node->heterogeneous_ticket_unit_contract)
+            {
+                switch(node->heterogeneous_ticket_unit_contract->disposition)
+                {
+                case GraphHeterogeneousTicketUnitDisposition::BeforeManualBoundary:kind=ReadAheadJoinFrontier::Kind::BeforeDeclaredHostBoundary;break;
+                case GraphHeterogeneousTicketUnitDisposition::TransactionTerminal:kind=ReadAheadJoinFrontier::Kind::TransactionTerminal;break;
+                default:throw std::logic_error("Unknown original native-unit frontier disposition");
+                }
+            }
+            frontiers.push_back({name,kind});
+        }
+        const auto selected=resolveReadAheadJoinAnchor(frontiers,branch.fork_node,branch.producer_node,branch.consume_node,branch.join_policy);
+        if(!branch.join_node.empty() && branch.join_node!=selected)
+            throw std::logic_error("Read-ahead native join anchor changed after planning");
+        if(branch.join_node.empty()){branch.join_node=selected;noteTopologyMutation();}
+    }
+
+    void ComputeGraph::planReadAheadRecordingStream(void* recording)
+    {
+        if(!read_ahead_branch_)return;
+        resolveReadAheadJoin();
+        const auto& resources=read_ahead_branch_->resources;
+        if(recording==resources->stream())throw std::logic_error("Read-ahead primary recording aliases its side lane");
+        if(read_ahead_recording_binding_.plan(recording,resources->primaryStream()))noteTopologyMutation();
+    }
+
+    void* ComputeGraph::executionStreamForNode(const std::string& name,void* primary) const
+    {
+        if (!primary) throw std::invalid_argument("Graph stage binding requires an exact non-null parent stream");
+        if (!read_ahead_branch_) return primary;
+        const auto& branch=*read_ahead_branch_;
+        read_ahead_recording_binding_.require(primary);
+        return name==branch.producer_node ? branch.resources->stream() : primary;
+    }
+
+    std::uint64_t ComputeGraph::readAheadCaptureIdentity() const noexcept
+    {
+        if(!read_ahead_branch_)return read_ahead_phase_identity_;
+        const auto& branch=*read_ahead_branch_;
+        auto identity=branch.resources->captureIdentity()^read_ahead_phase_identity_^read_ahead_recording_binding_.identity();
+        for(const auto* name:{&branch.fork_node,&branch.producer_node,&branch.consume_node,&branch.join_node})
+        {
+            for(unsigned char c:*name){identity^=c;identity*=1099511628211ull;}
+            identity^=0xffu;identity*=1099511628211ull;
+        }
+        identity^=static_cast<std::uint64_t>(branch.join_policy);identity*=1099511628211ull;
+        return identity;
+    }
+
     const std::vector<std::string> &ComputeGraph::getExecutionOrder() const
     {
         if (!order_dirty_)
@@ -311,6 +393,19 @@ namespace llaminar2
         if (order.size() != nodes_.size())
         {
             LOG_ERROR("[ComputeGraph] Cycle detected in graph!");
+        }
+
+        if (read_ahead_branch_)
+        {
+            // Submission priority is distinct from a dependency: gathering must
+            // enqueue early without making independent trunk kernels wait.
+            const auto &branch=*read_ahead_branch_;
+            auto producer=std::find(order.begin(),order.end(),branch.producer_node);
+            if (producer==order.end()) throw std::logic_error("Read-ahead producer is absent from executable order");
+            order.erase(producer);
+            auto fork=std::find(order.begin(),order.end(),branch.fork_node);
+            if (fork==order.end()) throw std::logic_error("Read-ahead fork is absent from executable order");
+            order.insert(fork+1,branch.producer_node);
         }
 
         cached_order_ = std::move(order);
@@ -421,6 +516,15 @@ namespace llaminar2
         return total;
     }
 
+    bool ComputeGraph::requiresCollectiveRuntimeCapture(const std::unordered_set<std::string>* named)const{
+        if(named)for(const auto& name:*named){const auto* node=getNode(name);if(!node || !node->stage)return true;}
+        for(const auto& name:getExecutionOrder()){
+            const auto* node=getNode(name);
+            if(node && node->stage && node->stage->requiresCollectiveRuntimeCapture(named && named->count(name)))return true;
+        }
+        return false;
+    }
+
     std::unordered_set<std::string> ComputeGraph::collectiveNodeNames() const
     {
         std::unordered_set<std::string> collective_nodes;
@@ -444,7 +548,11 @@ namespace llaminar2
     void ComputeGraph::clear()
     {
         nodes_.clear();
+        participant_source_plan_.reset();
         storage_boundary_.reset();
+        read_ahead_branch_.reset();
+        read_ahead_phase_identity_=0;
+        read_ahead_recording_binding_={};
         purpose_=ExecutionPurpose::Executable;
         node_index_.clear();
         cached_order_.clear();
@@ -491,6 +599,15 @@ namespace llaminar2
 
     ComputeGraph &ComputeGraph::merge(ComputeGraph &&other, const std::string &connect_from)
     {
+        if(other.read_ahead_branch_)
+            throw std::logic_error("Read-ahead graphs must be retained as complete native parents, not merged into another topology");
+        if(other.participant_source_plan_)
+        {
+            if(participant_source_plan_ && participant_source_plan_!=other.participant_source_plan_)
+                throw std::logic_error("One retained source parent cannot hide multiple participant invocation plans");
+            setRetainedParticipantSourcePlan(other.participant_source_plan_);
+        }
+
         if(other.isWorkspaceDeclaration())markWorkspaceDeclaration();
         if (other.nodes_.empty())
         {

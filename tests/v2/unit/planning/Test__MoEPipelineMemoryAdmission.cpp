@@ -8,6 +8,7 @@
  * construct the same histogram, residency and empty prepared-bank owners used
  * by production, then hand them to the checked pipeline binding.
  */
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "planning/PlanningForwardWeightWork.h"
 #include "planning/MoEOverlayPlanningInputs.h"
@@ -101,7 +102,7 @@ namespace
 
     /** @return Explicit capture inventory small enough for fast metadata-only regression. */
     OrchestrationCandidateMemoryPolicy policy()
-    { return {.prefill_bucket_rows = {1, 8, 32}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 16}; }
+    { return {.prefill_bucket_rows = {1, 8, 32}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 16, .retained_host_services = planningHostServiceBudgets(1)}; }
 
     /** @return Every supported source codebook, excluding the runtime-only Q8_1 representation. */
     std::vector<TensorType> formats()

@@ -63,18 +63,20 @@ class QFNTP4SourceClosureTests(unittest.TestCase):
         registration = source_call(source, '    discover_v2_parity_tests(' + TARGET + '\n')
         sink = self.root / 'declaration.cmake'
         sink.write_text('''function(discover_v2_parity_tests target)
-  cmake_parse_arguments(ARG "" "MPI_PROCS;TEST_PREFIX;TIMEOUT;PRODUCTION_PERF_STATS_FILTER"
-    "LABELS;MODEL_FILES;CPU_MODEL_FILES;CUDA_MODEL_FILES;ROCM_MODEL_FILES;PRODUCTION_ISOLATED_TESTS" ${ARGN})
+  cmake_parse_arguments(ARG "" "MPI_PROCS;TEST_PREFIX;TIMEOUT;PRODUCTION_PERF_STATS_FILTER;SOURCE_ADMISSION_TIMEOUT;SOURCE_ADMISSION_MTP_SOURCE_KIND"
+    "LABELS;MODEL_FILES;CPU_MODEL_FILES;CUDA_MODEL_FILES;ROCM_MODEL_FILES;PRODUCTION_ISOLATED_TESTS;SOURCE_ADMISSION_MTP_MODEL_FILES" ${ARGN})
+  file(WRITE "${CMAKE_CURRENT_LIST_DIR}/isolated.txt" "${ARG_PRODUCTION_ISOLATED_TESTS}")
   foreach(scope IN ITEMS MODEL_FILES CPU_MODEL_FILES CUDA_MODEL_FILES ROCM_MODEL_FILES)
     file(WRITE "${CMAKE_CURRENT_LIST_DIR}/${scope}.txt" "${ARG_${scope}}")
   endforeach()
 endfunction()
 ''' + model_set + '\n' + registration + '\n')
         cmake(['cmake', '-P', str(sink)])
+        self.isolated_patterns = (self.root / "isolated.txt").read_text().split(";")
         return {scope: [v for v in (self.root / (scope + '.txt')).read_text().split(';') if v]
                 for scope in ('MODEL_FILES', 'CPU_MODEL_FILES', 'CUDA_MODEL_FILES', 'ROCM_MODEL_FILES')}
 
-    def discover(self, omit_predictor=False):
+    def discover(self, omit_predictor=False, opposite=False):
         """Feed actual scoped declarations to production CMake and live inventory."""
         declared = self.declared_sources()
         # Preserve original names/roles while replacing only fixture storage roots.
@@ -85,21 +87,27 @@ endfunction()
         main = sources['MODEL_FILES'][0]
         predictor = str(self.root / PREDICTOR)
         cases = ['CPU0', 'CUDA0', 'ROCm0123_TP4_AllGPUExperts', 'CUDA0_ROCm0_CPU0']
+        if opposite:
+            cases = [f'{source}_CPU0_DeclaredOwners_{source}_C{slots}_{owner}_C{slots}_R15_MTPOff'
+                     for source, owner in [('CUDA0', 'ROCm0'), ('ROCm0', 'CUDA0')] for slots in (0, 64)]
+        suite = ('Qwen4ExpOppositeVendorOrdinaryRetained15/Qwen4ExpMainParityTest'
+                 if opposite else 'QFNFixtureSuite')
         records = []
         for case in cases:
             record = dict(model_parity_schema=1, id=case, model=main, e2e=None,
                           cross_host_e2e=[], runtime={'generation': {'mtp_policy': 'off'}})
-            if case == 'ROCm0123_TP4_AllGPUExperts':
+            if opposite or case == 'ROCm0123_TP4_AllGPUExperts':
                 record['shared_predictor'] = predictor
             records.append(dict(name='ProductionParity/' + case, value_param=json.dumps(record)))
         binary = self.root / TARGET
         # Only --gtest_list_tests and --gtest_output=json are handled. No test body exists.
         binary.write_text('#!/usr/bin/env python3\nimport json,sys\n'
             + 'rows=' + repr(records) + '\n'
-            + "if not any(a.startswith('--gtest_output=json:') for a in sys.argv):\n print('QFNFixtureSuite.')\n"
+            + "suite=" + repr(suite) + "\n"
+            + "if not any(a.startswith('--gtest_output=json:') for a in sys.argv):\n print(suite+'.')\n"
             + " for row in rows: print('  '+row['name'])\n"
             + "else:\n path=next(a.split(':',1)[1] for a in sys.argv if a.startswith('--gtest_output=json:'))\n"
-            + " with open(path,'w') as out: json.dump({'testsuites':[{'name':'QFNFixtureSuite','testsuite':rows}]},out)\n")
+            + " with open(path,'w') as out: json.dump({'testsuites':[{'name':suite,'testsuite':rows}]},out)\n")
         binary.chmod(0o755)
         output = self.root / 'generated.cmake'
         command = ['cmake', '-DTEST_EXECUTABLE=' + str(binary), '-DCTEST_FILE=' + str(output),
@@ -107,6 +115,7 @@ endfunction()
                    '-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm', '-DMPI_PROCS=1',
                    '-DCORES_PER_SOCKET=1', '-DNUM_SOCKETS=1', '-DWORKING_DIR=' + str(self.root)]
         command += discovery_session_arguments(self.root)
+        command.append('-DPRODUCTION_ISOLATED_TESTS_SERIALIZED=' + '|'.join(self.isolated_patterns))
         for scope, values in sources.items():
             if omit_predictor and scope == 'ROCM_MODEL_FILES':
                 values = [v for v in values if Path(v).name != PREDICTOR]
@@ -139,6 +148,29 @@ endfunction()
         self.assertEqual(tp4[2]['shared_predictor'], str(self.root / PREDICTOR))
         self.assertEqual(tp4[2]['runtime']['generation']['mtp_policy'], 'off')
         self.assertEqual(len(tp4[0].model_files), 5)
+
+    def test_opposite_vendor_ordinary_retained15_has_exact_sources_and_fresh_processes(self):
+        sources, campaigns = self.discover(opposite=True)
+        self.assertEqual(len(campaigns), 4)
+        expected = sources['MODEL_FILES'] + [str(self.root / PREDICTOR)]
+        for campaign in campaigns:
+            self.assertEqual(campaign.group.backends, 'CPU+CUDA+ROCm')
+            self.assertEqual(list(campaign.model_files), expected)
+            self.assertEqual(len(campaign.gtest_cases), 1)
+        args = argparse.Namespace(manifest=None, build_dir=self.root, source_revision='fixture',
+                                  backend='.*', campaign='.*', cell='.*')
+        selected = inventory.discover(args, inventory.InventoryScope.ALL)
+        self.assertEqual(len(selected), 4)
+        for _, _, record in selected:
+            self.assertEqual(record['shared_predictor'], str(self.root / PREDICTOR))
+            self.assertEqual(record['runtime']['generation']['mtp_policy'], 'off')
+
+    def test_opposite_vendor_missing_inactive_predictor_remains_fatal(self):
+        self.discover(omit_predictor=True, opposite=True)
+        args = argparse.Namespace(manifest=None, build_dir=self.root, source_revision='fixture',
+                                  backend='.*', campaign='.*', cell='.*')
+        with self.assertRaisesRegex(ValueError, 'shared_predictor is not in the canonical GGUF manifest'):
+            inventory.discover(args, inventory.InventoryScope.ALL)
 
     def test_missing_predictor_in_actual_discovery_is_rejected_by_live_inventory(self):
         self.discover(omit_predictor=True)

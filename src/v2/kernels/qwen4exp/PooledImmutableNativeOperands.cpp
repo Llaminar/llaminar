@@ -8,6 +8,7 @@
  * role and only when their read ranges are disjoint.
  */
 #include "PooledImmutableNativeOperands.h"
+#include "PooledImmutableNativeRootStorage.h"
 #include "transfer/TransferEngine.h"
 #include <algorithm>
 #include <limits>
@@ -109,9 +110,17 @@ std::uint64_t combine(std::uint64_t first,std::uint64_t second){return ((first^s
 }
 PooledNativeOperandSchema pooledNativeSchema(n::OwnerAction action,const n::OwnerParameters& plan,n::SourceCondition condition,n::RecordLayout records)
 {
+    // Remote packing requires the original admitted ingress/payload family.
+    // Source17 owns the separate direct-local path and never calls this schema.
+    if(action==n::OwnerAction::ReadRows && !plan.native.ingress)
+        throw std::invalid_argument("Public pinned-hit packing requires its original remote owner ingress; local reads use Source17");
     PooledNativeOperandSchema schema{};const auto c=plan.native.reply_capacity,participants=plan.owner.participants();
     need(schema,PooledNativeOperand::Invocation,sizeof(n::Invocation),8);
     switch(action){
+    case n::OwnerAction::AcquireReaderRetirement:need(schema,PooledNativeOperand::Frontier,sizeof(n::ReadersRetiredGate),8);break;
+    case n::OwnerAction::ReadRows:
+        need(schema,PooledNativeOperand::Records,times(c,sizeof(p::Grant)),8);
+        need(schema,PooledNativeOperand::RecordBytes,c?8:0,8);break;
     case n::OwnerAction::Pin:
         need(schema,PooledNativeOperand::Records,times(c,sizeof(p::OwnerCommand)),8);
         need(schema,PooledNativeOperand::RecordBytes,c?8:0,8);break;
@@ -131,15 +140,26 @@ PooledNativeOperandSchema pooledNativeSchema(n::OwnerAction action,const n::Owne
         need(schema,PooledNativeOperand::Frontier,sizeof(n::SourceFrontier),8);break;
     case n::OwnerAction::AcquirePublication:need(schema,PooledNativeOperand::Frontier,times(participants,sizeof(p::PublishHeader)),8);break;
     case n::OwnerAction::SealSource:
-    case n::OwnerAction::CancelSource:need(schema,PooledNativeOperand::Frontier,sizeof(n::SourceFrontier),8);break;
+    case n::OwnerAction::CancelSource:case n::OwnerAction::DrainSourceFailure:need(schema,PooledNativeOperand::Frontier,sizeof(n::SourceFrontier),8);break;
     case n::OwnerAction::Begin:case n::OwnerAction::SealPins:case n::OwnerAction::Availability:
     case n::OwnerAction::ExecuteFree:case n::OwnerAction::FreeReceipt:case n::OwnerAction::ExecuteVictim:
     case n::OwnerAction::VictimReceipt:case n::OwnerAction::ValidateFills:case n::OwnerAction::MakeReady:
     case n::OwnerAction::ReadyReceipt:case n::OwnerAction::Release:case n::OwnerAction::CancelFree:
-    case n::OwnerAction::CancelVictim:case n::OwnerAction::Retire:break;
+    case n::OwnerAction::CancelVictim:case n::OwnerAction::Retire:
+    case n::OwnerAction::PublishWire:case n::OwnerAction::ReadyWire:case n::OwnerAction::PublicationAcquiredWire:case n::OwnerAction::RetiredWire:break;
     default:throw std::invalid_argument("Unknown pooled native owner phase schema");
     }
-    if(records!=n::RecordLayout::Compact) {
+    if(records==n::RecordLayout::DirectedCommandBank){
+        if(action!=n::OwnerAction::Pin || !c)
+            throw std::invalid_argument("Directed commands require an original positive local Pin consumer");
+        need(schema,PooledNativeOperand::Records,times(plan.owner.maximumUnique(),sizeof(p::OwnerCommand)),8);
+        need(schema,PooledNativeOperand::RecordBytes,0,8);
+        need(schema,PooledNativeOperand::AllocationSlice,sizeof(n::DirectedSlice),8);
+    }else if(records==n::RecordLayout::TransportedAllocationPrefix){
+        if(action!=n::OwnerAction::AcceptFree && action!=n::OwnerAction::AcceptVictim)
+            throw std::invalid_argument("Transported allocation count is valid only for its nominal allocation consumer");
+        need(schema,PooledNativeOperand::RecordBytes,c?8:0,8);
+    }else if(records!=n::RecordLayout::Compact) {
         if(records!=n::RecordLayout::DirectedAllocationBank || !c ||
            (action!=n::OwnerAction::AcceptFree && action!=n::OwnerAction::AcceptVictim))
             throw std::invalid_argument("Directed allocation records require a positive nominal free/victim consumer");
@@ -148,13 +168,17 @@ PooledNativeOperandSchema pooledNativeSchema(n::OwnerAction action,const n::Owne
     }
     if(condition!=n::SourceCondition::Always) {
         const bool success=condition==n::SourceCondition::AfterSuccess &&
-            (action==n::OwnerAction::ApplySourceDelivery || action==n::OwnerAction::ValidateFills ||
+            (action==n::OwnerAction::ReadRows || action==n::OwnerAction::ApplySourceDelivery || action==n::OwnerAction::ValidateFills ||
              action==n::OwnerAction::AcquirePublication || action==n::OwnerAction::MakeReady || action==n::OwnerAction::ReadyReceipt);
         const bool failure=condition==n::SourceCondition::AfterFailure && action==n::OwnerAction::CancelSource;
         if(!success && !failure)throw std::invalid_argument("Pooled source gate is incompatible with its nominal owner operation");
         if(action!=n::OwnerAction::ApplySourceDelivery && action!=n::OwnerAction::CancelSource)
             need(schema,PooledNativeOperand::Outcome,sizeof(n::SourceFrontier),8);
     }
+    if(action==n::OwnerAction::AcquireReaderRetirement && condition!=n::SourceCondition::Always)
+        throw std::invalid_argument("Reader-retirement gate must authenticate its own fresh nominal source producer");
+    if(action==n::OwnerAction::ReadRows && condition!=n::SourceCondition::AfterSuccess)
+        throw std::invalid_argument("Pinned-hit read requires its original acquired source outcome");
     return schema;
 }
 PooledNativeOperandSchema pooledNativeSchema(n::CoordinatorAction action,const n::CoordinatorParameters& plan,std::optional<pooled_native::OriginalRows> original_rows,n::SourceCondition condition)
@@ -192,6 +216,13 @@ PooledNativeOperandSchema pooledNativeSchema(n::CoordinatorAction action,const n
         need(schema,PooledNativeOperand::RecordBytes,c?8:0,8);
         need(schema,PooledNativeOperand::Source,sizeof(n::SourceFrontier),8);break;
     case n::CoordinatorAction::Finish:need(schema,PooledNativeOperand::Frontier,times(participants,sizeof(p::RetiredHeader)),8);break;
+    case n::CoordinatorAction::ImportLocalPinHeader:case n::CoordinatorAction::ImportLocalAvailability:
+    case n::CoordinatorAction::ImportLocalFreeReceipt:case n::CoordinatorAction::ImportLocalVictimReceipt:
+        need(schema,PooledNativeOperand::Frontier,n::localFrontierBytes(action),8);
+        need(schema,PooledNativeOperand::RecordBytes,sizeof(std::uint64_t),8);
+        need(schema,PooledNativeOperand::OwnerControl,sizeof(p::OwnerFrame),8);
+        need(schema,PooledNativeOperand::AllocationControl,sizeof(p::AllocationFrame),8);
+        need(schema,PooledNativeOperand::HeaderKind,sizeof(n::OwnerHeaderKind),alignof(n::OwnerHeaderKind));break;
     case n::CoordinatorAction::PinCommands:case n::CoordinatorAction::PlanVictims:break;
     default:throw std::invalid_argument("Unknown pooled native coordinator phase schema");
     }
@@ -201,9 +232,27 @@ PooledNativeOperandSchema pooledNativeSchema(n::CoordinatorAction action,const n
         throw std::invalid_argument("Pooled source gate is incompatible with its nominal coordinator operation");
     return schema;
 }
-PooledImmutableOwnerOperands::PooledImmutableOwnerOperands(n::OwnerAction action,const PooledImmutableOwnerNativePlan& plan,PooledNativeOperandSpans spans,n::SourceCondition condition,n::RecordLayout records)
+PooledImmutableOwnerOperands::PooledImmutableOwnerOperands(n::OwnerAction action,const PooledImmutableOwnerNativePlan& plan,PooledNativeOperandSpans spans,n::SourceCondition condition,n::RecordLayout records,std::optional<PooledImmutableCoordinatorNativePlan> localCoordinator)
     :action_(action),condition_(condition),records_(records),plan_(plan.parameters()),schema_(pooledNativeSchema(action,plan_,condition,records)),spans_(std::move(spans))
 {
+    if((records_==n::RecordLayout::DirectedCommandBank)!=bool(localCoordinator))
+        throw std::invalid_argument("Local directed commands require their exact original coordinator plan only");
+    if(localCoordinator){
+        localCoordinator->requireOwnerPlan(plan);
+        if(localCoordinator->allocator()!=plan.allocator())throw std::invalid_argument("Local commands require the same original allocator");
+        const auto& c=localCoordinator->parameters();
+        const auto& invocation=spans_[index(PooledNativeOperand::Invocation)];
+        const auto& commands=spans_[index(PooledNativeOperand::Records)];
+        const auto& slice=spans_[index(PooledNativeOperand::AllocationSlice)];
+        const auto coordinate=plan_.owner.coordinate();
+        if(!invocation || !commands || !slice || invocation->root!=commands->root || slice->root!=commands->root ||
+            invocation->buffer!=BufferId::QFN_POOLED_COORDINATOR_NATIVE || commands->buffer!=invocation->buffer || slice->buffer!=invocation->buffer ||
+            invocation->offset!=c.native.invocation || commands->offset!=c.native.pin_commands ||
+            slice->offset!=c.native.pin_slices+size_t{coordinate}*sizeof(n::DirectedSlice) ||
+            commands->bytes!=times(c.native.reply_capacity,sizeof(p::OwnerCommand)))
+            throw std::invalid_argument("Local commands replaced the original coordinator command region or owner slice");
+        need(schema_,PooledNativeOperand::Records,commands->bytes,8);local_coordinator_identity_=c.identity;
+    }
     declarations();const auto original=roots(spans_);prepared_.emplace(plan_.device,original);
 }
 void PooledImmutableOwnerOperands::declarations()const{requireSpanDeclarations(spans_,schema_);}
@@ -218,7 +267,7 @@ void PooledImmutableOwnerOperands::require(n::OwnerAction action,const PooledImm
 {
     requireDeclarations(action,plan);prepared_->validate();requirePrepared(spans_,schema_,plan_.device);requireInputs(spans_,plan_.device,captured_);
 }
-std::uint64_t PooledImmutableOwnerOperands::declarationIdentity()const{validateIfSealed();return combine(combine(declaration(spans_,plan_.identity,static_cast<std::uint64_t>(action_)),static_cast<unsigned>(condition_)),static_cast<unsigned>(records_));}
+std::uint64_t PooledImmutableOwnerOperands::declarationIdentity()const{validateIfSealed();return combine(combine(combine(declaration(spans_,plan_.identity,static_cast<std::uint64_t>(action_)),static_cast<unsigned>(condition_)),static_cast<unsigned>(records_)),local_coordinator_identity_);}
 std::uint64_t PooledImmutableOwnerOperands::captureIdentity()const{requireInputs(spans_,plan_.device,captured_);return combine(declarationIdentity(),prepared_->preparedIdentity());}
 n::OwnerInputs PooledImmutableOwnerOperands::native()const
 {
@@ -230,19 +279,52 @@ n::OwnerInputs PooledImmutableOwnerOperands::native()const
             action_==n::OwnerAction::ApplySourceDelivery || action_==n::OwnerAction::CancelSource?
                 PooledNativeOperand::Frontier:PooledNativeOperand::Outcome)),records_,
         static_cast<const n::DirectedSlice*>(address(spans_,PooledNativeOperand::AllocationSlice)),
-        records_==n::RecordLayout::Compact?0:spans_[index(PooledNativeOperand::Records)]->offset,
-        records_==n::RecordLayout::Compact?0:spans_[index(PooledNativeOperand::Records)]->bytes};
+        records_==n::RecordLayout::DirectedAllocationBank?spans_[index(PooledNativeOperand::Records)]->offset:0,
+        (records_==n::RecordLayout::DirectedAllocationBank || records_==n::RecordLayout::DirectedCommandBank)?spans_[index(PooledNativeOperand::Records)]->bytes:0};
 }
 PooledImmutableCoordinatorOperands::PooledImmutableCoordinatorOperands(n::CoordinatorAction action,const PooledImmutableCoordinatorNativePlan& plan,
-    std::optional<pooled_native::OriginalRows> original_rows,PooledNativeOperandSpans spans,n::SourceCondition condition)
-    :action_(action),condition_(condition),plan_(plan.parameters()),rows_(original_rows),schema_(pooledNativeSchema(action,plan_,rows_,condition)),spans_(std::move(spans))
+    std::optional<pooled_native::OriginalRows> original_rows,PooledNativeOperandSpans spans,n::SourceCondition condition,std::shared_ptr<PooledImmutableOwnerPreparedStorage> localOwner)
+    :action_(action),condition_(condition),plan_(plan.parameters()),rows_(original_rows),local_owner_(std::move(localOwner)),schema_(pooledNativeSchema(action,plan_,rows_,condition)),spans_(std::move(spans))
 {
+    const bool localGrants=action_==n::CoordinatorAction::AcquirePins || action_==n::CoordinatorAction::AcquireFree || action_==n::CoordinatorAction::AcquireVictims;
+    if((n::localFrontierImport(action_) && !local_owner_) || (local_owner_ && !n::localFrontierImport(action_) && !localGrants))
+        throw std::invalid_argument("Original local owner belongs only to local metadata imports or direct Grant acquisition");
+    if(local_owner_){
+        if(n::localFrontierImport(action_) && (plan_.policy.participants()<2 || !plan_.native.ingress_frontier))
+            throw std::invalid_argument("Local import requires the original distributed frontier, never P1 offset zero");
+        plan.requireOwnerPlan(local_owner_->plan());
+        if(plan.allocator()!=local_owner_->plan().allocator())throw std::invalid_argument("Local metadata import requires the original equal allocator");
+        const auto roots=local_owner_->roots();const auto& o=local_owner_->plan().parameters();
+        const auto& publication=spans_[index(n::localFrontierImport(action_)?PooledNativeOperand::Frontier:PooledNativeOperand::Records)];
+        const auto& count=spans_[index(PooledNativeOperand::RecordBytes)];
+        const auto offset=n::localFrontierImport(action_)?o.native.header:o.native.replies;
+        const auto countOffset=o.native.progress+(n::localFrontierImport(action_)?offsetof(n::OwnerProgress,header_bytes):offsetof(n::OwnerProgress,reply_bytes));
+        if(!publication || !count || publication->root!=roots.native || count->root!=roots.native ||
+            publication->buffer!=BufferId::QFN_POOLED_OWNER_NATIVE || count->buffer!=publication->buffer ||
+            publication->offset!=offset || count->offset!=countOffset || (localGrants && !o.native.reply_capacity))
+            throw std::invalid_argument("Local import/acquisition replaced its actual original owner publication");
+        if(n::localFrontierImport(action_)){
+            const auto& control=spans_[index(PooledNativeOperand::OwnerControl)];const auto& allocation=spans_[index(PooledNativeOperand::AllocationControl)];
+            const auto& kind=spans_[index(PooledNativeOperand::HeaderKind)];
+            if(!control || !allocation || control->root!=roots.frame || allocation->root!=roots.frame ||
+                control->buffer!=BufferId::QFN_POOLED_OWNER_FRAME || allocation->buffer!=control->buffer ||
+                control->offset!=o.frame.control || allocation->offset!=o.frame.allocation_control || !kind || kind->root!=roots.native ||
+                kind->buffer!=BufferId::QFN_POOLED_OWNER_NATIVE || kind->offset!=o.native.progress+offsetof(n::OwnerProgress,header_kind))
+                throw std::invalid_argument("Local metadata import replaced its actual original producer phase/wave controls");
+        }
+        if(localGrants)need(schema_,PooledNativeOperand::Records,times(o.native.reply_capacity,sizeof(p::Grant)),8);
+        local_coordinate_=o.owner.coordinate();local_reply_capacity_=o.native.reply_capacity;local_owner_identity_=local_owner_->captureIdentity();
+    }
     declarations();const auto original=roots(spans_);
     // Metadata-only phases may have no input tensors. Their storage owner
     // remains independently sealed; no dummy operand is manufactured.
     if(!original.empty())prepared_.emplace(plan_.device,original);
 }
-void PooledImmutableCoordinatorOperands::declarations()const{requireSpanDeclarations(spans_,schema_);}
+void PooledImmutableCoordinatorOperands::declarations()const{
+    requireSpanDeclarations(spans_,schema_);
+    if(local_owner_ && local_owner_->captureIdentity()!=local_owner_identity_)
+        throw std::logic_error("Local metadata import owner capture identity changed");
+}
 void PooledImmutableCoordinatorOperands::seal()
 {
     declarations();if(prepared_)prepared_->seal();requirePrepared(spans_,schema_,plan_.device);retainInputs(spans_,plan_.device,captured_);
@@ -264,6 +346,7 @@ void PooledImmutableCoordinatorOperands::require(n::CoordinatorAction action,con
 std::uint64_t PooledImmutableCoordinatorOperands::declarationIdentity()const
 {
     validateIfSealed();auto value=combine(declaration(spans_,plan_.identity,static_cast<std::uint64_t>(action_)),static_cast<unsigned>(condition_));
+    if(local_owner_)value=combine(combine(combine(value,local_coordinate_),local_reply_capacity_),local_owner_identity_);
     if(rows_){
     value=combine(value,static_cast<unsigned>(rows_->id_width));
     const auto id=rows_->rows.captureIdentity();
@@ -280,7 +363,10 @@ n::CoordinatorInputs PooledImmutableCoordinatorOperands::native()const
     return {address(spans_,PooledNativeOperand::Records),
         static_cast<const std::uint64_t*>(address(spans_,PooledNativeOperand::RecordBytes)),address(spans_,PooledNativeOperand::Frontier),
         static_cast<const n::SourceFrontier*>(address(spans_,PooledNativeOperand::Source)),condition_,
-        condition_==n::SourceCondition::Always?nullptr:static_cast<const n::SourceFrontier*>(address(spans_,PooledNativeOperand::Source))};
+        condition_==n::SourceCondition::Always?nullptr:static_cast<const n::SourceFrontier*>(address(spans_,PooledNativeOperand::Source)),local_coordinate_,local_reply_capacity_,
+        static_cast<const p::OwnerFrame*>(address(spans_,PooledNativeOperand::OwnerControl)),
+        static_cast<const p::AllocationFrame*>(address(spans_,PooledNativeOperand::AllocationControl)),
+        static_cast<const n::OwnerHeaderKind*>(address(spans_,PooledNativeOperand::HeaderKind))};
 }
 n::CoordinatorQuery PooledImmutableCoordinatorOperands::query()const
 {

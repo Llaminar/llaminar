@@ -1,3 +1,4 @@
+#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 /**
  * @file Qwen4ExpPLEBuilder.cpp
  * @brief Wire native lexical lookup and prepared projections as one flat model block.
@@ -9,6 +10,7 @@
  * state crosses to a second authority while constructing or running the graph.
  */
 #include "Qwen4ExpPLEBuilder.h"
+#include "backends/ReadAheadNativeResourceFamily.h"
 #include "../GEMMStage.h"
 #include "../NativeAllGatherStage.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
@@ -58,10 +60,92 @@ std::unique_ptr<IComputeStage> norm(const Qwen4ExpPLEContext &context,
         .operation=Qwen4ExpPrimitiveStage::BranchRMSNorm{context.hidden,context.epsilon,input,gain,output}});
 }
 }
+Qwen4ExpEarlyLookupFrame::Qwen4ExpEarlyLookupFrame(ComputeGraph& graph,ImmutableLookupStage::Params params,
+    std::uint64_t hashIdentity,std::string producer)
+    :params_(std::move(params)),handoff_(graph,std::move(producer),
+        ImmutableLookupStage(params_).graphCaptureVariantSignature(),hashIdentity) {}
+
+std::unique_ptr<Qwen4ExpEarlyLookupFrame> Qwen4ExpEarlyLookupFrame::publish(ComputeGraph& graph,
+    const Qwen4ExpPLEContext& c,Qwen4ExpIntInput tokens,Qwen4ExpIntBinding prior,Qwen4ExpIntBinding ids,
+    Qwen4ExpFloatBinding output,ImmutableLookupStage::GPUStorage storage)
+{
+    require(c.device.is_gpu() && graph.size()==0,"Early current lookup must own the original empty local graph prefix");
+    const auto hash=c.prefix+"hash",published=c.prefix+"publish";
+    auto stage=std::make_unique<Qwen4ExpPrimitiveStage>(Qwen4ExpPrimitiveStage::Params{
+        .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
+        .operation=Qwen4ExpPrimitiveStage::NgramHash{tokens,prior,ids,c.hash}});
+    const auto identity=stage->graphCaptureVariantSignature();
+    ImmutableLookupStage::Params params{.device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,.ids=ids,.output=output,
+        .format=c.nativeFormat,.rowElements=c.nativeRowElements,.rowBytes=c.nativeRowBytes,.storage=storage};
+    (void)ImmutableLookupStage(params).graphCaptureVariantSignature(); // Validate all declarations before any graph mutation.
+    auto publication=std::unique_ptr<ImmutableLookupStage>(new ImmutableLookupStage(params,ImmutableLookupStage::Operation::Publish));
+    graph.setRetainedStorageBoundary(storage.boundary);
+    graph.addNode(hash,std::move(stage),c.device);graph.addNode(published,std::move(publication),c.device);
+    graph.addDependency(published,hash);
+    return std::unique_ptr<Qwen4ExpEarlyLookupFrame>(new Qwen4ExpEarlyLookupFrame(graph,params,identity,published));
+}
+void Qwen4ExpEarlyLookupFrame::requireConsumed() const
+{ handoff_.requireConsumed(); }
+Qwen4ExpEarlyLookupFrame::Consumption Qwen4ExpEarlyLookupFrame::consume(ComputeGraph& graph,
+    ImmutableLookupStage::Params params,std::uint64_t hashIdentity,const std::vector<std::string>& trunk)
+{
+    const auto* original=std::get_if<ImmutableLookupStage::GPUStorage>(&params_.storage);
+    const auto* current=std::get_if<ImmutableLookupStage::GPUStorage>(&params.storage);
+    require(original && current && current->boundary==original->boundary,"Early lookup consume replaced its actual source");
+    auto stage=std::unique_ptr<IComputeStage>(new ImmutableLookupStage(params,ImmutableLookupStage::Operation::Consume));
+    auto dependencies=handoff_.consume(graph,ImmutableLookupStage(params).graphCaptureVariantSignature(),hashIdentity,trunk);
+    return {std::move(stage),std::move(dependencies)};
+}
+
+Qwen4ExpResidentReadAheadFrame::Qwen4ExpResidentReadAheadFrame(ComputeGraph& graph,
+    ImmutableLookupStage::Params params,std::uint64_t hashIdentity,std::string hash,std::string gather,
+    std::shared_ptr<ReadAheadNativeResourceFamily> resources)
+    :params_(std::move(params)),handoff_(graph,std::move(gather),
+        ImmutableLookupStage(params_).graphCaptureVariantSignature(),hashIdentity),
+     hash_(std::move(hash)),resources_(std::move(resources)) {}
+std::unique_ptr<Qwen4ExpResidentReadAheadFrame> Qwen4ExpResidentReadAheadFrame::publish(ComputeGraph& graph,
+    const Qwen4ExpPLEContext& c,Qwen4ExpIntInput tokens,Qwen4ExpIntBinding prior,Qwen4ExpIntBinding ids,
+    Qwen4ExpFloatBinding output,ImmutableLookupStage::ResidentGPUStorage storage,
+    std::shared_ptr<ReadAheadNativeResourceFamily> resources)
+{
+    require(graph.size()==0 && c.device.is_gpu() && resources && resources->device()==c.device,
+        "Resident read-ahead requires the original empty graph and admitted exact-device event family");
+    const auto hash=c.prefix+"hash",gather=c.prefix+"gather";
+    auto hashStage=std::make_unique<Qwen4ExpPrimitiveStage>(Qwen4ExpPrimitiveStage::Params{
+        .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
+        .operation=Qwen4ExpPrimitiveStage::NgramHash{tokens,prior,ids,c.hash}});
+    const auto identity=hashStage->graphCaptureVariantSignature();
+    ImmutableLookupStage::Params params{.device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,.ids=ids,.output=output,
+        .format=c.nativeFormat,.rowElements=c.nativeRowElements,.rowBytes=c.nativeRowBytes,.storage=std::move(storage)};
+    auto producer=std::make_unique<ImmutableLookupStage>(params);
+    auto frame=std::unique_ptr<Qwen4ExpResidentReadAheadFrame>(new Qwen4ExpResidentReadAheadFrame(
+        graph,params,identity,hash,gather,std::move(resources)));
+    graph.addNode(hash,std::move(hashStage),c.device);
+    graph.addNode(gather,std::move(producer),c.device);graph.addDependency(gather,hash);
+    return frame;
+}
+std::vector<std::string> Qwen4ExpResidentReadAheadFrame::consume(ComputeGraph& graph,
+    ImmutableLookupStage::Params params,std::uint64_t hashIdentity,const std::vector<std::string>& trunk)
+{
+    const auto* original=std::get_if<ImmutableLookupStage::ResidentGPUStorage>(&params_.storage);
+    const auto* current=std::get_if<ImmutableLookupStage::ResidentGPUStorage>(&params.storage);
+    require(original && current && current->table==original->table,
+        "Resident read-ahead consume replaced its pinned immutable source");
+    return handoff_.consume(graph,ImmutableLookupStage(params).graphCaptureVariantSignature(),hashIdentity,trunk);
+}
+void Qwen4ExpResidentReadAheadFrame::sealBranch(ComputeGraph& graph,const std::string& consumer)
+{
+    handoff_.requireConsumed();require(!sealed_,"Resident read-ahead branch was sealed twice");
+    graph.setReadAheadBranch({hash_,handoff_.producer(),consumer,resources_,ReadAheadJoinPolicy::FirstDeclaredCaptureFrontier,{}});sealed_=true;
+}
+void Qwen4ExpResidentReadAheadFrame::requireConsumed()const
+{handoff_.requireConsumed();require(sealed_,"Resident read-ahead has no native Consume join");}
+
 std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLEContext &c,
     const Qwen4ExpPLEWeights &w,const Qwen4ExpPLEBuffers &b,
     LookupStorage storage,
-    const std::vector<std::string> &dependencies)
+    const std::vector<std::string> &dependencies,Qwen4ExpEarlyLookupFrame* early,
+    Qwen4ExpResidentReadAheadFrame* residentEarly)
 {
     require(c.device.is_valid() && !c.prefix.empty() && c.rows.capacity>0 && c.hidden>0 &&
         c.hidden<=std::numeric_limits<int>::max()/4 && c.nativeRowElements>0 &&
@@ -100,13 +184,43 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
     std::vector<Pending> nodes;
     std::optional<ComputeGraph> pooledGraph;
     std::string lookupTerminal=gather;
-    nodes.push_back({hash,std::make_unique<Stage>(Stage::Params{
+    auto hashStage=std::make_unique<Stage>(Stage::Params{
         .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
-        .operation=Stage::NgramHash{b.tokens,b.priorTokens,b.ids,c.hash}}),dependencies});
-    if(auto* pooled=std::get_if<Qwen4ExpPooledLookupStorage>(&storage))
+        .operation=Stage::NgramHash{b.tokens,b.priorTokens,b.ids,c.hash}});
+    const auto hashIdentity=hashStage->graphCaptureVariantSignature();
+    require(!(early && residentEarly),"PLE cannot own two early source modes");
+    std::vector<std::string> residentConsumeDependencies;
+    if(!early && !residentEarly)nodes.push_back({hash,std::move(hashStage),dependencies});
+    if(residentEarly){
+        auto* whole=std::get_if<ImmutableLookupStage::Storage>(&storage);
+        require(whole && std::holds_alternative<ImmutableLookupStage::ResidentGPUStorage>(*whole),
+            "Resident early PLE requires its original resident table");
+        residentConsumeDependencies=residentEarly->consume(graph,ImmutableLookupStage::Params{
+            .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,.ids=b.ids,.output=b.embedding,
+            .format=c.nativeFormat,.rowElements=c.nativeRowElements,.rowBytes=c.nativeRowBytes,
+            .storage=*whole},hashIdentity,dependencies);
+    }
+    else if(early){
+        require(!dependencies.empty(),"Early lookup Consume requires an actual trunk terminal");
+        auto* whole=std::get_if<ImmutableLookupStage::Storage>(&storage);
+        require(whole && std::holds_alternative<ImmutableLookupStage::GPUStorage>(*whole),"Early current lookup only consumes its hosted source");
+        auto consumption=early->consume(graph,ImmutableLookupStage::Params{
+            .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,.ids=b.ids,.output=b.embedding,
+            .format=c.nativeFormat,.rowElements=c.nativeRowElements,.rowBytes=c.nativeRowBytes,
+            .storage=*whole},hashIdentity,dependencies);
+        nodes.push_back({gather,std::move(consumption.stage),std::move(consumption.dependencies)});
+    }
+    else     if(auto* pooled=std::get_if<Qwen4ExpPooledLookupStorage>(&storage))
     {
         require(pooled->arena && pooled->boundary && pooled->boundary->isPooled() && pooled->code &&
             pooled->boundary->device()==c.device,"PLE split lookup lost its original model-owned source domain");
+        const auto sourceStorage=pooled->boundary->pooledStorage();
+        const bool hasRemote=std::any_of(sourceStorage->originalOwners().begin(),sourceStorage->originalOwners().end(),[&](const auto& owner){
+            return owner->plan().allocator()!=sourceStorage->coordinator()->plan().allocator();
+        });
+        require(hasRemote==bool(pooled->participants),"PLE remote storage requires its actual retained source participant domain; local arithmetic cannot substitute");
+        require(!pooled->participants || pooled->participants->boundary()==pooled->boundary,
+            "PLE participant domain differs from its original model source");
         const auto& declared=pooled->boundary->pooledStorage()->geometry().parameters();
         require(declared.format==c.nativeFormat && declared.row_elements==static_cast<std::uint32_t>(c.nativeRowElements) &&
             declared.owner.row_bytes==c.nativeRowBytes,"PLE split lookup differs from original source precision");
@@ -127,10 +241,16 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
             countSpan=qwen4exp::PooledNativeTensorSpan{count,pooled->count->buffer,pooled->count->byteOffset,sizeof(std::int32_t)};
         }
         pooledGraph.emplace();
-        const auto edge=appendPooledImmutablePLELookupGraph(*pooledGraph,*pooled->arena,pooled->boundary,pooled->code,
-            original,{ids,b.ids.buffer,b.ids.byteOffset,std::size_t{expanded.physicalRows()}*sizeof(std::uint64_t)},
+        const auto appendSource=[&](auto&&... operands){
+            if(pooled->participants)return pooled->participants->appendPLE(*pooledGraph,*pooled->arena,pooled->code,
+                std::forward<decltype(operands)>(operands)...);
+            return appendPooledImmutablePLELookupGraph(*pooledGraph,*pooled->arena,pooled->boundary,pooled->code,
+                std::forward<decltype(operands)>(operands)...);
+        };
+        const auto edge=appendSource(
+            original,qwen4exp::PooledNativeTensorSpan{ids,b.ids.buffer,b.ids.byteOffset,std::size_t{expanded.physicalRows()}*sizeof(std::uint64_t)},
             std::move(countSpan),pooled->control,
-            {output,b.embedding.buffer,b.embedding.byteOffset,std::size_t{expanded.physicalRows()}*c.nativeRowElements*sizeof(float)},
+            qwen4exp::PooledNativeTensorSpan{output,b.embedding.buffer,b.embedding.byteOffset,std::size_t{expanded.physicalRows()}*c.nativeRowElements*sizeof(float)},
             c.prefix+"pooled",gather);
         lookupTerminal=edge.last;
     }
@@ -186,8 +306,10 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
             .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,.ids=b.ids,.output=b.embedding,
             .format=c.nativeFormat,.rowElements=c.nativeRowElements,.rowBytes=c.nativeRowBytes,
             .storage=std::get<ImmutableLookupStage::Storage>(storage)}),{hash}});
-    nodes.push_back({key,project(c,w.key,b.embedding,b.key,4*c.hidden),{lookupTerminal}});
-    nodes.push_back({value,project(c,w.value,b.embedding,b.value,c.hidden),{lookupTerminal}});
+    nodes.push_back({key,project(c,w.key,b.embedding,b.key,4*c.hidden),residentEarly?residentConsumeDependencies:std::vector<std::string>{lookupTerminal}});
+    // Key is the first joined reader; value remains on that exact primary
+    // lane and follows key without any extra kernel, copy or global barrier.
+    nodes.push_back({value,project(c,w.value,b.embedding,b.value,c.hidden),{residentEarly?key:lookupTerminal}});
     nodes.push_back({keyNorm,norm(c,b.key,w.keyNorm,b.key),{key}});
     nodes.push_back({queryNorm,norm(c,b.trunk,w.queryNorm,b.query),dependencies});
     nodes.push_back({gate,std::make_unique<Stage>(Stage::Params{
@@ -220,6 +342,7 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
         for(const auto &edge:node.dependencies) graph.addDependency(node.name,edge);
         if(pooledGraph && node.name==hash){graph.merge(std::move(*pooledGraph),hash);pooledGraph.reset();}
     }
+    if(residentEarly)residentEarly->sealBranch(graph,key);
     return convolution;
 }
 } // namespace llaminar2

@@ -22,7 +22,7 @@ std::shared_ptr<HostImmutableRowProvider> HostImmutableRowProvider::fromWholeTab
 
 std::shared_ptr<HostImmutableRowProvider> HostImmutableRowProvider::fromAdaptiveCache(AdaptiveOwner cache)
 {
-    if (!cache || cache->subordinateRequester())
+    if (!cache || !cache->subordinateRequesters().empty())
         throw std::invalid_argument("Host native provider requires one complete independent adaptive owner");
     cache->authenticateSource();
     return std::shared_ptr<HostImmutableRowProvider>(new HostImmutableRowProvider(std::move(cache)));
@@ -30,7 +30,7 @@ std::shared_ptr<HostImmutableRowProvider> HostImmutableRowProvider::fromAdaptive
 
 std::shared_ptr<HostImmutableRowProvider> HostImmutableRowProvider::fromSubordinateAdaptiveCache(AdaptiveOwner cache)
 {
-    if(!cache || !cache->subordinateRequester())
+    if(!cache || cache->subordinateRequesters().empty())
         throw std::invalid_argument("Subordinate native provider requires exact GPU requester geometry");
     cache->authenticateSource();
     return std::shared_ptr<HostImmutableRowProvider>(new HostImmutableRowProvider(std::move(cache)));
@@ -40,10 +40,10 @@ std::optional<PhysicalMemoryAllocatorIdentity> HostImmutableRowProvider::subordi
     if(const auto *cache=std::get_if<AdaptiveOwner>(&owner_))return (*cache)->subordinateRequester();
     return std::nullopt;
 }
-void HostImmutableRowProvider::bindSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel)
+void HostImmutableRowProvider::bindSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel,DeviceId requester)
 {
-    if(!subordinateRequester())throw std::invalid_argument("Independent source cannot bind a subordinate processor");
-    std::get<AdaptiveOwner>(owner_)->bindSubordinate(channel);
+    if(subordinateRequesters().empty())throw std::invalid_argument("Independent source cannot bind a subordinate processor");
+    std::get<AdaptiveOwner>(owner_)->bindSubordinate(channel,requester);
 }
 void HostImmutableRowProvider::retireSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel) noexcept
 {
@@ -121,3 +121,10 @@ HostImmutableRowGatherObservation HostImmutableRowProvider::gather(
     return std::get<AdaptiveOwner>(owner_)->gather(ids, destination);
 }
 } // namespace llaminar2
+
+namespace llaminar2 {
+std::span<const PhysicalMemoryAllocatorIdentity> HostImmutableRowProvider::subordinateRequesters() const noexcept {
+    if(const auto* cache=std::get_if<AdaptiveOwner>(&owner_))return (*cache)->subordinateRequesters();
+    return {};
+}
+}

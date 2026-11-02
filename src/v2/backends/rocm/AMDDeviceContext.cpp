@@ -32,6 +32,7 @@
 #include "../../utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
+#include <exception>
 
 namespace llaminar2
 {
@@ -95,6 +96,9 @@ namespace llaminar2
     // ============================================================================
 
     AMDDeviceContext::AMDDeviceContext(int device_ordinal)
+        : AMDDeviceContext(device_ordinal,{}) {}
+
+    AMDDeviceContext::AMDDeviceContext(int device_ordinal,std::shared_ptr<PreparedGPUWorkerStack> prepared_stack)
         : process_lifetime_lease_(GPUDeviceProcessLifetime::acquireNativeContext()),
           device_ordinal_(device_ordinal)
     {
@@ -124,7 +128,10 @@ namespace llaminar2
                 // partition, not its creator's first OpenMP place. Restore
                 // the creator before waiting or executing any caller work.
                 const ScopedOpenMPPartitionAffinity control_affinity;
-                worker_thread_ = std::thread(&AMDDeviceContext::workerLoop, this);
+                if(prepared_stack)
+                    worker_thread_.start(std::move(prepared_stack),[](void* self){
+                        static_cast<AMDDeviceContext*>(self)->workerLoop();},this);
+                else worker_thread_ = std::thread(&AMDDeviceContext::workerLoop, this);
             }
 
             // Wait for worker to signal it's ready (or failed)
@@ -783,19 +790,25 @@ namespace llaminar2
         return static_cast<void *>(event);
     }
 
+    /**
+     * @brief Destroy an original event or fail fatally before its opaque commitment can retire.
+     * @param event Original native event; null denotes no created resource.
+     * @note A failed native cleanup is not evidence of physical retirement.
+     */
     void AMDDeviceContext::destroyEvent(void *event)
     {
-        if (event == nullptr)
-        {
-            return;
-        }
-
-        hipEvent_t hip_event = static_cast<hipEvent_t>(event);
+        if (!event) return;
         if (!setAMDDeviceForResource(device_ordinal_, "destroyEvent"))
         {
-            return;
+            LOG_ERROR("[AMDDeviceContext::destroyEvent] Original event device selection failed");
+            std::terminate();
         }
-        HIP_CHECK_VOID(hipEventDestroy(hip_event));
+        const auto hip_event = reinterpret_cast<hipEvent_t>(event);
+        if (const auto error = hipEventDestroy(hip_event); error != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext::destroyEvent] Native event destruction failed; ownership cannot retire, status=" << error);
+            std::terminate();
+        }
     }
 
     void AMDDeviceContext::recordEvent(void *event, void *stream)

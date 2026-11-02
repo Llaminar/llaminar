@@ -24,13 +24,14 @@ enum llaminarNativeRootFamilyV1 {
   llaminarNativeWorkFifoV1=3, llaminarNativeProfilerV1=4,
   llaminarNativeAbortFlagV1=5, llaminarNativeP2pBackingV1=6,
   llaminarNativeShmBackingV1=7, llaminarNativeCapturedWorkV1=8,
-  llaminarNativeProcessSDKV1=9, llaminarNativeDriverContextV1=10
+  llaminarNativeProcessSDKV1=9, llaminarNativeDriverContextV1=10,
+  llaminarNativeGPUWorkerAllocationV1=11
 };
 /** @brief Existing native lifetime that physically owns the allocation. */
 enum llaminarNativeRootLifetimeV1 {
   llaminarNativeCommLifetimeV1=1, llaminarNativeSharedLifetimeV1=2,
   llaminarNativeProxyLifetimeV1=3, llaminarNativeGraphLifetimeV1=4,
-  llaminarNativeProcessLifetimeV1=5
+  llaminarNativeProcessLifetimeV1=5, llaminarNativeContextGenerationLifetimeV1=6
 };
 /** @brief Explicit allocator semantics whose extent is known before Create. */
 enum llaminarNativeAllocatorV1 {

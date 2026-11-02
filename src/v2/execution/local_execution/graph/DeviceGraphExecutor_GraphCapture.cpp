@@ -17,10 +17,13 @@
  */
 
 #include "DeviceGraphExecutor.h"
+#include "../../../backends/ReadAheadNativeResourceFamily.h"
+#include "../../../backends/NativeContextPreparation.h"
 #include "DeviceGraphCaptureController.h"
 #include "GraphCaptureGuard.h"
 #include "GraphCaptureStageActivity.h"
 #include "RetainedParentTicketServiceWorker.h"
+#include "RetainedHostServiceProgram.h"
 #include "RetainedParentPerfEvidence.h"
 #include "../coherence/CoherencePolicy.h"
 #include "../../../tensors/TensorClasses.h"
@@ -143,20 +146,10 @@ namespace llaminar2
     {
         if (!retained_parent_ticket_service_worker_)
         {
-            try
-            {
-                retained_parent_ticket_service_worker_ =
-                    std::make_unique<RetainedParentTicketServiceWorker>();
-            }
-            catch (const std::exception &error)
-            {
-                LOG_ERROR(
-                    "[DeviceGraphExecutor] Could not create the retained-parent ticket-service worker: "
-                    << error.what());
-                return false;
-            }
+            LOG_ERROR("[DeviceGraphExecutor] Missing original pre-quota declared/admitted executor-ticket worker");
+            return false;
         }
-        if (!retained_parent_ticket_service_worker_->idle())
+        if (!retained_parent_ticket_service_worker_->worker().idle())
         {
             LOG_ERROR(
                 "[DeviceGraphExecutor] Retained-parent ticket-service worker is not idle before transaction admission");
@@ -218,7 +211,7 @@ namespace llaminar2
         RetainedParentTicketServiceWorker::Ticket service_ticket;
         try
         {
-            service_ticket = retained_parent_ticket_service_worker_->dispatch(
+            service_ticket = retained_parent_ticket_service_worker_->worker().dispatch(
                 [](void *opaque) -> bool
                 {
                     auto &job = *static_cast<Invocation *>(opaque);
@@ -277,7 +270,7 @@ namespace llaminar2
         try
         {
             service_ok =
-                retained_parent_ticket_service_worker_->await(service_ticket);
+                retained_parent_ticket_service_worker_->worker().await(service_ticket);
         }
         catch (const std::exception &error)
         {
@@ -426,7 +419,8 @@ namespace llaminar2
             }
             return DeviceLoopGraphTemplateView{.capture = retained_parent_capture.get(),
                 .stream = capture_stream, .stage_count = execution_order.size(),
-                .captured_node_count = retained_parent_capture->nodeCount(),.storage_boundary=graph.retainedStorageBoundary()};
+                .captured_node_count = retained_parent_capture->nodeCount(),.storage_boundary=graph.retainedStorageBoundary(),
+                .read_ahead_resources=graph.readAheadBranch()?graph.readAheadBranch()->resources:nullptr};
         }
         if (segments.size() != 1)
         {
@@ -476,6 +470,7 @@ namespace llaminar2
             .stage_count = segment.stage_names.size(),
             .captured_node_count = segment.capture->nodeCount(),
             .storage_boundary=graph.retainedStorageBoundary(),
+            .read_ahead_resources=graph.readAheadBranch()?graph.readAheadBranch()->resources:nullptr,
         };
     }
 
@@ -768,6 +763,7 @@ namespace llaminar2
          */
         bool bindGraphStagesForEagerExecution(ComputeGraph &graph, void *gpu_stream)
         {
+            if(graph.readAheadBranch())throw std::logic_error("Read-ahead cannot enter eager execution");
             bool has_gpu_stage = false;
 
             for (const auto &name : graph.getExecutionOrder())
@@ -1508,6 +1504,7 @@ namespace llaminar2
 
         const std::string capture_context =
             context ? context : "graph_capture_dependencies";
+        graph.requireReadAheadRecordingSealed(capture_stream);
         std::vector<GraphCaptureDependencyLedger::StagePlan> stage_plans;
         stage_plans.reserve(stage_names.size());
 
@@ -1575,6 +1572,7 @@ namespace llaminar2
             GraphCaptureDependencyLedger::StagePlan plan;
             plan.stage_identity = node->stage.get();
             plan.stage_name = stage_name;
+            plan.recording_stream = graph.executionStreamForNode(stage_name,capture_stream);
             const StageBufferContract contract = node->stage->bufferContract();
 
             std::unordered_map<const TensorBase *, size_t> internal_owners;
@@ -1640,14 +1638,49 @@ namespace llaminar2
             stage_plans.push_back(std::move(plan));
         }
 
+        IWorkerGPUContext *event_worker=nullptr;
+        if(const auto& declaration=graph.readAheadBranch())
+        {
+            const auto& branch=*declaration;
+            auto index=[&](const std::string& name) -> std::optional<size_t> {
+                for(size_t i=0;i<stage_names.size();++i)if(stage_names[i]==name)return i;
+                return std::nullopt;
+            };
+            const auto fork=index(branch.fork_node),producer=index(branch.producer_node),join=index(branch.join_node);
+            if(fork || producer || join)
+            {
+                if(!fork || !producer || !join)
+                    throw std::logic_error("Read-ahead fork/producer/planned join crosses an unsupported native unit");
+                if(stage_plans[*producer].recording_stream!=branch.resources->stream() ||
+                   stage_plans[*fork].recording_stream!=capture_stream ||
+                   stage_plans[*join].recording_stream!=capture_stream)
+                    throw std::logic_error("Read-ahead native unit does not bind the declared primary/side fork and join lanes");
+                stage_plans[*fork].completion_event=branch.resources->forkEvent();
+                stage_plans[*producer].wait_for_stage=*fork;
+                stage_plans[*producer].completion_event=branch.resources->joinEvent();
+                stage_plans[*join].wait_for_stage=*producer;
+                event_worker=&branch.resources->workerContext();
+            }
+            // Later PLE units import the original embedding as a typed retained
+            // parent input. Their existing native child edge follows this joined
+            // unit; no second gather, host readback or fabricated authority exists.
+        }
+
         try
         {
-            return std::make_unique<GraphCaptureDependencyLedger>(
+            auto ledger=std::make_unique<GraphCaptureDependencyLedger>(
                 capture_device,
                 capture_stream,
                 std::move(stage_plans),
                 capture_context,
-                external_input_authority);
+                external_input_authority,
+                nullptr,event_worker);
+            if(event_worker)
+                PerfStatsCollector::addCounter("forward_graph","read_ahead_dag_materializations",1.0,
+                    "graph_setup",capture_device.toString(),
+                    {{"side_lanes","1"},{"event_operations","4"},
+                     {"capture_identity",std::to_string(graph.readAheadCaptureIdentity())}});
+            return ledger;
         }
         catch (const std::exception &e)
         {
@@ -1662,9 +1695,17 @@ namespace llaminar2
         IDeviceContext *ctx,
         IGPUGraphCapture *capture,
         GraphCaptureRecordPurpose purpose,
-        const char *context)
+        const char *context,
+        IWorkerGPUContext *setup_worker)
     {
         graph.requireExecutable();
+        const bool setup_only = purpose == GraphCaptureRecordPurpose::SetupOnly;
+        const bool retained = purpose != GraphCaptureRecordPurpose::ImmediateReplay;
+        if (setup_only && (!setup_worker || !setup_worker->ownsCurrentThread()))
+            throw std::logic_error("Setup recording requires the exact original worker thread");
+        const auto input_authority = setup_only
+            ? GraphCaptureDependencyLedger::ExternalInputAuthority::BindDeclaredAddressesOnly
+            : GraphCaptureDependencyLedger::ExternalInputAuthority::RequireReadyBytes;
         const char *const capture_context =
             context && context[0] != '\0'
                 ? context
@@ -1691,7 +1732,7 @@ namespace llaminar2
                                                 << " capture owner has no explicit execution stream");
             return false;
         }
-        if (purpose == GraphCaptureRecordPurpose::RetainedComposition &&
+        if (retained &&
             (capture->hasExecutable() || capture->nodeCount() != 0u))
         {
             LOG_ERROR("[DeviceGraphExecutor] " << capture_context
@@ -1708,7 +1749,9 @@ namespace llaminar2
         }
 
         /*
-         * A retained child is a complete participant-local compute unit. Device
+         * A retained child is a complete participant-local native unit. A bound
+         * captured-transfer endpoint remains a collective, but performs no
+         * hidden host/rank coordination. Runtime collectives stay outside. Device
          * selection belongs to topology planning, so this recorder accepts any
          * GPU backend but requires every node and stage to agree with the exact
          * selected context. Cross-participant synchronization belongs to the
@@ -1741,7 +1784,7 @@ namespace llaminar2
                                                     << "' rejects selected backend");
                 return false;
             }
-            if (node->stage->isCollectiveStage() ||
+            if ((node->stage->isCollectiveStage() && !node->stage->isParticipantLocalCapturedTransfer()) ||
                 node->stage->isManualGraphBoundary())
             {
                 LOG_ERROR("[DeviceGraphExecutor] " << capture_context
@@ -1749,7 +1792,7 @@ namespace llaminar2
                                                     << "' crosses the participant-local capture boundary");
                 return false;
             }
-            if (purpose == GraphCaptureRecordPurpose::RetainedComposition &&
+            if (retained &&
                 node->graph_capture_wave.has_value())
             {
                 LOG_ERROR("[DeviceGraphExecutor] " << capture_context
@@ -1767,11 +1810,13 @@ namespace llaminar2
             }
         }
 
+        graph.planReadAheadRecordingStream(capture->executionStream());
+
         // Assign the exact capture stream before metadata preparation. Stages
         // may create immutable pointer tables here, never during native capture.
         for (const auto &name : order)
         {
-            graph.getNode(name)->stage->setGPUStream(gpu_stream);
+            graph.getNode(name)->stage->setGPUStream(graph.executionStreamForNode(name,gpu_stream));
         }
 
         /*
@@ -1795,7 +1840,7 @@ namespace llaminar2
             {
                 continue;
             }
-            if (!node->stage->prepareGraphLaunch(ctx, gpu_stream))
+            if (!node->stage->prepareGraphLaunch(ctx, node->stage->gpuStream()))
             {
                 LOG_ERROR("[DeviceGraphExecutor] " << capture_context
                                                     << " launch preparation failed for stage '"
@@ -1823,7 +1868,7 @@ namespace llaminar2
                                                     << readiness);
                 return false;
             }
-            if (purpose == GraphCaptureRecordPurpose::RetainedComposition &&
+            if (retained &&
                 stage->graphLaunchPreparationPolicy() ==
                     GraphLaunchPreparationPolicy::CaptureAndReplay)
             {
@@ -1839,19 +1884,26 @@ namespace llaminar2
          * recording starts, every dependency must be internal to this child.
          */
         if (!prepareGraphStorageForCapture(
-                graph, ctx, gpu_stream, capture_context))
+                graph, ctx, gpu_stream, capture_context, input_authority))
         {
             LOG_ERROR("[DeviceGraphExecutor] " << capture_context
                                                 << " storage preflight failed");
             return false;
         }
 
+        // Descriptor/storage admission is cold. The stage executor records each
+        // immutable copy on its producer lane before completing the event edge.
+        if (graph.readAheadBranch() &&
+            !prepareSnapshotsForGraphCapture(graph,ctx,gpu_stream,capture_context))
+            return false;
+        graph.sealReadAheadRecordingStream(capture->executionStream());
         auto dependency_ledger = planGraphCaptureDependencies(
             graph,
             std::span<const std::string>(order.data(), order.size()),
             ctx->deviceId(),
             gpu_stream,
-            capture_context);
+            capture_context,
+            {}, input_authority);
         if (!dependency_ledger)
         {
             LOG_ERROR("[DeviceGraphExecutor] " << capture_context
@@ -1873,10 +1925,16 @@ namespace llaminar2
             ctx,
             gpu_stream,
             capture_context);
+        // Construct the same nonmovable guard directly; only setup owns a
+        // worker software-capture flag. Prvalue construction adds no heap owner.
         ScopedBackendGraphCapture capture_transaction(
-            *capture,
-            capture_context,
-            dependency_ledger.get());
+            [&]() -> ScopedBackendGraphCapture {
+                if (setup_only)
+                    return ScopedBackendGraphCapture(*setup_worker, *capture,
+                        capture_context, dependency_ledger.get());
+                return ScopedBackendGraphCapture(*capture, capture_context,
+                    dependency_ledger.get());
+            }());
         if (!stage_capture_activity.begin())
         {
             LOG_ERROR("[DeviceGraphExecutor] " << capture_context
@@ -1894,7 +1952,8 @@ namespace llaminar2
 
         DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
         bool exec_success = true;
-        const StageRunPolicy capture_policy = StageRunPolicy::capturePhase();
+        const StageRunPolicy capture_policy = setup_only
+            ? StageRunPolicy::setupGraphMaterialization() : StageRunPolicy::capturePhase();
         for (const auto &name : order)
         {
             auto *node = graph.getNode(name);
@@ -1909,7 +1968,7 @@ namespace llaminar2
                 exec_success = false;
                 break;
             }
-            graph.markCompleted(name);
+            if (!setup_only) graph.markCompleted(name);
         }
 
         // End capture unconditionally before inspecting failure or graph state.
@@ -1959,6 +2018,18 @@ namespace llaminar2
             capture,
             GraphCaptureRecordPurpose::RetainedComposition,
             context);
+    }
+
+    bool DeviceGraphExecutor::captureSetupGraphFragment(
+        ComputeGraph &graph, IDeviceContext *ctx, IGPUGraphCapture *capture,
+        const PreparedGPUContextUsePermit &original, const char *context)
+    {
+        original.requireWorker(original.worker());
+        if (!ctx || ctx->deviceId() != original.device() || !capture ||
+            reinterpret_cast<std::uintptr_t>(capture->executionStream()) <= 2u)
+            throw std::invalid_argument("Setup recording requires its original device and exact capture stream");
+        return recordGraphCaptureBody(graph, ctx, capture,
+            GraphCaptureRecordPurpose::SetupOnly, context, original.worker().get());
     }
 
     bool DeviceGraphExecutor::executeWithGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
@@ -2234,6 +2305,61 @@ namespace llaminar2
     // Cached GPU Graph Replay
     // =========================================================================
 
+    void DeviceGraphExecutor::bindRetainedParticipantPreparationStream(
+        ComputeGraph& graph,GraphSegmentCache& cache,IWorkerGPUContext* worker){
+        const auto source=graph.retainedParticipantSourcePlan();
+        if(!source)return;
+        const auto& original=source->originalSource();
+        if(!worker)throw std::invalid_argument("Original source preparation is missing its worker");
+        const auto original_worker=original.worker();
+        if(original_worker.get()!=worker)
+            throw std::invalid_argument("Original source preparation worker differs from its admitted source");
+        if(!cache.capture_stream || reinterpret_cast<std::uintptr_t>(cache.capture_stream)<=2)
+            throw std::invalid_argument("Original source preparation requires its exact non-default cache stream");
+        original.requireWorker(original_worker);
+        const auto bind_on_original_worker=[&]{
+            if(!worker->ownsCurrentThread())
+                throw std::logic_error("Original source preparation dispatch did not enter its actual worker");
+            if(!cache.participant_preparation_stream)
+                cache.participant_preparation_stream.reset(new RetainedGraphParticipantPreparationStream(original,cache.capture_stream));
+            cache.participant_preparation_stream->requireLive(original);
+            if(cache.participant_preparation_stream->stream()!=cache.capture_stream)
+                throw std::logic_error("Original source cache replaced its preparation stream without retirement");
+            source->authenticatePreparationStream(cache.participant_preparation_stream);
+        };
+        // executeWithCachedGraphReplay is also entered from the control thread.
+        // Native stream creation already marshals to this worker; this cold
+        // capability publication must use the SAME authority before preparation.
+        // This call site is first-capture setup only, never steady replay.
+        if(worker->ownsCurrentThread())bind_on_original_worker();
+        else worker->submitAndWait(bind_on_original_worker);
+    }
+
+    void DeviceGraphExecutor::authenticateRetainedParticipantRecordingOwner(
+        ComputeGraph& graph,GraphSegmentCache& cache,IWorkerGPUContext* worker){
+        const auto source=graph.retainedParticipantSourcePlan();
+        if(!source)return;
+        const auto& original=source->originalSource();
+        const auto original_worker=original.worker();
+        if(!worker || original_worker.get()!=worker)
+            throw std::invalid_argument("Original source recording authentication requires its admitted worker");
+        if(!cache.retained_parent_capture || !cache.retained_parent_capture->hasExecutable() ||
+           !cache.capture_stream || reinterpret_cast<std::uintptr_t>(cache.capture_stream)<=2 ||
+           cache.retained_parent_capture->executionStream()!=cache.capture_stream)
+            throw std::invalid_argument("Original source recording authentication requires its exact native cache capture stream");
+        original.requireWorker(original_worker);
+        const auto authenticate_on_original_worker=[&]{
+            if(!worker->ownsCurrentThread())
+                throw std::logic_error("Original source recording authentication dispatch did not enter its actual worker");
+            source->authenticateRecordingOwner(*cache.retained_parent_capture);
+        };
+        // Parent sealing is cold control-thread bookkeeping. Authenticate the
+        // existing native definition on its original worker without launching,
+        // joining GPU work or substituting the parent submission stream.
+        if(worker->ownsCurrentThread())authenticate_on_original_worker();
+        else worker->submitAndWait(authenticate_on_original_worker);
+    }
+
     bool DeviceGraphExecutor::executeWithCachedGraphReplay(ComputeGraph &graph, IDeviceContext *ctx,
                                                                GraphSegmentCache &segment_cache,
                                                                void *gpu_stream,
@@ -2261,6 +2387,31 @@ namespace llaminar2
             return false;
         }
 
+        if(const auto& bound=segment_cache.participant_source_binding){
+            const auto original=graph.retainedParticipantSourcePlan();
+            if(!original || original->captureIdentity()!=bound->plan_identity ||
+               bound->seal.identity().graph!=&graph ||
+               bound->seal.identity().topology_generation!=graph.topologyGeneration())
+                throw std::logic_error("Recurring source identity changed after its original transaction was sealed");
+        }
+        if(graph.retainedParticipantSourcePlan() && force_recapture)
+            throw std::invalid_argument("Recurring source topology cannot be recaptured");
+        if(graph.retainedParticipantSourcePlan() && !segment_cache.initialized &&
+           initial_submission!=GraphInitialSubmissionPolicy::MaterializeWithoutLaunch){
+            // Cold construction publishes no arithmetic. First instantiate the
+            // exact original parent, then submit transaction zero through the
+            // same sealed enqueue path used by every later invocation.
+            if(!executeWithCachedGraphReplay(graph,ctx,segment_cache,gpu_stream,gpu_ctx,
+                collective_nodes,collectives_graph_capturable,false,defer_final_sync,
+                capture_boundary,plan_policy,launch_dependency,event_published_outputs,
+                retained_parent_composer,GraphInitialSubmissionPolicy::MaterializeWithoutLaunch,
+                auxiliary_branch_factory))return false;
+            return executeWithCachedGraphReplay(graph,ctx,segment_cache,gpu_stream,gpu_ctx,
+                collective_nodes,collectives_graph_capturable,false,defer_final_sync,
+                capture_boundary,plan_policy,launch_dependency,event_published_outputs,
+                retained_parent_composer,initial_submission,auxiliary_branch_factory);
+        }
+
         const bool has_collective_nodes = (collective_nodes && !collective_nodes->empty());
         const bool retained_parent_requested =
             isRetainedParentPlanPolicy(plan_policy);
@@ -2272,6 +2423,16 @@ namespace llaminar2
         const bool materialize_without_launch =
             initial_submission ==
             GraphInitialSubmissionPolicy::MaterializeWithoutLaunch;
+
+        if(const auto& branch=graph.readAheadBranch())
+        {
+            if(&branch->resources->workerContext()!=gpu_ctx)
+                throw std::logic_error("Read-ahead capture uses a different original worker/context owner");
+            graph.planReadAheadRecordingStream(segment_cache.capture_stream);
+            if(branch->resources->device()!=ctx->deviceId() || has_collective_nodes ||
+                (plan_policy!=GraphReplayPlanPolicy::RequireFullGraph && !isRetainedParentPlanPolicy(plan_policy)) || force_recapture)
+                throw std::logic_error("Resident read-ahead requires one unchanged participant-local retained native parent; unsupported segmentation/TP/PP/MTP/recapture is fatal");
+        }
 
         if(const auto &storage=graph.retainedStorageBoundary())
         {
@@ -2480,6 +2641,13 @@ namespace llaminar2
             return true;
         };
 
+        // Remote participants accompany the original full transaction; an eager
+        // first enqueue would escape its typed source/participant ownership scope.
+        if(graph.retainedParticipantSourcePlan() &&
+           (!retained_parent_requested ||
+            (!segment_cache.initialized && initial_submission!=GraphInitialSubmissionPolicy::MaterializeWithoutLaunch)))
+            throw std::invalid_argument("Recurring remote lookup requires its original materialized complete hosted transaction");
+
         auto seal_retained_parent_plan = [&]() -> bool
         {
             if (!retained_parent_requested)
@@ -2608,6 +2776,20 @@ namespace llaminar2
                 return false;
             }
 
+            if(const auto source_plan=graph.retainedParticipantSourcePlan()){
+                authenticateRetainedParticipantRecordingOwner(graph,segment_cache,gpu_ctx);
+                RetainedGraphParticipantSourceSeal source_seal(RetainedGraphParticipantSourceIdentity{
+                    .graph=&graph,.arena=arena_,.device=ctx->deviceId(),
+                    .recording_stream=segment_cache.capture_stream,
+                    .topology_generation=graph.topologyGeneration(),
+                    .capture_variant_signature=segment_cache.capture_variant_signature,
+                    .capture_generation=segment_cache.evidence_family,
+                    .original_parent=segment_cache.retained_parent_capture.get()});
+                auto invocation=source_plan->bindOriginalSource(source_seal);
+                segment_cache.participant_source_binding=std::make_shared<GraphSegmentCache::ParticipantSourceBinding>(
+                    GraphSegmentCache::ParticipantSourceBinding{std::move(source_seal),std::move(invocation),source_plan->captureIdentity()});
+            }
+
             PerfStatsCollector::addCounter(
                 "forward_graph",
                 "retained_parent_executable_nodes",
@@ -2665,6 +2847,8 @@ namespace llaminar2
             const bool snapshot_topology_changed =
                 retained_parent_plan.snapshot_configuration_epoch !=
                     graph_snapshot_configuration_identity;
+            if(graph.retainedParticipantSourcePlan() && stage_variant_changed)
+                throw std::logic_error("Recurring source launch topology changed after sealing");
             if (stage_variant_changed || diagnostic_recapture ||
                 snapshot_topology_changed)
             {
@@ -2759,6 +2943,14 @@ namespace llaminar2
                 {
                     return false;
                 }
+                std::optional<RetainedGraphParticipantSubmission> participant_submission;
+                if(const auto source_plan=graph.retainedParticipantSourcePlan()){
+                    const auto& bound=segment_cache.participant_source_binding;
+                    if(!bound || bound->plan_identity!=source_plan->captureIdentity())
+                        throw std::logic_error("Original remote source plan changed after transaction sealing");
+                    bound->invocation->requireCurrent(bound->seal);
+                    participant_submission.emplace(bound->invocation->enqueueOriginalParticipants());
+                }
                 const bool parent_submission_ok =
                     service_segments.empty()
                         ? segment_cache.retained_parent_capture->launch()
@@ -2776,6 +2968,7 @@ namespace llaminar2
                         "[DeviceGraphExecutor] Retained parent executable launch failed");
                     return false;
                 }
+                if(participant_submission)participant_submission->completeOriginalEnqueue();
                 for (const auto &write : retained_parent_plan.arena_writes)
                 {
                     if (!arena_)
@@ -2946,9 +3139,9 @@ namespace llaminar2
                     ctx->activateDevice();
                     device_activated_for_preparation = true;
                 }
-                stage->setGPUStream(segment_cache.capture_stream);
+                stage->setGPUStream(graph.executionStreamForNode(graph.getExecutionOrder()[index],segment_cache.capture_stream));
                 if (!stage->prepareGraphLaunch(
-                        ctx, segment_cache.capture_stream))
+                        ctx, stage->gpuStream()))
                 {
                     LOG_ERROR(
                         "[DeviceGraphExecutor] Retained full-graph replay metadata preparation failed");
@@ -3017,6 +3210,7 @@ namespace llaminar2
                     graph_snapshot_configuration_identity);
             if (!pristine_identity_adopted)
             {
+                if(graph.readAheadBranch())throw std::logic_error("Read-ahead snapshot topology changed after materialization");
                 /*
                  * A non-pristine cache may own native graph resources or
                  * snapshot destinations.  Retire those resources behind their
@@ -3045,6 +3239,7 @@ namespace llaminar2
         if (segment_cache.initialized &&
             segment_cache.capture_variant_signature != current_variant_signature)
         {
+            if(graph.readAheadBranch())throw std::logic_error("Read-ahead capture identity changed; stale native replay is fatal");
             LOG_DEBUG("[DeviceGraphExecutor] GPU graph launch-topology variant changed from "
                       << segment_cache.capture_variant_signature << " to "
                       << current_variant_signature << "; recapturing");
@@ -3118,9 +3313,23 @@ namespace llaminar2
                 arena_->markWrittenFlagsOnly(id, device);
         };
 
+        // One source-derived boundary selects both policy and callback owner.
+        const auto snapshot_boundary_for_node = [&](const ComputeNode& node)
+        {
+            return graph.readAheadBranch() && node.name==graph.readAheadBranch()->producer_node
+                ? SnapshotPublicationBoundary::NativeEventClosedProducer
+                : SnapshotPublicationBoundary::ControllerStage;
+        };
+
         auto record_graph_snapshot_copies = [&](ComputeNode &node, void *producer_stream) -> bool
         {
-            if (!config_.snapshot_callback || !node.stage)
+            // A side-lane producer must publish its immutable copy before the
+            // stage completion records join. runStage owns that exact copy;
+            // the controller must neither duplicate it nor use the main lane.
+            if (snapshotRecordingAuthorityForBoundary(
+                    StageSnapshotRecordingAuthority::GraphCaptureController,
+                    snapshot_boundary_for_node(node))!=StageSnapshotRecordingAuthority::GraphCaptureController ||
+                !config_.snapshot_callback || !node.stage)
                 return true;
 
             DeviceId snapshot_device = node.device.is_valid() ? node.device : node.stage->device();
@@ -3155,11 +3364,21 @@ namespace llaminar2
             return node.stage && node.stage->isCollectiveStage();
         };
 
+        // Only the side producer changes ownership: its copy must be inside
+        // the exact runStage completion scope. Later manual/ticket stages retain
+        // their original controller owner and original manifest.
+        const auto snapshot_policy_for_node = [&](const ComputeNode& node,StageRunPolicy policy)
+        {
+            policy.snapshot_recording_authority=snapshotRecordingAuthorityForBoundary(
+                policy.snapshot_recording_authority,
+                snapshot_boundary_for_node(node));
+            return policy;
+        };
+
         StageRunPolicy manual_replay_policy =
             StageRunPolicy::capturePhase();
         manual_replay_policy.snapshot_recording_authority =
-            StageRunPolicy::SnapshotRecordingAuthority::
-                GraphCaptureController;
+            StageRunPolicy::SnapshotRecordingAuthority::GraphCaptureController;
 
         // ===== FAST PATH: Phase 3 (Replay) =====
         // During steady-state replay, only the post_launch hook is invoked
@@ -3204,7 +3423,7 @@ namespace llaminar2
                     return runStage(
                         node,
                         ctx,
-                        manual_replay_policy,
+                        snapshot_policy_for_node(node,manual_replay_policy),
                         is_collective_node(node),
                         &segment_cache.snapshot_manifest);
                 },
@@ -3422,8 +3641,7 @@ namespace llaminar2
                 ? StageRunPolicy::setupGraphMaterialization()
                 : StageRunPolicy::capturePhase();
         capture_phase_policy.snapshot_recording_authority =
-            StageRunPolicy::SnapshotRecordingAuthority::
-                GraphCaptureController;
+            StageRunPolicy::SnapshotRecordingAuthority::GraphCaptureController;
 
         DeviceGraphCaptureController::ReplayHooks replay_hooks{
             .prebind_storage = prebind_segment_storage,
@@ -3445,7 +3663,7 @@ namespace llaminar2
                 return runStage(
                     node,
                     ctx,
-                    capture_phase_policy,
+                    snapshot_policy_for_node(node,capture_phase_policy),
                     is_collective_node(node),
                     &segment_cache.snapshot_manifest);
             },
@@ -3486,7 +3704,7 @@ namespace llaminar2
                 return runStage(
                     node,
                     ctx,
-                    capture_phase_policy,
+                    snapshot_policy_for_node(node,capture_phase_policy),
                     is_collective_node(node),
                     &segment_cache.snapshot_manifest);
             },
@@ -3606,6 +3824,7 @@ namespace llaminar2
                 return false;
             }
             void *capture_stream = segment_cache.capture_stream;
+            bindRetainedParticipantPreparationStream(graph,segment_cache,gpu_ctx);
 
             if (!DeviceGraphCaptureController::prepareReplayGpuTiming(
                     segment_cache,

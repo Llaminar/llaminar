@@ -52,6 +52,7 @@
 #include "../../factory/TestableInferenceRunnerOverrides.h"
 
 #include "IRankOrchestrator.h"
+#include <exception>
 #include "TPWorkerPool.h"
 #include "../../../backends/GlobalDeviceAddress.h"
 #include "../../../config/OrchestrationConfig.h"
@@ -74,6 +75,8 @@
 #include <string>
 
 // Forward declaration for fromPlan() factory method
+namespace llaminar2::test { struct RankRetainedStorageRetirementReplayAccess; }
+
 namespace llaminar2
 {
     class ResolvedImmutableRowTablePlacement;
@@ -289,7 +292,9 @@ namespace llaminar2
             /// Prefix-state cache feature gates and storage limits.
             PrefixCacheRuntimeConfig prefix_cache;
             ImmutableRowTablePolicy ngram_table_policy; ///< Rank-owned native PLE storage policy.
+            ImmutableLookupSchedule ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled; ///< Original planned phase policy.
             std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement; ///< Exact PMA-selected rank placement.
+            std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services; ///< SAME pre-quota rank declaration retained by every TP/PP child.
 
             /// Multi-token prediction feature gates and verification mode.
             MTPRuntimeConfig mtp;
@@ -1717,6 +1722,30 @@ namespace llaminar2
         void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
 
     private:
+        /** @brief Original source invocation retained across all TP participant launches and terminal closes. */
+        friend struct test::RankRetainedStorageRetirementReplayAccess;
+        /**
+         * @brief Retire every original participant and its group, preserving the first failure.
+         * @param participants Original participant owners, in authored order.
+         * @param retire Terminal-only operation on one original owner; it must retain native failure guards.
+         * @param finish Final original group retirement, attempted even when a participant fails.
+         * @throws The first original exception after every remaining retirement has been attempted.
+         * @note This does not authorize data clearing after missing native completion proof.
+         */
+        template<class Participants,class Retire,class Finish>
+        static void retireOriginalStorageParticipants(const Participants& participants,Retire retire,Finish finish) {
+            std::exception_ptr first;
+            for(const auto& participant:participants){
+                try{retire(participant);}catch(...){if(!first)first=std::current_exception();}
+            }
+            try{finish();}catch(...){if(!first)first=std::current_exception();}
+            if(first)std::rethrow_exception(first);
+        }
+        struct RetainedSourceAdmission;
+        std::unique_ptr<RetainedSourceAdmission> retained_source_admission_;
+        /** @brief Arm every original source channel before any TP participant can launch. */
+        void prepareRetainedSourceAdmission();
+
         /** @return The sole TP publication root; PP stages retain independent namespaces. */
         const IInferenceRunner *moeOptimizationOwner() const;
         /**

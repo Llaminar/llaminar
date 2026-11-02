@@ -30,6 +30,7 @@
 
 #pragma once
 #include "execution/mtp/OrdinaryForwardRetention.h"
+#include "backends/ReadAheadNativeResourceFamily.h"
 #include "../graph/RetainedStorageTerminalCapture.h"
 #include "../graph/RetainedStoragePerfStats.h"
 #include "execution/mtp/MTPMainForwardPolicy.h"
@@ -679,6 +680,17 @@ namespace llaminar2
         // existing event handoff; it never owns a second sampler/controller.
         friend class PipelineDeviceGeneration;
     public:
+        /** @brief Project only original declarative storage owner and host request epoch for complete TP source admission. */
+        std::pair<std::shared_ptr<IRetainedGraphStorageBoundary>,std::uint64_t> retainedStorageSourceAdmission() const;
+        /** @brief Join original prior producers and publish this grouped channel's reset close before any TP peer awaits. */
+        void prepareGroupedRetainedStorageReset(const InferenceStateResetRequest& request);
+        /** @brief Complete this original native result bridge, deferring only the shared CPU service await to its TP parent. */
+        bool finishGroupedDeviceResidentGeneration(DeviceGenerationTerminalResult* result);
+        /** @brief Consume this adopted channel only after all TP native terminal bridges have completed. */
+        void awaitGroupedRetainedStorageTerminal();
+
+
+
         /**
          * @brief Authenticate this materialized fixed-head producer against its actual Rank peer.
          * @param canonical First actual participant of the same Rank-owned cohort.
@@ -7750,6 +7762,14 @@ namespace llaminar2
          */
         bool publishCPUAcceptedVerifierLogits(const PrefixLogitsRowSelection &selection);
 
+        /**
+         * @brief Publish the canonical GPU row after its actual parent/selector producer.
+         * @param stream Exact producer or terminal-result stream already joined to it.
+         * @param producer_name Diagnostic label for the original publication.
+         * @return Whether the arena event and current-main identity were published.
+         */
+        bool publishCanonicalMTPMainLogits(void *stream, const char *producer_name);
+
         /** Invalidate tensor identity at a request or restore boundary. */
         void clearCurrentMainLogitsPublication(const char *reason) noexcept;
 
@@ -7955,6 +7975,14 @@ namespace llaminar2
             HiddenStateRowsSelectStage *stage = nullptr;
             TensorBase *input = nullptr;
             TensorBase *output = nullptr;
+            TensorBase *logits_input = nullptr; ///< Original admitted verifier root, never a transient view.
+            TensorBase *logits_output = nullptr; ///< Original canonical full/local destination.
+            void *logits_input_device = nullptr; ///< Captured allocation identity.
+            void *logits_output_device = nullptr; ///< Captured allocation identity.
+            int logits_columns = 0; ///< Live owned vocabulary, excluding padding.
+            int logits_source_rows = 0; ///< Exact retained verifier row capacity.
+            int logits_source_stride = 0; ///< Physical source row stride.
+            int logits_destination_stride = 0; ///< Physical destination row stride.
             DeviceId device = DeviceId::invalid();
             uint64_t workspace_generation = 0;
             int seq_capacity = 0;
@@ -7986,6 +8014,19 @@ namespace llaminar2
              * metadata.  It may keep topology within a request, but clear_cache()
              * and allocator-generation changes must invalidate the cache outright.
              */
+            /** @return Whether both captured raw-logit allocations and physical strides remain unchanged. */
+            [[nodiscard]] bool logitsBindingsCurrent() const noexcept
+            {
+                return logits_input && logits_output && logits_columns > 0 &&
+                    logits_input->gpu_data_ptr() == logits_input_device &&
+                    logits_output->gpu_data_ptr() == logits_output_device &&
+                    logits_input->rows() == logits_source_rows &&
+                    logits_input->cols() == logits_source_stride &&
+                    logits_output->cols() == logits_destination_stride &&
+                    logits_source_stride >= logits_columns && logits_destination_stride >= logits_columns &&
+                    logits_output->rows() >= 1;
+            }
+
             void resetSessionState()
             {
                 if (!graph)
@@ -8008,6 +8049,11 @@ namespace llaminar2
                 stage = nullptr;
                 input = nullptr;
                 output = nullptr;
+                logits_input = nullptr;
+                logits_output = nullptr;
+                logits_input_device = nullptr;
+                logits_output_device = nullptr;
+                logits_columns = logits_source_rows = logits_source_stride = logits_destination_stride = 0;
                 device = DeviceId::invalid();
                 workspace_generation = 0;
                 seq_capacity = 0;
@@ -8449,6 +8495,10 @@ namespace llaminar2
             };
 
             std::shared_ptr<void> stream;
+            /** Original same-PMA lane/events shared only by serialized complete
+             * ordinary parents on this exact stream. Captures die first; the
+             * family strongly retains its original terminal event and worker. */
+            std::shared_ptr<ReadAheadNativeResourceFamily> read_ahead_resources;
             std::unique_ptr<IGPUGraphCapture> capture;
             /** Exact child capture, policy, and predicate identities in the executable. */
             std::vector<DeviceControlledLoopFragment> source_fragments;
@@ -8531,7 +8581,8 @@ namespace llaminar2
              */
             [[nodiscard]] bool retireCompletedLaunch() noexcept
             {
-                if (!valid || !launched)
+                if (!valid || !launched ||
+                    (read_ahead_resources && read_ahead_resources->hasOutstandingSubmission()))
                     return false;
                 launched = false;
                 return true;
@@ -8539,6 +8590,10 @@ namespace llaminar2
 
             void invalidateGraph() noexcept
             {
+                // A failed/cancelled host path is not proof that native readers
+                // retired. Preserve the original obligation or fail fatally.
+                if (read_ahead_resources && read_ahead_resources->hasOutstandingSubmission())
+                    std::terminate();
                 if (capture)
                     capture->reset();
                 for (auto &child : ordinary_children)
@@ -8573,6 +8628,7 @@ namespace llaminar2
                 hosted_advance.reset();
                 source_fragments.clear();
                 hosted_fragments.clear();
+                read_ahead_resources.reset();
             }
 
             void release() noexcept
@@ -11310,13 +11366,21 @@ namespace llaminar2
         bool submitRetainedStorageTerminal();
         /** @brief Retire generation parent, terminal source and its borrowed stream in that order. */
         void releaseRetainedStorageGenerationTopology() noexcept;
+        /** @brief Terminal-only split preserving all original producer joins before peer-wide CPU retirement. */
+        enum class RetainedStorageTerminalPhase { PublishAndAwait, PublishOnly };
+        /** @brief One original result-materialization body with an explicit complete-group terminal await boundary. */
+        bool finishDeviceResidentGenerationImpl(DeviceGenerationTerminalResult* result,RetainedStorageTerminalPhase phase);
+
         /** @brief Close an outstanding prefill/generation I/O interval before request-state mutation.
          * @param stream Exact reset stream after all prior producers have joined it.
+         * @param phase PublishOnly leaves the original channel await for its complete TP parent.
          * @details Reuses the exclusive request lifecycle's setup-owned terminal event.
          * Only an active interval records/waits a terminal event; an already joined
          * generation or repeated reset performs no close, wait or statistics publication.
          */
-        void retireRetainedStorageForRequestReset(void *stream);
+        void retireRetainedStorageForRequestReset(void *stream,
+            RetainedStorageTerminalPhase phase=RetainedStorageTerminalPhase::PublishAndAwait);
+        bool retained_storage_reset_close_prepared_=false; ///< Original reset-close event completed; channel await remains owed.
         /** @brief Join the declared I/O lane and publish only its fresh terminal counters. */
         void awaitRetainedStorageTerminal();
         /**
@@ -11761,19 +11825,16 @@ namespace llaminar2
             void *stream = nullptr);
 
         /**
-         * @brief Derive Phase-10 publication metadata from a resident verifier outcome.
+         * @brief Validate resident publication bindings and complete exact no-launch capture.
+         * @param request Original compact outcome and verifier geometry authority.
+         * @param error Receives the first binding or capture failure.
+         * @return True after the exact publication cache is ready for submission.
          *
-         * This helper is the device-side half of
-         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().  It does not
-         * mutate KV, positions, or terminal hidden state; instead it validates
-         * that @p request belongs to the last all-position verifier graph,
-         * snapshots the canonical pre-verifier cache count device-to-device
-         * into the runner metadata workspace, and asks the backend to derive
-         * accepted restore rows,
-         * target cache counts, accepted-state counts, and per-request validity
-         * flags on the verifier stream.  Later publication slices consume those
-         * workspace buffers directly, so no code should reconstruct these
-         * counts from host-copied stochastic metadata.
+         * This phase queues only existing producer dependencies and cold graph
+         * preparation. It never opens a logical-row replacement writer or
+         * invalidates its mailbox. The sole submission caller acquires that
+         * writer after all remaining fallible readiness/penalty prerequisites.
+         * Numerical state is produced only by the actual captured publication.
          */
         bool prepareDeviceResidentMTPSpecPublicationMetadata(
             const DeviceSpeculativePublicationRequest &request,
@@ -12130,6 +12191,14 @@ namespace llaminar2
          * @throws std::logic_error For a missing builder or divergent epoch owner.
          * @throws std::invalid_argument For an unsupported execution/domain pair. */
         OrdinaryForwardRetentionKind ordinaryForwardRetentionKind() const;
+
+        /** @brief Bind the existing whole-request parent to its original storage source.
+         * @param stream Actual retained controller stream, never a child recording stream.
+         * @param error Receives a precise ownership/domain failure.
+         * @return True for a valid binding or a source without remote participants.
+         * No event, stream or separate request lifetime is created. */
+        bool bindRetainedStorageSubmissionStream(const std::shared_ptr<void>& stream,
+                                                 std::string* error);
 
         /** @brief Prepare local ordinary generation, or only the tail's borrowed fragments.
          * Pipeline composition installs the complete collective-bearing parent.
@@ -12582,7 +12651,8 @@ namespace llaminar2
          */
         bool joinPriorDeviceWorkForRequestStateReset(
             void *reset_stream,
-            const char *consumer_name);
+            const char *consumer_name,
+            RetainedStorageTerminalPhase phase=RetainedStorageTerminalPhase::PublishAndAwait);
 
         /**
          * @brief Queue the first graph behind request-state reset completion.

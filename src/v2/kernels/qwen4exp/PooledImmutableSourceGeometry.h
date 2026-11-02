@@ -10,9 +10,12 @@
  * the canonical terminal row is written only after every physical owner retires.
  */
 #pragma once
+#include "backends/NativeOrderingEventProgram.h"
 #include "PooledImmutableNativePlan.h"
 #include "tensors/TensorType.h"
 #include "execution/qwen4exp/ImmutableLookupProtocol.h"
+#include <vector>
+#include <span>
 namespace llaminar2 {struct ImmutableRowTableSource;}
 namespace llaminar2::qwen4exp {
 /** @brief Exact private source packet banks; only acquired live prefixes are consumed. */
@@ -20,6 +23,7 @@ struct PooledSourceOffsets {
     std::size_t coordinates=0,responses=0,invalidations=0,fills=0,payload=0,frame_bytes=0;
     std::size_t protocol=0,frontier=64,record_bytes=128,payload_bytes=136,invocation=144,response_stage=152;
     std::size_t observation=192,observation_ordinal=264,reported_ordinal=272,native_bytes=320;
+    std::size_t progress=160,seal_receipt=0; ///< Serial acquired owner receipt, distinct from canonical source frontier.
     bool operator==(const PooledSourceOffsets&)const=default;
 };
 /** @brief Complete immutable source-native declarations; actual authority is retained by its service-issued binder. */
@@ -30,6 +34,7 @@ struct PooledSourceParameters {
     TensorType format;
     std::uint32_t row_elements;
     std::uint64_t identity;
+    std::uint32_t local_owner=adaptive_lookup::None,packet_capacity=0;
 };
 /** @brief Closed exact source/frame geometry independent of any host cache decision or mirrored GPU state. */
 class PooledImmutableSourceGeometry final {
@@ -42,8 +47,14 @@ public:
      * @return Checked typed geometry; the source-issued binder separately proves the actual source/channel/roots.
      * @throws std::exception For incompatible format/table/source/count/owner geometry or overflow.
      */
-    static PooledImmutableSourceGeometry fromPlans(const PooledImmutableOwnerNativePlan& owner,
+    static PooledImmutableSourceGeometry fromPlans(std::span<const PooledImmutableOwnerNativePlan> owners,
         const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source);
+    /** @brief One-owner spelling delegates to the same complete-cohort validation; never admits a partial cohort. */
+    static PooledImmutableSourceGeometry fromPlans(const PooledImmutableOwnerNativePlan& owner,
+        const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source)
+    {return fromPlans(std::span{&owner,1},coordinator,source);}
+    /** @return Original immutable ordered cohort; this is not an ownership/location registry. */
+    std::span<const PooledImmutableOwnerNativePlan> originalOwners()const noexcept{return owners_;}
     /** @return Complete frozen native operands, including source precision and exact physical offsets. */
     const PooledSourceParameters& parameters()const noexcept{return parameters_;}
     /** @return Original coordinator allocator that owns the source request/private response staging. */
@@ -59,27 +70,39 @@ public:
      * @brief Price the same exact source staging before the actual retained service identity exists.
      * @param physical Original complete independent owner/coordinator geometry.
      * @param coordinator Matching global policy and original-ID admission bound.
-     * @param coordinate Actual owner edge whose immutable packet capacity is declared.
      * @param source Original immutable source metadata; no payload is read or permission minted.
      * @param resource Exact original coordinator resource observed by the sole PMA.
      * @return Typed mandatory staging only; runtime service/native identities are authenticated later.
      */
     static PhysicalMemoryPlan mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& physical,
-        const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,const ImmutableRowTableSource& source,
+        const PooledImmutableCoordinatorGeometry& coordinator,const ImmutableRowTableSource& source,
         PhysicalMemoryResource resource);
     /** @return Exact identity-free physical source roots from the runtime factory's checked layout.
      * @param physical Original complete physical declaration. @param coordinator Matching coalescing policy.
-     * @param coordinate Actual owner delivery edge. @param source Original source metadata.
+     * @param source Original source metadata for the single complete-cohort source root.
      * @throws std::exception For incompatible source/owner declarations or byte overflow. */
     static PooledSourceOffsets rootOffsets(const PooledImmutablePhysicalOwnerGeometry& physical,
-        const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,const ImmutableRowTableSource& source);
+        const PooledImmutableCoordinatorGeometry& coordinator,const ImmutableRowTableSource& source);
+    /** @return Closed source setup plus its two original Tensor publication events. */
+    NativeOrderingEventProgram orderingProgram()const;
+    /**
+     * @brief Derive the same closed source program before native materialization.
+     * @param physical Original ordered physical owner geometry.
+     * @param coordinator Matching complete coalescing policy.
+     * @param source Original source metadata; no payload is read.
+     * @return Setup plus publication of the exact frame/native roots.
+     * @throws std::exception For incompatible source/cohort geometry.
+     */
+    static NativeOrderingEventProgram orderingProgram(const PooledImmutablePhysicalOwnerGeometry& physical,
+        const PooledImmutableCoordinatorGeometry& coordinator,const ImmutableRowTableSource& source);
     /** @return The existing protocol2 mapped-channel layout; hostBytes remains the existing service's authority. */
     ImmutableLookupLayout channelLayout()const;
 private:
     /** @brief Only the checked factory constructs source geometry. */
-    PooledImmutableSourceGeometry(PooledSourceParameters parameters,PhysicalMemoryAllocatorIdentity allocator)
-        :parameters_(parameters),allocator_(allocator){}
+    PooledImmutableSourceGeometry(PooledSourceParameters parameters,PhysicalMemoryAllocatorIdentity allocator,std::vector<PooledImmutableOwnerNativePlan> owners)
+        :parameters_(parameters),allocator_(allocator),owners_(std::move(owners)){}
     PooledSourceParameters parameters_;
     PhysicalMemoryAllocatorIdentity allocator_;
+    std::vector<PooledImmutableOwnerNativePlan> owners_;
 };
 }

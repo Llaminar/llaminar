@@ -64,6 +64,8 @@ public:
     const ImmutableRowTableLayoutGeometry &gpuAdaptiveLayout() const;
     /** @return Exact original GPU/CPU slot and byte ceilings and replacement policies. */
     const AdaptiveVRAMRAMSSDRequest &gpuAdaptiveRequest() const;
+    /** @brief Resolve the actual source worker label after authenticating consumer membership. */
+    DeviceId lookupIOConsumer(DeviceId requester) const;
     /** @return Exact original native row element count, not inferred from byte capacity. */
     std::uint64_t gpuAdaptiveRowElements() const;
     /** @return One shared original-ID envelope for GPU frame and subordinate source. */

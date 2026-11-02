@@ -80,6 +80,8 @@
 
 namespace llaminar2
 {
+    class RetainedHostServiceDeclarations;
+
     // Forward declarations to avoid pulling in full headers
     class DeviceGraphOrchestrator;
     class ITPContext;
@@ -148,7 +150,10 @@ namespace llaminar2
         /// Prefix-state cache feature gates and storage limits.
         PrefixCacheRuntimeConfig prefix_cache;
         ImmutableRowTablePolicy ngram_table_policy; ///< One rank-owned native PLE table policy.
+        ImmutableLookupSchedule ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled; ///< Same pre-admission phase policy.
         std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        /** Rank-local immutable pre-quota declarations only; never a live owner or wire pointer. */
+        std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
         std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> ngram_replicated_ple_cohort; ///< Borrowed actual Rank source/cohort declaration. ///< Exact PMA-selected rank placement.
 
         /// Multi-token prediction feature gates and verification mode.
@@ -351,7 +356,9 @@ namespace llaminar2
             config.moe_rebalance = runtime.moe_rebalance;
             config.prefix_cache = runtime.prefix_cache;
             config.ngram_table_policy = runtime.ngram_table_policy;
+            config.ngram_lookup_schedule = runtime.ngram_lookup_schedule;
             config.ngram_table_placement = runtime.ngram_table_placement;
+            config.retained_host_services = runtime.retained_host_services;
             config.mtp = runtime.mtp;
             return config;
         }

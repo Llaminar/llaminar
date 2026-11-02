@@ -512,6 +512,13 @@ namespace llaminar2::test::parity
         DynamicDepth,
     };
 
+    /** @brief Keep functional byte replay separate from reference-scored numerical acceptance. */
+    enum class MTPParityProofPurpose : std::uint8_t
+    {
+        ReferenceNumerics,
+        NativeExactReplay,
+    };
+
     /**
      * @brief Configuration for parity test thresholds
      *
@@ -1045,6 +1052,21 @@ namespace llaminar2::test::parity
     {
     public:
         /**
+         * @brief Encode the complete existing test identity into a bounded relative path.
+         * @param test_name Original suite/test/parameter identity, never a shortened configuration.
+         * @return Original sanitized component through 255 bytes, or its lossless chunk hierarchy.
+         *
+         * The reserved namespace cannot alias an ordinary short identity. Each
+         * chunk has a distinct prefix and the terminal leaf has another name,
+         * so one complete identity cannot become another identity's ancestor.
+         * Removing a cell's terminal directory therefore cannot delete siblings.
+         */
+        static std::filesystem::path testIdentityPath(std::string test_name)
+        {
+            return parity::artifactIdentityPath(std::move(test_name));
+        }
+
+        /**
          * @brief Return the canonical per-test results directory.
          *
          * The identity intentionally matches ParityTestBase exactly so a
@@ -1065,17 +1087,7 @@ namespace llaminar2::test::parity
                             "/" +
                             std::string(info->name() ? info->name() : "");
             }
-            for (char &character : test_name)
-            {
-                if (character == '/' || character == '\\' ||
-                    character == ':' || character == '*' ||
-                    character == '?' || character == '"' ||
-                    character == '<' || character == '>' ||
-                    character == '|')
-                {
-                    character = '_';
-                }
-            }
+            const auto test_path = testIdentityPath(std::move(test_name));
 
             // Aggregate campaigns own a fresh, report-addressable root. This
             // makes stale files unrepresentable while focused/manual tests
@@ -1090,7 +1102,7 @@ namespace llaminar2::test::parity
                         "LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT must be an "
                         "absolute path");
                 }
-                return explicit_root / test_name;
+                return explicit_root / test_path;
             }
 
 #ifdef LLAMINAR_PARITY_SOURCE_DIR
@@ -1115,7 +1127,7 @@ namespace llaminar2::test::parity
                 }
                 pclose(pipe);
             }
-            return parity_dir / "results" / hash / test_name;
+            return parity_dir / "results" / hash / test_path;
         }
 
         /**
@@ -4263,6 +4275,29 @@ namespace llaminar2::test::parity
             return {true, {}};
         }
 
+        /**
+         * @brief Authenticate the existing reference-header inventory for native snapshot admission.
+         * Native byte replay retains its declared inputs and native numerical
+         * oracle. The same-model pack supplies only authenticated metadata and
+         * NPY shapes to deriveParitySnapshotMemoryCapacity before initialization;
+         * no reference values or teacher token trajectory enter execution.
+         * Missing or incompatible packs fail here without implicit generation.
+         */
+        void prepareNativeExactSnapshotGeometryMetadata()
+        {
+            resolveSnapshotDirIfNeeded();
+            const auto metadata = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
+            const auto validation = validateReferenceSnapshotMetadata(metadata, true);
+            ASSERT_TRUE(validation.usable)
+                << "Native exact snapshot-header geometry is unavailable or incompatible: "
+                << validation.reason;
+            const auto tokens = readSnapshotTokenIdentity(metadata, "token_ids");
+            ASSERT_TRUE(tokens.has_value());
+            const std::vector<int> declared(tokens->first.begin(), tokens->first.end());
+            ASSERT_EQ(declared, config_.token_ids)
+                << "Native exact snapshot-header geometry must match the original declared prompt IDs";
+        }
+
         const std::chrono::steady_clock::time_point parity_fixture_started_at_ =
             std::chrono::steady_clock::now();
         bool production_parity_campaign_active_ = false;
@@ -4279,6 +4314,8 @@ namespace llaminar2::test::parity
         /** One owned native row bank; never a pointer into reusable snapshots. */
         std::map<std::string, std::vector<float>> production_parity_native_serial_rows_;
         /** The exact input boundary selecting that bank, not an epoch heuristic. */
+        /** Exact integer checkpoints share the same serial boundary without floating conversion. */
+        std::map<std::string, std::vector<std::int64_t>> production_parity_native_serial_integer_rows_;
         std::optional<ProductionParityMTPSerialOracleBoundary> production_parity_native_serial_boundary_;
         std::vector<PrefixRestoreEvidence>
             production_parity_prefix_restore_evidence_;
@@ -4903,6 +4940,14 @@ namespace llaminar2::test::parity
                 !std::filesystem::is_regular_file(config_.shared_predictor->path()))
                 FAIL() << "Selected parity predictor GGUF not found: " << config_.shared_predictor->path();
 
+            // Native exact replay uses authenticated same-model reference
+            // headers for snapshot capacity only. It never regenerates a pack,
+            // imports teacher tokens, reads numerical payloads or scores HF.
+            if (mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay)
+            {
+                ASSERT_NO_FATAL_FAILURE(prepareNativeExactSnapshotGeometryMetadata());
+                return;
+            }
             resolveSnapshotDirIfNeeded();
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
@@ -7183,6 +7228,7 @@ namespace llaminar2::test::parity
             production_parity_decode_boundaries_.clear();
             production_parity_mtp_transaction_boundaries_.clear();
             production_parity_native_serial_rows_.clear();
+            production_parity_native_serial_integer_rows_.clear();
             production_parity_native_serial_boundary_.reset();
             production_parity_prefix_restore_evidence_.clear();
 
@@ -9391,10 +9437,34 @@ namespace llaminar2::test::parity
                 return {};
             if (!boundary.valid() || production_parity_native_serial_boundary_)
                 return "native verifier oracle requires exactly one valid serial boundary";
-            for (const auto &key : activeSnapshotKeys())
+            const auto published_keys = activeSnapshotKeys();
+            // The declared decode contract owns completeness. An absent key
+            // cannot disappear from both banks and thereby waive its proof.
+            const auto required = parityGraphSnapshotPolicy(ParityForwardPhase::Decode)
+                .requiredSnapshotKeys(ParityForwardPhase::Decode);
+            for (const auto &key : required)
+            {
+                if (isNativeVerifierRowCheckpoint(key) &&
+                    std::find(published_keys.begin(), published_keys.end(), key) == published_keys.end())
+                    return "native serial verifier omitted declared checkpoint: " + key;
+            }
+            for (const auto &key : published_keys)
             {
                 if (!isNativeVerifierRowCheckpoint(key))
                     continue;
+                const auto typed = activeTypedSnapshot(key);
+                if (typed.isInteger())
+                {
+                    const auto values = typed.integerValues();
+                    if (!typed || values.empty() || typed.rows != 1 ||
+                        typed.cols != values.size() || typed.size != values.size())
+                        return "native serial integer checkpoint has invalid row geometry: " + key;
+                    production_parity_native_serial_integer_rows_.emplace(
+                        key, std::vector<std::int64_t>(values.begin(), values.end()));
+                    continue;
+                }
+                if (key.ends_with("_PLE_HASH_INDICES"))
+                    return "native PLE hash checkpoint requires its original INT64 publication: " + key;
                 size_t size = 0;
                 const float *data = activeSnapshot(key, size);
                 if (!data || size == 0)
@@ -9424,7 +9494,8 @@ namespace llaminar2::test::parity
          * HF comparisons remain separate and retain their original thresholds.
          */
         void compareProductionParityNativeVerifierRows(
-            const ProductionParityMTPTransactionBoundary &boundary)
+            const ProductionParityMTPTransactionBoundary &boundary,
+            int native_prefix_rows = 0)
         {
             if (!isRank0())
                 return;
@@ -9446,7 +9517,9 @@ namespace llaminar2::test::parity
             ASSERT_GE(physical_rows, static_cast<size_t>(boundary.snapshot_execution_draft_depth + 1));
             ASSERT_LE(physical_rows, static_cast<size_t>(config_.mtp_expected_graph_capacity + 1));
 
-            const auto path = getResultsDir() / "mtp_native_verifier_rows.csv";
+            const auto suffix = native_prefix_rows > 0
+                ? "_prefix_" + std::to_string(native_prefix_rows) : std::string{};
+            const auto path = getResultsDir() / ("mtp_native_verifier_rows" + suffix + ".csv");
             std::ofstream csv(path);
             ASSERT_TRUE(csv.is_open()) << path;
             csv << "reference_step,condition_position,stage,physical_rows,row,row_elements,"
@@ -9473,6 +9546,164 @@ namespace llaminar2::test::parity
             }
             csv.flush();
             ASSERT_TRUE(csv.good()) << "Could not publish native verifier evidence: " << path;
+            if (!production_parity_native_serial_integer_rows_.empty())
+            {
+                std::ofstream integers(getResultsDir() / ("mtp_native_verifier_integer_rows" + suffix + ".csv"));
+                ASSERT_TRUE(integers.is_open());
+                integers << "stage,physical_rows,row,row_elements,status,first_mismatch,"
+                            "grouped_int64,serial_int64,passed\n";
+                for (const auto &[key, serial] : production_parity_native_serial_integer_rows_)
+                {
+                    const auto actual = activeTypedSnapshot(key);
+                    ASSERT_TRUE(actual && actual.isInteger()) << key;
+                    ASSERT_EQ(actual.rows, physical_rows) << key;
+                    ASSERT_EQ(actual.cols, serial.size()) << key;
+                    ASSERT_EQ(actual.size, actual.integerValues().size()) << key;
+                    const auto evidence = compareNativeVerifierIntegerMatrixRow(
+                        actual.integerValues(), physical_rows, 0, serial);
+                    integers << key << ',' << physical_rows << ",0," << serial.size() << ','
+                             << evidence.name() << ',' << evidence.first_mismatch << ','
+                             << evidence.grouped_value << ',' << evidence.serial_value << ','
+                             << evidence.passed() << '\n';
+                    EXPECT_TRUE(evidence.passed()) << "Native INT64 row zero: " << key;
+                }
+                integers.flush();
+                ASSERT_TRUE(integers.good());
+            }
+        }
+
+        /** @brief Seed the exact proof from the original native prompt, without a reference trajectory.
+         * The standard admitted runner and declared capture policy publish the
+         * same complete-prefix state consumed by the existing serial oracle.
+         */
+        void prepareProductionParityNativeExactCheckpoint()
+        {
+            ASSERT_NE(orch_runner_, nullptr);
+            const std::vector<std::int32_t> prompt(config_.token_ids.begin(), config_.token_ids.end());
+            activeClearSnapshots();
+            ASSERT_TRUE(orch_runner_->prefill(prompt)) << orch_runner_->lastError();
+            ASSERT_TRUE(validateParityGraphSnapshots(
+                ParityForwardPhase::Prefill, parityGraphSnapshotPolicy(ParityForwardPhase::Prefill)));
+            production_parity_decode_prefill_state_ = activePrefixStateProbe();
+        }
+
+        /** @brief Compare every actual verifier input against same-state native M=1 execution.
+         * @param boundary Original committed observation, including rejected proposals.
+         * @param prompt Original checkpoint prefix restored by the shared proof.
+         * Copy grouped snapshots before reset. Only the original recorded
+         * condition and drafts are forwarded, excluding inactive padding.
+         * The forced-token commit result proves each scalar row completed.
+         */
+        void compareProductionParityNativeVerifierInputRows(
+            const ProductionParityMTPTransactionBoundary &boundary,
+            const std::vector<std::int32_t> &prompt,
+            int native_prefix_rows = 0)
+        {
+            ASSERT_TRUE(isRank0());
+            ASSERT_NE(orch_runner_, nullptr);
+            ASSERT_TRUE(boundary.after.mtp_observed_verifier_condition_token);
+            ASSERT_GT(boundary.after.mtp_observed_verifier_transaction_count, 0);
+            const auto &serial_head = production_parity_native_serial_rows_.at("LM_HEAD");
+            size_t head_size = 0;
+            const auto *head = activeSnapshot("LM_HEAD", head_size);
+            ASSERT_NE(head, nullptr);
+            ASSERT_FALSE(serial_head.empty());
+            ASSERT_EQ(head_size % serial_head.size(), 0u);
+            const auto physical_rows = head_size / serial_head.size();
+            ASSERT_EQ(boundary.after.mtp_observed_verifier_draft_depth,
+                      boundary.snapshot_execution_draft_depth);
+            std::vector<std::int32_t> inputs;
+            ASSERT_NO_THROW(inputs = nativeVerifierInputRows(
+                *boundary.after.mtp_observed_verifier_condition_token,
+                boundary.after.mtp_observed_verifier_draft_tokens,
+                boundary.after.mtp_observed_verifier_draft_depth, physical_rows));
+
+            std::map<std::string, std::vector<float>> grouped;
+            for (const auto &[key, serial] : production_parity_native_serial_rows_)
+            {
+                size_t elements = 0;
+                const auto *data = activeSnapshot(key, elements);
+                ASSERT_NE(data, nullptr) << key;
+                ASSERT_EQ(elements, physical_rows * serial.size()) << key;
+                grouped.emplace(key, std::vector<float>(data, data + elements));
+            }
+            std::map<std::string, std::vector<std::int64_t>> grouped_integers;
+            for (const auto &[key, serial] : production_parity_native_serial_integer_rows_)
+            {
+                const auto actual = activeTypedSnapshot(key);
+                ASSERT_TRUE(actual && actual.isInteger()) << key;
+                const auto values = actual.integerValues();
+                ASSERT_EQ(actual.rows, physical_rows) << key;
+                ASSERT_EQ(actual.cols, serial.size()) << key;
+                ASSERT_EQ(actual.size, values.size()) << key;
+                ASSERT_EQ(values.size(), physical_rows * serial.size()) << key;
+                grouped_integers.emplace(key, std::vector<std::int64_t>(values.begin(), values.end()));
+            }
+            std::string error;
+            const auto restored = restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                prompt, ProductionParityCompletePrefixPayload::MainModelAndMTP, &error);
+            ASSERT_TRUE(restored) << error;
+            const auto identical = compareMTPRuntimeStateSnapshots(boundary.before, restored->state);
+            ASSERT_TRUE(identical) << identical.reason;
+            const auto suffix = native_prefix_rows > 0
+                ? "_prefix_" + std::to_string(native_prefix_rows) : std::string{};
+            std::ofstream csv(getResultsDir() / ("mtp_native_verifier_all_rows" + suffix + ".csv"));
+            ASSERT_TRUE(csv.is_open());
+            csv << "physical_rows,live_rows,row,input_token,stage,scalar_type,row_elements,status,"
+                   "first_mismatch,grouped_value_or_bits,serial_value_or_bits,passed\n";
+            for (size_t row = 0; row < inputs.size(); ++row)
+            {
+                activeClearSnapshots();
+                const auto before = activePrefixStateProbe();
+                const auto result = orch_runner_->forceDecodeToken(inputs[row]);
+                ASSERT_TRUE(result.success()) << result.error;
+                ASSERT_EQ(result.tokens.size(), 1u);
+                ASSERT_EQ(result.tokens.front(), inputs[row]);
+                ASSERT_EQ(result.returned_token_commit, ReturnedTokenCommitState::Committed)
+                    << "Exact replay requires the original GPU committed forced-token contract";
+                const auto after = activePrefixStateProbe();
+                ASSERT_EQ(after.current_position, before.current_position + 1);
+                ASSERT_EQ(after.mtp_verifier_runs, before.mtp_verifier_runs);
+                ASSERT_EQ(after.mtp_draft_steps, before.mtp_draft_steps);
+                for (const auto &[key, matrix] : grouped)
+                {
+                    size_t elements = 0;
+                    const auto *data = activeSnapshot(key, elements);
+                    const auto evidence = compareNativeVerifierMatrixRow(
+                        matrix, physical_rows, row,
+                        data ? std::span<const float>{data, elements} : std::span<const float>{});
+                    csv << physical_rows << ',' << inputs.size() << ',' << row << ',' << inputs[row]
+                        << ',' << key << ",FP32," << elements << ',' << evidence.name() << ','
+                        << evidence.first_mismatch << ',' << evidence.grouped_bits << ','
+                        << evidence.serial_bits << ',' << evidence.passed() << '\n';
+                    EXPECT_TRUE(evidence.passed()) << "Original verifier row " << row << " stage "
+                        << key << " input " << inputs[row] << " mismatch " << evidence.first_mismatch;
+                }
+                for (const auto &[key, matrix] : grouped_integers)
+                {
+                    const auto actual = activeTypedSnapshot(key);
+                    ASSERT_TRUE(actual && actual.isInteger()) << key;
+                    const auto values = actual.integerValues();
+                    ASSERT_EQ(actual.rows, 1u) << key;
+                    ASSERT_EQ(actual.cols, values.size()) << key;
+                    ASSERT_EQ(actual.size, values.size()) << key;
+                    const auto evidence = compareNativeVerifierIntegerMatrixRow(
+                        matrix, physical_rows, row, values);
+                    csv << physical_rows << ',' << inputs.size() << ',' << row << ',' << inputs[row]
+                        << ',' << key << ",INT64," << values.size() << ',' << evidence.name() << ','
+                        << evidence.first_mismatch << ',' << evidence.grouped_value << ','
+                        << evidence.serial_value << ',' << evidence.passed() << '\n';
+                    EXPECT_TRUE(evidence.passed()) << "Original INT64 verifier row " << row
+                        << " stage " << key << " mismatch " << evidence.first_mismatch;
+                }
+            }
+            csv.flush();
+            ASSERT_TRUE(csv.good());
+            const auto final_restore = restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                prompt, ProductionParityCompletePrefixPayload::MainModelAndMTP, &error);
+            ASSERT_TRUE(final_restore) << error;
+            const auto reset_match = compareMTPRuntimeStateSnapshots(boundary.before, final_restore->state);
+            ASSERT_TRUE(reset_match) << reset_match.reason;
         }
 
         /**
@@ -9489,7 +9720,8 @@ namespace llaminar2::test::parity
          * @param prompt Exact authenticated request prefix.
          * @param output_count Number of serial response tokens required.
          * @param checkpoint_reference_output_index Serial row retained for
-         *        grouped-verifier checkpoint comparison.
+         *        grouped-verifier checkpoint comparison, or nullopt to collect
+         *        only the existing native history without retaining a bank.
          * @param error Receives the first lifecycle or execution failure.
          * @param checkpoint_input Optional retained diagnostic input for an
          *        exact same-prefix verifier comparison; never execution state.
@@ -9499,7 +9731,7 @@ namespace llaminar2::test::parity
         captureProductionParityMTPSerialOracle(
             const std::vector<int32_t> &prompt,
             int output_count,
-            size_t checkpoint_reference_output_index,
+            std::optional<size_t> checkpoint_reference_output_index,
             std::string *error,
             PrefixRuntimeStateSnapshot *checkpoint_input = nullptr)
         {
@@ -9517,6 +9749,9 @@ namespace llaminar2::test::parity
                 return fail("serial MTP oracle requires the production runner");
             if (output_count <= 0)
                 return fail("serial MTP oracle requires a positive output count");
+            if (checkpoint_reference_output_index &&
+                *checkpoint_reference_output_index >= static_cast<size_t>(output_count))
+                return fail("serial MTP checkpoint index exceeds its original output extent");
 
             std::string restore_error;
             const auto complete_prefix =
@@ -9562,7 +9797,8 @@ namespace llaminar2::test::parity
                     .verifier_runs = before.mtp_verifier_runs,
                 };
 
-                if (static_cast<size_t>(output_index) == checkpoint_reference_output_index)
+                if (checkpoint_reference_output_index &&
+                    static_cast<size_t>(output_index) == *checkpoint_reference_output_index)
                 {
                     traceProductionParityMTPInputBoundary("serial_oracle", before);
                     if (checkpoint_input)
@@ -9638,8 +9874,8 @@ namespace llaminar2::test::parity
                     .output_index = static_cast<size_t>(output_index),
                     .token = result.tokens.front(),
                     .checkpoint_reference =
-                        static_cast<size_t>(output_index) ==
-                        checkpoint_reference_output_index,
+                        checkpoint_reference_output_index &&
+                        static_cast<size_t>(output_index) == *checkpoint_reference_output_index,
                     .before = before,
                     .after = after,
                 };
@@ -9670,6 +9906,42 @@ namespace llaminar2::test::parity
             return tokens;
         }
 
+        /** @brief One synchronous native checkpoint's immutable original input and diagnostic state. */
+        struct NativeMTPParityCheckpointAttempt
+        {
+            int prefix_rows;
+            int maximum_prefix_rows;
+            const std::vector<int32_t> &prompt;
+            const std::vector<int32_t> &policy_serial_oracle;
+            MTPParityNativeCheckpointWitness &selection;
+            std::ostream &trace;
+        };
+
+        /** @return The existing production topology's initial maintenance boundary, if any. */
+        std::optional<int> productionParityMTPInitialMaintenanceRows() const
+        {
+            const auto &runtime = orch_runner_->config();
+            return runtime.moe_routed_expert_plan &&
+                MoEOverlayCapacityAdmission::selectMigrationStorage(
+                    *runtime.moe_routed_expert_plan, runtime.moe_rebalance.mode) ==
+                    MoEOverlayMigrationStorageKind::DeviceTransferDirectory
+                ? std::optional<int>{runtime.moe_rebalance.device_initial_maintenance_period_tokens}
+                : std::nullopt;
+        }
+
+        /**
+         * @return Frozen native-functional continuation window for this fixture.
+         *
+         * The default preserves the numerical history. An explicit native-only
+         * fixture may declare a longer fixed history before execution so a short
+         * numerical sample does not imply guaranteed predictor acceptance.
+         * This changes neither the prompt nor the reference-scoring horizon.
+         */
+        virtual int nativeMTPFunctionalHistoryRows() const noexcept
+        {
+            return config_.decode_steps;
+        }
+
         /**
          * @brief Execute the production MTP path without rebuilding the model.
          *
@@ -9681,9 +9953,70 @@ namespace llaminar2::test::parity
          * and runs one full-budget transaction to prove the adaptive
          * controller. Keeping those roles explicit prevents a maintenance
          * boundary from either overwriting numerical evidence or masquerading
-         * as a dynamic-depth observation.
+         * as a dynamic-depth observation. Native exact replay retains every
+         * attempted checkpoint bank and requires genuine acceptance within the
+         * already-declared native decode history, including checkpoint zero.
          */
-        void runProductionParityMTPProof(DecodeParitySummary &summary)
+        void runProductionParityMTPProof(DecodeParitySummary &summary,
+            MTPParityProofPurpose purpose = MTPParityProofPurpose::ReferenceNumerics)
+        {
+            if (purpose == MTPParityProofPurpose::ReferenceNumerics ||
+                config_.mtp_expectation == ParityMTPExpectation::Disabled)
+            {
+                runProductionParityMTPCheckpointProof(summary, purpose, nullptr);
+                return;
+            }
+            ASSERT_NE(orch_runner_, nullptr);
+            const int functional_history_rows = nativeMTPFunctionalHistoryRows();
+            ASSERT_GT(functional_history_rows, 0)
+                << "Native acceptance requires its frozen functional history";
+            ASSERT_GE(functional_history_rows, config_.decode_steps)
+                << "The native window cannot omit original numerical-history checkpoints";
+            LOG_INFO("[ParityMTPNativeWindow] numerical_rows=" << config_.decode_steps
+                     << " functional_prefix_rows=" << functional_history_rows);
+            const bool dynamic = config_.mtp_expectation == ParityMTPExpectation::DynamicDepth;
+            const auto adaptive = makeMTPParityAdaptiveWitnessPlan(
+                config_.mtp_expected_draft_depth, productionParityMTPInitialMaintenanceRows());
+            ASSERT_TRUE(adaptive.valid());
+            const int history_rows = std::max(functional_history_rows,
+                dynamic ? adaptive.serial_oracle_tokens : 0);
+            const std::vector<int32_t> original_prompt(config_.token_ids.begin(), config_.token_ids.end());
+            std::string error;
+            const auto history = captureProductionParityMTPSerialOracle(
+                original_prompt, history_rows, std::nullopt, &error);
+            ASSERT_TRUE(history) << error;
+            ASSERT_EQ(history->size(), static_cast<size_t>(history_rows));
+            MTPParityNativeCheckpointWitness selection(functional_history_rows);
+            std::ofstream trace(getResultsDir() / "mtp_native_checkpoint_witnesses.csv");
+            ASSERT_TRUE(trace.is_open());
+            trace << "prefix_rows,condition_token,draft_tokens,accepted_delta,rejected_delta,verifier_runs,accepted_checkpoint,native_history_rows,numerical_history_rows\n";
+            for (std::int64_t prefix_index = 0; prefix_index <= functional_history_rows; ++prefix_index)
+            {
+                const int prefix_rows = static_cast<int>(prefix_index);
+                std::vector<int32_t> checkpoint = original_prompt;
+                checkpoint.insert(checkpoint.end(), history->begin(), history->begin() + prefix_rows);
+                production_parity_native_serial_rows_.clear();
+                production_parity_native_serial_integer_rows_.clear();
+                production_parity_native_serial_boundary_.reset();
+                NativeMTPParityCheckpointAttempt attempt{
+                    prefix_rows, functional_history_rows, checkpoint, *history, selection, trace};
+                ASSERT_NO_FATAL_FAILURE(runProductionParityMTPCheckpointProof(summary, purpose, &attempt));
+                if (::testing::Test::HasFailure())
+                    return;
+                if (selection.acceptedPrefixRows())
+                    return;
+            }
+            ASSERT_TRUE(selection.acceptedPrefixRows())
+                << "No actual accepting checkpoint in frozen native functional window [0,"
+                << functional_history_rows << "]; original rejection and complete row-bank evidence retained";
+        }
+
+        /** @brief Execute the unchanged shared transaction proof for one original checkpoint.
+         * @param summary Existing numerical accumulator, unused by native-only row evidence.
+         * @param purpose Numerical reference scoring or exact native execution.
+         * @param native_attempt Present only for an ordered native checkpoint from the same loaded runner. */
+        void runProductionParityMTPCheckpointProof(DecodeParitySummary &summary,
+            MTPParityProofPurpose purpose, const NativeMTPParityCheckpointAttempt *native_attempt)
         {
             auto profile_scope = profileParityScope("mtp_proof.total");
             if (config_.mtp_expectation == ParityMTPExpectation::Disabled)
@@ -9704,23 +10037,13 @@ namespace llaminar2::test::parity
                 config_.mtp_expectation ==
                 ParityMTPExpectation::DynamicDepth;
             const int limited_depth = config_.mtp_expected_draft_depth;
-            const auto &runtime = orch_runner_->config();
-            // Use the production topology resolver, not vendor/rank heuristics.
-            // Other overlays have a different maintenance clock and retain the
-            // existing one-row prefix-to-generation warmup.
-            const std::optional<int> initial_device_maintenance_rows =
-                runtime.moe_routed_expert_plan &&
-                MoEOverlayCapacityAdmission::selectMigrationStorage(
-                    *runtime.moe_routed_expert_plan, runtime.moe_rebalance.mode) ==
-                    MoEOverlayMigrationStorageKind::DeviceTransferDirectory
-                    ? std::optional<int>{
-                          runtime.moe_rebalance.device_initial_maintenance_period_tokens}
-                    : std::nullopt;
+            ASSERT_EQ(purpose == MTPParityProofPurpose::NativeExactReplay, native_attempt != nullptr);
+            const auto initial_device_maintenance_rows = productionParityMTPInitialMaintenanceRows();
             const auto adaptive_witness = makeMTPParityAdaptiveWitnessPlan(
                 limited_depth, initial_device_maintenance_rows);
             ASSERT_TRUE(adaptive_witness.valid());
             const auto accepted_reference =
-                dynamic_depth
+                (dynamic_depth || purpose == MTPParityProofPurpose::NativeExactReplay)
                     ? std::optional<MTPParityAcceptedDraftReference>{
                           MTPParityAcceptedDraftReference{
                               .reference_step = 0u,
@@ -9729,8 +10052,8 @@ namespace llaminar2::test::parity
             ASSERT_TRUE(accepted_reference.has_value())
                 << "The authenticated MTP reference pack contains no valid "
                    "checkpoint with a matching native condition and first draft";
-            const size_t checkpoint_reference_step =
-                accepted_reference->reference_step;
+            const size_t checkpoint_reference_step = native_attempt
+                ? static_cast<size_t>(native_attempt->prefix_rows) : accepted_reference->reference_step;
             const int dynamic_policy_witness_budget =
                 dynamic_depth
                     ? adaptive_witness.response_tokens
@@ -9740,12 +10063,12 @@ namespace llaminar2::test::parity
             // One request identity owns the checkpoint's serial tokens, input
             // state and main-verifier tensors. Never seed this observer from
             // teacher-forced rows or another request in the same placement.
-            const auto transaction_prompt = dynamic_depth
-                ? prompt
-                : mtpParityCheckpointPrompt(
-                      prompt, readDecodeTokensFromMetadata(), *accepted_reference);
-            const int serial_oracle_output_count = dynamic_depth
-                ? adaptive_witness.serial_oracle_tokens
+            const auto transaction_prompt = native_attempt ? native_attempt->prompt
+                : dynamic_depth ? prompt
+                : mtpParityCheckpointPrompt(prompt, readDecodeTokensFromMetadata(), *accepted_reference);
+            const int serial_oracle_output_count = native_attempt
+                ? (activePrimaryDevice().is_gpu() ? 2 : limited_depth + 1)
+                : dynamic_depth ? adaptive_witness.serial_oracle_tokens
                 : (activePrimaryDevice().is_gpu() ? 2 : limited_depth + 1);
             PrefixRuntimeStateSnapshot checkpoint_input;
             std::string serial_oracle_error;
@@ -9972,20 +10295,44 @@ namespace llaminar2::test::parity
                         boundary.emitted_tokens;
                     boundary.acceptance_witness_serial_oracle_tokens =
                         boundary.serial_oracle_tokens;
-                    EXPECT_GT(
-                        boundary.acceptance_witness_accepted_token_delta,
-                        0u)
-                        << "The authenticated accepting checkpoint row did "
-                           "not commit a production draft";
+                    if (!native_attempt)
+                        EXPECT_GT(boundary.acceptance_witness_accepted_token_delta, 0u)
+                            << "The authenticated accepting checkpoint row did not commit a production draft";
                 }
 
-                compareProductionParityMTPCheckpoints(boundary, summary);
-                compareProductionParityNativeVerifierRows(boundary);
-                observeComparedProductionParityMTPTransaction(
-                    boundary, *serial_oracle);
+                if (purpose == MTPParityProofPurpose::ReferenceNumerics)
+                    compareProductionParityMTPCheckpoints(boundary, summary);
+                compareProductionParityNativeVerifierRows(
+                    boundary, native_attempt ? native_attempt->prefix_rows : 0);
+                if (native_attempt)
+                {
+                    ASSERT_NO_FATAL_FAILURE(compareProductionParityNativeVerifierInputRows(
+                        boundary, transaction_prompt, native_attempt->prefix_rows));
+                    ASSERT_GE(after.mtp_accepted_tokens, before.mtp_accepted_tokens);
+                    ASSERT_GE(after.mtp_rejected_tokens, before.mtp_rejected_tokens);
+                    const auto accepted = after.mtp_accepted_tokens - before.mtp_accepted_tokens;
+                    const auto rejected = after.mtp_rejected_tokens - before.mtp_rejected_tokens;
+                    native_attempt->selection.observe(native_attempt->prefix_rows,
+                        accepted, rejected, boundary.verifier_transactions);
+                    native_attempt->trace << native_attempt->prefix_rows << ','
+                        << after.mtp_observed_verifier_condition_token.value_or(-1) << ',';
+                    for (const auto token : after.mtp_observed_verifier_draft_tokens)
+                        native_attempt->trace << token << ';';
+                    native_attempt->trace << ',' << accepted << ',' << rejected << ','
+                        << boundary.verifier_transactions << ',' << (accepted > 0) << ','
+                        << native_attempt->maximum_prefix_rows << ',' << config_.decode_steps << '\n';
+                    native_attempt->trace.flush();
+                    ASSERT_TRUE(native_attempt->trace.good());
+                    if (!native_attempt->selection.acceptedPrefixRows())
+                        return;
+                }
+                else
+                    observeComparedProductionParityMTPTransaction(boundary, *serial_oracle);
 
                 if (dynamic_depth)
                 {
+                    const auto &policy_serial_oracle = native_attempt
+                        ? native_attempt->policy_serial_oracle : *serial_oracle;
                     /*
                      * Numerical snapshots have already been consumed. Start a
                      * fresh server-facing request without a stop token, then
@@ -10020,7 +10367,7 @@ namespace llaminar2::test::parity
                         ASSERT_EQ(maintenance_result.tokens.size(), 1u);
                         ASSERT_FALSE(maintenance_result.is_complete)
                             << "Dynamic MTP warmup terminated before adaptive admission";
-                        ASSERT_EQ(maintenance_result.tokens.front(), serial_oracle->at(row))
+                        ASSERT_EQ(maintenance_result.tokens.front(), policy_serial_oracle.at(row))
                             << "Dynamic MTP maintenance warmup diverged at row " << row;
                         ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(1u))
                             << "Dynamic MTP maintenance warmup failed: "
@@ -10072,13 +10419,13 @@ namespace llaminar2::test::parity
                         static_cast<size_t>(adaptive_witness.warmup_tokens);
                     ASSERT_LE(
                         oracle_offset + witness_result.tokens.size(),
-                        serial_oracle->size())
+                        policy_serial_oracle.size())
                         << "Dynamic MTP policy witness exceeded its serial "
                            "oracle suffix";
                     std::vector<int32_t> witness_serial_tokens(
-                        serial_oracle->begin() +
+                        policy_serial_oracle.begin() +
                             static_cast<std::ptrdiff_t>(oracle_offset),
-                        serial_oracle->begin() +
+                        policy_serial_oracle.begin() +
                             static_cast<std::ptrdiff_t>(
                                 oracle_offset +
                                 witness_result.tokens.size()));
@@ -10120,7 +10467,9 @@ namespace llaminar2::test::parity
                     // The adaptive workload retains rejection coverage even
                     // when its first draft is wrong. Acceptance has its own
                     // independently authenticated checkpoint and continuation.
-                    runProductionParityMTPAcceptanceWitness(boundary);
+                    runProductionParityMTPAcceptanceWitness(boundary, purpose,
+                        native_attempt ? &transaction_prompt : nullptr,
+                        native_attempt ? native_attempt->maximum_prefix_rows : 0);
                 }
                 production_parity_mtp_transaction_boundaries_.push_back(
                     std::move(boundary));
@@ -10130,6 +10479,9 @@ namespace llaminar2::test::parity
         /**
          * @brief Prove dynamic acceptance independently of the adaptive workload.
          * @param boundary Receives the authenticated positive transaction evidence.
+         * @param purpose Original reference-numerical or native-only proof.
+         * @param native_accepting_prompt Actual native prefix that already proved acceptance.
+         * @param native_history_rows Frozen functional window carried from the original proof.
          *
          * A valid adaptive observation may reject every draft. The HF sidecar
          * and certified native serial rows select a separate accepting edge;
@@ -10138,20 +10490,40 @@ namespace llaminar2::test::parity
          * convolution, and terminal state through a complete byte comparison.
          */
         void runProductionParityMTPAcceptanceWitness(
-            ProductionParityMTPTransactionBoundary &boundary)
+            ProductionParityMTPTransactionBoundary &boundary,
+            MTPParityProofPurpose purpose = MTPParityProofPurpose::ReferenceNumerics,
+            const std::vector<int32_t> *native_accepting_prompt = nullptr,
+            int native_history_rows = 0)
         {
-            const auto reference = productionParityMTPAcceptedDraftReference();
+            auto reference = purpose == MTPParityProofPurpose::NativeExactReplay
+                ? std::optional<MTPParityAcceptedDraftReference>{MTPParityAcceptedDraftReference{.reference_step=0u}}
+                : productionParityMTPAcceptedDraftReference();
             ASSERT_TRUE(reference.has_value())
                 << "Dynamic MTP needs an independently authenticated accepting edge";
             const std::vector<int32_t> base_prompt(
                 config_.token_ids.begin(), config_.token_ids.end());
-            const auto prompt = mtpParityCheckpointPrompt(
-                base_prompt, readDecodeTokensFromMetadata(), *reference);
+            if (purpose == MTPParityProofPurpose::NativeExactReplay)
+            {
+                ASSERT_NE(native_accepting_prompt, nullptr);
+                ASSERT_GT(native_history_rows, 0);
+                ASSERT_GE(native_accepting_prompt->size(), base_prompt.size());
+                ASSERT_LE(native_accepting_prompt->size() - base_prompt.size(),
+                          static_cast<size_t>(native_history_rows));
+                ASSERT_TRUE(std::equal(
+                    base_prompt.begin(), base_prompt.end(), native_accepting_prompt->begin()));
+                reference->reference_step = native_accepting_prompt->size() - base_prompt.size();
+            }
+            const auto prompt = purpose == MTPParityProofPurpose::NativeExactReplay
+                ? *native_accepting_prompt
+                : mtpParityCheckpointPrompt(base_prompt, readDecodeTokensFromMetadata(), *reference);
             const int response_tokens = config_.mtp_expected_draft_depth + 2;
             constexpr int continuation_tokens = 2;
             const int total_tokens = response_tokens + continuation_tokens;
             orch_runner_->setStopTokens({});
             PrefixProbeCapturePolicy probe = PrefixProbeCapturePolicy::fromEnvironment();
+            // Required original pending-token proof reuses the existing packed
+            // diagnostic export; its staging was admitted by the outer fixture.
+            probe.capture_device_logical_state = activePrimaryDevice().is_gpu();
             probe.hash_full_kv_payloads = true;
             probe.hash_gdn_device_state = true;
             probe.hash_terminal_state = true;
@@ -10243,7 +10615,25 @@ namespace llaminar2::test::parity
                       static_cast<uint64_t>(before.mtp_current_depth));
             ASSERT_EQ(before.mtp_current_depth, config_.mtp_expected_draft_depth);
             ASSERT_TRUE(before.mtp_request.adaptive_depth_enabled);
-            ASSERT_EQ(after.mtp_observed_verifier_draft_depth, before.mtp_current_depth);
+            if (activePrimaryDevice().is_gpu())
+            {
+                // The isolated accepted checkpoint above proves the original
+                // full depth. This depth+2 response may execute several real
+                // transactions; its published identity names the LAST one.
+                ASSERT_TRUE(validMTPParityAcceptanceDepthAttribution(
+                    boundary.snapshot_execution_draft_depth,
+                    resolveMTPMaximumDraftDepth(orch_runner_->config().mtp),
+                    {boundary.after.mtp_observed_verifier_draft_depth,
+                     boundary.after.mtp_observed_verifier_draft_tokens.size(),
+                     boundary.verifier_transactions, boundary.attempted_draft_tokens},
+                    {after.mtp_observed_verifier_draft_depth,
+                     after.mtp_observed_verifier_draft_tokens.size(),
+                     boundary.acceptance_witness_verifier_transactions,
+                     boundary.acceptance_witness_attempted_draft_tokens}))
+                    << "Acceptance response lost its isolated full-depth proof or terminal verifier identity";
+            }
+            else
+                ASSERT_EQ(after.mtp_observed_verifier_draft_depth, before.mtp_current_depth);
             ASSERT_TRUE(grouped_prefix->state.prefix_request.hit);
             ASSERT_TRUE(grouped_prefix->state.prefix_request.mtp_state_restored);
             ASSERT_GT(boundary.acceptance_witness_accepted_token_delta, 0u)
@@ -10283,13 +10673,22 @@ namespace llaminar2::test::parity
             }
             ASSERT_TRUE(candidate_state.terminal_hidden_hash_available);
             ASSERT_TRUE(candidate_state.terminal_logits_hash_available);
+            std::vector<int> serial_committed_positions;
+            serial_committed_positions.reserve(continuation_end);
+            for (size_t row = 0; row < continuation_end; ++row)
+                serial_committed_positions.push_back(serial_states[row].current_position);
+            const auto committed_frontier = selectMTPParityCommittedFrontier(
+                serial_committed_positions,
+                std::span<const int32_t>(serial.data(), continuation_end),
+                candidate_state.current_position, candidate_state.resident_condition);
+            ASSERT_TRUE(committed_frontier)
+                << "Acceptance continuation has no authenticated exact committed frontier";
             const auto state_match = compareMTPRuntimeStateSnapshots(
-                serial_states.at(continuation_end - 1u),
-                candidate_state, options);
+                serial_states.at(*committed_frontier), candidate_state, options);
             // Diagnose each owning state bank even when the complete gate
             // stops at terminal logits. These copies never certify a relaxed
             // state: the unchanged complete state_match below remains fatal.
-            auto bank_oracle = serial_states.at(continuation_end - 1u);
+            auto bank_oracle = serial_states.at(*committed_frontier);
             auto bank_candidate = candidate_state;
             bank_oracle.terminal_hidden_hash_available = false;
             bank_oracle.terminal_logits_hash_available = false;
@@ -10328,7 +10727,7 @@ namespace llaminar2::test::parity
                        << ";reason=" << bank_diagnostic.reason << '\n';
             diagnostic.flush();
             ASSERT_TRUE(diagnostic.good()) << diagnostic_path;
-            const auto &oracle_logits = serial_states.at(continuation_end - 1u).terminal_logits_values;
+            const auto &oracle_logits = serial_states.at(*committed_frontier).terminal_logits_values;
             const auto &candidate_logits = candidate_state.terminal_logits_values;
             const auto logit_diff_path = getResultsDir() / "mtp_acceptance_logits_diff.csv";
             std::ofstream logit_diff(logit_diff_path);
@@ -10374,6 +10773,31 @@ namespace llaminar2::test::parity
             }
             native_rows.flush();
             ASSERT_TRUE(native_rows.good()) << native_rows_path;
+            // Retain bounded provenance for the exact committed-row comparison.
+            // The one-off full raw exports that diagnosed stale publication live
+            // with their original failed receipt, not every future passing run.
+            const auto frontier_path = getResultsDir() / "mtp_acceptance_same_frontier.csv";
+            std::ofstream frontier(frontier_path);
+            ASSERT_TRUE(frontier.is_open()) << frontier_path;
+            frontier << "serial_row,serial_position,candidate_position,state_byte_exact,"
+                        "original_publication_generation,original_live_epoch,"
+                        "original_pending_token,original_publication_ok,original_stopped,"
+                        "authenticated_already_emitted\n";
+            frontier << *committed_frontier << ','
+                     << serial_states.at(*committed_frontier).current_position << ','
+                     << candidate_state.current_position << ',' << static_cast<bool>(state_match) << ',';
+            if (candidate_state.resident_condition)
+            {
+                const auto &condition = *candidate_state.resident_condition;
+                frontier << condition.publication_generation << ',' << condition.live_state_epoch << ','
+                         << condition.next_condition_token << ',' << condition.publication_ok << ','
+                         << condition.stopped << ',' << condition.isAlreadyEmitted();
+            }
+            else
+                frontier << ",,,,,";
+            frontier << '\n';
+            frontier.flush();
+            ASSERT_TRUE(frontier.good()) << frontier_path;
             const auto witness_path = getResultsDir() / "mtp_acceptance_witness.csv";
             std::ofstream witness_csv(witness_path);
             ASSERT_TRUE(witness_csv.is_open()) << witness_path;
@@ -10679,6 +11103,12 @@ namespace llaminar2::test::parity
             // aggregate driver reports the performance miss after all cells run.
         }
 
+        /** @return Explicit test obligation; numerical fixtures always retain reference scoring. */
+        virtual MTPParityProofPurpose mtpParityProofPurpose() const noexcept
+        {
+            return MTPParityProofPurpose::ReferenceNumerics;
+        }
+
         virtual ParityGraphSnapshotPolicy parityGraphSnapshotPolicy(
             ParityForwardPhase phase) const
         {
@@ -10859,11 +11289,12 @@ namespace llaminar2::test::parity
                     decode.required_decode_snapshot_keys.end());
             }
             const auto reference_keys =
-                authenticatedReferenceSnapshotCaptureFilter();
-            union_keys.insert(
-                union_keys.end(),
-                reference_keys.begin(),
-                reference_keys.end());
+                mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay
+                    ? std::vector<std::string>{}
+                    : authenticatedReferenceSnapshotCaptureFilter();
+            union_keys.insert(union_keys.end(), reference_keys.begin(), reference_keys.end());
+            if (mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay)
+                union_keys.push_back("FINAL_NORM");
 
             /*
              * A completed collective is a distinct live graph value, not an
@@ -11035,10 +11466,13 @@ namespace llaminar2::test::parity
                     orchestration_parity_decode_trajectory_index_ = 0;
                     orchestration_parity_force_mode_ =
                         ParityForcedTokenCommitMode::Unknown;
-                    for (const int token : readDecodeTokensFromMetadata())
+                    if (mtpParityProofPurpose() == MTPParityProofPurpose::ReferenceNumerics)
                     {
-                        orchestration_parity_decode_trajectory_.push_back(
-                            static_cast<int32_t>(token));
+                        for (const int token : readDecodeTokensFromMetadata())
+                        {
+                            orchestration_parity_decode_trajectory_.push_back(
+                                static_cast<int32_t>(token));
+                        }
                     }
                     std::vector<int32_t> input;
                     input.reserve(static_cast<size_t>(std::max(token_count, 0)));

@@ -20,14 +20,38 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "planning/PlanningObservedResource.h"
 #include "utils/MPIContext.h"
+#include "tensors/Tensors.h"
+#include "memory/CPUTensorStorageDeclaration.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <thread>
 #include <vector>
 
 using namespace llaminar2;
+
+namespace llaminar2
+{
+    /**
+     * @brief Test-only observation of actual mapped payload writes after both exact terminal joins.
+     *
+     * The probe exposes no control/cursor/count fields. The fixture poisons the
+     * complete payload while the lane is idle, then checks its inactive tail
+     * after real captured execution; consumer output alone could hide a
+     * producer that wrongly copied source capacity into the mapped slot.
+     */
+    struct CapturedTransferChannelReplayProbe
+    {
+        /** @return Exact payload span; callers join both endpoints before reading or poisoning it. */
+        static std::span<std::byte> payload(const CapturedTransferChannel &channel)
+        {
+            return {static_cast<std::byte *>(channel.mapped_->mutableHostData(CapturedTransferChannel::payload_offset)),
+                channel.capacityBytes()};
+        }
+    };
+}
 
 namespace
 {
@@ -70,6 +94,19 @@ namespace
         throw std::invalid_argument("Counted channel fixture requires GPU endpoints");
     }
 
+    /** @brief Dispatch the GPU-owned source descriptor writer; no host offset or count is supplied. */
+    void prepareSourceSlice(DeviceId device, void *payload, CapturedTransferSourceSlice *slice,
+        const std::uint64_t *sequence, size_t capacity, size_t source_span, std::uint64_t source_origin, void *stream)
+    {
+#ifdef HAVE_CUDA
+        if (device.is_cuda()) { require(counted_channel_test::prepareSlicedCUDA(payload, slice, sequence, capacity, source_span, source_origin, stream), "CUDA slice writer"); return; }
+#endif
+#ifdef HAVE_ROCM
+        if (device.is_rocm()) { require(counted_channel_test::prepareSlicedROCm(payload, slice, sequence, capacity, source_span, source_origin, stream), "ROCm slice writer"); return; }
+#endif
+        throw std::invalid_argument("Sliced channel fixture requires GPU endpoints");
+    }
+
     /** @brief Advance the fixture sequence as the captured round trip's last device node. */
     void advanceSequence(DeviceId device, std::uint64_t *sequence, void *stream)
     {
@@ -85,8 +122,13 @@ namespace
     /** @brief Exercise 128 changing extents in one captured graph per physical alignment.
      * @param first Producer and result endpoint; ordering is independent of vendor.
      * @param second Receiver and echo endpoint, with its own graph and private count.
-     * @param capacity Immutable upper bound, exercising either complete lowering. */
-    void verifyCountedRoundTrip(DeviceId first, DeviceId second, size_t capacity = 1024 * 1024 + 3)
+     * @param capacity Immutable upper bound, exercising either complete lowering.
+     * @param sliced Exercise the retained original Tensor source descriptor instead of a fixed source origin.
+     * @param batched Freeze one-endpoint batch lowering for both directions when sliced.
+     * @param tensor_source Use an original Tensor source instead of its existing workspace control.
+     * @param source_origin Frozen original descriptor coordinate; only local offsets select payload bytes. */
+    void verifyCountedRoundTrip(DeviceId first, DeviceId second, size_t capacity = 1024 * 1024 + 3,
+        bool sliced = false, bool batched = false, bool tensor_source = false, std::uint64_t source_origin = 0)
     {
         const auto mpi = MPIContextFactory::global();
         const auto inventory = mpi->clusterInventory();
@@ -111,23 +153,41 @@ namespace
 #endif
             });
         }
+        ASSERT_TRUE(!tensor_source || sliced);
         ASSERT_GE(capacity, 257u);
-        const size_t storage_bytes = capacity + 64;
+        const size_t source_span = capacity + 64;
+        const size_t storage_bytes = sliced ? source_span + 64 : capacity + 64;
+        const size_t source_tensor_bytes = (storage_bytes + sizeof(std::int32_t) - 1) / sizeof(std::int32_t) * sizeof(std::int32_t);
+        const CPUTensorStorageDeclaration slice_declaration(1, sizeof(CapturedTransferSourceSlice) / sizeof(std::int32_t),
+            BufferTensorType::INT32, PhysicalMemoryOwner::ActivationTransportStaging, DeviceId::cpu());
+        const CPUTensorStorageDeclaration source_declaration(1, source_tensor_bytes / sizeof(std::int32_t),
+            BufferTensorType::INT32, PhysicalMemoryOwner::ActivationTransportStaging, DeviceId::cpu());
         WorkspaceRequirements requirements;
         requirements.buffers = {{"payload", storage_bytes, 16, true}, {"returned", storage_bytes, 16, true},
             {"counts", 3 * sizeof(std::uint64_t), 8, true}};
-        const auto workspace_bytes = requirements.total_bytes_with_alignment();
+        auto first_requirements = requirements;
+        if (tensor_source) first_requirements.buffers.erase(first_requirements.buffers.begin());
+        const std::array workspace_requirements{first_requirements, requirements};
+        const std::array workspace_bytes{first_requirements.total_bytes_with_alignment(), requirements.total_bytes_with_alignment()};
         const auto geometry = CapturedTransferChannel::memoryFor(capacity);
         PhysicalMemoryPlanBuilder builder;
         builder.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
             2 * geometry.mapped_host_bytes);
-        for (const auto device : devices)
+        for (size_t participant = 0; participant < devices.size(); ++participant)
         {
+            const auto device = devices[participant];
             const auto resource = planningObservedResource(rank, device);
             builder.add(resource, PhysicalMemoryOwner::ActivationTransportStaging, 2 * geometry.cursor_bytes_per_device);
-            builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, workspace_bytes);
+            builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, workspace_bytes[participant]);
             builder.add(resource, PhysicalMemoryOwner::NativeGraphExecutable, GPUGraphMemoryContract::reservationBytesPerExecutable(device));
         }
+        if (sliced) builder.add(planningObservedResource(rank, first), PhysicalMemoryOwner::ActivationTransportStaging,
+            sizeof(CapturedTransferSourceSlice));
+        if (tensor_source) builder.add(planningObservedResource(rank, first), PhysicalMemoryOwner::ActivationTransportStaging, source_tensor_bytes);
+        if (sliced) builder.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
+            slice_declaration.physicalBytes());
+        if (tensor_source) builder.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
+            source_declaration.physicalBytes());
         auto authority = std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()), rank.rank);
         auto &transfer = TransferEngine::instance();
@@ -137,13 +197,35 @@ namespace
             std::array<std::shared_ptr<const WorkspaceBufferLease>, 2> payloads, returned, counts;
             for (size_t i = 0; i < 2; ++i)
             {
-                DeviceWorkspaceManager workspace(devices[i], workspace_bytes, authority);
-                ASSERT_TRUE(workspace.allocate(requirements));
-                payloads[i] = workspace.retainBuffer("payload", 0, storage_bytes);
+                DeviceWorkspaceManager workspace(devices[i], workspace_bytes[i], authority);
+                ASSERT_TRUE(workspace.allocate(workspace_requirements[i]));
+                if (i != 0 || !tensor_source) payloads[i] = workspace.retainBuffer("payload", 0, storage_bytes);
                 returned[i] = workspace.retainBuffer("returned", 0, storage_bytes);
                 counts[i] = workspace.retainBuffer("counts", 0, 3 * sizeof(std::uint64_t));
                 workspace.release();
             }
+            PhysicalMemoryAllocationLease slice_claim, source_claim;
+            std::shared_ptr<TensorBase> slice_root, source_root;
+            if (sliced)
+            {
+                slice_claim = authority->claimNewAllocation(first, PhysicalMemoryOwner::ActivationTransportStaging,
+                    sizeof(CapturedTransferSourceSlice));
+                slice_root = slice_declaration.materialize(authority);
+                ASSERT_EQ(slice_root->size_bytes(), sizeof(CapturedTransferSourceSlice));
+                workers[0]->submitAndWait([&] { TransferEngine::prepareDeviceOutput(slice_root.get(), first, streams[0]); });
+            }
+            if (tensor_source)
+            {
+                source_claim = authority->claimNewAllocation(first, PhysicalMemoryOwner::ActivationTransportStaging, source_tensor_bytes);
+                source_root = source_declaration.materialize(authority);
+                ASSERT_EQ(source_root->size_bytes(), source_tensor_bytes);
+                workers[0]->submitAndWait([&] { TransferEngine::prepareDeviceOutput(source_root.get(), first, streams[0]); });
+                ASSERT_NE(source_root.get(), slice_root.get());
+            }
+            if (sliced)
+                ASSERT_EQ(authority->claimedBytes(first, PhysicalMemoryOwner::ActivationTransportStaging,
+                    PhysicalMemoryMaterializationKind::NewAllocation),
+                    2 * geometry.cursor_bytes_per_device + sizeof(CapturedTransferSourceSlice) + (tensor_source ? source_tensor_bytes : 0));
             Terminal first_done{backends[0], first, backends[0]->createEvent(first.ordinal)};
             Terminal second_done{backends[1], second, backends[1]->createEvent(second.ordinal)};
             ASSERT_NE(first_done.event, nullptr);
@@ -152,8 +234,11 @@ namespace
             {
                 // These are the ONLY captures for this alignment. The device
                 // sequence selects all 128 live sizes through the same graphs.
-                const auto send = transfer.bindDeviceCountedTransfer(transfer.bindCapturedTransfer(forward,
-                    CapturedTransferEndpoint::Producer, {51, capacity}, payloads[0], offset), counts[0], 0);
+                const auto source_capacity = tensor_source
+                    ? transfer.bindCapturedTransfer(forward, CapturedTransferEndpoint::Producer, {51, capacity}, source_root, offset)
+                    : transfer.bindCapturedTransfer(forward, CapturedTransferEndpoint::Producer, {51, capacity}, payloads[0], offset);
+                const auto send = sliced ? transfer.bindDeviceSlicedTransfer(source_capacity, slice_root, 0, source_span, source_origin)
+                    : transfer.bindDeviceCountedTransfer(source_capacity, counts[0], 0);
                 const auto receive = transfer.bindDeviceCountedTransfer(transfer.bindCapturedTransfer(forward,
                     CapturedTransferEndpoint::Consumer, {51, capacity}, payloads[1], offset), counts[1], 0);
                 const auto reply = transfer.bindDeviceCountedTransfer(transfer.bindCapturedTransfer(backward,
@@ -173,30 +258,77 @@ namespace
                     workers[i]->submitAndWait([&] {
                         graphs[i] = workers[i]->createGraphCapture(streams[i]);
                         require(bool(graphs[i]), "Missing counted channel graph");
-                        ScopedBackendGraphCapture capture(*workers[i], *graphs[i], "device-counted round trip");
+                        std::array<int, 2> stage_identities{};
+                        std::optional<GraphCaptureDependencyLedger> ledger;
+                        if (sliced && i == 0)
+                        {
+                            std::vector<const TensorBase *> outputs{slice_root.get()};
+                            std::vector<GraphCaptureDependencyLedger::InternalInput> inputs{{slice_root.get(), 0}};
+                            if (source_root) { outputs.push_back(source_root.get()); inputs.push_back({source_root.get(), 0}); }
+                            ledger.emplace(first, streams[0], std::vector<GraphCaptureDependencyLedger::StagePlan>{
+                                {.stage_identity = &stage_identities[0], .stage_name = "original slice producer", .outputs = std::move(outputs)},
+                                {.stage_identity = &stage_identities[1], .stage_name = "directed source transfer",
+                                    .internal_inputs = std::move(inputs)}}, "source slice capture");
+                        }
+                        ScopedBackendGraphCapture capture(*workers[i], *graphs[i], "device-counted round trip", ledger ? &*ledger : nullptr);
                         require(capture.begin(), "Counted capture begin");
                         if (i == 0)
                         {
                             require(backends[i]->memset(returned[i]->data(), 0xa5, storage_bytes, first.ordinal, streams[i]), "Reset returned guards");
-                            preparePayload(first, payloads[0]->data(offset), static_cast<std::uint64_t *>(counts[0]->data()), sequence, capacity, streams[0]);
-                            transfer.enqueueCapturedTransfer(send, streams[0]);
-                            transfer.enqueueCapturedTransfer(collect, streams[0]);
-                            advanceSequence(first, sequence, streams[0]);
+                            if (sliced)
+                            {
+                                ScopedGraphCaptureStage writer(&stage_identities[0]);
+                                auto *source_address = source_root ? static_cast<std::byte *>(source_root->gpu_data_ptr()) + offset : payloads[0]->data(offset);
+                                prepareSourceSlice(first, source_address,
+                                    static_cast<CapturedTransferSourceSlice *>(slice_root->gpu_data_ptr()), sequence, capacity, source_span, source_origin, streams[0]);
+                                TransferEngine::publishDeviceWrite(slice_root.get(), first, streams[0]);
+                                if (source_root) TransferEngine::publishDeviceWrite(source_root.get(), first, streams[0]);
+                                writer.complete();
+                            }
+                            else preparePayload(first, payloads[0]->data(offset), static_cast<std::uint64_t *>(counts[0]->data()), sequence, capacity, streams[0]);
+                            ScopedGraphCaptureStage transfer_stage(&stage_identities[1]);
+                            if (batched)
+                            {
+                                transfer.enqueueCapturedTransferBatch(std::span(&send, 1), streams[0]);
+                                transfer.enqueueCapturedTransferBatch(std::span(&collect, 1), streams[0]);
+                            }
+                            else { transfer.enqueueCapturedTransfer(send, streams[0]); transfer.enqueueCapturedTransfer(collect, streams[0]); }
+                            advanceSequence(first, sequence, streams[0]); transfer_stage.complete();
                         }
                         else
                         {
                             require(backends[i]->memset(payloads[i]->data(), 0xa5, storage_bytes, second.ordinal, streams[i]), "Reset peer guards");
-                            transfer.enqueueCapturedTransfer(receive, streams[1]);
-                            transfer.enqueueCapturedTransfer(reply, streams[1]);
+                            if (batched)
+                            {
+                                transfer.enqueueCapturedTransferBatch(std::span(&receive, 1), streams[1]);
+                                transfer.enqueueCapturedTransferBatch(std::span(&reply, 1), streams[1]);
+                            }
+                            else { transfer.enqueueCapturedTransfer(receive, streams[1]); transfer.enqueueCapturedTransfer(reply, streams[1]); }
                         }
                         capture.finish();
-                        counted_channel_test::verifyCapturedChannelGraph(*graphs[i], capacity, 2);
+                        if (batched) counted_channel_test::verifyCapturedChannelBatchGraph(*graphs[i], capacity, 1, 2);
+                        else counted_channel_test::verifyCapturedChannelGraph(*graphs[i], capacity, 2);
                         require(graphs[i]->instantiate(), "Incomplete counted capture");
                     });
                 std::array<std::vector<std::uint8_t>, 2> actual{std::vector<std::uint8_t>(storage_bytes), std::vector<std::uint8_t>(storage_bytes)};
                 std::array<std::uint64_t, 3> observed_counts{};
                 for (size_t replay = 0; replay < 128; ++replay)
                 {
+                    if (sliced)
+                        for (const auto &channel : {forward, backward})
+                        {
+                            auto wire = CapturedTransferChannelReplayProbe::payload(*channel);
+                            std::fill(wire.begin(), wire.end(), std::byte{0xa5});
+                        }
+                    const auto input_sequence = sliced ? replay % 64 : replay;
+                    if (sliced && replay == 64)
+                    {
+                        workers[0]->submitAndWait([&] {
+                            require(backends[0]->memset(sequence, 0, sizeof(*sequence), first.ordinal, streams[0]), "Reset next request source data");
+                            require(backends[0]->recordEvent(first_done.event, first.ordinal, streams[0]), "Reset exact producer event");
+                        });
+                        first_done.await(); // Explicit test request boundary; channel epochs/captured graphs are retained.
+                    }
                     const auto order = replay % 2 ? std::array<size_t, 2>{1, 0} : std::array<size_t, 2>{0, 1};
                     for (const auto i : order)
                     {
@@ -217,20 +349,31 @@ namespace
                             require(backends[i]->deviceToHostOnStream(actual[i].data(), i == 0 ? returned[0]->data() : payloads[1]->data(),
                                 storage_bytes, devices[i].ordinal, streams[i]), "Observe counted payload");
                             if (i == 0)
-                                require(backends[i]->deviceToHostOnStream(observed_counts.data(), counts[0]->data(), sizeof(observed_counts),
-                                    first.ordinal, streams[i]), "Observe terminal counts");
+                                require(backends[i]->deviceToHostOnStream(observed_counts.data() + (sliced ? 1 : 0),
+                                    counts[0]->data((sliced ? 1 : 0) * sizeof(std::uint64_t)),
+                                    (sliced ? 2 : 3) * sizeof(std::uint64_t), first.ordinal, streams[i]), "Observe terminal counts");
                             require(backends[i]->recordEvent(i == 0 ? first_done.event : second_done.event, devices[i].ordinal, streams[i]), "Counted terminal event");
                         });
                     first_done.await(); second_done.await();
-                    const auto bytes = counted_channel_test::extent(replay, capacity);
-                    ASSERT_EQ(observed_counts[0], bytes);
+                    const auto bytes = counted_channel_test::extent(input_sequence, capacity);
+                    if (!sliced) ASSERT_EQ(observed_counts[0], bytes);
                     ASSERT_EQ(observed_counts[1], bytes);
-                    ASSERT_EQ(observed_counts[2], replay + 1);
+                    ASSERT_EQ(observed_counts[2], input_sequence + 1);
+                    const auto source_offset = sliced ? counted_channel_test::sliceOffset(input_sequence, capacity, source_span) : 0;
+                    if (sliced)
+                        for (const auto &channel : {forward, backward})
+                        {
+                            const auto wire = CapturedTransferChannelReplayProbe::payload(*channel);
+                            for (size_t byte = 0; byte < wire.size(); ++byte)
+                                ASSERT_EQ(wire[byte], byte < bytes
+                                    ? static_cast<std::byte>(counted_channel_test::byte(input_sequence, source_offset + byte))
+                                    : std::byte{0xa5}) << "Unused wire capacity was copied at byte " << byte;
+                        }
                     for (size_t peer = 0; peer < 2; ++peer)
                         for (size_t byte = 0; byte < storage_bytes; ++byte)
                         {
                             const auto expected = byte >= offset && byte - offset < bytes
-                                ? counted_channel_test::byte(replay, byte - offset) : std::uint8_t{0xa5};
+                                ? counted_channel_test::byte(input_sequence, source_offset + byte - offset) : std::uint8_t{0xa5};
                             if (actual[peer][byte] != expected)
                                 FAIL() << first.toString() << " -> " << second.toString() << " replay=" << replay << " peer=" << peer
                                     << " offset=" << offset << " live_bytes=" << bytes << " first_bad_byte=" << byte;
@@ -506,6 +649,17 @@ namespace
              {1, CapturedTransferKernelPlan::SingleBlock, 1}});
     }
 
+    /** @brief Reuse retained graphs across empty/unaligned/full/shrinking source slices and request reset. */
+    void verifySourceSlices(DeviceId first, DeviceId second)
+    {
+        for (const bool batched : {false, true})
+            for (const size_t capacity : {size_t{257}, size_t{16385}})
+            {
+                verifyCountedRoundTrip(first, second, capacity, true, batched); // Existing workspace/relative control.
+                verifyCountedRoundTrip(first, second, capacity, true, batched, true, 4000); // Two original Tensor roots and absolute coordinates.
+            }
+    }
+
     /** @brief Cross the exact dispatch boundary without changing the protocol oracle. */
     void verifyFusedBoundaries(DeviceId first, DeviceId second)
     {
@@ -517,12 +671,14 @@ namespace
 
 #ifdef HAVE_CUDA
 TEST(DeviceCountedTransferChannel, CUDA_CUDA) { verifyCountedRoundTrip(DeviceId::cuda(0), DeviceId::cuda(1)); }
+TEST(DeviceCountedTransferChannel, CUDA_CUDA_SourceSlices) { verifySourceSlices(DeviceId::cuda(0), DeviceId::cuda(1)); }
 TEST(DeviceCountedTransferChannel, CUDA_CUDA_BatchedEndpoints) { verifyCountedBatches(DeviceId::cuda(0), DeviceId::cuda(1)); }
 TEST(DeviceCountedTransferChannel, CUDA_CUDA_Batch16KiBBoundaries) { verifyBatch16KiBBoundaries(DeviceId::cuda(0), DeviceId::cuda(1)); }
 TEST(DeviceCountedTransferChannel, CUDA_CUDA_FusedBoundaries) { verifyFusedBoundaries(DeviceId::cuda(0), DeviceId::cuda(1)); }
 #endif
 #ifdef HAVE_ROCM
 TEST(DeviceCountedTransferChannel, ROCm_ROCm) { verifyCountedRoundTrip(DeviceId::rocm(0), DeviceId::rocm(1)); }
+TEST(DeviceCountedTransferChannel, ROCm_ROCm_SourceSlices) { verifySourceSlices(DeviceId::rocm(0), DeviceId::rocm(1)); }
 TEST(DeviceCountedTransferChannel, ROCm_ROCm_BatchedEndpoints) { verifyCountedBatches(DeviceId::rocm(0), DeviceId::rocm(1)); }
 TEST(DeviceCountedTransferChannel, ROCm_ROCm_Batch16KiBBoundaries) { verifyBatch16KiBBoundaries(DeviceId::rocm(0), DeviceId::rocm(1)); }
 TEST(DeviceCountedTransferChannel, ROCm_ROCm_FusedBoundaries) { verifyFusedBoundaries(DeviceId::rocm(0), DeviceId::rocm(1)); }
@@ -531,9 +687,11 @@ TEST(DeviceCountedTransferChannel, ROCm_ROCm_FusedBoundaries) { verifyFusedBound
 TEST(DeviceCountedTransferChannel, CUDA_ROCm_BatchedEndpoints) { verifyCountedBatches(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(DeviceCountedTransferChannel, CUDA_ROCm_Batch16KiBBoundaries) { verifyBatch16KiBBoundaries(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(DeviceCountedTransferChannel, CUDA_ROCm) { verifyCountedRoundTrip(DeviceId::cuda(0), DeviceId::rocm(0)); }
+TEST(DeviceCountedTransferChannel, CUDA_ROCm_SourceSlices) { verifySourceSlices(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(DeviceCountedTransferChannel, ROCm_CUDA_BatchedEndpoints) { verifyCountedBatches(DeviceId::rocm(0), DeviceId::cuda(0)); }
 TEST(DeviceCountedTransferChannel, ROCm_CUDA_Batch16KiBBoundaries) { verifyBatch16KiBBoundaries(DeviceId::rocm(0), DeviceId::cuda(0)); }
 TEST(DeviceCountedTransferChannel, ROCm_CUDA) { verifyCountedRoundTrip(DeviceId::rocm(0), DeviceId::cuda(0)); }
+TEST(DeviceCountedTransferChannel, ROCm_CUDA_SourceSlices) { verifySourceSlices(DeviceId::rocm(0), DeviceId::cuda(0)); }
 TEST(DeviceCountedTransferChannel, CUDA_ROCm_FusedBoundaries) { verifyFusedBoundaries(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(DeviceCountedTransferChannel, ROCm_CUDA_FusedBoundaries) { verifyFusedBoundaries(DeviceId::rocm(0), DeviceId::cuda(0)); }
 #endif

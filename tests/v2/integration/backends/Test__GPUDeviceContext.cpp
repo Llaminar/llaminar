@@ -7,6 +7,9 @@
  * - GPUDeviceContextPool singleton
  * - NvidiaDeviceContext (if CUDA available)
  * - AMDDeviceContext (if ROCm available)
+ *
+ * Backend-specific cases are registered only in their matching native binary;
+ * missing runtime hardware remains a failed native qualification, not a pass.
  * - Ordering receipts cover retained compute after DMA on reused stream lanes
  * - Actual backend-owned workers inherit admitted OpenMP places and restore their creator
  * - Admission prices every retained verifier width before request execution
@@ -710,6 +713,7 @@ TEST(Test__GPUDeviceContextPool, DeviceCountQueries)
     }
 }
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool, GetContextByType_CUDA)
 {
     SKIP_IF_NO_CUDA();
@@ -726,7 +730,9 @@ TEST(Test__GPUDeviceContextPool, GetContextByType_CUDA)
     // Both should return the same context (same device ordinal)
     EXPECT_EQ(&ctx1, &ctx2);
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool, GetContextByType_ROCm)
 {
     SKIP_IF_NO_ROCM();
@@ -751,6 +757,7 @@ TEST(Test__GPUDeviceContextPool, GetContextByType_ROCm)
     EXPECT_EQ(&ctx2, &ctx3);
     EXPECT_EQ(&ctx3, &ctx4);
 }
+#endif
 
 TEST(Test__GPUDeviceContextPool, GetContextInvalidType)
 {
@@ -769,11 +776,11 @@ TEST(Test__GPUDeviceContextPool, GetContextInvalidOrdinal)
     // Negative ordinal should throw
     if (pool.hasNvidiaSupport())
     {
-        EXPECT_THROW(pool.getNvidiaContext(-1), std::runtime_error);
+        EXPECT_THROW(pool.getNvidiaContext(-1), std::invalid_argument);
     }
     if (pool.hasAMDSupport())
     {
-        EXPECT_THROW(pool.getAMDContext(-1), std::runtime_error);
+        EXPECT_THROW(pool.getAMDContext(-1), std::invalid_argument);
     }
 
     // Ordinal beyond device count should throw
@@ -797,6 +804,7 @@ TEST(Test__GPUDeviceContextPool, ExclusiveRetirementRejectsCPU)
         std::invalid_argument);
 }
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool, CUDAExclusiveRetirementCreatesFreshGeneration)
 {
     SKIP_IF_NO_CUDA();
@@ -819,7 +827,9 @@ TEST(Test__GPUDeviceContextPool, CUDAExclusiveRetirementCreatesFreshGeneration)
     // Leave a live context for the remaining backend integration cases.
     ASSERT_TRUE(pool.getNvidiaContext(0).isInitialized());
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool, ROCmExclusiveRetirementCreatesFreshGeneration)
 {
     SKIP_IF_NO_ROCM();
@@ -840,21 +850,27 @@ TEST(Test__GPUDeviceContextPool, ROCmExclusiveRetirementCreatesFreshGeneration)
     // Later tests consume the ordinary live generation, not a retired handle.
     ASSERT_TRUE(pool.getAMDContext(0).isInitialized());
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool,
      CUDAAcquisitionIsExcludedAcrossRuntimeRetirementScope)
 {
     SKIP_IF_NO_CUDA();
     expectContextAcquisitionExcludedDuringRetirement(DeviceId::cuda(0));
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool,
      ROCmAcquisitionIsExcludedAcrossRuntimeRetirementScope)
 {
     SKIP_IF_NO_ROCM();
     expectContextAcquisitionExcludedDuringRetirement(DeviceId::rocm(0));
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool,
      CUDAExclusiveModelRetirementResetsRuntimeGeneration)
 {
@@ -866,7 +882,9 @@ TEST(Test__GPUDeviceContextPool,
         expectExclusiveRuntimeGenerationRetirement(DeviceId::cuda(0));
     }
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool,
      ROCmExclusiveModelRetirementResetsRuntimeGeneration)
 {
@@ -878,7 +896,9 @@ TEST(Test__GPUDeviceContextPool,
         expectExclusiveRuntimeGenerationRetirement(DeviceId::rocm(0));
     }
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__GPUDeviceContextPool,
      CUDAExclusiveMultiDeviceModelRetirementIsStableForTwentyCycles)
 {
@@ -895,7 +915,9 @@ TEST(Test__GPUDeviceContextPool,
             DeviceId::cuda(0), DeviceId::cuda(1));
     }
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__GPUDeviceContextPool,
      ROCmExclusiveMultiDeviceModelRetirementIsStableForTwentyCycles)
 {
@@ -912,6 +934,7 @@ TEST(Test__GPUDeviceContextPool,
             DeviceId::rocm(0), DeviceId::rocm(1));
     }
 }
+#endif
 
 TEST(Test__GPUDeviceContextPool, ConcurrentAccess)
 {
@@ -951,6 +974,7 @@ TEST(Test__GPUDeviceContextPool, ConcurrentAccess)
 // NvidiaDeviceContext Tests
 // ===========================================================================
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__NvidiaDeviceContext, CreationAndInitialization)
 {
     SKIP_IF_NO_CUDA();
@@ -1311,11 +1335,13 @@ TEST(Test__NvidiaDeviceContext, CollectiveCommInitiallyNull)
     // Don't assert null - it may have been set by previous tests
     (void)comm;
 }
+#endif
 
 // ===========================================================================
 // AMDDeviceContext Tests (mirror NVIDIA tests)
 // ===========================================================================
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__AMDDeviceContext, CreationAndInitialization)
 {
     SKIP_IF_NO_ROCM();
@@ -1440,7 +1466,9 @@ TEST(Test__AMDDeviceContext, StreamCreationAndDestruction)
     ctx.submitAndWait([&]()
                       { ctx.destroyStream(stream); });
 }
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 #if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__AMDDeviceContext, StreamCreationUsesContextDeviceWhenCallerDeviceDiffers)
 {
@@ -1485,7 +1513,9 @@ TEST(Test__AMDDeviceContext, StreamCreationUsesContextDeviceWhenCallerDeviceDiff
     }
 }
 #endif
+#endif
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__AMDDeviceContext, MultipleStreams)
 {
     SKIP_IF_NO_ROCM();
@@ -1707,6 +1737,7 @@ TEST(Test__AMDDeviceContext, CollectiveCommInitiallyNull)
     void *comm = ctx.collectiveComm();
     (void)comm;
 }
+#endif
 
 // ===========================================================================
 // Cross-Platform Interface Tests
@@ -1956,16 +1987,20 @@ void expectBackendWorkerAffinity(Factory construct)
 
 #if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 /** @test Real CUDA context construction preserves its parent and places its own task worker. */
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 TEST(Test__NvidiaDeviceContext, OwnedWorkerInheritsPartitionAndRestoresParent)
 {
     SKIP_IF_NO_CUDA();
     expectBackendWorkerAffinity([] { return std::make_unique<NvidiaDeviceContext>(0); });
 }
+#endif
 #elif defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 /** @test Real ROCm context construction preserves its parent and places its own task worker. */
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 TEST(Test__AMDDeviceContext, OwnedWorkerInheritsPartitionAndRestoresParent)
 {
     SKIP_IF_NO_ROCM();
     expectBackendWorkerAffinity([] { return std::make_unique<AMDDeviceContext>(0); });
 }
+#endif
 #endif

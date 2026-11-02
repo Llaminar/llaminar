@@ -70,11 +70,12 @@ def validate_described_config(topology, described):
 
 
 def physical_devices(config):
-    """Project only original symbolic GlobalDeviceAddress fields for resource observation.
+    """Observe original compute addresses and separately declared rank-local cache GPUs.
 
     This does not resolve placement or grant devices. Native compares the entire
     original config and validates its actual admitted execution plan separately.
     """
+    require(type(config) is dict, 'Invalid canonical configuration document')
     found = set()
     def visit(value):
         if type(value) is dict:
@@ -88,6 +89,43 @@ def physical_devices(config):
         elif type(value) is list:
             for child in value: visit(child)
     visit(config)
+    # Cache endpoints are rank-local storage roles, not GlobalDeviceAddress
+    # compute participants. Observe their physical GPUs without modifying the
+    # canonical configuration or inferring an extra compute/expert domain.
+    configuration = config.get('configuration', {})
+    require(type(configuration) is dict, 'Invalid canonical configuration')
+    table = configuration.get('ngram_table_policy')
+    if table is not None:
+        require(type(table) is dict, 'Invalid canonical ngram policy')
+        adaptive = table.get('gpu_adaptive', {})
+        require(type(adaptive) is dict, 'Invalid canonical GPU cache policy')
+        placement = adaptive.get('placement')
+        if placement is not None:
+            require(type(placement) is dict and placement.get('mode') in ('ConsumerLocal', 'DeclaredRankLocal'),
+                    'Invalid explicit GPU cache placement')
+            owners = placement.get('owners')
+            require(type(owners) is list, 'Invalid explicit GPU cache owners')
+            endpoints = []
+            for owner in owners:
+                require(type(owner) is dict and 'participant' in owner, 'Invalid explicit GPU cache owner')
+                endpoints.append(owner['participant'])
+            coordinator = placement.get('coordinator')
+            if placement['mode'] == 'ConsumerLocal':
+                require(not endpoints and coordinator is None, 'Consumer-local cache has declared endpoints')
+            else:
+                require(endpoints and coordinator is not None, 'Declared GPU cache has incomplete endpoints')
+                endpoints.append(coordinator)
+            for endpoint in endpoints:
+                require(type(endpoint) is dict and set(endpoint) == {'world_rank', 'backend', 'ordinal'},
+                        'Invalid explicit GPU cache participant')
+                require(type(endpoint['world_rank']) is int and endpoint['world_rank'] == 0,
+                        'QFN observer requires rank-local GPU cache participants')
+                require(type(endpoint['backend']) is str, 'Invalid explicit GPU cache participant backend')
+                backend = {'CUDA': 'cuda', 'ROCm': 'rocm'}.get(endpoint['backend'])
+                ordinal = endpoint['ordinal']
+                require(backend is not None and type(ordinal) is int and ordinal >= 0,
+                        'Invalid explicit GPU cache participant device')
+                found.add(backend + ':' + str(ordinal))
     require(found, 'Canonical config has no original physical device inventory')
     return sorted(found)
 

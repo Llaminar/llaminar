@@ -62,6 +62,21 @@ namespace llaminar2
         return false;
     }
 
+    /**
+     * @brief One producer-owned live slice within an immutable retained source region.
+     *
+     * Offsets use the binding's immutable coordinate origin, independent of
+     * the mapped slot. The graph orders this whole descriptor before acquisition;
+     * acquire snapshots both fields before waiting and retains them through
+     * payload publication. Empty slices may name the source region's end.
+     */
+    struct CapturedTransferSourceSlice
+    {
+        std::uint64_t byte_offset = 0;
+        std::uint64_t live_bytes = 0;
+    };
+    static_assert(sizeof(CapturedTransferSourceSlice) == 16);
+
     /** @brief Local lease state; a failed endpoint is never reusable. */
     enum class CapturedTransferPhase : std::uint32_t { Idle, Acquired, Publishing, Failed };
 
@@ -133,6 +148,7 @@ namespace llaminar2
         CapturedTransferPhase phase = CapturedTransferPhase::Idle;
         std::uint32_t completed_payload_blocks = 0; ///< GPU-only completion cohort; occupies former alignment padding.
         CapturedTransferMessage acquired_message;
+        std::uint64_t acquired_source_offset = 0; ///< Producer-private snapshot; never a wire extent or host observation.
     };
 
     /** @brief Setup-owned mapped header and independent release words. */
@@ -160,13 +176,21 @@ namespace llaminar2
         std::uint64_t timeout_ticks = 0;
         CapturedTransferExtentSource extent_source = CapturedTransferExtentSource::FixedMessage;
         std::uint64_t *device_extent = nullptr; ///< Producer input or consumer output; retained device storage.
+        const CapturedTransferSourceSlice *source_slice = nullptr; ///< Optional producer descriptor in its original retained Tensor.
+        std::uint64_t source_span_bytes = 0; ///< Immutable local source region, independent of maximum/live wire bytes.
+        std::uint64_t source_offset_origin = 0; ///< Coordinate origin of that source region in the original descriptor.
 
         /** @return Whether immutable fields can name a bounded native operation. */
         [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr bool valid() const noexcept
         {
             return control && cursor && expected.valid() && message.fits(expected.capacity) && timeout_ticks != 0 &&
                 capturedTransferExtentMatchesRole(extent_source, role) &&
-                ((extent_source == CapturedTransferExtentSource::FixedMessage) == (device_extent == nullptr));
+                ((extent_source == CapturedTransferExtentSource::FixedMessage) == (device_extent == nullptr)) &&
+                (source_slice ? role == CapturedTransferEndpoint::Producer &&
+                    extent_source == CapturedTransferExtentSource::ProducerDevice &&
+                    device_extent == &source_slice->live_bytes && source_span_bytes != 0 && source_span_bytes >= message.bytes &&
+                    source_offset_origin <= ~std::uint64_t{0} - source_span_bytes
+                    : source_span_bytes == 0 && source_offset_origin == 0);
         }
     };
 
@@ -202,6 +226,9 @@ namespace llaminar2
          * @param message Semantic role and exact size or positive maximum extent.
          * @param extent_source Immutable authority for this invocation's live size.
          * @param producer_bytes Producer device scalar sampled once, ignored by other sources.
+         * @param producer_source_offset Optional offset sampled with that scalar from its original slice.
+         * @param producer_source_span Positive immutable source region for a sliced producer; zero for ordinary bindings.
+         * @param producer_source_origin Immutable coordinate origin; subtraction never widens the admitted region.
          * @return Ready with one lease, WaitForPeer without mutation, or failure.
          *
          * The producer waits for acknowledgement of its previous epoch. The
@@ -214,12 +241,22 @@ namespace llaminar2
             CapturedTransferChannelIdentity actual, CapturedTransferCursor &cursor,
             CapturedTransferPublication peer, CapturedTransferMessage message,
             CapturedTransferExtentSource extent_source = CapturedTransferExtentSource::FixedMessage,
-            std::uint64_t producer_bytes = 0) noexcept
+            std::uint64_t producer_bytes = 0,
+            std::uint64_t producer_source_offset = 0,
+            std::uint64_t producer_source_span = 0,
+            std::uint64_t producer_source_origin = 0) noexcept
         {
             if (!identity.valid() || identity.nonce != actual.nonce || identity.capacity != actual.capacity ||
                 !message.fits(identity.capacity) ||
                 !capturedTransferExtentMatchesRole(extent_source, role) ||
-                (extent_source == CapturedTransferExtentSource::ProducerDevice && producer_bytes > message.bytes))
+                (extent_source == CapturedTransferExtentSource::ProducerDevice && producer_bytes > message.bytes) ||
+                (producer_source_span ? role != CapturedTransferEndpoint::Producer ||
+                    extent_source != CapturedTransferExtentSource::ProducerDevice || producer_source_span < message.bytes ||
+                    producer_source_origin > ~std::uint64_t{0} - producer_source_span ||
+                    producer_source_offset < producer_source_origin ||
+                    producer_source_offset - producer_source_origin > producer_source_span ||
+                    producer_bytes > producer_source_span - (producer_source_offset - producer_source_origin)
+                    : producer_source_offset != 0 || producer_source_origin != 0))
                 return fail(cursor, CapturedTransferStatus::InvalidBinding);
             if (cursor.phase != CapturedTransferPhase::Idle)
                 return fail(cursor, CapturedTransferStatus::InvalidPhase);
@@ -254,6 +291,7 @@ namespace llaminar2
             }
             cursor.phase = CapturedTransferPhase::Acquired;
             cursor.acquired_message = message;
+            cursor.acquired_source_offset = producer_source_offset - producer_source_origin;
             return {CapturedTransferStatus::Ready, completed + 1};
         }
 
@@ -282,6 +320,7 @@ namespace llaminar2
             cursor.completed_epoch = lease;
             cursor.phase = CapturedTransferPhase::Idle;
             cursor.acquired_message = {};
+            cursor.acquired_source_offset = 0;
             return {CapturedTransferStatus::Ready, lease};
         }
 
@@ -312,7 +351,7 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<CapturedTransferPublication>);
     static_assert(std::is_trivially_copyable_v<CapturedTransferCursor>);
     static_assert(sizeof(CapturedTransferPublication) == 64);
-    static_assert(sizeof(CapturedTransferCursor) == 32);
+    static_assert(sizeof(CapturedTransferCursor) == 40);
     static_assert(sizeof(CapturedTransferChannelControl) == 192);
 }
 

@@ -73,6 +73,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <nlohmann/json.hpp>
 
 using namespace llaminar2;
 
@@ -8018,20 +8019,23 @@ namespace
         GPUSamplingTest,
         CapturedStochasticTargetPreparationIsProductionByteExactAcrossDepths)
     {
-        constexpr int vocab_size = 4096;
-        constexpr int output_stride = 32;
+        constexpr int output_stride = 256;
         constexpr float presence_penalty = 0.31F;
         constexpr float frequency_penalty = 0.17F;
         constexpr float top_p = 0.91F;
         constexpr float temperature = 0.73F;
-        const std::array<int, 4> row_cases = {2, 4, 8, 16};
-        const std::array<int, 4> top_k_cases = {1, 7, 20, 32};
+        const std::array<int, 9> row_cases = {2, 4, 8, 16, 3, 5, 9, 15, 16};
+        const std::array<int, 9> top_k_cases = {1, 7, 20, 32, 40, 64, 65, 128, 256};
 
         auto run_case = [&](IWorkerGPUContext &ctx,
                             int rows,
                             int top_k,
-                            bool first_token_already_in_history)
+                            bool first_token_already_in_history,
+                            bool enabled, int vocabulary = 4099)
         {
+            const int vocab_size = vocabulary;
+            const float selected_presence = enabled ? presence_penalty : 0.0f;
+            const float selected_frequency = enabled ? frequency_penalty : 0.0f;
             const size_t logit_count =
                 static_cast<size_t>(rows) * vocab_size;
             const size_t output_count =
@@ -8054,7 +8058,7 @@ namespace
             for (int row = 0; row < rows; ++row)
             {
                 verifier_tokens[static_cast<size_t>(row)] =
-                    37 + (row * 53) % (vocab_size - 37);
+                    37 + ((row / 2) * 53) % (vocab_size - 37);
                 for (int token = 0; token < vocab_size; ++token)
                 {
                     logits[static_cast<size_t>(row) * vocab_size + token] =
@@ -8064,11 +8068,20 @@ namespace
                             113.0F;
                 }
             }
+            // Force both prompt-only repetition and generated/branch penalties
+            // into the selected candidates; an unpenalized selector must fail.
+            for (int row = 0; row < rows; ++row)
+            {
+                logits[static_cast<size_t>(row) * vocab_size + 37] = 12.0f;
+                logits[static_cast<size_t>(row) * vocab_size + 11] = 11.5f;
+                logits[static_cast<size_t>(row) * vocab_size + 3] = 10.5f;
+            }
             for (int token : {3, 37, 101, 997, 2047, 4095})
             {
                 generated_counts[static_cast<size_t>(token)] =
                     1 + token % 4;
             }
+            generated_counts[11] = sampling_math::TokenPenaltyHistory::withPrompt(0);
             if (first_token_already_in_history)
             {
                 ++generated_counts[static_cast<size_t>(
@@ -8194,19 +8207,19 @@ namespace
                 ASSERT_TRUE(
                     backend_->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
                         d_reference_policy,
-                        presence_penalty,
-                        frequency_penalty,
+                        selected_presence,
+                        selected_frequency,
                         first_token_already_in_history,
                         device_id_,
-                        stream));
+                        stream, enabled ? 1.25f : 1.0f));
                 ASSERT_TRUE(
                     backend_->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
                         d_captured_policy,
-                        presence_penalty,
-                        frequency_penalty,
+                        selected_presence,
+                        selected_frequency,
                         first_token_already_in_history,
                         device_id_,
-                        stream));
+                        stream, enabled ? 1.25f : 1.0f));
                 ASSERT_TRUE(
                     backend_->enqueueApplyMTPPenaltiesToF32RowsDevice(
                         d_reference_logits,
@@ -8284,10 +8297,11 @@ namespace
                     stage.execute(execution_context.get());
                 ASSERT_TRUE(capture->endCapture());
                 ASSERT_TRUE(stage_enqueued);
-                ASSERT_GE(capture->nodeCount(), 3U)
-                    << "target preparation capture omitted required kernels";
+                ASSERT_EQ(capture->nodeCount(), 2U)
+                    << "History must stay fused into selection plus normalization";
                 ASSERT_TRUE(capture->instantiate());
-                ASSERT_TRUE(capture->launch());
+                for (int replay = 0; replay < 3; ++replay)
+                    ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 /*
@@ -8302,6 +8316,12 @@ namespace
                         static_cast<float>((index * 29 + rows * 41) % 1237) /
                             127.0F;
                 }
+                for (int row = 0; row < rows; ++row)
+                {
+                    logits[static_cast<size_t>(row) * vocab_size + 37] = 15.0f;
+                    logits[static_cast<size_t>(row) * vocab_size + 11] = 13.0f;
+                    logits[static_cast<size_t>(row) * vocab_size + 3] = 14.0f;
+                }
                 for (size_t token = 0;
                      token < generated_counts.size();
                      ++token)
@@ -8310,6 +8330,7 @@ namespace
                         token % 509 == 0 ? 1 + static_cast<int>(token % 5)
                                          : 0;
                 }
+                generated_counts[11] = sampling_math::TokenPenaltyHistory::withPrompt(0);
                 if (first_token_already_in_history)
                 {
                     ++generated_counts[static_cast<size_t>(
@@ -8336,11 +8357,11 @@ namespace
                 ASSERT_TRUE(
                     backend_->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
                         d_reference_policy,
-                        presence_penalty,
-                        frequency_penalty,
+                        selected_presence,
+                        selected_frequency,
                         first_token_already_in_history,
                         device_id_,
-                        stream));
+                        stream, enabled ? 1.25f : 1.0f));
                 ASSERT_TRUE(
                     backend_->enqueueApplyMTPPenaltiesToF32RowsDevice(
                         d_reference_logits,
@@ -8369,11 +8390,11 @@ namespace
                         d_reference_scratch_values,
                         d_reference_scratch_indices,
                         scratch_capacity));
-                ASSERT_TRUE(capture->launch());
+                for (int replay = 0; replay < 3; ++replay)
+                    ASSERT_TRUE(capture->launch());
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
             });
 
-            std::vector<float> reference_logits(logit_count);
             std::vector<float> captured_logits(logit_count);
             std::vector<int32_t> reference_ids(output_count);
             std::vector<int32_t> captured_ids(output_count);
@@ -8381,11 +8402,6 @@ namespace
             std::vector<float> captured_probs(output_count);
             MTPGreedyPenaltyPolicy reference_policy{};
             MTPGreedyPenaltyPolicy captured_policy{};
-            ASSERT_TRUE(copyDeviceToHost(
-                reference_logits.data(),
-                d_reference_logits,
-                logit_count * sizeof(float),
-                device_id_));
             ASSERT_TRUE(copyDeviceToHost(
                 captured_logits.data(),
                 d_captured_logits,
@@ -8441,34 +8457,34 @@ namespace
                 << ", enabled=" << captured_policy.enabled << "}";
 
             const auto first_logit_mismatch = std::mismatch(
-                reference_logits.begin(),
-                reference_logits.end(),
+                logits.begin(),
+                logits.end(),
                 captured_logits.begin(),
                 [](float lhs, float rhs)
                 {
                     return std::memcmp(&lhs, &rhs, sizeof(float)) == 0;
                 });
-            if (first_logit_mismatch.first != reference_logits.end())
+            if (first_logit_mismatch.first != logits.end())
             {
                 const size_t index = static_cast<size_t>(
-                    first_logit_mismatch.first - reference_logits.begin());
+                    first_logit_mismatch.first - logits.begin());
                 const size_t token = index % static_cast<size_t>(vocab_size);
                 ADD_FAILURE()
                     << "first captured logit mismatch at row="
                     << index / static_cast<size_t>(vocab_size)
                     << " token=" << token
                     << " history_count=" << generated_counts[token]
-                    << " reference=" << *first_logit_mismatch.first
+                    << " raw_expected=" << *first_logit_mismatch.first
                     << " captured=" << *first_logit_mismatch.second;
             }
 
             EXPECT_EQ(
                 std::memcmp(
-                    reference_logits.data(),
+                    logits.data(),
                     captured_logits.data(),
                     logit_count * sizeof(float)),
                 0)
-                << "captured penalty bytes differ at rows=" << rows;
+                << "captured raw logits were mutated at rows=" << rows;
             EXPECT_EQ(
                 std::memcmp(
                     reference_ids.data(),
@@ -8500,8 +8516,14 @@ namespace
                 ctx,
                 row_cases[case_index],
                 top_k_cases[case_index],
-                case_index % 2 != 0);
+                case_index % 2 != 0, true);
+            run_case(ctx, row_cases[case_index], top_k_cases[case_index],
+                     case_index % 2 != 0, false);
         }
+        IWorkerGPUContext &generic_ctx = GetParam() == "CUDA"
+            ? GPUDeviceContextPool::instance().getNvidiaContext(device_id_)
+            : GPUDeviceContextPool::instance().getAMDContext(device_id_);
+        run_case(generic_ctx, 2, 7, true, true, 600019);
     }
 
     /**
@@ -8697,19 +8719,21 @@ namespace
             const bool stage_enqueued = stage.execute(execution_context.get());
             ASSERT_TRUE(capture->endCapture());
             ASSERT_TRUE(stage_enqueued);
-            ASSERT_GE(capture->nodeCount(), 3U);
+            ASSERT_EQ(capture->nodeCount(), 2U)
+                << "Resident row masking must preserve the two-kernel target preparation";
             ASSERT_TRUE(capture->instantiate());
 
-            std::vector<float> reference_logits(logit_count);
             std::vector<float> captured_logits(logit_count);
             std::vector<int32_t> reference_ids(output_count);
             std::vector<int32_t> captured_ids(output_count);
             std::vector<float> reference_probs(output_count);
             std::vector<float> captured_probs(output_count);
 
-            for (int active_rows = 2;
-                 active_rows <= physical_rows;
-                 ++active_rows)
+            std::vector<int> active_cases;
+            for (int active = 0; active <= physical_rows; ++active)
+                active_cases.push_back(active);
+            active_cases.insert(active_cases.end(), {16, 2, 0, 1});
+            for (int active_rows : active_cases)
             {
                 ASSERT_TRUE(copyHostToDevice(
                     d_reference_logits,
@@ -8754,42 +8778,38 @@ namespace
                     device_id_,
                     stream));
 
-                ASSERT_TRUE(
-                    backend_->enqueueApplyMTPPenaltiesToF32RowsDevice(
-                        d_reference_logits,
-                        active_rows,
-                        vocab_size,
-                        vocab_size,
-                        d_tokens,
-                        d_counts,
-                        d_reference_policy,
-                        device_id_,
-                        stream));
-                ASSERT_TRUE(
-                    backend_->enqueueBuildTopKTopPDistributionsF32Device(
-                        d_reference_logits,
-                        active_rows,
-                        vocab_size,
-                        vocab_size,
-                        top_k,
-                        top_p,
-                        temperature,
-                        device_id_,
-                        stream,
-                        d_reference_ids,
-                        output_stride,
-                        d_reference_probs,
-                        d_reference_scratch_values,
-                        d_reference_scratch_indices,
-                        scratch_capacity));
+                if (active_rows > 0)
+                {
+                    ASSERT_TRUE(
+                        backend_->enqueueApplyMTPPenaltiesToF32RowsDevice(
+                            d_reference_logits,
+                            active_rows,
+                            vocab_size,
+                            vocab_size,
+                            d_tokens,
+                            d_counts,
+                            d_reference_policy,
+                            device_id_,
+                            stream));
+                    ASSERT_TRUE(
+                        backend_->enqueueBuildTopKTopPDistributionsF32Device(
+                            d_reference_logits,
+                            active_rows,
+                            vocab_size,
+                            vocab_size,
+                            top_k,
+                            top_p,
+                            temperature,
+                            device_id_,
+                            stream,
+                            d_reference_ids,
+                            output_stride,
+                            d_reference_probs,
+                            d_reference_scratch_values,
+                            d_reference_scratch_indices,
+                            scratch_capacity));
+                }
                 ASSERT_TRUE(capture->launch());
-
-                ASSERT_TRUE(copyDeviceToHost(
-                    reference_logits.data(),
-                    d_reference_logits,
-                    logit_count * sizeof(float),
-                    device_id_,
-                    stream));
                 ASSERT_TRUE(copyDeviceToHost(
                     captured_logits.data(),
                     d_captured_logits,
@@ -8824,11 +8844,11 @@ namespace
 
                 EXPECT_EQ(
                     std::memcmp(
-                        reference_logits.data(),
+                        logits.data(),
                         captured_logits.data(),
                         logit_count * sizeof(float)),
                     0)
-                    << "maximum target graph changed inactive logits at M="
+                    << "maximum target graph mutated raw logits at M="
                     << active_rows;
                 EXPECT_EQ(
                     std::memcmp(
@@ -8854,6 +8874,305 @@ namespace
             if (allocation)
                 backend_->free(allocation, device_id_);
         }
+    }
+
+    /**
+     * @brief Compare native history selection with its original destructive reference.
+     *
+     * Each interval contains exactly one retained preparation graph. The same
+     * raw logits are restored on the original stream BEFORE both arms' start
+     * events; repeated legacy penalties therefore cannot accumulate. Byte
+     * oracles, input reset and terminal observations are outside every interval.
+     * This is cache-hot component timing, not model throughput or an absolute
+     * hardware performance gate. No attached CUDA/HIP profiler is required.
+     */
+    TEST_P(GPUSamplingTest, StochasticHistorySelectorNativeEvents)
+    {
+        constexpr int vocab = 248320;
+        constexpr int top_k = 40;
+        constexpr int partial_entries_per_row = 128 * 64;
+        constexpr int warmups = 5;
+        constexpr size_t samples = 20;
+        enum class Path { LegacyTransform, ReadOnlyCandidates };
+        auto &pool = GPUDeviceContextPool::instance();
+        auto &worker = GetParam() == "CUDA"
+            ? pool.getNvidiaContext(device_id_) : pool.getAMDContext(device_id_);
+        worker.submitAndWait([&]
+        {
+            const auto device = GetParam() == "CUDA"
+                ? DeviceId::cuda(device_id_) : DeviceId::rocm(device_id_);
+            auto execution = IDeviceContext::create(device);
+            ASSERT_NE(execution, nullptr);
+            void *const stream = worker.defaultStream();
+            ASSERT_NE(stream, nullptr);
+            const auto free_buffer = [&](void *pointer)
+            {
+                if (pointer)
+                    backend_->free(pointer, device_id_);
+            };
+            const auto allocate = [&](size_t bytes)
+            {
+                return std::unique_ptr<void, decltype(free_buffer)>(
+                    backend_->allocate(bytes, device_id_), free_buffer);
+            };
+            const auto free_event = [&](void *event)
+            {
+                if (event)
+                    backend_->destroyEvent(event, device_id_);
+            };
+            for (int rows : {1, 4, 16})
+            {
+                SCOPED_TRACE(::testing::Message() << GetParam() << " rows=" << rows);
+                const size_t logit_elements = static_cast<size_t>(rows) * vocab;
+                const size_t logit_bytes = logit_elements * sizeof(float);
+                const size_t compact_elements = static_cast<size_t>(rows) * top_k;
+                const int partial_capacity = rows * partial_entries_per_row;
+                std::vector<float> raw(logit_elements);
+                std::vector<int32_t> counts(vocab);
+                std::vector<int32_t> branch(static_cast<size_t>(rows));
+                for (int token = 0; token < vocab; ++token)
+                {
+                    counts[token] = token % 509 == 0 ? token % 5 + 1 : 0;
+                    if (token % 127 == 0)
+                        counts[token] = sampling_math::TokenPenaltyHistory::withPrompt(counts[token]);
+                }
+                counts[11] = sampling_math::TokenPenaltyHistory::withPrompt(0);
+                counts[37] = 2;
+                for (int row = 0; row < rows; ++row)
+                {
+                    branch[row] = 37 + (row / 2) * 53;
+                    for (int token = 0; token < vocab; ++token)
+                        raw[static_cast<size_t>(row) * vocab + token] =
+                            -8.0f + static_cast<float>((token * 19 + row * 71) % 1009) / 113.0f;
+                    raw[static_cast<size_t>(row) * vocab + 37] = 12.0f;
+                    raw[static_cast<size_t>(row) * vocab + 11] = 11.5f;
+                }
+                const MTPGreedyPenaltyPolicy policy{
+                    .presence_penalty = 0.31f, .frequency_penalty = 0.17f,
+                    .repetition_penalty = 1.25f, .first_token_already_in_history = 1, .enabled = 1};
+                auto original = allocate(logit_bytes);
+                auto working = allocate(logit_bytes);
+                auto history = allocate(counts.size() * sizeof(int32_t));
+                auto tokens = allocate(branch.size() * sizeof(int32_t));
+                auto controls = allocate(sizeof(policy));
+                auto active = allocate(sizeof(rows));
+                auto ids = allocate(compact_elements * sizeof(int32_t));
+                auto probabilities = allocate(compact_elements * sizeof(float));
+                auto partial_values = allocate(static_cast<size_t>(partial_capacity) * sizeof(float));
+                auto partial_indices = allocate(static_cast<size_t>(partial_capacity) * sizeof(int32_t));
+                ASSERT_TRUE(original && working && history && tokens && controls && active && ids &&
+                            probabilities && partial_values && partial_indices);
+                std::unique_ptr<void, decltype(free_event)> start(
+                    backend_->createTimingEvent(device_id_), free_event);
+                std::unique_ptr<void, decltype(free_event)> stop(
+                    backend_->createTimingEvent(device_id_), free_event);
+                ASSERT_TRUE(start && stop);
+                std::unique_ptr<IGPUGraphCapture> legacy_graph;
+                std::unique_ptr<IGPUGraphCapture> readonly_graph;
+                // On failure, drain this diagnostic stream before graph/event/
+                // buffer owners unwind. This terminal fence is never timed.
+                const auto drain = [&](void *)
+                {
+                    if (!backend_->synchronizeStream(stream, device_id_))
+                        std::terminate();
+                };
+                std::unique_ptr<void, decltype(drain)> terminal_drain(stream, drain);
+                ASSERT_TRUE(copyHostToDevice(original.get(), raw.data(), logit_bytes, device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(history.get(), counts.data(), counts.size() * sizeof(int32_t), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(tokens.get(), branch.data(), branch.size() * sizeof(int32_t), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(controls.get(), &policy, sizeof(policy), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(active.get(), &rows, sizeof(rows), device_id_, stream));
+
+                MTPStochasticTargetDistributionStage::Params params;
+                params.device_id = device;
+                params.backend = backend_;
+                params.logits_device = static_cast<const float *>(working.get());
+                params.row_count = rows;
+                params.vocab_size = vocab;
+                params.logits_row_stride = vocab;
+                params.active_rows_device = static_cast<const int32_t *>(active.get());
+                params.apply_penalties = true;
+                params.verifier_input_tokens_device = static_cast<const int32_t *>(tokens.get());
+                params.generated_token_counts_device = static_cast<const int32_t *>(history.get());
+                params.penalty_policy_device = controls.get();
+                params.top_k = top_k;
+                params.top_p = 0.9f;
+                params.temperature = 0.7f;
+                params.target_token_ids_device = static_cast<int32_t *>(ids.get());
+                params.target_probs_device = static_cast<float *>(probabilities.get());
+                params.target_row_stride = top_k;
+                params.topk_partial_values_device = static_cast<float *>(partial_values.get());
+                params.topk_partial_indices_device = static_cast<int32_t *>(partial_indices.get());
+                params.topk_partial_capacity = static_cast<size_t>(partial_capacity);
+                MTPStochasticTargetDistributionStage stage(params);
+                stage.setGPUStream(stream);
+                const auto enqueue = [&](Path path)
+                {
+                    if (path == Path::ReadOnlyCandidates)
+                        return stage.execute(execution.get());
+                    return backend_->enqueueApplyMTPPenaltiesToF32RowsDevice(
+                               working.get(), rows, vocab, vocab, tokens.get(), history.get(),
+                               controls.get(), device_id_, stream, active.get()) &&
+                           backend_->enqueueBuildTopKTopPDistributionsF32Device(
+                               working.get(), rows, vocab, vocab, top_k, 0.9f, 0.7f, device_id_, stream,
+                               ids.get(), top_k, probabilities.get(), partial_values.get(),
+                               partial_indices.get(), partial_capacity, active.get());
+                };
+                const auto reset = [&]
+                {
+                    ASSERT_TRUE(backend_->deviceCopyAsync(
+                        working.get(), original.get(), logit_bytes, device_id_, stream));
+                };
+                const auto capture = [&](Path path, std::unique_ptr<IGPUGraphCapture> &graph,
+                                         std::vector<GPUGraphKernelNodeInfo> &nodes)
+                {
+                    graph = worker.createGraphCapture(stream);
+                    ASSERT_NE(graph, nullptr);
+                    ScopedBackendGraphCapture recording(worker, *graph, "stochastic_history_native_events");
+                    ASSERT_TRUE(recording.begin());
+                    const bool queued = enqueue(path);
+                    recording.finish();
+                    ASSERT_TRUE(queued);
+                    ASSERT_EQ(graph->nodeCount(), path == Path::LegacyTransform ? 3u : 2u);
+                    std::string error;
+                    ASSERT_TRUE(graph->inspectKernelNodes(nodes, &error)) << error;
+                    ASSERT_EQ(nodes.size(), path == Path::LegacyTransform ? 3u : 2u);
+                    for (const auto &node : nodes)
+                    {
+                        ASSERT_TRUE(node.valid());
+                        EXPECT_EQ(node.local_memory_bytes_per_thread, 0u) << node.name;
+                    }
+                    ASSERT_TRUE(graph->instantiate());
+                };
+                std::vector<GPUGraphKernelNodeInfo> legacy_nodes, readonly_nodes;
+                ASSERT_NO_FATAL_FAILURE(capture(Path::LegacyTransform, legacy_graph, legacy_nodes));
+                ASSERT_NO_FATAL_FAILURE(capture(Path::ReadOnlyCandidates, readonly_graph, readonly_nodes));
+                ASSERT_EQ(std::count_if(readonly_nodes.begin(), readonly_nodes.end(), [&](const auto &node)
+                {
+                    return node.grid_x == 64 && node.grid_y == static_cast<uint32_t>(rows) &&
+                           node.block_x == 256 && node.block_y == 1;
+                }), 1) << "Timing requires the original default QFN K40 cooperative geometry";
+
+                std::vector<int32_t> reference_ids(compact_elements), actual_ids(compact_elements);
+                std::vector<float> reference_probs(compact_elements), actual_probs(compact_elements);
+                std::vector<float> observed_raw(logit_elements);
+                const auto read_distribution = [&](std::vector<int32_t> &out_ids, std::vector<float> &out_probs)
+                {
+                    ASSERT_TRUE(copyDeviceToHost(out_ids.data(), ids.get(), compact_elements * sizeof(int32_t), device_id_, stream));
+                    ASSERT_TRUE(copyDeviceToHost(out_probs.data(), probabilities.get(), compact_elements * sizeof(float), device_id_, stream));
+                };
+                ASSERT_NO_FATAL_FAILURE(reset());
+                ASSERT_TRUE(legacy_graph->launch());
+                ASSERT_NO_FATAL_FAILURE(read_distribution(reference_ids, reference_probs));
+                ASSERT_TRUE(copyDeviceToHost(observed_raw.data(), working.get(), logit_bytes, device_id_, stream));
+                ASSERT_NE(std::memcmp(raw.data(), observed_raw.data(), logit_bytes), 0)
+                    << "Reference must actually apply nonneutral history penalties";
+                const auto check_readonly = [&]
+                {
+                    ASSERT_NO_FATAL_FAILURE(reset());
+                    ASSERT_TRUE(readonly_graph->launch());
+                    ASSERT_NO_FATAL_FAILURE(read_distribution(actual_ids, actual_probs));
+                    ASSERT_TRUE(copyDeviceToHost(observed_raw.data(), working.get(), logit_bytes, device_id_, stream));
+                    ASSERT_EQ(std::memcmp(raw.data(), observed_raw.data(), logit_bytes), 0);
+                    ASSERT_EQ(std::memcmp(reference_ids.data(), actual_ids.data(), compact_elements * sizeof(int32_t)), 0);
+                    ASSERT_EQ(std::memcmp(reference_probs.data(), actual_probs.data(), compact_elements * sizeof(float)), 0);
+                };
+                ASSERT_NO_FATAL_FAILURE(check_readonly());
+                for (int warmup = 0; warmup < warmups; ++warmup)
+                {
+                    ASSERT_NO_FATAL_FAILURE(reset());
+                    ASSERT_TRUE(legacy_graph->launch());
+                    ASSERT_NO_FATAL_FAILURE(reset());
+                    ASSERT_TRUE(readonly_graph->launch());
+                }
+                std::array<float, samples> legacy_ms{}, readonly_ms{};
+                const auto measure = [&](IGPUGraphCapture &graph, float &elapsed)
+                {
+                    ASSERT_NO_FATAL_FAILURE(reset());
+                    ASSERT_TRUE(backend_->recordEvent(start.get(), device_id_, stream));
+                    ASSERT_TRUE(graph.launch());
+                    ASSERT_TRUE(backend_->recordEvent(stop.get(), device_id_, stream));
+                    ASSERT_TRUE(backend_->waitForEvent(stop.get(), device_id_));
+                    ASSERT_TRUE(backend_->eventElapsedTimeMs(start.get(), stop.get(), device_id_, &elapsed));
+                    ASSERT_TRUE(std::isfinite(elapsed));
+                    ASSERT_GT(elapsed, 0.0f);
+                };
+                for (size_t sample = 0; sample < samples; ++sample)
+                {
+                    if (sample % 2 == 0)
+                    {
+                        ASSERT_NO_FATAL_FAILURE(measure(*legacy_graph, legacy_ms[sample]));
+                        ASSERT_NO_FATAL_FAILURE(measure(*readonly_graph, readonly_ms[sample]));
+                    }
+                    else
+                    {
+                        ASSERT_NO_FATAL_FAILURE(measure(*readonly_graph, readonly_ms[sample]));
+                        ASSERT_NO_FATAL_FAILURE(measure(*legacy_graph, legacy_ms[sample]));
+                    }
+                }
+                // Reuse both retained executables after the timed repetitions.
+                ASSERT_NO_FATAL_FAILURE(reset());
+                ASSERT_TRUE(legacy_graph->launch());
+                ASSERT_NO_FATAL_FAILURE(read_distribution(actual_ids, actual_probs));
+                ASSERT_EQ(std::memcmp(reference_ids.data(), actual_ids.data(), compact_elements * sizeof(int32_t)), 0);
+                ASSERT_EQ(std::memcmp(reference_probs.data(), actual_probs.data(), compact_elements * sizeof(float)), 0);
+                ASSERT_NO_FATAL_FAILURE(check_readonly());
+                std::vector<int32_t> observed_counts(counts.size()), observed_branch(branch.size());
+                MTPGreedyPenaltyPolicy observed_policy{};
+                int observed_rows = 0;
+                ASSERT_TRUE(copyDeviceToHost(observed_counts.data(), history.get(), counts.size() * sizeof(int32_t), device_id_, stream));
+                ASSERT_TRUE(copyDeviceToHost(observed_branch.data(), tokens.get(), branch.size() * sizeof(int32_t), device_id_, stream));
+                ASSERT_TRUE(copyDeviceToHost(&observed_policy, controls.get(), sizeof(policy), device_id_, stream));
+                ASSERT_TRUE(copyDeviceToHost(&observed_rows, active.get(), sizeof(rows), device_id_, stream));
+                ASSERT_EQ(observed_counts, counts);
+                ASSERT_EQ(observed_branch, branch);
+                ASSERT_EQ(std::memcmp(&observed_policy, &policy, sizeof(policy)), 0);
+                ASSERT_EQ(observed_rows, rows);
+                const auto node_records = [](const auto &nodes)
+                {
+                    auto result = nlohmann::json::array();
+                    for (const auto &node : nodes)
+                        result.push_back({{"name", node.name}, {"name_resolved", node.name_resolved},
+                            {"function_identity", node.function_identity},
+                            {"grid", {node.grid_x, node.grid_y, node.grid_z}},
+                            {"block", {node.block_x, node.block_y, node.block_z}},
+                            {"registers", node.registers_per_thread},
+                            {"static_shared_bytes", node.static_shared_memory_bytes},
+                            {"dynamic_shared_bytes", node.dynamic_shared_memory_bytes},
+                            {"local_bytes_per_thread", node.local_memory_bytes_per_thread},
+                            {"max_active_blocks_per_sm", node.max_active_blocks_per_sm}});
+                    return result;
+                };
+                const auto median = [](auto values)
+                {
+                    std::sort(values.begin(), values.end());
+                    const size_t middle = values.size() / 2;
+                    return 0.5 * (static_cast<double>(values[middle - 1]) + values[middle]);
+                };
+                const double legacy_median = median(legacy_ms);
+                const double readonly_median = median(readonly_ms);
+                const nlohmann::json record{
+                    {"schema", "llaminar.test.stochastic_history_native_events.v1"},
+                    {"backend", GetParam()}, {"device_ordinal", device_id_}, {"rows", rows},
+                    {"physical_rows", rows}, {"active_rows", rows},
+                    {"vocab", vocab}, {"top_k", top_k}, {"top_p", 0.9f}, {"temperature", 0.7f},
+                    {"logit_row_stride", vocab}, {"compact_row_stride", top_k},
+                    {"partial_entries_per_row", partial_entries_per_row}, {"scratch_capacity", partial_capacity},
+                    {"history_policy", {{"presence", policy.presence_penalty}, {"frequency", policy.frequency_penalty},
+                        {"repetition", policy.repetition_penalty}, {"first_in_history", policy.first_token_already_in_history}}},
+                    {"warmups", warmups}, {"samples", samples}, {"operations_per_interval", 1},
+                    {"scope", "captured_preparation_including_native_scheduling"},
+                    {"input_reset", "same_stream_outside_both_event_intervals"},
+                    {"byte_exact_tables", true}, {"readonly_raw_input", true},
+                    {"retained_input_reset_byte_check", true}, {"history_unchanged", true},
+                    {"legacy_nodes", node_records(legacy_nodes)}, {"readonly_nodes", node_records(readonly_nodes)},
+                    {"legacy_elapsed_ms", legacy_ms}, {"readonly_elapsed_ms", readonly_ms},
+                    {"legacy_median_ms", legacy_median}, {"readonly_median_ms", readonly_median},
+                    {"readonly_over_legacy_median", readonly_median / legacy_median}};
+                std::cout << "[StochasticHistoryNativeEvents] " << record.dump() << '\n';
+                RecordProperty("stochastic_history_native_events_rows_" + std::to_string(rows), record.dump());
+            }
+        });
     }
 
     /**

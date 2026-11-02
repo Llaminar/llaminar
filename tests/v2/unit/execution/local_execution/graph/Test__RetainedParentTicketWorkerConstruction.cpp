@@ -5,12 +5,13 @@
  * This executable alone interposes two public POSIX symbols. A creator-thread
  * TLS arm selects exactly one pthread_create call; its real entrypoint/argument
  * are forwarded unchanged. The constructor cannot resume until that actual
- * child enters its first condition wait or returns. Recycled aligned storage
- * retains bytes left by an actual previous worker destructor, never a copied
- * State definition or test-authored private-field mutation. All other threads
+ * child enters its first condition wait or returns. Every lifetime uses the production admitted mapped owner and actual worker constructor;
+ * no private State definition or field mutation substitutes for construction. All other threads
  * and condition waits forward directly to libc. No backend/model is used.
  */
 #include "execution/local_execution/graph/RetainedParentTicketServiceWorker.h"
+#include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "backends/GPUDeviceProcessLifetime.h"
 
 #include <gtest/gtest.h>
 #include <array>
@@ -146,27 +147,33 @@ bool countInvocation(void *context)
 }
 
 /**
- * @brief Exercise twenty-one real lifetimes on identical aligned storage.
- * @return Zero only when every child was waiting before constructor return and
- *         every public dispatch/await completed on that same persistent thread.
- *
- * The first lifetime starts from ordinary zero-initialized raw storage. Each
- * later one consumes bytes left by the actual destructor (including Stopping
- * in the original implementation). No byte is inspected or rewritten between
- * lifetimes. An early-return observation deliberately skips dispatch so the
- * original broken implementation can retire/join instead of hanging await().
+ * @brief Exercise twenty-one admitted actual worker lifetimes under creator/child interposition.
+ * @return Zero only when the actual child waits before pthread_create returns and
+ *         both original dispatch/await tasks complete before exact owner teardown.
+ * Exact stack/object storage is reused by concurrency; opaque native commitments
+ * remain additive in the same original process authority across all lifetimes.
  */
 int exerciseRecycledWorker()
 {
     alarm(10); // A broken destructor/unexpected native stall cannot hang the gate.
     (void)realCreate();
     (void)realWait();
-    alignas(Worker) std::array<std::byte, sizeof(Worker)> storage{};
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    const PhysicalMemoryResource cpu{0,DeviceId::cpu(),256u<<20,256u<<20};
+    const auto program=RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ExecutorParentTicket);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add(cpu,PhysicalMemoryOwner::RetainedHostServiceStorage,program.allocationBytes());
+    plan.add(cpu,PhysicalMemoryOwner::RetainedHostServiceRuntime,21*4096);
+    auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
     for (unsigned lifetime = 0; lifetime != 21; ++lifetime)
     {
         ConstructionProbe probe; // Outlives the worker and its trampoline.
+        auto fixture=RetainedHostServiceFixture::recorded(RetainedHostServiceRole::ExecutorParentTicket,{0,DeviceId::cuda(0)},lifetime);
+        auto token=fixture.take(memory);
         armed_creator = &probe;
-        std::unique_ptr<Worker, DestroyWorker> worker(::new (storage.data()) Worker);
+        auto owner=PreparedRetainedHostService::materialize(std::move(token));
+        auto* worker=&owner->worker();
         if (armed_creator != nullptr)
             return 84; // The expected real pthread_create call was not interposed.
         if (!probe.observed_before_create_return.load(std::memory_order_acquire))
@@ -185,9 +192,9 @@ int exerciseRecycledWorker()
         const auto second = worker->dispatch(countInvocation, &calls);
         if (second.generation <= first.generation || !worker->await(second) || calls != 2 || !worker->idle())
             return 89;
-        // unique_ptr teardown precedes probe destruction and leaves original
-        // worker storage untouched for the next real constructor.
+        // Admitted owner joins/unmaps before the probe retires and the next constructor starts.
     }
+    GPUDeviceProcessLifetime::retireActive();
     alarm(0);
     return 0;
 }
@@ -231,7 +238,7 @@ extern "C" int pthread_cond_wait(pthread_cond_t *condition, pthread_mutex_t *mut
 }
 
 /** @test Construction cannot publish a worker before all lifecycle members are initialized. */
-TEST(RetainedParentTicketWorkerConstruction, RecycledStorageStartsActualWorkerBeforeConstructorReturns)
+TEST(RetainedParentTicketWorkerConstruction, AdmittedOwnerStartsActualWorkerBeforeNativeCreateReturns)
 {
     // Re-exec isolates the symbol interposition and any intentionally detected
     // early-exit constructor from other test lifetimes; no production hooks.

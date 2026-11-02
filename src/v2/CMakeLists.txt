@@ -491,6 +491,7 @@ if(HAVE_CUDA)
         backends/cuda/NvidiaDeviceContext.cu
         backends/cuda/NvidiaContextFactory.cu
         backends/cuda/CUDAWorkerImpl.cu
+        backends/cuda/CUDAGraphObjectGeometry.cpp
         backends/cuda/CUDAGraphCapture.cu
         backends/CUDAEnumeration.cu
         collective/backends/NCCLBackendCUDA.cu
@@ -762,6 +763,7 @@ if(HAVE_ROCM)
         backends/rocm/AMDContextFactory.cpp
         backends/rocm/ROCmWorkerImpl.cpp
         backends/rocm/HipDeviceGuard.cpp
+        backends/rocm/HIPGraphObjectGeometry.cpp
         backends/rocm/HIPGraphCapture.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp              # HIP-specific host memory registration
@@ -1484,6 +1486,10 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/CPUBackend.cpp
     # GPUDeviceContextPool is backend-agnostic (uses factory functions registered by cuda_backend/rocm_backend)
     backends/GPUDeviceContextPool.cpp
+    backends/PreparedGPUWorkerThread.cpp
+    backends/NativeContextOpaqueContract.cpp
+    backends/NativeContextPreparation.cpp
+    backends/NativeContextRetirement.cpp
     backends/GPUDeviceProcessLifetime.cpp
     # GPUDeviceWorker is backend-agnostic (uses forward-declared cuda_worker/rocm_worker namespaces)
     backends/GPUDeviceWorker.cpp
@@ -1696,6 +1702,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/graph/DeviceGraphExecutor.cpp
     execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp
     execution/local_execution/graph/RetainedParentTicketServiceWorker.cpp
+    execution/local_execution/graph/RetainedHostServiceProgram.cpp
+    execution/local_execution/graph/RetainedHostServiceDeclarations.cpp
+    execution/moe/MoEOverlayHostServiceContract.cpp
     execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
@@ -1707,6 +1716,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/orchestrators/DeviceGraphOrchestratorPLE.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMovement.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorServingGraphFamily.cpp
+    execution/local_execution/orchestrators/MTPGraphPolicyScopes.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp
     execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp
     execution/local_execution/orchestrators/PipelineMTPDeviceGeneration.cpp
@@ -1784,6 +1795,14 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PersistentStateMemoryEstimator.cpp
     planning/ActivationMemoryEstimator.cpp
     planning/WorkspaceMemoryEstimator.cpp
+    backends/NativeAuxiliaryResourceCatalog.cpp
+    backends/NativeOrderingEventBudgetProjection.cpp
+    backends/NativeOrderingEventGroup.cpp
+    backends/ReadAheadNativeResourceFamily.cpp
+    backends/ReadAheadNativeParentTerminal.cpp
+    backends/PooledRemoteGraphProgram.cpp
+    backends/GPUFlatGraphStructure.cpp
+    backends/RetainedParticipantGraphExecutable.cpp
     planning/PhysicalMemoryAuthority.cpp
     planning/MemoryPlanner.cpp
     planning/ImmutableRowTablePlacementPlanner.cpp
@@ -1795,6 +1814,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/MoEPipelineMemoryAdmission.cpp
     planning/PlanningModelMetadata.cpp
     planning/PlanningPublication.cpp
+    planning/PlanningHostServiceEvidence.cpp
     planning/ResolvedRankOrchestration.cpp
     planning/AutomaticOrchestrationCandidates.cpp
     planning/OrchestrationCandidateAdmission.cpp
@@ -2188,6 +2208,7 @@ target_include_directories(llaminar2_core PRIVATE
 # - Debug builds: Always enabled (development/debugging)
 # - Integration builds: Always enabled (Release + debug symbols + snapshots)
 # - Release builds: Disabled by default (performance), enable with -DENABLE_SNAPSHOTS=ON
+# GPU opaque allowances use typed runtime/geometry classes, not application source fingerprints.
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
     message(STATUS "V2: Pipeline snapshot capture enabled (Debug build)")
@@ -2583,7 +2604,16 @@ target_sources(llaminar2_core PRIVATE
     kernels/qwen4exp/PooledImmutableSourcePreparedStorage.cpp
     kernels/qwen4exp/PooledImmutableSourceKernels.cpp
     execution/compute_stages/stages/qwen4exp/PooledImmutableSourcePhaseStage.cpp
-    execution/qwen4exp/PooledImmutableLocalLookupGraph.cpp)
+    execution/qwen4exp/PooledImmutableLocalLookupGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantPinGraph.cpp
+    execution/qwen4exp/PooledImmutableDirectedTransport.cpp
+    execution/qwen4exp/PooledImmutableParticipantFreeGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantVictimGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantLocalGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantSourceGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantPublicationGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantReadGraph.cpp
+    execution/qwen4exp/PooledImmutableParticipantRetirementGraph.cpp)
 if(HAVE_CUDA)
     target_sources(cuda_backend PRIVATE kernels/cuda/qwen4exp/CUDAPooledImmutableSourceKernels.cu)
 endif()
@@ -2596,3 +2626,9 @@ endif()
 target_sources(llaminar2_core PRIVATE
     utils/MPISessionSharedDirectory.cpp
     execution/moe/MoEOverlaySharedBackingStartup.cpp)
+
+# Closed source-authored remote plans and the actual participant-local builder.
+target_sources(llaminar2_core PRIVATE
+    execution/qwen4exp/PooledImmutableDirectedOwnerProgram.cpp
+    execution/qwen4exp/PooledImmutableDirectedLookupGraph.cpp
+    execution/qwen4exp/PooledImmutableRetainedParticipants.cpp)

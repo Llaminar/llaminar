@@ -27,6 +27,8 @@
 
 #include <gtest/gtest.h>
 #include "../../../utils/CPUSerialArenaTestAdmission.h"
+#include "../../../fixtures/execution/RetainedHostServiceFixture.h"
+#include "backends/HostMemoryCapacity.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include <memory>
 #include <span>
@@ -593,6 +595,15 @@ namespace
         bool complete_ = false;
     };
 } // namespace
+
+/** @return Original CPU0 observation before the route roots or ticket worker materialize. */
+PhysicalMemoryResource originalTicketHostResource()
+{
+    const auto capacity=observeSystemMemoryCapacity();
+    if(!capacity.valid() || capacity.admission_available_bytes>capacity.total_bytes)
+        throw std::runtime_error("Original retained-ticket fixture CPU observation unavailable");
+    return {0,DeviceId::cpu(),capacity.total_bytes,capacity.admission_available_bytes};
+}
 
 class CachedGraphReplayExecutionTest : public ::testing::Test
 {
@@ -1724,9 +1735,10 @@ TEST_F(CachedGraphReplayExecutionTest,
     const std::array<DeviceId, 1> mapped_devices{device};
     auto ticket_arena =
         TransferEngine::instance().createMappedHostArena(mapped_devices);
-    auto cpu_canonical_arena =
-        std::make_shared<MoELocalExpertSerialBufferArena>(
-            llaminar2::test::admitCPUSerialArenaForTest(MoELocalExpertSerialBufferArena::Config{
+    auto ticket_worker=RetainedHostServiceFixture::original(
+        RetainedHostServiceRole::ExecutorParentTicket,{0,device});
+    const auto host=originalTicketHostResource();
+    const std::array route_declarations{MoELocalExpertSerialBufferArena::Config{
                 .device_id = DeviceId::cpu(),
                 .row_capacity = bucket_rows,
                 .row_capacity_buckets = {bucket_rows},
@@ -1738,7 +1750,11 @@ TEST_F(CachedGraphReplayExecutionTest,
                 .cpu_canonical_route_gpu_consumer = device,
                 .debug_name =
                     "integration.production_mapped_cpu_canonical_routes",
-            }));
+            }};
+    const auto admitted_routes=admitCPUSerialArenasForTest(route_declarations,host,ticket_worker.bom(host));
+    const auto memory=admitted_routes.front().physical_memory_authority;
+    auto cpu_canonical_arena=std::make_shared<MoELocalExpertSerialBufferArena>(admitted_routes.front());
+    ASSERT_EQ(cpu_canonical_arena->physicalMemoryAuthority().get(),memory.get());
     auto contribution_region =
         cpu_canonical_arena->mappedCPUCanonicalRoutes(device);
     ASSERT_NE(contribution_region, nullptr);
@@ -1875,6 +1891,9 @@ TEST_F(CachedGraphReplayExecutionTest,
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
     DeviceGraphExecutor executor(exec_config);
+    executor.setRetainedParentTicketServiceWorker(
+        PreparedRetainedHostService::materialize(ticket_worker.take(memory)),memory);
+    ASSERT_TRUE(executor.hasRetainedParentTicketServiceWorker());
     graph_arena_.bindExecutor(executor);
     DeviceGraphExecutor::GraphSegmentCache segment_cache;
     void *const dispatch_stream = gpu_ctx_->defaultStream();
@@ -2102,12 +2121,23 @@ void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
     const std::array<DeviceId, 1> mapped_devices{device};
     auto ticket_arena =
         TransferEngine::instance().createMappedHostArena(mapped_devices);
-    auto first_contribution_region =
-        TransferEngine::instance().allocateMappedHostRegion(
-            payload_bytes, mapped_devices);
-    auto second_contribution_region =
-        TransferEngine::instance().allocateMappedHostRegion(
-            payload_bytes, mapped_devices);
+    auto ticket_worker=RetainedHostServiceFixture::original(
+        RetainedHostServiceRole::ExecutorParentTicket,{0,device});
+    const auto host=originalTicketHostResource();
+    const MoELocalExpertSerialBufferArena::Config route_declaration{
+        .device_id=DeviceId::cpu(),.row_capacity=bucket_rows,.row_capacity_buckets={bucket_rows},
+        .d_model=d_model,.routing_top_k=top_k,
+        .cpu_canonical_route_storage=MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,
+        .cpu_canonical_route_gpu_consumer=device,.debug_name="integration.retained_ticket_routes"};
+    const std::array route_declarations{route_declaration,route_declaration};
+    const auto admitted_routes=admitCPUSerialArenasForTest(route_declarations,host,ticket_worker.bom(host));
+    const auto memory=admitted_routes.front().physical_memory_authority;
+    auto first_routes=std::make_shared<MoELocalExpertSerialBufferArena>(admitted_routes[0]);
+    auto second_routes=std::make_shared<MoELocalExpertSerialBufferArena>(admitted_routes[1]);
+    ASSERT_EQ(first_routes->physicalMemoryAuthority().get(),memory.get());
+    ASSERT_EQ(second_routes->physicalMemoryAuthority().get(),memory.get());
+    auto first_contribution_region=first_routes->mappedCPUCanonicalRoutes(device);
+    auto second_contribution_region=second_routes->mappedCPUCanonicalRoutes(device);
     ASSERT_NE(first_contribution_region, nullptr);
     ASSERT_NE(second_contribution_region, nullptr);
     ASSERT_TRUE(first_contribution_region->isBound());
@@ -2243,6 +2273,9 @@ void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
     DeviceGraphExecutor executor(exec_config);
+    executor.setRetainedParentTicketServiceWorker(
+        PreparedRetainedHostService::materialize(ticket_worker.take(memory)),memory);
+    ASSERT_TRUE(executor.hasRetainedParentTicketServiceWorker());
     graph_arena_.bindExecutor(executor);
     DeviceGraphExecutor::GraphSegmentCache segment_cache;
     void *const dispatch_stream = gpu_ctx_->defaultStream();

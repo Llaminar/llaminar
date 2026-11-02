@@ -188,6 +188,18 @@ namespace llaminar2
                 << g.gpu_policy.aging_accesses << ',' << g.gpu_policy.protected_numerator << ',' << g.gpu_policy.protected_denominator
                 << ",subordinate=" << g.host.maximum_cache_rows << ',' << g.host.cache_physical_byte_limit << ','
                 << g.host.policy.aging_accesses << ',' << g.host.policy.protected_numerator << ',' << g.host.policy.protected_denominator;
+            g.placement.validate();
+            if(g.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+            {
+                // Retained authorities cannot normalize away authored physical
+                // coordinate order, C0 owners, individual limits or coordinator.
+                out << ",gpu_placement=" << static_cast<int>(g.placement.mode) << ",owners=" << g.placement.owners.size();
+                for(const auto& owner:g.placement.owners)
+                    out << ';' << owner.participant.world_rank << ',' << static_cast<int>(owner.participant.backend) << ','
+                        << owner.participant.ordinal << ',' << owner.maximum_cache_rows << ',' << owner.cache_physical_byte_limit;
+                const auto& coordinator=*g.placement.coordinator;
+                out << ",coordinator=" << coordinator.world_rank << ',' << static_cast<int>(coordinator.backend) << ',' << coordinator.ordinal;
+            }
         }
         // Explicit HC-up correction changes stage workspace capacity even
         // though every prepared source weight byte remains identical. A

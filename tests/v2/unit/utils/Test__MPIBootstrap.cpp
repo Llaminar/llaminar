@@ -10,6 +10,7 @@
  */
 
 #include "utils/MPIBootstrap.h"
+#include "utils/DebugEnv.h"
 #include "app/MPIBootstrapPhase.h"
 #include "backends/ComputeBackend.h"
 #include "config/ExecutionDomainDefinition.h"
@@ -251,7 +252,7 @@ TEST(Test__MPIBootstrap, ObserverOpaqueArgvRetainsOriginalSeparatorAndLaunchFlag
     EXPECT_EQ(*(cpus + 1), "0-3");
 }
 
-/** @test Existing callers keep the exact launch-flag consumption contract by default. */
+/** @test Ordinary callers retain configuration while consuming only launch actions. */
 TEST(Test__MPIBootstrap, ObserverArgumentExtensionPreservesLegacyDefaultFiltering)
 {
     using namespace llaminar2;
@@ -265,7 +266,8 @@ TEST(Test__MPIBootstrap, ObserverArgumentExtensionPreservesLegacyDefaultFilterin
     const auto binary = std::find(unchanged.begin(), unchanged.end(), "observer");
     ASSERT_NE(binary, unchanged.end());
     EXPECT_EQ((std::vector<std::string>(binary, unchanged.end())),
-        (std::vector<std::string>{"observer", "--workload", "work.json", "--output", "out", "--", "--device", "cpu:0"}));
+        (std::vector<std::string>{"observer", "--workload", "work.json", "--output", "out", "--",
+            "--mpi-procs", "1", "--mpi-procs=1", "--device", "cpu:0"}));
     EXPECT_THROW((void)MPIBootstrap::buildMPIRunCommand(static_cast<int>(argv.size()), argv.data(), {}, {},
         static_cast<MPIBootstrapArgumentPolicy>(99)), std::invalid_argument);
 }
@@ -334,4 +336,74 @@ TEST(Test__MPIBootstrap, NativeOptionBoundaryPreservesOpaqueRuntimeNamedApplicat
     EXPECT_EQ(*(application-1),"--");
     EXPECT_EQ((std::vector<std::string>(application,command.end())),
               (std::vector<std::string>{binary,option,value}));
+}
+
+/** @test Ordinary child parsing preserves explicit rank intent and unspecified auto. */
+TEST(Test__MPIBootstrap, ApplicationRankConfigurationSurvivesFilteredReexec)
+{
+    using namespace llaminar2;
+    for (const int count : {0, 1, 4})
+    {
+        for (const bool equals : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << "count=" << count << " equals=" << equals);
+            std::vector<std::string> original = {"llaminar2", "--model", "/synthetic/main.gguf",
+                "--backend", "host", "--no-mtp"};
+            if (count != 0)
+            {
+                original.push_back(equals ? "--mpi-procs=" + std::to_string(count) : "--mpi-procs");
+                if (!equals) original.push_back(std::to_string(count));
+            }
+            const auto parse = [](std::vector<std::string> arguments)
+            {
+                std::vector<char *> argv;
+                for (auto &argument : arguments) argv.push_back(argument.data());
+                return OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()), argv.data());
+            };
+            const auto before = parse(original);
+            auto launched = original;
+            launched.insert(launched.end(), {"--mpi-bootstrap", "--mpi-dry-run"});
+            std::vector<char *> argv;
+            for (auto &argument : launched) argv.push_back(argument.data());
+            MPILaunchConfig launch;
+            launch.num_procs = count == 0 ? 2 : count;
+            const auto command = MPIBootstrap::buildMPIRunCommand(
+                static_cast<int>(argv.size()), argv.data(), launch, {});
+            const auto child = std::find(command.begin(), command.end(), "llaminar2");
+            ASSERT_NE(child, command.end());
+            const std::vector<std::string> restored(child, command.end());
+            EXPECT_EQ(restored, original);
+            const auto after = parse(restored);
+            EXPECT_EQ(after.mpi_procs, count);
+            EXPECT_EQ(serializeOrchestrationConfig(after), serializeOrchestrationConfig(before));
+            const auto ranks = std::find(command.begin(), child, "-np");
+            ASSERT_NE(ranks, child);
+            ASSERT_NE(ranks + 1, child);
+            EXPECT_EQ(*(ranks + 1), std::to_string(launch.num_procs));
+        }
+    }
+}
+
+/** @test A retained explicit rank count does not launch recursively inside MPI. */
+TEST(Test__MPIBootstrap, ExistingMPIKeepsExplicitRankConfigurationWithoutRelaunch)
+{
+    using namespace llaminar2;
+    /** @brief Restore the original typed environment snapshot after injected MPI metadata. */
+    struct RestoreBootstrapSnapshot
+    {
+        MPIBootstrapEnvConfig original = debugEnv().mpi_bootstrap;
+        ~RestoreBootstrapSnapshot() { mutableDebugEnv().mpi_bootstrap = original; }
+    } restore_snapshot;
+    ScopedLaunchEnvironment rank("OMPI_COMM_WORLD_RANK", "1");
+    ScopedLaunchEnvironment size("OMPI_COMM_WORLD_SIZE", "4");
+    mutableDebugEnv().mpi_bootstrap.reload();
+    ASSERT_TRUE(MPIBootstrap::detectMPIEnvironment().is_mpi_process);
+    auto config = OrchestrationConfig::defaults();
+    config.mpi_procs = 4;
+    config.device_for_this_rank = GlobalDeviceAddress::cpu(0);
+    char binary[] = "llaminar2";
+    char *argv[] = {binary};
+    const auto result = MPIBootstrapPhase{}.execute(config, 1, argv);
+    EXPECT_EQ(result.action, BootstrapResult::Action::CONTINUE);
+    EXPECT_EQ(config.mpi_procs, 4);
 }

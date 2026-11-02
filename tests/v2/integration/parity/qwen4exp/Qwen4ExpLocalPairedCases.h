@@ -34,6 +34,13 @@ inline QFNCaseFamilies qfnOriginalCaseFamilies()
             {"Qwen4ExpHostAdaptiveRAMSSD", qwen4ExpHostAdaptiveProductionCases()},
             {"Qwen4ExpFixedHeadTP", qwen4ExpFixedHeadProductionCases()},
             {"Qwen4ExpGPUAdaptive", qwen4ExpGPUAdaptiveProductionCases()},
+            {"Qwen4ExpOppositeVendorOrdinaryRetained15", qwen4ExpOppositeVendorOrdinaryRetained15Cases()},
+            {"Qwen4ExpOppositeVendorMTPRetained15", qwen4ExpOppositeVendorMTPRetained15Cases()},
+            {"Qwen4ExpOppositeVendorDynamicOrdinalRetained15", qwen4ExpOppositeVendorDynamicExpertRetained15Cases(RoutedExpertOwnerOrder::Ordinal)},
+            {"Qwen4ExpOppositeVendorDynamicRandomRetained15", qwen4ExpOppositeVendorDynamicExpertRetained15Cases(RoutedExpertOwnerOrder::Random)},
+            {"Qwen4ExpConsumerLocalTP2StaticRetained15", qwen4ExpConsumerLocalTP2ExecutionCases(ModelParityExpertOverlayPolicy{})},
+            {"Qwen4ExpConsumerLocalTP2DynamicOrdinalRetained15", qwen4ExpConsumerLocalTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})},
+            {"Qwen4ExpConsumerLocalTP2DynamicRandomRetained15", qwen4ExpConsumerLocalTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic})},
             {"Qwen4ExpFullROCmTP4", qwen4ExpFullROCmTP4ProductionCases()},
             {"Qwen4ExpROCm4OverlayPolicy", qwen4ExpROCm4OverlayPolicyProductionCases()}};
 }

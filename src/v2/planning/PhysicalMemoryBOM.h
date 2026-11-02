@@ -61,6 +61,11 @@ namespace llaminar2
         NativeExecutionContext,   ///< Driver-private storage retained until native context retirement.
         ImmutableTableStorage,    ///< Native RAM row table or bounded SSD mapping residency.
         ImmutableLookupStaging,   ///< Exact mapped request/native-row response and device lookup scratch.
+        NativeReadAheadFamily,    ///< Certified opaque one-stream/two-event retained family.
+        NativeReadAheadParentTerminal, ///< Independently certified one-event parent baseline.
+        NativeImmutableLookupOrderingEvent, ///< Certified existing lookup setup/publication/retirement event program.
+        RetainedHostServiceStorage, ///< Exact admitted CPU service stack and compiled worker object.
+        RetainedHostServiceRuntime, ///< Separately qualified process-retained libc/TLS backing.
         Count,                    ///< Sentinel; never a valid charge owner.
     };
 
@@ -116,6 +121,16 @@ namespace llaminar2
             return "immutable_table_storage";
         case PhysicalMemoryOwner::ImmutableLookupStaging:
             return "immutable_lookup_staging";
+        case PhysicalMemoryOwner::NativeReadAheadFamily:
+            return "native_read_ahead_family";
+        case PhysicalMemoryOwner::NativeReadAheadParentTerminal:
+            return "native_read_ahead_parent_terminal";
+        case PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent:
+            return "native_immutable_lookup_ordering_event";
+        case PhysicalMemoryOwner::RetainedHostServiceStorage:
+            return "retained_host_service_storage";
+        case PhysicalMemoryOwner::RetainedHostServiceRuntime:
+            return "retained_host_service_runtime";
         case PhysicalMemoryOwner::Count:
             break;
         }

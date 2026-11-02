@@ -54,7 +54,7 @@ namespace llaminar2
 
             IBackend *backend = nullptr;
 
-            float *logits_device = nullptr;
+            const float *logits_device = nullptr;
             int first_logit_row = 0;
             int row_count = 0;
             int vocab_size = 0;

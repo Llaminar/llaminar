@@ -1,6 +1,6 @@
 # DeviceGraphOrchestrator incremental source split
 
-Date: 2026-10-19. Status: proposed; implementation has not started under this plan.
+Date: 2026-10-19. Status: first serving-family extraction in implementation (2026-10-31); the broader split remains planned.
 
 ## Purpose and scope
 
@@ -17,9 +17,10 @@ This plan does not satisfy that facade's line budget or claim to remove the
 class's internal coupling. It provides a useful source organization without
 requiring the larger ownership migration. The earlier document remains intact.
 
-The task creating this document authorizes documentation only. Implementation
-and its scheduling belong to the main development conversation; this plan must
-not interrupt ongoing QFN development or its active build/test transactions.
+The original task authorized documentation only. The user has now authorized a
+bounded serving/MTP-family extraction alongside graph-template preparation.
+This slice is isolated from the active QFN source-admission transaction; the
+rest of the responsibility split remains separately scheduled.
 
 ## Observed starting point
 
@@ -59,6 +60,7 @@ boundary. Split further only when a coherent responsibility warrants it.
 | `DeviceGraphOrchestratorForward.cpp` | Forward entrypoints, prefill chunking, invocation preparation and integration with `ForwardExecutionEngine`. |
 | `DeviceGraphOrchestratorRequestLifecycle.cpp` | Request admission, producer-event joins, reset, terminal storage retirement, reset-ready publication and session epochs. |
 | `DeviceGraphOrchestratorGeneration.cpp` | Composition and materialization of complete ordinary generation programs and their retained graph identities. Extend the existing file. |
+| `DeviceGraphOrchestratorServingGraphFamily.cpp` | Cold construction of the exact prefill/decode/MTP serving family and its ordered seal. `MTPGraphPolicyScopes` provides one implementation of the shared builder-policy guards. |
 | `DeviceGraphOrchestratorGenerationReplay.cpp` | Launch, authenticated hosted tickets, transaction submission and terminal observation for the admitted execution policy. |
 | `DeviceGraphOrchestratorMTPSidecar.cpp` | Draft-model invocation and retained sidecar graph binding. |
 | `DeviceGraphOrchestratorMTPVerifier.cpp` | Grouped verifier preparation, verifier graph composition, outcome handling and checkpoint/rollback coordination. |
@@ -130,6 +132,23 @@ and expose more parallel compilation. Repeated parsing and lost cross-function
 inlining can also increase build or runtime costs. Measure those effects instead
 of promising a speedup from file count alone. Keep Ninja, ccache, unrestricted
 `cmake --build ... --parallel`, the configured compiler/SDK and spill guards.
+
+## Current bounded slice
+
+The serving-family extraction moves three complete methods and the setup-only
+phase timer from the main translation unit. Their bodies remain byte identical;
+the shared policy constructors/destructors retain the same body tokens in one
+implementation file. The class declaration, member layout and ownership do not
+change. Source-policy checks now read the compiled serving-family source and
+require its registration in the canonical core inventory.
+
+This establishes a smaller implementation unit for subsequent template work.
+It does not claim completion of P1–P5, a runtime speedup, or a full-current-tree
+qualification. Record compile and focused test evidence separately from the
+functional template optimization. The initial measured preparation hotspot is
+repeated canonical expert-owner construction, so immutable source preparation
+must reuse the original residency/weight authorities while each specialization
+retains fresh stages and the existing exact capture identity.
 
 ## Delivery sequence
 

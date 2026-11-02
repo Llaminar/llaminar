@@ -1171,7 +1171,7 @@ __device__ __forceinline__ void cudaSelectBatchedTopKCooperative(
 /**
  * @brief Produce exact sorted Top-K partials for Qwen-sized batched rows.
  */
-template <int K_CAP>
+template <int K_CAP, bool WithHistory = false>
 __global__ void cuda_topk_cooperative_partials_batched_f32_kernel(
     const float *__restrict__ data,
     int n,
@@ -1180,7 +1180,8 @@ __global__ void cuda_topk_cooperative_partials_batched_f32_kernel(
     int partial_blocks,
     float *__restrict__ partial_values,
     int *__restrict__ partial_indices,
-    const int *__restrict__ active_rows_device)
+    const int *__restrict__ active_rows_device,
+    llaminar2::sampling_math::PenaltyLogitRead history)
 {
     const int row = blockIdx.y;
     const int active_rows =
@@ -1209,7 +1210,9 @@ __global__ void cuda_topk_cooperative_partials_batched_f32_kernel(
             threadIdx.x + item * TOPK_BATCHED_COOPERATIVE_THREADS;
         const int index = block_start + offset;
         const bool valid = index < block_end;
-        local_values[item] = valid ? row_data[index] : -FLT_MAX;
+        local_values[item] = valid
+            ? llaminar2::sampling_math::historyLogit<WithHistory>(row_data[index], index, row, history)
+            : -FLT_MAX;
         local_indices[item] = valid ? index : -1;
     }
 
@@ -1290,7 +1293,7 @@ __global__ void cuda_topk_topp_distribution_cooperative_batched_f32_kernel(
     }
 }
 
-template <int K_CAP>
+template <int K_CAP, bool WithHistory = false>
 __global__ void cuda_topk_smallk_partials_batched_f32_kernel(
     const float *__restrict__ data,
     int n,
@@ -1299,7 +1302,8 @@ __global__ void cuda_topk_smallk_partials_batched_f32_kernel(
     int partial_blocks,
     float *__restrict__ partial_values,
     int *__restrict__ partial_indices,
-    const int *__restrict__ active_rows_device)
+    const int *__restrict__ active_rows_device,
+    llaminar2::sampling_math::PenaltyLogitRead history)
 {
     if (k > K_CAP)
         return;
@@ -1333,7 +1337,8 @@ __global__ void cuda_topk_smallk_partials_batched_f32_kernel(
 
     for (int i = block_start + tid; i < block_end; i += num_threads)
     {
-        const float val = row_data[i];
+        const float val = llaminar2::sampling_math::historyLogit<WithHistory>(
+            row_data[i], i, row, history);
         if (local_count >= k &&
             !topkCandidateBetter(val, i, local_vals[k - 1], local_idxs[k - 1]))
             continue;
@@ -6830,6 +6835,180 @@ extern "C"
         return true;
     }
 
+} // extern "C"
+
+/** @brief Shared selection/normalization dispatch; history changes only candidate reads. */
+template <bool WithHistory>
+static bool cudaTopKDistributionsImpl(
+    const float *data,
+    int row_count,
+    int n,
+    int row_stride,
+    int k,
+    float top_p,
+    float temperature,
+    int *out_token_ids,
+    int out_stride,
+    float *out_probs,
+    float *scratch_values,
+    int *scratch_indices,
+    int scratch_capacity,
+    const int *active_rows,
+    int device_idx,
+    void *stream,
+    llaminar2::sampling_math::PenaltyLogitRead history)
+{
+    if (row_count <= 0 || n <= 0 || row_stride < n ||
+        k <= 0 || k > TOPK_MAX_K || out_stride < k ||
+        !data || !out_token_ids || !out_probs || !stream)
+    {
+        return false;
+    }
+
+    if (k > n)
+        k = n;
+
+    cudaSetDevice(device_idx);
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+
+    if (k > TOPK_SMALL_K_CAP)
+    {
+        const auto geometry = llaminar2::sampling_wide::geometry(n, row_count, k, scratch_capacity);
+        if (!geometry || !scratch_values || !scratch_indices)
+            return false;
+        // Wide K reuses the admitted scratch pair. The complete warp
+        // merges bounded shared lists; no K-entry automatic arrays spill.
+        llaminar2::sampling_wide::partials<32, WithHistory>
+            <<<dim3(geometry->partial_blocks, row_count), 32, geometry->shared_bytes, s>>>(
+                data, n, row_stride, k, geometry->partial_blocks,
+                scratch_values, scratch_indices, active_rows, history);
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
+        llaminar2::sampling_wide::distributions<32><<<row_count, 32, 0, s>>>(
+            scratch_values, scratch_indices, geometry->partial_blocks, k,
+            top_p, temperature, out_token_ids, out_stride, out_probs, active_rows);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    if (k <= TOPK_SMALL_K_CAP && scratch_values && scratch_indices)
+    {
+        const int threads = TOPK_SMALL_K_THREADS;
+        int partial_blocks = (n + threads - 1) / threads;
+        if (partial_blocks < 1)
+            partial_blocks = 1;
+        const int partial_block_cap = topkSmallKPartialBlockCap(k);
+        if (partial_blocks > partial_block_cap)
+            partial_blocks = partial_block_cap;
+        const int required_scratch = row_count * partial_blocks * k;
+        if (scratch_capacity >= required_scratch)
+        {
+            const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
+            const dim3 partial_grid(partial_blocks, row_count);
+            const int maximum_partial_span =
+                (n + partial_blocks - 1) / partial_blocks;
+            const bool use_cooperative_selector =
+                maximum_partial_span <= TOPK_BATCHED_COOPERATIVE_CAPACITY &&
+                partial_blocks * k <= TOPK_BATCHED_COOPERATIVE_CAPACITY;
+            if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
+            {
+                cuda_topk_cooperative_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP, WithHistory>
+                    <<<partial_grid,
+                       TOPK_BATCHED_COOPERATIVE_THREADS,
+                       0,
+                       s>>>(
+                        data, n, row_stride, k, partial_blocks,
+                        scratch_values, scratch_indices, active_rows, history);
+            }
+            else if (use_cooperative_selector)
+            {
+                cuda_topk_cooperative_partials_batched_f32_kernel<TOPK_SMALL_K_CAP, WithHistory>
+                    <<<partial_grid,
+                       TOPK_BATCHED_COOPERATIVE_THREADS,
+                       0,
+                       s>>>(
+                        data, n, row_stride, k, partial_blocks,
+                        scratch_values, scratch_indices, active_rows, history);
+            }
+            else if (k <= TOPK_MEDIUM_K_CAP)
+            {
+                cuda_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP, WithHistory>
+                    <<<partial_grid, threads, smem_size, s>>>(
+                        data, n, row_stride, k, partial_blocks,
+                        scratch_values, scratch_indices, active_rows, history);
+            }
+            else
+            {
+                cuda_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP, WithHistory>
+                    <<<partial_grid, threads, smem_size, s>>>(
+                        data, n, row_stride, k, partial_blocks,
+                        scratch_values, scratch_indices, active_rows, history);
+            }
+
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "CUDA batched small-k Top-K partial FP32 kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
+
+            if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
+            {
+                cuda_topk_topp_distribution_cooperative_batched_f32_kernel<
+                    TOPK_MEDIUM_K_CAP>
+                    <<<row_count,
+                       TOPK_BATCHED_COOPERATIVE_THREADS,
+                       0,
+                       s>>>(
+                        scratch_values, scratch_indices, partial_blocks, k,
+                        top_p, temperature, out_token_ids, out_stride,
+                        out_probs, active_rows);
+            }
+            else if (use_cooperative_selector)
+            {
+                cuda_topk_topp_distribution_cooperative_batched_f32_kernel<
+                    TOPK_SMALL_K_CAP>
+                    <<<row_count,
+                       TOPK_BATCHED_COOPERATIVE_THREADS,
+                       0,
+                       s>>>(
+                        scratch_values, scratch_indices, partial_blocks, k,
+                        top_p, temperature, out_token_ids, out_stride,
+                        out_probs, active_rows);
+            }
+            else if (k <= TOPK_MEDIUM_K_CAP)
+            {
+                cuda_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_MEDIUM_K_CAP>
+                    <<<row_count, threads, smem_size, s>>>(
+                        scratch_values, scratch_indices, partial_blocks, k,
+                        top_p, temperature, out_token_ids, out_stride, out_probs,
+                        active_rows);
+            }
+            else
+            {
+                cuda_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_SMALL_K_CAP>
+                    <<<row_count, threads, smem_size, s>>>(
+                        scratch_values, scratch_indices, partial_blocks, k,
+                        top_p, temperature, out_token_ids, out_stride, out_probs,
+                        active_rows);
+            }
+
+            err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "CUDA batched small-k Top-K/Top-P Distribution FP32 kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+extern "C"
+{
     bool cudaOps_topk_topp_distributions_f32(
         const float *data,
         int row_count,
@@ -6848,155 +7027,40 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (row_count <= 0 || n <= 0 || row_stride < n ||
-            k <= 0 || k > TOPK_MAX_K || out_stride < k ||
-            !data || !out_token_ids || !out_probs || !stream)
-        {
+        return cudaTopKDistributionsImpl<false>(
+            data, row_count, n, row_stride, k, top_p, temperature,
+            out_token_ids, out_stride, out_probs, scratch_values, scratch_indices,
+            scratch_capacity, active_rows, device_idx, stream, {});
+    }
+
+/** @brief Read-only row selection with original durable/speculative history. */
+    bool cudaOps_topk_topp_distributions_f32_with_history(
+        const float *data,
+        int row_count,
+        int n,
+        int row_stride,
+        int k,
+        float top_p,
+        float temperature,
+        int *out_token_ids,
+        int out_stride,
+        float *out_probs,
+        float *scratch_values,
+        int *scratch_indices,
+        int scratch_capacity,
+        const int *active_rows,
+        const int *counts,
+        const llaminar2::MTPGreedyPenaltyPolicy *policy,
+        const int *tokens,
+        int device_idx,
+        void *stream)
+    {
+        if (!counts || !policy)
             return false;
-        }
-
-        if (k > n)
-            k = n;
-
-        cudaSetDevice(device_idx);
-        cudaStream_t s = static_cast<cudaStream_t>(stream);
-
-        if (k > TOPK_SMALL_K_CAP)
-        {
-            const auto geometry = llaminar2::sampling_wide::geometry(n, row_count, k, scratch_capacity);
-            if (!geometry || !scratch_values || !scratch_indices)
-                return false;
-            // Wide K reuses the admitted scratch pair. The complete warp
-            // merges bounded shared lists; no K-entry automatic arrays spill.
-            llaminar2::sampling_wide::partials<32>
-                <<<dim3(geometry->partial_blocks, row_count), 32, geometry->shared_bytes, s>>>(
-                    data, n, row_stride, k, geometry->partial_blocks,
-                    scratch_values, scratch_indices, active_rows);
-            if (cudaGetLastError() != cudaSuccess)
-                return false;
-            llaminar2::sampling_wide::distributions<32><<<row_count, 32, 0, s>>>(
-                scratch_values, scratch_indices, geometry->partial_blocks, k,
-                top_p, temperature, out_token_ids, out_stride, out_probs, active_rows);
-            return cudaGetLastError() == cudaSuccess;
-        }
-
-        if (k <= TOPK_SMALL_K_CAP && scratch_values && scratch_indices)
-        {
-            const int threads = TOPK_SMALL_K_THREADS;
-            int partial_blocks = (n + threads - 1) / threads;
-            if (partial_blocks < 1)
-                partial_blocks = 1;
-            const int partial_block_cap = topkSmallKPartialBlockCap(k);
-            if (partial_blocks > partial_block_cap)
-                partial_blocks = partial_block_cap;
-            const int required_scratch = row_count * partial_blocks * k;
-            if (scratch_capacity >= required_scratch)
-            {
-                const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
-                const dim3 partial_grid(partial_blocks, row_count);
-                const int maximum_partial_span =
-                    (n + partial_blocks - 1) / partial_blocks;
-                const bool use_cooperative_selector =
-                    maximum_partial_span <= TOPK_BATCHED_COOPERATIVE_CAPACITY &&
-                    partial_blocks * k <= TOPK_BATCHED_COOPERATIVE_CAPACITY;
-                if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
-                {
-                    cuda_topk_cooperative_partials_batched_f32_kernel<
-                        TOPK_MEDIUM_K_CAP>
-                        <<<partial_grid,
-                           TOPK_BATCHED_COOPERATIVE_THREADS,
-                           0,
-                           s>>>(
-                            data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices, active_rows);
-                }
-                else if (use_cooperative_selector)
-                {
-                    cuda_topk_cooperative_partials_batched_f32_kernel<
-                        TOPK_SMALL_K_CAP>
-                        <<<partial_grid,
-                           TOPK_BATCHED_COOPERATIVE_THREADS,
-                           0,
-                           s>>>(
-                            data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices, active_rows);
-                }
-                else if (k <= TOPK_MEDIUM_K_CAP)
-                {
-                    cuda_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>
-                        <<<partial_grid, threads, smem_size, s>>>(
-                            data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices, active_rows);
-                }
-                else
-                {
-                    cuda_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>
-                        <<<partial_grid, threads, smem_size, s>>>(
-                            data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices, active_rows);
-                }
-
-                cudaError_t err = cudaGetLastError();
-                if (err != cudaSuccess)
-                {
-                    fprintf(stderr, "CUDA batched small-k Top-K partial FP32 kernel launch failed: %s\n",
-                            cudaGetErrorString(err));
-                    return false;
-                }
-
-                if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
-                {
-                    cuda_topk_topp_distribution_cooperative_batched_f32_kernel<
-                        TOPK_MEDIUM_K_CAP>
-                        <<<row_count,
-                           TOPK_BATCHED_COOPERATIVE_THREADS,
-                           0,
-                           s>>>(
-                            scratch_values, scratch_indices, partial_blocks, k,
-                            top_p, temperature, out_token_ids, out_stride,
-                            out_probs, active_rows);
-                }
-                else if (use_cooperative_selector)
-                {
-                    cuda_topk_topp_distribution_cooperative_batched_f32_kernel<
-                        TOPK_SMALL_K_CAP>
-                        <<<row_count,
-                           TOPK_BATCHED_COOPERATIVE_THREADS,
-                           0,
-                           s>>>(
-                            scratch_values, scratch_indices, partial_blocks, k,
-                            top_p, temperature, out_token_ids, out_stride,
-                            out_probs, active_rows);
-                }
-                else if (k <= TOPK_MEDIUM_K_CAP)
-                {
-                    cuda_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_MEDIUM_K_CAP>
-                        <<<row_count, threads, smem_size, s>>>(
-                            scratch_values, scratch_indices, partial_blocks, k,
-                            top_p, temperature, out_token_ids, out_stride, out_probs,
-                            active_rows);
-                }
-                else
-                {
-                    cuda_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_SMALL_K_CAP>
-                        <<<row_count, threads, smem_size, s>>>(
-                            scratch_values, scratch_indices, partial_blocks, k,
-                            top_p, temperature, out_token_ids, out_stride, out_probs,
-                            active_rows);
-                }
-
-                err = cudaGetLastError();
-                if (err != cudaSuccess)
-                {
-                    fprintf(stderr, "CUDA batched small-k Top-K/Top-P Distribution FP32 kernel launch failed: %s\n",
-                            cudaGetErrorString(err));
-                    return false;
-                }
-                return true;
-            }
-        }
-
-        return false;
+        return cudaTopKDistributionsImpl<true>(
+            data, row_count, n, row_stride, k, top_p, temperature,
+            out_token_ids, out_stride, out_probs, scratch_values, scratch_indices,
+            scratch_capacity, active_rows, device_idx, stream, {counts, policy, tokens});
     }
 
     bool cudaOps_topk_topp_processed_logits_f32(
@@ -7047,14 +7111,14 @@ extern "C"
                     cuda_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>
                         <<<partial_grid, threads, smem_size, s>>>(
                             data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices, nullptr);
+                            scratch_values, scratch_indices, nullptr, llaminar2::sampling_math::PenaltyLogitRead{});
                 }
                 else
                 {
                     cuda_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>
                         <<<partial_grid, threads, smem_size, s>>>(
                             data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices, nullptr);
+                            scratch_values, scratch_indices, nullptr, llaminar2::sampling_math::PenaltyLogitRead{});
                 }
 
                 cudaError_t err = cudaGetLastError();

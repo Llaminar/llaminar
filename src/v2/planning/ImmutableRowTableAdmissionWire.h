@@ -36,6 +36,19 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
  */
 std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRequests(
     std::span<const std::uint8_t> bytes, int expected_rank,const ModelMemoryProfile *canonical_source = nullptr);
+namespace test {struct ImmutableRowTableAdmissionWireReplayAccess;}
+/** @brief Closed common parser; only production installed selection or a sealed fixture source can enter. */
+class ImmutableRowTableAdmissionParser final {
+private:
+    friend std::vector<ImmutableRowTableAdmissionRequest> parseImmutableRowTableAdmissionRequests(
+        std::span<const std::uint8_t>,int,const ModelMemoryProfile*);
+    friend class ImmutableRowTableAdmissionSendFrame;
+    friend struct test::ImmutableRowTableAdmissionWireReplayAccess;
+    /** @brief Reconstruct with the receiver's immutable source; no source identity or caps are read from wire. */
+    static std::vector<ImmutableRowTableAdmissionRequest> parse(
+        std::span<const std::uint8_t>,int,const ModelMemoryProfile*,const NativeOrderingEventBudgetProjection&,
+        const std::shared_ptr<const RetainedHostServiceDeclarations>& = {});
+};
 /**
  * @brief Immutable sender bytes validated before distributed readiness succeeds.
  *

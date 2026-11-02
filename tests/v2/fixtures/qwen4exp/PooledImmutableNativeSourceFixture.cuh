@@ -41,6 +41,37 @@ __global__ __launch_bounds__(256,2) void poison(Args x){
     for(auto i=std::uint64_t{blockIdx.x}*256+threadIdx.x;i<std::uint64_t{x.owner.owner.capacity()}*x.owner.slot_stride;i+=std::uint64_t{gridDim.x}*256)
         x.cache[x.owner.cache.payload+i]=std::byte{0xa5};
 }
+/** @brief Author one deliberately invalid recorded input before the ACTUAL production owner phase.
+ * @param x Original owned roots and immutable fault/position declaration.
+ * @note No validation helper runs here. Partial/empty prefixes leave all inactive bytes untouched.
+ */
+__global__ void corruptIdentity(Args x)
+{
+    const auto position=x.identity_position;
+    if(x.retained_identity){
+        const auto count=n::at<p::OwnerFrame>(x.owner_frame,x.owner.frame.control)->initial_pin_count;
+        if(count>x.owner.owner.maximumUnique() || position>=count)return;
+        auto* pins=n::at<p::Grant>(x.owner_frame,x.owner.frame.initial_pins);
+        if(x.identity_fault==IdentityFault::DuplicateRow)pins[position].row=pins[0].row;
+        else if(x.identity_fault==IdentityFault::DuplicateUnique)pins[position].unique=pins[0].unique;
+        else if(x.identity_fault==IdentityFault::ForeignOwner)++pins[position].owner;
+        else if(x.identity_fault==IdentityFault::ForeignInterval)++pins[position].interval.sequence;
+        return;
+    }
+    const auto slice=n::at<n::DirectedSlice>(x.coordinator_native,x.coordinator.native.pin_slices)[0];
+    if(x.coordinator.native.pin_commands>x.coordinator.native.bytes ||
+        slice.byte_offset>x.coordinator.native.bytes-x.coordinator.native.pin_commands ||
+        slice.live_bytes>x.coordinator.native.bytes-x.coordinator.native.pin_commands-slice.byte_offset ||
+        slice.live_bytes%sizeof(p::OwnerCommand) || slice.live_bytes/sizeof(p::OwnerCommand)>x.owner.native.reply_capacity ||
+        position>=slice.live_bytes/sizeof(p::OwnerCommand))return;
+    auto* commands=reinterpret_cast<p::OwnerCommand*>(x.coordinator_native+x.coordinator.native.pin_commands+slice.byte_offset);
+    auto& bad=commands[position];const auto original=commands[0];
+    if(x.identity_fault==IdentityFault::DuplicateRow){
+        const auto unique=bad.target.unique;
+        bad.target=original.target;bad.target.unique=unique;bad.requested_row=original.requested_row;
+    }else if(x.identity_fault==IdentityFault::DuplicateUnique)bad.target.unique=original.target.unique;
+    else if(x.identity_fault==IdentityFault::DuplicateSlot)bad.target.slot=original.target.slot;
+}
 /** @brief Deliver only actual directed pin bytes and preserve every unused record byte. */
 __global__ __launch_bounds__(256,2) void pins(Args x){
     const auto slice=n::at<n::DirectedSlice>(x.coordinator_native,x.coordinator.native.pin_slices)[0];
@@ -114,9 +145,14 @@ void QFN_FIXTURE_FUNCTION(Action action,const Args& x,void* exact){
     using namespace QFN_FIXTURE_NAMESPACE;
     int current=-1;if(x.owner.device.type!=QFN_FIXTURE_BACKEND || !exact || reinterpret_cast<std::uintptr_t>(exact)<=2 || QFN_FIXTURE_DEVICE(&current)!=QFN_FIXTURE_SUCCESS || current!=x.owner.device.ordinal)
         throw std::invalid_argument("Native source fixture requires its exact current device and non-default stream");
+    if(action==Action::CorruptIdentity && (x.identity_fault==IdentityFault::None || x.identity_position>=x.owner.owner.maximumUnique() ||
+        (x.retained_identity?x.identity_fault==IdentityFault::DuplicateSlot:
+            (x.identity_fault==IdentityFault::ForeignOwner || x.identity_fault==IdentityFault::ForeignInterval))))
+        throw std::invalid_argument("Native identity fault has incompatible original role/geometry");
     if(action==Action::ReadRows && x.owner.owner.rowWidth()!=a::RowKeyWidth::UInt32)throw std::invalid_argument("Native diagnostic byte reader requires its declared UInt32 source trace");
     const auto stream=static_cast<QFN_FIXTURE_STREAM>(exact);
     switch(action){
+    case Action::CorruptIdentity:corruptIdentity<<<1,1,0,stream>>>(x);break;
     case Action::PoisonCache:poison<<<1,256,0,stream>>>(x);break;
     case Action::DeliverPins:pins<<<1,256,0,stream>>>(x);break;
     case Action::DeliverFree:plan<false><<<1,256,0,stream>>>(x);break;

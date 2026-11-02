@@ -24,6 +24,9 @@
  * Resident condition forwards retire the preceding host result before fan-out.
  * Only an explicitly enabled diagnostic observation republishes current logits;
  * pending input publication and device-only sampling do not gather host rows.
+ * Every main-model entry admits all shared source channels before participant
+ * dispatch, including a first MTP condition or verifier after prefix restoration.
+ * Input-only publication does not open or replace a storage interval.
  *
  * Ordinary native QFN local TP derives one immutable assignment from the original
  * directory before weight slicing; physical device order remains context-owned.
@@ -41,6 +44,7 @@
 #include "LogitsGatherer.h"
 #include "DeviceSampler.h"
 #include "DeviceGraphOrchestrator.h"
+#include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "PipelineGraphExecutionPlan.h"
 #include "PipelineDeviceGeneration.h"
 #include "../../../collective/CollectiveTimeoutPolicy.h"
@@ -913,6 +917,40 @@ namespace llaminar2
         return std::make_unique<TPWorkerPool>(members.size(), tpWorkerHostPlacement(members, scope));
     }
 
+    struct RankOrchestrator::RetainedSourceAdmission
+    {
+        std::unique_ptr<qwen4exp::ImmutableLookupExecutionBoundary::SourceGroupAdmission> original;
+        /** @brief Abort only the original source invocation when an actual participant launch/admission fails. */
+        struct Attempt {
+            std::unique_ptr<RetainedSourceAdmission>& owner;
+            bool keep=false;
+            ~Attempt(){if(!keep)owner.reset();}
+        };
+    };
+
+    void RankOrchestrator::prepareRetainedSourceAdmission()
+    {
+        using Boundary=qwen4exp::ImmutableLookupExecutionBoundary;
+        std::vector<Boundary::SourceAdmissionParticipant> participants;
+        for(const auto& runner:device_runners_){
+            const auto* device=dynamic_cast<const DeviceGraphOrchestrator*>(runner.get());
+            if(!device)continue;
+            const auto [declared,epoch]=device->retainedStorageSourceAdmission();
+            const auto boundary=std::dynamic_pointer_cast<Boundary>(declared);
+            if(boundary&&boundary->requiresSourceGroupAdmission())participants.push_back({boundary,epoch});
+        }
+        if(participants.empty())return;
+        if(retained_source_admission_&&retained_source_admission_->original->reuses(participants))return;
+        if(retained_source_admission_){
+            if(!retained_source_admission_->original->finish())
+                throw std::logic_error("Original TP source group did not close every channel");
+            retained_source_admission_.reset();
+        }
+        auto retained=std::make_unique<RetainedSourceAdmission>();
+        retained->original=Boundary::armSourceGroup(participants);
+        retained_source_admission_=std::move(retained);
+    }
+
     RankOrchestrator::~RankOrchestrator()
     {
         // Complete parents borrow the stages' events, streams, arenas and native
@@ -920,6 +958,7 @@ namespace llaminar2
         // the collective/edge owner until those original child graphs retire.
         if (pp_device_generation_)
             pp_device_generation_->retireForwardOnlyBeforeStageRelease();
+        retained_source_admission_.reset();
     }
 
     void RankOrchestrator::initializeRankMTPScratch()
@@ -1722,7 +1761,9 @@ namespace llaminar2
                                                      config_.tp_allreduce_precision_override;
                                                  runner_config.prefix_cache = config_.prefix_cache;
                                                  runner_config.ngram_table_policy = config_.ngram_table_policy;
+                                                 runner_config.ngram_lookup_schedule = config_.ngram_lookup_schedule;
                                                  runner_config.ngram_table_placement = config_.ngram_table_placement;
+                                                 runner_config.retained_host_services = config_.retained_host_services;
                                                  runner_config.ngram_replicated_ple_cohort = replicated_ple_cohort_;
                                                  runner_config.mtp = config_.mtp;
                                                  runner_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
@@ -2082,7 +2123,9 @@ namespace llaminar2
                 child_config.tp_allreduce_precision_override;
             runner_config.prefix_cache = child_config.prefix_cache;
             runner_config.ngram_table_policy = child_config.ngram_table_policy;
+            runner_config.ngram_lookup_schedule = child_config.ngram_lookup_schedule;
             runner_config.ngram_table_placement = child_config.ngram_table_placement;
+            runner_config.retained_host_services = child_config.retained_host_services;
             runner_config.mtp = child_config.mtp;
             runner_config.routed_expert_compute_policy = child_config.routed_expert_compute_policy;
             runner_config.routed_expert_owner_order = child_config.routed_expert_owner_order;
@@ -3235,6 +3278,12 @@ namespace llaminar2
             }
         }
 
+        // A restored prefix can make this the first main-model operation of
+        // the request. Admit the complete source cohort before either worker
+        // reaches its participant-local storage prelude.
+        prepareRetainedSourceAdmission();
+        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
@@ -3366,6 +3415,7 @@ namespace llaminar2
             "rank",
             {{"participants", std::to_string(device_runners_.size())},
              {"seq_len", std::to_string(seq_len)}});
+        source_attempt.keep=true;
         return true;
     }
 
@@ -3669,6 +3719,11 @@ namespace llaminar2
             }
         }
 
+        // Grouped rows share the same original request/source cohort as scalar
+        // conditions; a verifier may be their first execution after restore.
+        prepareRetainedSourceAdmission();
+        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
@@ -3801,6 +3856,7 @@ namespace llaminar2
             {{"participants", std::to_string(device_runners_.size())},
              {"requests", std::to_string(token_batches.size())},
              {"padded_seq_len", std::to_string(padded_seq_len)}});
+        source_attempt.keep=true;
         return true;
     }
 
@@ -4122,6 +4178,9 @@ namespace llaminar2
             LOG_ERROR("RankOrchestrator::forwardTP: No device runners available");
             return false;
         }
+        prepareRetainedSourceAdmission();
+        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+
         const bool restored_prefix_bridge =
             dispatch == MainForwardDispatch::RestoredPrefixMTPDecodeBridge;
         if ((restored_prefix_bridge &&
@@ -4783,6 +4842,7 @@ namespace llaminar2
         if (all_success)
             tp_first_forward_completed_ = true;
 
+        source_attempt.keep=all_success;
         return all_success;
     }
 
@@ -6582,6 +6642,11 @@ namespace llaminar2
             }
         }
 
+        // This transaction executes the main model before its sidecar. Keep
+        // source admission at the rank boundary, before concurrent child work.
+        prepareRetainedSourceAdmission();
+        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
@@ -6714,6 +6779,7 @@ namespace llaminar2
              {"requests", std::to_string(request_batch)},
              {"sampling", params.is_greedy() ? "greedy" : "stochastic"},
              {"logical_state_owner", "child_device_mailboxes"}});
+        source_attempt.keep=true;
         return true;
     }
 
@@ -6835,6 +6901,18 @@ namespace llaminar2
             (!logits_gatherer_ || !logits_gatherer_->isAllocated()))
             return fail("requested host decode observation has no retained output owner");
 
+        // Prefix restoration can skip ordinary forwardTP admission entirely.
+        // The parent must arm every original channel before either child can
+        // enter its main-model prelude. Merely publishing a pending input has
+        // no source-lifetime effect. Repeated forwards reuse the same epoch;
+        // failed or throwing forwards cancel the original group through RAII.
+        std::optional<RetainedSourceAdmission::Attempt> source_attempt;
+        if (effect == LocalTPConditionEffect::ForwardMainRow)
+        {
+            prepareRetainedSourceAdmission();
+            source_attempt.emplace(retained_source_admission_);
+        }
+
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
@@ -6951,6 +7029,8 @@ namespace llaminar2
                  {"participants", std::to_string(device_runners_.size())},
                  {"input_owner", "participant_device_logical_state"}});
         }
+        if (source_attempt)
+            source_attempt->keep=all_success;
         return all_success;
     }
 
@@ -12662,6 +12742,9 @@ namespace llaminar2
                              request.initial_leading_row_disposition));
             return false;
         }
+        prepareRetainedSourceAdmission();
+        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+
         materialized_device_generation_execution_policy_.reset();
         materialized_device_generation_loop_topology_.reset();
         rank_hosted_device_generation_tickets_.clear();
@@ -12701,6 +12784,7 @@ namespace llaminar2
                 return false;
             }
         }
+        source_attempt.keep=true;
         admitted_device_generation_max_new_tokens_ = request.max_new_tokens;
         return true;
     }
@@ -13388,6 +13472,7 @@ namespace llaminar2
             return false;
         }
 
+        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
         std::vector<DeviceGenerationTerminalResult> participant_results;
         participant_results.reserve(participants.size());
         for (size_t participant_index = 0;
@@ -13395,11 +13480,12 @@ namespace llaminar2
              ++participant_index)
         {
             DeviceGenerationTerminalResult participant_result;
-            if (!participants[participant_index] ||
-                !participants[participant_index]
-                     ->finishDeviceResidentGeneration(
-                         &participant_result) ||
-                !participant_result.valid())
+            auto* original=retained_source_admission_
+                ? dynamic_cast<DeviceGraphOrchestrator*>(participants[participant_index].get()):nullptr;
+            const bool completed=participants[participant_index] &&
+                (original?original->finishGroupedDeviceResidentGeneration(&participant_result)
+                    :participants[participant_index]->finishDeviceResidentGeneration(&participant_result));
+            if (!completed || !participant_result.valid())
             {
                 LOG_ERROR("[RankOrchestrator] Terminal device-generation materialization failed on participant "
                           << participant_index);
@@ -13408,6 +13494,18 @@ namespace llaminar2
             participant_results.push_back(
                 std::move(participant_result));
         }
+
+        // Each original result event has completed, including its captured close.
+        // A fast participant cannot cancel a peer whose terminal is still queued.
+        if(retained_source_admission_)
+            retireOriginalStorageParticipants(participants,
+                [](const auto& participant){
+                    dynamic_cast<DeviceGraphOrchestrator&>(*participant).awaitGroupedRetainedStorageTerminal();
+                },[&]{
+                    const bool success=retained_source_admission_->original->finish();
+                    retained_source_admission_.reset();
+                    if(!success)throw std::runtime_error("Original TP source group failed terminal retirement");
+                });
 
         const auto &authoritative_requests =
             participant_results.front().requests;
@@ -13510,6 +13608,7 @@ namespace llaminar2
             "rank",
             {{"participants", std::to_string(participants.size())},
              {"validation", "byte_identical_host_terminal_results"}});
+        source_attempt.keep=true;
         return true;
     }
 
@@ -15858,6 +15957,9 @@ namespace llaminar2
             return false;
         }
 
+        prepareRetainedSourceAdmission();
+        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+
         LOG_DEBUG("RankOrchestrator::" << operation
                                         << ": batch_size=" << token_batches.size()
                                         << ", devices=" << device_runners_.size());
@@ -15986,6 +16088,7 @@ namespace llaminar2
             stats_dirty_ = true;
         }
 
+        source_attempt.keep=all_success;
         return all_success;
     }
 
@@ -16050,13 +16153,40 @@ namespace llaminar2
                   << pp_stage_runners_.size() << " PP stages"
                   << " reason=" << (request.reason ? request.reason : "request-boundary"));
 
-        // Reset TP device runners.
-        for (auto &runner : device_runners_)
-        {
-            if (runner)
-            {
-                runner->resetInferenceState(request);
+        // Close publication is a separate native-proof phase. A missing proof
+        // still fails before any participant's data reset can start.
+        if(retained_source_admission_){
+            try{
+                retireOriginalStorageParticipants(device_runners_,[&](const auto& runner){
+                    if(auto* device=dynamic_cast<DeviceGraphOrchestrator*>(runner.get()))
+                        device->prepareGroupedRetainedStorageReset(request);
+                },[]{});
+            }catch(...){
+                const auto original=std::current_exception();
+                // Only cancel/join the original CPU owner. Adopted GPU duties
+                // remain with their original DGOs; no missing event is invented.
+                try{(void)retained_source_admission_->original->finish();}catch(...){}
+                retained_source_admission_.reset();
+                std::rethrow_exception(original);
             }
+            // Drain every adopted right before full DGO reset: its generic
+            // reset transaction deliberately terminates on missing prior work.
+            // A recoverable service failure must not enter that data-clearing
+            // transaction or prevent an original peer from retiring its right.
+            retireOriginalStorageParticipants(device_runners_,[](const auto& runner){
+                if(auto* device=dynamic_cast<DeviceGraphOrchestrator*>(runner.get()))
+                    device->awaitGroupedRetainedStorageTerminal();
+            },[&]{
+                const bool success=retained_source_admission_->original->finish();
+                retained_source_admission_.reset();
+                if(!success)throw std::runtime_error("Original TP source group failed terminal request retirement");
+            });
+            // Only successful original IO retirement permits model-state clear.
+            retireOriginalStorageParticipants(device_runners_,[&](const auto& runner){
+                if(runner)runner->resetInferenceState(request);
+            },[]{});
+        }else{
+            for(auto& runner:device_runners_)if(runner)runner->resetInferenceState(request);
         }
 
         // Reset PP stage runners (each has its own KV/GDN owner).
@@ -17612,6 +17742,16 @@ namespace llaminar2
 
         const bool use_authoritative_child_logical_state =
             pp_stage_runners_.empty() && !device_runners_.empty();
+        // Packed scalar observations retain the existing logical-state owner.
+        // Child native publication generations are independent; only their
+        // authenticated logical values form the symmetric LocalTP consensus.
+        const auto condition_owner = capture_policy.capture_device_logical_state &&
+                use_authoritative_child_logical_state
+            ? deviceResidentLogicalSequenceState()
+            : DeviceResidentLogicalSequenceStateHandle{};
+        const bool project_condition = condition_owner.valid() &&
+            condition_owner.request_count == 1;
+        std::optional<PrefixResidentConditionProbe> mirrored_condition;
         std::optional<int> authoritative_child_position;
         std::vector<int> authoritative_child_positions;
         std::vector<int> authoritative_child_sequence_lengths;
@@ -17772,6 +17912,7 @@ namespace llaminar2
             const bool child_has_verifier_identity =
                 child.mtp_observed_verifier_transaction_count > 0 ||
                 child.mtp_observed_verifier_draft_depth > 0 ||
+                child.mtp_observed_verifier_condition_token.has_value() ||
                 !child.mtp_observed_verifier_draft_tokens.empty();
             if (!authoritative_verifier_identity_present.has_value())
             {
@@ -17791,6 +17932,8 @@ namespace llaminar2
             {
                 if (child.mtp_observed_verifier_transaction_count <= 0 ||
                     child.mtp_observed_verifier_draft_depth <= 0 ||
+                    !child.mtp_observed_verifier_condition_token ||
+                    *child.mtp_observed_verifier_condition_token < 0 ||
                     child.mtp_observed_verifier_draft_tokens.size() !=
                         static_cast<size_t>(
                             child.mtp_observed_verifier_draft_depth))
@@ -17805,6 +17948,8 @@ namespace llaminar2
                         child.mtp_observed_verifier_transaction_count;
                     snapshot.mtp_observed_verifier_draft_depth =
                         child.mtp_observed_verifier_draft_depth;
+                    snapshot.mtp_observed_verifier_condition_token =
+                        child.mtp_observed_verifier_condition_token;
                     snapshot.mtp_observed_verifier_draft_tokens =
                         child.mtp_observed_verifier_draft_tokens;
                 }
@@ -17813,6 +17958,8 @@ namespace llaminar2
                         child.mtp_observed_verifier_transaction_count ||
                     snapshot.mtp_observed_verifier_draft_depth !=
                         child.mtp_observed_verifier_draft_depth ||
+                    snapshot.mtp_observed_verifier_condition_token !=
+                        child.mtp_observed_verifier_condition_token ||
                     snapshot.mtp_observed_verifier_draft_tokens !=
                         child.mtp_observed_verifier_draft_tokens)
                 {
@@ -17926,11 +18073,44 @@ namespace llaminar2
             {
                 const PrefixRuntimeStateSnapshot child =
                     runner->prefixStateProbe(capture_policy);
+                if (project_condition)
+                {
+                    const auto original = runner->deviceResidentLogicalSequenceState();
+                    if (!child.initialized || !child.resident_condition || !original.valid() ||
+                        original.request_count != 1 ||
+                        child.resident_condition->device != original.device ||
+                        child.resident_condition->publication_generation != original.publication_generation ||
+                        child.resident_condition->live_state_epoch != original.live_state_epoch ||
+                        child.resident_condition->target_position != child.current_position)
+                        throw std::runtime_error("Rank prefix-state diagnostics lost an original participant condition publication");
+                    const auto& observed = *child.resident_condition;
+                    if (mirrored_condition &&
+                        (mirrored_condition->target_position != observed.target_position ||
+                         mirrored_condition->next_condition_token != observed.next_condition_token ||
+                         mirrored_condition->publication_ok != observed.publication_ok ||
+                         mirrored_condition->stopped != observed.stopped))
+                        throw std::runtime_error("Rank prefix-state diagnostics observed divergent logical condition values across LocalTP participants");
+                    mirrored_condition = observed;
+                }
                 adopt_authoritative_child_logical_state(child);
                 tp_movement_epoch = std::max(tp_movement_epoch, child.moe_runtime_movement_epoch.epoch());
                 merge_child(child);
                 saw_child = true;
             }
+        }
+        if (project_condition)
+        {
+            if (!mirrored_condition ||
+                !deviceResidentLogicalSequenceState().sameMailboxAs(condition_owner))
+                throw std::runtime_error("Rank prefix-state diagnostics rejected a replaced logical condition owner");
+            // This is the same already-authenticated aggregate ownership token,
+            // not a choice of one GPU's unrelated event generation. The outer
+            // runner alone authenticates ReadyMTPCondition response disposition.
+            snapshot.resident_condition = *mirrored_condition;
+            snapshot.resident_condition->device = condition_owner.device;
+            snapshot.resident_condition->publication_generation = condition_owner.publication_generation;
+            snapshot.resident_condition->live_state_epoch = condition_owner.live_state_epoch;
+            snapshot.resident_condition->response_disposition.reset();
         }
         snapshot.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(tp_movement_epoch);
         std::vector<PrefixMovementEpochSnapshot> pipeline_epochs;

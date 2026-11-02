@@ -8,6 +8,7 @@
  * this builder never hides a collective inside an ordinary compute stage.
  */
 #include "PooledImmutableLocalLookupGraph.h"
+#include "PooledImmutableParticipantPinGraph.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <stdexcept>
@@ -47,8 +48,7 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
         input(spans,q::PooledNativeOperand::Invocation,coord.native,BufferId::QFN_POOLED_COORDINATOR_NATIVE,c.native.invocation,sizeof(n::Invocation));
         switch(action){
         case n::OwnerAction::Pin:
-            input(spans,q::PooledNativeOperand::Records,coord.native,BufferId::QFN_POOLED_COORDINATOR_NATIVE,c.native.pin_commands,std::size_t{capacity}*sizeof(p::OwnerCommand));
-            input(spans,q::PooledNativeOperand::RecordBytes,coord.native,BufferId::QFN_POOLED_COORDINATOR_NATIVE,c.native.pin_slices+offsetof(n::DirectedSlice,live_bytes),capacity?8:0);break;
+            spans=q::PooledImmutablePinEdge::fromPlans(coordinator->plan(),owner->plan()).localPinInputs(*coordinator);break;
         case n::OwnerAction::AcquirePins:
             input(spans,q::PooledNativeOperand::Frontier,own.native,BufferId::QFN_POOLED_OWNER_NATIVE,o.native.header,sizeof(p::PinHeader));break;
         case n::OwnerAction::AcceptFree:case n::OwnerAction::AcceptVictim:{
@@ -109,8 +109,8 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
         q::PooledImmutableCoordinatorOperands operands(action,coordinator->plan(),rows,std::move(spans),condition);
         append(std::make_unique<PooledImmutableNativePhaseStage>(arena,code,PooledImmutableNativePhaseStage::Coordinator{action,coordinator,std::move(operands)}));
     };
-    const auto sourcePhase=[&](q::PooledSourceAction action){append(std::make_unique<PooledImmutableSourcePhaseStage>(arena,boundary,action,control,
-        action==q::PooledSourceAction::Read?std::optional(output):std::nullopt),action==q::PooledSourceAction::Read?outputIdentity:std::string{});};
+    const auto sourcePhase=[&](q::PooledSourceAction action,std::uint32_t ownerCoordinate=q::adaptive_lookup::None){append(std::make_unique<PooledImmutableSourcePhaseStage>(arena,boundary,action,control,
+        action==q::PooledSourceAction::Read?std::optional(output):std::nullopt,ownerCoordinate),action==q::PooledSourceAction::Read?outputIdentity:std::string{});};
     coordinatorPhase(n::CoordinatorAction::Begin);ownerPhase(n::OwnerAction::Begin);
     coordinatorPhase(n::CoordinatorAction::PinCommands);ownerPhase(n::OwnerAction::Pin);ownerPhase(n::OwnerAction::SealPins);
     coordinatorPhase(n::CoordinatorAction::AcquirePins);coordinatorPhase(n::CoordinatorAction::SealPins);ownerPhase(n::OwnerAction::AcquirePins);
@@ -120,7 +120,8 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
     coordinatorPhase(n::CoordinatorAction::PlanVictims);ownerPhase(n::OwnerAction::AcceptVictim);ownerPhase(n::OwnerAction::ExecuteVictim);
     coordinatorPhase(n::CoordinatorAction::AcquireVictims);ownerPhase(n::OwnerAction::VictimReceipt);coordinatorPhase(n::CoordinatorAction::CompleteVictims);
     sourcePhase(q::PooledSourceAction::Plan);coordinatorPhase(n::CoordinatorAction::SealSource);ownerPhase(n::OwnerAction::SealSource);
-    sourcePhase(q::PooledSourceAction::Publish);sourcePhase(q::PooledSourceAction::Acquire);
+    sourcePhase(q::PooledSourceAction::AcquireSeal,0);sourcePhase(q::PooledSourceAction::Publish);sourcePhase(q::PooledSourceAction::AcquireResponse);
+    sourcePhase(q::PooledSourceAction::PackOwner,0);sourcePhase(q::PooledSourceAction::RetireResponse);
     ownerPhase(n::OwnerAction::ApplySourceDelivery,n::SourceCondition::AfterSuccess);
     ownerPhase(n::OwnerAction::ValidateFills,n::SourceCondition::AfterSuccess);ownerPhase(n::OwnerAction::AcquirePublication,n::SourceCondition::AfterSuccess);
     sourcePhase(q::PooledSourceAction::BeforeReady);

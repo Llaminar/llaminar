@@ -3,8 +3,8 @@
  * @brief Admitted rank-local message storage and immutable capture bindings.
  *
  * TransferEngine alone constructs a channel or enqueues a complete message.
- * The mapped slot has two GPU-private cursors and one initialization event per
- * endpoint, joined once before setup returns. Captured bindings retain those owners, exact tensor/buffer storage,
+ * The mapped slot has two GPU-private cursors. Cold setup observes each exact
+ * original initialization stream before publication, creating no extra events. Captured bindings retain those owners, exact tensor/buffer storage,
  * and message geometry; neither binding nor channel exposes live protocol state
  * to the host. This is a same-process/node transport, not an MPI address space.
  */
@@ -13,6 +13,9 @@
 #include "CapturedTransferChannelProtocol.h"
 #include "TransferEngine.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "backends/GPUDeviceContextPool.h"
+#include <optional>
+#include <chrono>
 
 #include <array>
 #include <variant>
@@ -32,7 +35,7 @@ namespace llaminar2
      * Bindings hold this owner until their graph family is retired. The enclosing
      * graph owner must join its final submitted work before releasing its graph
      * and bindings, just as for every other captured arena allocation. Destruction
-     * releases events/storage before their PMA leases and never synchronizes.
+     * releases mapped/cursor storage before its original worker and PMA claims and never synchronizes.
      */
     class CapturedTransferChannel final
     {
@@ -54,24 +57,35 @@ namespace llaminar2
 
     private:
         friend class TransferEngine;
+        friend class CapturedTransferBinding;
+        friend struct CapturedTransferChannelReplayProbe; ///< Test-only payload canary access after both endpoints' terminal joins; no production observation API.
         /** @brief Create only inside TransferEngine's all-or-nothing setup transaction. */
         CapturedTransferChannel() = default;
 
         /** @brief Private endpoint resources, declared in reverse retirement order. */
         struct Endpoint
         {
+            std::optional<GPUContextProvenance> original; ///< Retires after its cursor and canonical claim.
             PhysicalMemoryAllocationLease lease; ///< Released after cursor storage.
             std::shared_ptr<DeviceTransferBuffer> cursor;
             IBackend *backend = nullptr; ///< Exact process-lifetime backend authority.
             DeviceId device = DeviceId::invalid();
-            void *initialized_event = nullptr; ///< Recorded once after setup memset.
+            enum class Initialization {Unused,Pending,Ready};
+            std::uint64_t runtime_generation=0;
+            void* setup_stream=nullptr;
+            Initialization initialization=Initialization::Unused;
+            std::chrono::steady_clock::time_point initialization_deadline{};
             std::uint64_t timeout_ticks = 0; ///< Frozen native clock geometry.
         };
+        /** @brief Cold-only bounded initialization join; replay cannot invoke this operation. */
+        static void completeColdInitialization(Endpoint& endpoint);
+        /** @brief Authenticate original ready generation/controlblock before accessing any frozen pointer. */
+        void requireOriginalEndpoint(CapturedTransferEndpoint role)const;
         static constexpr size_t payload_offset = sizeof(CapturedTransferChannelControl);
         CapturedTransferChannelIdentity identity_;
+        std::array<Endpoint, 2> endpoints_; ///< Original workers outlive mapped registration teardown.
         PhysicalMemoryAllocationLease mapped_lease_; ///< Outlives mapped storage.
         std::shared_ptr<MappedHostTransferRegion> mapped_;
-        std::array<Endpoint, 2> endpoints_;
     };
 
     /**
@@ -85,10 +99,41 @@ namespace llaminar2
     class CapturedTransferBinding final
     {
     public:
+        /** @brief Share the same immutable physical/count owners without another native borrow. */
+        CapturedTransferBinding(const CapturedTransferBinding &) = default;
+        /** @brief Move the complete retained endpoint with its original allocation borrow. */
+        CapturedTransferBinding(CapturedTransferBinding &&) noexcept = default;
+        /**
+         * @brief Replace a complete binding before retiring its former physical owners.
+         * @param other Fully retained replacement, copied or moved before the swap.
+         * @return This binding after complete ownership replacement.
+         *
+         * The temporary retires its allocation borrow before its final tensor
+         * owner. Memberwise assignment could release that tensor while the old
+         * borrow was still live, violating the allocator's free contract.
+         */
+        CapturedTransferBinding &operator=(CapturedTransferBinding other) noexcept
+        {
+            using std::swap;
+            swap(channel_, other.channel_); swap(storage_, other.storage_);
+            swap(native_, other.native_); swap(device_, other.device_);
+            swap(device_bytes_, other.device_bytes_); swap(offset_, other.offset_);
+            swap(extent_storage_, other.extent_storage_); swap(extent_offset_, other.extent_offset_);
+            swap(extent_capture_, other.extent_capture_); swap(source_capture_, other.source_capture_);
+            return *this;
+        }
+        /**
+         * @return Complete immutable channel, payload, extent, slice and allocation-borrow capture identity.
+         * @note This never dereferences device state or joins a producer. Enqueue separately
+         * rejects original owner/backend/address drift before submitting the retained binding.
+         */
+        [[nodiscard]] std::uint64_t captureIdentity() const;
         /** @return Exact fixed extent or counted maximum embedded in the recorded operation. */
         [[nodiscard]] CapturedTransferMessage message() const noexcept { return native_.message; }
         /** @return Capture-frozen extent authority; never reads the live device count. */
         [[nodiscard]] CapturedTransferExtentSource extentSource() const noexcept { return native_.extent_source; }
+        /** @return Whether this original endpoint carries a capture-frozen source slice descriptor. */
+        [[nodiscard]] bool hasSourceSlice() const noexcept { return native_.source_slice != nullptr; }
         /** @return Physical device which must execute this endpoint. */
         [[nodiscard]] DeviceId device() const noexcept { return device_; }
         /** @return Producer or consumer, without consulting mutable GPU state. */
@@ -106,7 +151,9 @@ namespace llaminar2
         void *device_bytes_ = nullptr; ///< Immutable physical subregion start.
         size_t offset_ = 0; ///< Revalidated against the retained physical owner.
         std::variant<std::monostate, std::shared_ptr<DeviceTransferBuffer>,
-            std::shared_ptr<const WorkspaceBufferLease>> extent_storage_; ///< Exact count input/output owner.
+            std::shared_ptr<const WorkspaceBufferLease>, std::shared_ptr<TensorBase>> extent_storage_; ///< Exact count input/output owner.
         size_t extent_offset_ = 0; ///< Aligned uint64 within that retained device region.
+        std::shared_ptr<const CapturedDeviceStorageLease> extent_capture_; ///< Original tensor allocation borrow; retires before its strong tensor owner.
+        std::shared_ptr<const CapturedDeviceStorageLease> source_capture_; ///< Optional sliced Tensor source borrow, distinct from descriptor authority.
     };
 }

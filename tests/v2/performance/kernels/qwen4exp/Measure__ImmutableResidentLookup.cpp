@@ -11,6 +11,7 @@
  * cold-DRAM bandwidth. This executable is diagnostic, never an inference path.
  */
 #include "backends/GPUDeviceProcessLifetime.h"
+#include "backends/GPUGraphMemoryContract.h"
 #include "kernels/qwen4exp/ImmutableResidentLookupKernels.h"
 #include "kernels/qwen4exp/ImmutableLookupKernels.h"
 #include "backends/BackendManager.h"
@@ -21,11 +22,12 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "transfer/TransferEngine.h"
-#include "utils/Sha256.h"
+#include "utils/PooledNgramReplayTrace.h"
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <charconv>
+#include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -44,6 +46,7 @@ namespace
 {
 constexpr int kWidth=160;
 constexpr std::size_t kRowBytes=5*sizeof(IQ4_NLBlock);
+namespace trace=llaminar2::test::ngram_replay;
 /** @brief Reject failed infrastructure or invalid measurement declarations.
  * @param ok Required invariant.
  * @param why Precise failure diagnostic.
@@ -71,9 +74,9 @@ std::size_t sum(std::size_t a,std::size_t b)
 struct Options
 {
     DeviceId device=DeviceId::invalid();
-    int rows=0,live=-1,iterations=100,batches=7,warmup=20;
+    int rows=0,live=-1,iterations=1,batches=9,warmup=2;
     std::size_t tableRows=1048576;
-    std::uint32_t seed=1701;
+    trace::Locality locality=trace::Locality::Scattered;
 };
 /** @brief Parse one complete unsigned decimal CLI scalar.
  * @param text Exact option value, without suffix/trailing whitespace.
@@ -103,9 +106,10 @@ Options options(int argc,char **argv)
         }
         else if(key=="--format"){require(text=="IQ4_NL","This native measurement supports exactly IQ4_NL width160");format=true;}
         else if(key=="--table-rows")value.tableRows=number(text);
-        else if(key=="--seed")
+        else if(key=="--locality")
         {
-            const auto n=number(text);require(n<=std::numeric_limits<std::uint32_t>::max(),"Seed exceeds uint32");value.seed=static_cast<std::uint32_t>(n);
+            require(text=="scattered"||text=="contiguous","Locality must be scattered or contiguous");
+            value.locality=text=="scattered"?trace::Locality::Scattered:trace::Locality::Contiguous;
         }
         else
         {
@@ -120,6 +124,7 @@ Options options(int argc,char **argv)
     }
     require(value.device.is_gpu()&&format&&value.rows>0&&value.live>=0&&value.live<=value.rows,"Explicit backend, IQ4_NL, positive rows and bounded live rows required");
     require(value.tableRows>=product(static_cast<std::size_t>(value.rows),16),"Table must contain distinct admitted IDs");
+    (void)trace::ids({value.tableRows,static_cast<std::uint32_t>(value.rows),static_cast<std::uint32_t>(value.live),value.locality},trace::Pattern::DistinctA);
     require(value.iterations>0&&value.batches>0&&value.warmup>0,"Positive iterations/batches/warmup required");return value;
 }
 /** @brief Obtain the startup-authorized endpoint observation without raw driver probes.
@@ -136,20 +141,14 @@ ComputeDevice observedDevice(DeviceId device)
 }
 /** @brief Author original IQ4_NL blocks directly, without floating source requantization.
  * @param rows Exact immutable source-table row count.
- * @param seed Stable native-byte fixture identity.
  * @return Complete row-major original blocks, 90 bytes per row.
  */
-std::vector<std::byte> nativeTable(std::size_t rows,std::uint32_t seed)
+std::vector<std::byte> nativeTable(std::size_t rows)
 {
     std::vector<std::byte> bytes(product(rows,kRowBytes));
 #pragma omp parallel for schedule(static)
     for(std::size_t row=0;row<rows;++row)
-        for(std::size_t b=0;b<5;++b)
-        {
-            IQ4_NLBlock block{};block.d=static_cast<std::uint16_t>(0x2000u+((row*5+b+seed)%32)*32);
-            for(std::size_t q=0;q<16;++q)block.qs[q]=static_cast<std::uint8_t>((row*13+b*17+q*29+seed)&255u);
-            std::memcpy(bytes.data()+row*kRowBytes+b*sizeof(block),&block,sizeof(block));
-        }
+        trace::fillRow(row,{bytes.data()+row*kRowBytes,kRowBytes});
     return bytes;
 }
 /** @brief Persistent graph storage with physical claims released after actual buffers. */
@@ -222,6 +221,8 @@ std::shared_ptr<PhysicalMemoryAuthority> admit(const ComputeDevice &hardware,Dev
     PhysicalMemoryResource resource{.world_rank=0,.device=device,.total_bytes=hardware.total_memory_bytes,.admission_available_bytes=hardware.free_memory_bytes};
     PhysicalMemoryPlanBuilder plan;plan.add(resource,PhysicalMemoryOwner::ImmutableTableStorage,tableBytes);
     plan.add(resource,PhysicalMemoryOwner::ActivationArena,workingBytes);
+    plan.add(resource,PhysicalMemoryOwner::NativeGraphExecutable,
+        GPUGraphMemoryContract::reservationBytesPerExecutable(device,GPUGraphExecutableClass::General));
     return std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
 }
 /** @brief Assert exact live output, native controller health and inactive sentinels.
@@ -233,15 +234,13 @@ std::shared_ptr<PhysicalMemoryAuthority> admit(const ComputeDevice &hardware,Dev
  */
 void validate(Session &session,const float *output,const int *controls,const std::vector<float> &expected,std::size_t capacity)
 {
-    const auto actual=session.download(output,expected.size());
-    if(!actual.empty())require(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float))==0,"Native output differs from original-block CPU decode");
+    const auto actual=session.download(output,capacity);
+    if(!expected.empty())require(std::memcmp(actual.data(),expected.data(),expected.size()*sizeof(float))==0,"Native output differs from original-block CPU decode");
     const auto control=session.download(controls,3);require(control[0]==static_cast<int>(expected.size()/(16*kWidth))&&control[1]==1&&control[2]==0,"Resident lookup failed canonical live/health/error validation");
-    if(expected.size()<capacity)
-    {
-        for(const auto index:std::array<std::size_t,2>{expected.size(),capacity-1})
-            require(std::bit_cast<std::uint32_t>(session.download(output+index,1).front())==std::bit_cast<std::uint32_t>(-12345.0f),"Inactive output sentinel changed");
-    }
+    require(std::all_of(actual.begin()+expected.size(),actual.end(),[](float x){return std::bit_cast<std::uint32_t>(x)==std::bit_cast<std::uint32_t>(-12345.0f);}),"Inactive output sentinel changed");
 }
+/** @brief Separate native stream time and host submission-to-completion time. */
+struct Timing {double event_us,wall_us;};
 /** @brief Time whole repeated two-kernel submissions using outer events only.
  * @param session Stable graph, stream and backend.
  * @param start Exact native start event outside capture.
@@ -249,13 +248,16 @@ void validate(Session &session,const float *output,const int *controls,const std
  * @param iterations Number of complete graph submissions.
  * @return Complete amortized submitted-transaction microseconds, including gaps.
  */
-float elapsed(Session &session,void *start,void *stop,int iterations)
+Timing elapsed(Session &session,void *start,void *stop,int iterations)
 {
+    const auto begin=std::chrono::steady_clock::now();
     require(session.backend->recordEvent(start,session.device.ordinal,session.stream),"Outer start event failed");
     for(int i=0;i<iterations;++i)require(session.graph->launch(),"Timed captured lookup submission failed");
     require(session.backend->recordEvent(stop,session.device.ordinal,session.stream),"Outer stop event failed");
     require(session.backend->waitForEvent(stop,session.device.ordinal),"Outer event completion failed");
-    float ms=0;require(session.backend->eventElapsedTimeMs(start,stop,session.device.ordinal,&ms),"Outer elapsed time unavailable");return ms*1000.0f/iterations;
+    const auto end=std::chrono::steady_clock::now();
+    float ms=0;require(session.backend->eventElapsedTimeMs(start,stop,session.device.ordinal,&ms),"Outer elapsed time unavailable");
+    return {ms*1000.0/iterations,std::chrono::duration<double,std::micro>(end-begin).count()/iterations};
 }
 /** @brief Prepare and measure exactly one declared native geometry.
  * @param option Immutable CLI selection, printed with all evidence.
@@ -268,16 +270,10 @@ void measure(const Options &option)
     const auto idsBytes=product(idsCapacity,sizeof(std::int64_t)),outputBytes=product(outputCapacity,sizeof(float));
     const auto workingBytes=sum(sum(idsBytes,outputBytes),3*sizeof(int));
     auto authority=admit(hardware,option.device,tableBytes,workingBytes);
-    const auto source=nativeTable(option.tableRows,option.seed);
-    const auto sourceSha=sha256BytesHex({reinterpret_cast<const char *>(source.data()),source.size()});require(sourceSha.has_value(),"Native source SHA unavailable");
+    const auto source=nativeTable(option.tableRows);
     std::vector<std::int64_t> hostIds(idsCapacity,-1);const auto liveIds=product(static_cast<std::size_t>(option.live),16);
-    const auto step=option.tableRows/idsCapacity;
-    const auto shift=static_cast<std::size_t>(option.seed)%option.tableRows;
-    for(std::size_t i=0;i<liveIds;++i)
-    {
-        const auto base=i*step;
-        hostIds[i]=static_cast<std::int64_t>(base>=option.tableRows-shift?base-(option.tableRows-shift):base+shift);
-    }
+    const auto original=trace::ids({option.tableRows,static_cast<std::uint32_t>(option.rows),static_cast<std::uint32_t>(option.live),option.locality},trace::Pattern::DistinctA);
+    std::copy(original.begin(),original.end(),hostIds.begin());
     std::vector<std::byte> gathered(product(liveIds,kRowBytes));
     for(std::size_t i=0;i<liveIds;++i)std::memcpy(gathered.data()+i*kRowBytes,source.data()+static_cast<std::size_t>(hostIds[i])*kRowBytes,kRowBytes);
     std::vector<float> expected(product(liveIds,kWidth));decodeCPUImmutableLookupRows(TensorType::IQ4_NL,kWidth,kRowBytes,gathered.data(),liveIds,expected.data());
@@ -285,6 +281,8 @@ void measure(const Options &option)
     auto &worker=GPUDeviceContextPool::instance().getContext(option.device);
     worker.submitAsync([&] {
         Session session{option.device,backend,ExplicitGPUStream(worker.defaultStream()).get(),authority};
+        session.claims.push_back(authority->claimNewAllocation(option.device,PhysicalMemoryOwner::NativeGraphExecutable,
+            GPUGraphMemoryContract::reservationBytesPerExecutable(option.device,GPUGraphExecutableClass::General)));
         auto *table=session.allocate<std::byte>(tableBytes,PhysicalMemoryOwner::ImmutableTableStorage);session.upload<std::byte>(table,source);
         auto *ids=session.allocate<std::int64_t>(idsCapacity,PhysicalMemoryOwner::ActivationArena);session.upload<std::int64_t>(ids,hostIds);
         auto *output=session.allocate<float>(outputCapacity,PhysicalMemoryOwner::ActivationArena);
@@ -318,16 +316,18 @@ void measure(const Options &option)
             <<" rows="<<option.rows<<" live="<<option.live<<" table_rows="<<option.tableRows<<" row_bytes="<<kRowBytes
             <<" table_bytes="<<tableBytes<<" observed_l2_bytes="<<hardware.last_level_cache_bytes<<" compute_units="<<hardware.compute_units
             <<" live_ids="<<liveIds<<" live_native_bytes="<<product(liveIds,kRowBytes)<<" live_output_bytes="<<expected.size()*sizeof(float)
-            <<" seed="<<option.seed<<" source_sha256="<<*sourceSha<<" kernels_per_graph=2 table_gt_l2=1 cache_regime=fixed_replay_ids"
+            <<" source_pattern="<<trace::NativePattern<<" locality="<<(option.locality==trace::Locality::Scattered?"scattered":"contiguous")<<" kernels_per_graph=2 table_gt_l2=1 cache_regime=fixed_replay_ids"
             <<" live_working_set_may_fit_l2="<<(product(liveIds,kRowBytes)<=hardware.last_level_cache_bytes)
             <<" source_requantization=0 lookup_service=0 timed_host_observations=0\n";
-        std::vector<float> samples; samples.reserve(static_cast<std::size_t>(option.batches));
+        std::vector<double> samples; samples.reserve(static_cast<std::size_t>(option.batches));
         for(int batch=0;batch<option.batches;++batch)
         {
             const auto us=elapsed(session,start,stop,option.iterations);validate(session,output,controls,expected,outputCapacity);
-            require(session.owners.size()==owners&&session.kernels->table()==view,"Captured native allocation identity drift");samples.push_back(us);
-            std::cout<<"RESIDENT_LOOKUP_TIMING batch="<<batch<<" submissions="<<option.iterations<<" complete_transaction_us="<<std::setprecision(9)<<us
-                <<" validation=byte_exact_live_and_inactive_sentinels scope=outer_complete_two_kernel_graph includes_submission_gaps=1\n";
+            require(session.owners.size()==owners&&session.kernels->table()==view,"Captured native allocation identity drift");samples.push_back(us.event_us);
+            std::cout<<"NGRAM_PERF_SAMPLE {\"schema\":1,\"continuation\":\""<<option.device.toString()<<"\",\"kind\":\"resident_vram\",\"format\":\"IQ4_NL\",\"width\":160,\"row_bytes\":90,\"tokens\":"<<option.live
+                <<",\"capacity_tokens\":"<<option.rows<<",\"table_rows\":"<<option.tableRows<<",\"live_ids\":"<<liveIds<<",\"unique_ids\":"<<trace::uniqueCount(original)<<",\"sample\":"<<batch<<",\"submissions\":"<<option.iterations
+                <<",\"event_us\":"<<std::setprecision(10)<<us.event_us<<",\"wall_us\":"<<us.wall_us<<",\"source_pattern\":\""<<trace::NativePattern<<"\",\"locality\":\""<<(option.locality==trace::Locality::Scattered?"scattered":"contiguous")
+                <<"\",\"scope\":\""<<(option.iterations==1?"complete_lookup_single_submission":"amortized_complete_lookup_submissions")<<"\",\"cache_regime\":\"fixed_replay_ids_may_fit_l2\",\"byte_validation\":\"exact_live_and_inactive_tail\"}\n";
         }
         std::sort(samples.begin(),samples.end());std::cout<<"RESIDENT_LOOKUP_MEDIAN complete_transaction_us="<<samples[samples.size()/2]
             <<" samples="<<samples.size()<<" pointers_stable=1 native_owner_allocations="<<owners<<" validation=pass no_cold_dram_bandwidth_claim=1\n";

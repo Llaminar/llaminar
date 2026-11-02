@@ -96,7 +96,44 @@ def _child(mode: str, report: Path, outside: Path, singleton: Path | None = None
         temporary.mkdir(mode=0o700)
         (temporary / "foreign").write_text("replacement must survive")
         observation["moved"] = str(moved)
+    if mode.startswith("root-"):
+        # Only this child's exact guardian-issued root is a mutation target.
+        operation, side = mode.removeprefix("root-").rsplit("-", 1)
+        original, loan = (shared, 7) if side == "shared" else (temporary, 6)
+        held, named = os.fstat(loan), original.stat()
+        if (held.st_dev, held.st_ino, held.st_uid) != (named.st_dev, named.st_ino, named.st_uid):
+            raise AssertionError("Fixture root differs from its original guardian loan")
+        observation.update(root=str(original), operation=operation,
+                           original_inode=held.st_ino, original_device=held.st_dev)
+        if operation == "unlink":
+            shutil.rmtree(original)
+            observation["held_nlink"] = os.fstat(loan).st_nlink
+            if observation["held_nlink"] != 0:
+                raise AssertionError("Actual original directory did not become unlinked")
+            observation["release"] = str(report.with_suffix(".release"))
+        else:
+            if operation.startswith("unlinked-"):
+                shutil.rmtree(original)
+                replacement = operation.removeprefix("unlinked-")
+            else:
+                moved = original.with_name(original.name + "-moved")
+                original.rename(moved)
+                observation["moved"] = str(moved)
+                replacement = operation
+            observation["held_nlink"] = os.fstat(loan).st_nlink
+            if replacement == "replace-dir":
+                original.mkdir(mode=0o700)
+                (original / "foreign").write_text("replacement must survive")
+            elif replacement == "replace-file":
+                original.write_text("replacement must survive")
+            elif replacement == "replace-symlink":
+                original.symlink_to(outside, target_is_directory=True)
+            elif replacement != "rename":
+                raise AssertionError("Unknown root mutation")
     _publish(report, observation)
+    if mode.startswith("root-unlink-"):
+        # Keep a real consumer alive until the parent proves no cleanup occurred.
+        _wait(lambda: Path(observation["release"]).exists(), "original consumer release")
     if mode.startswith("frontend-"):
         if singleton is None:
             raise AssertionError("Frontend ownership replay requires the actual singleton probe")
@@ -263,6 +300,80 @@ class Replay:
             if path.exists():
                 shutil.rmtree(path)
         self.results.append({"case": "changed-root", "returncode": status, "rejected": True})
+
+    def root_unlink(self) -> None:
+        """Accept only actual zero-link originals after the last real child exits."""
+        self.root_mutations(("unlink",))
+
+    def root_identity(self) -> None:
+        """Retain still-linked originals and every foreign replacement unchanged."""
+        self.root_mutations(("rename", "replace-dir", "replace-file", "replace-symlink",
+                             "unlinked-replace-dir", "unlinked-replace-file", "unlinked-replace-symlink"))
+
+    def root_retirement(self) -> None:
+        """Run both physical-unlink and adversarial original-root contracts."""
+        self.root_unlink()
+        self.root_identity()
+
+    def root_mutations(self, operations: tuple[str, ...]) -> None:
+        """Use only exact test-owned helpers/roots; a neighboring owner stays live."""
+        group = "-".join(operations)
+        neighbor, neighbor_dir, neighbor_state = self.child("neighbor-" + group, "wait")
+        sides = ("shared", "temporary") if self.args.root_side == "both" else (self.args.root_side,)
+        try:
+            for repeat in range(self.args.repeat):
+                for operation in operations:
+                    for side in sides:
+                        name = f"{operation}-{side}-{repeat}"
+                        process, directory, observation = self.child(name, f"root-{operation}-{side}")
+                        target = Path(observation["root"])
+                        if operation == "unlink":
+                            # The untouched opposite root proves the guardian has
+                            # not begun cleanup while its actual child remains.
+                            opposite = Path(observation["temporary" if side == "shared" else "shared"])
+                            if process.poll() is not None or not (opposite / ".owner").is_file():
+                                raise AssertionError("Guardian retired backing before its live consumer")
+                            Path(observation["release"]).write_text("original consumer may exit")
+                            self.finish(process, directory, 0, [observation])
+                        else:
+                            status = process.wait(timeout=15)
+                            log = (directory / "output.log").read_text()
+                            if status != 125 or "MPI session root identity changed; backing retained: " + str(target) not in log:
+                                raise AssertionError(f"{name}: original identity rejection missing: {status}: {log}")
+                            if "moved" in observation and not Path(observation["moved"]).is_dir():
+                                raise AssertionError("Renamed still-linked original was removed")
+                            if operation.endswith("replace-dir") and (target / "foreign").read_text() != "replacement must survive":
+                                raise AssertionError("Foreign directory was changed")
+                            if operation.endswith("replace-file") and target.read_text() != "replacement must survive":
+                                raise AssertionError("Foreign file was changed")
+                            if operation.endswith("replace-symlink") and (not target.is_symlink() or target.resolve() != self.outside):
+                                raise AssertionError("Foreign symlink was changed")
+                            # These exact roots/replacements were created by this
+                            # disposable test. All original children have exited.
+                            retained = [target, Path(observation["temporary"]), Path(observation["shared"])]
+                            if "moved" in observation:
+                                retained.append(Path(observation["moved"]))
+                            for path in retained:
+                                if path.is_symlink() or path.is_file():
+                                    path.unlink()
+                                elif path.is_dir():
+                                    shutil.rmtree(path)
+                            require_retired([directory / "sessions"], timeout_seconds=0)
+                            self.results.append({"case": name, "returncode": status, "rejected": True,
+                                                 "held_nlink": observation["held_nlink"]})
+                        self.results[-1].update(original_device=observation["original_device"],
+                                                original_inode=observation["original_inode"],
+                                                held_nlink=observation["held_nlink"],
+                                                original_root=observation["root"])
+                        if neighbor.poll() is not None or not all((Path(neighbor_state[key]) / ".owner").is_file()
+                                                                  for key in ("temporary", "shared")):
+                            raise AssertionError("Root retirement changed a live neighboring owner")
+                        if (self.outside / "sentinel").read_text() != "untouched":
+                            raise AssertionError("Root retirement followed a foreign symlink")
+        finally:
+            if neighbor.poll() is None:
+                neighbor.terminate()
+            self.finish(neighbor, neighbor_dir, 143, [neighbor_state])
 
     def terminal(self) -> None:
         """Keep real interactive stdin/stdout usable through the detached owner."""
@@ -496,7 +607,9 @@ def main() -> None:
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--singleton", type=Path)
     parser.add_argument("--mpirun", type=Path, required=True)
-    parser.add_argument("--case", choices=("launcher", "mpi", "native_options", "stubborn", "ctest_timeout", "singleton", "identity", "retirement", "all"), default="all")
+    parser.add_argument("--case", choices=("launcher", "mpi", "native_options", "stubborn", "ctest_timeout", "singleton", "identity", "retirement", "root_retirement", "root_unlink", "root_identity", "all"), default="all")
+    parser.add_argument("--root-side", choices=("both", "shared", "temporary"), default="both")
+    parser.add_argument("--repeat", type=int, choices=range(1, 21), default=1)
     args = parser.parse_args()
     if args.case in {"singleton", "identity", "all"} and args.singleton is None:
         parser.error("Actual frontend ownership cases require --singleton")
@@ -505,7 +618,7 @@ def main() -> None:
     passed = False
     failures = []
     try:
-        selected = (("retirement",) if args.case == "retirement" else
+        selected = ((args.case,) if args.case != "all" else
                     ("launcher", "mpi", "native_options", "stubborn", "ctest_timeout", "singleton", "identity"))
         for case in selected:
             if args.case in {case, "all"}:

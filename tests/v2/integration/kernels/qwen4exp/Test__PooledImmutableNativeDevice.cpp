@@ -9,6 +9,9 @@
  * cross-device transport remain unqualified. Readback/timing are diagnostics.
  */
 #include "backends/BackendManager.h"
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "fixtures/backends/RetainedParticipantGraphExecutableFixtureAccess.h"
+#include "backends/NativeOrderingEventBudgetProjection.h"
 #include "backends/ExplicitGPUStream.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/GPUGraphMemoryContract.h"
@@ -107,12 +110,17 @@ enum class RecordedTrace {PlanCancellation,SuccessfulSource};
 class NativeReplay {
 public:
     /** @brief Declare exact PMA roots and one general executable before any materialization. */
-    NativeReplay(DeviceId device,IWorkerGPUContext& worker,std::uint32_t maximum,std::uint32_t slots,RecordedTrace mode=RecordedTrace::PlanCancellation,n::OriginalIdWidth width=n::OriginalIdWidth::UInt64):device(device),worker(worker),
+    NativeReplay(DeviceId device,PreparedNativeLookupFixture& session,std::uint32_t maximum,std::uint32_t slots,RecordedTrace mode=RecordedTrace::PlanCancellation,n::OriginalIdWidth width=n::OriginalIdWidth::UInt64,bool declarationOnly=false):device(device),worker(*session.permit(device).worker()),
         backend(getBackendFor(device)),stream(ExplicitGPUStream(worker.defaultStream()).get()),maximum(maximum),slots(slots),mode(mode),originalWidth(width)
     {
+        // Ownership/admission stays on the original control thread. Only native
+        // storage preparation and recording marshal onto the exact worker.
+        if(!declarationOnly)
+            graphOwner=RetainedParticipantGraphExecutableFixtureAccess::original(session.permit(device),stream);
+        worker.submitAndWait([&]{
         // A constructor exception must retire diagnostic uploads before host input backing unwinds.
         struct ConstructionRetirement {IBackend* backend;DeviceId device;void* stream;
-            ~ConstructionRetirement(){if(!backend || !backend->synchronizeStream(stream,device.ordinal))std::terminate();}} retirement{backend,device,stream};
+            ~ConstructionRetirement(){if(backend && !backend->synchronizeStream(stream,device.ordinal))std::terminate();}} retirement{declarationOnly?nullptr:backend,device,stream};
         const PhysicalMemoryAllocatorIdentity participant{0,device},host{0,DeviceId::cpu()};
         const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::MemoryMapped};
         const auto layout=ImmutableRowTableLayoutGeometry::checked(
@@ -124,7 +132,7 @@ public:
         const auto geometry=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},maximum);
         auto ownerPlan=q::PooledImmutableOwnerNativePlan::fromGeometry(physical,geometry,0,701,17);
         auto coordinatorPlan=q::PooledImmutableCoordinatorNativePlan::fromGeometry(physical,geometry,701,17);
-        const PhysicalMemoryResource gpu{0,device,std::size_t{1}<<34,std::size_t{1}<<34},cpu{0,DeviceId::cpu(),std::size_t{1}<<34,std::size_t{1}<<34};
+        const auto& gpu=session.resource(device);const auto& cpu=session.resource(DeviceId::cpu());
         PhysicalMemoryPlanBuilder bom;
         for(const auto& plan:{physical.cacheBOM(0,gpu),physical.mandatoryBOM(0,gpu),geometry.policyBOM(gpu),geometry.mandatoryBOM(gpu),ownerPlan.mandatoryBOM(gpu),coordinatorPlan.mandatoryBOM(gpu)})
             for(const auto& resource:plan.resources())bom.add(resource);
@@ -136,14 +144,21 @@ public:
         const auto inputBytes=std::size_t{maximum}*idBytes+4+128+ioOffsets.bytes+(mode==RecordedTrace::SuccessfulSource?std::size_t{maximum}*90:0);
         const auto sourceBytes=mode==RecordedTrace::SuccessfulSource?std::size_t{1024}*90:0;
         graphClass=mode==RecordedTrace::SuccessfulSource && maximum>512?GPUGraphExecutableClass::General:GPUGraphExecutableClass::BoundedFlatHelper;
-        const auto graphBytes=GPUGraphMemoryContract::reservationBytesPerExecutable(device,graphClass);
         bom.add(gpu,PhysicalMemoryOwner::ActivationArena,inputBytes);bom.add(cpu,PhysicalMemoryOwner::ActivationArena,inputBytes);
-        bom.add(gpu,PhysicalMemoryOwner::NativeGraphExecutable,graphBytes);
+        const auto general=RetainedParticipantGraphExecutable::generalBOM(cpu,gpu,1);
+        for(const auto& row:general.resources())bom.add(row);
+        for(const auto program:{q::PooledImmutableOwnerNativePlan::orderingProgram(physical,geometry,0),
+                                q::PooledImmutableCoordinatorNativePlan::orderingProgram(physical,geometry)})
+        {
+            const auto ordering=NativeOrderingEventBudgetProjection::installed().bom(program,cpu,gpu);
+            for(const auto& row:ordering.resources())bom.add(row);
+        }
         if(sourceBytes){bom.add(gpu,PhysicalMemoryOwner::ImmutableTableStorage,sourceBytes);bom.add(cpu,PhysicalMemoryOwner::ImmutableTableStorage,sourceBytes);}
-        memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(bom.build()),0);
+        declaredBOM=bom.build();
+        if(declarationOnly)return;
+        memory=session.memory();materialized=true;
         gpuInputs=memory->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,inputBytes);
         hostInputs=memory->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ActivationArena,inputBytes);
-        executable=memory->claimNewAllocation(device,PhysicalMemoryOwner::NativeGraphExecutable,graphBytes);
         owner=q::PooledImmutableOwnerPreparedStorage::create(std::move(ownerPlan),memory,stream);
         coordinator=q::PooledImmutableCoordinatorPreparedStorage::create(std::move(coordinatorPlan),memory,stream);
         ids=std::make_shared<INT32Tensor>(std::vector<std::size_t>{std::size_t{maximum}*(width==n::OriginalIdWidth::UInt32?1u:2u)});
@@ -187,9 +202,19 @@ public:
         }
         context=IDeviceContext::create(device,1);
         build();identity=coordinator->captureIdentity();
+        });
     }
     /** @brief Retire the diagnostic stream before graph/input/root/claim destruction, including failed setup. */
-    ~NativeReplay(){if(backend && !backend->synchronizeStream(stream,device.ordinal))std::terminate();}
+    ~NativeReplay(){
+        if(!materialized)return;
+        try{
+            worker.submitAndWait([&]{if(!backend->synchronizeStream(stream,device.ordinal))std::terminate();});
+            if(!RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(graphOwner))std::terminate();
+            graphOwner.reset();
+        }catch(...){std::terminate();}
+    }
+    /** @return Exact declaration consumed by the same original session before any payload creator. */
+    const PhysicalMemoryPlan& declaration()const noexcept{return declaredBOM;}
     /** @brief Seal one declared original input with its exact nominal role and byte interval. */
     static void input(q::PooledNativeOperandSpans& spans,q::PooledNativeOperand role,std::shared_ptr<TensorBase> root,BufferId id,std::size_t offset,std::size_t bytes){
         spans[static_cast<unsigned>(role)]=q::PooledNativeTensorSpan{std::move(root),id,offset,bytes};
@@ -283,10 +308,12 @@ public:
         requireNative(executor.prepareGraphStorageForCapture(compute,context.get(),stream,"pooled native recorded frontier"),"Native diagnostic capture frontier failed");
         auto dependency=executor.planGraphCaptureDependencies(compute,order,device,stream,"pooled native exact phase dependencies");
         requireNative(bool(dependency),"Native diagnostic capture dependency plan unavailable");
-        graph=worker.createGraphCapture(stream);requireNative(bool(graph),"Native diagnostic graph unavailable");
+        graph=&RetainedParticipantGraphExecutableFixtureAccess::capture(graphOwner);requireNative(bool(graph),"Native diagnostic graph unavailable");
         ScopedBackendGraphCapture capture(worker,*graph,mode==RecordedTrace::PlanCancellation?"pooled native planned cancellation replay":"pooled native successful diagnostic source replay",dependency.get());requireNative(capture.begin(),"Native diagnostic capture begin failed");
         requireNative(executor.recordSetupGraphMaterialization(compute,context.get()),"Native diagnostic production stage recording failed");capture.finish();
-        std::string detail;requireNative(graph->validateExecutableMemoryClass(graphClass,&detail),detail.c_str());
+        std::string detail;
+        const bool validClass=graph->validateExecutableMemoryClass(graphClass,&detail);
+        requireNative(validClass,detail.c_str());
         requireNative(graph->instantiate(),"Native diagnostic captured graph instantiation failed");
     }
     /** @brief Upload a complete immutable recorded input outside capture; live state is never downloaded/re-uploaded. */
@@ -317,7 +344,7 @@ public:
         timing.start=backend->createTimingEvent(device.ordinal);timing.stop=backend->createTimingEvent(device.ordinal);
         requireNative(timing.start && timing.stop,"Native diagnostic timing events unavailable");
         requireNative(backend->recordEvent(timing.start,device.ordinal,stream),"Native diagnostic start event failed");
-        requireNative(graph->launch(),"Native diagnostic retained replay failed");
+        requireNative(RetainedParticipantGraphExecutableFixtureAccess::submit(graphOwner,++submissionOrdinal),"Native diagnostic retained replay failed");
         // The test's native graph-launch boundary publishes actual authority once, after submission.
         for(const auto& storage:{owner->roots(),coordinator->roots()})for(const auto& root:{storage.cache,storage.frame,storage.native})
             if(root)TransferEngine::publishDeviceWrite(root.get(),device,stream);
@@ -375,7 +402,11 @@ public:
     }
     DeviceId device;IWorkerGPUContext& worker;IBackend* backend;void* stream;std::uint32_t maximum,slots;
     std::shared_ptr<PhysicalMemoryAuthority> memory;
-    PhysicalMemoryAllocationLease gpuInputs,hostInputs,executable,sourceGPU,sourceHost;
+    PhysicalMemoryAllocationLease gpuInputs,hostInputs,sourceGPU,sourceHost;
+    PhysicalMemoryPlan declaredBOM;
+    bool materialized=false;
+    std::shared_ptr<RetainedParticipantGraphExecutable> graphOwner;
+    std::uint64_t submissionOrdinal=0;
     std::shared_ptr<q::PooledImmutableOwnerPreparedStorage> owner;
     std::shared_ptr<q::PooledImmutableCoordinatorPreparedStorage> coordinator;
     std::shared_ptr<TensorBase> ids,count,trace,source,io,output;
@@ -389,49 +420,86 @@ public:
     std::vector<std::unique_ptr<IComputeStage>> stages;
     ComputeGraph compute;
     DeviceGraphExecutor executor;
-    std::unique_ptr<IGPUGraphCapture> graph;
+    IGPUGraphCapture* graph=nullptr;
     std::uint64_t identity=0,hotGeneration=0;
     GPUGraphExecutableClass graphClass=GPUGraphExecutableClass::General;
 };
 /** @brief Exercise both cooperative Begin paths and original N>>U under actual native graph replay. */
 void nativeReplay(DeviceId device){
     auto* backend=getBackendFor(device);requireNative(backend && backend->deviceCount()>device.ordinal,"Explicit pooled native backend unavailable");
-    if(!hasCPUBackend())initCPUBackend(-1);auto& worker=GPUDeviceContextPool::instance().getContext(device);
-    worker.submitAndWait([&]{for(const auto maximum:{32u,32768u})for(const auto slots:{0u,2u}){
-        NativeReplay replay(device,worker,maximum,slots);std::vector<std::uint64_t> large(maximum);
+    if(!hasCPUBackend())initCPUBackend(-1);
+    auto session=PreparedNativeLookupFixture::prepare(std::array{device});
+    auto& worker=*session->permit(device).worker();
+    PhysicalMemoryPlanBuilder plan;
+    for(const auto maximum:{32u,32768u})for(const auto slots:{0u,2u}){
+        NativeReplay declaration(device,*session,maximum,slots,RecordedTrace::PlanCancellation,n::OriginalIdWidth::UInt64,true);
+        for(const auto& row:declaration.declaration().resources())plan.add(row);
+    }
+    session->admit(plan.build());
+    for(const auto maximum:{32u,32768u})for(const auto slots:{0u,2u}){
+        NativeReplay replay(device,*session,maximum,slots);
+        worker.submitAndWait([&]{std::vector<std::uint64_t> large(maximum);
         for(std::size_t i=0;i<large.size();++i)large[i]=(i%3==0)?0x100000007ULL:((i%3==1)?9:3);
         replay.replay(1,large);replay.replay(2,std::array<std::uint64_t,1>{0x100000007ULL});replay.replay(3,{});replay.replay(4,large);
-        std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;requireNative(replay.graph->inspectKernelNodes(nodes,&detail),detail.c_str());
+        std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;
+        const bool inspected=replay.graph->inspectKernelNodes(nodes,&detail);
+        requireNative(inspected,detail.c_str());
         EXPECT_EQ(nodes.size(),(maximum<=512?16u:63u)+(slots?1u:0u));
         for(const auto& node:nodes){requireNative(node.valid(),"Native diagnostic kernel resource inventory incomplete");
             std::cout<<"POOLED_NATIVE_NODE name="<<node.name<<" threads="<<node.block_x<<" registers="<<node.registers_per_thread<<" local_bytes="<<node.local_memory_bytes_per_thread<<" shared_bytes="<<node.static_shared_memory_bytes+node.dynamic_shared_memory_bytes<<" active_blocks_per_sm="<<node.max_active_blocks_per_sm<<'\n';}
         std::cout<<"POOLED_NATIVE_REPLAY maximum_original="<<maximum<<" unique=3 owner_slots="<<slots<<" graph_nodes="<<nodes.size()<<" serving=unqualified source_transport=decoded_fixture\n";
-    }});
+        });
+    }
+    session->requirePayloadRetired();session->retire();
 }
 /** @brief Actual unsigned UInt32 originals exercise both sides of the 512/513 dispatch boundary. */
 void narrowBoundaryReplay(DeviceId device){
     auto* backend=getBackendFor(device);requireNative(backend && backend->deviceCount()>device.ordinal,"Explicit pooled UInt32 native backend unavailable");
-    if(!hasCPUBackend())initCPUBackend(-1);auto& worker=GPUDeviceContextPool::instance().getContext(device);
-    worker.submitAndWait([&]{for(const auto maximum:{512u,513u})for(const auto slots:{0u,2u}){
-        NativeReplay replay(device,worker,maximum,slots,RecordedTrace::PlanCancellation,n::OriginalIdWidth::UInt32);
+    if(!hasCPUBackend())initCPUBackend(-1);
+    auto session=PreparedNativeLookupFixture::prepare(std::array{device});
+    auto& worker=*session->permit(device).worker();
+    PhysicalMemoryPlanBuilder plan;
+    for(const auto maximum:{512u,513u})for(const auto slots:{0u,2u}){
+        NativeReplay declaration(device,*session,maximum,slots,RecordedTrace::PlanCancellation,n::OriginalIdWidth::UInt32,true);
+        for(const auto& row:declaration.declaration().resources())plan.add(row);
+    }
+    session->admit(plan.build());
+    for(const auto maximum:{512u,513u})for(const auto slots:{0u,2u}){
+        NativeReplay replay(device,*session,maximum,slots,RecordedTrace::PlanCancellation,n::OriginalIdWidth::UInt32);
+        worker.submitAndWait([&]{
         std::vector<std::uint64_t> original(maximum);for(std::size_t i=0;i<original.size();++i)original[i]=i%3==0?0xffff0007u:i%3==1?9u:3u;
         replay.replay(1,original);replay.replay(2,std::array<std::uint64_t,1>{0xffff0007u});replay.replay(3,{});replay.replay(4,original);
-        std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;requireNative(replay.graph->inspectKernelNodes(nodes,&detail),detail.c_str());
+        std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;
+        const bool inspected=replay.graph->inspectKernelNodes(nodes,&detail);
+        requireNative(inspected,detail.c_str());
         EXPECT_EQ(nodes.size(),(maximum<=512?16u:63u)+(slots?1u:0u));
         for(const auto& node:nodes){requireNative(node.valid(),"Native UInt32 boundary resource inventory incomplete");
             std::cout<<"POOLED_NATIVE_UINT32_NODE maximum_original="<<maximum<<" original_bits=32 owner_slots="<<slots<<" name="<<node.name<<" registers="<<node.registers_per_thread<<" shared_bytes="<<node.static_shared_memory_bytes+node.dynamic_shared_memory_bytes<<" local_bytes="<<node.local_memory_bytes_per_thread<<'\n';}
-    }});
+        });
+    }
+    session->requirePayloadRetired();session->retire();
 }
 /** @brief Actual admitted original rows and ACKs drive successful free+victim, Ready, reader and retained-hit frames. */
 void successfulNativeReplay(DeviceId device){
     auto* backend=getBackendFor(device);requireNative(backend && backend->deviceCount()>device.ordinal,"Explicit pooled successful native backend unavailable");
-    if(!hasCPUBackend())initCPUBackend(-1);auto& worker=GPUDeviceContextPool::instance().getContext(device);
-    worker.submitAndWait([&]{for(const auto maximum:{32u,32768u})for(const auto width:{n::OriginalIdWidth::UInt32,n::OriginalIdWidth::UInt64}){
-        NativeReplay replay(device,worker,maximum,4,RecordedTrace::SuccessfulSource,width);
+    if(!hasCPUBackend())initCPUBackend(-1);
+    auto session=PreparedNativeLookupFixture::prepare(std::array{device});
+    auto& worker=*session->permit(device).worker();
+    PhysicalMemoryPlanBuilder plan;
+    for(const auto maximum:{32u,32768u})for(const auto width:{n::OriginalIdWidth::UInt32,n::OriginalIdWidth::UInt64}){
+        NativeReplay declaration(device,*session,maximum,4,RecordedTrace::SuccessfulSource,width,true);
+        for(const auto& row:declaration.declaration().resources())plan.add(row);
+    }
+    session->admit(plan.build());
+    for(const auto maximum:{32u,32768u})for(const auto width:{n::OriginalIdWidth::UInt32,n::OriginalIdWidth::UInt64}){
+        NativeReplay replay(device,*session,maximum,4,RecordedTrace::SuccessfulSource,width);
+        worker.submitAndWait([&]{
         std::vector<std::uint64_t> original(maximum,900);original[0]=700;original[1]=701;
         replay.replay(1,std::array<std::uint64_t,2>{101,102});replay.replay(2,original);replay.replay(3,std::array<std::uint64_t,1>{900});replay.replay(4,{});replay.replay(5,original);
         // Resource inspection follows all unprofiled timing records; source/diagnostic kernels have their own class.
-        std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;requireNative(replay.graph->inspectKernelNodes(nodes,&detail),detail.c_str());
+        std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;
+        const bool inspected=replay.graph->inspectKernelNodes(nodes,&detail);
+        requireNative(inspected,detail.c_str());
         EXPECT_EQ(nodes.size(),maximum<=512?47u:76u);
         for(const auto& node:nodes){requireNative(node.valid(),"Native successful kernel resource inventory incomplete");
             const std::array coordinatorNames{"coordinator","Original","radix","coalesceSmall","seedKeys","markGroups","scanGroups","materializeGroups","materializeUnique"};
@@ -439,7 +507,9 @@ void successfulNativeReplay(DeviceId device){
                 std::any_of(coordinatorNames.begin(),coordinatorNames.end(),[&](const auto* name){return node.name.find(name)!=std::string::npos;})?"coordinator":"owner";
             std::cout<<"POOLED_NATIVE_SOURCE_NODE maximum_original="<<maximum<<" original_bits="<<(width==n::OriginalIdWidth::UInt32?32:64)<<" scope="<<scope<<" name="<<node.name<<" threads="<<node.block_x<<" registers="<<node.registers_per_thread<<" local_bytes="<<node.local_memory_bytes_per_thread<<" shared_bytes="<<node.static_shared_memory_bytes+node.dynamic_shared_memory_bytes<<" active_blocks_per_sm="<<node.max_active_blocks_per_sm<<'\n';}
         std::cout<<"POOLED_NATIVE_SUCCESS maximum_original="<<maximum<<" original_bits="<<(width==n::OriginalIdWidth::UInt32?32:64)<<" owner_slots=4 graph_nodes="<<nodes.size()<<" source=admitted_diagnostic_original_IQ4_NL production_RAM_SSD_transport=unqualified serving=unqualified\n";
-    }});
+        });
+    }
+    session->requirePayloadRetired();session->retire();
 }
 }
 #ifdef HAVE_CUDA

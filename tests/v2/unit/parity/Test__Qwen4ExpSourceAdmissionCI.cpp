@@ -9,6 +9,8 @@
 #include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionCI.h"
 #include <gtest/gtest.h>
 #include <sstream>
+#include <set>
+#include <nlohmann/json.hpp>
 using namespace llaminar2::test::parity;
 using namespace llaminar2::test::parity::qwen4exp;
 
@@ -160,4 +162,29 @@ TEST(Qwen4ExpSourceAdmissionCI, ROCmReplicatedFull15RequiresItsAuthoredPhysicalC
     for (auto &cell : foreign)
         cell.topology.participants.front().address = llaminar2::GlobalDeviceAddress::cuda(0);
     EXPECT_THROW(qwen4ExpROCm4OverlayPolicySourceAdmissionParameters(foreign), std::invalid_argument);
+}
+
+/** @test Actual GTest source discovery retains64typed policies without another compute/storage cohort. */
+TEST(Qwen4ExpSourceAdmissionCI, GPUAdaptiveDiscoveryRetainsAllTypedExpertAndMTPPolicies)
+{
+    const auto cells=qwen4ExpExpandSourceAdmissionMTP(qwen4ExpGPUAdaptiveSourceAdmissionSeeds());
+    const auto parameters=qwen4ExpSourceAdmissionParameters(cells);
+    const ::testing::internal::ParamGenerator<Qwen4ExpSourceAdmissionCase> discovered=::testing::ValuesIn(parameters);
+    std::set<std::string> names;std::size_t count=0,movement=0;
+    for(const auto& cell:discovered){
+        ASSERT_LT(count,cells.size());
+        EXPECT_EQ(cell.testName(),cells[count].testName());EXPECT_EQ(cell.expert_overlay,cells[count].expert_overlay);
+        EXPECT_EQ(cell.mtp,cells[count].mtp);EXPECT_EQ(cell.ngram_table_policy,cells[count].ngram_table_policy);
+        EXPECT_TRUE(names.insert(cell.testName()).second);EXPECT_EQ(cell.topology.participants.size(),2u);
+        EXPECT_FALSE(cell.minimum_cuda_total_memory_bytes);EXPECT_FALSE(cell.minimum_rocm_total_memory_bytes);EXPECT_FALSE(cell.gpu_memory_cap_mb);
+        std::ostringstream printed;PrintTo(cell,&printed);const auto json=nlohmann::json::parse(printed.str());
+        EXPECT_EQ(json.at("qfn_source_admission_schema"),2);EXPECT_EQ(json.at("id"),cell.testName());
+        EXPECT_EQ(json.at("mpi_ranks"),1);EXPECT_EQ(json.at("participants").size(),2u);
+        EXPECT_EQ(json.at("retained_mtp_draft_capacity"),cell.mtp==ModelParityMTP::Off?0:15);
+        EXPECT_EQ(json.at("mtp_enabled"),cell.mtp!=ModelParityMTP::Off);
+        if(cell.requiresPhysicalExpertMovement())++movement;
+        ++count;
+    }
+    EXPECT_EQ(count,64u);EXPECT_EQ(names.size(),64u);EXPECT_EQ(movement,32u);
+    EXPECT_EQ(qwen4ExpGPUAdaptiveProductionCases().size(),4u);
 }

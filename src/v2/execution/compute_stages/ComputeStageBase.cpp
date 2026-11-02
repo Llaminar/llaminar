@@ -268,6 +268,7 @@ namespace llaminar2
         case ComputeStageType::QWEN4EXP_POOLED_NATIVE_PHASE:
             return "QWEN4EXP_POOLED_NATIVE_PHASE";
         case ComputeStageType::QWEN4EXP_POOLED_SOURCE_PHASE:return "QWEN4EXP_POOLED_SOURCE_PHASE";
+        case ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER:return "QWEN4EXP_POOLED_DIRECTED_TRANSFER";
         case ComputeStageType::QWEN4EXP_NGRAM_LOOKUP:
             return "QWEN4EXP_NGRAM_LOOKUP";
         case ComputeStageType::QWEN4EXP_QSA_PREPARE_REPLAY:

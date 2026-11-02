@@ -292,7 +292,13 @@ def validate_obsolete_symbols(repo_root: pathlib.Path) -> list[str]:
     for path in (repo_root / "src" / "v2").rglob("*"):
         if path.suffix not in {".cpp", ".cu", ".cuh", ".h", ".hip", ".hpp"}:
             continue
-        executable = strip_comments_and_literals(path.read_text(encoding="utf-8"))
+        source = path.read_text(encoding="utf-8")
+        # Neither comment/literal erasure nor these contiguous identifier
+        # regexes can introduce a spelling absent in the original source.
+        # Retain every file in inventory; parse only lexical candidates.
+        if "clear_sequence" not in source and "clear_layer" not in source:
+            continue
+        executable = strip_comments_and_literals(source)
         for pattern in patterns:
             match = pattern.search(executable)
             if match:

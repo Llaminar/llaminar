@@ -31,6 +31,8 @@ boundary is explicitly reviewed here.
 
 from __future__ import annotations
 
+from graph_capture_perf_policy import DecodeGraphRequirement, validate_graph_capture_policy
+
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
@@ -206,6 +208,73 @@ def _is_authenticated_captured_scheduler_ticket(
     )
 
 
+def _live_heterogeneous_ticket_owners(records, device_kinds):
+    """Authenticate current-window hosted launches without requiring cold setup telemetry.
+
+    The exact same rank/device must own completed heterogeneous native replay,
+    typed hosted geometry and balanced immutable-ticket/branch/terminal records.
+    Materializing an unused sibling, or merely naming a mixed CLI, proves none
+    of those. This reads existing observations only; it changes no runtime path.
+    """
+    owners = set()
+    if len(device_kinds) < 2 or "cuda" not in device_kinds:
+        return owners
+    integer = lambda value: str(value).isdigit()
+    for launch in records:
+        device = str(launch.get("device", "")).lower()
+        if (launch.get("domain") != "mtp" or launch.get("name") != "device_generation_loop_graph_launches"
+                or not device.startswith("cuda:") or not _record_exercised(launch)):
+            continue
+        tags = launch.get("tags") or {}
+        fields = ("requests", "draft_depth", "minimum_draft_depth", "maximum_draft_depth", "fragments")
+        if (tags.get("execution") != "hosted_ticket_selected_captured_transactions"
+                or tags.get("backend") != "CUDA" or not all(integer(tags.get(k)) for k in fields)
+                or int(tags["requests"]) != 1 or int(tags["fragments"]) <= 0
+                or not 0 <= int(tags["minimum_draft_depth"]) <= int(tags["draft_depth"]) <= int(tags["maximum_draft_depth"]) <= 15
+                or tags.get("conditional_fragments") != "0" or tags.get("selector_gated_fragments") != "0"
+                or type(launch.get("rank")) is not int or launch["rank"] < 0):
+            continue
+        owner = (launch.get("rank"), device)
+        local = tuple(row for row in records if row.get("rank") == owner[0])
+        graph_records = tuple(row for row in local if row.get("domain") != "forward_graph"
+            or str(row.get("device", "")).lower() == device
+            or row.get("device") in {"pipeline_coordinator", "continuation_rank"})
+        graph = validate_graph_capture_policy(graph_records, device_kinds,
+            decode_requirement=DecodeGraphRequirement.REPLAY)
+        if graph.error or not (graph.has_overlay_boundary_evidence or graph.has_pipeline_boundary_evidence):
+            continue
+        controller = tuple(row for row in local if row.get("domain") == "mtp"
+            and str(row.get("device", "")).lower() == device and _record_exercised(row))
+        named = lambda name: tuple(row for row in controller if row.get("name") == name)
+        total = lambda name: sum(_numeric(row.get("value")) for row in named(name))
+        tickets = named("device_generation_dispatch_ticket_d2h_submissions")
+        observed = named("device_generation_dispatch_tickets_observed")
+        branches = named("hosted_device_generation_transaction_submissions")
+        terminal = total("hosted_device_generation_terminal_submissions")
+        fragments = named("hosted_device_generation_fragment_submissions")
+        if (not tickets or not observed or not branches or terminal <= 0
+                or terminal != _numeric(launch.get("value"))
+                or any(not device_generation_dispatch_ticket_abi_is_canonical(row.get("tags") or {})
+                    or (row.get("tags") or {}).get("authority") != "immutable_scheduler_snapshot"
+                    or (row.get("tags") or {}).get("state_payload") != "false" for row in tickets)
+                or any((row.get("tags") or {}).get("entry_source") != "committed_transaction_ticket"
+                    or (row.get("tags") or {}).get("complete") not in {"true", "false"} for row in observed)
+                or any((row.get("tags") or {}).get("entry_source") != "committed_transaction_ticket"
+                    or (row.get("tags") or {}).get("dynamic_depth_source") != "device_controller_ticket"
+                    or not integer((row.get("tags") or {}).get("fragments"))
+                    or not 0 < int((row.get("tags") or {})["fragments"]) <= int(tags["fragments"]) for row in branches)
+                or any(not integer((row.get("tags") or {}).get("fragment_index"))
+                    or not 0 <= int((row.get("tags") or {})["fragment_index"]) < int(tags["fragments"]) for row in fragments)
+                or sum(_numeric(row.get("value")) for row in observed if (row.get("tags") or {}).get("complete") == "true") != terminal
+                or sum(_numeric(row.get("value")) for row in observed if (row.get("tags") or {}).get("complete") == "false") != total("hosted_device_generation_transaction_submissions")
+                or sum(_numeric(row.get("value")) * int((row.get("tags") or {})["fragments"]) for row in branches) != total("hosted_device_generation_fragment_submissions")
+                or total("device_generation_dispatch_ticket_d2h_submissions") != total("device_generation_dispatch_tickets_observed")
+                or total("device_generation_dispatch_ticket_d2h_submissions") != total("hosted_device_generation_transaction_submissions") + terminal):
+            continue
+        owners.add(owner)
+    return owners
+
+
 def validate_gpu_host_transfer_policy(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -240,6 +309,7 @@ def validate_gpu_host_transfer_policy(
             "hosted_captured_transactions_with_ticket_only_dispatch"
         and _numeric((record.get("tags") or {}).get("fragments")) > 0
     )
+    heterogeneous_ticket_owners |= frozenset(_live_heterogeneous_ticket_owners(records, device_kinds))
     # Registration is runtime proof that the shared wire actually belongs to
     # this process and node. A different rank's mapping cannot authorize DMA.
     mapped_ranks = {

@@ -1132,6 +1132,7 @@ namespace llaminar2
         if (device_id >= device_count_ || device_id < 0 ||
             !data_device || rows <= 0 || cols <= 0 ||
             !history.admitsRows(rows) ||
+            (history.branchTokens() && !history.activeRows()) ||
             !stream || !out_values_device || !out_indices_device ||
             !partial_vals || !partial_idxs || partial_capacity < rows ||
             output_stride <= 0)
@@ -1350,6 +1351,14 @@ namespace llaminar2
         int *out_token_ids, int out_stride, float *out_probs,
         float *scratch_values, int *scratch_indices, int scratch_capacity,
         const int *active_rows,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_topk_topp_distributions_f32_with_history(
+        const float *data, int row_count, int n, int row_stride, int k,
+        float top_p, float temperature,
+        int *out_token_ids, int out_stride, float *out_probs,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        const int *active_rows,
+        const int *counts, const MTPGreedyPenaltyPolicy *policy, const int *tokens,
         int device_idx, void *stream);
     extern "C" bool rocmOps_topk_topp_processed_logits_f32(
         const float *data, int row_count, int n, int row_stride, int k,
@@ -2137,6 +2146,56 @@ namespace llaminar2
             static_cast<int *>(scratch_indices_device),
             scratch_capacity,
             static_cast<const int *>(active_rows_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
+        const void *data_device,
+        int row_count,
+        int n,
+        int row_stride,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_token_ids_device,
+        int out_stride,
+        void *out_probs_device,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity,
+        const GenerationPenaltyHistory &history)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !history.admitsRows(row_count) ||
+            !data_device || row_count <= 0 || n <= 0 || row_stride < n ||
+            top_k <= 0 || top_k > 256 || top_k > n || out_stride <= 0 || out_stride < top_k ||
+            !stream || !out_token_ids_device || !out_probs_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_topk_topp_distributions_f32_with_history(
+            static_cast<const float *>(data_device),
+            row_count,
+            n,
+            row_stride,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<int *>(out_token_ids_device),
+            out_stride,
+            static_cast<float *>(out_probs_device),
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
+            static_cast<const int *>(history.activeRows()),
+            static_cast<const int *>(history.counts()),
+            static_cast<const MTPGreedyPenaltyPolicy *>(history.policy()),
+            static_cast<const int *>(history.branchTokens()),
             device_id,
             stream);
     }
@@ -4306,17 +4365,32 @@ namespace llaminar2
         return reinterpret_cast<void *>(event);
     }
 
+    /**
+     * @brief Destroy an original event or fail fatally before its opaque commitment can retire.
+     * @param event Original native event; null denotes no created resource.
+     * @param device_id Exact original event device ordinal.
+     * @note A failed native cleanup is not evidence of physical retirement.
+     */
     void ROCmBackend::destroyEvent(void *event, int device_id)
     {
-        if (!event || device_id >= device_count_ || device_id < 0)
+        if (!event) return;
+        if (device_id < 0 || device_id >= device_count_)
         {
-            return;
+            LOG_ERROR("[ROCmBackend::destroyEvent] Non-null event has an invalid original device");
+            std::terminate();
         }
-
         HipDeviceSaveRestore device_guard;
-        HIP_WARN_IF_FAIL(hipSetDevice(device_id));
-        hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
-        HIP_WARN_IF_FAIL(hipEventDestroy(hip_event));
+        if (const auto error = hipSetDevice(device_id); error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::destroyEvent] Original event device selection failed, status=" << error);
+            std::terminate();
+        }
+        const auto hip_event = reinterpret_cast<hipEvent_t>(event);
+        if (const auto error = hipEventDestroy(hip_event); error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::destroyEvent] Native event destruction failed; ownership cannot retire, status=" << error);
+            std::terminate();
+        }
     }
 
     bool ROCmBackend::recordEvent(void *event, int device_id, void *stream)
@@ -5992,7 +6066,8 @@ namespace llaminar2
         const auto native = requireExplicitStream(stream, "ROCmBackend::enqueueCapturedTransferChannel");
         if (!binding.valid() || !destination || !source || device_id < 0 || device_id >= device_count_ ||
             !setDevice(device_id)) return false;
-        const bool aligned = reinterpret_cast<std::uintptr_t>(destination) % alignof(uint4) == 0 &&
+        // A live slice may be unaligned even when its immutable base is aligned.
+        const bool aligned = !binding.source_slice && reinterpret_cast<std::uintptr_t>(destination) % alignof(uint4) == 0 &&
             reinterpret_cast<std::uintptr_t>(source) % alignof(uint4) == 0;
         // The same immutable policy and system-publication proof serve both
         // vendors. No device count readback or HIP host scheduling ticket is needed.
@@ -6029,7 +6104,8 @@ namespace llaminar2
         for (unsigned i = 0; i < batch.count; ++i)
         {
             auto &entry = batch.entries[i];
-            entry.vector_aligned = reinterpret_cast<std::uintptr_t>(entry.destination) % alignof(uint4) == 0 &&
+            entry.vector_aligned = !entry.binding.source_slice &&
+                reinterpret_cast<std::uintptr_t>(entry.destination) % alignof(uint4) == 0 &&
                 reinterpret_cast<std::uintptr_t>(entry.source) % alignof(uint4) == 0;
             const auto bytes = entry.binding.message.bytes;
             entry.copy_blocks = entry.vector_aligned

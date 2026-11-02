@@ -19,7 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
-#include <thread>
+#include <pthread.h>
 
 namespace llaminar2
 {
@@ -56,7 +56,7 @@ namespace llaminar2
          * @details Thread creation occurs in the constructor body so no member
          * declaration order can expose uninitialized lifecycle state to run().
          */
-        RetainedParentTicketServiceWorker();
+        RetainedParentTicketServiceWorker()=delete;
 
         /**
          * @brief Join the persistent worker after any accepted invocation retires.
@@ -99,6 +99,11 @@ namespace llaminar2
         [[nodiscard]] bool idle() const noexcept;
 
     private:
+        friend class PreparedRetainedHostService;
+        /** @brief Construct complete idle data; only the admitted owner can start the entry. */
+        explicit RetainedParentTicketServiceWorker(pthread_t) noexcept;
+        /** @brief Enter the original run loop, terminating on any escaping exception. */
+        static void* invoke(void*) noexcept;
         /** @brief Complete typed lifecycle of the worker's single task slot. */
         enum class State : std::uint8_t
         {
@@ -115,7 +120,8 @@ namespace llaminar2
         mutable std::mutex mutex_;
         std::condition_variable work_ready_;
         std::condition_variable work_complete_;
-        std::thread worker_;
+        pthread_t worker_{};
+        bool running_=false; ///< Published only after pthread_create succeeds.
         State state_ = State::Idle;
         Task task_ = nullptr;
         void *context_ = nullptr;

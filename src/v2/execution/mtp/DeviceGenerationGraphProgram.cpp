@@ -9,6 +9,8 @@
 #include "DeviceGenerationGraphProgram.h"
 
 #include "backends/IBackend.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/graph/IRetainedGraphStorageBoundary.h"
 
@@ -158,6 +160,28 @@ bool DeviceGenerationGraphProgram::ticketPublisher(IGPUGraphCapture &destination
     {
         error = "Generation ticket publisher requires the exact GPU backend and persistent ticket storage";
         return false;
+    }
+    if(storage_boundary){
+        if(const auto original=storage_boundary->retainedParticipantSource()){
+            if(original->device()!=device || storage_boundary->device()!=device || original->worker().get()!=&context)
+                throw std::invalid_argument("Generation ticket publisher requires its original retained source worker/device");
+            const auto current=GPUDeviceContextPool::instance().retainExistingContextProvenance(device);
+            original->requireWorker(current.worker());
+            if(original->generation()!=current.generation() || original->memory()->phase()!=PhysicalMemoryAuthorityPhase::Admitted)
+                throw std::logic_error("Generation ticket publisher has a stale original source generation");
+            if(!context.ownsCurrentThread()){
+                // Move the WHOLE cold native/software capture, not only its
+                // terminal kernel. No host capture scope crosses worker queues.
+                bool compiled=false;
+                context.submitAndWait([&]{
+                    if(!context.ownsCurrentThread())
+                        throw std::logic_error("Generation ticket publisher dispatch did not enter its original worker");
+                    compiled=ticketPublisher(destination,context,backend,device,
+                        control,maintenance_due,tickets,error,storage_boundary);
+                });
+                return compiled;
+            }
+        }
     }
     ScopedBackendGraphCapture recording(context, destination, "device_generation_ticket_publisher");
     if (!recording.begin())

@@ -2,8 +2,9 @@
  * @file ParitySnapshotMemoryCapacity.h
  * @brief Metadata-only memory envelope for production parity graph snapshots.
  *
- * The authenticated reference directory is also the authoritative checkpoint
- * inventory selected into production graphs. This helper reads only each NPY
+ * The authenticated reference directory owns header-backed checkpoint geometry.
+ * Selected raw indexer queries have a separate native source payload/metadata
+ * declaration and need no invented or borrowed reference header. This helper reads only each NPY
  * header, never its numerical payload, and converts that inventory into a
  * conservative per-accelerator capacity. Prefill payloads are widened to the
  * retained graph-row capacity and completed-collective aliases are charged as
@@ -314,6 +315,8 @@ namespace llaminar2::test::parity
             const auto source = std::find_if(source_outputs.begin(), source_outputs.end(),
                 [&](const auto &entry) { return entry.semanticKey() == semantic_key; });
             const bool native_state = source != source_outputs.end() && source->replacesReferencePayload();
+            const bool native_raw = source != source_outputs.end() &&
+                source->role() == GraphSnapshotSourceRole::QwenSparseRawQuery;
             if (source != source_outputs.end()) observed_sources.insert(source->semanticKey());
             if (source != source_outputs.end())
             {
@@ -391,7 +394,7 @@ namespace llaminar2::test::parity
                       payload_bytes,
                       reference_rows,
                       retained_graph_rows);
-            std::size_t projected_payload = native_state ? 0u : admitted_payload;
+            std::size_t projected_payload = (native_state || native_raw) ? 0u : admitted_payload;
             if (native_state)
             {
                 // Authentication is against the exact selected source key, not
@@ -407,7 +410,7 @@ namespace llaminar2::test::parity
                 evidence.replaced_state_payload_bytes = detail::paritySnapshotCheckedAdd(
                     evidence.replaced_state_payload_bytes, admitted_payload, "replaced live state inventory");
             }
-            else
+            else if (!native_raw)
             {
                 capacity_bytes = detail::paritySnapshotCheckedAdd(
                     capacity_bytes, admitted_payload, "capacity inventory");
@@ -439,8 +442,17 @@ namespace llaminar2::test::parity
             ++evidence.reference_file_count;
         }
 
-        if (observed_sources.size() != source_outputs.size())
-            throw std::invalid_argument("Selected source-owned snapshot has no authenticated reference header");
+        for (const auto &source : source_outputs)
+        {
+            // Raw query has an exact source-owned native payload/metadata BOM.
+            // Authenticate a header when present, but do not require a pack to
+            // invent that distinct producer. All other selected roles still
+            // require their own authenticated header, never another role's.
+            if (!observed_sources.contains(source.semanticKey()) &&
+                source.role() != GraphSnapshotSourceRole::QwenSparseRawQuery)
+                throw std::invalid_argument("Selected source-owned snapshot has no authenticated reference header: " +
+                    source.semanticKey());
+        }
         evidence.capacity.authored_source_outputs = std::move(source_outputs);
         if (evidence.reference_file_count == 0u ||
             (capacity_bytes == 0u && evidence.capacity.authored_source_outputs.empty()))

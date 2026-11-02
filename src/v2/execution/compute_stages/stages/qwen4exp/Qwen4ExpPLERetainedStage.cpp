@@ -34,6 +34,12 @@ Qwen4ExpPLERetainedStage::Qwen4ExpPLERetainedStage(Params p):IComputeStage(p.dev
  const bool snapshot=params_.operation==Operation::SnapshotPrior;
  if (!snapshot)
  {
+     acceptedPublicationInputs_ = {{
+         {params_.transactionLiveCounts.buffer, BufferAccess::READ, "INT32", false},
+         {params_.priorTokens.buffer, BufferAccess::READ, "INT32", false},
+         {params_.priorConvolution.buffer, BufferAccess::READ, "FP32", false},
+         {params_.retainedTokens.buffer, BufferAccess::READ, "INT32", false},
+         {params_.retainedNormalized.buffer, BufferAccess::READ, "FP32", false}}};
      acceptedPublicationOutputs_ = {{
          {params_.acceptedTokens.buffer, BufferAccess::WRITE, "INT32", false},
          {params_.acceptedConvolution.buffer, BufferAccess::WRITE, "FP32", false}}};
@@ -94,6 +100,13 @@ bool Qwen4ExpPLERetainedStage::publish(const int*rows,int requests,int stride,vo
 }
 bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRow(int row,void*s){return !device().is_gpu()&&params_.requests==1&&publish(&row,1,1,s);}
 bool Qwen4ExpPLERetainedStage::restoreVerifierStateCaptureRows(const int*r,int n,void*s){return !device().is_gpu()&&publish(r,n,1,s);}
+std::span<const BufferBinding> Qwen4ExpPLERetainedStage::verifierStatePublicationInputs() const noexcept
+{
+    return params_.operation == Operation::RetainCandidates
+        ? std::span<const BufferBinding>{acceptedPublicationInputs_}
+        : std::span<const BufferBinding>{};
+}
+
 std::span<const BufferBinding> Qwen4ExpPLERetainedStage::verifierStatePublicationOutputs() const noexcept
 {
     return params_.operation == Operation::RetainCandidates

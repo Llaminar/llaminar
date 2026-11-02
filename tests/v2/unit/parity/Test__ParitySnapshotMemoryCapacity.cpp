@@ -303,7 +303,7 @@ TEST(ParitySnapshotMemoryCapacity, RetainedServingPhasesIncludeOriginalPrefillBu
         (512u + 2u) * 2u * sizeof(float));
 }
 
-/** @test Raw query has a distinct exact source key and retains its existing FP32 payload envelope. */
+/** @test Raw query keeps its identity while its native owner replaces any header payload charge. */
 TEST(ParitySnapshotMemoryCapacity, RawIndexerQueryHasIndependentAuthenticatedSourceIdentity)
 {
     const auto raw=GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseRawQuery);
@@ -318,8 +318,30 @@ TEST(ParitySnapshotMemoryCapacity, RawIndexerQueryHasIndependentAuthenticatedSou
     saveCheckpoint(snapshots.path()/"decode_step0_layer3_QSA_INDEXER_RAW_QUERY.npy",{1,1,512});
     const auto ordinary=deriveParitySnapshotMemoryCapacity(snapshots.path(),9,9,{});
     const auto selected=deriveParitySnapshotMemoryCapacity(snapshots.path(),9,9,{}, {raw});
-    ASSERT_TRUE(selected.valid());EXPECT_EQ(selected.capacity.per_accelerator_bytes,ordinary.capacity.per_accelerator_bytes);
+    ASSERT_TRUE(selected.valid());EXPECT_GT(ordinary.capacity.per_accelerator_bytes,0u);
+    EXPECT_EQ(selected.capacity.per_accelerator_bytes,0u);
     EXPECT_EQ(selected.replaced_state_payload_bytes,0u);
     ASSERT_EQ(selected.capacity.authored_source_outputs.size(),1u);
     EXPECT_EQ(selected.capacity.authored_source_outputs.front(),raw);
+}
+
+/** @test Native raw geometry needs no borrowed header; other selected roles still require their own. */
+TEST(ParitySnapshotMemoryCapacity, NativeRawQueryWithoutHeaderKeepsOtherHeadersMandatory)
+{
+    TemporarySnapshotDirectory snapshots;
+    saveCheckpoint(snapshots.path()/"EMBEDDING.npy",{9,2});
+    const auto raw=GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseRawQuery);
+    const auto baseline=deriveParitySnapshotMemoryCapacity(snapshots.path(),9,16,{});
+    const auto selected=deriveParitySnapshotMemoryCapacity(snapshots.path(),9,16,{}, {raw});
+    ASSERT_TRUE(selected.valid());
+    EXPECT_EQ(selected.capacity.per_accelerator_bytes,baseline.capacity.per_accelerator_bytes);
+    ASSERT_EQ(selected.capacity.authored_source_outputs.size(),1u);
+    EXPECT_EQ(selected.capacity.authored_source_outputs.front(),raw);
+    const auto prepared=GraphSnapshotSourceOutput::qwenSparse(3,GraphSnapshotSourceRole::QwenSparseQuery);
+    try {
+        (void)deriveParitySnapshotMemoryCapacity(snapshots.path(),9,16,{}, {raw,prepared});
+        FAIL()<<"A distinct prepared producer still needs its authenticated header";
+    } catch(const std::invalid_argument& error) {
+        EXPECT_NE(std::string(error.what()).find(prepared.semanticKey()),std::string::npos);
+    }
 }

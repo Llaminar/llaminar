@@ -1,0 +1,61 @@
+/** @file RetainedParticipantGraphExecutableFixtureAccess.h
+ * @brief Original General graph owners and explicitly unqualified actual-program diagnostics.
+ *
+ * Both roles retain the existing General device reservation on the original
+ * prepared-source PMA through ProcessRuntime retirement. Raw diagnostic access
+ * mints no host certificate and is unavailable in ordinary perf/test targets.
+ */
+#pragma once
+#include "backends/RetainedParticipantGraphExecutable.h"
+#include <memory>
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
+#include "execution/qwen4exp/PooledImmutableDirectedTransport.h"
+#include "fixtures/backends/PooledNativeProgramTerminalOrder.h"
+#ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
+#include "fixtures/backends/PooledNativeProgramDiagnosticAccess.h"
+#include "fixtures/execution/RetainedHostServiceCalibrationAccess.h"
+#include "integration/backends/NativeContextSourceProbeSupport.h"
+#include "execution/compute_stages/stages/qwen4exp/PooledImmutableSourcePhaseStage.h"
+#endif
+namespace llaminar2::test {
+/** @brief Named test-only bridge to the original closed graph lifecycle. */
+struct RetainedParticipantGraphExecutableFixtureAccess final {
+    /** @return Original same-PMA General owner, using the same typed allowance as production capture. */
+    static std::shared_ptr<RetainedParticipantGraphExecutable> original(const PreparedGPUContextUsePermit& original,void* stream){
+        return RetainedParticipantGraphExecutable::create(original,stream);
+    }
+    /** @return Device-free recorded original lifecycle; no native General host qualification is asserted. */
+    static std::shared_ptr<RetainedParticipantGraphExecutable> recorded(const PreparedGPUContextUsePermit& original){
+        return RetainedParticipantGraphExecutable::createDeviceBound(original,original.worker()->defaultStream());
+    }
+#ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
+    /** @return Explicit raw diagnostic owner: General device bound only, no host qualification claim. */
+    static std::shared_ptr<RetainedParticipantGraphExecutable> rawDiagnostic(const PreparedGPUContextUsePermit& original,void* stream){
+        return RetainedParticipantGraphExecutable::createDeviceBound(original,stream);
+    }
+#endif
+    /** @return Actual original capture; no replacement graph or kernel program is introduced. */
+    static IGPUGraphCapture& capture(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner){return owner->capture();}
+    /** @brief Apply the ACK adversarial topology splice to the sole original recorded definition.
+     * @param owner Original retained definition, never a replacement capture.
+     * @param mutate Test-only SDK mutation which retains and verifies all original dependencies.
+     * @throws std::exception Before mutation for foreign worker/source, wrong phase or stream.
+     * A failed splice irreversibly fails the definition, matching recording failure semantics.
+     */
+    template<class Mutation>
+    static void spliceRecordedACK(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,
+                                  Mutation&& mutate){
+        if(!owner)throw std::invalid_argument("ACK splice requires its original graph owner");
+        owner->requireRecordingAuthority();
+        if(owner->phase_!=RetainedParticipantGraphExecutable::Phase::Recorded ||
+           !owner->capture_ || owner->capture_->executionStream()!=owner->stream_)
+            throw std::logic_error("ACK splice requires the original recorded, uninstantiated definition");
+        try{mutate(*owner->capture_);}
+        catch(...){owner->phase_=RetainedParticipantGraphExecutable::Phase::Failed;throw;}
+    }
+    /** @return Owner-controlled original enqueue; the recording facade cannot launch independently. */
+    static bool submit(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,std::uint64_t ordinal){return owner->submit(ordinal);}
+    /** @return Original native terminal observation, called only outside its owner worker. */
+    static bool observeTerminal(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner){return owner->observeTerminal();}
+};
+}

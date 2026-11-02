@@ -14,6 +14,7 @@
  */
 #pragma once
 #include "config/OrchestrationConfigParser.h"
+#include "tools/ModelKLDQFNOwner.h"
 #include "Qwen4ExpProductionParityCases.h"
 #include "Qwen4ExpSourceAdmission.h"
 #include "Qwen4ExpPrefillAcceptance.h"
@@ -443,6 +444,27 @@ protected:
         return status == 0 && log.good();
     }
 
+    /** @brief Retain one original observation export until the existing fixture retirement edge. */
+    const ModelContextReuseContract &qfnObservationOwner()
+    {
+        if (!qfn_observation_owner_)
+            qfn_observation_owner_ = Base::orch_runner_->modelContextReuseContract();
+        if (!qfn_observation_owner_)
+            throw std::logic_error("QFN observation requires its initialized original model export");
+        return *qfn_observation_owner_;
+    }
+
+    /** @brief Retire the runner before its same exported source/model authority, including failed proofs. */
+    void retireOwnedParityRunners() override
+    {
+        if (qfn_observation_owner_)
+            accuracy::retireQFNFinalOwner(Base::orch_runner_, qfn_observation_owner_);
+        Base::retireOwnedParityRunners();
+    }
+
+    /** Sole original export; observations borrow it and teardown consumes it. */
+    std::optional<ModelContextReuseContract> qfn_observation_owner_;
+
     /**
      * @brief Prove the one actual mixed source/root/PMA owner after complete runner initialization.
      *
@@ -455,7 +477,7 @@ protected:
         // The setup-only and numerical fixtures consume the same retained
         // native owners/PMA attestation; neither reconstructs a live ledger.
         ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceGPUAdaptiveOwners(
-            static_cast<const Derived *>(this)->modelParityCase(), *Base::orch_runner_));
+            static_cast<const Derived *>(this)->modelParityCase(), *Base::orch_runner_, qfnObservationOwner()));
     }
 
     /**
@@ -490,6 +512,43 @@ protected:
     void runQwen4ExpProductionParityCampaign()
     {
         Base::runProductionParityCampaign();
+        assertLookupReuseAfterProductionProof();
+    }
+
+    /** @brief Exact functional MTP replay, separate from frozen-history numerical acceptance.
+     * Uses the same admitted runner, captured source/remote graphs, prefix
+     * restore and native serial/grouped proof. The original native prompt is
+     * the checkpoint. Authenticated reference metadata/NPY headers price the
+     * snapshot BOM only; no HF numerical payload or score enters this proof.
+     */
+    void runQwen4ExpMTPExactReplay()
+    {
+        ASSERT_NE(Base::config_.mtp_expectation, ParityMTPExpectation::Disabled);
+        ASSERT_NO_FATAL_FAILURE(Base::beginProductionParitySnapshotAdmission());
+        ASSERT_TRUE(Base::setupProductionParityPipeline());
+        ASSERT_NO_FATAL_FAILURE(Base::prepareProductionParityNativeExactCheckpoint());
+        DecodeParitySummary unused_numerical_summary;
+        ASSERT_NO_FATAL_FAILURE(Base::runProductionParityMTPProof(
+            unused_numerical_summary, MTPParityProofPurpose::NativeExactReplay));
+        ASSERT_NO_FATAL_FAILURE(Base::finishProductionParityEvidence());
+        std::ofstream scope(Base::ensureResultsDir() / "mtp_exact_replay_scope.txt");
+        ASSERT_TRUE(scope.is_open());
+        scope << "scope=native_serial_grouped_exact_functional\n"
+                 "snapshot_capacity_source=authenticated_same_model_reference_headers\n"
+                 "hf_scoring_executed=false\n"
+              << "frozen_history_numerical_acceptance=false\n";
+        scope.flush();
+        ASSERT_TRUE(scope.good());
+        assertLookupReuseAfterProductionProof();
+    }
+
+    /** @brief Keep original immutable owners and real repeated-request traffic after either proof.
+     * Numerical and exact-only tests share this same lifetime/lookup check;
+     * active MTP is authenticated by actual controller evidence, never relabeled
+     * as an ordinary request or inferred from retained predictor capacity.
+     */
+    void assertLookupReuseAfterProductionProof()
+    {
         exportGDNProjectionRouteEvidence();
         if (::testing::Test::HasFatalFailure()) return;
         const auto &test_case = static_cast<const Derived *>(this)->modelParityCase();
@@ -503,21 +562,44 @@ protected:
         placement->requireRequestedPolicy(*test_case.ngram_table_policy);
         if(placement->isGPUAdaptive())
         {
-            ASSERT_EQ(test_case.mtp, ModelParityMTP::Off);
-            ASSERT_FALSE(Base::orch_runner_->config().mtp.enabled);
+            if (test_case.mtp == ModelParityMTP::Off)
+            {
+                ASSERT_FALSE(Base::orch_runner_->config().mtp.enabled);
+            }
+            else
+            {
+                ASSERT_TRUE(Base::orch_runner_->config().mtp.enabled);
+                ASSERT_EQ(resolveMTPMaximumExecutionDraftDepth(Base::orch_runner_->config().mtp),
+                          test_case.requestedMTPDraftDepth());
+                ASSERT_NO_FATAL_FAILURE(Base::assertProductionParityMTPEvidence());
+            }
             // The partial-prefix proof intentionally ends at a standalone
             // suffix-prefill boundary. Retire it through the actual public
             // request reset before asking for idle retained-source credit.
             // Nonfatal HF numerical failures do not waive this lifecycle duty.
             ASSERT_NO_THROW(Base::activeClearCache());
             ASSERT_NO_FATAL_FAILURE(assertGPUAdaptiveNativeOwners());
-            const auto boundary=context->adaptiveImmutableLookupBoundary(
-                placement->gpuAdaptiveLayout().consumers().front().device);
-            ASSERT_TRUE(boundary);
-            const auto source_before=boundary->retainedSourceOwnerObservation();
             const auto provider_before=context->hostImmutableRowProvider();
-            const std::array roots_before{boundary->pooledStorage()->owner()->roots(),boundary->pooledStorage()->coordinator()->roots(),boundary->pooledStorage()->roots()};
-            const auto identity_before=boundary->captureIdentity();
+            struct ConsumerWitness final {
+                std::shared_ptr<::llaminar2::qwen4exp::ImmutableLookupExecutionBoundary> boundary;
+                HostImmutableRowOwnerObservation source;
+                std::vector<::llaminar2::qwen4exp::PooledImmutableNativeRoots> roots;
+                std::uint64_t identity;
+            };
+            const auto retainedRoots=[](const auto& boundary) {
+                std::vector<::llaminar2::qwen4exp::PooledImmutableNativeRoots> roots;
+                for(const auto& owner:boundary->pooledStorage()->originalOwners())roots.push_back(owner->roots());
+                roots.push_back(boundary->pooledStorage()->coordinator()->roots());
+                roots.push_back(boundary->pooledStorage()->roots());
+                return roots;
+            };
+            std::vector<ConsumerWitness> witnesses;
+            for (const auto consumer : placement->gpuAdaptiveLayout().consumers()) {
+                const auto boundary=context->adaptiveImmutableLookupBoundary(consumer.device);
+                ASSERT_TRUE(boundary);
+                witnesses.push_back({boundary,boundary->retainedSourceOwnerObservation(),
+                    retainedRoots(boundary),boundary->captureIdentity()});
+            }
             const auto original_path=Base::ensureResultsDir()/"production_path.csv";
             ASSERT_TRUE(std::filesystem::copy_file(original_path,
                 Base::ensureResultsDir()/"production_path_forward.csv",
@@ -529,7 +611,7 @@ protected:
             (void)beginQwen4ExpGPUAdaptiveGenerationEvidenceWindow();
 
             // Forced numerical rows never certify the captured generation
-            // controller. Use the existing public ordinary request path on
+            // controller. Use the existing public request path on
             // this same runner, original prompt and installed sampling law.
             // Two outputs require one real model forward after the initial
             // sample; an early EOS remains a failed witness, never suppressed.
@@ -543,33 +625,63 @@ protected:
             for(const auto token:generation.tokens)generation_record<<token<<' ';
             generation_record<<'\n';generation_record.flush();ASSERT_TRUE(generation_record.good());
             const auto records=PerfStatsCollector::snapshot({"immutable_lookup"});
+            for (const auto& witness : witnesses) {
+                const auto& boundary = witness.boundary;
+                if (boundary->retainedParticipantSource())
+                {
+                    double source_invocations = 0;
+                    double remote_enqueues = 0;
+                    for (const auto &record : PerfStatsCollector::snapshot({"ngram_lookup"}))
+                    {
+                        if (record.kind != PerfStatRecord::Kind::Counter ||
+                            record.device != boundary->device().toString())
+                            continue;
+                        if (record.name == "retained_source_native_invocations")
+                            source_invocations += record.value;
+                        if (record.name == "retained_remote_native_enqueues")
+                            remote_enqueues += record.value;
+                    }
+                    const auto owners = boundary->pooledStorage()->geometry().originalOwners();
+                    const auto remote_count = std::count_if(owners.begin(), owners.end(),
+                        [&](const auto &owner) {
+                            return owner.allocator().device != boundary->device() &&
+                                   owner.allocator().device.is_gpu();
+                        });
+                    EXPECT_GT(source_invocations, 0);
+                    EXPECT_GT(remote_count, 0);
+                    EXPECT_EQ(remote_enqueues, source_invocations * remote_count);
+                }
+            }
             std::ofstream csv(Base::ensureResultsDir()/"ngram_storage.csv");ASSERT_TRUE(csv.is_open());
             writeQwen4ExpLookupCounterCSV(csv,records);csv.flush();ASSERT_TRUE(csv.good());
             ASSERT_TRUE(generation.success())<<generation.error;
-            EXPECT_EQ(generation.tokens.size(),2u)<<"Adaptive terminal witness ended before one complete ordinary model forward";
-            ASSERT_FALSE(boundary->hasActiveInterval());
-            const auto source_after=boundary->retainedSourceOwnerObservation();
-            EXPECT_EQ(source_after.authority().get(),source_before.authority().get());
-            EXPECT_EQ(source_after.allocator(),source_before.allocator());
-            EXPECT_EQ(source_after.hostPlacement(),source_before.hostPlacement());
-            EXPECT_EQ(source_after.tableStorageBytes(),source_before.tableStorageBytes());
-            EXPECT_EQ(source_after.lookupStagingBytes(),source_before.lookupStagingBytes());
-            const std::array roots_after{boundary->pooledStorage()->owner()->roots(),boundary->pooledStorage()->coordinator()->roots(),boundary->pooledStorage()->roots()};
-            for(std::size_t group=0;group<roots_before.size();++group){
-                EXPECT_EQ(roots_after[group].cache.get(),roots_before[group].cache.get());
-                EXPECT_EQ(roots_after[group].frame.get(),roots_before[group].frame.get());
-                EXPECT_EQ(roots_after[group].native.get(),roots_before[group].native.get());
+            EXPECT_EQ(generation.tokens.size(),2u)<<"Adaptive terminal witness ended before one complete model forward";
+            for (const auto& witness : witnesses) {
+                const auto& boundary = witness.boundary;
+                ASSERT_FALSE(boundary->hasActiveInterval());
+                const auto source_after=boundary->retainedSourceOwnerObservation();
+                EXPECT_EQ(source_after.authority().get(),witness.source.authority().get());
+                EXPECT_EQ(source_after.allocator(),witness.source.allocator());
+                EXPECT_EQ(source_after.hostPlacement(),witness.source.hostPlacement());
+                EXPECT_EQ(source_after.tableStorageBytes(),witness.source.tableStorageBytes());
+                EXPECT_EQ(source_after.lookupStagingBytes(),witness.source.lookupStagingBytes());
+                const auto roots_after=retainedRoots(boundary);
+                ASSERT_EQ(roots_after.size(),witness.roots.size());
+                for(std::size_t group=0;group<witness.roots.size();++group){
+                    EXPECT_EQ(roots_after[group].cache.get(),witness.roots[group].cache.get());
+                    EXPECT_EQ(roots_after[group].frame.get(),witness.roots[group].frame.get());
+                    EXPECT_EQ(roots_after[group].native.get(),witness.roots[group].native.get());
+                }
+                EXPECT_EQ(boundary->captureIdentity(),witness.identity);
+                EXPECT_EQ(context->adaptiveImmutableLookupBoundary(boundary->device()).get(),boundary.get());
             }
-            EXPECT_EQ(boundary->captureIdentity(),identity_before);
             ASSERT_EQ(Base::activeModelContextForDiagnostics(),context);
-            EXPECT_EQ(context->adaptiveImmutableLookupBoundary(boundary->device()).get(),boundary.get());
             EXPECT_EQ(context->hostImmutableRowProvider().get(),provider_before.get());
             ASSERT_NO_FATAL_FAILURE(assertGPUAdaptiveNativeOwners());
             const auto &layout=placement->gpuAdaptiveLayout();
             const auto provider=context->hostImmutableRowProvider();ASSERT_TRUE(provider);
-            const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),placement->gpuAdaptiveRequest());
-            ASSERT_NO_THROW((void)requireQwen4ExpGPUAdaptiveLookupEvidence(records,layout.consumers().front().device,
-                placement->extent().rowBytes(),placement->gpuAdaptiveMaximumLiveRows(),geometry.physical().owners().front().slots,geometry.host().slots()));
+            ASSERT_NO_THROW((void)requireQwen4ExpGPUAdaptiveCohortEvidence(
+                records,layout,provider->source(),placement->gpuAdaptiveRequest()));
             // Refresh from actual work while preserving every inherited raw
             // numerical/prefix result. No ModelContext reuse claim is inferred.
             Base::finishProductionParityEvidence();

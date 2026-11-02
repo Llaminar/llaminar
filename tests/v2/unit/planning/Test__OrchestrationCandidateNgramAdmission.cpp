@@ -6,7 +6,9 @@
  * FA/GDN/MoE projection has complete source geometry. No payload, device context,
  * inference graph or synthetic allocation authority is materialized here.
  */
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/OrchestrationCandidateAdmission.h"
+#include "fixtures/planning/RecordedNgramOrdering.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/CpuAdaptiveImmutableRowCache.h"
@@ -100,9 +102,16 @@ AutomaticOrchestrationCandidate multirankNgramCandidate(const PlanningModelSourc
     return {OrchestrationStrategy::TensorParallel,std::move(membership),std::move(config)};
 }
 /** @return Frozen small capture ladder and original bounded upload policy. */
-OrchestrationCandidateMemoryPolicy ngramPolicy(std::size_t slot=1u<<20)
-{return {.prefill_bucket_rows={32,64},.minimum_prefill_sequence_rows=1,.maximum_cached_prefill_buckets=8,
-    .weight_load={.staging_stream_count=1,.staging_budget_bytes=slot}};}
+OrchestrationCandidateMemoryPolicy ngramPolicy(const AutomaticOrchestrationCandidate& candidate,std::size_t slot=1u<<20)
+{
+    OrchestrationCandidateMemoryPolicy policy{.prefill_bucket_rows={32,64},.minimum_prefill_sequence_rows=1,.maximum_cached_prefill_buckets=8,
+        .weight_load={.staging_stream_count=1,.staging_budget_bytes=slot}};
+    std::vector<DeviceId> devices;for(const auto& rank:candidate.membership.inventory().ranks)for(const auto& gpu:rank.gpus){
+        const DeviceId device{gpu.type,gpu.local_device_id};if(std::find(devices.begin(),devices.end(),device)==devices.end())devices.push_back(device);}
+    policy.native_ordering_events=test::NativeOrderingEventGroupReplayAccess::projection(devices);
+    policy.retained_host_services=test::planningHostServiceBudgets(candidate.membership.discoverySize());
+    return policy;
+}
 /** @brief Authenticate pointer publication and exact canonical table owner on every admitted consumer. */
 void expectCompleteTable(const AdmittedOrchestrationCandidate &admitted,ImmutableRowStorage storage)
 {
@@ -125,6 +134,57 @@ void expectCompleteTable(const AdmittedOrchestrationCandidate &admitted,Immutabl
     EXPECT_GT(placements,0u);
 }
 }
+/** @test Hosted workers are mandatory CPU0 owners and retain the session actually admitted. */
+TEST(OrchestrationCandidateNgramAdmission, HostedServiceBOMPrecedesOptionalPlacement)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto storage : {ImmutableRowStoragePreference::RAM, ImmutableRowStoragePreference::MemoryMapped}) {
+            auto candidate = ngramCandidate(source, backend);
+            candidate.config.ngram_table_policy = {storage, 65536, 3};
+            auto policy = ngramPolicy(candidate);
+            const auto expected = policy.retained_host_services.at(0).program(RetainedHostServiceRole::ImmutableLookupIO);
+            const auto admitted = AdmittedOrchestrationCandidate::admit(candidate, source, policy);
+            const auto& rank = admitted.rankPlans().front();
+            ASSERT_TRUE(rank.runtime.retained_host_services);
+            const auto* cpu = admitted.physicalAdmission().plan().find({rank.rank, DeviceId::cpu()});
+            ASSERT_NE(cpu, nullptr);
+            EXPECT_EQ(cpu->bytes(PhysicalMemoryOwner::RetainedHostServiceStorage), expected.allocationBytes());
+            EXPECT_EQ(cpu->bytes(PhysicalMemoryOwner::RetainedHostServiceRuntime), expected.resourceDeclaration().opaqueBytes);
+            for (const auto& device : admitted.devicePlans())
+                EXPECT_EQ(device.retained_host_services, rank.runtime.retained_host_services);
+
+            // A missing mandatory worker program is a malformed admission, not
+            // a capacity event that may shrink rows or change table topology.
+            policy.retained_host_services.clear();
+            try {
+                (void)AdmittedOrchestrationCandidate::admit(candidate, source, policy);
+                FAIL() << "Hosted lookup admitted without its original service evidence";
+            } catch (const PhysicalMemoryCapacityExhausted&) {
+                FAIL() << "Missing service evidence was disguised as capacity exhaustion";
+            } catch (const std::logic_error&) {}
+        }
+}
+
+/** @test Explicit full VRAM has no hosted worker; unused alternatives are not charged. */
+TEST(OrchestrationCandidateNgramAdmission, FixedVRAMRequiresNoHostedServiceClass)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm}) {
+        auto candidate = ngramCandidate(source, backend);
+        candidate.config.ngram_table_policy = {ImmutableRowStoragePreference::VRAM, 65536, 3};
+        auto policy = ngramPolicy(candidate);
+        policy.retained_host_services.clear();
+        const auto admitted = AdmittedOrchestrationCandidate::admit(candidate, source, policy);
+        for (const auto& resource : admitted.physicalAdmission().plan().resources()) {
+            EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::RetainedHostServiceStorage), 0u);
+            EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::RetainedHostServiceRuntime), 0u);
+        }
+    }
+}
+
 /** @test Ordinary candidates seal concrete original table owners and publish exact consumer bindings. */
 TEST(OrchestrationCandidateNgramAdmission, OrdinaryFinalCertificateIncludesRequestedTierAndAutomaticOrder)
 {
@@ -135,16 +195,16 @@ TEST(OrchestrationCandidateNgramAdmission, OrdinaryFinalCertificateIncludesReque
             SCOPED_TRACE(::testing::Message()<<int(backend)<<":"<<int(requested));
             auto proposal=ngramCandidate(source,backend);proposal.config.ngram_table_policy={requested,65536,3};
             if(backend==DeviceType::CPU&&requested==ImmutableRowStoragePreference::VRAM) {
-                EXPECT_THROW((void)AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy()),std::invalid_argument);continue;
+                EXPECT_THROW((void)AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal)),std::invalid_argument);continue;
             }
-            const auto result=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());
+            const auto result=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));
             const auto expected=requested==ImmutableRowStoragePreference::MemoryMapped?ImmutableRowStorage::MemoryMapped:
                 requested==ImmutableRowStoragePreference::RAM||backend==DeviceType::CPU?ImmutableRowStorage::RAM:ImmutableRowStorage::VRAM;
             expectCompleteTable(result,expected);
         }
         if(backend==DeviceType::CPU)continue;
         auto hosted=ngramCandidate(source,backend);hosted.config.ngram_table_policy={ImmutableRowStoragePreference::Automatic,65536,3};
-        const auto resident=AdmittedOrchestrationCandidate::admit(hosted,source,ngramPolicy());
+        const auto resident=AdmittedOrchestrationCandidate::admit(hosted,source,ngramPolicy(hosted));
         const auto placement=resident.rankPlans().front().runtime.ngram_table_placement;ASSERT_TRUE(placement);
         ASSERT_EQ(placement->storage(),ImmutableRowStorage::VRAM);
         const auto *gpu=resident.physicalAdmission().plan().find(placement->allocators().front());ASSERT_NE(gpu,nullptr);
@@ -152,10 +212,10 @@ TEST(OrchestrationCandidateNgramAdmission, OrdinaryFinalCertificateIncludesReque
         // frozen higher-priority base still fits without the table bank.
         auto limited=hosted.membership.inventory();limited.ranks.front().gpus.front().free_memory_bytes=gpu->totalBytes()-1;
         limited.buildNodeAggregations();hosted.membership=ExecutionRankMembership(limited,hosted.membership.discoveryRanks());
-        expectCompleteTable(AdmittedOrchestrationCandidate::admit(hosted,source,ngramPolicy()),ImmutableRowStorage::RAM);
+        expectCompleteTable(AdmittedOrchestrationCandidate::admit(hosted,source,ngramPolicy(hosted)),ImmutableRowStorage::RAM);
         limited.ranks.front().cpu.free_memory_bytes=2ull<<30;limited.buildNodeAggregations();
         hosted.membership=ExecutionRankMembership(limited,hosted.membership.discoveryRanks());
-        expectCompleteTable(AdmittedOrchestrationCandidate::admit(hosted,source,ngramPolicy()),ImmutableRowStorage::MemoryMapped);
+        expectCompleteTable(AdmittedOrchestrationCandidate::admit(hosted,source,ngramPolicy(hosted)),ImmutableRowStorage::MemoryMapped);
     }
 }
 /** @test Distinct ranks extend the same certificate once each without same-rank table collisions. */
@@ -165,7 +225,7 @@ TEST(OrchestrationCandidateNgramAdmission, MultirankConsumersRetainDistinctOrigi
     for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}) {
         auto proposal=multirankNgramCandidate(source,backend);
         proposal.config.ngram_table_policy.storage=ImmutableRowStoragePreference::VRAM;
-        const auto result=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());
+        const auto result=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));
         ASSERT_EQ(result.rankPlans().size(),2u);expectCompleteTable(result,ImmutableRowStorage::VRAM);
         const auto first=result.rankPlans()[0].runtime.ngram_table_placement;
         const auto second=result.rankPlans()[1].runtime.ngram_table_placement;
@@ -199,7 +259,7 @@ TEST(OrchestrationCandidateNgramAdmission, GlobalExpertOnlyRankOwnsNoImmutableTa
     for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}) {
         auto proposal=multirankNgramCandidate(source,backend,ExecutionDomainScope::GLOBAL);
         proposal.config.ngram_table_policy.storage=ImmutableRowStoragePreference::VRAM;
-        const auto result=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());
+        const auto result=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));
         ASSERT_EQ(result.rankPlans().size(),2u);
         ASSERT_TRUE(result.rankPlans()[0].runtime.ngram_table_placement);
         EXPECT_FALSE(result.rankPlans()[1].runtime.ngram_table_placement);
@@ -226,17 +286,17 @@ TEST(OrchestrationCandidateNgramAdmission, FinalTableRejectionNeverReopensRowsOr
         SCOPED_TRACE(::testing::Message()<<int(strategy)<<":"<<int(backend));
         auto proposal=ngramCandidate(source,backend,strategy,strategy==OrchestrationStrategy::ExpertOverlay?2:1);
         proposal.config.ngram_table_policy={ImmutableRowStoragePreference::RAM,65536,3};
-        const auto high=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());
+        const auto high=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));
         ASSERT_EQ(high.rankPlans().front().runtime.resident_graph_rows,64);
         const auto placement=high.rankPlans().front().runtime.ngram_table_placement;ASSERT_TRUE(placement);
         const auto *host=high.physicalAdmission().plan().find(placement->allocators().front());ASSERT_NE(host,nullptr);
         auto limited=proposal.membership.inventory();limited.ranks.front().cpu.free_memory_bytes=host->totalBytes()-1;
         limited.buildNodeAggregations();proposal.membership=ExecutionRankMembership(limited,proposal.membership.discoveryRanks());
         const auto original=serializeOrchestrationConfig(proposal.config);
-        try {(void)AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());FAIL()<<"Final table exceeded its frozen owner";}
+        try {(void)AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));FAIL()<<"Final table exceeded its frozen owner";}
         catch(const PhysicalMemoryCapacityExhausted &e) {EXPECT_NE(std::string(e.what()).find("Explicit ngram storage cannot be admitted"),std::string::npos)<<e.what();}
         EXPECT_EQ(serializeOrchestrationConfig(proposal.config),original);
-        auto small=ngramPolicy();small.prefill_bucket_rows={32};
+        auto small=ngramPolicy(proposal);small.prefill_bucket_rows={32};
         const auto lower=AdmittedOrchestrationCandidate::admit(proposal,source,small);
         ASSERT_EQ(lower.rankPlans().front().runtime.resident_graph_rows,32);expectCompleteTable(lower,ImmutableRowStorage::RAM);
         if(high.overlayCapacity()) {
@@ -261,7 +321,7 @@ TEST(OrchestrationCandidateNgramAdmission, HostedExecutionIsInFixedBaseBeforeExp
         SCOPED_TRACE(::testing::Message()<<int(backend)<<":"<<int(preference));
         auto proposal=ngramCandidate(source,backend,OrchestrationStrategy::ExpertOverlay,2);
         proposal.config.ngram_table_policy={preference,65536,3};
-        const auto high=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());
+        const auto high=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));
         ASSERT_TRUE(high.overlayCapacity());
         auto groups=std::vector<std::vector<DevicePlanConfig>>{high.devicePlans()};
         for(auto &cfg:groups.front())cfg.ngram_table_placement.reset();
@@ -281,7 +341,7 @@ TEST(OrchestrationCandidateNgramAdmission, HostedExecutionIsInFixedBaseBeforeExp
         auto inventory=proposal.membership.inventory();
         inventory.ranks.front().gpus.front().free_memory_bytes=full->totalBytes()-mandatory+1;
         inventory.buildNodeAggregations();proposal.membership=ExecutionRankMembership(inventory,proposal.membership.discoveryRanks());
-        const auto admitted=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());
+        const auto admitted=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));
         ASSERT_TRUE(admitted.overlayCapacity());EXPECT_TRUE(admitted.physicalAdmission().plan().fits());
         EXPECT_EQ(admitted.rankPlans().front().runtime.resident_graph_rows,high.rankPlans().front().runtime.resident_graph_rows);
         const auto *limited=admitted.physicalAdmission().plan().find({0,device});ASSERT_NE(limited,nullptr);
@@ -300,9 +360,9 @@ TEST(OrchestrationCandidateNgramAdmission, HostAdaptiveRamSsdOptionalSlotsNeverR
         if(backend==DeviceType::CPU && strategy==OrchestrationStrategy::ExpertOverlay)continue;
         auto proposal=ngramCandidate(source,backend,strategy,strategy==OrchestrationStrategy::ExpertOverlay?2:1);
         proposal.config.ngram_table_policy={ImmutableRowStoragePreference::HostAdaptiveRAMSSD,65536,3};
-        const auto zero=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());
+        const auto zero=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));
         proposal.config.ngram_table_policy.host_adaptive={17,1u<<20,{}};
-        const auto optional=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy());
+        const auto optional=AdmittedOrchestrationCandidate::admit(proposal,source,ngramPolicy(proposal));
         ASSERT_EQ(zero.rankPlans().size(),optional.rankPlans().size());std::size_t providers=0;
         for(std::size_t rank=0;rank<zero.rankPlans().size();++rank)
         {

@@ -13,6 +13,7 @@
 #include <optional>
 
 #include "utils/PrefillGraphBucketDefaults.h"
+#include "execution/local_execution/graph/ReadAheadScheduling.h"
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "config/GDNRecurrenceStatePolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
@@ -90,6 +91,7 @@ namespace llaminar2
                 "LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
                 "LLAMINAR_PREFILL_GRAPH_REQUIRED",
                 "LLAMINAR_GPU_GRAPHS",
+                "LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE",
                 "LLAMINAR_ALLREDUCE_PRECISION",
                 "LLAMINAR_MOE_REBALANCE",
                 "LLAMINAR_MOE_REBALANCE_WINDOW",
@@ -1147,6 +1149,13 @@ namespace llaminar2
      */
     struct ExecutionConfig
     {
+        /** @brief Cold diagnostic policy, snapshotted into RuntimeConfig before admission.
+         * LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE accepts only consumer_scheduled,
+         * early_current_hosted_candidate or early_current_resident_decode_gpu_candidate.
+         * Absence does not enable a candidate. Models never read this environment.
+         */
+        std::optional<ImmutableLookupSchedule> qfn_ngram_lookup_schedule;
+
         /** @brief Cold LLAMINAR_CUDA_GDN_STATE_LAYOUT physical-format override; copied into the cache owner. */
         GDNRecurrenceStateLayout cuda_gdn_state_layout = kDefaultCUDAGDNStateLayout;
         /** @brief Cold LLAMINAR_ROCM_GDN_STATE_LAYOUT override of the ValueMajor default; never changes a live bank. */
@@ -1264,6 +1273,9 @@ namespace llaminar2
         /** @brief Reload execution controls without performing device work. */
         void reload()
         {
+            const char* lookup_schedule=std::getenv("LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE");
+            qfn_ngram_lookup_schedule=lookup_schedule?std::optional{parseImmutableLookupSchedule(lookup_schedule)}:std::nullopt;
+
             const char *cuda_gdn_layout = std::getenv("LLAMINAR_CUDA_GDN_STATE_LAYOUT");
             const char *rocm_gdn_layout = std::getenv("LLAMINAR_ROCM_GDN_STATE_LAYOUT");
             cuda_gdn_state_layout = cuda_gdn_layout

@@ -3,7 +3,9 @@
 
 Subprocess fixtures own their binaries, output and Git provenance. These tests
 also run from installed source archives: an enclosing developer checkout must
-not silently supply metadata that a real container does not have.
+not silently supply metadata that a real container does not have. Ordinary dry-run
+fixtures select the CPU policy fitter explicitly; automatic accelerator discovery
+is exercised only with fixture-owned command responses.
 """
 
 from __future__ import annotations
@@ -178,11 +180,14 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
-                env=(
-                    {**os.environ, **environment}
-                    if environment is not None
-                    else None
-                ),
+                # Dry-run does not suppress automatic policy discovery. Unit
+                # fixtures select CPU explicitly unless testing a mocked policy
+                # population; never consult the developer's live accelerators.
+                env={
+                    **os.environ,
+                    "LLAMINAR_NATIVE_VNNI_POLICY_ACCELERATORS": "cpu",
+                    **(environment or {}),
+                },
             )
 
     def test_cpu_fixed_timing_floor_preflights_before_collection(self) -> None:
@@ -1642,6 +1647,41 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("rocm_profiler_features.csv", result.stdout)
         self.assertIn("cpu_profiler_features.csv", result.stdout)
         self.assertIn("--observation", result.stdout)
+
+    def test_dry_run_policy_discovery_is_fixture_owned(self) -> None:
+        """Ordinary dry runs avoid GPU probes; explicit auto uses fake tools."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = root / "calls"
+            for name, response in (
+                ("nvidia-smi", "0\n"),
+                ("rocm-smi", "device,Unique ID\ncard0,fixture\n"),
+            ):
+                tool = root / name
+                tool.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s\\n' '{name}' >> '{calls}'\n"
+                    f"printf '%s' '{response}'\n",
+                    encoding="utf-8",
+                )
+                tool.chmod(0o755)
+            environment = {"PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            ordinary = self.run_script_with_output_files(
+                {}, "--backend", "cuda", "--profile", "all", environment=environment,
+            )
+            self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
+            self.assertIn("canonical CPU process pool", ordinary.stdout)
+            self.assertFalse(calls.exists(), "Ordinary dry run queried accelerator hardware")
+            automatic = self.run_script_with_output_files(
+                {}, "--backend", "cuda", "--profile", "all",
+                "--policy-accelerators", "auto",
+                "--policy-cuda-scorer", "/bin/true",
+                "--policy-rocm-scorer", "/bin/true",
+                environment=environment,
+            )
+            self.assertEqual(automatic.returncode, 0, automatic.stderr)
+            self.assertEqual(calls.read_text().splitlines(), ["nvidia-smi", "rocm-smi"])
+            self.assertIn("accelerators=cuda:0,rocm:0", automatic.stdout)
 
     def test_production_refresh_exports_explicit_gpu_policy_workers(self) -> None:
         result = self.run_script(

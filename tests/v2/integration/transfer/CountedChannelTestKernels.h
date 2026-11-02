@@ -9,6 +9,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include "transfer/CapturedTransferChannelProtocol.h"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define LLAMINAR_CHANNEL_TEST_HD __host__ __device__
@@ -34,6 +35,11 @@ namespace llaminar2::counted_channel_test
         }
     }
 
+    /** @return Adversarial source origin; empty work may name the exact end without reading it. */
+    LLAMINAR_CHANNEL_TEST_HD inline std::uint64_t sliceOffset(std::uint64_t sequence,
+        std::uint64_t capacity, std::uint64_t source_span)
+    { return extent(sequence, capacity) ? (sequence * 13) % (source_span - capacity + 1) : source_span; }
+
     /** @return Position/sequence-sensitive raw bytes, independent of arithmetic precision. */
     LLAMINAR_CHANNEL_TEST_HD inline std::uint8_t byte(std::uint64_t sequence, std::size_t position)
     {
@@ -50,6 +56,10 @@ namespace llaminar2::counted_channel_test
     bool prepareCUDA(void *payload, std::uint64_t *count, const std::uint64_t *sequence, std::size_t capacity, void *stream);
     /** @brief Advance only after the complete captured round trip has consumed this sequence. */
     bool advanceCUDA(std::uint64_t *sequence, void *stream);
+    /** @brief Author one original source slice and its whole retained source bank in the captured graph. */
+    bool prepareSlicedCUDA(void *payload, CapturedTransferSourceSlice *slice,
+        const std::uint64_t *sequence, std::size_t capacity, std::size_t source_span,
+        std::uint64_t source_origin, void *stream);
 #endif
 #ifdef HAVE_ROCM
     /** @brief Symmetric HIP function preparation outside capture. */
@@ -58,6 +68,10 @@ namespace llaminar2::counted_channel_test
     bool prepareROCm(void *payload, std::uint64_t *count, const std::uint64_t *sequence, std::size_t capacity, void *stream);
     /** @brief Advance the HIP producer after its same-stream round trip. */
     bool advanceROCm(std::uint64_t *sequence, void *stream);
+    /** @brief Author one original source slice and its whole retained source bank in the captured graph. */
+    bool prepareSlicedROCm(void *payload, CapturedTransferSourceSlice *slice,
+        const std::uint64_t *sequence, std::size_t capacity, std::size_t source_span,
+        std::uint64_t source_origin, void *stream);
 #endif
 }
 #undef LLAMINAR_CHANNEL_TEST_HD

@@ -4,7 +4,9 @@
  *
  * Separate translation units reuse these declarations without recompiling every
  * state, ordinary-generation and speculative-generation test together. All
- * cache and GPU operations remain production implementations.
+ * cache and GPU operations remain production implementations. The numerical
+ * probe owns its immutable table recipe; it does not borrow a transformer
+ * layer-weight source for the graph methods it replaces.
  */
 #pragma once
 #include <gtest/gtest.h>
@@ -145,6 +147,27 @@ public:
     }
     /** @return This model-free graph owns its only immutable weight. */
     bool isInitialized() const override { return true; }
+    /**
+     * @brief Prepare the actual table source used by this numerical probe.
+     * @param device Original participant retained by every graph specialization.
+     * @throws std::invalid_argument for a foreign participant or malformed table.
+     * @details Qwen supplies the arena schema, but this builder replaces all
+     * transformer arithmetic with its own table. It therefore prepares that
+     * original source, without inventing layer-weight bindings for Qwen's recipe.
+     */
+    void prepareForwardGraphTemplate(DeviceId device) override
+    {
+        if (device == DeviceId::invalid() || device != config().default_device ||
+            table.rows() != 32 || table.cols() != 32)
+            throw std::invalid_argument("Ordinary graph template requires its original participant and table");
+        (void)table_template_.prepare([this] { return &table; });
+    }
+    /** @return Actual immutable preparation and main-forward construction counts. */
+    PreparedGraphTemplateStats forwardGraphTemplateStats() const override
+    {
+        return {.preparations = table_template_.preparations(),
+            .specialization_attempts = table_template_.specializationAttempts()};
+    }
     /** @brief Bind actual resident token input, logits and KV append in one DAG.
      * @param input Exact production invocation, never a host token shadow.
      * @param output Receives the arena-owned terminal logits.
@@ -153,10 +176,12 @@ public:
     {
         if (input.seq_len <= 0 || input.batch_size != 1 || !input.kv_cache)
             throw std::invalid_argument("Ordinary DGO probe requires one canonical KV row");
+        prepareForwardGraphTemplate(input.device);
+        auto *const original_table = table_template_.beginSpecialization();
         ++builds;
         EmbeddingStage::Params embedding;
         embedding.device_id = input.device;
-        embedding.embed_table = &table;
+        embedding.embed_table = original_table;
         embedding.token_ids = input.token_ids;
         embedding.token_ids_device = input.token_ids_device;
         embedding.output = buffers_.current_hidden;
@@ -260,6 +285,7 @@ public:
         if (!input.kv_cache || !input.terminal_hidden ||
             input.batch_size <= 0 || input.seq_len <= 0)
             return graph;
+        prepareForwardGraphTemplate(input.device);
 
         KVCacheAppendStage::Params append;
         append.device_id = input.device;
@@ -277,7 +303,7 @@ public:
         {
             EmbeddingStage::Params prediction;
             prediction.device_id = input.device;
-            prediction.embed_table = &table;
+            prediction.embed_table = table_template_.recipe();
             prediction.token_ids = input.draft_token_ids;
             prediction.token_ids_device = input.draft_token_ids_device;
             prediction.output = output.logits;
@@ -314,8 +340,10 @@ public:
     }
     FP32Tensor table; ///< Outlives the runner's retained embedding graph.
     int builds = 0; ///< Setup-only evidence of cache reuse, not inference authority.
-    bool owns_embedding; ///< Only the pipeline entry embeds the tail's token.
-    bool owns_head; ///< Only the tail produces vocabulary logits for sampling.
+    const bool owns_embedding; ///< Only the pipeline entry embeds the tail's token.
+    const bool owns_head; ///< Only the tail produces vocabulary logits for sampling.
+private:
+    PreparedGraphTemplate<FP32Tensor *> table_template_; ///< Borrows this builder's original table.
 };
 
 /**

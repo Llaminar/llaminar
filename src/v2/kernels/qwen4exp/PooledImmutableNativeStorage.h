@@ -13,6 +13,7 @@
 #include "loaders/ImmutableLookupNativeOwnership.h"
 #include "tensors/TensorClasses.h"
 #include <memory>
+namespace llaminar2 {class NativeOrderingEventGroup;namespace test {struct PooledImmutableFactoryReplayAccess;}}
 namespace llaminar2::qwen4exp
 {
 namespace detail {class PooledNativeRootStorage;}
@@ -55,6 +56,18 @@ public:
     PooledImmutableOwnerPreparedStorage(const PooledImmutableOwnerPreparedStorage&)=delete;
     PooledImmutableOwnerPreparedStorage& operator=(const PooledImmutableOwnerPreparedStorage&)=delete;
 private:
+    friend struct ::llaminar2::test::PooledImmutableFactoryReplayAccess;
+    /**
+     * @brief Shared factory body; only the closed fixture friend may supply an exact recorded group.
+     * @param plan Original checked native root geometry and closed initialization program.
+     * @param memory Same final admitted authority that owns every root and group.
+     * @param stream Exact non-default setup producer, unchanged through initialization.
+     * @param group Closed original claim, or empty only for the public installed-selector path.
+     * @return Original storage wrapper retaining the common root owner.
+     * @throws std::exception Before creators for foreign claims, or on actual allocation failure.
+     */
+    static std::shared_ptr<PooledImmutableOwnerPreparedStorage> createImpl(PooledImmutableOwnerNativePlan plan,
+        std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,std::unique_ptr<NativeOrderingEventGroup> group);
     friend class IPooledImmutableNativeKernels;
     /** @brief Construct only around the one exact materialized claim owner. */
     PooledImmutableOwnerPreparedStorage(PooledImmutableOwnerNativePlan plan,std::shared_ptr<detail::PooledNativeRootStorage> roots)
@@ -93,6 +106,18 @@ public:
     PooledImmutableCoordinatorPreparedStorage(const PooledImmutableCoordinatorPreparedStorage&)=delete;
     PooledImmutableCoordinatorPreparedStorage& operator=(const PooledImmutableCoordinatorPreparedStorage&)=delete;
 private:
+    friend struct ::llaminar2::test::PooledImmutableFactoryReplayAccess;
+    /**
+     * @brief Shared factory body; only the closed fixture friend may supply an exact recorded group.
+     * @param plan Original checked native root geometry and closed initialization program.
+     * @param memory Same final admitted authority that owns every root and group.
+     * @param stream Exact non-default setup producer, unchanged through initialization.
+     * @param group Closed original claim, or empty only for the public installed-selector path.
+     * @return Original storage wrapper retaining the common root owner.
+     * @throws std::exception Before creators for foreign claims, or on actual allocation failure.
+     */
+    static std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> createImpl(PooledImmutableCoordinatorNativePlan plan,
+        std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,std::unique_ptr<NativeOrderingEventGroup> group);
     friend class IPooledImmutableNativeKernels;
     /** @brief Only create() binds the exact canonical materialized claim owner. */
     PooledImmutableCoordinatorPreparedStorage(PooledImmutableCoordinatorNativePlan plan,std::shared_ptr<detail::PooledNativeRootStorage> roots)

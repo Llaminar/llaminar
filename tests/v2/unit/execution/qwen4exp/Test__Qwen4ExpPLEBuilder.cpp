@@ -35,7 +35,8 @@ using Weight=Qwen4ExpImmutableWeightBinding;
 /** @brief Every admitted mode enters one unambiguous append API, without per-call compatibility casts. */
 using PLEAppend=std::string (*)(ComputeGraph &,const Qwen4ExpPLEContext &,
     const Qwen4ExpPLEWeights &,const Qwen4ExpPLEBuffers &,
-    Qwen4ExpPLEBuilder::LookupStorage,const std::vector<std::string> &);
+    Qwen4ExpPLEBuilder::LookupStorage,const std::vector<std::string> &,
+    Qwen4ExpEarlyLookupFrame*,Qwen4ExpResidentReadAheadFrame*);
 static_assert(std::is_same_v<decltype(&Qwen4ExpPLEBuilder::append),PLEAppend>);
 static_assert(std::is_convertible_v<ImmutableLookupStage::CPUStorage,Qwen4ExpPLEBuilder::LookupStorage>);
 static_assert(std::is_convertible_v<ImmutableLookupStage::GPUStorage,Qwen4ExpPLEBuilder::LookupStorage>);

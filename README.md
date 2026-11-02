@@ -269,12 +269,27 @@ adaptive residency, cross-rank cache sharding and adaptive no-SSD are not
 implemented by this host mode.
 
 `--ngram-storage gpu-adaptive-vram-ram-ssd` is the explicit experimental
-single-GPU native cache over a local subordinate CPU RAM/SSD source. Its initial
-scope is one full-main CUDA or ROCm continuation, request batch1, with local CPU
-source ownership; TP, PP, hybrid continuation, sharding and no-SSD reject. Auto
-and host-adaptive storage do not select it. Native component and full-model
-qualification of this new mode remain pending; declaration is not an economy
-or numerical certificate.
+GPU-coordinated native cache over a local subordinate CPU RAM/SSD source. Its
+admission scope includes one full-main CUDA or ROCm continuation and homogeneous
+ConsumerLocal TP2, request batch1. TP2 retains one CPU provider, RAM cache and I/O
+worker, with disjoint request frames and a local GPU cache for each participant.
+PP, shared-owner TP, mixed-vendor compute and no-SSD remain unsupported. Auto
+and host-adaptive storage do not select it. The new TP2 path still requires native
+admission, execution, numerical and performance qualification; its declaration
+alone does not establish any of those results.
+
+`--ngram-gpu-cache-placement consumer-local` explicitly retains that original
+policy. A declared storage cohort uses, for example,
+`--ngram-gpu-cache-placement '0:cuda:0/64/1048576,0:rocm:0/64/1048576@0:cuda:0'`:
+ordered `rank:backend:ordinal/maximum_rows/byte_ceiling` owners precede the exact
+`@rank:backend:ordinal` coordinator. YAML uses `ngram.gpu_cache_placement` with
+the same grammar. This arm uses per-owner ceilings and requires both consumer-local
+GPU ceilings to remain zero. Storage owners do not become compute or expert domains. The
+coordinator must be the original sole PLE consumer and have an explicit owner
+entry, including at C0. Cross-rank and same-vendor remote materialization reject.
+Opposite-vendor declarations still require the original admitted directed
+transport and complete retained remote transaction implementation; declaration,
+source-owner initialization and checked geometry alone do not qualify inference.
 
 Use `--ngram-gpu-cache-max-rows` / `--ngram-gpu-cache-bytes` for GPU payload plus
 metadata, and `--ngram-source-cache-max-rows` / `--ngram-source-cache-bytes` for

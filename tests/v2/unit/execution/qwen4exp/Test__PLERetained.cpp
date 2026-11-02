@@ -7,6 +7,7 @@
  * atomic publication rather than merely checking a happy-path convolution tail.
  */
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLERetainedStage.h"
+#include "execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/mtp/MTPSpecStatePublisher.h"
 #include "tensors/Tensors.h"
@@ -135,4 +136,31 @@ TEST(PLERetained, ColdWriteOnlyRootsUseOrdinaryPreparation) {
   EXPECT_EQ(c.writesRequiringPrepare().size(),c.outputs.size());
   for(const auto&inout:c.inouts)EXPECT_FALSE(inout.prepare_write_storage)<<bufferIdName(inout.id);
  }
+}
+
+/** @test The actual outer publication declares the original retained tensor read frontier. */
+TEST(PLERetained, OuterPublicationExposesExactRetainedInputFrontier) {
+ Fixture f;
+ auto p=f.params(0,Stage::Operation::RetainCandidates);
+ p.priorTokens.buffer=BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY;
+ p.priorConvolution.buffer=BufferId::QFN_PLE_PRIOR_CONV_HISTORY;
+ Stage retained(p);
+ MTPSpeculativeStatePublicationStage::Params publication;
+ publication.device_id=DeviceId::cpu();
+ publication.authority=MTPSpeculativeStatePublicationStage::Authority::PipelineFollower;
+ // Repeated hook references cannot create duplicate read authorities.
+ publication.verifier_state_stages={&retained,&retained};
+ MTPSpeculativeStatePublicationStage outer(std::move(publication));
+ const auto contract=outer.bufferContract();
+ const std::array expected{BufferId::QFN_PLE_TRANSACTION_LIVE,BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY,
+  BufferId::QFN_PLE_PRIOR_CONV_HISTORY,BufferId::QFN_PLE_RETAINED_TOKENS,BufferId::QFN_PLE_RETAINED_NORMALIZED};
+ ASSERT_EQ(contract.inputs.size(),expected.size());
+ GraphArenaDependencyTracker frontier;
+ const auto external=frontier.observeStage(contract);
+ ASSERT_EQ(external.size(),expected.size());
+ for(auto id:expected){
+  EXPECT_EQ(std::count_if(contract.inputs.begin(),contract.inputs.end(),[&](const auto&b){return b.id==id;}),1);
+  EXPECT_NE(std::find_if(external.begin(),external.end(),[&](const auto&b){return b.id==id;}),external.end());
+ }
+ EXPECT_EQ(contract.outputs.size(),2u);
 }

@@ -6,6 +6,9 @@
  * retire initialization/admission before these boundaries release. Production
  * submission-retirement events must preserve original physical/source owners.
  */
+#include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "backends/NativeOrderingEventBudgetProjection.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "kernels/qwen4exp/ImmutableLookupDecode.h"
@@ -97,7 +100,8 @@ void abandonOrdinaryAdmission(DeviceId device)
                     Source source(iq4Source(97, 160), 97, 160, GGUFTensorType::IQ4_NL);
                     const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode, 4096, 2);
                     const auto layout = ImmutableLookupLayout::create(16, 90);
-                    PhysicalMemoryPlanBuilder plan;
+                    auto io=llaminar2::test::RetainedHostServiceFixture::original(RetainedHostServiceRole::ImmutableLookupIO,{0,device});
+                    PhysicalMemoryPlanBuilder plan;const auto workerBOM=io.bom(resource(DeviceId::cpu()));for(const auto& row:workerBOM.resources())plan.add(row);
                     plan.add(resource(DeviceId::cpu()), PhysicalMemoryOwner::ImmutableTableStorage,
                              ImmutableRowTable::physicalBytes(source.descriptor(), policy));
                     plan.add(resource(DeviceId::cpu()), PhysicalMemoryOwner::ImmutableLookupStaging,
@@ -118,7 +122,7 @@ void abandonOrdinaryAdmission(DeviceId device)
                         source.descriptor(), policy, DeviceId::cpu(), memory,
                         ImmutableRowTableHostPlacement::taskPolicy()));
                     auto boundary = q::ImmutableLookupExecutionBoundary::create(table, device,
-                                                                                       protocol, 1, memory);
+                                                                                       protocol, 1, memory,io.take(memory));
                     // Null/default admission fails before any producer changes.
                     EXPECT_THROW(boundary->beginAdmission(1, nullptr), std::logic_error);
                     EXPECT_FALSE(boundary->hasActiveInterval());
@@ -142,11 +146,21 @@ void abandonPooledPreparation(DeviceId device)
     auto* backend=getBackendFor(device);
     require(backend && backend->deviceCount()>device.ordinal,"Explicit pooled preparation GPU unavailable");
     if(!hasCPUBackend())initCPUBackend(-1);
-    auto& worker=GPUDeviceContextPool::instance().getContext(device);
-    worker.submitAndWait([&]{
-        for(const auto slots:{0u,4u})for(const bool admit:{false,true})for(int iteration=0;iteration<20;++iteration){
-            std::shared_ptr<PhysicalMemoryAuthority> memory;
-            {
+    auto session=PreparedNativeLookupFixture::prepare(std::array{device});
+    auto& worker=*session->permit(device).worker();
+    RetainedHostServiceDeclarations::Builder serviceBuilder(0);
+    std::vector<RetainedHostServiceInstance> instances;
+    for(const auto slots:{0u,4u})for(const bool admit:{false,true})for(int iteration=0;iteration<20;++iteration){
+        const RetainedHostServiceInstance key{0,device,RetainedHostServiceRole::ImmutableLookupIO,instances.size()};
+        serviceBuilder.addOriginal(key);instances.push_back(key);
+    }
+    const auto serviceDeclarations=std::move(serviceBuilder).freeze();
+    std::unique_ptr<RetainedHostServiceBinding> serviceBinding;
+    // The declaration and materialization passes share exact case geometry and
+    // one original authority. Opaque per-case event/worker obligations are additive.
+    const auto runCase=[&](std::uint32_t slots,bool admit,RetainedHostServiceInstance instance,bool declarationOnly){
+            PhysicalMemoryPlan result;
+            worker.submitAndWait([&]{
                 Source file(iq4Source(97,160),97,160,GGUFTensorType::IQ4_NL);
                 const auto source=file.descriptor();
                 const PhysicalMemoryAllocatorIdentity gpuId{0,device},hostId{0,DeviceId::cpu()};
@@ -160,21 +174,33 @@ void abandonPooledPreparation(DeviceId device)
                 const auto physical=PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,std::array{gpuId},gpuId);
                 const auto policy=PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},64);
                 const auto hostGeometry=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,gpuId);
-                const PhysicalMemoryResource gpu{0,device,1ull<<34,1ull<<34},host{0,DeviceId::cpu(),1ull<<34,1ull<<34};
+                const auto& gpu=session->resource(device);const auto& host=session->resource(DeviceId::cpu());
                 const auto channel=ImmutableLookupLayout::createSubordinate(16,source.rowBytes());
                 PhysicalMemoryPlanBuilder plan;
                 for(const auto& bom:{hostGeometry.bom(host),physical.cacheBOM(0,gpu),physical.mandatoryBOM(0,gpu),
                     policy.policyBOM(gpu),policy.mandatoryBOM(gpu),
                     PooledImmutableOwnerNativePlan::mandatoryBOM(physical,policy,0,gpu),
                     PooledImmutableCoordinatorNativePlan::mandatoryBOM(physical,policy,gpu),
-                    PooledImmutableSourceGeometry::mandatoryBOM(physical,policy,0,source,gpu)})
+                    PooledImmutableSourceGeometry::mandatoryBOM(physical,policy,source,gpu)})
                     for(const auto& resource:bom.resources())plan.add(resource);
+                const auto workerBOM=serviceDeclarations->bom(instance,host);for(const auto& row:workerBOM.resources())plan.add(row);
                 plan.add(host,PhysicalMemoryOwner::ImmutableLookupStaging,ImmutableLookupService::hostBytes(channel));
-                memory=std::make_shared<PhysicalMemoryAuthority>(
-                    std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+                for(const auto program:{PooledImmutableOwnerNativePlan::orderingProgram(physical,policy,0),
+                    PooledImmutableCoordinatorNativePlan::orderingProgram(physical,policy),
+                    PooledImmutableSourceGeometry::orderingProgram(physical,policy,source),NativeOrderingEventProgram::lookupSubmissionRetirement()}){
+                    const auto ordering=NativeOrderingEventBudgetProjection::installed().bom(program,host,gpu);
+                    for(const auto& row:ordering.resources())plan.add(row);
+                }
+                result=plan.build();
+                if(declarationOnly)return;
+                const auto& memory=session->memory();
                 auto provider=HostImmutableRowProvider::fromSubordinateAdaptiveCache(
                     CpuAdaptiveImmutableRowCache::create(source,hostGeometry,memory));
-                auto service=ImmutableLookupService::create(provider,channel,std::array{device},memory,DeviceId::cpu());
+                auto io=serviceBinding->take(instance);
+                // The original instance cannot be minted twice through another
+                // temporal case while this service owns its admitted token.
+                EXPECT_THROW(serviceBinding->take(instance),std::logic_error);
+                auto service=ImmutableLookupService::create(provider,channel,std::array{device},memory,DeviceId::cpu(),std::move(io));
                 const auto binding=service->bindSubordinate(device);
                 const auto ownerPlan=PooledImmutableOwnerNativePlan::fromGeometry(physical,policy,0,
                     binding.deviceView().base.table,binding.storageGeneration());
@@ -199,13 +225,25 @@ void abandonPooledPreparation(DeviceId device)
                 // The original boundary alone retires the final producer. No
                 // graph/controller/helper object can hide an eager teardown.
                 boundary.reset();owner.reset();coordinator.reset();
-            }
-            for(const auto participant:{device,DeviceId::cpu()})
-                for(unsigned index=0;index<static_cast<unsigned>(PhysicalMemoryOwner::Count);++index)
-                    EXPECT_EQ(memory->claimedBytes(participant,static_cast<PhysicalMemoryOwner>(index),
-                        PhysicalMemoryMaterializationKind::NewAllocation),0u);
-        }
-    });
+            });
+            return result;
+    };
+    PhysicalMemoryPlanBuilder complete;
+    std::size_t index=0;
+    for(const auto slots:{0u,4u})for(const bool admit:{false,true})for(int iteration=0;iteration<20;++iteration){
+        const auto declaration=runCase(slots,admit,instances.at(index++),true);
+        for(const auto& row:declaration.resources())complete.add(row);
+    }
+    session->admit(complete.build());
+    serviceBinding=serviceDeclarations->bind(session->memory(),instances);
+    index=0;
+    for(const auto slots:{0u,4u})for(const bool admit:{false,true})for(int iteration=0;iteration<20;++iteration){
+        runCase(slots,admit,instances.at(index++),false);
+        session->requirePayloadRetired();
+    }
+    EXPECT_EQ(index,80u);
+    serviceBinding.reset();
+    session->retire();session->requireExactRetired();
 }
 } // namespace
 #ifdef HAVE_CUDA

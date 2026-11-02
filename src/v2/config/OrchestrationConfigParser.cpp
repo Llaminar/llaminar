@@ -649,6 +649,8 @@ namespace llaminar2
                 config.ngram_table_policy.host_adaptive.policy.protected_numerator = parseNonNegativeUint32Value(value, "ngram.protected_numerator");
             else if (key == "protected_denominator")
                 config.ngram_table_policy.host_adaptive.policy.protected_denominator = parseNonNegativeUint32Value(value, "ngram.protected_denominator");
+            else if (key == "gpu_cache_placement")
+                config.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(value);
             else if (key == "gpu_cache_max_rows")
                 config.ngram_table_policy.gpu_adaptive.maximum_gpu_cache_rows = parseNonNegativeSizeTValue(value, "ngram.gpu_cache_max_rows");
             else if (key == "gpu_cache_bytes")
@@ -2514,7 +2516,7 @@ namespace llaminar2
             .long_name = "--ngram-storage",
             .category = "Ngram Storage",
             .value_label = "<auto|vram|ram|mmap|host-adaptive-ram-ssd|gpu-adaptive-vram-ram-ssd>",
-            .description = "Ngram storage: auto (unchanged VRAM/RAM/mmap order), explicit whole-tier vram/ram/mmap, host-adaptive-ram-ssd (CPU-owned cache), or gpu-adaptive-vram-ram-ssd (one full-main GPU/R1 with local subordinate RAM/SSD, no TP/PP/sharding/no-SSD); both adaptive modes retain mandatory SSD/request scratch and explicit optional ceilings; no runtime fallback",
+            .description = "Ngram storage: auto (unchanged VRAM/RAM/mmap order), explicit whole-tier vram/ram/mmap, host-adaptive-ram-ssd (CPU-owned cache), or gpu-adaptive-vram-ram-ssd (full-main GPU/R1 or homogeneous ConsumerLocal TP2 with shared local subordinate RAM/SSD; no PP/shared-owner TP/no-SSD); both adaptive modes retain mandatory SSD/request scratch and explicit optional ceilings; no runtime fallback",
             .valid_values = {"auto", "vram", "ram", "mmap", "host-adaptive-ram-ssd", "gpu-adaptive-vram-ram-ssd"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &value)
@@ -2582,6 +2584,14 @@ namespace llaminar2
 
         // Disjoint fields are independent of option order. Existing host-only
         // --ngram-cache-* never writes the subordinate GPU source arm.
+        spec.add({
+            .long_name = "--ngram-gpu-cache-placement",
+            .category = "Ngram Storage", .value_label = "<owners@coordinator>",
+            .description = "Storage-only placement: consumer-local or rank:cuda|rocm:ordinal/rows/bytes,...@rank:cuda|rocm:ordinal",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(value); }),
+        });
         spec.add({
             .long_name = "--ngram-gpu-cache-max-rows",
             .category = "Ngram Storage", .value_label = "<count>",

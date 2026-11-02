@@ -137,25 +137,37 @@ namespace llaminar2
 
         const GraphConfig &config() const override { return config_; }
 
+        /** @copydoc IGraphBuilder::prepareForwardGraphTemplate */
+        void prepareForwardGraphTemplate(DeviceId device) override;
+        /** @copydoc IGraphBuilder::forwardGraphTemplateStats */
+        [[nodiscard]] PreparedGraphTemplateStats forwardGraphTemplateStats() const override;
+
+
         void setPipelineConfig(std::shared_ptr<PipelineConfig> pipeline_config) override
         {
+            requireUnpreparedForwardSource("setPipelineConfig");
             config_.pipeline_config = std::move(pipeline_config);
         }
 
         void setPPContext(int from_stage, int to_stage, ILocalPPContext *pp_ctx) override
         {
+            requireUnpreparedForwardSource("setPPContext");
             config_.pp_contexts[{from_stage, to_stage}] = pp_ctx;
         }
 
         void setTPContext(const std::string &domain_name, ITPContext *tp_ctx) override
         {
+            requireUnpreparedForwardSource("setTPContext");
             config_.domain_tp_contexts[domain_name] = tp_ctx;
         }
 
-        void setWeights(const ModelWeights &weights) override { weights_ = weights; }
-        void setWeightBindings(const ModelWeightBindings &bindings) override { weight_bindings_ = bindings; }
+        void setWeights(const ModelWeights &weights) override
+        { requireUnpreparedForwardSource("setWeights"); weights_ = weights; }
+        void setWeightBindings(const ModelWeightBindings &bindings) override
+        { requireUnpreparedForwardSource("setWeightBindings"); weight_bindings_ = bindings; }
         void setDecodeReplicatedDenseWeightBindings(const ModelWeightBindings &bindings) override
         {
+            requireUnpreparedForwardSource("setDecodeReplicatedDenseWeightBindings");
             decode_replicated_dense_weight_bindings_ = bindings;
         }
         void setBuffers(const ModelBuffers &buffers) override { buffers_ = buffers; }
@@ -170,6 +182,8 @@ namespace llaminar2
 
         void setPreparedWeightStore(PreparedWeightStore *store) override
         {
+            if (prepared_weight_store_ != store)
+                requireUnpreparedForwardSource("setPreparedWeightStore");
             prepared_weight_store_ = store;
         }
 
@@ -357,16 +371,53 @@ namespace llaminar2
 
     protected:
         /**
+         * @brief Immutable views of the original already-prepared layer sources.
+         * @details The enclosing nonmovable builder owns these objects. Existing
+         * frozen WeightBindings retain their tensor/prepared roots; this recipe
+         * adds no copied layer table or physical payload. Family-specific dense
+         * selection and arena pointers remain in the specialization scopes.
+         */
+        struct ForwardGraphRecipe
+        {
+            DeviceId device;
+            const ModelWeightBindings *primary;
+            const ModelWeightBindings *replicated_dense;
+            const ModelWeights *legacy;
+        };
+        /** @brief Close actual source setters while permitting request/buffer scopes. */
+        void requireUnpreparedForwardSource(const char *operation) const;
+        /** @brief Borrow the original source views for a typed layer specialization. */
+        [[nodiscard]] const ForwardGraphRecipe *preparedForwardRecipe() const noexcept;
+        /** @brief Emit one actual construction-attempt observation. */
+        void beginForwardGraphSpecialization(DeviceId device);
+        PreparedGraphTemplate<ForwardGraphRecipe> forward_graph_template_;
+
+        /** @brief Exact construction shape; early source publication requires an authenticated local root. */
+        enum class ModelInvocationShape { FullLocal, Partial, UnifiedPipeline };
+        /** @brief Stack-owned graph construction handoff; never retained as live model/request state. */
+        class ModelInvocationPrefix {
+        public:
+            virtual ~ModelInvocationPrefix()=default;
+            /** @return Explicit prefix terminal, or empty when this model has none. */
+            virtual std::string terminal() const { return {}; }
+            /** @brief Reject a completed graph that left an issued frame unconsumed. */
+            virtual void requireConsumed() const {}
+        };
+        /** @brief Construct original invocation producers before trunk roots; unsupported requested roles reject here. */
+        virtual std::unique_ptr<ModelInvocationPrefix> addModelInvocationPrefix(ComputeGraph&,const ForwardInput&,
+            DeviceId,ModelInvocationShape);
+        /**
          * @brief Declare a model-specific layer input operation before attention/FFN.
          * @param graph Complete participant-local forward graph being assembled.
          * @param input Exact invocation token, row, position and cache authorities.
          * @param layer Global decoder layer whose input is being prepared.
          * @param device Exact compute participant.
          * @param dependency Previous layer/embedding producer; empty for a PP ingress.
+         * @param prefix Lexically owned original invocation handoff; never retained by the model.
          * @return Terminal input producer, or the unchanged dependency without an extension.
          */
         virtual std::string addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
-            int layer,DeviceId device,const std::string &dependency);
+            int layer,DeviceId device,const std::string &dependency,ModelInvocationPrefix &prefix);
 
         /**
          * @brief Retain immutable input bindings only during declarative graph construction.
@@ -525,6 +576,22 @@ namespace llaminar2
             const ForwardInput &input,
             const std::string &dependency_node,
             DeviceId device);
+        /**
+         * @brief Append the canonical raw-logit row to its original main graph.
+         * @param graph Original participant-local forward graph.
+         * @param input Immutable canonical output binding.
+         * @param dependency_node Original LM-head/outcome terminal.
+         * @param device Original graph participant.
+         * @param column_parallel Actual LM-head ownership mode.
+         * @param all_positions Whether the producer wrote a multirow bank.
+         * @return Ordered canonical-publication node, or the unchanged terminal.
+         */
+        std::string maybeAddMTPMainTerminalLogitsPublication(
+            ComputeGraph &graph, const ForwardInput &input,
+            const std::string &dependency_node, DeviceId device,
+            bool column_parallel, bool all_positions);
+        /** @return Arena-owned scalar destination for the actual LM-head surface. */
+        TensorBase *canonicalMainLogitsDestination(const ForwardInput &input, bool column_parallel) const;
         bool needsTPAllreduce() const;
         bool denseTPAllreduceEnabledForCurrentGraph() const;
         bool hasActiveExpertMask(const std::vector<bool> &expert_mask) const;

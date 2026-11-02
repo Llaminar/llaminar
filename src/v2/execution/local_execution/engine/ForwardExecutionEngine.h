@@ -908,6 +908,7 @@ namespace llaminar2
             size_t stage_count = 0;
             size_t captured_node_count = 0;
             std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary; ///< Retained immutable I/O declaration, independent of ticket scheduling.
+            std::shared_ptr<ReadAheadNativeResourceFamily> read_ahead_resources; ///< Original event/lane owner retained through native parent completion.
 
             explicit operator bool() const noexcept
             {
@@ -939,6 +940,7 @@ namespace llaminar2
             uint64_t workspace_generation = 0; ///< Existing arena/workspace preparation generation.
             uint64_t capture_variant_signature = 0; ///< Complete immutable stage launch-policy identity.
             uint64_t capture_generation = 0; ///< Existing cache lifetime materialization generation.
+            std::shared_ptr<ReadAheadNativeResourceFamily> read_ahead_resources; ///< Original side-lane family retained across complete hosted/ticket request lifetime.
             /** @return Exact immutable owner/geometry match; no count or tensor data is observed. */
             bool operator==(const RetainedDecodeGraphView &) const = default;
 

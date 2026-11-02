@@ -6,6 +6,8 @@
  * four explicit host-table requests each. An additive CUDA/CPU 15/33-layer family
  * retains the same full15 MTP dimension. Twelve rejection cases retain unsupported internally sharded
  * expert requests across GPU-plus-CPU tiers, pairing RAM with fixed-head VRAM.
+ * ConsumerLocal TP2 adds the existing C0/C64 axes with StaticOrdinal expert
+ * policy and all four original MTP setup modes; actual grouped runtime must materialize.
  * These are plain source-admission fixture inputs, never numerical campaign
  * registrations or claims that absent hardware or an unadmitted BOM is supported.
  * Reference metadata remains immutable provenance; the plain fixture does not
@@ -14,6 +16,7 @@
 #pragma once
 
 #include "Qwen4ExpFixedHeadParityCases.h"
+#include "Qwen4ExpGPUAdaptiveParityCases.h"
 #include "Qwen4ExpMTPAdmissionCases.h"
 #include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
 #include "backends/HardwareInventory.h"
@@ -89,6 +92,56 @@ inline std::vector<ModelParityCase> qwen4ExpExpandSourceAdmissionMTP(
         }
     }
     return result;
+}
+
+/**
+ * @return Four ConsumerLocal TP2 C0/C64 StaticOrdinal seeds over the existing original source/topology builder.
+ * @note Policy expansion below supplies Off/Fixed1/Fixed3/Dynamic setup gates.
+ * These declarations prove no execution, movement, accuracy or performance until their actual gates run.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpConsumerLocalTP2AdaptiveSourceAdmissionSeeds()
+{
+    static const auto cases = [] {
+        std::vector<ModelParityCase> result;
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm}) {
+            auto definition = qwen4ExpConsumerLocalTP2AdaptiveDefinition(backend);
+            for (auto cell : expandModelParityDefinition(definition)) {
+                if (cell.mtp != ModelParityMTP::Off || cell.retained_mtp_draft_capacity != 0)
+                    throw std::logic_error("ConsumerLocal TP2 source seeds changed their original inactive policy");
+                if (cell.expert_overlay == std::optional{ModelParityExpertOverlayPolicy{}})
+                    result.push_back(std::move(cell));
+            }
+        }
+        if (result.size() != 4) throw std::logic_error("ConsumerLocal TP2 lost its two-backend C0/C64 source product");
+        return result;
+    }();
+    return cases;
+}
+
+/**
+ * @return Source-only GPU-adaptive seeds retaining all existing expert policies.
+ * @note The numerical GPU-adaptive family intentionally remains its original
+ * four StaticOrdinal cells. Source setup must also retain DynamicOrdinal,
+ * StaticRandom and DynamicRandom requests before qualification. These seeds
+ * reuse the existing typed definition/expander and original one-GPU/CPU-source
+ * topology; no new compute/storage owner or numerical support is advertised.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpGPUAdaptiveSourceAdmissionSeeds()
+{
+    static const auto cases=[] {
+        std::vector<ModelParityCase> result;
+        for(const auto topology:{Qwen4ExpParityTopology::CUDACPU,Qwen4ExpParityTopology::ROCmCPU}){
+            auto expanded=expandModelParityDefinition(qwen4ExpGPUAdaptiveParityDefinition(topology));
+            for(auto& cell:expanded){
+                if(cell.mtp!=ModelParityMTP::Off || cell.retained_mtp_draft_capacity!=0)
+                    throw std::logic_error("GPU-adaptive source seeds require the original inactive MTP definition");
+                result.push_back(std::move(cell));
+            }
+        }
+        if(result.size()!=16)throw std::logic_error("GPU-adaptive source seeds lost their two-backend/tier/expert-policy product");
+        return result;
+    }();
+    return cases;
 }
 
 /**

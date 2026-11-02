@@ -35,7 +35,8 @@ namespace llaminar2
     }
 
     AutomaticPlanningStartupResult AutomaticPlanningStartup::run(const OrchestrationConfig &request,
-        const ClusterInventory &inventory, const std::shared_ptr<IMPIContext> &mpi, const Prepare &prepare)
+        const ClusterInventory &inventory, const std::shared_ptr<IMPIContext> &mpi, const Prepare &prepare,
+        const PrepareHostServices &prepare_host_services)
     {
         OrchestrationConfig shared;
         std::optional<OrchestrationPlanningWorkload> workload;
@@ -45,7 +46,8 @@ namespace llaminar2
             const auto document = serializeOrchestrationConfig(resolved);
             return std::vector<uint8_t>(document.begin(), document.end());
         }, [&](std::span<const uint8_t> bytes) {
-            if (!prepare) throw std::invalid_argument("Automatic startup requires an evidence preparation policy");
+            if (!prepare || !prepare_host_services)
+                throw std::invalid_argument("Automatic startup requires complete cost and CPU service evidence policies");
             const int count = mpi ? mpi->world_size() : 1;
             if (inventory.world_size != count || inventory.ranks.size() != static_cast<size_t>(count))
                 throw std::invalid_argument("Automatic inventory does not cover the discovery communicator");
@@ -90,10 +92,32 @@ namespace llaminar2
                 throw std::invalid_argument("Automatic cost evidence must produce one nonempty root-only evaluator");
         });
 
+        // Every original process reports its own class before membership narrows.
+        // As with cost preparation, the collector owns its internal collective
+        // failure edges; the final vote covers only local result construction.
+        PlanningHostServiceBudgets host_services;
+        std::exception_ptr service_error;
+        try { host_services = prepare_host_services(context); }
+        catch (...) { service_error = std::current_exception(); }
+        acceptPlanningCostPreparation(mpi, [&] {
+            if (service_error) std::rethrow_exception(service_error);
+            if (context.isRoot()) {
+                if (host_services.size() != inventory.ranks.size())
+                    throw std::invalid_argument("Automatic CPU service evidence omitted an original discovery rank");
+                for (int rank = 0; rank < inventory.world_size; ++rank)
+                    if (!host_services.contains(rank))
+                        throw std::invalid_argument("Automatic CPU service evidence changed discovery membership");
+            } else if (!host_services.empty()) {
+                throw std::invalid_argument("Automatic CPU service evidence published root-only metadata on a follower");
+            }
+        });
+
         std::optional<SelectedAutomaticOrchestration> selected;
         auto applied = exchangeSelectedOrchestration(mpi, [&] {
+            auto memory = OrchestrationCandidateMemoryPolicy::fromStartup();
+            memory.retained_host_services = std::move(host_services);
             selected.emplace(AutomaticOrchestrationPlanner::select(shared, *source, inventory,
-                OrchestrationCandidateMemoryPolicy::fromStartup(), *workload, *evaluate));
+                memory, *workload, *evaluate));
             return selected->candidate().config();
         });
         return {std::move(applied), std::move(selected)};

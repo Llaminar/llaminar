@@ -389,6 +389,9 @@ namespace llaminar2
             return resident_memory_bytes_;
         }
         size_t nodeCount() const override;
+        /** @copydoc IGPUGraphCapture::inspectFlatGraphStructure */
+        bool inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,std::span<std::byte> scratch,
+            GPUFlatGraphStructure& observed,std::string* error=nullptr)const override;
         bool inspectKernelNodes(
             std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
             std::string *error = nullptr) const override;

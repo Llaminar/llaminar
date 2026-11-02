@@ -16,6 +16,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "kernels/RowSelectPolicy.h"
 #include "../StageParamsBase.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
@@ -136,6 +137,7 @@ namespace llaminar2
             int request_count = 0; ///< Fixed request count represented by this graph.
             std::optional<BufferId> terminal_hidden_archive_buffer_id; ///< Arena identity of terminal_hidden_archive.
             ///@}
+            RowsSelectPolicy row_copy_policy{}; ///< Exact native strides and absent-row publication semantics.
         };
 
         explicit HiddenStateRowsSelectStage(Params params);
@@ -144,7 +146,16 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         /** @return Immutable model-origin policy contribution to existing capture invalidation. */
         uint64_t graphCaptureVariantSignature() const override
-        { return 0x4d54504f52494701ULL ^ static_cast<uint64_t>(params_.shifted_cache_origin); }
+        {
+            uint64_t identity = 0x4d54504f52494702ULL;
+            const auto mix = [&](uint64_t value) { identity = (identity ^ value) * UINT64_C(1099511628211); };
+            mix(static_cast<uint64_t>(params_.shifted_cache_origin));
+            mix(static_cast<uint64_t>(params_.row_copy_policy.negative_rows));
+            mix(static_cast<uint64_t>(params_.row_copy_policy.source_stride));
+            mix(static_cast<uint64_t>(params_.row_copy_policy.destination_stride));
+            mix(static_cast<uint64_t>(params_.row_copy_policy.fixed_first_row));
+            return identity;
+        }
         ComputeStageType type() const override { return ComputeStageType::ROW_SELECT; }
         size_t estimatedFlops() const override { return 0; }
         size_t estimatedMemoryBytes() const override;

@@ -16,13 +16,12 @@
 
 namespace llaminar2
 {
-    RetainedParentTicketServiceWorker::RetainedParentTicketServiceWorker()
+    RetainedParentTicketServiceWorker::RetainedParentTicketServiceWorker(pthread_t) noexcept {}
+
+    void* RetainedParentTicketServiceWorker::invoke(void* state) noexcept
     {
-        // A thread may enter run() before std::thread construction returns.
-        // Starting it in the body guarantees even members declared after
-        // worker_ are initialized. An early member-initializer launch could
-        // observe the previous lifetime's Stopping value in reused storage.
-        worker_ = std::thread(&RetainedParentTicketServiceWorker::run, this);
+        static_cast<RetainedParentTicketServiceWorker*>(state)->run();
+        return nullptr;
     }
 
     RetainedParentTicketServiceWorker::~RetainedParentTicketServiceWorker()
@@ -39,8 +38,9 @@ namespace llaminar2
             state_ = State::Stopping;
         }
         work_ready_.notify_one();
-        if (worker_.joinable())
-            worker_.join();
+        if (running_ && ::pthread_join(worker_,nullptr)!=0)
+            std::terminate();
+        running_=false;
     }
 
     RetainedParentTicketServiceWorker::Ticket

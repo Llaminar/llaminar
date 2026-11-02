@@ -12,6 +12,7 @@
  */
 
 #pragma once
+#include "backends/NativeOrderingEventBudgetProjection.h"
 #include "backends/CPUExecutionGeometry.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
@@ -43,6 +44,15 @@
 
 namespace llaminar2
 {
+class IMPIContext;
+struct MoERoutedExpertPlacementPlan;
+
+    class RetainedHostServiceDeclarations;
+class RetainedHostServiceBudgetProjection;
+struct ClusterInventory;
+
+namespace test {struct MemoryPlannerOrderingReplayAccess;}
+
 
 /** @brief Persistent execution state owned by one planned device. */
 enum class DeviceExecutionMemoryRole
@@ -225,8 +235,19 @@ resolveCapturedServingGraphMemoryInventory(
 }
 
 /// Configuration for a single device in a memory plan.
+class NativeContextPreparation;
+
 struct DevicePlanConfig
 {
+    /** Immutable event-program certificate source; production selects installed rows lazily.
+     * Recorded bounds can only originate from the named closed replay fixture.
+     * This is a BOM input, never a mutable catalog, allocation balance or mode flag.
+     */
+    NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
+
+    /** Original source/PMA-bound immutable mandatory input; never a copied allocation balance. */
+    std::shared_ptr<NativeContextPreparation> native_context_preparation;
+
     /** MPI rank owning this allocator; -1 is valid for unbound pure estimates. */
     int world_rank = -1;
     DeviceId device;
@@ -244,10 +265,13 @@ struct DevicePlanConfig
     /** Requested execution policy on compiled PLE consumers. Absence is valid only for
      * lower-level incremental estimates, never a production final table request. */
     std::optional<ImmutableRowTablePolicy> ngram_execution_policy;
+    ImmutableLookupSchedule ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled; ///< Same source-selected lookup phase policy.
     ImmutableRowTableHostPlacement ngram_host_placement = ImmutableRowTableHostPlacement::taskPolicy(); ///< Compiled before quotas, not inferred from CPU ordinal.
     /** Sealed final tier shared across actual PLE participants. Absent in the
      * higher-priority base, which already includes mandatory lookup execution. */
     std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        /** Rank-local immutable pre-quota declarations only; never a live owner or wire pointer. */
+        std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
     /** Existing live table lease attested by ModelContext against the same PMA.
      * This is an admission observation, never a parallel allocation ledger. */
     std::size_t retained_immutable_table_bytes = 0u;
@@ -642,6 +666,21 @@ struct ImmutableRowTableUploadBinding
 class MemoryPlanner
 {
 public:
+    /** @brief Author immutable rank-local CPU service roles from candidate topology BEFORE any quota sizing.
+     * @param profile Original source geometry. @param configs Actual candidate continuation/expert instances.
+     * @param rank Original local physical rank. @param routed Original authored routed topology, if any.
+     * @param world Original rank namespace required by routed host-boundary classification.
+     * @return One shared immutable declaration set; no thread, mapping or PMA reservation exists yet.
+     */
+    static std::shared_ptr<const RetainedHostServiceDeclarations> declareRetainedHostServices(
+        const ModelMemoryProfile&,std::vector<DevicePlanConfig>&,int rank,
+        const MoERoutedExpertPlacementPlan* routed,const IMPIContext* world);
+
+    /** @brief Price candidate roles using original discovery-rank receipts and canonical physical inventory. */
+    static std::shared_ptr<const RetainedHostServiceDeclarations> declareRetainedHostServices(
+        const ModelMemoryProfile&,std::vector<DevicePlanConfig>&,int rank,
+        const MoERoutedExpertPlacementPlan*,const ClusterInventory&,const RetainedHostServiceBudgetProjection&);
+
     /** @brief Retain the exact declarations from successful admitted device inputs. */
     [[nodiscard]] static std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>>
     cpuSerialExpertStorageAdmissions(std::span<const DevicePlanConfig> configs);
@@ -685,6 +724,7 @@ public:
     /**
      * @brief Project exact mode costs after higher-priority row and expert decisions are frozen.
      * @param profile Original source metadata.
+     * @param requested Original tier policy; explicit VRAM has no hosted-mode contribution.
      * @param device_groups Exact retained continuation instances; expert-only devices own no PLE lane.
      * @param ordinary_upload Original per-consumer canonical loader geometry; a missing GPU binding makes fresh VRAM ineligible.
      * @return Incremental tier-dependent arena/channel/executable/upload BOMs; no table payload yet.
@@ -693,6 +733,7 @@ public:
      */
     static ImmutableRowTableModeContributions immutableRowTableModeContributions(
         const ModelMemoryProfile &profile,
+        const ImmutableRowTablePolicy &requested,
         std::span<const std::vector<DevicePlanConfig>> device_groups,
         std::span<const ImmutableRowTableUploadBinding> ordinary_upload);
     /**
@@ -779,6 +820,13 @@ public:
         const std::vector<int>& candidate_rows
     );
 private:
+    friend class ImmutableRowTableAdmissionParser;
+    friend struct test::MemoryPlannerOrderingReplayAccess;
+    /** @brief Same receiver-owned reconstruction with a sealed local source; no caps come from wire. */
+    static std::shared_ptr<const ImmutableRowTableExecutionProvision> restoreImmutableRowTableExecutionProvisionWithOrderingProjection(
+        const ModelMemoryProfile&,const ImmutableRowTablePolicy&,const ImmutableRowTablePlacementInput&,
+        std::vector<ImmutableRowTableExecutionConsumer>,PhysicalMemoryPlan,PhysicalMemoryPlan,
+        const NativeOrderingEventBudgetProjection&,const std::shared_ptr<const RetainedHostServiceDeclarations>& = {});
     struct SharedOwnerIdentities;
     /**
      * @brief Emit one group's fixed BOM using transaction-owned shared identities.

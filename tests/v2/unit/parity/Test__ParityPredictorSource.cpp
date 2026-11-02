@@ -127,3 +127,20 @@ TEST(ParityPredictorSource, CampaignRequiresDeclaredPredictorAndRemapsBothSource
  EXPECT_THROW(resolveParityPredictorSource(selected),std::runtime_error);
 }
 }
+
+namespace llaminar2::test::parity {
+TEST(ParityPredictorSource, DisabledExecutionRetainsPredictorMaterializationCapacity) {
+ MTPRuntimeConfig policy;
+ policy.enabled=false;
+ policy.graph_capacity_draft_tokens=15;
+ EXPECT_FALSE(policy.enabled);
+ EXPECT_TRUE(retainsMTPGraphCapacity(policy));
+ EXPECT_EQ(parityPredictorMaterialization(policy),SharedPredictorMaterialization::Active);
+ // Dropping retained capacity changes storage selection without enabling execution.
+ policy.graph_capacity_draft_tokens=0;
+ EXPECT_EQ(parityPredictorMaterialization(policy),SharedPredictorMaterialization::Inactive);
+ EXPECT_FALSE(policy.enabled);
+ policy.enabled=true;
+ EXPECT_EQ(parityPredictorMaterialization(policy),SharedPredictorMaterialization::Active);
+}
+}

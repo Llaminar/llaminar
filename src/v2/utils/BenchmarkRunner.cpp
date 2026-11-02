@@ -17,6 +17,7 @@
  */
 
 #include "BenchmarkRunner.h"
+#include "config/OrchestrationConfigDocument.h"
 #include "app/modes/PrefixMovementJson.h"
 #include "Logger.h"
 #include "DebugEnv.h"
@@ -1043,6 +1044,9 @@ namespace llaminar2
 
         if (config)
         {
+            // The original runner-resolved owner is serialized verbatim; this
+            // evidence never reconstructs placement from benchmark arguments.
+            doc["runtime_configuration"] = nlohmann::json::parse(serializeOrchestrationConfig(*config));
             nlohmann::json config_json{
                 {"benchmark_mode", config->benchmark_mode},
                 {"n_predict", config->n_predict},

@@ -43,6 +43,8 @@ public:
      * @throws std::exception On absent roots, wrong roles, invalid extents or backend mismatch.
      */
     PooledImmutableNativePhaseStage(BufferArena& arena,std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,Phase phase);
+    /** @return Immutable actual operation/source owner used to authenticate directed producer dependencies. */
+    const Phase& phase()const noexcept{return phase_;}
     /** @brief Seal ordinary prepared inputs, retain their original allocation leases and join exact setup events. */
     bool prepareGraphLaunch(IDeviceContext* context,void* stream)override;
     /** @brief Record the checked phase and publish original mutable roots on the executor's exact stream. */

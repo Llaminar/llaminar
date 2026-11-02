@@ -505,6 +505,7 @@ namespace llaminar2
         QWEN4EXP_PLE_RETAIN_CANDIDATES, ///< Live retention and accepted-prefix publication.
         QWEN4EXP_BRANCH_CONCAT, ///< Token-owned Dense0 four-branch concatenation.
         MTP_DIRECT_TOKEN_HISTORY_PUBLICATION, ///< Append-only diagnostic identity for direct history commit.
+        QWEN4EXP_POOLED_DIRECTED_TRANSFER, ///< Exact participant-local endpoint of an explicit original pooled protocol edge.
     };
 
     /**
@@ -529,6 +530,7 @@ namespace llaminar2
         case ComputeStageType::ALLGATHER:
         case ComputeStageType::NATIVE_ALLGATHER:
         case ComputeStageType::DEVICE_COUNTED_ALLGATHER:
+        case ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER:
         case ComputeStageType::NATIVE_REDUCE_SCATTER:
         case ComputeStageType::ALLGATHER_V:
         case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:
@@ -676,6 +678,13 @@ namespace llaminar2
      * Derived classes implement device-specific kernels while maintaining
      * a common interface for orchestration.
      */
+    /** @brief Which existing authority owns capture of a stage's collective operation.
+     * A participant-local captured transfer still is a collective. Its immutable
+     * native binding and device-counted kernels do not depend on NCCL/RCCL/CPU
+     * collective-runtime graph support. Neither arm overrides stage readiness.
+     */
+    enum class CollectiveGraphCaptureAuthority : uint8_t { RuntimeBackend, ParticipantLocalCapturedTransfer };
+
     /**
      * @brief Declares when a stage needs work outside its captured graph body.
      *
@@ -1226,6 +1235,25 @@ namespace llaminar2
          */
         virtual bool isPassiveGraphCaptureNoOp() const { return false; }
 
+        /** @return Immutable source-declared collective capture authority; ordinary collectives retain the runtime-backend contract. */
+        virtual CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept {return CollectiveGraphCaptureAuthority::RuntimeBackend;}
+        /** @return Whether this actual stage is a participant-local native captured endpoint.
+         * @throws std::logic_error For an invalid authority or a non-collective claiming transport authority.
+         */
+        bool isParticipantLocalCapturedTransfer() const {
+            switch(collectiveGraphCaptureAuthority()){
+            case CollectiveGraphCaptureAuthority::RuntimeBackend:return false;
+            case CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer:
+                if(!isCollectiveStage() || !device().is_gpu())throw std::logic_error("Captured transport authority requires an actual participant-local GPU collective stage");
+                return true;
+            }
+            throw std::logic_error("Unknown collective graph capture authority");
+        }
+        /** @return Shared capture-dependency rule for actual stages and existing named collective declarations. */
+        bool requiresCollectiveRuntimeCapture(bool named_collective=false)const {
+            return (isCollectiveStage() || named_collective) && !isParticipantLocalCapturedTransfer();
+        }
+
         /**
          * @brief Variant signature for graph-captured launch topology.
          *
@@ -1448,6 +1476,18 @@ namespace llaminar2
         virtual CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row)
         {
             (void)row;
+            return {};
+        }
+
+        /**
+         * @brief Exact arena reads performed by accepted-state restore hooks.
+         * @return Preallocated READ bindings consumed on the publication stream.
+         * The containing publication stage forwards these to its ordinary input
+         * frontier so TransferEngine joins original producer events before capture.
+         * These are publication inputs, not the verifier's ordinary inputs.
+         */
+        virtual std::span<const BufferBinding> verifierStatePublicationInputs() const noexcept
+        {
             return {};
         }
 

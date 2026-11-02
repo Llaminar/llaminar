@@ -58,9 +58,12 @@
 
 namespace llaminar2
 {
+    class RetainedHostServiceDeclarations;
+
 
     // Forward declarations
     class TensorBase;
+    class ReadAheadNativeResourceFamily;
     class Qwen4ExpConfig;
     class ResolvedImmutableRowTablePlacement;
     class IKVCache;
@@ -268,9 +271,22 @@ namespace llaminar2
 
         /// Prefix-state cache feature gates and storage limits.
         PrefixCacheRuntimeConfig prefix_cache;
+        /** @brief Internal unpromoted graph policy; no runtime auto-selection or CLI advertisement. */
+        using NgramLookupSchedule=ImmutableLookupSchedule;
+        /** ResidentDecode is explicit phase policy: ordinary resident prefill
+         * remains consumer-scheduled; only complete ordinary decode parents use
+         * the admitted side lane. Unsupported decode roles fail before mutation.
+         */
+        NgramLookupSchedule ngram_lookup_schedule=NgramLookupSchedule::ConsumerScheduled;
+        /** Original certified exclusive lane, shared only by serialized variants on one parent stream.
+         * Candidate construction requires this source-minted owner; no automatic stream allocation occurs.
+         */
+        std::shared_ptr<ReadAheadNativeResourceFamily> ngram_read_ahead_resources;
         ImmutableRowTablePolicy ngram_table_policy; ///< Rank-owned native PLE storage policy.
         /** Concrete PMA-selected table placement. Owning PLE graphs reject an unresolved policy. */
         std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        /** Rank-local immutable pre-quota declarations only; never a live owner or wire pointer. */
+        std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
         std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> ngram_replicated_ple_cohort; ///< Actual Rank-owned fixed-head producer composition; no live state.
 
         /// Multi-token prediction feature gates and verification mode.

@@ -43,6 +43,8 @@ private:
 };
 /** @brief Fixed source ranges versus mutable pooled cache placement. */
 enum class ImmutableRowTableResidency : std::uint8_t { Fixed, Adaptive };
+/** @brief Whether adaptive GPU caches share one directory or belong to independent consumers. */
+enum class ImmutableRowTableAdaptiveGPUDomain : std::uint8_t { SharedCoordinator, ConsumerLocal };
 /** @brief One physical storage endpoint and its concrete tier, independent of consumers. */
 struct ImmutableRowTableOwnerKey final {
     PhysicalMemoryAllocatorIdentity allocator;
@@ -92,8 +94,9 @@ public:
      * @param fixed_ranges Source intervals for Fixed only; each extra native copy is explicitly Replica. An SSD service supplies implicit primary coverage for the original source.
      * @param source_services Exact CPU SSD services, required iff SSD is enabled.
      * @param replicas Explicit adaptive replica groups; absence means unique primary cache residency.
-     * @param gpu_coordinator Exact GPU directory owner, required iff adaptive GPU slots exist.
+     * @param gpu_coordinator Exact shared GPU directory owner, required for positive shared pools and absent for independent consumer-local directories.
      * @param maximum_inflight_rows Source-authored request-row bound, not a live count. Host adaptive placements retain it for execution scratch; only GPU pools add it to directory capacity.
+     * @param gpu_domain Explicit shared-directory or independent consumer-local adaptive policy.
      * @return Checked immutable metadata; PMA remains sole admission/materialization authority.
      * @throws std::invalid_argument For invalid identities, coverage, modes, capacities or policies.
      * @throws std::overflow_error For unrepresentable source, slot or record arithmetic.
@@ -111,7 +114,8 @@ public:
         std::vector<ImmutableRowTableSourceService> source_services,
         std::vector<ImmutableRowTableReplicaGroup> replicas = {},
         std::optional<PhysicalMemoryAllocatorIdentity> gpu_coordinator = std::nullopt,
-        std::uint64_t maximum_inflight_rows = 0);
+        std::uint64_t maximum_inflight_rows = 0,
+        ImmutableRowTableAdaptiveGPUDomain gpu_domain = ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator);
     /**
      * @brief Project the EXISTING admitted whole-tier modes through the same invariant implementation.
      * @param storage Existing concrete mode and original mmap geometry.
@@ -146,6 +150,10 @@ public:
     std::span<const ImmutableRowTableReplicaGroup> replicaGroups() const noexcept { return replicas_; }
     /** @return Exact GPU coordinator when adaptive GPU pools require one. */
     std::optional<PhysicalMemoryAllocatorIdentity> gpuCoordinator() const noexcept { return gpu_coordinator_; }
+    /** @return Exact authored cache-domain policy; independent consumers never claim one global directory. */
+    ImmutableRowTableAdaptiveGPUDomain adaptiveGPUDomain() const noexcept { return gpu_domain_; }
+    /** @brief Project the existing directory owner for an actual local consumer, including C0. */
+    std::optional<PhysicalMemoryAllocatorIdentity> gpuCoordinatorFor(PhysicalMemoryAllocatorIdentity requester) const;
     /** @return Source-authored maximum in-flight rows, not execution state. */
     std::uint64_t maximumInflightRows() const noexcept { return maximum_inflight_rows_; }
     /** @return GPU slots plus admitted in-flight rows when a GPU coordinator exists; otherwise zero, including bounded host requests. */
@@ -179,11 +187,11 @@ private:
         std::vector<ImmutableRowTableSourceService> services,
         std::vector<ImmutableRowTableReplicaGroup> replicas,
         std::optional<PhysicalMemoryAllocatorIdentity> coordinator,
-        std::uint64_t inflight, std::uint64_t directory)
+        std::uint64_t inflight, std::uint64_t directory, ImmutableRowTableAdaptiveGPUDomain gpu_domain)
         : extent_(extent),tiers_(tiers),residency_(residency),owners_(std::move(owners)),
           consumers_(std::move(consumers)),fixed_ranges_(std::move(ranges)),source_services_(std::move(services)),
           replicas_(std::move(replicas)),gpu_coordinator_(coordinator),maximum_inflight_rows_(inflight),
-          gpu_directory_records_(directory) {}
+          gpu_directory_records_(directory), gpu_domain_(gpu_domain) {}
     ImmutableRowTableExtent extent_;
     ImmutableRowTableTiers tiers_;
     ImmutableRowTableResidency residency_;
@@ -194,5 +202,6 @@ private:
     std::vector<ImmutableRowTableReplicaGroup> replicas_;
     std::optional<PhysicalMemoryAllocatorIdentity> gpu_coordinator_;
     std::uint64_t maximum_inflight_rows_,gpu_directory_records_;
+    ImmutableRowTableAdaptiveGPUDomain gpu_domain_;
 };
 } // namespace llaminar2

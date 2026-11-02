@@ -18,6 +18,7 @@
  * Retained graph owners follow declared participant domains and actual PP roles.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "backends/NativeContextPreparation.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "utils/DebugEnv.h"
 #include "planning/ActivationBufferSizing.h"
@@ -139,21 +140,25 @@ namespace llaminar2
     {
         const auto &ngram=plan.runtime.ngram_table_policy;
         ngram.validate();
-        if(ngram.isFixedHeadSharded())
+        const bool consumerLocal = ngram.isGPUAdaptive() &&
+            ngram.gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal && plan.usesLocalTP();
+        if(ngram.isFixedHeadSharded() || consumerLocal)
         {
             const auto &devices=plan.local_tp_devices;
             if(!profile.flash_next || !plan.usesLocalTP() || !plan.local_pp_devices.empty() ||
                plan.usesGlobalTP() || plan.prev_rank || plan.next_rank ||
                plan.first_layer!=0 || (plan.last_layer>=0 && plan.last_layer!=profile.mainLayerCount()-1) ||
                !plan.has_embedding || !plan.has_lm_head ||
-               (devices.size()!=2 && devices.size()!=4 && devices.size()!=8))
-                throw std::invalid_argument("FixedHeadSharded requires full-main rank-local homogeneous GPU TP degree2/4/8, without PP/global TP");
+               (consumerLocal ? devices.size()!=2 : (devices.size()!=2 && devices.size()!=4 && devices.size()!=8)))
+                throw std::invalid_argument(consumerLocal
+                    ? "ConsumerLocal adaptive lookup requires full-main rank-local homogeneous GPU TP2, without PP/global TP"
+                    : "FixedHeadSharded requires full-main rank-local homogeneous GPU TP degree2/4/8, without PP/global TP");
             const auto type=devices.front().device_type;
             for(const auto &d:devices)
                 if(!d.toLocalDeviceId().is_gpu() || d.device_type!=type || d.hostname!=plan.primary_device.hostname)
                     throw std::invalid_argument("FixedHeadSharded has a foreign, CPU, or mixed-backend TP participant");
         }
-        return ngram.isFixedHeadSharded()?ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal:
+        return (ngram.isFixedHeadSharded() || consumerLocal)?ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal:
             ImmutableRowTableTPTopology::None;
     }
 
@@ -482,8 +487,7 @@ namespace llaminar2
                     request.plan.local_tp_devices,
                     request.plan.local_tp_weights);
                 cfg.local_tp_backend = resolved_backend;
-                if(ngram.isFixedHeadSharded())
-                    cfg.ngram_tp_topology=ngram_topology;
+                cfg.ngram_tp_topology=ngram_topology;
                 device_configs.push_back(std::move(cfg));
             }
         }
@@ -572,13 +576,34 @@ namespace llaminar2
                     cfg.first_layer <= layer && (cfg.last_layer < 0 || cfg.last_layer >= layer))
                 {
                     cfg.ngram_execution_policy = request.plan.runtime.ngram_table_policy;
+                    cfg.ngram_lookup_schedule = request.plan.runtime.ngram_lookup_schedule;
                     cfg.ngram_host_placement = ImmutableRowTableHostPlacement::fromObservedNUMANode(request.plan.numa_node);
                     cfg.ngram_table_placement = request.plan.runtime.ngram_table_placement;
                 }
         }
         // PP overrides final layer ranges after makeConfigForDevice; resolve only now.
-        for (auto &input : device_configs)
+        for (auto &input : device_configs){
+            input.native_context_preparation=request.plan.runtime.native_context_preparation;
+            input.retained_host_services=request.plan.runtime.retained_host_services;
+            if(input.native_context_preparation){
+                const auto& original=input.native_context_preparation->mandatoryBOM();
+                if(input.native_context_preparation->memory()->worldRank()!=input.world_rank)
+                    throw std::logic_error("Rank planning received a foreign native source authority");
+                if(input.device.is_gpu()){
+                    input.native_context_preparation->requireSelectedDevice(input.device);
+                    const auto* resource=original.find({input.world_rank,input.device});
+                    if(!resource)throw std::logic_error("Native source omitted original GPU observation");
+                    input.device_total_bytes=resource->resource().total_bytes;
+                    input.device_free_bytes=resource->resource().admission_available_bytes;
+                }
+                if(input.associated_host_memory){
+                    const auto* host=original.find({input.world_rank,DeviceId::cpu()});
+                    if(!host)throw std::logic_error("Native source omitted original CPU0 observation");
+                    input.associated_host_memory=host->resource();
+                }
+            }
             resolveQwenSparseAttentionDeviceProgram(profile, input, request.plan.runtime);
+        }
         return device_configs;
     }
 }

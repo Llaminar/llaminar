@@ -7,6 +7,7 @@
  * cleanup cannot publish evidence, and repeated observations retain no owners.
  */
 #include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionObservation.h"
+#include "integration/NativeLifetimeCompletion.h"
 #include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
 #include <memory>
@@ -124,4 +125,27 @@ TEST(Qwen4ExpSourceAdmissionRetirement, SuccessfulObservationRetiresExactlyOnce)
                                     [&] { order += "retire;publish;"; });
     EXPECT_EQ(order, "observe;retire;publish;");
 }
+/** @test Ordinary assertion failure preserves terminal proof after the original lifetime closes. */
+TEST(Qwen4ExpSourceAdmissionRetirement, ProcessCompletionFollowsLifetimeForPassingAndFailedTests)
+{
+    struct Lifetime { static int& live(){static int value=0;return value;} Lifetime(){++live();} ~Lifetime(){--live();} };
+    for (int result : {0, 1})
+    {
+        bool published=false;
+        EXPECT_EQ(llaminar2::test::runWithNativeLifetimeCompletion<Lifetime>(
+            [&]{EXPECT_EQ(Lifetime::live(),1);return result;},
+            [&](int observed){EXPECT_EQ(Lifetime::live(),0);EXPECT_EQ(observed,result);published=true;}),result);
+        EXPECT_TRUE(published);
+    }
+}
+/** @test Terminal publication is unreachable if the original destructor does not return. */
+TEST(Qwen4ExpSourceAdmissionRetirement, FailedProcessLifetimeCannotPublishTerminalProof)
+{
+    struct Lifetime { ~Lifetime() noexcept(false){throw std::runtime_error("original teardown failed");} };
+    bool published=false;
+    EXPECT_THROW(llaminar2::test::runWithNativeLifetimeCompletion<Lifetime>(
+        []{return 1;},[&](int){published=true;}),std::runtime_error);
+    EXPECT_FALSE(published);
+}
+
 } // namespace llaminar2::test::parity::qwen4exp

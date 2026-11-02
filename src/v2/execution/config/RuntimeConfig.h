@@ -22,6 +22,7 @@
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../loaders/ImmutableRowTablePolicy.h"
+#include "../local_execution/graph/ReadAheadScheduling.h"
 #include "RoutedExpertPolicy.h"
 #include "OrdinaryTerminalProjectionCapacity.h"
 #include "MTPDepthDefaults.h"
@@ -48,6 +49,9 @@
 
 namespace llaminar2
 {
+    class RetainedHostServiceDeclarations;
+
+    class NativeContextPreparation;
     struct CPUSerialExpertStorageAdmission;
     class ResolvedImmutableRowTablePlacement;
 
@@ -2160,6 +2164,9 @@ namespace llaminar2
      */
     struct RuntimeConfig
     {
+        /** Original selected-worker source owner; immutable mandatory BOM precedes all optional quotas. */
+        std::shared_ptr<NativeContextPreparation> native_context_preparation;
+
         /// Optional startup intent resolved before participant BOMs; never a live DebugEnv
         /// reference.
         qwen4exp::QwenSparseAttentionSetupRequest attention_setup_request;
@@ -2234,10 +2241,14 @@ namespace llaminar2
 
         /// Explicit native PLE table storage; file capacity is not prepared-weight memory.
         ImmutableRowTablePolicy ngram_table_policy;
+        /** Internal explicit phase policy, projected unchanged into planning and native graph construction. */
+        ImmutableLookupSchedule ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled;
         /** Canonical setup-selected concrete tier and exact physical consumers.
          * Absence is permitted before final PMA selection or for models without PLE.
          * Runtime graph/materialization must never infer concrete storage from Auto. */
         std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        /** Rank-local immutable pre-quota declarations only; never a live owner or wire pointer. */
+        std::shared_ptr<const RetainedHostServiceDeclarations> retained_host_services;
 
         /// Multi-token prediction speculative decode configuration.
         MTPRuntimeConfig mtp;
@@ -2287,6 +2298,8 @@ namespace llaminar2
             // the admitted value copied through participant and graph adapters.
             rc.attention_setup_request = {debugEnv().attention.qfn_sparse_attention,
                                           debugEnv().attention.qfn_sparse_attention_phase_schedule};
+            rc.ngram_lookup_schedule=debugEnv().execution.qfn_ngram_lookup_schedule.value_or(
+                ImmutableLookupSchedule::ConsumerScheduled);
             rc.max_seq_len = max_seq_len;
             rc.batch_size = resolveRuntimeBatchSizeForMTP(batch_size, mtp);
             rc.activation_precision = parseActivationPrecision(activation_precision_str);

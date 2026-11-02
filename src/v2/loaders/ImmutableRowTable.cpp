@@ -82,13 +82,19 @@ ImmutableRowFileIdentity fileIdentity(const struct stat &value)
             value.st_ctim.tv_sec, value.st_ctim.tv_nsec};
 }
 
-/** @brief Fixed descriptor for one LRU slot; replacement never grows the directory. */
+/** @brief Sentinel shared by the fixed hash chains and intrusive recency list. */
+constexpr auto NoWindow = std::numeric_limits<std::size_t>::max();
+
+/** @brief Fixed descriptor; indices keep hash and LRU maintenance allocation-free. */
 struct MappingWindow
 {
     void *base = MAP_FAILED;
     std::uint64_t file_offset = 0;
     std::size_t length = 0;
-    std::uint64_t touched = 0;
+    std::size_t hash_previous = NoWindow;
+    std::size_t hash_next = NoWindow;
+    std::size_t older = NoWindow;
+    std::size_t newer = NoWindow;
 };
 
 /** @brief Round a mapping extent with an already authenticated native page size. */
@@ -143,9 +149,9 @@ std::size_t ImmutableRowTable::physicalBytesForNativeExtent(
         return table_bytes;
     if (policy.storage() == ImmutableRowStorage::RAM)
         return pageAligned(table_bytes);
-    if (policy.windowBytes() > std::numeric_limits<std::size_t>::max() - sizeof(MappingWindow))
+    if (policy.windowBytes() > std::numeric_limits<std::size_t>::max() - sizeof(MappingWindow) - sizeof(std::size_t))
         throw std::invalid_argument("immutable row mmap window directory overflow");
-    return multiply(policy.windowBytes() + sizeof(MappingWindow), policy.windowCount());
+    return multiply(policy.windowBytes() + sizeof(MappingWindow) + sizeof(std::size_t), policy.windowCount());
 }
 
 struct ImmutableRowTable::Impl
@@ -161,6 +167,9 @@ struct ImmutableRowTable::Impl
     int fd = -1;
     void *ram = MAP_FAILED;
     std::vector<MappingWindow> windows;
+    std::vector<std::size_t> buckets;
+    std::size_t oldest = NoWindow;
+    std::size_t newest = NoWindow;
     mutable std::mutex mutex;
     ImmutableRowTableStats counters;
     std::uint64_t clock = 0;
@@ -215,32 +224,82 @@ struct ImmutableRowTable::Impl
         }
     }
 
-    /** @brief Resolve one byte through the bounded LRU; return remaining contiguous extent. */
+    /**
+     * @brief Select a fixed bucket from the window number, never its aligned byte offset.
+     * @details A power-of-two byte alignment must not collapse all keys into bucket zero.
+     */
+    std::size_t bucketFor(std::uint64_t aligned) const
+    {
+        return (aligned / policy.windowBytes()) % buckets.size();
+    }
+
+    /** @brief Unlink one retained mapping before its slot is reused; no tombstones accumulate. */
+    void eraseIndex(std::size_t index)
+    {
+        auto &slot = windows[index];
+        if (slot.hash_previous == NoWindow)
+            buckets[bucketFor(slot.file_offset)] = slot.hash_next;
+        else
+            windows[slot.hash_previous].hash_next = slot.hash_next;
+        if (slot.hash_next != NoWindow)
+            windows[slot.hash_next].hash_previous = slot.hash_previous;
+        slot.hash_previous = slot.hash_next = NoWindow;
+    }
+
+    /** @brief Publish one successfully mapped slot into its fixed collision chain. */
+    void insertIndex(std::size_t index)
+    {
+        auto &slot = windows[index];
+        auto &head = buckets[bucketFor(slot.file_offset)];
+        slot.hash_next = head;
+        if (head != NoWindow)
+            windows[head].hash_previous = index;
+        head = index;
+    }
+
+    /**
+     * @brief Move one resolved slot to most recent without scanning other windows.
+     * @details Initially all slots are unused in ascending order, matching the old
+     * min-timestamp tie break. Each successful access removes precisely that slot
+     * and appends it, preserving exact replacement order without timestamp sorting.
+     */
+    void touch(std::size_t index)
+    {
+        if (index == newest)
+            return;
+        auto &slot = windows[index];
+        if (slot.older == NoWindow)
+            oldest = slot.newer;
+        else
+            windows[slot.older].newer = slot.newer;
+        windows[slot.newer].older = slot.older;
+        windows[newest].newer = index;
+        slot.older = newest;
+        slot.newer = NoWindow;
+        newest = index;
+    }
+
+    /** @brief Resolve one byte through the indexed bounded LRU; return readable contiguous extent. */
     std::pair<const std::byte *, std::size_t> resolve(std::uint64_t offset)
     {
         const auto aligned = offset - offset % policy.windowBytes();
-        MappingWindow *slot = nullptr;
-        for (auto &window : windows)
-        {
-            if (window.base != MAP_FAILED && window.file_offset == aligned)
-            {
-                slot = &window;
-                ++counters.window_hits;
-                break;
-            }
-        }
-        if (!slot)
+        auto index = buckets[bucketFor(aligned)];
+        while (index != NoWindow && windows[index].file_offset != aligned)
+            index = windows[index].hash_next;
+        if (index != NoWindow)
+            ++counters.window_hits;
+        else
         {
             ++counters.window_misses;
-            slot = &*std::min_element(windows.begin(), windows.end(),
-                [](const MappingWindow &a, const MappingWindow &b)
-                { return a.touched < b.touched; });
-            if (slot->base != MAP_FAILED)
+            index = oldest;
+            auto &slot = windows[index];
+            if (slot.base != MAP_FAILED)
             {
-                if (::munmap(slot->base, slot->length) != 0)
+                if (::munmap(slot.base, slot.length) != 0)
                     ioError("munmap", source.path);
-                counters.mapped_virtual_bytes -= pageAligned(slot->length, page_bytes);
-                slot->base = MAP_FAILED;
+                counters.mapped_virtual_bytes -= pageAligned(slot.length, page_bytes);
+                eraseIndex(index);
+                slot.base = MAP_FAILED;
                 ++counters.window_evictions;
             }
             const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(
@@ -249,20 +308,24 @@ struct ImmutableRowTable::Impl
                                 static_cast<off_t>(aligned));
             if (base == MAP_FAILED)
                 ioError("mmap", source.path);
-            *slot = {base, aligned, length, 0};
+            slot.base = base;
+            slot.file_offset = aligned;
+            slot.length = length;
+            insertIndex(index);
             // mmap/munmap cover complete native pages even at EOF. Keep
-            // slot.length as readable file bytes; using the rounded extent
-            // for data access would expose file padding as valid table rows.
+            // length as readable file bytes, excluding padding from row access.
             counters.mapped_virtual_bytes += pageAligned(length, page_bytes);
             if (::madvise(base, length, MADV_RANDOM) != 0)
                 ioError("madvise", source.path);
         }
-        // Clock overflow is a lifecycle error, never silent LRU inversion.
+        // Retain the existing lifecycle limit even though recency uses links.
         if (clock == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("immutable row table LRU generation exhausted");
-        slot->touched = ++clock;
-        const auto within = static_cast<std::size_t>(offset - slot->file_offset);
-        return {static_cast<const std::byte *>(slot->base) + within, slot->length - within};
+        ++clock;
+        touch(index);
+        const auto &slot = windows[index];
+        const auto within = static_cast<std::size_t>(offset - slot.file_offset);
+        return {static_cast<const std::byte *>(slot.base) + within, slot.length - within};
     }
 };
 
@@ -304,6 +367,14 @@ ImmutableRowTable::ImmutableRowTable(ImmutableRowTableSource source,
     if (policy.storage() == ImmutableRowStorage::MemoryMapped)
     {
         state.windows.resize(policy.windowCount());
+        state.buckets.resize(policy.windowCount(), NoWindow);
+        state.oldest = 0;
+        state.newest = policy.windowCount() - 1;
+        for (std::size_t index = 0; index < state.windows.size(); ++index)
+        {
+            state.windows[index].older = index ? index - 1 : NoWindow;
+            state.windows[index].newer = index + 1 < state.windows.size() ? index + 1 : NoWindow;
+        }
         return;
     }
     state.ram = ::mmap(nullptr, physical, PROT_READ | PROT_WRITE,

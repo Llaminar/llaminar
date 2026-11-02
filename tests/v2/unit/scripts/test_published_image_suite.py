@@ -23,6 +23,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
+from run_qfn_source_admission import SOURCE_ADMISSION_REPORT_SCHEMA
 import run_published_image_suite as suite
 import wait_for_develop_image_gate as image_wait
 import publish_master_release as master_release
@@ -107,13 +108,13 @@ def write_e2e_bundle(root, pair=None):
         receipt['model_kld_reports'][isa] = digest(numerical)
     receipt.update(qfn_source_admission_required=True, qfn_source_admission_reports={})
     for isa in suite.ISAS:
-        admission = {'schema': 1, 'complete': True, 'passed': True, 'all_resources_retired': True,
+        admission = {'schema': SOURCE_ADMISSION_REPORT_SCHEMA, 'complete': True, 'passed': True, 'all_resources_retired': True,
                      'selected_cases': ['Source.CandidateSourceAdmission/Opaque'], 'selected': 1,
                      'discovered': 1, 'hardware_ineligible': 0, 'unqualified': {},
                      'attempted': 1, 'passed_cells': 1, 'failed_cells': 0, 'unexecuted_selected': 0,
                      'inventory_digest': digest({'inventory': 'fixture'}), 'hardware_digest': digest({'hardware': 'fixture'}),
                      'results': {'Source.CandidateSourceAdmission/Opaque': {
-                         'passed': True, 'retirement_proved': True, 'qualification': 'native-source-admission', 'contract': 'positive-source-admission'}}}
+                         'passed': True, 'retirement_proved': True, 'runner_retirement_proved': True, 'qualification': 'native-source-admission', 'contract': 'positive-source-admission'}}}
         binding = {'schema': 1, 'source': pair['source'], 'cpu_isa': isa,
                    'test_runner_image': 'companion-' + isa, 'runtime_image': pair['images'][isa]['id'],
                    'report_digest': digest(admission), 'container_retired': True, 'prefix_cleanup_complete': True}

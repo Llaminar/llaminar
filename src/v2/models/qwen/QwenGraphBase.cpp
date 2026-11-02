@@ -9,12 +9,14 @@
  * Contains shared infrastructure: forward graph construction, FFN,
  * embedding, LM head, TP/PP support, arena management.
  * Arena MTP target rows follow retained admission independently of execution policy.
+ * Immutable source views are prepared once; every family retains fresh stages.
  */
 
 #include "QwenGraphBase.h"
 #include "../TerminalInputWeights.h"
 #include "../../execution/prefix_cache/ResidualRowGeometry.h"
 #include "../../utils/Logger.h"
+#include "../../utils/PerfStatsCollector.h"
 #include "../../utils/DebugEnv.h"
 #include "../../tensors/TensorSlice.h"
 #include "../../tensors/Tensors.h"
@@ -411,11 +413,58 @@ namespace llaminar2
 
     void QwenGraphBase::setModelContext(std::shared_ptr<IModelContext> model_ctx)
     {
+        requireUnpreparedForwardSource("setModelContext");
         model_ctx_ = std::dynamic_pointer_cast<ModelContext>(std::move(model_ctx));
         if (!model_ctx_)
         {
             LOG_DEBUG("[QwenGraphBase] setModelContext ignored non-ModelContext instance");
         }
+    }
+
+    void QwenGraphBase::requireUnpreparedForwardSource(const char *operation) const
+    {
+        forward_graph_template_.requireUnprepared(operation);
+    }
+
+    const QwenGraphBase::ForwardGraphRecipe *QwenGraphBase::preparedForwardRecipe() const noexcept
+    {
+        return forward_graph_template_.prepared() ? &forward_graph_template_.recipe() : nullptr;
+    }
+
+    void QwenGraphBase::prepareForwardGraphTemplate(DeviceId device)
+    {
+        // Validate before recipe publication: a rejected cold participant or
+        // absent source must leave ordinary setup setters available.
+        if (device == DeviceId::invalid() || device != config_.default_device)
+            throw std::invalid_argument("Qwen forward template requires its original valid participant");
+        if (config_.n_layers < 0 || (config_.n_layers > 0 && !hasLayerWeightSource()))
+            throw std::invalid_argument("Qwen forward template requires its original layer weight source");
+        const auto before = forward_graph_template_.preparations();
+        const auto &recipe = forward_graph_template_.prepare([&] {
+            return ForwardGraphRecipe{device, &weight_bindings_,
+                &decode_replicated_dense_weight_bindings_, &weights_};
+        });
+        if (recipe.device != device)
+            throw std::invalid_argument("Qwen forward template requires its original participant");
+        if (forward_graph_template_.preparations() != before)
+            PerfStatsCollector::addCounter("forward_graph", "immutable_template_preparations", 1.0,
+                "template", device.to_string());
+    }
+
+    PreparedGraphTemplateStats QwenGraphBase::forwardGraphTemplateStats() const
+    {
+        return {.preparations = forward_graph_template_.preparations(),
+            .specialization_attempts = forward_graph_template_.specializationAttempts()};
+    }
+
+    void QwenGraphBase::beginForwardGraphSpecialization(DeviceId device)
+    {
+        prepareForwardGraphTemplate(device);
+        (void)forward_graph_template_.beginSpecialization();
+        PerfStatsCollector::addCounter("forward_graph", "immutable_template_specializations", 1.0,
+            "graph", device.to_string(),
+            {{"grouped_verifier", config_.grouped_mtp_verifier ? "true" : "false"},
+             {"all_position_logits", config_.compute_all_position_logits ? "true" : "false"}});
     }
 
     bool QwenGraphBase::hasLayerWeightSource() const
@@ -1101,25 +1150,28 @@ namespace llaminar2
 
     LayerWeightBindings QwenGraphBase::layerWeightBindingsForGraph(int layer_idx) const
     {
+        const auto *recipe = preparedForwardRecipe();
+        const auto &primary = recipe ? *recipe->primary : weight_bindings_;
+        const auto &replicated = recipe ? *recipe->replicated_dense : decode_replicated_dense_weight_bindings_;
         LayerWeightBindings bindings;
-        if (weight_bindings_.get_layer_weights)
-            bindings = weight_bindings_.get_layer_weights(layer_idx);
+        if (primary.get_layer_weights)
+            bindings = primary.get_layer_weights(layer_idx);
 
         if (useReplicatedAttentionStateWeights() &&
-            decode_replicated_dense_weight_bindings_.get_layer_weights)
+            replicated.get_layer_weights)
         {
             bindings = mergeReplicatedAttentionBindings(
                 bindings,
-                decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
+                replicated.get_layer_weights(layer_idx));
         }
 
         if ((useDecodeReplicatedDenseWeights() ||
              useReplicatedMTPSidecarDenseWeights()) &&
-            decode_replicated_dense_weight_bindings_.get_layer_weights)
+            replicated.get_layer_weights)
         {
             bindings = mergeDenseDecodeBindings(
                 bindings,
-                decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
+                replicated.get_layer_weights(layer_idx));
         }
 
         return bindings;
@@ -1127,10 +1179,13 @@ namespace llaminar2
 
     LayerWeights QwenGraphBase::layerWeightsForGraph(int layer_idx) const
     {
-        if (weight_bindings_.get_layer_weights)
+        const auto *recipe = preparedForwardRecipe();
+        const auto &primary = recipe ? *recipe->primary : weight_bindings_;
+        const auto &legacy = recipe ? *recipe->legacy : weights_;
+        if (primary.get_layer_weights)
             return toLegacyLayerWeights(layerWeightBindingsForGraph(layer_idx));
-        if (weights_.get_layer_weights)
-            return weights_.get_layer_weights(layer_idx);
+        if (legacy.get_layer_weights)
+            return legacy.get_layer_weights(layer_idx);
         return {};
     }
 
@@ -2066,6 +2121,68 @@ namespace llaminar2
         return publication_node;
     }
 
+    TensorBase *QwenGraphBase::canonicalMainLogitsDestination(
+        const ForwardInput &input, bool column_parallel) const
+    {
+        auto *source = graphLMHeadOutput(column_parallel);
+        if (!input.mtp_main_terminal_logits)
+            return source;
+        return source == buffers_.logits_local
+            ? input.mtp_main_terminal_logits->local
+            : input.mtp_main_terminal_logits->full;
+    }
+
+    std::string QwenGraphBase::maybeAddMTPMainTerminalLogitsPublication(
+        ComputeGraph &graph, const ForwardInput &input,
+        const std::string &dependency_node, DeviceId device,
+        bool column_parallel, bool all_positions)
+    {
+        if (!input.mtp_main_terminal_logits)
+            return dependency_node;
+        const auto &binding = *input.mtp_main_terminal_logits;
+        auto *source = graphLMHeadOutput(column_parallel);
+        const bool local = source == buffers_.logits_local;
+        auto *destination = canonicalMainLogitsDestination(input, column_parallel);
+        const int columns = local ? binding.local_columns : binding.full_columns;
+        const int source_rows = all_positions ? input.batch_size * input.seq_len : input.batch_size;
+        const int first_row = all_positions ? input.seq_len - 1 : 0;
+        if (!device.is_gpu() || input.execution_phase != ForwardExecutionPhase::Decode ||
+            (input.execution_role != ForwardExecutionRole::MainInference &&
+             input.execution_role != ForwardExecutionRole::MTPCondition) ||
+            !binding.validForRequestCount(input.batch_size) || !source || !destination ||
+            columns <= 0 || source->native_type() != TensorType::FP32 ||
+            destination->native_type() != TensorType::FP32 ||
+            source->rows() < source_rows || source->cols() < columns ||
+            destination->rows() < 1 || destination->cols() < columns ||
+            source->cols() > std::numeric_limits<int>::max() || destination->cols() > std::numeric_limits<int>::max() ||
+            (input.seq_len != 1 && input.batch_size != 1))
+        {
+            throw std::logic_error("MTP canonical logits require the original live vocabulary surface and physical row strides");
+        }
+        if (source == destination)
+            return dependency_node;
+        HiddenStateRowsSelectStage::Params params;
+        params.device_id = device;
+        params.input = source;
+        params.output = destination;
+        params.seq_len = source_rows;
+        params.d_model = columns;
+        // The canonical vocabulary bank is request zero, as in the CPU
+        // accepted-state publisher. Batched consumers keep the original bank.
+        params.selected_row_count = 1;
+        params.device_row_index_source = HiddenStateRowsSelectStage::DeviceRowIndexSource::FixedContiguousRange;
+        params.fixed_contiguous_row_start = first_row;
+        params.input_buffer_id = logitsBufferId(local, all_positions);
+        params.output_buffer_id = local ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+        params.row_copy_policy.source_stride = static_cast<int>(source->cols());
+        params.row_copy_policy.destination_stride = static_cast<int>(destination->cols());
+        constexpr const char *name = "mtp_main_terminal_logits_publish";
+        graph.addNode(name, ComputeStageFactory::createHiddenStateRowsSelect(std::move(params)), device);
+        graph.addDependency(name, dependency_node);
+        graph.setTerminalNode(name);
+        return name;
+    }
+
     ComputeGraph QwenGraphBase::buildFullForwardGraph(
         const ForwardInput &input,
         ForwardOutput &output)
@@ -2094,9 +2211,12 @@ namespace llaminar2
             throw std::runtime_error("QwenStandardGraph buffers not initialized");
         }
 
+        beginForwardGraphSpecialization(config_.default_device);
+
         DeviceId device = config_.default_device;
 
         ComputeGraph graph;
+        auto invocation_prefix=addModelInvocationPrefix(graph,input,config_.default_device,ModelInvocationShape::FullLocal);
 
         // -------------------------------------------------------------------------
         // Stage 1: Embedding Lookup
@@ -2128,6 +2248,7 @@ namespace llaminar2
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(embed_params),
                       device);
+        if(!invocation_prefix->terminal().empty())graph.addDependency("embedding",invocation_prefix->terminal());
 
         // -------------------------------------------------------------------------
         // Stage 1b: Embedding AllReduce (vocab-parallel embedding sharding)
@@ -2182,7 +2303,7 @@ namespace llaminar2
         // Build complete graphs for each layer
         for (int layer = 0; layer < config_.n_layers; ++layer)
         {
-            prev_node=addModelLayerInput(graph,input,layer,device,prev_node);
+            prev_node=addModelLayerInput(graph,input,layer,device,prev_node,*invocation_prefix);
             // Get layer weights
             LayerWeights layer_weights = layerWeightsForGraph(layer);
 
@@ -2351,14 +2472,17 @@ namespace llaminar2
             input,
             prev_node,
             device);
+        prev_node = maybeAddMTPMainTerminalLogitsPublication(graph, input, prev_node,
+            device, use_column_parallel, lm_layout.compute_all_positions);
         sealInferenceTransactionGraph(graph, prev_node);
 
-        // Set output
+        // Preserve original graph semantic output for immediate scalar/batch sampling.
         output.logits = graphLMHeadOutput(use_column_parallel);
 
         LOG_DEBUG("[QwenGraphBase] Built full forward graph with "
                   << graph.size() << " nodes");
 
+        invocation_prefix->requireConsumed();
         return graph;
     }
 
@@ -2428,6 +2552,7 @@ namespace llaminar2
         DeviceId device = config_.default_device;
 
         ComputeGraph graph;
+        auto invocation_prefix=addModelInvocationPrefix(graph,input,config_.default_device,ModelInvocationShape::Partial);
         std::string prev_node;
 
         // -------------------------------------------------------------------------
@@ -2462,6 +2587,7 @@ namespace llaminar2
             graph.addNode("embedding",
                           ComputeStageFactory::createEmbedding(embed_params),
                           device);
+            if(!invocation_prefix->terminal().empty())graph.addDependency("embedding",invocation_prefix->terminal());
             prev_node = "embedding";
 
             // Stage 1b: Embedding AllReduce (vocab-parallel embedding sharding)
@@ -2516,6 +2642,8 @@ namespace llaminar2
             throw std::runtime_error("PP stage without embedding requires external_hidden_state");
         }
 
+        beginForwardGraphSpecialization(config_.default_device);
+
         // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (subset for this PP stage)
         // -------------------------------------------------------------------------
@@ -2525,7 +2653,7 @@ namespace llaminar2
         // Build graphs for assigned layer range [first_layer, last_layer)
         for (int layer = first_layer; layer < last_layer; ++layer)
         {
-            prev_node=addModelLayerInput(graph,input,layer,device,prev_node);
+            prev_node=addModelLayerInput(graph,input,layer,device,prev_node,*invocation_prefix);
             // Get layer weights
             LayerWeights layer_weights = layerWeightsForGraph(layer);
 
@@ -2682,7 +2810,8 @@ namespace llaminar2
                 lm_layout.seq_len,
                 device);
 
-            // Set output logits
+            prev_node = maybeAddMTPMainTerminalLogitsPublication(graph, input, prev_node,
+                device, use_column_parallel, lm_layout.compute_all_positions);
             output.logits = graphLMHeadOutput(use_column_parallel);
         }
         else
@@ -2698,6 +2827,7 @@ namespace llaminar2
         LOG_DEBUG("[QwenGraphBase] Built partial forward graph with "
                   << graph.size() << " nodes for layers [" << first_layer << ", " << last_layer << ")");
 
+        invocation_prefix->requireConsumed();
         return graph;
     }
 
@@ -2742,6 +2872,7 @@ namespace llaminar2
         // 2. Prepare execution context
         // =====================================================================
         ComputeGraph graph;
+        auto invocation_prefix=addModelInvocationPrefix(graph,input,config_.default_device,ModelInvocationShape::UnifiedPipeline);
         std::string prev_node;
         int total_tokens = input.batch_size * input.seq_len;
 
@@ -2874,7 +3005,7 @@ namespace llaminar2
 
             for (int layer = pp_stage.first_layer; layer < pp_stage.last_layer; ++layer)
             {
-                prev_node=addModelLayerInput(graph,input,layer,stage_device,prev_node);
+                prev_node=addModelLayerInput(graph,input,layer,stage_device,prev_node,*invocation_prefix);
                 // Get layer weights
                 LayerWeights layer_weights = layerWeightsForGraph(layer);
 
@@ -3082,6 +3213,8 @@ namespace llaminar2
                     .stage_name = "lm_head_allgather",
                 });
 
+                prev_node = maybeAddMTPMainTerminalLogitsPublication(graph, input, prev_node,
+                    stage_device, use_column_parallel, lm_layout.compute_all_positions);
                 output.logits = graphLMHeadOutput(use_column_parallel);
 
                 LOG_DEBUG("[QwenGraphBase] Added LM head stage on device " << stage_device.to_string());
@@ -3091,6 +3224,7 @@ namespace llaminar2
         LOG_DEBUG("[QwenGraphBase] Built unified pipeline graph with " << graph.size()
                                                                        << " nodes across " << config_.pipeline_config->numStages() << " PP stages");
 
+        invocation_prefix->requireConsumed();
         return graph;
     }
 
@@ -4868,10 +5002,18 @@ namespace llaminar2
         (void)graph;(void)binding;return {};
     }
 
-    std::string QwenGraphBase::addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
-        int layer,DeviceId device,const std::string &dependency)
+    std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> QwenGraphBase::addModelInvocationPrefix(
+        ComputeGraph&,const ForwardInput&,DeviceId,ModelInvocationShape)
     {
-        (void)graph;(void)input;(void)layer;(void)device;return dependency;
+        if(config_.ngram_lookup_schedule!=GraphConfig::NgramLookupSchedule::ConsumerScheduled)
+            throw std::invalid_argument("This model does not implement the requested early current lookup candidate");
+        return std::make_unique<ModelInvocationPrefix>();
+    }
+
+    std::string QwenGraphBase::addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
+        int layer,DeviceId device,const std::string &dependency,ModelInvocationPrefix &prefix)
+    {
+        (void)graph;(void)input;(void)layer;(void)device;(void)prefix;return dependency;
     }
 
     const ForwardInput &QwenGraphBase::modelForwardInput() const

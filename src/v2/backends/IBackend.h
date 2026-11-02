@@ -1693,6 +1693,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief Build compact distributions without modifying canonical logits.
+         * @copydetails enqueueBuildTopKTopPDistributionsF32Device
+         * @param history Original complete durable/speculative history binding.
+         *
+         * Apply the serial penalty law when each candidate is loaded, before
+         * Top-K selection. Reduction, tie breaking, top-p and normalization are
+         * identical to the raw builder. Only admitted compact/scratch outputs
+         * are written; inactive rows and the entire raw input remain untouched.
+         */
+        virtual bool enqueueBuildTopKTopPDistributionsF32WithHistoryDevice(
+            const void *data_device,
+            int row_count,
+            int n,
+            int row_stride,
+            int top_k,
+            float top_p,
+            float temperature,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            int out_stride,
+            void *out_probs_device,
+            void *scratch_values_device,
+            void *scratch_indices_device,
+            int scratch_capacity,
+            const GenerationPenaltyHistory &history)
+        {
+            (void)data_device;
+            (void)row_count;
+            (void)n;
+            (void)row_stride;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_ids_device;
+            (void)out_stride;
+            (void)out_probs_device;
+            (void)scratch_values_device;
+            (void)scratch_indices_device;
+            (void)scratch_capacity;
+            (void)history;
+            return false;
+        }
+
+        /**
          * @brief Enqueue graph-capturable top-k/top-p processing into full logits.
          *
          * Converts raw logits into the processed-logit representation consumed by

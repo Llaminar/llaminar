@@ -73,7 +73,16 @@ namespace llaminar2::test::parity
         if(policy.isGPUAdaptive())
         {
             const auto &g=policy.gpu_adaptive;const auto &h=g.host;
-            return prefix+"G"+std::to_string(g.maximum_gpu_cache_rows)+"_B"+std::to_string(g.gpu_cache_physical_byte_limit)+
+            std::string placement;
+            if(g.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+            {
+                placement="DeclaredOwners_";
+                for(const auto &owner:g.placement.owners)
+                    placement+="R"+std::to_string(owner.participant.world_rank)+(owner.participant.backend==DeviceType::CUDA?std::string{"CUDA"}:std::string{"ROCm"})+std::to_string(owner.participant.ordinal)+
+                        "C"+std::to_string(owner.maximum_cache_rows)+"B"+std::to_string(owner.cache_physical_byte_limit)+"_";
+                placement+="CoordinatorR"+std::to_string(g.placement.coordinator->world_rank)+(g.placement.coordinator->backend==DeviceType::CUDA?std::string{"CUDA"}:std::string{"ROCm"})+std::to_string(g.placement.coordinator->ordinal)+"_";
+            }
+            return prefix+placement+"G"+std::to_string(g.maximum_gpu_cache_rows)+"_B"+std::to_string(g.gpu_cache_physical_byte_limit)+
                 "_A"+std::to_string(g.gpu_policy.aging_accesses)+"_P"+std::to_string(g.gpu_policy.protected_numerator)+
                 "of"+std::to_string(g.gpu_policy.protected_denominator)+"_H"+std::to_string(h.maximum_cache_rows)+
                 "_B"+std::to_string(h.cache_physical_byte_limit)+"_A"+std::to_string(h.policy.aging_accesses)+

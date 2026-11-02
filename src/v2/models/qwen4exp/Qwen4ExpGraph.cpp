@@ -8,6 +8,8 @@
  * so reset, rollback and prefix archive share one lifecycle and frontier.
  */
 #include "Qwen4ExpGraph.h"
+#include "collective/ILocalTPContext.h"
+#include "execution/local_execution/graph/ReadAheadParticipantContract.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "Qwen4ExpConfig.h"
 #include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
@@ -93,6 +95,14 @@ void Qwen4ExpGraph::bindStorageMemoryAuthority(std::shared_ptr<PhysicalMemoryAut
     if(memory_ && memory_!=authority)
         throw std::logic_error("Flash Next cannot replace a bound physical-memory authority");
     memory_=std::move(authority);
+}
+void Qwen4ExpGraph::bindReadAheadNativeResources(std::shared_ptr<ReadAheadNativeResourceFamily> resources)
+{
+    if(config_.ngram_lookup_schedule!=GraphConfig::NgramLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate || !resources)
+        throw std::invalid_argument("Read-ahead resources require the explicit resident candidate policy");
+    if(config_.ngram_read_ahead_resources && config_.ngram_read_ahead_resources!=resources)
+        throw std::logic_error("Flash Next cannot replace a bound read-ahead native family");
+    config_.ngram_read_ahead_resources=std::move(resources);
 }
 Qwen4ExpGraph::AuxiliaryContent Qwen4ExpGraph::auxiliaryContent() const
 {
@@ -193,7 +203,7 @@ std::shared_ptr<IRetainedGraphStorageBoundary> Qwen4ExpGraph::retainedStorageBou
         // Register original model-owned external roots only. The shared arena
         // inventory never allocates a second cache, frame or protocol tensor.
         if(arena_){
-            bindPooledNativeRoots(*arena_,*boundary->pooledStorage()->owner());
+            if(const auto local=boundary->pooledStorage()->owner())bindPooledNativeRoots(*arena_,*local);
             bindPooledNativeRoots(*arena_,*boundary->pooledStorage()->coordinator());
             bindPooledSourceRoots(*arena_,*boundary);
         }
@@ -221,7 +231,8 @@ std::shared_ptr<IRetainedGraphStorageBoundary> Qwen4ExpGraph::retainedStorageBou
         throw std::logic_error("Flash Next immutable lookup protocol lost its original arena owner");
     const auto rows=tensor(BufferId::QFN_PLE_EMBEDDING).rows();
     lookup_=qwen4exp::ImmutableLookupExecutionBoundary::create(
-        model_ctx_->hostImmutableRowProvider(),device,std::move(protocol_owner),rows,memory_);
+        model_ctx_->hostImmutableRowProvider(),device,std::move(protocol_owner),rows,memory_,
+        model_ctx_->takeRetainedHostService({memory_->worldRank(),device},RetainedHostServiceRole::ImmutableLookupIO,memory_));
     return lookup_;
 }
 std::optional<Qwen4ExpIntBinding> Qwen4ExpGraph::rowParameters(DeviceId device) const
@@ -369,24 +380,9 @@ std::optional<Qwen4ExpIntBinding> Qwen4ExpGraph::adaptiveCountBinding(const Forw
     return Qwen4ExpIntBinding(*owner, role, static_cast<std::size_t>(count - base));
 }
 
-std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
-    int layer,DeviceId device,const std::string &dependency)
+Qwen4ExpPLEBuilder::LookupStorage Qwen4ExpGraph::pleLookupStorage(const ForwardInput& input,
+    DeviceId device,Qwen4ExpStageRows rows,Qwen4ExpAuxiliaryState& owner)
 {
-    const auto &ngram=config_.flash_next->ngrams();
-    if(layer!=static_cast<int>(ngram.decoder_layer))return dependency;
-    const std::string prefix="layer"+std::to_string(layer)+"_ple_";
-    const auto context=pleContext(input,device,prefix);
-    auto *cache=input.getKVCacheForDevice(device);
-    if(!cache)throw std::invalid_argument("Flash Next requires canonical KV and recurrent cache ownership");
-    auto &owner=state(*cache,input.device_state_publication_stream);
-    if(input.batch_size!=1)
-        throw std::logic_error("Flash Next PLE quantized projections require a counted request-hole ABI before request batching");
-    const auto rows=context.rows;
-    const auto *tokens=static_cast<const std::int32_t *>(device.is_gpu()?input.token_ids_device:input.token_ids);
-    if(!tokens)throw std::invalid_argument("Flash Next PLE requires exact native token rows on its execution authority");
-    const Qwen4ExpIntInput tokenRows=Qwen4ExpNativeIntInput{device,tokens,static_cast<std::size_t>(input.seq_len)};
-    const auto &history=owner.ple(0);
-    const auto &weights=layerWeightBindingsForGraph(layer).flash_next.ple;
     if (!model_ctx_ || !config_.ngram_table_placement)
         throw std::logic_error("Flash Next PLE requires its admitted source and concrete placement");
     const auto sourcePlacement=model_ctx_->resolvedImmutableRowTablePlacement();
@@ -394,7 +390,7 @@ std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardI
         throw std::logic_error("Flash Next graph and model source have different admitted ngram placements");
     const auto tier=config_.ngram_table_placement->lookupForConsumer(
         {config_.ngram_table_placement->worldRank(),device});
-    const Qwen4ExpPLEBuilder::LookupStorage storage=[&]() -> Qwen4ExpPLEBuilder::LookupStorage {
+    return [&]() -> Qwen4ExpPLEBuilder::LookupStorage {
         if(tier==ImmutableRowLookupExecution::FixedHeadShardGPU)
         {
             if(!config_.ngram_replicated_ple_cohort || !input.replicated_ple_query || !arena_)
@@ -428,7 +424,7 @@ std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardI
 #endif
             if(!code)throw std::invalid_argument("PLE split lookup requires its compiled original native backend");
             return Qwen4ExpPooledLookupStorage{arena_,lookup_,std::move(code),
-                DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original)};
+                DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original),model_ctx_->adaptiveImmutableLookupParticipants(device)};
         }
         if (tier==ImmutableRowLookupExecution::ResidentGPU)
         {
@@ -448,6 +444,134 @@ std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardI
         (void)retainedStorageBoundary(device);
         return ImmutableLookupStage::Storage{ImmutableLookupStage::GPUStorage{lookup_,integer(BufferId::QFN_NGRAM_LOOKUP_STATE),native}};
     }();
+}
+
+/** @brief Owned only by one generic builder's lexical stack; no model member retains the frame. */
+struct Qwen4ExpGraph::EarlyPrefix final : ModelInvocationPrefix {
+    std::unique_ptr<Qwen4ExpEarlyLookupFrame> frame;
+    explicit EarlyPrefix(std::unique_ptr<Qwen4ExpEarlyLookupFrame> value):frame(std::move(value)){}
+    std::string terminal() const override { return frame->producer(); }
+    void requireConsumed() const override { frame->requireConsumed(); }
+};
+/** @brief Lexically scoped current-demand resident prefix, independent of hosted protocol frames. */
+struct Qwen4ExpGraph::ResidentPrefix final : ModelInvocationPrefix {
+    std::unique_ptr<Qwen4ExpResidentReadAheadFrame> frame;
+    explicit ResidentPrefix(std::unique_ptr<Qwen4ExpResidentReadAheadFrame> value):frame(std::move(value)){}
+    std::string terminal()const override{return frame->frontier();}
+    void requireConsumed()const override{frame->requireConsumed();}
+};
+std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> Qwen4ExpGraph::addModelInvocationPrefix(
+    ComputeGraph& graph,const ForwardInput& input,DeviceId device,ModelInvocationShape shape)
+{
+    const auto selected=resolveImmutableLookupInvocationSchedule(config_.ngram_lookup_schedule,input.execution_phase);
+    if(!ownsPLE())return std::make_unique<ModelInvocationPrefix>();
+    // Workspace sizing declares the original consumer geometry without borrowing
+    // a live request producer or native ordering family. The graph purpose is
+    // permanent: executors and retained capture reject this topology.
+    if(input.graph_submission_intent==ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+    {
+        graph.markWorkspaceDeclaration();
+        return std::make_unique<ModelInvocationPrefix>();
+    }
+
+    if(selected==ImmutableLookupInvocationSchedule::ConsumerScheduled)
+    {
+        if(config_.ngram_lookup_schedule==GraphConfig::NgramLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate)
+            graph.setReadAheadPhasePolicy(input.execution_phase,selected);
+        return std::make_unique<ModelInvocationPrefix>();
+    }
+    const bool residentCandidate=selected==ImmutableLookupInvocationSchedule::ResidentSideLane;
+    if(!residentCandidate && config_.ngram_lookup_schedule!=GraphConfig::NgramLookupSchedule::EarlyCurrentHostedCandidate)
+        throw std::invalid_argument("Unknown typed ngram lookup construction policy");
+    if(shape!=ModelInvocationShape::FullLocal || input.execution_role!=ForwardExecutionRole::MainInference ||
+       config_.grouped_mtp_verifier || config_.pipeline_config ||
+       !device.is_gpu() || input.batch_size!=1)
+        throw std::invalid_argument("Early current hosted lookup candidate requires ordinary complete single-participant local GPU forward; PP/MTP and multi-participant/non-local TP roles are unqualified");
+    if(!config_.ngram_table_placement || config_.ngram_table_placement->isGPUAdaptive() || config_.ngram_replicated_ple_cohort)
+        throw std::invalid_argument("Early current hosted lookup candidate requires an admitted ordinary hosted source");
+    {
+        const ILocalTPContext* local=nullptr;
+        if(config_.tp_ctx)
+        {
+            local=dynamic_cast<const ILocalTPContext*>(config_.tp_ctx);
+            if(!local || !local->isLocal() || local->degree()!=1 || local->devices().size()!=1)
+                throw std::invalid_argument("Read-ahead requires an authenticated degree-one rank-local continuation domain");
+        }
+        if(config_.tp_config && config_.tp_config->worldSize()!=1)
+            throw std::invalid_argument("Read-ahead sharding declaration must name exactly one original assignment");
+        if((config_.tp_ctx || config_.tp_config) && (config_.local_rank!=0 || config_.tp_device_idx!=0))
+            throw std::invalid_argument("Read-ahead singleton context retains a nonzero participant coordinate");
+        requireReadAheadSingleParticipantShape(device,
+            local?std::span<const GlobalDeviceAddress>(local->devices()):std::span<const GlobalDeviceAddress>{},
+            config_.tp_config?std::span<const DeviceShardingAssignment>(config_.tp_config->assignments()):std::span<const DeviceShardingAssignment>{},
+            {config_.n_heads,config_.n_kv_heads,config_.d_ff,config_.vocab_size});
+        if(config_.head_start!=0 || (config_.local_n_heads>0 && config_.local_n_heads!=config_.n_heads) ||
+           (config_.local_n_kv_heads>0 && config_.local_n_kv_heads!=config_.n_kv_heads) ||
+           (config_.d_ff_local>0 && config_.d_ff_local!=config_.d_ff) ||
+           (config_.vocab_local>0 && config_.vocab_local!=config_.vocab_size))
+            throw std::invalid_argument("Read-ahead continuation still owns a partial model assignment");
+    }
+    const auto tier=config_.ngram_table_placement->lookupForConsumer({config_.ngram_table_placement->worldRank(),device});
+    if(!residentCandidate && immutableRowLookupUsesNativeDeviceStorage(tier))
+        throw std::invalid_argument("Early current hosted lookup candidate does not implement resident/fixed-head GPU overlap");
+    const auto prefix="layer"+std::to_string(config_.flash_next->ngrams().decoder_layer)+"_ple_";
+    const auto context=pleContext(input,device,prefix);
+    if((input.execution_phase==ForwardExecutionPhase::Decode && (input.seq_len!=1 || context.rows.liveRows)) ||
+       (input.execution_phase==ForwardExecutionPhase::Prefill && !context.rows.liveRows) ||
+       (input.execution_phase!=ForwardExecutionPhase::Decode && input.execution_phase!=ForwardExecutionPhase::Prefill))
+        throw std::invalid_argument("Early lookup requires one ordinary decode query or its original native counted prefill producer");
+    if(!input.device_state_publication_stream || reinterpret_cast<std::uintptr_t>(input.device_state_publication_stream)<=2)
+        throw std::invalid_argument("Early lookup requires the original explicit invocation publication stream");
+    auto* cache=input.getKVCacheForDevice(device);
+    if(!cache || !input.token_ids_device)throw std::invalid_argument("Early lookup requires original current token and accepted-history owners");
+    auto& owner=state(*cache,input.device_state_publication_stream);
+    const auto storage=pleLookupStorage(input,device,context.rows,owner);
+    const auto* whole=std::get_if<ImmutableLookupStage::Storage>(&storage);
+    if(residentCandidate)
+    {
+        const auto* resident=whole?std::get_if<ImmutableLookupStage::ResidentGPUStorage>(whole):nullptr;
+        if(!resident || !config_.ngram_read_ahead_resources)
+            throw std::invalid_argument("Resident read-ahead candidate requires its original native table and certified exclusive event family");
+        graph.setReadAheadPhasePolicy(input.execution_phase,selected);
+        const Qwen4ExpIntInput tokens=Qwen4ExpNativeIntInput{device,static_cast<const std::int32_t*>(input.token_ids_device),static_cast<std::size_t>(input.seq_len)};
+        return std::make_unique<ResidentPrefix>(Qwen4ExpResidentReadAheadFrame::publish(graph,context,tokens,
+            owner.ple(0).acceptedTokens,integer(BufferId::QFN_NGRAM_ROW_IDS),fp32(BufferId::QFN_PLE_EMBEDDING),
+            *resident,config_.ngram_read_ahead_resources));
+    }
+    const auto* hosted=whole?std::get_if<ImmutableLookupStage::GPUStorage>(whole):nullptr;
+    if(!hosted)throw std::invalid_argument("Early lookup candidate lost its original hosted GPU source");
+    const Qwen4ExpIntInput tokens=Qwen4ExpNativeIntInput{device,static_cast<const std::int32_t*>(input.token_ids_device),static_cast<std::size_t>(input.seq_len)};
+    return std::make_unique<EarlyPrefix>(Qwen4ExpEarlyLookupFrame::publish(graph,context,tokens,
+        owner.ple(0).acceptedTokens,integer(BufferId::QFN_NGRAM_ROW_IDS),fp32(BufferId::QFN_PLE_EMBEDDING),*hosted));
+}
+
+std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
+    int layer,DeviceId device,const std::string &dependency,ModelInvocationPrefix &invocationPrefix)
+{
+    const auto &ngram=config_.flash_next->ngrams();
+    if(layer!=static_cast<int>(ngram.decoder_layer))return dependency;
+    auto* early=dynamic_cast<EarlyPrefix*>(&invocationPrefix);
+    auto* residentEarly=dynamic_cast<ResidentPrefix*>(&invocationPrefix);
+    const bool executable=executableForwardSubmissionIntent(input.graph_submission_intent);
+    if((executable && config_.ngram_lookup_schedule==GraphConfig::NgramLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate &&
+        input.execution_phase==ForwardExecutionPhase::Decode)!=(residentEarly!=nullptr))
+        throw std::invalid_argument("PLE consumer lost or forged its selected graph-local resident read-ahead frame");
+    if((executable && config_.ngram_lookup_schedule==GraphConfig::NgramLookupSchedule::EarlyCurrentHostedCandidate)!=(early!=nullptr))
+        throw std::invalid_argument("PLE consumer lost or forged its selected graph-local early lookup frame");
+    const std::string prefix="layer"+std::to_string(layer)+"_ple_";
+    const auto context=pleContext(input,device,prefix);
+    auto *cache=input.getKVCacheForDevice(device);
+    if(!cache)throw std::invalid_argument("Flash Next requires canonical KV and recurrent cache ownership");
+    auto &owner=state(*cache,input.device_state_publication_stream);
+    if(input.batch_size!=1)
+        throw std::logic_error("Flash Next PLE quantized projections require a counted request-hole ABI before request batching");
+    const auto rows=context.rows;
+    const auto *tokens=static_cast<const std::int32_t *>(device.is_gpu()?input.token_ids_device:input.token_ids);
+    if(!tokens)throw std::invalid_argument("Flash Next PLE requires exact native token rows on its execution authority");
+    const Qwen4ExpIntInput tokenRows=Qwen4ExpNativeIntInput{device,tokens,static_cast<std::size_t>(input.seq_len)};
+    const auto &history=owner.ple(0);
+    const auto &weights=layerWeightBindingsForGraph(layer).flash_next.ple;
+    const auto storage=pleLookupStorage(input,device,rows,owner);
     const auto normalized=fp32(BufferId::QFN_PLE_NORMALIZED);
     std::vector<std::string> dependencies=dependency.empty()?std::vector<std::string>{}:std::vector<std::string>{dependency};
     std::optional<Qwen4ExpAuxiliaryState::PLEVerifierPrior> prior;
@@ -463,7 +587,7 @@ std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardI
             fp32(BufferId::QFN_PLE_EMBEDDING),fp32(BufferId::QFN_PLE_KEY),fp32(BufferId::QFN_PLE_VALUE),
             fp32(BufferId::QFN_PLE_QUERY),fp32(BufferId::QFN_PLE_GATED),fp32(BufferId::QFN_PLE_NORMALIZED),
             prior?prior->convolution():history.acceptedConvolution,qwen4ExpTrunkBinding(buffers_.layer_buffers)},storage,
-        dependencies);
+        dependencies,early?early->frame.get():nullptr,residentEarly?residentEarly->frame.get():nullptr);
     if(prior)
         return owner.appendVerifierPLERetain(graph,prefix,std::move(*prior),tokenRows,normalized,{terminal,prefix+"conv_norm"});
     return owner.appendAcceptedPLECommit(graph,prefix,0,rows,{rows.liveRows,rows.capacity},tokenRows,

@@ -24,6 +24,7 @@
 #include "HostImmutableRowProvider.h"
 #include "ResidentImmutableRowTable.h"
 #include "ImmutableLookupNativeOwnership.h"
+#include "backends/NativeContextPreparation.h"
 #include <map>
 #include <span>
 #include <condition_variable>
@@ -37,8 +38,13 @@
 #include <mutex>
 #include <string>
 
+namespace llaminar2::qwen4exp { class ImmutableLookupService; }
+
 namespace llaminar2
 {
+struct GraphConfig;
+namespace qwen4exp {class PooledImmutableRetainedParticipants;}
+
 
     /**
      * @brief Model context for pipeline initialization
@@ -191,6 +197,11 @@ namespace llaminar2
         std::shared_ptr<const ResidentImmutableRowTable> residentImmutableRowTable(DeviceId device) const override;
         /** @brief Borrow the source-owned adaptive boundary; original roots and live claims survive the last graph borrow. */
         std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> adaptiveImmutableLookupBoundary(DeviceId device) const override;
+        /** @brief Prepare original remote programs off all participant workers after immutable source materialization.
+         * @param graph Actual full source policy; unsupported parent/MTP shapes reject before recording. */
+        void prepareAdaptiveImmutableLookupParticipants(const GraphConfig& graph);
+        /** @return Original model-owned remote programs; storage coordinates are never compute domains. */
+        std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> adaptiveImmutableLookupParticipants(DeviceId device) const override;
         /** @brief Exact live immutable-bank bytes for the existing model-retention owner row. */
         std::size_t residentImmutableRowTableBytes(DeviceId device) const override;
 
@@ -207,6 +218,15 @@ namespace llaminar2
             std::shared_ptr<PhysicalMemoryAuthority> authority,
             std::span<const ImmutableRowTableDevicePreparation> uploads,
             const TransferEngine &transfers);
+
+        /** @brief Retain the original cold source-preparation authority before any table owner exists. */
+        /** @brief Retain exactly one final same-PMA CPU service binding; repeated identical publication is idempotent. */
+        void bindRetainedHostServices(std::shared_ptr<const RetainedHostServiceDeclarations>,std::shared_ptr<PhysicalMemoryAuthority>,std::span<const RetainedHostServiceInstance>)override;
+        /** @brief Move one exact selected role to its sole consumer. */
+        RetainedHostServiceUseToken takeRetainedHostService(PhysicalMemoryAllocatorIdentity,RetainedHostServiceRole,const std::shared_ptr<PhysicalMemoryAuthority>&)override;
+        void bindNativeContextPreparation(std::shared_ptr<NativeContextPreparation>);
+        /** @return Same original source authority for factory-to-loader typed worker handoff. */
+        std::shared_ptr<NativeContextPreparation> nativeContextPreparation() const;
 
         /**
          * @brief Materialize one actual PLE participant after its ordinary loader drains.
@@ -369,6 +389,12 @@ namespace llaminar2
             ImmutableRowPreparationState state;
             std::thread::id preparing_thread;
         };
+        std::mutex host_service_mutex_; ///< Cold binding publication/one-shot role transfer only.
+        std::shared_ptr<const RetainedHostServiceDeclarations> host_service_declarations_;
+        std::shared_ptr<PhysicalMemoryAuthority> host_service_memory_;
+        std::vector<RetainedHostServiceInstance> host_service_selected_;
+        std::shared_ptr<RetainedHostServiceBinding> host_service_binding_; ///< Original admitted tokens, never a second byte ledger.
+        std::shared_ptr<NativeContextPreparation> native_context_preparation_; ///< Original same-PMA selected worker owner, never a second resource ledger.
         mutable std::mutex immutable_row_table_mutex_;
         std::condition_variable immutable_row_table_ready_;
         std::map<DeviceId, ImmutableRowPreparation> immutable_row_table_preparations_;
@@ -377,7 +403,16 @@ namespace llaminar2
         std::exception_ptr immutable_row_table_preparation_failure_;
 
         std::shared_ptr<HostImmutableRowProvider> host_row_provider_;
-        std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> adaptive_lookup_boundary_; ///< One source domain; graph variants share the same original roots.
+        /** @brief Original GPU-local roots and remote companion preparation for one actual PLE consumer. */
+        struct AdaptiveLookupConsumer
+        {
+            std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
+            std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> participants;
+            std::optional<ImmutableRowPreparation> participant_preparation;
+            std::exception_ptr participant_failure;
+        };
+        std::map<DeviceId,AdaptiveLookupConsumer> adaptive_lookup_consumers_;
+        std::shared_ptr<qwen4exp::ImmutableLookupService> adaptive_lookup_service_; ///< One original shared provider/worker and closed channel population.
         std::shared_ptr<const ResolvedImmutableRowTablePlacement> immutable_row_table_placement_;
         std::map<DeviceId, std::shared_ptr<const ResidentImmutableRowTable>> resident_row_tables_;
         std::shared_ptr<PhysicalMemoryAuthority> immutable_row_table_authority_;

@@ -16,6 +16,7 @@
 #ifdef HAVE_ROCM
 
 #include <algorithm>
+#include <limits>
 #include <hip/hip_runtime.h>
 
 namespace llaminar2::rocm
@@ -143,24 +144,23 @@ namespace llaminar2::rocm
             const int *__restrict__ selected_rows,
             int seq_len,
             int d_model,
-            int selected_row_count)
+            int selected_row_count, RowsSelectPolicy policy)
         {
             const int total = selected_row_count * d_model;
             const int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
             const int stride = blockDim.x * gridDim.x;
-            const int upper_bound_row = seq_len - 1;
-            for (int idx = thread_index; idx < total; idx += stride)
+            for (int64_t idx = thread_index; idx < total; idx += stride)
             {
                 const int output_row = idx / d_model;
                 const int column = idx - output_row * d_model;
-                const int raw_selected_row = selected_rows ? selected_rows[output_row] : 0;
-                const int selected_row = raw_selected_row < 0
-                                             ? 0
-                                             : (raw_selected_row > upper_bound_row ? upper_bound_row : raw_selected_row);
+                const int raw_selected_row = selected_rows ? selected_rows[output_row] : policy.fixed_first_row + output_row;
+                const int selected_row = selectedRowForCopy(raw_selected_row, seq_len, policy.negative_rows);
+                if (selected_row < 0)
+                    continue;
                 const size_t source_offset =
-                    static_cast<size_t>(selected_row) * static_cast<size_t>(d_model) +
+                    static_cast<size_t>(selected_row) * static_cast<size_t>(policy.source_stride) +
                     static_cast<size_t>(column);
-                output[static_cast<size_t>(idx)] = input[source_offset];
+                output[static_cast<size_t>(output_row) * policy.destination_stride + column] = input[source_offset];
             }
         }
 
@@ -705,15 +705,26 @@ namespace llaminar2::rocm
         int seq_len,
         int d_model,
         int selected_row_count,
-        void *stream)
+        void *stream,
+        RowsSelectPolicy policy)
     {
-        if (!input || !output || !device_selected_rows || seq_len <= 0 || d_model <= 0 ||
-            selected_row_count <= 0 || !stream)
+        if (!input || !output || (!device_selected_rows && policy.fixed_first_row < 0) || seq_len <= 0 || d_model <= 0 ||
+            selected_row_count <= 0 || !stream ||
+            (device_selected_rows && policy.fixed_first_row >= 0) ||
+            selected_row_count > std::numeric_limits<int>::max() / d_model)
             return false;
 
+        if (policy.negative_rows != NegativeRowSelectionPolicy::ClampToFirst &&
+            policy.negative_rows != NegativeRowSelectionPolicy::PreserveDestination)
+            return false;
+        policy.source_stride = policy.source_stride ? policy.source_stride : d_model;
+        policy.destination_stride = policy.destination_stride ? policy.destination_stride : d_model;
+        if (policy.source_stride < d_model || policy.destination_stride < d_model ||
+            (!device_selected_rows && policy.fixed_first_row > seq_len - selected_row_count))
+            return false;
         constexpr int threads_per_block = 256;
         const int total = selected_row_count * d_model;
-        const int blocks = std::max(1, std::min(1024, (total + threads_per_block - 1) / threads_per_block));
+        const int blocks = std::max(1, std::min(1024, 1 + (total - 1) / threads_per_block));
         auto hip_stream = reinterpret_cast<hipStream_t>(stream);
         hipLaunchKernelGGL(
             rowsSelectFP32Kernel,
@@ -726,7 +737,7 @@ namespace llaminar2::rocm
             device_selected_rows,
             seq_len,
             d_model,
-            selected_row_count);
+            selected_row_count, policy);
         return ok(hipGetLastError());
     }
 

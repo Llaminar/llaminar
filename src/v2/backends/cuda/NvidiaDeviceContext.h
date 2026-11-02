@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "backends/PreparedGPUWorkerThread.h"
 #include "../IWorkerGPUContext.h"
 #include "../GPUDeviceProcessLifetime.h"
 #include <cuda_runtime.h>
@@ -30,6 +31,7 @@
 
 namespace llaminar2
 {
+    namespace test { struct NativeContextSourceLifecycleDiagnosticAccess; }
 
     /**
      * @class NvidiaDeviceContext
@@ -183,6 +185,11 @@ namespace llaminar2
         bool debugSynchronize() override;
 
     private:
+        friend struct test::NativeContextSourceLifecycleDiagnosticAccess;
+        friend class PreparedGPUContextFactory;
+        /** @brief Original constructor body with an exact source-admitted worker stack. */
+        NvidiaDeviceContext(int device_ordinal,std::shared_ptr<PreparedGPUWorkerStack> stack);
+
         /** Declared first so native admission retires last, after worker cleanup and all resource members. */
         GPUDeviceProcessLifetime::NativeContextLease process_lifetime_lease_;
         // =========================================================================
@@ -280,7 +287,7 @@ namespace llaminar2
         // Worker Thread
         // =========================================================================
 
-        std::thread worker_thread_;
+        PreparedGPUWorkerThread worker_thread_;
         /// Immutable identity published before the context reports initialized.
         std::thread::id worker_thread_id_{};
         std::atomic<bool> running_{false};

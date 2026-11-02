@@ -17,7 +17,7 @@ import uuid
 import docker_paths
 import run_production_pipeline as pipeline
 from production_artifacts import digest, write_json
-from run_qfn_source_admission import cleanup_prefixes, source_contract, valid_unqualified
+from run_qfn_source_admission import SOURCE_ADMISSION_REPORT_SCHEMA, cleanup_prefixes, source_contract, valid_unqualified
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tests/v2/e2e/server'))
 import gpu_driver_diagnostics as driver
@@ -74,7 +74,7 @@ def validate_report(report: dict, *, require_pass: bool = True) -> None:
     unavailable = report.get('unqualified', {})
     passed = sum(row.get('passed') is True for row in results.values())
     retired = bool(results) and all(row.get('retirement_proved') is True for row in results.values())
-    if (report.get('schema') != 1 or report.get('complete') is not True
+    if (report.get('schema') != SOURCE_ADMISSION_REPORT_SCHEMA or report.get('complete') is not True
             or not isinstance(selected, list) or not selected or len(set(selected)) != len(selected)
             or set(results) != set(selected) or set(results) & set(unavailable)
             or report.get('selected') != len(selected) or report.get('attempted') != len(selected)
@@ -84,6 +84,8 @@ def validate_report(report: dict, *, require_pass: bool = True) -> None:
             or report.get('hardware_ineligible') != len(unavailable)
             or report.get('discovered') != len(selected) + len(unavailable)
             or any(type(row.get('retirement_proved')) is not bool or type(row.get('passed')) is not bool
+                   or type(row.get('runner_retirement_proved')) is not bool
+                   or (row['retirement_proved'] and not row['runner_retirement_proved'])
                    or (row['passed'] and (row.get('qualification') != 'native-source-admission' or not row['retirement_proved']))
                    or (not row['passed'] and (row.get('qualification') != 'failed-source-contract' or not row.get('error')))
                    for row in results.values())

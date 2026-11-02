@@ -325,6 +325,82 @@ class EmptyGTestGateTests(unittest.TestCase):
                                      observed.stdout + observed.stderr)
 
 
+    def test_native_selection_rejects_skipped_or_empty_execution(self) -> None:
+        """The actual native registration rejects skip summaries, not normal tools.
+
+        Synthetic stdout is emitted by an exit-zero Python child under real
+        CTest. No GPU discovery occurs; only the production registration policy
+        classifies the declared backend and finalized gate alias.
+        """
+        source = (REPO_ROOT / "tests/v2/CMakeLists.txt").read_text(encoding="utf-8")
+        begin = source.index("function(add_v2_test TEST_NAME)")
+        end = source.index("endfunction()", begin) + len("endfunction()")
+        cases = [
+            ("AllSkipped", "[  SKIPPED ] 9 tests.\n[  PASSED  ] 0 tests.", False),
+            ("PartialSkipped", "[  PASSED  ] 2 tests.\n[  SKIPPED ] 1 test.", False),
+            ("ColorSkipped", "\x1b[0;33m[  SKIPPED ]\x1b[m One.Native", False),
+            ("Empty", "[==========] 0 tests from 0 test suites ran.", False),
+            ("Executed", "[==========] 1 test from 1 test suite ran.\n[  PASSED  ] 1 test.", True),
+            ("NonGTest", "NATIVE_ACTOR_BYTE_TAIL_TERMINAL_PASS", True),
+            ("ExistingFailure", "existing_failure_sentinel", False),
+        ]
+        with tempfile.TemporaryDirectory(prefix="llaminar-native-gtest-") as directory:
+            root = Path(directory)
+            printer = root / "summary.py"
+            printer.write_text(
+                f"import sys\nsummaries = {[case[1] for case in cases]!r}\n"
+                "print(summaries[int(sys.argv[1])])\n", encoding="utf-8",
+            )
+            declarations = []
+            expected = []
+            for backend in ("CUDA", "ROCm"):
+                for index, (suffix, output, passes) in enumerate(cases):
+                    name = f"Native{backend}{suffix}"
+                    # Deliberately omit preflight at declaration: existing
+                    # native aliases acquire their gate label later in CMake.
+                    declarations.append(
+                        f'add_v2_test({name} COMMAND "{sys.executable}" "{printer}" '
+                        f'{index} LABELS "V2;Integration;{backend}" '
+                        'MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 5)'
+                    )
+                    declarations.append(
+                        f'set_property(TEST {name} APPEND PROPERTY LABELS ProductionTestPreflight)'
+                    )
+                    declarations.append(
+                        f'set_property(TEST {name} APPEND PROPERTY FAIL_REGULAR_EXPRESSION existing_failure_sentinel)'
+                    )
+                    expected.append((name, passes))
+            # Device-free/backend metadata and ordinary host tests may exercise
+            # GTest skip reporting without claiming native execution.
+            for label in ("V2;Integration;DeviceFree;CUDA", "V2;Unit;CPU"):
+                name = f"Excluded{len(expected)}"
+                declarations.append(
+                    f'add_v2_test({name} COMMAND "{sys.executable}" "{printer}" '
+                    '0 '
+                    f'LABELS "{label}" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 5)'
+                )
+                expected.append((name, True))
+            (root / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\nproject(NativeGTestGate NONE)\n"
+                "enable_testing()\nset(V2_TEST_CORES_PER_SOCKET 1)\nset(V2_TEST_SOCKETS 1)\n"
+                + native_mpi_helper_target() + source[begin:end] + "\n"
+                + "\n".join(declarations), encoding="utf-8",
+            )
+            configured = subprocess.run(
+                ["cmake", "-S", str(root), "-B", str(root / "build")],
+                text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            for name, passes in expected:
+                with self.subTest(name=name):
+                    observed = subprocess.run(
+                        ["ctest", "--test-dir", str(root / "build"), "--output-on-failure",
+                         "-R", f"^{name}$"], text=True, capture_output=True, timeout=10,
+                    )
+                    self.assertEqual(observed.returncode, 0 if passes else 8,
+                                     observed.stdout + observed.stderr)
+
+
 class DeviceInventoryGateTests(unittest.TestCase):
     """Prove CMake startup ownership reaches the actual preflight scheduler."""
 
@@ -842,8 +918,50 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     components.add(component)
                     if rows:
                         old = exact.replace("Qwen4ExpGPUAdaptive/", "Qwen4ExpGPUAdaptiveVRAMRAMSSD/", 1)
-                        self.assertGreater(len(campaigns._gtest_artifact_directory_name(old).encode("utf-8")), 255)
+                        raw_old = re.sub(r'[/\\:*?"<>|]', "_", old.replace(".", "/", 1))
+                        self.assertGreater(len(raw_old.encode("utf-8")), 255)
+                        bounded_old = Path(campaigns._gtest_artifact_directory_name(old))
+                        self.assertEqual(bounded_old.parts[0], "long-identities")
+                        self.assertEqual(bounded_old.parts[-1], "artifacts")
+                        self.assertTrue(all(len(os.fsencode(part)) <= 255 for part in bounded_old.parts))
         self.assertEqual(len(components), 8)
+
+    def test_long_exact_artifact_paths_preserve_full_identity_and_prefix_neighbors(self) -> None:
+        """The existing mirror chunks bytes without hashes or shared cleanup ancestors."""
+        prefix = "Qwen4ExpOppositeVendorMTPRetained15Exact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/"
+        identities = [prefix + "a" * size for size in (260, 480, 481)]
+        paths = [Path(campaigns._gtest_artifact_directory_name(value)) for value in identities]
+        self.assertEqual(len(set(paths)), len(identities))
+        for original, path in zip(identities, paths):
+            self.assertEqual(path.parts[0], "long-identities")
+            self.assertEqual(path.parts[-1], "artifacts")
+            self.assertTrue(all(len(os.fsencode(part)) <= 255 for part in path.parts))
+            self.assertTrue(all(part.startswith("c") for part in path.parts[1:-1]))
+            reconstructed = b"".join(os.fsencode(part)[1:] for part in path.parts[1:-1])
+            expected = re.sub(r'[/\\:*?"<>|]', "_", original.replace(".", "/", 1))
+            self.assertEqual(reconstructed, os.fsencode(expected))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in paths:
+                (root / path).mkdir(parents=True)
+                (root / path / "original.txt").write_text("original")
+            import shutil
+            shutil.rmtree(root / paths[0])
+            for path in paths[1:]:
+                self.assertEqual((root / path / "original.txt").read_text(), "original")
+        for left in paths:
+            for right in paths:
+                if left != right:
+                    self.assertNotIn(left, right.parents)
+
+    def test_short_artifact_names_and_reserved_namespace(self) -> None:
+        """Short numerical names retain the original sanitizer; reserved encoding remains disjoint."""
+        self.assertEqual(campaigns._gtest_artifact_directory_name("Suite.ProductionParity/Original"),
+                         "Suite_ProductionParity_Original")
+        # A boundary control exercises escaping without changing a canonical case ID.
+        with mock.patch.object(campaigns.re, "sub", return_value="long-identities"):
+            self.assertEqual(campaigns._gtest_artifact_directory_name("Suite.Method"),
+                             "long-identities/clong-identities/artifacts")
 
     @staticmethod
     def write_canonical_artifacts(directory: Path) -> None:
@@ -1465,8 +1583,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "V2_Unit_One", "V2_Integration_Host", "V2_Integration_CUDA",
             "V2_Integration_ROCm", "V2_Integration_Mixed",
         ))
-        self.assertEqual(discover_units.call_count, 2)
-        self.assertEqual(discover_registrations.call_count, 2)
+        self.assertEqual(discover_units.call_count, 1)
+        self.assertEqual(discover_registrations.call_count, 1)
         self.assertEqual(run_process.call_count, 4)  # build, Unit, host, mixed
         cpu_sets.assert_called_once_with()
         commands = parallel.call_args.args[0]
@@ -1510,9 +1628,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ),
         )
         self.assertEqual(discover_units.call_args_list,
-                         [mock.call(Path("build"))] * 2)
+                         [mock.call(Path("build"))])
         self.assertEqual(discover.call_args_list,
-                         [mock.call(Path("build"))] * 2)
+                         [mock.call(Path("build"))])
         self.assertEqual(run_process.call_count, 3)
         build_command = run_process.call_args_list[0].args[0]
         unit_command = run_process.call_args_list[1].args[0]
@@ -1527,24 +1645,80 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertFalse(Path(command[command.index("-I") + 1]).exists())
 
     def test_preflight_receipt_uses_registrations_after_build_regeneration(self) -> None:
-        """A build-triggered CMake refresh must not certify a stale inventory."""
+        """Only the successfully built, regenerated inventory enters the receipt."""
+        built = False
+        def execute(_command, _timeout):
+            nonlocal built
+            built = True
+            return 0
         with mock.patch.object(
             campaigns, "discover_production_parity_unit_tests",
-            side_effect=[("V2_Unit_Old",), ("V2_Unit_New", "V2_Unit_Added")],
+            side_effect=lambda _build: ("V2_Unit_New", "V2_Unit_Added") if built else ("V2_Unit_Old",),
         ), mock.patch.object(
             campaigns, "discover_production_test_preflight_registrations",
-            side_effect=[
-                preflight_registrations("V2_Integration_Old"),
-                preflight_registrations("V2_Integration_New"),
-            ],
-        ), mock.patch.object(campaigns, "_run_process", return_value=0):
-            return_code, _, tests = campaigns.run_production_test_preflight(
-                Path("build"), 60.0
-            )
+            side_effect=lambda _build: preflight_registrations(
+                "V2_Integration_New" if built else "V2_Integration_Old"),
+        ), mock.patch.object(campaigns, "_run_process", side_effect=execute):
+            return_code, _, tests = campaigns.run_production_test_preflight(Path("build"), 60.0)
         self.assertEqual(return_code, 0)
-        self.assertEqual(tests, (
-            "V2_Unit_New", "V2_Unit_Added", "V2_Integration_New",
-        ))
+        self.assertEqual(tests, ("V2_Unit_New", "V2_Unit_Added", "V2_Integration_New"))
+
+    def test_preflight_build_bootstraps_missing_ctest_command_without_weakening_discovery(self) -> None:
+        """An unbuilt CTest entry becomes mandatory runnable metadata after the build."""
+        for remains_missing in (False, True):
+            built = False
+            document = json.loads(preflight_ctest_document("V2_Integration_Bootstrap"))
+            def inventory(*_args, **_kwargs):
+                current = json.loads(json.dumps(document))
+                if not built or remains_missing:
+                    current["tests"][0].pop("command", None)
+                return subprocess.CompletedProcess([], 0, json.dumps(current), "")
+            def execute(command, _timeout):
+                nonlocal built
+                if command[0] == "cmake":
+                    built = True
+                return 0
+            with self.subTest(remains_missing=remains_missing), \
+                 mock.patch.object(campaigns.subprocess, "run", side_effect=inventory), \
+                 mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_Bootstrap",)), \
+                 mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
+                 mock.patch.object(campaigns, "_run_process", side_effect=execute) as run:
+                if remains_missing:
+                    with self.assertRaisesRegex(RuntimeError, "has no command"):
+                        campaigns.run_production_test_preflight(Path("build"), None)
+                    self.assertEqual(run.call_count, 1)  # Build only; no unchecked CTest execution.
+                else:
+                    code, _, tests = campaigns.run_production_test_preflight(Path("build"), None)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(tests, ("V2_Unit_Bootstrap", "V2_Integration_Bootstrap"))
+                    self.assertEqual(run.call_args_list[0].args[0][0], "cmake")
+                    self.assertTrue(built)
+
+    def test_preflight_installed_receipt_is_authenticated_before_runnable_inventory(self) -> None:
+        """Installed images never build, and bad receipts cannot reach CTest discovery."""
+        image = mock.Mock()
+        events = []
+        image.validate.side_effect = lambda *_args: events.append("receipt")
+        def registrations(_build):
+            self.assertEqual(events, ["receipt"])
+            events.append("inventory")
+            return preflight_registrations("V2_Integration_Installed")
+        with mock.patch.dict(sys.modules, {"prebuilt_test_image": image}), \
+             mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_Installed",)), \
+             mock.patch.object(campaigns, "discover_production_test_preflight_registrations", side_effect=registrations) as discover, \
+             mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
+             mock.patch.object(campaigns, "_run_process", return_value=0) as run:
+            code, _, tests = campaigns.run_production_test_preflight(Path("build"), None, Path("receipt.json"))
+            self.assertEqual(code, 0)
+            self.assertEqual(tests, ("V2_Unit_Installed", "V2_Integration_Installed"))
+            self.assertTrue(all(call.args[0][0] != "cmake" for call in run.call_args_list))
+            discover.reset_mock()
+            run.reset_mock()
+            image.validate.side_effect = RuntimeError("invalid installed receipt")
+            with self.assertRaisesRegex(RuntimeError, "invalid installed receipt"):
+                campaigns.run_production_test_preflight(Path("build"), None, Path("receipt.json"))
+            discover.assert_not_called()
+            run.assert_not_called()
 
     @mock.patch.object(
         campaigns,
@@ -1675,7 +1849,10 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     self.assertEqual(report["preflight_build_directory"], str(directory.resolve()))
                     self.assertEqual(report["preflight_elapsed_seconds"], elapsed)
                     self.assertEqual(report["preflight_tests"], list(inventory))
-                    self.assertEqual(report["preflight_test_count"], len(tests))
+                    # A failed build has admitted no runnable inventory yet.
+                    expected_tests = () if len(outcomes) == 1 else tests
+                    self.assertEqual(inventory, expected_tests)
+                    self.assertEqual(report["preflight_test_count"], len(expected_tests))
                     self.assertIs(report["certification_eligible"], False)
                     for command in run.call_args_list[1:]:
                         self.assertIn("--output-log", command.args[0])

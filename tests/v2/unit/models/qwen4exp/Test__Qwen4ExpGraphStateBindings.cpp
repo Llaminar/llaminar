@@ -17,6 +17,7 @@
 #include "models/qwen4exp/Qwen4ExpTrunkBinding.h"
 #include "memory/BufferArena.h"
 #include "execution/local_execution/graph/GraphResolver.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
@@ -37,6 +38,14 @@ struct Qwen4ExpPLEProjectionTestPeer
     {
         QwenGraphBase::ForwardInputConstructionScope invocation(graph,input);
         return graph.pleContext(input,device,"actual_ple_");
+    }
+    /** @brief Invoke the real prefix hook without a trunk or native source. */
+    static std::string prefix(Qwen4ExpGraph& owner,const ForwardInput& input,unsigned shape,ComputeGraph& graph){
+        QwenGraphBase::ForwardInputConstructionScope invocation(owner,input);
+        auto prefix=owner.addModelInvocationPrefix(graph,input,input.device,
+            shape==0?QwenGraphBase::ModelInvocationShape::FullLocal:shape==1?QwenGraphBase::ModelInvocationShape::Partial:
+                QwenGraphBase::ModelInvocationShape::UnifiedPipeline);
+        prefix->requireConsumed();return prefix->terminal();
     }
     /** @brief Keep the original scope while testing a different claimed complete invocation. */
     static Qwen4ExpPLEContext mismatchedInvocation(Qwen4ExpGraph &graph,const ForwardInput &original,const ForwardInput &claimed)
@@ -257,3 +266,84 @@ TEST(Qwen4ExpGraphStateBindings, PLEVerifierContextRejectsForeignRolesAndPhasesB
         }
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @brief Unsupported early roles fail before source acquisition or graph mutation. */
+TEST(Qwen4ExpGraphStateBindings, EarlyCurrentCandidateRejectsUnsupportedRolesBeforeSourceWork){
+    for(unsigned shape=0;shape<3;++shape)for(auto role:{ForwardExecutionRole::MainInference,
+        ForwardExecutionRole::MTPCondition,ForwardExecutionRole::GroupedMTPVerifier}){
+        if(shape==0 && role==ForwardExecutionRole::MainInference)continue;
+        GraphConfig config;config.default_device=DeviceId::cuda(0);config.max_request_count=1;
+        Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false),config);
+        config.ngram_lookup_schedule=GraphConfig::NgramLookupSchedule::EarlyCurrentHostedCandidate;
+        Qwen4ExpGraph owner(config);ForwardInput input;input.device=config.default_device;
+        input.seq_len=1;input.batch_size=1;input.execution_role=role;input.execution_phase=ForwardExecutionPhase::Decode;
+        ComputeGraph graph;
+        try{(void)Qwen4ExpPLEProjectionTestPeer::prefix(owner,input,shape,graph);FAIL()<<"Unsupported early role accepted";}
+        catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("ordinary complete"),std::string::npos);}
+        EXPECT_EQ(graph.size(),0u);EXPECT_FALSE(graph.retainedStorageBoundary());
+    }
+}
+/** @brief Existing scheduling emits no detached prefix for any established shape. */
+TEST(Qwen4ExpGraphStateBindings, ConsumerScheduledPrefixKeepsExistingRoles){
+    GraphConfig config;config.default_device=DeviceId::cpu();config.max_request_count=1;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false),config);
+    Qwen4ExpGraph owner(config);ForwardInput input;input.device=config.default_device;input.seq_len=1;input.batch_size=1;
+    for(unsigned shape=0;shape<3;++shape){ComputeGraph graph;
+        EXPECT_EQ(Qwen4ExpPLEProjectionTestPeer::prefix(owner,input,shape,graph),"");EXPECT_EQ(graph.size(),0u);}
+}
+}
+
+namespace llaminar2::test {
+/** @test Geometry-only early policies preserve every original admitted buffer
+ * capacity and cannot enter either execution or retained native capture. */
+TEST(Qwen4ExpGraphStateBindings, ReadAheadWorkspaceDeclarationRetainsOriginalBufferBOMAndRejectsExecution)
+{
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+        for(const auto tier:{ImmutableRowStoragePreference::RAM,
+                            ImmutableRowStoragePreference::MemoryMapped,
+                            ImmutableRowStoragePreference::VRAM})
+    {
+        GraphConfig baseline;baseline.default_device=device;baseline.max_request_count=1;
+        baseline.max_seq_len=512;baseline.max_activation_rows=128;
+        Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false),baseline);
+        baseline.local_n_heads=baseline.n_heads;
+        baseline.local_n_kv_heads=baseline.n_kv_heads;
+        // Declaration consumes the real selector's sealed placement even when
+        // no source is materialized. Compare schedules within that same tier.
+        admitQwen4ExpTestTable(baseline,tier);
+        Qwen4ExpGraph ordinary(baseline);
+        const auto policy=tier==ImmutableRowStoragePreference::VRAM
+            ?ImmutableLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate
+            :ImmutableLookupSchedule::EarlyCurrentHostedCandidate;
+        for(const auto rows:{1,17,128})
+        {
+            SCOPED_TRACE(device.toString()+" rows="+std::to_string(rows)+" tier="+std::to_string(static_cast<int>(tier)));
+            const auto expected=BufferAllocator::resolveLayerBuffers(ordinary.getSchema(),ordinary.getResolverConfig(rows));
+            auto config=baseline;config.ngram_lookup_schedule=policy;
+            Qwen4ExpGraph candidate(config);
+            const auto actual=BufferAllocator::resolveLayerBuffers(candidate.getSchema(),candidate.getResolverConfig(rows));
+            ASSERT_EQ(actual.buffers.size(),expected.buffers.size());
+            std::size_t actualBytes=0,expectedBytes=0;
+            for(std::size_t i=0;i<actual.buffers.size();++i)
+            {
+                EXPECT_EQ(actual.buffers[i].name,expected.buffers[i].name);
+                EXPECT_EQ(actual.buffers[i].shape,expected.buffers[i].shape);
+                EXPECT_EQ(actual.buffers[i].tensor_type,expected.buffers[i].tensor_type);
+                EXPECT_EQ(actual.buffers[i].device,expected.buffers[i].device);
+                EXPECT_EQ(actual.buffers[i].sizeBytes(),expected.buffers[i].sizeBytes());
+                actualBytes+=actual.buffers[i].sizeBytes();expectedBytes+=expected.buffers[i].sizeBytes();
+            }
+            EXPECT_EQ(actualBytes,expectedBytes);
+            ForwardInput input;input.device=config.default_device;input.batch_size=1;input.seq_len=rows;
+            input.execution_phase=rows==1?ForwardExecutionPhase::Decode:ForwardExecutionPhase::Prefill;
+            input.graph_submission_intent=ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+            ComputeGraph declaration;
+            EXPECT_EQ(Qwen4ExpPLEProjectionTestPeer::prefix(candidate,input,0,declaration),"");
+            DeviceGraphExecutor executor;
+            EXPECT_THROW(executor.execute(declaration,nullptr),std::invalid_argument);
+            EXPECT_THROW(executor.captureRetainedGraphFragment(declaration,nullptr,nullptr),std::invalid_argument);
+        }
+    }
+}
+}

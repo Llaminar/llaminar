@@ -22,6 +22,7 @@
 
 #ifdef HAVE_ROCM
 
+#include "backends/detail/GPUFlatGraphInspection.h"
 #include "HIPGraphCapture.h"
 #include "AMDDeviceContext.h"
 #include "../NativeParallelGraphBranch.h"
@@ -1568,6 +1569,36 @@ namespace llaminar2
         return node_count_;
     }
 
+    bool HIPGraphCapture::inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,
+        std::span<std::byte> scratch,GPUFlatGraphStructure& observed,std::string* error)const
+    {
+        observed={};if(error)error->clear();
+        if(!activateOwner("inspectFlatGraphStructure") || !graph_){
+            if(error)*error="Flat graph inspection lost its original backend owner/definition";
+            return false;
+        }
+        struct API {
+            using Node=hipGraphNode_t;
+            hipGraph_t graph;
+            bool nodes(Node* values,std::size_t* count){return hipGraphGetNodes(graph,values,count)==hipSuccess;}
+            bool edges(Node* from,Node* to,std::size_t* count){return hipGraphGetEdges(graph,from,to,count)==hipSuccess;}
+            bool kind(Node node,GPUFlatGraphNodeKind& value){
+                hipGraphNodeType native;
+                if(hipGraphNodeGetType(node,&native)!=hipSuccess)return false;
+                switch(native){
+                case hipGraphNodeTypeKernel:value=GPUFlatGraphNodeKind::Kernel;return true;
+                case hipGraphNodeTypeMemcpy:value=GPUFlatGraphNodeKind::Copy;return true;
+                case hipGraphNodeTypeMemset:value=GPUFlatGraphNodeKind::Set;return true;
+                case hipGraphNodeTypeEmpty:value=GPUFlatGraphNodeKind::Empty;return true;
+                case hipGraphNodeTypeWaitEvent:value=GPUFlatGraphNodeKind::EventWait;return true;
+                case hipGraphNodeTypeEventRecord:value=GPUFlatGraphNodeKind::EventRecord;return true;
+                default:return false;
+                }
+            }
+        } api{graph_};
+        return detail::inspectFlatGraph(api,limits,scratch,observed,error);
+    }
+
     bool HIPGraphCapture::validateFlatHelperNodeKinds(std::string *error) const
     {
         const auto fail = [&](const std::string &detail)
@@ -1648,6 +1679,11 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Destroy original native handles before clearing ownership/accounting state.
+     * @note Failed activation or native teardown is fatal: returning would let an
+     * enclosing PMA retirement owner falsely publish successful handle destruction.
+     */
     void HIPGraphCapture::reset()
     {
         if (native_capture_active_)
@@ -1677,13 +1713,19 @@ namespace llaminar2
         }
         if (exec_)
         {
-            HIP_WARN_IF_FAIL(hipGraphExecDestroy(exec_));
+            if(hipGraphExecDestroy(exec_)!=hipSuccess) {
+                LOG_ERROR("[HIPGraphCapture] Native executable teardown failed before handle/accounting release");
+                std::terminate();
+            }
             exec_ = nullptr;
         }
         resident_memory_bytes_ = 0u;
         if (graph_)
         {
-            HIP_WARN_IF_FAIL(hipGraphDestroy(graph_));
+            if(hipGraphDestroy(graph_)!=hipSuccess) {
+                LOG_ERROR("[HIPGraphCapture] Native graph teardown failed before handle/accounting release");
+                std::terminate();
+            }
             graph_ = nullptr;
         }
         destroyOrderedTimelineTimingEvents();

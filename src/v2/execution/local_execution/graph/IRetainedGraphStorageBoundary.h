@@ -11,12 +11,16 @@
  * model graphs or choose branches.
  */
 #pragma once
+#include <stdexcept>
+#include <optional>
+#include "backends/NativeContextPreparation.h"
 #include "../../../backends/DeviceId.h"
 #include "RetainedStorageStatistics.h"
 #include <cstdint>
 
 namespace llaminar2
 {
+class RetainedGraphParticipantParentStream;
 /** @brief Immutable addresses of canonical generation failure publication words. */
 struct RetainedStorageGenerationControl
 {
@@ -33,6 +37,13 @@ public:
     virtual DeviceId device() const noexcept=0;
     /** @brief Stable complete binding identity; immutable for this object's lifetime. */
     virtual std::uint64_t captureIdentity() const noexcept=0;
+    /** @return Original consumed source permit only when this boundary owns explicit retained remote participants. */
+    virtual std::optional<PreparedGPUContextUsePermit> retainedParticipantSource()const{return std::nullopt;}
+    /** @brief Bind only a canonical retained parent stream when explicit participants require it.
+     * Ordinary local storage has no such authority and rejects this operation. */
+    virtual void bindSourceSubmissionStream(const RetainedGraphParticipantParentStream&){
+        throw std::logic_error("Storage boundary has no retained participant parent stream");
+    }
     /** @brief Bind canonical generation failure addresses once before stage construction. */
     virtual void bindGenerationControl(RetainedStorageGenerationControl control)=0;
     /** @brief Return already-bound canonical addresses without reading their device values. */

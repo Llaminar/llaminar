@@ -6,6 +6,18 @@ application wiring and native capture remain under implementation. The existing
 complete preflight checkpoint and source-cell results remain in
 [the admission matrix](QFN_SOURCE_ADMISSION_MATRIX.md).
 
+The connected next implementation and ownership sequence is recorded in
+[the selected native program factory plan](QFN_NATIVE_SELECTED_PROGRAM_FACTORY.md).
+It names the actual missing operation inventory, original SDK topology and
+transport producers, and the pre-birth runtime-resource boundary. A complete
+original pooled Pin family is the first native test client; full joint
+model/pooled/PP/MTP inventory is still required for QFN serving promotion.
+
+Graph-construction latency is addressed separately by the
+[prepared forward-template slice](QFN_FORWARD_GRAPH_TEMPLATE_PREPARATION.md).
+It reuses immutable model/topology metadata while preserving this admission
+lifecycle, exact native root declarations and all retained capture identities.
+
 ## Problem and target
 
 Native communicator topology preparation needs real CPU storage before it can

@@ -9,6 +9,8 @@
  */
 
 #include "PhysicalMemoryAuthority.h"
+#include "backends/NativeContextOpaqueContract.h"
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 
 #include <algorithm>
 #include <array>
@@ -101,9 +103,19 @@ namespace llaminar2
 
     namespace detail
     {
+        struct PhysicalMemoryOpaqueContextRootState;
+        /** @brief One typed instance use record, never another byte/allocation ledger. */
+        struct PhysicalMemoryHostServiceInstanceRecord {
+            RetainedHostServiceInstance instance;
+            std::string original_program;
+            PhysicalMemoryHostServiceInstancePolicy policy;
+            bool active=false,published=false;
+        };
         /** @brief Mutable live counters protected by one setup-time mutex. */
         struct PhysicalMemoryMaterializationState
         {
+            PhysicalMemoryOpaqueContextRootState* opaque_contexts=nullptr;
+            std::vector<std::shared_ptr<PhysicalMemoryHostServiceInstanceRecord>> host_service_instances; ///< Original instance lifecycle only; all byte claims remain above.
             struct ResourceClaims
             {
                 // Direct leases describe fixed backing allocations.
@@ -262,6 +274,20 @@ namespace llaminar2
             bool registered = false;
         };
 
+        /** @brief One actual source-owned reservation family in the canonical authority. */
+        struct PhysicalMemoryOpaqueContextRootState {
+            enum class Phase { Preclaimed,NativeStarted,Created,Retired };
+            const NativeContextBirthKey key;
+            const NativePhysicalLifetime lifetime;
+            const std::string evidence;
+            const std::uint64_t epoch_identity;
+            std::array<std::shared_ptr<PhysicalMemoryReservationState>,2> reservations;
+            Phase phase=Phase::Preclaimed;
+            PhysicalMemoryOpaqueContextRootState* previous=nullptr;
+            PhysicalMemoryOpaqueContextRootState* next=nullptr;
+            PhysicalMemoryOpaqueContextRootState(const NativeContextOpaqueContract& contract,std::uint64_t epoch)
+                :key(contract.key()),lifetime(contract.lifetime()),evidence(contract.evidenceSha256()),epoch_identity(epoch){}
+        };
         /** @brief One immutable SDK source declaration and its canonical one-shot lifecycle. */
         struct PhysicalMemoryNativeRootPermitState
         {
@@ -595,6 +621,137 @@ namespace llaminar2
         return PhysicalMemoryNativeSetupEpoch(std::move(epoch));
     }
 
+    /** @brief Unique source family owner; all capacity remains in original PMA reservation states. */
+    struct PhysicalMemoryOpaqueRuntimeCommitment::State {
+        std::shared_ptr<detail::PhysicalMemoryNativeSetupEpochState> epoch;
+        std::unique_ptr<detail::PhysicalMemoryOpaqueContextRootState> root;
+        std::weak_ptr<PhysicalMemoryAuthority> original_memory;
+    };
+    PhysicalMemoryOpaqueRuntimeCommitment::PhysicalMemoryOpaqueRuntimeCommitment(std::unique_ptr<State> state)
+        :state_(std::move(state)){}
+    PhysicalMemoryOpaqueRuntimeCommitment::~PhysicalMemoryOpaqueRuntimeCommitment() noexcept {
+        if(!state_ || !state_->root)return;
+        {
+            std::lock_guard lock(state_->epoch->authority->mutex);
+            if(state_->root->phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted ||
+               state_->root->phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::Created)std::terminate();
+        }
+        try{retirePhysically();}catch(...){std::terminate();}
+    }
+    std::shared_ptr<PhysicalMemoryOpaqueRuntimeCommitment> PhysicalMemoryNativeSetupEpoch::reserveOpaqueContext(
+        const NativeContextOpaqueContract& contract,const std::shared_ptr<PhysicalMemoryAuthority>& memory) const {
+        if(!epoch_ || !memory || memory->ledger_.state_!=epoch_->authority)throw std::logic_error("Opaque context has no original source epoch");
+        contract.key().requireComplete();
+        if(contract.evidenceSha256().size()!=64 || (!contract.hostUpperBytes() && !contract.deviceUpperBytes()))
+            throw std::invalid_argument("Opaque context has no qualified positive family commitment/evidence");
+        auto holder=std::make_unique<PhysicalMemoryOpaqueRuntimeCommitment::State>();holder->epoch=epoch_;holder->original_memory=memory;
+        holder->root=std::make_unique<detail::PhysicalMemoryOpaqueContextRootState>(contract,epoch_->identity);
+        auto& state=*epoch_->authority;
+        const std::array devices{DeviceId::cpu(),contract.key().device};
+        const std::array bytes{contract.hostUpperBytes(),contract.deviceUpperBytes()};
+        const auto owner=ownerIndex(PhysicalMemoryOwner::NativeExecutionContext);
+        for(std::size_t part=0;part<devices.size();++part){
+            const auto found=std::find_if(state.observations.begin(),state.observations.end(),[&](const auto& observed){
+                return observed.world_rank==epoch_->world_rank && observed.device==devices[part];});
+            if(found==state.observations.end())throw std::invalid_argument("Opaque context changed its original physical allocator set");
+            holder->root->reservations[part]=std::make_shared<detail::PhysicalMemoryReservationState>(
+                epoch_->authority,static_cast<std::size_t>(found-state.observations.begin()),PhysicalMemoryOwner::NativeExecutionContext,bytes[part]);
+        }
+        auto result=std::shared_ptr<PhysicalMemoryOpaqueRuntimeCommitment>(new PhysicalMemoryOpaqueRuntimeCommitment(std::move(holder)));
+        std::lock_guard lock(state.mutex);
+        if(state.phase!=PhysicalMemoryAuthorityPhase::Preparing || state.preparation_frozen ||
+           epoch_->phase!=detail::PhysicalMemoryNativeSetupEpochState::Phase::Preparation)
+            throw std::logic_error("Opaque context commitment must precede original native birth and optional admission");
+        for(auto* existing=state.opaque_contexts;existing;existing=existing->next)
+            if(existing->key.device==contract.key().device)
+                throw std::logic_error("Original opaque context family is already committed; borrow its original owner instead");
+        for(const auto& reservation:result->state_->root->reservations){
+            const auto& claims=state.claims[reservation->resource_index];std::size_t committed=0;
+            for(std::size_t at=0;at<PhysicalMemoryBOM::ownerCount();++at){
+                committed=checkedAdd(committed,claims.new_allocations[at],"opaque original allocations");
+                committed=checkedAdd(committed,claims.new_reservation_capacity[at],"opaque original reservations");
+                committed=checkedAdd(committed,claims.preparation_committed[at],"opaque original preparation");
+            }
+            const auto available=state.observations[reservation->resource_index].admission_available_bytes;
+            if(committed>available || reservation->capacity_bytes>available-committed)
+                throw PhysicalMemoryCapacityExhausted("Qualified context commitment displaces original pending owners");
+        }
+        if(epoch_->live_roots==std::numeric_limits<std::size_t>::max() || epoch_->unpublished_roots==std::numeric_limits<std::size_t>::max())
+            throw std::overflow_error("Opaque source lifetime exhausted");
+        auto* root=result->state_->root.get();root->next=state.opaque_contexts;
+        if(root->next)root->next->previous=root;state.opaque_contexts=root;
+        for(const auto& reservation:root->reservations){
+            state.claims[reservation->resource_index].new_reservation_capacity[owner]+=reservation->capacity_bytes;
+            reservation->registered=true;
+        }
+        ++epoch_->live_roots;++epoch_->unpublished_roots;
+        return result;
+    }
+    void PhysicalMemoryOpaqueRuntimeCommitment::requireOriginalProcessRetention(
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,const NativeContextOpaqueContract& contract) const {
+        if(!memory || !state_ || !state_->epoch || !state_->root)
+            throw std::logic_error("Process opaque retention lost its original source token");
+        const auto originalMemory=state_->original_memory.lock();
+        if(!originalMemory || originalMemory.get()!=memory.get() || originalMemory.owner_before(memory) || memory.owner_before(originalMemory))
+            throw std::logic_error("Process opaque retention substituted its original source authority owner");
+        const auto& original=state_->epoch->authority;const auto& candidate=memory->ledger_.state_;
+        if(!candidate || original.get()!=candidate.get() || original.owner_before(candidate) || candidate.owner_before(original))
+            throw std::logic_error("Process opaque retention crossed the original physical authority");
+        std::lock_guard lock(original->mutex);const auto& root=*state_->root;
+        if(contract.lifetime()!=NativePhysicalLifetime::ProcessRuntime || root.lifetime!=contract.lifetime() ||
+           root.key!=contract.key() || root.evidence!=contract.evidenceSha256() ||
+           root.epoch_identity!=state_->epoch->identity || root.phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Preclaimed ||
+           original->phase!=PhysicalMemoryAuthorityPhase::Preparing || original->preparation_frozen ||
+           state_->epoch->phase!=detail::PhysicalMemoryNativeSetupEpochState::Phase::Preparation)
+            throw std::logic_error("Process opaque retention requires its exact original unpublished source certificate");
+        const std::array bounds{contract.hostUpperBytes(),contract.deviceUpperBytes()};
+        for(std::size_t part=0;part<bounds.size();++part){const auto& reservation=root.reservations[part];
+            if(!reservation || !reservation->registered || reservation->capacity_bytes!=bounds[part] ||
+               reservation->authority!=original || reservation->owner!=PhysicalMemoryOwner::NativeExecutionContext ||
+               reservation->materialized_bytes || reservation->native_preclaimed_bytes)
+                throw std::logic_error("Process opaque retention changed its original reservation obligation");}
+    }
+    void PhysicalMemoryOpaqueRuntimeCommitment::beginNative(){
+        auto& original=*state_->epoch->authority;std::lock_guard lock(original.mutex);
+        if(original.phase!=PhysicalMemoryAuthorityPhase::Preparing || original.preparation_frozen ||
+           state_->root->phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Preclaimed)
+            throw std::logic_error("Original opaque context birth permit is stale or already used");
+        state_->root->phase=detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted;
+    }
+    void PhysicalMemoryOpaqueRuntimeCommitment::publishCreated(){
+        auto& epoch=*state_->epoch;std::lock_guard lock(epoch.authority->mutex);
+        if(epoch.authority->phase!=PhysicalMemoryAuthorityPhase::Preparing || epoch.authority->preparation_frozen ||
+           state_->root->phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted || !epoch.unpublished_roots)
+            throw std::logic_error("Original opaque context cannot publish a missing/duplicate creator");
+        state_->root->phase=detail::PhysicalMemoryOpaqueContextRootState::Phase::Created;--epoch.unpublished_roots;
+    }
+    void PhysicalMemoryOpaqueRuntimeCommitment::retirePhysically(){
+        if(!state_ || !state_->root)return;
+        auto& epoch=*state_->epoch;auto& authority=*epoch.authority;std::lock_guard lock(authority.mutex);
+        auto& root=*state_->root;
+        if(root.phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::Retired)return;
+        if(root.lifetime==NativePhysicalLifetime::ProcessRuntime &&
+           (root.phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted || root.phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::Created))
+            throw std::logic_error("Process-runtime opaque backing survives context reset; original tokens cannot retire here");
+        // Unregistered pending construction never acquired capacity or a source lifetime.
+        if(!root.reservations[0]->registered && !root.reservations[1]->registered){root.phase=detail::PhysicalMemoryOpaqueContextRootState::Phase::Retired;return;}
+        if(!epoch.live_roots || (root.phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Created && !epoch.unpublished_roots))
+            throw std::logic_error("Opaque runtime retirement lost its original source obligation");
+        for(const auto& reservation:root.reservations){
+            auto& capacity=authority.claims[reservation->resource_index].new_reservation_capacity[ownerIndex(reservation->owner)];
+            if(!reservation->registered || reservation->materialized_bytes || reservation->native_preclaimed_bytes || capacity<reservation->capacity_bytes)
+                throw std::logic_error("Opaque runtime reservation acquired an unrelated child or changed authority");
+        }
+        for(const auto& reservation:root.reservations){
+            authority.claims[reservation->resource_index].new_reservation_capacity[ownerIndex(reservation->owner)]-=reservation->capacity_bytes;
+            reservation->registered=false;
+        }
+        if(root.previous)root.previous->next=root.next;else authority.opaque_contexts=root.next;
+        if(root.next)root.next->previous=root.previous;
+        if(root.phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Created)--epoch.unpublished_roots;
+        --epoch.live_roots;root.phase=detail::PhysicalMemoryOpaqueContextRootState::Phase::Retired;
+    }
+
     PhysicalMemoryNativeSetupLease PhysicalMemoryNativeSetupEpoch::claimPreparation(
         const PhysicalMemoryNativeRootDeclaration &declaration) const
     {
@@ -678,7 +835,13 @@ namespace llaminar2
                         throw std::logic_error("Preparing source root is unpublished");
                     builder.add(resource, PhysicalMemoryBOM::ownerAt(owner), bytes);
                 }
+            for(std::size_t owner=0;owner<PhysicalMemoryBOM::ownerCount();++owner)
+                if(const auto opaque=state.claims[i].new_reservation_capacity[owner])
+                    builder.add(resource,PhysicalMemoryBOM::ownerAt(owner),opaque);
         }
+        for(auto* root=state.opaque_contexts;root;root=root->next)
+            if(root->epoch_identity!=epoch_->identity || root->phase!=detail::PhysicalMemoryOpaqueContextRootState::Phase::Created)
+                throw std::logic_error("Opaque birth family was not completely created in its original source epoch");
         for (auto *root = epoch_->preparation_roots; root; root = root->next)
             snapshot->declarations.push_back(root->declaration);
         std::sort(snapshot->declarations.begin(), snapshot->declarations.end(),
@@ -699,6 +862,10 @@ namespace llaminar2
         std::lock_guard lock(state.mutex);
         if (state.phase == PhysicalMemoryAuthorityPhase::Admitted)
             throw std::logic_error("Admitted source cannot cancel/reopen its Preparing authority");
+        for(auto* root=state.opaque_contexts;root;root=root->next)
+            if(root->lifetime==NativePhysicalLifetime::ProcessRuntime &&
+               (root->phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::NativeStarted || root->phase==detail::PhysicalMemoryOpaqueContextRootState::Phase::Created))
+                throw std::logic_error("Original Preparing source retains attempted process-runtime backing and cannot be cancelled");
         state.phase = PhysicalMemoryAuthorityPhase::Cancelled;
         state.preparation_frozen = true;
         epoch_->phase = detail::PhysicalMemoryNativeSetupEpochState::Phase::Abandoned;
@@ -790,8 +957,8 @@ namespace llaminar2
                 {
                     const auto kind = PhysicalMemoryBOM::ownerAt(owner);
                     const auto bytes = retained->charge(kind).incrementalBytes();
-                    if (state.claims[i].preparation_committed[owner] != bytes ||
-                        state.claims[i].preparation_materialized[owner] != bytes)
+                    if (checkedAdd(state.claims[i].preparation_committed[owner],state.claims[i].new_reservation_capacity[owner],"original opaque preparation") != bytes ||
+                        state.claims[i].preparation_materialized[owner] != state.claims[i].preparation_committed[owner])
                         throw std::logic_error("A retained preparation root retired/changed after "
                                                "optional planning snapshot");
                     if (resources[i].charge(kind).incrementalBytes() < bytes)
@@ -835,9 +1002,8 @@ namespace llaminar2
                         bytes > candidate->charge(owner).incrementalBytes())
                         throw std::logic_error("Final source plan omitted/duplicated/relabelled "
                                                "exact mandatory native storage");
-                    if (bytes && owner != (identity.device.is_gpu()
-                                               ? PhysicalMemoryOwner::NativeExecutionContext
-                                               : PhysicalMemoryOwner::LocalCollective))
+                    if (bytes && owner != PhysicalMemoryOwner::NativeExecutionContext &&
+                        (identity.device.is_gpu() || owner!=PhysicalMemoryOwner::LocalCollective))
                         throw std::invalid_argument(
                             "Mandatory native descriptor charged an ordinary model owner");
                 }
@@ -1978,6 +2144,11 @@ namespace llaminar2
                 const auto *charge =
                     admitted ? &state_->certificate->plan().resources()[resource].charge(kind)
                              : nullptr;
+                std::size_t opaque=0;
+                for(auto* root=state_->opaque_contexts;root;root=root->next)
+                    for(const auto& reservation:root->reservations)
+                        if(reservation->registered && reservation->resource_index==resource && ownerIndex(reservation->owner)==owner)
+                            opaque=checkedAdd(opaque,reservation->capacity_bytes,"named opaque source commitments");
                 result.push_back({
                     .identity = {observed.world_rank, observed.device},
                     .phase = state_->phase,
@@ -1997,10 +2168,69 @@ namespace llaminar2
                     .preparation_committed_bytes = claims.preparation_committed[owner],
                     .preparation_materialized_bytes = claims.preparation_materialized[owner],
                     .native_declared_preclaimed_bytes = claims.native_declared_preclaimed[owner],
+                    .opaque_runtime_committed_bytes = opaque,
                 });
             }
         }
         return result;
+    }
+
+    /** @brief Lease teardown runs after the actual worker and existing byte claims have retired. */
+    struct PhysicalMemoryHostServiceInstanceLease::State {
+        std::shared_ptr<detail::PhysicalMemoryMaterializationState> authority;
+        std::shared_ptr<detail::PhysicalMemoryHostServiceInstanceRecord> record;
+        ~State()noexcept{
+            if(!record)return; // An exception before arming owns no instance.
+            if(!authority)std::terminate();
+            std::lock_guard lock(authority->mutex);
+            if(!record->active)std::terminate();
+            record->active=false;
+            // Failed claims never published an instance. Remove only their own
+            // stable record, allowing explicit retry without poisoning a role.
+            if(!record->published){
+                auto& records=authority->host_service_instances;
+                const auto found=std::find(records.begin(),records.end(),record);
+                if(found==records.end())std::terminate();records.erase(found);
+            }
+        }
+    };
+    PhysicalMemoryHostServiceInstanceLease::PhysicalMemoryHostServiceInstanceLease(std::unique_ptr<State> state):state_(std::move(state)){}
+    PhysicalMemoryHostServiceInstanceLease::PhysicalMemoryHostServiceInstanceLease(PhysicalMemoryHostServiceInstanceLease&&)noexcept=default;
+    PhysicalMemoryHostServiceInstanceLease& PhysicalMemoryHostServiceInstanceLease::operator=(PhysicalMemoryHostServiceInstanceLease&&)noexcept=default;
+    PhysicalMemoryHostServiceInstanceLease::~PhysicalMemoryHostServiceInstanceLease()noexcept=default;
+    void PhysicalMemoryHostServiceInstanceLease::publish()noexcept{
+        if(!state_)std::terminate();std::lock_guard lock(state_->authority->mutex);
+        if(!state_->record->active)std::terminate();state_->record->published=true;
+    }
+    void PhysicalMemoryAuthority::requireOriginalHostServiceOwner(const std::shared_ptr<PhysicalMemoryAuthority>& memory)const{
+        const auto original=weak_from_this().lock();
+        if(!memory||memory.get()!=this||!original||original.get()!=this||original.owner_before(memory)||memory.owner_before(original))
+            throw std::logic_error("CPU service requires its original canonical PMA shared owner/controlblock");
+    }
+    PhysicalMemoryHostServiceInstanceLease PhysicalMemoryAuthority::claimHostServiceInstance(
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,const RetainedHostServiceInstance& instance,
+        const std::string& program,PhysicalMemoryHostServiceInstancePolicy policy){
+        requireOriginalHostServiceOwner(memory);
+        if(instance.worldRank!=world_rank_||!instance.consumer.is_valid()||program.empty())throw std::logic_error("CPU service original instance identity is incomplete/foreign");
+        auto lease=std::make_unique<PhysicalMemoryHostServiceInstanceLease::State>();
+        lease->authority=ledger_.state_;
+        // No PMA lock spans source checks, native creators or existing byte claims.
+        std::lock_guard lock(ledger_.state_->mutex);
+        if(ledger_.state_->phase!=PhysicalMemoryAuthorityPhase::Admitted)throw std::logic_error("CPU service original instance requires final admission");
+        auto& records=ledger_.state_->host_service_instances;
+        auto found=std::find_if(records.begin(),records.end(),[&](const auto& record){return record->instance==instance;});
+        if(found!=records.end()){
+            const auto& record=*found;
+            if(record->active||record->policy!=policy||record->original_program!=program||
+               (record->published&&policy==PhysicalMemoryHostServiceInstancePolicy::OneShot))
+                throw std::logic_error("CPU service original instance already active/consumed or changed policy");
+            lease->record=record;
+        }else{
+            auto record=std::make_shared<detail::PhysicalMemoryHostServiceInstanceRecord>(detail::PhysicalMemoryHostServiceInstanceRecord{instance,program,policy});
+            records.push_back(record);lease->record=std::move(record);
+        }
+        lease->record->active=true;
+        return PhysicalMemoryHostServiceInstanceLease(std::move(lease));
     }
 
     PhysicalMemoryAuthority::PhysicalMemoryAuthority(
@@ -2316,6 +2546,7 @@ namespace llaminar2
                    << " adopted_resident=" << row.adopted_resident_bytes
                    << " preparation_committed=" << row.preparation_committed_bytes
                    << " preparation_materialized=" << row.preparation_materialized_bytes
+                   << " opaque_runtime_committed=" << row.opaque_runtime_committed_bytes
                    << " native_declared_preclaimed=" << row.native_declared_preclaimed_bytes
                    << " committed=" << (row.committed() ? "true" : "false")
                    << " complete=" << (row.complete() ? "true" : "false");

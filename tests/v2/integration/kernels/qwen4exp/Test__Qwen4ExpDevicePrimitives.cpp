@@ -14,6 +14,9 @@
  * Real RAM/mmap service-worker affinity is observed by exact-inode libc delegation.
  * CPU arena roots use an explicit model-free fixture admission authority.
  */
+#include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "backends/NativeOrderingEventGroup.h"
 #include "../../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
 #include <bit>
@@ -730,22 +733,26 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
 {
     auto *backend=getBackendFor(device);
     if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested GPU backend unavailable";
-    auto &worker=GPUDeviceContextPool::instance().getContext(device);
-    worker.submitAsync([&] {
+    // Original observations precede worker creation; both serialized storage
+    // alternatives retain one source/PMA and additive process obligations.
+    auto session = test::PreparedNativeLookupFixture::prepare(std::array{device});
+    auto &worker = *session->permit(device).worker();
+    {
         constexpr int capacity=1025,width=160;
         constexpr std::size_t rowBytes=90,maxIds=capacity*16;
         LookupFile file;
         // The same real captured service proof covers unchanged whole-tier
         // controls and explicit zero/nonzero adaptive RAM/SSD ownership.
-        for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
-        {
+        const auto hostResource = session->resource(DeviceId::cpu());
+        const auto gpuResource = session->resource(device);
+        const auto io=RetainedHostServiceProgram::original(RetainedHostServiceRole::ImmutableLookupIO);
+        const auto caseBudget=[&](ImmutableRowStorage mode) {
             const std::size_t slots=mode==ImmutableRowStorage::RAM?0u:2u;
-            SCOPED_TRACE(::testing::Message()<<device.toString()<<" adaptive="<<adaptive<<" mode="<<static_cast<int>(mode));
+
             const auto layout=ImmutableLookupLayout::create(maxIds,rowBytes);
             const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
             PhysicalMemoryPlanBuilder plan;
-            const PhysicalMemoryResource resource{.world_rank=0,.device=DeviceId::cpu(),
-                .total_bytes=1u<<28,.admission_available_bytes=1u<<28};
+            const auto &resource = hostResource;
             std::optional<CpuAdaptiveImmutableRowCacheGeometry> cache;
             if(adaptive)
             {
@@ -760,15 +767,35 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
             }
             else plan.add(resource,PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(file.source(),policy));
             plan.add(resource,PhysicalMemoryOwner::ImmutableLookupStaging,ImmutableLookupService::hostBytes(layout));
-            auto memory=std::make_shared<PhysicalMemoryAuthority>(
-                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+            return std::pair{plan.build(),cache};
+        };
+        const std::array cases{caseBudget(ImmutableRowStorage::RAM).first,caseBudget(ImmutableRowStorage::MemoryMapped).first};
+        PhysicalMemoryPlanBuilder joint;joint.addMutuallyExclusive(cases);
+        const auto ordering=NativeOrderingEventGroup::bom(NativeOrderingEventProgram::lookupSubmissionRetirement(),hostResource,gpuResource);
+        for(std::size_t i=0;i<cases.size();++i)
+            for(const auto& bom:ordering.resources())joint.add(bom);
+        const auto ioBOM=io.bom(hostResource);
+        for(const auto& row:ioBOM.resources())joint.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceStorage,row.bytes(PhysicalMemoryOwner::RetainedHostServiceStorage));
+        for(std::size_t i=0;i<cases.size();++i)for(const auto& row:ioBOM.resources())joint.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceRuntime,row.bytes(PhysicalMemoryOwner::RetainedHostServiceRuntime));
+        session->admit(joint.build());
+        auto memory = session->memory();
+        worker.submitAsync([&] {
+        std::uint64_t ioOrdinal=0;
+        for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
+        {
+            const auto layout=ImmutableLookupLayout::create(maxIds,rowBytes);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+            const auto cache=caseBudget(mode).second;
+            const std::size_t slots=mode==ImmutableRowStorage::RAM?0u:2u;
             auto table=adaptive?HostImmutableRowProvider::fromAdaptiveCache(CpuAdaptiveImmutableRowCache::create(file.source(),*cache,memory)):
                 HostImmutableRowProvider::fromWholeTable(std::make_unique<ImmutableRowTable>(
                     file.source(),policy, DeviceId::cpu(),memory,ImmutableRowTableHostPlacement::taskPolicy()));
             std::unique_ptr<immutable_lookup_affinity_test::Probe> affinity;
             if (placement == LookupWorkerPlacementProof::ActualOwnedWorker)
                 affinity = std::make_unique<immutable_lookup_affinity_test::Probe>(file.fd);
-            auto service=ImmutableLookupService::create(table,layout,std::array{device},memory,DeviceId::cpu());
+            const RetainedHostServiceInstance ioKey{0,device,RetainedHostServiceRole::ImmutableLookupIO,ioOrdinal++};RetainedHostServiceDeclarations::Builder declaration(0);declaration.add(ioKey,io);
+            const auto declared=std::move(declaration).freeze();auto ioBinding=declared->bind(memory,std::span{&ioKey,std::size_t{1}});
+            auto service=ImmutableLookupService::create(table,layout,std::array{device},memory,DeviceId::cpu(),ioBinding->take(ioKey));
             if (affinity) affinity->created();
             LookupAdmissionStream admissionStream(*backend,device);
             auto protocolOwner=std::make_shared<INT32Tensor>(std::vector<std::size_t>{16});
@@ -795,7 +822,7 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
 #ifdef HAVE_ROCM
             if(device.is_rocm())native=createROCmImmutableLookupKernels(device,TensorType::IQ4_NL,width,rowBytes);
 #endif
-            auto boundary=std::make_shared<ImmutableLookupExecutionBoundary>(service,device,std::move(native),protocolOwner);
+            auto boundary=std::make_shared<ImmutableLookupExecutionBoundary>(service,device,std::move(native),protocolOwner,memory);
             EXPECT_THROW(boundary->terminalObservation(),std::logic_error);
             std::vector<int> initialController(sampling_math::kDeviceGenerationControlCount);
             initialController[sampling_math::kDeviceGenerationControlOk]=1;
@@ -1039,7 +1066,11 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
             EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableTableStorage,
                 PhysicalMemoryMaterializationKind::NewAllocation),0u);
         }
-    }).get();
+        }).get();
+    }
+    session->requirePayloadRetired();
+    session->retire();
+    session->requireExactRetired();
 }
 #ifdef HAVE_ROCM
 /** @brief Explicit fixture-only execution demand; no production dispatch policy changes. */

@@ -62,6 +62,7 @@ namespace llaminar2
     {
         RetiredExecutionTopology,
         ExclusiveModelRetirement,
+        ExclusiveNativeContextRetirement,
     };
 
     /** @return Stable diagnostic spelling for a reclamation intent. */
@@ -115,6 +116,8 @@ namespace llaminar2
      * The owner must then be destroyed before the ticket is consumed by
      * `completeExclusiveModelRetirement()`. Keeping construction private
      * prevents callers from inventing a baseline after allocations disappear.
+     * The explicit native-context entry point uses this same reset transaction
+     * with a certified empty tensor ledger and a distinct diagnostic intent.
      */
     class ExclusiveModelRetirementTicket final
     {
@@ -126,6 +129,7 @@ namespace llaminar2
         ExclusiveModelRetirementTicket(
             ExclusiveModelRetirementTicket &&other) noexcept
             : retention_(other.retention_),
+              intent_(other.intent_),
               driver_free_bytes_before_owner_release_(
                   other.driver_free_bytes_before_owner_release_),
               canonical_allocations_before_owner_release_(
@@ -181,10 +185,12 @@ namespace llaminar2
         /** @brief Construct only from a live backend observation. */
         ExclusiveModelRetirementTicket(
             ModelDeviceMemoryRetention retention,
+            DeviceMemoryReclamationIntent intent,
             size_t driver_free_bytes_before_owner_release,
             size_t canonical_allocations_before_owner_release,
             size_t canonical_allocation_bytes_before_owner_release) noexcept
             : retention_(std::move(retention)),
+              intent_(intent),
               driver_free_bytes_before_owner_release_(
                   driver_free_bytes_before_owner_release),
               canonical_allocations_before_owner_release_(
@@ -196,6 +202,7 @@ namespace llaminar2
         }
 
         ModelDeviceMemoryRetention retention_; ///< Exact admission-owned BOM.
+        DeviceMemoryReclamationIntent intent_; ///< Positive model BOM or proven empty native context.
         size_t driver_free_bytes_before_owner_release_ = 0u; ///< Diagnostic.
         size_t canonical_allocations_before_owner_release_ = 0u; ///< Owners.
         size_t canonical_allocation_bytes_before_owner_release_ = 0u; ///< Bytes.
@@ -292,8 +299,8 @@ namespace llaminar2
         [[nodiscard]] size_t
         driverBytesVisibleSinceOwnerRelease() const noexcept
         {
-            if (intent !=
-                DeviceMemoryReclamationIntent::ExclusiveModelRetirement)
+            if (intent != DeviceMemoryReclamationIntent::ExclusiveModelRetirement &&
+                intent != DeviceMemoryReclamationIntent::ExclusiveNativeContextRetirement)
             {
                 return reclaimedDriverBytes();
             }
@@ -1288,6 +1295,25 @@ namespace llaminar2
             const ModelDeviceMemoryRetention &retention) const;
 
         /**
+         * @brief Begin native-only retirement before any model payload exists.
+         *
+         * Startup failure may leave a worker or private driver backing without
+         * a single tensor allocation. This entry point requires the canonical
+         * allocation count AND byte total to be zero before it issues the same
+         * exclusive reset ticket. It does not accept a caller-supplied BOM.
+         * Native handles must retire before completion, and original PMA
+         * obligations remain charged until the validated physical reset.
+         *
+         * @param device Exact GPU whose native ownership is being retired.
+         * @return Single-use ticket for completeExclusiveModelRetirement(s).
+         * @throws std::invalid_argument for a CPU or invalid endpoint.
+         * @throws std::runtime_error for absent accounting or live allocations.
+         * @throws std::logic_error if called during graph capture.
+         */
+        [[nodiscard]] ExclusiveModelRetirementTicket
+        beginExclusiveNativeContextRetirement(DeviceId device) const;
+
+        /**
          * @brief Retire the worker generation and prove a released model BOM.
          *
          * The final model and reusable-workspace owners must be gone before
@@ -1548,7 +1574,8 @@ namespace llaminar2
          * @return Complete owner or throw, rolling back every partial allocation/claim.
          *
          * This same-process API cannot express a remote rank. Initial cursor
-         * publication has one bounded setup event join before returning ready;
+         * publication joins the exact original setup streams at one bounded cold
+         * boundary without creating auxiliary events before returning ready;
          * no stream/device synchronization or inference-time host wait occurs.
          * Caller establishes NUMA first-touch affinity before materialization.
          */
@@ -1630,6 +1657,46 @@ namespace llaminar2
             CapturedTransferBinding capacity_binding,
             std::shared_ptr<DeviceTransferBuffer> extent_storage,
             size_t extent_offset = 0) const;
+
+        /**
+         * @brief Bind a counted message directly to an existing tensor's device scalar.
+         * @param capacity_binding Original fixed-capacity endpoint binding, prepared before capture.
+         * @param extent_tensor Tensor/view retaining the canonical physical count owner.
+         * @param extent_offset Eight-byte-aligned physical offset of its uint64 byte scalar.
+         * @return Frozen producer input or consumer publication, retaining the original allocation borrow.
+         * @throws std::exception For absent/foreign storage, capture-time binding, bounds or alias failure.
+         *
+         * No scalar is copied or allocated. Submission acquires the producer's exact
+         * tensor publication and publishes a consumer scalar on that same stream.
+         * A fork must acquire a producer count as an explicit companion; a forked
+         * receive count must share its destination tensor so the existing join
+         * publishes both outputs together. Independent fork outputs need their own
+         * paired publication contract and are rejected before submission.
+         */
+        [[nodiscard]] CapturedTransferBinding bindDeviceCountedTransfer(
+            CapturedTransferBinding capacity_binding,
+            std::shared_ptr<ITensor> extent_tensor,
+            size_t extent_offset = 0) const;
+
+        /**
+         * @brief Bind an original GPU-authored source slice without packing or host observation.
+         * @param capacity_binding Fixed positive wire maximum on a producer endpoint.
+         * @param slice_tensor Tensor/view retaining its original canonical descriptor owner.
+         * @param slice_offset Eight-byte-aligned physical offset of CapturedTransferSourceSlice.
+         * @param source_span_bytes Exact readable source region from the binding's fixed payload base.
+         * @param source_offset_origin Coordinate of that base in the original source descriptor; zero for relative slices.
+         * @return Complete counted producer with acquired offset/length snapshots in its original channel cursor.
+         * @throws std::exception For non-producer/count-rebinding, absent storage, invalid source/descriptor bounds or aliasing.
+         *
+         * The source span can exceed the wire maximum; it is not transmitted.
+         * Each replay sends only the acquired live bytes, including zero. The
+         * source and descriptor producers must precede this node and keep their
+         * original allocation/geometry through retirement. Capture retains each
+         * physical authority; replay never queries a registry or allocates scratch.
+         */
+        [[nodiscard]] CapturedTransferBinding bindDeviceSlicedTransfer(
+            CapturedTransferBinding capacity_binding, std::shared_ptr<ITensor> slice_tensor,
+            size_t slice_offset, size_t source_span_bytes, std::uint64_t source_offset_origin = 0) const;
 
         /**
          * @brief Record one complete acquire/copy/release DAG on an exact stream.
@@ -2801,6 +2868,18 @@ namespace llaminar2
         /// Resolve a backend for the given device.
         /// Uses injected resolver if set, otherwise the global BackendManager.
         IBackend *resolveBackend(DeviceId device) const;
+
+        /**
+         * @brief Capture one original canonical ledger for either typed reset entry.
+         * @param retention Validated positive model BOM or native-only zero payload.
+         * @param intent Exact factory-selected exclusive retirement contract.
+         * @return Original observation retained through the existing reset transaction.
+         * @throws std::runtime_error when canonical ownership violates the contract.
+         * @throws std::logic_error for a capture-time lifecycle transition.
+         */
+        [[nodiscard]] ExclusiveModelRetirementTicket beginExclusiveRetirement(
+            const ModelDeviceMemoryRetention &retention,
+            DeviceMemoryReclamationIntent intent) const;
 
         /**
          * @brief Validate and resolve a mapped signal alias for kernel capture.

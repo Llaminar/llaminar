@@ -12,6 +12,8 @@
  * Two-device cases deliberately change the runtime's current device before
  * every public reset without changing the actual DGO stream/root ownership.
  */
+#include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "backends/NativeOrderingEventGroup.h"
 #include "backends/BackendManager.h"
 #include "backends/ExplicitGPUStream.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -449,13 +451,38 @@ void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
     auto &worker=GPUDeviceContextPool::instance().getContext(device);
     worker.submitAsync([&] {
         using Peer=DeviceGraphOrchestratorLiveStateTestAccess;
+        HostedSource file;
+        const PhysicalMemoryResource host{0,DeviceId::cpu(),1u<<24,1u<<24};
+        const PhysicalMemoryResource gpu{0,device,backend->deviceMemoryTotal(device.ordinal),backend->deviceMemoryFree(device.ordinal)};
+        const auto io=RetainedHostServiceProgram::original(RetainedHostServiceRole::ImmutableLookupIO);
+        const auto caseBudget=[&](ImmutableRowStorage mode,int capacity) {
+            constexpr std::size_t stride=5*sizeof(IQ4_NLBlock);
+            const auto idCapacity=static_cast<std::size_t>(capacity)*16;
+            const auto layout=ImmutableLookupLayout::create(idCapacity,stride);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+
+            PhysicalMemoryPlanBuilder plan;
+            plan.add(host,PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(file.source(),policy));
+            plan.add(host,PhysicalMemoryOwner::ImmutableLookupStaging,ImmutableLookupService::hostBytes(layout));
+            return plan.build();
+        };
+        const std::array cases{caseBudget(ImmutableRowStorage::RAM,1),caseBudget(ImmutableRowStorage::RAM,3),
+            caseBudget(ImmutableRowStorage::MemoryMapped,1),caseBudget(ImmutableRowStorage::MemoryMapped,3)};
+        PhysicalMemoryPlanBuilder joint;joint.addMutuallyExclusive(cases);
+        const auto ordering=NativeOrderingEventGroup::bom(NativeOrderingEventProgram::lookupSubmissionRetirement(),host,gpu);
+        for(std::size_t i=0;i<cases.size();++i)
+            for(const auto& bom:ordering.resources())joint.add(bom);
+        const auto ioBOM=io.bom(host);
+        for(const auto& row:ioBOM.resources())joint.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceStorage,row.bytes(PhysicalMemoryOwner::RetainedHostServiceStorage));
+        for(std::size_t i=0;i<cases.size();++i)for(const auto& row:ioBOM.resources())joint.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceRuntime,row.bytes(PhysicalMemoryOwner::RetainedHostServiceRuntime));
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(joint.build()),0);
+        std::uint64_t ioOrdinal=0;
         for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
         for(const int capacity:{1,3})
         {
             SCOPED_TRACE(::testing::Message()<<device.toString()<<" capacity="<<capacity<<" tier="<<static_cast<int>(mode));
             constexpr int width=160;constexpr std::size_t stride=5*sizeof(IQ4_NLBlock);
             const auto idCapacity=static_cast<std::size_t>(capacity)*16,outputElements=idCapacity*width;
-            HostedSource file;
             // This owner precedes DGO construction, so its graphs/operands remain
             // alive through the runner's event-aware arena/topology destruction.
             Storage storage{device,backend,ExplicitGPUStream(worker.getOrCreateAuxiliaryStream("hosted_prefill_reset")).get(),
@@ -480,14 +507,11 @@ void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
             auto *scratch=storage.allocate<std::byte>(idCapacity*stride);auto *output=storage.allocate<float>(outputElements);
             const auto layout=ImmutableLookupLayout::create(idCapacity,stride);
             const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
-            const PhysicalMemoryResource host{.world_rank=0,.device=DeviceId::cpu(),.total_bytes=1u<<24,.admission_available_bytes=1u<<24};
-            PhysicalMemoryPlanBuilder plan;
-            plan.add(host,PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(file.source(),policy));
-            plan.add(host,PhysicalMemoryOwner::ImmutableLookupStaging,ImmutableLookupService::hostBytes(layout));
-            auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
             auto source=HostImmutableRowProvider::fromWholeTable(std::make_unique<ImmutableRowTable>(file.source(),policy,
                 DeviceId::cpu(),memory,ImmutableRowTableHostPlacement::taskPolicy()));
-            auto service=ImmutableLookupService::create(source,layout,std::array{device},memory,DeviceId::cpu());
+            const RetainedHostServiceInstance ioKey{0,device,RetainedHostServiceRole::ImmutableLookupIO,ioOrdinal++};RetainedHostServiceDeclarations::Builder declaration(0);declaration.add(ioKey,io);
+            const auto declared=std::move(declaration).freeze();auto ioBinding=declared->bind(memory,std::span{&ioKey,std::size_t{1}});
+            auto service=ImmutableLookupService::create(source,layout,std::array{device},memory,DeviceId::cpu(),ioBinding->take(ioKey));
             std::unique_ptr<IImmutableLookupKernels> kernels;
 #ifdef HAVE_CUDA
             if(device.is_cuda())kernels=createCUDAImmutableLookupKernels(device,TensorType::IQ4_NL,width,stride);
@@ -496,7 +520,7 @@ void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
             if(device.is_rocm())kernels=createROCmImmutableLookupKernels(device,TensorType::IQ4_NL,width,stride);
 #endif
             auto *generation=reinterpret_cast<std::uint64_t *>(reinterpret_cast<std::byte *>(state)+offsetof(ImmutableLookupDeviceState,admissionGeneration));
-            auto boundary=std::make_shared<ImmutableLookupExecutionBoundary>(service,device,std::move(kernels),protocolOwner);
+            auto boundary=std::make_shared<ImmutableLookupExecutionBoundary>(service,device,std::move(kernels),protocolOwner,memory);
             builder->boundary=boundary;storage.hostedBoundary=boundary;
             auto *control=Peer::control(runner);ASSERT_NE(control,nullptr);
             boundary->bindGenerationControl({control+kDeviceGenerationControlOk,control+kDeviceGenerationControlErrorCode});

@@ -31,9 +31,13 @@
 #endif
 #include "PooledImmutableNativeKernels.h"
 #include "PooledImmutableNativeOps.h"
+#include "PooledImmutableOwnerLaunchPlan.h"
+#include "PooledImmutableReadOps.h"
 #include <stdexcept>
 #include <string>
 #include "GPUPooledImmutableCoalescing.cuh"
+#include "GPUPooledImmutableExactIdentity.cuh"
+#include "GPUPooledImmutableOwnerValidation.cuh"
 namespace llaminar2::qwen4exp::QFN_NATIVE_NAMESPACE
 {
 /** @brief Seed mandatory owner controls once; no physical slot is made Ready or zero-filled. */
@@ -49,7 +53,21 @@ template<class Slot> __global__ __launch_bounds__(Threads,2) void initializeSlot
 template<class Slot> __global__ void sealOwnerKernel(n::OwnerArgs a){n::sealOwner<Slot>(a);}
 /** @brief One real ordered owner state mutation; no row payload work runs here. */
 template<n::OwnerAction Action,class Slot> __global__ void ownerPhase(n::OwnerArgs a)
-{n::owner<Action,Slot>(a);}
+{
+    bool succeeded;
+    if constexpr(Action==n::OwnerAction::Pin || Action==n::OwnerAction::AcceptFree || Action==n::OwnerAction::AcceptVictim)
+        succeeded=n::CooperativeOwnerValidation<Slot>::template run<Action>(a);
+    else succeeded=n::owner<Action,Slot>(a);
+    if constexpr(Action==n::OwnerAction::AcquireReaderRetirement || Action==n::OwnerAction::RetiredWire || Action==n::OwnerAction::ReadRows || Action==n::OwnerAction::PublishWire || Action==n::OwnerAction::ReadyWire || Action==n::OwnerAction::PublicationAcquiredWire){
+        if(!succeeded){
+#if defined(QFN_POOLED_NATIVE_CUDA)
+            __trap();
+#else
+            __builtin_trap();
+#endif
+        }
+    }
+}
 /** @brief Copy only the current immutable actual grant prefix to reusable directed transport staging. */
 template<n::OwnerAction Action> __global__ __launch_bounds__(Threads,2) void publishReplies(n::OwnerArgs a)
 {
@@ -72,6 +90,15 @@ template<class Slot> __global__ __launch_bounds__(Threads,2) void copyRows(n::Ow
         a.cache[a.plan.cache.payload+std::uint64_t{n::grants(a)[row].slot}*a.plan.slot_stride+byte]=a.input.payload[i];
     }
 }
+/** @brief Pack only actual validated pinned bytes, excluding all native slot stride padding. */
+__global__ __launch_bounds__(Threads,2) void copyHits(n::OwnerArgs a){
+    if(n::progress(a).delivery!=n::Delivery::Validated)return;
+    const auto bytes=n::at<n::OwnerIngress>(a.native,a.plan.native.ingress)->payload_bytes;
+    for(auto i=std::uint64_t{blockIdx.x}*Threads+threadIdx.x;i<bytes;i+=std::uint64_t{gridDim.x}*Threads)
+        a.native[a.plan.native.source_payload+i]=*n::hitReadByte(a,i);
+}
+/** @brief Publish fresh receipt64/count only after every ordered packed-byte writer. */
+template<class Slot> __global__ void hitsComplete(n::OwnerArgs a){(void)n::completeHitRead<Slot>(a);}
 /** @brief Actual copy completion is published only after every disjoint payload writer's launch completes. */
 template<class Slot> __global__ void copyComplete(n::OwnerArgs a){n::copied<Slot>(a);}
 /** @brief Seed only actual coordinator controls. */
@@ -93,7 +120,7 @@ __global__ void sealCoordinatorKernel(n::CoordinatorSetupArgs a)
 {auto op=p::CoordinatorOperations(n::coordinatorView(a));p::CoordinatorCoalescingAccess::seal(op);}
 /** @brief One ordered policy/consensus operation; independent coalescing and payload copies use their own producers. */
 template<n::CoordinatorAction Action> __global__ void coordinatorPhase(n::CoordinatorArgs a)
-{n::coordinator<Action>(a);}
+{n::submitCoordinator<Action>(a);}
 /** @brief Reject default streams and foreign current contexts before any enqueue; no context guessing or substitution. */
 void require(DeviceId device,void* stream)
 {
@@ -117,9 +144,9 @@ class Kernels final:public IPooledImmutableNativeKernels
 public:
     /** @return Actual compile-time native backend with no device discovery. */
     DeviceType backend()const noexcept override{return QFN_NATIVE_BACKEND;}
-    /** @return Version, thread geometry and deterministic coalescing policy are immutable capture identity. */
+    /** @return Version, exact identity algorithm, thread geometry and deterministic coalescing policy are immutable capture identity. */
     std::uint64_t codeIdentity()const noexcept override
-    {return (n::Version<<48)|(static_cast<std::uint64_t>(QFN_NATIVE_BACKEND)<<40)|(std::uint64_t{Threads}<<16)|SmallRows;}
+    {return (n::Version<<48)|(static_cast<std::uint64_t>(QFN_NATIVE_BACKEND)<<40)|(std::uint64_t{1}<<32)|(std::uint64_t{Threads}<<16)|SmallRows;}
 protected:
     /** @brief Initialize one checked owner once on its exact setup stream. */
     void initializeOwner(const n::OwnerArgs& a,void* exact)const override
@@ -159,6 +186,10 @@ protected:
             }
             throw std::invalid_argument("Pooled native Begin received an unsupported original producer width");
 #define QFN_COORDINATOR_CASE(Name) case n::CoordinatorAction::Name:coordinatorPhase<n::CoordinatorAction::Name><<<1,1,0,stream>>>(a);checked();return;
+        QFN_COORDINATOR_CASE(ImportLocalPinHeader)
+        QFN_COORDINATOR_CASE(ImportLocalAvailability)
+        QFN_COORDINATOR_CASE(ImportLocalFreeReceipt)
+        QFN_COORDINATOR_CASE(ImportLocalVictimReceipt)
         QFN_COORDINATOR_CASE(PinCommands)
         QFN_COORDINATOR_CASE(AcquirePins)
         QFN_COORDINATOR_CASE(SealPins)
@@ -189,11 +220,15 @@ private:
     /** @brief Execute one closed owner phase specialization and publish only its actual live reply prefix. */
     template<n::OwnerAction Action,class Slot> static void submitOwner(const n::OwnerArgs& a,QFN_NATIVE_STREAM stream)
     {
-        ownerPhase<Action,Slot><<<1,1,0,stream>>>(a);checked();
-        if constexpr(Action==n::OwnerAction::Pin || Action==n::OwnerAction::ExecuteFree || Action==n::OwnerAction::ExecuteVictim ||
-            Action==n::OwnerAction::CancelFree || Action==n::OwnerAction::CancelVictim)
+        constexpr auto lanes=Action==n::OwnerAction::Pin || Action==n::OwnerAction::AcceptFree || Action==n::OwnerAction::AcceptVictim?Threads:1;
+        ownerPhase<Action,Slot><<<1,lanes,0,stream>>>(a);checked();
+        if constexpr(n::OwnerLaunchPlan<Action>::publishesReplies)
             if(a.plan.native.reply_capacity){publishReplies<Action><<<blocks(a.plan.native.reply_capacity),Threads,0,stream>>>(a);checked();}
-        if constexpr(Action==n::OwnerAction::ApplySourceDelivery){
+        if constexpr(n::OwnerLaunchPlan<Action>::readsRows){
+            if(a.plan.native.reply_capacity){copyHits<<<blocks(std::uint64_t{a.plan.native.reply_capacity}*a.plan.row_bytes),Threads,0,stream>>>(a);checked();}
+            hitsComplete<Slot><<<1,1,0,stream>>>(a);checked();
+        }
+        if constexpr(n::OwnerLaunchPlan<Action>::appliesSource){
             if(a.plan.native.reply_capacity){
                 copyRows<Slot><<<blocks(std::uint64_t{a.plan.native.reply_capacity}*a.plan.row_bytes),Threads,0,stream>>>(a);checked();
             }
@@ -205,6 +240,7 @@ private:
     {
         switch(action){
 #define QFN_OWNER_CASE(Name) case n::OwnerAction::Name:submitOwner<n::OwnerAction::Name,Slot>(a,stream);return;
+        QFN_OWNER_CASE(ReadRows)
         QFN_OWNER_CASE(Begin)
         QFN_OWNER_CASE(Pin)
         QFN_OWNER_CASE(SealPins)
@@ -228,6 +264,12 @@ private:
         QFN_OWNER_CASE(CancelVictim)
         QFN_OWNER_CASE(CancelSource)
         QFN_OWNER_CASE(Retire)
+        QFN_OWNER_CASE(DrainSourceFailure)
+        QFN_OWNER_CASE(PublishWire)
+        QFN_OWNER_CASE(ReadyWire)
+        QFN_OWNER_CASE(PublicationAcquiredWire)
+        QFN_OWNER_CASE(RetiredWire)
+        QFN_OWNER_CASE(AcquireReaderRetirement)
 #undef QFN_OWNER_CASE
         }
         throw std::invalid_argument("Unknown pooled native owner phase");

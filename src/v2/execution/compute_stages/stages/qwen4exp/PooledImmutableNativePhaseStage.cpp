@@ -9,6 +9,8 @@
 #include "PooledImmutableNativePhaseStage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <array>
+#include "kernels/qwen4exp/PooledImmutableNativeAliasPolicy.h"
+#include <type_traits>
 #include <stdexcept>
 namespace llaminar2 {
 namespace {
@@ -58,7 +60,12 @@ void PooledImmutableNativePhaseStage::requireDeclarations()const{
             ((span->root==values[i])!=(span->buffer==ids[i])))
             throw std::logic_error("Pooled native input role aliases a different mutable authority");
     }
-    std::visit([](const auto& value){value.storage->captureIdentity();value.operands.requireDeclarations(value.action,value.storage->plan());},phase_);
+    std::visit([](const auto& value){
+        value.storage->captureIdentity();
+        if constexpr(std::is_same_v<std::decay_t<decltype(value)>,Owner>)
+            qwen4exp::detail::requireOwnerAliasDeclarations(value.action,value.operands,value.storage->roots(),value.storage->plan());
+        else qwen4exp::detail::requireCoordinatorAliasDeclarations(value.action,value.operands,value.storage->roots(),value.storage->plan());
+    },phase_);
 }
 void PooledImmutableNativePhaseStage::requirePreparedBindings()const{
     requireDeclarations();

@@ -12,6 +12,7 @@
  * joins so publication racing its retirement cannot disappear from the ledger.
  */
 #include "ImmutableLookupService.h"
+#include "backends/NativeOrderingEventGroup.h"
 #include "../local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
@@ -54,16 +55,16 @@ std::uint64_t nextTableId()
 
 ImmutableLookupHostProcessor::ImmutableLookupHostProcessor(HostImmutableRowProvider &table,ImmutableLookupLayout layout,
     std::span<std::byte> channel,std::uint64_t tableId,std::atomic<ImmutableLookupStatus> *fatalStatus,
-    const std::atomic<bool> *cancelled)
+    const std::atomic<bool> *cancelled,DeviceId requester)
     :table_(&table),layout_(layout),channel_(channel),tableId_(tableId),fatalStatus_(fatalStatus),cancelled_(cancelled)
 {
     if(tableId==0||channel.size()<layout.bytes()||reinterpret_cast<std::uintptr_t>(channel.data())%64!=0||
         table.source().rowBytes()!=layout.rowBytes() ||
-        layout.subordinate()!=table.subordinateRequester().has_value() ||
+        layout.subordinate()!=!table.subordinateRequesters().empty() ||
         (table.maximumLiveRows() && layout.maximumIds()>*table.maximumLiveRows()))
         throw std::invalid_argument("Immutable lookup requires aligned complete channel storage and exact table-row geometry");
     // Mode/source/bounds checks precede metadata initialization and binding.
-    if(layout.subordinate())table.bindSubordinate(this);
+    if(layout.subordinate())table.bindSubordinate(this,requester);
     std::construct_at(reinterpret_cast<ImmutableLookupRequest *>(channel.data()+layout.requestOffset()));
     std::construct_at(reinterpret_cast<ImmutableLookupCompletion *>(channel.data()+layout.completionOffset()));
     std::construct_at(reinterpret_cast<ImmutableLookupAcknowledgement *>(channel.data()+layout.acknowledgementOffset()));
@@ -298,8 +299,11 @@ std::size_t ImmutableLookupService::hostBytes(ImmutableLookupLayout layout)
 
 std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shared_ptr<HostImmutableRowProvider> table,
     ImmutableLookupLayout layout,std::span<const DeviceId> devices,std::shared_ptr<PhysicalMemoryAuthority> memory,
-    DeviceId hostDevice,TransferEngine &transfers)
+    DeviceId hostDevice,RetainedHostServiceUseToken worker,TransferEngine &transfers)
 {
+    if(worker.program().role()!=RetainedHostServiceRole::ImmutableLookupIO ||
+       worker.memory().get()!=memory.get() || worker.memory().owner_before(memory) || memory.owner_before(worker.memory()))
+        throw std::logic_error("Immutable lookup requires its original admitted I/O worker role and PMA control block");
     if(!table||!memory||!hostDevice.is_cpu()||devices.empty()||table->source().rowBytes()!=layout.rowBytes()||
         table->retainedOwnerObservation().allocator()!=PhysicalMemoryAllocatorIdentity{memory->worldRank(),hostDevice})
         throw std::invalid_argument("Immutable lookup service requires table, canonical admission and explicit mapped endpoints");
@@ -308,18 +312,18 @@ std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shar
     const auto source_owner=table->retainedOwnerObservation();
     if(source_owner.authority().get()!=memory.get())
         throw std::invalid_argument("Hosted lookup cannot borrow a provider from a different PMA");
-    if(layout.subordinate())
-    {
-        const auto requester=table->subordinateRequester();
-        if(!requester || devices.size()!=1 || requester->world_rank!=memory->worldRank() ||
-            devices.front()!=requester->device)
-            throw std::invalid_argument("Subordinate source service requires its exact single declared GPU requester");
-    }
-    else if(table->subordinateRequester())
+    if(layout.subordinate()) {
+        const auto requesters=table->subordinateRequesters();
+        if(requesters.size()!=devices.size())throw std::invalid_argument("Subordinate service requires the complete original consumer population");
+        for(const auto requester:requesters)
+            if(requester.world_rank!=memory->worldRank() || std::find(devices.begin(),devices.end(),requester.device)==devices.end())
+                throw std::invalid_argument("Subordinate service has a foreign or missing original consumer");
+    } else if(!table->subordinateRequesters().empty())
         throw std::invalid_argument("Subordinate source cannot enter the ordinary channel ABI");
-    const auto bytes=hostBytes(layout);
+    const auto geometry=ImmutableLookupServiceGeometry::checked(layout,devices);
+    const auto bytes=geometry.hostBytes();
     auto physical=memory->claimNewAllocation(hostDevice,PhysicalMemoryOwner::ImmutableLookupStaging,bytes);
-    auto mapped=transfers.allocateMappedHostRegion(layout.bytes(),devices);
+    auto mapped=transfers.allocateMappedHostRegion(geometry.bytes(),devices);
     if(!mapped||!mapped->isBound()||mapped->sizeBytes()!=bytes)
         throw std::runtime_error("Immutable lookup mapped allocation differs from its admitted physical extent");
     auto backing=std::make_shared<ImmutableLookupChannelBacking>(ImmutableLookupChannelBacking{
@@ -329,17 +333,36 @@ std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shar
     // retained workers and CPU expert compute placement remain unchanged.
     const ScopedOpenMPPartitionAffinity io_worker_affinity;
     return std::shared_ptr<ImmutableLookupService>(
-        new ImmutableLookupService(std::move(table), std::move(backing), std::move(memory)));
+        new ImmutableLookupService(std::move(table), std::move(backing), geometry,std::move(memory),
+            PreparedRetainedHostService::materialize(std::move(worker))));
 }
 
 ImmutableLookupService::ImmutableLookupService(std::shared_ptr<HostImmutableRowProvider> table,
-                                               std::shared_ptr<ImmutableLookupChannelBacking> backing,
-                                               std::shared_ptr<const PhysicalMemoryAuthority> memory)
+                                               std::shared_ptr<ImmutableLookupChannelBacking> backing,ImmutableLookupServiceGeometry geometry,
+                                               std::shared_ptr<const PhysicalMemoryAuthority> memory,
+                                               std::unique_ptr<PreparedRetainedHostService> worker)
     : table_(std::move(table)), backing_(std::move(backing)), memory_(std::move(memory)),
-      processor_(*table_, backing_->layout,
+      geometry_(std::move(geometry)),processor_(*table_, backing_->layout,
                  {static_cast<std::byte *>(backing_->mapped->mutableHostData()), backing_->layout.bytes()},
-                 backing_->tableId, &fatalStatus_, &cancelled_)
+                 backing_->tableId, &fatalStatus_, &cancelled_,geometry_.device(0)),
+      worker_owner_(std::move(worker)),worker_(worker_owner_->worker())
 {
+    adopted_.resize(geometry_.channelCount());retired_.resize(geometry_.channelCount());
+    pooled_storages_.resize(geometry_.channelCount());
+    for(std::size_t i=1;i<geometry_.channelCount();++i)
+        extra_processors_.push_back(std::make_unique<ImmutableLookupHostProcessor>(*table_,backing_->layout,
+            std::span<std::byte>{static_cast<std::byte*>(backing_->mapped->mutableHostData())+geometry_.offset(i),backing_->layout.bytes()},
+            backing_->tableId,&fatalStatus_,&cancelled_,geometry_.device(i)));
+}
+std::size_t ImmutableLookupService::channelIndex(DeviceId device) const {
+    for(std::size_t i=0;i<geometry_.channelCount();++i)if(geometry_.device(i)==device)return i;
+    throw std::invalid_argument("Immutable lookup names a foreign original consumer");
+}
+ImmutableLookupHostProcessor& ImmutableLookupService::processor(std::size_t index) {
+    return index?*extra_processors_.at(index-1):processor_;
+}
+const ImmutableLookupHostProcessor& ImmutableLookupService::processor(std::size_t index) const {
+    return index?*extra_processors_.at(index-1):processor_;
 }
 
 ImmutableLookupService::~ImmutableLookupService()
@@ -358,7 +381,7 @@ ImmutableLookupService::Binding ImmutableLookupService::bind(DeviceId device)
         throw std::logic_error("Subordinate source requires the future explicit GPU request/ACK kernel binding");
     if(!device.is_gpu()||!backing_->mapped->hasDevice(device))
         throw std::invalid_argument("Immutable lookup binding names an unmapped GPU endpoint");
-    auto *base=static_cast<std::byte *>(backing_->mapped->deviceAlias(device));
+    auto *base=static_cast<std::byte *>(backing_->mapped->deviceAlias(device))+geometry_.offset(channelIndex(device));
     const auto &layout=backing_->layout;
     // This is the explicit storage infrastructure boundary: TransferEngine owns
     // every mapping/alias and PMA owns its physical lease. Kernels receive only
@@ -373,13 +396,12 @@ ImmutableLookupService::Binding ImmutableLookupService::bind(DeviceId device)
 
 ImmutableSubordinateLookupBinding ImmutableLookupService::bindSubordinate(DeviceId device)
 {
-    const auto requester = table_->subordinateRequester();
-    if (!backing_->layout.subordinate() || !requester || requester->device != device || !device.is_gpu() ||
+    if (!backing_->layout.subordinate() || table_->subordinateRequesters().empty() || !device.is_gpu() ||
         !backing_->mapped->hasDevice(device))
         throw std::invalid_argument(
             "Adaptive native binding requires its exact declared protocol2 requester");
     table_->authenticateSource();
-    auto *base = static_cast<std::byte *>(backing_->mapped->deviceAlias(device));
+    auto *base = static_cast<std::byte *>(backing_->mapped->deviceAlias(device))+geometry_.offset(channelIndex(device));
     const auto &l = backing_->layout;
     return ImmutableSubordinateLookupBinding(
         shared_from_this(), device,
@@ -400,14 +422,14 @@ void ImmutableSubordinateLookupBinding::requireFor(const PooledImmutableSourceGe
     if(!owner_ || !owner_->backing_->layout.subordinate() || geometry.allocator().device!=device_ ||
         geometry.allocator().world_rank!=owner_->memory_->worldRank() || !owner_->backing_->mapped->hasDevice(device_))
         throw std::invalid_argument("Pooled source binding has foreign provider/channel/rank/device ownership");
-    const auto requester=owner_->table_->subordinateRequester();const auto& actual=owner_->table_->source();const auto& layout=owner_->backing_->layout;
-    if(!requester || *requester!=geometry.allocator() || actual.rows!=p.coordinator.policy.sourceRows() || actual.row_elements!=p.row_elements ||
+    const auto requesters=owner_->table_->subordinateRequesters();const auto& actual=owner_->table_->source();const auto& layout=owner_->backing_->layout;
+    if(std::find(requesters.begin(),requesters.end(),geometry.allocator())==requesters.end() || actual.rows!=p.coordinator.policy.sourceRows() || actual.row_elements!=p.row_elements ||
         ggufToTensorType(actual.format)!=p.format || actual.rowBytes()!=p.owner.row_bytes || layout.protocol()!=kImmutableLookupSubordinateProtocol ||
         layout.maximumIds()!=p.coordinator.policy.maximumUnique() || layout.rowBytes()!=p.owner.row_bytes ||
         owner_->backing_->tableId!=view_.base.table || p.owner.table!=view_.base.table || p.coordinator.table!=view_.base.table ||
         p.owner.source_storage_generation!=storageGeneration() || p.coordinator.source_storage_generation!=storageGeneration())
         throw std::invalid_argument("Pooled source native fields do not match the real protocol2 provider and original source generation");
-    auto* base=static_cast<std::byte*>(owner_->backing_->mapped->deviceAlias(device_));
+    auto* base=static_cast<std::byte*>(owner_->backing_->mapped->deviceAlias(device_))+owner_->geometry_.offset(owner_->channelIndex(device_));
     if(view_.base.request!=reinterpret_cast<ImmutableLookupRequest*>(base+layout.requestOffset()) ||
         view_.base.completion!=reinterpret_cast<ImmutableLookupCompletion*>(base+layout.completionOffset()) ||
         view_.base.acknowledgement!=reinterpret_cast<ImmutableLookupAcknowledgement*>(base+layout.acknowledgementOffset()) ||
@@ -418,29 +440,37 @@ void ImmutableSubordinateLookupBinding::requireFor(const PooledImmutableSourceGe
         throw std::invalid_argument("Pooled source original mapped aliases changed after binding");
 }
 std::shared_ptr<PooledImmutableSourcePreparedStorage> ImmutableSubordinateLookupBinding::preparePooled(
-    const PooledImmutableSourceGeometry& geometry,std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,
+    const PooledImmutableSourceGeometry& geometry,std::vector<std::shared_ptr<PooledImmutableOwnerPreparedStorage>> owners,
     std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream)const{
+    return preparePooledImpl(geometry,std::move(owners),std::move(coordinator),std::move(memory),stream,{});
+}
+std::shared_ptr<PooledImmutableSourcePreparedStorage> ImmutableSubordinateLookupBinding::preparePooledImpl(
+    const PooledImmutableSourceGeometry& geometry,std::vector<std::shared_ptr<PooledImmutableOwnerPreparedStorage>> owners,
+    std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,
+    void* stream,std::unique_ptr<NativeOrderingEventGroup> group)const{
     requireFor(geometry);
-    return owner_->declarePooledSourceStorage(*this,geometry,std::move(owner),std::move(coordinator),std::move(memory),stream);
+    return owner_->declarePooledSourceStorage(*this,geometry,std::move(owners),std::move(coordinator),std::move(memory),stream,std::move(group));
 }
 std::shared_ptr<PooledImmutableSourcePreparedStorage> ImmutableLookupService::declarePooledSourceStorage(
     const ImmutableSubordinateLookupBinding& binding,const PooledImmutableSourceGeometry& geometry,
-    std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
-    std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream){
+    std::vector<std::shared_ptr<PooledImmutableOwnerPreparedStorage>> owners,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
+    std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,std::unique_ptr<NativeOrderingEventGroup> group){
     if(isGraphCaptureActive())throw std::logic_error("Pooled source registration must be materialized before capture");
     binding.requireFor(geometry);requireHealthy();
-    if(!memory || memory.get()!=memory_.get() || !owner || !coordinator)
+    if(!memory || memory.get()!=memory_.get() || owners.empty() || !coordinator)
         throw std::invalid_argument("Pooled source registration requires its actual original PMA and native authorities");
     table_->authenticateSource();
     // Cold declaration is serialized once. No model state or host policy shadow
     // is consulted; failure never publishes partial roots into this service.
     std::lock_guard lock(pooled_setup_);
+    auto& pooled_storage_=pooled_storages_.at(channelIndex(binding.device()));
     if(pooled_storage_){
-        if(pooled_storage_->geometry().parameters().identity!=geometry.parameters().identity || pooled_storage_->owner()!=owner || pooled_storage_->coordinator()!=coordinator)
+        if(group)throw std::invalid_argument("Existing pooled source cannot consume a second initialization claim");
+        if(pooled_storage_->geometry().parameters().identity!=geometry.parameters().identity || pooled_storage_->originalOwners().size()!=owners.size() || !std::equal(owners.begin(),owners.end(),pooled_storage_->originalOwners().begin()) || pooled_storage_->coordinator()!=coordinator)
             throw std::invalid_argument("Pooled source cannot replace its original native source/accepted-owner/coordinator registration");
         pooled_storage_->captureIdentity();return pooled_storage_;
     }
-    auto storage=PooledImmutableSourcePreparedStorage::materialize(geometry,std::move(owner),std::move(coordinator),std::move(memory),stream);
+    auto storage=PooledImmutableSourcePreparedStorage::materialize(geometry,std::move(owners),std::move(coordinator),std::move(memory),stream,std::move(group));
     pooled_storage_=std::move(storage);return pooled_storage_;
 }
 std::uint64_t ImmutableSubordinateLookupBinding::captureIdentity() const noexcept
@@ -468,11 +498,27 @@ std::uint64_t ImmutableSubordinateLookupBinding::captureIdentity() const noexcep
     return h ? h : 1;
 }
 
-ImmutableLookupService::Ticket ImmutableLookupService::arm(std::uint64_t generation)
+ImmutableLookupService::Ticket ImmutableLookupService::arm(std::uint64_t generation) {
+    if(geometry_.channelCount()!=1)throw std::logic_error("Multiple source consumers require complete original group admission");
+    auto ticket=armImpl(generation);
+    std::lock_guard lock(lifecycle_);adopted_[0]=true;return ticket;
+}
+ImmutableLookupService::GroupAdmission ImmutableLookupService::armGroup(std::uint64_t generation) {
+    return GroupAdmission(shared_from_this(),armImpl(generation));
+}
+ImmutableLookupService::Ticket ImmutableLookupService::adoptGroupChannel(const GroupAdmission& group,DeviceId consumer) {
+    std::lock_guard lock(lifecycle_);const auto index=channelIndex(consumer);
+    if(group.owner_.get()!=this || state_!=Lifecycle::Serving || group.ticket_.generation!=outstanding_.generation ||
+       group.ticket_.invocation!=outstanding_.invocation || adopted_[index])
+        throw std::logic_error("Source channel requires its unique original complete-group admission");
+    adopted_[index]=true;return {outstanding_.generation,outstanding_.invocation,index};
+}
+ImmutableLookupService::Ticket ImmutableLookupService::armImpl(std::uint64_t generation)
 {
     std::lock_guard lock(lifecycle_);
     if(state_!=Lifecycle::Idle||outstanding_.valid()||generation==0||generation<=generation_)
         throw std::logic_error("Immutable lookup service requires an idle healthy lane and a newer admission generation");
+    std::fill(adopted_.begin(),adopted_.end(),false);std::fill(retired_.begin(),retired_.end(),false);joined_=false;joined_result_=false;
     generation_=generation;cancelled_.store(false,std::memory_order_release);state_=Lifecycle::Serving;
     // run() acquires lifecycle_ before reading this immutable ticket. dispatch
     // may wake the retained thread before returning, so publication stays under
@@ -482,32 +528,123 @@ ImmutableLookupService::Ticket ImmutableLookupService::arm(std::uint64_t generat
     return outstanding_;
 }
 
-bool ImmutableLookupService::await(Ticket ticket)
-{
+ImmutableLookupService::GroupAdmission::~GroupAdmission() noexcept {
+    if(!owner_)return;
+    owner_->abandonGroup(*this);
+}
+ImmutableLookupService::GroupAdmission& ImmutableLookupService::GroupAdmission::operator=(GroupAdmission&& other) noexcept {
+    if(this!=&other){
+        if(owner_)owner_->abandonGroup(*this);
+        owner_=std::move(other.owner_);ticket_=other.ticket_;
+    }
+    return *this;
+}
+void ImmutableLookupService::abandonGroup(const GroupAdmission& group) noexcept {
+    try{
+        {
+            std::lock_guard lock(lifecycle_);
+            if(group.owner_.get()!=this || state_!=Lifecycle::Serving ||
+               group.ticket_.generation!=outstanding_.generation || group.ticket_.invocation!=outstanding_.invocation)return;
+        }
+        (void)cancel(group.ticket_);(void)finishGroup(group);
+    }catch(...){std::terminate();}
+}
+bool ImmutableLookupService::finishGroup(const GroupAdmission& group) {
+    bool cancelMissing=false;
     {
         std::lock_guard lock(lifecycle_);
-        if(state_!=Lifecycle::Serving||!ticket.valid()||ticket.generation!=outstanding_.generation||ticket.invocation!=outstanding_.invocation)
-            throw std::logic_error("Immutable lookup await names a stale or unrelated service invocation");
+        if(group.owner_.get()!=this || group.ticket_.generation!=generation_)
+            throw std::logic_error("Source terminal group lost its original admission");
+        if(state_==Lifecycle::Serving && !joined_){
+            if(group.ticket_.invocation!=outstanding_.invocation)
+                throw std::logic_error("Source terminal group lost its original worker invocation");
+            for(std::size_t i=0;i<geometry_.channelCount();++i){
+                auto* ack=reinterpret_cast<ImmutableLookupAcknowledgement*>(static_cast<std::byte*>(backing_->mapped->mutableHostData())+
+                    geometry_.offset(i)+backing_->layout.acknowledgementOffset());
+                cancelMissing=acquire(ack->closedGeneration)!=group.ticket_.generation || cancelMissing;
+            }
+        }
     }
-    // await() is a terminal boundary. A complete GPU parent must have published
-    // its close metadata; never mask a missing close by waiting indefinitely.
-    auto *ack=reinterpret_cast<ImmutableLookupAcknowledgement *>(
-        backing_->mapped->mutableHostData(backing_->layout.acknowledgementOffset()));
-    const bool missingClose=acquire(ack->closedGeneration)!=generation_;
-    if(missingClose)(void)cancel(ticket);
-    const bool workerResult=worker_.await({ticket.invocation});
+    // A participant may already be in the shared terminal wait. Publish the
+    // parent's actual failure before taking the join mutex, so it can drain.
+    if(cancelMissing)(void)cancel(group.ticket_);
+    std::lock_guard terminalLock(terminal_join_);
+    bool join=false;
+    {
+        std::lock_guard lock(lifecycle_);
+        if(group.owner_.get()!=this || group.ticket_.generation!=generation_)
+            throw std::logic_error("Source terminal group lost its original admission");
+        if(state_!=Lifecycle::Serving)return joined_result_;
+        if(group.ticket_.invocation!=outstanding_.invocation)
+            throw std::logic_error("Source terminal group lost its original worker invocation");
+        join=!joined_;
+    }
+    if(join)joinInvocation(group.ticket_,true);
     std::lock_guard lock(lifecycle_);
-    // The complete source parent has retired before await. Only mapped I/O
-    // metadata is inspected here; a publication racing CPU retirement is still
-    // counted once by this ticket's unique terminal transition.
-    const bool aborted=processor_.observeTerminalAbort(ticket.generation,ticket.invocation);
-    const bool result=workerResult && !aborted;
-    if(aborted)fatalStatus_.store(ImmutableLookupStatus::Cancelled,std::memory_order_release);
-    // The worker is retired before touching its diagnostic string.
-    if(aborted)serviceFailure_="Immutable lookup GPU source aborted its exact admitted I/O invocation";
-    else if(missingClose)serviceFailure_="Immutable lookup GPU terminal did not publish its explicit service close";
-    outstanding_={};state_=result?Lifecycle::Idle:Lifecycle::Failed;
+    // A group handles unlaunched peers. It never steals an adopted boundary's
+    // right to drain its original native stream and await its own interval.
+    for(std::size_t i=0;i<geometry_.channelCount();++i)if(!adopted_[i])retired_[i]=true;
+    if(std::all_of(retired_.begin(),retired_.end(),[](bool value){return value;})){
+        outstanding_={};state_=joined_result_?Lifecycle::Idle:Lifecycle::Failed;
+    }
+    return joined_result_;
+}
+bool ImmutableLookupService::await(Ticket ticket) {
+    bool missingOwnClose=false;
+    {
+        std::lock_guard lock(lifecycle_);
+        if(state_!=Lifecycle::Serving || !ticket.valid() || ticket.generation!=outstanding_.generation ||
+           ticket.invocation!=outstanding_.invocation || ticket.channel>=adopted_.size() ||
+           !adopted_[ticket.channel] || retired_[ticket.channel])
+            throw std::logic_error("Immutable lookup await names a stale or unrelated channel invocation");
+        auto* ack=reinterpret_cast<ImmutableLookupAcknowledgement*>(static_cast<std::byte*>(backing_->mapped->mutableHostData())+
+            geometry_.offset(ticket.channel)+backing_->layout.acknowledgementOffset());
+        missingOwnClose=acquire(ack->closedGeneration)!=ticket.generation;
+    }
+    // A peer may already wait inside the terminal join. The caller owns its
+    // native terminal, so its missing close is a concrete failure: publish
+    // original cancellation before the join mutex and let both callers drain.
+    if(missingOwnClose)(void)cancel(ticket);
+    std::lock_guard terminalLock(terminal_join_);
+    bool join=false;
+    {
+        std::lock_guard lock(lifecycle_);
+        if(state_!=Lifecycle::Serving || !ticket.valid() || ticket.generation!=outstanding_.generation ||
+           ticket.invocation!=outstanding_.invocation || ticket.channel>=adopted_.size() ||
+           !adopted_[ticket.channel] || retired_[ticket.channel])
+            throw std::logic_error("Immutable lookup await names a stale or unrelated channel invocation");
+        join=!joined_;
+    }
+    if(join)joinInvocation(ticket,false);
+    std::lock_guard lock(lifecycle_);retired_[ticket.channel]=true;
+    const bool result=joined_result_;
+    if(std::all_of(retired_.begin(),retired_.end(),[](bool value){return value;})){
+        outstanding_={};state_=result?Lifecycle::Idle:Lifecycle::Failed;
+    }
     return result;
+}
+
+void ImmutableLookupService::joinInvocation(Ticket ticket,bool complete_parent) {
+        bool missing=false;
+        // A participant's own native terminal does not prove its peers have
+        // reached theirs. Only the complete parent may require every close;
+        // ordinary await lets the existing worker fairly drain late peers.
+        const auto first=complete_parent?std::size_t{0}:ticket.channel;
+        const auto end=complete_parent?geometry_.channelCount():ticket.channel+1;
+        for(std::size_t i=first;i<end;++i){
+            auto* ack=reinterpret_cast<ImmutableLookupAcknowledgement*>(static_cast<std::byte*>(backing_->mapped->mutableHostData())+
+                geometry_.offset(i)+backing_->layout.acknowledgementOffset());
+            missing=acquire(ack->closedGeneration)!=ticket.generation || missing;
+        }
+        if(missing)(void)cancel(ticket);
+        const bool result=worker_.await({ticket.invocation});
+        std::lock_guard lock(lifecycle_);
+        bool aborted=false;
+        for(std::size_t i=0;i<geometry_.channelCount();++i)aborted=processor(i).observeTerminalAbort(ticket.generation,ticket.invocation)||aborted;
+        joined_=true;joined_result_=result&&!aborted&&!missing;
+        if(aborted)serviceFailure_="Immutable lookup GPU source aborted its exact admitted I/O invocation";
+        else if(missing)serviceFailure_="Immutable lookup GPU terminal did not publish every original service close";
+
 }
 
 bool ImmutableLookupService::cancel(Ticket ticket)
@@ -516,22 +653,16 @@ bool ImmutableLookupService::cancel(Ticket ticket)
     if(state_!=Lifecycle::Serving || !ticket.valid() || ticket.generation!=outstanding_.generation ||
        ticket.invocation!=outstanding_.invocation)
         return false;
-    auto *ack=reinterpret_cast<ImmutableLookupAcknowledgement *>(
-        backing_->mapped->mutableHostData(backing_->layout.acknowledgementOffset()));
-    // The worker publishes retirement under this same lifecycle lock. A late
-    // caller cannot add an unobserved cancellation message after retirement.
-    const auto retiredInvocation=acquire(ack->retiredInvocation);
-    const auto retiredGeneration=acquire(ack->retiredGeneration);
-    if(ImmutableLookupProtocol::matchesInvocation(retiredInvocation,retiredGeneration,ticket.generation,ticket.invocation))
-        return false;
-    // The complete terminal boundary can repeat cancellation while joining the
-    // same live invocation. Its one metadata message is published exactly once.
-    if(cancelled_.load(std::memory_order_acquire))return true;
-    // This is CPU I/O control only. No GPU state or terminal result is read.
-    // Both fields are atomic because readers can reject an older publication
-    // while a later admission publishes its distinct generation body.
-    release(ack->cancelledGeneration,ticket.generation);
-    release(ack->cancelledInvocation,ticket.invocation);
+    const bool alreadyCancelled=cancelled_.load(std::memory_order_acquire);
+    bool live=false;
+    for(std::size_t i=0;i<geometry_.channelCount();++i){
+        auto* ack=reinterpret_cast<ImmutableLookupAcknowledgement*>(static_cast<std::byte*>(backing_->mapped->mutableHostData())+
+            geometry_.offset(i)+backing_->layout.acknowledgementOffset());
+        if(ImmutableLookupProtocol::matchesInvocation(acquire(ack->retiredInvocation),acquire(ack->retiredGeneration),ticket.generation,ticket.invocation))continue;
+        live=true;
+        if(!alreadyCancelled){release(ack->cancelledGeneration,ticket.generation);release(ack->cancelledInvocation,ticket.invocation);}
+    }
+    if(!live)return false;
     cancelled_.store(true,std::memory_order_release);
     return true;
 }
@@ -581,20 +712,26 @@ bool ImmutableLookupService::run(void *context)
         // This lock orders only host I/O cancellation and retirement. Device
         // model/control state is neither queried nor mirrored by this worker.
         std::lock_guard lock(self.lifecycle_);
-        self.processor_.retireInvocation(admitted.generation,admitted.invocation);
+        for(std::size_t i=0;i<self.geometry_.channelCount();++i)self.processor(i).retireInvocation(admitted.generation,admitted.invocation);
     };
     const std::unique_ptr<void,decltype(retire)> retirement(&self,retire);
     try
     {
         while(!self.cancelled_.load(std::memory_order_acquire))
         {
-            (void)self.processor_.poll(admitted.generation,admitted.invocation);
-            if(self.processor_.lastStatus()!=ImmutableLookupStatus::Success)
-            {
-                self.fatalStatus_.store(self.processor_.lastStatus(),std::memory_order_release);
-                return false; // The failed completion is already visible; this lane cannot accept another request.
+            bool closed=true;
+            for(std::size_t i=0;i<self.geometry_.channelCount();++i){
+                auto& processor=self.processor(i);
+                (void)processor.poll(admitted.generation,admitted.invocation);
+                if(processor.lastStatus()!=ImmutableLookupStatus::Success){
+                    self.fatalStatus_.store(processor.lastStatus(),std::memory_order_release);
+                    self.serviceFailure_=processor.lastFailure();
+                    if(self.geometry_.channelCount()>1)(void)self.cancel(admitted);
+                    return false;
+                }
+                closed=processor.closed(admitted.generation)&&closed;
             }
-            if(self.processor_.closed(admitted.generation))return self.processor_.lastFailure().empty();
+            if(closed)return true;
             std::this_thread::sleep_for(std::chrono::microseconds(20));
         }
         self.serviceFailure_="Immutable lookup service cancelled before the GPU terminal close";
@@ -603,7 +740,8 @@ bool ImmutableLookupService::run(void *context)
     catch(const std::exception &error)
     {
         self.serviceFailure_=error.what();
-        const auto status=self.processor_.lastStatus();
+        if(self.geometry_.channelCount()>1)(void)self.cancel(admitted);
+        const auto status=self.fatalStatus_.load(std::memory_order_acquire);
         self.fatalStatus_.store(status==ImmutableLookupStatus::Success?ImmutableLookupStatus::StorageFailure:status,std::memory_order_release);
     }
     return false;
@@ -612,8 +750,40 @@ bool ImmutableLookupService::run(void *context)
 ImmutableLookupServiceStats ImmutableLookupService::stats() const
 {
     std::lock_guard lock(lifecycle_);
-    if(state_==Lifecycle::Serving)throw std::logic_error("Immutable lookup stats require terminal service ownership");
-    return processor_.stats();
+    if(state_==Lifecycle::Serving && !joined_)throw std::logic_error("Immutable lookup stats require terminal service ownership");
+    ImmutableLookupServiceStats result;
+    const auto add=[](std::uint64_t& value,std::uint64_t extra){
+        if(extra>std::numeric_limits<std::uint64_t>::max()-value)throw std::overflow_error("Grouped source counter overflow");
+        value+=extra;
+    };
+    for(std::size_t i=0;i<geometry_.channelCount();++i){
+        const auto next=processor(i).stats();
+        add(result.requests,next.requests);
+        add(result.ids,next.ids);
+        add(result.idBytes,next.idBytes);
+        add(result.nativeBytes,next.nativeBytes);
+        add(result.metadataBytes,next.metadataBytes);
+        add(result.failures,next.failures);
+        add(result.acknowledgementBytes,next.acknowledgementBytes);
+        add(result.terminalBytes,next.terminalBytes);
+        add(result.windowHits,next.windowHits);
+        add(result.windowMisses,next.windowMisses);
+        add(result.windowEvictions,next.windowEvictions);
+        add(result.adaptiveBatches,next.adaptiveBatches);
+        add(result.ramRows,next.ramRows);
+        add(result.sourceRows,next.sourceRows);
+        add(result.duplicateRows,next.duplicateRows);
+        add(result.cacheAdmissions,next.cacheAdmissions);
+        add(result.cacheEvictions,next.cacheEvictions);
+        add(result.cacheAdmissionRejections,next.cacheAdmissionRejections);
+        add(result.allPinnedResponses,next.allPinnedResponses);
+    }
+    return result;
+}
+ImmutableLookupServiceStats ImmutableLookupService::stats(DeviceId consumer) const {
+    std::lock_guard lock(lifecycle_);
+    if(state_==Lifecycle::Serving && !joined_)throw std::logic_error("Immutable lookup stats require terminal service ownership");
+    return processor(channelIndex(consumer)).stats();
 }
 HostImmutableRowOwnerObservation ImmutableLookupService::retainedSourceOwnerObservation() const
 {
@@ -638,7 +808,7 @@ HostImmutableRowOwnerObservation ImmutableLookupService::retainedSourceOwnerObse
 std::string ImmutableLookupService::lastFailure() const
 {
     std::lock_guard lock(lifecycle_);
-    if(state_==Lifecycle::Serving)throw std::logic_error("Immutable lookup diagnostics require terminal service ownership");
+    if(state_==Lifecycle::Serving && !joined_)throw std::logic_error("Immutable lookup diagnostics require terminal service ownership");
     return serviceFailure_.empty()?processor_.lastFailure():serviceFailure_;
 }
 void ImmutableLookupService::requireHealthy() const

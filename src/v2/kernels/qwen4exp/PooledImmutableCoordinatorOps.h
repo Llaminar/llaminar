@@ -18,8 +18,8 @@ namespace llaminar2::qwen4exp::adaptive_lookup::pooled
 class CoordinatorOperations final
 {
 public:
-    /** @brief Bind existing roots; decoded pointers and records do not mint a runtime capability. */
-    QFN_ADAPTIVE_HD explicit CoordinatorOperations(CoordinatorView view) : v_(view) {}
+    /** @brief Copy and validate immutable root layout once; live pointees remain checked on every operation. */
+    QFN_ADAPTIVE_HD explicit CoordinatorOperations(CoordinatorView view) : v_(view), layout_(v_) {}
     /**
      * @brief Initialize virgin policy and frame roots once, without touching physical owners.
      * @return False on missing/aliased roots, inconsistent exact capacities or repeated setup.
@@ -298,19 +298,17 @@ public:
         return true;
     }
     /**
-     * @brief Reconcile actual release receipts after accepted waves drain and source/readers retire.
-     * @param retirement Actual source retirement disposition.
-     * @param consumed Exact original consumed source identity, or zero before publication.
-     * @param receipts Complete increasing-global-unique actual releaseWithReceipt prefix.
-     * @param count Exact actual acquired grant count, excluding unaccepted plans and source-only rows.
-     * @return True only after complete receipt prevalidation; unknown accepted/source state poisons the frame.
+     * @brief Authenticate the complete original physical release set before terminal policy/reporting changes.
+     * @param receipts Actual increasing-global-unique releaseWithReceipt records, never capacity padding.
+     * @param count Exact live prefix count, including original hits and accepted reservations only.
+     * @return True after every target/kind/token/disposition is checked without changing queue or row state.
+     * @note Both successful terminal retirement and cancellation consume this same original evidence;
+     * a caller cannot substitute a sum of per-owner counts for the actual retained receipt set.
      */
-    QFN_ADAPTIVE_HD bool cancel(SourceRetirement retirement,SourceWindow consumed,
-        const ReleaseReceipt *receipts,std::uint32_t count)
+    QFN_ADAPTIVE_HD bool validateReleased(const ReleaseReceipt *receipts,std::uint32_t count)
     {
-        if (!valid() || v_.frame->phase == LookupPhase::Idle || v_.frame->phase == LookupPhase::Uninitialized ||
-            v_.frame->status != Status::Success || v_.frame->outstanding || !retired(retirement,consumed))
-            return fail(Status::SourceFailure);
+        if (!valid() || v_.frame->outstanding || v_.frame->phase == LookupPhase::Idle ||
+            v_.frame->phase == LookupPhase::Uninitialized) return fail(Status::InvalidPhase);
         std::uint32_t expected = 0;
         for (std::uint32_t i = 0; i < v_.frame->unique_rows; ++i) expected += acquired(v_.unique[i].phase);
         if (expected != count || (count && !receipts)) return fail(Status::Invariant);
@@ -326,6 +324,24 @@ public:
                 ((r.phase == UniquePhase::Read || v_.entries[r.entry].present) &&
                     receipt.disposition != ReleaseDisposition::RetainedReady)) return fail(Status::Invariant);
         }
+        return true;
+    }
+    /**
+     * @brief Reconcile actual release receipts after accepted waves drain and source/readers retire.
+     * @param retirement Actual source retirement disposition.
+     * @param consumed Exact original consumed source identity, or zero before publication.
+     * @param receipts Complete increasing-global-unique actual releaseWithReceipt prefix.
+     * @param count Exact actual acquired grant count, excluding unaccepted plans and source-only rows.
+     * @return True only after complete receipt prevalidation; unknown accepted/source state poisons the frame.
+     */
+    QFN_ADAPTIVE_HD bool cancel(SourceRetirement retirement,SourceWindow consumed,
+        const ReleaseReceipt *receipts,std::uint32_t count)
+    {
+        if (!valid() || v_.frame->phase == LookupPhase::Idle || v_.frame->phase == LookupPhase::Uninitialized ||
+            v_.frame->status != Status::Success || v_.frame->outstanding || !retired(retirement,consumed))
+            return fail(Status::SourceFailure);
+        if (!validateReleased(receipts,count)) return false;
+        std::uint32_t cursor = 0;
         if (!applyQueues()) return false;
         cursor = 0;
         for (std::uint32_t i = 0; i < v_.frame->unique_rows; ++i)
@@ -347,6 +363,10 @@ public:
      * @param headers Exactly P acquired actual retired-owner records.
      * @param count Actual declared owner count.
      * @return True on healthy completion or clean cancellation; original ordinal and policy persist.
+     * @note Only cancel() can establish Draining+Cancelled after prevalidating the complete
+     * original release set. An unsealed cancelled owner truthfully retains its zero source
+     * window; its actual Cancelled retirement must not be rewritten to a global sealed window.
+     * Successful retirement and every nonzero window retain exact source equality.
      */
     QFN_ADAPTIVE_HD bool finish(const RetiredHeader *headers,std::uint32_t count)
     {
@@ -354,7 +374,10 @@ public:
             (v_.frame->phase != LookupPhase::Ready && v_.frame->phase != LookupPhase::Draining) ||
             (v_.frame->status != Status::Success && v_.frame->status != Status::Cancelled)) return fail(Status::InvalidPhase);
         for (std::uint32_t i = 0; i < count; ++i)
-            if (!same(headers[i].interval,interval()) || !sameSource(headers[i].source,v_.frame->source) ||
+            if (!same(headers[i].interval,interval()) ||
+                (!sameSource(headers[i].source,v_.frame->source) &&
+                    !(v_.frame->phase == LookupPhase::Draining && v_.frame->status == Status::Cancelled &&
+                      headers[i].status == Status::Cancelled && sameSource(headers[i].source,SourceWindow{}))) ||
                 headers[i].owner != i || (headers[i].status != Status::Success &&
                     (v_.frame->status != Status::Cancelled || headers[i].status != Status::Cancelled)))
                 return fail(Status::Invariant);
@@ -537,25 +560,27 @@ private:
     /** @brief One byte range in the exact native root declaration; never a physical allocation ledger. */
     struct Range { const void *data; std::size_t bytes; };
     /** @brief Describe all exact immutable/mutable banks in constant work for alias validation. */
-    QFN_ADAPTIVE_HD void ranges(Range (&out)[15]) const
+    QFN_ADAPTIVE_HD void ranges(Range (&out)[15]) const { describeRanges(v_,out); }
+    /** @brief Describe copied addresses without reading any bank contents. */
+    QFN_ADAPTIVE_HD static void describeRanges(const CoordinatorView& v,Range (&out)[15])
     {
-        const auto k = std::size_t{v_.parameters.maximumUnique()}, n = std::size_t{v_.parameters.maximumOriginal()};
-        const auto p = std::size_t{v_.parameters.participants()}, c = std::size_t{capacity()};
-        const auto lanes = std::size_t{4}*v_.parameters.laneWidth();
-        out[0] = {v_.frame,sizeof(LookupFrame)};
-        out[1] = {v_.unique,k*sizeof(CoordinatorUnique)};
-        out[2] = {v_.sort_a,n*sizeof(CoordinatorOccurrence)};
-        out[3] = {v_.sort_b,n*sizeof(CoordinatorOccurrence)};
-        out[4] = {v_.radix_counts,256*sizeof(std::uint32_t)};
-        out[5] = {v_.original_to_unique,n*sizeof(std::uint32_t)};
-        out[6] = {v_.owner_plans,p*sizeof(CoordinatorOwnerPlan)};
-        out[7] = {v_.decisions,k*sizeof(AllocationDecision)};
-        out[8] = {v_.owners,p*sizeof(CoordinatorOwnerGeometry)};
-        out[9] = {v_.policy,c?sizeof(CoordinatorPolicyControl):0};
-        out[10] = {v_.entries,c*sizeof(DirectoryEntry)};
-        out[11] = {v_.nodes,(c?c-1:0)*sizeof(RadixNode)};
-        out[12] = {v_.frequency_epochs,lanes*sizeof(std::uint32_t)};
-        out[13] = {v_.frequency_counts,lanes*sizeof(std::uint16_t)};
+        const auto k = std::size_t{v.parameters.maximumUnique()}, n = std::size_t{v.parameters.maximumOriginal()};
+        const auto p = std::size_t{v.parameters.participants()}, c = std::size_t{v.parameters.entries()};
+        const auto lanes = std::size_t{4}*v.parameters.laneWidth();
+        out[0] = {v.frame,sizeof(LookupFrame)};
+        out[1] = {v.unique,k*sizeof(CoordinatorUnique)};
+        out[2] = {v.sort_a,n*sizeof(CoordinatorOccurrence)};
+        out[3] = {v.sort_b,n*sizeof(CoordinatorOccurrence)};
+        out[4] = {v.radix_counts,256*sizeof(std::uint32_t)};
+        out[5] = {v.original_to_unique,n*sizeof(std::uint32_t)};
+        out[6] = {v.owner_plans,p*sizeof(CoordinatorOwnerPlan)};
+        out[7] = {v.decisions,k*sizeof(AllocationDecision)};
+        out[8] = {v.owners,p*sizeof(CoordinatorOwnerGeometry)};
+        out[9] = {v.policy,c?sizeof(CoordinatorPolicyControl):0};
+        out[10] = {v.entries,c*sizeof(DirectoryEntry)};
+        out[11] = {v.nodes,(c?c-1:0)*sizeof(RadixNode)};
+        out[12] = {v.frequency_epochs,lanes*sizeof(std::uint32_t)};
+        out[13] = {v.frequency_counts,lanes*sizeof(std::uint16_t)};
         out[14] = {nullptr,0};
     }
     /** @return True only for a complete nonwrapping native range. */
@@ -703,7 +728,24 @@ private:
         f.queues_applied = true;
         return true;
     }
-    CoordinatorView v_;
+    /** @brief Immutable borrower declaration; pointee execution state remains live. */
+    const CoordinatorView v_;
+    /**
+     * @brief Object-local proof of copied pointer/scalar layout, never of mutable data.
+     * Construction performs no state publication or failure reporting. Every caller
+     * still reports a rejected layout at its original operation boundary.
+     */
+    class ValidatedLayout final {
+    public:
+        /** @brief Validate the immutable copied declaration once for this borrower. */
+        QFN_ADAPTIVE_HD explicit ValidatedLayout(const CoordinatorView& view)
+            : valid_(validateLayout(view)) {}
+        /** @return Structural validity only; no live phase/policy permission. */
+        QFN_ADAPTIVE_HD bool valid() const { return valid_; }
+    private:
+        const bool valid_;
+    };
+    const ValidatedLayout layout_;
     /** @return Checked coordinator device dispatch order, unrelated to source unique/token/generation. */
     QFN_ADAPTIVE_HD CommandOrdinal nextCommand()
     {
@@ -737,16 +779,18 @@ private:
     /** @return None after recording a bounded structural error. */
     QFN_ADAPTIVE_HD std::uint32_t failIndex() { fail(Status::Invariant); return None; }
     /** @return Exact typed disjoint native roots in constant work; static owner offsets are setup-authenticated. */
-    QFN_ADAPTIVE_HD bool valid() const
+    QFN_ADAPTIVE_HD bool valid() const { return layout_.valid(); }
+    /** @return Exact immutable declaration validity, independent of all pointee values. */
+    QFN_ADAPTIVE_HD static bool validateLayout(const CoordinatorView& v)
     {
-        const auto &p = v_.parameters;
-        if (!v_.frame || !v_.table || !v_.source_storage_generation || !p.sourceRows() ||
+        const auto &p = v.parameters;
+        if (!v.frame || !v.table || !v.source_storage_generation || !p.sourceRows() ||
             !p.maximumUnique() || p.maximumUnique()>MaximumSlots || p.maximumOriginal()<p.maximumUnique() ||
             p.maximumOriginal()>MaximumSlots || !p.participants() || p.participants()>MaximumSlots ||
-            v_.unique_capacity!=p.maximumUnique() || v_.original_capacity!=p.maximumOriginal() ||
-            v_.owner_capacity!=p.participants() || !p.agingAccesses() || capacity()>MaximumSlots ||
-            (capacity() && (!p.laneWidth() || (p.laneWidth() & (p.laneWidth()-1))))) return false;
-        Range banks[15];ranges(banks);
+            v.unique_capacity!=p.maximumUnique() || v.original_capacity!=p.maximumOriginal() ||
+            v.owner_capacity!=p.participants() || !p.agingAccesses() || v.parameters.entries()>MaximumSlots ||
+            (v.parameters.entries() && (!p.laneWidth() || (p.laneWidth() & (p.laneWidth()-1))))) return false;
+        Range banks[15];describeRanges(v,banks);
         for (unsigned i=0;i<15;++i)
         {
             if (!bounded(banks[i])) return false;

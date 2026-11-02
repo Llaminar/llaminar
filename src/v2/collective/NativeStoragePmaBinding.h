@@ -233,9 +233,9 @@ namespace llaminar2
             if (request->setup_epoch != binding.epoch_.identity())
                 return llaminarNativeStorageInvalidV1;
             if (request->owner_family < llaminarNativeCommMetadataV1 ||
-                request->owner_family > llaminarNativeDriverContextV1 ||
+                request->owner_family > llaminarNativeGPUWorkerAllocationV1 ||
                 request->lifetime < llaminarNativeCommLifetimeV1 ||
-                request->lifetime > llaminarNativeProcessLifetimeV1)
+                request->lifetime > llaminarNativeContextGenerationLifetimeV1)
                 return llaminarNativeStorageUnsupportedV1;
             try
             {

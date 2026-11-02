@@ -265,6 +265,58 @@ struct Pool
     {begin(original,admission);freeWave();victimWave();finish();}
 };
 }
+/** @brief Object-local layout proof cannot hide subsequent mutable authority changes. */
+TEST(PooledImmutableCoordinator, LayoutBorrowerReplayMutableAuthorityAndFreshBindings)
+{
+    for(unsigned defect=0;defect<5;++defect){
+        Pool pool(std::array{2u});const std::array<std::uint64_t,1> row{17};
+        ASSERT_NO_THROW(pool.run(row));auto op=pool.operations();
+        ASSERT_TRUE(op.begin(2,row.data(),row.size()));
+        if(defect==0)pool.frame.phase=p::LookupPhase::Idle;
+        if(defect==1)pool.frame.status=a::Status::Invariant;
+        if(defect==2)++pool.frame.source_storage_generation;
+        if(defect==3)++pool.policy.aging_accesses;
+        if(defect==4)pool.policy.flags=0;
+        p::OwnerCommand command{};EXPECT_FALSE(op.pinCommand(0,command));
+    }
+    Pool original(std::array{2u}),fresh(std::array{2u});
+    auto op=original.operations();auto rebound=fresh.operations();
+    original.view.sort_a=original.view.sort_b; // Caller declaration cannot rebind this existing borrower.
+    ASSERT_TRUE(op.begin<std::uint64_t>(1,nullptr,0));
+    EXPECT_FALSE(original.operations().begin<std::uint64_t>(2,nullptr,0));
+    ASSERT_TRUE(rebound.begin<std::uint64_t>(1,nullptr,0));
+    EXPECT_EQ(fresh.frame.status,a::Status::Success);
+}
+/** @brief An invalid copied declaration remains rejected even if the caller repairs its own copy. */
+TEST(PooledImmutableCoordinator, LayoutBorrowerReplayMalformedRoots)
+{
+    for(unsigned defect=0;defect<4;++defect){
+        Pool pool(std::array{2u});auto view=pool.view;
+        if(defect==0)view.sort_a=view.sort_b;
+        if(defect==1)view.unique_capacity=K-1;
+        if(defect==2)view.frame=nullptr;
+        if(defect==3)view.source_storage_generation=0;
+        p::CoordinatorOperations op(view);view=pool.view;
+        const auto scratch=pool.sort_a;
+        EXPECT_FALSE(op.begin<std::uint64_t>(1,nullptr,0));
+        EXPECT_EQ(std::memcmp(scratch.data(),pool.sort_a.data(),sizeof(scratch)),0);
+    }
+}
+/** @brief Actual pin issuance preserves a successful prefix and rejects the first repeated command. */
+TEST(PooledImmutableCoordinator, LayoutBorrowerReplayPrefixAndRepeatedReset)
+{
+    Pool pool(std::array{2u});const std::array<std::uint64_t,2> rows{17,19};
+    ASSERT_NO_THROW(pool.run(rows));
+    for(unsigned replay=0;replay<3;++replay)ASSERT_NO_THROW(pool.run(rows,2+replay));
+    auto op=pool.operations();ASSERT_TRUE(op.begin(5,rows.data(),rows.size()));
+    p::OwnerCommand first{},second{};
+    ASSERT_TRUE(op.pinCommand(0,first));ASSERT_TRUE(op.pinCommand(1,second));
+    const auto outstanding=pool.frame.outstanding;const auto ordinal=pool.frame.command_ordinal;
+    EXPECT_FALSE(op.pinCommand(0,first));
+    EXPECT_EQ(pool.frame.outstanding,outstanding);EXPECT_EQ(pool.frame.command_ordinal,ordinal);
+    EXPECT_EQ(pool.unique[0].phase,p::UniquePhase::PinPending);
+    EXPECT_EQ(pool.unique[1].phase,p::UniquePhase::PinPending);
+}
 TEST(PooledImmutableCoordinator, StableGlobalCoalescingPreservesEveryOriginalPositionAndHighRowBits)
 {
     Pool pool(std::array{1u,0u,2u,0u,1u});

@@ -26,6 +26,45 @@
 
 namespace llaminar2
 {
+    class PhysicalMemoryAuthority;
+    class GPUDeviceProcessLifetime;
+    class RetainedHostServiceUseToken;
+    class RetainedHostServiceDeclarations;
+    struct RetainedHostServiceInstance;
+    class NativeContextOpaqueContract;
+    class NativeContextPreparation;
+    class GPUDeviceContextPool;
+    namespace test { struct NativeContextPreparationReplayAccess; }
+    /**
+     * @brief One same-PMA opaque commitment, explicitly distinct from materialized bytes.
+     * It reserves the source certificate's CPU/GPU limits before any creator and
+     * retains failed native obligations until actual physical retirement.
+     */
+    class PhysicalMemoryOpaqueRuntimeCommitment final {
+    public:
+        ~PhysicalMemoryOpaqueRuntimeCommitment() noexcept;
+        PhysicalMemoryOpaqueRuntimeCommitment(const PhysicalMemoryOpaqueRuntimeCommitment&)=delete;
+        PhysicalMemoryOpaqueRuntimeCommitment& operator=(const PhysicalMemoryOpaqueRuntimeCommitment&)=delete;
+    private:
+        friend class PhysicalMemoryNativeSetupEpoch;
+        friend class GPUDeviceProcessLifetime;
+        friend class NativeContextPreparation;
+        friend class PreparedGPUContextBirth;
+        friend class GPUDeviceContextPool;
+        friend struct test::NativeContextPreparationReplayAccess;
+        struct State;
+        explicit PhysicalMemoryOpaqueRuntimeCommitment(std::unique_ptr<State>);
+        /** @brief Arm immediately before original runtime discovery/creation. */
+        void beginNative();
+        /** @brief Validate this exact preclaimed original token before process-owner publication. */
+        void requireOriginalProcessRetention(const std::shared_ptr<PhysicalMemoryAuthority>&,const NativeContextOpaqueContract&) const;
+        /** @brief Publish actual completed creation, never a caller-ready assertion. */
+        void publishCreated();
+        /** @brief Release only after the original native reset/physical-retirement authority succeeds. */
+        void retirePhysically();
+        std::unique_ptr<State> state_;
+    };
+
     /** @brief Stable join key for one rank-local CPU or accelerator allocator. */
     struct PhysicalMemoryAllocatorIdentity
     {
@@ -322,6 +361,7 @@ namespace llaminar2
         std::size_t preparation_materialized_bytes = 0u; ///< Published early physical roots.
         std::size_t native_declared_preclaimed_bytes =
             0u; ///< Unpublished native children within source BOM reservations.
+        std::size_t opaque_runtime_committed_bytes = 0u; ///< Named qualified limits; never reported as exact materialized backing.
 
         /** @return All canonical source commitments, including exact native preparation/SDK roots.
          */
@@ -513,6 +553,9 @@ namespace llaminar2
         friend class PhysicalMemoryMaterializationLedger;
         friend class NativeStoragePreparationPmaBinding;
         friend class NativeMandatoryStorageDeclarations;
+        /** @brief Commit one qualified opaque birth family in the existing reservation columns before native calls. */
+        std::shared_ptr<PhysicalMemoryOpaqueRuntimeCommitment> reserveOpaqueContext(
+            const NativeContextOpaqueContract& contract,const std::shared_ptr<PhysicalMemoryAuthority>& memory) const;
         /**
          * @brief Preclaim an exact source preparation root before native Create.
          * @param declaration SDK-issued CPU0 allocator geometry and stable actual owner anchor.
@@ -901,6 +944,8 @@ namespace llaminar2
 
     private:
         friend class PhysicalMemoryAuthority;
+        friend class PhysicalMemoryOpaqueRuntimeCommitment;
+        friend class PhysicalMemoryNativeSetupEpoch;
         friend class NativeStoragePreparationPmaBinding;
         /**
          * @brief Start the same canonical state without inventing an admission certificate.
@@ -923,6 +968,33 @@ namespace llaminar2
             std::size_t bytes);
     };
 
+    /** @brief Closed instance use policy; only the original CPU owner can select the diagnostic arm. */
+    enum class PhysicalMemoryHostServiceInstancePolicy : std::uint8_t { OneShot, DiagnosticSequential };
+    /**
+     * @brief Move-only CPU instance identity lease; existing PMA byte leases remain the sole byte authority.
+     *
+     * The lease survives binding destruction and moves with the actual token/worker.
+     * An unpublished failed claim rolls back; a published production instance is
+     * one-shot for this original PMA. Explicit diagnostics may reuse only after
+     * the previous exact/native owner has completely closed.
+     */
+    class PhysicalMemoryHostServiceInstanceLease final {
+    public:
+        PhysicalMemoryHostServiceInstanceLease(PhysicalMemoryHostServiceInstanceLease&&)noexcept;
+        PhysicalMemoryHostServiceInstanceLease& operator=(PhysicalMemoryHostServiceInstanceLease&&)noexcept;
+        ~PhysicalMemoryHostServiceInstanceLease()noexcept;
+        PhysicalMemoryHostServiceInstanceLease(const PhysicalMemoryHostServiceInstanceLease&)=delete;
+        PhysicalMemoryHostServiceInstanceLease& operator=(const PhysicalMemoryHostServiceInstanceLease&)=delete;
+    private:
+        friend class PhysicalMemoryAuthority;
+        friend class RetainedHostServiceUseToken;
+        struct State;
+        explicit PhysicalMemoryHostServiceInstanceLease(std::unique_ptr<State>);
+        /** @brief Seal the successfully returned original token; no caller can reset consumption. */
+        void publish()noexcept;
+        std::unique_ptr<State> state_;
+    };
+
     /**
      * @brief Rank-bound production authority for all live CPU/GPU allocations.
      *
@@ -933,7 +1005,7 @@ namespace llaminar2
      * dependency passed to concrete allocators; callers never carry a loose
      * certificate, ledger, and integer rank that could disagree.
      */
-    class PhysicalMemoryAuthority final
+    class PhysicalMemoryAuthority final : public std::enable_shared_from_this<PhysicalMemoryAuthority>
     {
     public:
         /**
@@ -1096,6 +1168,20 @@ namespace llaminar2
             bool include_zero_lines = false) const;
 
     private:
+        friend class RetainedHostServiceUseToken;
+        friend class RetainedHostServiceDeclarations;
+        // Canonical ownership is a private service check, not a new public borrow API.
+        using std::enable_shared_from_this<PhysicalMemoryAuthority>::shared_from_this;
+        using std::enable_shared_from_this<PhysicalMemoryAuthority>::weak_from_this;
+        /** @brief Authenticate the existing canonical shared owner before any service reservation. */
+        void requireOriginalHostServiceOwner(const std::shared_ptr<PhysicalMemoryAuthority>&)const;
+        /** @brief Acquire only typed instance lifecycle; performs no byte estimation or accounting. */
+        [[nodiscard]] PhysicalMemoryHostServiceInstanceLease claimHostServiceInstance(
+            const std::shared_ptr<PhysicalMemoryAuthority>&,const RetainedHostServiceInstance&,
+            const std::string& originalProgramIdentity,PhysicalMemoryHostServiceInstancePolicy);
+
+        friend class PhysicalMemoryOpaqueRuntimeCommitment;
+        friend class PhysicalMemoryNativeSetupEpoch;
         friend class NativeStoragePmaBinding;
         friend class NativeStoragePreparationPmaBinding;
         struct PreparingNativeStorageTag

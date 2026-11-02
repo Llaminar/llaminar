@@ -1,6 +1,6 @@
 # QFN tuning dashboard
 
-Updated 2026-10-30. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-02. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
@@ -17,30 +17,21 @@ same 255-token decode denominator. Native ignores stop termination; the fork
 permits EOS. This qualifies the observed finite trajectory, not identical EOS
 semantics or general performance superiority. Speed 6/10 remains diagnostic.
 
-That checkpoint passed **2,981 checks / 29 hardware skips**, including 786
-Unit; Release passed. Its receipt does not certify subsequent changes.
-Off/Serving-Dynamic HTTP passed with exact serial IDs, prefix restoration,
-ticket/branch proof and clean retirement. The host note retains the evidence
-and limitations.
-
-Full OpenCode **passes**: ten phases, 110 tools, zero errors, 85 requests,
-one client context compaction, 1,950.81 seconds; independent acceptance and
-45 application tests. Native audit joins 85 responses/110 calls unchanged.
-Runtime/resources/archive/driver and normal unforced retirement pass. Prefix
-token reuse is **95.1%**; all owned disk-cache payloads are reclaimed after a
-metadata-only audit. Earlier failed receipts remain unchanged.
+The checkpoint's Unit/preflight, HTTP and ten-phase OpenCode evidence is
+retained in the host note: 110 tools, zero errors, 95.1% prefix-token reuse,
+clean retirement and owned-cache cleanup. It does not certify later changes
+or the 29 hardware cases skipped at that checkpoint.
 [Host diagnosis and receipts](QFN_HOST_REGISTRATION_INVALIDATION_20261028.md);
 [controller plan](QFN_MTP_TARGET_CONFIRMATION_20261028.md).
 
-Other component work retains 185 exact logit rows and neutral model timing:
-[query omission](QFN_SHORT_CONTEXT_QUERY_OMISSION.md), [QSA][qsa], [GDN][gdn]
-and [online rescale][online-rescale]. Component savings do not establish model gain.
+[QSA][qsa], [GDN][gdn] and [online rescale][online-rescale] retain exact
+logits; component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Admission | [Matrix](QFN_SOURCE_ADMISSION_MATRIX.md): `6f4c742e7` prerequisites green (3,048 passes/29 hardware skips); CUDA15/CPU33 16/16 source passes; 484 eligible. [Native init fix](QFN_NCCL_GIN_INITIALIZATION.md). |
-| CUDA QSA timing | First M1/512 component saves 22.685%; remaining shapes pending, no model claim. |
-| Broader topologies | Tune admitted A rows, then qualify B–D with matched references. |
+| Admission | [Matrix](QFN_SOURCE_ADMISSION_MATRIX.md): 64 adaptive cells open. Focused policy/lifecycle checks green; full gate pending. |
+| Native lifetime | [Review](QFN_NATIVE_RESOURCE_ALLOWANCE_REVIEW_2026-11-01.md): r65 passes all four source controls, final retirement and driver checks. |
+| Continuation / ngrams | [TP2 evidence](QFN_CONSUMER_LOCAL_QUALIFICATION_2026-11-02.md): source16/MTP12 green. Candidate Unit974 and four byte-exact model panels pass; native107 green, gfx1100 14 green. GPU-hit lookup: CUDA1.34x/ROCm1.87x; model decode -1.64% to +1.00%. Movement gate next. |
 
 QSA temporal/page certificates did not repay their costs through **64K/128K**;
 no pruning policy is installed. [Study][certificates]. CUDA hardware profiling
@@ -116,6 +107,8 @@ Never switch GGUF or placement silently. Strata baselines remain pending.
 | C1 | CPU1; RAM ngrams | ⚪ | — | — | — | — | C; qualify independently of SSD row A4. |
 | C2 | ROCm TP2 | ⚪ | — | — | — | — | C; source partition/capacity. |
 | C3 | CUDA TP2 | ⚪ | — | — | — | — | U; source partition/capacity. |
+| C2a | ROCm2 + CPU1 experts; ConsumerLocal C64 | 🟢 four-panel slice | 111.211 | — | 14.611 | — | 8 GPU experts/layer; reference pending. |
+| C3a | CUDA2 + CPU1 experts; ConsumerLocal C64 | 🟢 four-panel slice | 116.941 | — | 17.988 | — | Same source/policy; reference pending. |
 | C4 | ROCm TP4; Castagna within-expert F split | ⚪ | — | — | — | — | C; exact F slices 128/128/128/256; distinct from A1. |
 | C5 | ROCm PP2; equal contiguous layer ranges | ⚪ | — | — | — | — | C; pipeline admission and ranges. |
 | C6 | ROCm PP2; unequal contiguous layer ranges | ⚪ | — | — | — | — | C; pipeline admission and ranges. |

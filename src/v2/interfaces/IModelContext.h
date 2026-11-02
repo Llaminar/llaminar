@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "../loaders/IModelLoader.h"
 #include "../loaders/IWeightManager.h"
 #include <memory>
@@ -24,6 +25,8 @@
 
 namespace llaminar2
 {
+namespace qwen4exp {class PooledImmutableRetainedParticipants;}
+
     class HostImmutableRowProvider;
     class ResidentImmutableRowTable;
     class ResolvedImmutableRowTablePlacement;
@@ -63,6 +66,14 @@ namespace llaminar2
     class IModelContext
     {
     public:
+        /** @brief Bind actual selected CPU roles after original final admission, before source/graph materialization. */
+        virtual void bindRetainedHostServices(std::shared_ptr<const RetainedHostServiceDeclarations>,
+            std::shared_ptr<PhysicalMemoryAuthority>,std::span<const RetainedHostServiceInstance>)
+        { throw std::logic_error("Model context does not own admitted retained CPU service declarations"); }
+        /** @brief Consume one original rank-local role token; missing/substituted roles fail before capture. */
+        virtual RetainedHostServiceUseToken takeRetainedHostService(PhysicalMemoryAllocatorIdentity,
+            RetainedHostServiceRole,const std::shared_ptr<PhysicalMemoryAuthority>&)
+        { throw std::logic_error("Model context has no original retained CPU service instance"); }
         virtual ~IModelContext() = default;
 
         // =========================================================================
@@ -144,6 +155,9 @@ namespace llaminar2
          */
         virtual std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> adaptiveImmutableLookupBoundary(DeviceId device) const
         { (void)device;return {}; }
+
+        /** @return Original source-owned remote participant domain, absent only when this layout has no remote owners. */
+        virtual std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> adaptiveImmutableLookupParticipants(DeviceId) const { return {}; }
 
         /** @return Exact sealed model-owned placement; retained contexts cannot replace its owners/tier. */
         virtual std::shared_ptr<const ResolvedImmutableRowTablePlacement> resolvedImmutableRowTablePlacement() const

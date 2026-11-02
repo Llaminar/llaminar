@@ -9,11 +9,13 @@
  */
 
 #pragma once
+#include "IRetainedGraphParticipants.h"
 
 #include "../../compute_stages/ComputeStages.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../backends/GPUGraphMemoryContract.h"
 #include "IRetainedGraphStorageBoundary.h"
+#include "ReadAheadScheduling.h"
 #include <stdexcept>
 #include <cstdint>
 #include <memory>
@@ -170,6 +172,26 @@ namespace llaminar2
                    HeterogeneousTicketFollowerTransaction;
     }
 
+    class ReadAheadNativeResourceFamily;
+
+    /**
+     * @brief One immutable participant-local GPU read-ahead fork/gather/join.
+     *
+     * Hash publishes query IDs on the primary lane. Exactly one producer runs
+     * on the admitted side lane while independent primary work proceeds; the
+     * consumer imports its exact event. This is scheduling topology, never
+     * execution state. All source/output storage remains owned by graph stages.
+     */
+    struct GraphReadAheadBranch
+    {
+        std::string fork_node; ///< Primary producer of the complete device query.
+        std::string producer_node; ///< Sole independent side-lane gather/transfer stage.
+        std::string consume_node; ///< First primary reader of the side result.
+        std::shared_ptr<ReadAheadNativeResourceFamily> resources; ///< Shared native parent lifetime.
+        ReadAheadJoinPolicy join_policy=ReadAheadJoinPolicy::AtConsumer; ///< Explicit cold native-unit closure rule.
+        std::string join_node; ///< Frozen exact join anchor; actual PLE consumption remains distinct.
+    };
+
     /**
      * @brief Represents a node in the compute graph
      */
@@ -248,6 +270,57 @@ namespace llaminar2
         /** @brief Retain complete I/O lifetime when exporting this graph into a native parent. */
         const std::shared_ptr<IRetainedGraphStorageBoundary> &retainedStorageBoundary() const noexcept
         {return storage_boundary_;}
+
+        /** @brief Declare one actual collective participant plan before source capture.
+         * @param plan Original closed source/participant declaration, never a substitute source executable.
+         * @throws std::invalid_argument For null, incomplete or conflicting invocation declarations.
+         */
+        void setRetainedParticipantSourcePlan(std::shared_ptr<const IRetainedGraphParticipantSourcePlan> plan)
+        {
+            if(!plan || !plan->captureIdentity() || (participant_source_plan_ && participant_source_plan_!=plan))
+                throw std::invalid_argument("ComputeGraph retained participant source plan is invalid or duplicated");
+            if(!participant_source_plan_){participant_source_plan_=std::move(plan);noteTopologyMutation();}
+        }
+        /** @return Original collective metadata; it never launches or captures model work. */
+        const std::shared_ptr<const IRetainedGraphParticipantSourcePlan>& retainedParticipantSourcePlan()const noexcept
+        {return participant_source_plan_;}
+
+        /** @brief Freeze explicit phase/implementation selection in native capture identity.
+         * @throws std::logic_error If a graph attempts to change an existing phase policy.
+         */
+        void setReadAheadPhasePolicy(ForwardExecutionPhase phase,ImmutableLookupInvocationSchedule selected)
+        {
+            const auto identity=immutableLookupPhaseIdentity(phase,selected);
+            if(read_ahead_phase_identity_ && read_ahead_phase_identity_!=identity)
+                throw std::logic_error("Graph cannot replace its immutable lookup phase policy");
+            if(!read_ahead_phase_identity_){read_ahead_phase_identity_=identity;noteTopologyMutation();}
+        }
+        /** @brief Declare and seal one admitted branch before capture.
+         * @param branch Exact existing nodes and original native resource owner.
+         * @throws std::invalid_argument On invalid topology, device or rebinding.
+         */
+        void setReadAheadBranch(GraphReadAheadBranch branch);
+        /** @return Frozen branch declaration; absent means the ordinary main lane. */
+        const std::optional<GraphReadAheadBranch>& readAheadBranch() const noexcept
+        {return read_ahead_branch_;}
+        /** @brief Plan the exact cache-owned recording stream before identity/preparation. */
+        void planReadAheadRecordingStream(void* recording);
+        /** @brief Freeze the source-derived native-unit join before preparation/cache identity. */
+        void resolveReadAheadJoin();
+        /** @brief Seal only the actual native capture owner's recording stream. */
+        void sealReadAheadRecordingStream(void* actual)
+        {if(read_ahead_branch_)read_ahead_recording_binding_.seal(actual);}
+        /** @brief Reject unsealed/mismatched recording before native event emission. */
+        void requireReadAheadRecordingSealed(void* actual)const
+        {if(read_ahead_branch_)read_ahead_recording_binding_.requireSealed(actual);}
+        /** @brief Resolve the executor-owned exact lane, rejecting parent-stream drift.
+         * @param name Existing stage name.
+         * @param primary Exact current native recording stream; parent submission is a separate authority.
+         * @return Exact non-null primary or admitted side stream.
+         */
+        void* executionStreamForNode(const std::string& name,void* primary) const;
+        /** @return Complete immutable native read-ahead closure identity, or zero. */
+        std::uint64_t readAheadCaptureIdentity() const noexcept;
 
         /**
          * @brief Add a node to the graph
@@ -424,6 +497,8 @@ namespace llaminar2
          *         reports true.
          */
         std::unordered_set<std::string> collectiveNodeNames() const;
+        /** @return Whether cold planning contains a collective requiring runtime-backend capture support, preserving all semantic collective identities. */
+        bool requiresCollectiveRuntimeCapture(const std::unordered_set<std::string>* named=nullptr)const;
 
         /**
          * @brief Clear the graph
@@ -574,7 +649,11 @@ namespace llaminar2
         GPUGraphExecutableClass executable_memory_class_ =
             GPUGraphExecutableClass::General; ///< Admission/capture shape, preserved across request reset.
         ExecutionPurpose purpose_=ExecutionPurpose::Executable; ///< Monotone non-executable purpose; moves/merges preserve it.
-        std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary_; ///< Explicit retained native I/O lane.
+        std::shared_ptr<const IRetainedGraphParticipantSourcePlan> participant_source_plan_;
+        std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary_;
+        ReadAheadRecordingBinding read_ahead_recording_binding_; ///< Exact recording/submission lifecycle, not GPU execution state.
+        std::uint64_t read_ahead_phase_identity_=0; ///< Typed phase and selected implementation, independent of M.
+        std::optional<GraphReadAheadBranch> read_ahead_branch_; ///< Immutable native stream/event topology. ///< Explicit retained native I/O lane.
     };
 
 } // namespace llaminar2

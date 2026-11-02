@@ -7,6 +7,7 @@
  * the very same validator after preserving the original raw counter CSV.
  */
 #include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveLookupEvidence.h"
+#include "planning/ImmutableRowTablePlacementPlanner.h"
 #include <gtest/gtest.h>
 #include <limits>
 #include <sstream>
@@ -65,7 +66,7 @@ std::vector<PerfStatRecord> example(DeviceId owner=DeviceId::cuda(0),bool zero=f
     const std::uint64_t requests=hitsOnly?0:zero?3:2,ids=gpu[4];
     const auto metadata=requests*(::llaminar2::qwen4exp::kLookupRequestLiveBytes+::llaminar2::qwen4exp::kLookupCompletionLiveBytes)+
         ids*(sizeof(ImmutableRowSubordinateIntent)+sizeof(ImmutableRowInvalidationAcknowledgement));
-    const std::array<std::uint64_t,20> source{1,requests,ids,ids*8,ids*90,metadata,requests*8,8,0,
+    const std::array<std::uint64_t,20> source{1,requests,ids,ids*8,ids*90,metadata,requests*8,24,0,
         hitsOnly?0u:1u,hitsOnly?0u:2u,0,requests,hitsOnly||zero?0u:1u,hitsOnly?0u:zero?6u:3u,0,
         hitsOnly||zero?0u:2u,hitsOnly||zero?0u:1u,0,0};
     std::vector<PerfStatRecord> records;
@@ -86,6 +87,54 @@ Qwen4ExpGPUAdaptiveLookupEvidence validate(const std::vector<PerfStatRecord> &re
 {
     return requireQwen4ExpGPUAdaptiveLookupEvidence(records,owner,90,8192,zero?0:64,zero?0:64);
 }
+}
+
+/** @test Plural source projection validates every native channel once, preserving shared host ownership. */
+TEST(Qwen4ExpGPUAdaptiveLookupEvidence, PluralConsumerProjectionPreservesEveryChannelAndExactTotals)
+{
+    for (const auto type : {DeviceType::CUDA,DeviceType::ROCm})
+        for (const bool zero : {false,true}) {
+            const DeviceId first{type,0},second{type,1};
+            const PhysicalMemoryResource host{0,DeviceId::cpu(),1ull<<34,1ull<<34};
+            const std::array resources{PhysicalMemoryResource{0,second,1ull<<34,1ull<<34},
+                PhysicalMemoryResource{0,first,1ull<<34,1ull<<34}};
+            ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+            policy.gpu_adaptive.maximum_gpu_cache_rows=zero?0:64;
+            policy.gpu_adaptive.host.maximum_cache_rows=zero?0:64;
+            const auto input=ImmutableRowTablePlacementInput::forConsumers(
+                ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,128,90),host,resources);
+            const auto layout=input.gpuAdaptiveLayout(policy,zero?0:64,zero?0:64,8192);
+            const ImmutableRowTableSource source{.rows=128,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+            auto records=example(first,zero);
+            const auto peer=example(second,zero);
+            records.insert(records.end(),peer.begin(),peer.end());
+            const auto actual=requireQwen4ExpGPUAdaptiveCohortEvidence(records,layout,source,policy.gpu_adaptive);
+            ASSERT_EQ(layout.sourceServices().size(),1u);
+            ASSERT_EQ(actual.size(),2u);
+            std::uint64_t total_source=0,total_bytes=0,total_intervals=0;
+            for (std::size_t i=0;i<actual.size();++i) {
+                const auto requester=layout.consumers()[i];
+                const auto geometry=AdaptiveImmutableLookupGeometry::forRequester(layout,source,policy.gpu_adaptive,requester);
+                EXPECT_EQ(geometry.physical().owners().size(),1u);
+                EXPECT_EQ(geometry.physical().owners().front().allocator,requester);
+                EXPECT_EQ(actual[i].source[2],zero?6u:4u);
+                total_source+=actual[i].source[2];total_bytes+=actual[i].source[4];total_intervals+=actual[i].source[0];
+            }
+            EXPECT_EQ(total_source,zero?12u:8u);
+            EXPECT_EQ(total_bytes,total_source*90u);
+            EXPECT_EQ(total_intervals,2u); // Two original channel closures, not duplicated global provider stats.
+            EXPECT_THROW(AdaptiveImmutableLookupGeometry::fromLayout(layout,source,policy.gpu_adaptive),std::invalid_argument);
+            EXPECT_THROW(requireQwen4ExpGPUAdaptiveCohortEvidence(peer,layout,source,policy.gpu_adaptive),std::invalid_argument);
+            auto foreign=records;foreign.front().device=DeviceId{type,2}.toString();
+            EXPECT_THROW(requireQwen4ExpGPUAdaptiveCohortEvidence(foreign,layout,source,policy.gpu_adaptive),std::invalid_argument);
+            auto doubled=records;
+            for (const auto& record:peer)
+                if (record.tags.at("storage")!="vram") doubled.push_back(record);
+            EXPECT_THROW(requireQwen4ExpGPUAdaptiveCohortEvidence(doubled,layout,source,policy.gpu_adaptive),std::invalid_argument);
+            auto padded=records;
+            for (auto& record:padded) if(record.name=="metadata_bytes") {record.value+=1;break;}
+            EXPECT_THROW(requireQwen4ExpGPUAdaptiveCohortEvidence(padded,layout,source,policy.gpu_adaptive),std::invalid_argument);
+        }
 }
 
 /** @test A fresh real-generation reporting window preserves all unrelated evidence and the original raw forward rows. */
@@ -153,7 +202,7 @@ TEST(Qwen4ExpGPUAdaptiveLookupEvidence, CompletePositiveZeroAndAllHitWindowsReta
         const auto records=example(owner,zero);const auto actual=validate(records,owner,zero);
         EXPECT_EQ(actual.device.completed_live_ids,48u);EXPECT_EQ(actual.device.source_bytes,actual.source[4]);
         EXPECT_EQ(actual.device.source_rows,actual.source[2]);EXPECT_EQ(actual.source[3],actual.source[2]*8);
-        EXPECT_EQ(actual.source[6],actual.source[1]*8);EXPECT_EQ(actual.source[7],8u);
+        EXPECT_EQ(actual.source[6],actual.source[1]*8);EXPECT_EQ(actual.source[7],24u);
         if(zero) { EXPECT_EQ(actual.device.promotions,0u); }
         else { EXPECT_EQ(actual.device.promotions,2u); }
         const auto hits=validate(example(owner,false,true),owner);
@@ -286,5 +335,37 @@ TEST(Qwen4ExpGPUAdaptiveLookupEvidence, RawCSVAndInputsRemainUntouchedOnFailure)
     EXPECT_NE(csv.str().find("vram,pooled_subordinate,generation_terminal,CUDA:0,adaptive_source_rows,8192\n"),std::string::npos);
     EXPECT_THROW((void)validate(records),std::invalid_argument);
     EXPECT_EQ(records[4].value,value);EXPECT_EQ(records.size(),29u);
+}
+
+/** @test Replay the completed native source tuple, including its exact worker-retirement words. */
+TEST(Qwen4ExpGPUAdaptiveLookupEvidence, CompletedWorkerRetirementRetainsExactTerminalBytes)
+{
+    // Recorded CUDA C0 Fixed1 generation witness: one source request, 32 native
+    // rows at 90 bytes each, one GPU close and one CPU worker retirement pair.
+    // Replaying the same schema with either consumer identity is device-free;
+    // native integration remains responsible for executing each backend.
+    constexpr std::array<std::uint64_t,9> device{1,32,0,32,32,2880,0,0,0};
+    constexpr std::array<std::uint64_t,20> source{
+        1,1,32,256,2880,992,8,24,0,32,0,0,1,0,32,0,0,0,0,0};
+    for(const auto owner:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        auto records=example(owner,true);
+        for(std::size_t i=0;i<device.size();++i)records[i].value=device[i];
+        for(std::size_t i=0;i<source.size();++i)records[device.size()+i].value=source[i];
+        const auto actual=validate(records,owner,true);
+        EXPECT_EQ(actual.source[7],24u);
+        EXPECT_EQ(actual.device.source_rows,32u);
+        // Missing the close or either retirement word, or including unrelated
+        // cancellation/padding, must still fail the exact successful protocol.
+        for(const auto bytes:{0u,8u,16u,23u,25u,32u,40u})
+        {
+            auto invalid=records;invalid[device.size()+7].value=bytes;
+            EXPECT_THROW((void)validate(invalid,owner,true),std::invalid_argument)<<bytes;
+        }
+        auto second=records;
+        for(std::size_t i=0;i<device.size();++i)second[i].tags["request"]="1";
+        records.insert(records.end(),second.begin(),second.end());
+        EXPECT_EQ(validate(records,owner,true).source[7],48u);
+    }
 }
 } // namespace llaminar2::test::parity::qwen4exp

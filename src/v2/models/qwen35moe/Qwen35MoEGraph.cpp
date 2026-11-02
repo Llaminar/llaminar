@@ -17,6 +17,7 @@
  * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
+#include "execution/moe/MoEOverlayHostServiceContract.h"
 #include "Qwen35MoEGraph.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "planning/ModelMemoryProfile.h"
@@ -2233,14 +2234,7 @@ namespace llaminar2
          * runtime tables instead use the participant's domain-local index;
          * callers obtain it from the owner-map participant record.
          */
-        struct RoutedContinuationTopology
-        {
-            int tier_index = -1;
-            const RoutedExpertDomain *domain = nullptr;
-            int graph_local_participant = -1;
-            bool captured_continuation_device = false;
-            bool captured_local_tp = false;
-        };
+        using RoutedContinuationTopology = QwenRoutedContinuationTopology;
 
         /**
          * @brief One graph's immutable role in a distributed sparse MoE round trip.
@@ -2352,6 +2346,7 @@ namespace llaminar2
          */
         RoutedContinuationTopology resolveRoutedContinuationTopology(
             const MoERoutedExpertPlacementPlan &plan,
+            const MoEExpertOwnerMap *prepared_owners,
             DeviceId device,
             ILocalTPContext *local_tp_ctx,
             int local_tp_device_index,
@@ -2381,8 +2376,9 @@ namespace llaminar2
                 return result;
             }
 
-            const MoEExpertOwnerMap owner_map =
-                MoEExpertOwnerMap::build(plan);
+            if (!prepared_owners)
+                throw std::logic_error("Qwen35 MoE continuation has no prepared canonical owner map");
+            const auto &owner_map = *prepared_owners;
             for (const auto &candidate : owner_map.participants())
             {
                 if (candidate.tier_idx != result.tier_index ||
@@ -2455,6 +2451,111 @@ namespace llaminar2
             return result;
         }
     } // namespace
+
+    const Qwen35MoEGraph::RoutedForwardRecipe &Qwen35MoEGraph::prepareRoutedForwardRecipe(DeviceId device)
+    {
+        if (device == DeviceId::invalid() || device != config_.default_device)
+            throw std::invalid_argument("Qwen35 routed template requires its original valid participant");
+        const auto before = routed_forward_template_.preparations();
+        const auto &recipe = routed_forward_template_.prepare([&] {
+            RoutedForwardRecipe prepared{.source_device = device,
+                .effective_device = device, .runtime = runtimePlanForGraph(config_)};
+            prepared.source = prepared.runtime ? prepared.runtime->sourcePlanPtr()
+                                               : config_.moe.routed_expert_plan;
+            if (prepared.runtime)
+            {
+                const auto &domain = prepared.runtime->continuationDomain();
+                const auto continuation = prepared.runtime->continuationDevice();
+                const bool contains = std::any_of(domain.participants.begin(), domain.participants.end(),
+                    [&](const auto &participant) { return participant.local_device == device; });
+                if (continuation.is_valid() && continuation != device && !contains)
+                    prepared.effective_device = continuation;
+            }
+            if (prepared.source && prepared.source->usesExpertOverlayAuthority())
+            {
+                // The existing map constructor remains the sole validator and
+                // canonical ordering authority, including random owner order
+                // and reject_tensor_sharded_domains. Run it once, not per layer.
+                ++canonical_owner_map_build_attempts_;
+                auto canonical = std::make_shared<MoEExpertOwnerMap>(
+                    MoEExpertOwnerMap::build(*prepared.source));
+                const auto &residency = config_.moe.expert_overlay_participant_residency;
+                if (residency && residency->initialOwnerMap().participants() == canonical->participants() &&
+                    residency->initialOwnerMap().owners() == canonical->owners())
+                {
+                    prepared.owners = std::shared_ptr<const MoEExpertOwnerMap>(
+                        residency, &residency->initialOwnerMap());
+                    prepared.reused_original_owners = true;
+                    ++original_owner_map_reuses_;
+                }
+                else
+                {
+                    // A preferred/explicit original placement can intentionally
+                    // differ. The old graph consumed the canonical source map;
+                    // retain exactly that result, never substitute live placement.
+                    prepared.owners = std::move(canonical);
+                }
+                ++continuation_resolution_attempts_;
+                prepared.continuation = resolveRoutedContinuationTopology(
+                    *prepared.source, prepared.owners.get(), prepared.effective_device,
+                    dynamic_cast<ILocalTPContext *>(config_.tp_ctx), config_.tp_device_idx,
+                    config_.moe.overlay_mpi_ctx != nullptr,
+                    config_.moe.overlay_mpi_ctx ? config_.moe.overlay_mpi_ctx->rank() : -1);
+            }
+            return prepared;
+        });
+        if (recipe.source_device != device)
+            throw std::invalid_argument("Qwen35 routed template requires its original participant");
+        if (routed_forward_template_.preparations() != before && recipe.owners)
+        {
+            PerfStatsCollector::addCounter("forward_graph", "immutable_owner_map_preparations", 1.0,
+                "map", device.to_string());
+            PerfStatsCollector::addCounter("forward_graph", "immutable_continuation_preparations", 1.0,
+                "topology", device.to_string());
+            if (recipe.reused_original_owners)
+                PerfStatsCollector::addCounter("forward_graph", "immutable_original_owner_map_reuses", 1.0,
+                    "map", device.to_string());
+        }
+        return recipe;
+    }
+
+    void Qwen35MoEGraph::prepareForwardGraphTemplate(DeviceId device)
+    {
+        if (device == DeviceId::invalid() || device != config_.default_device)
+            throw std::invalid_argument("Qwen35 forward template requires its original valid participant");
+        if (config_.n_layers < 0 || (config_.n_layers > 0 && !hasLayerWeightSource()))
+            throw std::invalid_argument("Qwen35 forward template requires its original layer weight source");
+        (void)prepareRoutedForwardRecipe(device);
+        QwenGraphBase::prepareForwardGraphTemplate(device);
+    }
+
+    const Qwen35MoEGraph::RoutedForwardRecipe &Qwen35MoEGraph::routedForwardRecipe(DeviceId device)
+    {
+        if (!routed_forward_template_.prepared())
+            (void)prepareRoutedForwardRecipe(config_.default_device);
+        const auto &recipe = routed_forward_template_.recipe();
+        if (device != recipe.source_device && device != recipe.effective_device)
+            throw std::invalid_argument("Qwen35 routed template cannot borrow a foreign participant");
+        return recipe;
+    }
+
+    const Qwen35MoEGraph::RoutedForwardRecipe &Qwen35MoEGraph::routedForwardRecipe(DeviceId device) const
+    {
+        const auto &recipe = routed_forward_template_.recipe();
+        if (device != recipe.source_device && device != recipe.effective_device)
+            throw std::invalid_argument("Qwen35 routed template cannot borrow a foreign participant");
+        return recipe;
+    }
+
+    PreparedGraphTemplateStats Qwen35MoEGraph::forwardGraphTemplateStats() const
+    {
+        auto result = QwenGraphBase::forwardGraphTemplateStats();
+        result.canonical_owner_map_builds = canonical_owner_map_build_attempts_;
+        result.continuation_resolutions = continuation_resolution_attempts_;
+        result.original_owner_map_reuses = original_owner_map_reuses_;
+        result.routed_layer_specialization_attempts = routed_layer_specialization_attempts_;
+        return result;
+    }
 
     // =========================================================================
     // Constructors
@@ -2709,7 +2810,7 @@ namespace llaminar2
             return false;
         }
 
-        const auto runtime_plan = runtimePlanForGraph(config_);
+        const auto runtime_plan = routedForwardRecipe(config_.default_device).runtime;
         const auto &placement_plan = runtime_plan
                                          ? runtime_plan->sourcePlanPtr()
                                          : config_.moe.routed_expert_plan;
@@ -2735,7 +2836,7 @@ namespace llaminar2
             return false;
         }
 
-        const auto owner_map = MoEExpertOwnerMap::build(*placement_plan);
+        const auto &owner_map = *routedForwardRecipe(device).owners;
         const int local_world_rank = config_.moe.overlay_mpi_ctx
                                          ? config_.moe.overlay_mpi_ctx->rank()
                                          : -1;
@@ -2964,7 +3065,7 @@ namespace llaminar2
             return {};
         }
 
-        const auto owner_map = MoEExpertOwnerMap::build(*placement_plan);
+        const auto &owner_map = *routedForwardRecipe(device).owners;
         const int local_world_rank = config_.moe.overlay_mpi_ctx
                                          ? config_.moe.overlay_mpi_ctx->rank()
                                          : -1;
@@ -4351,8 +4452,8 @@ namespace llaminar2
             const auto residency = config_.moe.expert_overlay_participant_residency;
             if (!residency || !residency->projectionPreparation() || !model_ctx_)
                 throw std::logic_error("Projection runtime has no authenticated participant preparation");
-            const auto runtime_plan = runtimePlanForGraph(config_);
-            const auto owners = MoEExpertOwnerMap::build(runtime_plan->sourcePlan());
+            const auto runtime_plan = routedForwardRecipe(config_.default_device).runtime;
+            const auto &owners = *routedForwardRecipe(device).owners;
             const int id = participantIdForTierDevice(owners, 0, device);
             const auto *participant = owners.participantForId(id);
             if (!participant) throw std::logic_error("Projection runtime cannot resolve its graph-local participant");
@@ -4421,7 +4522,7 @@ namespace llaminar2
         (void)device;
         return {};
 #else
-        const auto runtime_plan = runtimePlanForGraph(config_);
+        const auto runtime_plan = routedForwardRecipe(config_.default_device).runtime;
         const auto &source_plan = runtime_plan
                                       ? runtime_plan->sourcePlanPtr()
                                       : config_.moe.routed_expert_plan;
@@ -4706,6 +4807,7 @@ namespace llaminar2
                 "Qwen35 MoE graph has an inconsistent ExpertOverlayRCU "
                 "durable residency authority binding");
         }
+        ++routed_layer_specialization_attempts_;
         ComputeGraph graph;
         const bool mtp_sidecar_context = identity.workload() == GraphLayerWorkload::MTPDepth;
         const int mtp_depth_idx = identity.predictorDepth().value_or(-1);
@@ -4754,7 +4856,7 @@ namespace llaminar2
                         ? "true"
                         : "false"));
         }
-        auto overlay_runtime_plan = runtimePlanForGraph(config_);
+        auto overlay_runtime_plan = routedForwardRecipe(config_.default_device).runtime;
         const auto &overlay_plan = overlay_runtime_plan
                                        ? overlay_runtime_plan->sourcePlanPtr()
                                        : config_.moe.routed_expert_plan;
@@ -5049,17 +5151,7 @@ namespace llaminar2
             config_.moe.overlay_mpi_ctx &&
             config_.moe.overlay_mpi_ctx->world_size() > 1;
         const RoutedContinuationTopology routed_continuation_topology =
-            use_expert_overlay
-                ? resolveRoutedContinuationTopology(
-                      *overlay_plan,
-                      device,
-                      local_tp_ctx,
-                      config_.tp_device_idx,
-                      config_.moe.overlay_mpi_ctx != nullptr,
-                      config_.moe.overlay_mpi_ctx
-                          ? config_.moe.overlay_mpi_ctx->rank()
-                          : -1)
-                : RoutedContinuationTopology{};
+            use_expert_overlay ? routedForwardRecipe(device).continuation : RoutedContinuationTopology{};
         const bool captured_overlay_continuation =
             routed_continuation_topology
                 .captured_continuation_device;
@@ -7997,7 +8089,7 @@ namespace llaminar2
                 if (!runtime || !local_tp_ctx || !residency || !model_ctx_)
                     throw std::logic_error("Projection graph has incomplete runtime/native-domain ownership");
                 auto fixed = runtime->retainFixedDownProjectionBank(layer_idx);
-                const auto owners = MoEExpertOwnerMap::build(*overlay_plan);
+                const auto &owners = *routedForwardRecipe(device).owners;
                 const auto *participant = fixed ? owners.participantForId(fixed->participantId()) : nullptr;
                 const auto manager = model_ctx_->concreteWeightManager();
                 if (!participant || !manager)
@@ -8032,8 +8124,7 @@ namespace llaminar2
             }
             else if (use_local_tp_routed_fast_path)
             {
-                auto owner_map_lifetime = std::make_shared<MoEExpertOwnerMap>(
-                    MoEExpertOwnerMap::build(*overlay_plan));
+                auto owner_map_lifetime = routedForwardRecipe(device).owners;
                 const auto graph_scope = MoEExpertOverlayGraphScope::resolveForTPParticipant(
                     *overlay_runtime_plan, device, config_.tp_ctx, config_.tp_device_idx);
                 const int local_participant = participantIdForTierDevice(
@@ -9166,8 +9257,7 @@ namespace llaminar2
             }
             else if (use_expert_overlay)
             {
-                auto owner_map_lifetime = std::make_shared<MoEExpertOwnerMap>(
-                    MoEExpertOwnerMap::build(*overlay_plan));
+                auto owner_map_lifetime = routedForwardRecipe(device).owners;
                 const int continuation_root_participant =
                     continuationRootParticipant(*overlay_plan);
                 const int participant_count =
@@ -9818,72 +9908,18 @@ namespace llaminar2
                             "Qwen35 MoE mapped activation parent cannot resolve its continuation rank");
                     }
 
-                    bool saw_remote_participant = false;
-                    bool all_remote_participants_are_node_local = true;
-                    for (size_t tier_index = 0;
-                         tier_index < overlay_plan->routed_tiers.size();
-                         ++tier_index)
-                    {
-                        /* The complete continuation tier is already represented
-                         * by symmetric graph-local branches. Inspect every
-                         * other topology-declared endpoint even when its
-                         * initial mask is empty so migration cannot require a
-                         * recapture. */
-                        if (static_cast<int>(tier_index) ==
-                            continuation_tier_index)
-                        {
-                            continue;
-                        }
-                        auto tier_participants =
-                            owner_map_lifetime->participantIdsForTier(
-                                static_cast<int>(tier_index));
-                        std::sort(
-                            tier_participants.begin(),
-                            tier_participants.end());
-                        for (const int target_participant :
-                             tier_participants)
-                        {
-                            const auto *const target_descriptor =
-                                owner_map_lifetime->participantForId(
-                                    target_participant);
-                            if (!target_descriptor ||
-                                !target_descriptor->world_rank_known)
-                            {
-                                throw std::logic_error(
-                                    "Qwen35 MoE mapped activation topology contains an unresolved endpoint");
-                            }
-                            if (target_descriptor->world_rank ==
-                                source_descriptor->world_rank)
-                            {
-                                /*
-                                 * A NodeTP domain can place one lower-tier CPU
-                                 * endpoint beside the continuation GPU. That
-                                 * edge is graph-local and must never be
-                                 * represented by a self-MPI or mapped-rank
-                                 * channel. It is lowered through the fixed
-                                 * direct sparse ticket path below.
-                                 */
-                                mapped_activation_local_participants.push_back(
-                                    target_participant);
-                                continue;
-                            }
-                            saw_remote_participant = true;
-                            mapped_activation_remote_participants.push_back(
-                                target_participant);
-                            if (resolveMoEOverlayRankBatchTransportKind(
-                                    *config_.moe.overlay_mpi_ctx,
-                                    source_descriptor->world_rank,
-                                    target_descriptor->world_rank) !=
-                                MoEOverlayRankBatchTransportKind::
-                                    NodeLocalSharedRows)
-                            {
-                                all_remote_participants_are_node_local = false;
-                            }
-                        }
-                    }
-                    const bool mapped_activation_topology =
-                        saw_remote_participant &&
-                        all_remote_participants_are_node_local;
+                    // Planning and lowering classify the SAME authored endpoints,
+                    // including initially empty owners. No quota or mutable expert
+                    // assignment can alter this native host-boundary declaration.
+                    const auto hostService=MoEOverlayHostServiceContract::resolve(*overlay_plan,
+                        owner_map_lifetime->participants(),*config_.moe.overlay_mpi_ctx);
+                    if(hostService.continuationTier()!=continuation_tier_index)
+                        throw std::logic_error("Routed host service changed original continuation tier");
+                    mapped_activation_local_participants.assign(hostService.localParticipants().begin(),hostService.localParticipants().end());
+                    mapped_activation_remote_participants.assign(hostService.remoteParticipants().begin(),hostService.remoteParticipants().end());
+                    const bool saw_remote_participant=!mapped_activation_remote_participants.empty();
+                    const bool all_remote_participants_are_node_local=!saw_remote_participant||hostService.mappedActivationTopology();
+                    const bool mapped_activation_topology=hostService.mappedActivationTopology();
                     if (!mapped_activation_local_participants.empty() ||
                         (saw_remote_participant &&
                          !all_remote_participants_are_node_local))

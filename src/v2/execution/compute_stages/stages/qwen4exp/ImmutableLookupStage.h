@@ -19,6 +19,7 @@
 namespace llaminar2
 {
 /** @brief One native immutable lookup operation with participant-local output. */
+class Qwen4ExpEarlyLookupFrame;
 class ImmutableLookupStage final : public IComputeStage
 {
 public:
@@ -80,6 +81,12 @@ public:
     /** @brief Declare exact arena identities; table/channel lifetime is retained by Params. */
     StageBufferContract bufferContract() const override;
 private:
+    friend class Qwen4ExpEarlyLookupFrame;
+    /** @brief Split operations are constructible only through the graph-local exact-once frame. */
+    enum class Operation { Complete, Publish, Consume };
+    /** @brief Bind one operation-specific immutable preparation and arena contract. */
+    ImmutableLookupStage(Params params,Operation operation);
+    Operation operation_=Operation::Complete;
     /** @brief Resolve a prebound arena view on the exact execution participant. */
     template<typename T,TensorType Type> T *pointer(Qwen4ExpArenaBinding<Type> binding) const;
     /** @brief Resolve an optional live count without reading GPU contents on the host. */

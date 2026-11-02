@@ -43,7 +43,7 @@ struct ResponsePlan {std::uint32_t first=0,initial_slot=None;};
 /** @brief Bounded outstanding destination tokens only; never a persistent GPU residency directory. */
 struct GrantTarget {std::uint64_t token=0,row=0,stamp=0;};
 /** @brief Immutable CPU read-grant rows retained only until the existing channel consumption ACK. */
-struct GrantedRow {std::int64_t row=0;ImmutableRowReadIntent intent=ImmutableRowReadIntent::Read;};
+struct GrantedRow {std::int64_t row=0;ImmutableRowReadIntent intent=ImmutableRowReadIntent::Read;std::uint32_t slot=None;std::uint64_t generation=0;};
 /** @return Checked byte/index addition, never a free-memory calculation. */
 std::size_t plus(std::size_t a,std::size_t b) {
     if(b>std::numeric_limits<std::size_t>::max()-a)throw std::overflow_error("CPU row cache byte sum overflows");
@@ -107,12 +107,15 @@ CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::forSu
     const ImmutableRowTableLayoutGeometry &layout,PhysicalMemoryAllocatorIdentity host,
     PhysicalMemoryAllocatorIdentity requester,CpuImmutableRowCachePolicy policy) {
     if(requester.world_rank!=host.world_rank || !requester.device.is_gpu() ||
-        layout.consumers().size()!=1 || layout.consumers().front()!=requester ||
         !layout.maximumInflightRows() || layout.maximumInflightRows()>std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Subordinate CPU source requires exact one local GPU requester and bounded live rows");
+    // Consumer identity survives C0 even when there is no GPU directory. The
+    // requester role is independent of every GPU storage owner's membership.
+    if(layout.consumers().size()!=1 || layout.consumers().front()!=requester)
+        throw std::invalid_argument("Subordinate CPU source requires its sole original declared GPU consumer");
     std::uint64_t gpu_slots=0;
     for(const auto &owner:layout.owners())if(owner.key.tier==ImmutableRowStorage::VRAM) {
-        if(owner.key.allocator!=requester || owner.fixed_rows)
+        if(owner.key.allocator.world_rank!=requester.world_rank || !owner.key.allocator.device.is_gpu() || owner.fixed_rows)
             throw std::invalid_argument("Subordinate CPU source has a foreign GPU owner");
         gpu_slots=countPlus(gpu_slots,owner.cache_rows);
     }
@@ -121,6 +124,28 @@ CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::forSu
     if(layout.sourceServices().size()!=1 || layout.sourceServices().front().allocator!=host)
         throw std::invalid_argument("Subordinate CPU source requires its sole original rank-local SSD service");
     return project(layout,host,static_cast<std::size_t>(layout.maximumInflightRows()),policy,requester);
+}
+CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPUs(
+    const ImmutableRowTableLayoutGeometry &layout,PhysicalMemoryAllocatorIdentity host,CpuImmutableRowCachePolicy policy) {
+    if(layout.consumers().empty() || !layout.maximumInflightRows() ||
+       layout.sourceServices().size()!=1 || layout.sourceServices().front().allocator!=host)
+        throw std::invalid_argument("Shared subordinate cache requires its exact closed local source/consumer declaration");
+    for(const auto requester:layout.consumers())
+        if(requester.world_rank!=host.world_rank || !requester.device.is_gpu())
+            throw std::invalid_argument("Shared subordinate cache has a foreign/non-GPU consumer");
+    for(const auto& owner:layout.owners())if(owner.key.tier==ImmutableRowStorage::VRAM &&
+        (owner.key.allocator.world_rank!=host.world_rank || !owner.key.allocator.device.is_gpu() || owner.fixed_rows))
+        throw std::invalid_argument("Shared subordinate source has a foreign or fixed GPU owner");
+    if(layout.consumers().size()==1)return forSubordinateGPU(layout,host,layout.consumers().front(),policy);
+    // The first requester is used only to select subordinate scratch in the
+    // common array projection. It is never installed as a shared coordinator.
+    auto geometry=project(layout,host,layout.maximumInflightRows(),policy,layout.consumers().front());
+    geometry.requesters_.assign(layout.consumers().begin(),layout.consumers().end());
+    geometry.requester_=geometry.requesters_.size()==1?std::optional(geometry.requesters_.front()):std::nullopt;
+    geometry.channels_offset_=align(plus(geometry.read_rows_offset_,times(times(geometry.maximum_live_rows_,
+        geometry.requesters_.size()),sizeof(GrantedRow))),alignof(void*));
+    geometry.execution_bytes_=align(plus(geometry.channels_offset_,times(geometry.requesters_.size(),sizeof(void*))),page());
+    return geometry;
 }
 CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::project(
     const ImmutableRowTableLayoutGeometry &layout,PhysicalMemoryAllocatorIdentity host,
@@ -143,6 +168,7 @@ CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::proje
     CpuAdaptiveImmutableRowCacheGeometry g(layout.extent(),host,service->windows,
         ImmutableRowTableHostPlacement::taskPolicy(),policy);
     g.requester_=requester;
+    if(requester)g.requesters_.push_back(*requester);
     std::optional<std::size_t> limit;
     for(const auto &o:layout.owners()) {
         if(o.key.tier==ImmutableRowStorage::VRAM) {
@@ -176,6 +202,10 @@ CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::proje
     g.grant_offset_=align(scatter_end,alignof(GrantTarget));
     g.read_rows_offset_=align(plus(g.grant_offset_,requester?times(g.request_count_,sizeof(GrantTarget)):0),alignof(GrantedRow));
     g.execution_bytes_=align(requester?plus(g.read_rows_offset_,times(maximum_live_rows,sizeof(GrantedRow))):scatter_end,page());
+    if(requester){
+        g.channels_offset_=align(plus(g.read_rows_offset_,times(maximum_live_rows,sizeof(GrantedRow))),alignof(void*));
+        g.execution_bytes_=align(plus(g.channels_offset_,sizeof(void*)),page());
+    }
     g.source_bytes_=ImmutableRowTable::physicalBytesForNativeExtent(g.extent_.nativeBytes(),g.source_policy_);
     if(limit && g.storage_bytes_>*limit)throw std::invalid_argument("CPU row cache payload and ALL metadata exceed RAM owner byte limit");
     return g;
@@ -206,7 +236,14 @@ struct CpuAdaptiveImmutableRowCache::Impl {
     CpuImmutableRowCacheStats counters;
     std::uint64_t next_policy_ordinal=0,clock=0;
     std::uint32_t filled=0,free_head=None,heap_size=0,protected_head=None,protected_tail=None,protected_count=0;
-    const qwen4exp::ImmutableLookupHostProcessor *subordinate_channel=nullptr;
+    /** @return Predeclared channel identities; these are CPU I/O ownership, never device execution state. */
+    const qwen4exp::ImmutableLookupHostProcessor **channels() const {
+        return reinterpret_cast<const qwen4exp::ImmutableLookupHostProcessor**>(static_cast<std::byte*>(execution.data)+geometry.channels_offset_);
+    }
+    std::size_t channelIndex(const qwen4exp::ImmutableLookupHostProcessor *channel) const {
+        for(std::size_t i=0;i<geometry.requesters_.size();++i)if(channels()[i]==channel)return i;
+        throw std::invalid_argument("Subordinate request has no original channel binding");
+    }
     bool retired=false,failed=false;
     /** @brief Retain one proven immutable geometry; source creation/allocation complete before facade publication. */
     Impl(CpuAdaptiveImmutableRowCacheGeometry g,std::shared_ptr<PhysicalMemoryAuthority> m):geometry(std::move(g)),memory(std::move(m)){}
@@ -329,6 +366,16 @@ struct CpuAdaptiveImmutableRowCache::Impl {
         s.retiring=true;--counters.resident_rows;++counters.invalidations;
         if(!s.pins)recycle(slot);
     }
+    /** @brief Drop one original slot generation under the existing cache mutex. */
+    void releasePin(std::uint32_t slot,std::uint64_t row,std::uint64_t generation) noexcept {
+        auto& record=slots()[slot];
+        if(!record.ready || record.row!=row || record.generation!=generation || !record.pins)std::terminate();
+        if(!--record.pins){
+            --counters.pinned_rows;
+            if(record.retiring){try{recycle(slot);}catch(...){std::terminate();}}
+            else eligible(slot);
+        }
+    }
     /** @brief Optionally retain an already complete response; failure never publishes half-filled bytes. */
     void admit(std::uint64_t row,const std::byte *response) {
         if(!geometry.slots_)return;
@@ -371,11 +418,12 @@ std::unique_ptr<CpuAdaptiveImmutableRowCache> CpuAdaptiveImmutableRowCache::crea
     auto *plans=reinterpret_cast<ResponsePlan*>(static_cast<std::byte*>(state->execution.data)+g.plan_offset_);
     auto *targets=reinterpret_cast<ImmutableRowTableScatterRow*>(static_cast<std::byte*>(state->execution.data)+g.scatter_offset_);
     for(std::size_t i=0;i<g.maximum_live_rows_;++i){std::construct_at(plans+i);std::construct_at(targets+i);}
-    if(g.requester_) {
+    if(!g.requesters_.empty()) {
         auto *grants=reinterpret_cast<GrantTarget*>(static_cast<std::byte*>(state->execution.data)+g.grant_offset_);
         for(std::size_t i=0;i<g.request_count_;++i)std::construct_at(grants+i);
         auto *rows=reinterpret_cast<GrantedRow*>(static_cast<std::byte*>(state->execution.data)+g.read_rows_offset_);
-        for(std::size_t i=0;i<g.maximum_live_rows_;++i)std::construct_at(rows+i);
+        for(std::size_t i=0;i<times(g.maximum_live_rows_,g.requesters_.size());++i)std::construct_at(rows+i);
+        for(std::size_t i=0;i<g.requesters_.size();++i)std::construct_at(state->channels()+i,nullptr);
     }
     state->source->authenticateSource();return std::unique_ptr<CpuAdaptiveImmutableRowCache>(new CpuAdaptiveImmutableRowCache(std::move(state)));
 }
@@ -388,26 +436,32 @@ void CpuAdaptiveImmutableRowCache::authenticateSource() const {
 std::optional<PhysicalMemoryAllocatorIdentity> CpuAdaptiveImmutableRowCache::subordinateRequester() const noexcept {
     return impl_->geometry.requester_;
 }
-void CpuAdaptiveImmutableRowCache::bindSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel) {
+std::span<const PhysicalMemoryAllocatorIdentity> CpuAdaptiveImmutableRowCache::subordinateRequesters() const noexcept {
+    return impl_->geometry.requesters_;
+}
+void CpuAdaptiveImmutableRowCache::bindSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel,DeviceId requester) {
     auto &s=*impl_;std::lock_guard lock(s.mutex);s.requireOpen();
-    if(!channel || !s.geometry.requester_ || s.subordinate_channel)
-        throw std::invalid_argument("Subordinate CPU source requires its sole actual processor binding");
+    if(!requester.is_valid() && s.geometry.requesters_.size()==1)requester=s.geometry.requesters_.front().device;
+    const auto found=std::find_if(s.geometry.requesters_.begin(),s.geometry.requesters_.end(),[&](auto r){return r.device==requester;});
+    if(!channel || found==s.geometry.requesters_.end())throw std::invalid_argument("Subordinate source requires its exact original consumer channel");
+    const auto index=std::size_t(found-s.geometry.requesters_.begin());
+    if(s.channels()[index])throw std::invalid_argument("Subordinate consumer already owns its original channel");
     try{s.source->authenticateSource();}catch(...){s.failed=true;throw;}
-    s.subordinate_channel=channel;
+    s.channels()[index]=channel;
 }
 void CpuAdaptiveImmutableRowCache::retireSubordinate(const qwen4exp::ImmutableLookupHostProcessor *channel) noexcept {
     auto &s=*impl_;std::lock_guard lock(s.mutex);
-    if(s.subordinate_channel==channel)s.retired=true;
+    for(std::size_t i=0;i<s.geometry.requesters_.size();++i)if(s.channels()[i]==channel){s.retired=true;return;}
 }
 CpuAdaptiveImmutableRowCache::ReadGrant CpuAdaptiveImmutableRowCache::authorizeSubordinate(
     const qwen4exp::ImmutableLookupHostProcessor *channel,std::uint64_t generation,std::uint64_t sequence,
     std::span<const std::int64_t> ids,std::span<const ImmutableRowSubordinateIntent> intents,
     std::span<ImmutableRowInvalidationAcknowledgement> acknowledgements) {
     auto &s=*impl_;std::lock_guard lock(s.mutex);s.requireOpen();
-    if(!s.geometry.requester_ || s.subordinate_channel!=channel || !generation || !sequence ||
+    if(s.geometry.requesters_.empty() || !generation || !sequence ||
         ids.size()!=intents.size() || ids.size()!=acknowledgements.size() || ids.size()>s.geometry.maximum_live_rows_)
         throw std::invalid_argument("Subordinate CPU source requires the original acquired processor frame");
-    return ReadGrant(impl_,channel,generation,sequence,ids,intents,acknowledgements);
+    return ReadGrant(impl_,channel,generation,sequence,ids,intents,acknowledgements,s.channelIndex(channel));
 }
 CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gather(std::span<const std::int64_t> ids,std::span<std::byte> destination) {
     return gatherImpl(ids,destination,nullptr);
@@ -415,8 +469,8 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gather(std::span<
 CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
     std::span<const std::int64_t> ids,std::span<std::byte> destination,const ReadGrant *grant) {
     auto &s=*impl_;std::lock_guard lock(s.mutex);s.requireOpen();const auto &g=s.geometry;
-    if(static_cast<bool>(g.requester_)!=static_cast<bool>(grant) ||
-        (grant && (grant->owner_.get()!=impl_.get() || grant->channel_!=s.subordinate_channel ||
+    if(!g.requesters_.empty()!=static_cast<bool>(grant) ||
+        (grant && (grant->owner_.get()!=impl_.get() || s.channels()[grant->channel_index_]!=grant->channel_ ||
          grant->ids_.data()!=ids.data() || grant->ids_.size()!=ids.size())))
         throw std::invalid_argument("Subordinate CPU source forbids independent or foreign reads");
     if(s.next_policy_ordinal==std::numeric_limits<std::uint64_t>::max() ||
@@ -521,9 +575,19 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
         }
         // ACKs are written only after every fill, duplicate and invalidation succeeds.
         if(grant) {
-            auto *rows=reinterpret_cast<GrantedRow*>(static_cast<std::byte*>(s.execution.data)+g.read_rows_offset_);
+            auto *rows=reinterpret_cast<GrantedRow*>(static_cast<std::byte*>(s.execution.data)+g.read_rows_offset_)+grant->channel_index_*g.maximum_live_rows_;
             for(std::size_t i=0;i<ids.size();++i) {
                 rows[i]={ids[i],grant->intents_[i].intent};
+                if(rows[i].intent==ImmutableRowReadIntent::Read){
+                    const auto slot=s.find(static_cast<std::uint64_t>(ids[i]));
+                    if(slot!=None){
+                        auto &record=s.slots()[slot];
+                        if(record.pins==std::numeric_limits<std::uint32_t>::max())throw std::overflow_error("CPU response pin count exhausted");
+                        if(!record.pins){s.ineligible(slot);++s.counters.pinned_rows;}
+                        ++record.pins;rows[i].slot=slot;rows[i].generation=record.generation;
+                    }
+                }
+                ++grant->retained_rows_;
                 grant->acknowledgements_[i].destination_grant=grant->intents_[i].destination_grant;
             }
         }
@@ -547,15 +611,22 @@ std::optional<CpuAdaptiveImmutableRowCache::Pin> CpuAdaptiveImmutableRowCache::p
 }
 std::optional<CpuAdaptiveImmutableRowCache::Pin> CpuAdaptiveImmutableRowCache::pinImpl(std::int64_t row,const ReadGrant *grant) {
     auto &s=*impl_;std::lock_guard lock(s.mutex);s.requireOpen();
-    if(static_cast<bool>(s.geometry.requester_)!=static_cast<bool>(grant) ||
-        (grant && (grant->owner_.get()!=impl_.get() || grant->channel_!=s.subordinate_channel)))
+    if(!s.geometry.requesters_.empty()!=static_cast<bool>(grant) ||
+        (grant && (grant->owner_.get()!=impl_.get() || s.channels()[grant->channel_index_]!=grant->channel_)))
         throw std::invalid_argument("Subordinate CPU source forbids independent or foreign pins");
     if(grant) {
-        const auto *rows=reinterpret_cast<const GrantedRow*>(static_cast<const std::byte*>(s.execution.data)+s.geometry.read_rows_offset_);
+        const auto *rows=reinterpret_cast<const GrantedRow*>(static_cast<const std::byte*>(s.execution.data)+s.geometry.read_rows_offset_)+grant->channel_index_*s.geometry.maximum_live_rows_;
         const auto &record=rows[static_cast<std::size_t>(row)];
         if(record.intent!=ImmutableRowReadIntent::Read)
             throw std::invalid_argument("Invalidated promotion rows cannot publish new RAM read pins");
-        row=record.row;
+        try{s.source->authenticateSource();}catch(...){s.failed=true;throw;}
+        if(record.slot==None)return std::nullopt;
+        auto &slot=s.slots()[record.slot];
+        if(!slot.ready || slot.row!=static_cast<std::uint64_t>(record.row) || slot.generation!=record.generation || !slot.pins)
+            throw std::logic_error("Subordinate response lost its original pinned cache row");
+        if(slot.pins==std::numeric_limits<std::uint32_t>::max())throw std::overflow_error("CPU borrowed pin count exhausted");
+        ++slot.pins;
+        return Pin(impl_,record.slot,slot.row,slot.generation);
     }
     if(row<0 || static_cast<std::uint64_t>(row)>=s.geometry.extent_.rows())throw std::out_of_range("CPU row cache pin ID invalid");
     // A transient source-path failure is still a failed immutable owner. A
@@ -606,13 +677,8 @@ CpuAdaptiveImmutableRowCache::Pin &CpuAdaptiveImmutableRowCache::Pin::operator=(
 }
 void CpuAdaptiveImmutableRowCache::Pin::release() noexcept {
     if(!owner_)return;
-    auto state=std::move(owner_);std::lock_guard lock(state->mutex);auto &s=state->slots()[slot_];
-    if(!s.ready || s.row!=row_ || s.generation!=generation_ || !s.pins)std::terminate();
-    if(!--s.pins){
-        --state->counters.pinned_rows;
-        if(s.retiring){try{state->recycle(slot_);}catch(...){std::terminate();}}
-        else state->eligible(slot_);
-    }
+    auto state=std::move(owner_);std::lock_guard lock(state->mutex);
+    state->releasePin(slot_,row_,generation_);
 }
 /**
  * @brief Read a live pinned generation after ordinary retirement, never after source failure.
@@ -635,3 +701,24 @@ std::span<const std::byte> CpuAdaptiveImmutableRowCache::Pin::bytes() const {
     return {owner_->data(slot_),owner_->geometry.extent_.rowBytes()};
 }
 } // namespace llaminar2
+
+namespace llaminar2 {
+CpuAdaptiveImmutableRowCache::ReadGrant::~ReadGrant(){release();}
+CpuAdaptiveImmutableRowCache::ReadGrant& CpuAdaptiveImmutableRowCache::ReadGrant::operator=(ReadGrant&& other) noexcept {
+    if(this!=&other){release();owner_=std::move(other.owner_);channel_=other.channel_;generation_=other.generation_;
+        sequence_=other.sequence_;row_count_=other.row_count_;channel_index_=other.channel_index_;retained_rows_=other.retained_rows_;
+        ids_=other.ids_;intents_=other.intents_;acknowledgements_=other.acknowledgements_;}
+    return *this;
+}
+void CpuAdaptiveImmutableRowCache::ReadGrant::release() noexcept {
+    if(!owner_)return;
+    auto state=std::move(owner_);
+    std::lock_guard lock(state->mutex);
+    auto* rows=reinterpret_cast<GrantedRow*>(static_cast<std::byte*>(state->execution.data)+state->geometry.read_rows_offset_)
+        +channel_index_*state->geometry.maximum_live_rows_;
+    for(std::size_t i=0;i<retained_rows_;++i)if(rows[i].slot!=None){
+        state->releasePin(rows[i].slot,static_cast<std::uint64_t>(rows[i].row),rows[i].generation);
+        rows[i].slot=None;
+    }
+}
+}

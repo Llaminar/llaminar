@@ -271,9 +271,20 @@ namespace llaminar2
             auto &transfers = TransferEngine::instance();
             if(execution==ImmutableRowLookupExecution::AdaptiveGPUCache)
             {
+                if(const auto source=model->nativeContextPreparation()){
+                    if(source->memory()!=memory)throw std::logic_error("PLE factory lost its original prepared source PMA");
+                    auto permit=source->acquire(device);
+                    if(permit.worker()->ownsCurrentThread())
+                        throw std::logic_error("Prepared participant source must be materialized outside its original workers");
+                    model->prepareImmutableRowTableForConsumer(*placement,memory,device,std::nullopt,transfers,
+                        AdaptiveImmutableLookupDevicePreparation{device,permit.worker()->defaultStream()});
+                    model->prepareAdaptiveImmutableLookupParticipants(graph);
+                    return;
+                }
                 if(model->adaptiveImmutableLookupBoundary(device))
                 {
                     model->prepareImmutableRowTableForConsumer(*placement,memory,device,std::nullopt,transfers);
+                    model->prepareAdaptiveImmutableLookupParticipants(graph);
                     return;
                 }
                 auto &worker=GPUDeviceContextPool::instance().getContext(device);
@@ -283,6 +294,7 @@ namespace llaminar2
                     model->prepareImmutableRowTableForConsumer(*placement,memory,device,std::nullopt,transfers,
                         AdaptiveImmutableLookupDevicePreparation{device,stream});
                 });
+                model->prepareAdaptiveImmutableLookupParticipants(graph);
                 return;
             }
             if (!immutableRowLookupUsesNativeDeviceStorage(execution) || model->residentImmutableRowTable(device))
@@ -3104,7 +3116,9 @@ namespace llaminar2
             config.tp_allreduce_precision_override;
         graph_config.prefix_cache = config.prefix_cache;
         graph_config.ngram_table_policy = config.ngram_table_policy;
+        graph_config.ngram_lookup_schedule = config.ngram_lookup_schedule;
         graph_config.ngram_table_placement = config.ngram_table_placement;
+        graph_config.retained_host_services = config.retained_host_services;
         graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
         graph_config.cpu_serial_expert_storage = config.cpu_serial_expert_storage;
@@ -3318,6 +3332,10 @@ namespace llaminar2
             deps.model_ctx = model_ctx;
             if (graph_config.flash_next)
                 graph_config.bindAdmittedQwenSparseAttentionProgram(config.attention_participants);
+            if(config.retained_host_services){
+                const auto selected=config.retained_host_services->selectedForLookup(config.ngram_table_placement.get());
+                if(!selected.empty())model_ctx->bindRetainedHostServices(config.retained_host_services,physicalMemoryAuthorityForModel(model_ctx),selected);
+            }
             deps.graph_builder =
                 GraphBuilderRegistry::create(architecture, graph_config, mpi_ctx);
             deps.graph_builder->setModelContext(model_ctx);
@@ -4230,7 +4248,9 @@ namespace llaminar2
             config.tp_allreduce_precision_override;
         graph_config.prefix_cache = config.prefix_cache;
         graph_config.ngram_table_policy = config.ngram_table_policy;
+        graph_config.ngram_lookup_schedule = config.ngram_lookup_schedule;
         graph_config.ngram_table_placement = config.ngram_table_placement;
+        graph_config.retained_host_services = config.retained_host_services;
         graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
         graph_config.cpu_serial_expert_storage = config.cpu_serial_expert_storage;
@@ -4342,6 +4362,10 @@ namespace llaminar2
         deps.model_ctx = model_ctx;
         if (graph_config.flash_next)
             graph_config.bindAdmittedQwenSparseAttentionProgram(config.attention_participants);
+        if(config.retained_host_services){
+            const auto selected=config.retained_host_services->selectedForLookup(config.ngram_table_placement.get());
+            if(!selected.empty())model_ctx->bindRetainedHostServices(config.retained_host_services,physicalMemoryAuthorityForModel(model_ctx),selected);
+        }
         deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
         deps.graph_builder->setModelContext(model_ctx);
         deps.turboquant_ctx = std::move(turboquant_ctx);

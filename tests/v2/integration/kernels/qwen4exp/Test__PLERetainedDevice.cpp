@@ -83,12 +83,20 @@ void prove(DeviceId device, bool outerLedger = false){
    MTPSpeculativeStatePublicationStage outer(outerParams);
    auto outerPlan = qfn_outer_publication_test::plan(outer, {
        {BufferId::QFN_PLE_TOKEN_HISTORY, &acceptedTokens},
-       {BufferId::QFN_PLE_CONV_HISTORY, &acceptedConv}});
+       {BufferId::QFN_PLE_CONV_HISTORY, &acceptedConv},
+       {BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY, &priorTokens},
+       {BufferId::QFN_PLE_PRIOR_CONV_HISTORY, &priorConv},
+       {BufferId::QFN_PLE_TRANSACTION_LIVE, &frozen},
+       {BufferId::QFN_PLE_RETAINED_TOKENS, &retainedTokens},
+       {BufferId::QFN_PLE_RETAINED_NORMALIZED, &retainedNorm}});
    if (outerLedger)
    {
+       qfn_outer_publication_test::rejectUnrelatedRead(outer);
        ASSERT_EQ(outerPlan.outputs.size(), 2u);
-       outerPlan.retained_parent_inputs = {&priorTokens, &priorConv, &frozen,
-           &retainedTokens, &retainedNorm};
+       ASSERT_EQ(outerPlan.retained_parent_inputs.size(), 5u);
+       EXPECT_THROW(qfn_outer_publication_test::plan(outer, {
+           {BufferId::QFN_PLE_TOKEN_HISTORY, &acceptedTokens},
+           {BufferId::QFN_PLE_CONV_HISTORY, &acceptedConv}}), std::logic_error);
        qfn_outer_publication_test::rejectMissingWrites(worker, device, stream, outerPlan, [&] {
            require(retain.restoreVerifierStateCaptureRowFromDeviceIndex(std::span<const int>(deviceControls, controls.numel()).subspan(1), stream),
                "PLE negative outer hook failed without a ledger diagnostic");

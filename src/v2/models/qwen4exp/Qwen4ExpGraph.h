@@ -12,6 +12,7 @@
 #include "../../execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "../../execution/qwen4exp/Qwen4ExpAuxiliaryState.h"
 #include "../../kernels/qwen4exp/QwenSparseAttentionArithmetic.h"
+#include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
 
 namespace llaminar2
 {
@@ -58,6 +59,8 @@ public:
     void setArena(BufferArena *arena) override;
     /** @copydoc IGraphBuilder::bindStorageMemoryAuthority */
     void bindStorageMemoryAuthority(std::shared_ptr<PhysicalMemoryAuthority> authority) override;
+    /** @copydoc IGraphBuilder::bindReadAheadNativeResources */
+    void bindReadAheadNativeResources(std::shared_ptr<ReadAheadNativeResourceFamily> resources) override;
     /** @brief Exact model-owned auxiliary content in this participant's declared PP interval. */
     enum class AuxiliaryContent { Absent, PLEOnly, SparseOnly, PLEAndSparse };
     /**
@@ -73,14 +76,21 @@ public:
     /** @copydoc IGraphBuilder::retainedStorageBoundary */
     std::shared_ptr<IRetainedGraphStorageBoundary> retainedStorageBoundary(DeviceId device) override;
 protected:
+    /** @copydoc QwenGraphBase::addModelInvocationPrefix */
+    std::unique_ptr<ModelInvocationPrefix> addModelInvocationPrefix(ComputeGraph&,const ForwardInput&,
+        DeviceId,ModelInvocationShape) override;
     /** @copydoc QwenGraphBase::addModelLayerInput */
     std::string addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
-        int layer,DeviceId device,const std::string &dependency) override;
+        int layer,DeviceId device,const std::string &dependency,ModelInvocationPrefix &prefix) override;
     /** @copydoc QwenGraphBase::addModelAttentionPreparation */
     std::string addModelAttentionPreparation(ComputeGraph &graph,const AttentionConsumerBinding &binding) override;
     /** @copydoc QwenGraphBase::addModelAttentionConsumer */
     std::optional<std::string> addModelAttentionConsumer(ComputeGraph &graph,const AttentionConsumerBinding &binding) override;
 private:
+  struct EarlyPrefix;
+  struct ResidentPrefix;
+  /** @brief Resolve the original admitted PLE source for both prefix and consumer construction. */
+  Qwen4ExpPLEBuilder::LookupStorage pleLookupStorage(const ForwardInput&,DeviceId,Qwen4ExpStageRows,Qwen4ExpAuxiliaryState&);
   const qwen4exp::QwenSparseAttentionArithmetic sparse_attention_arithmetic_; ///< Existing explicit base arithmetic snapshot.
   const qwen4exp::QwenSparseAttentionPhaseSchedule sparse_attention_phase_schedule_; ///< Canonical immutable setup scalar shared with arena planning; no DebugEnv reread.
   /**

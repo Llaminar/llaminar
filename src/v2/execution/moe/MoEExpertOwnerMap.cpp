@@ -9,6 +9,8 @@
  * deterministic.
  */
 
+#include <atomic>
+#include "utils/PerfStatsCollector.h"
 #include "MoEExpertOwnerMap.h"
 #include "RoutedExpertOwnerAssignment.h"
 
@@ -23,6 +25,8 @@ namespace llaminar2
 {
     namespace
     {
+        std::atomic<std::uint64_t> initial_build_attempts{0};
+
         std::string formatValidationErrors(const MoERoutedExpertPlacementValidationResult &validation)
         {
             std::ostringstream message;
@@ -369,10 +373,35 @@ namespace llaminar2
 
     } // namespace
 
+    std::uint64_t MoEExpertOwnerMap::initialBuildAttempts() noexcept
+    {
+        return initial_build_attempts.load(std::memory_order_relaxed);
+    }
+
+    std::vector<MoEExpertOwnerParticipant> MoEExpertOwnerMap::declaredParticipants(
+        const MoERoutedExpertPlacementPlan& plan,const MoEExpertOwnerMapBuildOptions& options)
+    {
+        if(!plan.usesExpertOverlayAuthority())throw std::invalid_argument("Routed participants require original enabled tiered topology");
+        std::vector<MoEExpertOwnerParticipant> result;
+        for(std::size_t tier=0;tier<plan.routed_tiers.size();++tier){
+            const auto& domain=requireDomain(plan,plan.routed_tiers[tier].domain,"routed tier");
+            if(domain.participants.size()>static_cast<std::size_t>(std::numeric_limits<int>::max())-result.size())
+                throw std::overflow_error("Routed participant identity extent overflows");
+            auto next=buildTierParticipants(plan,tier,options,static_cast<int>(result.size()));
+            if(result.size()+next.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+                throw std::overflow_error("Routed participant identity extent overflows");
+            result.insert(result.end(),std::make_move_iterator(next.begin()),std::make_move_iterator(next.end()));
+        }
+        return result;
+    }
+
     MoEExpertOwnerMap MoEExpertOwnerMap::build(
         const MoERoutedExpertPlacementPlan &plan,
         const MoEExpertOwnerMapBuildOptions &options)
     {
+        initial_build_attempts.fetch_add(1, std::memory_order_relaxed);
+        PerfStatsCollector::addCounter("forward_graph", "canonical_owner_map_build_attempts", 1.0,
+            "setup", {}, {{"reject_tensor_sharded_domains", options.reject_tensor_sharded_domains ? "true" : "false"}});
         return buildWithPreferredOwners(plan, options, nullptr);
     }
 
@@ -498,18 +527,7 @@ namespace llaminar2
             throw std::invalid_argument(formatValidationErrors(validation));
 
         MoEExpertOwnerMap owner_map;
-        for (size_t tier_index = 0; tier_index < plan.routed_tiers.size(); ++tier_index)
-        {
-            auto participants = buildTierParticipants(
-                plan,
-                tier_index,
-                options,
-                static_cast<int>(owner_map.participants_.size()));
-            owner_map.participants_.insert(
-                owner_map.participants_.end(),
-                std::make_move_iterator(participants.begin()),
-                std::make_move_iterator(participants.end()));
-        }
+        owner_map.participants_=declaredParticipants(plan,options);
 
         if (previous)
             requireCompatiblePreviousMap(plan, owner_map, *previous);

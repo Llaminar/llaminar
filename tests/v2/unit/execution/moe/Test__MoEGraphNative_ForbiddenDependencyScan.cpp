@@ -11699,7 +11699,7 @@ namespace llaminar2::test
                 std::string non_observer_source = contents;
                 for (const auto signature : {
                          "json requireQFNPath(",
-                         "std::uint64_t qfnTPHostPublications()"})
+                         "std::uint64_t qfnTPHostPublications(std::size_t participants)"})
                 {
                     const auto observer = braceBalancedDeclarationRegion(
                         non_observer_source, signature);

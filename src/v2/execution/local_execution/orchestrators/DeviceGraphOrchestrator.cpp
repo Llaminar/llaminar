@@ -18,8 +18,11 @@
  * admission, including explicit phase-split and retained MTP mailboxes.
  */
 
+#include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "DeviceGraphOrchestrator.h"
+#include "MTPGraphPolicyScopes.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
@@ -134,77 +137,11 @@
 
 namespace llaminar2
 {
+    using dgo_detail::ScopedGroupedMTPVerifierGraphPolicy;
+    using dgo_detail::ScopedLiveMTPRequestBatchConditionPolicy;
+
     namespace
     {
-        /**
-         * @brief Records one setup-only serving-graph materialization phase.
-         *
-         * Serving-family construction runs concurrently on every LocalTP
-         * participant. A process-wide runtime or library bottleneck can leave
-         * the rank coordinator waiting without revealing which device or graph
-         * family member owns the long tail. This scope publishes the exact
-         * phase boundary at INFO level and records its elapsed time in
-         * PerfStats. It never observes device state, synchronizes a stream, or
-         * participates in correctness decisions.
-         */
-        class ServingGraphMaterializationPhaseTrace final
-        {
-        public:
-            /**
-             * @brief Begin timing one named phase for one exact participant.
-             * @param device Immutable participant identity.
-             * @param phase Stable setup phase name used by logs and PerfStats.
-             */
-            ServingGraphMaterializationPhaseTrace(
-                DeviceId device,
-                std::string phase)
-                : device_(device.toString()),
-                  phase_(std::move(phase)),
-                  started_(std::chrono::steady_clock::now())
-            {
-                LOG_INFO(
-                    "[ServingGraphMaterialization] phase begin device="
-                    << device_ << " phase=" << phase_);
-            }
-
-            /**
-             * @brief Publish elapsed host setup time when the phase exits.
-             *
-             * "Exited" deliberately does not claim success: the owning method
-             * emits the authoritative error when an operation fails. If a
-             * process is externally terminated, the unmatched begin line names
-             * the operation that was still active.
-             */
-            ~ServingGraphMaterializationPhaseTrace() noexcept
-            {
-                const auto elapsed = std::chrono::duration_cast<
-                    std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - started_);
-                PerfStatsCollector::recordTimingNs(
-                    "forward_graph",
-                    "serving_graph_family_setup_phase",
-                    static_cast<std::uint64_t>(elapsed.count()),
-                    "setup",
-                    device_,
-                    {{"phase", phase_}});
-                LOG_INFO(
-                    "[ServingGraphMaterialization] phase exit device="
-                    << device_ << " phase=" << phase_
-                    << " elapsed_ms="
-                    << (static_cast<double>(elapsed.count()) / 1.0e6));
-            }
-
-            ServingGraphMaterializationPhaseTrace(
-                const ServingGraphMaterializationPhaseTrace &) = delete;
-            ServingGraphMaterializationPhaseTrace &operator=(
-                const ServingGraphMaterializationPhaseTrace &) = delete;
-
-        private:
-            std::string device_; ///< Stable participant name for diagnostics.
-            std::string phase_;  ///< Stable setup phase name.
-            std::chrono::steady_clock::time_point started_; ///< Host timer origin.
-        };
-
         /**
          * @brief Persistent backend event closing one calibration sample.
          *
@@ -2406,187 +2343,6 @@ namespace llaminar2
         private:
             std::string &target_;
             std::string previous_;
-        };
-
-        /**
-         * @brief Install the declarative live-MTP-condition graph policy for one scope.
-         *
-         * Runtime replay, setup-only executable materialization, and workspace
-         * family declaration must all select the same GDN/logits namespace for
-         * a device-resident MTP condition.  Centralizing the paired builder and
-         * orchestrator flags here prevents one lifecycle path from restoring
-         * only half of that policy after graph construction.
-         */
-        class ScopedLiveMTPRequestBatchConditionPolicy
-        {
-        public:
-            /**
-             * @param builder Declarative graph builder receiving the policy.
-             * @param orchestrator_flag Matching execution-host policy flag.
-             * @param enable Whether this transaction is a live MTP condition.
-             */
-            ScopedLiveMTPRequestBatchConditionPolicy(
-                IGraphBuilder *builder,
-                bool *orchestrator_flag,
-                bool enable)
-                : builder_(builder),
-                  orchestrator_flag_(orchestrator_flag),
-                  active_(enable)
-            {
-                if (!active_)
-                {
-                    ready_ = true;
-                    return;
-                }
-                ready_ = builder_ && orchestrator_flag_ &&
-                         builder_->setLiveMTPRequestBatchCondition(true);
-                if (ready_)
-                    *orchestrator_flag_ = true;
-            }
-
-            ~ScopedLiveMTPRequestBatchConditionPolicy()
-            {
-                if (!active_ || !ready_)
-                    return;
-                (void)builder_->setLiveMTPRequestBatchCondition(false);
-                *orchestrator_flag_ = false;
-            }
-
-            ScopedLiveMTPRequestBatchConditionPolicy(
-                const ScopedLiveMTPRequestBatchConditionPolicy &) = delete;
-            ScopedLiveMTPRequestBatchConditionPolicy &operator=(
-                const ScopedLiveMTPRequestBatchConditionPolicy &) = delete;
-
-            /// Return whether the requested policy was installed completely.
-            bool ready() const noexcept { return ready_; }
-
-        private:
-            IGraphBuilder *builder_ = nullptr;
-            bool *orchestrator_flag_ = nullptr;
-            bool active_ = false;
-            bool ready_ = false;
-        };
-
-        /**
-         * @brief Install one immutable grouped-verifier graph topology.
-         *
-         * Serving-family setup must capture the same declarative policy that a
-         * live verifier later selects, while leaving request data untouched.
-         * This scope changes the builder and execution-host mirrors together and
-         * restores both on every exit.  Partial installation is rolled back as
-         * well, so a failed setup cannot leak verifier topology into the next
-         * family member.
-         */
-        class ScopedGroupedMTPVerifierGraphPolicy
-        {
-        public:
-            /**
-             * @param builder Declarative model graph receiving the policy.
-             * @param compute_all_position_logits Matching execution-host flag.
-             * @param compute_row_indexed_logits Matching row-selection flag.
-             * @param row_indexed_logit_count Matching physical output-row count.
-             * @param outcome_mode Matching terminal verifier topology.
-             * @param physical_rows Immutable captured verifier width.
-             * @param requested_outcome_mode Greedy or external stochastic outcome.
-             */
-            ScopedGroupedMTPVerifierGraphPolicy(
-                IGraphBuilder *builder,
-                bool *compute_all_position_logits,
-                bool *compute_row_indexed_logits,
-                int *row_indexed_logit_count,
-                MTPVerifierOutcomeGraphMode *outcome_mode,
-                int physical_rows,
-                MTPVerifierOutcomeGraphMode requested_outcome_mode)
-                : builder_(builder),
-                  compute_all_position_logits_(
-                      compute_all_position_logits),
-                  compute_row_indexed_logits_(
-                      compute_row_indexed_logits),
-                  row_indexed_logit_count_(row_indexed_logit_count),
-                  outcome_mode_(outcome_mode)
-            {
-                if (!builder_ || !compute_all_position_logits_ ||
-                    !compute_row_indexed_logits_ ||
-                    !row_indexed_logit_count_ || !outcome_mode_ ||
-                    physical_rows <= 0 ||
-                    (*outcome_mode_ !=
-                         MTPVerifierOutcomeGraphMode::Disabled) ||
-                    *compute_all_position_logits_ ||
-                    *compute_row_indexed_logits_ ||
-                    *row_indexed_logit_count_ != 0)
-                {
-                    return;
-                }
-
-                selected_rows_.resize(
-                    static_cast<std::size_t>(physical_rows));
-                std::iota(
-                    selected_rows_.begin(),
-                    selected_rows_.end(),
-                    0);
-
-                touched_builder_ = true;
-                ready_ =
-                    builder_->setComputeAllPositionLogits(true) &&
-                    builder_->setComputeRowIndexedAllPositionLogits(
-                        true, physical_rows) &&
-                    builder_->setRowIndexedAllPositionLogitRows(
-                        selected_rows_) &&
-                    builder_->setGroupedMTPVerifier(true) &&
-                    builder_->setMTPVerifierOutcomeGraphMode(
-                        requested_outcome_mode);
-                if (!ready_)
-                    return;
-
-                *compute_all_position_logits_ = true;
-                *compute_row_indexed_logits_ = true;
-                *row_indexed_logit_count_ = physical_rows;
-                *outcome_mode_ = requested_outcome_mode;
-            }
-
-            /** @brief Restore the ordinary forward-graph policy. */
-            ~ScopedGroupedMTPVerifierGraphPolicy()
-            {
-                if (touched_builder_ && builder_)
-                {
-                    (void)builder_->setMTPVerifierOutcomeGraphMode(
-                        MTPVerifierOutcomeGraphMode::Disabled);
-                    (void)builder_->setGroupedMTPVerifier(false);
-                    (void)builder_->setRowIndexedAllPositionLogitRows({});
-                    (void)builder_->setComputeRowIndexedAllPositionLogits(
-                        false, 0);
-                    (void)builder_->setComputeAllPositionLogits(false);
-                }
-                if (compute_all_position_logits_)
-                    *compute_all_position_logits_ = false;
-                if (compute_row_indexed_logits_)
-                    *compute_row_indexed_logits_ = false;
-                if (row_indexed_logit_count_)
-                    *row_indexed_logit_count_ = 0;
-                if (outcome_mode_)
-                {
-                    *outcome_mode_ =
-                        MTPVerifierOutcomeGraphMode::Disabled;
-                }
-            }
-
-            ScopedGroupedMTPVerifierGraphPolicy(
-                const ScopedGroupedMTPVerifierGraphPolicy &) = delete;
-            ScopedGroupedMTPVerifierGraphPolicy &operator=(
-                const ScopedGroupedMTPVerifierGraphPolicy &) = delete;
-
-            /** @return True only when builder and host mirrors agree. */
-            [[nodiscard]] bool ready() const noexcept { return ready_; }
-
-        private:
-            IGraphBuilder *builder_ = nullptr; ///< Declarative topology owner.
-            bool *compute_all_position_logits_ = nullptr; ///< Host policy mirror.
-            bool *compute_row_indexed_logits_ = nullptr; ///< Host row-policy mirror.
-            int *row_indexed_logit_count_ = nullptr; ///< Captured physical rows.
-            MTPVerifierOutcomeGraphMode *outcome_mode_ = nullptr; ///< Terminal topology.
-            std::vector<int> selected_rows_; ///< Immutable identity row ordering.
-            bool touched_builder_ = false; ///< Whether rollback is required.
-            bool ready_ = false; ///< Complete paired-policy installation.
         };
 
         /**
@@ -7224,7 +6980,12 @@ namespace llaminar2
         if (state_.device_id.is_gpu() &&
             retainsMTPGraphCapacity(graph_builder_->config().mtp))
         {
-            constexpr std::array<BufferId, 22> kMTPGraphTensorFamily{
+            // Canonical terminal rows are registered arena roots too. Materialize
+            // their original admitted storage here, before selectors capture
+            // addresses; workspace sizing alone does not materialize tensors.
+            constexpr std::array<BufferId, 24> kMTPGraphTensorFamily{
+                BufferId::LOGITS,
+                BufferId::LOGITS_LOCAL,
                 BufferId::MTP_EMBEDDING,
                 BufferId::MTP_NORM_HIDDEN,
                 BufferId::MTP_NORM_EMBEDDING,
@@ -16202,6 +15963,17 @@ namespace llaminar2
                 return false;
             }
         }
+        if(config.retained_host_services && physical_memory_authority_){
+            const RetainedHostServiceInstance role{physical_memory_authority_->worldRank(),device,RetainedHostServiceRole::ExecutorParentTicket};
+            if(config.retained_host_services->contains(role)){
+                const auto& program=config.retained_host_services->program(role);
+                if(!executor_.hasRetainedParentTicketServiceWorker()){
+                    auto token=injected_model_ctx_->takeRetainedHostService({role.worldRank,device},role.role,physical_memory_authority_);
+                    executor_.setRetainedParentTicketServiceWorker(PreparedRetainedHostService::materialize(std::move(token)),physical_memory_authority_);
+                }
+                executor_.requireRetainedParentTicketServiceProgram(program,physical_memory_authority_);
+            }
+        }
         if (config.mtp.enabled && !device.is_gpu())
         {
             mtp_committed_verifier_identities_host_.assign(
@@ -16758,854 +16530,6 @@ namespace llaminar2
                    /*batch_size=*/1,
                    role,
                    ForwardInvocationKind::RestoredPrefixMTPDecodeBridge).has_value();
-    }
-
-    bool DeviceGraphOrchestrator::
-        materializeMTPServingForwardExecutablesWithoutLaunch(
-            TensorBase *pipeline_hidden_input,
-            void *publication_stream)
-    {
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
-            return true;
-        // Retain both condition purposes and both terminal outcome topologies
-        // symmetrically: every participant must enter the same capture waves.
-        for (const auto purpose : kMTPConditionForwardPurposes)
-            if (!executeMTPMainForward(purpose, pipeline_hidden_input, publication_stream,
-                    ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch))
-                return false;
-        const auto family = mtpVerifierGraphFamily();
-        const auto retained = resolveMTPServingForwardCaptureGeometry(graph_builder_->config().mtp, mtp_max_verifier_rows_, family);
-        for (const auto &geometry : resolveMTPServingForwardCaptureFamily(graph_builder_->config().mtp, mtp_max_verifier_rows_, family))
-        for (const auto outcome : {MTPVerifierOutcomeGraphMode::Greedy, MTPVerifierOutcomeGraphMode::Disabled})
-            if (!executeMTPMainForward(MTPVerifierForwardPolicy(outcome, geometry.verifier_rows, retained), pipeline_hidden_input, publication_stream,
-                    ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch))
-                return false;
-        return true;
-    }
-
-    bool DeviceGraphOrchestrator::executeMTPMainForward(
-        const MTPMainForwardPolicy &policy, TensorBase *pipeline_hidden_input,
-        void *publication_stream, ForwardGraphSubmissionIntent submission, std::string *error)
-    {
-        const auto fail = [&](const char *reason) {
-            if (error) *error = reason;
-            LOG_ERROR("[DeviceGraphOrchestrator] Resident MTP main forward: " << reason);
-            return false;
-        };
-        if (error) error->clear();
-        const bool setup = submission == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
-        if (!state_.device_id.is_gpu() || !publication_stream || !graph_builder_ ||
-            !graph_builder_->config().mtp.enabled ||
-            (submission != ForwardGraphSubmissionIntent::Execute && !setup))
-            return fail("requires one MTP GPU participant, exact stream and explicit submission policy");
-        if (!setup && (!pp_stage_config_ || pp_stage_config_->has_lm_head || !pipeline_forward_edges_))
-            return fail("live main-forward submission here belongs only to a frozen pipeline follower");
-        const auto &logical = device_resident_logical_sequence_state_storage_;
-        if (!logical.validFor(1) || !mtp_verifier_input_tokens_dev_ ||
-            !mtp_verifier_position_ids_dev_ || !mtp_verifier_request_lengths_dev_)
-            return fail("persistent condition or verifier rows are incomplete");
-
-        ForwardInput input;
-        input.batch_size = 1;
-        input.execution_phase = ForwardExecutionPhase::Decode;
-        input.graph_submission_intent = submission;
-        input.position_policy = ForwardPositionPolicy::ExplicitRows;
-        input.device_state_publication_stream = publication_stream;
-        input.device = state_.device_id;
-        input.kv_cache = state_.kv_cache.get();
-        input.external_hidden_state = pipeline_hidden_input;
-        input.moe_overlay_collective_generation_id = 1;
-
-        // These scopes install immutable graph policy only. The collective
-        // receive, not this host code, supplies each follower's live row data.
-        std::optional<ScopedLiveMTPRequestBatchConditionPolicy> condition_scope;
-        std::optional<ScopedGroupedMTPVerifierGraphPolicy> verifier_scope;
-        const auto *purpose = std::get_if<MTPConditionForwardPurpose>(&policy);
-        if (purpose)
-        {
-            if (*purpose != MTPConditionForwardPurpose::SpeculativeContinuation &&
-                *purpose != MTPConditionForwardPurpose::CommittedSerialToken)
-                return fail("unknown condition commit purpose");
-            condition_scope.emplace(graph_builder_.get(), &live_mtp_request_batch_condition_, true);
-            if (!condition_scope->ready()) return fail("cannot install condition topology");
-            input.execution_role = ForwardExecutionRole::MTPCondition;
-            input.state_transaction = *purpose == MTPConditionForwardPurpose::CommittedSerialToken
-                ? ForwardStateTransaction::CommittedMTPCondition : ForwardStateTransaction::Ordinary;
-            input.token_ids_device = logical.next_condition_tokens_device;
-            input.position_ids_device = logical.target_cached_tokens_device;
-            input.sequence_lengths_device = logical.target_cached_tokens_device;
-            input.seq_len = input.real_seq_len = 1;
-        }
-        else
-        {
-            const auto &verifier = std::get<MTPVerifierForwardPolicy>(policy);
-            const auto mode = verifier.outcome();
-            if (mode != MTPVerifierOutcomeGraphMode::Greedy && mode != MTPVerifierOutcomeGraphMode::Disabled)
-                return fail("unknown verifier outcome topology");
-            auto geometry = resolveMTPServingForwardCaptureGeometry(graph_builder_->config().mtp,
-                mtp_max_verifier_rows_, mtpVerifierGraphFamily());
-            if (!geometry.enabled || !geometry.valid() || geometry.verifier_rows <= 0 ||
-                geometry.verifier_rows > mtp_max_verifier_rows_ || verifier.physicalRows() > geometry.verifier_rows)
-                return fail("configured verifier envelope is invalid");
-            // Physical bucket identity is shared with the terminal. Active
-            // token/position extents still arrive through device-owned metadata.
-            geometry.verifier_rows = verifier.physicalRows();
-            geometry.draft_depth = geometry.verifier_rows - 1;
-            verifier_scope.emplace(graph_builder_.get(), &compute_all_position_logits_,
-                &compute_row_indexed_all_position_logits_, &row_indexed_all_position_logits_row_count_,
-                &mtp_verifier_outcome_graph_mode_, geometry.verifier_rows, mode);
-            if (!verifier_scope->ready()) return fail("cannot install grouped verifier topology");
-            input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
-            input.state_transaction = ForwardStateTransaction::Ordinary;
-            input.token_ids_device = mtp_verifier_input_tokens_dev_;
-            input.position_ids_device = mtp_verifier_position_ids_dev_;
-            input.sequence_lengths_device = static_cast<const int32_t *>(mtp_verifier_request_lengths_dev_);
-            input.seq_len = geometry.verifier_rows;
-            input.real_seq_len = geometry.draft_depth + 1;
-            input.bucket_seq_len = input.real_seq_len < input.seq_len ? input.seq_len : 0;
-            input.position_offset = input.token_offset = 1;
-            input.moe_overlay_collective_step_id = 1;
-            input.moe_overlay_mtp_depth = geometry.draft_depth;
-        }
-
-        TensorBase *logits = state_.logits.get();
-        TensorBase *logits_local = state_.logits_local.get();
-        if (!bindAllPositionLogitsOutputs(input.execution_role, input.seq_len, logits, logits_local))
-            return fail("cannot bind main-model outputs for this participant");
-        ModelBuffers buffers = state_.toModelBuffers();
-        buffers.logits = logits;
-        buffers.logits_local = logits_local;
-        setBuffers(buffers);
-        if (!bindShiftedMTPPrefillTransaction(input, 1) || !bindMTPMainTerminalHiddenTransaction(input, 1))
-            return fail("cannot bind the local model-state transaction");
-        ForwardOutput output;
-        output.logits = logits;
-        output.hidden = state_.hidden.get();
-        std::optional<ForwardGraphSignature> materialized;
-        if (!executeForward(input, output, setup ? &materialized : nullptr))
-            return fail("canonical captured forward execution failed");
-        if (setup && !purpose)
-        {
-            if (!materialized || !forward_engine_->retainedDecodeGraph(*materialized, error))
-                return fail("setup verifier has no exact retained native signature");
-            const auto &verifier = std::get<MTPVerifierForwardPolicy>(policy);
-            const auto outcome_index = verifier.outcome() == MTPVerifierOutcomeGraphMode::Greedy ? 0u : 1u;
-            mtp_retained_verifier_signatures_.at(sparseQueryExecutionProgramIndex(sparseQueryGraphProgram()))
-                .at(static_cast<std::size_t>(verifier.physicalRows() - 2)).at(outcome_index) = *materialized;
-        }
-        if (setup)
-            PerfStatsCollector::addCounter("forward_graph", "serving_graph_family_materializations",
-                1.0, "setup", state_.device_id.toString(),
-                {{"role", purpose ? "mtp_condition" : "mtp_grouped_verifier"},
-                 {"sparse_query_program", std::to_string(sparseQueryExecutionProgramIndex(sparseQueryGraphProgram()))},
-                 {"physical_rows", std::to_string(input.seq_len)},
-                 {"commit_purpose", purpose ? std::to_string(static_cast<int>(*purpose)) : "none"},
-                 {"draft_depth", std::to_string(input.moe_overlay_mtp_depth)},
-                 {"outcome_mode", purpose ? "none" :
-                    std::to_string(static_cast<int>(std::get<MTPVerifierForwardPolicy>(policy).outcome()))},
-                 {"submission", "materialized_unlaunched"}});
-        return true;
-    }
-
-    bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch(
-        const ServingGraphFamilyMaterializationPlan &requested_plan)
-    {
-        auto plan = requested_plan;
-        if (pipeline_forward_edges_ && pipeline_forward_edges_->hasHeterogeneousBoundary())
-            plan.pipeline_hidden_input = pp_stage_config_ && !pp_stage_config_->has_embedding
-                ? state_.hidden.get() : nullptr;
-        ScopedDeviceLog device_log(state_.device_id);
-        LOG_INFO(
-            "[ServingGraphMaterialization] participant begin device="
-            << state_.device_id.toString());
-
-        const std::vector<int> normalized_buckets =
-            normalizePrefillGraphBuckets(plan.prefill_bucket_rows);
-        if (!plan.valid() || normalized_buckets != plan.prefill_bucket_rows)
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup requires a "
-                "strictly increasing, duplicate-free physical bucket ladder");
-            return false;
-        }
-        if (!state_.isInitialized() || !hasGlobalWeights())
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup requires a "
-                "fully initialized runner with model weights");
-            return false;
-        }
-        const uint64_t snapshot_identity =
-            executor_.snapshotConfigurationEpoch();
-        if (snapshot_identity == 0)
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup has an invalid zero snapshot topology identity");
-            return false;
-        }
-        if (serving_graph_family_plan_ &&
-            !serving_graph_family_plan_->sameCaptureIdentity(plan))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph variant changed the sealed capture plan");
-            return false;
-        }
-        if (serving_graph_family_lifecycle_ ==
-                ServingGraphFamilyLifecycle::Sealed &&
-            materialized_serving_snapshot_identities_.contains(
-                snapshot_identity))
-        {
-            /*
-             * Re-selecting a setup-certified diagnostic topology is an
-             * idempotent readiness check. Return before inspecting the installed
-             * request coordinator: no capture, allocation, reset, or ticket
-             * publication is needed after inference admission begins.
-             */
-            return true;
-        }
-        if (serving_graph_family_lifecycle_ ==
-                ServingGraphFamilyLifecycle::Sealed &&
-            (moe_overlay_inference_transaction_coordinator_ ||
-             moe_overlay_inference_transaction_participant_index_ >= 0 ||
-             moe_overlay_inference_completion_fence_))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] A new serving graph topology cannot be materialized after request-ticket authority is installed");
-            return false;
-        }
-        if (serving_graph_family_lifecycle_ !=
-                ServingGraphFamilyLifecycle::Sealed &&
-            (moe_overlay_inference_transaction_coordinator_ ||
-            moe_overlay_inference_transaction_participant_index_ >= 0 ||
-             moe_overlay_inference_completion_fence_))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup must complete "
-                "before request ticket authority is installed");
-            return false;
-        }
-        if (!serving_graph_family_plan_)
-            serving_graph_family_plan_ = plan;
-        if (pp_stage_config_.has_value() &&
-            !pp_stage_config_->has_embedding &&
-            !plan.pipeline_hidden_input)
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Non-embedding PP serving graph setup requires its stable previous-stage activation owner");
-            return false;
-        }
-        if (normalized_buckets.back() > residentGraphRows() ||
-            (state_.device_id.is_gpu() &&
-             normalized_buckets.back() > prefill_chunk_row_capacity_))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup bucket exceeds "
-                "the memory-plan-admitted resident graph capacity"
-                << " largest_bucket=" << normalized_buckets.back()
-                << " resident_rows=" << residentGraphRows()
-                << " chunk_rows=" << prefill_chunk_row_capacity_);
-            return false;
-        }
-        if (state_.device_id.is_gpu() &&
-            (!cache_config_.enabled ||
-             !debugEnv().execution.gpu_graphs))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Native device serving graph setup requires graph caching and GPU graphs to be enabled");
-            return false;
-        }
-
-        bool prefix_cache_ready = true;
-        if (graph_builder_->config().prefix_cache.enabled)
-        {
-            ServingGraphMaterializationPhaseTrace phase(
-                state_.device_id, "prefix_cache_ready");
-            prefix_cache_ready = ensurePrefixCacheReady();
-        }
-        if (!prefix_cache_ready)
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup could not "
-                "reserve its configured prefix-cache storage topology: "
-                << prefix_cache_bypass_reason_);
-            return false;
-        }
-
-        /*
-         * Captured request/chunk rows are arena-owned, but every stage may also
-         * retain WorkspaceAllocator addresses. Publish the complete serial
-         * family before deriving any capture identity so setup cannot embed a
-         * zero or partial workspace generation. This performs graph building
-         * only; no model arithmetic or request state is executed.
-         */
-        bool workspace_family_materialized = false;
-        {
-            ServingGraphMaterializationPhaseTrace phase(
-                state_.device_id, "workspace_family_declaration");
-            workspace_family_materialized = materializeForwardGraphForShape(
-                /*seq_len=*/1,
-                state_.batch_size,
-                plan.pipeline_hidden_input);
-        }
-        if (!workspace_family_materialized)
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup could not materialize its complete workspace family");
-            return false;
-        }
-
-        if (state_.device_id.is_cpu())
-        {
-            /*
-             * Host execution has no native executable to capture. The common
-             * workspace-family declaration above nevertheless builds every
-             * exact CPU stage topology (including grouped MTP and MoE),
-             * validates the frozen maximum-row envelope, and publishes its
-             * stable workspace allocation. Construct the long-lived eager
-             * engine now so admission certifies the same runtime owner that
-             * will build and execute request graphs. No model arithmetic, KV
-             * mutation, ticket publication, or synthetic inference occurs.
-             */
-            {
-                ServingGraphMaterializationPhaseTrace phase(
-                    state_.device_id, "host_forward_engine");
-                ensureForwardEngine();
-            }
-            serving_graph_family_lifecycle_ =
-                ServingGraphFamilyLifecycle::Sealed;
-            materialized_serving_snapshot_identities_.insert(
-                snapshot_identity);
-            PerfStatsCollector::addCounter(
-                "forward_graph",
-                "serving_graph_family_participant_completions",
-                1.0,
-                "setup",
-                state_.device_id.toString(),
-                {{"prefill_buckets",
-                  std::to_string(normalized_buckets.size())},
-                 {"main_decode_graphs", "1"},
-                 {"preparation_kind", "eager_host_graph"},
-                 {"request_state_mutations", "0"},
-                 {"executable_launches", "0"}});
-            LOG_INFO(
-                "[ServingGraphMaterialization] participant complete device="
-                << state_.device_id.toString()
-                << " preparation=eager_host_graph");
-            return true;
-        }
-
-        ModelBuffers model_buffers = state_.toModelBuffers();
-        model_buffers.logits = state_.logits.get();
-        model_buffers.logits_local = state_.logits_local.get();
-        setBuffers(model_buffers);
-
-        void *const publication_stream =
-            explicitGPUStreamForOperation(
-                "serving_graph_family_setup_publication");
-        if (!publication_stream)
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup could not "
-                "resolve an explicit device publication stream");
-            return false;
-        }
-
-        {
-            ServingGraphMaterializationPhaseTrace phase(
-                state_.device_id, "native_forward_engine");
-            ensureForwardEngine();
-        }
-
-        if (mtpVerifierGraphFamily() != resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole()))
-            throw std::logic_error("Serving verifier capture ownership differs from its admitted native owner family");
-        const MTPServingForwardCaptureGeometry mtp_capture_geometry =
-            graph_builder_
-                ? resolveMTPServingForwardCaptureGeometry(
-                      graph_builder_->config().mtp,
-                      mtp_max_verifier_rows_, mtpVerifierGraphFamily())
-                : MTPServingForwardCaptureGeometry{};
-        if (!mtp_capture_geometry.valid() ||
-            (mtp_capture_geometry.enabled &&
-             (mtp_capture_geometry.verifier_rows <= 0 ||
-              mtp_capture_geometry.verifier_rows >
-                  mtp_max_verifier_rows_)))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup could not "
-                "resolve its retained MTP verifier geometry"
-                << " draft_depth="
-                << mtp_capture_geometry.draft_depth
-                << " physical_rows="
-                << mtp_capture_geometry.verifier_rows
-                << " maximum_rows=" << mtp_max_verifier_rows_);
-            return false;
-        }
-        if (mtp_capture_geometry.enabled && state_.device_id.is_gpu() &&
-            deviceGenerationExecutionPolicy(graph_builder_->config().mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic
-                ? DeviceGenerationLoopTopology::DynamicDepth : DeviceGenerationLoopTopology::FixedDepth) ==
-                DeviceGenerationExecutionPolicy::Unsupported)
-            throw std::logic_error("Serving MTP family declaration has no complete native capture implementation");
-        const bool mtp_wide_checkpoint_lane_first =
-            materializeMTPWideCheckpointLaneFirst(
-                snapshot_enabled_,
-                normalized_buckets.back(),
-                mtp_capture_geometry);
-
-        /*
-         * Prefill buckets and grouped verification share one wide checkpoint
-         * lane. This closure is invoked before decode for ordinary/shallow MTP
-         * families and after grouped-verifier capture when the verifier owns
-         * at least as many physical rows. In either ordering the largest graph
-         * freezes the address before a smaller alternative can capture it.
-         */
-        const auto materialize_prefill_family = [&]() -> bool
-        {
-            ModelBuffers prefill_buffers = state_.toModelBuffers();
-            prefill_buffers.logits = state_.logits.get();
-            prefill_buffers.logits_local = state_.logits_local.get();
-            setBuffers(prefill_buffers);
-
-            for (auto bucket_it = normalized_buckets.rbegin();
-                 bucket_it != normalized_buckets.rend();
-                 ++bucket_it)
-            {
-                const int bucket_rows = *bucket_it;
-                if (!prepareServingGraphSetupInputs(
-                        bucket_rows,
-                        publication_stream))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Serving prefill graph setup could not publish its setup-only request frontier for bucket "
-                        << bucket_rows);
-                    return false;
-                }
-
-                ForwardInput input;
-                input.token_ids = nullptr;
-                input.token_ids_device = prefill_chunk_token_ids_dev_;
-                input.position_ids = nullptr;
-                input.position_ids_device = prefill_chunk_position_ids_dev_;
-                input.position_policy = ForwardPositionPolicy::ExplicitRows;
-                input.execution_role = ForwardExecutionRole::MainInference;
-                input.execution_phase = ForwardExecutionPhase::Prefill;
-                input.graph_submission_intent =
-                    ForwardGraphSubmissionIntent::
-                        MaterializeExecutableWithoutLaunch;
-                input.batch_size = 1;
-                input.seq_len = bucket_rows;
-                input.real_seq_len = bucket_rows;
-                input.bucket_seq_len = bucket_rows;
-                input.position_offset = 0;
-                input.token_offset = 0;
-                /*
-                 * Generation one is a setup-only dynamic value. It is never
-                 * published to a follower and never becomes part of cache
-                 * identity; the first admitted request overwrites it before the
-                 * retained executable is launched.
-                 */
-                input.moe_overlay_collective_generation_id = 1;
-                input.moe_overlay_collective_step_id = 0;
-                input.device_state_publication_stream = publication_stream;
-                input.device = state_.device_id;
-                input.kv_cache = state_.kv_cache.get();
-                input.sequence_lengths = nullptr;
-                input.sequence_lengths_device = prefill_chunk_real_rows_dev_;
-                input.rehydrate_prefix_runtime_on_device = false;
-                input.external_hidden_state = plan.pipeline_hidden_input;
-                input.device_prefill_chunk =
-                    makeDevicePrefillChunkGraphBinding(
-                        bucket_rows,
-                        plan.prefill_pad_token_id);
-                if (!input.device_prefill_chunk)
-                    return false;
-                if (!bindShiftedMTPPrefillTransaction(
-                        input, /*request_count=*/1))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Serving prefill graph setup "
-                        "could not bind its shifted-MTP transaction for bucket "
-                        << bucket_rows);
-                    return false;
-                }
-                if (!bindMTPMainTerminalHiddenTransaction(
-                        input, /*request_count=*/1))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Serving prefill graph setup "
-                        "could not bind its MTP terminal publication contract");
-                    return false;
-                }
-
-                ForwardOutput output;
-                output.logits = state_.logits.get();
-                output.hidden = state_.hidden.get();
-                bool bucket_materialized = false;
-                {
-                    ServingGraphMaterializationPhaseTrace phase(
-                        state_.device_id,
-                        "prefill_bucket_" + std::to_string(bucket_rows));
-                    bucket_materialized = executeForward(input, output);
-                }
-                if (!bucket_materialized)
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Failed to capture and "
-                        "instantiate serving prefill bucket "
-                        << bucket_rows << " without launch");
-                    return false;
-                }
-                PerfStatsCollector::addCounter(
-                    "forward_graph",
-                    "serving_graph_family_materializations",
-                    1.0,
-                    "setup",
-                    state_.device_id.toString(),
-                    {{"role", "main_prefill"},
-                     {"physical_rows", std::to_string(bucket_rows)},
-                     {"submission", "materialized_unlaunched"},
-                     {"capacity_authority", "orchestration_memory_plan"}});
-            }
-            return true;
-        };
-
-        if (!mtp_wide_checkpoint_lane_first &&
-            !materialize_prefill_family())
-        {
-            return false;
-        }
-
-        /*
-         * The first decode arrives only after prompt prefill, so its cache
-         * identity is the history-bearing serial variant. External token rows
-         * enter REQUEST_TOKEN_IDS once; every native consumer, including PLE
-         * and embedding, retains that same bank. The captured root derives
-         * position from the canonical device KV count. Setup binds permanent
-         * pointers and a history-bearing scalar without publishing live tokens.
-         * Request state remains untouched because MaterializeWithoutLaunch
-         * captures and instantiates without running the live-state prelude or
-         * any model arithmetic.
-         */
-        if (plan.main_decode_graph !=
-                ServingMainDecodeGraphKind::HistoryBearingSerial ||
-            (!request_token_ids_dev_ || !request_position_ids_dev_))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Serving graph setup is missing "
-                "its history-bearing serial decode inventory or persistent "
-                "request rows");
-            return false;
-        }
-
-        for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
-        {
-            ServingProgramBufferScope buffer_scope(*this, model_buffers);
-            SparseQueryProgramCompilationScope program_scope(*this,
-                program == 0 ? SparseQueryExecutionProgram::RankingPossible : SparseQueryExecutionProgram::ProvenNoRanking);
-            ForwardInput decode_input;
-            decode_input.token_ids = nullptr;
-            decode_input.token_ids_device = request_token_ids_dev_;
-            decode_input.position_ids = nullptr;
-            decode_input.position_ids_device = request_position_ids_dev_;
-            decode_input.device_decode_position = DeviceDecodePositionBinding{
-                .backend = getBackendFor(state_.device_id),
-                .cached_tokens = state_.kv_cache->deviceSequenceCachedTokenCountPtr(0),
-                .position = static_cast<int32_t *>(request_position_ids_dev_)};
-            decode_input.position_policy = ForwardPositionPolicy::ExplicitRows;
-            decode_input.execution_role = ForwardExecutionRole::MainInference;
-            decode_input.execution_phase = ForwardExecutionPhase::Decode;
-            decode_input.graph_submission_intent =
-                ForwardGraphSubmissionIntent::
-                    MaterializeExecutableWithoutLaunch;
-            decode_input.batch_size = 1;
-            decode_input.seq_len = 1;
-            decode_input.real_seq_len = 1;
-            decode_input.bucket_seq_len = 0;
-            decode_input.position_offset = 1;
-            decode_input.token_offset = 1;
-            decode_input.moe_overlay_collective_generation_id = 1;
-            decode_input.moe_overlay_collective_step_id = 1;
-            decode_input.device_state_publication_stream = publication_stream;
-            decode_input.device = state_.device_id;
-            decode_input.kv_cache = state_.kv_cache.get();
-            decode_input.sequence_lengths = nullptr;
-            decode_input.sequence_lengths_device = nullptr;
-            decode_input.rehydrate_prefix_runtime_on_device = false;
-            decode_input.external_hidden_state = plan.pipeline_hidden_input;
-            if (!bindShiftedMTPPrefillTransaction(
-                    decode_input, /*request_count=*/1))
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Serving decode graph setup could "
-                    "not bind its production MTP contract");
-                return false;
-            }
-            if (!bindMTPMainTerminalHiddenTransaction(
-                    decode_input, /*request_count=*/1))
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Serving decode graph setup could "
-                    "not bind its graph-integrated MTP terminal publication");
-                return false;
-            }
-
-            ForwardOutput decode_output;
-            decode_output.logits = state_.logits.get();
-            decode_output.hidden = state_.hidden.get();
-            bool decode_materialized = false;
-            {
-                ServingGraphMaterializationPhaseTrace phase(
-                    state_.device_id, "history_bearing_serial_decode");
-                decode_materialized = executeForward(
-                    decode_input, decode_output);
-            }
-            if (!decode_materialized)
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Failed to capture and instantiate "
-                    "the history-bearing serial decode executable without launch");
-                return false;
-            }
-            PerfStatsCollector::addCounter(
-                "forward_graph",
-                "serving_graph_family_materializations",
-                1.0,
-                "setup",
-                state_.device_id.toString(),
-                {{"role", "main_decode"},
-                 {"physical_rows", "1"},
-                 {"decode_history", "present"},
-                 {"submission", "materialized_unlaunched"},
-                 {"capacity_authority", "orchestration_memory_plan"}});
-
-            {
-                // The complete generation controller consumes a device-owned
-                // condition token. Its input address and pipeline ingress differ
-                // from the host-token serial graph above. Retain that exact
-                // forward now; OrdinaryGenerationGraphPlan already prices its
-                // independent executable. No request or sampler is admitted here.
-                ServingGraphMaterializationPhaseTrace phase(
-                    state_.device_id, "device_resident_ordinary_forward");
-                std::string error;
-                if (!materializeOrdinaryGenerationForward(
-                        device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
-                        ordinaryForwardRetentionKind(), &error))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Serving graph setup could not retain "
-                              "its device-resident ordinary forward: " << error);
-                    return false;
-                }
-                PerfStatsCollector::addCounter(
-                    "forward_graph", "serving_graph_family_materializations", 1.0,
-                    "setup", state_.device_id.toString(),
-                    {{"role", "device_resident_main_decode"}, {"physical_rows", "1"},
-                     {"submission", "materialized_unlaunched"},
-                     {"capacity_authority", "orchestration_memory_plan"}});
-            }
-
-            if (graph_builder_ && graph_builder_->config().mtp.enabled)
-            {
-                /*
-                 * A one-token suffix following prefix restore shares decode math
-                 * with the ordinary history-bearing graph, but its terminal node
-                 * additionally advances shifted depth-zero MTP KV. Capture that
-                 * complete transaction as a distinct typed family member. The
-                 * device token/geometry addresses are the same request-admission
-                 * owners used at runtime; no synthetic inference is launched.
-                 */
-                if (!device_resident_logical_sequence_state_storage_.validFor(
-                        /*request_count=*/1))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Serving graph setup has no "
-                        "persistent MTP logical-state mailbox storage");
-                    return false;
-                }
-
-                TensorBase *bridge_logits_output = state_.logits.get();
-                TensorBase *bridge_logits_local_output =
-                    state_.logits_local.get();
-                if (!bindAllPositionLogitsOutputs(
-                        ForwardExecutionRole::MTPCondition,
-                        /*rows=*/1,
-                        bridge_logits_output,
-                        bridge_logits_local_output))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Serving graph setup could not "
-                        "bind the restored-prefix MTP condition logits surface");
-                    return false;
-                }
-                ModelBuffers bridge_model_buffers = state_.toModelBuffers();
-                bridge_model_buffers.logits = bridge_logits_output;
-                bridge_model_buffers.logits_local =
-                    bridge_logits_local_output;
-                setBuffers(bridge_model_buffers);
-
-                ForwardInput bridge_input = decode_input;
-                bridge_input.token_ids = nullptr;
-                bridge_input.token_ids_device =
-                    device_resident_logical_sequence_state_storage_
-                        .next_condition_tokens_device;
-                bridge_input.position_ids_device =
-                    device_resident_logical_sequence_state_storage_
-                        .target_cached_tokens_device;
-                bridge_input.sequence_lengths_device =
-                    device_resident_logical_sequence_state_storage_
-                        .target_cached_tokens_device;
-                bridge_input.device_decode_position.reset();
-                bridge_input.position_offset = 0;
-                bridge_input.token_offset = 0;
-                bridge_input.execution_role =
-                    ForwardExecutionRole::MTPCondition;
-                bridge_input.state_transaction =
-                    ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
-                bridge_input.shifted_mtp_prefill.reset();
-                bridge_input.mtp_main_terminal_hidden.reset();
-                if (!bindShiftedMTPPrefillTransaction(
-                        bridge_input, /*request_count=*/1) ||
-                    !bindMTPMainTerminalHiddenTransaction(
-                        bridge_input, /*request_count=*/1))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Serving graph setup could not "
-                        "bind its restored-prefix MTP decode bridge");
-                    return false;
-                }
-
-                ForwardOutput bridge_output;
-                bridge_output.logits = bridge_logits_output;
-                bridge_output.hidden = state_.hidden.get();
-                ScopedLiveMTPRequestBatchConditionPolicy condition_scope(
-                    graph_builder_.get(),
-                    &live_mtp_request_batch_condition_,
-                    /*enable=*/true);
-                if (!condition_scope.ready())
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Serving graph setup could not "
-                        "install its restored-prefix MTP condition policy");
-                    return false;
-                }
-                bool bridge_materialized = false;
-                {
-                    ServingGraphMaterializationPhaseTrace phase(
-                        state_.device_id,
-                        "restored_prefix_mtp_decode_bridge");
-                    bridge_materialized = executeForward(
-                        bridge_input, bridge_output);
-                }
-                if (!bridge_materialized)
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Failed to capture and "
-                        "instantiate the restored-prefix MTP decode bridge");
-                    return false;
-                }
-                PerfStatsCollector::addCounter(
-                    "forward_graph",
-                    "serving_graph_family_materializations",
-                    1.0,
-                    "setup",
-                    state_.device_id.toString(),
-                    {{"role", "restored_prefix_mtp_decode_bridge"},
-                     {"physical_rows", "1"},
-                     {"decode_history", "present"},
-                     {"submission", "materialized_unlaunched"},
-                     {"capacity_authority", "orchestration_memory_plan"}});
-            }
-
-            {
-                ServingGraphMaterializationPhaseTrace phase(
-                    state_.device_id, "mtp_forward_executable_family");
-                if (!materializeMTPServingForwardExecutablesWithoutLaunch(
-                        plan.pipeline_hidden_input,
-                        publication_stream))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphOrchestrator] Serving graph setup could not "
-                        "materialize its complete MTP forward family");
-                    return false;
-                }
-            }
-
-        }
-
-        if (mtp_wide_checkpoint_lane_first &&
-            !materialize_prefill_family())
-        {
-            return false;
-        }
-
-        // This helper owns no model work or payload. Its one native executable
-        // is charged by the canonical controller inventory before setup and
-        // remains ready across every request/reset, including sampled EOS.
-        if (state_.device_id.is_gpu() && mtp_graph_owner_plan_.directTokenHistoryGraphSlots() != 0)
-        {
-            std::string history_error;
-            if (!prepareMTPDirectTokenHistoryPublication(publication_stream, &history_error))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Direct MTP history setup failed: " << history_error);
-                return false;
-            }
-        }
-
-        PerfStatsCollector::addCounter(
-            "forward_graph",
-            "serving_graph_family_participant_completions",
-            1.0,
-            "setup",
-            state_.device_id.toString(),
-            {{"prefill_buckets", std::to_string(normalized_buckets.size())},
-             {"main_decode_graphs", "2"},
-             {"request_state_mutations", "0"},
-             {"executable_launches", "0"}});
-
-        /*
-         * Stream capture does not launch model arithmetic, but stateful stage
-         * methods also maintain host-side logical KV/GDN metadata. Recording a
-         * prefill executable can therefore advance those mirrors even though
-         * its device kernels remain unlaunched. Close setup through the same
-         * complete typed state transaction used by serving boundaries. It
-         * resets contents behind stable addresses, publishes one exact reset
-         * event, and keeps every executable captured above alive. The first
-         * admitted request consequently starts at logical position zero and is
-         * a replay, never a synthetic warmup transaction.
-         */
-        {
-            ServingGraphMaterializationPhaseTrace phase(
-                state_.device_id, "serving_graph_state_reset");
-            resetInferenceState(
-                InferenceStateResetRequest::servingGraphSetupBoundary(
-                    "serving_graph_family_materialization"));
-        }
-        PerfStatsCollector::addCounter(
-            "forward_graph",
-            "serving_graph_setup_state_scrubs",
-            1.0,
-            "setup",
-            state_.device_id.toString(),
-            {{"owners", "kv_gdn_mtp_model_runtime_logical_sequence"},
-             {"captured_executables_preserved", "true"},
-             {"request_admitted", "false"}});
-
-        if (moe_overlay_transfer_progress_epoch_)
-        {
-            const auto progress_stats =
-                moe_overlay_transfer_progress_epoch_->stats();
-            LOG_DEBUG(
-                "[DeviceGraphOrchestrator] Serving graph family sealed without transfer-progress joins"
-                << " device=" << state_.device_id.toString()
-                << " background_copy_submissions="
-                << progress_stats.copy_submissions);
-        }
-        serving_graph_family_lifecycle_ =
-            ServingGraphFamilyLifecycle::Sealed;
-        materialized_serving_snapshot_identities_.insert(snapshot_identity);
-        LOG_INFO(
-            "[ServingGraphMaterialization] participant complete device="
-            << state_.device_id.toString()
-            << " preparation=native_device_executable_family");
-        return true;
     }
 
     /**
@@ -20891,8 +19815,60 @@ namespace llaminar2
         }
         const std::string stable_row_buffer =
             row_buffer_name ? std::string(row_buffer_name) : std::string{};
+        // Only accepted-state selection owns a raw verifier-logit row. Other
+        // hidden archival helpers retain their original one-output contract.
+        const bool accepted_publication = row_index_source ==
+            HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
+        TensorBase *logits_input = nullptr;
+        TensorBase *logits_output = nullptr;
+        int logits_columns = 0;
+        bool local_logits = false;
+        BufferId logits_source_id = BufferId::MTP_LOGITS;
+        if (accepted_publication)
+        {
+            local_logits = allPositionVerifierGraphWritesLocalLogits(1) &&
+                !graph_builder_->config().hasNativeLocalVocabularyGather();
+            logits_source_id = local_logits || !graph_builder_->config().mtpParticipantLogitsAreVocabularySharded()
+                ? BufferId::MTP_LOGITS : BufferId::MTP_LOGITS_GATHERED;
+            const auto source = state_.extension_buffers.find(logits_source_id);
+            logits_input = source == state_.extension_buffers.end() ? nullptr : source->second.get();
+            logits_output = local_logits ? state_.logits_local.get() : state_.logits.get();
+            logits_columns = local_logits ? graph_builder_->config().vocab_local
+                : graph_builder_->config().vocab_size;
+            if (!logits_input || !logits_output || logits_columns <= 0 ||
+                logits_input->native_type() != TensorType::FP32 || logits_output->native_type() != TensorType::FP32 ||
+                logits_input->cols() < logits_columns || logits_output->cols() < logits_columns ||
+                logits_input->cols() > std::numeric_limits<int>::max() ||
+                logits_output->cols() > std::numeric_limits<int>::max() ||
+                logits_input->rows() <= 0 ||
+                logits_input->rows() > std::numeric_limits<int>::max() ||
+                logits_output->rows() < 1 ||
+                !logits_input->gpu_data_ptr() || !logits_output->gpu_data_ptr())
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Accepted terminal logits require original admitted FP32 vocabulary roots"
+                    << " source=" << bufferIdName(logits_source_id)
+                    << " source_present=" << (logits_input != nullptr)
+                    << " source_rows=" << (logits_input ? logits_input->rows() : 0)
+                    << " source_cols=" << (logits_input ? logits_input->cols() : 0)
+                    << " source_native_storage=" << (logits_input && logits_input->gpu_data_ptr())
+                    << " destination=" << (local_logits ? "LOGITS_LOCAL" : "LOGITS")
+                    << " destination_present=" << (logits_output != nullptr)
+                    << " destination_rows=" << (logits_output ? logits_output->rows() : 0)
+                    << " destination_cols=" << (logits_output ? logits_output->cols() : 0)
+                    << " destination_native_storage=" << (logits_output && logits_output->gpu_data_ptr())
+                    << " live_columns=" << logits_columns);
+                return false;
+            }
+        }
         const bool bindings_match =
             cache.valid && cache.graph && cache.stage &&
+            cache.logits_input == logits_input && cache.logits_output == logits_output &&
+            cache.logits_columns == logits_columns &&
+            cache.logits_source_rows == (logits_input ? logits_input->rows() : 0) &&
+            cache.logits_input_device == (logits_input ? logits_input->gpu_data_ptr() : nullptr) &&
+            cache.logits_output_device == (logits_output ? logits_output->gpu_data_ptr() : nullptr) &&
+            cache.logits_source_stride == (logits_input ? logits_input->cols() : 0) &&
+            cache.logits_destination_stride == (logits_output ? logits_output->cols() : 0) &&
             cache.input == state_.hidden.get() &&
             cache.output == state_.prefix_terminal_hidden.get() &&
             cache.device == state_.device_id &&
@@ -20948,6 +19924,8 @@ namespace llaminar2
                 params.selected_row_indices.end(),
                 0);
         }
+        if (accepted_publication)
+            params.row_copy_policy.negative_rows = NegativeRowSelectionPolicy::PreserveDestination;
         params.input_buffer_id = BufferId::HIDDEN_STATE;
         params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
         params.device_row_index_source = row_index_source;
@@ -21006,10 +19984,43 @@ namespace llaminar2
             std::move(stage),
             state_.device_id);
 
+        if (accepted_publication)
+        {
+            HiddenStateRowsSelectStage::Params logits;
+            logits.device_id = state_.device_id;
+            logits.input = logits_input;
+            logits.output = logits_output;
+            logits.seq_len = static_cast<int>(logits_input->rows());
+            logits.d_model = logits_columns;
+            // LOGITS is the existing scalar request-zero authority. Other
+            // requests retain their original all-position batch consumers.
+            logits.selected_row_count = 1;
+            logits.input_buffer_id = logits_source_id;
+            logits.output_buffer_id = local_logits ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+            logits.device_row_index_source = HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
+            logits.external_device_row_indices = external_device_row_indices;
+            logits.row_copy_policy = {
+                .negative_rows = NegativeRowSelectionPolicy::PreserveDestination,
+                .source_stride = static_cast<int>(logits_input->cols()),
+                .destination_stride = static_cast<int>(logits_output->cols())};
+            const std::string logits_node = stable_node_name + "_canonical_logits";
+            graph->addNode(logits_node, ComputeStageFactory::createHiddenStateRowsSelect(std::move(logits)), state_.device_id);
+            graph->addDependency(logits_node, stable_node_name);
+            graph->setTerminalNode(logits_node);
+        }
+
         invalidateSparseQueryParents();
         cache.invalidate();
         cache.graph = std::move(graph);
         cache.stage = rows_select_stage;
+        cache.logits_input = logits_input;
+        cache.logits_output = logits_output;
+        cache.logits_columns = logits_columns;
+        cache.logits_source_rows = logits_input ? static_cast<int>(logits_input->rows()) : 0;
+        cache.logits_input_device = logits_input ? logits_input->gpu_data_ptr() : nullptr;
+        cache.logits_output_device = logits_output ? logits_output->gpu_data_ptr() : nullptr;
+        cache.logits_source_stride = logits_input ? static_cast<int>(logits_input->cols()) : 0;
+        cache.logits_destination_stride = logits_output ? static_cast<int>(logits_output->cols()) : 0;
         cache.input = state_.hidden.get();
         cache.output = state_.prefix_terminal_hidden.get();
         cache.device = state_.device_id;
@@ -22227,7 +21238,7 @@ namespace llaminar2
         }
         auto &accepted_cache = *accepted_cache_owner;
         if (!accepted_cache.valid || !accepted_cache.graph ||
-            !accepted_cache.stage ||
+            !accepted_cache.stage || !accepted_cache.logitsBindingsCurrent() ||
             accepted_cache.workspace_generation != generation ||
             accepted_cache.row_index_source !=
                 HiddenStateRowsSelectStage::DeviceRowIndexSource::
@@ -22276,7 +21287,9 @@ namespace llaminar2
         }
 
         state_.mtp_terminal_hidden_publication.publishAcceptedVerifier();
-        return true;
+        // Batched samplers retain their original all-position publication
+        // contract; the canonical rows above are still copied for every request.
+        return row_count != 1 || publishCanonicalMTPMainLogits(stream, "device_accepted_verifier_row");
     }
 
     void DeviceGraphOrchestrator::noteMainForwardHiddenProducedForMTP(
@@ -24425,8 +23438,8 @@ namespace llaminar2
         if (!cache_owner)
             return reject("accepted terminal-hidden graph owner is missing");
         const MTPTerminalHiddenRowsSelectGraphCache &cache = *cache_owner;
-        if (!cache.valid || !cache.graph || !cache.stage)
-            return reject("accepted terminal-hidden graph is not initialized");
+        if (!cache.valid || !cache.graph || !cache.stage || !cache.logitsBindingsCurrent())
+            return reject("accepted terminal-hidden/logit graph is not initialized with current allocations");
         if (cache.workspace_generation == 0 ||
             cache.workspace_generation != workspaceGeneration(state_.device_id))
         {
@@ -24842,6 +23855,10 @@ namespace llaminar2
             return fail(
                 "device-generation graph has no complete execution policy for its backend and depth topology");
         }
+        // Condition and verifier children borrow this same whole-request
+        // parent; their recording streams never become submission authority.
+        if (!bindRetainedStorageSubmissionStream(loop.stream, error))
+            return false;
         if (execution_policy ==
                 DeviceGenerationExecutionPolicy::NativeConditionalGraph &&
             (!loop.capture->supportsDeviceControlledWhileLoop() ||
@@ -28151,6 +27168,7 @@ namespace llaminar2
         MTPMainTerminalHiddenGraphBinding::Purpose purpose)
     {
         input.mtp_main_terminal_hidden.reset();
+        input.mtp_main_terminal_logits.reset();
         // Only the tail archives the terminal hidden row consumed by drafting.
         // Intermediate activation banks are already ordered by pipeline edges.
         if (pp_stage_config_ && !pp_stage_config_->has_lm_head)
@@ -28171,6 +27189,45 @@ namespace llaminar2
         }
         if (input.execution_phase != ForwardExecutionPhase::Decode)
             return true;
+        if (state_.device_id.is_gpu())
+        {
+            if (input.seq_len <= 0 || (input.seq_len != 1 && request_count != 1) ||
+                request_count <= 0 || request_count != input.batch_size ||
+                !state_.logits || graph_builder_->config().vocab_size <= 0)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Canonical MTP logits require scalar main rows and original vocabulary storage");
+                return false;
+            }
+            const uint64_t generation = workspaceGeneration(state_.device_id);
+            if (!declaration_only && generation == 0)
+                return false;
+            uint64_t identity = UINT64_C(1469598103934665603);
+            const auto mix = [&](uint64_t value) { identity = (identity ^ value) * UINT64_C(1099511628211); };
+            mix(declaration_only ? UINT64_MAX : generation);
+            mix(static_cast<uint64_t>(request_count));
+            mix(static_cast<uint64_t>(input.seq_len));
+            for (TensorBase *tensor : {state_.logits.get(), state_.logits_local.get()})
+            {
+                mix(reinterpret_cast<uintptr_t>(tensor));
+                if (!tensor) continue;
+                if (tensor->native_type() != TensorType::FP32 || tensor->rows() < 1 ||
+                    tensor->cols() > std::numeric_limits<int>::max() || (!declaration_only && !tensor->gpu_data_ptr()))
+                    return false;
+                mix(reinterpret_cast<uintptr_t>(tensor->gpu_data_ptr()));
+                mix(static_cast<uint64_t>(tensor->rows()));
+                mix(static_cast<uint64_t>(tensor->cols()));
+            }
+            const int full_columns = graph_builder_->config().vocab_size;
+            const int local_columns = graph_builder_->config().vocab_local;
+            mix(static_cast<uint64_t>(full_columns));
+            mix(static_cast<uint64_t>(local_columns));
+            mix(static_cast<uint64_t>(localLogitsVocabOffset()));
+            input.mtp_main_terminal_logits = MTPMainTerminalLogitsGraphBinding{
+                .full = state_.logits.get(), .local = state_.logits_local.get(),
+                .full_columns = full_columns, .local_columns = local_columns,
+                .request_count = request_count, .capture_identity = identity ? identity : UINT64_MAX,
+                .declaration_only = declaration_only};
+        }
         if (input.state_transaction ==
             ForwardStateTransaction::RestoredPrefixMTPDecodeBridge)
         {
@@ -30897,6 +29954,29 @@ namespace llaminar2
                 static_cast<double>(slice.byteCount()), "decode", state_.device_id.toString());
         }
         return published;
+    }
+
+    bool DeviceGraphOrchestrator::publishCanonicalMTPMainLogits(
+        void *stream, const char *producer_name)
+    {
+        if (!state_.device_id.is_gpu() || !stream || !graph_builder_ || !arena_)
+            return false;
+        if (pp_stage_config_ && !pp_stage_config_->has_lm_head)
+            return true;
+        const bool local = allPositionVerifierGraphWritesLocalLogits(1) &&
+            !graph_builder_->config().hasNativeLocalVocabularyGather();
+        TensorBase *destination = local ? state_.logits_local.get() : state_.logits.get();
+        if (!destination || !destination->gpu_data_ptr())
+            return false;
+        // Same canonical tensor/event authority as an ordinary forward output.
+        // The caller has either enqueued its selector on this exact stream or
+        // joined the original complete parent's terminal event on this stream.
+        arena_->markWritten(local ? BufferId::LOGITS_LOCAL : BufferId::LOGITS, state_.device_id, stream);
+        return publishCurrentMainLogits(destination,
+            {.execution_role = ForwardExecutionRole::MainInference,
+             .logical_all_position_logits = false,
+             .storage_surface = local ? ForwardLogitsStorageSurface::CanonicalLocal : ForwardLogitsStorageSurface::CanonicalFull},
+            MainLogitsPublicationSource::AcceptedVerifierState, producer_name);
     }
 
     void DeviceGraphOrchestrator::clearCurrentMainLogitsPublication(
@@ -36012,6 +35092,19 @@ namespace llaminar2
             return false;
         }
 
+        // Cold capture, producer readiness and penalty preparation have all
+        // succeeded. Open the original exclusive writer immediately before
+        // submission. Once submission can enqueue writes, failure stays closed
+        // until authentic retirement; it must never restore an older mailbox.
+        if (!waitForDeviceResidentLogicalSequenceStateRowReuse(
+                request.outcome.stream,
+                "mtp_spec_publication_logical_state_row_reuse"))
+        {
+            if (error)
+                *error = "device-resident MTP publication could not order reusable logical-state rows";
+            return false;
+        }
+
         std::string publication_error;
         {
             PerfStatsCollector::ScopedTimer timer(
@@ -36842,18 +35935,14 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * Acquire the exclusive reusable-row writer last. Every geometry,
-         * storage, controller, producer-lease, and captured-stage check has now
-         * succeeded. A successful return transfers responsibility for completing
-         * this writer transaction to the captured publication endpoint.
-         */
-        if (!waitForDeviceResidentLogicalSequenceStateRowReuse(
-                request.outcome.stream,
-                "mtp_spec_publication_logical_state_row_reuse"))
+        // Finish the exact cache's cold capture before opening any replacement
+        // writer. A prelaunch capture failure leaves the original logical-state
+        // mailbox and access epoch intact; no device publication is invented.
+        if (!executeMTPStatePublicationGraph(
+                request.outcome.stream, error,
+                DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch))
         {
-            return fail(
-                "device-resident MTP publication could not order reusable logical-state rows");
+            return false;
         }
 
         PerfStatsCollector::addCounter(
@@ -42407,11 +41496,13 @@ namespace llaminar2
     {
         if (!state_.device_id.is_gpu())
             return true;
-        // Immutable storage is admitted before the first real prefill, then
-        // remains armed through the complete device-owned generation policy.
+        // Every role here executes the main model, including restored-prefix
+        // MTP conditions and grouped verification. A full prefix hit can skip
+        // MainInference prefill entirely, so the first real condition must arm
+        // the same request interval. Repeated entries remain epoch-idempotent.
+        // Predictor sidecars do not enter this main-model forward prelude.
         // Setup-only graph materialization neither starts I/O nor launches it.
         if(input.graph_submission_intent!=ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch&&
-            input.execution_role==ForwardExecutionRole::MainInference&&
             !beginRetainedStorageAdmission(execution_stream))return false;
         if (pending_device_resident_logical_state_forward_read_.valid())
         {
@@ -46028,6 +45119,22 @@ namespace llaminar2
                 throw std::runtime_error(message.str());
             }
 
+            if (logical_state.request_count == 1)
+            {
+                // Reuse the SAME ordered packed export. No second readback or
+                // host response token supplies this continuation identity.
+                const auto scalar = [&](DeviceResidentLogicalSequenceStateStorage::Field field) {
+                    return packed_state[static_cast<size_t>(field) * request_capacity];
+                };
+                snapshot.resident_condition = PrefixResidentConditionProbe{
+                    .device = logical_state.device,
+                    .publication_generation = logical_state.publication_generation,
+                    .live_state_epoch = logical_state.live_state_epoch,
+                    .target_position = resident_positions.front(),
+                    .next_condition_token = scalar(DeviceResidentLogicalSequenceStateStorage::Field::NextConditionTokens),
+                    .publication_ok = scalar(DeviceResidentLogicalSequenceStateStorage::Field::PublicationOkFlags) == 1,
+                    .stopped = scalar(DeviceResidentLogicalSequenceStateStorage::Field::StoppedFlags) != 0};
+            }
             snapshot.current_position = resident_positions.front();
             snapshot.positions.assign(
                 resident_positions.begin(),
@@ -46320,6 +45427,7 @@ namespace llaminar2
                     identity.transaction_count;
                 snapshot.mtp_observed_verifier_draft_depth =
                     identity.draft_depth;
+                snapshot.mtp_observed_verifier_condition_token = identity.verifier_input_tokens[0];
                 snapshot.mtp_observed_verifier_draft_tokens.assign(
                     identity.verifier_input_tokens + 1,
                     identity.verifier_input_tokens +
@@ -52734,6 +51842,21 @@ namespace llaminar2
             return false;
         }
 
+        if (kind == DeviceGenerationStatePublicationKind::Terminal)
+        {
+            if (const auto& resources=deviceGenerationLoopGraph().read_ahead_resources;
+                resources && resources->hasOutstandingSubmission())
+            {
+                // The original handoff above is the sole event producer. This
+                // unforgeable capability records its exact successful original
+                // event/controlblock/stream/submission, with no second record.
+                try {
+                    resources->acceptTerminalPublication(
+                        ReadAheadNativeResourceFamily::PublishedTerminal(resources,ready.event,producer_stream));
+                } catch (...) { std::terminate(); } // The original terminal is already enqueued.
+            }
+        }
+
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_state_publications",
@@ -53008,6 +52131,12 @@ namespace llaminar2
                       << " response_capacity="
                       << device_generation_storage_.response_token_stride);
             return false;
+        }
+
+        if(speculative){
+            const auto source=graph_builder_->retainedStorageBoundary(state_.device_id);
+            if(source && source->retainedParticipantSource())
+                qwen4exp::PooledImmutableParticipantExecutionPolicy::requireAdmission(depth_policy, graph_builder_->config().mtp);
         }
 
         IBackend *backend = getBackendFor(state_.device_id);
@@ -53680,6 +52809,13 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation scheduler rejected its initial typed transition");
                 return false;
             }
+            if (loop.read_ahead_resources)
+            {
+                // The original family spans the authenticated request cursor,
+                // including every heterogeneous forward/maintenance boundary.
+                // Tickets select retained work; none retires this commitment.
+                loop.read_ahead_resources->beginSubmission();
+            }
             // The ticket protocol observes completed transactions. Ordinary
             // requests have not executed their initial sample externally, so
             // submit that complete retained boundary on the controller stream
@@ -53747,6 +52883,10 @@ namespace llaminar2
             loop.launched = true;
             if (!enqueueDeviceGenerationDispatchTicketObservation())
                 return false;
+            if (loop.read_ahead_resources)
+                PerfStatsCollector::addCounter("ngram", "read_ahead_complete_request_submissions", 1.0,
+                    "decode", state_.device_id.toString(),
+                    {{"execution", "hosted_ticket_selected_captured_transactions"}});
         }
 
         if (!hosted_device_generation_cursor_.ticketObservationPending() ||
@@ -54301,6 +53441,8 @@ namespace llaminar2
          * consumer edge for terminal materialization, so either backend failure
          * is process-fatal rather than a recoverable boolean result.
          */
+        if (loop.read_ahead_resources)
+            loop.read_ahead_resources->beginSubmission();
         if (!loop.capture->launch())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Native device-generation parent launch failed after lifecycle consumption on "
@@ -54317,6 +53459,12 @@ namespace llaminar2
             std::terminate();
         }
         loop.launched = true;
+        if (loop.read_ahead_resources)
+            PerfStatsCollector::addCounter("ngram", "read_ahead_complete_parent_submissions", 1.0,
+                "decode", state_.device_id.toString(),
+                {{"scope", "complete_native_parent"},
+                 {"native_family_identity", std::to_string(loop.read_ahead_resources->captureIdentity())}});
+
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -54435,8 +53583,13 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::finishDeviceResidentGeneration(
-        DeviceGenerationTerminalResult *out_result)
+    bool DeviceGraphOrchestrator::finishDeviceResidentGeneration(DeviceGenerationTerminalResult* out_result)
+    {
+        return finishDeviceResidentGenerationImpl(out_result,RetainedStorageTerminalPhase::PublishAndAwait);
+    }
+
+    bool DeviceGraphOrchestrator::finishDeviceResidentGenerationImpl(
+        DeviceGenerationTerminalResult *out_result,RetainedStorageTerminalPhase phase)
     {
         using namespace sampling_math;
         if (out_result)
@@ -54562,7 +53715,26 @@ namespace llaminar2
             }
         }
 
-        awaitRetainedStorageTerminal();
+        // The existing terminal-result wait above closes the complete parent,
+        // including its side-stream join. Query only this original family event
+        // here; never add a token/transaction wait or infer retirement from a
+        // cancelled host request.
+        if (const auto& resources = deviceGenerationLoopGraph().read_ahead_resources)
+        {
+            try {
+                const bool retiring = resources->hasOutstandingSubmission();
+                if (retiring && !resources->observeTerminal())
+                    throw std::logic_error("Read-ahead parent terminal remained pending after the original result join");
+                if (retiring)
+                    PerfStatsCollector::addCounter("ngram", "read_ahead_terminal_retirements", 1.0,
+                        "decode", state_.device_id.toString(),
+                        {{"scope", "complete_request_terminal"},
+                         {"native_family_identity", std::to_string(resources->captureIdentity())}});
+            } catch (...) { std::terminate(); }
+        }
+
+        if(phase==RetainedStorageTerminalPhase::PublishAndAwait)
+            awaitRetainedStorageTerminal();
 
         /*
          * The first speculative transaction is retained in arena-owned device
@@ -55249,6 +54421,21 @@ namespace llaminar2
             !observeOrdinaryGenerationForwardCompletion(total_published_state_commits))
             return false;
 
+        // Ordinary budget-one continuations can execute an MTP-bound main
+        // graph too. Its exact retained signature, rather than enabled policy
+        // or emitted tokens, authenticates that the canonical copy was present.
+        const auto &completed_loop = deviceGenerationLoopGraph();
+        const bool canonical_main_producer =
+            !active_device_generation_admission_->depth_policy.isOrdinary() ||
+            (completed_loop.ordinary_forward_identity &&
+             completed_loop.ordinary_forward_identity->mtp_main_terminal_logits_capture_identity != 0);
+        if (request_count == 1 && canonical_main_producer &&
+            !publishCanonicalMTPMainLogits(result_stream, "completed_main_parent_terminal"))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Completed parent lost its canonical terminal-logit publication");
+            return false;
+        }
+
         /*
          * Validation above is the sole release gate. The device-generation loop
          * has already committed every accepted KV/recurrent/logical-state row
@@ -55529,7 +54716,7 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::joinPriorDeviceWorkForRequestStateReset(
         void *reset_stream,
-        const char *consumer_name)
+        const char *consumer_name,RetainedStorageTerminalPhase phase)
     {
         if (!state_.device_id.is_gpu())
             return true;
@@ -55613,7 +54800,7 @@ namespace llaminar2
         // producer joined reset, before clearing caches or advancing the epoch.
         try
         {
-            retireRetainedStorageForRequestReset(reset_stream);
+            retireRetainedStorageForRequestReset(reset_stream,phase);
         }
         catch (const std::exception &error)
         {

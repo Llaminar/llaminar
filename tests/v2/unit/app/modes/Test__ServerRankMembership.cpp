@@ -402,3 +402,53 @@ TEST(ServerExecutionEvidence, SparseTrunkAndDensePredictorHaveIndependentAttenti
         model.flash_next_predictor.reset();
     }
 }
+
+namespace {
+/** @brief Original typed overlay: GPU model rank plus explicitly addressed CPU expert endpoints. */
+OrchestrationConfig observedCPUOverlay(DeviceId gpu,std::vector<GlobalDeviceAddress> cpus,int modelRank=0){
+ OrchestrationConfig config;auto overlay=std::make_shared<MoERoutedExpertPlacementPlan>();
+ overlay->enabled=true;overlay->topology=RoutedExpertPlacementTopology::TieredOverlay;
+ overlay->continuation_domain="model";overlay->shared_expert_domain="model";
+ RoutedExpertDomain model;model.name="model";model.scope=ExecutionDomainScope::SINGLE;
+ model.participants={GlobalDeviceAddress::fromLocalDeviceId(gpu)};model.world_ranks={modelRank};model.owner_rank=modelRank;
+ RoutedExpertDomain experts;experts.name="experts";experts.scope=ExecutionDomainScope::RANK_LOCAL;
+ experts.participants=std::move(cpus);experts.owner_rank=0;
+ overlay->domains={model,experts};overlay->routed_tiers={{.name="first",.domain="model",.priority=0},
+  {.name="last",.domain="experts",.priority=1,.fallback=true}};
+ config.moe_routed_expert_plan=std::move(overlay);return config;
+}
+}
+/** @test CPU expert NUMA comes from the frozen endpoint even when the primary GPU has no NUMA binding. */
+TEST(ServerExecutionEvidence, OverlayCPUObservationUsesItsOwnResolvedNUMA){
+ for(const auto gpu:{DeviceId::cuda(0),DeviceId::rocm(0)}){
+  RankExecutionPlan plan;plan.rank=0;plan.primary_device=GlobalDeviceAddress::fromLocalDeviceId(gpu);plan.numa_node=-1;
+  RankInventory physical{.rank=0,.node_id=0};physical.cpu.numa_node=0;
+  physical.gpus={{.type=gpu.type,.local_device_id=gpu.ordinal,.uuid="original-gpu",.pci_bus_address="0000:41:00.0"}};
+  const auto config=observedCPUOverlay(gpu,{GlobalDeviceAddress::cpu(0)});
+  const auto cpu=serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,config,1);
+  ASSERT_EQ(cpu.size(),1u);EXPECT_EQ(cpu.front().at("physical_id"),"numa:0");
+  const auto observedGPU=serverExecutionParticipantRecords(gpu,physical,plan,config,1);
+  ASSERT_EQ(observedGPU.size(),1u);EXPECT_EQ(observedGPU.front(),serverExecutionParticipantTags(gpu,physical,-1));
+  // An expert-only rank retains its own endpoint; it never inherits the remote model primary.
+  const auto remote=observedCPUOverlay(gpu,{GlobalDeviceAddress::cpu(0)},1);
+  const auto expert=serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,remote,2);
+  EXPECT_EQ(expert,cpu);
+ }
+}
+/** @test Multiple original endpoints deduplicate, but missing/invalid/conflicting physical ownership stays fatal. */
+TEST(ServerExecutionEvidence, OverlayCPUObservationRejectsMissingAndConflictingNUMA){
+ RankExecutionPlan plan;plan.rank=0;plan.primary_device=GlobalDeviceAddress::cuda(0);plan.numa_node=-1;
+ RankInventory physical{.rank=0,.node_id=0};physical.cpu.numa_node=-1;
+ const auto multiple=observedCPUOverlay(DeviceId::cuda(0),{GlobalDeviceAddress::cpu(0),GlobalDeviceAddress::cpu(1)});
+ const auto records=serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,multiple,1);
+ ASSERT_EQ(records.size(),2u);EXPECT_EQ(records[0].at("physical_id"),"numa:0");EXPECT_EQ(records[1].at("physical_id"),"numa:1");
+ physical.cpu.numa_node=0;
+ EXPECT_THROW(serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,multiple,1),std::invalid_argument);
+ const auto unresolved=observedCPUOverlay(DeviceId::cuda(0),{GlobalDeviceAddress::cpu()});
+ EXPECT_THROW(serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,unresolved,1),std::invalid_argument);
+ auto invalid=GlobalDeviceAddress::cpu();invalid.numa_node=-2;
+ const auto malformed=observedCPUOverlay(DeviceId::cuda(0),{invalid});
+ EXPECT_THROW(serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,malformed,1),std::invalid_argument);
+ const auto gpuOnly=observedCPUOverlay(DeviceId::cuda(0),{GlobalDeviceAddress::rocm(0)});
+ EXPECT_THROW(serverExecutionParticipantRecords(DeviceId::cpu(),physical,plan,gpuOnly,1),std::invalid_argument);
+}

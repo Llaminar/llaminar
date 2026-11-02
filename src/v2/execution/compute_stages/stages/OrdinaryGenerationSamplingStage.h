@@ -68,7 +68,7 @@ public:
     {
         STAGE_PARAMS_COMMON_FIELDS;
         IBackend *backend = nullptr; ///< Backend of the explicit owning GPU.
-        float *logits = nullptr; ///< Fresh full-vocabulary rows; stochastic penalties consume them in place.
+        const float *logits = nullptr; ///< Canonical full-vocabulary model rows; samplers never modify them.
         int vocab_size = 0;
         int logits_row_stride = 0;
         std::variant<Greedy, Stochastic> policy = Greedy{};

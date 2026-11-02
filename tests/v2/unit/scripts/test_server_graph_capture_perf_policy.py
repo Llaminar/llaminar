@@ -1003,6 +1003,42 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 self.assertIsNotNone(validate_gpu_host_transfer_policy([sample, proof], device_kinds=kinds).error)
         self.assertIsNotNone(validate_gpu_host_transfer_policy([ticket], device_kinds=mixed).error)
 
+    def test_cuda_hosted_transfer_audit_authenticates_live_window_without_setup(self) -> None:
+        """Current-window ordinary hosted tickets require actual same-owner replay and exact ABI."""
+        import copy
+        graph = self.local_ticket_boundary_records("CUDA:0", 0)
+        def row(name, value, tags):
+            return counter(name, value=value, domain="mtp", device="CUDA:0", tags=tags) | {"rank":0}
+        launch = row("device_generation_loop_graph_launches",1,
+            {"execution":"hosted_ticket_selected_captured_transactions","backend":"CUDA","requests":"1",
+             "draft_depth":"0","minimum_draft_depth":"0","maximum_draft_depth":"0",
+             "fragments":"1","conditional_fragments":"0","selector_gated_fragments":"0"})
+        ticket = row("device_generation_dispatch_ticket_d2h_submissions",4,device_generation_ticket_tags())
+        observation = row("device_generation_dispatch_tickets_observed",3,{"entry_source":"committed_transaction_ticket","complete":"false"})
+        final_observation = row("device_generation_dispatch_tickets_observed",1,{"entry_source":"committed_transaction_ticket","complete":"true"})
+        fragment = row("hosted_device_generation_fragment_submissions",3,{"fragment_index":"0"})
+        branch = row("hosted_device_generation_transaction_submissions",3,
+            {"entry_source":"committed_transaction_ticket","dynamic_depth_source":"device_controller_ticket","fragments":"1"})
+        terminal = row("hosted_device_generation_terminal_submissions",1,{})
+        rows = [*graph,launch,ticket,observation,final_observation,branch,fragment,terminal]
+        mixed = frozenset({"cuda","cpu","rocm"})
+        self.assertIsNone(validate_gpu_host_transfer_policy(rows,device_kinds=mixed).error)
+        for name,changed in (
+            ("missing_graph",[launch,ticket,observation,final_observation,branch,fragment,terminal]),
+            ("foreign_rank",[*graph,launch|{"rank":1},ticket,observation,final_observation,branch,fragment,terminal]),
+            ("foreign_device",[*graph,launch|{"device":"CUDA:1"},ticket,observation,final_observation,branch,fragment,terminal]),
+            ("unobserved_ticket",[*graph,launch,ticket,observation|{"value":2},final_observation,branch,fragment,terminal]),
+            ("missing_branch",[*graph,launch,ticket,observation,final_observation,fragment,terminal]),
+            ("wrong_bytes",[*graph,launch,ticket|{"tags":device_generation_ticket_tags()|{"bytes":"64"}},observation,final_observation,branch,fragment,terminal]),
+        ):
+            with self.subTest(case=name):
+                self.assertIsNotNone(validate_gpu_host_transfer_policy(changed,device_kinds=mixed).error)
+        for key,value in (("execution","native_conditional_parent"),("requests","2"),("conditional_fragments","1"),("maximum_draft_depth","-1")):
+            changed=copy.deepcopy(rows);changed[len(graph)]["tags"][key]=value
+            with self.subTest(geometry=key):
+                self.assertIsNotNone(validate_gpu_host_transfer_policy(changed,device_kinds=mixed).error)
+        self.assertIsNotNone(validate_gpu_host_transfer_policy(rows,device_kinds=frozenset({"cuda"})).error)
+
     def test_llep_verifier_policy_accepts_grouped_static_owner_execution(
         self,
     ) -> None:

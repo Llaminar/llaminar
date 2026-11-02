@@ -23,6 +23,19 @@ namespace
             payload[i] = llaminar2::counted_channel_test::byte(epoch, i);
     }
 
+    /** @brief Write one immutable original source descriptor and position-sensitive source bank. */
+    __global__ __launch_bounds__(128) void prepareSlicedPayload(
+        std::uint8_t *payload, llaminar2::CapturedTransferSourceSlice *slice,
+        const std::uint64_t *sequence, std::size_t capacity, std::size_t source_span, std::uint64_t source_origin)
+    {
+        const auto epoch = *sequence;
+        const auto lane = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (lane == 0) *slice = {source_origin + llaminar2::counted_channel_test::sliceOffset(epoch, capacity, source_span),
+            llaminar2::counted_channel_test::extent(epoch, capacity)};
+        for (auto i = lane; i < source_span; i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+            payload[i] = llaminar2::counted_channel_test::byte(epoch, i);
+    }
+
     /** @brief One captured terminal update for the next replay's input generation. */
     __global__ void advanceCountedSequence(std::uint64_t *sequence)
     { if (threadIdx.x == 0) ++*sequence; }

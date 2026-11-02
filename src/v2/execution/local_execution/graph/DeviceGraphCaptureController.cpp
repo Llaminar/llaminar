@@ -836,7 +836,7 @@ namespace llaminar2
                 });
             const bool complete_native_dag =
                 every_unit_captured &&
-                (!has_collective_nodes || collectives_graph_capturable);
+                (!has_collective_nodes || cache.runtime_collective_capture_requirement==DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::NotRequired || collectives_graph_capturable);
             if (complete_native_dag)
             {
                 return {
@@ -1705,7 +1705,13 @@ namespace llaminar2
         constexpr uint64_t kFnvPrime = 1099511628211ull;
 
         uint64_t h = kFnvOffset;
-        bool has_variant = false;
+        bool has_variant = graph.readAheadCaptureIdentity()!=0;
+        if(has_variant){h ^= graph.readAheadCaptureIdentity();h *= kFnvPrime;h ^= graph.topologyGeneration();h *= kFnvPrime;}
+        if(const auto participants=graph.retainedParticipantSourcePlan()){
+            has_variant=true;
+            h^=participants->captureIdentity();h*=kFnvPrime;
+            h^=graph.topologyGeneration();h*=kFnvPrime;
+        }
         const auto &order = graph.getExecutionOrder();
         for (const auto &name : order)
         {
@@ -1716,7 +1722,8 @@ namespace llaminar2
             }
 
             const uint64_t stage_variant = node->stage->graphCaptureVariantSignature();
-            if (stage_variant == 0)
+            const auto authority=static_cast<uint64_t>(node->stage->collectiveGraphCaptureAuthority());
+            if (stage_variant == 0 && authority==0)
             {
                 continue;
             }
@@ -1724,7 +1731,7 @@ namespace llaminar2
             has_variant = true;
             const uint64_t name_hash = static_cast<uint64_t>(std::hash<std::string>{}(name));
             const uint64_t type_hash = static_cast<uint64_t>(static_cast<int>(node->stage->type()));
-            for (uint64_t part : {name_hash, type_hash, stage_variant})
+            for (uint64_t part : {name_hash, type_hash, stage_variant, authority})
             {
                 h ^= part;
                 h *= kFnvPrime;
@@ -1882,6 +1889,7 @@ namespace llaminar2
     {
         segment_cache.segments.clear();
         segment_cache.graph_replay_plan_policy = plan_policy;
+        segment_cache.runtime_collective_capture_requirement=DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::NotRequired;
         // One setup-only identity joins capture, transaction zero and replay.
         // Context names are semantic labels and can name several unused/live
         // variants; pointers are unsuitable because allocator reuse aliases them.
@@ -2057,17 +2065,20 @@ namespace llaminar2
                 stage_capturable = true;
             }
             const bool stage_capture_capable = stage_capturable;
-            const bool collective_by_stage = node->stage->isCollectiveStage();
             const bool collective_by_name = (collective_nodes && collective_nodes->count(name));
+            const bool native_transport=node->stage->isParticipantLocalCapturedTransfer();
+            const bool requires_runtime_capture=node->stage->requiresCollectiveRuntimeCapture(collective_by_name);
+            if(requires_runtime_capture)segment_cache.runtime_collective_capture_requirement=DeviceGraphExecutor::GraphSegmentCache::RuntimeCollectiveCaptureRequirement::Required;
 
             /*
-             * A collective belongs in the graph only when both contracts hold:
-             * the concrete stage instance is capture-ready and the LocalTP
-             * backend supports stream-ordered graph-captured collectives.
+             * A runtime collective needs both stage readiness and its backend's
+             * stream-ordered capture support. An actual participant-local native
+             * transport owns its separate immutable captured binding, while
+             * retaining the SAME readiness AND and semantic collective identity.
              * Backend capability must never override a stage-level rejection
              * caused by invalid geometry, missing workspace, or stale state.
              */
-            if (collective_by_stage || collective_by_name)
+            if (requires_runtime_capture)
             {
                 stage_capturable =
                     stage_capturable && collectives_graph_capturable;
@@ -2077,14 +2088,16 @@ namespace llaminar2
                 wave_contract->participation ==
                     GraphCaptureWaveParticipation::Active &&
                 stage_capture_capable &&
-                (collective_by_stage || collective_by_name) &&
+                requires_runtime_capture &&
                 !collectives_graph_capturable;
 
             if (has_collective_nodes && !segmented_collective_capture_allow.empty())
             {
                 // Explicit allowlist mode: only allowlisted stages are capturable
-                stage_capturable = stage_in_collective_allowlist(name);
+                stage_capturable = stage_capturable && stage_in_collective_allowlist(name);
             }
+            if(native_transport && !stage_capturable)
+                throw std::invalid_argument("Participant-local captured transfer is not capture-ready; manual ticket execution is forbidden: "+name);
             // Otherwise: trust each stage's isGraphCapturable() declaration.
             // Stages that need per-step updates either return false or report
             // segment boundaries around themselves when they can be captured
@@ -2835,6 +2848,7 @@ namespace llaminar2
         void *capture_stream,
         bool use_default_stream)
     {
+        if(graph.readAheadBranch())throw std::logic_error("Read-ahead requires an unchanged complete captured parent; eager/manual/recapture verification is forbidden");
         if (!ctx || !gpu_ctx)
         {
             LOG_ERROR("[DeviceGraphCaptureController] Stream-only replay missing context");
@@ -2915,6 +2929,7 @@ namespace llaminar2
         const std::function<bool(ComputeNode &)> &execute_node_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb)
     {
+        if(graph.readAheadBranch())throw std::logic_error("Read-ahead requires an unchanged complete captured parent; eager/manual/recapture verification is forbidden");
         if (!ctx || !gpu_ctx)
         {
             LOG_ERROR("[DeviceGraphCaptureController] Manual replay missing context");
@@ -2932,6 +2947,10 @@ namespace llaminar2
             }
 
             const auto stage_type = node->stage->type();
+            if(node->stage->isParticipantLocalCapturedTransfer()){
+                LOG_ERROR("[DeviceGraphCaptureController] Native captured transfer cannot execute as a manual service: "<<stage_name);
+                return false;
+            }
             const bool is_collective = node->stage->isCollectiveStage();
 
             if (is_collective)
@@ -3199,6 +3218,7 @@ namespace llaminar2
         const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
+        if(graph.readAheadBranch())throw std::logic_error("Read-ahead requires an unchanged complete captured parent; eager/manual/recapture verification is forbidden");
         if (auxiliary_branch)
         {
             LOG_ERROR("[DeviceGraphCaptureController] A sealed auxiliary authority cannot be diagnostically recaptured");
@@ -3470,6 +3490,7 @@ namespace llaminar2
         const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
+        if(graph.readAheadBranch())throw std::logic_error("Read-ahead requires an unchanged complete captured parent; eager/manual/recapture verification is forbidden");
         VerifyReplayResult result{false, false};
 
         if (!ctx || !gpu_ctx)
@@ -4129,6 +4150,7 @@ namespace llaminar2
         const std::function<bool(ComputeNode &)> &execute_node_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb)
     {
+        if(graph.readAheadBranch())throw std::logic_error("Read-ahead requires an unchanged complete captured parent; eager/manual/recapture verification is forbidden");
         if (!ctx || !gpu_ctx || !capture_stream)
         {
             LOG_ERROR("[DeviceGraphCaptureController] Capture manual segment missing context");
@@ -4157,6 +4179,10 @@ namespace llaminar2
                 return false;
             }
 
+            if(node->stage->isParticipantLocalCapturedTransfer()){
+                LOG_ERROR("[DeviceGraphCaptureController] Native captured transfer cannot execute as a manual service: "<<stage_name);
+                return false;
+            }
             const bool is_collective = node->stage->isCollectiveStage();
             void *stage_stream = capture_stream;
             if (is_collective)
@@ -4373,8 +4399,8 @@ namespace llaminar2
                 continue;
 
             if (stream)
-                node->stage->setGPUStream(stream);
-            if (!node->stage->prepareGraphLaunch(ctx, stream))
+                node->stage->setGPUStream(graph.executionStreamForNode(node->name,stream));
+            if (!node->stage->prepareGraphLaunch(ctx, node->stage->gpuStream()))
             {
                 LOG_ERROR("[DeviceGraphCaptureController] Graph launch metadata preparation failed for stage: "
                           << stage_name);
@@ -4794,7 +4820,7 @@ namespace llaminar2
             {
                 auto *node = graph.getNode(stage_name);
                 if (node && node->stage)
-                    node->stage->setGPUStream(capture_stream);
+                    node->stage->setGPUStream(graph.executionStreamForNode(node->name,capture_stream));
             }
             if (!prepareGraphLaunchMetadata(
                     graph,
@@ -4997,6 +5023,8 @@ namespace llaminar2
                     result.success = false;
                     return result;
                 }
+
+                graph.sealReadAheadRecordingStream(seg.capture->executionStream());
 
                 auto dependency_ledger = planCaptureDependencies(
                     graph,

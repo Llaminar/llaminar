@@ -10,7 +10,9 @@
 #pragma once
 #include "ImmutableLookupKernels.h"
 #include <memory>
+#include <vector>
 #include <utility>
+namespace llaminar2 {class NativeOrderingEventGroup;namespace test {struct PooledImmutableFactoryReplayAccess;}}
 namespace llaminar2::qwen4exp
 {
 class ImmutableLookupService;
@@ -69,12 +71,32 @@ public:
      * @return Same source registration for an identical declaration; competing roots fail.
      */
     std::shared_ptr<PooledImmutableSourcePreparedStorage> preparePooled(const PooledImmutableSourceGeometry& geometry,
-        std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
+        std::vector<std::shared_ptr<PooledImmutableOwnerPreparedStorage>> owners,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
         std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream)const;
+    /** @brief One-owner spelling retains the same complete-cohort admission checks. */
+    std::shared_ptr<PooledImmutableSourcePreparedStorage> preparePooled(const PooledImmutableSourceGeometry& geometry,
+        std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
+        std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream)const
+    {return preparePooled(geometry,std::vector{std::move(owner)},std::move(coordinator),std::move(memory),stream);}
     /** @return Complete source/channel declaration identity for the native capture signature. */
     std::uint64_t captureIdentity() const noexcept;
 
 private:
+    friend class ImmutableLookupExecutionBoundary;
+    friend struct ::llaminar2::test::PooledImmutableFactoryReplayAccess;
+    /**
+     * @brief Original source registration with a closed preclaimed group.
+     * @param geometry Original source-issued packet and root geometry.
+     * @param owners Same ordered original cache roots. @param coordinator Original policy roots.
+     * @param memory Same final source authority. @param stream Exact ordinary setup producer.
+     * @param group Original sealed claim, empty only for installed public selection.
+     * @return The source service's one original registration.
+     * @throws std::exception For changed bindings/ownership or failed materialization.
+     */
+    std::shared_ptr<PooledImmutableSourcePreparedStorage> preparePooledImpl(const PooledImmutableSourceGeometry& geometry,
+        std::vector<std::shared_ptr<PooledImmutableOwnerPreparedStorage>> owners,std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
+        std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,std::unique_ptr<NativeOrderingEventGroup> group)const;
+
     friend class ImmutableLookupService;
     /** @brief Service retains original backing/provider and exact mapped aliases. */
     ImmutableSubordinateLookupBinding(std::shared_ptr<ImmutableLookupService> owner, DeviceId device,

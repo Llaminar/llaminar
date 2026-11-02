@@ -963,7 +963,8 @@ TEST(QSA_SUITE, CompactConsumerKVEveryDegreeMatchesFullOriginalBytes)
     }
 }
 
-TEST(QSA_SUITE, ExactCandidateProfilerLaunch)
+// Explicit profiler entry: enable disabled tests and supply the exact M/context.
+TEST(QSA_SUITE, DISABLED_ExactCandidateProfilerLaunch)
 {
     const char *rows_env = std::getenv("LLAMINAR_QSA_PROFILE_M");
     const char *context_env = std::getenv("LLAMINAR_QSA_PROFILE_CONTEXT");
@@ -1030,7 +1031,8 @@ TEST(QSA_SUITE, ExactCandidateProfilerLaunch)
     }
 }
 /** @test Isolate acceptance-only publication for one exact profiler candidate. */
-TEST(QSA_SUITE, ExactCommitProfilerLaunch)
+// Explicit commit-profiler entry; ordinary functional sweeps must execute no skips.
+TEST(QSA_SUITE, DISABLED_ExactCommitProfilerLaunch)
 {
     const char *rows_env=std::getenv("LLAMINAR_QSA_PROFILE_M");
     const char *context_env=std::getenv("LLAMINAR_QSA_PROFILE_CONTEXT");

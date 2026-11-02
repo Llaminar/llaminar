@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file run_production_parity_campaigns.py
+#  @brief Own complete prerequisites, production parity scheduling and exact evidence.
 """Run the complete real-weight production parity matrix and measure its SLA.
 
 The C++ `ProductionParity` case is the atomic matrix cell: it constructs one
@@ -56,6 +58,8 @@ a partial ambient locator or an LM-only reference cannot select another history.
 """
 
 from __future__ import annotations
+
+from production_artifacts import artifact_identity_path
 
 import argparse
 import csv
@@ -2295,7 +2299,8 @@ def _gtest_artifact_directory_name(gtest_case: str) -> str:
     if not separator or not suite or not test:
         raise ValueError(f"invalid exact GTest case identity: {gtest_case}")
     raw_name = f"{suite}/{test}"
-    return re.sub(r'[/\\:*?"<>|]', "_", raw_name)
+    return artifact_identity_path(raw_name)
+
 
 
 def _exact_cell_timeout_watch(
@@ -3692,10 +3697,10 @@ def run_production_test_preflight(
     campaign proves both without adding a parallel manifest.
     """
 
-    unit_tests = discover_production_parity_unit_tests(build_dir)
-    integration_registrations = discover_production_test_preflight_registrations(build_dir)
-    integration_tests = tuple(registration.name for registration in integration_registrations)
-    tests = unit_tests + integration_tests
+    # CTest omits command metadata for executables not built yet. Authenticate
+    # the complete runnable inventory only after this owner builds its gates
+    # (or validates the installed image receipt); never weaken discovery itself.
+    tests: tuple[str, ...] = ()
     timeout_text = (
         "disabled" if timeout_seconds is None else f"{timeout_seconds:.3f}"
     )
@@ -3726,9 +3731,7 @@ def run_production_test_preflight(
 
     print(
         "[production-parity] preflight_status=RUNNING "
-        f"unit_test_count={len(unit_tests)} "
-        f"integration_test_count={len(integration_tests)} "
-        f"test_count={len(tests)} "
+        "inventory_status=PENDING_BUILD "
         f"completion_timeout_remaining_seconds={timeout_text}",
         flush=True,
     )
@@ -3776,13 +3779,21 @@ def run_production_test_preflight(
         )
         return complete(return_code, elapsed)
 
-    # Ninja can regenerate CMake while building the gate, adding or removing
-    # registrations. CTest below consumes that regenerated inventory, so its
-    # receipt must name those exact tests rather than the pre-build snapshot.
+    # Ninja can regenerate CMake and CTest can now resolve the built binaries.
+    # Validate every command, label, timeout and lane before executing any test;
+    # the receipt names this exact complete inventory, never a pre-build view.
     unit_tests = discover_production_parity_unit_tests(build_dir)
     integration_registrations = discover_production_test_preflight_registrations(build_dir)
     integration_tests = tuple(registration.name for registration in integration_registrations)
     tests = unit_tests + integration_tests
+    print(
+        "[production-parity] prerequisite_inventory_status=PASS "
+        f"unit_test_count={len(unit_tests)} "
+        f"integration_test_count={len(integration_tests)} "
+        f"test_count={len(tests)}",
+        flush=True,
+    )
+
 
     # CTest before 3.29 requires an explicit parallel level. Use the kernel's
     # full affinity mask on every supported CTest version, not a fixed worker

@@ -18,6 +18,8 @@
 #include "execution/prefix_cache/PrefixCacheStats.h"
 #include "execution/prefix_cache/PrefixMovementEpochSnapshot.h"
 
+#include "kernels/common/SamplingMath.h"
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -348,10 +350,39 @@ namespace llaminar2
         std::string reject_stage_type;
     };
 
+    /**
+     * @brief Immutable scalar continuation observation from the existing packed diagnostic export.
+     * Device bytes and ready-condition disposition have distinct original owners.
+     * The runner attaches disposition only after authenticating the exact current
+     * mailbox generation/epoch and sampling law. Inference never consumes this value.
+     */
+    struct PrefixResidentConditionProbe
+    {
+        DeviceId device = DeviceId::invalid(); ///< Original packed mailbox device.
+        std::uint64_t publication_generation = 0; ///< Exact original event-protected publication.
+        std::uint64_t live_state_epoch = 0; ///< Original mailbox epoch.
+        int target_position = -1; ///< Original committed target position.
+        int next_condition_token = -1; ///< Original packed token, never a response reconstruction.
+        bool publication_ok = false; ///< Original packed publication status.
+        bool stopped = false; ///< Original packed stop status.
+        std::optional<sampling_math::DeviceGenerationLeadingRowDisposition> response_disposition;
+        ///< Original ReadyMTPCondition disposition, absent until exact owner authentication.
+
+        /** @return True only for a valid original, already-emitted, uncommitted continuation row. */
+        [[nodiscard]] bool isAlreadyEmitted() const noexcept
+        {
+            return device.is_gpu() && publication_generation > 0 && live_state_epoch > 0 &&
+                target_position >= 0 && next_condition_token >= 0 && publication_ok && !stopped &&
+                response_disposition == sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+        }
+    };
+
     struct PrefixRuntimeStateSnapshot
     {
         bool initialized = false;
         bool prefill_logits_ready = false;
+        /** Existing deep packed export, scalar only; absent means unavailable, never committed-by-default. */
+        std::optional<PrefixResidentConditionProbe> resident_condition;
         bool has_hidden = false;
         bool has_logits = false;
         std::string architecture;
@@ -417,6 +448,10 @@ namespace llaminar2
         int mtp_observed_verifier_transaction_count = 0;
         /** Exact active draft depth paired with the observed row. */
         int mtp_observed_verifier_draft_depth = 0;
+        /** Original row-zero condition from the same validated committed verifier record.
+         * Absent after reset or when no committed verifier observation exists;
+         * never reconstructed from a sampled or accepted response token. */
+        std::optional<int32_t> mtp_observed_verifier_condition_token;
         /**
          * @brief Draft-token identity of the last committed verifier transaction.
          *
@@ -426,8 +461,8 @@ namespace llaminar2
          * controller state; its transaction ordinal, depth, and token prefix
          * therefore cannot name different transactions. These bytes never
          * participate in controller decisions. The vector contains exactly
-         * `mtp_observed_verifier_draft_depth` draft tokens (the target token is
-         * retained in the device record but intentionally omitted here).
+         * `mtp_observed_verifier_draft_depth` draft tokens. The original row-zero
+         * condition is projected separately from that same device record.
          */
         std::vector<int32_t> mtp_observed_verifier_draft_tokens;
         /**

@@ -26,6 +26,7 @@
 
 #ifdef HAVE_CUDA
 
+#include "backends/detail/GPUFlatGraphInspection.h"
 #include "CUDAGraphCapture.h"
 #include "NvidiaDeviceContext.h"
 #include "CUDADriverApi.h"
@@ -3609,6 +3610,36 @@ namespace llaminar2
         return node_count_;
     }
 
+    bool CUDAGraphCapture::inspectFlatGraphStructure(const GPUFlatGraphLimits& limits,
+        std::span<std::byte> scratch,GPUFlatGraphStructure& observed,std::string* error)const
+    {
+        observed={};if(error)error->clear();
+        if(!activateOwner("inspectFlatGraphStructure") || !graph_){
+            if(error)*error="Flat graph inspection lost its original backend owner/definition";
+            return false;
+        }
+        struct API {
+            using Node=cudaGraphNode_t;
+            cudaGraph_t graph;
+            bool nodes(Node* values,std::size_t* count){return cudaGraphGetNodes(graph,values,count)==cudaSuccess;}
+            bool edges(Node* from,Node* to,std::size_t* count){return cudaGraphGetEdges(graph,from,to,nullptr,count)==cudaSuccess;}
+            bool kind(Node node,GPUFlatGraphNodeKind& value){
+                cudaGraphNodeType native;
+                if(cudaGraphNodeGetType(node,&native)!=cudaSuccess)return false;
+                switch(native){
+                case cudaGraphNodeTypeKernel:value=GPUFlatGraphNodeKind::Kernel;return true;
+                case cudaGraphNodeTypeMemcpy:value=GPUFlatGraphNodeKind::Copy;return true;
+                case cudaGraphNodeTypeMemset:value=GPUFlatGraphNodeKind::Set;return true;
+                case cudaGraphNodeTypeEmpty:value=GPUFlatGraphNodeKind::Empty;return true;
+                case cudaGraphNodeTypeWaitEvent:value=GPUFlatGraphNodeKind::EventWait;return true;
+                case cudaGraphNodeTypeEventRecord:value=GPUFlatGraphNodeKind::EventRecord;return true;
+                default:return false;
+                }
+            }
+        } api{graph_};
+        return detail::inspectFlatGraph(api,limits,scratch,observed,error);
+    }
+
     bool CUDAGraphCapture::validateFlatHelperNodeKinds(std::string *error) const
     {
         const auto fail = [&](const std::string &detail)
@@ -3698,6 +3729,11 @@ namespace llaminar2
         ordered_timeline_timing_pending_ = false;
     }
 
+    /**
+     * @brief Destroy original native handles before clearing ownership/accounting state.
+     * @note Failed activation or native teardown is fatal: returning would let an
+     * enclosing PMA retirement owner falsely publish successful handle destruction.
+     */
     void CUDAGraphCapture::reset()
     {
         if (native_capture_active_)
@@ -3709,18 +3745,26 @@ namespace llaminar2
         }
         if ((exec_ || graph_) && device_ordinal_ >= 0)
         {
-            CUDA_WARN_IF_FAIL(cudaSetDevice(device_ordinal_));
+            if(cudaSetDevice(device_ordinal_)!=cudaSuccess) {
+                LOG_ERROR("[CUDAGraphCapture] Cannot activate original graph owner before teardown");
+                std::terminate();
+            }
         }
         if (exec_)
         {
-            CUDA_WARN_IF_FAIL(cudaGraphExecDestroy(exec_));
+            if(cudaGraphExecDestroy(exec_)!=cudaSuccess) {
+                LOG_ERROR("[CUDAGraphCapture] Native executable teardown failed before handle/accounting release");
+                std::terminate();
+            }
             exec_ = nullptr;
         }
         resident_memory_bytes_ = 0u;
         if (graph_)
         {
-            if (!timeline_recording_)
-                CUDA_WARN_IF_FAIL(cudaGraphDestroy(graph_));
+            if (!timeline_recording_ && cudaGraphDestroy(graph_)!=cudaSuccess) {
+                LOG_ERROR("[CUDAGraphCapture] Native graph teardown failed before handle/accounting release");
+                std::terminate();
+            }
             graph_ = nullptr;
         }
         // Invalidating the owner revokes any surviving fragment views. Their

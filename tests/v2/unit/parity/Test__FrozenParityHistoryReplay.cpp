@@ -16,6 +16,7 @@
 #include "integration/parity/ModelParityRuntimeExport.h"
 #include "config/OrchestrationConfigParser.h"
 #include <gtest/gtest.h>
+#include "mocks/MockOrchestrationRunner.h"
 #include <unistd.h>
 
 namespace llaminar2::test::parity
@@ -603,4 +604,222 @@ TEST(FrozenParityHistoryReplay, StandaloneSnapshotAdmissionPreservesFrozenServin
     EXPECT_EQ(probe.snapshotPolicy().required_prefill_snapshot_keys, keys);
 }
 
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity
+{
+/** @test Every exact original active cell retains all identity bytes under filesystem bounds. */
+TEST(FrozenParityHistoryReplay, ArtifactIdentityBoundsExactAndNumericalOriginalCells)
+{
+    std::set<std::filesystem::path> paths;
+    for (const auto &cell : qwen4exp::qwen4ExpOppositeVendorMTPRetained15Cases())
+    {
+        for (const auto *body : {"MTPExactReplay", "ProductionParity"})
+        {
+            const std::string suite = std::string_view(body) == "MTPExactReplay"
+                ? "Qwen4ExpOppositeVendorMTPRetained15Exact/Qwen4ExpMTPExactReplayTest/"
+                : "Qwen4ExpOppositeVendorMTPRetained15/Qwen4ExpMainParityTest/";
+            const auto raw = suite + body + "/" + cell.testName();
+            auto expected = raw;
+            std::replace(expected.begin(), expected.end(), '/', '_');
+            ASSERT_GT(expected.size(), 255u);
+            const auto path = ParityCSVArtifactWriter::testIdentityPath(raw);
+            ASSERT_EQ(path.begin()->string(), "long-identities");
+            ASSERT_EQ(path.filename(), "artifacts");
+            std::string restored;
+            for (auto it = std::next(path.begin()); std::next(it) != path.end(); ++it)
+            {
+                const auto chunk = it->string();
+                EXPECT_LE(chunk.size(), 255u);
+                ASSERT_TRUE(chunk.starts_with('c'));
+                restored += chunk.substr(1);
+            }
+            EXPECT_EQ(restored, expected);
+            EXPECT_TRUE(paths.insert(path).second);
+        }
+    }
+    EXPECT_EQ(paths.size(), 24u);
+}
+
+/** @test Existing bounded numerical paths remain byte-identical; the reserved name escapes itself. */
+TEST(FrozenParityHistoryReplay, ArtifactIdentityPreservesShortNumericsAndEscapesReservedName)
+{
+    for (const auto &cell : qwen4exp::qwen4ExpGPUAdaptiveProductionCases())
+    {
+        for (const auto *body : {"ProductionParity", "SnapshotAdmission"})
+        {
+            auto raw = std::string("Qwen4ExpGPUAdaptive/Qwen4ExpMainParityTest/") +
+                body + "/" + cell.testName();
+            std::replace(raw.begin(), raw.end(), '/', '_');
+            ASSERT_LE(raw.size(), 255u);
+            EXPECT_EQ(ParityCSVArtifactWriter::testIdentityPath(raw), std::filesystem::path(raw));
+        }
+    }
+    EXPECT_EQ(ParityCSVArtifactWriter::testIdentityPath("long-identities"),
+              std::filesystem::path("long-identities") / "clong-identities" / "artifacts");
+    EXPECT_EQ(ParityCSVArtifactWriter::testIdentityPath(std::string(255, 'a')),
+              std::filesystem::path(std::string(255, 'a')));
+    EXPECT_THROW(ParityCSVArtifactWriter::testIdentityPath(""), std::invalid_argument);
+}
+
+/** @test Complete-prefix names cannot make one cell's cleanup delete another cell's artifacts. */
+TEST(FrozenParityHistoryReplay, ArtifactIdentityTerminalLeafKeepsPrefixNeighborsIndependent)
+{
+    MetadataOwner owner;
+    const auto prefix = std::string(480, 'a');
+    const auto a = owner.root / ParityCSVArtifactWriter::testIdentityPath(prefix);
+    const auto b = owner.root / ParityCSVArtifactWriter::testIdentityPath(prefix + "tail");
+    ASSERT_NE(a, b);
+    ASSERT_EQ(*b.lexically_relative(a).begin(), "..");
+    ASSERT_EQ(*a.lexically_relative(b).begin(), "..");
+    ASSERT_EQ(prepareParityArtifactDirectory(a, true, [] {}).ready, 1);
+    ASSERT_EQ(prepareParityArtifactDirectory(b, true, [&] {
+        std::ofstream(b / "neighbor.csv") << "original neighboring cell";
+    }).ready, 1);
+    ASSERT_EQ(prepareParityArtifactDirectory(a, true, [] {}).ready, 1);
+    EXPECT_TRUE(std::filesystem::is_regular_file(b / "neighbor.csv"));
+    // Actual original unbounded owner behavior fails before publication on the same filesystem.
+    EXPECT_EQ(prepareParityArtifactDirectory(owner.root / prefix, true, [] {}).ready, 0);
+}
+
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity
+{
+namespace
+{
+/** @brief Native publications only; no model, controller admission or backend is constructed. */
+class NativeExactSnapshotRunner : public llaminar2::test::MockOrchestrationRunner
+{
+public:
+    std::map<std::string, std::vector<float>> floating;
+    std::map<std::string, std::vector<std::int64_t>> integers;
+
+    /** @brief Feed original typed runner interfaces consumed by the actual parity owner. */
+    NativeExactSnapshotRunner()
+    {
+        ON_CALL(*this, prefill(::testing::_)).WillByDefault(::testing::Return(true));
+        ON_CALL(*this, getSnapshotKeys()).WillByDefault([this] {
+            std::vector<std::string> result;
+            for (const auto &[key, values] : floating)
+                result.push_back(key);
+            for (const auto &[key, values] : integers)
+                result.push_back(key);
+            return result;
+        });
+        ON_CALL(*this, getSnapshot(::testing::_, ::testing::_))
+            .WillByDefault([this](const std::string &key, size_t &size) -> const float * {
+                if (integers.contains(key))
+                    throw std::logic_error("INT64 publication cannot enter a floating snapshot adapter");
+                const auto found = floating.find(key);
+                size = found == floating.end() ? 0 : found->second.size();
+                return size ? found->second.data() : nullptr;
+            });
+    }
+    /** @return The same immutable typed publication shape used by original runner APIs. */
+    SnapshotInfo getSnapshotWithShape(const std::string &key) const override
+    {
+        if (const auto found = integers.find(key); found != integers.end())
+            return {.size = found->second.size(), .rows = 1, .cols = found->second.size(),
+                    .typed_values = std::span<const std::int64_t>(found->second)};
+        return {};
+    }
+};
+
+/** @brief Invoke actual native-prefill and serial-bank bodies without SetUp/model loading. */
+class NativeExactFixtureOwnerProbe final : public ParityTestBase
+{
+public:
+    /** @brief Keep every original declared QFN row checkpoint; source geometry is not fabricated. */
+    explicit NativeExactFixtureOwnerProbe(MTPParityProofPurpose purpose) : purpose_(purpose)
+    {
+        config_.graph_snapshot_policy = qwen4exp::qwen4ExpProductionDefinition(
+            qwen4exp::Qwen4ExpParityTopology::CPU).graph_snapshot_policy;
+        auto runner = std::make_unique<::testing::NiceMock<NativeExactSnapshotRunner>>();
+        original = runner.get();
+        auto keys = config_.graph_snapshot_policy.required_decode_snapshot_keys;
+        keys.insert(keys.end(), {"EMBEDDING", "FINAL_NORM", "LM_HEAD"});
+        for (const auto &key : keys)
+        {
+            if (!isNativeVerifierRowCheckpoint(key))
+                continue;
+            if (key.ends_with("_PLE_HASH_INDICES"))
+                original->integers[key] = {9'007'199'254'740'993LL};
+            else
+                original->floating[key] = {1.0f};
+        }
+        orch_runner_ = std::move(runner);
+    }
+    /** @brief Manually scoped owner probe never enters the GTest fixture lifecycle. */
+    void TestBody() override {}
+    /** @return Diagnostic name, without backend startup. */
+    std::string getBackendName() override { return "NativeExactOwnerOnly"; }
+    /** @return Typed obligation selected by the actual test owner. */
+    MTPParityProofPurpose mtpParityProofPurpose() const noexcept override
+    {
+        return purpose_;
+    }
+    /** @brief Exercise the actual common prefill body with an original tiny metadata file. */
+    bool prefill(const std::filesystem::path &directory)
+    {
+        config_.snapshot_dir = directory.string();
+        const int token = 13;
+        return executeActiveParityForward(ParityForwardPhase::Prefill, &token, 1);
+    }
+    /** @return Only the existing teacher trajectory, never a second execution owner. */
+    const std::vector<int32_t> &teachers() const
+    {
+        return orchestration_parity_decode_trajectory_;
+    }
+    /** @brief Exercise actual serial-bank admission, not a reconstructed predicate. */
+    std::string retain()
+    {
+        ProductionParityMTPSerialOracleBoundary boundary;
+        boundary.token = 13;
+        boundary.checkpoint_reference = true;
+        boundary.before.initialized = true;
+        boundary.after.initialized = true;
+        return retainProductionParityNativeSerialRow(boundary);
+    }
+    /** @return Exact original integer bank value, proving no floating adaptation. */
+    std::int64_t retainedHash() const
+    {
+        return production_parity_native_serial_integer_rows_.at("layer1_PLE_HASH_INDICES").at(0);
+    }
+    NativeExactSnapshotRunner *original = nullptr;
+private:
+    MTPParityProofPurpose purpose_;
+};
+}
+
+/** @test Native prefill never imports teachers; numerical prefill keeps its exact original trajectory. */
+TEST(FrozenParityHistoryReplay, NativeExactOwnerDoesNotImportNumericalTeacherTokens)
+{
+    MetadataOwner owner;
+    std::ofstream(owner.root / "metadata.txt") << "decode_tokens: 31,7\n";
+    NativeExactFixtureOwnerProbe native(MTPParityProofPurpose::NativeExactReplay);
+    EXPECT_CALL(*native.original, prefill(::testing::ElementsAre(13))).Times(1);
+    EXPECT_TRUE(native.prefill(owner.root));
+    EXPECT_TRUE(native.teachers().empty());
+    NativeExactFixtureOwnerProbe numerical(MTPParityProofPurpose::ReferenceNumerics);
+    EXPECT_CALL(*numerical.original, prefill(::testing::ElementsAre(13))).Times(1);
+    EXPECT_TRUE(numerical.prefill(owner.root));
+    EXPECT_EQ(numerical.teachers(), (std::vector<int32_t>{31, 7}));
+}
+
+/** @test Omitting a declared PLE/FFN row cannot shrink the original snapshot proof silently. */
+TEST(FrozenParityHistoryReplay, NativeExactOwnerRequiresEveryDeclaredEligibleSerialCheckpoint)
+{
+    for (const auto *missing : {"layer1_PLE_HASH_INDICES", "layer1_PLE_GATHER", "layer0_FFN_NORM"})
+    {
+        NativeExactFixtureOwnerProbe probe(MTPParityProofPurpose::NativeExactReplay);
+        probe.original->floating.erase(missing);
+        probe.original->integers.erase(missing);
+        const auto error = probe.retain();
+        EXPECT_NE(error.find(missing), std::string::npos) << error;
+    }
+    NativeExactFixtureOwnerProbe complete(MTPParityProofPurpose::NativeExactReplay);
+    EXPECT_TRUE(complete.retain().empty());
+    EXPECT_EQ(complete.retainedHash(), 9'007'199'254'740'993LL);
+}
 } // namespace llaminar2::test::parity

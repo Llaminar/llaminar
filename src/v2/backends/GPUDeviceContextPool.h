@@ -26,18 +26,66 @@
 #pragma once
 
 #include "DeviceId.h"
+#include "NativeContextRetirement.h"
 #include "IWorkerGPUContext.h"
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace llaminar2
 {
     class GPUDeviceContextPool;
+    class PhysicalMemoryAuthority;
+    class NativeContextPreparation;
+    class PreparedGPUContextBirth;
+    struct NativeContextBirthKey;
+    class PreparedGPUContextUsePermit;
+    class PreparedGPUWorkerStack;
+    class TransferEngine;
+    namespace test {struct NativeContextPreparationReplayAccess;}
+    namespace test {struct NativeContextRetirementReplayAccess;}
+
+    /** @brief Pool-only immutable provenance for one already-live original physical worker. */
+    class GPUContextProvenance final
+    {
+    public:
+        /** @return Exact backend and physical ordinal selected by the original pool map. */
+        DeviceId device()const noexcept{return device_;}
+        /** @return Original immutable pool generation; no context can be created through this capability. */
+        std::uint64_t generation()const noexcept{return generation_;}
+        /** @return Strong original worker, preventing physical generation retirement while borrowed. */
+        const std::shared_ptr<IWorkerGPUContext>& worker()const noexcept{return worker_;}
+        /** @brief Reject substituted pointers and independent shared ownership control blocks. */
+        void requireWorker(const std::shared_ptr<IWorkerGPUContext>& candidate)const {
+            if(!worker_ || !candidate || !device_.is_gpu() || !generation_ ||
+               candidate.get()!=worker_.get() || candidate.owner_before(worker_) || worker_.owner_before(candidate))
+                throw std::logic_error("Native family substituted original pool worker/control block");
+        }
+        /**
+         * @brief Borrow the immutable key owned by this exact original prepared birth.
+         * @return Strong alias to the original birth/key control block, without retaining its worker.
+         * @throws std::logic_error For ordinary, moved-from, stale, substituted or retiring provenance.
+         * @note This lookup performs no native query, provider hashing, key copying or context creation.
+         *       A retained metadata alias never authorizes new native resource use after reset.
+         */
+        std::shared_ptr<const NativeContextBirthKey> originalBirthKey()const;
+        /** @brief Reserve one original generation slot after its PMA commitments exist, before native creators. */
+        NativeContextRetirementSlot reserveNativeRetirementSlot(
+            const std::shared_ptr<PhysicalMemoryAuthority>& originalAuthority,const std::string& certificateIdentity)const;
+
+    private:
+        friend class GPUDeviceContextPool;
+        GPUContextProvenance(DeviceId device,std::uint64_t generation,std::shared_ptr<IWorkerGPUContext> worker)
+            :device_(device),generation_(generation),worker_(std::move(worker)){}
+        DeviceId device_;
+        std::uint64_t generation_;
+        std::shared_ptr<IWorkerGPUContext> worker_;
+    };
 
     /**
      * @brief Proof that one process-local GPU context generation was retired.
@@ -95,12 +143,18 @@ namespace llaminar2
 
     private:
         friend class GPUDeviceContextPool;
+        friend class TransferEngine;
+        friend struct test::NativeContextPreparationReplayAccess;
+        friend struct test::NativeContextRetirementReplayAccess;
+        /** @brief Discharge original reservations only after TransferEngine validated physical reset. */
+        void retireNativeObligationsAfterValidatedReset()noexcept;
 
         /** @brief Construct only after the pool installed its retiring marker. */
         ExclusiveGPUDeviceGenerationRetirement(
             GPUDeviceContextPool *pool,
-            GPUDeviceContextGenerationRetirementReceipt receipt) noexcept
-            : pool_(pool), receipt_(std::move(receipt))
+            GPUDeviceContextGenerationRetirementReceipt receipt,
+            std::shared_ptr<NativeContextRetirementOwner> nativeOwner={}) noexcept
+            : pool_(pool), receipt_(std::move(receipt)),native_owner_(std::move(nativeOwner))
         {
         }
 
@@ -109,6 +163,7 @@ namespace llaminar2
 
         GPUDeviceContextPool *pool_ = nullptr; ///< Pool owning the marker.
         GPUDeviceContextGenerationRetirementReceipt receipt_; ///< Retired worker.
+        std::shared_ptr<NativeContextRetirementOwner> native_owner_; ///< Original tokens, never a worker.
     };
 
     /**
@@ -162,6 +217,17 @@ namespace llaminar2
          * @thread_safety Thread-safe (uses Meyers singleton with static local)
          */
         static GPUDeviceContextPool &instance();
+
+        /** @brief Retain only the original source-prepared selected worker and PMA identity. */
+        PreparedGPUContextUsePermit retainPreparedContext(std::shared_ptr<PreparedGPUContextBirth>);
+        /** @brief Borrow original existing worker provenance without discovery, registration, creation or PMA accounting. */
+        GPUContextProvenance retainExistingContextProvenance(DeviceId);
+
+        /** @brief Borrow exact already-published source worker; never discover, register or create a context. */
+        PreparedGPUContextUsePermit retainExistingPreparedContext(DeviceId,const std::shared_ptr<PhysicalMemoryAuthority>&);
+
+        /** @brief Reject unsupported late context-stack growth for original source-prepared generations. */
+        void requireOrdinaryContextStackGrowth(DeviceId,const std::shared_ptr<PhysicalMemoryAuthority>&) const;
 
         // Non-copyable, non-movable
         GPUDeviceContextPool(const GPUDeviceContextPool &) = delete;
@@ -260,6 +326,13 @@ namespace llaminar2
          * mutex is held while a caller waits for its context's submission lock.
          */
         [[nodiscard]] std::shared_ptr<IWorkerGPUContext> retainContext(const DeviceId &device);
+        /**
+         * @brief Retain an already-existing exact GPU owner without discovery or initialization.
+         * @throws std::logic_error If absent, retiring, or not initialized.
+         * @note Cold capture/session publication uses this lookup to reject a
+         * wrong-family worker without creating another native context.
+         */
+        [[nodiscard]] std::shared_ptr<IWorkerGPUContext> retainExistingContext(const DeviceId &device);
         /** @brief Atomically initialize or retain the exact CUDA context owner. */
         [[nodiscard]] std::shared_ptr<IWorkerGPUContext> retainNvidiaContext(int ordinal);
         /** @brief Atomically initialize or retain the exact ROCm context owner. */
@@ -366,6 +439,42 @@ namespace llaminar2
         beginExclusiveGenerationRetirement(DeviceId device);
 
     private:
+        friend class NativeContextPreparation;
+        /** @brief Identify only THIS installed original birth for native-only failed-creation cleanup. */
+        bool ownsPreparedBirth(const std::shared_ptr<PreparedGPUContextBirth>&)const;
+        friend void ensureNvidiaPreparedFactoryRegistered();
+        friend void ensureAMDPreparedFactoryRegistered();
+        friend struct test::NativeContextPreparationReplayAccess;
+        /** @brief Register a pure original backend creator without discovering or initializing devices. */
+        void registerPreparedFactory(DeviceType, std::function<std::shared_ptr<IWorkerGPUContext>(int,std::shared_ptr<PreparedGPUWorkerStack>)>);
+
+        friend class GPUContextProvenance;
+        /** @brief Reject armed/failed prepared birth before ordinary factory admission.
+         * @param device Exact ordinary lookup endpoint. @throws std::logic_error For an existing incomplete source. */
+        void requireOrdinaryContextBirthEligible(DeviceId device);
+        /** @brief Run the original CUDA creator phase with a second locked source/retirement check.
+         * @param device_ordinal Exact original CUDA ordinal. @return Existing or newly created ordinary worker.
+         * @throws std::exception For source competition, retirement, invalid geometry or creator failure. */
+        std::shared_ptr<IWorkerGPUContext> retainNvidiaContextAfterFactoryAdmission(int device_ordinal);
+        /** @brief Run the original ROCm creator phase with a second locked source/retirement check.
+         * @param device_ordinal Exact original ROCm ordinal. @return Existing or newly created ordinary worker.
+         * @throws std::exception For source competition, retirement, invalid geometry or creator failure. */
+        std::shared_ptr<IWorkerGPUContext> retainAMDContextAfterFactoryAdmission(int device_ordinal);
+
+        friend class NativeContextRetirementSlot;
+        /**
+         * @brief Authenticate an existing prepared source under the original pool lock.
+         * @param original Exact original worker/control block and generation capability.
+         * @return Strong alias to the already-owned immutable birth key.
+         * @throws std::logic_error When no exact live prepared source owns the worker.
+         */
+        std::shared_ptr<const NativeContextBirthKey> originalBirthKey(const GPUContextProvenance& original);
+        /** @brief Allocate one exact original slot without native work or a byte balance. */
+        NativeContextRetirementSlot reserveNativeRetirementSlot(const GPUContextProvenance&,
+            const std::shared_ptr<PhysicalMemoryAuthority>&,const std::string&);
+        /** @brief Remove cancelled pre-native bookkeeping only when no token remains. */
+        void discardEmptyNativeRetirementOwner(DeviceId,std::uint64_t,const std::shared_ptr<NativeContextRetirementOwner>&)noexcept;
+
         friend class ExclusiveGPUDeviceGenerationRetirement;
 
         GPUDeviceContextPool() = default;
@@ -373,6 +482,11 @@ namespace llaminar2
 
         /** @brief Release one marker held by an RAII retirement scope. */
         void finishExclusiveGenerationRetirement(DeviceId device) noexcept;
+
+        /** @brief Release original obligations only after actual reset; called under exclusion. */
+        void confirmPreparedPhysicalRetirement(DeviceId);
+        std::unordered_map<std::string,std::shared_ptr<PreparedGPUContextBirth>> prepared_births_;
+        std::function<std::shared_ptr<IWorkerGPUContext>(int,std::shared_ptr<PreparedGPUWorkerStack>)> prepared_cuda_,prepared_rocm_;
 
         // Mutex protecting all mutable state
         mutable std::mutex mutex_;
@@ -385,6 +499,8 @@ namespace llaminar2
         // Generation IDs distinguish a fresh context from address reuse.
         std::unordered_map<int, std::uint64_t> nvidia_generations_;
         std::unordered_map<int, std::uint64_t> amd_generations_;
+        std::unordered_map<int,std::shared_ptr<NativeContextRetirementOwner>> nvidia_native_retirements_;
+        std::unordered_map<int,std::shared_ptr<NativeContextRetirementOwner>> amd_native_retirements_;
         std::uint64_t next_generation_ = 1u;
 
         // Acquisition fails while cleanup runs outside mutex_.
@@ -415,6 +531,7 @@ namespace llaminar2
 namespace llaminar2
 {
     void ensureAMDFactoryRegistered();
+    void ensureAMDPreparedFactoryRegistered();
 }
 #endif
 
@@ -422,5 +539,6 @@ namespace llaminar2
 namespace llaminar2
 {
     void ensureNvidiaFactoryRegistered();
+    void ensureNvidiaPreparedFactoryRegistered();
 }
 #endif

@@ -70,9 +70,12 @@ ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(Immutable
     :value_(GPUAdaptive{std::move(layout),requested,row_elements})
 {
     const auto &g=gpuAdaptiveLayout();
-    if(g.owners().size()!=2 || g.sourceServices().size()!=1 || g.consumers().size()!=1 ||
+    const bool independent = g.adaptiveGPUDomain() == ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal;
+    if ((independent && (requested.placement.mode != AdaptiveGPUCachePlacementMode::ConsumerLocal || g.consumers().size() < 2)) ||
+        g.owners().size()!=(requested.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal?requested.placement.owners.size()+1:g.consumers().size()+1) ||
+        g.sourceServices().size()!=1 || g.consumers().empty() || (!independent && g.consumers().size()!=1) ||
         !g.consumers().front().device.is_gpu() || !g.maximumInflightRows() || g.maximumInflightRows()%16)
-        throw std::invalid_argument("GPU adaptive placement requires one exact GPU, subordinate RAM/SSD and bounded original IDs");
+        throw std::invalid_argument("GPU adaptive placement requires exact original GPU directories, subordinate RAM/SSD and bounded original IDs");
     const auto &windows=g.sourceServices().front().windows;
     ImmutableRowTablePolicy policy;
     policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
@@ -80,12 +83,23 @@ ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(Immutable
     policy.validate();
     const auto &e=g.extent();
     const ImmutableRowTableSource source{.rows=e.rows(),.row_elements=row_elements,.format=e.format()};
-    const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(g,source,requested);
-    if(geometry.physical().owners().front().slots>requested.maximum_gpu_cache_rows ||
-        geometry.gpuSlotDependentBytes()>requested.gpu_cache_physical_byte_limit ||
-        geometry.host().slots()>requested.host.maximum_cache_rows ||
-        geometry.host().storageBytes()>requested.host.cache_physical_byte_limit)
-        throw std::invalid_argument("GPU adaptive placement exceeds its original GPU/host slot or physical-byte ceiling");
+    const auto validate = [&](const AdaptiveImmutableLookupGeometry& geometry) {
+    for(std::size_t coordinate=0;coordinate<geometry.physical().owners().size();++coordinate)
+    {
+        const auto &owner=geometry.physical().owners()[coordinate];
+        const bool declared=requested.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+        const auto maximum=declared?requested.placement.owners[coordinate].maximum_cache_rows:requested.maximum_gpu_cache_rows;
+        const auto ceiling=declared?requested.placement.owners[coordinate].cache_physical_byte_limit:requested.gpu_cache_physical_byte_limit;
+        if(owner.slots>maximum || geometry.gpuSlotDependentBytes(owner.allocator)>ceiling)
+            throw std::invalid_argument("GPU adaptive placement exceeds an original ordered owner slot/physical-byte ceiling");
+    }
+    if(geometry.host().slots()>requested.host.maximum_cache_rows || geometry.host().storageBytes()>requested.host.cache_physical_byte_limit)
+        throw std::invalid_argument("GPU adaptive placement exceeds its original subordinate host ceiling");
+    };
+    if (independent) {
+        for (const auto requester : g.consumers())
+            validate(AdaptiveImmutableLookupGeometry::forRequester(g,source,requested,requester));
+    } else validate(AdaptiveImmutableLookupGeometry::fromLayout(g,source,requested));
 }
 ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry layout)
     :value_(FixedHeadShards{std::move(layout)})
@@ -139,7 +153,7 @@ ImmutableRowAllocatorInventory ResolvedImmutableRowTablePlacement::allocators() 
     // inventory is the immutable identity view, not another stored owner map.
     if(const auto *f=std::get_if<FixedHeadShards>(&value_))return {f->layout.consumers()};
     if(const auto *a=std::get_if<GPUAdaptive>(&value_))
-        return {a->layout.consumers(),{&a->layout.sourceServices().front().allocator,1}};
+        return ImmutableRowAllocatorInventory(std::span<const ImmutableRowTableLayoutOwner>{a->layout.owners()});
     return {{&std::get<HostAdaptive>(value_).layout.sourceServices().front().allocator,1}};
 }
 std::span<const PhysicalMemoryAllocatorIdentity> ResolvedImmutableRowTablePlacement::consumers() const noexcept
@@ -190,6 +204,14 @@ const AdaptiveVRAMRAMSSDRequest &ResolvedImmutableRowTablePlacement::gpuAdaptive
 {
     if(const auto *a=std::get_if<GPUAdaptive>(&value_))return a->request;
     throw std::logic_error("Other ngram placements have no GPU adaptive request");
+}
+DeviceId ResolvedImmutableRowTablePlacement::lookupIOConsumer(DeviceId requester) const
+{
+    const auto& layout = gpuAdaptiveLayout();
+    if (std::none_of(layout.consumers().begin(), layout.consumers().end(), [&](const auto consumer) {
+            return consumer.device == requester;
+        })) throw std::invalid_argument("Lookup worker label requires an actual original consumer");
+    return gpuAdaptiveRequest().lookupIOConsumer(requester, layout.consumers().size());
 }
 std::uint64_t ResolvedImmutableRowTablePlacement::gpuAdaptiveRowElements() const
 {

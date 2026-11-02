@@ -213,6 +213,7 @@ public:
         snapshot.current_position = *prefix_probe_position_override_;
         snapshot.positions = {*prefix_probe_position_override_};
         snapshot.sequence_lengths = {*prefix_probe_position_override_};
+        snapshot.mtp_observed_verifier_condition_token = prefix_probe_verifier_condition_token_;
         snapshot.mtp_observed_verifier_draft_tokens =
             prefix_probe_verifier_draft_tokens_;
         if (!prefix_probe_verifier_draft_tokens_.empty())
@@ -2361,6 +2362,14 @@ public:
     void set_prefix_probe_verifier_draft_tokens(std::vector<int32_t> tokens)
     {
         prefix_probe_verifier_draft_tokens_ = std::move(tokens);
+        prefix_probe_verifier_condition_token_ = prefix_probe_verifier_draft_tokens_.empty()
+            ? std::nullopt : std::optional<int32_t>{17};
+    }
+    /** @brief Override the observed condition for malformed/mirrored trace tests.
+     * @param token Recorded condition or absence for an incomplete observation. */
+    void set_prefix_probe_verifier_condition(std::optional<int32_t> token)
+    {
+        prefix_probe_verifier_condition_token_ = token;
     }
     /**
      * @brief Seed the mock's device-owned pre-verifier sequence position.
@@ -2824,6 +2833,7 @@ private:
     std::optional<int> prefix_probe_position_override_;
     mutable PrefixProbeCapturePolicy observed_prefix_probe_policy_;
     std::vector<int32_t> prefix_probe_verifier_draft_tokens_;
+    std::optional<int32_t> prefix_probe_verifier_condition_token_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
     bool prefix_terminal_restore_ok_ = true;
@@ -8805,9 +8815,16 @@ TEST_F(Test__RankOrchestrator,
 
     const PrefixRuntimeStateSnapshot snapshot =
         orchestrator->prefixStateProbe();
+    EXPECT_EQ(snapshot.mtp_observed_verifier_condition_token, std::optional<int32_t>{17});
     EXPECT_EQ(
         snapshot.mtp_observed_verifier_draft_tokens,
         committed_drafts);
+    runner0_ptr->set_prefix_probe_verifier_draft_tokens({});
+    runner1_ptr->set_prefix_probe_verifier_draft_tokens({});
+    const auto reset = orchestrator->prefixStateProbe();
+    EXPECT_FALSE(reset.mtp_observed_verifier_condition_token);
+    EXPECT_TRUE(reset.mtp_observed_verifier_draft_tokens.empty());
+    EXPECT_EQ(reset.mtp_observed_verifier_transaction_count, 0);
 }
 
 /**
@@ -8817,6 +8834,37 @@ TEST_F(Test__RankOrchestrator,
  * transaction-coherence failure and must never be silently attributed to one
  * participant.
  */
+/** @test Equal draft suffixes cannot hide missing, invalid or divergent original row-zero inputs. */
+TEST_F(Test__RankOrchestrator, PrefixStateProbeRejectsMissingOrDivergentVerifierCondition)
+{
+    auto a = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *first = a.get();
+    auto b = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *second = b.get();
+    first->set_primary_device_id(DeviceId::cuda(0));
+    second->set_primary_device_id(DeviceId::cuda(1));
+    for (auto *runner : {first, second})
+    {
+        runner->set_prefix_probe_position_override(64);
+        runner->set_prefix_probe_verifier_draft_tokens({41, 73, 109});
+    }
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(a));
+    runners.push_back(std::move(b));
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(), std::move(runners),
+        makeTPContextForRunnerCount(2), makeRankConfigForRunnerCount(2));
+    for (const auto condition : {std::optional<int32_t>{}, std::optional<int32_t>{-1},
+                                 std::optional<int32_t>{19}})
+    {
+        second->set_prefix_probe_verifier_condition(condition);
+        EXPECT_THROW(static_cast<void>(orchestrator->prefixStateProbe()), std::runtime_error);
+    }
+    second->set_prefix_probe_verifier_condition(17);
+    EXPECT_EQ(orchestrator->prefixStateProbe().mtp_observed_verifier_condition_token,
+              std::optional<int32_t>{17});
+}
+
 TEST_F(Test__RankOrchestrator,
        PrefixStateProbeRejectsDivergentCommittedVerifierDraftIdentity)
 {
@@ -12392,5 +12440,169 @@ TEST(RankServingHostMaterialization, ChangedSealedPlanIsForwardedExactlyAndRejec
         EXPECT_TRUE(child->plans[1].sameCaptureIdentity(changed));
         EXPECT_EQ(child->workers[0],child->workers[1]);
         EXPECT_EQ(child->forward_call_count(),0u);
+    }
+}
+
+/**
+ * @brief Preserve original rank condition ownership across the existing packed TP probe.
+ * Distinct native child generations must authenticate locally, while logical
+ * pending values agree. No GPU mailbox pointer is dereferenced by this replay.
+ */
+TEST_F(Test__RankOrchestrator, PrefixStateProbeRetainsOriginalMirroredPendingCondition)
+{
+    class Participant final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        /** @brief Publish one existing typed mock mailbox through the actual rank adoption entrypoint. */
+        bool publishForcedDeviceResidentConditionToken(int32_t token,int slot) override
+        {
+            if (slot != 0) return false;
+            pending_token = token;
+            ready = true;
+            ++generation;
+            return true;
+        }
+        /** @brief Return stable participant-local addresses and its independent publication identity. */
+        DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const override
+        {
+            if (!ready) return {};
+            DeviceResidentLogicalSequenceStateHandle state;
+            state.target_positions_device = words.data();
+            state.target_sequence_lengths_device = words.data()+1;
+            state.accepted_state_counts_device = words.data()+2;
+            state.next_condition_tokens_device = words.data()+3;
+            state.all_drafts_accepted_flags_device = words.data()+4;
+            state.stopped_flags_device = words.data()+5;
+            state.publication_ok_flags_device = words.data()+6;
+            state.request_count = 1;
+            state.device = primaryDeviceId();
+            state.stream = const_cast<int*>(&stream);
+            state.ready_event = const_cast<int*>(&event);
+            state.live_state_epoch = epoch;
+            state.publication_generation = generation;
+            return state;
+        }
+        /** @brief Attach the existing scalar packed observation to the real mock prefix snapshot. */
+        PrefixRuntimeStateSnapshot prefixStateProbe(const PrefixProbeCapturePolicy& policy) const override
+        {
+            auto snapshot = MockDeviceGraphOrchestrator::prefixStateProbe(policy);
+            const auto current = deviceResidentLogicalSequenceState();
+            if (policy.capture_device_logical_state && current.valid() && !omit)
+            {
+                snapshot.resident_condition = altered.value_or(PrefixResidentConditionProbe{
+                    .device=current.device,
+                    .publication_generation=current.publication_generation,
+                    .live_state_epoch=current.live_state_epoch,
+                    .target_position=snapshot.current_position,
+                    .next_condition_token=pending_token,
+                    .publication_ok=true,
+                    .stopped=false});
+            }
+            if (during_probe) during_probe();
+            return snapshot;
+        }
+        std::function<void()> during_probe;
+        bool ready = false, omit = false;
+        int pending_token = 760;
+        std::uint64_t epoch = 1, generation = 100;
+        std::optional<PrefixResidentConditionProbe> altered;
+    private:
+        std::array<int32_t,7> words{};
+        int stream=1,event=2;
+    };
+    for (const auto backend : {DeviceType::CUDA,DeviceType::ROCm})
+    for (const int degree : {2,4,8})
+    {
+        SCOPED_TRACE(::testing::Message()<<static_cast<int>(backend)<<"/TP"<<degree);
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        std::vector<Participant*> children(static_cast<std::size_t>(degree));
+        auto config = makeRankConfigForRunnerCount(degree);
+        for (std::size_t index=0;index<children.size();++index)
+        {
+            auto child=std::make_unique<Participant>();
+            child->set_primary_device_id({backend,static_cast<int>(index)});
+            child->set_prefix_probe_position_override(30);
+            child->generation += index*100;
+            child->epoch += index*10;
+            children[index]=child.get();
+            runners.push_back(std::move(child));
+            config.devices[index]=backend==DeviceType::CUDA
+                ?GlobalDeviceAddress::cuda(static_cast<int>(index))
+                :GlobalDeviceAddress::rocm(static_cast<int>(index));
+        }
+        MockLocalTPContext::Config tp;
+        tp.devices=config.devices;
+        tp.weights=config.weights;
+        auto rank=RankOrchestrator::createForTest(
+            llaminar2::test::MockModelContext::createMinimal(),std::move(runners),
+            std::make_unique<MockLocalTPContext>(tp),config);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(760,0));
+        const auto owner=rank->deviceResidentLogicalSequenceState();
+        ASSERT_TRUE(owner.valid());
+        PrefixProbeCapturePolicy policy;
+        policy.capture_device_logical_state=true;
+        const auto observed=rank->prefixStateProbe(policy);
+        ASSERT_TRUE(observed.resident_condition);
+        EXPECT_EQ(observed.current_position,30);
+        EXPECT_EQ(observed.resident_condition->device,owner.device);
+        EXPECT_EQ(observed.resident_condition->publication_generation,owner.publication_generation);
+        EXPECT_EQ(observed.resident_condition->live_state_epoch,owner.live_state_epoch);
+        EXPECT_EQ(observed.resident_condition->next_condition_token,760);
+        EXPECT_FALSE(observed.resident_condition->response_disposition);
+        EXPECT_NE(children[0]->generation,children[1]->generation);
+        EXPECT_NE(children[0]->epoch,children[1]->epoch);
+        children[1]->omit=true;
+        EXPECT_THROW(static_cast<void>(rank->prefixStateProbe(policy)),std::runtime_error);
+        children[1]->omit=false;
+        auto actual=*children[1]->prefixStateProbe(policy).resident_condition;
+        for (int defect=0;defect<7;++defect)
+        {
+            auto wrong=actual;
+            if(defect==0)wrong.device={backend,7};
+            if(defect==1)++wrong.publication_generation;
+            if(defect==2)++wrong.live_state_epoch;
+            if(defect==3)++wrong.target_position;
+            if(defect==4)++wrong.next_condition_token;
+            if(defect==5)wrong.publication_ok=false;
+            if(defect==6)wrong.stopped=true;
+            children[1]->altered=wrong;
+            EXPECT_THROW(static_cast<void>(rank->prefixStateProbe(policy)),std::runtime_error)<<defect;
+        }
+        children[1]->altered.reset();
+        // The final participant still returns its own exact observation. Its
+        // hook changes an ALREADY validated peer, so only the existing final
+        // aggregate-owner revalidation can reject this interleaving.
+        for (const bool replacement : {false,true})
+        {
+            children.back()->during_probe=[&]{
+                if (replacement) ++children.front()->generation;
+                else children.front()->ready=false;
+            };
+            try
+            {
+                static_cast<void>(rank->prefixStateProbe(policy));
+                FAIL()<<"Replaced/retired owner survived the completed probe";
+            }
+            catch (const std::runtime_error& error)
+            {
+                EXPECT_STREQ(error.what(),"Rank prefix-state diagnostics rejected a replaced logical condition owner");
+            }
+            children.back()->during_probe={};
+            ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(760,0));
+            ASSERT_TRUE(rank->prefixStateProbe(policy).resident_condition);
+        }
+        children[1]->ready=false;
+        EXPECT_FALSE(rank->deviceResidentLogicalSequenceState().valid());
+        EXPECT_FALSE(rank->prefixStateProbe(policy).resident_condition);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(760,0));
+        const auto successor=rank->deviceResidentLogicalSequenceState();
+        ASSERT_TRUE(successor.valid());
+        EXPECT_FALSE(successor.sameMailboxAs(owner));
+        const auto after_reset=rank->prefixStateProbe(policy);
+        ASSERT_TRUE(after_reset.resident_condition);
+        EXPECT_EQ(after_reset.resident_condition->publication_generation,successor.publication_generation);
+        EXPECT_EQ(after_reset.resident_condition->next_condition_token,760);
+        policy.capture_device_logical_state=false;
+        EXPECT_FALSE(rank->prefixStateProbe(policy).resident_condition);
     }
 }

@@ -82,10 +82,62 @@ namespace llaminar2::test
     TEST(NativeVerifierRowEvidence, StageIdentityExcludesSidecarAndSelectedRowAliases)
     {
         for (const auto key : {"EMBEDDING", "FINAL_NORM", "LM_HEAD", "layer0_FFN_NORM",
-                               "layer123_MOE_ROUTING_INDICES", "layer2_ATTENTION_OUTPUT_ALLREDUCED"})
+                               "layer123_MOE_ROUTING_INDICES", "layer2_ATTENTION_OUTPUT_ALLREDUCED",
+                               "layer1_PLE_HASH_INDICES", "layer1_PLE_GATHER",
+                               "layer1_PLE_GATE", "layer1_PLE_CONVOLUTION"})
             EXPECT_TRUE(isNativeVerifierRowCheckpoint(key)) << key;
         for (const auto key : {"MTP0_LM_HEAD", "LM_HEAD_ROWS_SELECT", "layer_FFN_NORM",
                                "layerX_FFN_NORM", "layer1_unrelated_FFN_NORM", "OTHER_LM_HEAD"})
             EXPECT_FALSE(isNativeVerifierRowCheckpoint(key)) << key;
     }
+    /** @test Rejected proposals, not greedy response tokens, own later verifier row inputs. */
+    TEST(NativeVerifierRowEvidence, ActualDraftInputsOwnEveryLiveRowAndExcludePadding)
+    {
+        const std::array<std::int32_t, 3> drafts{31, 7, 29};
+        const auto rows = nativeVerifierInputRows(13, drafts, 3, 16);
+        EXPECT_EQ(rows, (std::vector<std::int32_t>{13, 31, 7, 29}));
+        EXPECT_EQ(rows.size(), 4u);
+        const std::array<std::int32_t, 1> clipped{91};
+        EXPECT_EQ(nativeVerifierInputRows(13, clipped, 1, 4),
+                  (std::vector<std::int32_t>{13, 91}));
+        const std::array grouped{1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 99.f, 99.f};
+        const std::array serial{5.f, 6.f};
+        EXPECT_TRUE(compareNativeVerifierMatrixRow(grouped, 4, 2, serial).passed());
+        EXPECT_FALSE(compareNativeVerifierMatrixRow(grouped, 4, 1, serial).passed());
+    }
+
+    /** @test Reset/stale, missing and padded traces never invent replay inputs. */
+    TEST(NativeVerifierRowEvidence, IncompleteOrChangedDraftObservationRejects)
+    {
+        const std::array<std::int32_t, 2> drafts{31, 7};
+        EXPECT_THROW(nativeVerifierInputRows(13, drafts, 3, 4), std::invalid_argument);
+        EXPECT_THROW(nativeVerifierInputRows(13, drafts, 1, 4), std::invalid_argument);
+        EXPECT_THROW(nativeVerifierInputRows(13, drafts, 2, 2), std::invalid_argument);
+        EXPECT_THROW(nativeVerifierInputRows(-1, drafts, 2, 4), std::invalid_argument);
+        const std::array<std::int32_t, 1> invalid{-1};
+        EXPECT_THROW(nativeVerifierInputRows(13, invalid, 1, 2), std::invalid_argument);
+        EXPECT_THROW(nativeVerifierInputRows(13, {}, 0, 2), std::invalid_argument);
+    }
+
+    /** @test PLE identities remain exact beyond every floating integer mantissa. */
+    TEST(NativeVerifierRowEvidence, IntegerRowsPreserveNonrepresentableSignedIdentities)
+    {
+        constexpr std::int64_t large = 9'007'199'254'740'993LL;
+        const std::array<std::int64_t, 4> grouped{
+            17, 23, large, std::numeric_limits<std::int64_t>::max()};
+        const std::array<std::int64_t, 2> serial{
+            large, std::numeric_limits<std::int64_t>::max()};
+        EXPECT_TRUE(compareNativeVerifierIntegerMatrixRow(grouped, 2, 1, serial).passed());
+        auto changed = serial;
+        --changed[0];
+        const auto mismatch = compareNativeVerifierIntegerMatrixRow(grouped, 2, 1, changed);
+        EXPECT_EQ(mismatch.status, NativeVerifierRowStatus::ByteMismatch);
+        EXPECT_EQ(mismatch.grouped_value, large);
+        EXPECT_EQ(mismatch.serial_value, large - 1);
+        EXPECT_FALSE(compareNativeVerifierIntegerMatrixRow(grouped, 2, 0, serial).passed());
+        EXPECT_FALSE(compareNativeVerifierIntegerMatrixRow(grouped, 3, 1, serial).passed());
+        EXPECT_FALSE(compareNativeVerifierIntegerMatrixRow(grouped, 2, 2, serial).passed());
+        EXPECT_FALSE(compareNativeVerifierIntegerMatrixRow({}, 2, 0, serial).passed());
+    }
+
 }

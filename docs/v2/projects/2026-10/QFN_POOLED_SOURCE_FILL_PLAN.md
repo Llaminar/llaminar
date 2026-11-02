@@ -1,6 +1,6 @@
 # Original distributed source request, delivery and owner fill
 
-Limit: 15,000 UTF-8 bytes. Uninstalled implementation plan. Base: reviewed participant r5/r5b and Tensor-source transport prerequisite. Source/fill phase only; publication/Ready/read/release remains subsequent work.
+Uninstalled implementation plan. Base: reviewed participant r5/r5b and Tensor-source transport prerequisite. Source/fill phase only; publication/Ready/read/release remains subsequent work.
 
 ## Actual existing authorities and missing seam
 
