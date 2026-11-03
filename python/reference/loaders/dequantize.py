@@ -1235,6 +1235,34 @@ def dequantize_q5_1(data: bytes, n_elements: int) -> np.ndarray:
     return (dm[:, :1] * codes.astype(np.float32) + dm[:, 1:]).reshape(-1)
 
 
+# ggml kvalues_mxfp4: E2M1 code values doubled (the block scale is halved to match).
+_MXFP4_KVALUES = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
+
+
+def dequantize_mxfp4(data: bytes, n_elements: int) -> np.ndarray:
+    """
+    Dequantize MXFP4 (OCP microscaling FP4) to FP32.
+
+    Block layout (ggml ``block_mxfp4``, 32 elements, 17 bytes):
+    - 1 byte E8M0 biased exponent ``e``; scale = 2^(e - 127)
+    - 16 bytes of 4-bit E2M1 codes: byte j holds element j in the low nibble
+      and element j + 16 in the high nibble.
+
+    ggml stores doubled code values and multiplies by 2^(e - 128), which is
+    the same real value as the OCP definition E2M1(code) * 2^(e - 127).
+    """
+    BLOCK_BYTES = 17
+    raw = np.frombuffer(data, dtype=np.uint8)
+    n_blocks = n_elements // 32
+    blocks = raw[:n_blocks * BLOCK_BYTES].reshape(n_blocks, BLOCK_BYTES)
+    scale = np.ldexp(np.float32(1.0), blocks[:, 0].astype(np.int32) - 128).astype(np.float32)
+    qs = blocks[:, 1:]
+    lo = _MXFP4_KVALUES[qs & 0x0F]
+    hi = _MXFP4_KVALUES[qs >> 4]
+    vals = np.concatenate([lo, hi], axis=1) * scale[:, None]
+    return vals.reshape(-1).astype(np.float32)
+
+
 def dequantize(data: bytes, tensor_type: GGUFTensorType, shape: Tuple[int, ...]) -> np.ndarray:
     """
     Dequantize tensor data based on its type.
@@ -1293,6 +1321,10 @@ def dequantize(data: bytes, tensor_type: GGUFTensorType, shape: Tuple[int, ...])
         result = dequantize_iq3_xxs(data, shape)
     elif tensor_type == GGUFTensorType.IQ4_XS:
         result = dequantize_iq4_xs(data, shape)
+    elif tensor_type == GGUFTensorType.MXFP4:
+        result = dequantize_mxfp4(data, n_elements)
+    elif tensor_type == GGUFTensorType.I32:
+        result = np.frombuffer(data[:n_elements * 4], dtype='<i4').astype(np.float32)
     else:
         raise ValueError(f"Unsupported tensor type for dequantization: {tensor_type.name}")
     
