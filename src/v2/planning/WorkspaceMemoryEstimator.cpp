@@ -390,9 +390,11 @@ bool isRoutedExpertWeight(std::string_view name)
 /** @brief Whether a tensor is prepared through the quantized NativeVNNI GEMM. */
 bool isQuantizedMatrixWeight(const TensorSizeInfo& tensor)
 {
+    // Integer tables (e.g. DeepSeek-V4 INT32 hash routing) are lookups, not projections.
     return tensor.K > 0u && tensor.elements >= tensor.K &&
            tensor.elements % tensor.K == 0u &&
-           !tensor.quant_type.empty() && !isFloatingWeight(tensor);
+           !tensor.quant_type.empty() && !isFloatingWeight(tensor) &&
+           tensor.quant_type != "I32" && tensor.quant_type != "INT32";
 }
 
 /** @brief Whether a matrix supplies the terminal vocabulary projection. */

@@ -12,6 +12,7 @@
 #include "planning/ModelMemoryProfile.h"
 #include "kernels/common/SparseQueryExecutionProgram.h"
 #include "../models/qwen4exp/Qwen4ExpConfig.h"
+#include "../models/deepseek4/DeepSeekV4Config.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "../models/qwen4exp/Qwen4ExpPublishedGeometry.h"
 #include <array>
@@ -64,6 +65,15 @@ namespace llaminar2
         constexpr uint32_t kProfileWireVersion = 6U;
 
         /** Exact stable order of fixed-width Flash Next geometry scalars. */
+        /** @brief Wire order of the DeepSeek-V4 activation geometry. */
+        constexpr std::array<uint32_t DeepSeekV4MemoryGeometry::*, 16> kDeepSeekV4Fields{
+            &DeepSeekV4MemoryGeometry::layers, &DeepSeekV4MemoryGeometry::hidden, &DeepSeekV4MemoryGeometry::hc,
+            &DeepSeekV4MemoryGeometry::heads, &DeepSeekV4MemoryGeometry::head_dim, &DeepSeekV4MemoryGeometry::q_rank,
+            &DeepSeekV4MemoryGeometry::o_groups, &DeepSeekV4MemoryGeometry::o_rank, &DeepSeekV4MemoryGeometry::window,
+            &DeepSeekV4MemoryGeometry::index_heads, &DeepSeekV4MemoryGeometry::index_head_dim,
+            &DeepSeekV4MemoryGeometry::index_topk, &DeepSeekV4MemoryGeometry::experts,
+            &DeepSeekV4MemoryGeometry::experts_used, &DeepSeekV4MemoryGeometry::csa_layers,
+            &DeepSeekV4MemoryGeometry::hca_layers};
         constexpr std::array<uint32_t Qwen4ExpMemoryGeometry::*, 18> kFlashNextFields{
             &Qwen4ExpMemoryGeometry::residual_width,
             &Qwen4ExpMemoryGeometry::terminal_head_width,
@@ -230,6 +240,8 @@ namespace llaminar2
                 return "IQ1_M";
             case GGUFTensorType::BF16:
                 return "BF16";
+            case GGUFTensorType::I32:
+                return "I32";
             default:
                 return "UNKNOWN";
             }
@@ -447,6 +459,8 @@ namespace llaminar2
         }
         else
         {
+            if (model.architecture == "deepseek4")
+                profile.deepseek_v4 = DeepSeekV4MemoryGeometry::fromConfig(DeepSeekV4Config(model));
             profile.n_layers = static_cast<int>(model.block_count);
             profile.d_model = static_cast<int>(model.embedding_length);
             profile.n_heads = static_cast<int>(model.head_count);
@@ -523,6 +537,14 @@ namespace llaminar2
                 {
                     profile.d_ff = profile.d_model * 4; // Fallback heuristic
                 }
+            }
+            if (profile.deepseek_v4)
+            {
+                // Every DeepSeek-V4 FFN is MoE: the routed/shared expert width is the
+                // only dense projection width (the router tensor is not an FFN shape).
+                const auto &ff = model.metadata.at("deepseek4.expert_feed_forward_length");
+                profile.d_ff = static_cast<int>(ff.asUInt64Checked());
+                profile.expert_shared_feed_forward_length = profile.d_ff;
             }
 
         }
@@ -753,6 +775,10 @@ namespace llaminar2
             for (const auto layer : g.sparse_decoder_layers) writeVal<uint32_t>(buf, layer);
         }
 
+        writeVal<uint8_t>(buf, deepseek_v4.has_value() ? 1u : 0u);
+        if (deepseek_v4)
+            for (const auto field : kDeepSeekV4Fields) writeVal<uint32_t>(buf, (*deepseek_v4).*field);
+
         writeVal<uint8_t>(buf, flash_next_predictor.has_value() ? 1u : 0u);
         if (flash_next_predictor)
         {
@@ -845,6 +871,14 @@ namespace llaminar2
             g.sparse_decoder_layers.reserve(layers);
             for (uint32_t i = 0; i < layers; ++i)
                 g.sparse_decoder_layers.push_back(readVal<uint32_t>(ptr, end));
+        }
+        const auto has_deepseek_v4 = readVal<uint8_t>(ptr, end);
+        if (has_deepseek_v4 > 1u)
+            throw std::runtime_error("ModelMemoryProfile deserialization: invalid deepseek4 presence tag");
+        if (has_deepseek_v4)
+        {
+            auto &g = p.deepseek_v4.emplace();
+            for (const auto field : kDeepSeekV4Fields) g.*field = readVal<uint32_t>(ptr, end);
         }
         const auto has_predictor = readVal<uint8_t>(ptr, end);
         if (has_predictor > 1) throw std::runtime_error("Invalid qwen4exp predictor presence tag");

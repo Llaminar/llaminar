@@ -232,6 +232,34 @@ namespace llaminar2
         QFN_POOLED_SOURCE_FRAME, ///< Real provider private response/ACK/original-grant packet banks.
         QFN_POOLED_SOURCE_NATIVE, ///< Existing source protocol, exact invocation and source outcome.
         GDN_PREPARED_QK, ///< Scalar producer-normalized Q/K; transient activation, not recurrent state.
+        // DeepSeek-V4 hyper-connection, compressed sparse attention and routing roles.
+        DSV4_HC_MIXES, ///< Hyper-connection mix logits [rows, (2+hc)*hc] (or [rows, hc] for the head).
+        DSV4_HC_POST, ///< Hyper-connection write weights [rows, hc] of the pending block.
+        DSV4_HC_COMB, ///< Sinkhorn hc x hc combination [rows, hc*hc] of the pending block.
+        DSV4_QR, ///< Normalized low-rank query [rows, q_lora_rank].
+        DSV4_Q, ///< Per-head normalized rotated queries [rows, heads*head_dim].
+        DSV4_KV, ///< Normalized rotated latent [rows, head_dim].
+        DSV4_COMP_KV, ///< Compressor kv projection [rows, coff*head_dim].
+        DSV4_COMP_SCORE, ///< Compressor gate projection [rows, coff*head_dim].
+        DSV4_IDX_Q, ///< Indexer rotated queries [rows, index_heads*index_head_dim].
+        DSV4_IDX_W, ///< Indexer head weights [rows, index_heads].
+        DSV4_IDX_KV, ///< Indexer compressor kv projection [rows, 2*index_head_dim].
+        DSV4_IDX_SCORE, ///< Indexer compressor gate projection [rows, 2*index_head_dim].
+        DSV4_IDX_SCORES, ///< Indexer score scratch [rows, pool_rows].
+        DSV4_IDX_SELECTED, ///< Selected compressed block ids [rows, index_topk].
+        DSV4_ATTN, ///< De-rotated sparse attention output [rows, heads*head_dim].
+        DSV4_OA, ///< Grouped low-rank output [rows, groups*rank].
+        DSV4_RAW_RING, ///< Persistent raw window rings of every layer [layers*raw_ring_rows, head_dim].
+        DSV4_COMP_RING_KV, ///< Persistent compressor kv rings of compressed layers.
+        DSV4_COMP_RING_SCORE, ///< Persistent compressor score rings of compressed layers.
+        DSV4_COMP_POOL, ///< Persistent compressed kv pools of compressed layers.
+        DSV4_IDX_RING_KV, ///< Persistent indexer compressor kv rings of ratio-4 layers.
+        DSV4_IDX_RING_SCORE, ///< Persistent indexer compressor score rings of ratio-4 layers.
+        DSV4_IDX_POOL, ///< Persistent indexer key pools of ratio-4 layers.
+        DSV4_ROUTE_IDS, ///< Routed expert ids [rows, top_k] (INT32).
+        DSV4_ROUTE_WEIGHTS, ///< Routing weights [rows, top_k].
+        DSV4_ROUTER_LOGITS, ///< Router GEMM output [rows, experts].
+
         _COUNT ///< Sentinel – must be last
     };
 
@@ -559,6 +587,32 @@ namespace llaminar2
         case BufferId::QFN_POOLED_SOURCE_FRAME:return "QFN_POOLED_SOURCE_FRAME";
         case BufferId::QFN_POOLED_SOURCE_NATIVE:return "QFN_POOLED_SOURCE_NATIVE";
         case BufferId::GDN_PREPARED_QK: return "GDN_PREPARED_QK";
+        case BufferId::DSV4_HC_MIXES: return "DSV4_HC_MIXES";
+        case BufferId::DSV4_HC_POST: return "DSV4_HC_POST";
+        case BufferId::DSV4_HC_COMB: return "DSV4_HC_COMB";
+        case BufferId::DSV4_QR: return "DSV4_QR";
+        case BufferId::DSV4_Q: return "DSV4_Q";
+        case BufferId::DSV4_KV: return "DSV4_KV";
+        case BufferId::DSV4_COMP_KV: return "DSV4_COMP_KV";
+        case BufferId::DSV4_COMP_SCORE: return "DSV4_COMP_SCORE";
+        case BufferId::DSV4_IDX_Q: return "DSV4_IDX_Q";
+        case BufferId::DSV4_IDX_W: return "DSV4_IDX_W";
+        case BufferId::DSV4_IDX_KV: return "DSV4_IDX_KV";
+        case BufferId::DSV4_IDX_SCORE: return "DSV4_IDX_SCORE";
+        case BufferId::DSV4_IDX_SCORES: return "DSV4_IDX_SCORES";
+        case BufferId::DSV4_IDX_SELECTED: return "DSV4_IDX_SELECTED";
+        case BufferId::DSV4_ATTN: return "DSV4_ATTN";
+        case BufferId::DSV4_OA: return "DSV4_OA";
+        case BufferId::DSV4_RAW_RING: return "DSV4_RAW_RING";
+        case BufferId::DSV4_COMP_RING_KV: return "DSV4_COMP_RING_KV";
+        case BufferId::DSV4_COMP_RING_SCORE: return "DSV4_COMP_RING_SCORE";
+        case BufferId::DSV4_COMP_POOL: return "DSV4_COMP_POOL";
+        case BufferId::DSV4_IDX_RING_KV: return "DSV4_IDX_RING_KV";
+        case BufferId::DSV4_IDX_RING_SCORE: return "DSV4_IDX_RING_SCORE";
+        case BufferId::DSV4_IDX_POOL: return "DSV4_IDX_POOL";
+        case BufferId::DSV4_ROUTE_IDS: return "DSV4_ROUTE_IDS";
+        case BufferId::DSV4_ROUTE_WEIGHTS: return "DSV4_ROUTE_WEIGHTS";
+        case BufferId::DSV4_ROUTER_LOGITS: return "DSV4_ROUTER_LOGITS";
         case BufferId::_COUNT:
             return "_COUNT";
         }

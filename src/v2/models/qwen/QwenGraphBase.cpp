@@ -622,7 +622,7 @@ namespace llaminar2
         case FinalNormSource::ModelOutputNorm:
             // The QFN terminal mixer validates and binds its complete norm/down/up
             // chain in addBranchHeadRead; it never consumes an ordinary RMS gain.
-            if (!config_.flash_next)
+            if (!config_.usesResidualTrunk())
                 policy.norm_gamma = modelFinalNorm();
             break;
         case FinalNormSource::MTPSidecarNorm:
@@ -2199,7 +2199,7 @@ namespace llaminar2
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len);
 
-        if (!modelEmbeddingTable() || (!config_.flash_next && !modelFinalNorm()) || !modelLMHead())
+        if (!modelEmbeddingTable() || (!config_.usesResidualTrunk() && !modelFinalNorm()) || !modelLMHead())
         {
             LOG_ERROR("[QwenGraphBase] Weights not set! Call setWeights() first.");
             throw std::runtime_error("QwenStandardGraph weights not initialized");
@@ -2526,7 +2526,7 @@ namespace llaminar2
             LOG_ERROR("[QwenGraphBase] Embedding weights required but not set");
             throw std::runtime_error("QwenStandardGraph embedding weights not initialized");
         }
-        if (has_lm_head && ((!config_.flash_next && !modelFinalNorm()) || !modelLMHead()))
+        if (has_lm_head && ((!config_.usesResidualTrunk() && !modelFinalNorm()) || !modelLMHead()))
         {
             LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
             throw std::runtime_error("QwenStandardGraph LM head weights not initialized");
@@ -3116,7 +3116,7 @@ namespace llaminar2
             // -----------------------------------------------------------------
             if (pp_stage.has_lm_head)
             {
-                if ((!config_.flash_next && !modelFinalNorm()) || !modelLMHead())
+                if ((!config_.usesResidualTrunk() && !modelFinalNorm()) || !modelLMHead())
                 {
                     LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
                     throw std::runtime_error("LM head weights not initialized for unified PP graph");
@@ -3439,7 +3439,7 @@ namespace llaminar2
 
         TensorBase *head_rows = hidden_states;
         BufferId head_rows_id = BufferId::HIDDEN_STATE;
-        if (config_.flash_next)
+        if (config_.usesResidualTrunk())
         {
             head_rows = buffers_.layer_buffers.normalized;
             head_rows_id = BufferId::NORMALIZED;
@@ -3909,10 +3909,10 @@ namespace llaminar2
 
         // Model-level weights
         tensors.model_weights["embedding_table"] = modelEmbeddingTable();
-        tensors.model_weights["final_norm"] = config_.flash_next ? nullptr : modelFinalNorm();
+        tensors.model_weights["final_norm"] = config_.usesResidualTrunk() ? nullptr : modelFinalNorm();
         tensors.model_weights["lm_head"] = modelLMHead();
         tensors.model_weight_bindings["embedding_table"] = modelEmbeddingBinding();
-        tensors.model_weight_bindings["final_norm"] = config_.flash_next ? nullptr : modelFinalNormBinding();
+        tensors.model_weight_bindings["final_norm"] = config_.usesResidualTrunk() ? nullptr : modelFinalNormBinding();
         tensors.model_weight_bindings["lm_head"] = modelLMHeadBinding();
 
         // Layer weight accessor
@@ -4220,7 +4220,7 @@ namespace llaminar2
         BufferId input_buffer_id,
         const int32_t *sequence_lengths_device)
     {
-        if (config_.flash_next)
+        if (config_.usesResidualTrunk())
             return addBranchHeadRead(graph, hidden, normalized_out, prev_node,
                                      n_tokens, device, input_buffer_id);
         RMSNormStage::Params norm_params;
@@ -4523,7 +4523,7 @@ namespace llaminar2
         return {local_n_heads, local_n_kv_heads};
     }
 
-    std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> QwenGraphBase::addPreAttentionNorm(
+    std::optional<ResidualBlockRead> QwenGraphBase::addPreAttentionNorm(
         ComputeGraph &graph,
         const std::string &prefix,
         ActivationBuffers &buffers,
@@ -4536,7 +4536,7 @@ namespace llaminar2
     {
         if (workload != GraphLayerWorkload::MainDecoder && workload != GraphLayerWorkload::MTPDepth)
             throw std::invalid_argument("Pre-attention norm requires an explicit main or MTP workload");
-        if (config_.flash_next)
+        if (config_.usesResidualTrunk())
         {
             if (mtp_kv_cache_only_graph_active_)
             {

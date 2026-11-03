@@ -245,6 +245,28 @@ namespace llaminar2
             return "QWEN4EXP_PLE_GATE";
         case ComputeStageType::QWEN4EXP_PLE_CONV:
             return "QWEN4EXP_PLE_CONV";
+        case ComputeStageType::DEEPSEEK_V4_HC_READ:
+            return "DEEPSEEK_V4_HC_READ";
+        case ComputeStageType::DEEPSEEK_V4_HC_WRITE:
+            return "DEEPSEEK_V4_HC_WRITE";
+        case ComputeStageType::DEEPSEEK_V4_HC_EXPAND:
+            return "DEEPSEEK_V4_HC_EXPAND";
+        case ComputeStageType::DEEPSEEK_V4_HEAD_NORM_ROPE:
+            return "DEEPSEEK_V4_HEAD_NORM_ROPE";
+        case ComputeStageType::DEEPSEEK_V4_COMPRESSOR_STORE:
+            return "DEEPSEEK_V4_COMPRESSOR_STORE";
+        case ComputeStageType::DEEPSEEK_V4_COMPRESSOR_POOL:
+            return "DEEPSEEK_V4_COMPRESSOR_POOL";
+        case ComputeStageType::DEEPSEEK_V4_RAW_STORE:
+            return "DEEPSEEK_V4_RAW_STORE";
+        case ComputeStageType::DEEPSEEK_V4_INDEXER_TOPK:
+            return "DEEPSEEK_V4_INDEXER_TOPK";
+        case ComputeStageType::DEEPSEEK_V4_SPARSE_ATTENTION:
+            return "DEEPSEEK_V4_SPARSE_ATTENTION";
+        case ComputeStageType::DEEPSEEK_V4_GROUPED_PROJECTION:
+            return "DEEPSEEK_V4_GROUPED_PROJECTION";
+        case ComputeStageType::DEEPSEEK_V4_ROUTE:
+            return "DEEPSEEK_V4_ROUTE";
         case ComputeStageType::QWEN4EXP_COMMIT_CONV_HISTORY:
             return "QWEN4EXP_COMMIT_CONV_HISTORY";
         case ComputeStageType::QWEN4EXP_COMMIT_TOKEN_HISTORY:

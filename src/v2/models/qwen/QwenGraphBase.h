@@ -38,6 +38,7 @@
 #include "../../execution/compute_stages/stages/AttentionConsumerBinding.h"
 #include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorResidualBinding.h"
 #include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
+#include "ResidualBlockRead.h"
 #include "../../execution/local_execution/device/DeviceContext.h"
 #include "../../execution/config/ExecutionPolicy.h"
 #include "../../memory/BufferArena.h"
@@ -1242,7 +1243,7 @@ namespace llaminar2
          * capability for ordinary residual addition or a read-only KV probe.
          * @throws std::invalid_argument For an invalid workload tag, before graph mutation.
          */
-        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> addPreAttentionNorm(
+        std::optional<ResidualBlockRead> addPreAttentionNorm(
             ComputeGraph &graph,
             const std::string &prefix,
             ActivationBuffers &buffers,
@@ -1267,7 +1268,7 @@ namespace llaminar2
          * @param block Attention or FFN role selecting a paired weight bundle.
          * @return Capability required to append the corresponding branch write.
          */
-        Qwen4ExpHyperconnectionBuilder::BlockRead addBranchBlockRead(
+        ResidualBlockRead addBranchBlockRead(
             ComputeGraph &graph, const std::string &prefix, ActivationBuffers &buffers,
             int layer_idx, int rows, DeviceId device, ResidualBlock block,
             const Qwen4ExpPredictorResidualBinding *predictor = nullptr);
@@ -1292,8 +1293,21 @@ namespace llaminar2
          * @param dependency Final block/collective producer of ATTN_PROJ.
          * @return Updated-trunk producer consumed by the following block.
          */
+        /** @brief DeepSeek-V4 Sinkhorn block read (mix GEMM + split/read/norm stage). */
+        DeepSeekV4BlockRead addDeepSeekV4BlockRead(ComputeGraph &graph, const std::string &prefix,
+            ActivationBuffers &buffers, int layer_idx, int rows, DeviceId device, ResidualBlock block);
+        /** @brief DeepSeek-V4 Sinkhorn trunk write consuming its paired read. */
+        std::string addDeepSeekV4BlockWrite(ComputeGraph &graph, DeepSeekV4BlockRead &&read,
+            ActivationBuffers &buffers, const std::string &dependency);
+        /** @brief DeepSeek-V4 terminal head read (pre mix + output RMSNorm) published as final_norm. */
+        std::string addDeepSeekV4HeadRead(ComputeGraph &graph, TensorBase *hidden, TensorBase *normalized_out,
+            const std::string &dependency, int rows, DeviceId device, BufferId input_buffer_id);
+        /** @brief Hyper-connection mix projection of the flattened trunk into DSV4_HC_MIXES. */
+        std::string addDeepSeekV4MixGEMM(ComputeGraph &graph, const std::string &node, const WeightBinding *fn,
+            TensorBase *trunk, BufferId trunk_id, int rows, DeviceId device);
+
         std::string addBranchBlockWrite(ComputeGraph &graph,
-            Qwen4ExpHyperconnectionBuilder::BlockRead &&read,
+            ResidualBlockRead &&read,
             ActivationBuffers &buffers, const std::string &dependency,
             const Qwen4ExpPredictorTrunkTarget *predictor_output = nullptr);
 
@@ -1335,7 +1349,7 @@ namespace llaminar2
         /** @brief Identity of the compute-width vocabulary lookup/allreduce output. */
         BufferId embeddingBufferId() const noexcept
         {
-            return config_.flash_next ? BufferId::QFN_EMBEDDING_ROWS : BufferId::HIDDEN_STATE;
+            return config_.usesResidualTrunk() ? BufferId::QFN_EMBEDDING_ROWS : BufferId::HIDDEN_STATE;
         }
 
         /**

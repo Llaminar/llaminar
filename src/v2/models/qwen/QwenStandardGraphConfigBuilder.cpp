@@ -13,6 +13,7 @@
 #include "../qwen35/Qwen35GraphConfigBuilder.h"
 #include "../qwen35moe/Qwen35MoEGraphConfigBuilder.h"
 #include "../qwen4exp/Qwen4ExpGraphConfigBuilder.h"
+#include "../deepseek4/DeepSeekV4GraphConfigBuilder.h"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -47,6 +48,8 @@ namespace llaminar2
         }
         if (model_type == "qwen4exp")
             return std::make_unique<Qwen4ExpGraphConfigBuilder>();
+        if (model_type == "deepseek4")
+            return std::make_unique<DeepSeekV4GraphConfigBuilder>();
         return nullptr;
     }
 

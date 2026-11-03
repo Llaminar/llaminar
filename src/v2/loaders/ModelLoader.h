@@ -112,6 +112,7 @@ namespace llaminar2
         IQ3_S = 21,
         IQ2_S = 22,
         IQ4_XS = 23,
+        I32 = 26, ///< Integer tables such as DeepSeek-V4 token-id hash routing.
         IQ1_M = 29
     };
 

@@ -1034,6 +1034,49 @@ namespace llaminar2
                 float *probabilities =
                     result.router_logits.data() +
                     static_cast<size_t>(row) * num_experts;
+                if (!router_scoring_.isSoftmax())
+                {
+                    // DeepSeek-V4: s = sqrt(softplus(logit)); select by s + bias
+                    // (or the token's hash row); weights are the unbiased s,
+                    // normalized and scaled. Ties break to the lower expert id.
+                    for (int e = 0; e < num_experts; ++e)
+                    {
+                        const float x = probabilities[e];
+                        probabilities[e] = std::sqrt(x > 20.0f ? x : std::log1p(std::exp(x)));
+                    }
+                    thread_local std::vector<int> chosen;
+                    chosen.resize(static_cast<size_t>(top_k));
+                    if (router_scoring_.hash_table)
+                    {
+                        const int token = router_scoring_.token_ids[row];
+                        for (int k = 0; k < top_k; ++k)
+                            chosen[k] = router_scoring_.hash_table[static_cast<size_t>(token) * top_k + k];
+                    }
+                    else
+                    {
+                        thread_local std::vector<int> order;
+                        order.resize(static_cast<size_t>(num_experts));
+                        std::iota(order.begin(), order.end(), 0);
+                        const float *bias = router_scoring_.selection_bias;
+                        std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                            [probabilities, bias](int left, int right) {
+                                const float l = probabilities[left] + bias[left];
+                                const float r = probabilities[right] + bias[right];
+                                return l > r || (l == r && left < right);
+                            });
+                        std::copy(order.begin(), order.begin() + top_k, chosen.begin());
+                    }
+                    float sum = 0.0f;
+                    for (int k = 0; k < top_k; ++k) sum += probabilities[chosen[k]];
+                    for (int k = 0; k < top_k; ++k)
+                    {
+                        const size_t route_index = static_cast<size_t>(row) * top_k + k;
+                        result.expert_indices[route_index] = chosen[k];
+                        result.expert_weights[route_index] =
+                            probabilities[chosen[k]] / sum * router_scoring_.route_scale;
+                    }
+                    continue;
+                }
                 primitives::softmax_row_fp32(probabilities, num_experts);
 
                 /*

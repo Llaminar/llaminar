@@ -10,6 +10,7 @@
 
 #pragma once
 #include "models/qwen4exp/Qwen4ExpPredictorPolicy.h"
+#include "models/deepseek4/DeepSeekV4BufferLayout.h"
 #include "loaders/SharedPredictorGGUFSource.h"
 #include <string>
 #include <vector>
@@ -107,6 +108,8 @@ namespace llaminar2
 
         /** Validated Flash Next metadata; absent for every other model family. */
         std::optional<Qwen4ExpMemoryGeometry> flash_next;
+        /** Validated DeepSeek-V4 metadata; absent for every other model family. */
+        std::optional<DeepSeekV4MemoryGeometry> deepseek_v4;
 
         /** @brief Number of routed experts addressable by each MoE router. */
         int expert_count = 0;

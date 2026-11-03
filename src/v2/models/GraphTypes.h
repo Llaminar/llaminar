@@ -42,6 +42,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/ToolCallTypes.h"
 #include "qwen4exp/Qwen4ExpWeights.h"
+#include "deepseek4/DeepSeekV4Weights.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -65,6 +66,7 @@ namespace llaminar2
     class TensorBase;
     class ReadAheadNativeResourceFamily;
     class Qwen4ExpConfig;
+    class DeepSeekV4Config;
     class ResolvedImmutableRowTablePlacement;
     class IKVCache;
     class IMPIContext;
@@ -125,6 +127,13 @@ namespace llaminar2
 
         /// Exact Flash Next metadata contract. Null denotes the ordinary single residual stream.
         std::shared_ptr<const Qwen4ExpConfig> flash_next;
+
+        /// Exact DeepSeek-V4 metadata contract (Sinkhorn hyper-connections, compressed sparse
+        /// attention, sqrt-softplus routing). Mutually exclusive with flash_next.
+        std::shared_ptr<const DeepSeekV4Config> deepseek_v4;
+
+        /** @return Whether the residual stream is a widened multi-branch trunk. */
+        [[nodiscard]] bool usesResidualTrunk() const noexcept { return flash_next || deepseek_v4; }
 
         /// Exact admitted attention program; graph construction must not re-read DebugEnv.
         qwen4exp::QwenSparseAttentionArithmetic attention_arithmetic =
@@ -1063,6 +1072,7 @@ namespace llaminar2
     struct LayerWeights
     {
         Qwen4ExpLayerWeights<TensorBase *> flash_next; ///< Typed branch, indexer and PLE views.
+        DeepSeekV4LayerWeights<TensorBase *> deepseek_v4; ///< DeepSeek-V4 extension views.
         // Attention weights (Full Attention layers)
         TensorBase *wq = nullptr;        ///< Query projection
         TensorBase *wk = nullptr;        ///< Key projection
@@ -1129,6 +1139,7 @@ namespace llaminar2
     struct LayerWeightBindings
     {
         Qwen4ExpLayerWeights<const WeightBinding *> flash_next; ///< Frozen extension identities.
+        DeepSeekV4LayerWeights<const WeightBinding *> deepseek_v4; ///< Frozen DeepSeek-V4 identities.
         // Attention weights (Full Attention layers)
         const WeightBinding *wq = nullptr;
         const WeightBinding *wk = nullptr;
@@ -1335,6 +1346,7 @@ namespace llaminar2
     {
         LayerWeights weights;
         weights.flash_next = mapQwen4ExpLayerWeights(bindings.flash_next, legacyTensor);
+        weights.deepseek_v4 = mapDeepSeekV4LayerWeights(bindings.deepseek_v4, legacyTensor);
         weights.wq = legacyTensor(bindings.wq);
         weights.wk = legacyTensor(bindings.wk);
         weights.wv = legacyTensor(bindings.wv);
@@ -1409,6 +1421,7 @@ namespace llaminar2
     struct ModelWeightBindings
     {
         HyperConnectionWeights<const WeightBinding *> hyper_connection_head;
+        DeepSeekV4HyperConnectionWeights<const WeightBinding *> deepseek_v4_head; ///< output_hc_{fn,base,scale}.
         const WeightBinding *embedding_table = nullptr;
         const WeightBinding *final_norm = nullptr;
         const WeightBinding *lm_head = nullptr;
@@ -1428,6 +1441,7 @@ namespace llaminar2
     struct ModelWeights
     {
         HyperConnectionWeights<TensorBase *> hyper_connection_head;
+        DeepSeekV4HyperConnectionWeights<TensorBase *> deepseek_v4_head; ///< output_hc_{fn,base,scale}.
         TensorBase *embedding_table = nullptr; ///< [vocab_size, d_model]
         TensorBase *final_norm = nullptr;      ///< [d_model]
         TensorBase *lm_head = nullptr;         ///< [vocab_size, d_model]
@@ -1441,6 +1455,8 @@ namespace llaminar2
     {
         ModelWeights weights;
         weights.hyper_connection_head = mapHyperConnectionWeights(bindings.hyper_connection_head, legacyTensor);
+        weights.deepseek_v4_head = {legacyTensor(bindings.deepseek_v4_head.fn), legacyTensor(bindings.deepseek_v4_head.base),
+                                    legacyTensor(bindings.deepseek_v4_head.scale)};
         weights.embedding_table = legacyTensor(bindings.embedding_table);
         weights.final_norm = legacyTensor(bindings.final_norm);
         weights.lm_head = legacyTensor(bindings.lm_head);
@@ -1598,6 +1614,9 @@ namespace llaminar2
         bindings.hyper_connection_head = loadHyperConnectionWeights(
             [&weight_set](const std::string &name) { return optionalGlobalBinding(weight_set, name); },
             "output_hc_");
+        bindings.deepseek_v4_head = {optionalGlobalBinding(weight_set, "output_hc_fn.weight"),
+                                     optionalGlobalBinding(weight_set, "output_hc_base.weight"),
+                                     optionalGlobalBinding(weight_set, "output_hc_scale.weight")};
         bindings.mtp = makeMTPWeightBindings(weight_set);
         bindings.get_layer_weights = [&weight_set, preferred_device](int layer_idx)
         {
@@ -1647,6 +1666,7 @@ namespace llaminar2
             layer.shared_expert_down = get("ffn_down_shexp.weight");
             layer.shared_expert_gate_inp = get("ffn_gate_inp_shexp.weight");
             layer.flash_next = loadQwen4ExpLayerWeights(get);
+            layer.deepseek_v4 = loadDeepSeekV4LayerWeights(get);
             return layer;
         };
         return bindings;

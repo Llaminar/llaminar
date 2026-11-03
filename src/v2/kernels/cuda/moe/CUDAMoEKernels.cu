@@ -21067,10 +21067,164 @@ namespace
             return 8;
         return 16;
     }
+
+    /**
+     * @brief DeepSeek-V4 sqrt(softplus) selection expressed as router logits.
+     *
+     * Each row's raw logits are replaced by log(s) for the selected experts and
+     * -1e30 elsewhere, where s = sqrt(softplus(logit)) and the selection is the
+     * top-k of s + bias (ascending expert id on ties) or the token's hash row.
+     * The unchanged softmax/top-k kernels then select exactly that set with
+     * normalized weights s / sum(s); the route scale is applied afterwards.
+     */
+    __global__ void scored_router_logit_transform_kernel(
+        float *__restrict__ logits, int seq_len, int num_experts, int top_k,
+        const float *__restrict__ bias, const int32_t *__restrict__ hash_table, int hash_vocab,
+        const int32_t *__restrict__ token_ids, const int *__restrict__ effective_seq_len)
+    {
+        const int row = blockIdx.x;
+        int live = seq_len;
+        if (effective_seq_len)
+            live = min(max(*effective_seq_len, 0), seq_len);
+        if (row >= live)
+            return;
+        __shared__ float scores[kMaxExperts];
+        __shared__ float keys[kMaxExperts];
+        __shared__ int chosen[kMaxTopK];
+        __shared__ float best_value[kThreads];
+        __shared__ int best_index[kThreads];
+        float *row_logits = logits + static_cast<size_t>(row) * num_experts;
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        {
+            const float x = row_logits[e];
+            const float s = sqrtf(x > 20.0f ? x : log1pf(expf(x)));
+            scores[e] = s;
+            keys[e] = hash_table ? 0.0f : s + bias[e];
+        }
+        __syncthreads();
+        if (hash_table)
+        {
+            if (threadIdx.x == 0)
+            {
+                const int token = token_ids[row];
+                if (token < 0 || token >= hash_vocab)
+                    __trap();
+                for (int k = 0; k < top_k; ++k)
+                    chosen[k] = hash_table[static_cast<size_t>(token) * top_k + k];
+            }
+        }
+        else
+        {
+            for (int k = 0; k < top_k; ++k)
+            {
+                float value = -INFINITY;
+                int index = num_experts;
+                for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+                    if (keys[e] > value || (keys[e] == value && e < index))
+                    {
+                        value = keys[e];
+                        index = e;
+                    }
+                best_value[threadIdx.x] = value;
+                best_index[threadIdx.x] = index;
+                __syncthreads();
+                for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+                {
+                    if (threadIdx.x < stride)
+                    {
+                        const float other = best_value[threadIdx.x + stride];
+                        const int other_index = best_index[threadIdx.x + stride];
+                        if (other > best_value[threadIdx.x] ||
+                            (other == best_value[threadIdx.x] && other_index < best_index[threadIdx.x]))
+                        {
+                            best_value[threadIdx.x] = other;
+                            best_index[threadIdx.x] = other_index;
+                        }
+                    }
+                    __syncthreads();
+                }
+                if (threadIdx.x == 0)
+                {
+                    chosen[k] = best_index[0];
+                    keys[best_index[0]] = -INFINITY;
+                }
+                __syncthreads();
+            }
+        }
+        __syncthreads();
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        {
+            bool selected = false;
+            for (int k = 0; k < top_k; ++k)
+                selected |= chosen[k] == e;
+            row_logits[e] = selected ? logf(scores[e]) : -1.0e30f;
+        }
+    }
+
+    /** @brief Multiply published prefill route weights by the route scale. */
+    __global__ void scale_route_weights_kernel(
+        float *__restrict__ weights, int seq_len, int top_k, float scale, const int *__restrict__ effective_seq_len)
+    {
+        int live = seq_len;
+        if (effective_seq_len)
+            live = min(max(*effective_seq_len, 0), seq_len);
+        const int index = blockIdx.x * blockDim.x + threadIdx.x;
+        if (index < live * top_k)
+            weights[index] *= scale;
+    }
+
+    /** @brief Multiply the published decode runtime route weights (and legacy copy) by the route scale. */
+    __global__ void scale_runtime_route_weights_kernel(
+        DeviceMoELayerRuntimeView *__restrict__ runtime, float *legacy_weights, int top_k, float scale)
+    {
+        const int k = threadIdx.x;
+        if (k >= top_k)
+            return;
+        runtime->topk_weights[k] *= scale;
+        if (legacy_weights)
+            legacy_weights[k] *= scale;
+    }
 }
 
 extern "C"
 {
+    bool cudaMoE_scored_router_logit_transform(
+        float *logits, int seq_len, int num_experts, int top_k,
+        const float *bias, const int32_t *hash_table, int hash_vocab, const int32_t *token_ids,
+        const int *effective_seq_len, int device_idx, void *stream)
+    {
+        if (!logits || !stream || seq_len <= 0 || num_experts <= 0 || num_experts > kMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK || top_k > num_experts || (hash_table ? !token_ids : !bias))
+            return false;
+        cudaSetDevice(device_idx);
+        scored_router_logit_transform_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, seq_len, num_experts, top_k, bias, hash_table, hash_vocab, token_ids, effective_seq_len);
+        return finishLaunch("cudaMoE_scored_router_logit_transform");
+    }
+
+    bool cudaMoE_scale_route_weights(float *weights, int seq_len, int top_k, float scale,
+                                     const int *effective_seq_len, int device_idx, void *stream)
+    {
+        if (!weights || !stream || seq_len <= 0 || top_k <= 0)
+            return false;
+        cudaSetDevice(device_idx);
+        const int total = seq_len * top_k;
+        scale_route_weights_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            weights, seq_len, top_k, scale, effective_seq_len);
+        return finishLaunch("cudaMoE_scale_route_weights");
+    }
+
+    bool cudaMoE_scale_runtime_route_weights(void *runtime_layer, float *legacy_weights, int top_k, float scale,
+                                             int device_idx, void *stream)
+    {
+        if (!runtime_layer || !stream || top_k <= 0 || top_k > kMaxTopK)
+            return false;
+        cudaSetDevice(device_idx);
+        scale_runtime_route_weights_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layer), legacy_weights, top_k, scale);
+        return finishLaunch("cudaMoE_scale_runtime_route_weights");
+    }
+
     /**
      * @brief Inspect the production row-major Y/Z launch decomposition.
      *

@@ -9,6 +9,7 @@
  */
 #include "Qwen4ExpGraphConfigBuilder.h"
 #include "Qwen4ExpConfig.h"
+#include "../deepseek4/DeepSeekV4Config.h"
 #include "../GraphTypes.h"
 #include "../qwen35moe/Qwen35MoEGraphConfigBuilder.h"
 #include "../../interfaces/IModelContext.h"
@@ -18,6 +19,12 @@ namespace llaminar2
 {
 int GraphConfig::residualWidth() const
 {
+    if (deepseek_v4)
+    {
+        if (flash_next || d_model != deepseek_v4->hidden())
+            throw std::invalid_argument("DeepSeek-V4 graph compute width disagrees with its immutable metadata");
+        return deepseek_v4->residualWidth();
+    }
     if (!flash_next)
         return d_model;
     if (d_model != static_cast<int>(flash_next->activations().compute))

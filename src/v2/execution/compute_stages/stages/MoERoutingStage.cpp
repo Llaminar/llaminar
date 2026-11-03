@@ -868,6 +868,35 @@ namespace llaminar2
         const int num_experts = params_.num_experts;
         const int top_k = params_.top_k;
 
+        if (params_.scoring_function != MoERouterScoringPolicy::Function::Softmax)
+        {
+            // Resolve frozen policy tensors on the routing device and install
+            // the policy on this layer's routed pipeline kernel. Host-only work:
+            // pointers are stable, nothing is transferred or synchronized here.
+            const bool gpu = params_.device_id.is_gpu();
+            const auto address = [gpu](const TensorBase *tensor) -> const void * {
+                return tensor ? (gpu ? tensor->gpu_data_ptr() : tensor->raw_data()) : nullptr;
+            };
+            MoERouterScoringPolicy policy;
+            policy.function = params_.scoring_function;
+            policy.selection_bias = static_cast<const float *>(address(params_.scoring_selection_bias));
+            policy.route_scale = params_.scoring_route_scale;
+            policy.hash_table = static_cast<const int32_t *>(address(params_.scoring_hash_table));
+            policy.hash_vocab = params_.scoring_hash_table ? static_cast<int>(params_.scoring_hash_table->rows()) : 0;
+            policy.token_ids = params_.scoring_token_ids;
+            if (policy.hash_table ? !policy.token_ids : !policy.selection_bias)
+            {
+                LOG_ERROR("[MoERoutingStage] scoring policy lacks its bias or hash-routing operands");
+                return false;
+            }
+            if (params_.force_decode_equivalent_verifier_prefill)
+            {
+                LOG_ERROR("[MoERoutingStage] grouped verifier routing does not implement the scoring policy");
+                return false;
+            }
+            ensureMoEKernel()->setRouterScoringPolicy(policy);
+        }
+
         if (params_.force_decode_equivalent_verifier_prefill)
             return executeDecodeEquivalentVerifierPrefill(ctx);
 
@@ -1628,6 +1657,10 @@ namespace llaminar2
         // Gate weights are model weights, not arena-managed
         if (params_.gate_weights)
             contract.addWeight(params_.gate_weights);
+        if (params_.scoring_selection_bias)
+            contract.addWeight(const_cast<TensorBase *>(params_.scoring_selection_bias));
+        if (params_.scoring_hash_table)
+            contract.addWeight(const_cast<TensorBase *>(params_.scoring_hash_table));
 
         return contract;
     }

@@ -426,6 +426,7 @@ if(HAVE_CUDA)
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
         kernels/cuda/gemm/CUDAQ8ResidualCorrection.cu # Explicit two-term native Q8 activation projection
         kernels/cuda/qwen4exp/CUDAQwen4ExpKernels.cu # Flash Next residual and PLE primitives
+        kernels/cuda/deepseek4/CUDADeepSeekV4Kernels.cu # DeepSeek-V4 HC, compressor, indexer, sparse attention, routing
         kernels/cuda/qwen4exp/CUDADiagnosticSnapshotCopy.cu
         kernels/cuda/qwen4exp/CUDAImmutableLookupKernels.cu
         kernels/cuda/qwen4exp/CUDAImmutableFixedHeadLookupKernels.cu
@@ -1962,6 +1963,13 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/qwen4exp/Qwen4ExpKernels.cpp
     kernels/common/DiagnosticSnapshotCopy.cpp
     kernels/cpu/qwen4exp/CPUQwen4ExpKernels.cpp
+    kernels/deepseek4/DeepSeekV4Kernels.cpp
+    kernels/cpu/deepseek4/CPUDeepSeekV4Kernels.cpp
+    execution/compute_stages/stages/deepseek4/DeepSeekV4PrimitiveStage.cpp
+    models/deepseek4/DeepSeekV4Config.cpp
+    models/deepseek4/DeepSeekV4GraphConfigBuilder.cpp
+    models/deepseek4/DeepSeekV4BufferLayout.cpp
+    models/deepseek4/DeepSeekV4Graph.cpp
     kernels/cpu/qwen4exp/CPUImmutableLookupKernels.cpp
     kernels/qwen4exp/ImmutableFixedHeadLookupKernels.cpp
     kernels/qwen4exp/QwenSparseAttention.cpp

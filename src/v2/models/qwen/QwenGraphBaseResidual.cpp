@@ -10,6 +10,9 @@
 #include "QwenGraphBase.h"
 #include "../qwen4exp/Qwen4ExpConfig.h"
 #include "../qwen4exp/Qwen4ExpHCUpArithmetic.h"
+#include "../deepseek4/DeepSeekV4Config.h"
+#include "../../execution/compute_stages/stages/deepseek4/DeepSeekV4PrimitiveStage.h"
+#include "../../execution/compute_stages/ComputeStageFactory.h"
 #include <stdexcept>
 #include <utility>
 
@@ -173,11 +176,17 @@ DeviceRowRange QwenGraphBase::singleRequestProjectionQueryRows(int capacity, Dev
     throw std::invalid_argument("Counted projection has no authenticated ordinary query or grouped verifier authority");
 }
 
-Qwen4ExpHyperconnectionBuilder::BlockRead QwenGraphBase::addBranchBlockRead(
+ResidualBlockRead QwenGraphBase::addBranchBlockRead(
     ComputeGraph &graph, const std::string &prefix, ActivationBuffers &buffers,
     int layer_idx, int rows, DeviceId device, ResidualBlock block,
     const Qwen4ExpPredictorResidualBinding *predictor)
 {
+    if (config_.deepseek_v4)
+    {
+        if (predictor)
+            throw std::invalid_argument("DeepSeek-V4 has no Qwen4Exp predictor residual binding");
+        return ResidualBlockRead(addDeepSeekV4BlockRead(graph, prefix, buffers, layer_idx, rows, device, block));
+    }
     if(!predictor && forward_input_construction_)applyForwardGraphConstructionIntent(graph,*forward_input_construction_);
     const auto binding = predictor ? predictor->weights().fa_block.flash_next
                                    : layerWeightBindingsForGraph(layer_idx).flash_next;
@@ -203,20 +212,27 @@ Qwen4ExpHyperconnectionBuilder::BlockRead QwenGraphBase::addBranchBlockRead(
         context.arithmetic = Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
     else if (usesHCUpCorrection(config_,prepared_read.up))
         context.upProjectionRows = singleRequestProjectionQueryRows(rows, device);
-    return Qwen4ExpHyperconnectionBuilder::appendRead(graph, context,
+    return ResidualBlockRead(Qwen4ExpHyperconnectionBuilder::appendRead(graph, context,
         {prepared_read,
          Qwen4ExpPreparedProjection(*weights.inject, *prepared_weight_store_, device)},
         readBuffers(buffers, buffers.current_hidden, buffers.idFor(BufferId::HIDDEN_STATE),
-                    buffers.normalized, buffers.idFor(BufferId::NORMALIZED)), {});
+                    buffers.normalized, buffers.idFor(BufferId::NORMALIZED)), {}));
 }
 
 std::string QwenGraphBase::addBranchBlockWrite(ComputeGraph &graph,
-    Qwen4ExpHyperconnectionBuilder::BlockRead &&read, ActivationBuffers &buffers,
+    ResidualBlockRead &&read, ActivationBuffers &buffers,
     const std::string &dependency, const Qwen4ExpPredictorTrunkTarget *predictor_output)
 {
     if (!buffers.attn_proj || !buffers.current_hidden || dependency.empty())
         throw std::invalid_argument("Flash Next branch write requires a completed block and original trunk");
-    return Qwen4ExpHyperconnectionBuilder::appendWrite(graph, std::move(read),
+    if (auto *dsv4 = std::get_if<DeepSeekV4BlockRead>(&read.value()))
+    {
+        if (predictor_output)
+            throw std::invalid_argument("DeepSeek-V4 has no Qwen4Exp predictor trunk target");
+        return addDeepSeekV4BlockWrite(graph, std::move(*dsv4), buffers, dependency);
+    }
+    return Qwen4ExpHyperconnectionBuilder::appendWrite(graph,
+        std::move(std::get<Qwen4ExpHyperconnectionBuilder::BlockRead>(read.value())),
         {{*buffers.attn_proj, buffers.idFor(BufferId::ATTN_PROJ)},
          branchBuffer(buffers, BufferId::QFN_HC_WRITE_LOGITS),
          predictor_output ? predictor_output->binding()
@@ -248,6 +264,8 @@ std::string QwenGraphBase::addBranchHeadRead(ComputeGraph &graph, TensorBase *hi
     TensorBase *normalized_out, const std::string &dependency,
     int rows, DeviceId device, BufferId input_buffer_id)
 {
+    if (config_.deepseek_v4)
+        return addDeepSeekV4HeadRead(graph, hidden, normalized_out, dependency, rows, device, input_buffer_id);
     if(forward_input_construction_)applyForwardGraphConstructionIntent(graph,*forward_input_construction_);
     const auto prepared_read=readWeights(modelHyperConnectionHeadBindings(),prepared_weight_store_,device);
     auto context = mixerContext(config_, mpi_ctx_.get(), "hc_head_", "final_norm",
@@ -268,10 +286,20 @@ std::string QwenGraphBase::addEmbeddingTrunkExpansion(ComputeGraph &graph,
     TensorBase *embedding, TensorBase *trunk, const std::string &dependency,
     int rows, DeviceId device)
 {
-    if (!config_.flash_next)
+    if (!config_.usesResidualTrunk())
         return dependency;
     if (!embedding || !trunk || dependency.empty())
         throw std::invalid_argument("Flash Next embedding expansion requires reconstructed compute rows and trunk storage");
+    if (config_.deepseek_v4)
+    {
+        using Stage = DeepSeekV4PrimitiveStage;
+        graph.addNode("embedding_expand", std::make_unique<Stage>(Stage::Params{
+            .device_id = device, .mpi_ctx = mpi_ctx_.get(), .rows = modelExtensionRows(rows, device),
+            .operation = Stage::HCExpand{config_.deepseek_v4->hcMult(), config_.d_model,
+                {*embedding, BufferId::QFN_EMBEDDING_ROWS}, {*trunk, BufferId::HIDDEN_STATE}}}), device);
+        graph.addDependency("embedding_expand", dependency);
+        return "embedding_expand";
+    }
     using Stage = Qwen4ExpPrimitiveStage;
     graph.addNode("embedding_expand", std::make_unique<Stage>(Stage::Params{
         .device_id = device, .mpi_ctx = mpi_ctx_.get(), .rows = modelExtensionRows(rows,device),
@@ -283,11 +311,153 @@ std::string QwenGraphBase::addEmbeddingTrunkExpansion(ComputeGraph &graph,
 
 TensorBase *QwenGraphBase::embeddingDestination(TensorBase *ordinary_trunk) const
 {
-    if (!config_.flash_next)
+    if (!config_.usesResidualTrunk())
         return ordinary_trunk;
     auto *tensor = buffers_.layer_buffers.get(BufferId::QFN_EMBEDDING_ROWS);
     if (!tensor)
         throw std::invalid_argument("Flash Next vocabulary lookup requires QFN_EMBEDDING_ROWS");
     return tensor;
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek-V4 Sinkhorn hyper-connections
+// ---------------------------------------------------------------------------
+namespace
+{
+/** @brief Require an admitted arena role for a DeepSeek-V4 mixer stage. */
+Qwen4ExpFloatBinding dsv4Buffer(ActivationBuffers &buffers, BufferId role)
+{
+    const auto id = buffers.idFor(role);
+    auto *tensor = buffers.get(id);
+    if (!tensor)
+        throw std::invalid_argument("DeepSeek-V4 is missing admitted arena buffer " + std::string(bufferIdName(id)));
+    return {*tensor, id};
+}
+
+/** @brief Require a frozen native FP32 operator weight (norm gain, Sinkhorn base/scale). */
+Qwen4ExpImmutableWeightBinding dsv4Gain(const WeightBinding *binding, const char *role)
+{
+    if (!binding || !binding->tensor)
+        throw std::invalid_argument(std::string("DeepSeek-V4 hyper-connection requires its frozen ") + role);
+    return Qwen4ExpImmutableWeightBinding(*binding->tensor);
+}
+} // namespace
+
+std::string QwenGraphBase::addDeepSeekV4MixGEMM(ComputeGraph &graph, const std::string &node,
+    const WeightBinding *fn, TensorBase *trunk, BufferId trunk_id, int rows, DeviceId device)
+{
+    if (!fn || !fn->tensor || !trunk)
+        throw std::invalid_argument("DeepSeek-V4 hyper-connection requires its frozen fn projection and trunk");
+    auto &buffers = buffers_.layer_buffers;
+    TensorBase *mixes = buffers.get(buffers.idFor(BufferId::DSV4_HC_MIXES));
+    if (!mixes)
+        throw std::invalid_argument("DeepSeek-V4 is missing admitted DSV4_HC_MIXES");
+    const int n = static_cast<int>(fn->tensor->shape()[0]);
+    const int k = static_cast<int>(fn->tensor->shape()[1]);
+    if (k != config_.residualWidth())
+        throw std::invalid_argument("DeepSeek-V4 hyper-connection fn width differs from the trunk width");
+    GEMMStage::Params params{
+        .device_id = device,
+        .A = trunk,
+        .B = fn->tensor,
+        .C = mixes,
+        .m = rows,
+        .n = n,
+        .k = k,
+        .a_buffer_id = trunk_id,
+        .c_buffer_id = buffers.idFor(BufferId::DSV4_HC_MIXES),
+        .prepared_ref = preparedRefForGraphWeight(fn, device),
+        .prepared_store = prepared_weight_store_,
+    };
+    graph.addNode(node, ComputeStageFactory::createGEMM(params), device);
+    return node;
+}
+
+DeepSeekV4BlockRead QwenGraphBase::addDeepSeekV4BlockRead(ComputeGraph &graph, const std::string &prefix,
+    ActivationBuffers &buffers, int layer_idx, int rows, DeviceId device, ResidualBlock block)
+{
+    if (forward_input_construction_) applyForwardGraphConstructionIntent(graph, *forward_input_construction_);
+    const auto &model = *config_.deepseek_v4;
+    const auto bindings = layerWeightBindingsForGraph(layer_idx);
+    const bool attention = block == ResidualBlock::Attention;
+    const auto &site = attention ? bindings.deepseek_v4.hc_attn : bindings.deepseek_v4.hc_ffn;
+    const std::string role = attention ? "attn" : "ffn";
+    const std::string mix_prefix = prefix + "hc_" + role + "_";
+    const auto stage_rows = modelExtensionRows(rows, device);
+    const std::string mixes = addDeepSeekV4MixGEMM(graph, mix_prefix + "mixes", site.fn, buffers.current_hidden,
+                                                   buffers.idFor(BufferId::HIDDEN_STATE), rows, device);
+    using Stage = DeepSeekV4PrimitiveStage;
+    Stage::HCRead read{
+        .hc = model.hcMult(), .hidden = config_.d_model, .head = false,
+        .normEps = model.normEps(), .hcEps = model.hcEps(), .outputEps = model.normEps(),
+        .sinkhornIters = model.sinkhornIters(),
+        .trunk = {*buffers.current_hidden, buffers.idFor(BufferId::HIDDEN_STATE)},
+        .mixes = dsv4Buffer(buffers, BufferId::DSV4_HC_MIXES),
+        .scale = dsv4Gain(site.scale, "scale"),
+        .base = dsv4Gain(site.base, "base"),
+        .gain = dsv4Gain(attention ? bindings.attn_norm : bindings.ffn_norm,
+                         attention ? "attn_norm (layer read)" : "ffn_norm (layer read)"),
+        .mixed = std::nullopt,
+        .output = {*buffers.normalized, buffers.idFor(BufferId::NORMALIZED)},
+        .post = dsv4Buffer(buffers, BufferId::DSV4_HC_POST),
+        .comb = dsv4Buffer(buffers, BufferId::DSV4_HC_COMB),
+    };
+    const std::string terminal = prefix + role + "_norm";
+    graph.addNode(terminal, std::make_unique<Stage>(Stage::Params{
+        .device_id = device, .mpi_ctx = mpi_ctx_.get(), .rows = stage_rows, .operation = std::move(read)}), device);
+    graph.addDependency(terminal, mixes);
+    return DeepSeekV4BlockRead(terminal, mix_prefix, device, stage_rows);
+}
+
+std::string QwenGraphBase::addDeepSeekV4BlockWrite(ComputeGraph &graph, DeepSeekV4BlockRead &&read,
+    ActivationBuffers &buffers, const std::string &dependency)
+{
+    using Stage = DeepSeekV4PrimitiveStage;
+    const Qwen4ExpFloatBinding trunk{*buffers.current_hidden, buffers.idFor(BufferId::HIDDEN_STATE)};
+    Stage::HCWrite write{
+        .hc = config_.deepseek_v4->hcMult(), .hidden = config_.d_model,
+        .block = {*buffers.attn_proj, buffers.idFor(BufferId::ATTN_PROJ)},
+        .post = dsv4Buffer(buffers, BufferId::DSV4_HC_POST),
+        .comb = dsv4Buffer(buffers, BufferId::DSV4_HC_COMB),
+        .trunk = trunk,
+        .output = trunk,
+    };
+    const std::string node = read.prefix() + "write";
+    graph.addNode(node, std::make_unique<Stage>(Stage::Params{
+        .device_id = read.device(), .mpi_ctx = mpi_ctx_.get(), .rows = read.rows(), .operation = std::move(write)}),
+        read.device());
+    graph.addDependency(node, dependency);
+    return node;
+}
+
+std::string QwenGraphBase::addDeepSeekV4HeadRead(ComputeGraph &graph, TensorBase *hidden,
+    TensorBase *normalized_out, const std::string &dependency, int rows, DeviceId device, BufferId input_buffer_id)
+{
+    if (forward_input_construction_) applyForwardGraphConstructionIntent(graph, *forward_input_construction_);
+    const auto &model = *config_.deepseek_v4;
+    const auto &head = weight_bindings_.deepseek_v4_head;
+    auto &buffers = buffers_.layer_buffers;
+    const std::string mixes = addDeepSeekV4MixGEMM(graph, "hc_head_mixes", head.fn, hidden, input_buffer_id, rows, device);
+    if (!dependency.empty()) graph.addDependency(mixes, dependency);
+    using Stage = DeepSeekV4PrimitiveStage;
+    Stage::HCRead read{
+        .hc = model.hcMult(), .hidden = config_.d_model, .head = true,
+        .normEps = model.normEps(), .hcEps = model.hcEps(), .outputEps = model.normEps(),
+        .sinkhornIters = model.sinkhornIters(),
+        .trunk = {*hidden, input_buffer_id},
+        .mixes = dsv4Buffer(buffers, BufferId::DSV4_HC_MIXES),
+        .scale = dsv4Gain(head.scale, "head scale"),
+        .base = dsv4Gain(head.base, "head base"),
+        .gain = dsv4Gain(modelFinalNormBinding(), "output norm"),
+        .mixed = std::nullopt,
+        .output = {*normalized_out, BufferId::NORMALIZED},
+        .post = std::nullopt,
+        .comb = std::nullopt,
+    };
+    graph.addNode("final_norm", std::make_unique<Stage>(Stage::Params{
+        .device_id = device, .mpi_ctx = mpi_ctx_.get(), .rows = modelExtensionRows(rows, device),
+        .operation = std::move(read)}), device);
+    graph.addDependency("final_norm", mixes);
+    return "final_norm";
 }
 } // namespace llaminar2

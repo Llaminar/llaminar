@@ -1998,7 +1998,7 @@ namespace llaminar2
         // Stage 1: Pre-attention RMSNorm (same as Qwen2)
         // =================================================================
         auto residual_read = predictor
-            ? std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead>{addBranchBlockRead(
+            ? std::optional<ResidualBlockRead>{addBranchBlockRead(
                 graph, prefix, buffers, layer_idx, total_tokens, device, ResidualBlock::Attention, predictor)}
             : addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm, total_tokens, layer_idx, device,
                 /*check_hybrid_q16=*/true, identity.source().workload());
