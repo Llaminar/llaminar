@@ -342,6 +342,10 @@ struct DevicePlanConfig
 
     /// Canonical observed topology for the optional rank-local compact projection transport.
     std::optional<PeerAccessCoverage> projection_peer_access;
+    /** Original inventory observation for explicitly declared mapped pooled transport. */
+    std::optional<PeerAccessCoverage> ngram_gpu_peer_access;
+    /** Original coordinator-to-compute-reader observations, independent of storage edges. */
+    std::vector<ImmutableRowTableReaderPeerAccess> ngram_reader_peer_access;
 
     /**
      * Optional resolved rank-local collective backend for this participant.

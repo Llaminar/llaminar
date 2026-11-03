@@ -25,6 +25,12 @@
 #include <utility>
 namespace llaminar2::qwen4exp
 {
+bool ImmutableLookupExecutionBoundary::requiresSourceGroupAdmission()const noexcept
+{
+    return service_->channelDevices().size() > 1 ||
+        (pooled_ && pooled_->storage->geometry().parameters().consumers > 1);
+}
+
 namespace {
 /** @brief Validate the exact already-materialized original protocol root without reading its contents.
  * @param owner Retained canonical tensor declaration. @param device Exact native participant.
@@ -615,7 +621,7 @@ std::shared_ptr<PooledImmutableRetirementAuthority> ImmutableLookupExecutionBoun
     if (!pooled_)return {};
     const auto& p=pooled_->storage->geometry().parameters();
     auto cohort=completeCohort_.load(std::memory_order_acquire).lock();
-    if (!cohort && (p.coordinator.policy.participants()!=1 || p.local_owner==adaptive_lookup::None))
+    if (!cohort && (p.consumers>1 || p.coordinator.policy.participants()!=1 || p.local_owner==adaptive_lookup::None))
         throw std::logic_error("Distributed pooled admission requires its retained complete Read/Retirement cohort");
     if (cohort)cohort->requireCurrent();
     return cohort;
@@ -773,10 +779,27 @@ void ImmutableLookupExecutionBoundary::requireProtocolOwner() const
 ImmutableLookupExecutionBoundary::SourceGroupAdmission::SourceGroupAdmission(
     std::shared_ptr<ImmutableLookupService> service,ImmutableLookupService::GroupAdmission admission,
     std::vector<SourceAdmissionParticipant> participants)
-    :service_(std::move(service)),participants_(std::move(participants)),admission_(std::move(admission)){}
+    :service_(std::move(service)),participants_(std::move(participants)),admission_(std::move(admission))
+{
+    const auto& boundary = participants_.front().boundary;
+    if (boundary->pooled_ && boundary->pooled_->storage->geometry().parameters().consumers > 1) {
+        const auto retained = std::dynamic_pointer_cast<PooledImmutableRetainedParticipants>(boundary->requireCompleteCohort());
+        if (!retained || !retained->transport()->readerGeometry())
+            throw std::logic_error("Shared source admission requires its original complete reader transport");
+        shared_reader_transport_ = retained->transport();
+        shared_reader_transport_->beginInvocation({admission_.generation(), admission_.invocation()});
+    }
+}
 ImmutableLookupExecutionBoundary::SourceGroupAdmission::~SourceGroupAdmission() noexcept
 {
-    if(service_&&!finished_)try{(void)finish();}catch(...){std::terminate();}
+    try {
+        // Abandonment cancels only CPU/reader progress. A missing source
+        // proof must not erase storage release/SourceFrontier/Retired packets.
+        // Original model/graph owners retain those channels and native duties.
+        if (shared_reader_transport_)
+            shared_reader_transport_->failureCallback({admission_.generation(), admission_.invocation()}, PooledImmutableDirectedTransport::CancellationEdges::ComputeReaders)();
+        if (service_ && !finished_) (void)finish();
+    } catch (...) { std::terminate(); }
 }
 bool ImmutableLookupExecutionBoundary::SourceGroupAdmission::reuses(
     std::span<const SourceAdmissionParticipant> participants)const
@@ -792,6 +815,18 @@ bool ImmutableLookupExecutionBoundary::SourceGroupAdmission::reuses(
            !member.boundary->pending_group_admission_))return false;
     return true;
 }
+std::function<void()> ImmutableLookupExecutionBoundary::SourceGroupAdmission::failureCallback() const
+{
+    auto source = service_->failureCallback(admission_);
+    if (!shared_reader_transport_) return source;
+    auto channels = shared_reader_transport_->failureCallback({admission_.generation(), admission_.invocation()}, PooledImmutableDirectedTransport::CancellationEdges::ComputeReaders);
+    return [source = std::move(source), channels = std::move(channels)] {
+        std::exception_ptr failure;
+        try { source(); } catch (...) { failure = std::current_exception(); }
+        try { channels(); } catch (...) { if (!failure) failure = std::current_exception(); }
+        if (failure) std::rethrow_exception(failure);
+    };
+}
 bool ImmutableLookupExecutionBoundary::SourceGroupAdmission::finish()
 {
     if(finished_)return result_;
@@ -802,7 +837,25 @@ bool ImmutableLookupExecutionBoundary::SourceGroupAdmission::finish()
         auto& pending=participant.boundary->pending_group_admission_;
         if(pending){(void)service_->await(pending->ticket);pending.reset();}
     }
+    if (shared_reader_transport_ && !result_)
+        shared_reader_transport_->failureCallback({admission_.generation(), admission_.invocation()}, PooledImmutableDirectedTransport::CancellationEdges::ComputeReaders)();
     finished_=true;return result_;
+}
+void ImmutableLookupExecutionBoundary::SourceGroupAdmission::cancelStorageChannelsAfterSourceProof()
+{
+    if (shared_reader_transport_)
+        shared_reader_transport_->failureCallback({admission_.generation(), admission_.invocation()},
+            PooledImmutableDirectedTransport::CancellationEdges::StorageOwners)();
+}
+bool ImmutableLookupExecutionBoundary::SourceGroupAdmission::finishNativeChannelsAfterProof()
+{
+    if (!finished_)
+        throw std::logic_error("Shared reader native retirement preceded original CPU/adopted-right cleanup");
+    if (!shared_reader_transport_) return result_;
+    const auto outcome = shared_reader_transport_->finishInvocation({admission_.generation(), admission_.invocation()});
+    result_ = result_ && outcome == CapturedTransferInvocationRetirement::Completed;
+    shared_reader_transport_.reset();
+    return result_;
 }
 std::unique_ptr<ImmutableLookupExecutionBoundary::SourceGroupAdmission>
 ImmutableLookupExecutionBoundary::armSourceGroup(std::span<const SourceAdmissionParticipant> participants)
@@ -811,7 +864,8 @@ ImmutableLookupExecutionBoundary::armSourceGroup(std::span<const SourceAdmission
         throw std::invalid_argument("Immutable lookup group requires its original participants");
     const auto service=participants.front().boundary->service_;
     const auto devices=service->channelDevices();
-    if(devices.size()<2||devices.size()!=participants.size())
+    if(devices.empty()||devices.size()!=participants.size()||
+       (devices.size()==1&&!participants.front().boundary->requiresSourceGroupAdmission()))
         throw std::invalid_argument("Immutable lookup group requires every declared source channel");
     const auto previous=participants.front().boundary->intervalGeneration_;
     if(previous==~std::uint64_t{0})throw std::overflow_error("Immutable lookup group interval exhausted");
@@ -969,7 +1023,7 @@ void ImmutableLookupExecutionBoundary::awaitTerminal()
 {
     // Lock lifetime before joining, but never let metadata drift bypass the
     // original failed-worker retirement. Validation follows the actual join.
-    const auto cohort=completeCohort_.load(std::memory_order_acquire).lock();
+    const auto originalCohort=completeCohort_.load(std::memory_order_acquire).lock();
     // A failed I/O lane still owes its worker join; launch admission's health
     // check must never bypass terminal retirement and its precise diagnostic.
     if(!armed_.load(std::memory_order_acquire))throw std::logic_error("Immutable lookup terminal has no armed storage interval");
@@ -978,9 +1032,18 @@ void ImmutableLookupExecutionBoundary::awaitTerminal()
     terminal_=RetainedStorageTerminalObservation::between(intervalGeneration_,service_->mode(),intervalStart_,service_->stats(device_));
     if (pooled_)
         terminal_->transport = RetainedStorageTransport::PooledSubordinate;
-    armed_.store(false,std::memory_order_release);
+    // Validation cannot bypass the original CPU/adopted join. It must still
+    // reject an expired required cohort or a replaced original ownership block
+    // before inactive state or safe-retired failure can be published.
+    const auto cohort = requireCompleteCohort();
+    if (cohort != originalCohort || cohort.owner_before(originalCohort) ||
+        originalCohort.owner_before(cohort))
+        throw std::logic_error("Immutable lookup terminal replaced its original retained cohort");
     if(cohort){cohort->awaitNativeTerminal(nativeDeadline);cohort->requireCurrent();}
-    if(!success)throw std::runtime_error("Immutable lookup retained-generation storage failed: "+service_->lastFailure());
+    // Keep the original native duty armed if its proof fails. A consumed CPU
+    // ticket/terminal statistic alone never authorizes retry or safe teardown.
+    armed_.store(false,std::memory_order_release);
+    if(!success)throw RetiredStorageRequestFailure("Immutable lookup retained-generation storage failed: "+service_->lastFailure());
 }
 RetainedStorageTerminalObservation ImmutableLookupExecutionBoundary::terminalObservation() const
 {

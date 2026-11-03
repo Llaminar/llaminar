@@ -1164,7 +1164,9 @@ namespace llaminar2
                 config.mpi_ctx->rank() == config.source_world_rank;
             const bool target =
                 config.mpi_ctx->rank() == config.target_world_rank;
-            if (source == target)
+            const bool rank_local = config.endpoint_scope ==
+                MoEOverlayActivationEndpointScope::RankLocalGPU;
+            if (source == target && !(rank_local && source))
             {
                 throw std::logic_error(
                     "MoE shared activation payload placement requires exactly one local endpoint role");
@@ -1189,17 +1191,16 @@ namespace llaminar2
             }
             for (const auto &participant : layout_.participants)
             {
-                const auto &range = source
-                                        ? participant.return_pages
-                                        : participant.dispatch_pages;
-                std::memset(
-                    static_cast<std::byte *>(base_) + range.offset,
-                    0,
-                    range.bytes);
-                touched_bytes = checkedAdd(
-                    touched_bytes,
-                    range.bytes,
-                    "directional first-touch bytes");
+                const auto touch = [&](const auto &range)
+                {
+                    std::memset(static_cast<std::byte *>(base_) + range.offset, 0, range.bytes);
+                    touched_bytes = checkedAdd(touched_bytes, range.bytes,
+                                               "directional first-touch bytes");
+                };
+                if (source)
+                    touch(participant.return_pages);
+                if (target)
+                    touch(participant.dispatch_pages);
             }
             if (source)
             {
@@ -1214,9 +1215,10 @@ namespace llaminar2
                     "canonical return first-touch bytes");
             }
 
-            const size_t expected_touched = source
-                                                ? layout_.sourceOwnedBytes()
-                                                : layout_.targetOwnedBytes();
+            const size_t expected_touched = rank_local
+                ? checkedAdd(layout_.sourceOwnedBytes(), layout_.targetOwnedBytes(),
+                             "rank-local original mapping pages")
+                : (source ? layout_.sourceOwnedBytes() : layout_.targetOwnedBytes());
             if (touched_bytes != expected_touched)
             {
                 throw std::logic_error(
@@ -1230,6 +1232,8 @@ namespace llaminar2
                 source ? header_->target_payload_pages_ready
                        : header_->source_payload_pages_ready;
             local_ready.store(1u, std::memory_order_release);
+            if (rank_local)
+                peer_ready.store(1u, std::memory_order_release);
 
             const auto deadline =
                 std::chrono::steady_clock::now() +
@@ -1330,7 +1334,10 @@ namespace llaminar2
                 .generation=config.transaction_topology.workspace_generation,
                 .fingerprint_low=config.transaction_topology.topology_fingerprint_low,
                 .fingerprint_high=config.transaction_topology.topology_fingerprint_high},
-                config.source_world_rank,participants,shm_name_,layout_.mapping_bytes);
+                config.source_world_rank,
+                std::span<const int>(participants.data(),
+                    config.endpoint_scope == MoEOverlayActivationEndpointScope::RankLocalGPU ? 1u : 2u),
+                shm_name_,layout_.mapping_bytes);
             file_.requireExtent(layout_.mapping_bytes);
             base_ = ::mmap(
                 nullptr,
@@ -1481,15 +1488,57 @@ namespace llaminar2
         MoEOverlayActivationEpochControl *activation_controls_ = nullptr;
     };
 
+    namespace
+    {
+        /** @brief Validate both exact GPU roles before any original channel allocation. */
+        void requireRankLocalGPUConfig(const MoEOverlayRankBatchTransportConfig &config)
+        {
+        if (!config.mpi_ctx || config.source_world_rank < 0 ||
+            config.source_world_rank != config.target_world_rank ||
+            config.mpi_ctx->rank() != config.source_world_rank ||
+            config.local_lanes.empty() || !config.workspace ||
+            !config.rank_local_source_device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "Rank-local GPU activation requires original same-rank endpoint membership");
+        }
+        for (const int participant : config.workspace->participantIds())
+        {
+            std::vector<DeviceId> devices;
+            for (const auto &lane : config.local_lanes)
+                if (lane.participant_id == participant)
+                    devices.push_back(lane.device);
+            if (devices.size() != 2u || !devices[0].is_gpu() || !devices[1].is_gpu() ||
+                devices[0] == devices[1] ||
+                std::count(devices.begin(), devices.end(), config.rank_local_source_device) != 1)
+            {
+                throw std::invalid_argument(
+                    "Rank-local activation requires both distinct original GPU grants for every target");
+            }
+        }
+        }
+    } // namespace
+
     MoEOverlayNodeLocalRankBatchTransport::
         MoEOverlayNodeLocalRankBatchTransport(
             MoEOverlayRankBatchTransportConfig config)
         : config_(std::move(config))
     {
+        switch (config_.endpoint_scope)
+        {
+        case MoEOverlayActivationEndpointScope::RankLocalGPU:
+            requireRankLocalGPUConfig(config_);
+            break;
+        case MoEOverlayActivationEndpointScope::DistinctRanks:
+            break;
+        default:
+            throw std::invalid_argument("Invalid ExpertOverlay endpoint ownership scope");
+        }
         if (!config_.mpi_ctx || !config_.workspace ||
             config_.source_world_rank < 0 ||
             config_.target_world_rank < 0 ||
-            config_.source_world_rank == config_.target_world_rank ||
+            ((config_.source_world_rank == config_.target_world_rank) !=
+             (config_.endpoint_scope == MoEOverlayActivationEndpointScope::RankLocalGPU)) ||
             config_.source_world_rank >= config_.mpi_ctx->world_size() ||
             config_.target_world_rank >= config_.mpi_ctx->world_size() ||
             (config_.mpi_ctx->rank() != config_.source_world_rank &&
@@ -1941,6 +1990,12 @@ namespace llaminar2
         std::span<MoEOverlaySparseRows *const> inbound)
     {
         MoEOverlayCollectiveResult result;
+        if (config_.endpoint_scope == MoEOverlayActivationEndpointScope::RankLocalGPU)
+        {
+            result.ok = false;
+            result.error = "Rank-local GPU activation requires its exact device endpoint protocol";
+            return result;
+        }
         InFlightGuard guard(in_flight_);
         if (!guard.acquired())
         {
@@ -2139,6 +2194,12 @@ namespace llaminar2
         std::span<MoEOverlayReturnRows *const> inbound)
     {
         MoEOverlayCollectiveResult result;
+        if (config_.endpoint_scope == MoEOverlayActivationEndpointScope::RankLocalGPU)
+        {
+            result.ok = false;
+            result.error = "Rank-local GPU activation requires its exact device endpoint protocol";
+            return result;
+        }
         InFlightGuard guard(in_flight_);
         if (!guard.acquired())
         {
@@ -2351,6 +2412,8 @@ namespace llaminar2
         if (!config.mpi_ctx)
             throw std::invalid_argument(
                 "MoE rank-batch transport factory requires an MPI context");
+        if (config.endpoint_scope != MoEOverlayActivationEndpointScope::DistinctRanks)
+            throw std::invalid_argument("Distributed activation construction requires distinct rank ownership");
         const auto kind = resolveMoEOverlayRankBatchTransportKind(
             *config.mpi_ctx,
             config.source_world_rank,
@@ -2370,6 +2433,14 @@ namespace llaminar2
                 .asynchronous_send_slot_count =
                     config.asynchronous_send_slot_count,
             });
+    }
+
+    std::shared_ptr<IMoEOverlayRankBatchTransport>
+    createMoEOverlayRankLocalGPUActivationTransport(
+        MoEOverlayRankBatchTransportConfig config)
+    {
+        config.endpoint_scope = MoEOverlayActivationEndpointScope::RankLocalGPU;
+        return std::make_shared<MoEOverlayNodeLocalRankBatchTransport>(std::move(config));
     }
 
 } // namespace llaminar2

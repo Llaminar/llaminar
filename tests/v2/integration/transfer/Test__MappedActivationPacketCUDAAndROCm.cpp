@@ -1730,9 +1730,11 @@ namespace
          */
         bool abortQueuedSourceAndValidate()
         {
-            if (!source_queued_ahead_)
+            if (!source_queued_ahead_ || !protocol_ || !identity_)
                 return false;
-            publishAbort();
+            if (!protocol_->cancelOriginalInvocation(*identity_,
+                    MoEOverlayActivationStatusCode::ExplicitAbort, &error_))
+                return false;
             if (!awaitEvent(source_backend_, source_terminal_,
                             std::chrono::seconds(2)))
             {
@@ -1745,6 +1747,12 @@ namespace
                 MoEOverlayActivationEndpointState::Aborted)
             {
                 error_ = "aborted epoch admission did not publish terminal failure";
+                return false;
+            }
+            if (protocol_->admissionState() != MoEOverlayActivationAdmissionState::Failed ||
+                protocol_->reset(*identity_, &error_))
+            {
+                error_ = "cancelled original scheduler invocation became reusable";
                 return false;
             }
             source_queued_ahead_ = false;

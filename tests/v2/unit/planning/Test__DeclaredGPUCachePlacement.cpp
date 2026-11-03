@@ -18,7 +18,9 @@
 #include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionCI.h"
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <array>
+#include "collective/LocalTPCollectiveInventory.h"
 namespace llaminar2::test {
 namespace {
 /** @return One exact original observation, without a runtime probe or PMA allocation. */
@@ -36,6 +38,90 @@ ImmutableRowTablePlacementInput input(){
         ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),128,64),observed(DeviceId::cpu()),consumer);
 }
 }
+/** @test Same-vendor intent needs exact original None evidence; syntax alone grants no transport. */
+TEST(DeclaredGPUCachePlacement, ExplicitNoPeerUsesOriginalInventoryAndSurvivesWireWithoutComputeRoles)
+{
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm}) {
+        const std::string backend = type == DeviceType::CUDA ? "cuda" : "rocm";
+        for (const unsigned count : {2u, 4u, 8u}) {
+            RankInventory inventory;
+            inventory.rank = 0;
+            std::string text;
+            std::vector<PhysicalMemoryResource> resources;
+            for (unsigned i = 0; i < count; ++i) {
+                inventory.gpus.push_back(DeviceInfo{.type = type, .local_device_id = static_cast<int>(i)});
+                if (i) text += ",";
+                text += "0:" + backend + ":" + std::to_string(i) + "/64/1048576";
+                resources.push_back(observed({type, static_cast<int>(i)}));
+            }
+            text += "@0:" + backend + ":0";
+            auto& matrix = type == DeviceType::CUDA ? inventory.p2p_cuda : inventory.p2p_rocm;
+            auto& matrixCount = type == DeviceType::CUDA ? inventory.p2p_cuda_count : inventory.p2p_rocm_count;
+            matrix.assign(count * count, false);
+            // Only coordinator-owner edges carry packets. Unused owner-owner
+            // connectivity must not manufacture a rejection of the star.
+            for (unsigned from = 1; from < count; ++from)
+                for (unsigned to = 1; to < count; ++to)
+                    if (from != to) matrix[from * count + to] = true;
+            matrixCount = count;
+            ImmutableRowTablePolicy policy{.storage = ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+            policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(text);
+            EXPECT_EQ(ImmutableRowTableDirectedTransportPolicy::observe(policy.gpu_adaptive.placement, inventory), PeerAccessCoverage::None);
+            auto originalInventory = std::make_shared<ClusterInventory>();
+            originalInventory->world_size = 1;
+            originalInventory->ranks.push_back(inventory);
+            std::vector<PhysicalMemoryAllocatorIdentity> endpoints;
+            for (const auto& resource : resources) endpoints.push_back({0,resource.device});
+            EXPECT_NO_THROW(ImmutableRowTableDirectedTransportPolicy::requireOriginal(endpoints.front(),endpoints,
+                originalInventory,PeerAccessCoverage::None));
+            EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::requireOriginal(endpoints.front(),endpoints,
+                {},PeerAccessCoverage::None),std::invalid_argument);
+            auto wrongInventory = std::make_shared<ClusterInventory>(*originalInventory);
+            wrongInventory->ranks.front().rank = 1;
+            EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::requireOriginal(endpoints.front(),endpoints,
+                wrongInventory,PeerAccessCoverage::None),std::invalid_argument);
+            auto changedInventory = std::make_shared<ClusterInventory>(*originalInventory);
+            auto& changedMatrix = type == DeviceType::CUDA ? changedInventory->ranks.front().p2p_cuda : changedInventory->ranks.front().p2p_rocm;
+            changedMatrix[1] = true;
+            EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::requireOriginal(endpoints.front(),endpoints,
+                changedInventory,PeerAccessCoverage::None),std::invalid_argument);
+            auto duplicateEndpoints = endpoints;
+            duplicateEndpoints.push_back(endpoints.front());
+            EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::requireOriginal(endpoints.front(),duplicateEndpoints,
+                originalInventory,PeerAccessCoverage::None),std::invalid_argument);
+            const std::array consumers{resources.front()};
+            const auto original = ImmutableRowTablePlacementInput::forConsumers(
+                ImmutableRowTableExtent::fromNative(GGUFTensorType::F32, 128, 64), observed(DeviceId::cpu()), consumers)
+                .withGPUCacheResources(policy, resources).withGPUCachePeerAccess(PeerAccessCoverage::None);
+            const std::array requests{ImmutableRowTableAdmissionRequest{policy, original, {}}};
+            const auto wire = serializeImmutableRowTableAdmissionRequests(requests);
+            const auto parsed = parseImmutableRowTableAdmissionRequests(wire, 0);
+            ASSERT_EQ(parsed.size(), 1u);
+            EXPECT_EQ(parsed.front().input.gpuCachePeerAccess(), PeerAccessCoverage::None);
+            EXPECT_EQ(parsed.front().input.gpuResources().size(), count);
+            EXPECT_EQ(parsed.front().input.consumers().size(), 1u);
+            const std::vector<std::size_t> slots(count, 0);
+            const auto layout = parsed.front().input.gpuAdaptiveLayout(policy, slots, 0, 16);
+            EXPECT_EQ(layout.peerAccess(), PeerAccessCoverage::None);
+            EXPECT_EQ(layout.consumers().size(), 1u);
+            EXPECT_NO_THROW(original.withGPUCachePeerAccess(PeerAccessCoverage::Complete));
+            EXPECT_THROW(original.withGPUCachePeerAccess(PeerAccessCoverage::Partial), std::invalid_argument);
+            matrix[1] = true;
+            EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::observe(policy.gpu_adaptive.placement, inventory), std::invalid_argument);
+            matrix.assign(count * count, true);
+            EXPECT_EQ(ImmutableRowTableDirectedTransportPolicy::observe(policy.gpu_adaptive.placement, inventory), PeerAccessCoverage::Complete);
+            matrix.clear();
+            EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::observe(policy.gpu_adaptive.placement, inventory), std::invalid_argument);
+            inventory.rank = 1;
+            EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::observe(policy.gpu_adaptive.placement, inventory), std::invalid_argument);
+        }
+    }
+    const PhysicalMemoryAllocatorIdentity source{0, DeviceId::cuda(0)}, remote{0, DeviceId::cuda(1)};
+    EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::require(source, remote, std::nullopt), std::invalid_argument);
+    EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::require(source, {1, DeviceId::cuda(1)}, PeerAccessCoverage::None), std::invalid_argument);
+    EXPECT_THROW(ImmutableRowTableDirectedTransportPolicy::require(source, {0, DeviceId::cpu()}, PeerAccessCoverage::None), std::invalid_argument);
+}
+
 /** @test New source siblings retain canonical TP/expert/model policies and all four original setup modes. */
 TEST(DeclaredGPUCachePlacement, ConsumerLocalTP2SourceSiblingsPreserveOriginalPoliciesAndSeparateQualification)
 {
@@ -148,7 +234,7 @@ TEST(DeclaredGPUCachePlacement, PublicGrammarKeepsBothFirstClassArmsAndExactOrde
 TEST(DeclaredGPUCachePlacement, RejectsMixedMalformedDuplicateForeignAndUnimplementedRequests){
     for(const auto *text:{"", "auto", "0:cuda:0/1/1", "0:cuda:0/1/1,@0:cuda:0", "0:cpu:0/0/0@0:cpu:0",
         "0:cuda:0/1/1,0:cuda:0/1/1@0:cuda:0", "1:rocm:0/1/1,0:cuda:0/1/1@0:cuda:0",
-        "0:cuda:0/1/1,0:cuda:1/1/1@0:cuda:0", "0:rocm:0/1/1@0:cuda:0", "0:cuda:0/-1/1@0:cuda:0",
+        "0:rocm:0/1/1@1:cuda:0", "0:cuda:0/-1/1@0:cuda:0",
         "0:cuda:0/2147483648/1@0:cuda:0", "0:cuda:0/1/1@0:cuda:0@0:cuda:0"})
         EXPECT_THROW(parseAdaptiveGPUCachePlacement(text),std::invalid_argument)<<text;
     auto mixed=declared();mixed.gpu_adaptive.maximum_gpu_cache_rows=1;EXPECT_THROW(mixed.validate(),std::invalid_argument);
@@ -311,4 +397,203 @@ TEST(DeclaredGPUCachePlacement, PhysicalInventoryBorrowsStorageOwnersWithoutDupl
     }
 }
 
+}
+
+namespace llaminar2::test {
+/** @test A non-first authored coordinator owns one source; a foreign reader owns only result/ACK roots. */
+TEST(DeclaredGPUCachePlacement, SharedCoordinatorReadersPreserveOneSourceAndExactResultACKBOM)
+{
+    ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+    policy.gpu_adaptive.placement=parseAdaptiveGPUCachePlacement("0:rocm:2/64/1048576@0:rocm:1");
+    policy.gpu_adaptive.host.maximum_cache_rows=16;
+    policy.gpu_adaptive.host.cache_physical_byte_limit=1048576;
+    policy.validate();
+    const std::array devices{observed(DeviceId::rocm(0)),observed(DeviceId::rocm(1)),observed(DeviceId::rocm(2))};
+    const std::array consumers{devices[1],devices[0]}; // Actual TP order is deliberately nonordinal.
+    const auto host=observed(DeviceId::cpu());
+    const std::array readerEdges{ImmutableRowTableReaderPeerAccess{
+        {0,DeviceId::rocm(1)}, {0,DeviceId::rocm(0)}, PeerAccessCoverage::None}};
+    const auto input=ImmutableRowTablePlacementInput::forConsumers(
+        ImmutableRowTableExtent::fromNative(GGUFTensorType::F32,128,64),host,consumers)
+        .withGPUCacheResources(policy,devices).withGPUCachePeerAccess(PeerAccessCoverage::None)
+        .withReaderPeerAccess(readerEdges);
+    const ImmutableRowTableSource source{.rows=128,.row_elements=16,.format=GGUFTensorType::F32};
+    for (const auto storageCoverage : {PeerAccessCoverage::None, PeerAccessCoverage::Complete})
+    for (const auto readerCoverage : {PeerAccessCoverage::None, PeerAccessCoverage::Complete})
+    for(const size_t slots:{0u,64u}){
+        const std::array owned{slots};
+        auto selectedEdges = readerEdges;
+        selectedEdges.front().coverage = readerCoverage;
+        const auto selectedInput = input.withGPUCachePeerAccess(storageCoverage).withReaderPeerAccess(selectedEdges);
+        const auto layout=selectedInput.gpuAdaptiveLayout(policy,owned,16,32);
+        const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,source,policy.gpu_adaptive);
+        ASSERT_EQ(layout.consumers().size(),2u);
+        ASSERT_TRUE(geometry.readerGeometry());
+        const PhysicalMemoryAllocatorIdentity coordinator{0,DeviceId::rocm(1)},reader{0,DeviceId::rocm(0)};
+        EXPECT_EQ(geometry.physical().coordinator(),coordinator);
+        EXPECT_EQ(geometry.computeReaderCount(),2u);
+        EXPECT_EQ(geometry.maximumIds(),32u); // Replicated sixteen-head original; never a two-consumer union.
+        EXPECT_EQ(geometry.readerGeometry()->maximumOriginal(),32u);
+        EXPECT_EQ(geometry.readerGeometry()->resultMaximum(),32u*16u*sizeof(float));
+        EXPECT_EQ(geometry.gpuCacheBytes(reader),0u);
+        EXPECT_EQ(geometry.mandatoryDeviceBytes(reader),0u);
+        EXPECT_EQ(geometry.gpuSlotDependentBytes(reader),0u);
+        EXPECT_GT(geometry.mandatoryDeviceBytes(coordinator),0u);
+        const auto projected=AdaptiveImmutableLookupGeometry::sourceLayout(layout,policy.gpu_adaptive);
+        ASSERT_EQ(projected.consumers().size(),1u);EXPECT_EQ(projected.consumers().front(),coordinator);
+        EXPECT_EQ(projected.owners().size(),layout.owners().size());
+        const auto single=AdaptiveImmutableLookupGeometry::fromLayout(projected,source,policy.gpu_adaptive);
+        EXPECT_FALSE(single.readerGeometry());EXPECT_EQ(single.computeReaderCount(),1u);
+        const std::array source_devices{devices[1],devices[2]};
+        const auto baseline=recordedNgramMandatory(single,source_devices,host);
+        const auto actual=recordedNgramMandatory(geometry,devices,host);
+        const auto reader_bom=geometry.readerGeometry()->completeBOM(host,devices);
+        PhysicalMemoryPlanBuilder expected(baseline);
+        for(const auto& line:reader_bom.resources())expected.add(line);
+        EXPECT_FALSE(actual.requiredFootprintMismatch(expected.build()));
+        EXPECT_FALSE(expected.build().requiredFootprintMismatch(actual));
+        EXPECT_EQ(actual.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableTableStorage),
+            baseline.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableTableStorage));
+        EXPECT_EQ(actual.find(reader)->bytes(PhysicalMemoryOwner::ImmutableLookupStaging),0u);
+        EXPECT_EQ(actual.find(reader)->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
+            sizeof(qwen4exp::replicated_reader::Control)+geometry.readerGeometry()->resultMemory(reader).cursor_bytes_per_device+
+            geometry.readerGeometry()->acknowledgementMemory(reader).cursor_bytes_per_device+
+            geometry.readerGeometry()->acknowledgementMemory(reader).producer_payload_bytes);
+        EXPECT_EQ(policy.lookupIOConsumer(reader.device,2),coordinator.device);
+        const std::array requests{ImmutableRowTableAdmissionRequest{policy,selectedInput,{}}};
+        const auto restored=parseImmutableRowTableAdmissionRequests(serializeImmutableRowTableAdmissionRequests(requests),0);
+        ASSERT_EQ(restored.size(),1u);
+        EXPECT_EQ(restored.front().input.consumers().size(),2u);
+        EXPECT_EQ(restored.front().input.gpuResources().size(),3u);
+        EXPECT_EQ(restored.front().requested,policy);
+        EXPECT_EQ(restored.front().input.gpuAdaptiveLayout(policy,owned,16,32), layout);
+        ASSERT_EQ(restored.front().input.readerPeerAccess().size(), 1u);
+        EXPECT_EQ(restored.front().input.readerPeerAccess().front(), selectedEdges.front());
+        const auto wire = serializeImmutableRowTableAdmissionRequests(requests);
+        auto oldSchema = wire;
+        oldSchema[4] = 14;
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(oldSchema,0), std::invalid_argument);
+        std::vector<std::uint8_t> edgeWords;
+        const auto word = [&](std::uint32_t value) {
+            for (unsigned byte = 0; byte < 4; ++byte)
+                edgeWords.push_back(static_cast<std::uint8_t>(value >> (byte * 8)));
+        };
+        for (const auto endpoint : {coordinator, reader}) {
+            word(endpoint.world_rank);
+            word(static_cast<std::uint32_t>(endpoint.device.type));
+            word(endpoint.device.ordinal);
+        }
+        word(static_cast<std::uint32_t>(readerCoverage));
+        const auto encoded = std::search(wire.begin(), wire.end(), edgeWords.begin(), edgeWords.end());
+        ASSERT_NE(encoded, wire.end());
+        ASSERT_EQ(std::search(encoded + edgeWords.size(), wire.end(), edgeWords.begin(), edgeWords.end()), wire.end());
+        const auto offset = static_cast<std::size_t>(encoded - wire.begin());
+        auto malformed = wire;
+        malformed[offset + 24] = 255;
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(malformed,0), std::invalid_argument);
+        malformed = wire;
+        malformed[offset + 8] = 2; // Real storage endpoint is not the authored query/source coordinator.
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(malformed,0), std::invalid_argument);
+    }
+    auto foreign=policy;foreign.gpu_adaptive.placement.coordinator=AdaptiveGPUCacheParticipant{0,DeviceType::ROCm,3};
+    EXPECT_THROW(input.withGPUCacheResources(foreign,devices),std::invalid_argument);
+    EXPECT_THROW(input.withGPUCacheResources(policy,std::span{devices}.first(2)),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test {
+/** @test Shared storage changes only the explicit placement arm of original ROCm TP2 source policies. */
+TEST(DeclaredGPUCachePlacement, SharedCoordinatorTP2SourceSiblingsPreserveOriginalPolicies)
+{
+    using namespace parity;using namespace parity::qwen4exp;
+    const auto& seeds=qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds();
+    ASSERT_EQ(seeds.size(),2u);
+    const auto expanded=qwen4ExpExpandSourceAdmissionMTP(seeds);
+    ASSERT_EQ(expanded.size(),8u);
+    std::array<size_t,4> modes{};
+    for(const auto& cell:expanded){
+        ASSERT_TRUE(cell.ngram_table_policy);
+        const auto& placement=cell.ngram_table_policy->gpu_adaptive.placement;
+        ASSERT_TRUE(placement.coordinator);ASSERT_EQ(placement.owners.size(),1u);
+        EXPECT_EQ(placement.mode,AdaptiveGPUCachePlacementMode::DeclaredRankLocal);
+        EXPECT_EQ(placement.coordinator->device(),DeviceId::rocm(0));
+        EXPECT_EQ(placement.owners.front().participant.device(),DeviceId::rocm(2));
+        ASSERT_TRUE(cell.topology.expert_overlay_plan);
+        const auto& plan=*cell.topology.expert_overlay_plan;
+        ASSERT_EQ(plan.domains.front().participants.size(),2u);
+        EXPECT_EQ(plan.domains.front().participants[0].toLocalDeviceId(),DeviceId::rocm(0));
+        EXPECT_EQ(plan.domains.front().participants[1].toLocalDeviceId(),DeviceId::rocm(1));
+        EXPECT_EQ(plan.routed_tiers.front().max_experts_per_layer,8);
+        EXPECT_EQ(cell.expert_overlay,std::optional{ModelParityExpertOverlayPolicy{}});
+        switch(cell.mtp){
+        case ModelParityMTP::Off:++modes[0];EXPECT_EQ(cell.retained_mtp_draft_capacity,0);break;
+        case ModelParityMTP::Depth1:++modes[1];EXPECT_EQ(cell.retained_mtp_draft_capacity,15);break;
+        case ModelParityMTP::Depth3:++modes[2];EXPECT_EQ(cell.retained_mtp_draft_capacity,15);break;
+        case ModelParityMTP::DynamicDepth:++modes[3];EXPECT_EQ(cell.retained_mtp_draft_capacity,15);break;
+        default:FAIL()<<"Shared source introduced an unauthored MTP mode";
+        }
+    }
+    for(auto count:modes)EXPECT_EQ(count,2u);
+}
+}
+
+namespace llaminar2::test {
+/** @test The distinct CUDA source family preserves original model/math/policies and storage hardware roles. */
+TEST(DeclaredGPUCachePlacement, SharedCoordinatorCUDATP2SourceSiblingsPreserveOriginalPoliciesAndStorageRole)
+{
+    using namespace parity;
+    using namespace parity::qwen4exp;
+    const auto rocmBefore=qwen4ExpExpandSourceAdmissionMTP(qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds());
+    std::vector<std::string> rocmNames;
+    for(const auto& cell:rocmBefore)rocmNames.push_back(cell.testName());
+    const auto& seeds=qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmissionSeeds();
+    ASSERT_EQ(seeds.size(),2u);
+    const auto expanded=qwen4ExpExpandSourceAdmissionMTP(seeds);
+    ASSERT_EQ(expanded.size(),8u);
+    std::array<std::size_t,4> modes{};
+    std::set<std::string> names;
+    for(const auto& cell:expanded){
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        EXPECT_EQ(cell.model.model_path,rocmBefore.front().model.model_path);
+        EXPECT_EQ(cell.model.transformer_layers,rocmBefore.front().model.transformer_layers);
+        ASSERT_TRUE(cell.ngram_table_policy);
+        const auto reference=std::find_if(rocmBefore.begin(),rocmBefore.end(),[&](const auto& original){
+            return original.mtp==cell.mtp && original.ngram_table_policy->gpu_adaptive.placement.owners.front().maximum_cache_rows==
+                cell.ngram_table_policy->gpu_adaptive.placement.owners.front().maximum_cache_rows;
+        });
+        ASSERT_NE(reference,rocmBefore.end());
+        EXPECT_EQ(cell.model.shared_predictor,reference->model.shared_predictor);
+        EXPECT_EQ(cell.activation_precision,rocmBefore.front().activation_precision);
+        EXPECT_EQ(cell.kv_cache_precision,rocmBefore.front().kv_cache_precision);
+        EXPECT_EQ(cell.model.token_ids,rocmBefore.front().model.token_ids);
+        ASSERT_TRUE(cell.ngram_table_policy);
+        const auto& placement=cell.ngram_table_policy->gpu_adaptive.placement;
+        ASSERT_TRUE(placement.coordinator);
+        ASSERT_EQ(placement.owners.size(),1u);
+        EXPECT_EQ(placement.coordinator->device(),DeviceId::cuda(0));
+        EXPECT_EQ(placement.owners.front().participant.device(),DeviceId::rocm(0));
+        EXPECT_TRUE(placement.owners.front().maximum_cache_rows==0 || placement.owners.front().maximum_cache_rows==64);
+        ASSERT_TRUE(cell.topology.expert_overlay_plan);
+        const auto& plan=*cell.topology.expert_overlay_plan;
+        EXPECT_EQ(plan.domains.front().participants,(std::vector{GlobalDeviceAddress::cuda(0),GlobalDeviceAddress::cuda(1)}));
+        EXPECT_EQ(plan.domains.back().participants,(std::vector{GlobalDeviceAddress::cpu(0)}));
+        EXPECT_EQ(plan.routed_tiers.front().max_experts_per_layer,8);
+        const auto config=cell.toTestConfig();
+        ASSERT_TRUE(config.local_hardware_requirements);
+        EXPECT_EQ(config.local_hardware_requirements->cuda_devices,2);
+        EXPECT_EQ(config.local_hardware_requirements->rocm_devices,1);
+        EXPECT_EQ(cell.expert_overlay,std::optional{ModelParityExpertOverlayPolicy{}});
+        switch(cell.mtp){
+        case ModelParityMTP::Off:++modes[0];EXPECT_EQ(cell.retained_mtp_draft_capacity,0);break;
+        case ModelParityMTP::Depth1:++modes[1];EXPECT_EQ(cell.retained_mtp_draft_capacity,15);break;
+        case ModelParityMTP::Depth3:++modes[2];EXPECT_EQ(cell.retained_mtp_draft_capacity,15);break;
+        case ModelParityMTP::DynamicDepth:++modes[3];EXPECT_EQ(cell.retained_mtp_draft_capacity,15);break;
+        default:FAIL()<<"CUDA shared source introduced an unauthored MTP mode";
+        }
+    }
+    for(auto count:modes)EXPECT_EQ(count,2u);
+    const auto rocmAfter=qwen4ExpExpandSourceAdmissionMTP(qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds());
+    ASSERT_EQ(rocmAfter.size(),rocmNames.size());
+    for(std::size_t i=0;i<rocmAfter.size();++i)EXPECT_EQ(rocmAfter[i].testName(),rocmNames[i]);
+}
 }

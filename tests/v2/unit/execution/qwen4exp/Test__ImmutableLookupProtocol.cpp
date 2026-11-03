@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <map>
 #include <new>
 #include <optional>
 #include <unistd.h>
@@ -693,4 +694,67 @@ TEST(ImmutableLookupProtocol, PooledSubordinateTransportIsExactAndDoesNotEraseSo
         {
             EXPECT_EQ(record.value, 0.0);
         }
+}
+
+/** @test The actual terminal emitter preserves full-RAM adaptive counters, exact tags and failed-publication freshness. */
+TEST(ImmutableLookupProtocol, FullRAMTerminalCollectorPublishesCompleteSourceTuple){
+    WindowEvidence scope;
+    EXPECT_TRUE(hostImmutableRowModeIsAdaptive(HostImmutableRowMode::AdaptiveFullRAM));
+    EXPECT_TRUE(hostImmutableRowModeIsAdaptive(HostImmutableRowMode::AdaptiveRAMSSD));
+    EXPECT_FALSE(hostImmutableRowModeIsAdaptive(HostImmutableRowMode::WholeRAM));
+    EXPECT_FALSE(hostImmutableRowModeIsAdaptive(HostImmutableRowMode::WholeMemoryMapped));
+    EXPECT_THROW(hostImmutableRowModeIsAdaptive(static_cast<HostImmutableRowMode>(255)),std::invalid_argument);
+    for(const auto mode:{HostImmutableRowMode::AdaptiveFullRAM,HostImmutableRowMode::AdaptiveRAMSSD,HostImmutableRowMode::WholeRAM}){
+        PerfStatsCollector::reset();RetainedStoragePerfStats emitter;
+        RetainedStorageCounters completed{.requests=1,.ids=2,.idBytes=16,.nativeBytes=180,
+            .metadataBytes=kLookupRequestLiveBytes+kLookupCompletionLiveBytes,
+            .acknowledgementBytes=8,.terminalBytes=24};
+        if(mode!=HostImmutableRowMode::WholeRAM){completed.adaptiveBatches=1;completed.sourceRows=2;}
+        if(mode==HostImmutableRowMode::AdaptiveRAMSSD){completed.sourceRows=1;completed.ramRows=1;completed.cacheAdmissions=1;completed.windowMisses=1;}
+        auto terminal=RetainedStorageTerminalObservation::between(1,mode,{},completed);
+        terminal.transport=mode==HostImmutableRowMode::WholeRAM?RetainedStorageTransport::MappedChannel:RetainedStorageTransport::PooledSubordinate;
+        ASSERT_NO_THROW(emitter.publish(terminal,"CUDA:0"));
+        const auto records=PerfStatsCollector::snapshot({"immutable_lookup"});ASSERT_EQ(records.size(),mode==HostImmutableRowMode::WholeRAM?12u:20u);
+        std::map<std::string,double> values;
+        for(const auto& record:records){EXPECT_EQ(record.tags.at("storage"),hostImmutableRowModeName(mode));
+            EXPECT_EQ(record.tags.at("transport"),mode==HostImmutableRowMode::WholeRAM?"mapped_channel":"pooled_subordinate");values.emplace(record.name,record.value);}
+        EXPECT_EQ(values.at("native_bytes"),180);EXPECT_EQ(values.at("ids"),2);EXPECT_EQ(values.at("terminal_bytes"),24);
+        if(mode==HostImmutableRowMode::AdaptiveFullRAM){
+            EXPECT_EQ(values.at("source_rows"),2);EXPECT_EQ(values.at("adaptive_batches"),1);
+            for(const auto name:{"ram_rows","window_hits","window_misses","window_evictions","cache_admissions","cache_evictions","cache_admission_rejections","all_pinned_responses"})EXPECT_EQ(values.at(name),0)<<name;
+        }
+        EXPECT_THROW(emitter.publish(terminal,"CUDA:0"),std::logic_error);
+    }
+    // Each impossible full-RAM observation must reject BEFORE publishing or
+    // consuming generation1; the correct original interval remains publishable.
+    for(const auto member:{&RetainedStorageCounters::windowHits,&RetainedStorageCounters::windowMisses,&RetainedStorageCounters::windowEvictions,
+        &RetainedStorageCounters::ramRows,&RetainedStorageCounters::cacheAdmissions,&RetainedStorageCounters::cacheEvictions,
+        &RetainedStorageCounters::cacheAdmissionRejections,&RetainedStorageCounters::allPinnedResponses}){
+        PerfStatsCollector::reset();RetainedStoragePerfStats emitter;
+        auto valid=RetainedStorageTerminalObservation::between(1,HostImmutableRowMode::AdaptiveFullRAM,{},{});valid.transport=RetainedStorageTransport::PooledSubordinate;
+        auto invalid=valid;invalid.counters.*member=1;EXPECT_THROW(emitter.publish(invalid,"ROCm:0"),std::invalid_argument);
+        EXPECT_TRUE(PerfStatsCollector::snapshot({"immutable_lookup"}).empty());EXPECT_NO_THROW(emitter.publish(valid,"ROCm:0"));
+    }
+}
+/** @test CPU-native and subordinate projections share the same closed backing laws without hiding source work. */
+TEST(ImmutableLookupProtocol, FullRAMCPUCollectorRejectsRedundantCacheAndMappingWork){
+    WindowEvidence scope;
+    for(const auto mode:{HostImmutableRowMode::AdaptiveFullRAM,HostImmutableRowMode::AdaptiveRAMSSD}){
+        PerfStatsCollector::reset();CpuImmutableRowGatherObservation actual{.rows=2,.bytes=180,.source_rows=2};
+        if(mode==HostImmutableRowMode::AdaptiveRAMSSD){actual.ram_rows=1;actual.source_rows=1;actual.windows.windowMisses=1;actual.admissions=1;}
+        ASSERT_NO_THROW(recordCPUImmutableLookup(mode,DeviceId::cpu(),2,180,RetainedStorageCPUOutcome::Completed,actual));
+        const auto records=PerfStatsCollector::snapshot({"immutable_lookup"});ASSERT_EQ(records.size(),15u);
+        bool source=false;for(const auto& record:records){EXPECT_EQ(record.tags.at("storage"),hostImmutableRowModeName(mode));EXPECT_EQ(record.tags.at("transport"),"cpu_direct");if(record.name=="source_rows"){source=true;EXPECT_EQ(record.value,actual.source_rows);}}
+        EXPECT_TRUE(source);
+    }
+    PerfStatsCollector::reset();
+    EXPECT_NO_THROW(recordCPUImmutableLookup(HostImmutableRowMode::WholeRAM,DeviceId::cpu(),2,180,RetainedStorageCPUOutcome::Completed,
+        WholeImmutableRowGatherObservation{ImmutableRowStorage::RAM,2,180,{}}));
+    EXPECT_EQ(PerfStatsCollector::snapshot({"immutable_lookup"}).size(),7u);
+    for(const auto member:{&CpuImmutableRowGatherObservation::ram_rows,&CpuImmutableRowGatherObservation::admissions,
+        &CpuImmutableRowGatherObservation::evictions,&CpuImmutableRowGatherObservation::admission_rejections,&CpuImmutableRowGatherObservation::all_pinned_responses}){
+        PerfStatsCollector::reset();CpuImmutableRowGatherObservation invalid{.rows=2,.bytes=180,.source_rows=2};invalid.*member=1;
+        EXPECT_THROW(recordCPUImmutableLookup(HostImmutableRowMode::AdaptiveFullRAM,DeviceId::cpu(),2,180,RetainedStorageCPUOutcome::Completed,invalid),std::invalid_argument);
+        EXPECT_TRUE(PerfStatsCollector::snapshot({"immutable_lookup"}).empty());
+    }
 }

@@ -30,6 +30,11 @@ if(NOT V2_PERF_TESTS_ONLY)
             RecordingNativeFailuresIrreversiblyRejectEveryRetry
             RecordingRejectsForeignControlBlockAndWrongWorkerBeforeNative
             RecordingDelegatesBoundedFlatNativeValidation
+            PreparedCalibrationCUDATimingOwner PreparedCalibrationROCmTimingOwner
+    PreparedCalibrationCUDASequential
+            PreparedCalibrationROCmSequential
+            PreparedCalibrationCUDARejectsUnproved
+            PreparedCalibrationROCmRejectsUnproved
         )
         foreach(_native_program_case IN LISTS _native_program_cases)
             set(_native_program_gate "V2_Integration_PooledNativeProgram_${_native_program_case}Replay")

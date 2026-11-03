@@ -18,6 +18,8 @@
 #include "kernels/qwen4exp/PooledImmutableSourceGeometry.h"
 #include "execution/qwen4exp/ImmutableLookupService.h"
 #include "execution/qwen4exp/ImmutableLookupServiceGeometry.h"
+#include "execution/qwen4exp/PooledImmutableReplicatedReaderGeometry.h"
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -36,7 +38,7 @@ class AdaptiveImmutableLookupGeometry final
 {
 public:
     /**
-     * @brief Preserve the original single-consumer, single-owner declaration.
+     * @brief Declare one original source around a singleton or explicitly shared reader cohort.
      * @param layout Original source, owner and consumer layout.
      * @param source Native source metadata; payload is never inspected.
      * @param request Original bounded GPU/RAM policies.
@@ -47,20 +49,53 @@ public:
         const ImmutableRowTableLayoutGeometry& layout, const ImmutableRowTableSource& source,
         const AdaptiveVRAMRAMSSDRequest& request)
     {
-        if (layout.consumers().size() != 1)
-            throw std::invalid_argument("Adaptive lookup requires one original GPU consumer");
+        if (layout.consumers().empty())
+            throw std::invalid_argument("Adaptive lookup requires original GPU consumers");
         if(request.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
         {
             request.placement.validate();
-            if(layout.consumers().front()!=PhysicalMemoryAllocatorIdentity{request.placement.coordinator->world_rank,request.placement.coordinator->device()})
-                throw std::invalid_argument("Declared GPU cache coordinator differs from actual original PLE consumer");
+            (void)sourceLayout(layout,request); // Authored coordinator membership, never consumer enumeration order.
             std::vector<PhysicalMemoryAllocatorIdentity> owners;
             for(const auto &owner:request.placement.owners)
                 owners.push_back({owner.participant.world_rank,owner.participant.device()});
             return fromLayout(layout,source,request,owners);
         }
+        if(layout.consumers().size()!=1)
+            throw std::invalid_argument("ConsumerLocal plural geometry requires exact per-requester projection");
         const std::array owners{layout.consumers().front()};
         return fromLayout(layout, source, request, owners);
+    }
+
+    /**
+     * @brief Project one authored source channel without cloning the shared storage layout.
+     * @param layout Full original owner/reader layout, retained by resolved placement.
+     * @param request Original policy naming the exact shared coordinator.
+     * @return Coordinator-only CPU-source view preserving every physical storage owner.
+     * @throws std::invalid_argument For foreign coordinator, incompatible reader domain or unbound policy.
+     */
+    static ImmutableRowTableLayoutGeometry sourceLayout(
+        const ImmutableRowTableLayoutGeometry& layout,const AdaptiveVRAMRAMSSDRequest& request)
+    {
+        if(layout.sourceServices().size()!=1 || layout.sourceServices().front().windows.storage()!=request.sourceStorage())
+            throw std::invalid_argument("Adaptive source differs from its explicit original backing");
+        if(layout.consumers().empty())throw std::invalid_argument("Adaptive source lost its original consumers");
+        if(request.placement.mode!=AdaptiveGPUCachePlacementMode::DeclaredRankLocal){
+            if(layout.consumers().size()!=1)
+                throw std::invalid_argument("Plural ConsumerLocal sources require their grouped provider contract");
+            return layout;
+        }
+        request.placement.validate();
+        const PhysicalMemoryAllocatorIdentity coordinator{request.placement.coordinator->world_rank,request.placement.coordinator->device()};
+        if(layout.adaptiveGPUDomain()!=ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator ||
+           std::find(layout.consumers().begin(),layout.consumers().end(),coordinator)==layout.consumers().end())
+            throw std::invalid_argument("Shared source coordinator is not its authored original compute consumer");
+        for(const auto consumer:layout.consumers())
+            if(consumer.world_rank!=coordinator.world_rank || consumer.device.type!=coordinator.device.type)
+                throw std::invalid_argument("Shared source readers must be original homogeneous rank-local GPUs");
+        return ImmutableRowTableLayoutGeometry::checked(layout.extent(),layout.tiers(),layout.residency(),
+            {layout.owners().begin(),layout.owners().end()},{coordinator},{},
+            {layout.sourceServices().begin(),layout.sourceServices().end()},{},layout.gpuCoordinator(),
+            layout.maximumInflightRows(),ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,layout.peerAccess());
     }
 
     /**
@@ -108,21 +143,22 @@ public:
         const AdaptiveVRAMRAMSSDRequest& request,
         std::span<const PhysicalMemoryAllocatorIdentity> ordered_owners)
     {
-        if (layout.consumers().size() != 1 || !layout.consumers().front().device.is_gpu() ||
+        const auto source_layout=sourceLayout(layout,request);
+        if (source_layout.consumers().size() != 1 || !source_layout.consumers().front().device.is_gpu() ||
             layout.sourceServices().size() != 1 || !layout.maximumInflightRows() ||
             layout.maximumInflightRows() % 16 ||
             layout.maximumInflightRows() > qwen4exp::adaptive_lookup::MaximumSlots)
             throw std::invalid_argument("Adaptive lookup requires one original GPU/source domain and complete sixteen-head query geometry");
-        const auto requester = layout.consumers().front();
+        const auto requester = source_layout.consumers().front();
         const auto physical = qwen4exp::PooledImmutablePhysicalOwnerGeometry::fromLayout(
-            layout, ordered_owners, requester);
+            source_layout, ordered_owners, requester);
         const qwen4exp::adaptive_lookup::Policy policy{
             request.gpu_policy.aging_accesses, request.gpu_policy.protected_numerator,
             request.gpu_policy.protected_denominator};
         const auto coordinator = qwen4exp::PooledImmutableCoordinatorGeometry::fromOwners(
             physical, policy, static_cast<std::uint32_t>(layout.maximumInflightRows()));
         const auto host = CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(
-            layout, layout.sourceServices().front().allocator, requester, request.host.policy);
+            source_layout, layout.sourceServices().front().allocator, requester, request.host.policy);
 
         // Project the SAME cohort with no optional GPU slots. Source/query/owner
         // ordering survives; this is not another placement solver or ledger.
@@ -132,7 +168,7 @@ public:
         const auto zero = ImmutableRowTableLayoutGeometry::checked(
             layout.extent(), layout.tiers(), layout.residency(), std::move(owners),
             {requester}, {}, {layout.sourceServices().begin(), layout.sourceServices().end()},
-            {}, std::nullopt, layout.maximumInflightRows());
+            {}, std::nullopt, layout.maximumInflightRows(), ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator, layout.peerAccess());
         const auto floor = qwen4exp::PooledImmutablePhysicalOwnerGeometry::fromLayout(
             zero, ordered_owners, requester);
         const auto floor_policy = qwen4exp::PooledImmutableCoordinatorGeometry::fromOwners(
@@ -146,7 +182,15 @@ public:
         auto fixed_roots = NativeRoots::from(floor, floor_policy, source);
         if (actual_roots.source.native_bytes != fixed_roots.source.native_bytes)
             throw std::logic_error("Adaptive source metadata unexpectedly depends on optional slot capacity");
-        return {physical, coordinator, host, std::move(actual_roots), std::move(fixed_roots)};
+        std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry> readers;
+        if(layout.consumers().size()>1){
+            if(source.row_elements>std::numeric_limits<std::uint32_t>::max())
+                throw std::overflow_error("Shared reader output width exceeds its original ABI");
+            readers=qwen4exp::PooledImmutableReplicatedReaderGeometry::checked(requester,layout.consumers(),
+                static_cast<std::uint32_t>(layout.maximumInflightRows()),static_cast<std::uint32_t>(source.row_elements),
+                layout.readerPeerAccess());
+        }
+        return {physical, coordinator, host, std::move(actual_roots), std::move(fixed_roots),std::move(readers)};
     }
 
     /**
@@ -160,8 +204,8 @@ public:
     {
         if (request.placement.mode != AdaptiveGPUCachePlacementMode::ConsumerLocal ||
             layout.adaptiveGPUDomain() != ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal ||
-            layout.sourceServices().size() != 1)
-            throw std::invalid_argument("Grouped CPU source requires exact consumer-local placement");
+            layout.sourceServices().size() != 1 || layout.sourceServices().front().windows.storage()!=request.sourceStorage())
+            throw std::invalid_argument("Grouped CPU source requires exact consumer-local placement and original backing");
         return CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPUs(
             layout, layout.sourceServices().front().allocator, request.host.policy);
     }
@@ -202,6 +246,11 @@ public:
     {
         return consumerLocalBOM(layout, source, request, devices, host, projection, ConsumerLocalContribution::Optional);
     }
+
+    /** @return Optional exact result/ACK cohort; absence retains existing singleton semantics. */
+    const std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry>& readerGeometry()const noexcept{return readers_;}
+    /** @return Actual compute readers, independent of the single original CPU source channel. */
+    std::uint32_t computeReaderCount()const noexcept{return readers_?static_cast<std::uint32_t>(readers_->consumers().size()):1u;}
 
     /** @return Original ordered physical declarations, including C0 participants. */
     const qwen4exp::PooledImmutablePhysicalOwnerGeometry& physical() const noexcept { return physical_; }
@@ -389,6 +438,7 @@ private:
             result.add(coordinator, PhysicalMemoryOwner::ImmutableLookupStaging, bytes);
         append(result, orderingBOM(devices,host,projection));
         append(result, host_.mandatoryBOM(host));
+        if(readers_)append(result,readers_->completeBOM(host,devices));
         result.add(host, PhysicalMemoryOwner::ImmutableLookupStaging,
                    qwen4exp::ImmutableLookupService::hostBytes(channelLayout()));
         return result.build();
@@ -470,9 +520,10 @@ private:
     /** @brief Retain original declarations without native operations or reservations. */
     AdaptiveImmutableLookupGeometry(qwen4exp::PooledImmutablePhysicalOwnerGeometry physical,
         qwen4exp::PooledImmutableCoordinatorGeometry coordinator, CpuAdaptiveImmutableRowCacheGeometry host,
-        NativeRoots actual, NativeRoots floor)
+        NativeRoots actual, NativeRoots floor,
+        std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry> readers={})
         : physical_(std::move(physical)), coordinator_(std::move(coordinator)), host_(std::move(host)),
-          actual_(std::move(actual)), floor_(std::move(floor)) {}
+          actual_(std::move(actual)), floor_(std::move(floor)),readers_(std::move(readers)) {}
     /** @return Checked extent sum, never available-memory arithmetic. */
     static std::size_t plus(std::size_t a, std::size_t b)
     {
@@ -490,17 +541,18 @@ private:
     /** @brief Append original typed BOM lines without another capacity ledger. */
     static void append(PhysicalMemoryPlanBuilder& result, const PhysicalMemoryPlan& original)
     { for (const auto& line : original.resources()) result.add(line); }
-    /** @brief Reject an allocator that owns neither slots nor the shared coordinator. */
+    /** @brief Reject an allocator outside the original owners, coordinator and declared reader cohort. */
     void requireAllocator(PhysicalMemoryAllocatorIdentity allocator) const
     {
         if (allocator != physical_.coordinator() && std::none_of(physical_.owners().begin(), physical_.owners().end(),
-            [&](const auto& owner) { return owner.allocator == allocator; }))
+            [&](const auto& owner) { return owner.allocator == allocator; }) &&
+            (!readers_ || std::find(readers_->consumers().begin(),readers_->consumers().end(),allocator)==readers_->consumers().end()))
             throw std::invalid_argument("Adaptive root projection names a foreign GPU allocator");
     }
     /** @return Original one-device owner; reject ambiguous projections for larger cohorts. */
     PhysicalMemoryAllocatorIdentity singleAllocator() const
     {
-        if (physical_.owners().size() != 1 || physical_.owners().front().allocator != physical_.coordinator())
+        if (readers_ || physical_.owners().size() != 1 || physical_.owners().front().allocator != physical_.coordinator())
             throw std::invalid_argument("Pooled adaptive root bytes require an explicit physical allocator");
         return physical_.coordinator();
     }
@@ -517,10 +569,11 @@ private:
     /** @brief Require the exact observation set, independent of presentation order. */
     void requireDevices(std::span<const PhysicalMemoryResource> devices) const
     {
-        const bool local = std::any_of(physical_.owners().begin(), physical_.owners().end(),
-            [&](const auto& owner) { return owner.allocator == physical_.coordinator(); });
-        if (devices.size() != physical_.owners().size() + (local ? 0 : 1))
-            throw std::invalid_argument("Adaptive BOM requires every original GPU owner and coordinator");
+        std::vector<PhysicalMemoryAllocatorIdentity> expected{physical_.coordinator()};
+        for(const auto& owner:physical_.owners())if(std::find(expected.begin(),expected.end(),owner.allocator)==expected.end())expected.push_back(owner.allocator);
+        if(readers_)for(const auto reader:readers_->consumers())if(std::find(expected.begin(),expected.end(),reader)==expected.end())expected.push_back(reader);
+        if (devices.size() != expected.size())
+            throw std::invalid_argument("Adaptive BOM requires every original GPU owner, coordinator and reader");
         for (std::size_t i = 0; i < devices.size(); ++i)
         {
             const PhysicalMemoryAllocatorIdentity allocator{devices[i].world_rank, devices[i].device};
@@ -552,5 +605,6 @@ private:
     qwen4exp::PooledImmutableCoordinatorGeometry coordinator_;
     CpuAdaptiveImmutableRowCacheGeometry host_;
     NativeRoots actual_, floor_;
+    std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry> readers_;
 };
 }

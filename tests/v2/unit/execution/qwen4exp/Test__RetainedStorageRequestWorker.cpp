@@ -4,6 +4,8 @@
  * Native APIs alone are doubled. The original source/pool/PMA, DGO methods,
  * capture scope and complete ticket builder remain production implementations.
  */
+#include <type_traits>
+#include <latch>
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/mtp/DeviceGenerationGraphProgram.h"
@@ -63,19 +65,42 @@ struct DeviceGraphOrchestratorLiveStateTestAccess {
     /** @brief Withdraw test-only borrowed words before normal DGO destruction. */
     static void clear(DeviceGraphOrchestrator& runner){runner.state_.device_id=DeviceId::cpu();runner.device_generation_storage_.control_device=nullptr;runner.device_generation_terminal_host_ready_event_.reset();}
 };
+template<class Owner> concept PublicSharedChannelFinisher = requires(Owner& owner) {
+    owner.finishNativeChannelsAfterProof();
+};
+static_assert(!PublicSharedChannelFinisher<qwen4exp::ImmutableLookupExecutionBoundary::SourceGroupAdmission>);
+static_assert(!std::is_constructible_v<RetiredStorageRequestFailure, const std::string &>);
+static_assert(!std::is_constructible_v<RetiredStorageRequestFailure, const char *>);
+static_assert(std::is_copy_constructible_v<RetiredStorageRequestFailure>);
+static_assert(std::is_copy_assignable_v<RetiredStorageRequestFailure>);
 namespace test {
 /** @brief Invoke the actual Rank terminal fanout owner without constructing a model or native context. */
 struct RankRetainedStorageRetirementReplayAccess {
+    /**
+     * @brief Manufacture recorded semantic failures only for the actual aggregation replay.
+     * @param message Original recorded service diagnostic used by the ordering oracle.
+     * @return Copyable failure value without manufacturing any native completion evidence.
+     */
+    static RetiredStorageRequestFailure failedService(const std::string &message)
+    {
+        return RetiredStorageRequestFailure(message);
+    }
     /** @brief Invoke the actual condition fan-out, including its original group preparation/attempt lifetime. */
     static bool condition(RankOrchestrator& rank,bool forward,const std::function<bool(IInferenceRunner&,size_t)>& operation){
         return rank.dispatchLocalTPMTPMainCondition("original-source-condition-replay",
             forward?RankOrchestrator::LocalTPConditionEffect::ForwardMainRow:RankOrchestrator::LocalTPConditionEffect::PublishInput,operation);
     }
+    /** @brief Await the actual retained original group after all native close publications complete. */
+    static void awaitGroup(RankOrchestrator &rank) { rank.awaitRetainedSourceAdmission(); }
     /** @return Opaque identity only; no private source state or device state is fabricated. */
     static const void* admission(const RankOrchestrator& rank){return rank.retained_source_admission_.get();}
+    template<class Participants,class Retire,class Finish,class AfterProof>
+    static void retire(const Participants& participants,Retire retire,Finish finish,AfterProof afterProof){
+        RankOrchestrator::retireOriginalStorageParticipants(participants,retire,finish,afterProof);
+    }
     template<class Participants,class Retire,class Finish>
     static void retire(const Participants& participants,Retire retire,Finish finish){
-        RankOrchestrator::retireOriginalStorageParticipants(participants,retire,finish);
+        RankOrchestrator::retireOriginalStorageParticipants(participants,retire,finish,[]{});
     }
 };
 /** @brief Closed replay of the exact production source-membership operations; no native source is manufactured. */
@@ -356,9 +381,23 @@ struct RankSourceCohort final {
     }
     /** @brief Execute actual rank fan-out and actual DGO admission; fault injection changes only the selected child result. */
     bool forward(int failure=-1,bool throws=false){
+        // The false-result case explicitly covers one already-adopted peer;
+        // the throwing case also permits cancellation before peer admission.
+        std::latch adopted(failure == 0 && !throws ? 1 : 0);
         return RankRetainedStorageRetirementReplayAccess::condition(*rank,true,[&](IInferenceRunner&,std::size_t i){
-            if(static_cast<int>(i)==failure){if(throws)throw std::runtime_error("original condition participant failed");return false;}
-            return Peer::admit(*children[i],program.permits[i]->worker()->defaultStream());
+            if (static_cast<int>(i) == failure) {
+                if (throws) throw std::runtime_error("original condition participant failed");
+                adopted.wait();
+                return false;
+            }
+            try {
+                const bool result = Peer::admit(*children[i],program.permits[i]->worker()->defaultStream());
+                if (failure == 0 && !throws) adopted.count_down();
+                return result;
+            } catch (...) {
+                if (failure == 0 && !throws) adopted.count_down();
+                throw;
+            }
         });
     }
 };
@@ -616,21 +655,143 @@ TEST(RetainedStorageRequestWorker,RankMainConditionArmsOriginalGroupBeforeFanout
             ASSERT_TRUE(success.forward());EXPECT_EQ(access.admission(*success.rank),first);
             for(auto* code:success.kernels)EXPECT_EQ(code->admissions,1);
             success.close();
+            // Channel joins alone do not retire the original parent admission.
+            // Run the actual Rank all-peer/native aggregation before an epoch can replace it.
+            EXPECT_NE(access.admission(*success.rank), nullptr);
+            EXPECT_NO_THROW(access.awaitGroup(*success.rank));
+            EXPECT_EQ(access.admission(*success.rank), nullptr);
             for(auto* child:success.children)Peer::epoch(*child,8);
             ASSERT_TRUE(success.forward());
             for(auto* code:success.kernels)EXPECT_EQ(code->admissions,2);
             success.close();
+            // Channel joins alone do not retire the original parent admission.
+            // Run the actual Rank all-peer/native aggregation before an epoch can replace it.
+            EXPECT_NE(access.admission(*success.rank), nullptr);
+            EXPECT_NO_THROW(access.awaitGroup(*success.rank));
+            EXPECT_EQ(access.admission(*success.rank), nullptr);
         }
         for(const auto throws:{false,true}){
             RankSourceCohort failed(original,throws?2:1);
             if(throws)EXPECT_THROW(failed.forward(0,true),std::runtime_error);
             else EXPECT_FALSE(failed.forward(0));
-            EXPECT_EQ(RankRetainedStorageRetirementReplayAccess::admission(*failed.rank),nullptr);
+            EXPECT_NE(RankRetainedStorageRetirementReplayAccess::admission(*failed.rank),nullptr);
+            EXPECT_THROW(failed.forward(), std::logic_error);
             failed.close(true);
             for(const auto& boundary:failed.boundaries)EXPECT_FALSE(boundary->hasActiveInterval());
+            EXPECT_THROW(RankRetainedStorageRetirementReplayAccess::awaitGroup(*failed.rank),
+                RetiredStorageRequestFailure);
+            // Retired failure is stable: neither a second cleanup nor a new
+            // launch may turn the same failed service into reusable admission.
+            EXPECT_THROW(RankRetainedStorageRetirementReplayAccess::awaitGroup(*failed.rank),
+                RetiredStorageRequestFailure);
+            EXPECT_THROW(failed.forward(), RetiredStorageRequestFailure);
         }
         }
         std::_Exit(::testing::Test::HasFailure()?2:0);
     }()),::testing::ExitedWithCode(0),"");
 }
 }
+
+namespace llaminar2::test {
+/** @brief A semantic service failure can never hide a later missing native proof, in either authored order. */
+TEST(RetainedStorageRequestWorker,RetiredServiceFailureNeverMasksMissingPeerNativeProof)
+{
+    for (const bool semanticFirst : {false, true}) {
+        const std::array originals{0, 1, 2};
+        std::vector<int> retired;
+        int finishes = 0;
+        try {
+            RankRetainedStorageRetirementReplayAccess::retire(originals, [&](int member) {
+                retired.push_back(member);
+                if (member == (semanticFirst ? 0 : 1))
+                    throw RankRetainedStorageRetirementReplayAccess::failedService("original failed IO diagnostic");
+                if (member == (semanticFirst ? 1 : 0))
+                    throw std::range_error("original missing native completion");
+            }, [&] { ++finishes; });
+            FAIL() << "Missing native completion was hidden";
+        } catch (const std::range_error &error) {
+            EXPECT_STREQ(error.what(), "original missing native completion");
+        } catch (...) {
+            FAIL() << "Semantic IO failure masked missing native proof";
+        }
+        EXPECT_EQ(retired, (std::vector<int>{0, 1, 2}));
+        EXPECT_EQ(finishes, 1);
+    }
+    int peers = 0;
+    try {
+        const std::array originals{0, 1};
+        RankRetainedStorageRetirementReplayAccess::retire(originals, [&](int member) {
+            ++peers;
+            if (member == 0) throw RankRetainedStorageRetirementReplayAccess::failedService("original failed IO");
+        }, [] { throw std::range_error("original group native completion missing"); });
+        FAIL() << "Missing group native completion was hidden";
+    } catch (const std::range_error &error) {
+        EXPECT_STREQ(error.what(), "original group native completion missing");
+    } catch (...) {
+        FAIL() << "Semantic IO failure masked group native proof";
+    }
+    EXPECT_EQ(peers, 2);
+}
+/** @brief All proven-retired peers and the original group drain before the first semantic failure is preserved. */
+TEST(RetainedStorageRequestWorker,RetiredServiceFailureDrainsEveryOriginalPeerAndGroup)
+{
+    const std::array originals{0, 1, 2};
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        int peers = 0, finishes = 0;
+        try {
+            RankRetainedStorageRetirementReplayAccess::retire(originals, [&](int member) {
+                ++peers;
+                if (member == 0) throw RankRetainedStorageRetirementReplayAccess::failedService("first original failed IO");
+                if (member == 2) throw RankRetainedStorageRetirementReplayAccess::failedService("later peer failed IO");
+            }, [&] {
+                ++finishes;
+                throw RankRetainedStorageRetirementReplayAccess::failedService("later original group failure");
+            });
+            FAIL() << "Failed IO was reported successful";
+        } catch (const RetiredStorageRequestFailure &error) {
+            EXPECT_STREQ(error.what(), "first original failed IO");
+        }
+        EXPECT_EQ(peers, 3);
+        EXPECT_EQ(finishes, 1);
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @brief Original CPU cleanup always runs, but channel retirement requires every original native proof. */
+TEST(RetainedStorageRequestWorker, SharedReaderChannelsRetireOnlyAfterAllOriginalNativeProofs)
+{
+    const std::array originals{0, 1, 2};
+    for (const int missing : {-1, 0, 1, 2}) {
+        for (const bool failedIO : {false, true}) {
+            std::vector<int> visited;
+            int cpuJoins = 0, channelRetirements = 0;
+            try {
+                RankRetainedStorageRetirementReplayAccess::retire(originals, [&](int member) {
+                    visited.push_back(member);
+                    if (member == missing) throw std::range_error("missing original reader native terminal");
+                    if (failedIO && member == (missing == 0 ? 1 : 0))
+                        throw RankRetainedStorageRetirementReplayAccess::failedService("original IO failure");
+                }, [&] { ++cpuJoins; }, [&] { ++channelRetirements; });
+                EXPECT_EQ(missing, -1);
+                EXPECT_FALSE(failedIO);
+            } catch (const std::range_error& error) {
+                EXPECT_GE(missing, 0);
+                EXPECT_STREQ(error.what(), "missing original reader native terminal");
+            } catch (const RetiredStorageRequestFailure& error) {
+                EXPECT_EQ(missing, -1);
+                EXPECT_TRUE(failedIO);
+                EXPECT_STREQ(error.what(), "original IO failure");
+            }
+            EXPECT_EQ(visited, (std::vector<int>{0, 1, 2}));
+            EXPECT_EQ(cpuJoins, 1);
+            EXPECT_EQ(channelRetirements, missing < 0 ? 1 : 0);
+        }
+    }
+    // A missing group proof is equally disqualifying, even after all peer joins.
+    int channels = 0;
+    EXPECT_THROW(RankRetainedStorageRetirementReplayAccess::retire(originals, [](int) {},
+        [] { throw std::range_error("missing original group proof"); }, [&] { ++channels; }), std::range_error);
+    EXPECT_EQ(channels, 0);
+}
+} // namespace llaminar2::test

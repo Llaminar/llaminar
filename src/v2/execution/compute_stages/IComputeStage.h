@@ -531,6 +531,10 @@ namespace llaminar2
         case ComputeStageType::NATIVE_ALLGATHER:
         case ComputeStageType::DEVICE_COUNTED_ALLGATHER:
         case ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER:
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_PACK:
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME:
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_RETURN_PACK:
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_RETURN_CONSUME:
         case ComputeStageType::NATIVE_REDUCE_SCATTER:
         case ComputeStageType::ALLGATHER_V:
         case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:

@@ -39,8 +39,8 @@ public:
      */
     static std::shared_ptr<HostImmutableRowProvider> fromWholeTable(std::unique_ptr<ImmutableRowTable> table);
     /**
-     * @brief Adopt one checked host-coordinated adaptive cache, retaining its private SSD service.
-     * @param cache Complete unique cache built from its exact layout and PMA; no separate SSD table.
+     * @brief Adopt one checked host-coordinated adaptive cache, retaining its private original RAM/SSD source.
+     * @param cache Complete unique cache built from its exact layout and PMA; no second source table.
      * @return Shared provider retaining exactly that physical/source owner.
      * @throws std::exception For null, retired, failed or stale source; no provider is published on failure.
      */

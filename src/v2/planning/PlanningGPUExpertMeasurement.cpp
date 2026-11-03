@@ -15,6 +15,11 @@
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/GPUGraphMemoryContract.h"
+#include "backends/RetainedParticipantGraphExecutable.h"
+#include "execution/moe/MoEOverlayPreparedWeightSource.h"
+#include <cmath>
+#include <chrono>
+#include <thread>
 #include "backends/IWorkerGPUContext.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/ComputeStageUtils.h"
@@ -38,6 +43,7 @@
 
 namespace llaminar2
 {
+    using llaminar::v2::kernels::KernelFactory;
     namespace
     {
         constexpr auto kWeightOwner = PhysicalMemoryOwner::RoutedExpertWeights;
@@ -177,6 +183,72 @@ namespace llaminar2
         };
 
         /**
+         * @brief One source-owned production stage binding for planning and resident observations.
+         * @param device Original GPU. @param layer Original model layer.
+         * @param phase Original semantic phase. @param rows Actual bounded phase rows.
+         * @param width Full expert width. @param intermediate Full intermediate width.
+         * @param input Private input. @param indices Private one-expert route indices.
+         * @param weights Private route weights. @param output Private FFN result.
+         * @param payload Original prepared execution views, with exclusive mutable workspace bindings.
+         * @return Same complete production stage parameters for both setup callers.
+         */
+        MoEExpertComputeStage::Params preparedStageParams(DeviceId device, int layer,
+            ExpertHistogramSource phase, int rows, int width, int intermediate,
+            FP32Tensor &input, FP32Tensor &indices, FP32Tensor &weights, FP32Tensor &output,
+            const MoEOverlayPreparedExpertPayload &payload)
+        {
+            MoEExpertComputeStage::Params params;
+            params.device_id = device;
+            params.input = &input;
+            params.output = &output;
+            params.seq_len = rows;
+            params.d_model = width;
+            params.expert_intermediate = intermediate;
+            params.num_experts = params.top_k = 1;
+            params.layer_idx = layer;
+            params.routing_indices = &indices;
+            params.routing_weights = &weights;
+            params.output_registered_in_arena = false;
+            params.service_phase = phase == ExpertHistogramSource::DecodeToken ? MoEOverlayServicePhaseHint::Decode :
+                phase == ExpertHistogramSource::PrefillChunk ? MoEOverlayServicePhaseHint::Prefill :
+                MoEOverlayServicePhaseHint::GroupedVerifier;
+            params.force_decode_equivalent_verifier_prefill = phase == ExpertHistogramSource::GroupedVerifier;
+            params.require_device_routing_tensor_decode = true;
+            params.expert_mask = {true};
+            params.prepared_gate_gemm = {payload.gate().get()};
+            params.prepared_up_gemm = {payload.up().get()};
+            params.prepared_down_gemm = {payload.down().get()};
+            params.expert_weight_resolution_policy = MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+            return params;
+        }
+
+        /**
+         * @brief Record the identical original FFN body through the supplied owner's facade.
+         * @param stage Prepared production expert stage. @param context Exact original device context.
+         * @param worker Original worker. @param device Original physical GPU.
+         * @param stream Exact original stream.
+         * @param graph Actual raw planning capture or original-owned recording facade.
+         * @param inputs Same three prepared device inputs. @param memory Original PMA.
+         * @return Actual sealed kernel/node population.
+         * @throws std::exception On missing inputs, capture/storage/seal failure; never eager replay.
+         */
+        size_t recordPreparedPhase(MoEExpertComputeStage &stage, IDeviceContext *context,
+            IWorkerGPUContext &worker, DeviceId device, void *stream, IGPUGraphCapture &graph,
+            std::array<FP32Tensor *, 3> inputs, const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+        {
+            require(stage.prepareGraphLaunch(context, stream), "capture preparation failed");
+            for (auto *tensor : inputs) TransferEngine::requireDeviceInput(tensor, device, stream);
+            ScopedBackendGraphCapture capture(worker, graph, "prepared original expert service");
+            require(capture.begin(), "capture begin failed");
+            require(stage.execute(context), "captured FFN failed");
+            capture.finish();
+            require(graph.prepareRuntimeContextStorage(memory), "expert context storage preparation failed");
+            const auto nodes = graph.nodeCount();
+            require(nodes > 0 && graph.instantiate(), "nonempty graph instantiation failed");
+            return nodes;
+        }
+
+        /**
          * @brief Capture and observe one FFN phase with private, admitted storage.
          *
          * Declaration order is the lifecycle: graph, binding, stage, workspace,
@@ -217,28 +289,8 @@ namespace llaminar2
             TransferEngine::prepareDeviceOutput(&output, device, exact_stream.get());
             auto context = IDeviceContext::create(device);
             std::unique_ptr<DeviceWorkspaceManager> workspace;
-            MoEExpertComputeStage::Params params;
-            params.device_id = device;
-            params.input = &input;
-            params.output = &output;
-            params.seq_len = rows;
-            params.d_model = width;
-            params.expert_intermediate = intermediate;
-            params.num_experts = params.top_k = 1;
-            params.layer_idx = description.layer;
-            params.routing_indices = &indices;
-            params.routing_weights = &weights;
-            params.output_registered_in_arena = false;
-            params.service_phase = phase == ExpertHistogramSource::DecodeToken ? MoEOverlayServicePhaseHint::Decode :
-                phase == ExpertHistogramSource::PrefillChunk ? MoEOverlayServicePhaseHint::Prefill :
-                MoEOverlayServicePhaseHint::GroupedVerifier;
-            params.force_decode_equivalent_verifier_prefill = phase == ExpertHistogramSource::GroupedVerifier;
-            params.require_device_routing_tensor_decode = true;
-            params.expert_mask = {true};
-            params.prepared_gate_gemm = {payload.gate().get()};
-            params.prepared_up_gemm = {payload.up().get()};
-            params.prepared_down_gemm = {payload.down().get()};
-            params.expert_weight_resolution_policy = MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+            auto params = preparedStageParams(device, description.layer, phase, rows, width, intermediate,
+                input, indices, weights, output, payload);
             MoEExpertComputeStage stage(std::move(params));
             StageBinding binding(stage);
             const auto requirements = stage.getWorkspaceRequirements(rows);
@@ -246,17 +298,10 @@ namespace llaminar2
                 requirements.total_bytes_with_alignment(), memory);
             require(workspace->allocate(requirements), "workspace allocation failed");
             stage.bindWorkspace(workspace.get());
-            require(stage.prepareGraphLaunch(context.get(), stream), "capture preparation failed");
-            for (auto *tensor : {&input, &indices, &weights})
-                TransferEngine::requireDeviceInput(tensor, device, stream);
             auto graph = worker.createGraphCapture(stream);
             require(bool(graph), "graph creation failed");
-            ScopedBackendGraphCapture capture(worker, *graph, "planning source-backed expert sample");
-            require(capture.begin(), "capture begin failed");
-            require(stage.execute(context.get()), "captured FFN failed");
-            capture.finish();
-            require(graph->prepareRuntimeContextStorage(memory), "expert context storage preparation failed");
-            require(graph->nodeCount() > 0 && graph->instantiate(), "nonempty graph instantiation failed");
+            (void)recordPreparedPhase(stage, context.get(), worker, device, stream, *graph,
+                {&input, &indices, &weights}, memory);
             if (graph->residentMemoryBytes() > std::numeric_limits<size_t>::max() - pool_growth)
                 throw std::overflow_error("GPU expert graph pool growth overflow");
             pool_growth += graph->residentMemoryBytes();
@@ -266,6 +311,133 @@ namespace llaminar2
                 6.0 * rows * width * intermediate, identity + "; rows=" + std::to_string(rows));
             return {phase, rows, graph->nodeCount(),
                 PlanningExecutionMeasurement::gpu(work, *backend, device, *graph)};
+        }
+    }
+
+    std::shared_ptr<RetainedParticipantGraphExecutable> PlanningGPUExpertMeasurement::beginPreparedCalibration(
+        DeviceId device,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
+    {
+        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,memory);
+        if(original.worker()->ownsCurrentThread())
+            throw std::invalid_argument("Prepared calibration must retain its off-worker owner");
+        void* stream=nullptr;
+        original.worker()->submitAndWait([&]{stream=ExplicitGPUStream(original.worker()->defaultStream()).get();});
+        return RetainedParticipantGraphExecutable::createPreparedCalibration(original,stream);
+    }
+
+    uint64_t PlanningGPUExpertMeasurement::measurePrepared(const MoEOverlayPreparedExpertPayload &payload,
+        DeviceId device, int layer, ExpertHistogramSource phase, int width, int intermediate,
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory, size_t declared_workspace_bytes,
+        const std::shared_ptr<RetainedParticipantGraphExecutable> &graph)
+    {
+        if (!device.is_gpu() || !memory || !payload.complete() || layer < 0 || width <= 0 || intermediate <= 0)
+            throw std::invalid_argument("Prepared GPU service requires original complete resident expert geometry");
+        const auto original = GPUDeviceContextPool::instance().retainExistingPreparedContext(device, memory);
+        const auto worker = original.worker();
+        if (worker->ownsCurrentThread())
+            throw std::invalid_argument("Prepared GPU service requires its off-worker startup owner");
+        static_assert(PlanningExecutionMeasurement::kTimedInvocations == MoEOverlayCPUServiceMeasurement::kMeasuredSamples);
+        const int rows = rowsFor(phase);
+        const auto layout = MoEOverlayCPUServiceMeasurement::gpuStorageLayout(
+            {.d_model = width, .intermediate = intermediate}, rows);
+        auto gpu_claim = memory->claimNewAllocation(device, PhysicalMemoryOwner::ExecutionWorkspace, layout.deviceBytes());
+        auto input_storage=std::make_unique<FP32Tensor>(std::vector<size_t>{size_t(rows),size_t(width)},layout.input.allocate(memory),DeviceId::cpu());
+        auto indices_storage=std::make_unique<FP32Tensor>(std::vector<size_t>{size_t(rows),1},layout.indices.allocate(memory),DeviceId::cpu());
+        auto weights_storage=std::make_unique<FP32Tensor>(std::vector<size_t>{size_t(rows),1},layout.weights.allocate(memory),DeviceId::cpu());
+        auto output_storage=std::make_unique<FP32Tensor>(std::vector<size_t>{size_t(rows),size_t(width)},layout.output.allocate(memory),DeviceId::cpu());
+        auto& input=*input_storage;auto& indices=*indices_storage;auto& weights=*weights_storage;auto& output=*output_storage;
+        for (int row = 0; row < rows; ++row)
+        {
+            indices.mutable_typed_data()[row] = 0;
+            weights.mutable_typed_data()[row] = 1;
+            for (int col = 0; col < width; ++col)
+                input.mutable_typed_data()[size_t(row) * width + col] =
+                    0.0001f * float((col % 31 * 13 + row * 7) % 31 - 15);
+        }
+        void *stream = nullptr;
+        worker->submitAndWait([&] { stream = ExplicitGPUStream(worker->defaultStream()).get(); });
+        if(!graph || graph->purpose_!=RetainedParticipantGraphExecutable::DefinitionPurpose::PreparedServiceCalibration ||
+           graph->device_!=device || graph->stream_!=stream || graph->memory_.get()!=memory.get() ||
+           graph->memory_.owner_before(memory) || memory.owner_before(graph->memory_) ||
+           graph->phase_!=RetainedParticipantGraphExecutable::Phase::Fresh)
+            throw std::invalid_argument("Prepared service requires its same fresh original cold calibration owner");
+        graph->requireLiveOriginal();
+        MoEOverlayPreparedExpertPayload engines;
+        std::unique_ptr<IDeviceContext> context;
+        std::unique_ptr<DeviceWorkspaceManager> workspace;
+        std::unique_ptr<MoEExpertComputeStage> stage;
+        std::unique_ptr<StageBinding> binding;
+        // Both prelaunch input copies and possible partial launches must retire
+        // on the exact original stream before any physical/view owner is freed.
+        const auto retire = [&](bool completed) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (!graph->observeTerminal())
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("Prepared expert original terminal exceeded 30s");
+                std::this_thread::yield();
+            }
+            if(completed)graph->resetPreparedCalibration();
+            else graph->retireDefinition();
+            worker->submitAndWait([&] {
+                binding.reset(); stage.reset(); workspace.reset(); context.reset(); engines = {};
+                // Tensor destruction retires its original completion event and
+                // device copies on the same worker after the graph is gone.
+                output_storage.reset();weights_storage.reset();indices_storage.reset();input_storage.reset();
+            });
+        };
+        try
+        {
+            worker->submitAndWait([&] {
+                const auto validate = [&](const std::shared_ptr<ITensorGemm> &engine, int n, int k) {
+                    MoEOverlayPreparedWeightSource source;
+                    std::string error;
+                    if (!resolveMoEOverlayPreparedWeightSource(engine, device, source, &error))
+                        throw std::invalid_argument("Prepared GPU service original source: " + error);
+                    const bool packed = source.kind == MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeVnni;
+                    if ((packed ? source.gpu_packed.n : source.floating.n) != n ||
+                        (packed ? source.gpu_packed.k : source.floating.k) != k)
+                        throw std::invalid_argument("Prepared GPU service source projection geometry changed");
+                };
+                validate(payload.gate(), intermediate, width);
+                validate(payload.up(), intermediate, width);
+                validate(payload.down(), width, intermediate);
+                engines = {KernelFactory::createExpertServiceExecutionView(payload.gate(), device),
+                    KernelFactory::createExpertServiceExecutionView(payload.up(), device),
+                    KernelFactory::createExpertServiceExecutionView(payload.down(), device)};
+                for (auto *tensor : {&input, &indices, &weights})
+                    TransferEngine::prepareDeviceInput(tensor, device, stream);
+                TransferEngine::prepareDeviceOutput(&output, device, stream);
+                context = IDeviceContext::create(device);
+                stage = std::make_unique<MoEExpertComputeStage>(preparedStageParams(device, layer, phase, rows,
+                    width, intermediate, input, indices, weights, output, engines));
+                binding = std::make_unique<StageBinding>(*stage);
+                const auto requirements = stage->getWorkspaceRequirements(rows);
+                if (requirements.total_bytes_with_alignment() > declared_workspace_bytes)
+                    throw std::logic_error("Prepared GPU service exceeds original declared source workspace");
+                workspace = std::make_unique<DeviceWorkspaceManager>(device, requirements.total_bytes_with_alignment(), memory);
+                require(workspace->allocate(requirements), "prepared resident workspace admission failed");
+                stage->bindWorkspace(workspace.get());
+                (void)recordPreparedPhase(*stage, context.get(), *worker, device, stream, graph->capture(),
+                    {&input, &indices, &weights}, memory);
+            });
+            auto *backend = getBackendFor(device);
+            require(backend != nullptr, "prepared resident backend missing");
+            const PlanningMeasurementWork work(PlanningWorkUnit::ArithmeticOperations,
+                6.0 * rows * width * intermediate,
+                "original resident prepared expert; layer=" + std::to_string(layer));
+            const auto observation = PlanningExecutionMeasurement::gpu(work, *backend, device, *graph);
+            const double nanoseconds = observation.elapsedSeconds() * 1.0e9;
+            if (!std::isfinite(nanoseconds) || nanoseconds < 1.0 || nanoseconds >= double(UINT64_MAX))
+                throw std::runtime_error("Prepared GPU service has no positive representable native timing");
+            retire(true);
+            return static_cast<uint64_t>(nanoseconds);
+        }
+        catch (...)
+        {
+            const auto first = std::current_exception();
+            try { retire(false); } catch (...) { std::terminate(); } // Missing native proof is never recoverable teardown.
+            std::rethrow_exception(first);
         }
     }
 

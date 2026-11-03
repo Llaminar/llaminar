@@ -1353,3 +1353,26 @@ snapshot export writes `.i64` payloads and records their dtype in the manifest.
 The PLE fusion boundaries are explicit: `PLE_GATE` contains the four gated
 shared-value branches (`[M,4H]`), and `PLE_CONVOLUTION` contains the updated trunk
 `trunk + gated + SiLU(depthwise_convolution)` (`[M,4H]`).
+
+
+### Adaptive GPU cache source backing
+
+The existing GPU-adaptive policy declares `--ngram-source-backing ssd|ram`.
+SSD preserves the original bounded mmap source and optional bounded RAM cache.
+RAM retains one complete original native table under the same CPU provider/PMA,
+shared across every actual channel; both source-cache ceilings must be zero.
+It does not change compute/storage membership, GPU cache capacity, arithmetic,
+MTP/expert policy or qualify an otherwise unsupported topology. Source admission
+must prove the mandatory full-table bytes once, then actual native lookup,
+accuracy and Release workload measurements remain required. No source capacity
+is communicated: requests/responses retain original live IDs and exact native
+row byte counts. Full-RAM terminal source observations use the distinct
+`gpu_subordinate_full_ram` mode, no RAM-cache admission/eviction, and zero mmap
+window traffic. C0 GPU grants remain valid admission evidence, not positive
+cache-performance evidence.
+
+Lossless config schema12 and ngram setup wire16 carry this explicit choice.
+Older/missing-field documents reject; refresh reviewed binding metadata through
+the canonical exporter/parser while preserving histories/source/policy limits.
+Prior numerical observations retain their original source/config identity and
+must not be relabeled as execution of a new backing policy.

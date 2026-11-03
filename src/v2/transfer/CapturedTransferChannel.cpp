@@ -2,7 +2,7 @@
  * @file CapturedTransferChannel.cpp
  * @brief TransferEngine lowering of admitted rank-local captured message channels.
  *
- * Setup claims all three physical allocations through PMA, resolves kernels,
+ * Setup claims every route-specific physical allocation through PMA, resolves kernels,
  * then joins the exact cursor-initialization events once before returning ready.
  * Live submission only validates frozen ownership and records acquire, parallel
  * byte copy and release. No live device epoch is read or reset by this host code.
@@ -13,6 +13,7 @@
 #include "utils/PerfStatsCollector.h"
 #include <algorithm>
 #include "collective/CollectiveTimeoutPolicy.h"
+#include "collective/LocalTPCollectiveInventory.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/device/WorkspaceBufferLease.h"
 #include "tensors/TensorClasses.h"
@@ -77,6 +78,85 @@ namespace llaminar2
             sizeof(CapturedTransferCursor)};
     }
 
+    void CapturedTransferChannel::beginInvocation(CapturedTransferInvocation original)
+    {
+        if (!original.valid()) throw std::invalid_argument("Captured channel requires an original admission identity");
+        requireOriginalEndpoint(CapturedTransferEndpoint::Producer);
+        requireOriginalEndpoint(CapturedTransferEndpoint::Consumer);
+        std::lock_guard lock(invocation_mutex_);
+        if (terminal_cancelled_ || invocation_active_ ||
+            original.generation < original_invocation_.generation ||
+            (original.generation == original_invocation_.generation &&
+                original.invocation <= original_invocation_.invocation))
+            throw std::logic_error("Captured channel admission is stale, overlapping or terminal");
+        original_invocation_ = original;
+        invocation_active_ = true;
+    }
+
+    CapturedTransferInvocationRetirement CapturedTransferChannel::finishInvocation(CapturedTransferInvocation original)
+    {
+        std::lock_guard lock(invocation_mutex_);
+        if (!invocation_active_ || original != original_invocation_)
+            throw std::logic_error("Captured channel retirement lost its original admission");
+        invocation_active_ = false;
+        return terminal_cancelled_ ? CapturedTransferInvocationRetirement::Cancelled
+            : CapturedTransferInvocationRetirement::Completed;
+    }
+
+    bool CapturedTransferChannel::cancelInvocation(CapturedTransferInvocation original)
+    {
+        std::lock_guard lock(invocation_mutex_);
+        if (original != original_invocation_) return false;
+        if (terminal_cancelled_) return true;
+        if (!invocation_active_) return false;
+        if (!terminal_cancelled_)
+        {
+            auto *control = static_cast<CapturedTransferChannelControl *>(mapped_->mutableHostData());
+            std::atomic_ref<std::uint64_t>(control->cancelled_nonce).store(identity_.nonce, std::memory_order_release);
+            terminal_cancelled_ = true;
+        }
+        return true;
+    }
+
+    void TransferEngine::beginCapturedTransferInvocation(const std::shared_ptr<CapturedTransferChannel> &channel,
+        CapturedTransferInvocation original) const
+    {
+        if (!channel) throw std::invalid_argument("Captured channel admission requires its original owner");
+        channel->beginInvocation(original);
+    }
+
+    CapturedTransferInvocationRetirement TransferEngine::finishCapturedTransferInvocation(const std::shared_ptr<CapturedTransferChannel> &channel,
+        CapturedTransferInvocation original) const
+    {
+        if (!channel) throw std::invalid_argument("Captured channel retirement requires its original owner");
+        return channel->finishInvocation(original);
+    }
+
+    CapturedTransferReceiveCompletion TransferEngine::capturedReceiveCompletion(
+        const CapturedTransferBinding& binding, void* stream) const
+    {
+        if (binding.role() != CapturedTransferEndpoint::Consumer)
+            throw std::invalid_argument("Captured receive completion requires its original consumer binding");
+        const auto endpoint = resolveCapturedTransferEndpoint(binding, stream, nullptr);
+        return CapturedTransferReceiveCompletion(endpoint.binding);
+    }
+
+    bool TransferEngine::cancelCapturedTransferInvocation(const std::shared_ptr<CapturedTransferChannel> &channel,
+        CapturedTransferInvocation original) const
+    {
+        if (!channel) throw std::invalid_argument("Captured channel cancellation requires its original owner");
+        return channel->cancelInvocation(original);
+    }
+
+    CapturedTransferChannelMemory CapturedTransferChannel::memoryFor(size_t capacity, CapturedTransferPayloadStorage storage)
+    {
+        if (storage == CapturedTransferPayloadStorage::MappedHost) return memoryFor(capacity);
+        if (storage != CapturedTransferPayloadStorage::PeerDevice || !capacity)
+            throw std::invalid_argument("Captured transfer requires a valid explicit payload route and positive capacity");
+        return {TransferEngine::mappedHostRegionAllocationBytes(sizeof(CapturedTransferChannelControl)),
+            sizeof(CapturedTransferCursor), capacity};
+    }
+
     void CapturedTransferChannel::completeColdInitialization(Endpoint& endpoint)
     {
         if(endpoint.initialization!=Endpoint::Initialization::Pending || !endpoint.original || !endpoint.setup_stream)
@@ -124,12 +204,39 @@ namespace llaminar2
         DeviceId producer, void *producer_setup_stream,
         DeviceId consumer, void *consumer_setup_stream, size_t capacity) const
     {
+        return createCapturedTransferChannelWithStorage(authority, host_device, producer, producer_setup_stream,
+            consumer, consumer_setup_stream, capacity, CapturedTransferPayloadStorage::MappedHost);
+    }
+
+    std::shared_ptr<CapturedTransferChannel> TransferEngine::createPeerCapturedTransferChannel(
+        PhysicalMemoryAuthority &authority, DeviceId host_device,
+        DeviceId producer, void *producer_setup_stream,
+        DeviceId consumer, void *consumer_setup_stream, size_t capacity,
+        const RankInventory &original_inventory) const
+    {
+        // Reuse the original discovery matrix before claiming or materializing
+        // any byte. A one-way edge is Partial, never a peer or mapped substitute.
+        if(original_inventory.rank!=authority.worldRank() ||
+           localTPPeerAccessCoverage(original_inventory,{producer,consumer})!=PeerAccessCoverage::Complete)
+            throw std::invalid_argument("Captured peer payload requires original cached complete bidirectional coverage");
+        return createCapturedTransferChannelWithStorage(authority,host_device,producer,producer_setup_stream,
+            consumer,consumer_setup_stream,capacity,CapturedTransferPayloadStorage::PeerDevice);
+    }
+
+    std::shared_ptr<CapturedTransferChannel> TransferEngine::createCapturedTransferChannelWithStorage(
+        PhysicalMemoryAuthority &authority, DeviceId host_device,
+        DeviceId producer, void *producer_setup_stream,
+        DeviceId consumer, void *consumer_setup_stream, size_t capacity, CapturedTransferPayloadStorage storage) const
+    {
         if (isGraphCaptureActive() || !host_device.is_cpu() || !producer.is_gpu() || !consumer.is_gpu() || producer == consumer ||
             reinterpret_cast<std::uintptr_t>(producer_setup_stream)<=2 || reinterpret_cast<std::uintptr_t>(consumer_setup_stream)<=2)
             throw std::invalid_argument("Captured transfer requires CPU backing, distinct local GPUs and explicit setup streams");
-        const auto geometry = CapturedTransferChannel::memoryFor(capacity);
+        if (storage == CapturedTransferPayloadStorage::PeerDevice && producer.type != consumer.type)
+            throw std::invalid_argument("Peer payload requires distinct same-vendor original GPU endpoints");
+        const auto geometry = CapturedTransferChannel::memoryFor(capacity, storage);
         auto channel = std::shared_ptr<CapturedTransferChannel>(new CapturedTransferChannel);
         channel->identity_ = {nextChannelIdentity(), capacity};
+        channel->payload_storage_ = storage;
         constexpr auto owner = PhysicalMemoryOwner::ActivationTransportStaging;
         const std::array devices{producer, consumer};
         const std::array streams{producer_setup_stream, consumer_setup_stream};
@@ -153,6 +260,26 @@ namespace llaminar2
             if (!endpoint.backend || !endpoint.backend->prepareCapturedTransferChannelKernels(devices[i].ordinal,
                     collective_timeout_policy::kDefaultCollectiveTimeoutMs, &endpoint.timeout_ticks) || !endpoint.timeout_ticks)
                 throw std::runtime_error("Captured transfer kernel preparation failed on " + devices[i].toString());
+        }
+        if (storage == CapturedTransferPayloadStorage::PeerDevice) {
+            // Admission occurs on both original workers; unknown/absent peer
+            // connectivity cannot silently select host payload storage.
+            for (std::size_t i = 0; i < devices.size(); ++i) {
+                auto& endpoint = channel->endpoints_[i];
+                const auto enable = [&] {
+                    if (!endpoint.backend->enableCapturedTransferPeerAccess(devices[i].ordinal, devices[1-i].ordinal))
+                        throw std::runtime_error("Captured peer payload requires complete enabled native peer access");
+                };
+                if (endpoint.original->worker()->ownsCurrentThread()) enable();
+                else endpoint.original->worker()->submitAndWait(enable);
+            }
+            channel->peer_payload_lease_ = authority.claimNewAllocation(producer, owner, geometry.producer_payload_bytes);
+            auto& originalProducer=channel->endpoints_[endpointIndex(CapturedTransferEndpoint::Producer)];
+            const auto allocatePayload=[&]{
+                channel->peer_payload_=allocateDeviceTransferBuffer(geometry.producer_payload_bytes,producer);
+            };
+            if(originalProducer.original->worker()->ownsCurrentThread())allocatePayload();
+            else originalProducer.original->worker()->submitAndWait(allocatePayload);
         }
         channel->mapped_ = allocateMappedHostRegion(geometry.mapped_host_bytes, devices);
         // The first-touch allocator zeroes every page; placement construction
@@ -393,7 +520,9 @@ namespace llaminar2
         const auto& endpoint=channel_->endpoints_[endpointIndex(native_.role)];
         std::uint64_t identity = 1469598103934665603ULL;
         const auto mix = [&](std::uint64_t word) { identity = (identity ^ word) * 1099511628211ULL; };
-        mix(2); mix(static_cast<std::uint64_t>(device_.type)); mix(device_.ordinal);
+        mix(3); mix(static_cast<std::uint64_t>(channel_->payload_storage_));
+        mix(reinterpret_cast<std::uintptr_t>(channel_->peer_payload_ ? channel_->peer_payload_->mutableDeviceData() : nullptr));
+        mix(static_cast<std::uint64_t>(device_.type)); mix(device_.ordinal);
         mix(endpoint.original->generation());mix(endpoint.runtime_generation);
         mix(reinterpret_cast<std::uintptr_t>(endpoint.original->worker().get()));mix(reinterpret_cast<std::uintptr_t>(endpoint.setup_stream));
         mix(reinterpret_cast<std::uintptr_t>(native_.control)); mix(reinterpret_cast<std::uintptr_t>(native_.cursor));
@@ -591,7 +720,9 @@ namespace llaminar2
         // Setup certified initialization. Submit one complete typed operation;
         // the backend may fuse nodes without splitting ownership or making
         // TransferEngine dictate a needlessly fragmented native graph.
-        auto *mapped_bytes = binding.channel_->mapped_->deviceAlias(binding.device_, CapturedTransferChannel::payload_offset);
+        auto *mapped_bytes = binding.channel_->payload_storage_ == CapturedTransferPayloadStorage::PeerDevice
+            ? binding.channel_->peer_payload_->mutableDeviceData()
+            : binding.channel_->mapped_->deviceAlias(binding.device_, CapturedTransferChannel::payload_offset);
         const bool outbound = binding.native_.role == CapturedTransferEndpoint::Producer;
         void *destination = outbound ? mapped_bytes : binding.device_bytes_;
         const void *source = outbound ? binding.device_bytes_ : mapped_bytes;

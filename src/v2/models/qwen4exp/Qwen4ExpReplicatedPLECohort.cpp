@@ -28,14 +28,22 @@ Qwen4ExpReplicatedPLECohort::Qwen4ExpReplicatedPLECohort(ILocalTPContext &contex
     std::copy(n.head_vocab_sizes.begin(),n.head_vocab_sizes.end(),policy_.moduli.begin());
     policy_.eosToken=n.hash_reset_token;policy_.validate();
 }
+bool Qwen4ExpReplicatedPLECohort::requiresReplicatedQuery(const ResolvedImmutableRowTablePlacement &placement)
+{
+    return placement.isFixedHeadShards() ||
+        (placement.isGPUAdaptive() && placement.consumers().size()>1 &&
+         placement.gpuAdaptiveLayout().adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator &&
+         placement.gpuAdaptiveRequest().placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal);
+}
 void Qwen4ExpReplicatedPLECohort::requireDeclaration(ILocalTPContext &context,
     const ResolvedImmutableRowTablePlacement &placement,const Qwen4ExpConfig &source)
 {
     const auto &members=context.devices();
-    if(!placement.isFixedHeadShards() || !context.isLocal() ||
+    const bool fixedHeadStorage=placement.isFixedHeadShards();
+    if(!requiresReplicatedQuery(placement) || !context.isLocal() ||
         (members.size()!=2 && members.size()!=4 && members.size()!=8) ||
         context.degree()!=static_cast<int>(members.size()) || placement.consumers().size()!=members.size() ||
-        !context.supportsRawAllgatherOnStreamGraphCapture())
+        (fixedHeadStorage && !context.supportsRawAllgatherOnStreamGraphCapture()))
         throw std::invalid_argument("Fixed-head PLE requires its exact Rank-owned native local TP cohort");
     const auto &n=source.ngrams();
     if(n.table.dimensions.size()!=2 || n.heads!=16 || n.head_offsets.size()!=16 ||
@@ -56,6 +64,15 @@ void Qwen4ExpReplicatedPLECohort::requireDeclaration(ILocalTPContext &context,
         const auto device=members[p].toLocalDeviceId();
         if(device.type!=firstDevice.type)
             throw std::invalid_argument("Fixed-head PLE cannot reinterpret heterogeneous devices as one native cohort");
+        if(!fixedHeadStorage) {
+            for (std::size_t prior = 0; prior < p; ++prior)
+                if (members[prior].toLocalDeviceId() == device)
+                    throw std::invalid_argument("Replicated shared PLE has a duplicate original compute participant");
+            const PhysicalMemoryAllocatorIdentity consumer{placement.worldRank(),device};
+            if(std::find(placement.consumers().begin(),placement.consumers().end(),consumer)==placement.consumers().end())
+                throw std::invalid_argument("Replicated shared PLE lost its original compute consumer");
+            continue;
+        }
         const auto assignment=Qwen4ExpFixedHeadShards::assignmentFor(placement,{placement.worldRank(),device});
         const auto first=p?policy.offsets[p*16/members.size()]:0;
         const auto end=p+1==members.size()?placement.extent().rows():policy.offsets[(p+1)*16/members.size()];
@@ -72,7 +89,7 @@ ILocalTPContext &Qwen4ExpReplicatedPLECohort::context() const
         throw std::logic_error("Fixed-head PLE communicator changed after Rank composition");
     return *context_;
 }
-Qwen4ExpFixedHeadShardAssignment Qwen4ExpReplicatedPLECohort::requireParticipant(DeviceId device,int participant) const
+void Qwen4ExpReplicatedPLECohort::requireConsumer(DeviceId device,int participant) const
 {
     const auto &ctx=context();
     const auto backend=device.is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;
@@ -82,6 +99,52 @@ Qwen4ExpFixedHeadShardAssignment Qwen4ExpReplicatedPLECohort::requireParticipant
     for(const auto &member:members_)
         if(member.toLocalDeviceId().type!=device.type)
             throw std::invalid_argument("Fixed-head PLE cannot reinterpret heterogeneous devices as one native cohort");
+}
+void Qwen4ExpReplicatedPLECohort::prepareSharedSource(
+    DeviceId device, const std::function<void()>& prepare) const
+{
+    if (!prepare || !placement_->isGPUAdaptive() ||
+        placement_->gpuAdaptiveRequest().placement.mode != AdaptiveGPUCachePlacementMode::DeclaredRankLocal ||
+        placement_->gpuAdaptiveLayout().consumers().size() != members_.size())
+        throw std::invalid_argument("Shared source cold preparation lost its original complete cohort");
+    const auto& declaration = placement_->gpuAdaptiveRequest().placement;
+    if (!declaration.coordinator)
+        throw std::invalid_argument("Shared source cold preparation has no authored coordinator");
+    if (std::none_of(members_.begin(), members_.end(), [&](const auto& actual) {
+            return actual.toLocalDeviceId() == declaration.coordinator->device();
+        }))
+        throw std::invalid_argument("Shared source cold coordinator is not an original compute participant");
+    auto& tp = context();
+    const auto member = std::find_if(members_.begin(), members_.end(), [&](const auto& actual) {
+        return actual.toLocalDeviceId() == device;
+    });
+    if (member == members_.end())
+        throw std::invalid_argument("Shared source cold preparation has a foreign participant");
+    const auto index = static_cast<int>(member - members_.begin());
+    requireConsumer(device, index);
+    const auto rendezvous = [&](const char* phase) {
+        if (!tp.graphCaptureBoundaryRendezvous(phase, index, 30000))
+            throw std::runtime_error("Shared source original cold materialization boundary failed");
+    };
+    try
+    {
+        const bool source = device == declaration.coordinator->device();
+        if (source) prepare();
+        rendezvous("qfn-shared-source-materialized");
+        if (!source) prepare();
+        rendezvous("qfn-shared-readers-materialized");
+    }
+    catch (...)
+    {
+        tp.requestAbort();
+        throw;
+    }
+}
+Qwen4ExpFixedHeadShardAssignment Qwen4ExpReplicatedPLECohort::requireParticipant(DeviceId device,int participant) const
+{
+    requireConsumer(device,participant);
+    if(!placement_->isFixedHeadShards())
+        throw std::invalid_argument("Fixed-head source assignment cannot describe shared adaptive storage");
     const auto assignment=Qwen4ExpFixedHeadShards::assignmentFor(*placement_,{placement_->worldRank(),device});
     if(assignment.participant!=static_cast<std::size_t>(participant) ||
         assignment.first_head!=static_cast<std::size_t>(participant)*16/members_.size() ||
@@ -92,7 +155,8 @@ Qwen4ExpFixedHeadShardAssignment Qwen4ExpReplicatedPLECohort::requireParticipant
 void Qwen4ExpReplicatedPLECohort::requireQuery(const Qwen4ExpReplicatedPLEQuery &q,
     const ForwardInput &input,DeviceRowRange rows,const Qwen4ExpAuxiliaryState &history) const
 {
-    (void)requireParticipant(q.device_,q.participant_);
+    requireConsumer(q.device_,q.participant_);
+    if(placement_->isFixedHeadShards())(void)requireParticipant(q.device_,q.participant_);
     if(q.isWorkspaceDeclaration()!=(input.graph_submission_intent==ForwardGraphSubmissionIntent::WorkspaceDeclaration))
         throw std::invalid_argument("Fixed-head executable query and workspace declaration authority cannot be interchanged");
     if(q.cohort_!=this || !q.owner_ || q.device_!=input.device || input.batch_size!=1 ||

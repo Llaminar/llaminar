@@ -158,12 +158,15 @@ PooledImmutableOwnerNativePlan PooledImmutableOwnerNativePlan::fromGeometry(
     const auto& owner=physical.owners()[coordinate];
     const auto offsets=ownerOffsets(owner.slots,physical.maximumUniqueRows(),physical.rowBytes(),owner.allocator!=physical.coordinator());
     auto identity=common(physical,table,generation);
-    identity.mix(0);identity.mix(coordinate);identity.mix(coordinator.parameters().maximumOriginal());
+    identity.mix(0);
+    identity.mix(physical.peerAccess().has_value());
+    if (physical.peerAccess()) identity.mix(static_cast<unsigned>(*physical.peerAccess()));
+    identity.mix(coordinate);identity.mix(coordinator.parameters().maximumOriginal());
     identity.ownerCache(owner.cache);identity.ownerFrame(owner.frame);
     identity.mix(offsets.progress);identity.mix(offsets.header);identity.mix(offsets.replies);
     identity.mix(offsets.reply_capacity);identity.mix(offsets.ingress);identity.mix(offsets.source_outcome);identity.mix(offsets.source_fills);identity.mix(offsets.source_payload);identity.mix(offsets.bytes);
     return {{physical.ownerParameters(coordinate),owner.cache,owner.frame,offsets,owner.allocator.device,
-        coordinator.parameters().maximumOriginal(),physical.rowBytes(),physical.slotStride(),table,generation,identity.value()},owner.allocator};
+        coordinator.parameters().maximumOriginal(),physical.rowBytes(),physical.slotStride(),table,generation,identity.value()},owner.allocator,physical.peerAccess()};
 }
 PhysicalMemoryPlan PooledImmutableOwnerNativePlan::mandatoryBOM(PhysicalMemoryResource observed)const
 {return bom(allocator_,parameters_.native.bytes,observed);}

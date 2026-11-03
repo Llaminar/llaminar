@@ -56,7 +56,7 @@ std::shared_ptr<const PooledImmutableCapturedSourceWave> PooledImmutableCaptured
     previous->requireCurrent();const auto pin=previous->previous()->pin();const auto forward=pin->forward();const auto source=boundary->pooledStorage();const auto coordinate=previous->declaration().coordinate();
     forward->ownerStorage()->requireAuthority(memory);forward->coordinatorStorage()->requireAuthority(memory);
     if(source->coordinator()!=forward->coordinatorStorage() || coordinate>=source->originalOwners().size() || source->originalOwners()[coordinate]!=forward->ownerStorage() ||
-        !source->geometry().parameters().offsets.seal_receipt || !forward->declaration().capturedCrossVendor() || !forward->channel_ || !pin->channel_)
+        !source->geometry().parameters().offsets.seal_receipt || !forward->declaration().capturedChannelTransport() || !forward->channel_ || !pin->channel_)
         throw std::invalid_argument("Source fill requires original all-remote r5 cross-vendor cohort; native/rank/mixed-local factory remains guarded");
     source->coordinator()->requireAuthority(memory);source->captureIdentity();
     // The original service binding authenticated source roots against this same PMA at publication.

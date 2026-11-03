@@ -679,15 +679,22 @@ namespace llaminar2
         // Pipeline composition borrows participant-local recordings and the
         // existing event handoff; it never owns a second sampler/controller.
         friend class PipelineDeviceGeneration;
+        friend class RankOrchestrator;
     public:
         /** @brief Project only original declarative storage owner and host request epoch for complete TP source admission. */
         std::pair<std::shared_ptr<IRetainedGraphStorageBoundary>,std::uint64_t> retainedStorageSourceAdmission() const;
+    private:
+        // Only the original Rank can order these phases across every participant.
         /** @brief Join original prior producers and publish this grouped channel's reset close before any TP peer awaits. */
         void prepareGroupedRetainedStorageReset(const InferenceStateResetRequest& request);
         /** @brief Complete this original native result bridge, deferring only the shared CPU service await to its TP parent. */
         bool finishGroupedDeviceResidentGeneration(DeviceGenerationTerminalResult* result);
         /** @brief Consume this adopted channel only after all TP native terminal bridges have completed. */
         void awaitGroupedRetainedStorageTerminal();
+
+        /** @return Whether this genuine Rank participant owns only a shared pooled result/ACK endpoint. */
+        bool sharedPooledQueryOnlyReader() const;
+    public:
 
 
 
@@ -5052,6 +5059,10 @@ namespace llaminar2
             DeviceId execution_device,
             const std::string &boundary_name,
             void *capture_stream) override;
+        /** @copydoc IForwardExecutionHost::waitAtPrefillGraphCaptureBoundary */
+        bool waitAtPrefillGraphCaptureBoundary(const ForwardInput&,DeviceId,const std::string&,void*,LocalTPCaptureSourceDefinition&) override;
+        /** @brief One implementation preserves the existing stream fence for ordinary and typed cold boundaries. */
+        bool waitAtPrefillGraphCaptureBoundaryImpl(const ForwardInput&,DeviceId,const std::string&,void*,LocalTPCaptureSourceDefinition*);
 
         /** Wait at a LocalTP-aware decode graph-capture lifecycle boundary. */
         bool waitAtDecodeGraphCaptureBoundary(
@@ -5059,6 +5070,10 @@ namespace llaminar2
             DeviceId execution_device,
             const std::string &boundary_name,
             void *capture_stream) override;
+        /** @copydoc IForwardExecutionHost::waitAtDecodeGraphCaptureBoundary */
+        bool waitAtDecodeGraphCaptureBoundary(const ForwardInput&,DeviceId,const std::string&,void*,LocalTPCaptureSourceDefinition&) override;
+        /** @brief One implementation preserves the existing stream fence for ordinary and typed cold boundaries. */
+        bool waitAtDecodeGraphCaptureBoundaryImpl(const ForwardInput&,DeviceId,const std::string&,void*,LocalTPCaptureSourceDefinition*);
 
         /**
          * @brief Materialize pending verifier token IDs on the graph execution stream.

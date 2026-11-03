@@ -8,6 +8,7 @@
  * mixed participant builders; this file allocates no native storage or event.
  */
 #include "PooledImmutableDirectedLookupGraph.h"
+#include "PooledImmutableReplicatedReaderGraph.h"
 #include "PooledImmutableParticipantLocalGraph.h"
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -62,6 +63,7 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
     }
     if(transport->remotes().size()+(local?1u:0u)!=storage->originalOwners().size())
         throw std::invalid_argument("Directed lookup requires every original physical owner exactly once");
+    const auto originalCount = begin[static_cast<unsigned>(q::PooledNativeOperand::OriginalCount)];
     bindPooledNativeRoots(arena,*coordinator);
     if(local)bindPooledNativeRoots(arena,*local->ownerStorage());
     bindPooledSourceRoots(arena,*boundary);
@@ -102,6 +104,9 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
     const auto publication=appendPooledPublicationCoordinator(fragment,arena,source,publications,code,identity+"/publication");
     const auto read=appendPooledReadCoordinator(fragment,arena,publication,readers,std::move(output),identity+"/read",output_identity);
     auto retired=appendPooledRetirementCoordinator(fragment,arena,read,retirement_members,code,identity+"/retirement");
+    if (storage->geometry().parameters().consumers > 1)
+        retired.readers = appendPooledReplicatedSourceReaders(fragment, arena, transport, control,
+            original.rows, retired.read.outputSpan, read.output, retired.readersRetired, identity + "/readers", originalCount);
     requirePooledRetirementCompletion(fragment,retired);
     const auto last=retired.coordinator.last;
     publishFragment(graph,std::move(fragment));graph.setRetainedStorageBoundary(std::move(boundary));

@@ -91,3 +91,47 @@ if(TARGET v2_test_memory_planner)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ConsumerLocalGenericPopulationMetadataReplay)
 endif()
+
+# One replicated query/source owns shared physical caches; foreign readers own result/ACK edges only.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_SharedCoordinatorAdaptiveLookupGeometryReplay
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=DeclaredGPUCachePlacement.SharedCoordinatorReadersPreserveOneSourceAndExactResultACKBOM:DeclaredGPUCachePlacement.SharedCoordinatorTP2SourceSiblingsPreserveOriginalPolicies:DeclaredGPUCachePlacement.SharedCoordinatorCUDATP2SourceSiblingsPreserveOriginalPoliciesAndStorageRole
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Qwen4Exp;TP;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SharedCoordinatorAdaptiveLookupGeometryReplay)
+endif()
+if(TARGET v2_test_memory_planner)
+    add_v2_test(V2_Integration_SharedCoordinatorTP2LookupAdmissionReplay
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=GPUAdaptiveImmutableLookupAdmission.SharedCoordinatorTP2OriginalPMAAndWireReplay:RankMemoryPlanInputs.SharedCoordinatorTP2KeepsOriginalComputeAndStorageRoles:RankMemoryPlanInputs.SharedCoordinatorCUDATP2KeepsOppositeVendorStorageAndNoPeerReader:GPUAdaptiveImmutableLookupAdmission.SharedCoordinatorCUDATP2OriginalPMAAndMappedWireReplay
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Qwen4Exp;TP;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;GTEST_DEATH_TEST_STYLE=threadsafe")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SharedCoordinatorTP2LookupAdmissionReplay)
+endif()
+
+# Actual cold shared-source method retains both original TP rendezvous phases and abort ownership.
+if(TARGET v2_test_qwen4exp_metadata)
+    add_v2_test(V2_Integration_SharedCoordinatorColdSourcePreparationReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+            --gtest_filter=Qwen4ExpReplicatedPLECohort.SharedColdSourceUsesAuthoredCoordinatorAndBothOriginalPhases:Qwen4ExpReplicatedPLECohort.SharedColdSourceFailureAbortsAndUnblocksOriginalPeer
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;TP;Ownership;Lifecycle;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SharedCoordinatorColdSourcePreparationReplay)
+endif()
+
+if(TARGET v2_test_memory_planner)
+    add_v2_test(V2_Integration_ConsumerLocalTP4AndTP8RankAdmissionReplay
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=GPUAdaptiveImmutableLookupAdmission.ConsumerLocalTP4AndTP8RankInputsKeepOriginalAssignments --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Memory;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ConsumerLocalTP4AndTP8RankAdmissionReplay)
+endif()

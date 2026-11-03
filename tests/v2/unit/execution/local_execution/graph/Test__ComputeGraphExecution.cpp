@@ -1323,3 +1323,78 @@ TEST_F(ComputeGraphExecutionTest, RealResidualAddStage_InGraph)
         EXPECT_FLOAT_EQ(output_data[i], 3.0f); // 1.0 + 2.0
     }
 }
+
+/** @test Storage remains parallel to layer0 while Close includes its actual terminal. */
+TEST(NativeParallelGraphBranch, StorageSiblingSharesOpenAndExtendsCloseWithoutSerializingLayer0)
+{
+    BranchGraphProbe body{.name="main"}, storage{.name="storage"};
+    BranchGraphProbe open{.name="open"}, worker{.name="progress"}, close{.name="close"};
+    auto* layer0=body.add("layer0_follower");
+    auto* ple1=body.add("layer1_PLE");
+    auto* terminal=body.add("main_terminal");
+    body.edges={{layer0,ple1},{ple1,terminal}};
+    const std::array siblings{&storage};
+    const auto result=detail::appendNativeParallelBranch<BranchGraphProbeAPI>(&body,{&open,&worker,&close},siblings);
+    ASSERT_EQ(result.error,0);
+    auto* storage_node=body.nodes[3].get();
+    auto* open_node=body.nodes[4].get();
+    auto* worker_node=body.nodes[5].get();
+    auto* close_node=body.nodes[6].get();
+    auto* join=body.nodes[7].get();
+    EXPECT_TRUE(body.edges.contains({open_node,layer0}));
+    EXPECT_TRUE(body.edges.contains({open_node,storage_node}));
+    EXPECT_TRUE(body.edges.contains({open_node,worker_node}));
+    EXPECT_FALSE(body.edges.contains({storage_node,layer0}));
+    EXPECT_FALSE(body.edges.contains({layer0,storage_node}));
+    EXPECT_FALSE(body.edges.contains({close_node,storage_node}));
+    EXPECT_FALSE(body.edges.contains({worker_node,close_node}));
+    EXPECT_TRUE(body.edges.contains({terminal,close_node}));
+    EXPECT_TRUE(body.edges.contains({storage_node,close_node}));
+    EXPECT_TRUE(body.edges.contains({close_node,join}));
+    EXPECT_TRUE(body.edges.contains({worker_node,join}));
+    EXPECT_EQ(body.cloned_sources,(std::vector<BranchGraphProbe*>{&storage,&open,&worker,&close}));
+}
+/** @test Self, absent and duplicate siblings fail before mutation or open publication. */
+TEST(NativeParallelGraphBranch, InvalidFiniteSiblingsCannotPartiallyDecorateParent)
+{
+    BranchGraphProbe body{.name="main"}, storage{.name="storage"};
+    BranchGraphProbe open{.name="open"}, worker{.name="progress"}, close{.name="close"};
+    body.add("original");
+    for (const auto siblings : {std::vector<BranchGraphProbe*>{nullptr},
+            std::vector<BranchGraphProbe*>{&body}, std::vector<BranchGraphProbe*>{&storage,&storage},
+            std::vector<BranchGraphProbe*>{&open}, std::vector<BranchGraphProbe*>{&worker},
+            std::vector<BranchGraphProbe*>{&close}}) {
+        EXPECT_EQ(detail::appendNativeParallelBranch<BranchGraphProbeAPI>(&body,{&open,&worker,&close},siblings).error,BranchGraphProbeAPI::invalid);
+        EXPECT_EQ(body.nodes.size(),1u);
+        EXPECT_TRUE(body.cloned_sources.empty());
+    }
+}
+
+/** @test Native SDMA requires no synthetic Open/Close: main and finite storage retain independent roots/terminals. */
+TEST(NativeParallelGraphBranch, FiniteSiblingWithoutProgressPreservesOriginalMainAndAllTerminals)
+{
+    BranchGraphProbe storage{.name="original_storage"};storage.add("storage_leaf");
+    for(unsigned replay=0;replay<20;++replay){
+        BranchGraphProbe main{.name="main"};auto* first=main.add("layer0");auto* last=main.add("main_terminal");
+        main.edges={{first,last}};const std::array siblings{&storage};
+        ASSERT_EQ(detail::appendNativeFiniteBodySiblings<BranchGraphProbeAPI>(&main,siblings).error,0);
+        ASSERT_EQ(main.nodes.size(),3u);
+        auto* physical=main.nodes.back().get();
+        EXPECT_EQ(main.edges.size(),1u);EXPECT_TRUE(main.edges.contains({first,last}));
+        EXPECT_FALSE(main.edges.contains({physical,first}));EXPECT_FALSE(main.edges.contains({last,physical}));
+        EXPECT_EQ(main.cloned_sources,(std::vector<BranchGraphProbe*>{&storage}));
+        EXPECT_EQ(storage.nodes.size(),1u);EXPECT_TRUE(storage.edges.empty());
+    }
+}
+/** @test All malformed sibling sets reject before the first native import; source definitions are immutable/reusable. */
+TEST(NativeParallelGraphBranch, FiniteSiblingRejectsEmptySelfDuplicateBeforeMutation)
+{
+    BranchGraphProbe main{.name="main"},storage{.name="storage"},empty{.name="empty"};
+    main.add("main_leaf");storage.add("storage_leaf");
+    for(const auto siblings:{std::vector<BranchGraphProbe*>{},std::vector<BranchGraphProbe*>{nullptr},
+        std::vector<BranchGraphProbe*>{&main},std::vector<BranchGraphProbe*>{&storage,&storage},
+        std::vector<BranchGraphProbe*>{&storage,&empty}}){
+        EXPECT_EQ(detail::appendNativeFiniteBodySiblings<BranchGraphProbeAPI>(&main,siblings).error,BranchGraphProbeAPI::invalid);
+        EXPECT_EQ(main.nodes.size(),1u);EXPECT_TRUE(main.cloned_sources.empty());
+    }
+}

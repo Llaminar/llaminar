@@ -12,6 +12,16 @@
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 namespace llaminar2::test {
 struct PooledImmutableFactoryReplayAccess final {
+    /**
+     * @brief Withdraw only the recorded boundary's weak authority to replay missing terminal proof.
+     * @param boundary Original fixture boundary; its actual cohort owner remains retained by the test.
+     */
+    static void withdrawCohortForTerminalReplay(qwen4exp::ImmutableLookupExecutionBoundary &boundary)
+    {
+        boundary.completeCohort_.store(
+            std::weak_ptr<qwen4exp::PooledImmutableRetirementAuthority>{}, std::memory_order_release);
+    }
+
     /** @brief Append the actual plan's closed program using sealed recorded observations. */
     static void addOrdering(PhysicalMemoryPlanBuilder& builder,NativeOrderingEventProgram program,
         PhysicalMemoryResource host,PhysicalMemoryResource gpu){

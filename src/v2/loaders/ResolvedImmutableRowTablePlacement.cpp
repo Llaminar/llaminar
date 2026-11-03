@@ -73,7 +73,7 @@ ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(Immutable
     const bool independent = g.adaptiveGPUDomain() == ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal;
     if ((independent && (requested.placement.mode != AdaptiveGPUCachePlacementMode::ConsumerLocal || g.consumers().size() < 2)) ||
         g.owners().size()!=(requested.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal?requested.placement.owners.size()+1:g.consumers().size()+1) ||
-        g.sourceServices().size()!=1 || g.consumers().empty() || (!independent && g.consumers().size()!=1) ||
+        g.sourceServices().size()!=1 || g.sourceServices().front().windows.storage()!=requested.sourceStorage() || g.consumers().empty() ||
         !g.consumers().front().device.is_gpu() || !g.maximumInflightRows() || g.maximumInflightRows()%16)
         throw std::invalid_argument("GPU adaptive placement requires exact original GPU directories, subordinate RAM/SSD and bounded original IDs");
     const auto &windows=g.sourceServices().front().windows;

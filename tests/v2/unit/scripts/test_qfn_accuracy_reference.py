@@ -465,6 +465,39 @@ class QFNAccuracyReferenceTests(unittest.TestCase):
         args.output.mkdir()
         with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):parse_args(base)
 
+    def test_frozen_reference_survives_device_renumbering_before_admission(self):
+        """Real tiny file metadata survives reboot numbering; frozen records stay unchanged."""
+        import copy
+        args,manifest,history=self.frozen_fixture()
+        actual_source=copy.deepcopy(manifest['source'])
+        for descriptor in manifest['source']['shards']:
+            frozen=json.loads(descriptor['object_identity']);frozen['device']+=1
+            descriptor['object_identity']=json.dumps(frozen)
+        args.frozen_history.write_text(json.dumps(manifest))
+        self.assertEqual(load_frozen_history(args),(manifest,history))
+        before=args.frozen_history.read_bytes()
+        model=FakeReference(prompts={history['prompt']:history['prompt_ids']})
+        with patch.object(panel,'original_source',return_value=actual_source), \
+             patch('python.reference.generate_qwen4exp_pipeline_snapshots.write_metadata'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            generate_frozen_history(args,tokenizer=None,model_factory=lambda *a,**k:model)
+        self.assertEqual(model.closed,1)
+        self.assertEqual(args.frozen_history.read_bytes(),before)
+
+    def test_frozen_reference_rejects_device_change_during_actual_run(self):
+        """Cross-boot comparison does not relax this model lifetime's before/after check."""
+        import copy
+        args,manifest,history=self.frozen_fixture()
+        before=manifest['source'];after=copy.deepcopy(before)
+        descriptor=after['shards'][0];changed=json.loads(descriptor['object_identity'])
+        changed['device']+=1;descriptor['object_identity']=json.dumps(changed)
+        model=FakeReference(prompts={history['prompt']:history['prompt_ids']})
+        with patch.object(panel,'original_source',side_effect=[before,after]), \
+             patch('python.reference.generate_qwen4exp_pipeline_snapshots.write_metadata') as publish, \
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError,'changed during'):
+            generate_frozen_history(args,tokenizer=None,model_factory=lambda *a,**k:model)
+        self.assertEqual(model.closed,1);publish.assert_not_called()
+
     def test_frozen_full_stage_writer_closes_once_before_metadata(self):
         """Actual cached helper writes all fixture stages; only retired source can publish metadata."""
         args,manifest,history=self.frozen_fixture()

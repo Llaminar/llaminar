@@ -47,6 +47,16 @@ Admission accounting is supporting infrastructure. A successful load does not
 qualify a configuration for users, and another accounting refinement is not a
 substitute for running the admitted configuration.
 
+The immediate functional/performance campaign is the user-selected
+[six-row hardware target](QFN_FUNCTIONAL_PERFORMANCE_TARGET_2026-11-02.md):
+MI50 counts 1/2/4, RTX 3090 counts 1/2, and RTX 3090×2 continuation with all four
+MI50s doing follower expert work. Cross these with RAM/SSD backing and bounded
+RAM/VRAM row-cache policies, including observed promotion/demotion. The detailed
+note distinguishes cheap full-product metadata checks from complementary real
+execution, numerical and performance projections. Broader PP/cross-rank/mixed-TP
+capabilities below remain future contract coverage, not extra rows in this
+immediate campaign. Existing CPU/backend regressions remain in force.
+
 Use the existing canonical typed matrix as the configuration authority. For each
 configuration being qualified, keep these results distinct and traceable to its
 exact model, topology, placement, arithmetic and runtime policy:
@@ -75,13 +85,13 @@ execution and accuracy evidence. Missing hardware, unimplemented combinations,
 and unmeasured performance remain explicit gaps in the dashboard. Do not turn
 them into successful skips or add a separate manually maintained topology list.
 
-The current four opposite-vendor ordinary controls are a bridge to this work:
-they use static experts and MTP Off with retained capacity15. Their source,
-inference and required frozen-history groups now pass. The next user-prioritized
-slice is active fixed1, fixed3 and Dynamic MTP on the same execution path,
-followed by dynamic balancing, Release economy and the remaining consumer/domain combinations. A scoped
-recorder cleanup may remove duplicate setup; a graph-builder rewrite is outside
-this slice.
+The four earlier opposite-vendor ordinary controls and the 24 completed
+ConsumerLocal movement/MTP cells provide scoped baselines. They do not qualify
+one shared adaptive table across continuation and follower devices. The current
+priority is completing that owner integration and the native live-payload path,
+then running the six-row campaign with its numerical and Release economy pairs.
+A scoped recorder cleanup may remove duplicate setup; a graph-builder rewrite
+is outside this slice.
 
 ## Existing target and installed boundary
 
@@ -110,6 +120,104 @@ Mint one cold-admitted transport operation in the original LocalTPContext bindin
 
 ## Independent consumers and storage owners
 
+### Ownership and caching clarification — 2026-11-02
+
+Keep these concepts distinct in the implementation, tests and user-facing policy:
+
+| Concept | Contract |
+|---|---|
+| Backing table | A complete immutable row source supplied by RAM or SSD. |
+| Resident shard | An explicitly placed portion retained for the admitted configuration. |
+| Row cache | A bounded allocation containing replaceable copies of useful rows. |
+| Consumer | A participant that actually needs lookup output under its declared PLE layout. |
+
+The current pooled adaptive coordinator can allocate cached rows across owners;
+it does not impose a permanent source-row home partition. Here an owner usually
+owns physical cache slots and their lifetime. Do not describe that as exclusive
+logical ownership of a table range. Fixed-head resident partitioning is a
+separate existing policy. Immutable replicas may have independent physical
+owners without inventing a second authority for any allocation.
+
+Current source misses enter the coordinator's private response storage directly.
+Remote cache fills and remote-hit returns are separate transactions. Shared
+readers currently receive full replicated PLE lookup embeddings; downstream TP
+does not imply that this lookup has already been sharded. Expert-only followers
+are storage participants only when declared, and are not automatically PLE
+consumers.
+
+The user has authorized implementing and comparing the following policy
+variants. They are not installed defaults or qualified performance results.
+Prefer local hits, compare shared VRAM capacity
+against independent consumer caches, and consider bounded hot-row replication
+only when measured saved delivery cost repays the space and fill traffic.
+The six-row campaign should measure consumer-local, remote-GPU, RAM and actual
+SSD service separately. On this host without direct P2P, remote VRAM is not
+assumed faster than RAM. Placement priority remains VRAM, RAM, SSD; routing
+should consider actual delivery costs and consumers rather than require an
+extra visit to an arbitrary owner GPU. Optional promotion should not extend
+the demand critical path when its lifetime can be retained independently.
+
+For the mixed CUDA2 continuation/ROCm4 follower row, the CUDA domain consumes
+PLE output. The ROCm devices may contribute resident shards or cache capacity
+while doing genuine expert work; their expert role alone does not justify
+receiving every lookup result. Ngram placement and expert movement are separate
+policies, sharing the same admitted physical resources and transport authority.
+
+Cache contents may change within stable admitted pools. Evicting a row does not
+itself release the pool's VRAM allocation, and ordinary promotion/eviction must
+not cause readmission or graph reconstruction. Ngram caches remain lowest-priority
+VRAM admission consumers. A complete RAM backing table does not automatically
+need an additional RAM row cache; SSD-backed configurations require bounded RAM
+cache/read-ahead accounting. Immutable cache eviction requires no row writeback
+to SSD. Implementation proceeds through the existing typed declarations and
+original caller/transport ownership, with required accuracy and matched Release
+performance evidence before any production default is promoted. Compare resident
+shards, independent consumer caches, a shared dynamic pool, and a shared pool
+with bounded consumer-local hot replicas. Preserve the same expert residency
+when attributing a gain to cache policy; separately measure joint capacity tuning.
+
+### Placement priority clarified 2026-11-02
+
+The primary user configuration shares physical GPUs between ngram storage and
+ExpertOverlay compute. Shared adaptive ownership must be qualified on
+continuation domains, follower expert domains, and both simultaneously; a GPU
+dedicated to ngrams is a supported control, not the representative completion
+target. Fixed-head shards on TP compute GPUs and independent per-consumer
+caches are existing partial coverage, not substitutes for this shared pool.
+
+The current first shared-source candidate still requires TP2 compute plus one
+distinct storage GPU (optionally the coordinator also owns cache). Native
+qualification of that path establishes transport and source/ACK lifetimes; it
+does not certify colocation. The next canonical cells must exercise:
+
+| Ngram owners | Required compute activity |
+|---|---|
+| Continuation-domain GPUs only | Every declared continuation participant executes its model shard and services its own ngram share. |
+| Follower-domain GPUs only | Every ngram owner also executes positively routed expert work. |
+| Continuation and follower domains together | Both roles serve ngram rows during the same inference session and retain their actual compute obligations. |
+
+Cover homogeneous and cross-vendor domains, single and multiple physical owners,
+zero/positive VRAM and RAM quotas with the original SSD source, hot-row promotion
+and eviction, static and dynamic expert residency, and MTP off/fixed1/fixed3/
+dynamic. Reuse the typed topology definitions and their ordinary serial controls;
+do not introduce separate runner-owned topology lists. An idle expert domain
+cannot count as successful follower colocation.
+
+Each case needs source admission and final-owner retirement, captured inference,
+frozen-history final-logit scoring with layer/stage replay retained, exact MTP,
+observed expert movement when requested, and a matched Release benchmark.
+Assert one original context/PMA per physical GPU, admitted concurrent storage
+and compute bytes, exact live communication, all-reader pin retention and reset/
+cancellation. Scheduling must prove absence of same-stream compute/storage wait
+cycles; merely deleting topology restrictions is insufficient. Ngram storage
+remains the lowest-priority VRAM admission consumer.
+
+Performance records must separate lookup latency, transfer volume, prefill and
+decode throughput, and quantify interference with actual expert compute and
+rebalance. Retain dedicated-storage and cache-disabled controls to attribute
+contention. Numerical, admission and economy outcomes remain separate; declare
+the unavailable hardware configurations without treating them as passes.
+
 CPU, CUDA and ROCm storage resources must be independent of where PLE computes and independent of expert placement. Include single-device, TP, PP and composed named domains, cross-rank ownership and heterogeneous CUDA/ROCm/CPU. On this host, both CUDA cards and all four ROCm cards may contribute storage while continuation runs on any supported subset; CPU is optional compute but RAM/SSD service remains an explicitly admitted storage owner. A storage-only GPU is not silently inserted into a compute collective. A PP stage without PLE is not made a consumer merely because it has a device.
 
 Cross-vendor continuation compute is part of the target, as well as cross-vendor
@@ -132,6 +240,26 @@ Declare a source identity plus immutable row/range ownership and replication pol
 Use the existing ResolvedImmutableRowTablePlacement and ImmutableRowTableLayoutGeometry as source-owned roots for this vocabulary rather than a parallel planning registry. Extend the existing provision/wire serialization with owner+consumer+edge identities and versioned policy. ModelContext retains immutable source/service/cache owners; graph instances borrow admitted frames and exact owner generations. Rank/global orchestration owns cross-device protocol membership; ordinary stages remain single-participant. The completed declaration should be valid for arbitrary owner/consumer relations even when the first materializer supports a smaller explicit relation. Resolved placement needs an actual pooled arm; audit callers of worldRank(), which currently projects its first allocator, rather than treating that accessor as a multi-rank domain authority.
 
 ### Transport and execution contracts
+
+The starting transport policy is NCCL for CUDA-to-CUDA edges, RCCL for
+ROCm-to-ROCm edges, and the existing optimized cross-vendor transport for
+CUDA-to-ROCm edges in either direction. The native libraries own their physical
+P2P or host-staged choice. This development host has no direct GPU P2P; that is
+an expected topology, not a failed device configuration. Keep strict native
+P2P tests for eligible hardware and prove absent-peer admission on this host.
+Do not select a bespoke same-vendor peer channel merely because the inventory
+reports complete coverage. These are measured starting policies: qualify any
+subsequent topology/shape specialization against matched transfer and full
+lookup performance, with identical ownership, capture and numerical contracts.
+
+Ngram payload lengths remain device-owned. Ordinary captured NCCL/RCCL sends
+take a host count, and the installed device-row extension describes equal-prefix
+collectives rather than ragged directed ownership. Neither sending capacity nor
+reading counts back to the host closes this gap. Extend the existing native
+transport with an exact directed payload contract before enabling that route.
+A fixed-size native transport floor is useful performance evidence but cannot
+certify the variable-length lookup protocol. Preserve the actual source count,
+required header traffic, empty-participant progress and payload byte receipts.
 
 Partition edges into native homogeneous local domains, native homogeneous cross-rank domains, and explicit heterogeneous boundaries. CUDA NCCL and ROCm RCCL cannot form one invented mixed-vendor communicator. Cross-vendor storage edges use the public TransferEngine/captured transfer-channel authority with explicit source/destination endpoints and CPU mapped/pinned staging where the actual transport requires it. Cross-rank edges use existing MPI/global transfer infrastructure only after proving its native capture/live-count protocol; existing MPI availability is not proof of GPU-resident control. Unsupported edges fail admission with the exact missing transport capability.
 

@@ -19,6 +19,7 @@
 #include <span>
 #include <variant>
 namespace llaminar2 {
+namespace test {struct Qwen4ExpReplicatedPLECohortReplayAccess;}
 class ImmutableRowTablePlacementPlanner;
 class Qwen4ExpFixedHeadShards;
 /** @brief Exact rank placement, never an unresolved preference or allocation permit. */
@@ -86,6 +87,7 @@ public:
     bool operator==(const ResolvedImmutableRowTablePlacement &) const = default;
 private:
     friend class ImmutableRowTablePlacementPlanner;
+    friend struct test::Qwen4ExpReplicatedPLECohortReplayAccess;
     friend class Qwen4ExpFixedHeadShards;
     /** @brief Existing whole-tier owner record, without a duplicate retained layout. */
     struct WholeTier {

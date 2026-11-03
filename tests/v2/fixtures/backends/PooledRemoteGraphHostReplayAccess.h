@@ -54,5 +54,15 @@ struct PooledRemoteGraphHostReplayAccess final {
         return RetainedParticipantGraphExecutable::createDiagnosticRemote(original,original.worker()->defaultStream(),program);
     }
 #endif
+    /** @brief Exercise only the original owner's closed graph-only storage seal. */
+    static void sealStorage(RetainedParticipantGraphExecutable& owner){owner.sealRecordedStorageBody();}
+    /** @brief Claim the original fresh definition before native recording, as production does. */
+    static void claimStorage(RetainedParticipantGraphExecutable& owner){owner.bindCohortDefinition();}
+    /** @return The original owner primitive; no public raw native definition escapes. */
+    static auto storageBody(RetainedParticipantGraphExecutable& owner,const PreparedGPUContextUsePermit& parent,
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream> preparation){
+        return owner.retainRecordedStorageDefinition(parent,std::move(preparation));
+    }
+
 };
 }

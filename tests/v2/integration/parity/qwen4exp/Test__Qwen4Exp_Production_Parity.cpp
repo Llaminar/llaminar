@@ -85,6 +85,14 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorMTPRetained15Exact, Qwen4ExpMTPEx
     [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
 
 
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4StaticRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpConsumerLocalTP4NativeExactCases()),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4StaticRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpConsumerLocalTP4StaticRetained15",qwen4ExpConsumerLocalTP4ExecutionCases())),
+    [](const auto& info){return info.param.testName();});
+
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2StaticRetained15Exact, Qwen4ExpMTPExactReplayTest,
     ::testing::ValuesIn(qwen4ExpConsumerLocalTP2NativeExactCases(ModelParityExpertOverlayPolicy{})),
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
@@ -93,6 +101,18 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2DynamicOrdinalRetained15Exact, 
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2DynamicRandomRetained15Exact, Qwen4ExpMTPExactReplayTest,
     ::testing::ValuesIn(qwen4ExpConsumerLocalTP2NativeExactCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic})),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+// Shared source readers retain the same numerical cells and original serial
+// controls. Native exact replay is separate from source-only admission.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedCoordinatorTP2StaticRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpSharedCoordinatorTP2NativeExactCases(ModelParityExpertOverlayPolicy{})),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedCoordinatorTP2DynamicOrdinalRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpSharedCoordinatorTP2NativeExactCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedCoordinatorTP2DynamicRandomRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpSharedCoordinatorTP2NativeExactCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic})),
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
 
 // Active native exact proof remains the original fixture. Expert movement
@@ -204,7 +224,8 @@ TEST_P(Qwen4ExpMainParityTest, SnapshotAdmission)
     std::ofstream memory(ensureResultsDir() / "admission_memory.txt");
     ASSERT_TRUE(memory.is_open());
     memory << prepared->physical_memory_authority->rankAttestationSummary(true);
-    ASSERT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(prepared->physical_memory_authority->rankAttestation()));
+    ASSERT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(prepared->physical_memory_authority->rankAttestation(),
+        prepared->prepared_routed_weight_plan));
     memory.flush();
     ASSERT_TRUE(memory.good());
 
@@ -257,6 +278,16 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2DynamicOrdinalRetained15, Qwen4
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2DynamicRandomRetained15, Qwen4ExpMainParityTest,
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpConsumerLocalTP2DynamicRandomRetained15",qwen4ExpConsumerLocalTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic}))),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedCoordinatorTP2StaticRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpSharedCoordinatorTP2StaticRetained15",qwen4ExpSharedCoordinatorTP2ExecutionCases(ModelParityExpertOverlayPolicy{}))),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedCoordinatorTP2DynamicOrdinalRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpSharedCoordinatorTP2DynamicOrdinalRetained15",qwen4ExpSharedCoordinatorTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}))),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedCoordinatorTP2DynamicRandomRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpSharedCoordinatorTP2DynamicRandomRetained15",qwen4ExpSharedCoordinatorTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic}))),
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorOrdinaryRetained15, Qwen4ExpMainParityTest,
@@ -325,6 +356,19 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpGPUAdaptiveSourceAdmission, Qwen4ExpSourceAdmis
 // Concurrent consumer-local channels retain the original four-policy source setup product.
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP2AdaptiveSourceAdmission, Qwen4ExpSourceAdmissionTest,
     ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpConsumerLocalTP2AdaptiveSourceAdmissionSeeds()))),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4AdaptiveSourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpConsumerLocalTP4AdaptiveSourceAdmissionSeeds()))),
+    [](const auto& info){return info.param.testName();});
+
+// Shared physical owners retain one real source and an explicit foreign result/ACK reader.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds()))),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmissionSeeds()))),
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorOrdinaryRetained15SourceAdmission, Qwen4ExpSourceAdmissionTest,
@@ -577,7 +621,8 @@ TEST_P(Qwen4ExpNgramAdmissionTest, FullSourceAdmission)
         std::ofstream memory(output / "admission_memory.txt");
         ASSERT_TRUE(memory.is_open());
         memory << authority->rankAttestationSummary(true);
-        ASSERT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(authority->rankAttestation()));
+        ASSERT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(authority->rankAttestation(),
+            prepared->prepared_routed_weight_plan));
         memory.flush();
         ASSERT_TRUE(memory.good());
         std::ofstream csv(output / "admission.csv");
@@ -640,3 +685,48 @@ int main(int argc, char **argv)
     std::cerr.flush();
     _exit(result);
 }
+
+// Whole-source controls use supported original execution without GPU-owner colocation.
+// Fresh paired bindings are required before their diagnostic benchmark is eligible.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareProductionDefaults, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpHardwareProductionDefaults", qwen4ExpHardwareProductionSourceCases())),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareProductionDefaultsSourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpHardwareProductionSourceAdmissionCases())),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info) { return info.param.testName(); });
+
+// Experimental matched residency, never a production-default or fit certificate.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareMatchedCacheEconomy, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpHardwareMatchedCacheEconomy", qwen4ExpHardwareMatchedCacheEconomyCases())),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareMatchedCacheEconomySourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpHardwareMatchedCacheEconomyCases())),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info) { return info.param.testName(); });
+
+// Same matched original expert/cache workload, genuine single full-RAM source; fresh bindings required.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareMatchedCacheRAMBackingEconomy, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpHardwareMatchedCacheRAMBackingEconomy", qwen4ExpHardwareMatchedCacheRAMBackingEconomyCases())),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareMatchedCacheRAMBackingEconomySourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpHardwareMatchedCacheRAMBackingEconomyCases())),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info) { return info.param.testName(); });
+
+// Dedicated movement workload retains original histories/tiers and native exact controls.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpConsumerLocalTP4MovementNativeExactCases(RoutedExpertOwnerOrder::Ordinal)),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4MovementRandomRetained15Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpConsumerLocalTP4MovementNativeExactCases(RoutedExpertOwnerOrder::Random)),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15",
+        qwen4ExpConsumerLocalTP4MovementCases(RoutedExpertOwnerOrder::Ordinal))),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4MovementRandomRetained15, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpConsumerLocalTP4MovementRandomRetained15",
+        qwen4ExpConsumerLocalTP4MovementCases(RoutedExpertOwnerOrder::Random))),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4MovementSourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(
+        qwen4ExpConsumerLocalTP4MovementSourceAdmissionSeeds()))),
+    [](const auto& info){return info.param.testName();});

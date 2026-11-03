@@ -94,7 +94,8 @@ inline GPUAdaptiveLookupCounterRole classifyQwen4ExpGPUAdaptiveLookupCounter(
             throw std::invalid_argument("GPU adaptive device work requires its original controller/request publisher and known name");
         return GPUAdaptiveLookupCounterRole::DeviceTerminal;
     }
-    if(storage->second!=hostImmutableRowModeName(HostImmutableRowMode::AdaptiveRAMSSD) || record.tags.size()!=2 ||
+    if((storage->second!=hostImmutableRowModeName(HostImmutableRowMode::AdaptiveRAMSSD) &&
+        storage->second!=hostImmutableRowModeName(HostImmutableRowMode::AdaptiveFullRAM)) || record.tags.size()!=2 ||
         std::find(kGPUAdaptiveSourceCounters.begin(),kGPUAdaptiveSourceCounters.end(),record.name)==kGPUAdaptiveSourceCounters.end())
         throw std::invalid_argument("GPU adaptive source work requires its actual closed CPU provider and known name");
     return GPUAdaptiveLookupCounterRole::SubordinateSource;
@@ -111,14 +112,20 @@ struct Qwen4ExpGPUAdaptiveLookupEvidence final
  * @param consumer Sole resolved GPU requester. @param row_bytes Exact original native stride.
  * @param maximum_ids Original admitted per-frame ID bound, never a communication extent.
  * @param gpu_slots Actual admitted GPU slots. @param ram_slots Actual admitted CPU slots.
+ * @param backing Exact original host backing; full RAM cannot claim bounded-cache/mmap work.
  * @return Checked independent device/source totals, without mutating records.
  * @throws std::invalid_argument For missing tuple fields, invalid identities, errors, byte equations or overflow.
  * @note Positive cache churn is not required. C0 must never report cache hits/promotions/evictions.
  */
 inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidence(
     std::span<const PerfStatRecord> records,DeviceId consumer,std::size_t row_bytes,
-    std::uint64_t maximum_ids,std::uint64_t gpu_slots,std::uint64_t ram_slots)
+    std::uint64_t maximum_ids,std::uint64_t gpu_slots,std::uint64_t ram_slots,
+    AdaptiveImmutableRowBacking backing=AdaptiveImmutableRowBacking::SSD)
 {
+    if(backing!=AdaptiveImmutableRowBacking::SSD && backing!=AdaptiveImmutableRowBacking::RAM)
+        throw std::invalid_argument("GPU adaptive evidence has unknown original backing");
+    if(backing==AdaptiveImmutableRowBacking::RAM && ram_slots)
+        throw std::invalid_argument("Full-RAM source evidence cannot claim redundant RAM cache slots");
     struct DeviceWindow { std::array<std::uint64_t,9> values{};std::array<std::uint64_t,9> counts{};std::bitset<9> seen; };
     std::map<std::string,DeviceWindow> windows;
     std::array<std::uint64_t,20> source{},source_counts{};std::bitset<20> seen;
@@ -141,6 +148,8 @@ inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidenc
         }
         else
         {
+            const auto expected=backing==AdaptiveImmutableRowBacking::RAM?HostImmutableRowMode::AdaptiveFullRAM:HostImmutableRowMode::AdaptiveRAMSSD;
+            if(record.tags.at("storage")!=hostImmutableRowModeName(expected))throw std::invalid_argument("GPU source observation differs from original admitted backing");
             const auto index=static_cast<std::size_t>(std::find(kGPUAdaptiveSourceCounters.begin(),kGPUAdaptiveSourceCounters.end(),record.name)-kGPUAdaptiveSourceCounters.begin());
             add(source[index],value);add(source_counts[index],record.count);seen.set(index);
         }
@@ -186,7 +195,8 @@ inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidenc
         // source cache events cannot be justified by admitted frame capacity.
         partition!=ids || duplicates || admissions>ids || rejections>ids || all_pinned>ids || evictions>admissions ||
         (!gpu_slots && (device.hit_rows || device.promotions || device.evictions)) ||
-        (!ram_slots && (ram_rows || admissions || evictions)))
+        (!ram_slots && (ram_rows || admissions || evictions)) ||
+        (backing==AdaptiveImmutableRowBacking::RAM && (window_hits || window_misses || window_evictions || rejections || all_pinned)))
         throw std::invalid_argument("GPU adaptive compact source/cache evidence disagrees with exact live native work");
     return {device,source};
 }
@@ -230,7 +240,7 @@ inline std::vector<Qwen4ExpGPUAdaptiveLookupEvidence> requireQwen4ExpGPUAdaptive
             : AdaptiveImmutableLookupGeometry::fromLayout(layout, source, request);
         result.push_back(requireQwen4ExpGPUAdaptiveLookupEvidence(channels[i], consumers[i].device,
             layout.extent().rowBytes(), layout.maximumInflightRows(),
-            geometry.physical().owners().front().slots, geometry.host().slots()));
+            geometry.physical().owners().front().slots, geometry.host().slots(),request.source_backing));
     }
     return result;
 }

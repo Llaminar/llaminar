@@ -29,7 +29,8 @@ struct CrossVendorReadReplayGeometry final {
 #endif
     /** @return Original roots/channels and separately retained graph/event obligations before final admission. */
     static CrossVendorReadReplayGeometry create(const CrossVendorReadReplaySpec& spec,DeviceId sourceDevice,DeviceId ownerDevice,const PreparedNativeLookupFixture& session,const RetainedHostServiceProgram& ioProgram,
-        const NativeOrderingEventBudgetProjection& ordering=NativeOrderingEventBudgetProjection::installed()){
+        const NativeOrderingEventBudgetProjection& ordering=NativeOrderingEventBudgetProjection::installed(),
+        std::optional<PeerAccessCoverage> peerAccess=std::nullopt){
         spec.requireComplete();
         const PhysicalMemoryAllocatorIdentity sourceId{0,sourceDevice},ownerId{0,ownerDevice},hostId{0,DeviceId::cpu()};
         const auto& file_=*spec.file;const auto Maximum=spec.maximum,Unique=spec.unique,slots=spec.slots,ramSlots=spec.ramSlots;
@@ -37,7 +38,7 @@ struct CrossVendorReadReplayGeometry final {
         const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
             ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
             {{{ownerId,ImmutableRowStorage::VRAM},0,slots,{}},{{hostId,ImmutableRowStorage::RAM},0,ramSlots,{}}},{sourceId},{},
-            {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},slots?std::optional(sourceId):std::nullopt,Unique);
+            {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},slots?std::optional(sourceId):std::nullopt,Unique,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,peerAccess);
         const auto physical=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,std::array{ownerId},sourceId);
         const auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},Maximum);
         const auto cpuGeometry=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,sourceId);

@@ -145,6 +145,13 @@
             if(purpose.fault==identity_fixture::IdentityFault::DuplicateRow){const auto unique=bad.target.unique;bad.target=original.target;bad.target.unique=unique;bad.requested_row=original.requested_row;}
             else if(purpose.fault==identity_fixture::IdentityFault::DuplicateUnique)bad.target.unique=original.target.unique;
             else if(purpose.fault==identity_fixture::IdentityFault::DuplicateSlot)bad.target.slot=original.target.slot;
+            else if(purpose.fault==identity_fixture::IdentityFault::PinSlotBounds)bad.target.slot=plan.owner.capacity();
+            else if(purpose.fault==identity_fixture::IdentityFault::PinOrdinal)bad.ordinal.value=0;
+            else if(purpose.fault==identity_fixture::IdentityFault::PinCommitFlags){
+                if(plan.owner.rowWidth()==q::adaptive_lookup::RowKeyWidth::UInt32)
+                    n::at<q::adaptive_lookup::Slot32>(expectedCache.data(),plan.cache.slots)[bad.target.slot].flags|=0x80000000u;
+                else n::at<q::adaptive_lookup::Slot64>(expectedCache.data(),plan.cache.slots)[bad.target.slot].flags|=0x80000000u;
+            }
         }else{
             auto* pins=n::at<p::Grant>(args.frame,plan.frame.initial_pins);
             if(purpose.fault==identity_fixture::IdentityFault::DuplicateRow)pins[offset].row=pins[0].row;
@@ -195,7 +202,11 @@
         EXPECT_EQ(std::memcmp(actualNative.data(),expectedNative.data(),expectedNative.size()),0)<<"Captured rejection changed original publication/grant outputs";
         const auto actualControl=*n::at<p::OwnerFrame>(const_cast<std::byte*>(actualFrame.data()),plan.frame.control);
         EXPECT_EQ(actualControl.status,q::adaptive_lookup::Status::Invariant);
-        EXPECT_EQ(actualControl.held_pins,purpose.action==n::OwnerAction::Pin?0u:rows.size());
+        const auto expectedPins=purpose.action==n::OwnerAction::Pin?
+            (purpose.fault==identity_fixture::IdentityFault::PinCommitFlags?purpose.position:0u):rows.size();
+        EXPECT_EQ(actualControl.held_pins,expectedPins);
+        if(purpose.action==n::OwnerAction::Pin)
+            EXPECT_EQ(actualControl.initial_pin_count,expectedPins);
         if(identityDrainGraph){
             // Restore ONLY the deliberately invalid Grant input. Actual cache pin
             // bits and sticky Invariant remain; original cancel/release drains them.

@@ -1,14 +1,19 @@
 /**
  * @file MoEOverlayCPUServiceMeasurement.cpp
- * @brief Measures complete CPU expert FFNs without changing serving state.
+ * @brief Measures prepared CPU/GPU expert FFNs without changing serving state.
  *
- * Preparation owns a small bounded input and the normal grouped-CPU workspace.
+ * Preparation owns bounded inputs and the production backend workspace.
  * Every physical payload is claimed before construction and released after
  * the last stage has retired. Different phases/classes reuse that capacity
  * serially. Only the measured service rows survive setup; no graph, weight
  * copy, inference counter, or alternate placement lifecycle is retained.
  */
 #include "MoEOverlayCPUServiceMeasurement.h"
+#include "planning/PlanningGPUExpertMeasurement.h"
+#include "planning/WorkspaceMemoryEstimator.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
+#include <map>
+#include "backends/RetainedParticipantGraphExecutable.h"
 
 #include "MoEOverlayPreparedWeightSource.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
@@ -197,6 +202,53 @@ namespace llaminar2
         }
     }
 
+    size_t MoEOverlayCPUServiceMeasurement::GPUStorageLayout::hostBytes() const
+    {
+        size_t result = 0;
+        for (const auto *root : {&input, &indices, &weights, &output})
+        {
+            if (root->physicalBytes() > std::numeric_limits<size_t>::max() - result)
+                throw std::overflow_error("Prepared GPU service host roots overflow");
+            result += root->physicalBytes();
+        }
+        return result;
+    }
+
+    size_t MoEOverlayCPUServiceMeasurement::GPUStorageLayout::deviceBytes() const
+    {
+        size_t result = 0;
+        for (const auto *root : {&input, &indices, &weights, &output})
+        {
+            if (root->capacity() > (std::numeric_limits<size_t>::max() - result) / sizeof(float))
+                throw std::overflow_error("Prepared GPU service tensor copies overflow");
+            result += root->capacity() * sizeof(float);
+        }
+        return result;
+    }
+
+    MoEOverlayCPUServiceMeasurement::GPUStorageLayout
+    MoEOverlayCPUServiceMeasurement::gpuStorageLayout(Geometry geometry, int rows)
+    {
+        if (geometry.d_model <= 0 || geometry.intermediate <= 0 || rows <= 0 || rows > kMaximumRows ||
+            size_t(geometry.d_model) > std::numeric_limits<size_t>::max() / size_t(rows))
+            throw std::invalid_argument("Prepared GPU service requires valid original phase geometry");
+        const auto root = [](size_t count) {
+            return CPUStorageRoot<float>(count, PhysicalMemoryOwner::ExecutionWorkspace, DeviceId::cpu());
+        };
+        const auto payload = size_t(rows) * size_t(geometry.d_model);
+        return {root(payload), root(size_t(rows)), root(size_t(rows)), root(payload)};
+    }
+
+    MoEOverlayCPUServiceMeasurement::GPUAllocation
+    MoEOverlayCPUServiceMeasurement::gpuAllocationBytes(Geometry geometry, size_t invocation)
+    {
+        const auto layout = gpuStorageLayout(geometry, kMaximumRows);
+        const auto payload = layout.deviceBytes();
+        if (invocation > std::numeric_limits<size_t>::max() - payload)
+            throw std::overflow_error("Prepared GPU service workspace overflows");
+        return {layout.hostBytes(), payload + invocation};
+    }
+
     size_t MoEOverlayCPUServiceMeasurement::allocationBytes(Geometry geometry, size_t invocation_workspace_bytes)
     {
         const int rows = std::max(kPrefillRows, kVerifierRows);
@@ -227,9 +279,10 @@ namespace llaminar2
         const MoEOverlayParticipantResidencyRegistry &registry, uint64_t epoch,
         const MoEOverlayEconomyCalibrationLayerCatalog &catalog,
         const ExpertHistogramProductionTopology &topology, Geometry geometry,
-        const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory,
+        const ModelMemoryProfile *model_profile, const RankInventory *rank_inventory)
     {
-        if (!memory) throw std::invalid_argument("CPU prepared-service measurement requires physical admission");
+        if (!memory) throw std::invalid_argument("Prepared-service measurement requires physical admission");
         if (epoch != registry.initialEpoch())
             throw std::logic_error("CPU prepared-service measurement may only lease the published initial epoch");
         (void)payloadBytes(geometry, kMaximumRows); // Validate before indexing the immutable banks.
@@ -250,11 +303,11 @@ namespace llaminar2
             for (size_t layer = 0; layer < catalog.layerCount(); ++layer)
                 result.push_back({.participant_id = id, .layer = catalog.firstModelLayer() + static_cast<int>(layer)});
         }
+        std::map<DeviceId,std::shared_ptr<RetainedParticipantGraphExecutable>> gpu_calibrations;
         size_t observations = 0;
         for (const auto &gap : catalog.serviceEvidenceGaps(live, ids, topology))
         {
             const auto endpoint = registry.endpoint(gap.participant_id);
-            if (!endpoint->device().is_cpu()) continue; // GPU prices remain device-produced.
             const auto bank = endpoint->acquire(epoch);
             if (!bank) throw std::logic_error("CPU prepared-service lost its published bank lease");
             int selected_layer = -1;
@@ -272,9 +325,34 @@ namespace llaminar2
                 if (selected_expert >= 0) break;
             }
             if (selected_expert < 0)
-                throw std::logic_error("CPU prepared-service class has no exact resident source");
-            const auto duration = measurePrepared(bank->layerForModelLayer(selected_layer).experts[selected_expert],
-                bank->device, selected_layer, gap.source, geometry, memory);
+                throw std::logic_error("Prepared service unsupported: priced class has no complete resident source; participant=" +
+                    std::to_string(gap.participant_id) + " device=" + endpoint->device().toString() +
+                    " representative_layer=" + std::to_string(gap.representative_layer) +
+                    " phase=" + std::to_string(expertHistogramProductionSourceIndex(gap.source)));
+            uint64_t duration = 0;
+            if (bank->device.is_cpu())
+                duration = measurePrepared(bank->layerForModelLayer(selected_layer).experts[selected_expert],
+                    bank->device, selected_layer, gap.source, geometry, memory);
+            else
+            {
+                if (!model_profile || !rank_inventory || !bank->device.is_gpu() || rank_inventory->rank != memory->worldRank())
+                    throw std::invalid_argument("Prepared GPU service requires original rank/model workspace metadata");
+                const auto physical=std::find_if(rank_inventory->gpus.begin(),rank_inventory->gpus.end(),[&](const auto& gpu){
+                    return gpu.type==bank->device.type && gpu.local_device_id==bank->device.ordinal;
+                });
+                if(physical==rank_inventory->gpus.end() || physical->compute_units<=0)
+                    throw std::invalid_argument("Prepared GPU service lost its original compute geometry");
+                const auto invocation = WorkspaceMemoryEstimator::estimatePreparedExpertService(*model_profile,
+                    {.device = bank->device, .device_compute_units = physical->compute_units,
+                     .resident_graph_rows = kMaximumRows, .first_layer = catalog.firstModelLayer(),
+                     .last_layer = catalog.firstModelLayer() + int(catalog.layerCount()) - 1,
+                     .apportioned_routed_experts = true});
+                auto& calibration=gpu_calibrations[bank->device];
+                if(!calibration)calibration=PlanningGPUExpertMeasurement::beginPreparedCalibration(bank->device,memory);
+                duration = PlanningGPUExpertMeasurement::measurePrepared(
+                    bank->layerForModelLayer(selected_layer).experts[selected_expert], bank->device,
+                    selected_layer, gap.source, geometry.d_model, geometry.intermediate, memory, invocation, calibration);
+            }
             const auto participant_index = static_cast<size_t>(std::lower_bound(ids.begin(), ids.end(), gap.participant_id) - ids.begin());
             auto &row = result.at(participant_index * catalog.layerCount() +
                 static_cast<std::size_t>(selected_layer - catalog.firstModelLayer()));
@@ -283,14 +361,14 @@ namespace llaminar2
             row.activation_count[phase] = static_cast<uint64_t>(phaseGeometry(gap.source).second) * kMeasuredSamples;
             row.sample_count[phase] = kMeasuredSamples;
             ++observations;
-            LOG_DEBUG("[ExpertOverlay] prepared CPU service participant=" << gap.participant_id
+            LOG_DEBUG("[ExpertOverlay] prepared service participant=" << gap.participant_id
                 << " layer=" << selected_layer << " expert=" << selected_expert
                 << " phase=" << phase << " rows=" << phaseGeometry(gap.source).second
                 << " samples=" << kMeasuredSamples << " nanoseconds=" << duration);
         }
         const double elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started).count();
-        LOG_INFO("[ExpertOverlay] prepared CPU service observations=" << observations
+        LOG_INFO("[ExpertOverlay] prepared service observations=" << observations
             << " elapsed_ms=" << elapsed_ms);
         return result;
     }

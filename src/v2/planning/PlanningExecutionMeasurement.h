@@ -20,6 +20,7 @@ namespace llaminar2
 {
     class IBackend;
     class IGPUGraphCapture;
+    class RetainedParticipantGraphExecutable;
 
     /**
      * @brief Immutable work declaration for one bounded production sample.
@@ -83,6 +84,19 @@ namespace llaminar2
          */
         static PlanningServiceObservation gpu(const PlanningMeasurementWork &work,
             IBackend &backend, DeviceId device, const IGPUGraphCapture &graph);
+
+        /**
+         * @brief Time original-owner submissions without launching its sealed recording facade.
+         * @param work Exact operation/working-set identity.
+         * @param backend Canonical backend matching the original owner.
+         * @param device Exact original GPU.
+         * @param graph Original General owner, already recorded and instantiated under the same PMA.
+         * @return Three completed invocations in one native event interval, excluding warmup.
+         * @throws std::exception For foreign ownership, failed submission or unproved completion.
+         * @note Only original owner submit/terminal APIs advance lifecycle; no raw capture launch occurs.
+         */
+        static PlanningServiceObservation gpu(const PlanningMeasurementWork &work,
+            IBackend &backend, DeviceId device, RetainedParticipantGraphExecutable &graph);
 
         /**
          * @brief Observe retained GPU work with a fresh host publication before every invocation.

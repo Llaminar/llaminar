@@ -1863,7 +1863,9 @@ namespace llaminar2
                       std::move(other.retained_composed_parent_replay)),
                   auxiliary_branch_authority(
                       other.auxiliary_branch_authority),
-                  auxiliary_branch(std::move(other.auxiliary_branch))
+                  auxiliary_branch(std::move(other.auxiliary_branch)),
+                  original_storage_attachment(std::move(other.original_storage_attachment)),
+                  recorded_source_definition(std::move(other.recorded_source_definition))
             {
                 other.capture_stream = nullptr;
                 other.capture_stream_ownership = CaptureStreamOwnership::None;
@@ -1946,6 +1948,8 @@ namespace llaminar2
                     retained_full_graph_replay =
                         std::move(other.retained_full_graph_replay);
                     participant_source_binding = std::move(other.participant_source_binding);
+                    recorded_source_definition = std::move(other.recorded_source_definition);
+                    original_storage_attachment = std::move(other.original_storage_attachment);
                     participant_preparation_stream = std::move(other.participant_preparation_stream);
                     retained_parent_capture =
                         std::move(other.retained_parent_capture);
@@ -2174,7 +2178,9 @@ namespace llaminar2
                 participant_source_binding.reset();
                 segments.clear();
                 evidence_family = 0;
+                original_storage_attachment.reset();
                 auxiliary_branch.reset();
+                recorded_source_definition.reset();
                 auxiliary_branch_authority = nullptr;
                 initialized = false;
                 needs_capture = false;
@@ -2394,6 +2400,8 @@ namespace llaminar2
              * @return Non-null context that owns the live backend resource.
              */
             IWorkerGPUContext *requireLifecycleContext(const char *operation);
+            std::unique_ptr<IRetainedGraphParticipantStorageAttachment> original_storage_attachment; ///< Native parent dies before its original finite-body borrow.
+            std::shared_ptr<const RetainedGraphParticipantPreparationStream> recorded_source_definition; ///< Exact matched source token, never a newest-token lookup.
         };
 
         /**
@@ -2454,6 +2462,16 @@ namespace llaminar2
          * @throws std::invalid_argument For missing/foreign workers or null/default cache streams.
          * @throws std::logic_error If dispatched binding did not enter the original worker.
          */
+        /**
+         * @brief Attach only the exact matched source definition to its actual sealed parent.
+         * @param graph Actual receiver graph with its original declared source domain.
+         * @param cache Original final-address graph cache and exact capture stream.
+         * @param receiver Actual per-device execution identity, not source/coordinator inference.
+         * @param parent Original sealed native parent, still uninstantiated.
+         * @return True after finite storage and/or original progress attachment completes.
+         * @throws std::exception Before foreign/stale source, parent, stream or duplicate ownership.
+         */
+        bool attachRetainedParticipantStorageParent(ComputeGraph& graph,GraphSegmentCache& cache,DeviceId receiver,IGPUGraphCapture& parent);
         void bindRetainedParticipantPreparationStream(ComputeGraph&,GraphSegmentCache&,IWorkerGPUContext*);
         /** @brief Authenticate the exact native parent capture on its original worker during cold sealing.
          * @throws std::invalid_argument For foreign workers or incomplete/changed native capture streams.

@@ -93,7 +93,7 @@ struct AdaptiveGPUCachePlacementRequest final
     AdaptiveGPUCachePlacementMode mode = AdaptiveGPUCachePlacementMode::ConsumerLocal;
     std::vector<AdaptiveGPUCacheOwnerRequest> owners;
     std::optional<AdaptiveGPUCacheParticipant> coordinator;
-    /** @brief Reject mixed arms, duplicate/foreign endpoints, and unsupported same-vendor remote owners. */
+    /** @brief Reject mixed arms, duplicate/foreign endpoints; native transport eligibility remains inventory-owned. */
     void validate() const;
     /** @return Ordered unique declared source participants; local consumer arm returns an empty vector. */
     std::vector<AdaptiveGPUCacheParticipant> declaredParticipants() const;
@@ -107,6 +107,8 @@ struct AdaptiveGPUCachePlacementRequest final
  */
 AdaptiveGPUCachePlacementRequest parseAdaptiveGPUCachePlacement(const std::string &text);
 
+/** @brief Exact primary host backing; RAM owns the entire original table, SSD owns bounded mappings. */
+enum class AdaptiveImmutableRowBacking : std::uint8_t {SSD,RAM};
 /**
  * @brief Explicit GPU-coordinated cache with independent storage owners and subordinate RAM/SSD.
  * GPU cache payload plus metadata is admitted first, then RAM cache payload plus
@@ -118,15 +120,33 @@ struct AdaptiveVRAMRAMSSDRequest final
     std::uint64_t maximum_gpu_cache_rows = 0;
     std::size_t gpu_cache_physical_byte_limit = 0;
     CpuImmutableRowCachePolicy gpu_policy; ///< One explicit admission/recency policy, executed by the exact coordinator.
-    HostAdaptiveRAMSSDRequest host; ///< Independent CPU cache request; its SSD/request scratch is mandatory.
+    HostAdaptiveRAMSSDRequest host; ///< Optional CPU cache over SSD; full-RAM backing rejects positive cache ceilings.
     AdaptiveGPUCachePlacementRequest placement; ///< Explicit owner policy; scalar GPU ceilings belong only to ConsumerLocal.
-    /** @return Source-owned CPU worker label for plural independent consumers, otherwise the exact GPU consumer. */
+    /**
+     * @brief Resolve the one authored CPU-service instance without selecting a new coordinator.
+     * @param requester Actual compute GPU requesting the shared source role.
+     * @param actual_consumers Complete original compute population, independent of storage owners.
+     * @return Authored DeclaredRankLocal coordinator; CPU0 for plural ConsumerLocal; otherwise requester.
+     * @throws std::invalid_argument For invalid GPU/count or malformed explicit coordinator declaration.
+     */
     DeviceId lookupIOConsumer(DeviceId requester, std::size_t actual_consumers) const
     {
         if (!requester.is_gpu() || !actual_consumers)
             throw std::invalid_argument("Adaptive lookup service requires actual GPU consumers");
+        if(placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal){
+            placement.validate();
+            return placement.coordinator->device(); // Authored source, independent of sorted consumer order.
+        }
         return placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal && actual_consumers > 1
             ? DeviceId::cpu() : requester;
+    }
+    AdaptiveImmutableRowBacking source_backing = AdaptiveImmutableRowBacking::SSD; ///< Full RAM source excludes redundant host row-cache ceilings.
+    /** @return Concrete original host source storage; no fallback or residency selection.
+     * @throws std::invalid_argument For an unknown typed backing. */
+    ImmutableRowStorage sourceStorage() const {
+        switch(source_backing){case AdaptiveImmutableRowBacking::RAM:return ImmutableRowStorage::RAM;
+        case AdaptiveImmutableRowBacking::SSD:return ImmutableRowStorage::MemoryMapped;}
+        throw std::invalid_argument("Unknown adaptive native host backing");
     }
     bool operator==(const AdaptiveVRAMRAMSSDRequest &) const = default;
 };

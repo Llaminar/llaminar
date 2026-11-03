@@ -661,6 +661,8 @@ namespace llaminar2
                 config.ngram_table_policy.gpu_adaptive.gpu_policy.protected_numerator = parseNonNegativeUint32Value(value, "ngram.gpu_protected_numerator");
             else if (key == "gpu_protected_denominator")
                 config.ngram_table_policy.gpu_adaptive.gpu_policy.protected_denominator = parseNonNegativeUint32Value(value, "ngram.gpu_protected_denominator");
+            else if (key == "source_backing")
+                config.ngram_table_policy.gpu_adaptive.source_backing = value=="ssd"?AdaptiveImmutableRowBacking::SSD:value=="ram"?AdaptiveImmutableRowBacking::RAM:throw std::invalid_argument("ngram.source_backing requires ssd or ram");
             else if (key == "source_cache_max_rows")
                 config.ngram_table_policy.gpu_adaptive.host.maximum_cache_rows = parseNonNegativeSizeTValue(value, "ngram.source_cache_max_rows");
             else if (key == "source_cache_bytes")
@@ -2516,7 +2518,7 @@ namespace llaminar2
             .long_name = "--ngram-storage",
             .category = "Ngram Storage",
             .value_label = "<auto|vram|ram|mmap|host-adaptive-ram-ssd|gpu-adaptive-vram-ram-ssd>",
-            .description = "Ngram storage: auto (unchanged VRAM/RAM/mmap order), explicit whole-tier vram/ram/mmap, host-adaptive-ram-ssd (CPU-owned cache), or gpu-adaptive-vram-ram-ssd (full-main GPU/R1 or homogeneous ConsumerLocal TP2 with shared local subordinate RAM/SSD; no PP/shared-owner TP/no-SSD); both adaptive modes retain mandatory SSD/request scratch and explicit optional ceilings; no runtime fallback",
+            .description = "Ngram storage: auto (unchanged VRAM/RAM/mmap order), explicit whole-tier vram/ram/mmap, host-adaptive-ram-ssd (CPU-owned cache), or gpu-adaptive-vram-ram-ssd (full-main GPU/R1 or homogeneous ConsumerLocal TP2/4/8 with shared local subordinate RAM/SSD; no PP; explicit full-RAM source via --ngram-source-backing ram); host adaptive retains SSD; GPU adaptive retains its declared original source/request scratch and explicit optional ceilings; no runtime fallback",
             .valid_values = {"auto", "vram", "ram", "mmap", "host-adaptive-ram-ssd", "gpu-adaptive-vram-ram-ssd"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &value)
@@ -2631,6 +2633,15 @@ namespace llaminar2
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &value)
                 { c.ngram_table_policy.gpu_adaptive.gpu_policy.protected_denominator = parseNonNegativeUint32Value(value, "--ngram-gpu-cache-protected-denominator"); }),
+        });
+        spec.add({
+            .long_name = "--ngram-source-backing",
+            .category = "Ngram Storage", .value_label = "<ssd|ram>",
+            .description = "GPU-adaptive original source: ssd uses bounded mappings and optional RAM cache; ram owns the complete native table once and forbids redundant RAM cache ceilings; no fallback",
+            .valid_values = {"ssd", "ram"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                { c.ngram_table_policy.gpu_adaptive.source_backing = value=="ssd"?AdaptiveImmutableRowBacking::SSD:value=="ram"?AdaptiveImmutableRowBacking::RAM:throw std::invalid_argument("--ngram-source-backing requires ssd or ram"); }),
         });
         spec.add({
             .long_name = "--ngram-source-cache-max-rows",

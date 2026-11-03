@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "LocalTPCaptureSourceDefinition.h"
 #include "../backends/GlobalDeviceAddress.h"
 #include "../config/OrchestrationConfig.h"
 #include "../tensors/ITensor.h"
@@ -912,6 +913,30 @@ namespace llaminar2
         { throw std::logic_error("This LocalTP context cannot own a counted allgather"); }
         /** @return Frozen optional counted transport, not a capability probe or live state. */
         [[nodiscard]] virtual std::shared_ptr<DeviceCountedAllGather> deviceCountedAllGather() const { return {}; }
+        /**
+         * @brief Carry one immutable source definition through this SAME matched cold generation.
+         * @param name Original matched capture-end phase, including its existing geometry identity.
+         * @param participant Original authored LocalTP membership index.
+         * @param timeout_ms Original collective timeout; no separate payload deadline exists.
+         * @param definition Original domain and optional source publication; receives the exact token.
+         * @return True only after every original member matched and the source remained live.
+         * @throws std::logic_error If this implementation cannot own the typed exchange.
+         */
+        virtual bool graphCaptureBoundaryRendezvous(const std::string& name,int participant,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
+        {throw std::logic_error("LocalTP has no typed source-definition rendezvous");}
+        /**
+         * @brief Carry the definition through the original existing stream fence/rendezvous.
+         * @param name Original matched capture-end phase.
+         * @param participant Original authored LocalTP membership index.
+         * @param stream Exact non-default original participant capture stream.
+         * @param timeout_ms Original collective timeout.
+         * @param definition Original domain/publication and exact returned source token.
+         * @return True after the existing final fence boundary authenticates every member.
+         * @throws std::logic_error If this implementation cannot own the typed exchange.
+         */
+        virtual bool graphCaptureBoundaryOnStream(const std::string& name,int participant,void* stream,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
+        {throw std::logic_error("LocalTP has no typed source-definition stream boundary");}
+
     };
 
     /**

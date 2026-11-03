@@ -60,6 +60,7 @@ namespace
     ENUM(PrefixCacheStorageMode, VALUE(Disabled), VALUE(Ram), VALUE(Device), VALUE(Tiered))
     ENUM(AdaptiveGPUCachePlacementMode, VALUE(ConsumerLocal), VALUE(DeclaredRankLocal))
     ENUM(ImmutableRowTableDistribution, VALUE(Replicated), VALUE(FixedHeadSharded))
+    ENUM(AdaptiveImmutableRowBacking, VALUE(SSD), VALUE(RAM))
     ENUM(ImmutableRowStoragePreference, VALUE(Automatic), VALUE(VRAM), VALUE(RAM), VALUE(MemoryMapped), VALUE(HostAdaptiveRAMSSD), VALUE(AdaptiveVRAMRAMSSD))
     ENUM(PrefixCacheTerminalStateMode, VALUE(Off), VALUE(Auto), VALUE(Always))
     ENUM(PrefixCacheMoEPolicy, VALUE(Disabled), VALUE(PlacementFingerprint), VALUE(InvalidateOnRebalance))
@@ -152,7 +153,7 @@ namespace
 #define MEMBERS(X) X(owners) X(coordinator)
     RECORD(AdaptiveGPUCachePlacementRequest, mode, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(gpu_cache_physical_byte_limit) X(gpu_policy) X(host) X(placement)
+#define MEMBERS(X) X(gpu_cache_physical_byte_limit) X(gpu_policy) X(host) X(placement) X(source_backing)
     RECORD(AdaptiveVRAMRAMSSDRequest, maximum_gpu_cache_rows, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(window_bytes) X(window_count) X(host_adaptive) X(distribution) X(gpu_adaptive)

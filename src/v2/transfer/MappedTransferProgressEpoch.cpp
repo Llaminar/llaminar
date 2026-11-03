@@ -124,6 +124,13 @@ namespace llaminar2
         /** @brief Decorate the final native body once, including all external waits. */
         bool attach(IGPUGraphCapture &graph) noexcept override
         {
+            return attachWithFiniteBody(graph, {});
+        }
+
+        /** @brief Keep the original service active through every finite storage terminal. */
+        bool attachWithFiniteBody(IGPUGraphCapture& graph,
+            std::span<const IGPUGraphCapture* const> siblings) noexcept override
+        {
             if (state_ != AttachmentState::Prepared || isGraphCaptureActive())
                 return false;
             try
@@ -131,7 +138,7 @@ namespace llaminar2
                 if (!graph.appendParallelBranch({
                         .open = *fragments_[0],
                         .worker = *fragments_[1],
-                        .close = *fragments_[2]}))
+                        .close = *fragments_[2], .body_siblings = siblings}))
                     return false;
                 state_ = AttachmentState::Attached;
                 return true;

@@ -549,6 +549,7 @@ namespace llaminar2
     {
         nodes_.clear();
         participant_source_plan_.reset();
+        participant_definition_domain_.reset();
         storage_boundary_.reset();
         read_ahead_branch_.reset();
         read_ahead_phase_identity_=0;
@@ -601,6 +602,7 @@ namespace llaminar2
     {
         if(other.read_ahead_branch_)
             throw std::logic_error("Read-ahead graphs must be retained as complete native parents, not merged into another topology");
+        if(other.participant_definition_domain_)setRetainedParticipantDefinitionDomain(*other.participant_definition_domain_);
         if(other.participant_source_plan_)
         {
             if(participant_source_plan_ && participant_source_plan_!=other.participant_source_plan_)

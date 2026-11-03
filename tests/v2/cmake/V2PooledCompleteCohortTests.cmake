@@ -36,6 +36,7 @@ set(_cohort_original_unit_cases
     PooledImmutableCompleteCohort.MissingWrongOrStaleOriginalParticipantsRejectBeforeArm
     PooledImmutableCompleteCohort.ExternalLastBindingCannotReleaseAnActiveOriginalCapture
     PooledImmutableCompleteCohort.TerminalMetadataDriftStillJoinsTheOriginalWorker
+    PooledImmutableCompleteCohort.MissingRequiredTerminalCohortNeverClassifiesSafeRetirement
     PooledImmutableCompleteCohort.PartialRemoteSetupRetiresEverySubmittedFrontierBeforeCancel
     PooledImmutableCompleteCohort.TypedResetUsesOnlyTheOriginalCompleteSourceAndRetainedWorker
     PooledImmutableCompleteCohort.ConstructionFailureDestroysCapturesBeforeOriginalRootsAndContexts
@@ -506,3 +507,15 @@ foreach(_case IN ITEMS
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;GTEST_DEATH_TEST_STYLE=threadsafe")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_name}Replay)
 endforeach()
+
+add_v2_test(V2_Integration_PooledRequiredTerminalCohortProofReplay
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py"
+        $<TARGET_FILE:v2_test_pooled_complete_cohort>
+        --gtest_filter=PooledImmutableCompleteCohort.MissingRequiredTerminalCohortNeverClassifiesSafeRetirement
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+if(TEST V2_Integration_PooledRequiredTerminalCohortProofReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledRequiredTerminalCohortProofReplay)
+endif()

@@ -73,7 +73,7 @@ std::shared_ptr<const PooledImmutableCapturedFreeWave> PooledImmutableCapturedFr
     if(isGraphCaptureActive() || !pin || !memory)throw std::invalid_argument("Free wave binding requires actual cold Pin owners and same PMA");
     pin->requireCurrent();const auto forward=pin->forward();forward->coordinatorStorage()->requireAuthority(memory);forward->ownerStorage()->requireAuthority(memory);
     auto d=PooledImmutableFreeEdge::fromOriginal(forward->declaration());
-    if(!d.original().capturedCrossVendor() || !forward->channel_ || !pin->channel_ || memory->worldRank()!=d.original().sender().world_rank)
+    if(!d.original().capturedChannelTransport() || !forward->channel_ || !pin->channel_ || memory->worldRank()!=d.original().sender().world_rank)
         throw std::invalid_argument("Free wave needs actual original cross-vendor channels; native/rank factory remains guarded");
     const auto coord=forward->coordinatorStorage()->roots(),own=forward->ownerStorage()->roots();auto& transfer=TransferEngine::instance();Bindings bindings{};
     for(unsigned index=0;index<6;++index){const auto role=static_cast<PooledFreeWireRole>(index);

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[4]
 GUARD = REPO / "scripts/check_no_direct_getenv_outside_debugenv.sh"
@@ -24,7 +25,8 @@ class MPIBootstrapEnvironmentPolicy(unittest.TestCase):
         for name in (SCHEMA, OWNER, MODULE):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(REPO / name, target)
+            # Negative controls mutate private bytes, not checkout permissions.
+            shutil.copyfile(REPO / name, target)
         # Preserve the canonical legacy exceptions so this fixture also checks
         # the guard's real stale-exception validation, instead of bypassing it.
         for name in ("src/v2/app/RuntimeInitPhase.cpp", "src/v2/utils/CPUFeatures.h",
@@ -48,6 +50,34 @@ class MPIBootstrapEnvironmentPolicy(unittest.TestCase):
 
     def test_actual_mpi_infrastructure_has_one_live_bridge(self):
         self.run_guard(True)
+
+    def test_readonly_checkout_keeps_private_negative_controls_writable(self):
+        """Replay the actual fixture against immutable inputs, even in a writable CI checkout."""
+        with tempfile.TemporaryDirectory(prefix="mpi-env-readonly-") as temporary:
+            readonly = Path(temporary)
+            originals = {}
+            for name in (SCHEMA, OWNER, MODULE):
+                originals[name] = (REPO / name).read_bytes()
+                path = readonly / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(originals[name])
+                path.chmod(0o444)
+            # The real guard stays bound to this checkout. Only the actual
+            # fixture's input root changes; its copy and mutation bodies run.
+            replay = type(self)("test_changed_bridge_body_rejects")
+            with patch.dict(globals(), {"REPO": readonly}):
+                try:
+                    replay.setUp()
+                    for name in originals:
+                        # This assertion also catches the defect under root,
+                        # which could otherwise write through read-only modes.
+                        self.assertTrue((replay.root / name).stat().st_mode & 0o200)
+                    replay.test_changed_bridge_body_rejects()
+                finally:
+                    replay.doCleanups()
+            for name, original in originals.items():
+                self.assertEqual((readonly / name).read_bytes(), original)
+                self.assertEqual((readonly / name).stat().st_mode & 0o777, 0o444)
 
     def test_original_owner_raw_reads_reject(self):
         self.append(OWNER, 'auto regression = ::getenv("TMPDIR");\n')

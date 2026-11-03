@@ -42,7 +42,7 @@ public:
             const auto program=PooledImmutableDirectedOwnerProgram::declare(physical,geometry.coordinator(),coordinate);
             const auto host=source.remoteHostBOM(program,originalCPU0,*gpu);
             for(const auto& line:host.resources())result.add(line);
-            result.add(*gpu,PhysicalMemoryOwner::NativeGraphExecutable,
+            result.add(*gpu,PhysicalMemoryOwner::NativeStorageGraphExecutable,
                 GPUGraphMemoryContract::reservationBytesPerExecutable(gpu->device));
         }
         return result.build();

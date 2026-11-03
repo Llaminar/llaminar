@@ -171,6 +171,8 @@ namespace llaminar2
              * lifetime and is never used for segmented or retained-parent plans.
              */
             IGraphCaptureAuxiliaryBranch *auxiliary_branch = nullptr;
+            /** @brief Same cold parent attachment, optionally contributing an original finite storage sibling. */
+            std::function<bool(IGPUGraphCapture&)> attach_original_parent;
             /**
              * @brief Build the immutable internal-edge ledger for one capture unit.
              *

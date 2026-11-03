@@ -76,6 +76,15 @@ namespace llaminar2
             return false;
         }
 
+        /** @return Whether the scheduler still has no terminal failure reason to preserve. */
+        constexpr bool schedulerReasonPending(std::uint32_t code) noexcept
+        {
+            return code == static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Idle) ||
+                   code == static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success) ||
+                   code == static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::NotReady) ||
+                   code == static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::BufferBusy);
+        }
+
         /** @return Previous stage, with -1 representing the initial state. */
         constexpr std::int32_t previousStage(
             std::uint32_t stage_ordinal) noexcept
@@ -1020,6 +1029,42 @@ namespace llaminar2
             error);
     }
 
+    bool MoEOverlayActivationEpochProtocol::cancelOriginalInvocation(
+        const MoEOverlayActivationEpochIdentity &identity,
+        MoEOverlayActivationStatusCode code, std::string *error)
+    {
+        if (!fatalStatusCode(code))
+            return fail("Original scheduler cancellation requires a terminal reason", error);
+        const auto state = admissionState();
+        if ((state != MoEOverlayActivationAdmissionState::Armed &&
+             state != MoEOverlayActivationAdmissionState::Failed) || !matchesPublishedIdentity(identity))
+            return fail("Original scheduler cancellation identity is absent, stale or divergent", error);
+
+        auto reason = atomicValue(control_->admission.code);
+        auto observed = reason.load(std::memory_order_acquire);
+        while (schedulerReasonPending(observed))
+        {
+            if (reason.compare_exchange_weak(observed, static_cast<std::uint32_t>(code),
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
+        atomicValue(control_->admission.state).store(
+            static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Failed), std::memory_order_release);
+        // This is scheduler-owned cancellation, not a host observation or
+        // replacement of either GPU endpoint's first semantic failure. Existing
+        // admission acquisition and native timeline waits already drain this sentinel.
+        atomicValue(control_->admission.ready_signal).store(
+            kMoEOverlayActivationAbortTimeline, std::memory_order_release);
+        for (auto &buffer : control_->buffers)
+        {
+            atomicValue(buffer.dispatch_signal.value).store(kMoEOverlayActivationAbortTimeline,
+                std::memory_order_release);
+            atomicValue(buffer.return_signal.value).store(kMoEOverlayActivationAbortTimeline,
+                std::memory_order_release);
+        }
+        return true;
+    }
+
     bool MoEOverlayActivationEpochProtocol::markTimedOut(
         std::uint64_t epoch_generation,
         std::uint64_t observed_ns,
@@ -1040,10 +1085,15 @@ namespace llaminar2
         }
 
         control_->admission.observed_timeout_ns = observed_ns;
-        atomicValue(control_->admission.code).store(
-            static_cast<std::uint32_t>(
-                MoEOverlayActivationStatusCode::TimedOut),
-            std::memory_order_release);
+        auto reason = atomicValue(control_->admission.code);
+        auto observed = reason.load(std::memory_order_acquire);
+        while (schedulerReasonPending(observed))
+        {
+            if (reason.compare_exchange_weak(observed,
+                    static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::TimedOut),
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
         atomicValue(control_->admission.state).store(
             static_cast<std::uint32_t>(
                 MoEOverlayActivationAdmissionState::Failed),
@@ -1320,8 +1370,13 @@ namespace llaminar2
     bool MoEOverlayActivationEpochProtocol::matchesActiveIdentity(
         const MoEOverlayActivationEpochIdentity &identity) const noexcept
     {
-        if (admissionState() != MoEOverlayActivationAdmissionState::Armed ||
-            identity != control_->identity || !identity.digest.valid() ||
+        return admissionState() == MoEOverlayActivationAdmissionState::Armed && matchesPublishedIdentity(identity);
+    }
+
+    bool MoEOverlayActivationEpochProtocol::matchesPublishedIdentity(
+        const MoEOverlayActivationEpochIdentity &identity) const noexcept
+    {
+        if (identity != control_->identity || !identity.digest.valid() ||
             identity.digest != moeOverlayActivationIdentityDigest(identity) ||
             identity.channel_nonce != control_->channel.channel_nonce ||
             identity.topology_fingerprint_low !=

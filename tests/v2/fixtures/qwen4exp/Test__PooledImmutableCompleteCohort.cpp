@@ -274,11 +274,39 @@ TEST(PooledImmutableCompleteCohort, ExternalLastBindingCannotReleaseAnActiveOrig
     c.binding.reset();c.admit(1);c.terminalJoin();c.original.reset();c.source={};c.remotes.clear();c.terminal={};
     EXPECT_FALSE(owner.expired());alias.reset();EXPECT_TRUE(owner.expired());
 }
+/** @brief Metadata failure joins the original worker but cannot certify native retirement or release the duty. */
 TEST(PooledImmutableCompleteCohort, TerminalMetadataDriftStillJoinsTheOriginalWorker) {
-    CohortPrograms programs({{{2},q::adaptive_lookup::None,DeviceType::CUDA,0,1}});
-    CohortCase c({2});c.bind();c.admit(1);c.source.graph->getNode(c.terminal.read.output)->dependencies.clear();
-    EXPECT_ANY_THROW(c.terminalJoin());EXPECT_FALSE(c.original->boundary->hasActiveInterval());
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT(([&] {
+        CohortPrograms programs({{{2},q::adaptive_lookup::None,DeviceType::CUDA,0,1}});
+        CohortCase c({2});c.bind();c.admit(1);
+        c.source.graph->getNode(c.terminal.read.output)->dependencies.clear();
+        EXPECT_THROW(c.terminalJoin(),std::logic_error);
+        EXPECT_NO_THROW(c.original->service->stats());
+        EXPECT_TRUE(c.original->boundary->hasActiveInterval());
+        EXPECT_THROW(c.original->boundary->terminalObservation(),std::logic_error);
+        // Intentionally unproven native duty cannot be normally destroyed.
+        std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
+/** @brief A missing required distributed authority rejects only after joining the original CPU worker. */
+TEST(PooledImmutableCompleteCohort, MissingRequiredTerminalCohortNeverClassifiesSafeRetirement) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT(([&] {
+        CohortPrograms programs({{{2},q::adaptive_lookup::None,DeviceType::CUDA,0,1}});
+        CohortCase c({2});c.bind();c.admit(1);
+        PooledImmutableFactoryReplayAccess::withdrawCohortForTerminalReplay(*c.original->boundary);
+        // Missing close makes the original worker fail truthfully. A missing
+        // required native authority must outrank safe-retired IO classification.
+        EXPECT_THROW(c.original->boundary->awaitTerminal(),std::logic_error);
+        EXPECT_NO_THROW(c.original->service->stats());
+        EXPECT_TRUE(c.original->boundary->hasActiveInterval());
+        EXPECT_THROW(c.original->boundary->terminalObservation(),std::logic_error);
+        // The required case deliberately retains its unproven native duty.
+        std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
 TEST(PooledImmutableCompleteCohort, PartialRemoteSetupRetiresEverySubmittedFrontierBeforeCancel) {
     CohortPrograms programs({{{2,0,3,1},q::adaptive_lookup::None,DeviceType::CUDA,0,1}});
     CohortCase c({2,0,3,1});

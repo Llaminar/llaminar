@@ -140,6 +140,9 @@ namespace llaminar2
     MoEOverlayNodeLocalActivationChannelPlan::localLanes(
         int world_rank) const
     {
+        if (source_world_rank == target_world_rank &&
+            world_rank == source_world_rank)
+            return rank_local_lanes;
         if (world_rank == source_world_rank)
             return source_lanes;
         if (world_rank == target_world_rank)
@@ -162,7 +165,7 @@ namespace llaminar2
         return found == staging_charges.end() ? 0u : found->bytes;
     }
 
-    bool MoEOverlayActivationChannelPlanner::hasRemoteRankParticipants(
+    bool MoEOverlayActivationChannelPlanner::requiresActivationChannels(
         const MoERoutedExpertPlacementPlan &placement)
     {
         const auto participants =
@@ -183,7 +186,10 @@ namespace llaminar2
             [&](const auto &participant)
             {
                 return participant.participant_id != source_participant_id &&
-                       participant.world_rank != source->world_rank;
+                       (participant.world_rank != source->world_rank ||
+                        (participant.device.is_gpu() &&
+                         placement.routed_tiers.at(static_cast<std::size_t>(participant.tier_index)).domain !=
+                             placement.continuation_domain));
             });
     }
 
@@ -259,17 +265,15 @@ namespace llaminar2
             {
                 continue;
             }
-            if (participant.world_rank == source->world_rank)
+            if (participant.world_rank == source->world_rank &&
+                (!participant.device.is_gpu() ||
+                 placement.routed_tiers.at(
+                     static_cast<std::size_t>(participant.tier_index)).domain ==
+                     placement.continuation_domain))
             {
-                /*
-                 * A rank may own the continuation device and a participant in
-                 * another tier (for example one socket of a NodeTP CPU tier).
-                 * That participant is already part of the rank-local graph and
-                 * its compact activation arena is priced by the ordinary local
-                 * participant BOM. This planner owns only cross-rank channels;
-                 * manufacturing a self-channel would violate the transport's
-                 * two-rank identity and double-charge those local buffers.
-                 */
+                // Dense continuation shards and explicit CPU endpoints retain
+                // their existing graph-local storage. Only actual foreign GPU
+                // domains require a separately submitted endpoint parent.
                 continue;
             }
             const auto target_rank = rank_by_id.find(participant.world_rank);
@@ -373,6 +377,22 @@ namespace llaminar2
                         bytes,
                         canonical_route_matrix_bytes,
                         "participant canonical route bytes");
+                }
+            }
+            if (channel.source_world_rank == channel.target_world_rank)
+            {
+                channel.rank_local_lanes = channel.source_lanes;
+                for (const auto &lane : channel.target_lanes)
+                {
+                    const auto alias = std::find_if(
+                        channel.rank_local_lanes.begin(), channel.rank_local_lanes.end(),
+                        [&](const auto &existing)
+                        {
+                            return existing.participant_id == lane.participant_id &&
+                                   existing.device == lane.device;
+                        });
+                    if (alias == channel.rank_local_lanes.end())
+                        channel.rank_local_lanes.push_back(lane);
                 }
             }
             channel.mapping_layout =

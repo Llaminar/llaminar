@@ -80,8 +80,7 @@ __device__ __forceinline__ std::uint64_t clock(){
 }
 /** @brief Publish only the canonical request's first source error. */
 __device__ __forceinline__ void unhealthy(const DeviceArgs& a){
-    if(*a.error==0)*a.error=static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure);
-    *a.healthy=0;
+    s::publishFirstError(a);
 }
 /** @return Worker retirement for exactly this original admitted generation and actual ticket. */
 __device__ __forceinline__ bool retired(const DeviceArgs& a){
@@ -151,14 +150,10 @@ __global__ void plan(DeviceArgs a){
 }
 /** @brief Issue only after both actual owner/coordinator source seals, never before accepted waves drain. */
 __global__ void publish(DeviceArgs a){
-    auto& io=s::protocol(a);auto& frontier=s::frontier(a);
-    const auto& coordinator=*n::coordinatorView(a.coordinator).frame;
-    if(s::stage(a)==ResponseStage::Rejected)return;
-    if(s::stage(a)!=ResponseStage::Planned || s::progress(a).seals!=a.plan.coordinator.policy.participants() ||
-       coordinator.phase!=p::LookupPhase::Source ||
-       !n::same(coordinator.source,frontier.source)) {s::reject(a,ImmutableLookupStatus::InvalidProtocol);s::stage(a)=ResponseStage::Rejected;unhealthy(a);return;}
-    if(!s::forwardValid(a)){s::reject(a,ImmutableLookupStatus::Cancelled);s::stage(a)=ResponseStage::Rejected;return;}
-    if(!io.idCount){s::stage(a)=ResponseStage::Acquired;return;}
+    auto& io=s::protocol(a);
+    const auto cancelledInvocation=acquire(&a.channel.base.acknowledgement->cancelledInvocation);
+    const auto cancelledGeneration=acquire(&a.channel.base.acknowledgement->cancelledGeneration);
+    if(!s::prepareRequestPublication(a,cancelledInvocation,cancelledGeneration))return;
     if(retired(a)){aborted(a);return;}
     const auto body=s::requestBody(a);const auto* from=reinterpret_cast<const std::uint64_t*>(&body);
     auto* to=reinterpret_cast<std::uint64_t*>(a.channel.base.request);

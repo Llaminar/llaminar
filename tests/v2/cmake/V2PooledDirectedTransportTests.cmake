@@ -19,3 +19,31 @@ if(TARGET v2_test_captured_transfer_channel_binding)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedChannelColdInitializationReplay)
 endif()
+
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_PooledNoPeerInventoryReplay
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=DeclaredGPUCachePlacement.ExplicitNoPeerUsesOriginalInventoryAndSurvivesWireWithoutComputeRoles
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNoPeerInventoryReplay)
+endif()
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledNoPeerChannelGeometryReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableDirectedTransport.ExplicitNoPeerKeepsExactFloorGrowthAndNativeOwnerIdentity
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Memory;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNoPeerChannelGeometryReplay)
+endif()
+if(TARGET v2_test_physical_memory_authority)
+    add_v2_test(V2_Integration_PooledNoPeerOwnerProgramReplay
+        COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+            --gtest_filter=PooledImmutableDirectedOwnerProgram.ExplicitNoPeerBindsOriginalPlansWithoutChangingKernelPopulation
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Memory;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNoPeerOwnerProgramReplay)
+endif()

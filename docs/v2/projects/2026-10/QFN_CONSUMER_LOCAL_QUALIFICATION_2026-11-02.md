@@ -366,3 +366,45 @@ the preceding 12-case static-expert result belongs to the earlier r120/r121 core
 Receipts: `cooperative-owner-full-model-perf-r128/{summary,comparison}.json`;
 the comparison authenticates equality of the original exact cell, policy,
 source export and workload and retains every old/new timing sample.
+
+## Dynamic expert movement follow-up
+
+The first complete 24-case ConsumerLocal TP2 movement matrix is red: CUDA/ROCm,
+zero/64-row caches, ordinal/random expert placement, fixed1/fixed3/dynamic MTP.
+All cases fail during the initial nine-row prefill before active MTP verification,
+with `Expert transaction layer has overlapping routing publishers`. Both TP
+participants submit the same full logical routing history to one transaction
+bank. The original continuation map already provides the single publication root;
+that authority must govern history without dropping any participant's expert work.
+
+The failure also exposed premature source-group destruction. Shutdown then treats
+a failed I/O outcome as missing native completion and stops before draining every
+participant. The repair must retain the original group, cancel its exact invocation,
+and distinguish a failed request whose owners all retired from an unproven native
+retirement. Any missing peer proof must dominate the aggregate outcome regardless
+of error ordering. A failed request must remain ineligible for reuse.
+
+The complete run took 1,730.54 seconds. Original GGUF inputs remained unchanged,
+the driver window passed with no findings, and all 48 owned cache metadata files
+were removed without reading payloads. The source fixes and focused actual-body
+replays are prepared; coherent build and native requalification are pending.
+Evidence: `consumer-local-dynamic-experts-r129/` under the same root.
+
+## Decode-sized component baseline
+
+The six original controls also pass with only `--tokens 8` changed to `--tokens 1`:
+16 live rows per consumer, with retained capacity 64 tokens and 1,024-row graph
+bounds unchanged. Ten measured samples follow the original two-request schedule.
+All native byte/state, retirement and driver checks pass; no build/profiler overlap.
+These authored OS-hot component timings are not SSD-cold or full-model results.
+
+| Backend | C0 / RAM8 median us | C0 / RAM512 median us | GPU128 warm-hit median us |
+|---|---:|---:|---:|
+| CUDA TP2 | 493.792 | 459.403 | 577.452 |
+| ROCm TP2 | 1343.600 | 1365.269 | 1778.812 |
+
+Each GPU-hit control has 320 measured hits and zero sourced rows. The RAM512
+schedule's first C set is not prewarmed; its name does not imply every sample is a
+RAM hit. Preserve these small-live-count controls alongside the 128-row workload
+when qualifying the next cooperative field-validation candidate.
+Evidence: `one-token-controls-baseline-r127/{summary,timing-summary}.json`.

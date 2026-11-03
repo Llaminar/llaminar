@@ -62,6 +62,8 @@
 
 namespace llaminar2
 {
+    struct MoEOverlayParticipantGraphRunnerConfig;
+    enum class MoEOverlayParticipantGraphOwnership : std::uint8_t;
     enum class ModelContextPhysicalSealBoundary;
 
     class MoEOverlayResidencyAuthority;
@@ -850,25 +852,24 @@ namespace llaminar2
         bool validateContextLength();
 
         /**
-         * @brief Refresh live GPU capacity in the rank inventory.
+         * @brief Prepare selected GPU workers under their original physical authority.
          *
-         * Discovery-time free memory is valid only before persistent model
-         * allocations begin. A reused ModelContext observes free bytes after
-         * its certified weights and workspace are already resident, so final
-         * admission must replace the stale discovery value with one exact
-         * backend observation before applying retained-allocation credits.
-         * Capacity solving and final memory validation both use this method so
-         * they cannot drift onto different physical-memory authorities.
+         * Every native graph/resource BOM consumes an authenticated prepared
+         * worker, independently of ngram storage policy. Adaptive storage adds
+         * its explicitly authored endpoints to the compute participants. One
+         * source owns their original inventory observations, exact worker
+         * storage and typed opaque commitments before capacity solving.
          *
-         * Every selected context is initialized before any device is sampled;
-         * this preserves a common post-runtime-initialization observation
-         * boundary on backends with process-wide lazy state.
+         * Reuse preserves that source's PMA and generation; it does not adopt
+         * an ordinary worker or replace capacity with a late free-memory sample.
+         * The final admission later consumes the same preparation snapshot.
+         * CPU-only ranks require no native source.
          *
-         * @param devices Rank-local devices participating in the physical plan.
-         * @param purpose Stable diagnostic identity for the observation edge.
-         * @return True after every unique GPU has updated the rank inventory.
+         * @param devices Rank-local compute participants in the physical plan.
+         * @param purpose Stable diagnostic identity for this preparation edge.
+         * @return True after every selected GPU has its original prepared owner.
          */
-        bool refreshRankLocalGPUCapacityObservations(
+        bool prepareRankLocalGPUContexts(
             const std::vector<DeviceId> &devices,
             std::string_view purpose);
 
@@ -929,6 +930,13 @@ namespace llaminar2
          * @brief Build compute graphs
          */
         bool buildComputeGraph();
+        /**
+         * @brief Project the same original expert graph configuration for either actual owner role.
+         * @param ownership Existing expert-only rank or subordinate same-rank endpoint ownership.
+         * @return Original model/PMA/residency/controller family and exact admitted row bounds.
+         */
+        MoEOverlayParticipantGraphRunnerConfig makeMoEOverlayParticipantConfig(
+            MoEOverlayParticipantGraphOwnership ownership) const;
 
         /**
          * @brief Initialize MPI context if needed

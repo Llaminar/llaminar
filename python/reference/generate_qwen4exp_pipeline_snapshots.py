@@ -98,6 +98,7 @@ def load_frozen_history(args):
     prevents same-size source substitution. No topology is selected or modified.
     """
     from python.reference.qwen4exp_accuracy_panel import _file_identity
+    from model_kld_corpus import require_reference_file_identity
     from model_kld_corpus_v2 import validate_manifest
     path = args.frozen_history
     size = path.stat().st_size
@@ -125,9 +126,11 @@ def load_frozen_history(args):
     for descriptor in source['shards'] + ([paired] if paired else []):
         actual = _file_identity(descriptor['path'])
         original = json.loads(descriptor['object_identity'])
-        if (type(original) is not dict or set(original) != set(actual) or
-                any(type(original[key]) is not type(value) or original[key] != value for key,value in actual.items()) or
-                descriptor['bytes'] != actual['bytes'] or descriptor['name'] != Path(actual['path']).name):
+        try:
+            require_reference_file_identity(original, actual)
+        except ValueError as error:
+            raise ValueError('Frozen original source stat identity changed') from error
+        if (descriptor['bytes'] != actual['bytes'] or descriptor['name'] != Path(actual['path']).name):
             raise ValueError('Frozen original source stat identity changed')
     return manifest, history
 
@@ -139,7 +142,7 @@ def generate_frozen_history(args, *, tokenizer, model_factory):
     Complete metadata is published only after successful original model close.
     The optional inactive predictor is stat metadata only; no predictor is parsed.
     """
-    from python.reference.qwen4exp_accuracy_panel import original_source, metadata_digest
+    from python.reference.qwen4exp_accuracy_panel import original_source, metadata_digest, require_frozen_source
     if args.output.exists():
         raise ValueError('Frozen FullStages history requires a fresh output directory')
     manifest, history = load_frozen_history(args)
@@ -148,12 +151,12 @@ def generate_frozen_history(args, *, tokenizer, model_factory):
     model = None
     try:
         model = model_factory('qwen4exp',args.model,cache_bytes=args.cache_bytes,tokenizer=tokenizer)
-        if original_source(model,args.tokenizer,paired) != source:
-            raise ValueError('Actual admitted reference source differs from frozen original')
+        admitted_source = original_source(model,args.tokenizer,paired)
+        require_frozen_source(source, admitted_source)
         count, token_ids, teachers = run_prefill_and_decode(model,history['prompt'],args.decode_steps,args.output,
             expected_token_ids=history['prompt_ids'],forced_decode_tokens=history['continuation_ids'])
         after, _ = load_frozen_history(args)
-        if after != manifest or original_source(model,args.tokenizer,paired) != source:
+        if after != manifest or original_source(model,args.tokenizer,paired) != admitted_source:
             raise ValueError('Frozen history/source changed during full-stage collection')
     finally:
         if model is not None:

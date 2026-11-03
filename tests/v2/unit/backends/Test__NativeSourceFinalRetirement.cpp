@@ -31,6 +31,43 @@ public:
   runner.model_ctx_=model;runner.reusable_execution_workspaces_=workspace;runner.model_context_reuse_authority_=authority;
   runner.initialization_lifecycle_.publish(OrchestrationInitializationLifecycle::Completion::Inference);
  }
+ /** @brief Install original observed rank facts and an already-owned preparation without creating another source. */
+ static void sourceObservation(OrchestrationRunner& runner,const std::shared_ptr<NativeContextPreparation>& source,
+     ImmutableRowTablePolicy policy,int rank=0,std::span<const PhysicalMemoryResource> originalResources={}){
+  runner.plan_.rank=rank;runner.plan_.runtime.ngram_table_policy=std::move(policy);
+  runner.plan_.runtime.native_context_preparation=source;
+  runner.cluster_inventory_.ranks.resize(static_cast<std::size_t>(rank+1));
+  auto& observed=runner.cluster_inventory_.ranks[static_cast<std::size_t>(rank)];observed.rank=rank;
+  const auto resource=[&](DeviceId device){
+   if(originalResources.empty())return source->originalResource(device);
+   for(const auto& value:originalResources)if(value.device==device)return value;
+   throw std::logic_error("Original recorded observation omitted endpoint");
+  };
+  const auto cpu=resource(DeviceId::cpu());
+  observed.cpu.memory_bytes=cpu.total_bytes;observed.cpu.free_memory_bytes=cpu.admission_available_bytes;
+  observed.cpu_memory_bytes=cpu.total_bytes;
+  for(const auto device:{DeviceId::cuda(231),DeviceId::rocm(231)}){
+   const auto original=resource(device);DeviceInfo gpu;
+   gpu.type=device.type;gpu.local_device_id=device.ordinal;gpu.memory_bytes=original.total_bytes;
+   gpu.free_memory_bytes=original.admission_available_bytes;observed.gpus.push_back(std::move(gpu));
+  }
+ }
+ /** @brief Substitute only the declared source, retaining its independently recorded original rank inventory. */
+ static void replaceSource(OrchestrationRunner& runner,const std::shared_ptr<NativeContextPreparation>& source){
+  runner.plan_.runtime.native_context_preparation=source;
+ }
+ /** @return Actual selected-context preparation; no factory/result override exists. */
+ static bool prepareContexts(OrchestrationRunner& runner,const std::vector<DeviceId>& devices){
+  return runner.prepareRankLocalGPUContexts(devices,"original-observation-replay");
+ }
+ /** @return Original retained source identity after the actual preparation. */
+ static auto source(const OrchestrationRunner& runner){return runner.plan_.runtime.native_context_preparation;}
+ /** @return Same untouched original device observation, never a newly sampled capacity. */
+ static std::size_t observedFree(const OrchestrationRunner& runner,DeviceId device){
+  const auto& gpus=runner.cluster_inventory_.ranks.at(static_cast<std::size_t>(runner.plan_.rank)).gpus;
+  for(const auto& gpu:gpus)if(gpu.type==device.type&&gpu.local_device_id==device.ordinal)return gpu.free_memory_bytes;
+  throw std::logic_error("Recorded original inventory omitted endpoint");
+ }
  /** @brief Withdraw only a deliberately injected foreign authority after the negative invariant test. */
  static void discardForeignAuthority(OrchestrationRunner& runner){runner.model_context_reuse_authority_.reset();}
  static void failedSource(OrchestrationRunner& runner,const std::shared_ptr<NativeContextPreparation>& source,bool createdHere){
@@ -56,8 +93,10 @@ class Backend final:public MockBackend {
 public:
  explicit Backend(DeviceType type):MockBackend(type){}
  std::size_t live=0;std::uint64_t generation=1;
+ mutable unsigned freeQueries=0,totalQueries=0;
  DeviceAllocationAccounting deviceAllocationAccounting(int)const override{return {.supported=true,.active_allocations=live,.active_bytes=live*64};}
- std::size_t deviceMemoryFree(int)const override{return 32u<<20;}
+ std::size_t deviceMemoryFree(int)const override{++freeQueries;return 32u<<20;}
+ std::size_t deviceMemoryTotal(int)const override{++totalQueries;return 64u<<20;}
  DeviceRuntimeGenerationRetirementResult retireExclusiveDeviceRuntimeGeneration(const DeviceRuntimeGenerationRetirementRequest&)override{
   active->allDestroyed &= active->destroyed==2;++active->resets;
   DeviceRuntimeGenerationRetirementResult v;v.supported=v.success=v.reset_invoked=true;
@@ -176,6 +215,11 @@ TEST(NativeSourceFinalRetirement,ExportedContractRetiresOriginalStorageOnlySourc
  contract.reusable_execution_workspaces=std::make_shared<ReusableExecutionWorkspaceRegistry>();
  contract.reuse_authority=std::make_shared<ModelContextReuseAuthority>();std::string error;
  ASSERT_TRUE(contract.reuse_authority->beginSealing(&error));ASSERT_TRUE(contract.reuse_authority->publishReusable({},&error));
+ // The original fixture's missing final-owner handoff must remain RED:
+ // dropping reusable ownership is not the physical reset required by pool shutdown.
+ try{GPUDeviceContextPool::instance().shutdown();FAIL()<<"Unretired exported source accepted process shutdown";}
+ catch(const std::logic_error& error){EXPECT_EQ(std::string(error.what()),"Source-prepared native contexts require original physical reset before shutdown");}
+ EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);
  // No prepared-weight rows exist in this recorded final model. Both original
  // workers therefore expose the residual-birth path, not a fabricated weight BOM.
  // Same address with a foreign control block cannot authorize source cleanup.
@@ -332,6 +376,93 @@ TEST(NativeSourceFinalRetirement,LiveRunnerForeignReusableAuthorityStillRejectsS
   OrchestrationRunnerResolvedAdmissionTestAccess::discardForeignAuthority(runner);EXPECT_NO_THROW(runner.shutdown());
  }
  model.reset();workspace.reset();NativeContextPreparationReplayAccess::retireReleased(source,transfers);EXPECT_EQ(t.resets,2u);
+}
+
+/** @test Every GPU storage policy reuses the same original prepared source without late free-memory sampling. */
+TEST(NativeSourceFinalRetirement, EveryGPUStoragePolicyPreservesOriginalPrequotaSource){
+ using Access=OrchestrationRunnerResolvedAdmissionTestAccess;
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;TransferEngine transfers(resolve);
+ const std::array devices{DeviceId::cuda(231),DeviceId::rocm(231)};
+ auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ for(const auto storage:{ImmutableRowStoragePreference::RAM,ImmutableRowStoragePreference::MemoryMapped,
+     ImmutableRowStoragePreference::VRAM,ImmutableRowStoragePreference::Automatic,
+     ImmutableRowStoragePreference::HostAdaptiveRAMSSD,ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD}){
+  OrchestrationRunner runner(OrchestrationConfig{},nullptr);
+  Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=storage});
+  const auto freeQueries=c.freeQueries+r.freeQueries,totalQueries=c.totalQueries+r.totalQueries;
+  auto before=source->acquire(devices[0]);
+  EXPECT_TRUE(Access::prepareContexts(runner,{devices[0],DeviceId::cpu(),devices[0]}))<<runner.lastError();
+  EXPECT_EQ(Access::source(runner),source);
+  EXPECT_FALSE(Access::source(runner).owner_before(source));EXPECT_FALSE(source.owner_before(Access::source(runner)));
+  EXPECT_EQ(c.freeQueries+r.freeQueries,freeQueries);EXPECT_EQ(c.totalQueries+r.totalQueries,totalQueries);
+  EXPECT_EQ(Access::observedFree(runner,devices[0]),source->originalResource(devices[0]).admission_available_bytes);
+  auto after=GPUDeviceContextPool::instance().retainExistingPreparedContext(devices[0],source->memory());
+  EXPECT_EQ(before.generation(),after.generation());EXPECT_EQ(before.worker(),after.worker());
+  EXPECT_FALSE(before.worker().owner_before(after.worker()));EXPECT_FALSE(after.worker().owner_before(before.worker()));
+  EXPECT_EQ(after.memory(),source->memory());
+ }
+ NativeContextPreparationReplayAccess::retireReleased(source,transfers);EXPECT_EQ(t.resets,2u);
+}
+/** @test Authored storage membership/rank and foreign original PMA fail before adopting any worker. */
+TEST(NativeSourceFinalRetirement, SelectedSourceMembershipAndRankRemainExactAcrossStoragePolicies){
+ using Access=OrchestrationRunnerResolvedAdmissionTestAccess;
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;TransferEngine transfers(resolve);
+ const std::array devices{DeviceId::cuda(231),DeviceId::rocm(231)};
+ auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+ policy.gpu_adaptive.placement=parseAdaptiveGPUCachePlacement("0:rocm:231/0/0@0:cuda:231");
+ {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,policy);
+  EXPECT_TRUE(Access::prepareContexts(runner,{devices[0]}))<<runner.lastError();}
+ {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM});
+  EXPECT_FALSE(Access::prepareContexts(runner,{DeviceId::cuda(232)}));
+  EXPECT_NE(runner.lastError().find("did not declare"),std::string::npos);}
+ {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM},1);
+  EXPECT_FALSE(Access::prepareContexts(runner,{devices[0]}));
+  EXPECT_NE(runner.lastError().find("crossed original physical ranks"),std::string::npos);}
+ {auto foreign=NativeContextPreparationReplayAccess::source<Worker>(devices,std::array{
+    source->originalResource(DeviceId::cpu()),source->originalResource(devices[0]),source->originalResource(devices[1])});
+  OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM});
+  Access::replaceSource(runner,foreign);
+  EXPECT_FALSE(Access::prepareContexts(runner,{devices[0]}));
+  EXPECT_NE(runner.lastError().find("foreign PMA control block"),std::string::npos);}
+ NativeContextPreparationReplayAccess::retireReleased(source,transfers);EXPECT_EQ(t.resets,2u);
+}
+
+/** @test A source may not adopt/reset an ordinary legacy worker even on the same physical endpoint. */
+TEST(NativeSourceFinalRetirement, SelectedSourceCannotAdoptLegacyOrdinaryWorker){
+ GTEST_FLAG_SET(death_test_style,"threadsafe");
+ ASSERT_EXIT(([]{
+  using Access=OrchestrationRunnerResolvedAdmissionTestAccess;
+  Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+  auto& pool=GPUDeviceContextPool::instance();
+  pool.registerNvidiaFactory([](int ordinal){return std::make_unique<testing::MockWorkerGPUContext>(ordinal);},232);
+  auto legacy=pool.retainNvidiaContext(231);
+  const std::array devices{DeviceId::cuda(231),DeviceId::rocm(231)};
+  const std::array observed{PhysicalMemoryResource{0,DeviceId::cpu(),128u<<20,128u<<20},
+      PhysicalMemoryResource{0,devices[0],64u<<20,64u<<20},PhysicalMemoryResource{0,devices[1],64u<<20,64u<<20}};
+  auto source=NativeContextPreparationReplayAccess::source<Worker>(devices,observed);
+  {OrchestrationRunner runner(OrchestrationConfig{},nullptr);
+   Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM},0,observed);
+   EXPECT_FALSE(Access::prepareContexts(runner,{devices[0]}));
+   EXPECT_EQ(pool.retainNvidiaContext(231),legacy);
+   EXPECT_EQ(t.resets,0u);
+  }
+  source.reset();legacy.reset();EXPECT_NO_THROW(pool.shutdown());
+  std::_Exit(::testing::Test::HasFailure()?2:0);
+ }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test CPU-only/empty preparation needs no GPU rank inventory, while a selected GPU still does. */
+TEST(NativeSourceFinalRetirement, CPUOnlyPreparationDoesNotRequireGPUInventory){
+ using Access=OrchestrationRunnerResolvedAdmissionTestAccess;
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+ OrchestrationRunner runner(OrchestrationConfig{},nullptr);
+ EXPECT_TRUE(Access::prepareContexts(runner,{}));
+ EXPECT_TRUE(Access::prepareContexts(runner,{DeviceId::cpu(),DeviceId::cpu()}));
+ EXPECT_EQ(Access::source(runner),nullptr);
+ EXPECT_FALSE(Access::prepareContexts(runner,{DeviceId::cuda(231)}));
+ EXPECT_EQ(Access::source(runner),nullptr);
+ EXPECT_EQ(c.freeQueries+r.freeQueries,0u);EXPECT_EQ(c.totalQueries+r.totalQueries,0u);
 }
 
 }

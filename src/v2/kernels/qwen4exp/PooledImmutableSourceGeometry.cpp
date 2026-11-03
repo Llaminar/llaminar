@@ -51,10 +51,10 @@ PhysicalMemoryPlan sourceBOM(PhysicalMemoryAllocatorIdentity allocator,PooledSou
 
 }
 PooledImmutableSourceGeometry PooledImmutableSourceGeometry::fromPlans(std::span<const PooledImmutableOwnerNativePlan> owners,
-    const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source)
+    const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source,std::uint32_t consumers)
 {
     const auto& c=coordinator.parameters();
-    if(owners.size()!=c.policy.participants() || owners.empty() || !source.rows || !source.row_elements ||
+    if(!consumers || owners.size()!=c.policy.participants() || owners.empty() || !source.rows || !source.row_elements ||
        source.row_elements>static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
        source.rows>static_cast<std::uint64_t>(std::int64_t{0x7fffffffffffffffLL}) || c.policy.sourceRows()!=source.rows)
         throw std::invalid_argument("Pooled source requires its complete original ordered cohort/source");
@@ -71,12 +71,12 @@ PooledImmutableSourceGeometry PooledImmutableSourceGeometry::fromPlans(std::span
     const auto& representative=owners[local==adaptive_lookup::None?0:local].parameters();
     const auto offsets=sourceOffsets(c.policy.maximumUnique(),maximum,source.rowBytes(),remote);
     std::uint64_t identity=1469598103934665603ULL;const auto mix=[&](std::uint64_t x){identity=(identity^x)*1099511628211ULL;};
-    mix(pooled_native::Version);mix(2);mix(c.identity);mix(static_cast<std::uint64_t>(format));mix(source.row_elements);mix(local);mix(maximum);
+    mix(pooled_native::Version);mix(2);mix(c.identity);mix(static_cast<std::uint64_t>(format));mix(source.row_elements);mix(local);mix(maximum);mix(consumers);
     for(const auto& owner:owners)mix(owner.parameters().identity);
     for(const auto offset:{offsets.coordinates,offsets.responses,offsets.invalidations,offsets.fills,offsets.payload,offsets.frame_bytes,
         offsets.protocol,offsets.frontier,offsets.record_bytes,offsets.payload_bytes,offsets.invocation,offsets.response_stage,
         offsets.progress,offsets.observation,offsets.observation_ordinal,offsets.reported_ordinal,offsets.seal_receipt,offsets.native_bytes})mix(offset);
-    return {{representative,c,offsets,format,static_cast<std::uint32_t>(source.row_elements),identity?identity:1,local,maximum},coordinator.allocator(),{owners.begin(),owners.end()}};
+    return {{representative,c,offsets,format,static_cast<std::uint32_t>(source.row_elements),identity?identity:1,local,maximum,consumers},coordinator.allocator(),{owners.begin(),owners.end()}};
 }
 PhysicalMemoryPlan PooledImmutableSourceGeometry::mandatoryBOM(PhysicalMemoryResource resource)const{
     return sourceBOM(allocator_,parameters_.offsets,resource);

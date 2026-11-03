@@ -58,7 +58,7 @@ inline void accumulateHostImmutableRowWork(RetainedStorageCounters &totals,HostI
     else
     {
         const auto &cache=std::get<CpuImmutableRowGatherObservation>(work);
-        if(mode!=HostImmutableRowMode::AdaptiveRAMSSD || cache.rows!=rows || cache.bytes!=bytes)
+        if(!hostImmutableRowModeIsAdaptive(mode) || cache.rows!=rows || cache.bytes!=bytes)
             throw std::invalid_argument("Adaptive native row observation mode/extent changed");
         if(cache.ram_rows>rows || cache.source_rows>rows-cache.ram_rows ||
             cache.duplicate_rows!=rows-cache.ram_rows-cache.source_rows || cache.all_pinned_responses>rows ||
@@ -69,7 +69,7 @@ inline void accumulateHostImmutableRowWork(RetainedStorageCounters &totals,HostI
         add(next.cacheAdmissions,cache.admissions);add(next.cacheEvictions,cache.evictions);
         add(next.cacheAdmissionRejections,cache.admission_rejections);add(next.allPinnedResponses,cache.all_pinned_responses);
     }
-    if(mode==HostImmutableRowMode::WholeRAM && (windows.windowHits || windows.windowMisses || windows.windowEvictions))
+    if((mode==HostImmutableRowMode::WholeRAM || mode==HostImmutableRowMode::AdaptiveFullRAM) && (windows.windowHits || windows.windowMisses || windows.windowEvictions))
         throw std::invalid_argument("Whole RAM observation cannot claim mapping work");
     add(next.windowHits,windows.windowHits);add(next.windowMisses,windows.windowMisses);add(next.windowEvictions,windows.windowEvictions);
     totals=next;

@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1070,6 +1071,141 @@ TEST_F(Test__MoEExpertDispatchStage, FactoryCreatesDispatchStage)
     ASSERT_NE(stage, nullptr);
     EXPECT_EQ(stage->type(), ComputeStageType::MOE_EXPERT_DISPATCH);
     EXPECT_STREQ(computeStageTypeName(stage->type()), "MOE_EXPERT_DISPATCH");
+}
+
+/** @test Original TP root alone publishes logical demand while every peer dispatches live work. */
+TEST_F(Test__MoEExpertDispatchStage, CapturedTicketTPHistoryHasOneOriginalPublisher)
+{
+    for (const int degree : {2, 4, 8})
+    for (const auto phase : {ExpertHistogramSource::PrefillChunk,
+                            ExpertHistogramSource::DecodeToken,
+                            ExpertHistogramSource::GroupedVerifier})
+    {
+        SCOPED_TRACE(degree);
+        SCOPED_TRACE(static_cast<int>(phase));
+        constexpr int bucket = 16;
+        DecodeExpertHistogramConfig config;
+        config.num_layers = 5;
+        config.num_experts = 4;
+        config.top_k = 2;
+        config.window_size = 32;
+        config.sockets = {DeviceId::cpu()};
+        config.ownership = MoELayeredExpertOwnership::uniform(5, 1, {0, 0, 0, 0});
+        admitObservedExpertDemand(config,
+            {.target_rows = 32, .max_transaction_rows = bucket, .top_k = 2}, 1);
+        DecodeExpertHistogram histogram(std::move(config));
+        std::vector<std::shared_ptr<MoEOverlayDispatchTicketStorage>> tickets;
+        std::vector<MoEExpertDispatchOutput> outputs(degree);
+        std::vector<std::unique_ptr<MoEExpertDispatchStage>> stages;
+        // IDs are original logical participants, not assumed device ordinals.
+        const int root = 100 + 2 * (degree - 1);
+        for (int i = 0; i < degree; ++i)
+        {
+            auto ticket = std::make_shared<MoEOverlayDispatchTicketStorage>();
+            ticket->bindFixedCapacity(4, bucket, 2, 8, DeviceId::cpu(), 29);
+            auto params = paramsFor(nullptr, nullptr, bucket, 2,
+                placement({0, 1, 0, 1}), {tier("gpu", "gpu_domain"), tier("cpu", "cpu_domain")}, &outputs[i]);
+            params.ticket_storage = ticket;
+            params.routing_evidence_publication = MoEExpertDispatchStage::RoutingEvidencePublication{
+                .histogram = &histogram,
+                .producer_role = selectMoEContinuationHistogramProducerRole(100 + 2 * i, root),
+                .source = phase};
+            stages.push_back(std::make_unique<MoEExpertDispatchStage>(std::move(params)));
+            tickets.push_back(std::move(ticket));
+        }
+        // Reuse the same stage/ticket topology across empty, partial and full
+        // grouped rows. Poison physical suffixes must never enter any dispatch.
+        for (const int rows : phase == ExpertHistogramSource::DecodeToken
+                 ? std::vector<int>{1, 1, 1}
+                 : std::vector<int>{1, 3, 0, 2, 4, 9, 16, 2})
+        {
+            SCOPED_TRACE(rows);
+            histogram.resetWindow();
+            for (auto &storage : tickets)
+            {
+                auto &ticket = storage->ticket();
+                ticket.header->logical_row_count = rows;
+                for (int row = 0; row < bucket; ++row)
+                for (int k = 0; k < 2; ++k)
+                {
+                    ticket.routing_indices_fp32[2 * row + k] = row < rows ? float(2 + k) : 99.0f;
+                    ticket.routing_weights_fp32[2 * row + k] = row < rows ? 0.5f : 123.0f;
+                }
+            }
+            // The original root may arrive before or after peers. No entire
+            // forward is serialized; each actual dispatch runs independently.
+            std::vector<std::future<bool>> running;
+            for (int i = 0; i < degree; ++i)
+                running.push_back(std::async(std::launch::async, [&, i] { return stages[i]->execute(nullptr); }));
+            if (rows == 0)
+            {
+                // Empty routing tickets remain invalid under the original
+                // protocol; rejection cannot publish demand or replace output.
+                for (auto &result : running) EXPECT_FALSE(result.get());
+                EXPECT_EQ(histogram.windowTokenCount(), 0);
+                for (const auto &output : outputs) EXPECT_EQ(output.logical_seq_len, 3);
+                continue;
+            }
+            for (auto &result : running) ASSERT_TRUE(result.get());
+            EXPECT_EQ(histogram.windowTokenCount(), rows);
+            EXPECT_EQ(histogram.layerHistogram(4), (std::vector<uint64_t>{0, 0, uint64_t(rows), uint64_t(rows)}));
+            for (int i = 0; i < degree; ++i)
+            {
+                ASSERT_EQ(outputs[i].logical_seq_len, rows);
+                ASSERT_EQ(outputs[i].tiers.size(), 2u);
+                EXPECT_EQ(outputs[i].tiers[0].entries.size(), size_t(rows));
+                EXPECT_EQ(outputs[i].tiers[1].entries.size(), size_t(rows));
+                for (int row = 0; row < rows; ++row)
+                {
+                    expectContributionExactlyOnce(outputs[i], 0, row, 0, 2, 0.5f);
+                    expectContributionExactlyOnce(outputs[i], 1, row, 1, 3, 0.5f);
+                }
+            }
+            if (rows)
+            {
+                const auto frozen = histogram.freezeAndRotateWindow();
+                ASSERT_TRUE(frozen.valid());
+                const auto &demand = frozen.validatedView().transactionDemand();
+                ASSERT_EQ(demand.layerTransactions(4).size(), 1u);
+                EXPECT_EQ(demand.layerTransactions(4)[0].phase, phase);
+                EXPECT_EQ(demand.routes(4, 0).logical_rows, unsigned(rows));
+            }
+        }
+    }
+}
+
+/** @test Publication identity and invalid original IDs cannot alias another cached boundary. */
+TEST_F(Test__MoEExpertDispatchStage, CapturedTicketTPHistoryIdentityAndMissingOwnerReject)
+{
+    EXPECT_THROW((void)selectMoEContinuationHistogramProducerRole(-1, 7), std::invalid_argument);
+    EXPECT_THROW((void)selectMoEContinuationHistogramProducerRole(7, -1), std::invalid_argument);
+    DecodeExpertHistogramConfig config;
+    config.num_layers = 5; config.num_experts = 4; config.top_k = 2;
+    config.window_size = 8; config.sockets = {DeviceId::cpu()};
+    config.ownership = MoELayeredExpertOwnership::uniform(5, 1, {0, 0, 0, 0});
+    DecodeExpertHistogram first(config), second(config);
+    auto ticket = std::make_shared<MoEOverlayDispatchTicketStorage>();
+    ticket->bindFixedCapacity(4, 4, 2, 8, DeviceId::cpu(), 31);
+    MoEExpertDispatchOutput output;
+    const auto make = [&](DecodeExpertHistogram *histogram, MoERuntimeHistogramProducerRole role, ExpertHistogramSource phase) {
+        auto params = paramsFor(nullptr, nullptr, 4, 2, placement({0, 1, 0, 1}),
+            {tier("gpu", "gpu_domain"), tier("cpu", "cpu_domain")}, &output);
+        params.ticket_storage = ticket;
+        params.routing_evidence_publication = MoEExpertDispatchStage::RoutingEvidencePublication{
+            .histogram = histogram, .producer_role = role, .source = phase};
+        return params;
+    };
+    using Role = MoERuntimeHistogramProducerRole;
+    MoEExpertDispatchStage original(make(&first, Role::ProductionDecode, ExpertHistogramSource::PrefillChunk));
+    MoEExpertDispatchStage same(make(&first, Role::ProductionDecode, ExpertHistogramSource::PrefillChunk));
+    MoEExpertDispatchStage peer(make(&first, Role::NotProducer, ExpertHistogramSource::PrefillChunk));
+    MoEExpertDispatchStage foreign(make(&second, Role::ProductionDecode, ExpertHistogramSource::PrefillChunk));
+    MoEExpertDispatchStage verifier(make(&first, Role::ProductionDecode, ExpertHistogramSource::GroupedVerifier));
+    EXPECT_EQ(original.graphCaptureVariantSignature(), same.graphCaptureVariantSignature());
+    EXPECT_NE(original.graphCaptureVariantSignature(), peer.graphCaptureVariantSignature());
+    EXPECT_NE(original.graphCaptureVariantSignature(), foreign.graphCaptureVariantSignature());
+    EXPECT_NE(original.graphCaptureVariantSignature(), verifier.graphCaptureVariantSignature());
+    EXPECT_THROW(MoEExpertDispatchStage(make(&first, static_cast<Role>(255), ExpertHistogramSource::DecodeToken)), std::invalid_argument);
 }
 
 } // namespace llaminar2::test

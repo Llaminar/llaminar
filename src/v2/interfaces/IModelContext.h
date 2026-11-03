@@ -28,6 +28,7 @@ namespace llaminar2
 namespace qwen4exp {class PooledImmutableRetainedParticipants;}
 
     class HostImmutableRowProvider;
+    class ImmutableLookupSetupObservation;
     class ResidentImmutableRowTable;
     class ResolvedImmutableRowTablePlacement;
     namespace qwen4exp { class ImmutableLookupExecutionBoundary; }
@@ -158,6 +159,9 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
 
         /** @return Original source-owned remote participant domain, absent only when this layout has no remote owners. */
         virtual std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> adaptiveImmutableLookupParticipants(DeviceId) const { return {}; }
+
+        /** @return Historical admitted lookup capacities after complete original setup, never live occupancy. */
+        virtual std::shared_ptr<const ImmutableLookupSetupObservation> immutableLookupSetupObservation()const {return {};}
 
         /** @return Exact sealed model-owned placement; retained contexts cannot replace its owners/tier. */
         virtual std::shared_ptr<const ResolvedImmutableRowTablePlacement> resolvedImmutableRowTablePlacement() const

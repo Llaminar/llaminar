@@ -2757,6 +2757,28 @@ namespace llaminar2
         };
     }
 
+    bool CUDAGraphCapture::appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> originals)
+    {
+        if(!activateOwner("appendFiniteBodySiblings") || !graph_ || exec_ || !node_count_ || native_capture_active_ || recording_role_ != RecordingRole::Owner || originals.empty())return false;
+        cudaStreamCaptureStatus status{};
+        if(cudaStreamIsCapturing(stream_,&status)!=cudaSuccess || status!=cudaStreamCaptureStatusNone)return false;
+        std::vector<cudaGraph_t> siblings;siblings.reserve(originals.size());
+        for(const auto* original:originals){
+            const auto* sibling=dynamic_cast<const CUDAGraphCapture*>(original);
+            if(!sibling || sibling==this || sibling->deviceOrdinal()!=device_ordinal_ ||
+               sibling->recording_role_!=RecordingRole::Owner || !sibling->graph() || sibling->graph()==graph_ || !sibling->nodeCount() || sibling->hasExecutable() || sibling->native_capture_active_ ||
+               std::find(siblings.begin(),siblings.end(),sibling->graph())!=siblings.end())return false;
+            siblings.push_back(sibling->graph());
+        }
+        const auto result=detail::appendNativeFiniteBodySiblings<CUDAParallelGraphAPI>(graph_,siblings);
+        if(result.error!=cudaSuccess){
+            LOG_ERROR("[CUDAGraphCapture] Finite sibling assembly failed operation="<<result.operation<<" error="<<cudaGetErrorString(result.error));
+            return false;
+        }
+        std::size_t count=0;if(cudaGraphGetNodes(graph_,nullptr,&count)!=cudaSuccess)return false;
+        node_count_=count;return true;
+    }
+
     bool CUDAGraphCapture::appendParallelBranch(
         const GPUCapturedParallelBranch &branch)
     {
@@ -2787,7 +2809,25 @@ namespace llaminar2
             }
             fragments[i] = source->graph();
         }
-        const auto result = detail::appendNativeParallelBranch<CUDAParallelGraphAPI>(graph_, fragments);
+        // Every finite sibling is a cold original definition. Reject aliases
+        // of Open/progress/Close: a progress-as-body alias would make Close
+        // wait for the very worker whose device loop waits for Close.
+        std::vector<cudaGraph_t> siblings;
+        siblings.reserve(branch.body_siblings.size());
+        for (const auto* original : branch.body_siblings)
+        {
+            const auto* sibling = dynamic_cast<const CUDAGraphCapture*>(original);
+            if (!sibling || sibling == this || sibling->deviceOrdinal() != device_ordinal_ ||
+                !sibling->graph() || sibling->graph() == graph_ || !sibling->nodeCount() || sibling->hasExecutable() ||
+                std::find(fragments.begin(), fragments.end(), sibling->graph()) != fragments.end() ||
+                std::find(siblings.begin(), siblings.end(), sibling->graph()) != siblings.end())
+            {
+                LOG_ERROR("[CUDAGraphCapture] Finite body sibling has incompatible original graph ownership");
+                return false;
+            }
+            siblings.push_back(sibling->graph());
+        }
+        const auto result = detail::appendNativeParallelBranch<CUDAParallelGraphAPI>(graph_, fragments, siblings);
         if (result.error != cudaSuccess)
         {
             LOG_ERROR("[CUDAGraphCapture] Parallel graph assembly failed operation=" <<

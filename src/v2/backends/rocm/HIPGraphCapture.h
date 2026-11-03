@@ -67,6 +67,8 @@ namespace llaminar2
                 GPUOrderedTimelineInstrumentation::Disabled) override;
         [[nodiscard]] GPUOrderedTimelineTimingSnapshot
         consumeOrderedTimelineTiming() override;
+        /** @copydoc IGPUGraphCapture::appendFiniteBodySiblings */
+        bool appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> siblings)override;
         /** @copydoc IGPUGraphCapture::appendParallelBranch */
         [[nodiscard]] bool appendParallelBranch(
             const GPUCapturedParallelBranch &branch) override;

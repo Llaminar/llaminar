@@ -73,16 +73,20 @@ void exactIdentityNativeBoundary(DeviceId device,std::uint32_t live,ExactIdentit
  * @param live Full hot identity prefix, crossing64 or256.
  * @param action Actual production Pin, AcceptFree or AcceptVictim operation.
  * @param row64 True for original UInt64 physical source metadata, false for UInt32.
+ * @param singleFault Optional one closed field/commit fault, preserving the original default identity sweep.
+ * @param early Select the first command instead of the original final live command.
  * @note Recorded GPU state restoration is kernel-replay input, not production
  * recovery or proof of failed-request retirement. Original cancel/release drains
  * retained rights where supported; ordinary partial/empty and request close use
  * the unchanged complete provider graph and its existing separate lifecycle proof.
  */
-void exactIdentityNativeRejection(DeviceId device,std::uint32_t live,n::OwnerAction action,bool row64){
+void exactIdentityNativeRejection(DeviceId device,std::uint32_t live,n::OwnerAction action,bool row64,
+    std::optional<identity_fixture::IdentityFault> singleFault=std::nullopt,bool early=false){
     requireProvider(live==65 || live==257,"Captured identity rejection requires original64/256 neighbor");
     if(!hasCPUBackend())initCPUBackend(-1);
     std::vector<identity_fixture::IdentityFault> faults;
-    if(action==n::OwnerAction::Pin)faults={identity_fixture::IdentityFault::DuplicateRow,identity_fixture::IdentityFault::DuplicateUnique,identity_fixture::IdentityFault::DuplicateSlot};
+    if(singleFault)faults={*singleFault};
+    else if(action==n::OwnerAction::Pin)faults={identity_fixture::IdentityFault::DuplicateRow,identity_fixture::IdentityFault::DuplicateUnique,identity_fixture::IdentityFault::DuplicateSlot};
     else faults={identity_fixture::IdentityFault::DuplicateRow,identity_fixture::IdentityFault::DuplicateUnique,identity_fixture::IdentityFault::ForeignOwner,identity_fixture::IdentityFault::ForeignInterval};
     const auto base=row64?std::uint64_t{0x100000000ULL}:0u;
     std::vector<std::uint64_t> rows(live);for(std::uint32_t i=0;i<live;++i)rows[i]=base+100+i;
@@ -90,7 +94,7 @@ void exactIdentityNativeRejection(DeviceId device,std::uint32_t live,n::OwnerAct
     std::vector<ProviderReplaySpec> specs;
     for(const auto fault:faults){
         ProviderReplaySpec spec{file,live+17,live+17,2,n::OriginalIdWidth::UInt64,false,OwnerAdmission::Original,ACKInterleaving::None,ActivationPreparation::BeforeGraph,live+17,true};
-        spec.identityRejection=IdentityRejectionCase{action,fault,live-1};spec.requireComplete();specs.push_back(std::move(spec));
+        spec.identityRejection=IdentityRejectionCase{action,fault,early?0u:live-1};spec.requireComplete();specs.push_back(std::move(spec));
     }
     ProviderReplayPrograms programs(specs);programs.prepare(device);
     for(std::size_t index=0;index<specs.size();++index)programs.run(index,[&](ProviderReplay& replay){

@@ -8,6 +8,7 @@
  * so reset, rollback and prefix archive share one lifecycle and frontier.
  */
 #include "Qwen4ExpGraph.h"
+#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 #include "collective/ILocalTPContext.h"
 #include "execution/local_execution/graph/ReadAheadParticipantContract.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
@@ -196,7 +197,22 @@ std::shared_ptr<IRetainedGraphStorageBoundary> Qwen4ExpGraph::retainedStorageBou
         if (!sourcePlacement || *sourcePlacement != *config_.ngram_table_placement)
             throw std::logic_error("Adaptive graph and original source have different admitted placements");
         auto boundary = model_ctx_->adaptiveImmutableLookupBoundary(device);
-        if (!boundary || !boundary->isPooled() || boundary->device() != device ||
+        if (!boundary)
+        {
+            // Query-only readers retain the same source authority, but never
+            // acquire a fake local CPU channel or register foreign source roots.
+            const auto participants=model_ctx_->adaptiveImmutableLookupParticipants(device);
+            if(!participants || !participants->transport() || !participants->transport()->readerGeometry() || lookup_)
+                throw std::logic_error("Flash Next query-only reader lost its original source cohort");
+            participants->requireForPolicy(config_);
+            const auto& readers=participants->transport()->readers();
+            if(std::none_of(readers.begin(),readers.end(),[&](const auto& reader){
+                return reader->originalReader().device()==device;
+            }))
+                throw std::logic_error("Flash Next query-only reader is absent from its original transport");
+            return {};
+        }
+        if (!boundary->isPooled() || boundary->device() != device ||
             (lookup_ && lookup_ != boundary))
             throw std::logic_error(
                 "Flash Next adaptive lookup replaced or lost its model-owned source boundary");
@@ -411,10 +427,20 @@ Qwen4ExpPLEBuilder::LookupStorage Qwen4ExpGraph::pleLookupStorage(const ForwardI
         if (tier == ImmutableRowLookupExecution::AdaptiveGPUCache)
         {
             (void)retainedStorageBoundary(device);
+            const auto original = singleRequestProjectionQueryRows(input.seq_len, device);
+            const auto participants=model_ctx_->adaptiveImmutableLookupParticipants(device);
+            if(participants && participants->transport()->readerGeometry())
+            {
+                if(!config_.ngram_replicated_ple_cohort || !input.replicated_ple_query || !arena_)
+                    throw std::logic_error("Shared PLE requires its actual Rank cohort and original query producer");
+                config_.ngram_replicated_ple_cohort->requireQuery(*input.replicated_ple_query,input,original,owner);
+                if(!lookup_)
+                    return Qwen4ExpPooledReaderLookupStorage{arena_,participants,
+                        DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original)};
+            }
             if (!lookup_ || !arena_)
                 throw std::logic_error(
                     "Adaptive PLE requires its original source boundary and canonical arena");
-            const auto original = singleRequestProjectionQueryRows(input.seq_len, device);
             std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code;
 #ifdef HAVE_CUDA
             if(device.is_cuda())code=qwen4exp::createCUDAPooledImmutableNativeKernels();

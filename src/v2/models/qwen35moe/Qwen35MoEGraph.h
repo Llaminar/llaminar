@@ -11,6 +11,7 @@
 #include "../qwen35/Qwen35Graph.h"
 #include "../../execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "../../execution/moe/DeviceMoERebalanceController.h"
+#include "../../execution/moe/ExpertHistogramSource.h"
 #include "../../execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "../../execution/moe/MoERuntimeTable.h"
 #include "../../execution/moe/MoEOverlayReturnLayout.h"
@@ -19,6 +20,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -49,15 +52,6 @@ namespace llaminar2
         NonDecode,
         SerialDecode,
         GroupedMainVerifier,
-    };
-
-    /**
-     * @brief Typed authority decision for host runtime-histogram registration.
-     */
-    enum class MoERuntimeHistogramProducerRole : std::uint8_t
-    {
-        NotProducer,
-        ProductionDecode,
     };
 
     /**
@@ -135,6 +129,20 @@ namespace llaminar2
         const RoutedForwardRecipe &routedForwardRecipe(DeviceId device);
         /** @brief Const queries may only borrow a previously published routed recipe. */
         const RoutedForwardRecipe &routedForwardRecipe(DeviceId device) const;
+
+        /**
+         * @brief Resolve whether the canonical local GPU fold must consume external expert results.
+         * @param plan Original admitted routed topology and frozen per-layer quotas.
+         * @param owners Actual complete expert ownership used by this captured graph.
+         * @param layer Model-global routed layer.
+         * @param mode Existing residency policy; mutable zero tiers require frozen zero quotas.
+         * @param completed_return Exact root return node, or absent on a non-root graph.
+         * @return True only when this layer has an external contribution; no dummy frontier is created.
+         * @throws std::logic_error For absent/incompatible ownership or unresolved mutable zero capacity.
+         */
+        static bool requiresCapturedSparseReturn(const MoERoutedExpertPlacementPlan& plan,
+            const MoEExpertOwnerMap& owners, int layer, MoERebalanceRuntimeMode mode,
+            std::optional<std::string_view> completed_return = std::nullopt);
 
         /** Metadata-sealed arena replacement, present only for the explicit projection mode. */
         std::optional<MoEProjectionArenaGeometry> projection_arena_;

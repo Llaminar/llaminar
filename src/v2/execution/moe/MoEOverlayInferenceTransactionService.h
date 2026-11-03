@@ -465,7 +465,7 @@ namespace llaminar2
     enum class MoEOverlayInferenceCoordinatorSegmentRole : std::uint8_t
     {
         Continuation = 0, ///< Dense continuation graph group and ticket authority.
-        ExpertFollower,  ///< Remote retained sparse-expert transaction follower.
+        ExpertFollower,  ///< Original retained sparse-expert endpoints, local or remote.
     };
 
     /**
@@ -518,10 +518,10 @@ namespace llaminar2
         /**
          * @brief Seal a complete deterministic plan after graph-family consensus.
          * @param graph_family_generation Exact generation embedded in tickets.
-         * @param segments One continuation plus every remote follower rank.
+         * @param segments One continuation plus every original local/remote expert endpoint group.
          * @return Valid immutable plan in deterministic role/rank order.
          * @throws std::invalid_argument when the plan is incomplete or aliases a
-         *         rank, continuation authority, or follower boundary.
+         *         role on a rank, continuation authority, or follower boundary.
          */
         static MoEOverlayInferenceCoordinatorGraphPlan
         sealAfterSynchronizedMaterialization(
@@ -560,10 +560,19 @@ namespace llaminar2
 
         /**
          * @brief Find the unique segment owned by @p world_rank.
-         * @return Stable plan-owned pointer, or null when the rank is absent.
+         * @return Stable plan-owned pointer, or null when the rank is absent or ambiguous.
          */
         [[nodiscard]] const Segment *segmentForWorldRank(
             int world_rank) const noexcept;
+
+        /**
+         * @brief Find an exact original endpoint role on one actual world rank.
+         * @param world_rank Original process rank; no synthetic ranks are introduced.
+         * @param role Dense continuation or retained expert endpoint ownership.
+         * @return Stable plan-owned pointer, or null for missing/ambiguous membership.
+         */
+        [[nodiscard]] const Segment *segmentForWorldRank(
+            int world_rank, MoEOverlayInferenceCoordinatorSegmentRole role) const noexcept;
 
         /** @return Deterministically ordered immutable segment inventory. */
         [[nodiscard]] const std::vector<Segment> &segments() const noexcept

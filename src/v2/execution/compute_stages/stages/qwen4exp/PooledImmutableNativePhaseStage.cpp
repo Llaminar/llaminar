@@ -93,7 +93,10 @@ bool PooledImmutableNativePhaseStage::execute(IDeviceContext* context){
 std::uint64_t PooledImmutableNativePhaseStage::graphCaptureVariantSignature()const{
     requireDeclarations();std::uint64_t hash=1469598103934665603ULL;const auto mix=[&](std::uint64_t word){hash=(hash^word)*1099511628211ULL;};
     mix(1);mix(phase_.index());mix(static_cast<std::uint64_t>(device().type));mix(device().ordinal);mix(code_->codeIdentity());
-    std::visit([&](const auto& value){mix(static_cast<std::uint64_t>(value.action));mix(value.storage->captureIdentity());mix(value.operands.declarationIdentity());},phase_);
+    std::visit([&](const auto& value){mix(static_cast<std::uint64_t>(value.action));mix(value.storage->captureIdentity());
+        if constexpr (std::is_same_v<std::decay_t<decltype(value)>, Owner>)
+            mix(value.storage->invocationChannelIdentity());
+        mix(value.operands.declarationIdentity());},phase_);
     for(const auto id:roles(std::holds_alternative<Owner>(phase_)))mix(static_cast<std::uint64_t>(id));return hash?hash:1;
 }
 bool PooledImmutableNativePhaseStage::supportsBackend(ComputeBackendType backend)const{return

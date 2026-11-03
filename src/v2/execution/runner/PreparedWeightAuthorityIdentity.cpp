@@ -7,6 +7,10 @@
  * request controls may change within the unchanged admitted capacity envelope.
  */
 #include "PreparedWeightAuthorityIdentity.h"
+#include "execution/moe/MoEOverlayHostServiceContract.h"
+#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
+#include <algorithm>
+#include <stdexcept>
 #include "planning/MoEPipelineMemoryAdmission.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "utils/DebugEnv.h"
@@ -14,6 +18,48 @@
 
 namespace llaminar2
 {
+    std::vector<DeviceId> admittedOverlayPreparedWeightDevices(
+        const MoERoutedExpertPlacementPlan& plan, const MoEExpertOverlayExecutionPlan& execution)
+    {
+        // Initial import may precede placement admission. Without original
+        // layer ownership there is no proof permitting any endpoint omission.
+        if (plan.placements.empty()) return execution.currentRankPlan().local_devices;
+        // This is a residency/participant index, never whole-expert dispatch.
+        // Tensor-sharded continuation weights must retain every original shard.
+        const auto owners = MoEExpertOwnerMap::build(plan, {.reject_tensor_sharded_domains = false});
+        const auto admitted = MoEOverlayHostServiceContract::admittedExpertParticipants(plan, owners);
+        const auto& rank = execution.currentRankPlan();
+        const auto endpoint = [&](const auto& participant, DeviceId device) {
+            return participant.world_rank_known && participant.world_rank == rank.world_rank && participant.device == device;
+        };
+        const auto denseOwner = [&](DeviceId device) {
+            for (const auto& domain : execution.domains) {
+                const bool dense = domain.name == plan.continuation_domain ||
+                    std::find(rank.root_weight_domains.begin(), rank.root_weight_domains.end(), domain.name) != rank.root_weight_domains.end() ||
+                    std::find(rank.shared_expert_weight_domains.begin(), rank.shared_expert_weight_domains.end(), domain.name) != rank.shared_expert_weight_domains.end();
+                if (!dense) continue;
+                for (const auto& participant : domain.participants)
+                    if (participant.world_rank_known && participant.world_rank == rank.world_rank && participant.local_device == device)
+                        return true;
+            }
+            return false;
+        };
+        std::vector<DeviceId> result;
+        for (const auto device : rank.local_devices) {
+            if (!device.is_valid()) throw std::logic_error("Prepared-weight authority has an invalid original endpoint");
+            const bool declared = std::any_of(owners.participants().begin(), owners.participants().end(),
+                [&](const auto& participant) { return endpoint(participant, device); });
+            const bool live = std::any_of(admitted.begin(), admitted.end(),
+                [&](const auto& participant) { return endpoint(participant, device); });
+            // Unclassified original devices are retained conservatively. Only
+            // a routed membership explicitly removed by the shared admitted
+            // projection may disappear from the prepared-record authority set.
+            if ((!declared || live || denseOwner(device)) &&
+                std::find(result.begin(), result.end(), device) == result.end()) result.push_back(device);
+        }
+        return result;
+    }
+
     bool retainedMTPWeightAuthorityMatches(const MTPRuntimeConfig &retained, const MTPRuntimeConfig &requested)
     {
         return resolveMTPRetainedDraftCapacity(retained) == resolveMTPRetainedDraftCapacity(requested) &&

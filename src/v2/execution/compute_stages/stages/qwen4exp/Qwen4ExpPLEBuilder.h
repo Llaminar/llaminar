@@ -64,6 +64,20 @@ struct Qwen4ExpPooledLookupStorage {
     std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> participants; ///< Original model-owned recurring remote programs, absent only for an actually local layout.
 };
 /**
+ * @brief Query-only compute participant in the original shared replicated PLE cohort.
+ *
+ * The foreign graph owns its arena/controller/query descriptor and receives its
+ * exact live embedding. It borrows the same retained source participants and
+ * owns neither a CPU channel nor a source cache or physical pin authority.
+ */
+struct Qwen4ExpPooledReaderLookupStorage {
+    BufferArena* arena;
+    std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> participants;
+    DeviceGenerationControlBinding control;
+    DeviceRowRange originalRows;
+    std::optional<Qwen4ExpIntBinding> count; ///< Same original arena-owned primitive count, retained through capture/reset.
+};
+/**
  * @brief Graph-local exact-once current-demand publication, never request execution state.
  * The retained boundary owns the one device generation/sequence and pinned response.
  * This construction capability owns no physical bytes and never observes token values.
@@ -128,7 +142,7 @@ class Qwen4ExpPLEBuilder final
 {
 public:
     /** @brief Explicit whole-storage versus fixed-range composition; no automatic substitution. */
-    using LookupStorage=std::variant<ImmutableLookupStage::Storage,Qwen4ExpFixedHeadLookupStorage,Qwen4ExpPooledLookupStorage>;
+    using LookupStorage=std::variant<ImmutableLookupStage::Storage,Qwen4ExpFixedHeadLookupStorage,Qwen4ExpPooledLookupStorage,Qwen4ExpPooledReaderLookupStorage>;
     /**
      * @brief Append lexical computation using its explicitly admitted whole-table or fixed-head storage.
      * @param graph Existing participant-local declarative graph.

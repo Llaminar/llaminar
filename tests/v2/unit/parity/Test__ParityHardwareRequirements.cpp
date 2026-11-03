@@ -8,6 +8,7 @@
  * No backend, MPI world, model source or device allocation is initialized.
  */
 #include "integration/parity/qwen4exp/Qwen4ExpNgramAdmissionCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <limits>
@@ -83,6 +84,35 @@ TEST(ParityHardwareRequirements, SharedPhysicalOrdinalUsesItsExactVisibleRange)
         std::array{GlobalDeviceAddress::rocm(1), GlobalDeviceAddress::rocm(1), GlobalDeviceAddress::cpu(0)});
     EXPECT_EQ(required.cuda_devices, 0); EXPECT_EQ(required.rocm_devices, 2);
     EXPECT_FALSE(parityHardwareInventoryFailure(required, {0,2}));
+}
+
+/** @test Storage-only endpoints remain hardware prerequisites without becoming compute participants. */
+TEST(ParityHardwareRequirements, DeclaredNgramStorageRetainsExactIndependentGPURequirements)
+{
+    for(const auto& cell:qwen4ExpSharedCoordinatorTP2ExecutionCases(ModelParityExpertOverlayPolicy{})){
+        const auto config=cell.toTestConfig();
+        ASSERT_TRUE(config.local_hardware_requirements);
+        EXPECT_EQ(config.local_hardware_requirements->cuda_devices,0);
+        EXPECT_EQ(config.local_hardware_requirements->rocm_devices,3);
+        EXPECT_TRUE(parityHardwareInventoryFailure(*config.local_hardware_requirements,{0,2}));
+        EXPECT_FALSE(parityHardwareInventoryFailure(*config.local_hardware_requirements,{0,3}));
+        EXPECT_EQ(config.devices.size(),cell.topology.participants.size());
+    }
+    for(const auto& cell:qwen4ExpOppositeVendorOrdinaryRetained15Cases()){
+        const auto config=cell.toTestConfig();
+        ASSERT_TRUE(config.local_hardware_requirements);
+        EXPECT_EQ(config.local_hardware_requirements->cuda_devices,1);
+        EXPECT_EQ(config.local_hardware_requirements->rocm_devices,1);
+        EXPECT_TRUE(parityHardwareInventoryFailure(*config.local_hardware_requirements,{0,1}));
+        EXPECT_TRUE(parityHardwareInventoryFailure(*config.local_hardware_requirements,{1,0}));
+        EXPECT_FALSE(parityHardwareInventoryFailure(*config.local_hardware_requirements,{1,1}));
+        EXPECT_EQ(config.devices.size(),cell.topology.participants.size());
+    }
+    auto foreign=qwen4ExpSharedCoordinatorTP2ExecutionCases(ModelParityExpertOverlayPolicy{}).front();
+    auto& placement=foreign.ngram_table_policy->gpu_adaptive.placement;
+    placement.coordinator->world_rank=1;
+    for(auto& owner:placement.owners)owner.participant.world_rank=1;
+    EXPECT_THROW((void)foreign.toTestConfig(),std::invalid_argument);
 }
 
 /** @test Invalid or overflowing declarations cannot become permissive prerequisites. */

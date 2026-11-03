@@ -67,7 +67,7 @@ TEST(ImmutableRowTableAdmissionWire, ForeignVersionTruncationTrailingAndEnumAlia
     EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bad,2),std::invalid_argument);
     bad=valid;bad[16]=0;bad[17]=1; // preference256 must not truncate to Automatic0.
     EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bad,2),std::invalid_argument);
-    bad=valid;bad[172]=255;bad[173]=255; // v10 empty placement arm adds12bytes; physical backend must not truncate.
+    bad=valid;bad[176]=255;bad[177]=255; // v16 adds explicit backing; physical backend must not truncate.
     EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bad,2),std::invalid_argument);
 }
 /** @test A rank without PLE contributes a real empty frame; duplicate rank authority is never merged. */
@@ -111,9 +111,9 @@ TEST(ImmutableRowTableAdmissionWire, LocalityWireRejectsInvalidOrDiscardedPolicy
     {
         auto bytes=valid;
         if(mutation==0)bytes[4]=1; // Previous schema has no locality authority.
-        if(mutation==1)bytes[196]=2; // Unknown locality arm.
-        if(mutation==2)bytes[196]=0; // Task arm cannot retain a bound-node payload.
-        if(mutation==3)for(int i=0;i<4;++i)bytes[200+i]=255; // Unrepresentable node.
+        if(mutation==1)bytes[200]=2; // Unknown locality arm.
+        if(mutation==2)bytes[200]=0; // Task arm cannot retain a bound-node payload.
+        if(mutation==3)for(int i=0;i<4;++i)bytes[204+i]=255; // Unrepresentable node.
         EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bytes,2),std::invalid_argument)<<mutation;
     }
 }
@@ -140,3 +140,36 @@ TEST(ImmutableRowTableAdmissionWire, PreparedSenderFrameAuthenticatesBeforeColle
     EXPECT_TRUE(parseImmutableRowTableAdmissionRequests(empty.bytes(), 4).empty());
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Exact host backing survives canonical source agreement; unknown backing cannot cross its schema. */
+TEST(ImmutableRowTableAdmissionWire, AdaptiveFullRAMBackingRoundTripsWithoutHostCacheAlias){
+    auto original=request();original.requested.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    original.requested.gpu_adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;
+    const std::array requests{original};const auto decoded=parseImmutableRowTableAdmissionRequests(serializeImmutableRowTableAdmissionRequests(requests),2);
+    ASSERT_EQ(decoded.size(),1u);EXPECT_EQ(decoded.front().requested,original.requested);
+    auto old=serializeImmutableRowTableAdmissionRequests(requests);old[4]=15;
+    EXPECT_THROW(parseImmutableRowTableAdmissionRequests(old,2),std::invalid_argument);
+    for(const std::uint32_t raw:{2u,99u,256u,257u,UINT32_MAX}){
+        auto foreign=serializeImmutableRowTableAdmissionRequests(requests);
+        // The source-backing field follows the exact v16 header, window and
+        // host-policy words. Mutate all four bytes, not an already-narrowed enum.
+        for(unsigned byte=0;byte<4;++byte)foreign[72+byte]=static_cast<std::uint8_t>(raw>>(8*byte));
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(foreign,2),std::invalid_argument)<<raw;
+    }
+    original.requested.gpu_adaptive.source_backing=static_cast<AdaptiveImmutableRowBacking>(99);
+    EXPECT_THROW(serializeImmutableRowTableAdmissionRequests(std::array{original}),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test {
+/** @test Hostile full-width placement values cannot alias the uint8 ConsumerLocal arm. */
+TEST(ImmutableRowTableAdmissionWire, PlacementModeWireRejectsFullWidthAliases){
+    const std::array requests{request()};const auto valid=serializeImmutableRowTableAdmissionRequests(requests);
+    for(const std::uint32_t raw:{2u,99u,256u,257u,UINT32_MAX}){
+        auto foreign=valid;
+        for(unsigned byte=0;byte<4;++byte)foreign[140+byte]=static_cast<std::uint8_t>(raw>>(8*byte));
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(foreign,2),std::invalid_argument)<<raw;
+    }
+}
+}

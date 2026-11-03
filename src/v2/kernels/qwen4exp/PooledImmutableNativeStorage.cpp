@@ -13,6 +13,8 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <stdexcept>
+#include "transfer/CapturedTransferChannel.h"
+#include "transfer/TransferEngine.h"
 namespace llaminar2::qwen4exp::detail
 {
 namespace {
@@ -198,6 +200,23 @@ std::shared_ptr<PooledImmutableOwnerPreparedStorage> PooledImmutableOwnerPrepare
 PooledImmutableNativeRoots PooledImmutableOwnerPreparedStorage::roots()const{return roots_->roots();}
 void PooledImmutableOwnerPreparedStorage::requireAuthority(const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const{roots_->requireAuthority(memory);}
 ImmutableLookupNativeOwnerObservation PooledImmutableOwnerPreparedStorage::retainedOwnerObservation()const{return roots_->retainedOwnerObservation();}
+void PooledImmutableOwnerPreparedStorage::bindInvocationChannel(const CapturedTransferBinding& original)
+{
+    if (isGraphCaptureActive() || original_invocation_ || original.device() != plan_.parameters().device ||
+        original.role() != CapturedTransferEndpoint::Consumer)
+        throw std::logic_error("Pooled owner cancellation requires its once-bound original invocation receiver");
+    original_invocation_ = std::make_shared<const CapturedTransferBinding>(original);
+}
+std::uint64_t PooledImmutableOwnerPreparedStorage::invocationChannelIdentity() const
+{
+    return original_invocation_ ? original_invocation_->captureIdentity() : 0;
+}
+CapturedTransferReceiveCompletion PooledImmutableOwnerPreparedStorage::invocationReceiveCompletion(void* exact_stream) const
+{
+    return original_invocation_
+        ? TransferEngine::instance().capturedReceiveCompletion(*original_invocation_, exact_stream)
+        : CapturedTransferReceiveCompletion::notRequired();
+}
 std::uint64_t PooledImmutableOwnerPreparedStorage::captureIdentity()const{return roots_->identity();}
 void PooledImmutableOwnerPreparedStorage::acquireSetup(void* stream)const{roots_->acquire(stream);}
 std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> PooledImmutableCoordinatorPreparedStorage::create(

@@ -11,6 +11,8 @@
  * - Result-owned setup arithmetic observations survive resets without entering measured counters
  * - Exact tagged physical expert selections survive as setup metadata without warmup movement
  * - Opt-in terminal eligible-window counters serialize after the real measured reset
+ * - Existing immutable-source and native submission counters retain measured-only scope
+ * - Exact immutable lookup capacity observations survive without retaining warmup activity
  */
 
 #include <gtest/gtest.h>
@@ -38,6 +40,7 @@
 #include "config/OrchestrationConfigDocument.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "execution/local_execution/graph/RetainedStoragePerfStats.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "config/OrchestrationConfig.h"
 #include "backends/DeviceId.h"
@@ -603,6 +606,55 @@ namespace
     private:
         bool measured_ = false;
         int remaining_request_tokens_ = 0;
+    };
+
+    /**
+     * @brief Replay completed source observations through the real terminal emitter.
+     * @details This device-free benchmark fixture proves serialization/reset,
+     *          not GPU lookup, transport execution or cache performance.
+     */
+    class MockImmutableLookupEvidenceRunner final : public MockOrchestratedDecodeRunner
+    {
+    public:
+        /** @brief Mark the actual post-warmup callback before the measured reset. */
+        void beginMeasuredObservations() { measured_ = true; }
+        /** @param max_tokens Original request's remaining benchmark token budget. */
+        void setDecodeStepTokenBudget(int max_tokens) override
+        {
+            MockOrchestratedDecodeRunner::setDecodeStepTokenBudget(max_tokens);
+            remaining_ = max_tokens;
+        }
+        /** @return Original mock output, with passive observations on terminal completion only. */
+        DecodeStepOutput decodeStepForBenchmark() override
+        {
+            auto output = MockOrchestratedDecodeRunner::decodeStepForBenchmark();
+            if (remaining_ <= 0 || output.tokens.size() != static_cast<std::size_t>(remaining_))
+                return output;
+            const std::uint64_t rows = measured_ ? 2 : 101;
+            RetainedStorageCounters counters{
+                .requests=1, .ids=rows, .idBytes=rows*sizeof(std::uint64_t),
+                .nativeBytes=rows*90, .metadataBytes=32,
+                .acknowledgementBytes=8, .terminalBytes=24};
+            counters.adaptiveBatches=1;
+            counters.sourceRows=rows;
+            auto observation=RetainedStorageTerminalObservation::between(
+                ++generation_, HostImmutableRowMode::AdaptiveFullRAM, {}, counters);
+            observation.transport=RetainedStorageTransport::PooledSubordinate;
+            source_.publish(observation,"ROCm:0");
+            PerfStatsCollector::addCounter("immutable_lookup","adaptive_cache_hit_rows",
+                static_cast<double>(rows),"generation_terminal","ROCm:0",
+                {{"storage","vram"},{"transport","pooled_subordinate"},
+                 {"authority","terminal_device_generation_control"},{"request","0"}});
+            // Preserve submission units; these are not cache hits or wire bytes.
+            PerfStatsCollector::addCounter("ngram_lookup","retained_remote_native_enqueues",
+                measured_ ? 1.0 : 101.0,"hosted_transaction","ROCm:0",{{"policy","retained_hosted"}});
+            return output;
+        }
+    private:
+        RetainedStoragePerfStats source_; ///< Original freshness guard survives collector reset.
+        std::uint64_t generation_=0;
+        int remaining_=0;
+        bool measured_=false;
     };
 
     class MockPerfStatsMaintenanceRunner : public MockOrchestratedDecodeRunner
@@ -1875,6 +1927,124 @@ TEST(Test__BenchmarkRunnerCPU, TerminalDepthWindowEvidenceRemainsOptIn)
     EXPECT_FALSE(document.at("perf_stats").at("enabled").get<bool>());
     EXPECT_TRUE(document.at("perf_stats").at("records").empty());
     EXPECT_TRUE(PerfStatsCollector::snapshot().empty());
+    EXPECT_FALSE(PerfStatsCollector::cpuStageTimingEnabled());
+    EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
+}
+
+/** @test Actual source emitter and benchmark reset retain exact measured lookup counters and units. */
+TEST(Test__BenchmarkRunnerCPU, ImmutableLookupEvidenceSurvivesMeasuredSerializationAndDropsWarmup)
+{
+    ScopedTerminalEvidenceCollection collection(true);
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    auto runner=std::make_shared<MockImmutableLookupEvidenceRunner>();
+    BenchmarkRunner benchmark(runner,createMockTokenizer());
+    benchmark.setPostWarmupCallback([&] {
+        PerfStatsCollector::addCounter("ngram_lookup","post_warmup_only",999.0,"warmup");
+        runner->beginMeasuredObservations();
+    });
+    OrchestrationConfig config;
+    config.prompt="Hello world";
+    config.n_predict=3;
+    config.mtp.enabled=true;
+    const auto result=benchmark.run(config);
+    ASSERT_TRUE(result.success)<<result.failure_reason;
+    const auto doc=nlohmann::json::parse(benchmarkResultToJsonString(result,&config));
+    const auto& stats=doc.at("perf_stats");
+    std::size_t sourceRecords=0,gpuRecords=0,submissionRecords=0;
+    for(const auto& row:stats.at("records")) {
+        const auto domain=row.at("domain").get<std::string>();
+        if(domain!="immutable_lookup" && domain!="ngram_lookup")continue;
+        EXPECT_EQ(row.at("kind"),"counter");
+        EXPECT_EQ(row.at("count").get<std::uint64_t>(),static_cast<std::uint64_t>(result.measurement_iterations));
+        EXPECT_EQ(row.at("device"),"ROCm:0");
+        const auto name=row.at("name").get<std::string>();
+        if(domain=="ngram_lookup") {
+            ++submissionRecords;
+            EXPECT_EQ(name,"retained_remote_native_enqueues");
+            EXPECT_EQ(row.at("phase"),"hosted_transaction");
+            EXPECT_EQ(row.at("tags").at("policy"),"retained_hosted");
+            EXPECT_EQ(row.at("value").get<double>(),result.measurement_iterations);
+        } else if(row.at("tags").at("storage")=="vram") {
+            ++gpuRecords;
+            EXPECT_EQ(name,"adaptive_cache_hit_rows");
+            EXPECT_EQ(row.at("tags").at("authority"),"terminal_device_generation_control");
+            EXPECT_EQ(row.at("value").get<double>(),2.0*result.measurement_iterations);
+        } else {
+            ++sourceRecords;
+            EXPECT_EQ(row.at("phase"),"generation_terminal");
+            EXPECT_EQ(row.at("tags").at("storage"),"gpu_subordinate_full_ram");
+            EXPECT_EQ(row.at("tags").at("transport"),"pooled_subordinate");
+            if(name=="source_rows")EXPECT_EQ(row.at("value").get<double>(),2.0*result.measurement_iterations);
+            if(name=="native_bytes")EXPECT_EQ(row.at("value").get<double>(),180.0*result.measurement_iterations);
+            if(name=="ram_rows" || name.starts_with("window_") || name.starts_with("cache_"))
+                EXPECT_EQ(row.at("value").get<double>(),0.0);
+        }
+    }
+    EXPECT_EQ(sourceRecords,20u);
+    EXPECT_EQ(gpuRecords,1u);
+    EXPECT_EQ(submissionRecords,1u);
+    EXPECT_FALSE(PerfStatsCollector::cpuStageTimingEnabled());
+    EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
+}
+
+/** @test Original admitted capacity survives once while unrelated preparation work resets. */
+TEST(Test__BenchmarkRunnerCPU, ImmutableLookupSetupRetainsOnlyOriginalAdmittedOwners)
+{
+    ScopedTerminalEvidenceCollection collection(true);
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    auto runner=std::make_shared<MockOrchestratedDecodeRunner>();
+    BenchmarkRunner benchmark(runner,createMockTokenizer());
+    const PerfStatsCollector::Tags original{
+        {"world_rank","0"},{"role","gpu_cache"},{"admitted_slots","8"},
+        {"payload_bytes","720"},{"metadata_bytes","304"},
+        {"table_storage_bytes","1024"},{"lookup_staging_bytes","128"},
+        {"backing","ram"}};
+    benchmark.setPostWarmupCallback([&] {
+        // This replay supplies an already validated immutable setup observation.
+        // Owner/lease validation is exercised by the observation owner's tests.
+        PerfStatsCollector::addCounter("immutable_lookup_setup","admitted_owner",1,
+            "setup","CUDA:0",original);
+        PerfStatsCollector::addCounter("immutable_lookup_setup","preparation_rows",777,
+            "warmup","CUDA:0");
+    });
+    OrchestrationConfig config;
+    config.prompt="Hello world";config.n_predict=3;config.mtp.enabled=true;
+    const auto result=benchmark.run(config);
+    ASSERT_TRUE(result.success)<<result.failure_reason;
+    const auto doc=nlohmann::json::parse(benchmarkResultToJsonString(result,&config));
+    std::size_t records=0;
+    for(const auto& row:doc.at("perf_stats").at("records")) {
+        if(row.at("domain")!="immutable_lookup_setup")continue;
+        ++records;
+        EXPECT_EQ(row.at("name"),"admitted_owner");
+        EXPECT_EQ(row.at("phase"),"setup");
+        EXPECT_EQ(row.at("device"),"CUDA:0");
+        EXPECT_EQ(row.at("count"),1u);
+        EXPECT_EQ(row.at("value"),1.0);
+        EXPECT_EQ(row.at("tags"),nlohmann::json(original));
+    }
+    EXPECT_EQ(records,1u);
+    EXPECT_FALSE(PerfStatsCollector::cpuStageTimingEnabled());
+    EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
+}
+
+/** @test Exporting lookup domains does not activate instrumentation when collection is disabled. */
+TEST(Test__BenchmarkRunnerCPU, ImmutableLookupEvidenceRemainsOptIn)
+{
+    ScopedTerminalEvidenceCollection collection(false);
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    auto runner=std::make_shared<MockImmutableLookupEvidenceRunner>();
+    BenchmarkRunner benchmark(runner,createMockTokenizer());
+    benchmark.setPostWarmupCallback([&] { runner->beginMeasuredObservations(); });
+    OrchestrationConfig config;
+    config.prompt="Hello world";
+    config.n_predict=3;
+    config.mtp.enabled=true;
+    const auto result=benchmark.run(config);
+    ASSERT_TRUE(result.success)<<result.failure_reason;
+    const auto doc=nlohmann::json::parse(benchmarkResultToJsonString(result,&config));
+    EXPECT_FALSE(doc.at("perf_stats").at("enabled").get<bool>());
+    EXPECT_TRUE(doc.at("perf_stats").at("records").empty());
     EXPECT_FALSE(PerfStatsCollector::cpuStageTimingEnabled());
     EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
 }

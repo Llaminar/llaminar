@@ -10,8 +10,11 @@
 #pragma once
 #include "PooledImmutableRetirementAuthority.h"
 #include "PooledImmutableDirectedLookupGraph.h"
+#include "PooledImmutableReplicatedReaderGeometry.h"
+#include <optional>
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 namespace llaminar2 {struct GraphConfig;}
+namespace llaminar2 { struct ClusterInventory; }
 namespace llaminar2::qwen4exp {
 /** @brief Closed original source/owner native lifetime, shared by exclusive model graph variants. */
 class PooledImmutableRetainedParticipants final:public PooledImmutableRetirementAuthority,public IRetainedGraphParticipantEnqueueCompletion,
@@ -21,10 +24,14 @@ public:
      * @brief Validate the real ordinary hosted policy and prepare original remote captures off all workers.
      * @param boundary Original model-owned consumed source storage.
      * @param policy Actual full model policy; storage coordinates never become expert/compute roles.
+     * @param originalInventory Original rank discovery owner; required for explicit same-vendor NoPeer transport.
+     * @param readers Exact declared compute-reader cohort, distinct from actual CPU source channels.
      * @return Strong model lifetime; missing opaque host qualification rejects before native capture.
      */
     static std::shared_ptr<PooledImmutableRetainedParticipants> create(
-        std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,const GraphConfig& policy);
+        std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,const GraphConfig& policy,
+        std::shared_ptr<const ClusterInventory> originalInventory = {},
+        std::optional<PooledImmutableReplicatedReaderGeometry> readers = {});
     /** @brief Reject active or unobserved readers before actual participant definitions or roots destruct. */
     ~PooledImmutableRetainedParticipants()noexcept override;
     /** @return Original source boundary retained by the existing directed transport. */
@@ -45,6 +52,12 @@ public:
         std::shared_ptr<const IPooledImmutableNativeKernels>,DeviceRowRange,PooledNativeTensorSpan,
         std::optional<PooledNativeTensorSpan>,DeviceGenerationControlBinding,PooledNativeTensorSpan,
         const std::string&,const std::string&);
+    /** @return The exact original prepared compute/storage participant, never a newly adopted worker. */
+    PreparedGPUContextUsePermit originalParticipant(DeviceId device)const;
+    /** @return True only for an actual original physical owner embedded in a declared compute reader. */
+    bool hasEmbeddedParticipant(DeviceId device)const noexcept;
+    /** @brief Retain one original DGO enclosing stream, independently of each FEE variant's capture stream. */
+    void bindEmbeddedParentSubmissionStream(const RetainedGraphParticipantParentStream& owner);
     void requireCurrent()const override;
     void requireSource(const PooledImmutableSourcePreparedStorage&,void* stream)const override;
     void requireSourceStream(void* stream)const override;
@@ -54,6 +67,7 @@ private:
     /** @brief Join only original remote host enqueue calls after source submission. */
     void completeOriginalEnqueue()const noexcept override;
     class SourcePlan;
+    class StorageAttachment;
     class Invocation;
     struct State;
     /** @brief Build only through the checked actual model policy factory. */
@@ -61,7 +75,9 @@ private:
     /** @brief Prepare all owner programs before original source graph materialization can run. */
     void prepareOriginalOwners();
     /** @brief Submit remote definitions once for the authenticated actual source parent invocation. */
-    RetainedGraphParticipantSubmission enqueueOriginalParticipants()const;
+    RetainedGraphParticipantSubmission enqueueOriginalParticipants(const RetainedGraphParticipantPreparationStream&)const;
+    /** @brief Require every exact matched finite attachment before the original source can launch. */
+    void requireInvocation(const RetainedGraphParticipantPreparationStream&)const;
     std::unique_ptr<State> state_;
 };
 }

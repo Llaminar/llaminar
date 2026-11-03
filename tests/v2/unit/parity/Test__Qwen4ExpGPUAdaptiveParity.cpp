@@ -159,3 +159,20 @@ TEST(Qwen4ExpGPUAdaptiveParity, CPUAndPipelineDefinitionsRemainUnsupportedRather
     EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
 }
 } // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity {
+/** @test Public CLI/config/export preserve real RAM backing while all original SSD names and args stay unchanged. */
+TEST(Qwen4ExpGPUAdaptiveParity, FullRAMBackingHasLosslessPublicIdentityAndRejectsRedundantCache){
+    auto cell=qwen4exp::qwen4ExpGPUAdaptiveProductionCases().front();auto& policy=*cell.ngram_table_policy;
+    const auto oldName=cell.testName();const auto oldArgs=modelParityServerArguments(cell);
+    policy.gpu_adaptive.host={};policy.gpu_adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;
+    EXPECT_NE(cell.testName(),oldName);EXPECT_NE(cell.testName().find("SourceRAM_"),std::string::npos);
+    auto args=modelParityServerArguments(cell);EXPECT_NE(std::find(args.begin(),args.end(),"--ngram-source-backing"),args.end());
+    args.insert(args.begin(),"llaminar2");std::vector<char*> argv;for(auto& arg:args)argv.push_back(arg.data());
+    const auto parsed=OrchestrationConfigParser{}.parseArgs(argv.size(),argv.data());EXPECT_EQ(parsed.ngram_table_policy,policy);
+    EXPECT_EQ(deserializeOrchestrationConfig(serializeOrchestrationConfig(parsed)).ngram_table_policy,policy);
+    auto invalid=policy;invalid.gpu_adaptive.host.maximum_cache_rows=1;EXPECT_THROW(invalid.validate(),std::invalid_argument);
+    invalid=policy;invalid.gpu_adaptive.host.cache_physical_byte_limit=1;EXPECT_THROW(invalid.validate(),std::invalid_argument);
+    cell=qwen4exp::qwen4ExpGPUAdaptiveProductionCases().front();EXPECT_EQ(cell.testName(),oldName);EXPECT_EQ(modelParityServerArguments(cell),oldArgs);
+}
+}

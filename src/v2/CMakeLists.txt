@@ -2631,4 +2631,5 @@ target_sources(llaminar2_core PRIVATE
 target_sources(llaminar2_core PRIVATE
     execution/qwen4exp/PooledImmutableDirectedOwnerProgram.cpp
     execution/qwen4exp/PooledImmutableDirectedLookupGraph.cpp
+    execution/qwen4exp/PooledImmutableReplicatedReaderGraph.cpp
     execution/qwen4exp/PooledImmutableRetainedParticipants.cpp)

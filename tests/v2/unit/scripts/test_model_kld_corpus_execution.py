@@ -128,6 +128,34 @@ class CorpusExecutionTests(unittest.TestCase):
             descriptor['object_identity']='"not-an-original-stat-descriptor"'
             with self.assertRaises(ValueError):adapter.CorpusExecution(c,t)
 
+    def test_reboot_device_renumbering_keeps_all_current_runtime_pins(self):
+        """Only the frozen st_dev may differ; current pins remain completely strict."""
+        from model_kld_corpus import unchanged
+        with tempfile.TemporaryDirectory() as temp:
+            c,t=fixture(Path(temp))
+            for descriptor in c['manifest']['source']['shards']:
+                frozen=json.loads(descriptor['object_identity']);frozen['device']+=1
+                descriptor['object_identity']=json.dumps(frozen)
+            a=adapter.CorpusExecution(c,t)
+            for path in a.sources:self.assertEqual(a.pins[str(path)],adapter.identity(path))
+            path=a.sources[0];current=adapter.identity(path)
+            changed=list(current);changed[1]+=1
+            with patch('model_kld_corpus.identity',return_value=tuple(changed)), self.assertRaisesRegex(ValueError,'changed during execution'):
+                unchanged({str(path):current})
+
+    def test_durable_file_fields_and_device_types_remain_strict(self):
+        """Reference device renumbering cannot mask any independent file mutation."""
+        with tempfile.TemporaryDirectory() as temp:
+            c,t=fixture(Path(temp));descriptor=c['manifest']['source']['shards'][0]
+            frozen=json.loads(descriptor['object_identity']);frozen['device']+=1
+            for field in ('path','inode','bytes','mtime_ns','ctime_ns'):
+                changed=dict(frozen);changed[field]=changed[field]+'other' if field=='path' else changed[field]+1
+                descriptor['object_identity']=json.dumps(changed)
+                with self.subTest(field=field), self.assertRaises(ValueError):adapter.CorpusExecution(c,t)
+            for value in (-1,True,1.0,'other'):
+                changed=dict(frozen);changed['device']=value;descriptor['object_identity']=json.dumps(changed)
+                with self.subTest(device=value), self.assertRaises(ValueError):adapter.CorpusExecution(c,t)
+
     def test_prepare_uses_same_parser_binary_and_publishes_exact_workload(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);c,t=fixture(root);a=adapter.CorpusExecution(c,t)

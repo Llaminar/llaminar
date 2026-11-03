@@ -1,3 +1,7 @@
+# @file V2PooledReaderNativeTests.cmake
+# @brief Native mapped owner reads retain explicit transport, capacity and lifetime coverage.
+# Empty and positive cache geometries use independent registered cases so every
+# format retains the standard deadline and its original publication/reset oracle.
 # Actual supported cross-vendor source/reader components; native peer guards remain.
 if(HAVE_CUDA AND HAVE_ROCM)
     foreach(_pooled_read_direction CUDAConsumerROCmStorage ROCmConsumerCUDAStorage)
@@ -51,5 +55,31 @@ if(HAVE_CUDA AND HAVE_ROCM)
                 ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_pooled_multi_test})
         endforeach()
+    endforeach()
+endif()
+
+# Explicit same-vendor NoPeer candidates: eligibility and native economy remain unqualified until run.
+if(TARGET v2_test_qwen4exp_device_primitives)
+    foreach(_nopeer_backend CUDA ROCm)
+        if((_nopeer_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_nopeer_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            if(_nopeer_backend STREQUAL "CUDA")
+                set(_nopeer_skip_cuda 0)
+                set(_nopeer_skip_rocm 1)
+                set(_nopeer_locks "cuda_gpu_0;cuda_gpu_1")
+            else()
+                set(_nopeer_skip_cuda 1)
+                set(_nopeer_skip_rocm 0)
+                set(_nopeer_locks "rocm_gpu_0;rocm_gpu_1")
+            endif()
+            foreach(_nopeer_capacity C0 Positive)
+                add_v2_test(V2_Integration_NoPeer_PooledImmutable_${_nopeer_backend}2_${_nopeer_capacity}_ReadAllFormatsReplay
+                    COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                        --gtest_filter=PooledImmutableProviderSourceDevice.NoPeerCaptured${_nopeer_backend}Consumer${_nopeer_backend}Storage${_nopeer_capacity}ReadAllFormats
+                    LABELS "V2;Integration;${_nopeer_backend};NoPeerCandidate;Ngram;Ownership;Capture;Component;AllFormats;ByteExact;Regression"
+                    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+                    RESOURCE_LOCK "${_nopeer_locks}"
+                    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=${_nopeer_skip_cuda};LLAMINAR_SKIP_ROCM_STARTUP=${_nopeer_skip_rocm}")
+            endforeach()
+        endif()
     endforeach()
 endif()

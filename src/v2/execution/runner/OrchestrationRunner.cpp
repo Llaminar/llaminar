@@ -164,6 +164,7 @@
 #include "../../execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "../../execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "../../execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "../../execution/moe/MoEOverlayHostServiceContract.h"
 #include "../../execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "../../execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "../../execution/moe/RoutedExpertOwnerAssignment.h"
@@ -1591,6 +1592,8 @@ namespace llaminar2
          * endpoints, not the synthetic primary.  Ordinary LocalTP resolves the
          * same authority set from the rank plan. PP includes every inner TP
          * participant, not merely the primary device of each pipeline stage.
+         * Frozen-zero routed-only endpoints retain their runtime/storage life,
+         * but cannot be required to own prepared weight records they never load.
          */
         std::vector<DeviceId> rankLocalPreparedWeightAuthorityDevices(
             const RankExecutionPlan &rank_plan,
@@ -1613,12 +1616,7 @@ namespace llaminar2
                 resolveOverlayExecutionPlanForRunner(overlay_plan, mpi_ctx);
             if (overlay_execution)
             {
-                for (const DeviceId device :
-                     overlay_execution->currentRankPlan().local_devices)
-                {
-                    append_unique(device);
-                }
-                return devices;
+                return admittedOverlayPreparedWeightDevices(*overlay_plan, *overlay_execution);
             }
 
             if (rank_plan.usesLocalPP())
@@ -3195,6 +3193,7 @@ namespace llaminar2
 
     void OrchestrationRunner::shutdown()
     {
+        std::string retired_storage_request_failure;
         const bool was_inference_ready = initialization_lifecycle_.readyForInference();
         const bool has_live_resources =
             created_native_context_source_ || plan_.runtime.native_context_preparation || runner_ || model_ctx_ || local_tp_ctx_ || local_pp_ctx_ ||
@@ -3265,6 +3264,13 @@ namespace llaminar2
                         terminal_moe_optimization_status_ = drainedMoEOptimizationStatus(std::move(native_status));
                         terminal_moe_optimization_movement_ledger_ = runner_->moeOptimizationMovementLedger();
                     }
+                }
+                catch (const RetiredStorageRequestFailure &error)
+                {
+                    // Every original native/adopted duty retired, but the request
+                    // failed. Destroy owners safely and forbid prepared reuse.
+                    retired_storage_request_failure = error.what();
+                    LOG_ERROR("[OrchestrationRunner] Retired failed storage request: " << error.what());
                 }
                 catch (const std::exception &e)
                 {
@@ -3459,6 +3465,10 @@ namespace llaminar2
 
         if (exports_reusable_model_context)
         {
+            if (!retired_storage_request_failure.empty()) {
+                model_context_reuse_seal_succeeded_ = false;
+                model_context_reuse_seal_error_ = retired_storage_request_failure;
+            }
             if (model_context_reuse_seal_succeeded_)
             {
                 std::string publication_error;
@@ -3549,6 +3559,12 @@ namespace llaminar2
         created_native_context_source_.reset();
         mtp_depth_policy_scope_geometry_ = {};
         mtp_depth_policy_scope_generic_reason_ = "model_free";
+        // Failed request data is never reusable. Exclusive physical retirement
+        // above still used its original positive BOM and native-zero proof.
+        if (!retired_storage_request_failure.empty()) {
+            model_context_reuse_seal_succeeded_ = false;
+            model_context_reuse_seal_error_ = retired_storage_request_failure;
+        }
         initialization_lifecycle_.retire();
         LOG_DEBUG("OrchestrationRunner shut down");
     }
@@ -18548,7 +18564,7 @@ namespace llaminar2
                             .world_size = world_size,
                         });
 
-                if (!refreshRankLocalGPUCapacityObservations(
+                if (!prepareRankLocalGPUContexts(
                         execution_plan.currentRankPlan().local_devices,
                         "physical_capacity_resolution"))
                 {
@@ -19102,7 +19118,7 @@ namespace llaminar2
             else
             {
                 const auto devices = rankLocalGPUExecutionDevices(plan_, nullptr, mpi_ctx_);
-                if (!refreshRankLocalGPUCapacityObservations(devices, "pipeline_physical_capacity_resolution"))
+                if (!prepareRankLocalGPUContexts(devices, "pipeline_physical_capacity_resolution"))
                     return false;
                 const auto &execution = debugEnv().execution;
                 if (!execution.gpu_graphs || !execution.prefill_graph_buckets)
@@ -19117,7 +19133,8 @@ namespace llaminar2
                      .snapshot_capacity = snapshot_capture_setup_.enabled()
                          ? snapshot_capture_setup_.memory_capacity : GraphSnapshotMemoryCapacity{},
                      .model_graph_topology_variant_count = snapshot_capture_setup_.retainedModelGraphTopologyVariantCount(),
-                     .retained_host_services = RetainedHostServiceBudgetProjection::original()}));
+                     .retained_host_services = RetainedHostServiceBudgetProjection::original(),
+                     .native_context_preparation = plan_.runtime.native_context_preparation}));
                 moe_pipeline_prepared_plan_ = MoEPipelinePreparedPlan::create(std::move(admission), model_ctx_);
             }
             const auto &admission = *moe_pipeline_prepared_plan_->admission();
@@ -19683,10 +19700,10 @@ namespace llaminar2
             std::all_of(initial_snapshot->owner_map.participants().begin(), initial_snapshot->owner_map.participants().end(),
                 [](const auto &participant) { return participant.device.is_cpu(); });
         std::vector<MoEOverlayParticipantLayerServiceTotals>
-            prepared_cpu_service_measurements;
+            prepared_service_measurements;
         if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
             !local_cpu_host_maintenance &&
-            !run_maintenance_phase("measurePreparedCPUExpertService", [&]
+            !run_maintenance_phase("measurePreparedExpertService", [&]
             {
                 // This setup thread has the same MPI/NUMA/OpenMP placement as
                 // CPU serving. Finish private observations before maintenance
@@ -19698,11 +19715,11 @@ namespace llaminar2
                 const auto topology = ExpertHistogramProductionTopology::forRetainedExecution(
                     metadata.num_layers, metadata.main_inference_layer_count,
                     expertHistogramServingRegime(mtp));
-                prepared_cpu_service_measurements = MoEOverlayCPUServiceMeasurement::measure(
+                prepared_service_measurements = MoEOverlayCPUServiceMeasurement::measure(
                     *moe_expert_overlay_participant_residency_, initial_snapshot->epoch,
                     *catalog, topology,
                     {.d_model = metadata.d_model, .intermediate = metadata.routed_intermediate_size},
-                    physical_memory_authority_);
+                    physical_memory_authority_, &planningModelMetadata().memoryProfile(), &cluster_inventory_.ranks.at(plan_.rank));
                 return true;
             }))
             return false;
@@ -20048,7 +20065,7 @@ namespace llaminar2
                                             .migration_payoff_horizon_tokens,
                                 },
                             .production_topology = production_topology,
-                            .prepared_service_measurements = prepared_cpu_service_measurements,
+                            .prepared_service_measurements = prepared_service_measurements,
                             .evidence_exchange =
                                 std::move(economy_evidence_exchange),
                             .perf_device = perf_device,
@@ -20734,7 +20751,7 @@ namespace llaminar2
                                         .migration_payoff_horizon_tokens,
                             },
                         .production_topology = production_topology,
-                        .prepared_service_measurements = prepared_cpu_service_measurements,
+                        .prepared_service_measurements = prepared_service_measurements,
                         .evidence_exchange =
                             economy_evidence_exchange,
                         .perf_device = perf_device,
@@ -21947,7 +21964,7 @@ namespace llaminar2
         return true;
     }
 
-    bool OrchestrationRunner::refreshRankLocalGPUCapacityObservations(
+    bool OrchestrationRunner::prepareRankLocalGPUContexts(
         const std::vector<DeviceId> &devices,
         std::string_view purpose)
     {
@@ -21960,14 +21977,6 @@ namespace llaminar2
             const int world_rank = overlay_world
                                        ? overlay_world->rank()
                                        : plan_.rank;
-            if (world_rank < 0 ||
-                world_rank >=
-                    static_cast<int>(cluster_inventory_.ranks.size()))
-            {
-                return setError(
-                    "Runtime GPU capacity observation has no rank inventory");
-            }
-
             std::vector<DeviceId> unique_gpus;
             unique_gpus.reserve(devices.size());
             for (const DeviceId device : devices)
@@ -21983,9 +21992,17 @@ namespace llaminar2
                 unique_gpus.push_back(device);
             }
 
-            if(plan_.runtime.ngram_table_policy.isGPUAdaptive()){
-                const auto computeWorkerCount=unique_gpus.size();
-                const auto storageParticipants=plan_.runtime.ngram_table_policy.gpu_adaptive.placement.declaredParticipants();
+            const auto computeWorkerCount = unique_gpus.size();
+            const auto storageParticipants = plan_.runtime.ngram_table_policy.isGPUAdaptive()
+                ? plan_.runtime.ngram_table_policy.gpu_adaptive.placement.declaredParticipants()
+                : std::vector<AdaptiveGPUCacheParticipant>{};
+            if (!unique_gpus.empty() || !storageParticipants.empty()) {
+                if (world_rank < 0 || world_rank >= static_cast<int>(cluster_inventory_.ranks.size()))
+                    return setError("Native GPU preparation has no original rank inventory");
+                // Every GPU graph can own native event/graph resources. Their
+                // typed BOM requires the same original prepared worker whether
+                // ngrams use RAM, SSD, VRAM or adaptive caches. Storage policy
+                // contributes endpoints; it never selects another birth path.
                 // Storage endpoints are mandatory source-worker births, not
                 // extra compute/expert participants. Preserve authored ordering
                 // while deduplicating coordinator/consumer aliases exactly.
@@ -22001,7 +22018,7 @@ namespace llaminar2
                 auto source=plan_.runtime.native_context_preparation;
                 if(!source && model_ctx_)source=model_ctx_->nativeContextPreparation();
                 if(!source){
-                    if(unique_gpus.empty())throw std::invalid_argument("GPU adaptive source has no selected native participants");
+                    if(unique_gpus.empty())throw std::invalid_argument("Native source has no selected GPU participants");
                     const auto& observed=cluster_inventory_.ranks.at(static_cast<std::size_t>(world_rank));
                     std::vector<PhysicalMemoryResource> resources;
                     resources.push_back({world_rank,DeviceId::cpu(),observed.cpu.memory_bytes?observed.cpu.memory_bytes:observed.cpu_memory_bytes,
@@ -22036,74 +22053,9 @@ namespace llaminar2
                 return true;
             }
 
-            /*
-             * Finish every lazy backend/context allocation before observing
-             * any participant. Sampling one GPU while another context is
-             * still being initialized would give the rank a mixed lifecycle
-             * inventory and make automatic capacity order-dependent.
-             */
-            for (const DeviceId device : unique_gpus)
-                (void)GPUDeviceContextPool::instance().getContext(device);
-
-            auto &rank_inventory =
-                cluster_inventory_.ranks[static_cast<std::size_t>(world_rank)];
-            for (const DeviceId device : unique_gpus)
-            {
-                IBackend *const backend = getBackendFor(device);
-                if (!backend)
-                {
-                    return setError(
-                        "Runtime GPU capacity observation has no backend for " +
-                        device.toString());
-                }
-
-                const auto prior = std::find_if(
-                    rank_inventory.gpus.begin(),
-                    rank_inventory.gpus.end(),
-                    [&](const DeviceInfo &gpu)
-                    {
-                        return gpu.type == device.type &&
-                               gpu.local_device_id == device.ordinal;
-                    });
-                const std::size_t discovery_free_bytes =
-                    prior == rank_inventory.gpus.end()
-                        ? 0u
-                        : prior->free_memory_bytes;
-                const std::size_t total_bytes =
-                    backend->deviceMemoryTotal(device.ordinal);
-                const std::size_t free_bytes =
-                    backend->deviceMemoryFree(device.ordinal);
-                installMoEOverlayRuntimeGPUCapacityObservation(
-                    rank_inventory,
-                    device,
-                    total_bytes,
-                    free_bytes);
-                const std::size_t newly_owned_bytes =
-                    discovery_free_bytes > free_bytes
-                        ? discovery_free_bytes - free_bytes
-                        : 0u;
-
-                LOG_DEBUG(
-                    "[MoEOverlayCapacity] Runtime-stable GPU observation device="
-                    << device.toString()
-                    << " purpose=" << purpose
-                    << " prior_free=" << discovery_free_bytes
-                    << " runtime_free=" << free_bytes
-                    << " newly_owned=" << newly_owned_bytes);
-                PerfStatsCollector::addCounter(
-                    "moe_overlay_capacity",
-                    "runtime_stable_gpu_memory_observation",
-                    1.0,
-                    "model_setup",
-                    device.toString(),
-                    {{"backend", backend->backendName()},
-                     {"purpose", std::string(purpose)},
-                     {"prior_free_bytes",
-                      std::to_string(discovery_free_bytes)},
-                     {"runtime_free_bytes", std::to_string(free_bytes)},
-                     {"newly_owned_bytes",
-                      std::to_string(newly_owned_bytes)}});
-            }
+            // A CPU-only rank has no native worker birth. Do not resample
+            // physical capacity after setup: the original source PMA retains
+            // its observations and accounts every original context commitment.
             return true;
         }
         catch (const std::exception &error)
@@ -22178,8 +22130,8 @@ namespace llaminar2
             return true;
         }
 
-        if(plan_.runtime.ngram_table_policy.isGPUAdaptive() && !plan_.runtime.native_context_preparation){
-            if(!refreshRankLocalGPUCapacityObservations(rankLocalGPUExecutionDevices(plan_,config_.moe_routed_expert_plan,
+        if(!plan_.runtime.native_context_preparation){
+            if(!prepareRankLocalGPUContexts(rankLocalGPUExecutionDevices(plan_,config_.moe_routed_expert_plan,
                 moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_),"source_prequota_birth"))return false;
         }
 
@@ -22308,7 +22260,7 @@ namespace llaminar2
              * would otherwise reject valid reuse or admit against bytes owned
              * by a now-retired external process.
              */
-            if (!refreshRankLocalGPUCapacityObservations(
+            if (!prepareRankLocalGPUContexts(
                     rankLocalGPUExecutionDevices(
                         plan_,
                         config_.moe_routed_expert_plan,
@@ -22792,12 +22744,17 @@ namespace llaminar2
         const auto overlay_execution = resolveOverlayExecutionPlanForRunner(
             config_.moe_routed_expert_plan,
             overlay_context);
-        if (!overlay_execution || !overlay_context ||
-            overlay_context->world_size() <= 1)
+        if (!overlay_execution || !overlay_context)
         {
             return true;
         }
-        if (overlay_context->communicator() == MPI_COMM_NULL)
+        // Preserve the existing no-channel lifecycle for continuation-local
+        // GPUs and a same-rank CPU tier. The one typed planner predicate adds
+        // channels only for genuine off-continuation GPU/rank endpoints.
+        if (config_.moe_routed_expert_plan &&
+            !MoEOverlayActivationChannelPlanner::requiresActivationChannels(*config_.moe_routed_expert_plan))
+            return true;
+        if (overlay_context->world_size() > 1 && overlay_context->communicator() == MPI_COMM_NULL)
         {
             return setError(
                 "Distributed MoE ExpertOverlay cannot pre-create node-local "
@@ -22942,12 +22899,13 @@ namespace llaminar2
                 const auto participant_ids = channel.targetParticipantIds();
                 if (channel.source_world_rank != source->world_rank ||
                     channel.source_device != source->device ||
-                    resolveMoEOverlayRankBatchTransportKind(
+                    (channel.source_world_rank != target_world_rank &&
+                     resolveMoEOverlayRankBatchTransportKind(
                         *overlay_context,
                         channel.source_world_rank,
                         target_world_rank) !=
                         MoEOverlayRankBatchTransportKind::
-                            NodeLocalSharedRows)
+                            NodeLocalSharedRows))
                 {
                     throw std::logic_error(
                         "MoE activation capacity and MPI topology authorities disagree about a node-local channel");
@@ -22967,7 +22925,10 @@ namespace llaminar2
                             "MoE activation capacity topology diverged from the frozen owner map");
                     }
                 }
-                const std::string channel_identity =
+                const bool same_rank = source->world_rank == target_world_rank;
+                const std::string channel_identity = same_rank ?
+                    makeMoEOverlayRankLocalGPUChannelIdentity(tier_index, target_domain_ordinal,
+                        source->world_rank, participant_ids) :
                     makeMoEOverlayRankBatchChannelIdentity(
                         tier_index,
                         target_domain_ordinal,
@@ -23007,9 +22968,11 @@ namespace llaminar2
                         const auto &local_lanes =
                             channel.localLanes(local_world_rank);
 
-                        auto transport = createMoEOverlayRankBatchTransport(
-                            MoEOverlayRankBatchTransportConfig{
+                        auto transport_config = MoEOverlayRankBatchTransportConfig{
                                 .mpi_ctx = overlay_context,
+                                .endpoint_scope = same_rank ? MoEOverlayActivationEndpointScope::RankLocalGPU :
+                                    MoEOverlayActivationEndpointScope::DistinctRanks,
+                                .rank_local_source_device = same_rank ? source->device : DeviceId::invalid(),
                                 .source_world_rank = source->world_rank,
                                 .target_world_rank = target_world_rank,
                                 .workspace = std::move(workspace),
@@ -23023,6 +22986,8 @@ namespace llaminar2
                                 .channel_identity = channel_identity,
                                 .transaction_slot_count = 4096,
                                 .transaction_topology =
+                                    same_rank ? makeMoEOverlayRankLocalInferenceTopologyIdentity(
+                                        owner_map, graph_family, source_participant_id, participant_ids) :
                                     makeMoEOverlayInferenceTopologyIdentity(
                                         owner_map,
                                         graph_family,
@@ -23038,7 +23003,10 @@ namespace llaminar2
                                 .activation_layout =
                                     channel.mapping_layout,
                                 .local_lanes = local_lanes,
-                            });
+                            };
+                        auto transport = same_rank ?
+                            createMoEOverlayRankLocalGPUActivationTransport(std::move(transport_config)) :
+                            createMoEOverlayRankBatchTransport(std::move(transport_config));
                         if (!transport ||
                             transport->kind() !=
                                 MoEOverlayRankBatchTransportKind::
@@ -23070,8 +23038,8 @@ namespace llaminar2
                  * starting its timeout before the source reaches that group.
                  */
                 int group_ok = local_ok ? 1 : 0;
-                int global_group_ok = 0;
-                if (MPI_Allreduce(
+                int global_group_ok = group_ok;
+                if (overlay_context->world_size() > 1 && MPI_Allreduce(
                         &group_ok,
                         &global_group_ok,
                         1,
@@ -23353,52 +23321,15 @@ namespace llaminar2
         }
     }
 
-    bool OrchestrationRunner::buildComputeGraph()
+    MoEOverlayParticipantGraphRunnerConfig OrchestrationRunner::makeMoEOverlayParticipantConfig(
+        MoEOverlayParticipantGraphOwnership ownership) const
     {
-        ScopedWeightLoadTimer timer(WeightLoadPhase::GRAPH_BUILD);
-
-        // Cross-rank topology changes physical graph construction only. It must
-        // not bypass model admission, snapshot installation, or readiness.
-        if (requiresNamedDomainGlobalGraph(config_))
-        {
-            if (!plan_builder_)
-                return setError("Named-domain graph has no topology builder");
-            runner_ = buildNamedDomainGlobalGraph(
-                config_, plan_, cluster_inventory_, *plan_builder_, model_ctx_, mpi_ctx_);
-            // Resolve before readiness, while every rank still follows the
-            // common initialization schedule. The public frontend then runs
-            // on the same tail that owns logits, with no vocabulary transfer.
-            mpi_coordinated_root_rank_ = coordinatedRootRankForRunner(
-                config_.moe_routed_expert_plan, mpi_ctx_, runner_.get());
-            return static_cast<bool>(runner_);
-        }
-
-        auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
-            config_.moe_routed_expert_plan,
-            moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
-        if (overlay_execution_plan)
-        {
-            const auto execution_kind =
-                overlay_execution_plan->currentRankPlan().execution_kind;
-            if (execution_kind ==
-                OverlayRankExecutionKind::RelayOnly)
-            {
-                return setError(
-                    "ExpertOverlay relay-only ranks cannot enter model graph construction");
-            }
-            if (execution_kind ==
-                OverlayRankExecutionKind::ExpertOnlyFollower)
-            {
-                auto overlay_ctx =
-                    moe_expert_overlay_mpi_ctx_
-                        ? moe_expert_overlay_mpi_ctx_
-                        : mpi_ctx_;
-                const MTPRuntimeConfig &active_mtp = retainedMTPConfig();
-                const bool retains_mtp_capacity =
-                    retainsMTPGraphCapacity(active_mtp);
-                runner_ = createMoEOverlayParticipantGraphRunner(
-                    MoEOverlayParticipantGraphRunnerConfig{
+        auto overlay_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        const auto &active_mtp = retainedMTPConfig();
+        const bool retains_mtp_capacity = retainsMTPGraphCapacity(active_mtp);
+        return MoEOverlayParticipantGraphRunnerConfig{
                         .model_context = model_ctx_,
+                        .ownership = ownership,
                         .cpu_serial_expert_storage = plan_.runtime.cpu_serial_expert_storage,
                         .prepared_weight_admission =
                             retained_prepared_weight_plan_validated_
@@ -23455,7 +23386,67 @@ namespace llaminar2
                             resolveMTPRetainedDraftCapacity(active_mtp),
                         .max_request_count =
                             std::max(1, plan_.runtime.batch_size),
-                    });
+                    };
+    }
+
+    bool OrchestrationRunner::buildComputeGraph()
+    {
+        ScopedWeightLoadTimer timer(WeightLoadPhase::GRAPH_BUILD);
+
+        if (config_.moe_routed_expert_plan && moe_expert_overlay_residency_authority_)
+        {
+            const auto snapshot = moe_expert_overlay_residency_authority_->snapshot();
+            const auto context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!snapshot || !snapshot->valid() || !context)
+                return setError("Expert endpoint construction lost original admitted ownership");
+            const auto endpoints = MoEOverlayHostServiceContract::resolveAdmitted(
+                *config_.moe_routed_expert_plan, snapshot->owner_map, *context);
+            if (endpoints.requiresRankLocalInferencePublisher() &&
+                (!hasLocalTP() || plan_.usesLocalPP() || requiresNamedDomainGlobalGraph(config_)))
+                return setError("Same-rank cross-vendor expert endpoints require their original flat LocalTP parent; other enclosing graph roles are not implemented");
+        }
+
+        // Cross-rank topology changes physical graph construction only. It must
+        // not bypass model admission, snapshot installation, or readiness.
+        if (requiresNamedDomainGlobalGraph(config_))
+        {
+            if (!plan_builder_)
+                return setError("Named-domain graph has no topology builder");
+            runner_ = buildNamedDomainGlobalGraph(
+                config_, plan_, cluster_inventory_, *plan_builder_, model_ctx_, mpi_ctx_);
+            // Resolve before readiness, while every rank still follows the
+            // common initialization schedule. The public frontend then runs
+            // on the same tail that owns logits, with no vocabulary transfer.
+            mpi_coordinated_root_rank_ = coordinatedRootRankForRunner(
+                config_.moe_routed_expert_plan, mpi_ctx_, runner_.get());
+            return static_cast<bool>(runner_);
+        }
+
+        auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
+            config_.moe_routed_expert_plan,
+            moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
+        if (overlay_execution_plan)
+        {
+            const auto execution_kind =
+                overlay_execution_plan->currentRankPlan().execution_kind;
+            if (execution_kind ==
+                OverlayRankExecutionKind::RelayOnly)
+            {
+                return setError(
+                    "ExpertOverlay relay-only ranks cannot enter model graph construction");
+            }
+            if (execution_kind ==
+                OverlayRankExecutionKind::ExpertOnlyFollower)
+            {
+                auto overlay_ctx =
+                    moe_expert_overlay_mpi_ctx_
+                        ? moe_expert_overlay_mpi_ctx_
+                        : mpi_ctx_;
+                const MTPRuntimeConfig &active_mtp = retainedMTPConfig();
+                const bool retains_mtp_capacity =
+                    retainsMTPGraphCapacity(active_mtp);
+                runner_ = createMoEOverlayParticipantGraphRunner(
+                    makeMoEOverlayParticipantConfig(MoEOverlayParticipantGraphOwnership::ExpertOnlyRank));
                 if (!runner_)
                 {
                     return setError(
@@ -23876,8 +23867,10 @@ namespace llaminar2
                                         : mpi_ctx_;
         const auto execution = resolveOverlayExecutionPlanForRunner(
             config_.moe_routed_expert_plan, overlay_context);
+        auto *rank_runner = dynamic_cast<RankOrchestrator *>(runner_.get());
+        const auto local_endpoints = rank_runner ? rank_runner->rankLocalExpertEndpoints() : nullptr;
         if (!execution || !overlay_context ||
-            overlay_context->world_size() <= 1)
+            (overlay_context->world_size() <= 1 && !local_endpoints))
         {
             return true;
         }
@@ -23891,7 +23884,7 @@ namespace llaminar2
                 [](const OverlayRankPlan &rank_plan)
                 {
                     return rank_plan.usesExpertTransactionFollower();
-                }));
+                })) + (local_endpoints ? 1u : 0u);
         if (source_rank < 0 ||
             source_rank >= overlay_context->world_size() ||
             (local_rank == source_rank) !=
@@ -24245,6 +24238,13 @@ namespace llaminar2
                             },
                         }));
                 }
+                if (local_endpoints)
+                {
+                    if (local_rank != source_rank)
+                        return setError("Original same-rank experts have no continuation command authority");
+                    publishers.push_back(MoEOverlayParticipantGraphRunner::createRankLocalInferencePublisher(
+                        local_endpoints));
+                }
                 if (publishers.empty())
                 {
                     return setError(
@@ -24404,6 +24404,15 @@ namespace llaminar2
                     .local_participant_count =
                         static_cast<std::size_t>(continuation_participants),
                 });
+                if (local_endpoints)
+                {
+                    coordinator_segments.push_back({
+                        .role = MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower,
+                        .materialization = MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable,
+                        .world_rank = local_rank,
+                        .local_participant_count = local_endpoints->participantIds().size(),
+                    });
+                }
                 for (const auto &rank_plan : execution->rank_plans)
                 {
                     if (!rank_plan.usesExpertTransactionFollower())
@@ -24846,6 +24855,18 @@ namespace llaminar2
             moe_overlay_device_controller_fabric_;
         mdo_config.reusable_execution_workspaces =
             reusable_execution_workspaces_;
+        if (config_.moe_routed_expert_plan && moe_expert_overlay_residency_authority_)
+        {
+            const auto snapshot = moe_expert_overlay_residency_authority_->snapshot();
+            const auto context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!snapshot || !snapshot->valid() || !context)
+                return setError("Rank auxiliary expert selection lost its original admitted ownership");
+            const auto endpoints = MoEOverlayHostServiceContract::resolveAdmitted(
+                *config_.moe_routed_expert_plan, snapshot->owner_map, *context);
+            if (endpoints.requiresRankLocalInferencePublisher())
+                mdo_config.rank_local_expert_endpoints = makeMoEOverlayParticipantConfig(
+                    MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary);
+        }
 
         LOG_DEBUG("[OrchestrationRunner] Multi-device precision config: activation="
                   << activationPrecisionToString(mdo_config.activation_precision)

@@ -4607,6 +4607,18 @@ namespace llaminar2
          * that a GPU stream matches the backend before calling recordEvent).
          */
         virtual DeviceType backendDeviceType() const = 0;
+
+        /**
+         * @brief Enable already-admitted peer reads on the exact original worker during cold setup.
+         * @param device_id Exact consuming GPU ordinal. @param peer_device_id Payload-owning GPU ordinal.
+         * @return True only when native enable succeeds; unsupported backends reject.
+         * @note TransferEngine authenticates original cached bidirectional coverage before this call.
+         * No hardware query, alternative transport or parallel capability cache is installed.
+         */
+        virtual bool enableCapturedTransferPeerAccess(int device_id, int peer_device_id)
+        { (void)device_id; (void)peer_device_id; return false; }
+
+
     };
 
 } // namespace llaminar2

@@ -35,6 +35,7 @@ struct PooledSourceParameters {
     std::uint32_t row_elements;
     std::uint64_t identity;
     std::uint32_t local_owner=adaptive_lookup::None,packet_capacity=0;
+    std::uint32_t consumers=1; ///< Actual compute readers; never physical owner or CPU source-channel population.
 };
 /** @brief Closed exact source/frame geometry independent of any host cache decision or mirrored GPU state. */
 class PooledImmutableSourceGeometry final {
@@ -44,11 +45,13 @@ public:
      * @param owner Original storage-owner declaration, independent of consumer/coordinator placement.
      * @param coordinator Original global coalescing declaration.
      * @param source Actual immutable provider source metadata; payload is neither read nor hashed.
+     * @param consumers Original declared compute-reader cohort, independent of the one CPU source channel.
      * @return Checked typed geometry; the source-issued binder separately proves the actual source/channel/roots.
      * @throws std::exception For incompatible format/table/source/count/owner geometry or overflow.
      */
     static PooledImmutableSourceGeometry fromPlans(std::span<const PooledImmutableOwnerNativePlan> owners,
-        const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source);
+        const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source,
+        std::uint32_t consumers=1);
     /** @brief One-owner spelling delegates to the same complete-cohort validation; never admits a partial cohort. */
     static PooledImmutableSourceGeometry fromPlans(const PooledImmutableOwnerNativePlan& owner,
         const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source)

@@ -52,6 +52,8 @@ public:
         const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate);
     /** @return Exact original allocator, independent of coordinator/consumer placement. */
     PhysicalMemoryAllocatorIdentity allocator() const noexcept{return allocator_;}
+    /** @return Frozen original transport observation inherited from the physical owner declaration. */
+    std::optional<PeerAccessCoverage> peerAccess() const noexcept { return peer_access_; }
     /** @return Additional native bytes only; frozen cache/frame bytes are not charged twice. */
     PhysicalMemoryPlan mandatoryBOM(PhysicalMemoryResource observed) const;
     /**
@@ -66,10 +68,12 @@ public:
         const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate,PhysicalMemoryResource observed);
 private:
     /** @brief Only fromGeometry constructs a complete native declaration. */
-    PooledImmutableOwnerNativePlan(pooled_native::OwnerParameters p,PhysicalMemoryAllocatorIdentity a)
-        :parameters_(p),allocator_(a){}
+    PooledImmutableOwnerNativePlan(pooled_native::OwnerParameters p,PhysicalMemoryAllocatorIdentity a,
+        std::optional<PeerAccessCoverage> peer_access)
+        :parameters_(p),allocator_(a),peer_access_(peer_access){}
     pooled_native::OwnerParameters parameters_;
     PhysicalMemoryAllocatorIdentity allocator_;
+    std::optional<PeerAccessCoverage> peer_access_;
 };
 /** @brief Closed native coordinator geometry and only its additional mandatory staging contribution. */
 class PooledImmutableCoordinatorNativePlan final

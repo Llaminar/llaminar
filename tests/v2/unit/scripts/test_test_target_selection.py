@@ -101,6 +101,98 @@ endforeach()
                 capture_output=True, text=True, timeout=15, check=False,
             )
 
+    def test_finite_storage_cases_keep_original_aggregate_and_owned_processes(self):
+        """Actual declarations preserve every old suite and isolate all new source admissions."""
+        declaration = CMAKE_LISTS.read_text(encoding="utf-8")
+        first = declaration.index("function(add_v2_test TEST_NAME)")
+        stop = declaration.index("endfunction()", first) + len("endfunction()")
+        helper = declaration[first:stop]
+        first = declaration.index("    add_v2_test(V2_Integration_GPUExpertTransfer")
+        aggregate = declaration[first:declaration.index("    if(HAVE_CUDA)", first)]
+        owner = MODULE.with_name("V2FiniteStorageParentTests.cmake")
+        replay = CMAKE_LISTS.parent / "integration/transfer/FiniteBodySiblingNativeReplay.inc"
+        new_cases = re.findall(r"TEST\(FiniteBodySiblingNativeIntegration,\s*(\w+)\)", replay.read_text())
+        self.assertEqual(len(new_cases), 10)
+        self.assertEqual(len(set(new_cases)), 10)
+        source_first = declaration.index("set(V2_GPU_EXPERT_TRANSFER_TEST_SOURCES")
+        source_stop = declaration.index("    add_executable(v2_unit_gpu_expert_transfer", source_first)
+        old_sources = re.findall(r"(?:unit|integration)/[\w/.-]+[.]cpp", declaration[source_first:source_stop])
+        old_suites = set()
+        for relative in old_sources:
+            old_suites.update(re.findall(r"TEST(?:_F|_P)?\(\s*(\w+)\s*,", (CMAKE_LISTS.parent / relative).read_text()))
+        self.assertTrue(old_suites)
+        self.assertNotIn("FiniteBodySiblingNativeIntegration", old_suites)
+        for cuda, rocm in ((True, False), (False, True), (True, True)):
+            with self.subTest(cuda=cuda, rocm=rocm), tempfile.TemporaryDirectory(prefix="llaminar-finite-selection-") as tmp:
+                root = Path(tmp)
+                for relative in ("unit", "integration", "fixtures"):
+                    (root / relative).symlink_to(CMAKE_LISTS.parent / relative, target_is_directory=True)
+                (root / "main.cpp").write_text("int main(){return 0;}\n")
+                fixture = f"""
+cmake_minimum_required(VERSION 3.27)
+project(FiniteStorageSelection LANGUAGES CXX)
+enable_testing()
+set(V2_PERF_TESTS_ONLY OFF)
+set(HAVE_CUDA {"ON" if cuda else "OFF"})
+set(HAVE_ROCM {"ON" if rocm else "OFF"})
+set(V2_TEST_SOCKETS 1)
+set(V2_TEST_CORES_PER_SOCKET 1)
+set(REPO_ROOT "{MODULE.parents[3].as_posix()}")
+set(PROJECT_ROOT "${{REPO_ROOT}}")
+set(MPIEXEC_EXECUTABLE "${{CMAKE_COMMAND}}")
+set(Python3_EXECUTABLE "{sys.executable}")
+add_library(llaminar2_core INTERFACE)
+add_library(llaminar_mpi_session_owner INTERFACE)
+add_library(GTest::gtest INTERFACE IMPORTED)
+add_library(GTest::gtest_main INTERFACE IMPORTED)
+add_executable(llaminar_mpi_session IMPORTED)
+set_target_properties(llaminar_mpi_session PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")
+include("{MODULE.as_posix()}")
+{helper}
+foreach(target v2_unit_gpu_expert_transfer v2_test_compute_graph_execution)
+    add_executable(${{target}} main.cpp)
+    # CTest metadata requires an existing command. This stand-in is NEVER run;
+    # actual native fixture execution remains a separate GPU qualification.
+    file(CREATE_LINK "${{CMAKE_COMMAND}}" "${{CMAKE_CURRENT_BINARY_DIR}}/${{target}}" SYMBOLIC)
+endforeach()
+{aggregate}
+include("{owner.as_posix()}")
+"""
+                (root / "CMakeLists.txt").write_text(fixture)
+                built = subprocess.run([self.cmake, "-S", str(root), "-B", str(root / "build"),
+                                        "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={self.ninja}"],
+                                       capture_output=True, text=True, timeout=15, check=False)
+                self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+                inventory = subprocess.run([str(Path(self.cmake).with_name("ctest")), "--test-dir", str(root / "build"),
+                                            "--show-only=json-v1"], capture_output=True, text=True, timeout=15, check=False)
+                self.assertEqual(inventory.returncode, 0, inventory.stderr)
+                tests = {entry["name"]: entry for entry in json.loads(inventory.stdout)["tests"]}
+                old = tests["V2_Integration_GPUExpertTransfer"]["command"]
+                filters = [arg for arg in old if arg.startswith("--gtest_filter=")]
+                self.assertEqual(filters, ["--gtest_filter=-FiniteBodySiblingNativeIntegration.*"])
+                # The ONLY exclusion is the newly introduced namespace; every
+                # source-owned original suite remains admitted by that filter.
+                for suite in old_suites:
+                    self.assertFalse(suite.startswith("FiniteBodySiblingNativeIntegration"))
+                expected = {case for case in new_cases if (cuda and case.startswith("CUDA_")) or
+                            (rocm and case.startswith("ROCm_"))}
+                native = {name: entry for name, entry in tests.items() if re.match(r"V2_Integration_(CUDA|ROCm)_FiniteStorage_", name)}
+                self.assertEqual(len(native), len(expected))
+                actual = set()
+                for entry in native.values():
+                    command = entry["command"]
+                    filters = [arg for arg in command if arg.startswith("--gtest_filter=")]
+                    self.assertEqual(len(filters), 1)
+                    actual.add(filters[0].split("FiniteBodySiblingNativeIntegration.", 1)[1])
+                    properties = {item["name"]: item["value"] for item in entry["properties"]}
+                    self.assertEqual(properties["TIMEOUT"], 30)
+                    self.assertIn("ProductionTestPreflight", properties["LABELS"])
+                    if filters[0].endswith("RejectsOriginalForeignDevice"):
+                        backend = "CUDA" if "CUDA_" in filters[0] else "ROCm"
+                        self.assertIn(backend + "2", properties["LABELS"])
+                    self.assertNotIn("--gtest_repeat=20", command)  # The actual native body performs 20 replays.
+                self.assertEqual(actual, expected)
+
     def test_creation_and_all_requirements_follow_selection(self):
         """Both inventories configure and retain every admitted requirement."""
         for performance_only in (False, True):
@@ -384,10 +476,33 @@ endif()
 if(TARGET v2_perf_captured_ngram_channel_floor)
     get_target_property(floor_sources v2_perf_captured_ngram_channel_floor SOURCES)
     get_target_property(floor_scope v2_perf_captured_ngram_channel_floor V2_TEST_DEVICE_SCOPE)
-    if(NOT floor_sources STREQUAL "integration/transfer/Test__CapturedTransferChannel.cpp;integration/mpi_gtest_main.cpp" OR
+    set(expected_floor_sources
+        integration/transfer/Test__CapturedTransferChannel.cpp
+        integration/transfer/Test__DeviceCountedTransferChannel.cpp
+        integration/transfer/CountedChannelTestKernels.cu
+        integration/transfer/CountedChannelTestKernels.hip
+        integration/mpi_gtest_main.cpp)
+    if(NOT floor_sources STREQUAL expected_floor_sources OR
        NOT floor_scope STREQUAL "FullInventory")
         message(FATAL_ERROR "Channel floor lost production fixture or startup ownership")
     endif()
+    # The shared fixture calls the counted peer replay even when timing selects
+    # another case. Its complete native closure must link in both build modes.
+    get_target_property(floor_hip_standard v2_perf_captured_ngram_channel_floor HIP_STANDARD)
+    if(NOT floor_hip_standard EQUAL 20)
+        message(FATAL_ERROR "Channel floor lost counted HIP fixture standard")
+    endif()
+    foreach(source IN LISTS floor_sources)
+        if(source MATCHES "[.](cu|hip)$")
+            get_source_file_property(native_language "${{source}}" LANGUAGE)
+            if((source MATCHES "[.]cu$" AND native_language AND NOT native_language STREQUAL "CUDA") OR
+               (source MATCHES "[.]hip$" AND native_language AND NOT native_language STREQUAL "HIP"))
+                message(FATAL_ERROR "Channel floor lost native helper language: ${{source}}")
+            endif()
+            set_source_files_properties("${{source}}" PROPERTIES HEADER_FILE_ONLY TRUE)
+        endif()
+    endforeach()
+    set_target_properties(v2_perf_captured_ngram_channel_floor PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 get_property(tests DIRECTORY PROPERTY TESTS)
 set(expected_tests)
@@ -428,6 +543,15 @@ if(HAVE_CUDA AND HAVE_ROCM)
     foreach(direction CUDA_ROCm ROCm_CUDA)
         foreach(payload Decode1440 M512737280)
             list(APPEND expected_tests V2_Perf_CapturedNgramChannelFloor_${{direction}}_${{payload}})
+        endforeach()
+    endforeach()
+    foreach(backend CUDA ROCm)
+        foreach(transport Native Mapped)
+            foreach(direction Forward Reverse)
+                foreach(payload Header64 Decode1440 M512737280)
+                    list(APPEND expected_tests V2_Perf_CapturedNgramChannelFloor_${{backend}}_${{transport}}${{direction}}_${{payload}})
+                endforeach()
+            endforeach()
         endforeach()
     endforeach()
 endif()

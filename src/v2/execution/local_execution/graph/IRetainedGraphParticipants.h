@@ -9,6 +9,7 @@
  */
 #pragma once
 #include <atomic>
+#include "collective/LocalTPCaptureSourceDefinition.h"
 #include "RetainedGraphParticipantEnqueueGroup.h"
 #include "backends/DeviceId.h"
 #include "backends/NativeContextPreparation.h"
@@ -20,7 +21,19 @@
 namespace llaminar2 {
 namespace qwen4exp {class PooledImmutableRetainedParticipants;}
 class ComputeGraph;
+class IRetainedGraphParticipantSourcePlan;
 class IGPUGraphCapture;
+class RetainedParticipantGraphExecutable;
+class IGraphCaptureAuxiliaryBranch;
+/** @brief Cache-owned original finite-body borrow; destruction follows native parent retirement. */
+class IRetainedGraphParticipantStorageAttachment {
+public:
+    virtual ~IRetainedGraphParticipantStorageAttachment()=default;
+    /** @brief Mutate the exact native parent only AFTER this borrow belongs to its original cache. */
+    virtual bool attachTo(IGPUGraphCapture&,IGraphCaptureAuxiliaryBranch*)=0;
+    /** @brief Reject changed source cache/native parent identity before actual replay. */
+    virtual void requireCurrent()const=0;
+};
 class DeviceGraphExecutor;
 class DeviceGraphOrchestrator;
 /** @brief Actual original generation-loop stream owner, distinct from child recording streams.
@@ -51,6 +64,22 @@ private:
  * later request or a same-address replacement cache. */
 class RetainedGraphParticipantPreparationStream final {
 public:
+    /** @brief Immutable declarative definition; it grants no native executable or launch. */
+    struct Definition final {
+        const ComputeGraph* graph=nullptr;
+        const void* arena=nullptr;
+        uint64_t topology_generation=0, variant=0;
+        RetainedGraphParticipantDefinitionDomain domain;
+        std::shared_ptr<const IRetainedGraphParticipantSourcePlan> plan;
+    };
+    /** @return Exact executor-minted cold definition, absent for legacy stream-only borrows. */
+    const Definition& definition()const noexcept{return definition_;}
+    /** @return Original admitted source permit; observing it creates no context. */
+    const PreparedGPUContextUsePermit& originalSource()const noexcept{return original_;}
+    /** @brief Revalidate original live cache, graph/count/retirement definition without an executable seal. */
+    void requireDefinition()const;
+    /** @brief Require already-authenticated cold structure plus live exact cache/provenance, without rescanning its DAG. */
+    void requireCurrentDefinition()const;
     /** @return Actual existing cache stream, distinct from controller submission. */
     void* stream()const noexcept{return stream_;}
     /** @brief Reject retired borrows and changed original worker/PMA generations. */
@@ -70,11 +99,16 @@ private:
         if(!stream || reinterpret_cast<std::uintptr_t>(stream)<=2)
             throw std::invalid_argument("Original source preparation stream is null/default");
     }
+    /** @brief Mint the complete read-only definition only from the actual canonical cache. */
+    RetainedGraphParticipantPreparationStream(PreparedGPUContextUsePermit original,void* stream,Definition definition)
+        :RetainedGraphParticipantPreparationStream(std::move(original),stream){definition_=std::move(definition);}
     /** @brief Revoke on the original cache lifecycle before any native resource teardown. */
     void retire()noexcept{live_.store(false,std::memory_order_release);}
     PreparedGPUContextUsePermit original_;
     void* stream_;
     std::atomic<bool> live_{true};
+    Definition definition_;
+    mutable std::atomic<bool> definition_authenticated_{false};
 };
 /** @brief Exact original source capture ownership; no mutable token/model state is observed. */
 struct RetainedGraphParticipantSourceIdentity final {
@@ -95,6 +129,7 @@ public:
     const RetainedGraphParticipantSourceIdentity& identity()const noexcept{return identity_;}
 private:
     friend class DeviceGraphExecutor;
+    friend struct test::RetainedGraphParticipantsReplayAccess;
     explicit RetainedGraphParticipantSourceSeal(RetainedGraphParticipantSourceIdentity identity):identity_(identity){}
     RetainedGraphParticipantSourceIdentity identity_;
 };
@@ -151,5 +186,52 @@ public:
      */
     virtual std::shared_ptr<IRetainedGraphParticipantInvocation> bindOriginalSource(
         const RetainedGraphParticipantSourceSeal& original)const=0;
+    /** @brief Reject absent or foreign declarative source definitions without minting an invocation. */
+    virtual void requirePreparedSourceDefinition(const RetainedGraphParticipantPreparationStream&)const
+    {throw std::logic_error("Source plan has no declarative preparation contract");}
+    /** @brief Revalidate an already sealed source cache without cold DAG traversal/allocation. */
+    virtual void requireCurrentPreparedSourceDefinition(const RetainedGraphParticipantPreparationStream&)const
+    {throw std::logic_error("Source plan has no sealed preparation identity contract");}
+    /** @brief Revalidate an immutable original storage body without its cold stage walk. */
+    virtual void requireCurrentStorageDefinition(const RetainedParticipantGraphExecutable&)const
+    {throw std::logic_error("Source plan has no sealed original storage identity contract");}
+    /** @return Existing source/transport domain, not a graph role or selected depth. */
+    virtual RetainedGraphParticipantDefinitionDomain definitionDomain()const noexcept{return {};}
+    /**
+     * @brief Attach an actual colocated storage body to its matched original native parent.
+     * @param receiver Actual parent device from the canonical capture controller.
+     * @param parent Original sealed, uninstantiated per-device parent.
+     * @param progress Original optional progress contribution; never replaced or fabricated.
+     * @param definition Exact source-cache token returned by the matched cold boundary.
+     * @return Cache-owned attachment, or empty when this device owns no separate storage body.
+     * @throws std::exception For unsupported transport/parent/progress or changed original identity.
+     */
+    virtual std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareOriginalStorageAttachment(
+        DeviceId,IGPUGraphCapture&,IGraphCaptureAuxiliaryBranch*,
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream>)const{return {};}
+    /** @brief Authenticate one exact original storage definition independently of kernel/library recipe. */
+    virtual void requirePreparedStorageDefinition(const RetainedParticipantGraphExecutable&)const
+    {throw std::logic_error("Source plan has no original storage definition binding");}
+    /** @brief Join the exact original storage input event on the actual original parent stream before cloning. */
+    virtual void acquirePreparedStorageDefinition(const RetainedParticipantGraphExecutable&,void*)const
+    {throw std::logic_error("Source plan has no original storage input frontier");}
+
 };
+/** @brief Validate only after the original revocable cache token proves its graph/plan lifetime. */
+inline void RetainedGraphParticipantPreparationStream::requireDefinition()const {
+    requireLive(original_);
+    if(!definition_.plan || !definition_.graph || !definition_.arena || !definition_.topology_generation ||
+       !definition_.variant || !definition_.domain.source.is_gpu() || !definition_.domain.authority)
+        throw std::logic_error("Original source preparation has no complete declarative definition");
+    definition_.plan->requirePreparedSourceDefinition(*this);
+    definition_authenticated_.store(true,std::memory_order_release);
+}
+/** @brief Revocation is checked before dereferencing the original graph/plan. */
+inline void RetainedGraphParticipantPreparationStream::requireCurrentDefinition()const {
+    requireLive(original_);
+    if(!definition_authenticated_.load(std::memory_order_acquire) || !definition_.plan)
+        throw std::logic_error("Original source definition was never structurally authenticated");
+    definition_.plan->requireCurrentPreparedSourceDefinition(*this);
+}
+
 }

@@ -15,6 +15,7 @@
  */
 
 #include "LocalTPContext.h"
+#include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include "DeviceCountedAllGather.h"
 #include "AllreducePrecisionPolicy.h"
 #include "NativeReduceScatterContract.h"
@@ -1972,13 +1973,41 @@ namespace llaminar2
      * duplicate arrivals, or timeout so later collectives do not limp onward in a
      * poisoned state.
      */
-    bool LocalTPContext::graphCaptureBoundaryRendezvous(
+    bool LocalTPContext::graphCaptureBoundaryRendezvous(const std::string& name,int index,int timeout)
+    {return graphCaptureBoundaryRendezvousImpl(name,index,timeout,nullptr);}
+    bool LocalTPContext::graphCaptureBoundaryRendezvous(const std::string& name,int index,int timeout,
+        LocalTPCaptureSourceDefinition& definition)
+    {return graphCaptureBoundaryRendezvousImpl(name,index,timeout,&definition);}
+
+    bool LocalTPContext::graphCaptureBoundaryRendezvousImpl(
         const std::string &boundary_name,
         int device_index,
-        int timeout_ms)
+        int timeout_ms, LocalTPCaptureSourceDefinition* definition)
     {
-        if (degree() <= 1)
+        const auto valid_definition=[&]{
+            if(!definition)return true;
+            definition->result.reset();
+            if(device_index<0 || device_index>=degree() || !definition->domain.source.is_gpu() || !definition->domain.authority ||
+               boundary_name.find(":phase=capture_end:")==std::string::npos)return false;
+            const auto source=std::find_if(devices_.begin(),devices_.end(),[&](const auto& device){
+                return device.toLocalDeviceId()==definition->domain.source;});
+            if(source==devices_.end())return false;
+            const auto source_index=static_cast<int>(source-devices_.begin());
+            if(bool(definition->publication)!=(device_index==source_index))return false;
+            if(definition->publication){
+                definition->publication->requireDefinition();
+                if(definition->publication->originalSource().device()!=definition->domain.source ||
+                   definition->publication->definition().domain!=definition->domain)return false;
+            }
             return true;
+        };
+        try{if(!valid_definition()){requestAbort();return false;}}
+        catch(...){requestAbort();return false;}
+        if (degree() <= 1){
+            if(definition && abort_requested_.load(std::memory_order_acquire))return false;
+            if(definition)definition->result=definition->publication;
+            return !definition || bool(definition->result);
+        }
 
         if (device_index < 0 || device_index >= degree())
         {
@@ -2002,6 +2031,9 @@ namespace llaminar2
             graph_capture_boundary_name_.clear();
             graph_capture_boundary_error_.clear();
             graph_capture_boundary_seen_.clear();
+            graph_capture_source_definition_.reset();
+            graph_capture_source_domain_={};
+            graph_capture_source_exchange_=false;
             ++graph_capture_boundary_generation_;
         };
 
@@ -2030,9 +2062,16 @@ namespace llaminar2
 
         auto depart_generation = [&]() -> bool
         {
-            const bool result = graph_capture_boundary_ready_ &&
+            bool result = graph_capture_boundary_ready_ &&
                                 graph_capture_boundary_result_ &&
                                 !abort_requested_.load(std::memory_order_acquire);
+            if(result && definition){
+                try{
+                    if(!graph_capture_source_definition_)throw std::logic_error("Missing original source definition");
+                    graph_capture_source_definition_->requireDefinition();
+                    definition->result=graph_capture_source_definition_;
+                }catch(...){fail_generation("retired source definition boundary="+boundary_name);return false;}
+            }
             ++graph_capture_boundary_departures_;
             if (graph_capture_boundary_departures_ >= degree())
             {
@@ -2056,6 +2095,8 @@ namespace llaminar2
             graph_capture_boundary_name_ = boundary_name;
             graph_capture_boundary_error_.clear();
             graph_capture_boundary_seen_.assign(static_cast<size_t>(degree()), false);
+            graph_capture_source_exchange_=definition!=nullptr;
+            if(definition)graph_capture_source_domain_=definition->domain;
         }
         else if (graph_capture_boundary_name_ != boundary_name)
         {
@@ -2063,6 +2104,15 @@ namespace llaminar2
                             (graph_capture_boundary_name_.empty() ? std::string("(none)") : graph_capture_boundary_name_) +
                             " actual=" + (boundary_name.empty() ? std::string("(none)") : boundary_name));
             return false;
+        }
+
+        if(graph_capture_source_exchange_!=(definition!=nullptr) ||
+           (definition && graph_capture_source_domain_!=definition->domain)){
+            fail_generation("source definition phase/domain mismatch boundary="+boundary_name);return false;
+        }
+        if(definition && definition->publication){
+            if(graph_capture_source_definition_){fail_generation("duplicate original source definition boundary="+boundary_name);return false;}
+            graph_capture_source_definition_=definition->publication;
         }
 
         if (graph_capture_boundary_seen_[static_cast<size_t>(device_index)])
@@ -2139,6 +2189,9 @@ namespace llaminar2
             }
         }
 
+        if(definition && !graph_capture_source_definition_){
+            fail_generation("missing original source definition boundary="+boundary_name);return false;
+        }
         graph_capture_boundary_result_ = true;
         graph_capture_boundary_ready_ = true;
         if (debugEnv().tp_collective_contract_trace)
@@ -2154,19 +2207,27 @@ namespace llaminar2
         return depart_generation();
     }
 
-    bool LocalTPContext::graphCaptureBoundaryOnStream(
+    bool LocalTPContext::graphCaptureBoundaryOnStream(const std::string& name,int index,void* stream,int timeout)
+    {return graphCaptureBoundaryOnStreamImpl(name,index,stream,timeout,nullptr);}
+    bool LocalTPContext::graphCaptureBoundaryOnStream(const std::string& name,int index,void* stream,int timeout,
+        LocalTPCaptureSourceDefinition& definition)
+    {return graphCaptureBoundaryOnStreamImpl(name,index,stream,timeout,&definition);}
+
+    bool LocalTPContext::graphCaptureBoundaryOnStreamImpl(
         const std::string &boundary_name,
         int device_index,
         void *stream,
-        int timeout_ms)
+        int timeout_ms,LocalTPCaptureSourceDefinition* definition)
     {
+        if(definition && (boundary_name.find(":phase=capture_end:")==std::string::npos ||
+            reinterpret_cast<std::uintptr_t>(stream)<=2)){requestAbort();return false;}
         if (!stream)
         {
             throw std::invalid_argument(
                 "LocalTPContext::graphCaptureBoundaryOnStream requires a non-null GPU stream");
         }
         if (degree() <= 1)
-            return true;
+            return definition?graphCaptureBoundaryRendezvousImpl(boundary_name,device_index,timeout_ms,definition):true;
         if (device_index < 0 || device_index >= degree())
         {
             LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: invalid slot "
@@ -2269,10 +2330,10 @@ namespace llaminar2
                 return false;
             }
 
-            if (!graphCaptureBoundaryRendezvous(
+            if (!graphCaptureBoundaryRendezvousImpl(
                     boundary_name + ":ticket_observed",
                     device_index,
-                    timeout_ms))
+                    timeout_ms,definition))
             {
                 return false;
             }
@@ -2363,10 +2424,10 @@ namespace llaminar2
             return false;
         }
 
-        if (!graphCaptureBoundaryRendezvous(
+        if (!graphCaptureBoundaryRendezvousImpl(
                 boundary_name + ":device_fence_enqueued",
                 device_index,
-                timeout_ms))
+                timeout_ms,definition))
         {
             return false;
         }

@@ -8,6 +8,7 @@
  * of the CPU consumer and independent cross-vendor coordinator declaration.
  */
 #include "kernels/qwen4exp/PooledImmutableCoordinatorGeometry.h"
+#include "execution/qwen4exp/PooledImmutableReplicatedReaderGeometry.h"
 #include "kernels/qwen4exp/PooledImmutableCoordinatorOps.h"
 #include "loaders/ModelLoader.h"
 #include <gtest/gtest.h>
@@ -638,3 +639,122 @@ TEST(PooledImmutableCoordinator, UInt32OriginalRowsUseTheSameStableGlobalCoalesc
 }
 
 }
+
+namespace llaminar2::test {
+/** @brief Replay exact result/ACK state through the actual shared device/CPU metadata operations. */
+TEST(PooledImmutableCoordinator, ReplicatedReadersResultACKLiveExtentReplay)
+{
+    namespace rr = qwen4exp::replicated_reader;
+    namespace state = qwen4exp::adaptive_lookup::pooled;
+    constexpr rr::Geometry geometry{1, 2, 256, 64};
+    rr::Control control{};
+    int error = 0;
+    state::LookupFrame frame{};
+    frame.interval = {11, 7, 1};
+    frame.phase = state::LookupPhase::Ready;
+    frame.status = qwen4exp::adaptive_lookup::Status::Success;
+    for (const auto count : {256u, 16u, 0u, 64u}) {
+        frame.original_ids = count;
+        ASSERT_TRUE(rr::prepare(frame, geometry, 1, &error, control.incoming));
+        ASSERT_TRUE(rr::accept(control.incoming, sizeof(rr::Header), geometry, 1, frame.interval.table,
+            count, &error, control.outgoing));
+        ASSERT_TRUE(rr::acknowledge(control.outgoing, rr::outputBytes(geometry, count), geometry, &error, CapturedTransferStatus::Ready));
+        ASSERT_TRUE(rr::confirm(control.outgoing, sizeof(rr::Header), frame, geometry, 1, &error));
+        const auto retired = control.outgoing;
+        ++frame.interval.sequence;
+        EXPECT_FALSE(rr::confirm(retired, sizeof(rr::Header), frame, geometry, 1, &error));
+    }
+    EXPECT_EQ(error, 0);
+}
+/** @brief Missing, partial, foreign and failed replies cannot become last-reader evidence. */
+TEST(PooledImmutableCoordinator, ReplicatedReadersMissingCancelledAndStickyErrorReplay)
+{
+    namespace rr = qwen4exp::replicated_reader;
+    namespace state = qwen4exp::adaptive_lookup::pooled;
+    constexpr rr::Geometry geometry{1, 2, 256, 64};
+    int error = 0;
+    state::LookupFrame frame{};
+    frame.interval = {11, 7, 1};
+    frame.original_ids = 16;
+    frame.phase = state::LookupPhase::Ready;
+    frame.status = qwen4exp::adaptive_lookup::Status::Success;
+    rr::Header original{}, reply{};
+    ASSERT_TRUE(rr::prepare(frame, geometry, 1, &error, original));
+    for (const auto bytes : {0u, 47u, 49u}) {
+        EXPECT_FALSE(rr::accept(original, bytes, geometry, 1, frame.interval.table, 16, &error, reply));
+        EXPECT_FALSE(rr::confirm(reply, sizeof(reply), frame, geometry, 1, &error));
+    }
+    EXPECT_FALSE(rr::accept(original, sizeof(original), geometry, 1, frame.interval.table + 1, 16, &error, reply));
+    EXPECT_FALSE(rr::accept(original, sizeof(original), geometry, 1, frame.interval.table, 32, &error, reply));
+    ASSERT_TRUE(rr::accept(original, sizeof(original), geometry, 1, frame.interval.table, 16, &error, reply));
+    EXPECT_FALSE(rr::acknowledge(reply, 0, geometry, &error, CapturedTransferStatus::Ready));
+    EXPECT_FALSE(rr::confirm(reply, sizeof(reply), frame, geometry, 1, &error));
+    error = static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure);
+    EXPECT_FALSE(rr::prepare(frame, geometry, 1, &error, reply));
+    EXPECT_EQ(error, static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+    error = 0; // Only the original request-reset owner clears first error.
+    ++frame.interval.admission;
+    ++frame.interval.sequence;
+    frame.original_ids = 0;
+    ASSERT_TRUE(rr::prepare(frame, geometry, 1, &error, original));
+    EXPECT_FALSE(rr::accept(original, 0, geometry, 1, frame.interval.table, 0, &error, reply));
+    ASSERT_TRUE(rr::accept(original, sizeof(original), geometry, 1, frame.interval.table, 0, &error, reply));
+    auto cancelled = reply;
+    EXPECT_FALSE(rr::acknowledge(cancelled, 0, geometry, &error, CapturedTransferStatus::Cancelled));
+    EXPECT_FALSE(rr::confirm(cancelled, sizeof(cancelled), frame, geometry, 1, &error));
+    EXPECT_TRUE(rr::acknowledge(reply, 0, geometry, &error, CapturedTransferStatus::Ready));
+    EXPECT_TRUE(rr::confirm(reply, sizeof(reply), frame, geometry, 1, &error));
+}
+/** @brief Price actual concurrent reader channels without multiplying the original query envelope. */
+TEST(PooledImmutableCoordinator, ReplicatedReadersGeometryBOMReplay)
+{
+    using ReaderGeometry = qwen4exp::PooledImmutableReplicatedReaderGeometry;
+    const PhysicalMemoryAllocatorIdentity source{0, DeviceId::rocm(1)};
+    const PhysicalMemoryResource host{0, DeviceId::cpu(), 1ULL << 30, 1ULL << 30};
+    for (const auto count : {2u, 4u, 8u}) {
+        std::vector<PhysicalMemoryAllocatorIdentity> consumers;
+        std::vector<PhysicalMemoryResource> resources;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            consumers.push_back({0, DeviceId::rocm(i)});
+            resources.push_back({0, DeviceId::rocm(i), 1ULL << 30, 1ULL << 30});
+        }
+        for (const auto coverage : {PeerAccessCoverage::None, PeerAccessCoverage::Complete}) {
+            std::vector<ImmutableRowTableReaderPeerAccess> edges;
+            for (const auto consumer : consumers)
+                if (consumer != source) edges.push_back({source, consumer, coverage});
+            const auto geometry = ReaderGeometry::checked(source, consumers, 256, 64, edges);
+            EXPECT_EQ(geometry.maximumOriginal(), 256u);
+            EXPECT_EQ(geometry.resultMaximum(), 256u * 64u * sizeof(float));
+            const auto bom = geometry.completeBOM(host, resources);
+            const auto target = edges.front().reader;
+            const auto forward = geometry.resultMemory(target);
+            const auto reverse = geometry.acknowledgementMemory(target);
+            const auto channels = count - 1;
+            ASSERT_NE(bom.find({0, DeviceId::cpu()}), nullptr);
+            EXPECT_EQ(bom.find({0, DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
+                channels * (forward.mapped_host_bytes + reverse.mapped_host_bytes));
+            EXPECT_EQ(bom.find(source)->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
+                channels * (forward.cursor_bytes_per_device + reverse.cursor_bytes_per_device +
+                    sizeof(qwen4exp::replicated_reader::Control) + forward.producer_payload_bytes));
+            for (const auto consumer : consumers) {
+                if (consumer == source) continue;
+                EXPECT_EQ(bom.find(consumer)->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
+                    forward.cursor_bytes_per_device + reverse.cursor_bytes_per_device +
+                        sizeof(qwen4exp::replicated_reader::Control) + reverse.producer_payload_bytes);
+            }
+            EXPECT_EQ(forward.producer_payload_bytes != 0, coverage == PeerAccessCoverage::Complete);
+            EXPECT_EQ(reverse.producer_payload_bytes != 0, coverage == PeerAccessCoverage::Complete);
+            EXPECT_THROW(geometry.resultMemory(source), std::invalid_argument);
+            auto malformed = edges;
+            malformed.front().coverage = PeerAccessCoverage::Partial;
+            EXPECT_THROW(ReaderGeometry::checked(source, consumers, 256, 64, malformed), std::invalid_argument);
+            malformed = edges;
+            malformed.front().coordinator = target;
+            EXPECT_THROW(ReaderGeometry::checked(source, consumers, 256, 64, malformed), std::invalid_argument);
+            EXPECT_THROW(ReaderGeometry::checked(source, consumers, 256, 64), std::invalid_argument);
+        }
+        consumers.back() = consumers.front();
+        EXPECT_THROW(ReaderGeometry::checked(source, consumers, 256, 64), std::invalid_argument);
+    }
+}
+} // namespace llaminar2::test

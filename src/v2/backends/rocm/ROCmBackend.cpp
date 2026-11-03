@@ -6036,6 +6036,15 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmBackend::enableCapturedTransferPeerAccess(int device_id, int peer_device_id)
+    {
+        if (device_id < 0 || peer_device_id < 0 || device_id == peer_device_id) return false;
+        if (hipSetDevice(device_id) != hipSuccess) return false;
+        const auto status = hipDeviceEnablePeerAccess(peer_device_id, 0);
+        if (status == hipErrorPeerAccessAlreadyEnabled) { (void)hipGetLastError(); return true; }
+        return status == hipSuccess;
+    }
+
     bool ROCmBackend::prepareCapturedTransferChannelKernels(
         int device_id, int timeout_ms, std::uint64_t *timeout_ticks)
     {

@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "PooledImmutableDirectedChannelGeometry.h"
+#include "PooledImmutableReplicatedReaderGeometry.h"
 #include "PooledImmutableParticipantRetirementGraph.h"
 #include "ImmutableLookupExecutionBoundary.h"
 namespace llaminar2::qwen4exp {
@@ -24,6 +25,40 @@ struct PooledImmutableRemoteTransport final {
     std::shared_ptr<const PooledImmutableCapturedReadWave> read;
     std::shared_ptr<const PooledImmutableCapturedRetirementWave> retirement;
 };
+/** @brief Original result/ACK channel pair for one actual foreign compute reader. */
+class PooledImmutableReplicatedReaderTransport final {
+public:
+    /** @return Original declared reader coordinate, independent of physical storage coordinates. */
+    std::uint32_t coordinate() const noexcept { return coordinate_; }
+    /** @return Original source worker, independent of compute enumeration order. */
+    const PreparedGPUContextUsePermit& originalSource() const noexcept { return source_; }
+    /** @return Original reader worker permit retained until both native endpoints retire. */
+    const PreparedGPUContextUsePermit& originalReader() const noexcept { return reader_; }
+    /** @return Existing source-to-reader channel, phase-reused for result header and live output. */
+    const std::shared_ptr<CapturedTransferChannel>& result() const noexcept { return result_; }
+    /** @return Existing reader-to-source ACK channel. */
+    const std::shared_ptr<CapturedTransferChannel>& acknowledgement() const noexcept { return acknowledgement_; }
+    /** @return Exact source/reader metadata storage priced by the same channel geometry. */
+    const std::shared_ptr<DeviceTransferBuffer>& control(CapturedTransferEndpoint side) const;
+    /** @brief Reject substituted PMA/control blocks, retired worker generations or endpoint identities. */
+    void requireCurrent() const;
+private:
+    friend class PooledImmutableDirectedTransport;
+    /** @brief Construct only through the original cold transport owner after complete inventory validation. */
+    PooledImmutableReplicatedReaderTransport(std::uint32_t coordinate,
+        PreparedGPUContextUsePermit source, PreparedGPUContextUsePermit reader,
+        std::shared_ptr<CapturedTransferChannel> result, std::shared_ptr<CapturedTransferChannel> acknowledgement,
+        std::array<PhysicalMemoryAllocationLease,2> claims,
+        std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls)
+        : coordinate_(coordinate), source_(std::move(source)), reader_(std::move(reader)),
+          result_(std::move(result)), acknowledgement_(std::move(acknowledgement)),
+          control_claims_(std::move(claims)), controls_(std::move(controls)) {}
+    std::uint32_t coordinate_;
+    PreparedGPUContextUsePermit source_, reader_;
+    std::shared_ptr<CapturedTransferChannel> result_, acknowledgement_;
+    std::array<PhysicalMemoryAllocationLease,2> control_claims_;
+    std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls_;
+};
 /** @brief Pure BOM projection and actual original TransferEngine materialization, never another admission ledger. */
 class PooledImmutableDirectedTransport final {
 public:
@@ -38,19 +73,55 @@ public:
         PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources);
     /** @brief Bind original source permits/streams and existing directed waves once outside capture.
      * @param boundary Actual service/source owner retaining the original prepared participant cohort.
+     * @param originalInventory Original rank discovery owner; required for every explicit same-vendor mapped or peer route.
      * @return Strong two-channel chain owner; no peer graph/worker/stream is created here.
      */
-    static std::shared_ptr<const PooledImmutableDirectedTransport> create(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary);
+    static std::shared_ptr<const PooledImmutableDirectedTransport> create(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,
+        std::shared_ptr<const ClusterInventory> originalInventory = {},
+        std::optional<PooledImmutableReplicatedReaderGeometry> readers = {});
+    /** @return Original source boundary; foreign readers never reinterpret its device as their own. */
+    const std::shared_ptr<ImmutableLookupExecutionBoundary>& sourceBoundary() const noexcept { return boundary_; }
+    /** @return Actual foreign compute-reader channels; they are never storage-owner programs. */
+    std::span<const std::shared_ptr<const PooledImmutableReplicatedReaderTransport>> readers() const noexcept
+    { return readers_; }
+    /** @return Exact declared compute-reader shape, absent on the original singleton path. */
+    const std::optional<PooledImmutableReplicatedReaderGeometry>& readerGeometry() const noexcept
+    { return reader_geometry_; }
     /** @return Actual remotes in original coordinate order; co-located owners are absent. */
     std::span<const PooledImmutableRemoteTransport> remotes()const noexcept{return remotes_;}
     /** @return Actual original addressed remote chain; a local/foreign coordinate rejects. */
     const PooledImmutableRemoteTransport& remote(std::uint32_t coordinate)const;
+private:
+    friend class ImmutableLookupExecutionBoundary;
+    /** @brief Bind the actual whole-request source ticket before any native participant submits. */
+    void beginInvocation(CapturedTransferInvocation original) const;
+    /** @brief Original physical edge subset; source retirement precedes storage-edge cancellation. */
+    enum class CancellationEdges { StorageOwners, ComputeReaders };
+    /**
+     * @return Strong original edge cancellation captured before partial Rank submission.
+     * @param original Exact admitted group invocation, never a replacement generation.
+     * @param edges Readers cancel immediately; storage owners cancel after the original source terminal proof.
+     */
+    std::function<void()> failureCallback(CapturedTransferInvocation original, CancellationEdges edges) const;
+    /** @brief Retire successful channel admission after the original complete native reader frontier. */
+    [[nodiscard]] CapturedTransferInvocationRetirement finishInvocation(CapturedTransferInvocation original) const;
+public:
     /** @brief Reject source/worker/generation/channel/root drift before graph composition. */
     void requireCurrent()const;
 private:
     /** @brief Construct only after all actual source permits have authenticated. */
-    explicit PooledImmutableDirectedTransport(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary):boundary_(std::move(boundary)){}
+    explicit PooledImmutableDirectedTransport(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,
+        std::shared_ptr<const ClusterInventory> originalInventory)
+        :boundary_(std::move(boundary)),original_inventory_(std::move(originalInventory)){}
+    /** @brief Authenticate original source roots before any channel is materialized. */
+    void requireOriginalSource() const;
+    /** @return Existing physical channel owners only, with no new registry or progress state. */
+    std::vector<std::shared_ptr<CapturedTransferChannel>> originalChannels(std::optional<CancellationEdges> edges = {}) const;
     std::shared_ptr<ImmutableLookupExecutionBoundary> boundary_;
+    /** Original immutable discovery owner, retained until all original channels retire. */
+    std::shared_ptr<const ClusterInventory> original_inventory_;
     std::vector<PooledImmutableRemoteTransport> remotes_;
+    std::optional<PooledImmutableReplicatedReaderGeometry> reader_geometry_;
+    std::vector<std::shared_ptr<const PooledImmutableReplicatedReaderTransport>> readers_;
 };
 }

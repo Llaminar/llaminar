@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <string>
@@ -166,6 +167,8 @@ public:
         ~GroupAdmission() noexcept;
         /** @return Original monotone I/O interval, independent of the model request epoch. */
         std::uint64_t generation() const noexcept{return ticket_.generation;}
+        /** @return Same original retained worker invocation; never a newly minted reader sequence. */
+        std::uint64_t invocation() const noexcept{return ticket_.invocation;}
         /** @return Whether this handle still retains its original service and real worker dispatch. */
         bool valid() const noexcept{return owner_&&ticket_.valid();}
         GroupAdmission(const GroupAdmission&)=delete;
@@ -222,6 +225,14 @@ public:
     Ticket arm(std::uint64_t generation);
     /** @brief Arm every predeclared channel once from the original complete parent admission. */
     GroupAdmission armGroup(std::uint64_t generation);
+    /** @brief Capture only the exact original group's failure publication for an existing worker callback.
+     * @param group Actual live admission issued by this service, never a reconstructed ticket.
+     * @return Strong source/ticket capture; stale invocation cannot cancel a later request.
+     * @throws std::logic_error For foreign, moved-from or inactive admission.
+     * @note Invoke before channel cancellation and potentially blocking collective abort.
+     * This publishes failure only; it never joins, reads counts or claims native retirement.
+     */
+    std::function<void()> failureCallback(const GroupAdmission& group) const;
     /** @return Complete original channel membership, never storage-only cache participants. */
     std::span<const DeviceId> channelDevices() const noexcept{return geometry_.devices();}
     /** @brief Transfer a single exact channel ticket without starting independent work. */

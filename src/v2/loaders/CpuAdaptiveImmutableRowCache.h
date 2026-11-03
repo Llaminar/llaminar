@@ -55,21 +55,27 @@ public:
     /**
      * @brief Contribute exact source-owned storage and mandatory execution to canonical PMA.
      * @param resource Exact observed host resource from the canonical rank planner.
-     * @return Native cache+SSD bytes under ImmutableTableStorage and request scratch under ImmutableLookupStaging.
+     * @return Native cache+original source bytes under ImmutableTableStorage and request scratch under ImmutableLookupStaging.
      * @throws std::invalid_argument For a foreign physical resource.
      * @note Execution contribution must be included before expert quotas/graph rows freeze; cache storage is lowest priority.
      */
     PhysicalMemoryPlan bom(PhysicalMemoryResource resource) const;
-    /** @return Exact SSD service plus request scratch before quotas freeze; resource identity must match this host. */
+    /** @return Exact original RAM/SSD source plus request scratch before quotas freeze; resource identity must match this host. */
     PhysicalMemoryPlan mandatoryBOM(PhysicalMemoryResource resource) const;
     /** @return Only optional slot-sized native cache storage after quotas freeze; resource identity must match this host. */
     PhysicalMemoryPlan cacheBOM(PhysicalMemoryResource resource) const;
-    /** @return Actual RAM cache slot count; zero still has a complete explicit SSD response path. */
+    /** @return Actual RAM cache slot count; zero still has a complete explicit original-source response path. */
     std::size_t slots() const noexcept { return slots_; }
-    /** @return Exact page-rounded native cache payload/index/policy allocation, excluding original SSD service. */
+    /** @return Exact page-rounded native cache payload/index/policy allocation, excluding original host source. */
     std::size_t storageBytes() const noexcept { return storage_bytes_; }
-    /** @return Exact original source service bytes from its unchanged bounded-mmap factory. */
+    /** @return Original admitted cache metadata/alignment prefix; C0 owns no optional bank. */
+    std::size_t cacheMetadataBytes()const noexcept{return slots_?payload_offset_:0;}
+    /** @return Original admitted cache payload storage including terminal page alignment, not communication extent. */
+    std::size_t cachePayloadStorageBytes()const noexcept{return storage_bytes_-cacheMetadataBytes();}
+    /** @return Exact original source service bytes from its unchanged RAM or bounded-mmap factory. */
     std::size_t sourceBytes() const noexcept { return source_bytes_; }
+    /** @return Actual original backing storage; full RAM is not a bounded cache alias. */
+    ImmutableRowStorage sourceStorage() const noexcept { return source_policy_.storage(); }
     /** @return Exact mandatory bounded request dedup array, excluding caller-owned response. */
     std::size_t executionBytes() const noexcept { return execution_bytes_; }
     /** @return Original native source geometry retained without requantization or a payload hash. */
@@ -147,7 +153,7 @@ public:
         std::uint64_t row_=0,generation_=0;
     };
     /**
-     * @brief Create one host cache and its private existing explicit SSD source under the same PMA.
+     * @brief Create one host cache and its private existing explicit RAM/SSD source under the same PMA.
      * @param source Original loader-authenticated native descriptor; source metadata is authenticated before cache allocation.
      * @param geometry Exact checked source/host/array geometry.
      * @param memory Sole rank-local PMA which admitted all three contributions.
@@ -167,6 +173,8 @@ public:
      * a failed gather; existing pin lifetime and generation validation are unchanged.
      */
     void authenticateSource() const;
+    /** @return Exact native backing storage retained by the original source owner. */
+    ImmutableRowStorage sourceStorage() const noexcept;
     ~CpuAdaptiveImmutableRowCache();
     CpuAdaptiveImmutableRowCache(const CpuAdaptiveImmutableRowCache &)=delete;
     CpuAdaptiveImmutableRowCache &operator=(const CpuAdaptiveImmutableRowCache &)=delete;

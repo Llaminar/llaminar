@@ -7,6 +7,7 @@
  * Invalid metadata or a missing original consumer edge fails before graph mutation.
  */
 #include "PooledImmutableParticipantRetirementGraph.h"
+#include "PooledImmutableReplicatedReaderGraph.h"
 #include "PooledImmutableDirectedOperation.h"
 #include "PooledImmutableDirectedMessageGeometry.h"
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.h"
@@ -50,7 +51,7 @@ std::shared_ptr<const PooledImmutableCapturedRetirementWave> PooledImmutableCapt
     if(isGraphCaptureActive() || !read || !memory)throw std::invalid_argument("Retirement needs original cold read/PMA");read->requireCurrent();
     const auto source=read->publication()->sourceWave();const auto pin=source->previous()->previous()->pin();const auto forward=pin->forward();
     forward->ownerStorage()->requireAuthority(memory);forward->coordinatorStorage()->requireAuthority(memory);
-    if(!forward->channel_ || !pin->channel_ || !forward->declaration().capturedCrossVendor())throw std::invalid_argument("Retirement native/rank transport needs complete qualified factory");
+    if(!forward->channel_ || !pin->channel_ || !forward->declaration().capturedChannelTransport())throw std::invalid_argument("Retirement native/rank transport needs complete qualified factory");
     auto out=std::shared_ptr<PooledImmutableCapturedRetirementWave>(new PooledImmutableCapturedRetirementWave(read,memory));
     const auto own=forward->ownerStorage()->roots(),src=source->boundary()->pooledStorage()->roots();const auto& o=forward->ownerStorage()->plan().parameters();const auto& s=source->boundary()->pooledStorage()->geometry().parameters();auto& transfer=TransferEngine::instance();
     for(unsigned i=0;i<3;++i){const auto role=static_cast<PooledRetirementWireRole>(i);if(role==PooledRetirementWireRole::Releases && !o.native.reply_capacity)continue;
@@ -232,7 +233,16 @@ void requirePooledRetirementCompletion(const ComputeGraph& graph,const PooledImm
     const auto source=[&](const std::string& name,q::PooledSourceAction action,uint32_t owner=q::adaptive_lookup::None){const auto* value=node(name);const auto* phase=dynamic_cast<const PooledImmutableSourcePhaseStage*>(value->stage.get());if(!phase || !phase->matchesOriginal(boundary.get(),action,owner,*original.read.publication.source.control))throw std::invalid_argument("Retirement replaced actual source/owner/control phase");};
     const auto endpoint=[&](const std::string& name,const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& holder,q::PooledRetirementWireRole role,CapturedTransferEndpoint side){const auto* phase=dynamic_cast<const PooledRetirementTransferStage*>(node(name)->stage.get());if(!phase || !phase->matches(holder.get(),role,side))throw std::invalid_argument("Retirement replaced original exact channel endpoint");};
     source(original.readersRetired,q::PooledSourceAction::ReadersRetired);source(original.planned,q::PooledSourceAction::PlanReleases);source(original.reconciled,q::PooledSourceAction::ReconcileReleases);source(original.snapshot,q::PooledSourceAction::SnapshotReleased);source(original.finished,q::PooledSourceAction::FinishRetired);source(original.observed,q::PooledSourceAction::ObserveRetired);
-    requirePooledOriginalDependencies(graph,original.readersRetired,{original.read.output});requirePooledOriginalDependencies(graph,original.planned,{original.readersRetired});
+    std::vector<std::string> lastReaders{original.read.output};
+    if (original.readers) {
+        if (p.consumers <= 1)
+            throw std::invalid_argument("Singleton source cannot invent foreign reader ACK authority");
+        requirePooledReplicatedReaderCompletion(graph, *original.readers, original.readersRetired);
+        for (const auto& reader : original.readers->readers) lastReaders.push_back(reader.ackValidated);
+    } else if (p.consumers > 1) {
+        throw std::invalid_argument("Shared source retirement is missing original compute reader ACKs");
+    }
+    requirePooledOriginalDependencies(graph,original.readersRetired,std::move(lastReaders));requirePooledOriginalDependencies(graph,original.planned,{original.readersRetired});
     std::shared_ptr<const q::PooledImmutableLocalOwnerBinding> local;auto gates=original.planned;
     for(size_t i=0;i<count;++i){if(readMember(original.owners[i])!=original.read.owners[i])throw std::invalid_argument("Retirement substituted an original ordered read participant");
         if(i==p.local_owner){if(local || !std::holds_alternative<std::shared_ptr<const q::PooledImmutableLocalOwnerBinding>>(original.owners[i]) || !original.gatePacked[i].empty() || !original.gateSent[i].empty() || !original.releaseReceived[i].empty() || !original.retiredReceived[i].empty())throw std::invalid_argument("Retirement created a local self-transport or substituted coordinate");local=std::get<std::shared_ptr<const q::PooledImmutableLocalOwnerBinding>>(original.owners[i]);if(!local || local->coordinate()!=i || local->coordinatorStorage()!=storage->coordinator())throw std::invalid_argument("Retirement changed original local roots");local->requireCurrent();}

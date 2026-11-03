@@ -522,6 +522,9 @@ namespace llaminar2
         const IGPUGraphCapture &open;
         const IGPUGraphCapture &worker;
         const IGPUGraphCapture &close;
+        /** Finite body work sharing Open; all such terminals precede Close.
+         * These definitions may not depend on Close or parent completion. */
+        std::span<const IGPUGraphCapture* const> body_siblings{};
     };
 
     /// Abstract interface for GPU graph capture and replay.
@@ -740,6 +743,18 @@ namespace llaminar2
             (void)branch;
             return false;
         }
+
+        /**
+         * @brief Add finite native siblings without inventing a progress contribution.
+         * @param siblings Nonempty, unique graph-only definitions on this exact original device.
+         * @return True after all siblings are roots/terminals of this same parent.
+         * @note Original main nodes stay in place, including CUDA conditional handles.
+         * Native completion and outer timeline composition include ALL terminals.
+         * Empty/self/foreign/executable definitions reject before any mutation;
+         * a later native failure invalidates the parent. No operation executes here.
+         */
+        virtual bool appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> siblings)
+        {(void)siblings;return false;}
 
         /**
          * @brief Consume completed per-step timings without waiting on the GPU.

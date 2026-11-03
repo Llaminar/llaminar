@@ -119,6 +119,19 @@ namespace llaminar2
         MoEOverlayCollectiveDirection direction);
 
     /**
+     * @brief Name one real-rank GPU endpoint group without inventing MPI ranks.
+     * @param tier_index Original routed tier index.
+     * @param domain_ordinal Original expert domain index.
+     * @param original_world_rank Same actual rank owning both endpoint roles.
+     * @param participant_ids Strictly increasing target participant identifiers.
+     * @return Canonical identity consumed by the original channel registry.
+     * @throws std::invalid_argument for absent, duplicate or malformed metadata.
+     */
+    [[nodiscard]] std::string makeMoEOverlayRankLocalGPUChannelIdentity(
+        int tier_index, int domain_ordinal, int original_world_rank,
+        std::span<const int> participant_ids);
+
+    /**
      * @brief Model-lifetime wire buffers and codec for one remote rank group.
      *
      * The workspace owns exactly two byte buffers: one transmit buffer and one

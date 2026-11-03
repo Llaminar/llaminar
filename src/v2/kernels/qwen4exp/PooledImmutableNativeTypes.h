@@ -257,6 +257,7 @@ struct OwnerArgs
     OwnerParameters plan;
     std::byte *cache, *frame, *native;
     OwnerInputs input;
+    CapturedTransferReceiveCompletion original_invocation = CapturedTransferReceiveCompletion::notRequired();
 };
 /** @brief Coordinator inputs retain the original counted prefix, actual admission producer and acquired peers. */
 struct CoordinatorInputs

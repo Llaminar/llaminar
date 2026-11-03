@@ -6784,6 +6784,8 @@ if(HAVE_CUDA OR HAVE_ROCM)
         target_sources(v2_integration_captured_transfer_channel PRIVATE integration/transfer/CountedChannelTestKernels.hip)
     endif()
     v2_test_device_scope(v2_integration_captured_transfer_channel FullInventory)
+    # Original-source ownership fixtures share the canonical tests/v2 include root.
+    target_include_directories(v2_integration_captured_transfer_channel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(v2_integration_captured_transfer_channel llaminar2_core GTest::gtest)
     # Economy probes remain separate from functional ProductionTestPreflight.
     add_executable(v2_perf_moe_compact_intermediate
@@ -7834,6 +7836,16 @@ add_v2_test(V2_Integration_NativeHostedMTPBoundedTransactionEvidence
         --gtest_filter=Test__ProductionParityEvidence.RejectsIncompleteBoundedTicketRanges
     LABELS "V2;Integration;ProductionTestPreflight;MTP;PerfStats;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# Response-admission ticket zero is a distinct original lifecycle, never a completed transaction.
+add_v2_test(V2_Integration_NativeHostedMTPContinuationAdmissionEvidence
+    COMMAND $<TARGET_FILE:v2_test_perf_stats_collector>
+        --gtest_filter=Test__ProductionParityEvidence.HostedContinuationAdmissionHasExactIndependentWitnesses:Test__ProductionParityEvidence.HostedContinuationAdmissionRejectsIncompleteAndForeignEvidence:Test__ProductionParityEvidence.HostedContinuationAdmissionAggregatesRepeatedDepthEpochs:Test__ProductionParityEvidence.HostedContinuationAdmissionRejectsDroppedOrReorderedEpochWitness
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;PerfStats;TraceReplay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_NativeHostedMTPContinuationAdmissionEvidence)
 
 # Long coding sessions retain bounded counter keys and ordered lifecycle evidence.
 add_executable(v2_test_perf_stats_cardinality unit/utils/Test__PerfStatsCardinality.cpp)
@@ -12534,12 +12546,18 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen4Exp_Production
         # Each new original ProcessRuntime source owns a fresh numerical process;
         # existing aggregate families and their IDs remain unchanged.
-        PRODUCTION_ISOLATED_TESTS "Qwen4ExpOppositeVendorOrdinaryRetained15/Qwen4ExpMainParityTest.ProductionParity/"
+        PRODUCTION_ISOLATED_TESTS "Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15/Qwen4ExpMainParityTest.ProductionParity/"
+            "Qwen4ExpConsumerLocalTP4MovementRandomRetained15/Qwen4ExpMainParityTest.ProductionParity/"
+            "Qwen4ExpConsumerLocalTP4StaticRetained15/Qwen4ExpMainParityTest.ProductionParity/"
+            "Qwen4ExpOppositeVendorOrdinaryRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpOppositeVendorDynamicOrdinalRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpOppositeVendorDynamicRandomRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP2StaticRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP2DynamicOrdinalRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP2DynamicRandomRetained15/Qwen4ExpMainParityTest.ProductionParity/"
+            "Qwen4ExpSharedCoordinatorTP2StaticRetained15/Qwen4ExpMainParityTest.ProductionParity/"
+            "Qwen4ExpSharedCoordinatorTP2DynamicOrdinalRetained15/Qwen4ExpMainParityTest.ProductionParity/"
+            "Qwen4ExpSharedCoordinatorTP2DynamicRandomRetained15/Qwen4ExpMainParityTest.ProductionParity/"
         # Use the existing paired-source setup budget. Full original-source
         # preparation is bounded independently of numerical focused tests;
         # missing execution/collective evidence never extends this deadline.
@@ -13578,7 +13596,7 @@ add_v2_test(V2_Integration_MoEProjectionPolicy
 )
 add_v2_test(V2_Integration_MTPFrozenScopeConfigAuthority
     COMMAND $<TARGET_FILE:v2_test_orchestration_plan_config>
-        --gtest_filter=OrchestrationConfigDocument.FrozenMTPDepthScopeRoundTripsLosslesslyAtSchemaEleven:OrchestrationConfigDocument.FrozenMTPDepthScopeRejectsMalformedFieldsAndOldSchema:OrchestrationConfigDocument.FrozenMTPDepthScopeCannotAuthorStartupOrRequest
+        --gtest_filter=OrchestrationConfigDocument.FrozenMTPDepthScopeRoundTripsLosslesslyAtCurrentSchema:OrchestrationConfigDocument.FrozenMTPDepthScopeRejectsMalformedFieldsAndOldSchema:OrchestrationConfigDocument.FrozenMTPDepthScopeCannotAuthorStartupOrRequest
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Config;MTP;Admission;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPFrozenScopeConfigAuthority)
@@ -19145,6 +19163,8 @@ add_executable(v2_integration_prepared_expert_service_execution
     integration/moe/Test__PreparedExpertServiceExecution.cpp)
 target_link_libraries(v2_integration_prepared_expert_service_execution
     llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_integration_prepared_expert_service_execution
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set(V2_PREPARED_EXPERT_SERVICE_BACKENDS CPU)
 if(HAVE_CUDA)
     list(APPEND V2_PREPARED_EXPERT_SERVICE_BACKENDS CUDA)
@@ -21359,8 +21379,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
         GTest::gtest
         GTest::gtest_main
     )
+    # Fresh original-source cases have exact named process-owned registrations
+    # in V2FiniteStorageParentTests; legacy ordinary workers cannot precede
+    # those admissions in the same process. Every original aggregate case stays.
     add_v2_test(V2_Integration_GPUExpertTransfer
         COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=-FiniteBodySiblingNativeIntegration.*
         LABELS "V2;Integration;MoE;GPUTransfer"
         MPI_PROCS 1
         NO_MODELS
@@ -22709,13 +22733,17 @@ endforeach()
 # A heterogeneous GPU-only planning request can nominate different rank-local
 # reporters for CUDA and ROCm. Idle discovery ranks participate in the
 # publication collectives but own no source-free probe allocation; keep that
-# PMA lifecycle proof in the production preflight group.
+# PMA lifecycle proof in the production preflight group. One additional local
+# rank beyond the socket-mapped reporters guarantees duplicate GPU visibility
+# and therefore an idle observer, even when CUDA and ROCm occupy different NUMA
+# sockets. Two ranks on a two-socket host can both be active reporters.
 if(HAVE_CUDA AND HAVE_ROCM)
+    math(EXPR V2_PLANNING_GPU_IDLE_RANKS "${V2_TEST_SOCKETS} + 1")
     add_v2_test(V2_Integration_PlanningMPIKernelService_Heterogeneous
         COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
             --gtest_filter=PlanningKernelServiceCatalogMPI.Heterogeneous_GPUOnlySourceFreeCollectionWithIdleReporterRank
         LABELS "V2;Integration;Orchestration;Planning;Lifecycle;MPI;CUDA;ROCm;Regression"
-        MPI_PROCS 2 TIMEOUT 30 NO_MODELS)
+        MPI_PROCS ${V2_PLANNING_GPU_IDLE_RANKS} TIMEOUT 30 NO_MODELS)
 endif()
 
 # Own MPI finalization inside the executable so an excluded discovery rank can
@@ -26169,6 +26197,18 @@ foreach(_devices 4 8)
             --gtest_filter=DeviceCounts/MoEPipelineMultiDeviceMemory.*/Devices${_devices}
         LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CUDA;ROCm;PP;PrefixCache;DeviceFree;Devices${_devices};Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+endforeach()
+foreach(_source_case
+        OriginalSourceReachesParentAllStagesAndFinalPMAOnce
+        DiscoveryStaysSourceFreeAndCannotEraseServingSource
+        PartialOriginalPreparationRejectsBeforePlanningAndRetiresEveryAttempt)
+    add_v2_test(V2_Integration_MoEPipelineOriginalNativePreparation_${_source_case}
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=MoEPipelineNativePreparation.${_source_case} --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Planning;PP;PhysicalMemoryAuthority;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEPipelineOriginalNativePreparation_${_source_case})
 endforeach()
 add_v2_test(V2_Integration_CPUOverlayCompactWorkspaceAdmission
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
@@ -29863,6 +29903,14 @@ add_v2_test(V2_Integration_Qwen4ExpSourceAdmissionDeclarations
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_Qwen4ExpSourceAdmissionDeclarations)
+add_v2_test(V2_Integration_Qwen4ExpCPUComputeMaterializationReplay
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCases.CPUStorageMaterializationRejectsMissingLiveOwners:Qwen4ExpSourceAdmissionCases.CPUStorageMaterializationUsesFrozenComputeOwners
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;CPU;Admission;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCPUComputeMaterializationReplay)
 add_v2_test(V2_Integration_Qwen4ExpCUDAHostLayerPartitionAdmission
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=Qwen4ExpSourceAdmissionCases.ExplicitFifteenLayerCUDAHostFamilyPreservesOriginalFull15
@@ -31553,9 +31601,13 @@ foreach(declaration_backend CUDA ROCm)
             set(declaration_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
             set(declaration_lock rocm_gpu_0)
         endif()
+        # The owner registration covers C0; this separate original process
+        # repeats the same ownership/binding assertions with a positive cache.
+        # Immutable policies cannot recreate one-shot services under one PMA or
+        # transfer persistent process-runtime roots to a fresh authority.
         add_v2_test(V2_Integration_${declaration_backend}_AdaptiveGraphSourceBinding
             COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
-                --gtest_filter=GPUAdaptiveImmutableLookupOwners.${declaration_backend}
+                --gtest_filter=GPUAdaptiveImmutableLookupOwners.${declaration_backend}Positive
             LABELS "V2;Integration;ProductionTestPreflight;${declaration_backend};Qwen4Exp;Adaptive;GraphDeclaration;PMA;Lifetime;Regression"
             MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${declaration_lock} TIMEOUT 120
             ENVIRONMENT ${declaration_env})
@@ -32399,6 +32451,16 @@ add_v2_test(V2_Integration_BenchmarkTerminalDepthWindowEvidence
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_BenchmarkTerminalDepthWindowEvidence)
+
+# Existing terminal source observations must survive the measured-only report filter.
+add_v2_test(V2_Integration_BenchmarkImmutableLookupEvidence
+    COMMAND $<TARGET_FILE:v2_test_benchmark_runner_cpu>
+        --gtest_filter=Test__BenchmarkRunnerCPU.ImmutableLookupEvidenceSurvivesMeasuredSerializationAndDropsWarmup:Test__BenchmarkRunnerCPU.ImmutableLookupEvidenceRemainsOptIn:Test__BenchmarkRunnerCPU.ImmutableLookupSetupRetainsOnlyOriginalAdmittedOwners
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Benchmark;PerfStats;Evidence;TraceReplay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_BenchmarkImmutableLookupEvidence)
 
 # Existing v2_test_benchmark_runner_cpu target; no new source/target needed.
 add_v2_test(V2_Integration_BenchmarkPhysicalPlacementSetupEvidence
@@ -37149,3 +37211,221 @@ if(TEST V2_Integration_MPIBootstrapApplicationRankConfiguration)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_MPIBootstrapApplicationRankConfiguration)
 endif()
+
+# Original group cancellation must release a never-submitted captured peer.
+add_v2_test(V2_Integration_CapturedTransferOriginalInvocationCancellation
+    COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_binding>
+        --gtest_filter=CapturedTransferChannelBindingTest.OriginalInvocationCancellationIsTerminalAndRejectsStaleTickets:CapturedTransferChannelBindingTest.FailureWorkerOwnsExactChannelCancellationWithoutPeerSubmission
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Transfer;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+if(TEST V2_Integration_CapturedTransferOriginalInvocationCancellation)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CapturedTransferOriginalInvocationCancellation)
+endif()
+
+add_v2_test(V2_Integration_CapturedTransferCancellationIdentity
+    COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_protocol>
+        --gtest_filter=CapturedTransferChannelProtocol.OriginalCancellationNeverMasksForeignPhysicalIdentity:CapturedTransferChannelProtocol.OriginalFaultsNeverDrainAsCancellation:CapturedTransferChannelProtocol.PublisherFaultsPrecedeCancellationAndNeverAdvancePublication
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Transfer;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+if(TEST V2_Integration_CapturedTransferCancellationIdentity)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CapturedTransferCancellationIdentity)
+endif()
+
+# Original source cancellation must veto logical success, including empty/all-hit publication.
+add_v2_test(V2_Integration_PooledSourceOriginalCancellationPublication
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=PooledImmutableNative.OriginalParentCancellationSuppressesSourcePublicationAndSuccess:PooledImmutableNative.OriginalSourcePublicationPreservesFirstErrorOnCancellation
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Source;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_PooledSourceOriginalFailureCallback
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=ImmutableLookupSubordinate.OriginalGroupFailureCallbackReleasesMissingParticipant:ImmutableLookupSubordinate.OriginalGroupFailureCallbackCannotCancelSuccessor
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Source;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+if(TEST V2_Integration_PooledSourceOriginalCancellationPublication)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_PooledSourceOriginalCancellationPublication
+        V2_Integration_PooledSourceOriginalFailureCallback)
+endif()
+
+# Original TP routing-history root: peers retain all real expert work.
+if(TARGET v2_test_moe_expert_dispatch_stage)
+    add_v2_test(V2_Integration_MoETPOriginalRoutingHistoryReplay
+        COMMAND $<TARGET_FILE:v2_test_moe_expert_dispatch_stage>
+            --gtest_filter=Test__MoEExpertDispatchStage.CapturedTicketTPHistory* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;MTP;RoutingEvidence;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoETPOriginalRoutingHistoryReplay)
+endif()
+
+# Exact native cancellation visibility; prior-fault traps remain a separate contract.
+if(TARGET v2_integration_captured_transfer_channel)
+    foreach(_cancel_backend CUDA ROCm)
+        if((_cancel_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_cancel_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            foreach(_cancel_phase BeforeAcquire PublishedPeerAbsent PublishedPeerLate)
+                set(_cancel_name V2_Integration_CapturedChannelCancellation_${_cancel_backend}_${_cancel_phase})
+                add_v2_test(${_cancel_name}
+                    COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
+                        --gtest_filter=CapturedTransferCancellation.${_cancel_backend}${_cancel_phase}
+                    LABELS "V2;Integration;ProductionTestPreflight;GPU;${_cancel_backend};Transfer;Capture;Cancellation;Replay;Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_cancel_name})
+            endforeach()
+        endif()
+    endforeach()
+endif()
+
+add_v2_test(V2_Integration_RetainedSourceFailureRetirementProof
+    COMMAND $<TARGET_FILE:v2_test_retained_storage_request_worker>
+        --gtest_filter=RetainedStorageRequestWorker.RankRetiresEveryOriginalPeerAndGroupWhilePreservingFirstAwaitFailure:RetainedStorageRequestWorker.RetiredServiceFailureNeverMasksMissingPeerNativeProof:RetainedStorageRequestWorker.RetiredServiceFailureDrainsEveryOriginalPeerAndGroup:RetainedStorageRequestWorker.RankMainConditionArmsOriginalGroupBeforeFanoutAndAbortsFailures
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;GTEST_DEATH_TEST_STYLE=threadsafe")
+if(TEST V2_Integration_RetainedSourceFailureRetirementProof)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedSourceFailureRetirementProof)
+endif()
+
+# Exercise the actual original-PMA GPU startup producer, not only a raw probe stage.
+foreach(_prepared_gpu_backend IN ITEMS CUDA ROCm)
+    string(TOUPPER "${_prepared_gpu_backend}" _prepared_gpu_feature)
+    if(HAVE_${_prepared_gpu_feature})
+        add_v2_test(V2_Integration_${_prepared_gpu_backend}_PreparedGPUServiceOriginalMeasurement
+            COMMAND $<TARGET_FILE:v2_integration_prepared_expert_service_execution>
+                --gtest_filter=PreparedExpertServiceExecution.${_prepared_gpu_backend}OriginalMeasurement
+            LABELS "V2;Integration;ProductionTestPreflight;${_prepared_gpu_backend};MoE;PreparedWeights;GraphCapture;Ownership;Lifecycle;Regression"
+            ENVIRONMENT "OMP_NUM_THREADS=4"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        if(TEST V2_Integration_${_prepared_gpu_backend}_PreparedGPUServiceOriginalMeasurement)
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_${_prepared_gpu_backend}_PreparedGPUServiceOriginalMeasurement)
+        endif()
+    endif()
+endforeach()
+
+# Missing prepared GPU classes must not be replaced by invented service evidence.
+add_v2_test(V2_Integration_PreparedGPUServiceResidentSourceReplay
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_physical_residency_fabric>
+        --gtest_filter=Test__MoEOverlayPhysicalResidencyFabric.PreparedGPUServiceMissingResidentClassIsNotFabricated
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;Ownership;Lifecycle;Replay;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2PreparedGPUExpertServicePlanningTests.cmake)
+if(TEST V2_Integration_PreparedGPUServiceResidentSourceReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_PreparedGPUServiceResidentSourceReplay)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2PreparedCalibrationOwnerTests.cmake")
+
+# Replicated readers retain one original source transaction and require exact live result/ACK evidence.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledReplicatedReaderResultACKReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableCoordinator.ReplicatedReaders*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledReplicatedReaderResultACKReplay)
+endif()
+
+# Channel admission retirement follows complete original native proof, including failed-service peers.
+if(TARGET v2_test_retained_storage_request_worker)
+    add_v2_test(V2_Integration_SharedReaderNativeRetirementProof
+        COMMAND $<TARGET_FILE:v2_test_retained_storage_request_worker>
+            --gtest_filter=RetainedStorageRequestWorker.SharedReaderChannelsRetireOnlyAfterAllOriginalNativeProofs
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1"
+            "GTEST_DEATH_TEST_STYLE=threadsafe")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SharedReaderNativeRetirementProof)
+endif()
+if(TARGET v2_test_captured_transfer_channel_binding)
+    add_v2_test(V2_Integration_SharedReaderEmptyPayloadCancellation
+        COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_binding>
+            --gtest_filter=CapturedTransferChannelBindingTest.EmptySharedReaderPayloadCancellationAfterHeaderNeverAcknowledgesSuccess
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Transfer;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SharedReaderEmptyPayloadCancellation)
+endif()
+
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_SharedOwnerUnlaunchedCancellationIdle
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableNative.CancelledUnlaunchedOwnerRequiresOriginalInitializedDutyFreeIdle
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_SharedOwnerUnlaunchedCancellationIdle)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2SharedPLEReaderModelTests.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CapturedPeerPayloadTests.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2PooledReplicatedReaderNativeTests.cmake")
+
+# Original shared-reader terminal/reset event proof is not a hot execution allowance.
+add_v2_test(V2_Integration_GroupedReaderTerminalSynchronizationPolicy
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_blocking_sync_policy.py
+        TestGPUBlockingSyncPolicy.test_grouped_reader_terminal_and_reset_waits_are_exact
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;TP;Synchronization;SourcePolicy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_GroupedReaderTerminalSynchronizationPolicy)
+
+# Capture seals borrow one stable graph address through cold build, commit and cache reuse.
+add_v2_test(V2_Integration_ForwardGraphStableColdOwnerReplay
+    COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+        --gtest_filter=Test__ForwardExecutionEngine.CacheableGraphAddressRemainsStableAcrossCommitAndReuse:Test__ForwardExecutionEngine.FailedColdGraphOwnerRetiresBeforeRetryAndUncachedExit:Test__ForwardExecutionEngine.FailedCapturePublicationRetiresNativeBorrowersBeforeGraph
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;GraphCapture;Ownership;Lifecycle;TraceReplay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ForwardGraphStableColdOwnerReplay)
+
+if(TARGET v2_test_qwen35moe_graph)
+    add_v2_test(V2_Integration_CapturedLocalTPZeroExternalQuotaReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
+            --gtest_filter=Test__Qwen35MoEGraph.CapturedLocalTPZeroExternalQuotaPreservesCanonicalPublication --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Graph;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedLocalTPZeroExternalQuotaReplay)
+    add_v2_test(V2_Integration_AdmittedEmptyHostServiceReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
+            --gtest_filter=Test__Qwen35MoEGraph.AdmittedHostServiceOmitsOnlyPermanentlyEmptyTiers:Test__Qwen35MoEGraph.AdmittedPreparedWeightAuthoritiesExcludeOnlyEmptyExternalEndpoints --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Graph;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AdmittedEmptyHostServiceReplay)
+endif()
+# Original finite storage siblings and optional actual progress contribution.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2FiniteStorageParentTests.cmake")
+
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/V2AdaptiveFullRAMBackingTests.cmake)
+
+# Original same-rank expert endpoint ownership and bounded worker publication.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2RankLocalExpertEndpointTests.cmake")
+
+# A complete retained endpoint is a native collective; readiness and actual
+# runtime-CCL participation remain independent cold/replay contracts.
+add_v2_test(V2_Integration_RetainedFullNativeEndpointCaptureReplay
+    COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+        --gtest_filter=Test__GraphSegmentCache.MoEEndpointMetadataKeepsNativeAuthorityAndReadinessSeparate:Test__GraphSegmentCache.RetainedFullNativeEndpointRequiresExactExecutableAndDeferredOwner
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+        "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedFullNativeEndpointCaptureReplay)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ModelKLDSourceIdentityTests.cmake)

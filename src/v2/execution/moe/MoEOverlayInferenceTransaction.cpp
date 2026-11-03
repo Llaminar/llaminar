@@ -156,8 +156,7 @@ namespace llaminar2
         return workspace_generation != 0 &&
                topology_fingerprint_low != 0 &&
                topology_fingerprint_high != 0 && source_world_rank >= 0 &&
-               target_world_rank >= 0 &&
-               source_world_rank != target_world_rank;
+               target_world_rank >= 0;
     }
 
     bool MoEOverlayInferenceGraphFamilyIdentity::valid() const noexcept
@@ -282,16 +281,21 @@ namespace llaminar2
         return family;
     }
 
-    MoEOverlayInferenceTopologyIdentity
-    makeMoEOverlayInferenceTopologyIdentity(
+    namespace
+    {
+    /** @brief Hash the complete validated owner topology and retained family. */
+    MoEOverlayInferenceTopologyIdentity makeInferenceTopologyIdentity(
         const MoEExpertOwnerMap &owner_map,
         const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
         int source_world_rank,
-        int target_world_rank)
+        int target_world_rank,
+        int local_source_participant = -1,
+        std::span<const int> local_targets = {})
     {
         if (!graph_family.valid() || source_world_rank < 0 ||
             target_world_rank < 0 ||
-            source_world_rank == target_world_rank)
+            (source_world_rank == target_world_rank &&
+             local_source_participant < 0))
         {
             throw std::invalid_argument(
                 "Cannot fingerprint invalid ExpertOverlay inference graph geometry or rank pair");
@@ -328,6 +332,14 @@ namespace llaminar2
         digest.addString("MoEOverlayInferenceTopology/v2");
         digest.addScalar(source_world_rank);
         digest.addScalar(target_world_rank);
+        if (local_source_participant >= 0)
+        {
+            digest.addString("RankLocalEndpoints/v1");
+            digest.addScalar(local_source_participant);
+            digest.addScalar(static_cast<std::uint64_t>(local_targets.size()));
+            for (const int participant : local_targets)
+                digest.addScalar(participant);
+        }
         digest.addScalar(graph_family.first_model_layer);
         digest.addScalar(graph_family.main_layer_count);
         digest.addScalar(graph_family.max_graph_rows);
@@ -364,6 +376,62 @@ namespace llaminar2
             .source_world_rank = source_world_rank,
             .target_world_rank = target_world_rank,
         };
+    }
+
+    } // namespace
+
+    MoEOverlayInferenceTopologyIdentity
+    makeMoEOverlayInferenceTopologyIdentity(
+        const MoEExpertOwnerMap &owner_map,
+        const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
+        int source_world_rank,
+        int target_world_rank)
+    {
+        return makeInferenceTopologyIdentity(
+            owner_map, graph_family, source_world_rank, target_world_rank);
+    }
+
+    MoEOverlayInferenceTopologyIdentity
+    makeMoEOverlayRankLocalInferenceTopologyIdentity(
+        const MoEExpertOwnerMap &owner_map,
+        const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
+        int source_participant_id,
+        std::span<const int> target_participant_ids)
+    {
+        const auto *source = owner_map.participantForId(source_participant_id);
+        if (!source || !source->world_rank_known ||
+            source->world_rank < 0 || !source->device.is_gpu() ||
+            target_participant_ids.empty() ||
+            !std::is_sorted(target_participant_ids.begin(), target_participant_ids.end()) ||
+            std::adjacent_find(target_participant_ids.begin(), target_participant_ids.end()) !=
+                target_participant_ids.end())
+        {
+            throw std::invalid_argument(
+                "Rank-local expert endpoints require one original source and ordered unique targets");
+        }
+        for (const int id : target_participant_ids)
+        {
+            const auto *target = owner_map.participantForId(id);
+            if (!target || !target->world_rank_known ||
+                target->world_rank != source->world_rank ||
+                target->domain_name == source->domain_name ||
+                !target->device.is_gpu() ||
+                std::any_of(owner_map.participants().begin(), owner_map.participants().end(),
+                    [&](const auto &continuation)
+                    {
+                        return continuation.domain_name == source->domain_name &&
+                               continuation.world_rank_known &&
+                               continuation.world_rank == source->world_rank &&
+                               continuation.device == target->device;
+                    }))
+            {
+                throw std::invalid_argument(
+                    "Rank-local expert endpoint is absent, foreign, or belongs to the continuation domain");
+            }
+        }
+        return makeInferenceTopologyIdentity(
+            owner_map, graph_family, source->world_rank, source->world_rank,
+            source_participant_id, target_participant_ids);
     }
 
     bool MoEOverlayInferenceCommandIdentity::valid() const noexcept

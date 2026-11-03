@@ -43,6 +43,11 @@ namespace llaminar2
     class ImmutableNativeDeviceRead;
 
     class CapturedTransferChannel;
+    struct RankInventory;
+    struct CapturedTransferInvocation;
+    enum class CapturedTransferInvocationRetirement;
+    class CapturedTransferReceiveCompletion;
+    enum class CapturedTransferPayloadStorage : std::uint8_t;
     class CapturedTransferBinding;
     struct CapturedTransferChannelBatchEntry;
     class WorkspaceBufferLease;
@@ -1583,6 +1588,55 @@ namespace llaminar2
             PhysicalMemoryAuthority &authority, DeviceId host_device,
             DeviceId producer, void *producer_setup_stream,
             DeviceId consumer, void *consumer_setup_stream, size_t capacity) const;
+        /**
+         * @brief Materialize native peer payload from the original cached bidirectional hardware declaration.
+         * @param authority Same admitted channel PMA retaining every control/cursor/payload lease.
+         * @param host_device Original CPU control allocator, never a host payload mirror.
+         * @param producer Original payload-owning GPU.
+         * @param producer_setup_stream Exact original producer setup stream.
+         * @param consumer Original peer reader GPU.
+         * @param consumer_setup_stream Exact original consumer setup stream.
+         * @param capacity Positive admitted maximum, never the runtime communication extent.
+         * @param original_inventory Original cached rank discovery with both directed peer edges Complete.
+         * @return One retained peer channel after worker-local enablement and exact cold initialization.
+         * @throws std::exception For missing/partial/foreign evidence or failed native enable/materialization.
+         */
+        [[nodiscard]] std::shared_ptr<CapturedTransferChannel> createPeerCapturedTransferChannel(
+            PhysicalMemoryAuthority &authority, DeviceId host_device,
+            DeviceId producer, void *producer_setup_stream,
+            DeviceId consumer, void *consumer_setup_stream, size_t capacity,
+            const RankInventory &original_inventory) const;
+
+        /** @brief Bind an original parent admission before submitting any endpoint.
+         * @param channel Existing same-PMA physical owner, retained through native retirement.
+         * @param original Existing parent's immutable generation/invocation, never a new counter.
+         * @throws std::exception For stale, overlapping or terminal admission.
+         */
+        void beginCapturedTransferInvocation(const std::shared_ptr<CapturedTransferChannel> &channel,
+            CapturedTransferInvocation original) const;
+        /** @brief Retire the exact original admission after all original endpoint terminal joins.
+         * @param channel Same original owner. @param original Same parent admission identity.
+         * @return Completed or terminal Cancelled; neither outcome replaces the enclosing native proof.
+         * @throws std::exception For foreign or missing admission.
+         */
+        [[nodiscard]] CapturedTransferInvocationRetirement finishCapturedTransferInvocation(const std::shared_ptr<CapturedTransferChannel> &channel,
+            CapturedTransferInvocation original) const;
+        /**
+         * @brief Borrow actual consumer completion addresses without reading GPU state or adding storage.
+         * @param binding Original prepared consumer payload binding, retained through native retirement.
+         * @param stream Exact consuming participant stream; no operation is submitted here.
+         * @return Read-only device receipt naming that same channel/message/cursor.
+         */
+        [[nodiscard]] CapturedTransferReceiveCompletion capturedReceiveCompletion(
+            const CapturedTransferBinding& binding, void* stream) const;
+
+        /** @brief Cancel an incomplete original admission without waiting for an absent device peer.
+         * @param channel Same original owner. @param original Same active parent identity.
+         * @return False for stale/foreign admission; true for an absorbing terminal publication.
+         * @note Cancellation never clears endpoint state or makes the channel reusable.
+         */
+        bool cancelCapturedTransferInvocation(const std::shared_ptr<CapturedTransferChannel> &channel,
+            CapturedTransferInvocation original) const;
 
         /**
          * @brief Freeze a captured message against retained graph-private device scratch.
@@ -2784,6 +2838,24 @@ namespace llaminar2
     private:
         friend class TensorBase;
         friend class MappedHostTransferArena;
+
+        /**
+         * @brief Common physical owner after the public factory authenticates its explicit route.
+         * @param authority Original admitted channel ledger.
+         * @param host_device CPU control/payload allocator according to the selected route.
+         * @param producer Original local producer and its exact setup stream.
+         * @param producer_setup_stream Original non-default producer stream.
+         * @param consumer Original local consumer.
+         * @param consumer_setup_stream Original non-default consumer stream.
+         * @param capacity Positive capture-time envelope; device descriptors own live extents.
+         * @param storage Validated immutable payload route; no fallback or discovery occurs here.
+         * @return Complete physical channel or full materialization rollback.
+         */
+        [[nodiscard]] std::shared_ptr<CapturedTransferChannel> createCapturedTransferChannelWithStorage(
+            PhysicalMemoryAuthority &authority, DeviceId host_device,
+            DeviceId producer, void *producer_setup_stream,
+            DeviceId consumer, void *consumer_setup_stream, size_t capacity,
+            CapturedTransferPayloadStorage storage) const;
 
         /**
          * @brief Shared native channel lowering for ordinary or acquired-fork submission.

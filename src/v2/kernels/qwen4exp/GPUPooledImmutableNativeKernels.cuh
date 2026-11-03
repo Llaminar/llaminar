@@ -10,6 +10,7 @@
 #pragma once
 #if defined(QFN_POOLED_NATIVE_CUDA)
 #include <cuda_runtime.h>
+#include <cuda/atomic>
 #define QFN_NATIVE_NAMESPACE cuda_pooled_native
 #define QFN_NATIVE_STREAM cudaStream_t
 #define QFN_NATIVE_ERROR cudaGetLastError
@@ -51,9 +52,22 @@ template<class Slot> __global__ __launch_bounds__(Threads,2) void initializeSlot
 }
 /** @brief Publish the actual once-only owner setup identity after all slot producers. */
 template<class Slot> __global__ void sealOwnerKernel(n::OwnerArgs a){n::sealOwner<Slot>(a);}
+/** @return Rare cancellation drain over only original endpoint and owner state; normal work reads no mapped word. */
+template<class Slot> __device__ bool cancelledIdleOwner(const n::OwnerArgs& a)
+{
+    if (!a.original_invocation.hasCancelledCursor()) return false;
+#if defined(QFN_POOLED_NATIVE_CUDA)
+    auto* address = const_cast<std::uint64_t*>(a.original_invocation.cancellationAddress());
+    const auto cancellation = cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system>(*address).load(cuda::memory_order_acquire);
+#else
+    const auto cancellation = __hip_atomic_load(a.original_invocation.cancellationAddress(), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#endif
+    return n::cancelledIdleOwner<Slot>(a, cancellation);
+}
 /** @brief One real ordered owner state mutation; no row payload work runs here. */
 template<n::OwnerAction Action,class Slot> __global__ void ownerPhase(n::OwnerArgs a)
 {
+    if (cancelledIdleOwner<Slot>(a)) return;
     bool succeeded;
     if constexpr(Action==n::OwnerAction::Pin || Action==n::OwnerAction::AcceptFree || Action==n::OwnerAction::AcceptVictim)
         succeeded=n::CooperativeOwnerValidation<Slot>::template run<Action>(a);
@@ -69,8 +83,9 @@ template<n::OwnerAction Action,class Slot> __global__ void ownerPhase(n::OwnerAr
     }
 }
 /** @brief Copy only the current immutable actual grant prefix to reusable directed transport staging. */
-template<n::OwnerAction Action> __global__ __launch_bounds__(Threads,2) void publishReplies(n::OwnerArgs a)
+template<n::OwnerAction Action, class Slot> __global__ __launch_bounds__(Threads,2) void publishReplies(n::OwnerArgs a)
 {
+    if (cancelledIdleOwner<Slot>(a)) return;
     const auto bytes=n::progress(a).reply_bytes;
     if(bytes%sizeof(p::Grant) || bytes/sizeof(p::Grant)>a.plan.native.reply_capacity)return;
     const auto count=bytes/sizeof(p::Grant);
@@ -82,6 +97,7 @@ template<n::OwnerAction Action> __global__ __launch_bounds__(Threads,2) void pub
 /** @brief Fill exactly live unchanged native row bytes; slot stride padding is never copied. */
 template<class Slot> __global__ __launch_bounds__(Threads,2) void copyRows(n::OwnerArgs a)
 {
+    if (cancelledIdleOwner<Slot>(a)) return;
     if(n::progress(a).delivery!=n::Delivery::Validated || n::ownerView<Slot>(a).frame->status!=adaptive_lookup::Status::Success)return;
     const auto count=n::allocationFrame(a).count;
     const auto bytes=std::uint64_t{count}*a.plan.row_bytes;
@@ -91,16 +107,17 @@ template<class Slot> __global__ __launch_bounds__(Threads,2) void copyRows(n::Ow
     }
 }
 /** @brief Pack only actual validated pinned bytes, excluding all native slot stride padding. */
-__global__ __launch_bounds__(Threads,2) void copyHits(n::OwnerArgs a){
+template<class Slot> __global__ __launch_bounds__(Threads,2) void copyHits(n::OwnerArgs a){
+    if (cancelledIdleOwner<Slot>(a)) return;
     if(n::progress(a).delivery!=n::Delivery::Validated)return;
     const auto bytes=n::at<n::OwnerIngress>(a.native,a.plan.native.ingress)->payload_bytes;
     for(auto i=std::uint64_t{blockIdx.x}*Threads+threadIdx.x;i<bytes;i+=std::uint64_t{gridDim.x}*Threads)
         a.native[a.plan.native.source_payload+i]=*n::hitReadByte(a,i);
 }
 /** @brief Publish fresh receipt64/count only after every ordered packed-byte writer. */
-template<class Slot> __global__ void hitsComplete(n::OwnerArgs a){(void)n::completeHitRead<Slot>(a);}
+template<class Slot> __global__ void hitsComplete(n::OwnerArgs a){if (!cancelledIdleOwner<Slot>(a)) (void)n::completeHitRead<Slot>(a);}
 /** @brief Actual copy completion is published only after every disjoint payload writer's launch completes. */
-template<class Slot> __global__ void copyComplete(n::OwnerArgs a){n::copied<Slot>(a);}
+template<class Slot> __global__ void copyComplete(n::OwnerArgs a){if (!cancelledIdleOwner<Slot>(a)) n::copied<Slot>(a);}
 /** @brief Seed only actual coordinator controls. */
 __global__ void seedCoordinatorKernel(n::CoordinatorSetupArgs a){n::seedCoordinator(a);}
 /** @brief Write one exact immutable owner geometry record from setup scalars, without a host payload mirror. */
@@ -223,9 +240,9 @@ private:
         constexpr auto lanes=Action==n::OwnerAction::Pin || Action==n::OwnerAction::AcceptFree || Action==n::OwnerAction::AcceptVictim?Threads:1;
         ownerPhase<Action,Slot><<<1,lanes,0,stream>>>(a);checked();
         if constexpr(n::OwnerLaunchPlan<Action>::publishesReplies)
-            if(a.plan.native.reply_capacity){publishReplies<Action><<<blocks(a.plan.native.reply_capacity),Threads,0,stream>>>(a);checked();}
+            if(a.plan.native.reply_capacity){publishReplies<Action,Slot><<<blocks(a.plan.native.reply_capacity),Threads,0,stream>>>(a);checked();}
         if constexpr(n::OwnerLaunchPlan<Action>::readsRows){
-            if(a.plan.native.reply_capacity){copyHits<<<blocks(std::uint64_t{a.plan.native.reply_capacity}*a.plan.row_bytes),Threads,0,stream>>>(a);checked();}
+            if(a.plan.native.reply_capacity){copyHits<Slot><<<blocks(std::uint64_t{a.plan.native.reply_capacity}*a.plan.row_bytes),Threads,0,stream>>>(a);checked();}
             hitsComplete<Slot><<<1,1,0,stream>>>(a);checked();
         }
         if constexpr(n::OwnerLaunchPlan<Action>::appliesSource){
@@ -316,6 +333,7 @@ namespace llaminar2::qwen4exp {
 std::unique_ptr<IPooledImmutableNativeKernels> QFN_NATIVE_FACTORY()
 {return std::make_unique<QFN_NATIVE_NAMESPACE::Kernels>();}
 }
+#include "GPUPooledImmutableReplicatedReader.cuh"
 #undef QFN_NATIVE_NAMESPACE
 #undef QFN_NATIVE_STREAM
 #undef QFN_NATIVE_ERROR

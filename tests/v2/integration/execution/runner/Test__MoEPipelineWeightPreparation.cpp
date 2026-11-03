@@ -30,6 +30,7 @@
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
 #include "execution/runner/OrchestrationRunner.h"
+#include "execution/runner/ModelContextRetirement.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
@@ -172,6 +173,56 @@ namespace
         return config;
     }
 
+    /**
+     * @brief Own one real fixture runner and its explicitly exported final model duty.
+     * Inspection aliases declared later must die before this scope, including
+     * on fatal assertions. Shutdown publishes Reusable; only the canonical
+     * final-owner API may then reset its original prepared native generations.
+     */
+    class PipelinePreparedFixtureLifetime final
+    {
+    public:
+        /** @param config Actual public pipeline configuration, never a synthetic native-ready runner. */
+        explicit PipelinePreparedFixtureLifetime(const OrchestrationConfig& config)
+            :runner_(std::make_unique<OrchestrationRunner>(config,createExecutionPlanBuilder())){}
+        /** @brief Retire every original owner on normal and exceptional test exits. */
+        ~PipelinePreparedFixtureLifetime()noexcept
+        {
+            try{finish();}catch(...){std::terminate();}
+        }
+        /** @return Sole original runner, borrowed only before final retirement. */
+        OrchestrationRunner& runner()const{return *runner_;}
+        /**
+         * @brief Retain the actual exported contract rather than abandon its reset duty.
+         * @return Original optional contract, without another ModelContext ownership copy.
+         */
+        const std::optional<ModelContextReuseContract>& exportContract()
+        {
+            if(!contract_)contract_=runner_->modelContextReuseContract();
+            return contract_;
+        }
+        /**
+         * @brief Destroy the runner before consuming the sole original reusable model.
+         * @return Actual canonical receipt when a contract was exported, otherwise no model reuse.
+         * @throws std::logic_error For re-entry after an unproven retirement or retained inspection owners.
+         */
+        const std::optional<ModelContextRetirementReceipt>& finish()
+        {
+            if(phase_==Phase::Retired)return receipt_;
+            if(phase_!=Phase::Owned)throw std::logic_error("Pipeline fixture retirement did not prove completion");
+            phase_=Phase::Retiring;
+            runner_->shutdown();runner_.reset();
+            if(contract_){receipt_=retireExclusiveModelContextReuseContract(*contract_);contract_.reset();}
+            phase_=Phase::Retired;return receipt_;
+        }
+    private:
+        enum class Phase {Owned,Retiring,Retired};
+        std::optional<ModelContextReuseContract> contract_;
+        std::unique_ptr<OrchestrationRunner> runner_;
+        std::optional<ModelContextRetirementReceipt> receipt_;
+        Phase phase_=Phase::Owned;
+    };
+
     /** @brief Complete model initialization, not an admission-only substitute. */
     class MoEPipelineWeightPreparation : public ::testing::TestWithParam<PreparationCase>
     {
@@ -262,11 +313,12 @@ namespace
         config.prefix_cache.enabled = false;
         publishOrchestrationStartupPolicy(config);
         OrdinaryGraphEvidence evidence("generation,forward_graph,moe_overlay_residency,transfer,request_admission");
-        OrchestrationRunner runner(config, createExecutionPlanBuilder());
+        PipelinePreparedFixtureLifetime lifetime(config);
+        auto &runner=lifetime.runner();
         ASSERT_TRUE(runner.initialize()) << runner.lastError();
         ASSERT_EQ(runner.primaryDeviceId(), DeviceId::cpu());
         EXPECT_EQ(runner.executionPlan().runtime.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
-        const auto contract = runner.modelContextReuseContract();
+        const auto &contract = lifetime.exportContract();
         ASSERT_TRUE(contract);
         ASSERT_TRUE(contract->pipeline_prepared_plan);
         ASSERT_EQ(contract->pipeline_prepared_plan->stages().size(), test.stages.size());
@@ -402,6 +454,11 @@ namespace
         EXPECT_EQ(TransferProfiler::getH2DStats().total_bytes.load(), 0u);
         check_owners();
         runner.shutdown();
+        const auto &retirement=lifetime.finish();
+        ASSERT_TRUE(retirement.has_value());
+        std::set<DeviceType> gpuKinds;
+        for(const auto type:test.stages)if(type!=DeviceType::CPU)gpuKinds.insert(type);
+        EXPECT_EQ(retirement->retiredDeviceCount(),gpuKinds.size());
     }
 
     INSTANTIATE_TEST_SUITE_P(Topologies, MoENoPeerHostTail,
@@ -424,7 +481,8 @@ namespace
             }
         }
         publishOrchestrationStartupPolicy(config);
-        OrchestrationRunner runner(config, createExecutionPlanBuilder());
+        PipelinePreparedFixtureLifetime lifetime(config);
+        auto &runner=lifetime.runner();
         const bool initialized = runner.initialize();
         if (test.outcome != PreparationOutcome::NativeServing)
         {
@@ -444,10 +502,11 @@ namespace
         if (test.lane != MTPLane::Disabled)
             EXPECT_EQ(runner.executionPlan().runtime.mtp.depth_policy.mode,
                 test.lane == MTPLane::Fixed ? MTPDepthPolicyMode::Fixed : MTPDepthPolicyMode::Dynamic);
-        const auto contract = runner.modelContextReuseContract();
+        const auto &contract = lifetime.exportContract();
         ASSERT_TRUE(contract.has_value());
         ASSERT_NE(contract->pipeline_prepared_plan, nullptr);
         ASSERT_NE(contract->physical_memory_authority, nullptr);
+        {
         const auto manager = contract->context->concreteWeightManager();
         ASSERT_NE(manager, nullptr);
         EXPECT_TRUE(manager->lifecycleGates().graph_materialization_complete);
@@ -516,6 +575,10 @@ namespace
             EXPECT_EQ(row.prepared_weight_bytes, manager->retainedPreparedDeviceBytes(row.device));
         }
         EXPECT_EQ(retained_devices, expected_devices);
+        } // Release prepared-manager/registry inspection borrows before the actual final-owner API.
+        const auto &retirement=lifetime.finish();
+        ASSERT_TRUE(retirement.has_value());
+        EXPECT_EQ(retirement->retiredDeviceCount(),std::size_t(2*test.width));
     }
 
     INSTANTIATE_TEST_SUITE_P(Topologies, MoEPipelineWeightPreparation,

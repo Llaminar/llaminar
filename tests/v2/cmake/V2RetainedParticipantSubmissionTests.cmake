@@ -5,6 +5,12 @@ if(TARGET v2_test_physical_memory_authority)
         unit/execution/local_execution/graph/Test__RetainedGraphParticipantEnqueueGroup.cpp
         unit/execution/qwen4exp/Test__PooledImmutableParticipantExecutionPolicy.cpp)
     foreach(_case IN ITEMS
+        RetainedGraphParticipantEnqueueGroup.ColdStorageValidationSealsOnceAndRejectsReplacedGraphs
+        RetainedGraphParticipantEnqueueGroup.ColdStorageAdapterRetainsBorrowAcrossPartialNativeFailure
+        RetainedGraphParticipantEnqueueGroup.ColdStorageAdapterUsesExactMatchedParentAndRetiresNativeFirst
+        RetainedGraphParticipantEnqueueGroup.ColdStorageAdapterRejectsForeignAndPreservesAssemblyFailure
+        RetainedGraphParticipantEnqueueGroup.ColdDefinitionUsesOriginalMembershipAndGeneration
+        RetainedGraphParticipantEnqueueGroup.ColdDefinitionFailureWakesOriginalMembersWithoutSeal
         RetainedGraphParticipantEnqueueGroup.SourceBeforeRemoteHostJoinResetAndRepeat
         RetainedGraphParticipantEnqueueGroup.PreDispatchRejectionOwnsNoNativeReader
         RetainedGraphParticipantEnqueueGroup.PartialDispatchAndMissingSourceCannotUnwindReaders

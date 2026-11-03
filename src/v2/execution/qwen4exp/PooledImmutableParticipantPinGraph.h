@@ -4,9 +4,9 @@
  *
  * This is a bounded initial-wave component, not a complete lookup materializer.
  * Declarations derive from the existing source-owned plans. Actual binding
- * retains their original prepared roots/PMA and only uses a captured mapped
- * channel at a real cross-vendor local edge. Native source-offset/factory gaps
- * remain precise hard errors; no eligibility or placement policy changes here.
+ * retains their original prepared roots/PMA and uses the explicitly declared
+ * mapped or producer-owned peer channel. Original inventory validates same-vendor
+ * edges before materialization; no failed-peer fallback or host count readback exists.
  */
 #pragma once
 #include "PooledImmutableLocalLookupGraph.h"
@@ -53,8 +53,8 @@ public:
     PhysicalMemoryAllocatorIdentity receiver()const noexcept{return owner_.allocator();}
     /** @return Whether original allocators differ; this never claims heterogeneity or transport permission. */
     bool remote()const noexcept{return sender()!=receiver();}
-    /** @return True only for a real rank-local cross-vendor GPU edge supported by the captured transport prerequisite. */
-    bool capturedCrossVendor()const noexcept;
+    /** @return True only for a rank-local GPU edge with its explicit mapped transport policy. */
+    bool capturedChannelTransport()const noexcept;
     /** @return Original addressed owner coordinate, including C0. */
     uint32_t coordinate()const noexcept{return owner_.parameters().owner.coordinate();}
     /** @return Whether this owner has a positive admitted command bank; runtime zero remains a counted message. */
@@ -126,13 +126,15 @@ public:
      * @param memory Same original PMA that owns both local participant allocations and the channel.
      * @param senderSetupStream Exact original ordinary source setup stream.
      * @param receiverSetupStream Exact original ordinary receiver setup stream.
+     * @param originalInventory Retained original endpoint topology, required for peer payload materialization.
      * @return Retained original endpoint bindings; no native communicator or runtime eligibility is issued.
      * @throws std::exception For wrong cohort/generation/PMA/roots/endpoints, capture-time binding or a missing native transport.
      */
     static std::shared_ptr<const PooledImmutableCapturedPinEdge> bind(
         std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
         std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PhysicalMemoryAuthority> memory,
-        void* senderSetupStream,void* receiverSetupStream);
+        void* senderSetupStream,void* receiverSetupStream,
+        std::shared_ptr<const ClusterInventory> originalInventory = {});
     /** @return Original immutable edge declaration. */
     const PooledImmutablePinEdge& declaration()const noexcept{return declaration_;}
     /** @return Retained actual original coordinator owner. */
@@ -148,6 +150,8 @@ public:
     /** @return Complete immutable endpoint/root/source-slice identity for graph caching. */
     uint64_t captureIdentity()const;
 private:
+    friend class PooledImmutableDirectedTransport;
+    friend class PooledImmutableCapturedPinReturn;
     friend class PooledImmutableCapturedFreeWave;
     friend class PooledImmutableCapturedVictimWave;
     friend class PooledImmutableCapturedSourceWave;
@@ -160,12 +164,14 @@ private:
         std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PhysicalMemoryAuthority> memory,
         std::shared_ptr<CapturedTransferChannel> channel,CapturedTransferBinding invocationSend,CapturedTransferBinding invocationReceive,
         CapturedTransferBinding frontierSend,CapturedTransferBinding frontierReceive,
-        std::optional<CapturedTransferBinding> commandSend,std::optional<CapturedTransferBinding> commandReceive);
+        std::optional<CapturedTransferBinding> commandSend,std::optional<CapturedTransferBinding> commandReceive,
+        std::shared_ptr<const ClusterInventory> originalInventory);
     PooledImmutablePinEdge declaration_;
     std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator_;
     std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner_;
     std::shared_ptr<PhysicalMemoryAuthority> memory_;
     uint64_t coordinator_identity_,owner_identity_;
+    std::shared_ptr<const ClusterInventory> original_inventory_;
     std::shared_ptr<CapturedTransferChannel> channel_; // Same priced source channel, phase-reused by the free wave.
     CapturedTransferBinding invocation_send_,invocation_receive_,frontier_send_,frontier_receive_;
     std::optional<CapturedTransferBinding> command_send_,command_receive_;
@@ -192,6 +198,7 @@ public:
     /** @return Original forward plus every actual reverse binding/capture identity. */
     uint64_t captureIdentity()const;
 private:
+    friend class PooledImmutableDirectedTransport;
     friend class PooledImmutableCapturedFreeWave;
     friend class PooledImmutableCapturedVictimWave;
     friend class PooledImmutableCapturedSourceWave;

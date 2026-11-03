@@ -13,6 +13,8 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <optional>
+#include "PeerAccessCoverage.h"
 namespace llaminar2 {
 namespace qwen4exp {class PooledImmutableDirectedOwnerProgram;}
 namespace detail {struct NativeAuxiliaryQualifiedClass;}
@@ -22,6 +24,8 @@ struct PooledRemoteGraphGeometry final {
     std::uint32_t coordinate=0,participants=0,capacity=0,maximumOriginalIds=0,maximumUniqueIds=0;
     std::uint64_t sourceRows=0,rowBytes=0,slotStride=0,nativeLayoutIdentity=0;
     std::uint32_t rowKeyBits=0,nonemptyRootMask=0;
+    /** Original explicit None/Complete payload selection, when endpoints share a vendor. */
+    std::optional<PeerAccessCoverage> peerAccess;
     bool operator==(const PooledRemoteGraphGeometry&)const=default;
 };
 /** @brief Compiled argument envelope of this closed family; no SDK introspection or resource allowance. */
@@ -52,7 +56,7 @@ private:
     std::array<std::uint8_t,32> dispatch_;
     GPUFlatGraphLimits limits_;
 };
-/** @brief One exact opposite-vendor remote-owner definition, authored before original admission. */
+/** @brief One exact explicitly routed remote-owner definition, authored before original admission. */
 class PooledRemoteGraphProgram final {
 public:
     /** @return Complete original placement/geometry used by the actual owner builder. */

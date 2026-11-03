@@ -22,7 +22,7 @@
 namespace llaminar2
 {
     /** @brief Exact field schema shared by the writer and fail-closed reader. */
-    inline constexpr int kOrchestrationConfigDocumentSchemaVersion = 11;
+    inline constexpr int kOrchestrationConfigDocumentSchemaVersion = 12;
 
     /**
      * @brief Encode every supported configuration field without normalization.

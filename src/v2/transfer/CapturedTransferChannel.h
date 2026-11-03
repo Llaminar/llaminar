@@ -3,7 +3,7 @@
  * @brief Admitted rank-local message storage and immutable capture bindings.
  *
  * TransferEngine alone constructs a channel or enqueues a complete message.
- * The mapped slot has two GPU-private cursors. Cold setup observes each exact
+ * The explicitly selected payload slot has two GPU-private cursors. Cold setup observes each exact
  * original initialization stream before publication, creating no extra events. Captured bindings retain those owners, exact tensor/buffer storage,
  * and message geometry; neither binding nor channel exposes live protocol state
  * to the host. This is a same-process/node transport, not an MPI address space.
@@ -16,6 +16,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include <optional>
 #include <chrono>
+#include <mutex>
 
 #include <array>
 #include <variant>
@@ -25,8 +26,9 @@ namespace llaminar2
     /** @brief Pure allocation geometry contributed to the canonical memory plan. */
     struct CapturedTransferChannelMemory
     {
-        size_t mapped_host_bytes = 0; ///< Page-rounded control plus one byte slot.
+        size_t mapped_host_bytes = 0; ///< Page-rounded control plus payload only in MappedHost mode.
         size_t cursor_bytes_per_device = 0; ///< Exact private cursor, on each GPU.
+        size_t producer_payload_bytes = 0; ///< Native peer slab, absent for mapped-host payload.
     };
 
     /**
@@ -54,11 +56,37 @@ namespace llaminar2
         [[nodiscard]] DeviceId endpointDevice(CapturedTransferEndpoint role) const;
         /** @return Exact physical geometry used both in planning and materialization. */
         [[nodiscard]] static CapturedTransferChannelMemory memoryFor(size_t capacity);
+        /** @brief Quote the exact explicitly selected allocation route; never inspect residual capacity.
+         * @param capacity Positive maximum message bytes. @param storage Exact physical payload route.
+         * @return One mapped control bank, native cursors, and the selected payload allocation.
+         * @throws std::exception For invalid route, zero capacity or arithmetic overflow.
+         */
+        [[nodiscard]] static CapturedTransferChannelMemory memoryFor(size_t capacity, CapturedTransferPayloadStorage storage);
+        /** @return Immutable physical route retained in every endpoint capture identity. */
+        CapturedTransferPayloadStorage payloadStorage() const noexcept { return payload_storage_; }
+
 
     private:
         friend class TransferEngine;
         friend class CapturedTransferBinding;
         friend struct CapturedTransferChannelReplayProbe; ///< Test-only payload canary access after both endpoints' terminal joins; no production observation API.
+        /** @brief Bind the existing original parent's immutable identity before native submissions.
+         * @param original Nonzero original admission; never a channel-owned request counter.
+         * @throws std::exception For stale endpoint generations or overlapping/terminal admission.
+         */
+        void beginInvocation(CapturedTransferInvocation original);
+        /** @brief Retire admission only after every original native endpoint has joined.
+         * @param original Exact original admission whose terminal joins the caller owns.
+         * @return Truthful completed/cancelled outcome; cancellation stays absorbing and never permits reuse.
+         * @throws std::logic_error For missing or foreign admission.
+         */
+        CapturedTransferInvocationRetirement finishInvocation(CapturedTransferInvocation original);
+        /** @brief Publish terminal cancellation for this channel's exact active original admission.
+         * @param original Existing parent's identity, including its immutable generation.
+         * @return False for stale/foreign admission; true for idempotent terminal cancellation.
+         * @note Original physical owners remain retained until every submitted endpoint joins.
+         */
+        bool cancelInvocation(CapturedTransferInvocation original);
         /** @brief Create only inside TransferEngine's all-or-nothing setup transaction. */
         CapturedTransferChannel() = default;
 
@@ -86,6 +114,13 @@ namespace llaminar2
         std::array<Endpoint, 2> endpoints_; ///< Original workers outlive mapped registration teardown.
         PhysicalMemoryAllocationLease mapped_lease_; ///< Outlives mapped storage.
         std::shared_ptr<MappedHostTransferRegion> mapped_;
+        std::mutex invocation_mutex_; ///< Serializes CPU admission/cancellation only; never native progress.
+        CapturedTransferInvocation original_invocation_{};
+        bool invocation_active_ = false, terminal_cancelled_ = false;
+        PhysicalMemoryAllocationLease peer_payload_lease_; ///< Released after native peer payload storage.
+        std::shared_ptr<DeviceTransferBuffer> peer_payload_; ///< Producer-owned slab retained through both endpoint bindings.
+        CapturedTransferPayloadStorage payload_storage_ = CapturedTransferPayloadStorage::MappedHost;
+
     };
 
     /**

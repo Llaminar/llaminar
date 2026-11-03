@@ -2,6 +2,7 @@
  * @brief Device-free actual source acquisition/freeze/admission with original mapped worker and payload roots.
  */
 #include "fixtures/backends/PreparedNativeLookupFixtureReplayAccess.h"
+#include "fixtures/backends/NativeLookupCaseAdmission.h"
 #include "mocks/MockWorkerGPUContext.h"
 #include "memory/CPUTensorStorageDeclaration.h"
 #include "tensors/TensorClasses.h"
@@ -45,4 +46,38 @@ TEST(PreparedNativeLookupFixture, OriginalSourceFreezeAdmitAndPayloadResetReplay
         EXPECT_THROW(fixture->requirePayloadRetired(),std::logic_error);
     }
 }
+/** @test Serialized exact payloads share their maximum while all original retained instances remain charged. */
+TEST(PreparedNativeLookupFixture, SerialLookupCasesPreserveRetainedPopulationAndExactMaximum)
+{
+    const PhysicalMemoryResource host{0,DeviceId::cpu(),1u<<20,1u<<20};
+    const PhysicalMemoryResource gpu{0,DeviceId::cuda(49),1u<<20,1u<<20};
+    std::vector<PhysicalMemoryPlan> cases;
+    for(const auto count:{1u,4u,2u}){
+        PhysicalMemoryPlanBuilder original;
+        original.add(host,PhysicalMemoryOwner::ImmutableTableStorage,count*100);
+        original.add(gpu,PhysicalMemoryOwner::ImmutableLookupStaging,count*32);
+        original.add(host,PhysicalMemoryOwner::RetainedHostServiceStorage,count*64);
+        original.add(host,PhysicalMemoryOwner::RetainedHostServiceRuntime,count*16);
+        original.add(host,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,count*8);
+        original.add(gpu,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,count*4);
+        cases.push_back(original.build());
+    }
+    const auto envelope=serialNativeLookupCaseEnvelope(cases);
+    const auto* h=envelope.find({0,DeviceId::cpu()});const auto* g=envelope.find({0,DeviceId::cuda(49)});
+    ASSERT_NE(h,nullptr);ASSERT_NE(g,nullptr);
+    EXPECT_EQ(h->bytes(PhysicalMemoryOwner::ImmutableTableStorage),400u);
+    EXPECT_EQ(g->bytes(PhysicalMemoryOwner::ImmutableLookupStaging),128u);
+    EXPECT_EQ(h->bytes(PhysicalMemoryOwner::RetainedHostServiceStorage),256u);
+    EXPECT_EQ(h->bytes(PhysicalMemoryOwner::RetainedHostServiceRuntime),112u);
+    EXPECT_EQ(h->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),56u);
+    EXPECT_EQ(g->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),28u);
+    EXPECT_THROW(serialNativeLookupCaseEnvelope({}),std::invalid_argument);
+    auto foreign=host;--foreign.total_bytes;foreign.admission_available_bytes=foreign.total_bytes;
+    PhysicalMemoryPlanBuilder wrong;wrong.add(foreign,PhysicalMemoryOwner::ImmutableTableStorage,1);
+    auto changed=cases;changed.push_back(wrong.build());
+    EXPECT_THROW(serialNativeLookupCaseEnvelope(changed),std::invalid_argument);
+    // Replaying declaration composition cannot consume or mutate any original case.
+    for(int reset=0;reset<20;++reset)EXPECT_EQ(serialNativeLookupCaseEnvelope(cases).summary(),envelope.summary());
+}
+
 }

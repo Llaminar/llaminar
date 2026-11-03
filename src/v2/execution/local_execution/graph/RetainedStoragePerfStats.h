@@ -15,6 +15,23 @@
 
 namespace llaminar2
 {
+namespace detail {
+/**
+ * @brief Validate exact host backing work before freshness/collector publication.
+ * @param mode Original concrete source implementation.
+ * @param counters Already completed CPU-owned interval/call counters.
+ * @throws std::invalid_argument For mapping work on RAM or redundant full-RAM cache work.
+ */
+inline void requireRetainedStorageModeWork(HostImmutableRowMode mode,const RetainedStorageCounters& counters){
+    (void)hostImmutableRowModeName(mode);
+    if((mode==HostImmutableRowMode::WholeRAM || mode==HostImmutableRowMode::AdaptiveFullRAM) &&
+       (counters.windowHits || counters.windowMisses || counters.windowEvictions))
+        throw std::invalid_argument("RAM lookup evidence cannot claim mapping-window work");
+    if(mode==HostImmutableRowMode::AdaptiveFullRAM && (counters.ramRows || counters.cacheAdmissions ||
+       counters.cacheEvictions || counters.cacheAdmissionRejections || counters.allPinnedResponses))
+        throw std::invalid_argument("Full-RAM source cannot claim redundant bounded-cache work");
+}
+}
 /** @brief Direct CPU gather/decode completed or failed before publishing usable rows. */
 enum class RetainedStorageCPUOutcome { Completed,Failed };
 /** @brief Publish synchronous CPU-native I/O work after the stage completes.
@@ -42,13 +59,14 @@ inline void recordCPUImmutableLookup(HostImmutableRowMode mode,DeviceId device,
         throw std::invalid_argument("CPU native row evidence requires its exact successful observation or a failed zero-work result");
     RetainedStorageCounters observed;
     if(work)accumulateHostImmutableRowWork(observed,mode,*work,ids,nativeBytes);
+    detail::requireRetainedStorageModeWork(mode,observed);
     if(!PerfStatsCollector::isDomainEnabled("immutable_lookup"))return;
     const PerfStatsCollector::Tags tags{{"storage",std::string(hostImmutableRowModeName(mode))},{"transport","cpu_direct"}};
     const auto record=[&](const char *name,std::uint64_t value)
     {PerfStatsCollector::addCounter("immutable_lookup",name,static_cast<double>(value),"lookup_completion",device.toString(),tags);};
     record("requests",1);record("ids",ids);record("native_bytes",nativeBytes);record("failures",outcome==RetainedStorageCPUOutcome::Failed?1:0);
     record("window_hits",observed.windowHits);record("window_misses",observed.windowMisses);record("window_evictions",observed.windowEvictions);
-    if(mode==HostImmutableRowMode::AdaptiveRAMSSD)
+    if(hostImmutableRowModeIsAdaptive(mode))
     {
     record("adaptive_batches",observed.adaptiveBatches);record("ram_rows",observed.ramRows);record("source_rows",observed.sourceRows);
     record("duplicate_rows",observed.duplicateRows);record("cache_admissions",observed.cacheAdmissions);
@@ -69,15 +87,12 @@ public:
     {
         if(!observation.generation||observation.generation<=generation_)
             throw std::logic_error("Retained storage terminal evidence is stale or already published");
-        (void)hostImmutableRowModeName(observation.mode);
-        if(observation.mode==HostImmutableRowMode::WholeRAM&&(observation.counters.windowHits||
-            observation.counters.windowMisses||observation.counters.windowEvictions))
-            throw std::invalid_argument("RAM lookup evidence cannot claim mapping-window work");
+        detail::requireRetainedStorageModeWork(observation.mode,observation.counters);
         if (observation.transport != RetainedStorageTransport::MappedChannel &&
             observation.transport != RetainedStorageTransport::PooledSubordinate)
             throw std::invalid_argument("Retained storage evidence has an unknown executed transport");
         if ((observation.transport == RetainedStorageTransport::PooledSubordinate) &&
-            observation.mode != HostImmutableRowMode::AdaptiveRAMSSD)
+            !hostImmutableRowModeIsAdaptive(observation.mode))
             throw std::invalid_argument("Subordinate source work requires its "
                                         "actual adaptive host owner");
         generation_=observation.generation;
@@ -97,7 +112,7 @@ public:
         record("terminal_bytes",c.terminalBytes);record("failures",c.failures);
         record("window_hits",c.windowHits);record("window_misses",c.windowMisses);
         record("window_evictions",c.windowEvictions);
-        if(observation.mode==HostImmutableRowMode::AdaptiveRAMSSD)
+        if(hostImmutableRowModeIsAdaptive(observation.mode))
         {
         record("adaptive_batches",c.adaptiveBatches);record("ram_rows",c.ramRows);record("source_rows",c.sourceRows);
         record("duplicate_rows",c.duplicateRows);record("cache_admissions",c.cacheAdmissions);record("cache_evictions",c.cacheEvictions);

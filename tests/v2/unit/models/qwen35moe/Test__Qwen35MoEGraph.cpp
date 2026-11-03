@@ -16,6 +16,10 @@
 
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/moe/MoEOverlayParticipantResidency.h"
+#include "execution/moe/MoEOverlayHostServiceContract.h"
+#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
+#include "execution/runner/PreparedWeightAuthorityIdentity.h"
+#include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "collective/IGlobalTPContext.h"
 #include "config/GDNRecurrenceStatePolicy.h"
@@ -78,6 +82,12 @@ namespace llaminar2
     struct Qwen35MoEPrefixRuntimeTestPeer
     {
         using Role = Qwen35MoEGraph::MoERuntimeTableRole;
+        /** @brief Replay the production ownership-to-return decision without GPU materialization. */
+        static bool requiresReturn(const MoERoutedExpertPlacementPlan& plan, const MoEExpertOwnerMap& owners,
+            int layer, MoERebalanceRuntimeMode mode, std::optional<std::string_view> frontier = std::nullopt) {
+            return Qwen35MoEGraph::requiresCapturedSparseReturn(plan, owners, layer, mode, frontier);
+        }
+
 
         /**
          * @brief Resolve the production table recipe without materializing GPU owners.
@@ -6519,5 +6529,198 @@ TEST(Test__Qwen35MoEGraph, CPUOverlayGraphFamiliesReuseExactParticipantPackedEng
         for (const auto &role : expert)
             if (role.engine)
                 EXPECT_TRUE(role.lifetime.expired()) << "No hidden second authority may retain the engine";
+    }
+}
+
+/** @test All-GPU TP4 needs its real canonical reduction, never an invented external sparse return. */
+TEST(Test__Qwen35MoEGraph, CapturedLocalTPZeroExternalQuotaPreservesCanonicalPublication)
+{
+    for (const auto external : {DeviceId::cpu(), DeviceId::cuda(0)}) {
+        auto plan = makeROCmPhaseSplitApportionedOverlayPlan("rocm_continuation");
+        plan->continuation_domain_spec.setDensePolicy(DenseParallelPolicy::TensorParallel);
+        plan->routed_tiers.front().fallback = false;
+        plan->routed_tiers.front().resolved_live_experts_per_layer = {2};
+        plan->domains.push_back(expertDomain("external_experts", ExecutionDomainScope::SINGLE,
+            external.is_cpu() ? CollectiveBackendType::HOST : CollectiveBackendType::NCCL,
+            RoutedExpertComputePolicy::Apportioned,
+            {external.is_cpu() ? GlobalDeviceAddress::cpu(0) : GlobalDeviceAddress::cuda(0)}, {}));
+        plan->routed_tiers.push_back({.name = "external", .domain = "external_experts", .priority = 10,
+            .max_experts_per_layer = 2, .memory_budget_bytes = 4096, .fallback = true,
+            .resolved_live_experts_per_layer = {0}});
+        const auto local = MoEExpertOwnerMap::build(*plan);
+        EXPECT_FALSE(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(*plan, local, 0, MoERebalanceRuntimeMode::Off, ""));
+        EXPECT_FALSE(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(*plan, local, 0, MoERebalanceRuntimeMode::Dynamic, ""));
+        // A mutable tier without its admitted zero quota cannot be erased by an initially empty mask.
+        auto unfrozen = *plan;
+        unfrozen.routed_tiers.back().resolved_live_experts_per_layer.clear();
+        EXPECT_THROW(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(unfrozen, local, 0,
+            MoERebalanceRuntimeMode::Dynamic), std::logic_error);
+        // A separately admitted positive external quota requires a real CPU or mapped return.
+        auto moved = *plan;
+        moved.placements.front().routed_expert_tier = {0, 1};
+        moved.routed_tiers.front().resolved_live_experts_per_layer = {1};
+        moved.routed_tiers.back().resolved_live_experts_per_layer = {1};
+        const auto remote = MoEExpertOwnerMap::buildTransition(moved, local);
+        EXPECT_TRUE(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(moved, remote, 0, MoERebalanceRuntimeMode::Off));
+        EXPECT_TRUE(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(moved, remote, 0, MoERebalanceRuntimeMode::Dynamic));
+        EXPECT_TRUE(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(moved, remote, 0,
+            MoERebalanceRuntimeMode::Dynamic, "original_completed_sparse_return"));
+        EXPECT_THROW(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(moved, remote, 0,
+            MoERebalanceRuntimeMode::Dynamic, ""), std::runtime_error);
+        // A legal dynamic swap changes expert IDs, not the original per-tier physical quota.
+        auto swapped = moved;
+        swapped.placements.front().routed_expert_tier = {1, 0};
+        const auto next = MoEExpertOwnerMap::buildTransition(swapped, remote);
+        EXPECT_TRUE(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(swapped, next, 0,
+            MoERebalanceRuntimeMode::Dynamic, "original_completed_sparse_return"));
+        EXPECT_THROW(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(swapped, next, 0,
+            MoERebalanceRuntimeMode::Dynamic, ""), std::runtime_error);
+        EXPECT_THROW(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(moved, local, 0,
+            MoERebalanceRuntimeMode::Dynamic), std::logic_error);
+        EXPECT_THROW(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(*plan, local, 1,
+            MoERebalanceRuntimeMode::Off), std::logic_error);
+    }
+}
+
+/** @test Frozen empty tiers do not manufacture a CPU capture boundary, including PP layer offsets. */
+TEST(Test__Qwen35MoEGraph, AdmittedHostServiceOmitsOnlyPermanentlyEmptyTiers)
+{
+    MockMPIContext world(0, 1);
+    for (const int first_layer : {0, 17}) {
+        auto plan = makeROCmPhaseSplitApportionedOverlayPlan("rocm_continuation");
+        plan->first_model_layer = first_layer;
+        plan->continuation_domain_spec.setDensePolicy(DenseParallelPolicy::TensorParallel);
+        plan->routed_tiers.front().fallback = false;
+        plan->routed_tiers.front().resolved_live_experts_per_layer = {2, 2};
+        plan->placements = {{.layer = first_layer, .routed_expert_tier = {0, 0}},
+                            {.layer = first_layer + 1, .routed_expert_tier = {0, 0}}};
+        plan->domains.push_back(expertDomain("cpu_experts", ExecutionDomainScope::SINGLE,
+            CollectiveBackendType::HOST, RoutedExpertComputePolicy::Apportioned,
+            {GlobalDeviceAddress::cpu(0)}, {}));
+        plan->routed_tiers.push_back({.name = "external", .domain = "cpu_experts", .priority = 10,
+            .max_experts_per_layer = 2, .memory_budget_bytes = 4096, .fallback = true,
+            .resolved_live_experts_per_layer = {0, 0}});
+        const auto local = MoEExpertOwnerMap::build(*plan);
+
+        // Cold planning retains all authored services before it knows quotas.
+        const auto planned = MoEOverlayHostServiceContract::resolve(*plan, local.participants(), world);
+        ASSERT_TRUE(planned.hasHostBoundary());
+        ASSERT_EQ(planned.localParticipants().size(), 1u);
+        const auto admitted = MoEOverlayHostServiceContract::resolveAdmitted(*plan, local, world);
+        EXPECT_FALSE(admitted.hasHostBoundary());
+        EXPECT_TRUE(admitted.localParticipants().empty());
+        EXPECT_TRUE(admitted.externalParticipants().empty());
+        EXPECT_EQ(admitted.continuationTier(), planned.continuationTier());
+        for (const bool authority : {false, true}) {
+            EXPECT_EQ(admitted.captureEnvelope(authority), GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
+            DeviceGraphExecutor::DecodeCapturePolicy policy;
+            policy.allow_cached_graph_replay = true;
+            policy.heterogeneous_segmented_enabled = true;
+            policy.graph_replay_plan_policy = DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation;
+            ASSERT_TRUE(DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(
+                admitted.captureEnvelope(authority), policy));
+            EXPECT_EQ(policy.graph_replay_plan_policy, DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+            EXPECT_TRUE(policy.defer_final_sync);
+            policy.allow_cached_graph_replay = false;
+            EXPECT_FALSE(DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(
+                admitted.captureEnvelope(authority), policy));
+        }
+
+        EXPECT_FALSE(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(*plan, local, first_layer,
+            MoERebalanceRuntimeMode::Dynamic, ""));
+        EXPECT_FALSE(Qwen35MoEPrefixRuntimeTestPeer::requiresReturn(*plan, local, first_layer + 1,
+            MoERebalanceRuntimeMode::Dynamic, ""));
+
+        // Empty current ownership cannot erase an unresolved future tier.
+        auto unresolved = *plan;
+        unresolved.routed_tiers.back().resolved_live_experts_per_layer.clear();
+        EXPECT_TRUE(MoEOverlayHostServiceContract::resolveAdmitted(unresolved, local, world).hasHostBoundary());
+        auto incomplete = *plan;
+        incomplete.routed_tiers.back().resolved_live_experts_per_layer = {0};
+        EXPECT_THROW(MoEOverlayHostServiceContract::resolveAdmitted(incomplete, local, world), std::logic_error);
+
+        // One later layer's real contribution preserves the complete host service.
+        auto positive = *plan;
+        positive.routed_tiers.front().resolved_live_experts_per_layer = {2, 1};
+        positive.routed_tiers.back().resolved_live_experts_per_layer = {0, 1};
+        positive.placements.back().routed_expert_tier = {0, 1};
+        const auto external = MoEExpertOwnerMap::buildTransition(positive, local);
+        const auto active = MoEOverlayHostServiceContract::resolveAdmitted(positive, external, world);
+        EXPECT_TRUE(active.hasHostBoundary());
+        for (const bool authority : {false, true}) {
+            const auto envelope = authority ? GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction
+                                            : GraphNativeCaptureEnvelope::HeterogeneousTicketFollowerTransaction;
+            EXPECT_EQ(active.captureEnvelope(authority), envelope);
+            EXPECT_EQ(planned.captureEnvelope(authority), envelope);
+            DeviceGraphExecutor::DecodeCapturePolicy policy;
+            policy.allow_cached_graph_replay = true;
+            policy.heterogeneous_segmented_enabled = true;
+            ASSERT_TRUE(DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(envelope, policy));
+            EXPECT_EQ(policy.graph_replay_plan_policy,
+                DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation);
+            policy.heterogeneous_segmented_enabled = false;
+            EXPECT_FALSE(DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(envelope, policy));
+        }
+
+        ASSERT_EQ(active.localParticipants().size(), 1u);
+        EXPECT_EQ(active.localParticipants().front(), planned.localParticipants().front());
+        EXPECT_THROW(MoEOverlayHostServiceContract::resolveAdmitted(*plan, external, world), std::logic_error);
+
+        // Repeated projection cannot mutate the original declaration or owner map.
+        EXPECT_FALSE(MoEOverlayHostServiceContract::resolveAdmitted(*plan, local, world).hasHostBoundary());
+        EXPECT_TRUE(MoEOverlayHostServiceContract::resolve(*plan, local.participants(), world).hasHostBoundary());
+    }
+}
+
+/** @test Reuse checks prepared records only for original dense or possibly-live expert owners. */
+TEST(Test__Qwen35MoEGraph, AdmittedPreparedWeightAuthoritiesExcludeOnlyEmptyExternalEndpoints)
+{
+    for (const int first : {0, 17})
+    for (const auto external : {DeviceId::cpu(), DeviceId::cuda(7), DeviceId::rocm(7)}) {
+        auto plan = makeROCmPhaseSplitApportionedOverlayPlan("continuation");
+        plan->first_model_layer = first;
+        plan->routed_tiers.front().fallback = false;
+        plan->routed_tiers.front().resolved_live_experts_per_layer = {2, 2};
+        plan->placements = {{.layer = first, .routed_expert_tier = {0, 0}},
+                            {.layer = first + 1, .routed_expert_tier = {0, 0}}};
+        const auto address = external.is_cpu() ? GlobalDeviceAddress::cpu(0)
+            : external.is_cuda() ? GlobalDeviceAddress::cuda(7) : GlobalDeviceAddress::rocm(7);
+        plan->domains.push_back(expertDomain("external", ExecutionDomainScope::SINGLE,
+            external.is_cpu() ? CollectiveBackendType::HOST : external.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL,
+            RoutedExpertComputePolicy::Apportioned, {address}, {}));
+        plan->routed_tiers.push_back({.name = "empty", .domain = "external", .priority = 10,
+            .max_experts_per_layer = 2, .memory_budget_bytes = 4096, .fallback = true,
+            .resolved_live_experts_per_layer = {0, 0}});
+        const auto execution = resolveMoEExpertOverlayExecutionPlan(plan,
+            {.current_world_rank = 0, .world_size = 1});
+        ASSERT_NE(std::find(execution.current_rank.local_devices.begin(), execution.current_rank.local_devices.end(), external),
+            execution.current_rank.local_devices.end());
+        const auto projected = admittedOverlayPreparedWeightDevices(*plan, execution);
+        EXPECT_EQ(projected.size(), 4u);
+        EXPECT_EQ(std::find(projected.begin(), projected.end(), external), projected.end());
+        for (int gpu = 0; gpu < 4; ++gpu)
+            EXPECT_NE(std::find(projected.begin(), projected.end(), DeviceId::rocm(gpu)), projected.end());
+        // Runtime/source ownership remains the original five-device declaration.
+        EXPECT_EQ(execution.current_rank.local_devices.size(), 5u);
+        auto unresolved = *plan;
+        for (auto& tier : unresolved.routed_tiers) tier.resolved_live_experts_per_layer.clear();
+        EXPECT_EQ(admittedOverlayPreparedWeightDevices(unresolved, execution).size(), 5u);
+        auto pre_admission = *plan;
+        pre_admission.placements.clear();
+        EXPECT_EQ(admittedOverlayPreparedWeightDevices(pre_admission, execution), execution.current_rank.local_devices);
+        auto later = *plan;
+        later.routed_tiers.front().resolved_live_experts_per_layer = {2, 1};
+        later.routed_tiers.back().resolved_live_experts_per_layer = {0, 1};
+        later.placements.back().routed_expert_tier = {0, 1};
+        EXPECT_EQ(admittedOverlayPreparedWeightDevices(later, execution).size(), 5u);
+        auto incomplete = *plan;
+        incomplete.routed_tiers.back().resolved_live_experts_per_layer = {0};
+        EXPECT_THROW(admittedOverlayPreparedWeightDevices(incomplete, execution), std::logic_error);
+        // A zero routed quota cannot erase an independently authored shared expert owner.
+        auto shared = std::make_shared<MoERoutedExpertPlacementPlan>(*plan);
+        shared->shared_expert_domain = "external";
+        const auto shared_execution = resolveMoEExpertOverlayExecutionPlan(shared,
+            {.current_world_rank = 0, .world_size = 1});
+        EXPECT_EQ(admittedOverlayPreparedWeightDevices(*shared, shared_execution).size(), 5u);
     }
 }

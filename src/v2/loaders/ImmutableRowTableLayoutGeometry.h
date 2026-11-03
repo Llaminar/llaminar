@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include "backends/PeerAccessCoverage.h"
 #include <vector>
 #include <utility>
 namespace llaminar2 {
@@ -45,6 +46,19 @@ private:
 enum class ImmutableRowTableResidency : std::uint8_t { Fixed, Adaptive };
 /** @brief Whether adaptive GPU caches share one directory or belong to independent consumers. */
 enum class ImmutableRowTableAdaptiveGPUDomain : std::uint8_t { SharedCoordinator, ConsumerLocal };
+/**
+ * @brief Original bidirectional peer classification for one coordinator-to-reader edge.
+ *
+ * The reader is an exact physical endpoint, independent of consumer ordering.
+ * This immutable planning value authorizes no native materialization: the cold
+ * transport owner must validate it against the retained original inventory.
+ */
+struct ImmutableRowTableReaderPeerAccess final {
+    PhysicalMemoryAllocatorIdentity coordinator;
+    PhysicalMemoryAllocatorIdentity reader;
+    PeerAccessCoverage coverage;
+    bool operator==(const ImmutableRowTableReaderPeerAccess &) const = default;
+};
 /** @brief One physical storage endpoint and its concrete tier, independent of consumers. */
 struct ImmutableRowTableOwnerKey final {
     PhysicalMemoryAllocatorIdentity allocator;
@@ -81,6 +95,57 @@ struct ImmutableRowTableReplicaGroup final {
     std::uint32_t maximum_copies_per_row;
     bool operator==(const ImmutableRowTableReplicaGroup &) const = default;
 };
+struct RankInventory;
+struct ClusterInventory;
+/** @brief One immutable policy for explicitly selected mapped or peer pooled edges; no runtime route fallback. */
+class ImmutableRowTableDirectedTransportPolicy final {
+public:
+    /** @brief Project original rank inventory onto the declared coordinator/same-vendor owner subset.
+     * @param placement Authored storage-only owner request. @param inventory Original local discovery facts.
+     * @return Uniform None/Complete observation for required same-vendor storage edges; otherwise absent.
+     * @throws std::invalid_argument For missing, malformed, Partial or mixed-route storage-star observations.
+     */
+    static std::optional<PeerAccessCoverage> observe(const AdaptiveGPUCachePlacementRequest& placement,
+        const RankInventory& inventory);
+    /**
+     * @brief Project only required coordinator-to-reader edges from original discovery.
+     * @param coordinator Authored source/query endpoint, independent of consumer order.
+     * @param readers Complete original physical compute reader population.
+     * @param inventory Original rank observation, never a new capability query.
+     * @return Exact foreign edges with None or Complete coverage; Partial is unsupported.
+     */
+    static std::vector<ImmutableRowTableReaderPeerAccess> observeReaders(
+        PhysicalMemoryAllocatorIdentity coordinator,
+        std::span<const PhysicalMemoryAllocatorIdentity> readers, const RankInventory& inventory);
+    /** @return Whether the exact endpoints admit this explicit directed transport policy. */
+    static bool supports(PhysicalMemoryAllocatorIdentity coordinator,
+        PhysicalMemoryAllocatorIdentity owner, std::optional<PeerAccessCoverage> observation) noexcept;
+    /** @brief Authenticate the complete original observation once at cold transport construction.
+     * @param coordinator Exact original query/source endpoint.
+     * @param owners Complete physical owner population, including C0.
+     * @param inventory Retained original discovery owner; required for same-vendor remotes.
+     * @param observation Wire/layout policy value, which grants no runtime authority by itself.
+     * @throws std::invalid_argument For missing, foreign, stale or incompatible facts.
+     */
+    static void requireOriginal(PhysicalMemoryAllocatorIdentity coordinator,
+        std::span<const PhysicalMemoryAllocatorIdentity> owners,
+        const std::shared_ptr<const ClusterInventory>& inventory,
+        std::optional<PeerAccessCoverage> observation);
+    /**
+     * @return Whether an authenticated same-vendor edge selects producer-owned peer payload.
+     * @throws std::invalid_argument For invalid, cross-rank or missing explicit same-vendor coverage.
+     */
+    static bool usesPeerPayload(PhysicalMemoryAllocatorIdentity coordinator,
+        PhysicalMemoryAllocatorIdentity owner, std::optional<PeerAccessCoverage> observation);
+    /** @brief Require explicit endpoint policy before BOM or downstream graph composition.
+     * @param coordinator Original query GPU.
+     * @param owner Original physical storage GPU.
+     * @param observation Exact-subset classification, revalidated by the cold transport owner.
+     * @throws std::invalid_argument For foreign identities or unsupported transport policy.
+     */
+    static void require(PhysicalMemoryAllocatorIdentity coordinator,
+        PhysicalMemoryAllocatorIdentity owner, std::optional<PeerAccessCoverage> observation);
+};
 /** @brief Source/owner geometry consumed by planner and graph construction, not a resolved PMA seal. */
 class ImmutableRowTableLayoutGeometry final {
 public:
@@ -97,6 +162,8 @@ public:
      * @param gpu_coordinator Exact shared GPU directory owner, required for positive shared pools and absent for independent consumer-local directories.
      * @param maximum_inflight_rows Source-authored request-row bound, not a live count. Host adaptive placements retain it for execution scratch; only GPU pools add it to directory capacity.
      * @param gpu_domain Explicit shared-directory or independent consumer-local adaptive policy.
+     * @param peer_access Original inventory classification of coordinator and same-vendor storage owners; None selects mapped payload and Complete selects producer-owned peer payload.
+     * @param reader_peer_access Original exact coordinator-to-reader peer classifications, separately from storage owners.
      * @return Checked immutable metadata; PMA remains sole admission/materialization authority.
      * @throws std::invalid_argument For invalid identities, coverage, modes, capacities or policies.
      * @throws std::overflow_error For unrepresentable source, slot or record arithmetic.
@@ -115,7 +182,9 @@ public:
         std::vector<ImmutableRowTableReplicaGroup> replicas = {},
         std::optional<PhysicalMemoryAllocatorIdentity> gpu_coordinator = std::nullopt,
         std::uint64_t maximum_inflight_rows = 0,
-        ImmutableRowTableAdaptiveGPUDomain gpu_domain = ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator);
+        ImmutableRowTableAdaptiveGPUDomain gpu_domain = ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,
+        std::optional<PeerAccessCoverage> peer_access = std::nullopt,
+        std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access = {});
     /**
      * @brief Project the EXISTING admitted whole-tier modes through the same invariant implementation.
      * @param storage Existing concrete mode and original mmap geometry.
@@ -152,6 +221,11 @@ public:
     std::optional<PhysicalMemoryAllocatorIdentity> gpuCoordinator() const noexcept { return gpu_coordinator_; }
     /** @return Exact authored cache-domain policy; independent consumers never claim one global directory. */
     ImmutableRowTableAdaptiveGPUDomain adaptiveGPUDomain() const noexcept { return gpu_domain_; }
+    /** @return Original inventory classification authorizing a same-vendor NoPeer edge, never a runtime fallback. */
+    std::optional<PeerAccessCoverage> peerAccess() const noexcept { return peer_access_; }
+    /** @return Exact required reader edges; these do not describe storage-owner transport. */
+    std::span<const ImmutableRowTableReaderPeerAccess> readerPeerAccess() const noexcept
+    { return reader_peer_access_; }
     /** @brief Project the existing directory owner for an actual local consumer, including C0. */
     std::optional<PhysicalMemoryAllocatorIdentity> gpuCoordinatorFor(PhysicalMemoryAllocatorIdentity requester) const;
     /** @return Source-authored maximum in-flight rows, not execution state. */
@@ -187,11 +261,14 @@ private:
         std::vector<ImmutableRowTableSourceService> services,
         std::vector<ImmutableRowTableReplicaGroup> replicas,
         std::optional<PhysicalMemoryAllocatorIdentity> coordinator,
-        std::uint64_t inflight, std::uint64_t directory, ImmutableRowTableAdaptiveGPUDomain gpu_domain)
+        std::uint64_t inflight, std::uint64_t directory, ImmutableRowTableAdaptiveGPUDomain gpu_domain,
+        std::optional<PeerAccessCoverage> peer_access,
+        std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access)
         : extent_(extent),tiers_(tiers),residency_(residency),owners_(std::move(owners)),
           consumers_(std::move(consumers)),fixed_ranges_(std::move(ranges)),source_services_(std::move(services)),
           replicas_(std::move(replicas)),gpu_coordinator_(coordinator),maximum_inflight_rows_(inflight),
-          gpu_directory_records_(directory), gpu_domain_(gpu_domain) {}
+          gpu_directory_records_(directory), gpu_domain_(gpu_domain), peer_access_(peer_access),
+          reader_peer_access_(std::move(reader_peer_access)) {}
     ImmutableRowTableExtent extent_;
     ImmutableRowTableTiers tiers_;
     ImmutableRowTableResidency residency_;
@@ -203,5 +280,7 @@ private:
     std::optional<PhysicalMemoryAllocatorIdentity> gpu_coordinator_;
     std::uint64_t maximum_inflight_rows_,gpu_directory_records_;
     ImmutableRowTableAdaptiveGPUDomain gpu_domain_;
+    std::optional<PeerAccessCoverage> peer_access_;
+    std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access_;
 };
 } // namespace llaminar2

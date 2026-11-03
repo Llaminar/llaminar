@@ -13,6 +13,8 @@
  * every public reset without changing the actual DGO stream/root ownership.
  */
 #include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "fixtures/backends/NativeLookupCaseAdmission.h"
 #include "backends/NativeOrderingEventGroup.h"
 #include "backends/BackendManager.h"
 #include "backends/ExplicitGPUStream.h"
@@ -432,28 +434,27 @@ struct HostedGraphBeforeArena
         storage.graph.reset();
     }
 };
-/** @brief Exercise actual hosted DGO prefill/reset/readmission and completed/failed retirement.
- * @param device Exact CUDA or ROCm participant selected by its canonical native alias.
- * @param foreignCurrentDevice Select another actual device immediately before every public reset.
- * @details Captured production publish/consume kernels really exchange native
- * rows with the PMA-owned CPU worker. The forward publication is the exact
- * producer joined by the production reset. Nothing in reset reads a live count.
- */
-void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
+/** @brief One original creator policy and typed payload population for a real device replay. */
+struct HostedResetPreparation final
 {
-    auto *backend=getBackendFor(device);if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested native backend unavailable";
-    if(foreignCurrentDevice && backend->deviceCount()<2)
-    {
-        GTEST_SKIP()<<"Foreign-current reset requires two physical devices of the requested backend";
-    }
-    if(!hasCPUBackend())initCPUBackend(-1);
-    HostedEvidence evidence;
-    auto &worker=GPUDeviceContextPool::instance().getContext(device);
-    worker.submitAsync([&] {
-        using Peer=DeviceGraphOrchestratorLiveStateTestAccess;
+    RetainedHostServiceProgram io;
+    PhysicalMemoryPlan payload;
+};
+/**
+ * @brief Declare a device's actual original creator class before the shared final admission.
+ * @param session One original prepared population and its immutable allocator observations.
+ * @param device Exact participant whose worker later creates the declared services.
+ * @return Same original IO program and existing four-case payload/retained-instance BOM.
+ * @throws std::exception If original observation, installed class or typed BOM validation fails.
+ */
+HostedResetPreparation prepareHostedResetCases(test::PreparedNativeLookupFixture& session,DeviceId device)
+{
+    auto &worker=*session.permit(device).worker();
+    std::optional<HostedResetPreparation> result;
+    worker.submitAndWait([&]{
         HostedSource file;
-        const PhysicalMemoryResource host{0,DeviceId::cpu(),1u<<24,1u<<24};
-        const PhysicalMemoryResource gpu{0,device,backend->deviceMemoryTotal(device.ordinal),backend->deviceMemoryFree(device.ordinal)};
+        const auto host=session.resource(DeviceId::cpu());
+        const auto gpu=session.resource(device);
         const auto io=RetainedHostServiceProgram::original(RetainedHostServiceRole::ImmutableLookupIO);
         const auto caseBudget=[&](ImmutableRowStorage mode,int capacity) {
             constexpr std::size_t stride=5*sizeof(IQ4_NLBlock);
@@ -475,7 +476,46 @@ void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
         const auto ioBOM=io.bom(host);
         for(const auto& row:ioBOM.resources())joint.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceStorage,row.bytes(PhysicalMemoryOwner::RetainedHostServiceStorage));
         for(std::size_t i=0;i<cases.size();++i)for(const auto& row:ioBOM.resources())joint.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceRuntime,row.bytes(PhysicalMemoryOwner::RetainedHostServiceRuntime));
-        auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(joint.build()),0);
+        result.emplace(HostedResetPreparation{io,joint.build()});
+    });
+    return std::move(*result);
+}
+/** @brief Exercise actual hosted DGO prefill/reset/readmission and completed/failed retirement.
+ * @param device Exact CUDA or ROCm participant selected by its canonical native alias.
+ * @param foreignCurrentDevice Select another actual device immediately before every public reset.
+ * @details Captured production publish/consume kernels really exchange native
+ * rows with the PMA-owned CPU worker. The forward publication is the exact
+ * producer joined by the production reset. Nothing in reset reads a live count.
+ */
+void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
+{
+    auto *backend=getBackendFor(device);if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested native backend unavailable";
+    if(foreignCurrentDevice && backend->deviceCount()<2)
+    {
+        GTEST_SKIP()<<"Foreign-current reset requires two physical devices of the requested backend";
+    }
+    if(!hasCPUBackend())initCPUBackend(-1);
+    HostedEvidence evidence;
+    const std::vector devices=foreignCurrentDevice
+        ? std::vector{DeviceId(device.type,0),DeviceId(device.type,1)} : std::vector{device};
+    auto session=test::PreparedNativeLookupFixture::prepare(devices);
+    std::vector<HostedResetPreparation> preparations;
+    std::vector<PhysicalMemoryPlan> payloads;
+    for(const auto member:devices){
+        preparations.push_back(prepareHostedResetCases(*session,member));
+        payloads.push_back(preparations.back().payload);
+    }
+    session->admit(test::serialNativeLookupCaseEnvelope(payloads));
+    // Both real devices retain ONE source/PMA. Process-runtime native roots
+    // cannot be adopted into a second authority between the two resets.
+    for(std::size_t index=0;index<devices.size();++index){
+    const auto device=devices[index];
+    auto &worker=*session->permit(device).worker();
+    worker.submitAsync([&] {
+        using Peer=DeviceGraphOrchestratorLiveStateTestAccess;
+        HostedSource file;
+        const auto &io=preparations[index].io;
+        const auto memory=session->memory();
         std::uint64_t ioOrdinal=0;
         for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
         for(const int capacity:{1,3})
@@ -639,6 +679,10 @@ void proveHostedReset(DeviceId device,bool foreignCurrentDevice=false)
             EXPECT_EQ(storage.owners.size(),allocations);
         }
     }).get();
+    session->requirePayloadRetired();
+    }
+    session->retire();
+    session->requireExactRetired();
 }
 #ifdef HAVE_CUDA
 /** @test CUDA actual hosted prefill retires its interval before request reset/new admission. */
@@ -661,16 +705,16 @@ TEST(ResidentLookupPrefillLifecycle,ROCmCanonicalController){prove(DeviceId::roc
 /** @test Both actual CUDA owners retire/reset from a different current device, including empty/repeated and dirty capacity replays. */
 TEST(ResidentLookupPrefillLifecycle,CUDAForeignCurrentDeviceHostedTerminalReset)
 {
+    // The same helper executes both actual members before original source retirement.
     proveHostedReset(DeviceId::cuda(0),true);
-    proveHostedReset(DeviceId::cuda(1),true);
 }
 #endif
 #ifdef HAVE_ROCM
 /** @test Both actual HIP owners establish their declared device before native close and exact terminal-event retirement. */
 TEST(ResidentLookupPrefillLifecycle,ROCmForeignCurrentDeviceHostedTerminalReset)
 {
+    // The same helper executes both actual members before original source retirement.
     proveHostedReset(DeviceId::rocm(0),true);
-    proveHostedReset(DeviceId::rocm(1),true);
 }
 #endif
 } // namespace

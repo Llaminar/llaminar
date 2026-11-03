@@ -52,16 +52,21 @@ std::string familyIdentity(RetainedHostServiceRole role){
     switch(role){case RetainedHostServiceRole::ImmutableLookupIO:case RetainedHostServiceRole::ExecutorParentTicket:break;default:throw std::invalid_argument("Unknown CPU resource role");}
     return digest("mapped-pthread-linux-glibc2-merged-64-v1:"+std::to_string(static_cast<unsigned>(role)));
 }
-/** @brief Immutable loaded-file facts; comparison never hashes or dereferences an unloaded image. */
+/**
+ * @brief Loaded-file identity and content-change metadata, without payload reads.
+ * @details Inode ctime also changes on hardlink/permission operations that cannot
+ *          alter loaded code or TLS geometry. It is not a resource input. File
+ *          replacement, size/mtime changes and actual loader/TLS changes still reject.
+ */
 struct NativeFileFact {
-    std::string path;std::uint64_t device,inode,bytes;std::int64_t modifiedSeconds,modifiedNanos,changedSeconds,changedNanos;
+    std::string path;std::uint64_t device,inode,bytes;std::int64_t modifiedSeconds,modifiedNanos;
     bool operator==(const NativeFileFact&)const=default;
 };
 /** @return Original immutable provider identity, with no native resource creator. */
 NativeFileFact fileFact(const std::string& path){
     const auto canonical=std::filesystem::canonical(path).string();struct stat value{};
     if(::stat(canonical.c_str(),&value))throw std::system_error(errno,std::generic_category(),"CPU service original ELF file facts");
-    return {canonical,static_cast<std::uint64_t>(value.st_dev),static_cast<std::uint64_t>(value.st_ino),static_cast<std::uint64_t>(value.st_size),value.st_mtim.tv_sec,value.st_mtim.tv_nsec,value.st_ctim.tv_sec,value.st_ctim.tv_nsec};
+    return {canonical,static_cast<std::uint64_t>(value.st_dev),static_cast<std::uint64_t>(value.st_ino),static_cast<std::uint64_t>(value.st_size),value.st_mtim.tv_sec,value.st_mtim.tv_nsec};
 }
 /** @return Provider selected by the actual creator symbol; no resolver substitution is permitted. */
 NativeFileFact nativeProviderFact(const void* selected,const char* role){
@@ -92,11 +97,46 @@ LoaderFacts loadedFacts(){
         }catch(...){s.failure=std::current_exception();return 1;}};
     dl_iterate_phdr(copy,&snapshot);if(snapshot.failure)std::rethrow_exception(snapshot.failure);
     LoaderFacts result;result.adds=snapshot.adds;result.subs=snapshot.subs;for(const auto& image:snapshot.images){
-        const auto file=image.path.starts_with("linux-vdso")?NativeFileFact{image.path,0,0,0,0,0,0,0}:fileFact(image.path);
+        // Only PT_TLS files are resource inputs here. Unrelated images may be
+        // unlinked while still loaded; their copied loader path is diagnostic,
+        // never a reason to stat/canonicalize another provider's payload file.
+        const auto file=image.hasTLS?fileFact(image.path):NativeFileFact{image.path,0,0,0,0,0};
         result.modules.push_back(file);if(image.hasTLS)result.tls.push_back({file,image.offset,image.fileBytes,image.memoryBytes,image.alignment,image.moduleId,image.ownSource});
     }
     std::sort(result.tls.begin(),result.tls.end(),[](const auto& a,const auto& b){return std::tie(a.file.path,a.fileOffset)<std::tie(b.file.path,b.fileOffset);});
     std::sort(result.modules.begin(),result.modules.end(),[](const auto& a,const auto& b){return a.path<b.path;});return result;
+}
+/**
+ * @brief Describe cold loader differences without reading payloads or environment values.
+ * @param expected Original declaration snapshot.
+ * @param current One actual current loader snapshot.
+ * @return Component names, module paths and numeric ELF/lifecycle geometry only.
+ */
+std::string loaderDifference(const LoaderFacts& expected,const LoaderFacts& current){
+    std::ostringstream out;
+    if(expected.adds!=current.adds||expected.subs!=current.subs)
+        out<<" loader_lifecycle(adds="<<expected.adds<<"->"<<current.adds<<",subs="<<expected.subs<<"->"<<current.subs<<")";
+    const auto files=[&](const auto& before,const auto& after,const char* label){
+        for(const auto& old:before){
+            const auto found=std::find_if(after.begin(),after.end(),[&](const auto& now){return now.path==old.path;});
+            if(found==after.end())out<<" "<<label<<"_removed="<<old.path;
+            else if(*found!=old)out<<" "<<label<<"_file_changed="<<old.path;
+        }
+        for(const auto& now:after)if(std::none_of(before.begin(),before.end(),[&](const auto& old){return now.path==old.path;}))
+            out<<" "<<label<<"_added="<<now.path;
+    };
+    files(expected.modules,current.modules,"module");
+    const auto tls=[&](const TLSImageFact& image,const char* label){
+        out<<" "<<label<<"="<<image.file.path<<"(offset="<<image.fileOffset<<",file_bytes="<<image.fileBytes
+           <<",memory_bytes="<<image.memoryBytes<<",alignment="<<image.alignment<<",module_id="<<image.moduleId<<",own_source="<<image.ownSource<<")";
+    };
+    for(const auto& old:expected.tls){
+        const auto found=std::find_if(current.tls.begin(),current.tls.end(),[&](const auto& now){return now.file.path==old.file.path&&now.fileOffset==old.fileOffset;});
+        if(found==current.tls.end())tls(old,"tls_removed");
+        else if(*found!=old){tls(old,"tls_before");tls(*found,"tls_after");}
+    }
+    for(const auto& now:current.tls)if(std::none_of(expected.tls.begin(),expected.tls.end(),[&](const auto& old){return old.file.path==now.file.path&&old.fileOffset==now.fileOffset;}))tls(now,"tls_added");
+    return out.str();
 }
 /** @return Authenticated immutable bytes, rejecting replacement during the one cold read. */
 std::atomic<std::uint64_t> native_file_hash_attempts{0};
@@ -120,7 +160,8 @@ public:
     TLSProviderEvidence(NativeFileFact file,std::string digest):file_(std::move(file)),digest_(std::move(digest)){}
     /** @brief Revalidate the selected provider without rehashing its immutable file. */
     void requireCurrent(const void* selected)const{
-        if(nativeProviderFact(selected,"loader/TLS resolver")!=file_)throw std::logic_error("CPU service original loader/TLS resolver provider changed after declaration");
+        const auto current=nativeProviderFact(selected,"loader/TLS resolver");
+        if(current!=file_)throw std::logic_error("CPU service original loader/TLS resolver provider changed after declaration: before="+file_.path+" after="+current.path);
     }
     const std::string& digest()const noexcept{return digest_;}
 private:
@@ -138,7 +179,7 @@ void RetainedHostServiceProgram::requireTLSProviderEvidence(const std::shared_pt
 class RetainedHostServiceProgram::Evidence final {
     friend class RetainedHostServiceProgram;
     LoaderFacts loader;
-    NativeFileFact provider{},cppProvider{},openMPProvider{};
+    NativeFileFact provider{},cppProvider{},openMPProvider{},source{};
     std::vector<std::pair<std::string,std::string>> policy;
     std::string resourcePolicy,liveLoader;
     std::size_t tlsModules=0,tlsBytes=0;
@@ -150,18 +191,32 @@ class RetainedHostServiceProgram::Evidence final {
         if(recorded)return;
         if(!tlsResolver)throw std::logic_error("CPU service loader/TLS resolver evidence is missing");
         tlsResolver->requireCurrent(reinterpret_cast<const void*>(&::__tls_get_addr));
-        if(loadedFacts()!=loader||pthreadProviderFact()!=provider||cppProviderFact()!=cppProvider||openMPProviderFact()!=openMPProvider||runtimePolicy()!=policy)
-            throw std::logic_error("CPU service original loaded TLS/provider/runtime policy changed after declaration");
+        const auto currentLoader=loadedFacts();
+        const auto currentPthread=pthreadProviderFact(),currentCpp=cppProviderFact(),currentOpenMP=openMPProviderFact();
+        const auto currentPolicy=runtimePolicy();
+        const auto currentSource=nativeProviderFact(reinterpret_cast<const void*>(&RetainedHostServiceProgram::originalEvidence),"CPU service source");
+        // Passive no-TLS images/global dl counters are diagnostic history, not
+        // thread TLS storage. Exact current TLS/source/provider/policy stays sealed.
+        if(currentLoader.tls!=loader.tls||currentSource!=source||currentPthread!=provider||currentCpp!=cppProvider||currentOpenMP!=openMPProvider||currentPolicy!=policy){
+            std::ostringstream reason;
+            reason<<"CPU service original loaded TLS/provider/runtime policy changed after declaration:"<<loaderDifference(loader,currentLoader);
+            const auto providerChange=[&](const char* role,const NativeFileFact& original,const NativeFileFact& current){
+                if(original!=current)reason<<" "<<role<<"_provider(before="<<original.path<<",after="<<current.path<<")";
+            };
+            providerChange("source",source,currentSource);providerChange("pthread",provider,currentPthread);providerChange("cpp",cppProvider,currentCpp);providerChange("openmp",openMPProvider,currentOpenMP);
+            // Keys identify the changed policy component; values may contain secrets.
+            for(std::size_t i=0;i<policy.size();++i)if(policy[i]!=currentPolicy.at(i))reason<<" runtime_policy_key="<<policy[i].first;
+            throw std::logic_error(reason.str());
+        }
     }
 };
 std::shared_ptr<const RetainedHostServiceProgram::Evidence> RetainedHostServiceProgram::originalEvidence(){
     const auto start=std::chrono::steady_clock::now();
-    auto evidence=std::shared_ptr<Evidence>(new Evidence);evidence->loader=loadedFacts();evidence->provider=pthreadProviderFact();evidence->cppProvider=cppProviderFact();evidence->openMPProvider=openMPProviderFact();evidence->policy=runtimePolicy();
+    auto evidence=std::shared_ptr<Evidence>(new Evidence);evidence->loader=loadedFacts();evidence->source=nativeProviderFact(reinterpret_cast<const void*>(&RetainedHostServiceProgram::originalEvidence),"CPU service source");evidence->provider=pthreadProviderFact();evidence->cppProvider=cppProviderFact();evidence->openMPProvider=openMPProviderFact();evidence->policy=runtimePolicy();
     const auto resolver=nativeProviderFact(reinterpret_cast<const void*>(&::__tls_get_addr),"loader/TLS resolver");
     evidence->tlsResolver=std::make_shared<const TLSProviderEvidence>(resolver,std::string{});
-    // Passive modules affect only the reviewed eligibility and this session's
-    // cheap liveness facts. Their incidental code/payload bytes are not a new
-    // portable creator class or another full-library hashing campaign.
+    // Current TLS geometry determines the admitted byte envelope. Passive
+    // non-TLS module history remains diagnostic and never reprices the service.
     evidence->tlsModules=evidence->loader.tls.size();
     for(const auto& image:evidence->loader.tls){
         if(image.memoryBytes>std::numeric_limits<std::size_t>::max()-evidence->tlsBytes)throw std::overflow_error("CPU service TLS eligibility extent overflow");
@@ -169,8 +224,12 @@ std::shared_ptr<const RetainedHostServiceProgram::Evidence> RetainedHostServiceP
     }
     std::ostringstream policy;for(const auto& [name,value]:evidence->policy)if(name!="LD_LIBRARY_PATH")policy<<name.size()<<':'<<name<<value.size()<<':'<<value;
     evidence->resourcePolicy=digest(policy.str());
-    std::ostringstream live;live<<evidence->loader.adds<<':'<<evidence->loader.subs<<':';
-    for(const auto& image:evidence->loader.tls)live<<image.file.path.size()<<':'<<image.file.path<<':'<<image.moduleId<<':';
+    // Identity describes current immutable resource inputs, never incidental
+    // global loader history. Reused identical TLS modules have the same byte duty.
+    std::ostringstream live;
+    const auto file=[&](const NativeFileFact& fact){live<<fact.path.size()<<':'<<fact.path<<':'<<fact.device<<':'<<fact.inode<<':'<<fact.bytes<<':'<<fact.modifiedSeconds<<':'<<fact.modifiedNanos<<':';};
+    file(evidence->source);file(evidence->provider);file(evidence->cppProvider);file(evidence->openMPProvider);
+    for(const auto& image:evidence->loader.tls){file(image.file);live<<image.fileOffset<<':'<<image.fileBytes<<':'<<image.memoryBytes<<':'<<image.alignment<<':'<<image.moduleId<<':'<<image.ownSource<<':';}
     evidence->liveLoader=digest(live.str());evidence->requireCurrent();
     evidence->elapsedNs=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();return evidence;
 }

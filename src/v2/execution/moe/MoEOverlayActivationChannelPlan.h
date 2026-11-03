@@ -46,6 +46,8 @@ namespace llaminar2
         DeviceId source_device = DeviceId::invalid();
         std::vector<MoEOverlayActivationLocalLaneBinding> source_lanes;
         std::vector<MoEOverlayActivationLocalLaneBinding> target_lanes;
+        /** Combined exact endpoint grants when both ends belong to one rank. */
+        std::vector<MoEOverlayActivationLocalLaneBinding> rank_local_lanes;
         /** Exact shared mapping consumed unchanged by both endpoint ranks. */
         MoEOverlayNodeLocalActivationLayout mapping_layout;
 
@@ -117,17 +119,18 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Report whether any non-root participant lives on another rank.
+         * @brief Report whether any participant requires a distinct retained endpoint channel.
          * @param placement Frozen, hardware-bound routed placement.
          * @return True when capacity planning needs the gathered rank topology.
          * @throws std::invalid_argument when the continuation participant is
          *         absent or its rank identity is incomplete.
          *
          * This is the shared admission predicate for capacity and transport
-         * preflight. A participant's tier never changes whether activations
-         * must cross a rank boundary.
+         * preflight. Continuation shards and same-rank CPU work retain their original local
+         * graph storage. Foreign GPU domains require their own endpoint lanes
+         * even when their true world rank equals the continuation rank.
          */
-        [[nodiscard]] static bool hasRemoteRankParticipants(
+        [[nodiscard]] static bool requiresActivationChannels(
             const MoERoutedExpertPlacementPlan &placement);
 
         /**

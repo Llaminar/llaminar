@@ -366,3 +366,70 @@ TEST(CapturedTransferChannelProtocol, SourceSliceBindingRejectsForeignRoleAndCou
     binding.role = Role::Consumer; binding.extent_source = CapturedTransferExtentSource::ProducerPublication;
     EXPECT_FALSE(binding.valid());
 }
+
+/** @test Parent cancellation is terminal and cannot authenticate another physical owner. */
+TEST(CapturedTransferChannelProtocol, OriginalCancellationNeverMasksForeignPhysicalIdentity)
+{
+    CapturedTransferCursor cursor{};
+    const auto acquire = [&](CapturedTransferChannelIdentity expected, std::uint64_t cancelled)
+    {
+        return Protocol::acquire(Role::Consumer, expected, identity, cursor, {}, message,
+            CapturedTransferExtentSource::FixedMessage, 0, 0, 0, 0, cancelled);
+    };
+    EXPECT_EQ(acquire(identity, identity.nonce).status, Status::Cancelled);
+    EXPECT_EQ(cursor.phase, CapturedTransferPhase::Cancelled);
+    EXPECT_EQ(cursor.completed_epoch, 0u);
+    EXPECT_EQ(acquire(identity, identity.nonce).status, Status::Cancelled);
+    EXPECT_EQ(acquire(identity, 0).status, Status::InvalidPhase);
+    cursor = {};
+    EXPECT_EQ(acquire({identity.nonce + 1, identity.capacity}, identity.nonce).status, Status::InvalidBinding);
+    cursor = {};
+    EXPECT_EQ(acquire(identity, identity.nonce + 1).status, Status::InvalidBinding);
+}
+
+/** @test Original faults win every cancellation interleaving through the actual native decision owner. */
+TEST(CapturedTransferChannelProtocol, OriginalFaultsNeverDrainAsCancellation)
+{
+    for (const auto error : {Status::TimedOut, Status::InvalidPhase, Status::MessageMismatch,
+             Status::InvalidBinding, Status::PeerAborted, Status::EpochMismatch})
+    {
+        for (const auto phase : {CapturedTransferPhase::Idle, CapturedTransferPhase::Acquired,
+                 CapturedTransferPhase::Publishing, CapturedTransferPhase::Failed, CapturedTransferPhase::Cancelled})
+            EXPECT_FALSE(Protocol::drainsCancellation(phase, error, true));
+        CapturedTransferCursor cursor{};
+        CapturedTransferPublication publication{};
+        Protocol::abort(cursor, publication);
+        EXPECT_EQ(Protocol::acquire(Role::Consumer, identity, identity, cursor, {}, message,
+            CapturedTransferExtentSource::FixedMessage, 0, 0, 0, 0, identity.nonce).status, Status::InvalidPhase);
+        EXPECT_EQ(cursor.phase, CapturedTransferPhase::Failed);
+    }
+    EXPECT_FALSE(Protocol::drainsCancellation(CapturedTransferPhase::Failed, Status::Cancelled, true));
+    EXPECT_FALSE(Protocol::drainsCancellation(CapturedTransferPhase::Idle, Status::Cancelled, false));
+    EXPECT_TRUE(Protocol::drainsCancellation(CapturedTransferPhase::Acquired, Status::Cancelled, true));
+}
+
+/** @test Actual native publisher validates original phase/message/epoch before cancellation. */
+TEST(CapturedTransferChannelProtocol, PublisherFaultsPrecedeCancellationAndNeverAdvancePublication)
+{
+    for(const auto source:{CapturedTransferExtentSource::FixedMessage,CapturedTransferExtentSource::ProducerDevice}){
+        for(int fault=0;fault<4;++fault){
+            CapturedTransferCursor cursor{};cursor.phase=CapturedTransferPhase::Acquired;
+            cursor.completed_epoch=5;cursor.acquired_message=message;
+            CapturedTransferPublication publication{};publication.epoch=5;
+            Status expected=Status::Cancelled;
+            if(fault==1){cursor.phase=CapturedTransferPhase::Failed;expected=Status::InvalidPhase;}
+            if(fault==2){++cursor.acquired_message.key;expected=Status::MessageMismatch;}
+            if(fault==3){publication.epoch=4;expected=Status::EpochMismatch;}
+            const auto epoch=publication.epoch;
+            const auto result=Protocol::preparePublication(cursor,publication,message,source,identity.nonce,identity.nonce);
+            EXPECT_EQ(result.status,expected);
+            EXPECT_EQ(publication.epoch,epoch);EXPECT_EQ(cursor.completed_epoch,5u);
+            EXPECT_EQ(Protocol::drainsCancellation(cursor.phase,result.status,true),fault==0);
+        }
+    }
+    CapturedTransferCursor cursor{};cursor.phase=CapturedTransferPhase::Acquired;cursor.acquired_message=message;
+    CapturedTransferPublication publication{};
+    EXPECT_TRUE(Protocol::preparePublication(cursor,publication,message,
+        CapturedTransferExtentSource::FixedMessage,0,identity.nonce).ready());
+    EXPECT_EQ(publication.epoch,1u);
+}

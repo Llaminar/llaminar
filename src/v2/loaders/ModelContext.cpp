@@ -11,6 +11,7 @@
  */
 
 #include "ModelContext.h"
+#include "ImmutableLookupSetupObservation.h"
 #include "models/GraphTypes.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 #include "backends/IWorkerGPUContext.h"
@@ -165,6 +166,12 @@ namespace llaminar2
         return found == resident_row_tables_.end() ? nullptr : found->second;
     }
 
+    std::shared_ptr<const ImmutableLookupSetupObservation> ModelContext::immutableLookupSetupObservation()const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        return immutable_lookup_setup_observation_;
+    }
+
     std::size_t ModelContext::residentImmutableRowTableBytes(DeviceId device) const
     {
         const auto table = residentImmutableRowTable(device);
@@ -213,8 +220,16 @@ namespace llaminar2
         {
             std::unique_lock lock(immutable_row_table_mutex_);
             const auto found=adaptive_lookup_consumers_.find(graph.default_device);
-            if(found==adaptive_lookup_consumers_.end() || !found->second.boundary)
-                throw std::logic_error("Remote participant preparation has no original ready source boundary");
+            if(found==adaptive_lookup_consumers_.end())
+                throw std::logic_error("Remote participant preparation has no original ready source entry");
+            if(!found->second.boundary)
+            {
+                auto retained=found->second.participants;
+                if(!retained)throw std::logic_error("Query-only reader has no original retained source participants");
+                lock.unlock();
+                retained->requireForPolicy(graph);
+                return;
+            }
             auto& consumer=found->second;
             while(consumer.participant_preparation &&
                   consumer.participant_preparation->state==ImmutableRowPreparationState::Preparing)
@@ -241,7 +256,14 @@ namespace llaminar2
         try{
             // Existing remote topology guards remain authoritative. A local
             // consumer set never substitutes replicas for a shared-owner request.
-            auto prepared=qwen4exp::PooledImmutableRetainedParticipants::create(boundary,graph);
+            const auto& placement=*graph.ngram_table_placement;
+            const auto geometry=placement.gpuAdaptiveLayout().adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
+                ? AdaptiveImmutableLookupGeometry::forRequester(placement.gpuAdaptiveLayout(),*immutable_row_table_source_,
+                    placement.gpuAdaptiveRequest(),{immutable_row_table_authority_->worldRank(),graph.default_device})
+                : AdaptiveImmutableLookupGeometry::fromLayout(placement.gpuAdaptiveLayout(),
+                    *immutable_row_table_source_,placement.gpuAdaptiveRequest());
+            auto prepared=qwen4exp::PooledImmutableRetainedParticipants::create(boundary,graph,
+                immutable_source_mpi_ ? immutable_source_mpi_->clusterInventory() : nullptr,geometry.readerGeometry());
             {std::lock_guard lock(immutable_row_table_mutex_);
              auto& consumer=adaptive_lookup_consumers_.at(graph.default_device);
              consumer.participants=std::move(prepared);
@@ -319,18 +341,75 @@ namespace llaminar2
         const auto &layout=placement.gpuAdaptiveLayout();
         const PhysicalMemoryAllocatorIdentity requester{authority->worldRank(),consumer};
         const bool independent=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal;
-        if((!independent && layout.consumers().size()!=1) ||
-            std::find(layout.consumers().begin(),layout.consumers().end(),requester)==layout.consumers().end() ||
+        const bool shared=!independent && layout.consumers().size()>1;
+        if(std::find(layout.consumers().begin(),layout.consumers().end(),requester)==layout.consumers().end() ||
             placement.gpuAdaptiveRowElements()!=source.row_elements || !consumer.is_gpu() ||
             (setup && (setup->device!=consumer || !setup->stream || reinterpret_cast<std::uintptr_t>(setup->stream)<=2)))
             throw std::invalid_argument("Adaptive setup requires the exact sealed native source and original GPU worker stream");
         const auto host=layout.sourceServices().front().allocator;
         const auto nativeSource=nativeContextPreparation();
+        if(shared)
+        {
+            const auto sourceLayout=AdaptiveImmutableLookupGeometry::sourceLayout(layout,placement.gpuAdaptiveRequest());
+            const auto coordinator=sourceLayout.consumers().front();
+            if(requester!=coordinator)
+            {
+                // The actual factory prepares the genuine coordinator policy
+                // first. A foreign graph receives no substitute source owner.
+                if(!nativeSource)
+                    throw std::logic_error("Shared PLE reader requires its original prepared worker source");
+                const auto permit=nativeSource->acquire(consumer);
+                if(permit.worker()->ownsCurrentThread() || !setup ||
+                    setup->stream!=permit.worker()->defaultStream())
+                    throw std::logic_error("Shared PLE reader requires cold preparation on its exact original stream");
+                std::lock_guard lock(immutable_row_table_mutex_);
+                if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+                const auto original=adaptive_lookup_consumers_.find(coordinator.device);
+                if(!nativeSource || nativeSource->memory().get()!=authority.get() ||
+                    nativeSource->memory().owner_before(authority) || authority.owner_before(nativeSource->memory()) ||
+                    !immutable_row_table_placement_ || *immutable_row_table_placement_!=placement ||
+                    immutable_row_table_authority_.get()!=authority.get() ||
+                    immutable_row_table_authority_.owner_before(authority) || authority.owner_before(immutable_row_table_authority_) ||
+                    !immutable_row_table_source_ || *immutable_row_table_source_!=source ||
+                    original==adaptive_lookup_consumers_.end() || !original->second.boundary ||
+                    !original->second.participants)
+                    throw std::logic_error("Shared PLE reader requires its genuine coordinator source prepared first");
+                const auto retained=original->second.participants;
+                retained->requireCurrent();
+                const auto transport=retained->transport();
+                if(!transport->readerGeometry() || transport->readerGeometry()->coordinator()!=coordinator ||
+                    std::none_of(transport->readers().begin(),transport->readers().end(),[&](const auto& reader){
+                        return reader->originalReader().device()==consumer;
+                    }))
+                    throw std::logic_error("Shared PLE reader changed its original source transport membership");
+                const auto [entry,inserted]=adaptive_lookup_consumers_.try_emplace(consumer);
+                if(!inserted && (entry->second.boundary || entry->second.participants!=retained))
+                    throw std::logic_error("Shared PLE reader cannot replace its original source authority");
+                entry->second.participants=retained;
+                immutable_row_table_preparations_.insert_or_assign(consumer,
+                    ImmutableRowPreparation{ImmutableRowPreparationState::Ready,std::this_thread::get_id()});
+                return;
+            }
+        }
         std::vector<PhysicalMemoryAllocatorIdentity> orderedOwners;
         const auto& requestedOwners=placement.gpuAdaptiveRequest().placement;
         if(requestedOwners.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
         {
             requestedOwners.validate();
+            const bool needsPeerObservation = std::any_of(requestedOwners.owners.begin(), requestedOwners.owners.end(),
+                [&](const auto& owner) {
+                    return owner.participant != *requestedOwners.coordinator &&
+                        owner.participant.backend == requestedOwners.coordinator->backend;
+                });
+            if (needsPeerObservation) {
+                const auto inventory = immutable_source_mpi_ ? immutable_source_mpi_->clusterInventory() : nullptr;
+                if (!inventory || immutable_source_mpi_->rank() != authority->worldRank())
+                    throw std::logic_error("NoPeer pooled source requires its original rank inventory owner");
+                const auto original = ImmutableRowTableDirectedTransportPolicy::observe(requestedOwners,
+                    inventory->getRank(authority->worldRank()));
+                if (original != layout.peerAccess())
+                    throw std::logic_error("Pooled source changed its original declared peer coverage");
+            }
             // Layout metadata canonicalizes allocator keys. The executable
             // physical coordinate order remains the authored owner request,
             // including C0 participants, and fromLayout authenticates both.
@@ -354,8 +433,10 @@ namespace llaminar2
             for(const auto& owner:orderedOwners){
                 if(owner.world_rank!=authority->worldRank())
                     throw std::invalid_argument("Cross-rank source requires its admitted native rank factory");
-                if(owner!=requester && owner.device.type==consumer.type)
-                    throw std::invalid_argument("Same-vendor remote source requires its admitted native SDK factory; mapped replacement forbidden");
+                // The original inventory observation above selects an explicit
+                // mapped or peer route. Reuse the same policy validator here;
+                // a same-vendor endpoint is never an automatic peer fallback.
+                ImmutableRowTableDirectedTransportPolicy::require(requester,owner,layout.peerAccess());
                 participantPermits.push_back(nativeSource->acquire(owner.device));
             }
             if(coordinatorPermit->worker()->ownsCurrentThread() ||
@@ -441,7 +522,8 @@ namespace llaminar2
                 auto provider=HostImmutableRowProvider::fromSubordinateAdaptiveCache(
                     CpuAdaptiveImmutableRowCache::create(source,host_geometry,authority));
                 std::vector<DeviceId> consumers;
-                for(const auto& original:layout.consumers())consumers.push_back(original.device);
+                if(shared)consumers.push_back(consumer);
+                else for(const auto& original:layout.consumers())consumers.push_back(original.device);
                 auto service=qwen4exp::ImmutableLookupService::create(provider,geometry.channelLayout(),
                     consumers,authority,host.device,
                     takeRetainedHostService({authority->worldRank(),placement.lookupIOConsumer(consumer)},
@@ -508,7 +590,7 @@ namespace llaminar2
 #endif
                 if(!code)throw std::invalid_argument("Adaptive coordinator requires its compiled original native backend");
                 code->initialize(*coordinator,setup->stream);
-                const auto packets=qwen4exp::PooledImmutableSourceGeometry::fromPlans(ownerPlans,policyPlan,source);
+                const auto packets=qwen4exp::PooledImmutableSourceGeometry::fromPlans(ownerPlans,policyPlan,source,geometry.computeReaderCount());
                 boundary=qwen4exp::ImmutableLookupExecutionBoundary::createPooled(
                     service,packets,std::move(owners),std::move(coordinator),authority,setup->stream);
                 if(nativeSource)boundary->pooledStorage()->bindPreparedSourceWorkers(nativeSource,*coordinatorPermit,participantPermits);
@@ -708,16 +790,32 @@ namespace llaminar2
             if(!source || !provider || !service || !resident_row_tables_.empty() ||
                 adaptive_lookup_consumers_.size()!=placement.consumers().size())
                 throw std::logic_error("Ready adaptive model lost its exact consumer/source population");
+            const auto& fullLayout=placement.gpuAdaptiveLayout();
+            const bool shared=fullLayout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator &&
+                placement.consumers().size()>1;
+            const auto sourceLayout=shared
+                ? AdaptiveImmutableLookupGeometry::sourceLayout(fullLayout,placement.gpuAdaptiveRequest()) : fullLayout;
+            const auto expectedRequesters=sourceLayout.consumers();
             const auto requesters=provider->subordinateRequesters();
-            if(requesters.size()!=placement.consumers().size() ||
-                !std::equal(requesters.begin(),requesters.end(),placement.consumers().begin()))
+            if(requesters.size()!=expectedRequesters.size() ||
+                !std::equal(requesters.begin(),requesters.end(),expectedRequesters.begin()))
                 throw std::logic_error("Ready adaptive source has a different declared requester set");
             std::vector<std::pair<DeviceId,std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary>>> boundaries;
             for(const auto& consumer:placement.consumers())
             {
                 const auto found=adaptive_lookup_consumers_.find(consumer.device);
-                if(found==adaptive_lookup_consumers_.end() || !found->second.boundary)
-                    throw std::logic_error("Ready adaptive model omitted an original consumer boundary");
+                if(found==adaptive_lookup_consumers_.end())
+                    throw std::logic_error("Ready adaptive model omitted an original consumer entry");
+                if(shared && consumer!=expectedRequesters.front())
+                {
+                    const auto original=adaptive_lookup_consumers_.find(expectedRequesters.front().device);
+                    if(found->second.boundary || original==adaptive_lookup_consumers_.end() ||
+                        !found->second.participants || found->second.participants!=original->second.participants)
+                        throw std::logic_error("Ready query-only reader replaced its original shared source");
+                    continue;
+                }
+                if(!found->second.boundary)
+                    throw std::logic_error("Ready adaptive source omitted its original boundary");
                 boundaries.emplace_back(consumer.device,found->second.boundary);
             }
             lock.unlock();
@@ -737,6 +835,14 @@ namespace llaminar2
                     host.allocator()!=layout.sourceServices().front().allocator || host.hostPlacement()!=placement.hostPlacement())
                     throw std::logic_error("Ready mixed source/channel claims differ from the original placement/PMA");
             }
+            std::vector<std::shared_ptr<const qwen4exp::PooledImmutableSourcePreparedStorage>> originalSources;
+            for(const auto& [device,boundary]:boundaries)originalSources.push_back(boundary->pooledStorage());
+            const auto& request=placement.gpuAdaptiveRequest();
+            const auto hostGeometry=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
+                ? AdaptiveImmutableLookupGeometry::sharedHostGeometry(layout,request)
+                : AdaptiveImmutableLookupGeometry::fromLayout(layout,*source,request).host();
+            auto admitted=std::make_shared<const ImmutableLookupSetupObservation>(ImmutableLookupSetupObservation::captureAdaptive(
+                layout,hostGeometry,service,originalSources));
             lock.lock();
             if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
             if(host_row_provider_!=provider || adaptive_lookup_service_!=service)
@@ -744,6 +850,12 @@ namespace llaminar2
             for(const auto& [device,boundary]:boundaries)
                 if(adaptive_lookup_consumers_.at(device).boundary!=boundary)
                     throw std::logic_error("Adaptive consumer boundary changed during readiness validation");
+            if(immutable_lookup_setup_observation_ && !immutable_lookup_setup_observation_->sameCapacity(*admitted))
+                throw std::logic_error("Ready lookup setup replaced its original admitted capacity evidence");
+            if(!immutable_lookup_setup_observation_) {
+                immutable_lookup_setup_observation_=std::move(admitted);
+                immutable_lookup_setup_observation_->publish();
+            }
             return;
         }
         if (placement.isFixedHeadShards() || (!placement.isHostAdaptive() && !placement.isGPUAdaptive() && placement.storage()==ImmutableRowStorage::VRAM))
@@ -829,7 +941,7 @@ namespace llaminar2
                                std::shared_ptr<WeightPlacementMap> placement_map,
                                TensorFactory *factory,
                                WeightDistributionStrategy strategy)
-        : model_path_(model_path), loader_(factory)
+        : model_path_(model_path), immutable_source_mpi_(mpi_ctx), loader_(factory)
     {
         // WeightManager will be created after model is loaded (see create())
         // placement_map is passed through to WeightManager

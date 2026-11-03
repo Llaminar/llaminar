@@ -14,25 +14,14 @@
 #include "memory/BufferArena.h"
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "fixtures/execution/RetainedGraphParticipantsReplayAccess.h"
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include "collective/LocalTPContext.h"
+#include <array>
 namespace llaminar2::test {
-/** @brief Closed construction of the same actual group body with CPU-only worker jobs. */
-struct RetainedGraphParticipantsReplayAccess {
-    /** @brief Exercise the actual first-capture caller body, not a copied preparation helper. */
-    static void authenticateRecording(DeviceGraphExecutor& executor,ComputeGraph& graph,DeviceGraphExecutor::GraphSegmentCache& cache,IWorkerGPUContext* worker){executor.authenticateRetainedParticipantRecordingOwner(graph,cache,worker);}
-    static void bindPreparation(DeviceGraphExecutor& executor,ComputeGraph& graph,DeviceGraphExecutor::GraphSegmentCache& cache,IWorkerGPUContext* worker){executor.bindRetainedParticipantPreparationStream(graph,cache,worker);}
-
-    static std::shared_ptr<RetainedGraphParticipantPreparationStream> preparation(PreparedGPUContextUsePermit original,void* stream){
-        return std::shared_ptr<RetainedGraphParticipantPreparationStream>(new RetainedGraphParticipantPreparationStream(std::move(original),stream));
-    }
-    static void retire(RetainedGraphParticipantPreparationStream& original){original.retire();}
-    static std::unique_ptr<RetainedGraphParticipantEnqueueGroup> group(std::vector<RetainedGraphParticipantEnqueueGroup::Job> jobs){
-        return std::unique_ptr<RetainedGraphParticipantEnqueueGroup>(new RetainedGraphParticipantEnqueueGroup(std::move(jobs)));
-    }
-};
 /** @brief Genuine asynchronous CPU executor; synchronous submit emulation would mask the regression. */
 class EnqueueReplayWorker final:public testing::MockWorkerGPUContext {
 public:
@@ -145,11 +134,12 @@ public:
  }
  std::uint64_t captureIdentity()const noexcept override{return 19;}
  void authenticateRecordingOwner(const IGPUGraphCapture& actual)const override{
-  EXPECT_TRUE(original_.worker()->ownsCurrentThread());EXPECT_EQ(actual.executionStream(),prepared->stream());++recordings;
+  EXPECT_TRUE(original_.worker()->ownsCurrentThread());const auto current=prepared.lock();if(!current)throw std::logic_error("Cold recorder lost its original cache token");EXPECT_EQ(actual.executionStream(),current->stream());++recordings;
  }
  std::shared_ptr<IRetainedGraphParticipantInvocation> bindOriginalSource(const RetainedGraphParticipantSourceSeal&)const override{throw std::logic_error("Cold caller replay never submits a model");}
  mutable unsigned preparations=0,recordings=0;
- mutable std::shared_ptr<const RetainedGraphParticipantPreparationStream> prepared;
+ // Production retains preparation observers weakly: each token owns its source plan.
+ mutable std::weak_ptr<const RetainedGraphParticipantPreparationStream> prepared;
 private:PreparedGPUContextUsePermit original_;
 };
 /** @brief Recorded dispatch uses the same worker entry convention; broken queue tests cannot forge ownership. */
@@ -179,15 +169,16 @@ TEST(RetainedGraphParticipantEnqueueGroup, ColdOriginalPreparationMarshalsOffWor
    EXPECT_FALSE(worker->ownsCurrentThread());const auto before=worker->submissions;
    RetainedGraphParticipantsReplayAccess::bindPreparation(executor,graph,cache,worker);
    RetainedGraphParticipantsReplayAccess::authenticateRecording(executor,graph,cache,worker);
-   EXPECT_EQ(worker->submissions,before+2);EXPECT_EQ(plan->preparations,1u);EXPECT_EQ(plan->recordings,1u);EXPECT_EQ(plan->prepared->stream(),exact);
-   const auto first=plan->prepared;
+   EXPECT_EQ(worker->submissions,before+2);EXPECT_EQ(plan->preparations,1u);EXPECT_EQ(plan->recordings,1u);EXPECT_EQ(plan->prepared.lock()->stream(),exact);
+   auto first=plan->prepared.lock();
    worker->submitAndWait([&]{const auto inlineBefore=worker->submissions;
     RetainedGraphParticipantsReplayAccess::bindPreparation(executor,graph,cache,worker);
     RetainedGraphParticipantsReplayAccess::authenticateRecording(executor,graph,cache,worker);
     EXPECT_EQ(worker->submissions,inlineBefore);
    });
-   EXPECT_EQ(first,plan->prepared);EXPECT_EQ(plan->preparations,2u);EXPECT_EQ(plan->recordings,2u);
+   EXPECT_EQ(first,plan->prepared.lock());EXPECT_EQ(plan->preparations,2u);EXPECT_EQ(plan->recordings,2u);
    cache.reset();EXPECT_THROW(first->requireLive(original),std::logic_error);
+   first.reset();EXPECT_TRUE(plan->prepared.expired())<<"Only the original cache/scoped borrow may retain its token";
   }
  }
 }
@@ -212,7 +203,7 @@ TEST(RetainedGraphParticipantEnqueueGroup, ColdOriginalPreparationRejectsForeign
   cache.retained_parent_capture=std::make_unique<testing::MockGPUGraphCapture>(reinterpret_cast<void*>(0x8172));
   ASSERT_TRUE(cache.retained_parent_capture->beginCapture());ASSERT_TRUE(cache.retained_parent_capture->endCapture());ASSERT_TRUE(cache.retained_parent_capture->instantiate());
   EXPECT_THROW(RetainedGraphParticipantsReplayAccess::authenticateRecording(executor,graph,cache,worker),std::invalid_argument);
-  EXPECT_EQ(plan->recordings,0u);cache.reset();
+  EXPECT_EQ(plan->recordings,0u);cache.reset();EXPECT_TRUE(plan->prepared.expired());
  }
 }
 
@@ -299,3 +290,5 @@ TEST(RetainedGraphParticipantEnqueueGroup, SetupRecorderFailureAbortsWithoutComp
 }
 
 }
+
+#include "LocalTPCaptureSourceDefinitionReplay.inc"

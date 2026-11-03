@@ -41,8 +41,7 @@ std::shared_ptr<PooledImmutableSourcePreparedStorage> PooledImmutableSourcePrepa
         throw std::invalid_argument("Pooled source replaced its original complete coordinator/cohort");
     for(const auto& owner:owners)if(owner && owner->plan().allocator()!=coordinator->plan().allocator()){
         const auto a=owner->plan().allocator(),c=coordinator->plan().allocator();
-        if(a.world_rank!=c.world_rank || !a.device.is_gpu() || !c.device.is_gpu() || a.device.type==c.device.type)
-            throw std::invalid_argument("Native/rank source fill requires its qualified admitted native transport/factory; mapped replacement forbidden");
+        ImmutableRowTableDirectedTransportPolicy::require(c, a, owner->plan().peerAccess());
     }
     coordinator->requireAuthority(memory);coordinator->captureIdentity();
     for(std::size_t i=0;i<owners.size();++i){

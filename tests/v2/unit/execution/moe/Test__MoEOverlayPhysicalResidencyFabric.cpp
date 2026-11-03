@@ -1866,3 +1866,49 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, CPUHostMaintenanceRejectsForeignSc
     EXPECT_THROW(MoEOverlayCPUHostMaintenance{config}, std::invalid_argument);
     EXPECT_EQ(fixture.liveShadows(), 0u);
 }
+
+/** @brief Unpriced GPU endpoints stay empty; priced missing sources fail before native admission. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, PreparedGPUServiceMissingResidentClassIsNotFabricated)
+{
+    for (bool rocm : {false, true})
+    {
+        auto plan = twoCpuTierPlan({1, 1}, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+        plan.domains.front().participants = {rocm ? GlobalDeviceAddress::rocm(0) : GlobalDeviceAddress::cuda(0)};
+        plan.domains.front().backend = rocm ? CollectiveBackendType::RCCL : CollectiveBackendType::NCCL;
+        MoEOverlayParticipantResidencyRegistry registry({
+            .owner_map = MoEExpertOwnerMap::build(plan), .local_participant_ids = {0},
+            .num_layers = 1, .num_experts = 2, .initial_epoch = 1,
+            .collect_economy_service_measurements = true});
+        const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
+            oneLayerExpertModel(GGUFTensorType::Q4_0, 2), 1, 2);
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifest);
+        const auto resource = admitCpuShadowPools(sourceProjectionSpecs().front().format, 2, 1)
+            .authority->admission()->plan().resources().front().resource();
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, 1);
+        auto memory = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+        const ExpertHistogramProductionTopology priced({{true, true, true}}, {{false, true, false}});
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> zero{{.participant_id = 0, .layer = 0}};
+        const auto gaps = catalog.serviceEvidenceGaps(zero, {0}, priced);
+        ASSERT_EQ(gaps.size(), 1u); // Reachable unpriced phases author no obligation.
+        EXPECT_EQ(gaps.front().source, ExpertHistogramSource::PrefillChunk);
+        MoEOverlayParticipantResidencyRegistry idle({
+            .owner_map = MoEExpertOwnerMap::build(plan), .local_participant_ids = {},
+            .num_layers = 1, .num_experts = 2, .initial_epoch = 1,
+            .collect_economy_service_measurements = true});
+        EXPECT_TRUE(MoEOverlayCPUServiceMeasurement::measure(idle, 1, catalog,
+            priced, {.d_model = 64, .intermediate = 32}, memory).empty());
+        try
+        {
+            (void)MoEOverlayCPUServiceMeasurement::measure(registry, 1, catalog,
+                priced, {.d_model = 64, .intermediate = 32}, memory);
+            FAIL() << "Priced absent resident source was accepted";
+        }
+        catch (const std::logic_error &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("priced class has no complete resident source"), std::string::npos);
+            EXPECT_NE(std::string(error.what()).find("participant=0"), std::string::npos);
+        }
+    }
+}

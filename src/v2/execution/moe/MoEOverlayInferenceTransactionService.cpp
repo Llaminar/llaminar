@@ -214,7 +214,8 @@ namespace llaminar2
             }
             for (std::size_t earlier = 0u; earlier < index; ++earlier)
             {
-                if (segments_[earlier].world_rank == segment.world_rank)
+                if (segments_[earlier].world_rank == segment.world_rank &&
+                    segments_[earlier].role == segment.role)
                     return false;
             }
             if (segment.role ==
@@ -227,7 +228,17 @@ namespace llaminar2
                 ++follower_count;
             }
         }
-        return continuation_count == 1u && follower_count != 0u;
+        if (continuation_count != 1u || follower_count == 0u)
+            return false;
+        const int source_rank = continuationWorldRank();
+        return std::none_of(segments_.begin(), segments_.end(),
+            [source_rank](const Segment &segment)
+            {
+                return segment.role == MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower &&
+                       segment.world_rank == source_rank &&
+                       segment.materialization !=
+                           MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable;
+            });
     }
 
     std::size_t
@@ -310,14 +321,32 @@ namespace llaminar2
     MoEOverlayInferenceCoordinatorGraphPlan::segmentForWorldRank(
         int world_rank) const noexcept
     {
-        const auto found = std::find_if(
-            segments_.begin(),
-            segments_.end(),
-            [world_rank](const Segment &segment)
-            {
-                return segment.world_rank == world_rank;
-            });
-        return found == segments_.end() ? nullptr : &*found;
+        const Segment *result = nullptr;
+        for (const auto &segment : segments_)
+        {
+            if (segment.world_rank != world_rank)
+                continue;
+            if (result)
+                return nullptr;
+            result = &segment;
+        }
+        return result;
+    }
+
+    const MoEOverlayInferenceCoordinatorGraphPlan::Segment *
+    MoEOverlayInferenceCoordinatorGraphPlan::segmentForWorldRank(
+        int world_rank, MoEOverlayInferenceCoordinatorSegmentRole role) const noexcept
+    {
+        const Segment *result = nullptr;
+        for (const auto &segment : segments_)
+        {
+            if (segment.world_rank != world_rank || segment.role != role)
+                continue;
+            if (result)
+                return nullptr;
+            result = &segment;
+        }
+        return result;
     }
 
     /**
@@ -1132,7 +1161,8 @@ namespace llaminar2
         }
 
         const auto *const continuation_segment =
-            config_.graph_plan.segmentForWorldRank(source_rank);
+            config_.graph_plan.segmentForWorldRank(
+                source_rank, MoEOverlayInferenceCoordinatorSegmentRole::Continuation);
         if (!continuation_segment ||
             continuation_segment->role !=
                 MoEOverlayInferenceCoordinatorSegmentRole::Continuation ||
@@ -1156,7 +1186,7 @@ namespace llaminar2
             const auto &topology = publisher->topologyIdentity();
             const auto *const follower_segment =
                 config_.graph_plan.segmentForWorldRank(
-                    topology.target_world_rank);
+                    topology.target_world_rank, MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower);
             if (!follower_segment ||
                 follower_segment->role !=
                     MoEOverlayInferenceCoordinatorSegmentRole::

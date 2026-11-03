@@ -1089,6 +1089,30 @@ namespace llaminar2
         }
     }
 
+    namespace {
+    /**
+     * @brief Lower the declared source association through the existing cold host boundary.
+     * @param host Original graph execution host; retained callbacks never outlive this cold call.
+     * @param input Original prefill/decode input naming the existing boundary geometry.
+     * @param device Actual participant, without changing TP arithmetic membership order.
+     * @param decode Select the existing decode or prefill boundary operation.
+     * @param cache Original final-address graph/cache; ready replay creates no new callback.
+     * @return Original branch factory with an optional cold-only metadata callback.
+     */
+    GraphCaptureAuxiliaryBranchFactory sourceDefinitionBoundaryFactory(IForwardExecutionHost& host,
+        const ForwardInput& input,DeviceId device,bool decode,const ForwardGraphCache& cache){
+        auto factory=host.forwardGraphAuxiliaryBranchFactory(device);
+        // No new callback allocation or graph scan belongs to steady replay.
+        if(!cache.graph || !cache.graph->retainedParticipantDefinitionDomain() || cache.segment_cache.initialized)return factory;
+        factory.source_definition_boundary=[&host,&input,device,decode](const std::string& name,void* stream,
+            LocalTPCaptureSourceDefinition& handoff){
+            return decode?host.waitAtDecodeGraphCaptureBoundary(input,device,name,stream,handoff):
+                host.waitAtPrefillGraphCaptureBoundary(input,device,name,stream,handoff);
+        };
+        return factory;
+    }
+    }
+
     // =========================================================================
     // Construction
     // =========================================================================
@@ -3170,8 +3194,7 @@ namespace llaminar2
         try
         {
             capture_policy.auxiliary_branch_factory =
-                host.forwardGraphAuxiliaryBranchFactory(
-                    ctx->deviceId());
+                sourceDefinitionBoundaryFactory(host,input,ctx->deviceId(),true,forward_cache);
             const GraphNativeCaptureEnvelope native_capture_envelope =
                 forward_cache.graph->nativeCaptureEnvelope();
             std::string envelope_error;
@@ -3818,8 +3841,7 @@ namespace llaminar2
             try
             {
                 capture_policy.auxiliary_branch_factory =
-                    host.forwardGraphAuxiliaryBranchFactory(
-                        ctx->deviceId());
+                    sourceDefinitionBoundaryFactory(host,input,ctx->deviceId(),true,forward_cache);
                 std::string envelope_error;
                 if (!DeviceGraphCaptureController::
                         constrainReplayPolicyToNativeEnvelope(
@@ -4520,8 +4542,7 @@ namespace llaminar2
         try
         {
             prefill_capture_policy.auxiliary_branch_factory =
-                host.forwardGraphAuxiliaryBranchFactory(
-                    ctx->deviceId());
+                sourceDefinitionBoundaryFactory(host,input,ctx->deviceId(),false,forward_cache);
             std::string envelope_error;
             if (!DeviceGraphCaptureController::
                     constrainReplayPolicyToNativeEnvelope(
@@ -5633,6 +5654,13 @@ namespace llaminar2
 
         if (should_cache && build_cache)
         {
+            // Retire every previous capture/auxiliary/source borrower BEFORE
+            // replacing its graph or stable inputs. An invalid cache entry can
+            // still own a failed cold attempt's native objects. Reapply only
+            // immutable signature metadata after this original-owner teardown.
+            build_cache->invalidate();
+            bindGraphSnapshotArenaReusePolicy(*build_cache, signature);
+            build_cache->segment_cache.replay_workload = replayWorkloadGeometryForSignature(signature);
             const int total_tokens = effective_input.batch_size * effective_input.seq_len;
             if (effective_input.token_ids)
             {
@@ -5681,7 +5709,18 @@ namespace llaminar2
         }
 
         output = build_result.output();
-        ComputeGraph graph = build_result.takeGraph();
+        // Capture seals retain the ComputeGraph address, not just its stages.
+        // The existing INVALID entry owns its graph at the final heap address
+        // before workspace/capture callbacks. Only the original success boundary
+        // publishes validity. Failure erasure retires segment/source borrowers
+        // before graph destruction (ForwardGraphCache declaration order).
+        // Uncached execution retains its original stack allocation/lifetime.
+        std::optional<ComputeGraph> uncached_graph;
+        if (should_cache && build_cache)
+            build_cache->graph = std::make_unique<ComputeGraph>(build_result.takeGraph());
+        else
+            uncached_graph.emplace(build_result.takeGraph());
+        ComputeGraph &graph = should_cache && build_cache ? *build_cache->graph : *uncached_graph;
 
         // Native pipeline transport is an explicit graph operation. The
         // surrounding chunk/verifier prelude still owns local positions/real lengths;
@@ -5989,8 +6028,7 @@ namespace llaminar2
         if (should_cache && build_cache && atomic_gpu_graph_first_use &&
             effective_input.device.is_gpu())
         {
-            build_cache->graph =
-                std::make_unique<ComputeGraph>(std::move(graph));
+            // The original graph already occupies its final cache-owned address.
             build_cache->output = output;
             build_cache->workspace_generation = workspace_generation;
             build_cache->snapshot_configuration_epoch =
@@ -6338,7 +6376,7 @@ namespace llaminar2
         // Cache the graph for future matching forward signatures
         if (should_cache && build_cache && success)
         {
-            build_cache->graph = std::make_unique<ComputeGraph>(std::move(graph));
+            // The original graph already occupies its final cache-owned address.
             build_cache->output = output;
             build_cache->workspace_generation = workspace_generation;
             build_cache->snapshot_configuration_epoch =

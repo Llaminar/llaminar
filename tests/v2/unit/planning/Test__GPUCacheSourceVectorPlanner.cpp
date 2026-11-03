@@ -145,7 +145,11 @@ TEST(GPUCacheSourceVectorPlanner, OriginalTwoWorkerSourceFeedsFinalQFNPlanAtC0An
         const auto program=qwen4exp::PooledImmutableDirectedOwnerProgram::declare(geometry.physical(),geometry.coordinator(),1);
         EXPECT_THROW(eventOnly.remoteHostBOM(program,request->input.host(),source->originalResource(remote)),std::invalid_argument);
         const auto host=cfg.native_ordering_events.remoteHostBOM(program,request->input.host(),source->originalResource(remote));
-        EXPECT_GT(bytes(host,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeGraphExecutable),0u);
+        // Storage-definition metadata has its own admitted purpose. It must
+        // neither consume model graph capacity nor claim device payload here.
+        EXPECT_GT(bytes(host,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable),0u);
+        EXPECT_EQ(bytes(host,{0,remote},PhysicalMemoryOwner::NativeStorageGraphExecutable),0u);
+        EXPECT_EQ(bytes(host,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeGraphExecutable),0u);
         EXPECT_EQ(bytes(host,{0,remote},PhysicalMemoryOwner::NativeGraphExecutable),0u);
         PhysicalMemoryPlanBuilder optionalPlan(llaminar2::test::recordedNgramOptional(geometry,request->input.gpuResources(),request->input.host()));
         const auto remoteGrowth=qwen4exp::PooledImmutableRetainedParticipantBudget::slotDependentBOM(geometry,zero,request->input.host(),request->input.gpuResources(),cfg.native_ordering_events);

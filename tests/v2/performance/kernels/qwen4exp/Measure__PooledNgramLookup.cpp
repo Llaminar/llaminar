@@ -50,6 +50,7 @@
 #include <type_traits>
 #include <unistd.h>
 #include "backends/GPUDeviceProcessLifetime.h"
+#include "planning/ClusterInventoryGatherer.h"
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -155,13 +156,13 @@ Options options(int argc,char** argv){Options o;bool slots=false,tokens=false,ca
         requireProvider(o.placement=="cross_vendor","Authored remote calibration requires its explicit cross-vendor placement");
     }else{
         requireProvider(o.lifetimes==1 && !o.remoteHandshake,"Remote lifecycle observations require the explicit authored-remote diagnostic");
-        if(o.placement=="cross_vendor" && o.diagnosticProgram!=ProviderReplayDiagnosticProgram::OrdinaryLookup)
+        if((o.placement=="cross_vendor" || o.placement=="no_peer") && o.diagnosticProgram!=ProviderReplayDiagnosticProgram::OrdinaryLookup)
             throw std::invalid_argument("Cross-vendor program requires ordinary or explicitly authored-remote diagnostic; local side-lane composition is separate");
     }
 #endif
     if(!capacity)o.shape.capacity_tokens=o.shape.tokens;
     requireProvider(tokens&&o.shape.tokens&&slots&&o.continuation.is_gpu()&&o.samples&&o.samples<=200,"Explicit continuation/tokens/gpu-slots and bounded positive samples required");
-    requireProvider(o.placement=="local"||o.placement=="cross_vendor"||o.placement=="consumer_local","Placement must be local, cross_vendor or consumer_local");
+    requireProvider(o.placement=="local"||o.placement=="cross_vendor"||o.placement=="consumer_local"||o.placement=="no_peer","Placement must be local, cross_vendor, consumer_local or explicit no_peer");
     requireProvider(!o.mmapGeometryProvided || o.placement=="consumer_local",
         "Explicit mmap geometry is supported only by the ConsumerLocal actor");
     (void)ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,o.mmapWindowBytes,o.mmapWindowCount);
@@ -178,6 +179,8 @@ Options options(int argc,char** argv){Options o;bool slots=false,tokens=false,ca
     }else requireProvider(o.consumers.empty()&&!o.coldAttempt&&o.requests==1,"Grouped consumer/cold options require consumer_local placement");
     if(o.placement=="local"){requireProvider(!o.owner.is_valid()||o.owner==o.continuation,"Local pooled owner must be the continuation");o.owner=o.continuation;}
     else if(o.placement=="cross_vendor")requireProvider(o.owner.is_gpu()&&o.owner.type!=o.continuation.type,"Cross-vendor requires its actual opposite-vendor owner; native-peer substitution is forbidden");
+    else if(o.placement=="no_peer") requireProvider(o.owner.is_gpu()&&o.owner.type==o.continuation.type&&o.owner!=o.continuation,
+        "Explicit no_peer requires distinct same-vendor endpoints and original None discovery coverage");
     const auto ids=ngram_replay::ids(o.shape,ngram_replay::Pattern::DistinctA);const auto unique=ids.size();
     requireProvider(o.gpu_slots<=o.shape.table_rows,"Cache cannot exceed its declared original table rows");
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
@@ -342,7 +345,7 @@ template<class Actor>void measure(Actor& actor,ProviderFile& file,const Options&
         actor.validate(ids,declared.expected_hits);const auto observed=actor.observation();
         requireProvider(observed.live_ids==ids.size()&&observed.unique_ids==ngram_replay::uniqueCount(ids)&&(!declared.expected_hits || observed.gpu_hits==*declared.expected_hits),"Observed original workload differs from fixed trajectory");
         requireProvider(observed.source_rows+observed.gpu_hits==observed.unique_ids&&observed.source_native_bytes==observed.source_rows*ngram_replay::RowBytes,"Native source live extent disagrees with actual unique work");
-        nlohmann::json row={{"schema",1},{"production_program_qualified",!ProviderReplayRawDiagnostic},{"raw_native_program_diagnostic",ProviderReplayRawDiagnostic},{"kind",o.placement=="local"?"local_pooled":"cross_vendor_pooled"},{"continuation",o.continuation.toString()},{"owners",{o.owner.toString()}},
+        nlohmann::json row={{"schema",1},{"production_program_qualified",!ProviderReplayRawDiagnostic && o.placement!="no_peer"},{"raw_native_program_diagnostic",ProviderReplayRawDiagnostic},{"kind",o.placement=="local"?"local_pooled":(o.placement=="no_peer"?"no_peer_pooled_candidate":"cross_vendor_pooled")},{"continuation",o.continuation.toString()},{"owners",{o.owner.toString()}},
             {"format","IQ4_NL"},{"width",ngram_replay::Width},{"row_bytes",ngram_replay::RowBytes},{"tokens",observed.live_ids/16},{"capacity_tokens",o.shape.capacity_tokens},{"live_ids",observed.live_ids},{"unique_ids",observed.unique_ids},
             {"scenario",o.scenario},{"phase",declared.phase},{"gpu_slots",o.gpu_slots},{"ram_slots",o.ram_slots},{"sample",sample},{"event_us",event},{"wall_us",wall},
             {"gpu_hits",observed.gpu_hits},{"source_rows",observed.source_rows},{"promotions",observed.promotions},{"evictions",observed.evictions},{"source_native_bytes",observed.source_native_bytes},{"hit_wire_bytes",observed.hit_wire_bytes},
@@ -359,13 +362,13 @@ template<class Actor>void measure(Actor& actor,ProviderFile& file,const Options&
         std::cout<<"NGRAM_PERF_SAMPLE "<<row.dump()<<'\n';
     }
     const auto percentile=[](std::vector<double> values,std::size_t percent){std::sort(values.begin(),values.end());return values[(values.size()*percent+99)/100-1];};
-    std::cout<<"NGRAM_PERF_SUMMARY "<<nlohmann::json{{"schema",1},{"kind",o.placement=="local"?"local_pooled":"cross_vendor_pooled"},
+    std::cout<<"NGRAM_PERF_SUMMARY "<<nlohmann::json{{"schema",1},{"kind",o.placement=="local"?"local_pooled":(o.placement=="no_peer"?"no_peer_pooled_candidate":"cross_vendor_pooled")},
         {"continuation",o.continuation.toString()},{"scenario",o.scenario},{"samples",o.samples},{"latency_unit","microseconds_per_completed_lookup_request"},
         {"wall_p50_us",percentile(wallSamples,50)},{"wall_p95_us",percentile(wallSamples,95)},{"wall_max_us",*std::max_element(wallSamples.begin(),wallSamples.end())},
         {"event_p50_us",percentile(eventSamples,50)},{"event_p95_us",percentile(eventSamples,95)},{"event_max_us",*std::max_element(eventSamples.begin(),eventSamples.end())},
         {"quantile_method","nearest_rank_small_sample_diagnostic_raw_samples_retained"},{"per_row_amortization_primary",false}}.dump()<<'\n';
     const auto closing=std::chrono::steady_clock::now();actor.close();const auto closed=std::chrono::steady_clock::now();
-    std::cout<<"NGRAM_PERF_TERMINAL "<<nlohmann::json{{"schema",1},{"kind",o.placement=="local"?"local_pooled":"cross_vendor_pooled"},
+    std::cout<<"NGRAM_PERF_TERMINAL "<<nlohmann::json{{"schema",1},{"kind",o.placement=="local"?"local_pooled":(o.placement=="no_peer"?"no_peer_pooled_candidate":"cross_vendor_pooled")},
         {"continuation",o.continuation.toString()},{"scenario",o.scenario},{"terminal_close_us",std::chrono::duration<double,std::micro>(closed-closing).count()},
         {"scope","captured_service_terminal_close_and_original_worker_join_outside_lookup_timing"}}.dump()<<'\n';
 }

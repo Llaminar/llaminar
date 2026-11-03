@@ -1627,3 +1627,148 @@ TEST(PerfStatsCollector, BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy
         (PerfStatsCollector::CounterObservationBatch{.observations=2u, .value=0.0})),std::logic_error);
     PerfStatsCollector::reset();
 }
+
+namespace {
+/**
+ * @brief Replay the three real producer schemas through the actual bounded collector.
+ * @param repeatedDepth Add a later admission at the original first depth with distinct epoch/workspace.
+ * @param reorderSubmission Reverse only the actual first-branch witness producer order.
+ * @param dropObservation Omit only the final repeated-depth observation witness.
+ * @return Existing certified transactions plus actual collected continuation admission records.
+ */
+std::vector<PerfStatRecord> hostedContinuationAdmissionRecords(
+    bool repeatedDepth=false, bool reorderSubmission=false, bool dropObservation=false)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    const std::vector<uint64_t> depths=repeatedDepth?std::vector<uint64_t>{1,3,1}:std::vector<uint64_t>{1,3};
+    for(const auto* device:{"ROCm:0","ROCm:1"}) {
+        for(size_t step=0;step<depths.size();++step){
+            const auto depth=depths[step];
+            const auto epoch=40+step,workspace=70+step;
+            const auto depthText=std::to_string(depth),rows=std::to_string(depth+1);
+            PerfStatsCollector::addCounterWithSequence("mtp","device_generation_continuation_admission_tickets",1.0,
+                {0,epoch,workspace},"decode",device,{{"depth",depthText},{"physical_rows",rows},{"family","exact_rows"},
+                {"entry_source","native_continue_response_admission"}});
+            if(!(dropObservation && step==2))
+            PerfStatsCollector::addCounterWithSequence("mtp","device_generation_dispatch_tickets_observed",1.0,
+                {0,epoch,workspace},"decode",device,{{"next_depth",depthText},{"physical_rows",rows},{"family","exact_rows"},
+                {"entry_source","native_continue_response_admission"},{"complete","false"},{"maintenance_due","false"}});
+            if(!reorderSubmission)
+            PerfStatsCollector::addCounterWithSequence("mtp","hosted_device_generation_transaction_submissions",1.0,
+                {0,epoch,workspace},"decode",device,{{"depth",depthText},{"physical_rows",rows},{"family","exact_rows"},
+                {"entry_source","native_continue_response_admission"},{"fragments","5"},
+                {"dynamic_depth_source","device_controller_ticket"}});
+        }
+        if(reorderSubmission)for(size_t remaining=depths.size();remaining>0;--remaining){
+            const auto step=remaining-1,depth=depths[step];
+            PerfStatsCollector::addCounterWithSequence("mtp","hosted_device_generation_transaction_submissions",1.0,
+                {0,40+step,70+step},"decode",device,{{"depth",std::to_string(depth)},
+                {"physical_rows",std::to_string(depth+1)},{"family","exact_rows"},
+                {"entry_source","native_continue_response_admission"},{"fragments","5"},
+                {"dynamic_depth_source","device_controller_ticket"}});
+        }
+    }
+    auto records=certifiedHostedTicketRecords();
+    for(auto& record:records)
+        if(record.name=="device_generation_dispatch_ticket_d2h_submissions")record.value+=depths.size();
+    const auto admissions=PerfStatsCollector::snapshot();
+    records.insert(records.end(),admissions.begin(),admissions.end());
+    PerfStatsCollector::reset();
+    return records;
+}
+}
+
+/** @test Native admission ticket zero is authenticated separately from completed transactions. */
+TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionHasExactIndependentWitnesses)
+{
+    const auto records=hostedContinuationAdmissionRecords();
+    const auto evidence=collectProductionDeviceGenerationEvidence(records);
+    EXPECT_TRUE(evidence.hosted_ticket_boundary_certified)<<evidence.certification_detail;
+    EXPECT_TRUE(collectProductionDeviceGenerationEvidence(certifiedHostedTicketRecords()).hosted_ticket_boundary_certified);
+}
+
+/** @test Missing, foreign, stale or relabelled admission evidence cannot hide a lost committed transaction. */
+TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionRejectsIncompleteAndForeignEvidence)
+{
+    for(unsigned mutation=0;mutation<22;++mutation){
+        SCOPED_TRACE(mutation);
+        auto records=hostedContinuationAdmissionRecords();
+        const auto find=[&](const char* name){return std::find_if(records.begin(),records.end(),[&](const auto& record){
+            const auto entry=record.tags.find("entry_source");
+            return record.device=="ROCm:0" && record.name==name && entry!=record.tags.end() &&
+                entry->second=="native_continue_response_admission";
+        });};
+        auto observed=find("device_generation_dispatch_tickets_observed");
+        auto admission=find("device_generation_continuation_admission_tickets");
+        auto submitted=find("hosted_device_generation_transaction_submissions");
+        ASSERT_NE(observed,records.end());ASSERT_NE(admission,records.end());ASSERT_NE(submitted,records.end());
+        switch(mutation){
+        case 0:records.erase(admission);break;
+        case 1:records.erase(observed);break;
+        case 2:records.erase(submitted);break;
+        case 3:++observed->sequence_digest_lo;break;
+        case 4:++submitted->sequence_digest_hi;break;
+        case 5:observed->sequence_minimum_words[1]=0;break;
+        case 6:observed->sequence_minimum_words[2]=0;break;
+        case 7:observed->sequence_maximum_words[0]=1;break;
+        case 8:observed->sequence_word_count=1;break;
+        case 9:observed->tags["physical_rows"]="99";break;
+        case 10:observed->tags["complete"]="true";break;
+        case 11:observed->tags["maintenance_due"]="true";break;
+        case 12:observed->tags["entry_source"]="unknown";break;
+        case 13:submitted->tags["dynamic_depth_source"]="host";break;
+        case 14:observed->tags["transaction"]="0";break;
+        case 15:records.push_back(*admission);break;
+        case 16:for(auto& record:records)if(record.device=="ROCm:0"&&record.name=="device_generation_dispatch_ticket_d2h_submissions")--record.value;break;
+        case 17:for(auto& record:records)if(record.device=="ROCm:0"&&record.name=="device_generation_terminal_transactions")--record.value;break;
+        case 18:observed->device="ROCm:7";break;
+        case 19:observed->tags.erase("entry_source");break;
+        case 20:observed->phase="prefill";break;
+        case 21:observed->tags["next_depth"]="0";break;
+        }
+        EXPECT_FALSE(collectProductionDeviceGenerationEvidence(records).hosted_ticket_boundary_certified);
+    }
+}
+
+
+/** @test Same-depth admissions aggregate their distinct epochs in the same original producer order. */
+TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionAggregatesRepeatedDepthEpochs)
+{
+    const auto records=hostedContinuationAdmissionRecords(true);
+    unsigned repeated=0;
+    for(const auto& record:records){
+        if(record.name!="device_generation_continuation_admission_tickets" || record.tags.at("depth")!="1")continue;
+        ++repeated;
+        EXPECT_EQ(record.count,2u);EXPECT_EQ(record.value,2.0);EXPECT_EQ(record.sequence_word_count,6u);
+        EXPECT_EQ(record.sequence_minimum_words,(std::vector<uint64_t>{0,40,70}));
+        EXPECT_EQ(record.sequence_maximum_words,(std::vector<uint64_t>{0,42,72}));
+    }
+    EXPECT_EQ(repeated,2u);
+    const auto evidence=collectProductionDeviceGenerationEvidence(records);
+    EXPECT_TRUE(evidence.hosted_ticket_boundary_certified)<<evidence.certification_detail;
+}
+
+/** @test Equal-depth witness loss or reordering cannot be hidden by equal aggregate ranges. */
+TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionRejectsDroppedOrReorderedEpochWitness)
+{
+    for(const bool reorder:{false,true}){
+        const auto records=hostedContinuationAdmissionRecords(true,reorder,!reorder);
+        if(reorder){
+            const auto find=[&](const char* name)->const PerfStatRecord&{
+                return *std::find_if(records.begin(),records.end(),[&](const auto& record){
+                    const auto entry=record.tags.find("entry_source"),depth=record.tags.find("depth");
+                    return record.device=="ROCm:0" && record.name==name && entry!=record.tags.end() &&
+                        entry->second=="native_continue_response_admission" && depth!=record.tags.end() && depth->second=="1";
+                });
+            };
+            const auto& admission=find("device_generation_continuation_admission_tickets");
+            const auto& submission=find("hosted_device_generation_transaction_submissions");
+            EXPECT_EQ(admission.count,submission.count);
+            EXPECT_EQ(admission.sequence_minimum_words,submission.sequence_minimum_words);
+            EXPECT_EQ(admission.sequence_maximum_words,submission.sequence_maximum_words);
+            EXPECT_NE(admission.sequence_digest_lo,submission.sequence_digest_lo);
+        }
+        EXPECT_FALSE(collectProductionDeviceGenerationEvidence(records).hosted_ticket_boundary_certified)<<reorder;
+    }
+}

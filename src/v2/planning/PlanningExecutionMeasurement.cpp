@@ -11,6 +11,8 @@
 #include "planning/PlanningExecutionMeasurement.h"
 #include "backends/IBackend.h"
 #include "backends/IGPUGraphCapture.h"
+#include "backends/RetainedParticipantGraphExecutable.h"
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <stdexcept>
@@ -36,13 +38,17 @@ namespace llaminar2
         {
         public:
             /** @brief Create on the exact backend device; missing timing support is fatal. */
-            TimingEvent(IBackend &backend, int ordinal) : backend_(backend), ordinal_(ordinal),
-                event_(backend.createTimingEvent(ordinal))
+            TimingEvent(IBackend &backend, int ordinal,
+                std::function<void(const std::function<void()> &)> dispatch = [](const auto &operation) { operation(); },
+                void* borrowed = nullptr)
+                : backend_(backend), ordinal_(ordinal), dispatch_(std::move(dispatch)), borrowed_(borrowed!=nullptr)
             {
+                if(borrowed)event_=borrowed;
+                else dispatch_([&] { event_ = backend_.createTimingEvent(ordinal_); });
                 if (!event_) throw std::runtime_error("Planning measurement could not create a timing event");
             }
             /** @brief Retire only this owned event; never synchronize an entire stream. */
-            ~TimingEvent() { backend_.destroyEvent(event_, ordinal_); }
+            ~TimingEvent() { if(!borrowed_)dispatch_([&] { backend_.destroyEvent(event_, ordinal_); }); }
             TimingEvent(const TimingEvent &) = delete;
             TimingEvent &operator=(const TimingEvent &) = delete;
             /** @return Borrowed handle for elapsed-time calculation after completion. */
@@ -50,7 +56,9 @@ namespace llaminar2
             /** @brief Record on the producer's exact stream, rejecting submission errors. */
             void record(ExplicitGPUStream stream)
             {
-                if (!backend_.recordEvent(event_, ordinal_, stream.get()))
+                bool recorded = false;
+                dispatch_([&] { recorded = backend_.recordEvent(event_, ordinal_, stream.get()); });
+                if (!recorded)
                     throw std::runtime_error("Planning measurement event record failed");
             }
             /**
@@ -66,7 +74,9 @@ namespace llaminar2
                 for (;;)
                 {
                     bool ready = false;
-                    if (!backend_.queryEvent(event_, ordinal_, &ready))
+                    bool queried = false;
+                    dispatch_([&] { queried = backend_.queryEvent(event_, ordinal_, &ready); });
+                    if (!queried)
                         throw std::runtime_error("Planning measurement asynchronous event query failed");
                     if (ready) return;
                     if (std::chrono::steady_clock::now() >= deadline)
@@ -77,7 +87,9 @@ namespace llaminar2
         private:
             IBackend &backend_;
             int ordinal_;
-            void *event_;
+            std::function<void(const std::function<void()> &)> dispatch_;
+            bool borrowed_=false;
+            void *event_ = nullptr;
         };
     }
 
@@ -95,35 +107,86 @@ namespace llaminar2
             std::to_string(kTimedInvocations)};
     }
 
+    namespace
+    {
+        /**
+         * @brief Shared native-event loop; the original caller owns the only launch capability.
+         * @param work Complete original operation identity and issued work.
+         * @param backend Matching native backend.
+         * @param device Exact GPU owner.
+         * @param stream Exact original graph stream.
+         * @param submit Closed host enqueue capability, never a device callback node.
+         * @param dispatch Original worker dispatch for native timing operations; legacy callers already own it.
+         * @param borrowed Original calibration-owner timing pair, or empty for legacy owned events.
+         * @return Completed native GPU service excluding warmup and all preparation.
+         * @throws std::exception For failed submission/event/timing; no fallback rate is returned.
+         */
+        PlanningServiceObservation timeGPU(const PlanningMeasurementWork &work, IBackend &backend,
+            DeviceId device, ExplicitGPUStream stream, const std::function<bool()> &submit,
+            const std::function<void(const std::function<void()> &)> &dispatch = [](const auto &operation) { operation(); },
+            std::array<void*,2> borrowed = {})
+        {
+            TimingEvent start(backend, device.gpu_ordinal(), dispatch, borrowed[0]);
+            TimingEvent stop(backend, device.gpu_ordinal(), dispatch, borrowed[1]);
+            dispatch([&] {
+                if (!submit())
+                    throw std::runtime_error("Planning GPU measurement warmup graph submission failed");
+                stop.record(stream);
+            });
+            stop.awaitCompletion();
+            // The same executable, stream and pointer bindings are reused. Model
+            // loading, compilation, graph construction and the first launch are not
+            // included in the steady service observation.
+            // One original-worker closure brackets all timed native launches.
+            // Control-thread queue round trips must not inflate device service.
+            dispatch([&] {
+                start.record(stream);
+                for (int sample = 0; sample < PlanningExecutionMeasurement::kTimedInvocations; ++sample)
+                    if (!submit())
+                        throw std::runtime_error("Planning GPU measurement graph submission failed");
+                stop.record(stream);
+            });
+            stop.awaitCompletion();
+            float milliseconds = 0;
+            bool elapsed = false;
+            dispatch([&] { elapsed = backend.eventElapsedTimeMs(start.get(), stop.get(), device.gpu_ordinal(), &milliseconds); });
+            if (!elapsed)
+                throw std::runtime_error("Planning GPU measurement elapsed-time query failed");
+            return {work.unit(), work.perInvocation() * PlanningExecutionMeasurement::kTimedInvocations,
+                static_cast<double>(milliseconds) * 0.001,
+                work.provenance() + "; retained graph native events; warmup excluded; timed_invocations=" +
+                std::to_string(PlanningExecutionMeasurement::kTimedInvocations)};
+        }
+    }
+
     PlanningServiceObservation PlanningExecutionMeasurement::gpu(const PlanningMeasurementWork &work,
         IBackend &backend, DeviceId device, const IGPUGraphCapture &graph)
     {
         if (!device.is_gpu() || backend.backendDeviceType() != device.type || !graph.hasExecutable())
             throw std::invalid_argument("Planning GPU measurement requires a matching device/backend and retained executable");
-        // Stream identity comes from the graph owner, not a second caller hint.
-        const ExplicitGPUStream stream(graph.executionStream());
-        TimingEvent start(backend, device.gpu_ordinal());
-        TimingEvent stop(backend, device.gpu_ordinal());
-        if (!graph.launchOnStream(stream.get()))
-            throw std::runtime_error("Planning GPU measurement warmup graph submission failed");
-        stop.record(stream);
-        stop.awaitCompletion();
-        // The same executable, stream and pointer bindings are reused. Model
-        // loading, compilation, graph construction and the first launch are not
-        // included in the steady service observation.
-        start.record(stream);
-        for (int sample = 0; sample < kTimedInvocations; ++sample)
-            if (!graph.launchOnStream(stream.get()))
-                throw std::runtime_error("Planning GPU measurement graph submission failed");
-        stop.record(stream);
-        stop.awaitCompletion();
-        float milliseconds = 0;
-        if (!backend.eventElapsedTimeMs(start.get(), stop.get(), device.gpu_ordinal(), &milliseconds))
-            throw std::runtime_error("Planning GPU measurement elapsed-time query failed");
-        return {work.unit(), work.perInvocation() * kTimedInvocations,
-            static_cast<double>(milliseconds) * 0.001,
-            work.provenance() + "; retained graph native events; warmup excluded; timed_invocations=" +
-            std::to_string(kTimedInvocations)};
+        return timeGPU(work, backend, device, ExplicitGPUStream(graph.executionStream()),
+            [&] { return graph.launchOnStream(graph.executionStream()); });
+    }
+
+    PlanningServiceObservation PlanningExecutionMeasurement::gpu(const PlanningMeasurementWork &work,
+        IBackend &backend, DeviceId device, RetainedParticipantGraphExecutable &graph)
+    {
+        if (!device.is_gpu() || device != graph.device_ || backend.backendDeviceType() != device.type ||
+            !graph.readyForSubmission() || graph.worker_->ownsCurrentThread())
+            throw std::invalid_argument("Prepared GPU measurement requires its original off-worker graph owner");
+        graph.requireLiveOriginal();
+        if(graph.purpose_!=RetainedParticipantGraphExecutable::DefinitionPurpose::PreparedServiceCalibration ||
+            !graph.calibrationTimingEvents_[0] || !graph.calibrationTimingEvents_[1])
+            throw std::logic_error("Prepared measurement requires its original owner-held timing pair");
+        const auto measured = timeGPU(work, backend, device, ExplicitGPUStream(graph.stream_),
+            [&] { return graph.submit(graph.lastSubmission_ + 1); },
+            [&](const auto &operation) {
+                if(graph.worker_->ownsCurrentThread())operation();
+                else graph.worker_->submitAndWait(operation);
+            }, graph.calibrationTimingEvents_);
+        if (!graph.observeTerminal())
+            throw std::runtime_error("Prepared GPU measurement lost original terminal completion");
+        return measured;
     }
 
     PlanningServiceObservation PlanningExecutionMeasurement::gpuPublished(const PlanningMeasurementWork &work,

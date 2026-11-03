@@ -1712,6 +1712,11 @@ namespace llaminar2
             h^=participants->captureIdentity();h*=kFnvPrime;
             h^=graph.topologyGeneration();h*=kFnvPrime;
         }
+        if(const auto& domain=graph.retainedParticipantDefinitionDomain()){
+            has_variant=true;
+            for(const auto word:{static_cast<uint64_t>(domain->source.type),static_cast<uint64_t>(domain->source.ordinal),
+                static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(domain->authority))}){h^=word;h*=kFnvPrime;}
+        }
         const auto &order = graph.getExecutionOrder();
         for (const auto &name : order)
         {
@@ -4014,7 +4019,8 @@ namespace llaminar2
         }
         // Only this parent is executable. Its branch must span all child and
         // CPU-ticket waits, not stop in the gaps between graph-only children.
-        if (hooks.auxiliary_branch && !hooks.auxiliary_branch->attach(*parent))
+        if (hooks.attach_original_parent ? !hooks.attach_original_parent(*parent) :
+            (hooks.auxiliary_branch && !hooks.auxiliary_branch->attach(*parent)))
         {
             LOG_ERROR("[DeviceGraphCaptureController] Retained parent auxiliary attachment failed");
             return false;
@@ -5259,8 +5265,9 @@ namespace llaminar2
                                      InstantiateAndLaunch);
                 // Direct capture and parent composition use the same single
                 // attachment operation, always on the final execution owner.
-                if (!retained_parent_composition && hooks.auxiliary_branch &&
-                    !hooks.auxiliary_branch->attach(*seg.capture))
+                if (!retained_parent_composition &&
+                    (hooks.attach_original_parent ? !hooks.attach_original_parent(*seg.capture) :
+                     (hooks.auxiliary_branch && !hooks.auxiliary_branch->attach(*seg.capture))))
                 {
                     LOG_ERROR("[DeviceGraphCaptureController] Native executable auxiliary attachment failed");
                     result.reset_cache = true;

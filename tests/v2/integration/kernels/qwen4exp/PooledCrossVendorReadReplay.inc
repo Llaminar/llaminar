@@ -63,8 +63,7 @@ public:
         const auto source=file_.descriptor();memory_=program.session->memory();
         requireProvider(memory_->phase()==PhysicalMemoryAuthorityPhase::Admitted,"Cross-vendor program requires its original final admission");
         requireProvider(Maximum>=16 && Maximum%16==0 && Unique && Unique<=Maximum,"Read replay requires its exact retained token/unique geometry");
-        requireProvider(sourceDevice.type!=ownerDevice.type && sourceDevice.is_gpu() && ownerDevice.is_gpu(),
-            "Read component requires its real supported cross-vendor endpoints");
+        ImmutableRowTableDirectedTransportPolicy::require({0, sourceDevice}, {0, ownerDevice}, physical.peerAccess());
         for(unsigned i=0;i<2;++i){const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(devices_[i],memory_);original.requireWorker(workers_[i]);}
         for(unsigned i=0;i<2;++i){arenas_[i]=std::make_shared<BufferArena>();graphs_[i]=std::make_shared<ComputeGraph>();backends_[i]=getBackendFor(devices_[i]);requireProvider(backends_[i],"Read component backend unavailable");
             workers_[i]->submitAndWait([&,i]{streams_[i]=ExplicitGPUStream(workers_[i]->defaultStream()).get();contexts_[i]=IDeviceContext::create(devices_[i],1);});}
@@ -188,7 +187,20 @@ public:
     /** @brief Observe only the explicit source/storage endpoints, acquire/freeze their same source, then admit once. */
     void prepare(DeviceId source,DeviceId owner){
         if(session_)throw std::logic_error("Cross-vendor source program preparation is one-shot");
-        requireProvider(source.is_gpu() && owner.is_gpu() && source.type!=owner.type,"Cross-vendor program requires opposite-vendor rank-local storage");
+        requireProvider(source.is_gpu() && owner.is_gpu() && source!=owner,"Mapped program requires distinct original rank-local GPU endpoints");
+        std::optional<PeerAccessCoverage> peerAccess;
+        if (source.type == owner.type) {
+            // This is a declared NoPeer case, never a retry after failed peer creation.
+            inventory_ = gatherClusterInventory(nullptr);
+            if (!inventory_) throw std::logic_error("NoPeer candidate lacks its original inventory");
+            const AdaptiveGPUCacheParticipant coordinator{0,source.type,source.ordinal};
+            const AdaptiveGPUCacheParticipant remote{0,owner.type,owner.ordinal};
+            const AdaptiveGPUCachePlacementRequest placement{AdaptiveGPUCachePlacementMode::DeclaredRankLocal,
+                {{coordinator,0,0},{remote,0,0}},coordinator};
+            peerAccess = ImmutableRowTableDirectedTransportPolicy::observe(placement,inventory_->getRank(0));
+            if (peerAccess != PeerAccessCoverage::None)
+                throw std::invalid_argument("Explicit NoPeer read/performance cell requires original None coverage; peer transport is a separate cell");
+        }
         const std::array selected{source,owner};session_=std::shared_ptr<PreparedNativeLookupFixture>(PreparedNativeLookupFixture::prepare(selected));
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
         const auto io=RetainedHostServiceCalibrationAccess::program(RetainedHostServiceRole::ImmutableLookupIO);
@@ -200,7 +212,7 @@ public:
         std::vector<CrossVendorReadReplayGeometry> declarations;
         for(std::size_t index=0;const auto& spec:specs_){
             const RetainedHostServiceInstance instance{0,source,RetainedHostServiceRole::ImmutableLookupIO,index++};selectedIO.push_back(instance);ioDeclarations.add(instance,io);
-            auto geometry=CrossVendorReadReplayGeometry::create(spec,source,owner,*session_,io);declarations.push_back(geometry);
+            auto geometry=CrossVendorReadReplayGeometry::create(spec,source,owner,*session_,io,NativeOrderingEventBudgetProjection::installed(),peerAccess);declarations.push_back(geometry);
             programs_.push_back({spec,std::move(geometry),session_,source,owner,{},instance});
         }
         ioDeclarations_=std::move(ioDeclarations).freeze();session_->admit(crossVendorReadProgramBOM(declarations));
@@ -283,6 +295,7 @@ private:
     std::shared_ptr<RetainedHostServiceBinding> ioBinding_;
     std::vector<CrossVendorReadReplaySpec> specs_;
     std::shared_ptr<PreparedNativeLookupFixture> session_;
+    std::shared_ptr<const ClusterInventory> inventory_; ///< Original cold NoPeer observation retained through native owners.
     std::vector<PreparedCrossVendorReadReplayProgram> programs_;
     std::vector<bool> consumed_; ///< CPU-owned one-shot cold instance lifetime, never a GPU model/cache mirror.
 };

@@ -20,13 +20,14 @@ namespace llaminar2 {
 Qwen4ExpReplicatedPLEQuery DeviceGraphOrchestrator::fixedHeadPLEQuery(const ForwardInput &input) const
 {
     const auto &cfg=graph_builder_->config();const auto &cohort=cfg.ngram_replicated_ple_cohort;
-    if(!cohort || !cfg.ngram_table_placement || !cfg.ngram_table_placement->isFixedHeadShards() ||
+    if(!cohort || !cfg.ngram_table_placement || !Qwen4ExpReplicatedPLECohort::requiresReplicatedQuery(*cfg.ngram_table_placement) ||
         cohort->placement()!=*cfg.ngram_table_placement || &cohort->context()!=cfg.tp_ctx ||
         cohort->modelOwner()!=injected_model_ctx_.get() || !state_.device_id.is_gpu() ||
         input.device!=state_.device_id || input.batch_size!=1 || input.seq_len<=0 ||
         !input.token_ids_device || input.getKVCacheForDevice(input.device)!=state_.kv_cache.get())
         throw std::invalid_argument("Fixed-head PLE query requires its actual Rank cohort, native DGO bank and canonical main cache");
-    (void)cohort->requireParticipant(input.device,cfg.tp_device_idx);
+    if(cohort->placement().isFixedHeadShards())(void)cohort->requireParticipant(input.device,cfg.tp_device_idx);
+    else cohort->requireConsumer(input.device,cfg.tp_device_idx);
     const auto *tokens=static_cast<const std::int32_t *>(input.token_ids_device);
     const std::int32_t *count=nullptr;Qwen4ExpPLEQuerySource source;
     if(input.graph_submission_intent==ForwardGraphSubmissionIntent::WorkspaceDeclaration)
@@ -176,7 +177,8 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         mtp_request_stop_token_count_ != canonical.mtp_request_stop_token_count_ ||
         mtp_request_stop_tokens_ != canonical.mtp_request_stop_tokens_)
         fail();
-    (void)cohort->requireParticipant(state_.device_id,cfg.tp_device_idx);
+    if(cohort->placement().isFixedHeadShards())(void)cohort->requireParticipant(state_.device_id,cfg.tp_device_idx);
+    else cohort->requireConsumer(state_.device_id,cfg.tp_device_idx);
     const auto &a=*active_device_generation_admission_;const auto &b=*canonical.active_device_generation_admission_;
     Qwen4ExpReplicatedPLECohort::requireSameGenerationAdmission(b,a);
 

@@ -20,6 +20,8 @@
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
+#include "execution/compute_stages/ComputeStageUtils.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "kernels/rocm/gemm/ROCmFloatingPointGemmWorkspaceContract.h"
@@ -2443,6 +2445,90 @@ size_t WorkspaceMemoryEstimator::estimate(
             " admitted_bytes=" + std::to_string(bytes));
 
     return bytes;
+}
+
+
+size_t WorkspaceMemoryEstimator::estimatePreparedExpertService(
+    const ModelMemoryProfile& profile, const WorkspaceMemoryGeometry& geometry)
+{
+    if (!geometry.device.is_gpu() || profile.expert_count <= 0 ||
+        profile.d_model <= 0 || profile.expert_feed_forward_length <= 0)
+        throw std::invalid_argument("Prepared GPU service requires original expert geometry");
+    const auto sharding = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+    WorkspaceRequirements requirements;
+    bool found = false;
+    for (const auto phase : {ExpertHistogramSource::DecodeToken,
+             ExpertHistogramSource::PrefillChunk, ExpertHistogramSource::GroupedVerifier})
+    {
+        const int rows = MoEOverlayCPUServiceMeasurement::rowsForPhase(phase);
+        auto current = geometry.device.is_cuda()
+            ? MoEWorkspaceBuffers::cudaMoE(rows, profile.d_model,
+                  profile.expert_feed_forward_length, 1, 1)
+            : MoEWorkspaceBuffers::rocmMoE(rows, profile.d_model,
+                  profile.expert_feed_forward_length, 1, 1);
+        for (const auto& tensor : profile.tensors)
+        {
+            if (!isRoutedExpertWeight(tensor.name) ||
+                !ownsProjectionSource(tensor, profile, geometry))
+                continue;
+            const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, false);
+            if (!shape.valid())
+                throw std::invalid_argument("Prepared GPU service has incomplete projection metadata");
+            found = true;
+            const bool gate = tensor.name.ends_with(".ffn_gate_exps.weight");
+            if (isQuantizedMatrixWeight(tensor))
+            {
+                if (geometry.device.is_rocm())
+                {
+                    current.merge(rocm::quantized_gemm_workspace::projectionRequirements(
+                        rows, shape.output_columns, shape.input_columns));
+                    if (gate)
+                    {
+                        const std::array columns{shape.output_columns, shape.output_columns};
+                        rocm::quantized_gemm_workspace::appendFusedProjectionRequirements(
+                            current, rows, columns);
+                    }
+                }
+#ifdef HAVE_CUDA
+                else
+                {
+                    const auto* format = native_vnni_formats::forQuantType(tensor.quant_type);
+                    if (!format)
+                        throw std::invalid_argument("Prepared GPU service has no original NativeVNNI format");
+                    const auto hardware = geometry.device_compute_units != 0
+                        ? cuda::NativeVNNIWorkspaceHardware::checked(
+                              geometry.device.ordinal, geometry.device_compute_units)
+                        : cuda::NativeVNNIWorkspaceHardware::withoutSMObservation(geometry.device.ordinal);
+                    current.merge(cuda::quantized_gemm_workspace::projectionRequirements(
+                        rows, shape.output_columns, shape.input_columns, hardware,
+                        cuda::quantized_gemm_workspace::NativeCodebooks{
+                            canonicalDeviceVnniCodebookId(*format),
+                            canonicalDeviceVnniCodebookId(format->codebook_id)}));
+                    if (gate)
+                    {
+                        const std::array columns{shape.output_columns, shape.output_columns};
+                        cuda::quantized_gemm_workspace::appendFusedProjectionRequirements(
+                            current, rows, columns, shape.input_columns);
+                    }
+                }
+#endif
+            }
+            else if (isFloatingWeight(tensor))
+            {
+                current.merge(geometry.device.is_cuda()
+                    ? cuda::floating_gemm_workspace::projectionRequirements(rows, shape.output_columns)
+                    : rocm::floating_gemm_workspace::projectionRequirements());
+            }
+            else
+                throw std::invalid_argument("Prepared GPU service has an unsupported source projection");
+            if (gate)
+                addCudaConcurrentDecodeGemvSideStreamWorkspace(current, geometry.device, rows, 2);
+        }
+        requirements.merge(current);
+    }
+    if (!found)
+        throw std::invalid_argument("Prepared GPU service has no owned expert source metadata");
+    return requirements.total_bytes_with_alignment();
 }
 
 size_t WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(

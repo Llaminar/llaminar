@@ -28,6 +28,25 @@ def identity(path):
     return (str(p),s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
 
 
+
+def require_reference_file_identity(original, actual):
+    """Compare persistent file metadata while treating Linux device numbers as run-local.
+
+    A reboot can renumber the same filesystem's st_dev. Path, inode, extent and
+    nanosecond modification/change times must still match the frozen reference.
+    Callers retain the complete current identity, including device, for strict
+    before/after checks within each execution. No model payload is read or hashed.
+    """
+    fields = {'path', 'device', 'inode', 'bytes', 'mtime_ns', 'ctime_ns'}
+    require(type(original) is dict and type(actual) is dict and
+            set(original) == fields and set(actual) == fields and
+            type(original['path']) is str and type(actual['path']) is str and
+            all(type(record[key]) is int for record in (original, actual) for key in fields-{'path'}) and
+            original['device'] >= 0 and actual['device'] >= 0 and
+            all(original[key] == actual[key] for key in fields-{'device'}),
+            'Original source no longer matches reference-issued metadata identity')
+
+
 def metadata_digest(value):
     """Authenticate the small reviewed catalog document, never model/cache bytes."""
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()

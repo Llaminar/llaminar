@@ -307,6 +307,299 @@ def declared_inventory(args, binary: Path):
     return selected[0], pins
 
 
+# One source-bound, passive policy for every declared diagnostic candidate.
+DECLARED_PASSIVE_POLICY = 'passive_lookup_setup_terminal_v1'
+DECLARED_PASSIVE_FILTERS = ('immutable_lookup', 'ngram_lookup',
+    'immutable_lookup_setup.admitted_owner', 'moe_placement.routed_expert_weight_selection')
+
+
+def declared_environment(caller: dict, workload: dict, arithmetic: dict, output: Path) -> dict:
+    """Bind passive collection before startup; unrelated caller profiling/loader controls never survive."""
+    import model_kld_corpus_execution as owner
+    environment = {key: caller[key] for key in ('PATH','HOME','ROCR_VISIBLE_DEVICES','HIP_VISIBLE_DEVICES',
+        'CUDA_VISIBLE_DEVICES','GPU_DEVICE_ORDINAL','HWLOC_COMPONENTS',
+        'OMP_NUM_THREADS','OMP_PLACES','OMP_PROC_BIND','OPENBLAS_NUM_THREADS') if key in caller}
+    environment.update(LLAMINAR_BENCHMARK_ITERATIONS=str(workload['measurement_iterations']),
+        LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=str(workload['warmup_iterations']),
+        LLAMINAR_PERF_STATS_JSON=str(output/'passive-perfstats-rank-{rank}.json'),
+        LLAMINAR_PERF_STATS_FILTER=','.join(DECLARED_PASSIVE_FILTERS),
+        LLAMINAR_PERF_STATS_CPU_STAGE_TIMING='0', LLAMINAR_PERF_STATS_GPU_STAGE_TIMING='0',
+        LLAMINAR_GPU_STAGE_TIMING='0', LLAMINAR_GPU_STAGE_TIMING_DETAIL='0')
+    environment.update({owner.SELECTORS[key]:value for key,value in arithmetic.items()})
+    return environment
+
+
+def _passive_uint(value, name: str) -> int:
+    """Require exact unsigned metadata/counters, never bools, lossy floats or negative observations."""
+    if isinstance(value, str):
+        if not re.fullmatch(r'0|[1-9][0-9]*', value):
+            raise ValueError(f'invalid passive {name}')
+        return int(value)
+    if isinstance(value, bool) or not isinstance(value, (int,float)) or value < 0 or int(value) != value:
+        raise ValueError(f'invalid passive {name}')
+    return int(value)
+
+
+def _passive_device(value: str) -> str:
+    """Normalize only the original DeviceId backend spelling, preserving physical ordinal."""
+    if str(value).upper()=='CPU':return 'CPU:0'
+    match = re.fullmatch(r'(CPU|CUDA|ROCM):([0-9]+)', str(value).upper())
+    if match is None or match[1]=='CPU' and int(match[2])!=0:
+        raise ValueError('invalid passive physical device')
+    return f'{match[1]}:{int(match[2])}'
+
+
+def _declared_continuation(config: dict) -> list[tuple[int,str]]:
+    """Project original serialized continuation membership; do not create a topology registry."""
+    plan = config.get('moe_routed_expert_plan') or {}
+    name = plan.get('continuation_domain')
+    domains = [row for row in plan.get('dense_domains',[]) if row.get('name') == name]
+    if len(domains) != 1:
+        raise ValueError('passive adaptive evidence lacks original continuation domain')
+    domain = domains[0]
+    rank = _passive_uint(domain.get('owner_rank'),'continuation owner rank')
+    result = [(rank,_passive_device(f"{p['device_type']}:{p['device_ordinal']}")) for p in domain.get('participants',[])]
+    if not result or len(set(result)) != len(result) or any(device.startswith('CPU:') for _,device in result):
+        raise ValueError('passive adaptive evidence has incomplete/foreign continuation membership')
+    return result
+
+
+def _validate_declared_passive_evidence(data: dict) -> dict:
+    """Authenticate original setup partitions and measured terminal schemas, not locality or disk activity.
+
+    The source-bound BenchmarkRunner's pre-measurement reset owns scope. Counter
+    totals alone cannot detect same-key warmup contamination; no guessed token or
+    iteration multiplier is used as a replacement for that original owner.
+    """
+    stats = data.get('perf_stats')
+    if not isinstance(stats,dict) or stats.get('schema') != 'llaminar.perf_stats.v1' or stats.get('enabled') is not True:
+        raise ValueError('declared passive collection is missing or disabled')
+    records = stats.get('records')
+    if not isinstance(records,list):
+        raise ValueError('declared passive records are incomplete')
+    config = (data.get('runtime_configuration') or {}).get('configuration')
+    if not isinstance(config,dict):
+        raise ValueError('declared passive evidence lacks original resolved configuration')
+    policy = config.get('ngram_table_policy') or {}
+    adaptive = policy.get('storage') == 'AdaptiveVRAMRAMSSD'
+    expert = []
+    setup = []
+    terminal = {}
+    submissions = []
+    resets = {}
+    for record in records:
+        if not isinstance(record,dict) or record.get('kind') != 'counter':
+            raise ValueError('passive evidence contains a non-counter observation')
+        domain,name,phase = record.get('domain'),record.get('name'),record.get('phase')
+        if domain not in ('immutable_lookup','ngram_lookup','immutable_lookup_setup','moe_placement'):
+            raise ValueError('passive evidence includes an unrequested instrumentation family')
+        count = _passive_uint(record.get('count'),'record count')
+        value = _passive_uint(record.get('value'),'record value')
+        if not count or any(record.get(k,0) != 0 for k in ('total_ns','min_ns','max_ns')):
+            raise ValueError('passive evidence includes clocks or an empty observation')
+        if domain=='immutable_lookup' and (name=='failures' or str(name).endswith('_failures') or name=='adaptive_failed_frames') and value:
+            raise ValueError('passive lookup reports failed work')
+        device = _passive_device(record.get('device'))
+        tags = record.get('tags')
+        if not isinstance(tags,dict):
+            raise ValueError('passive evidence lacks original tags')
+        if domain == 'moe_placement':
+            if name != 'routed_expert_weight_selection' or phase != 'load':
+                raise ValueError('passive expert evidence is not original immutable setup')
+            if tags.get('owner_order') != {'Ordinal':'ordinal','Random':'random'}.get(config.get('routed_expert_owner_order')) or tags.get('selection_layout') not in ('contiguous','noncontiguous'):
+                raise ValueError('passive expert selection policy differs from original config')
+            layer = _passive_uint(tags.get('layer'),'expert layer')
+            participant = _passive_uint(tags.get('participant'),'expert participant')
+            if value % count:
+                raise ValueError('passive expert selection mixed incompatible setup populations')
+            expert.append(dict(device=device,layer=layer,participant=participant,owner_order=tags['owner_order'],
+                selection_layout=tags['selection_layout'],observations=count,selected_experts_per_observation=value//count))
+        elif domain == 'immutable_lookup_setup':
+            if name != 'admitted_owner' or phase != 'setup' or count != 1 or value != 1:
+                raise ValueError('passive admitted setup is missing, repeated or not immutable')
+            setup.append((device,tags))
+        elif domain == 'ngram_lookup':
+            if phase != 'hosted_transaction' or name not in ('retained_source_native_invocations','retained_remote_native_enqueues') or tags != {'policy':'retained_hosted'}:
+                raise ValueError('passive native submission evidence is not the original submission schema')
+            # These are submission observations, never a native payload byte oracle.
+            submissions.append(dict(name=name,device=device,count=count,value=value,tags=tags))
+        elif name in ('reset_terminal_closes','reset_terminal_waits'):
+            if phase!='request_reset' or tags or value!=count:
+                raise ValueError('passive reset observation is not the original terminal infrastructure')
+            group=resets.setdefault(device,{})
+            if name in group:raise ValueError('duplicate passive reset observation')
+            group[name]=(count,value)
+        else:
+            if phase != 'generation_terminal' and not (not adaptive and phase=='lookup_completion'):
+                raise ValueError('passive lookup evidence includes warmup/nonterminal scope')
+            key=(device,tuple(sorted(tags.items())))
+            group=terminal.setdefault(key,{})
+            if name in group:
+                raise ValueError('duplicate passive terminal counter')
+            group[name]=(count,value)
+    for group in resets.values():
+        if set(group)!= {'reset_terminal_closes','reset_terminal_waits'} or len(set(group.values()))!=1:
+            raise ValueError('passive reset terminal close/wait proof is incomplete')
+    for device in {r['device'] for r in submissions}:
+        group=[r for r in submissions if r['device']==device]
+        if len(group)!=2 or len({r['name'] for r in group})!=2 or len({r['count'] for r in group})!=1:
+            raise ValueError('passive native submission tuple is incomplete')
+    if config.get('moe_routed_expert_plan') and not expert:
+        raise ValueError('missing original routed expert selection setup')
+    if len({(x['device'],x['layer'],x['participant']) for x in expert}) != len(expert):
+        raise ValueError('duplicate passive expert setup identities')
+    plan=config.get('moe_routed_expert_plan') or {}
+    if plan:
+        tiers=plan.get('routed_tiers')
+        if not isinstance(tiers,list) or not tiers:
+            raise ValueError('passive expert setup lacks original frozen tier projection')
+        expected_selection=set()
+        for tier in tiers:
+            counts=tier.get('resolved_live_experts_per_layer')
+            domains=[d for d in plan.get('domains',[]) if d.get('name')==tier.get('domain')]
+            if not isinstance(counts,list) or len(domains)!=1:
+                raise ValueError('passive expert setup lacks original admitted layer/domain membership')
+            participants=domains[0].get('participants',[])
+            for layer,count in enumerate(counts):
+                if not _passive_uint(count,'resolved expert population'):continue
+                for participant,p in enumerate(participants):
+                    expected_selection.add((_passive_device(f"{p['device_type']}:{p['device_ordinal']}"),
+                        _passive_uint(plan.get('first_model_layer'),'first model layer')+layer,participant))
+        if not expected_selection.issubset({(r['device'],r['layer'],r['participant']) for r in expert}):
+            raise ValueError('passive expert physical selection coverage is partial')
+        declared_members={(_passive_device(f"{p['device_type']}:{p['device_ordinal']}"),index)
+            for domain in plan.get('domains',[]) for index,p in enumerate(domain.get('participants',[]))}
+        if any((r['device'],r['participant']) not in declared_members for r in expert):
+            raise ValueError('passive expert selection has a foreign original participant')
+
+
+    if not adaptive:
+        if setup:raise ValueError('ordinary lookup cannot claim adaptive admitted setup')
+        return dict(collection_policy=DECLARED_PASSIVE_POLICY,adaptive=False,
+            expert_selection=expert,qualification_limits=['ordinary lookup schema remains its original mode contract'])
+    request=policy['gpu_adaptive']
+    backing=request.get('source_backing')
+    if backing not in ('SSD','RAM'):
+        raise ValueError('unsupported adaptive source backing in passive evidence')
+    mode='gpu_subordinate_full_ram' if backing=='RAM' else 'host_adaptive_ram_ssd'
+    continuation=_declared_continuation(config)
+    placement=request.get('placement') or {}
+    arm=placement.get('mode')
+    if arm=='ConsumerLocal':
+        expected={key:(request['maximum_gpu_cache_rows'],request['gpu_cache_physical_byte_limit']) for key in continuation}
+        coordinators=set(continuation)
+    elif arm=='DeclaredRankLocal':
+        expected={}
+        for owner in placement.get('owners',[]):
+            p=owner['participant'];key=(_passive_uint(p['world_rank'],'owner rank'),_passive_device(f"{p['backend']}:{p['ordinal']}"))
+            if key in expected:raise ValueError('duplicate original configured cache owner')
+            expected[key]=(owner['maximum_cache_rows'],owner['cache_physical_byte_limit'])
+        p=placement['coordinator'];coordinators={(_passive_uint(p['world_rank'],'coordinator rank'),_passive_device(f"{p['backend']}:{p['ordinal']}"))}
+        if not coordinators.issubset(set(continuation)):
+            raise ValueError('configured coordinator is not an original continuation participant')
+    else:
+        raise ValueError('unsupported adaptive placement in passive evidence')
+    seen=set();cache={};roles={};source_identity=None;host=None
+    numeric=('world_rank','admitted_slots','payload_bytes','metadata_bytes','source_storage_bytes','table_storage_bytes','lookup_staging_bytes',
+        'source_generation','source_file_offset','source_rows','source_row_elements','source_row_bytes')
+    for device,tags in setup:
+        if any(not isinstance(tags.get(name),str) for name in numeric):raise ValueError('passive setup numeric tags are not original strings')
+        values={name:_passive_uint(tags.get(name),'setup '+name) for name in numeric}
+        if tags.get('storage') != mode or not values['source_generation'] or not values['source_rows'] or not values['source_row_elements'] or not values['source_row_bytes']:
+            raise ValueError('passive setup source/backing identity is incomplete')
+        identity=tuple(tags.get(k) for k in ('source_path','source_tensor','source_format','source_generation','source_file_offset','source_rows','source_row_elements','source_row_bytes'))
+        if any(v is None or v=='' for v in identity) or source_identity is not None and identity!=source_identity:
+            raise ValueError('passive setup combines different original sources')
+        source_identity=identity
+        key=(values['world_rank'],device);role=tags.get('role')
+        if role not in ('gpu_cache','gpu_policy','gpu_source_staging','shared_host_source') or (key,role) in seen:
+            raise ValueError('passive setup duplicates or invents a physical role')
+        seen.add((key,role));roles.setdefault(role,set()).add(key)
+        if not values['lookup_staging_bytes']:raise ValueError('passive setup omitted its mandatory original staging')
+        if values['table_storage_bytes'] != values['payload_bytes']+values['metadata_bytes']+values['source_storage_bytes']:
+            raise ValueError('passive setup physical byte partition is inconsistent')
+        if role=='gpu_cache':
+            if key not in expected or values['source_storage_bytes']:
+                raise ValueError('passive cache owner is foreign')
+            maximum,ceiling=map(lambda x:_passive_uint(x,'configured cache ceiling'),expected[key])
+            slots=values['admitted_slots']
+            if slots>maximum or values['table_storage_bytes']>ceiling or bool(slots)!=bool(values['table_storage_bytes']):
+                raise ValueError('passive cache grant violates original configured bounds')
+            if maximum and ceiling and not slots:
+                raise ValueError('positive cache comparison has no actual positive admitted grant')
+            cache[key]=values
+        elif role=='shared_host_source':
+            if device!='CPU:0' or values['world_rank'] not in {rank for rank,_ in coordinators} or host is not None or not values['source_storage_bytes']:
+                raise ValueError('passive setup must retain one original host source')
+            host=values
+            host_request=request['host']
+            if values['admitted_slots']>_passive_uint(host_request['maximum_cache_rows'],'host cache bound'):
+                raise ValueError('passive host cache grant exceeds original request')
+            if values['payload_bytes']+values['metadata_bytes']>_passive_uint(host_request['cache_physical_byte_limit'],'host byte ceiling'):
+                raise ValueError('passive host cache bytes exceed original request')
+            if host_request['maximum_cache_rows'] and host_request['cache_physical_byte_limit'] and not values['admitted_slots']:
+                raise ValueError('positive RAM cache comparison has no actual admitted grant')
+            if backing=='RAM' and any(values[k] for k in ('admitted_slots','payload_bytes','metadata_bytes')):
+                raise ValueError('full RAM source has a redundant cache grant')
+        elif key not in coordinators or values['admitted_slots'] or values['payload_bytes'] or values['source_storage_bytes']:
+            raise ValueError('passive source/policy root is foreign or aliases cache/source payload')
+    if set(cache)!=set(expected) or roles.get('gpu_policy')!=coordinators or roles.get('gpu_source_staging')!=coordinators or host is None:
+        raise ValueError('passive setup is partial')
+    row_bytes=_passive_uint(setup[0][1]['source_row_bytes'],'original source row width')
+    device_names={device for _,device in coordinators}
+    device_metrics=('adaptive_lookup_calls','adaptive_completed_live_ids','adaptive_cache_hit_rows','adaptive_cache_miss_rows',
+        'adaptive_source_rows','adaptive_source_native_bytes','adaptive_promotions','adaptive_evictions','adaptive_failed_frames')
+    host_metrics=('intervals','requests','ids','id_bytes','native_bytes','metadata_bytes','acknowledgement_bytes','terminal_bytes','failures',
+        'window_hits','window_misses','window_evictions','adaptive_batches','ram_rows','source_rows','duplicate_rows','cache_admissions',
+        'cache_evictions','cache_admission_rejections','all_pinned_responses')
+    device_seen=set();host_seen=set();observations=[]
+    for (device,tag_items),group in terminal.items():
+        tags=dict(tag_items)
+        if tags.get('transport')!='pooled_subordinate':raise ValueError('passive adaptive terminal transport changed')
+        if tags.get('authority')=='terminal_device_generation_control':
+            names=device_metrics;device_seen.add(device)
+            if tags.get('storage')!='vram' or device not in device_names:raise ValueError('foreign passive device terminal owner')
+        else:
+            names=host_metrics;host_seen.add(device)
+            if tags.get('storage')!=mode or device not in device_names:raise ValueError('foreign passive host terminal source')
+        if set(group)!=set(names) or len({group[name][0] for name in names})!=1:
+            raise ValueError('passive terminal tuple is incomplete or mixes intervals')
+        values={name:group[name][1] for name in names}
+        if any(value for name,value in values.items() if name in ('failures','adaptive_failed_frames')):
+            raise ValueError('passive measured lookup reports failed work')
+        if names==device_metrics:
+            if values['adaptive_source_native_bytes']!=values['adaptive_source_rows']*row_bytes:
+                raise ValueError('passive device native bytes differ from original row width')
+            if values['adaptive_source_rows']>values['adaptive_cache_miss_rows'] or values['adaptive_cache_hit_rows']+values['adaptive_cache_miss_rows']>values['adaptive_completed_live_ids']:
+                raise ValueError('passive device rows do not partition completed live work')
+        else:
+            if values['native_bytes']!=values['ids']*row_bytes or values['id_bytes']!=values['ids']*8:
+                raise ValueError('passive host native/id bytes differ from original row/channel width')
+            if values['ram_rows']+values['source_rows']+values['duplicate_rows']!=values['ids'] or values['cache_evictions']>values['cache_admissions']:
+                raise ValueError('passive source rows do not partition completed responses')
+            if backing=='RAM' and any(values[k] for k in ('ram_rows','cache_admissions','cache_evictions','cache_admission_rejections',
+                    'all_pinned_responses','window_hits','window_misses','window_evictions')):
+                raise ValueError('full RAM terminal tuple reports cache or mapping work')
+        observations.append(dict(device=device,tags=tags,count=next(iter(group.values()))[0],counters=values))
+    if device_seen!=device_names or host_seen!=device_names:
+        raise ValueError('passive measured terminal owner coverage is incomplete')
+    return dict(collection_policy=DECLARED_PASSIVE_POLICY,adaptive=True,backing=backing,
+        admitted_gpu_cache_class=('positive' if all(r['admitted_slots'] for r in cache.values()) else 'c0' if not any(r['admitted_slots'] for r in cache.values()) else 'mixed'),
+        measured_scope='original_benchmark_reset_before_measurement',setup=[dict(device=d,tags=t) for d,t in setup],
+        expert_selection=sorted(expert,key=lambda x:(x['device'],x['layer'],x['participant'])),
+        terminal_observations=observations,native_submission_observations=submissions,reset_terminal_observations=resets,
+        qualification_limits=['aggregate_gpu_hits_do_not_identify_locality','native_submissions_are_not_wire_bytes',
+            'mapping_window_misses_are_not_ssd_io','startup_full_ram_preload_is_outside_measured_window'])
+
+
+def validate_declared_passive_evidence(data: dict) -> dict:
+    """Reject incomplete external documents through the original passive schema owner."""
+    try:
+        return _validate_declared_passive_evidence(data)
+    except (KeyError,TypeError,OverflowError) as error:
+        raise ValueError('incomplete declared passive evidence schema') from error
+
+
 def run_declared_diagnostic(args) -> int:
     """Execute the existing benchmark mode under original paired/parser/process/driver owners; never certify."""
     import model_kld_corpus_execution as paired_owner
@@ -367,12 +660,7 @@ def run_declared_diagnostic(args) -> int:
         return 0
     output = args.report.parent / (args.report.stem + '-artifacts')
     output.mkdir(parents=True, exist_ok=False)
-    environment = {key: os.environ[key] for key in ('PATH','HOME','ROCR_VISIBLE_DEVICES','HIP_VISIBLE_DEVICES',
-        'CUDA_VISIBLE_DEVICES','GPU_DEVICE_ORDINAL','HWLOC_COMPONENTS',
-        'OMP_NUM_THREADS','OMP_PLACES','OMP_PROC_BIND','OPENBLAS_NUM_THREADS') if key in os.environ}
-    environment.update(LLAMINAR_BENCHMARK_ITERATIONS=str(workload['measurement_iterations']),
-        LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=str(workload['warmup_iterations']))
-    environment.update({paired_owner.SELECTORS[key]:value for key,value in selection.topology['arithmetic'].items()})
+    environment = declared_environment(os.environ,workload,selection.topology['arithmetic'],output)
     canonical = declared_config_identity(selection, observed, parser, environment)
     write_json(output/'described-config.json', canonical)
     helper = binary.parent/'llaminar_mpi_session'
@@ -384,9 +672,10 @@ def run_declared_diagnostic(args) -> int:
         '--temperature',str(workload['temperature']),'--top-k',str(workload['top_k']),
         '--top-p',str(workload['top_p']),'--benchmark-json-output',str(output/'benchmark.json')]
     command = [str(helper),'--session-base',str(output/'mpi-session'),'--',str(binary),*engine]
-    write_json(output/'invocation.json',dict(argv=command,environment=environment,exact_cell=exact))
+    write_json(output/'invocation.json',dict(argv=command,environment=environment,exact_cell=exact,collection_policy=DECLARED_PASSIVE_POLICY))
     result = dict(schema=1, policy='diagnostic_declared', diagnostic=True, certification_eligible=False,
         exact_cell=exact, source_export=record, complete=False, passed=False,
+        collection_policy=DECLARED_PASSIVE_POLICY,
         panel_report=str(args.panel_report), workload=workload)
     armed = False
     try:
@@ -397,8 +686,9 @@ def run_declared_diagnostic(args) -> int:
         data = json.loads((output/'benchmark.json').read_text())
         measured = validate_measurement(data,workload)
         declared_runtime_configuration(data,canonical,native['actual_owner']['actual_config'],workload,output,parser,environment)
+        passive = validate_declared_passive_evidence(data)
         unchanged(pins)
-        result.update(measurement=measured)
+        result.update(measurement=measured,passive_evidence=passive)
         armed=False # The exact driver owner is finished once, including failed validation.
         finish_declared_driver(driver,output)
         result.update(complete=True,passed=True,driver_window_clean=True)

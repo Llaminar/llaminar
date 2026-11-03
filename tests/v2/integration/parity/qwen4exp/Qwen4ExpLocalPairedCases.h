@@ -12,6 +12,7 @@
 #include "Qwen4ExpProductionParityCases.h"
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpGPUAdaptiveParityCases.h"
+#include "Qwen4ExpMatchedCacheEconomyCases.h"
 #include "Qwen4ExpFullROCmTP4ParityCases.h"
 #include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
 #include <nlohmann/json.hpp>
@@ -30,7 +31,13 @@ using QFNCaseFamilies = std::map<std::string, std::vector<ModelParityCase>>;
 /** @return Original case producers in their unchanged registration families. */
 inline QFNCaseFamilies qfnOriginalCaseFamilies()
 {
-    return {{"Qwen4ExpMain", qwen4ExpProductionCases()},
+    return {{"Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15", qwen4ExpConsumerLocalTP4MovementCases(RoutedExpertOwnerOrder::Ordinal)},
+            {"Qwen4ExpConsumerLocalTP4MovementRandomRetained15", qwen4ExpConsumerLocalTP4MovementCases(RoutedExpertOwnerOrder::Random)},
+            {"Qwen4ExpConsumerLocalTP4StaticRetained15", qwen4ExpConsumerLocalTP4ExecutionCases()},
+            {"Qwen4ExpHardwareProductionDefaults", qwen4ExpHardwareProductionSourceCases()},
+            {"Qwen4ExpHardwareMatchedCacheEconomy", qwen4ExpHardwareMatchedCacheEconomyCases()},
+            {"Qwen4ExpHardwareMatchedCacheRAMBackingEconomy", qwen4ExpHardwareMatchedCacheRAMBackingEconomyCases()},
+            {"Qwen4ExpMain", qwen4ExpProductionCases()},
             {"Qwen4ExpHostAdaptiveRAMSSD", qwen4ExpHostAdaptiveProductionCases()},
             {"Qwen4ExpFixedHeadTP", qwen4ExpFixedHeadProductionCases()},
             {"Qwen4ExpGPUAdaptive", qwen4ExpGPUAdaptiveProductionCases()},
@@ -41,6 +48,9 @@ inline QFNCaseFamilies qfnOriginalCaseFamilies()
             {"Qwen4ExpConsumerLocalTP2StaticRetained15", qwen4ExpConsumerLocalTP2ExecutionCases(ModelParityExpertOverlayPolicy{})},
             {"Qwen4ExpConsumerLocalTP2DynamicOrdinalRetained15", qwen4ExpConsumerLocalTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})},
             {"Qwen4ExpConsumerLocalTP2DynamicRandomRetained15", qwen4ExpConsumerLocalTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic})},
+            {"Qwen4ExpSharedCoordinatorTP2StaticRetained15", qwen4ExpSharedCoordinatorTP2ExecutionCases(ModelParityExpertOverlayPolicy{})},
+            {"Qwen4ExpSharedCoordinatorTP2DynamicOrdinalRetained15", qwen4ExpSharedCoordinatorTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})},
+            {"Qwen4ExpSharedCoordinatorTP2DynamicRandomRetained15", qwen4ExpSharedCoordinatorTP2ExecutionCases({.owner_order=RoutedExpertOwnerOrder::Random,.movement=ModelParityExpertMovement::Dynamic})},
             {"Qwen4ExpFullROCmTP4", qwen4ExpFullROCmTP4ProductionCases()},
             {"Qwen4ExpROCm4OverlayPolicy", qwen4ExpROCm4OverlayPolicyProductionCases()}};
 }

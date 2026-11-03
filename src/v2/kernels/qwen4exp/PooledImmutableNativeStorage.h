@@ -14,6 +14,7 @@
 #include "tensors/TensorClasses.h"
 #include <memory>
 namespace llaminar2 {class NativeOrderingEventGroup;namespace test {struct PooledImmutableFactoryReplayAccess;}}
+namespace llaminar2 { class CapturedTransferBinding; class CapturedTransferReceiveCompletion; }
 namespace llaminar2::qwen4exp
 {
 namespace detail {class PooledNativeRootStorage;}
@@ -49,6 +50,10 @@ public:
     void requireAuthority(const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const;
     /** @return Actual retained physical root claims without device state observation. */
     ImmutableLookupNativeOwnerObservation retainedOwnerObservation()const;
+    /** @return Original optional invocation-channel capture identity, separate from immutable physical roots. */
+    std::uint64_t invocationChannelIdentity() const;
+    /** @return Original bound receive receipt; this never reads device progress on the host. */
+    CapturedTransferReceiveCompletion invocationReceiveCompletion(void* exact_stream) const;
     /** @return Complete prepared geometry/allocator/runtime/root identity, rejecting stale storage. */
     std::uint64_t captureIdentity()const;
     /** @brief Validate actual roots and join only their original setup event on the exact consumer stream. */
@@ -69,11 +74,16 @@ private:
     static std::shared_ptr<PooledImmutableOwnerPreparedStorage> createImpl(PooledImmutableOwnerNativePlan plan,
         std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,std::unique_ptr<NativeOrderingEventGroup> group);
     friend class IPooledImmutableNativeKernels;
+    friend class PooledImmutableCapturedPinEdge;
+    /** @brief Bind once to the original owner invocation receiver before any graph is recorded. */
+    void bindInvocationChannel(const CapturedTransferBinding& original);
     /** @brief Construct only around the one exact materialized claim owner. */
     PooledImmutableOwnerPreparedStorage(PooledImmutableOwnerNativePlan plan,std::shared_ptr<detail::PooledNativeRootStorage> roots)
         :plan_(std::move(plan)),roots_(std::move(roots)){}
     PooledImmutableOwnerNativePlan plan_;
     std::shared_ptr<detail::PooledNativeRootStorage> roots_;
+    /** Destroy the original allocation borrow before releasing its physical root/claim owner. */
+    std::shared_ptr<const CapturedTransferBinding> original_invocation_;
 };
 /** @brief One independent coordinator allocation set, including complete static P geometry. */
 class PooledImmutableCoordinatorPreparedStorage final

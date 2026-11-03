@@ -16,6 +16,7 @@
 #include "utils/OpenMPUtils.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "loaders/HostImmutableRowProvider.h"
+#include "fixtures/qwen4exp/PooledImmutableReadGraphFixture.h"
 #include <limits>
 #include <type_traits>
 #include "../../../utils/PreparedWeightTestHarness.h"
@@ -44,6 +45,7 @@ static_assert(std::is_convertible_v<ImmutableLookupStage::ResidentGPUStorage,Qwe
 static_assert(std::is_convertible_v<ImmutableLookupStage::Storage,Qwen4ExpPLEBuilder::LookupStorage>);
 static_assert(std::is_convertible_v<Qwen4ExpFixedHeadLookupStorage,Qwen4ExpPLEBuilder::LookupStorage>);
 static_assert(std::is_convertible_v<Qwen4ExpPooledLookupStorage,Qwen4ExpPLEBuilder::LookupStorage>);
+static_assert(std::is_convertible_v<Qwen4ExpPooledReaderLookupStorage,Qwen4ExpPLEBuilder::LookupStorage>);
 /** @brief Real native source with its descriptor and allocation certificate. */
 struct Source
 {
@@ -380,4 +382,51 @@ TEST(Qwen4ExpPLEBuilder, OrdinaryProjectionsKeepTheirOriginalPolicy)
     ComputeGraph rejected;
     EXPECT_THROW(Qwen4ExpPLEBuilder::append(rejected,context,f.weights(),f.buffers(),storage,{}),std::invalid_argument);
     EXPECT_EQ(rejected.size(),0u);
+}
+
+/** @test A foreign reader cannot manufacture a source boundary or proceed without the original retained cohort. */
+TEST(Qwen4ExpPLEBuilder, SharedReaderRequiresOriginalCohortBeforeGraphMutation)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture fixture;
+    auto context=fixture.context();
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        context.device=device;
+        test::OwnerChainBackend backend(device.type);
+        const CPUTensorStorageDeclaration declaration(1,sampling_math::kDeviceGenerationControlCount,
+            BufferTensorType::INT32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu());
+        constexpr std::size_t capacity=1u<<20;
+        PhysicalMemoryPlanBuilder plan;
+        plan.add({.world_rank=0,.device=DeviceId::cpu(),.total_bytes=capacity,.admission_available_bytes=capacity},
+            PhysicalMemoryOwner::ActivationArena,declaration.physicalBytes());
+        plan.add({.world_rank=0,.device=device,.total_bytes=capacity,.admission_available_bytes=capacity},
+            PhysicalMemoryOwner::ActivationArena,sampling_math::kDeviceGenerationControlCount*sizeof(std::int32_t));
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+        auto gpuStorage=memory->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,
+            sampling_math::kDeviceGenerationControlCount*sizeof(std::int32_t));
+        std::shared_ptr<TensorBase> controller=declaration.materialize(memory);
+        controller->setBackendForTesting(&backend);
+        const auto stream=reinterpret_cast<void*>(0x3100);
+        TransferEngine::prepareDeviceOutput(controller.get(),device,stream);
+        BufferArena arena(ArenaConfig{.physical_memory_authority=memory});
+        ASSERT_TRUE(arena.registerExternalBuffer(BufferId::MTP_GENERATION_CONTROL,controller));
+        const auto control=DeviceGenerationControlBinding::admit(arena,device,0);
+        ComputeGraph graph;
+        const auto storage=Qwen4ExpPooledReaderLookupStorage{
+            &arena,{},control,DeviceRowRange::fullyActive(Fixture::rows),std::nullopt};
+        try
+        {
+            (void)Qwen4ExpPLEBuilder::append(graph,context,fixture.weights(),fixture.buffers(),storage,{});
+            FAIL()<<"Expected original shared source cohort rejection";
+        }
+        catch(const std::invalid_argument& error)
+        {
+            EXPECT_NE(std::string(error.what()).find("original shared source participants"),std::string::npos)
+                <<error.what();
+        }
+        EXPECT_EQ(graph.size(),0u);
+        EXPECT_FALSE(graph.retainedStorageBoundary());
+    }
 }

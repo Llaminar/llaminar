@@ -23,6 +23,7 @@
 #include "planning/RankMemoryPlanInputs.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "MoEOverlayCPUServiceMeasurement.h"
+#include "backends/RetainedParticipantGraphExecutable.h"
 #include "MoEOverlayNoPeerResidency.h"
 #include "collective/LocalTPCollectiveInventory.h"
 
@@ -495,7 +496,7 @@ namespace llaminar2
              * the channel planner so capacity admission and runtime preflight
              * cannot silently classify a same-tier peer differently. */
             const bool has_remote_activation_participant =
-                MoEOverlayActivationChannelPlanner::hasRemoteRankParticipants(
+                MoEOverlayActivationChannelPlanner::requiresActivationChannels(
                     overlay_plan);
             MoEOverlayActivationChannelPlan activation_channel_plan;
             if (has_remote_activation_participant)
@@ -976,6 +977,9 @@ namespace llaminar2
                     {
                         config.ngram_tp_topology=immutableRowTableTPTopology(profile,rank_plan);
                         config.ngram_execution_policy=rank_plan.runtime.ngram_table_policy;
+                    if (rank_plan.runtime.ngram_table_policy.isGPUAdaptive())
+                        config.ngram_gpu_peer_access = ImmutableRowTableDirectedTransportPolicy::observe(
+                            rank_plan.runtime.ngram_table_policy.gpu_adaptive.placement, inventory);
                         config.ngram_lookup_schedule=rank_plan.runtime.ngram_lookup_schedule;
                         config.ngram_host_placement=ImmutableRowTableHostPlacement::fromObservedNUMANode(rank_plan.numa_node);
                         config.ngram_table_placement=rank_plan.runtime.ngram_table_placement;
@@ -1066,6 +1070,36 @@ namespace llaminar2
                 physical_plan_builder.add(device_plan.bom());
             }
 
+            // Setup probes execute serially through one original reusable
+            // calibration graph owner per GPU. Scratch and native handles retire
+            // before the next class/phase; the one ProcessRuntime slot remains.
+            size_t gpu_service_host_bytes = 0;
+            std::map<DeviceId, size_t> gpu_service_device_bytes;
+            const bool dynamic_gpu_service =
+                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+                !MoEOverlayNoPeerResidency::hasNoPeerTopology(*input.overlay_plan) &&
+                std::any_of(endpoint_devices.begin(), endpoint_devices.end(),
+                    [](DeviceId device) { return device.is_gpu(); });
+            if (dynamic_gpu_service)
+            {
+                if (!resource_devices.contains(DeviceId::cpu()))
+                    throw std::invalid_argument("Dynamic GPU service requires its original CPU authority");
+                for (const auto device : endpoint_devices)
+                {
+                    if (!device.is_gpu()) continue;
+                    const auto invocation = WorkspaceMemoryEstimator::estimatePreparedExpertService(profile,
+                        {.device = device, .device_compute_units = inventoryComputeUnits(inventory, device),
+                         .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
+                         .first_layer = family.first_model_layer,
+                         .last_layer = family.first_model_layer + family.routedLayerCapacity() - 1,
+                         .apportioned_routed_experts = true});
+                    const auto allocation = MoEOverlayCPUServiceMeasurement::gpuAllocationBytes(
+                        {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, invocation);
+                    gpu_service_host_bytes = std::max(gpu_service_host_bytes, allocation.host_bytes);
+                    gpu_service_device_bytes.emplace(device, allocation.device_bytes);
+                }
+            }
+
             for (const DeviceId device : resource_devices)
             {
                 const auto [total_bytes, available_bytes] =
@@ -1108,7 +1142,7 @@ namespace llaminar2
                 // Startup probes reuse one serial scratch family on each CPU
                 // resource. Price it before automatic expert capacity fills RAM;
                 // serving and probe workspaces are independent physical owners.
-                size_t cpu_service_bytes = 0;
+                size_t prepared_service_bytes = 0;
                 if (device.is_cpu() &&
                     endpoint_devices.contains(device) &&
                     rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
@@ -1124,11 +1158,25 @@ namespace llaminar2
                          .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
                          .first_layer = family.first_model_layer,
                          .last_layer = family.first_model_layer + family.routedLayerCapacity() - 1});
-                    cpu_service_bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
+                    prepared_service_bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
                         {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, invocation_bytes);
                 }
+                if (device == DeviceId::cpu())
+                    prepared_service_bytes = std::max(prepared_service_bytes, gpu_service_host_bytes);
+                if (const auto probe = gpu_service_device_bytes.find(device);
+                    probe != gpu_service_device_bytes.end())
+                {
+                    prepared_service_bytes = probe->second;
+                    const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
+                    const auto service_graph_bom = RetainedParticipantGraphExecutable::calibrationBOM(
+                        {.world_rank = rank_plan.rank, .device = DeviceId::cpu(),
+                         .total_bytes = host_total, .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)},
+                        resource);
+                    for (const auto& contribution : service_graph_bom.resources())
+                        physical_plan_builder.add(contribution);
+                }
                 additions
-                    .add(PhysicalMemoryOwner::ExecutionWorkspace, cpu_service_bytes)
+                    .add(PhysicalMemoryOwner::ExecutionWorkspace, prepared_service_bytes)
                     // One host histogram/mailbox family per rank, regardless of
                     // how many CPU or GPU expert endpoints share that process.
                     .add(PhysicalMemoryOwner::ExecutionWorkspace,

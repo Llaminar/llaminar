@@ -3,16 +3,20 @@
 if(NOT COMMAND llaminar_native_source_fingerprint)
     include(${CMAKE_CURRENT_LIST_DIR}/../../../cmake/NativeSourceFingerprint.cmake)
 endif()
+
 if(NOT V2_PERF_TESTS_ONLY)
     add_library(v2_host_service_tls_control MODULE
         unit/execution/local_execution/graph/support/HostServiceTLSControl.cpp)
+    add_library(v2_host_service_non_tls_control MODULE
+        unit/execution/local_execution/graph/support/HostServiceNonTLSControl.cpp)
     add_executable(v2_test_retained_host_service
         unit/execution/local_execution/graph/Test__RetainedHostServiceOwner.cpp)
     target_include_directories(v2_test_retained_host_service PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(v2_test_retained_host_service PRIVATE llaminar2_core GTest::gtest_main Threads::Threads ${CMAKE_DL_LIBS})
     target_compile_definitions(v2_test_retained_host_service PRIVATE
-        LLAMINAR_HOST_SERVICE_TLS_CONTROL="$<TARGET_FILE:v2_host_service_tls_control>")
-    add_dependencies(v2_test_retained_host_service v2_host_service_tls_control)
+        LLAMINAR_HOST_SERVICE_TLS_CONTROL="$<TARGET_FILE:v2_host_service_tls_control>"
+        LLAMINAR_HOST_SERVICE_NON_TLS_CONTROL="$<TARGET_FILE:v2_host_service_non_tls_control>")
+    add_dependencies(v2_test_retained_host_service v2_host_service_tls_control v2_host_service_non_tls_control)
     v2_test_device_scope(v2_test_retained_host_service DeclaredBackends)
     v2_bind_gpu_process_test_entry(v2_test_retained_host_service v2_core_gtest_main)
     add_v2_test(V2_Unit_RetainedHostServiceOwner
@@ -27,6 +31,18 @@ if(NOT V2_PERF_TESTS_ONLY)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedHostServiceOwnerReplay)
 endif()
+# Real loaded TLS code is unchanged by hardlink/permission metadata; replacement still rejects.
+if(TARGET v2_test_retained_host_service)
+    add_v2_test(V2_Integration_RetainedHostServiceFileMetadataReplay
+        COMMAND $<TARGET_FILE:v2_test_retained_host_service>
+            --gtest_filter=RetainedHostServiceFamily.ColdEvidenceAcceptsTLSFileMetadataOnlyChanges:RetainedHostServiceFamily.ColdEvidenceRejectsTLSFileModification:RetainedHostServiceFamily.ColdEvidenceRejectsTLSFileReplacement
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Memory;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedHostServiceFileMetadataReplay)
+endif()
+
 # Explicit diagnostic source closure is independent of production creator identity and installed DATA.
 set(_host_service_diagnostic_sources
     integration/execution/Measure__RetainedHostService.cpp
@@ -157,3 +173,24 @@ add_v2_test(V2_Integration_HostServiceDebugEnvAuthority
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;StaticAnalysis;DebugEnv;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostServiceDebugEnvAuthority)
+
+# Diagnose the actual cold metadata rejection without weakening loader/TLS policy.
+if(TARGET v2_test_retained_host_service)
+    add_v2_test(V2_Integration_RetainedHostServiceEvidenceDiagnostics
+        COMMAND $<TARGET_FILE:v2_test_retained_host_service> --gtest_filter=RetainedHostServiceFamily.ColdEvidence* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Memory;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedHostServiceEvidenceDiagnostics)
+endif()
+
+# Current immutable TLS/provider/source facts, not incidental non-TLS loader history.
+if(TARGET v2_test_retained_host_service)
+    add_v2_test(V2_Integration_RetainedHostServiceCurrentResourceReplay
+        COMMAND $<TARGET_FILE:v2_test_retained_host_service>
+            --gtest_filter=RetainedHostServiceFamily.ColdEvidenceAcceptsNonTLSLoaderChurn:RetainedHostServiceFamily.ColdEvidenceAcceptsUnlinkedLoadedNonTLSImage:RetainedHostServiceFamily.ColdEvidenceRequiresCurrentTLSIdentityAcrossSameFileReload:RetainedHostServiceFamily.ColdEvidenceIdentifiesTLSGeometry:RetainedHostServiceFamily.ColdEvidenceRedactsRuntimePolicyValues --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Memory;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedHostServiceCurrentResourceReplay)
+endif()

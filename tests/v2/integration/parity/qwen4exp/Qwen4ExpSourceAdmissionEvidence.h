@@ -18,6 +18,8 @@
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/PreparedWeightStore.h"
 #include "execution/runner/IOrchestrationRunner.h"
+#include "execution/runner/PreparedWeightAuthorityIdentity.h"
+#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "tensors/TensorKernels.h"
@@ -429,16 +431,36 @@ inline void requireQwen4ExpHostLookupStaging(
 /**
  * @brief Reject the formerly unclaimed CPU storage categories after real setup.
  * @param rows Coherent rank-local attestation from the existing model authority.
+ * @param placement Original frozen routed placement, when this rank uses an overlay.
  * @throws std::logic_error If a CPU compute allocation category has no live claim.
  *
  * This is a materialization canary, not equality to a maximum admission budget.
  * Per-allocation unit regressions prove exact byte geometry and lifetime. A
  * prepared bank may consume less than its envelope, and primary/additional
  * copies may share immutable sources. Unused prefix capacity remains untouched.
+ * Conservative pre-quota arena/workspace capacity need not materialize for an
+ * exclusively routed CPU endpoint whose frozen quota is zero in every layer.
+ * The production prepared-weight owner projection supplies that proof; missing
+ * placement, unresolved quotas and dense/shared roles retain the strict check.
  */
 inline void requireQwen4ExpCPUStorageMaterialization(
-    std::span<const PhysicalMemoryOwnerAttestation> rows)
+    std::span<const PhysicalMemoryOwnerAttestation> rows,
+    const std::shared_ptr<const MoERoutedExpertPlacementPlan>& placement = {})
 {
+    std::vector<DeviceId> unused_cpu_compute;
+    if (placement && placement->usesExpertOverlayAuthority() && !rows.empty())
+    {
+        const auto rank = rows.front().identity.world_rank;
+        if (std::any_of(rows.begin(), rows.end(), [&](const auto& row) {
+                return row.identity.world_rank != rank;
+            }))
+            throw std::logic_error("QFN CPU materialization requires one coherent rank attestation");
+        const auto execution = resolveMoEExpertOverlayExecutionPlan(placement, rank);
+        const auto admitted = admittedOverlayPreparedWeightDevices(*placement, execution);
+        for (const auto device : execution.currentRankPlan().local_devices)
+            if (device.is_cpu() && std::find(admitted.begin(), admitted.end(), device) == admitted.end())
+                unused_cpu_compute.push_back(device);
+    }
     const auto planned = [](const auto &row) {
         return row.planned_new_bytes != 0 || row.planned_resident_bytes != 0;
     };
@@ -452,8 +474,11 @@ inline void requireQwen4ExpCPUStorageMaterialization(
             row.owner == PhysicalMemoryOwner::RoutedExpertWeights ||
             row.owner == PhysicalMemoryOwner::ExecutionWorkspace)
         {
+            if (row.owner != PhysicalMemoryOwner::RoutedExpertWeights &&
+                std::find(unused_cpu_compute.begin(), unused_cpu_compute.end(), row.identity.device) != unused_cpu_compute.end())
+                continue;
             if (!live(row))
-                throw std::logic_error("QFN CPU compute storage is admitted but has no live physical claim");
+                throw std::logic_error("QFN active CPU compute storage has no live physical claim");
         }
         else if (row.owner == PhysicalMemoryOwner::PrimaryModelWeights ||
                  row.owner == PhysicalMemoryOwner::AdditionalModelWeights)

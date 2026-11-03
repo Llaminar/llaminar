@@ -259,7 +259,7 @@ TEST(ModelKLDQFNContract, OriginalTPPublicationSchemaAndBoundedWindow)
         EXPECT_THROW((void)qfnTPHostPublicationCount(records,4), std::invalid_argument);
     }
 }
-/** @test Original real file stat binding rejects every field drift and same-size replacement. */
+/** @test Persistent file identity rejects file drift/replacement and malformed device metadata. */
 TEST(ModelKLDQFNContract, OriginalStatIdentityRejectsSameSizeReplacement)
 {
     char pattern[] = "/tmp/qfn-original-stat-unit-XXXXXX";
@@ -284,7 +284,10 @@ TEST(ModelKLDQFNContract, OriginalStatIdentityRejectsSameSizeReplacement)
         auto identity = frozen;
         identity[field] = identity[field].get<std::int64_t>() + 1;
         stale["object_identity"] = identity.dump();
-        EXPECT_THROW((void)qfnRequireOriginalSourceStat(stale, path), std::invalid_argument);
+        if (std::string_view(field) == "device")
+            EXPECT_EQ(qfnRequireOriginalSourceStat(stale, path), frozen);
+        else
+            EXPECT_THROW((void)qfnRequireOriginalSourceStat(stale, path), std::invalid_argument);
         // JSON's numeric comparison may otherwise narrow nanosecond integers
         // to double and accept a timestamp that no longer identifies this file.
         identity = frozen;
@@ -295,6 +298,31 @@ TEST(ModelKLDQFNContract, OriginalStatIdentityRejectsSameSizeReplacement)
     std::filesystem::rename(other, path);
     ASSERT_EQ(std::filesystem::file_size(path), 1);
     EXPECT_THROW((void)qfnRequireOriginalSourceStat(descriptor, path), std::invalid_argument);
+}
+/** @test A reboot may renumber a source device; current complete runtime metadata is returned. */
+TEST(ModelKLDQFNContract, OriginalStatDeviceRenumberingKeepsRuntimeIdentity)
+{
+    char pattern[] = "/tmp/qfn-device-renumber-unit-XXXXXX";
+    const int fd = ::mkstemp(pattern);
+    ASSERT_GE(fd, 0);
+    struct FileOwner {
+        int fd;
+        const char *path;
+        ~FileOwner() { ::close(fd); ::unlink(path); }
+    } owner{fd, pattern};
+    ASSERT_EQ(::write(fd, "x", 1), 1);
+    const auto current = qfnOriginalSourceStat(pattern);
+    auto reference = current;
+    reference["device"] = current.at("device").get<std::uint64_t>() + 1;
+    json descriptor{{"path", pattern}, {"bytes", 1}, {"object_identity", reference.dump()}};
+    EXPECT_EQ(qfnRequireOriginalSourceStat(descriptor, pattern), current);
+    EXPECT_NE(current, reference); // The owner can still detect a live mount change.
+    for (const json bad : {json(-1), json(true), json(1.0), json("other")})
+    {
+        reference["device"] = bad;
+        descriptor["object_identity"] = reference.dump();
+        EXPECT_THROW((void)qfnRequireOriginalSourceStat(descriptor, pattern), std::invalid_argument);
+    }
 }
 /** @test Real retained-parent vocabulary admits only a declared heterogeneous owner boundary. */
 TEST(ModelKLDQFNContract, CanonicalHeterogeneousPathAndStrictTP4RemainDistinct)

@@ -2561,6 +2561,37 @@ namespace llaminar2
     // Constructors
     // =========================================================================
 
+    bool Qwen35MoEGraph::requiresCapturedSparseReturn(const MoERoutedExpertPlacementPlan& plan,
+        const MoEExpertOwnerMap& owners, int layer, MoERebalanceRuntimeMode mode,
+        std::optional<std::string_view> completed_return)
+    {
+        if (layer < plan.first_model_layer || plan.first_model_layer < 0 || plan.continuation_domain.empty())
+            throw std::logic_error("Captured sparse publication has no original layer/domain");
+        const auto quota_layer = static_cast<std::size_t>(layer - plan.first_model_layer);
+        std::vector<std::size_t> counts(plan.routed_tiers.size(), 0);
+        for (const auto& owner : owners.owners()) {
+            if (owner.layer_idx != layer) continue;
+            if (owner.tier_idx < 0 || static_cast<std::size_t>(owner.tier_idx) >= counts.size() ||
+                owner.domain_name != plan.routed_tiers[static_cast<std::size_t>(owner.tier_idx)].domain)
+                throw std::logic_error("Captured sparse publication changed original tier ownership");
+            ++counts[static_cast<std::size_t>(owner.tier_idx)];
+        }
+        if (std::all_of(counts.begin(), counts.end(), [](auto count) { return count == 0; }))
+            throw std::logic_error("Captured sparse publication has no complete routed ownership");
+        bool external = false;
+        for (std::size_t tier = 0; tier < counts.size(); ++tier) {
+            if (plan.routed_tiers[tier].domain == plan.continuation_domain) continue;
+            const auto& quotas = plan.routed_tiers[tier].resolved_live_experts_per_layer;
+            if (counts[tier] != 0) external = true;
+            else if (mode == MoERebalanceRuntimeMode::Dynamic &&
+                (quota_layer >= quotas.size() || quotas[quota_layer] != 0))
+                throw std::logic_error("Mutable empty external tier requires its original frozen zero quota");
+        }
+        if (external && completed_return && completed_return->empty())
+            throw std::runtime_error("Qwen35 MoE captured distributed LocalTP root has no completed remote sparse return");
+        return external;
+    }
+
     Qwen35MoEGraph::Qwen35MoEGraph(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<IMPIContext> mpi_ctx,
@@ -3957,7 +3988,6 @@ namespace llaminar2
         if (!config_.moe.overlay_mpi_ctx || !graph_device.is_valid() ||
             tier_index < 0 || domain_ordinal < 0 ||
             source_world_rank < 0 || target_world_rank < 0 ||
-            source_world_rank == target_world_rank ||
             participant_ids.empty() || source_participant_id < 0 ||
             !model_ctx_ || !config_.moe.routed_expert_plan)
         {
@@ -4067,7 +4097,10 @@ namespace llaminar2
                 max_mtp_draft_depth).forRoutedLayerInterval(
                     overlay_plan.first_model_layer,
                     overlay_plan.placementLayerCapacity());
-        const auto transaction_topology =
+        const bool same_rank = source_world_rank == target_world_rank;
+        const auto transaction_topology = same_rank ?
+            makeMoEOverlayRankLocalInferenceTopologyIdentity(owner_map, graph_family,
+                source_participant_id, participant_ids) :
             makeMoEOverlayInferenceTopologyIdentity(
                 owner_map,
                 graph_family,
@@ -4111,14 +4144,16 @@ namespace llaminar2
             return existing->second;
         }
 
-        const std::string channel_identity =
+        const std::string channel_identity = same_rank ?
+            makeMoEOverlayRankLocalGPUChannelIdentity(tier_index, domain_ordinal,
+                source_world_rank, participant_ids) :
             makeMoEOverlayRankBatchChannelIdentity(
                 tier_index,
                 domain_ordinal,
                 source_world_rank,
                 target_world_rank,
                 participant_ids);
-        if (resolveMoEOverlayRankBatchTransportKind(
+        if (same_rank || resolveMoEOverlayRankBatchTransportKind(
                 *config_.moe.overlay_mpi_ctx,
                 source_world_rank,
                 target_world_rank) ==
@@ -5146,10 +5181,12 @@ namespace llaminar2
             layer_idx == config_.pp_layer_offset + config_.n_layers - 1;
         auto *local_tp_ctx = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
         auto *global_tp_ctx = dynamic_cast<IGlobalTPContext *>(config_.tp_ctx);
-        const bool distributed_expert_overlay =
-            use_expert_overlay &&
-            config_.moe.overlay_mpi_ctx &&
-            config_.moe.overlay_mpi_ctx->world_size() > 1;
+        const bool rank_local_expert_endpoints = use_expert_overlay && config_.moe.overlay_mpi_ctx &&
+            MoEOverlayHostServiceContract::resolveAdmitted(*overlay_plan,
+                *routedForwardRecipe(device).owners, *config_.moe.overlay_mpi_ctx)
+                .requiresRankLocalInferencePublisher();
+        const bool distributed_expert_overlay = use_expert_overlay && config_.moe.overlay_mpi_ctx &&
+            (config_.moe.overlay_mpi_ctx->world_size() > 1 || rank_local_expert_endpoints);
         const RoutedContinuationTopology routed_continuation_topology =
             use_expert_overlay ? routedForwardRecipe(device).continuation : RoutedContinuationTopology{};
         const bool captured_overlay_continuation =
@@ -9601,6 +9638,10 @@ namespace llaminar2
                 {
                     if (host_dispatch_path_materialized)
                         return;
+                    if (captured_overlay_continuation &&
+                        requiresSingleNativeExecutable(graph.nativeCaptureEnvelope()))
+                        throw std::logic_error(
+                            "Captured device-owned expert routing cannot create a host dispatch endpoint");
                     if (sparse_graph_contract.ownsDispatchAuthority() &&
                         device.is_gpu())
                     {
@@ -9721,6 +9762,16 @@ namespace llaminar2
                         dispatch_params.routing_evidence_publication =
                             MoEExpertDispatchStage::RoutingEvidencePublication{
                                 .histogram = config_.moe.decode_histogram,
+                                // Replicated TP routers describe one logical transaction.
+                                // The frozen owner map already authenticated both IDs;
+                                // only its continuation root publishes shared history.
+                                // Every peer still constructs and executes its own
+                                // original CPU/GPU expert dispatch and return work.
+                                .producer_role = captured_overlay_continuation
+                                    ? selectMoEContinuationHistogramProducerRole(
+                                          graph_local_continuation_participant,
+                                          continuation_root_participant)
+                                    : MoERuntimeHistogramProducerRole::ProductionDecode,
                                 .source = routed_histogram_source,
                             };
                     }
@@ -9908,49 +9959,21 @@ namespace llaminar2
                             "Qwen35 MoE mapped activation parent cannot resolve its continuation rank");
                     }
 
-                    // Planning and lowering classify the SAME authored endpoints,
-                    // including initially empty owners. No quota or mutable expert
-                    // assignment can alter this native host-boundary declaration.
-                    const auto hostService=MoEOverlayHostServiceContract::resolve(*overlay_plan,
-                        owner_map_lifetime->participants(),*config_.moe.overlay_mpi_ctx);
+                    // Planning reserves every authored service endpoint. Capture
+                    // uses that same topology after frozen quotas prove which
+                    // tiers can ever contribute; a mutable empty mask proves nothing.
+                    const auto hostService=MoEOverlayHostServiceContract::resolveAdmitted(*overlay_plan,
+                        *owner_map_lifetime,*config_.moe.overlay_mpi_ctx);
                     if(hostService.continuationTier()!=continuation_tier_index)
                         throw std::logic_error("Routed host service changed original continuation tier");
                     mapped_activation_local_participants.assign(hostService.localParticipants().begin(),hostService.localParticipants().end());
-                    mapped_activation_remote_participants.assign(hostService.remoteParticipants().begin(),hostService.remoteParticipants().end());
-                    const bool saw_remote_participant=!mapped_activation_remote_participants.empty();
-                    const bool all_remote_participants_are_node_local=!saw_remote_participant||hostService.mappedActivationTopology();
+                    mapped_activation_remote_participants.assign(hostService.externalParticipants().begin(),hostService.externalParticipants().end());
                     const bool mapped_activation_topology=hostService.mappedActivationTopology();
-                    if (!mapped_activation_local_participants.empty() ||
-                        (saw_remote_participant &&
-                         !all_remote_participants_are_node_local))
-                    {
-                        /*
-                         * Both colocated CPU service and portable inter-host
-                         * MPI require the same captured/manual/captured ticket
-                         * lifecycle. Transport locality selects the wire path,
-                         * not ownership of the executable launch. Declaring
-                         * this before building host dispatch also installs its
-                         * producer cutpoint and the base builder's terminal
-                         * contract, including setup-only materialization.
-                         *
-                         * The logical root owns host work. LocalTP siblings
-                         * close matching native units without running that
-                         * work or publishing the transaction a second time.
-                         */
-                        graph.setNativeCaptureEnvelope(
-                            sparse_graph_contract.ownsDispatchAuthority()
-                                ? GraphNativeCaptureEnvelope::
-                                      HeterogeneousTicketAuthorityTransaction
-                                : GraphNativeCaptureEnvelope::
-                                      HeterogeneousTicketFollowerTransaction);
-                    }
-                    else if (mapped_activation_topology)
-                    {
-                        // With no host-serviced boundary, every mapped device
-                        // wait/publication remains inside one native graph.
-                        graph.setNativeCaptureEnvelope(
-                            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
-                    }
+                    // The original admitted endpoint contract owns this decision.
+                    // No host boundary means one native parent; otherwise only
+                    // the declared logical root owns the ticket service.
+                    graph.setNativeCaptureEnvelope(hostService.captureEnvelope(
+                        sparse_graph_contract.ownsDispatchAuthority()));
                     if (mapped_activation_topology)
                     {
                         mapped_activation_dispatch_wave_identities.reserve(
@@ -10054,9 +10077,11 @@ namespace llaminar2
                 }
 
                 if (sparse_graph_contract.ownsDispatchAuthority() &&
-                    (!use_mapped_activation_parent ||
-                     !mapped_activation_local_participants.empty()))
+                    (!captured_overlay_continuation ||
+                     requiresHeterogeneousTicketSegmentation(graph.nativeCaptureEnvelope())))
                 {
+                    // The admitted endpoint contract is authoritative. An absent
+                    // mapped remote lane does not imply that CPU dispatch exists.
                     ensure_host_dispatch_path();
                 }
 
@@ -10742,12 +10767,12 @@ namespace llaminar2
                                 throw std::logic_error(
                                     "Qwen35 MoE distributed sparse tier contains an unresolved participant endpoint");
                             }
-                            if (participant->world_rank == source_world_rank)
+                            if (participant->world_rank == source_world_rank && participant->device.is_cpu())
                             {
-                                /* One rank may own both continuation and a
-                                 * NodeTP lower-tier endpoint. Preserve that
-                                 * endpoint as an explicit in-process sparse
-                                 * edge rather than inventing a self-MPI lane. */
+                                /* CPU service stays in the original local sparse
+                                 * boundary. Same-rank foreign GPUs instead use
+                                 * their real retained endpoint channel; they
+                                 * never become continuation TP participants. */
                                 local_rank_participants.push_back(
                                     target_participant);
                                 continue;
@@ -12512,12 +12537,10 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Qwen35 MoE captured distributed LocalTP publication has an incomplete rooted collective contract");
                     }
-                    if (sparse_graph_contract.ownsDispatchAuthority() &&
-                        last_return_reduce.empty())
-                    {
-                        throw std::runtime_error(
-                            "Qwen35 MoE captured distributed LocalTP root has no completed remote sparse return");
-                    }
+                    const bool has_external_contributions = requiresCapturedSparseReturn(
+                        *overlay_plan, *owner_map_lifetime, layer_idx, config_.moe.rebalance_config.mode,
+                        sparse_graph_contract.ownsDispatchAuthority()
+                            ? std::optional<std::string_view>{last_return_reduce} : std::nullopt);
 
                     const auto route_transport =
                         node_local_route_transport;
@@ -12795,7 +12818,8 @@ namespace llaminar2
                         ordered_reduce_name,
                         std::move(ordered_reduce_capture_wave));
                     if (requiresHeterogeneousTicketSegmentation(
-                            graph.nativeCaptureEnvelope()))
+                            graph.nativeCaptureEnvelope()) &&
+                        (has_external_contributions || use_mapped_activation_parent))
                     {
                         /*
                          * Close the captured producer immediately before the
@@ -12858,7 +12882,12 @@ namespace llaminar2
                     if (
                         sparse_graph_contract.ownsDispatchAuthority())
                     {
-                        if (use_mapped_activation_parent &&
+                        if (!has_external_contributions && last_return_reduce.empty())
+                        {
+                            // The same rooted GPU reduction already owns every expert route.
+                            // ATTN_PROJ has no remote payload and must not be merged as one.
+                        }
+                        else if (use_mapped_activation_parent &&
                             rank_local_ticket_return_terminal.empty())
                         {
                             /* Mapped GPU returns are already represented in

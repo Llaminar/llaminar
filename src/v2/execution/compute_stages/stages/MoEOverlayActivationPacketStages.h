@@ -79,6 +79,11 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         /** @return MOE_OVERLAY_ACTIVATION_DISPATCH_PACK. */
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         /** @return Stable diagnostic operation name. */
         std::string name() const override;
         /** @return Whether CUDA/ROCm supplies the packet kernel. */
@@ -332,6 +337,11 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         /** @return MOE_OVERLAY_ACTIVATION_DISPATCH_PACK. */
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         /** @return Stable batch-stage diagnostic name. */
         std::string name() const override;
         /** @return Whether CUDA/ROCm provides the batch kernel. */
@@ -419,6 +429,11 @@ namespace llaminar2
         /** @brief Enqueue descriptor validation and fixed-capacity expansion. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         std::string name() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
@@ -477,6 +492,11 @@ namespace llaminar2
         /** @brief Enqueue compact return publication in dispatch row order. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         std::string name() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
@@ -532,6 +552,11 @@ namespace llaminar2
         /** @brief Enqueue descriptor validation and deterministic FP32 fold. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         std::string name() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
@@ -598,6 +623,11 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         /** @return MOE_OVERLAY_ACTIVATION_RETURN_CONSUME. */
         ComputeStageType type() const override;
+        /** @return Native participant-local endpoint capture, never runtime CCL readiness. */
+        CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
+        {
+            return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+        }
         /** @return Stable batch-stage diagnostic name. */
         std::string name() const override;
         /** @return Whether CUDA/ROCm provides both kernels. */

@@ -66,7 +66,10 @@ public:
         execution.requirePreparedInput(own.frame.get());execution.requirePreparedInput(coord.native.get());
         auto* changed=fault_.action==n::OwnerAction::Pin?coord.native.get():own.frame.get();
         execution.requirePreparedOutput(changed);
-        identity_fixture::Args args{owner_->plan().parameters(),coordinator_->plan().parameters(),nullptr,
+        const bool changesSlot=fault_.fault==identity_fixture::IdentityFault::PinCommitFlags;
+        if(changesSlot){execution.requirePreparedInput(own.cache.get());execution.requirePreparedOutput(own.cache.get());}
+        identity_fixture::Args args{owner_->plan().parameters(),coordinator_->plan().parameters(),
+            changesSlot?static_cast<std::byte*>(own.cache->gpu_data_ptr()):nullptr,
             static_cast<std::byte*>(own.frame->gpu_data_ptr()),nullptr,nullptr,static_cast<std::byte*>(coord.native->gpu_data_ptr()),
             nullptr,nullptr,nullptr,nullptr,{},0,0,fault_.fault,fault_.position,fault_.action!=n::OwnerAction::Pin};
 #ifdef HAVE_CUDA
@@ -75,13 +78,17 @@ public:
 #ifdef HAVE_ROCM
         if(device().is_rocm())identity_fixture::launchROCm(identity_fixture::Action::CorruptIdentity,args,execution.nativeStream());
 #endif
-        execution.publish(changed);return true;
+        execution.publish(changed);
+        if(changesSlot)execution.publish(own.cache.get());
+        return true;
     }
     /** @return Only original preallocated root reads/writes. */
     StageBufferContract bufferContract()const override{
         auto contract=StageBufferContract::build();
         if(fault_.action==n::OwnerAction::Pin)contract.addInput(BufferId::QFN_POOLED_OWNER_FRAME,"INT8").addPreallocatedInOut(BufferId::QFN_POOLED_COORDINATOR_NATIVE,"INT8");
         else contract.addInput(BufferId::QFN_POOLED_COORDINATOR_NATIVE,"INT8").addPreallocatedInOut(BufferId::QFN_POOLED_OWNER_FRAME,"INT8");
+        if(fault_.fault==identity_fixture::IdentityFault::PinCommitFlags)
+            contract.addPreallocatedInOut(BufferId::QFN_POOLED_OWNER_CACHE,"INT8");
         return contract;
     }
     /** @return Complete immutable original address/geometry/fault identity. */
@@ -146,7 +153,8 @@ struct ProviderReplaySpec final {
             requireProvider(!tokenQueries && ownership==OwnerAdmission::Original && interleaving==ACKInterleaving::None &&
                 activationPreparation==ActivationPreparation::BeforeGraph && maximum>identityRejection->position && slots>=maximum &&
                 (pin || role==n::OwnerAction::AcceptFree || role==n::OwnerAction::AcceptVictim) &&
-                (common || (pin?fault==identity_fixture::IdentityFault::DuplicateSlot:
+                (common || (pin?(fault==identity_fixture::IdentityFault::DuplicateSlot || fault==identity_fixture::IdentityFault::PinSlotBounds ||
+                    fault==identity_fixture::IdentityFault::PinOrdinal || fault==identity_fixture::IdentityFault::PinCommitFlags):
                     fault==identity_fixture::IdentityFault::ForeignOwner || fault==identity_fixture::IdentityFault::ForeignInterval)),
                 "Invalid captured identity rejection declaration");
         }

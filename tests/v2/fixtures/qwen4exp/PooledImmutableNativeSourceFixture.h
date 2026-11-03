@@ -13,7 +13,7 @@ namespace n=qwen4exp::pooled_native;
 /** @brief Nominal recorded-boundary operation; unsupported source-only decisions fail the component trace. */
 enum class Action:std::uint32_t {PoisonCache,DeliverPins,DeliverFree,DeliverVictims,SourceHeader,DeliverSource,ReadRows,CorruptIdentity};
 /** @brief Immutable rejection trace; only the diagnostic producer may corrupt its selected live input. */
-enum class IdentityFault:std::uint32_t {None,DuplicateRow,DuplicateUnique,DuplicateSlot,ForeignOwner,ForeignInterval};
+enum class IdentityFault:std::uint32_t {None,DuplicateRow,DuplicateUnique,DuplicateSlot,ForeignOwner,ForeignInterval,PinSlotBounds,PinOrdinal,PinCommitFlags};
 /** @brief Exact private persistent diagnostic staging, separately admitted to the fixture PMA. */
 struct IO {
     std::size_t header=0,record_bytes=64,payload_bytes=72,records=128,payload=0,bytes=0;

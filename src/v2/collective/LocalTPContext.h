@@ -168,6 +168,10 @@ namespace llaminar2
             const std::string &boundary_name,
             int device_index,
             int timeout_ms) override;
+        /** @copydoc ILocalTPContext::graphCaptureBoundaryRendezvous */
+        bool graphCaptureBoundaryRendezvous(const std::string&,int,int,LocalTPCaptureSourceDefinition&) override;
+        /** @copydoc ILocalTPContext::graphCaptureBoundaryOnStream */
+        bool graphCaptureBoundaryOnStream(const std::string&,int,void*,int,LocalTPCaptureSourceDefinition&) override;
 
         /**
          * @brief Establish the backend-specific stream fence for a capture boundary.
@@ -824,6 +828,13 @@ namespace llaminar2
          * @return true when policy permits LocalTP collective execution.
          */
         bool isLocalTPGpuGraphPolicySupported(std::string *reason_out = nullptr) const;
+        /** @brief Ordinary and payload callers share the original cyclic barrier state machine. */
+        bool graphCaptureBoundaryRendezvousImpl(const std::string&,int,int,LocalTPCaptureSourceDefinition*);
+        /** @brief Preserve the original stream fence and attach payload only to its existing final rendezvous. */
+        bool graphCaptureBoundaryOnStreamImpl(const std::string&,int,void*,int,LocalTPCaptureSourceDefinition*);
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream> graph_capture_source_definition_;
+        RetainedGraphParticipantDefinitionDomain graph_capture_source_domain_;
+        bool graph_capture_source_exchange_=false;
     };
 
 } // namespace llaminar2

@@ -8,6 +8,7 @@
  */
 #include "planning/ImmutableRowTablePlacementPlanner.h"
 #include "loaders/ImmutableRowTable.h"
+#include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include <gtest/gtest.h>
 #include <array>
@@ -237,4 +238,25 @@ TEST(ImmutableRowTablePlacementPlanner, HostLocalityIsSealedSeparatelyFromPhysic
     EXPECT_EQ(task.placement->allocators().front(),exact.placement->allocators().front());
 }
 
+}
+
+namespace llaminar2::test {
+/** @test Mandatory full-RAM bytes belong to one exact source irrespective of actual cache consumer count. */
+TEST(ImmutableRowTablePlacementPlanner, AdaptiveFullRAMDeclaresSourceOnceAndRejectsRedundantCache){
+    for(const std::size_t count:{1u,2u,4u}){
+        std::vector<PhysicalMemoryResource> consumers;for(std::size_t i=0;i<count;++i)consumers.push_back(resource(DeviceId::cuda(i)));
+        auto policy=request(ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD);policy.gpu_adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;
+        policy.gpu_adaptive.maximum_gpu_cache_rows=64;policy.gpu_adaptive.gpu_cache_physical_byte_limit=1u<<20;ASSERT_NO_THROW(policy.validate());
+        const auto declared=input(consumers).gpuAdaptiveLayout(policy,0,0,16);
+        ASSERT_EQ(declared.sourceServices().size(),1u);EXPECT_EQ(declared.sourceServices().front().windows.storage(),ImmutableRowStorage::RAM);
+        EXPECT_FALSE(declared.tiers().contains(ImmutableRowStorage::MemoryMapped));
+        const auto geometry=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPUs(declared,{3,DeviceId::cpu()});
+        EXPECT_EQ(geometry.storageBytes(),0u);EXPECT_EQ(geometry.sourceBytes(),ImmutableRowTable::physicalBytesForNativeExtent(extent().nativeBytes(),ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM)));
+        const auto contribution=geometry.mandatoryBOM(resource(DeviceId::cpu()));ASSERT_EQ(contribution.resources().size(),1u);
+        EXPECT_EQ(contribution.resources().front().bytes(PhysicalMemoryOwner::ImmutableTableStorage),geometry.sourceBytes());
+        auto redundant=policy;redundant.gpu_adaptive.host.maximum_cache_rows=1;EXPECT_THROW(redundant.validate(),std::invalid_argument);
+        redundant=policy;redundant.gpu_adaptive.host.cache_physical_byte_limit=1;EXPECT_THROW(redundant.validate(),std::invalid_argument);
+        redundant=policy;redundant.gpu_adaptive.source_backing=static_cast<AdaptiveImmutableRowBacking>(99);EXPECT_THROW(redundant.validate(),std::invalid_argument);
+    }
+}
 }

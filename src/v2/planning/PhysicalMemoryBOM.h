@@ -66,6 +66,8 @@ namespace llaminar2
         NativeImmutableLookupOrderingEvent, ///< Certified existing lookup setup/publication/retirement event program.
         RetainedHostServiceStorage, ///< Exact admitted CPU service stack and compiled worker object.
         RetainedHostServiceRuntime, ///< Separately qualified process-retained libc/TLS backing.
+        NativePreparationGraphExecutable, ///< Closed startup calibration graph, isolated from serving reservations.
+        NativeStorageGraphExecutable, ///< Retained storage graph definitions, isolated from model/follower reservations.
         Count,                    ///< Sentinel; never a valid charge owner.
     };
 
@@ -103,6 +105,10 @@ namespace llaminar2
             return "local_collective";
         case PhysicalMemoryOwner::NativeGraphExecutable:
             return "native_graph_executable";
+        case PhysicalMemoryOwner::NativeStorageGraphExecutable:
+            return "native_storage_graph_executable";
+        case PhysicalMemoryOwner::NativePreparationGraphExecutable:
+            return "native_preparation_graph_executable";
         case PhysicalMemoryOwner::GraphSnapshotArena:
             return "graph_snapshot_arena";
         case PhysicalMemoryOwner::WeightLoadStaging:

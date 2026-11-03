@@ -10,6 +10,9 @@
 #include "fixtures/execution/RetainedHostServiceFixture.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "execution/qwen4exp/ImmutableLookupService.h"
+#include "execution/local_execution/graph/RetainedStoragePerfStats.h"
+#include "loaders/ImmutableLookupSetupObservation.h"
+#include "execution/local_execution/orchestrators/TPWorkerPool.h"
 #include "kernels/qwen4exp/PooledImmutableSourceOps.h"
 #include <gtest/gtest.h>
 #include "../../../mocks/MockBackend.h"
@@ -477,9 +480,10 @@ public:
     void *address=nullptr;unsigned frees=0;
 };
 WorkerMappedBackend *workerBackend=nullptr;
+unsigned workerMappingCount=2;
 /** @return One explicitly installed hardware-free mapping endpoint. */
 IBackend *resolveWorkerMapping(DeviceId device) {
-    return (device==DeviceId::cuda(0)||device==DeviceId::cuda(1))?workerBackend:nullptr;
+    return (device.is_cuda() && device.gpu_ordinal()>=0 && static_cast<unsigned>(device.gpu_ordinal())<workerMappingCount)?workerBackend:nullptr;
 }
 /** @brief Explicit replay or installed original fixture selection; never an automatic fallback. */
 enum class ServiceLaneOrigin {Recorded,InstalledOriginal};
@@ -493,26 +497,42 @@ struct ServiceLane {
     std::shared_ptr<HostImmutableRowProvider> provider;
     std::shared_ptr<ImmutableLookupService> service;
     std::optional<ImmutableSubordinateLookupBinding> binding,secondBinding;
-    /** @brief Use the production service create/arm/poll/retire/await path with original allocator identities. */
-    explicit ServiceLane(std::size_t gpuSlots=2,std::size_t ramSlots=2,ServiceLaneOrigin origin=ServiceLaneOrigin::Recorded,bool grouped=false) {
+    std::vector<ImmutableSubordinateLookupBinding> laterBindings;
+    /**
+     * @brief Use original service creation, worker and PMA ownership without a vendor runtime.
+     * @param gpuSlots Explicit test-local cache capacity, never a source replica.
+     * @param ramSlots Bounded shared RAM cache slots; full-RAM backing requires zero.
+     * @param origin Recorded host-service metadata or actual installed declaration.
+     * @param grouped Whether the source has multiple actual consumer channels.
+     * @param fullRAM Whether the original source is fully RAM-backed.
+     * @param groupCount Exact declared test endpoint count; original callers retain two.
+     * @throws std::exception If original geometry, admission or mapping rejects setup.
+     */
+    explicit ServiceLane(std::size_t gpuSlots=2,std::size_t ramSlots=2,ServiceLaneOrigin origin=ServiceLaneOrigin::Recorded,bool grouped=false,bool fullRAM=false,unsigned groupCount=2) {
         if(workerBackend)throw std::logic_error("Overlapping serial mapping fixture");
-        workerBackend=&backend;
+        workerBackend=&backend;workerMappingCount=grouped?groupCount:2;
         try {
-            const auto sourceLayout=grouped?ImmutableRowTableLayoutGeometry::checked(
-                ImmutableRowTableExtent::fromNative(file.source.format,file.source.rows,file.source.rowBytes()),
-                ImmutableRowTableTiers::of(std::array{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped}),
-                ImmutableRowTableResidency::Adaptive,
-                {{{hostId,ImmutableRowStorage::RAM},0,ramSlots,{}},
-                 {{{0,DeviceId::cuda(0)},ImmutableRowStorage::VRAM},0,gpuSlots,{}},
-                 {{{0,DeviceId::cuda(1)},ImmutableRowStorage::VRAM},0,gpuSlots,{}}},
-                {{0,DeviceId::cuda(0)},{0,DeviceId::cuda(1)}},{},
-                {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},
-                gpuSlots?std::optional(PhysicalMemoryAllocatorIdentity{0,DeviceId::cuda(0)}):std::nullopt,8)
-                :layoutFor(file,DeviceId::cuda(0),ramSlots,gpuSlots);
+            const auto sourceLayout=[&]{
+                if(!grouped)return layoutFor(file,DeviceId::cuda(0),ramSlots,gpuSlots);
+                std::vector<ImmutableRowTableLayoutOwner> owners{{{hostId,ImmutableRowStorage::RAM},0,ramSlots,{}}};
+                std::vector<PhysicalMemoryAllocatorIdentity> consumers;
+                for(unsigned i=0;i<groupCount;++i){
+                    consumers.push_back({0,DeviceId::cuda(static_cast<int>(i))});
+                    owners.push_back({{consumers.back(),ImmutableRowStorage::VRAM},0,gpuSlots,{}});
+                }
+                return ImmutableRowTableLayoutGeometry::checked(
+                    ImmutableRowTableExtent::fromNative(file.source.format,file.source.rows,file.source.rowBytes()),
+                    ImmutableRowTableTiers::of(fullRAM?std::vector{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM}:
+                        std::vector{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped}),
+                    ImmutableRowTableResidency::Adaptive,std::move(owners),consumers,{},
+                    {{hostId,ImmutableRowTableStoragePolicy::forStorage(fullRAM?ImmutableRowStorage::RAM:ImmutableRowStorage::MemoryMapped,4096,2)}},{},
+                    groupCount==2 && gpuSlots?std::optional(consumers.front()):std::nullopt,8,
+                    groupCount==2?ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator:ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal);
+            }();
             const auto geometry=grouped?CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPUs(sourceLayout,hostId)
                 :CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(sourceLayout,hostId,{0,DeviceId::cuda(0)});
             std::vector<DeviceId> endpoints{DeviceId::cuda(0)};
-            if(grouped)endpoints.push_back(DeviceId::cuda(1));
+            if(grouped)for(unsigned i=1;i<groupCount;++i)endpoints.push_back(DeviceId::cuda(static_cast<int>(i)));
             auto io=origin==ServiceLaneOrigin::InstalledOriginal
                 ?llaminar2::test::RetainedHostServiceFixture::original(RetainedHostServiceRole::ImmutableLookupIO,{0,DeviceId::cuda(0)})
                 :llaminar2::test::RetainedHostServiceFixture::recorded(RetainedHostServiceRole::ImmutableLookupIO,{0,DeviceId::cuda(0)});
@@ -522,19 +542,22 @@ struct ServiceLane {
             provider=HostImmutableRowProvider::fromSubordinateAdaptiveCache(CpuAdaptiveImmutableRowCache::create(file.source,geometry,memory));
             service=ImmutableLookupService::create(provider,layout,endpoints,memory,DeviceId::cpu(),io.take(memory),transfers);
             binding.emplace(service->bindSubordinate(endpoints[0]));
-            if(grouped)secondBinding.emplace(service->bindSubordinate(endpoints[1]));
+            if(grouped){secondBinding.emplace(service->bindSubordinate(endpoints[1]));
+                for(std::size_t i=2;i<endpoints.size();++i)laterBindings.push_back(service->bindSubordinate(endpoints[i]));}
         } catch(...) {workerBackend=nullptr;throw;}
     }
     /** @brief Final captured binding retires before its mapped backend and source fixture. */
-    ~ServiceLane(){secondBinding.reset();binding.reset();service.reset();provider.reset();workerBackend=nullptr;}
+    ~ServiceLane(){laterBindings.clear();secondBinding.reset();binding.reset();service.reset();provider.reset();workerBackend=nullptr;}
+    /** @param channel Original sealed channel index. @return Exact binding, without frame aliasing. @throws std::out_of_range For a foreign later channel. */
+    ImmutableSubordinateLookupBinding& channelBinding(std::size_t channel){return channel<2?*(channel?secondBinding:binding):laterBindings.at(channel-2);}
     /** @return Exact shared metadata retained by the original source binding. */
-    ImmutableLookupAcknowledgement &ack(std::size_t channel=0){return *(channel?secondBinding:binding)->deviceView().base.acknowledgement;}
+    ImmutableLookupAcknowledgement &ack(std::size_t channel=0){return *channelBinding(channel).deviceView().base.acknowledgement;}
     /** @return Original acquired-completion channel, never a copied successful observation. */
-    ImmutableLookupCompletion &completion(std::size_t channel=0){return *(channel?secondBinding:binding)->deviceView().base.completion;}
+    ImmutableLookupCompletion &completion(std::size_t channel=0){return *channelBinding(channel).deviceView().base.completion;}
     /** @brief Release an exact live request through the real protocol2 ABI. */
     void publish(std::uint64_t sequence,std::uint64_t generation,std::span<const std::int64_t> ids,
                  std::span<const Intent> intents,std::size_t channel=0) {
-        auto &view=(channel?secondBinding:binding)->deviceView();
+        auto &view=channelBinding(channel).deviceView();
         if(ids.size()!=intents.size() || ids.size()>layout.maximumIds())throw std::invalid_argument("Invalid service fixture frame");
         if(!ids.empty()) {
             std::memcpy(view.base.ids,ids.data(),ids.size_bytes());
@@ -1124,5 +1147,186 @@ TEST(ImmutableLookupSubordinate, SharedSourceJoinedFailureRemainsObservableBefor
         }
         GPUDeviceProcessLifetime::retireActive();
         std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test The existing TP failure worker releases the original source group before waiting for peers. */
+TEST(ImmutableLookupSubordinate, OriginalGroupFailureCallbackReleasesMissingParticipant)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            auto group=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+            const auto fail=lane.service->failureCallback(group);
+            TPWorkerPool workers(2);workers.setFailureCallback(fail);
+            std::atomic<bool> observed{false};
+            workers.dispatch([&](std::size_t participant){
+                if(!participant)return false;
+                const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(250);
+                while(std::chrono::steady_clock::now()<deadline){
+                    const auto invocation=std::atomic_ref(lane.ack(1).cancelledInvocation).load(std::memory_order_acquire);
+                    const auto generation=std::atomic_ref(lane.ack(1).cancelledGeneration).load(std::memory_order_acquire);
+                    if(ImmutableLookupProtocol::matchesInvocation(invocation,generation,first.generation,first.invocation)){
+                        observed.store(true,std::memory_order_release);break;
+                    }
+                    std::this_thread::yield();
+                }
+                return false;
+            });
+            const auto results=workers.collectAll(1000);
+            EXPECT_EQ(results.size(),2u);EXPECT_TRUE(observed.load(std::memory_order_acquire));
+            EXPECT_FALSE(lane.service->finishGroup(group));
+            EXPECT_FALSE(lane.service->await(first)); // The group cannot steal an adopted channel's original retirement right.
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        ::_exit(::testing::Test::HasFailure()?1:0);
+    })(),::testing::ExitedWithCode(0),"");
+}
+
+/** @test A retained original failure callback cannot cancel a later source group or mint its identity. */
+TEST(ImmutableLookupSubordinate, OriginalGroupFailureCallbackCannotCancelSuccessor)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            auto old=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(old,DeviceId::cuda(0));
+            const auto second=lane.service->adoptGroupChannel(old,DeviceId::cuda(1));
+            const auto oldFailure=lane.service->failureCallback(old);
+            lane.close(0,1,0);lane.close(0,1,1);
+            EXPECT_TRUE(lane.service->await(first));EXPECT_TRUE(lane.service->await(second));
+            EXPECT_TRUE(lane.service->finishGroup(old));
+            auto current=lane.service->armGroup(2);
+            const auto active=lane.service->adoptGroupChannel(current,DeviceId::cuda(0));
+            EXPECT_THROW(lane.service->failureCallback(old),std::logic_error);
+            oldFailure();
+            EXPECT_FALSE(ImmutableLookupProtocol::matchesInvocation(
+                std::atomic_ref(lane.ack(1).cancelledInvocation).load(std::memory_order_acquire),
+                std::atomic_ref(lane.ack(1).cancelledGeneration).load(std::memory_order_acquire),
+                active.generation,active.invocation));
+            const auto currentFailure=lane.service->failureCallback(current);currentFailure();oldFailure();
+            EXPECT_TRUE(ImmutableLookupProtocol::matchesInvocation(
+                std::atomic_ref(lane.ack(1).cancelledInvocation).load(std::memory_order_acquire),
+                std::atomic_ref(lane.ack(1).cancelledGeneration).load(std::memory_order_acquire),
+                active.generation,active.invocation));
+            EXPECT_FALSE(lane.service->finishGroup(current));EXPECT_FALSE(lane.service->await(active));
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        ::_exit(::testing::Test::HasFailure()?1:0);
+    })(),::testing::ExitedWithCode(0),"");
+}
+
+namespace llaminar2::qwen4exp {
+/** @test Real original two-channel worker serves full native RAM, retains one source and retires both exact ACKs. */
+TEST(ImmutableLookupSubordinate, FullRAMSharedSourceUsesOneOwnerAcrossActualChannelReset){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup",1);
+            PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
+            ServiceLane lane(0,0,ServiceLaneOrigin::Recorded,true,true);
+            EXPECT_EQ(lane.provider->mode(),HostImmutableRowMode::AdaptiveFullRAM);
+            const auto fullLayout=ImmutableRowTableLayoutGeometry::checked(
+                ImmutableRowTableExtent::fromNative(lane.file.source.format,lane.file.source.rows,lane.file.source.rowBytes()),
+                ImmutableRowTableTiers::of(std::array{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM}),ImmutableRowTableResidency::Adaptive,
+                {{{hostId,ImmutableRowStorage::RAM},0,0,{}},{{{0,DeviceId::cuda(0)},ImmutableRowStorage::VRAM},0,0,{}},
+                 {{{0,DeviceId::cuda(1)},ImmutableRowStorage::VRAM},0,0,{}}},{{0,DeviceId::cuda(0)},{0,DeviceId::cuda(1)}},{},
+                {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM)}},{},std::nullopt,8);
+            const auto hostGeometry=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPUs(fullLayout,hostId);
+            const auto setup=ImmutableLookupSetupObservation::hostOwner(hostGeometry,lane.service);
+            EXPECT_EQ(setup.admitted_slots,0u);EXPECT_EQ(setup.payload_bytes,0u);EXPECT_EQ(setup.metadata_bytes,0u);
+            EXPECT_EQ(setup.source_storage_bytes,hostGeometry.sourceBytes());
+            EXPECT_EQ(setup.table_storage_bytes,setup.source_storage_bytes);
+
+            const auto initial=lane.provider->retainedOwnerObservation();
+            EXPECT_EQ(initial.tableStorageBytes(),ImmutableRowTable::physicalBytes(lane.file.source,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM)));
+            const auto provider=lane.provider;lane.provider.reset(); // Original service retains the SAME source; no replacement/duplicate materialization.
+            std::array<RetainedStoragePerfStats,2> publications;
+            for(std::uint64_t generation=1;generation<=20;++generation){
+                const std::array before{lane.service->stats(DeviceId::cuda(0)),lane.service->stats(DeviceId::cuda(1))};
+                auto group=lane.service->armGroup(generation);
+                const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+                const auto second=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+                const std::array<std::int64_t,3> ids{7,31,7};const std::array<Intent,3> intents{};
+                for(std::size_t channel=0;channel<2;++channel){
+                    lane.publish(generation,generation,ids,intents,channel);ServiceLane::wait(lane.completion(channel).publication,generation);
+                    EXPECT_EQ(lane.completion(channel).nativeBytes,ids.size()*lane.layout.rowBytes());
+                    const auto& view=(channel?lane.secondBinding:lane.binding)->deviceView();
+                    for(std::size_t row=0;row<ids.size();++row)
+                        EXPECT_EQ(std::memcmp(view.base.nativeRows+row*lane.layout.rowBytes(),lane.file.bytes.data()+lane.file.source.file_offset+ids[row]*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+                }
+                lane.close(generation,generation,0);lane.close(generation,generation,1);
+                EXPECT_TRUE(lane.service->await(second));EXPECT_TRUE(lane.service->await(first));EXPECT_TRUE(lane.service->finishGroup(group));
+                for(std::size_t channel=0;channel<2;++channel)EXPECT_EQ(std::atomic_ref(lane.ack(channel).retiredGeneration).load(std::memory_order_acquire),generation);
+                EXPECT_EQ(provider->retainedOwnerObservation().tableStorageBytes(),initial.tableStorageBytes());
+                for(std::size_t channel=0;channel<2;++channel){
+                    const auto device=DeviceId::cuda(channel);
+                    auto terminal=RetainedStorageTerminalObservation::between(generation,provider->mode(),before[channel],lane.service->stats(device));
+                    terminal.transport=RetainedStorageTransport::PooledSubordinate;
+                    EXPECT_NO_THROW(publications[channel].publish(terminal,device.toString()));
+                }
+            }
+            EXPECT_EQ(provider->sourceStats().storage,ImmutableRowStorage::RAM);
+            EXPECT_EQ(provider->sourceStats().window_hits,0u);EXPECT_EQ(provider->sourceStats().window_misses,0u);EXPECT_EQ(provider->sourceStats().window_evictions,0u);
+            EXPECT_EQ(lane.service->stats().ramRows,0u); // No redundant bounded RAM row-cache hits.
+            EXPECT_GT(lane.service->stats().sourceRows,0u); // Completed ORIGINAL full-RAM source reads, distinguished by actual mode.
+            const auto collected=PerfStatsCollector::snapshot({"immutable_lookup"});ASSERT_EQ(collected.size(),40u);
+            for(const auto& record:collected){
+                EXPECT_EQ(record.tags.at("storage"),"gpu_subordinate_full_ram");EXPECT_EQ(record.tags.at("transport"),"pooled_subordinate");
+                EXPECT_EQ(record.count,20u);
+                if(record.name=="source_rows")EXPECT_EQ(record.value,40);
+                if(record.name=="terminal_bytes")EXPECT_EQ(record.value,20*3*sizeof(std::uint64_t));
+            }
+
+        }
+        GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+} // namespace llaminar2::qwen4exp
+
+/** @test The original shared provider and sole CPU worker serve every declared TP4/8 channel without aliasing. */
+TEST(ImmutableLookupSubordinate, ConsumerLocalTP4AndTP8OriginalServiceRetiresEveryChannel){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(const auto count:{4u,8u})for(const bool fullRAM:{false,true})
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,0,ServiceLaneOrigin::Recorded,true,fullRAM,count);
+            for(std::uint64_t generation=1;generation<=20;++generation){
+                auto group=lane.service->armGroup(generation);
+                std::vector<ImmutableLookupService::Ticket> tickets;
+                for(unsigned i=0;i<count;++i)tickets.push_back(lane.service->adoptGroupChannel(group,DeviceId::cuda(static_cast<int>(i))));
+                for(unsigned i=count;i-->0;){
+                    const std::array<std::int64_t,1> ids{static_cast<std::int64_t>(i+1)};
+                    const std::array<Intent,1> intent{};
+                    lane.publish(generation,generation,i%2?std::span<const std::int64_t>{}:std::span<const std::int64_t>{ids},
+                        i%2?std::span<const Intent>{}:std::span<const Intent>{intent},i);
+                }
+                // Publish every real frame before joining any response; the
+                // one original worker must make progress for all ready peers.
+                for(unsigned i=count;i-->0;){
+                    ServiceLane::wait(lane.completion(i).publication,generation);
+                    EXPECT_EQ(lane.completion(i).nativeBytes,i%2?0:lane.layout.rowBytes());
+                    if(i%2==0)EXPECT_EQ(std::memcmp(lane.channelBinding(i).deviceView().base.nativeRows,
+                        lane.file.bytes.data()+lane.file.source.file_offset+(i+1)*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+                    if(i)EXPECT_NE(lane.channelBinding(i).deviceView().base.request,lane.binding->deviceView().base.request);
+                }
+                for(unsigned i=count;i-->0;)lane.close(generation,generation,i);
+                for(auto& ticket:tickets)EXPECT_TRUE(lane.service->await(ticket));
+                EXPECT_TRUE(lane.service->finishGroup(group));
+                for(unsigned i=0;i<count;++i)EXPECT_EQ(std::atomic_ref(lane.ack(i).retiredInvocation).load(std::memory_order_acquire),tickets[i].invocation);
+            }
+            ImmutableLookupService::Ticket partial;
+            {auto group=lane.service->armGroup(21);partial=lane.service->adoptGroupChannel(group,DeviceId::cuda(static_cast<int>(count-1)));}
+            EXPECT_FALSE(lane.service->await(partial));
+            EXPECT_THROW(lane.service->armGroup(22),std::logic_error);
+            for(unsigned i=0;i<count;++i){
+                EXPECT_EQ(std::atomic_ref(lane.ack(i).retiredGeneration).load(std::memory_order_acquire),21u);
+                EXPECT_NE(std::atomic_ref(lane.ack(i).retiredInvocation).load(std::memory_order_acquire),0u);
+            }
+        }
+        GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
     }()),::testing::ExitedWithCode(0),"");
 }

@@ -49,6 +49,9 @@
  */
 
 #pragma once
+
+#include "execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "execution/local_execution/graph/IRetainedGraphStorageBoundary.h"
 #include "../../factory/TestableInferenceRunnerOverrides.h"
 
 #include "IRankOrchestrator.h"
@@ -371,6 +374,13 @@ namespace llaminar2
             /** Mapped all-GPU controller pages retained by every child graph. */
             std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
                 moe_device_controller_fabric;
+
+            /**
+             * Actual auxiliary expert ownership, constructed after continuation
+             * banks and before the original final host-weight release gate.
+             * This is independent of continuation TP membership.
+             */
+            std::optional<MoEOverlayParticipantGraphRunnerConfig> rank_local_expert_endpoints;
 
             /**
              * One process-local sparse route fabric shared by continuation
@@ -1345,6 +1355,11 @@ namespace llaminar2
         deviceMoERebalanceHostedObservationSchedule()
             const noexcept override;
 
+        /** @return Original owned auxiliary endpoints, absent for ordinary/single-domain ranks. */
+        std::shared_ptr<MoEOverlayParticipantGraphRunner> rankLocalExpertEndpoints() const noexcept
+        {
+            return rank_local_expert_endpoints_;
+        }
         /** @brief Concatenate exact controller runtime bindings from all children. */
         std::vector<MoEOverlayDeviceControllerRuntimeBinding>
         moeOverlayDeviceControllerRuntimeBindings() const override;
@@ -1728,23 +1743,43 @@ namespace llaminar2
          * @brief Retire every original participant and its group, preserving the first failure.
          * @param participants Original participant owners, in authored order.
          * @param retire Terminal-only operation on one original owner; it must retain native failure guards.
-         * @param finish Final original group retirement, attempted even when a participant fails.
-         * @throws The first original exception after every remaining retirement has been attempted.
+         * @param finish Original CPU/adopted-right cleanup, attempted even when a participant fails.
+         * @param afterProof Channel admission retirement, called only after all required native proofs succeed.
+         * @throws The first missing-proof exception, otherwise the first retired-service failure, after every owner is attempted.
          * @note This does not authorize data clearing after missing native completion proof.
          */
-        template<class Participants,class Retire,class Finish>
-        static void retireOriginalStorageParticipants(const Participants& participants,Retire retire,Finish finish) {
-            std::exception_ptr first;
-            for(const auto& participant:participants){
-                try{retire(participant);}catch(...){if(!first)first=std::current_exception();}
-            }
-            try{finish();}catch(...){if(!first)first=std::current_exception();}
-            if(first)std::rethrow_exception(first);
+        template<class Participants,class Retire,class Finish,class AfterProof>
+        static void retireOriginalStorageParticipants(const Participants& participants,Retire retire,Finish finish,AfterProof afterProof) {
+            std::exception_ptr semantic, unproven;
+            const auto observe = [&](auto &&operation) {
+                try { operation(); }
+                catch (const RetiredStorageRequestFailure &) {
+                    if (!semantic) semantic = std::current_exception();
+                }
+                catch (...) {
+                    if (!unproven) unproven = std::current_exception();
+                }
+            };
+            for (const auto &participant : participants)
+                observe([&] { retire(participant); });
+            observe(finish);
+            // Channel retirement is not CPU cleanup: it is permitted only
+            // after every required original native endpoint is proven retired.
+            if (!unproven) observe(afterProof);
+            // A later missing native proof outranks any earlier service failure.
+            if (unproven) std::rethrow_exception(unproven);
+            if (semantic) std::rethrow_exception(semantic);
         }
         struct RetainedSourceAdmission;
         std::unique_ptr<RetainedSourceAdmission> retained_source_admission_;
         /** @brief Arm every original source channel before any TP participant can launch. */
         void prepareRetainedSourceAdmission();
+        /**
+         * @brief Await every original native/adopted right before classifying failed service retirement.
+         * @param prior_unproven Original cancellation-identity failure; preserve it after attempting all peers.
+         * @throws RetiredStorageRequestFailure Only after all native proofs; any missing proof remains fatal.
+         */
+        void awaitRetainedSourceAdmission(std::exception_ptr prior_unproven = {});
 
         /** @return The sole TP publication root; PP stages retain independent namespaces. */
         const IInferenceRunner *moeOptimizationOwner() const;
@@ -2109,7 +2144,7 @@ namespace llaminar2
         std::unique_ptr<ILocalTPContext> tp_ctx_;
         std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> replicated_ple_cohort_; ///< Source/cohort metadata; actual Rank request and child authorities remain unchanged.
         /** @return Actual full-main DGO child order for immutable local rollback provenance. */
-        std::vector<const IInferenceRunner *> fixedHeadPLEPrefixOwners() const;
+        std::vector<const IInferenceRunner *> replicatedPLEPrefixOwners() const;
 
         /// LOCAL PP context for inter-stage transfers (PP mode)
         std::unique_ptr<ILocalPPContext> pp_ctx_;
@@ -2132,6 +2167,8 @@ namespace llaminar2
          * is the mandatory NCCL/RCCL graph-reference release order.
          */
         std::vector<std::unique_ptr<IInferenceRunner>> device_runners_;
+        /** Original same-rank expert parent family; never inserted into the TP cohort. */
+        std::shared_ptr<MoEOverlayParticipantGraphRunner> rank_local_expert_endpoints_;
 
         /// PP stage runners (when stages are TP domains, these are RankOrchestrator)
         /// Only used in TP+PP mode - in pure PP mode, device_runners_ holds stage runners

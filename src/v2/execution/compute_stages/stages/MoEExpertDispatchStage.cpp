@@ -235,6 +235,9 @@ namespace
         {
             const auto &publication =
                 *params_.routing_evidence_publication;
+            if (publication.producer_role != MoERuntimeHistogramProducerRole::ProductionDecode &&
+                publication.producer_role != MoERuntimeHistogramProducerRole::NotProducer)
+                throw std::invalid_argument("MoE routing evidence has an invalid producer role");
             if (!publication.histogram)
             {
                 throw std::invalid_argument(
@@ -288,10 +291,33 @@ namespace
         runtime_params_ = params;
     }
 
+    uint64_t MoEExpertDispatchStage::graphCaptureVariantSignature() const
+    {
+        uint64_t signature = 1469598103934665603ULL;
+        const auto mix = [&signature](uint64_t value) {
+            signature ^= value;
+            signature *= 1099511628211ULL;
+        };
+        mix(reinterpret_cast<std::uintptr_t>(params_.ticket_storage.get()));
+        mix(static_cast<uint64_t>(params_.seq_len));
+        mix(static_cast<uint64_t>(params_.top_k));
+        mix(params_.routing_evidence_publication.has_value());
+        if (params_.routing_evidence_publication)
+        {
+            const auto &publication = *params_.routing_evidence_publication;
+            mix(reinterpret_cast<std::uintptr_t>(publication.histogram));
+            mix(static_cast<uint64_t>(publication.producer_role));
+            mix(static_cast<uint64_t>(publication.source));
+        }
+        return signature;
+    }
+
     bool MoEExpertDispatchStage::publishRoutingEvidence(
         int logical_seq_len) const
     {
-        if (!params_.routing_evidence_publication)
+        if (!params_.routing_evidence_publication ||
+            params_.routing_evidence_publication->producer_role ==
+                MoERuntimeHistogramProducerRole::NotProducer)
             return true;
 
         const auto &publication = *params_.routing_evidence_publication;

@@ -12,11 +12,17 @@
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
+#include "execution/moe/MoEOverlayHostServiceContract.h"
+#include "execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "execution/moe/MoEOverlayParticipantResidency.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
+#include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -26,6 +32,40 @@
 
 namespace llaminar2::test
 {
+    /** Closed access to the actual native-proof aggregation body; no owner construction. */
+    struct MoEOverlayParticipantNativeRetirementReplayAccess
+    {
+        /** @brief Observe the actual private callable publisher protocol, never construct a native-ready runner. */
+        using PublicationState = MoEOverlayParticipantGraphRunner::RankLocalPublicationState;
+        template <class Enqueues, class Boundaries>
+        static void requireRetired(const Enqueues &enqueues, const Boundaries &boundaries, bool native_proven)
+        {
+            MoEOverlayParticipantGraphRunner::requireOriginalSubmissionRetired(enqueues, boundaries, native_proven);
+        }
+        /** @brief Exercise original worker failure cancellation before its async result is published. */
+        template<class Work,class Cancel> static bool enqueue(Work work,Cancel cancel){
+            return MoEOverlayParticipantGraphRunner::runOriginalEndpointEnqueue(std::move(work),std::move(cancel));
+        }
+        /** @brief Mutable original future handles must all be consumed despite one failure. */
+        template<class T,class Wait,class Abort> static bool joinMutable(T& terminals,Wait wait,Abort abort,std::string* error){
+            return MoEOverlayParticipantGraphRunner::joinAllOriginalNativeTerminals(terminals,std::move(wait),std::move(abort),error);
+        }
+
+        template <typename Owners, typename Registry>
+        static void requireRegistry(const Owners &owners, const Registry &registry,
+                                    int rank, std::uint64_t epoch)
+        {
+            MoEOverlayParticipantGraphRunner::requireOriginalRankRegistry(
+                owners, registry, rank, epoch);
+        }
+        template <typename Terminals, typename Wait, typename Abort>
+        static bool join(const Terminals &terminals, Wait wait, Abort abort, std::string *error)
+        {
+            return MoEOverlayParticipantGraphRunner::joinAllOriginalNativeTerminals(
+                terminals, std::move(wait), std::move(abort), error);
+        }
+    };
+
     namespace
     {
         MoEOverlayInferenceTopologyIdentity topology(int target_rank = 1)
@@ -63,9 +103,9 @@ namespace llaminar2::test
                 segments.push_back({
                     .role = MoEOverlayInferenceCoordinatorSegmentRole::
                         ExpertFollower,
-                    .materialization =
-                        MoEOverlayInferenceSegmentMaterializationKind::
-                            EagerHostGraph,
+                    .materialization = follower_rank == 0
+                        ? MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable
+                        : MoEOverlayInferenceSegmentMaterializationKind::EagerHostGraph,
                     .world_rank = follower_rank,
                     .local_participant_count = 1u,
                 });
@@ -362,6 +402,24 @@ namespace llaminar2::test
             return plan;
         }
 
+        /** @brief Exact one-rank CUDA2 continuation and ROCm4 expert domain. */
+        MoERoutedExpertPlacementPlan rankLocalHeterogeneousPlan()
+        {
+            auto placement = heterogeneousPlan();
+            auto &continuation = placement.domains[0];
+            continuation.scope = ExecutionDomainScope::RANK_LOCAL;
+            continuation.participants.push_back(GlobalDeviceAddress::cuda(1, 0, "node"));
+            continuation.world_ranks.clear();
+            auto &followers = placement.domains[1];
+            followers.scope = ExecutionDomainScope::RANK_LOCAL;
+            followers.owner_rank = 0;
+            followers.participants.clear();
+            for (int i = 0; i < 4; ++i)
+                followers.participants.push_back(GlobalDeviceAddress::rocm(i, 0, "node"));
+            followers.world_ranks.clear();
+            return placement;
+        }
+
         MoEExpertOwnerMap heterogeneousOwnerMap()
         {
             return MoEExpertOwnerMap::build(heterogeneousPlan());
@@ -467,6 +525,226 @@ namespace llaminar2::test
             (void)makeMoEOverlayInferenceTopologyIdentity(
                 owner_map, graph_family, 0, 2),
             std::invalid_argument);
+    }
+
+    /** Same-rank endpoints retain the original graph/ticket protocol and real IDs. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RankLocalEndpointIdentityRetainsGraphFamiliesAndRejectsForeignMembership)
+    {
+        auto placement = rankLocalHeterogeneousPlan();
+        const auto owners = MoEExpertOwnerMap::build(placement);
+        const MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 7, .main_layer_count = 2,
+            .mtp_source_layers = {2}, .max_graph_rows = 16,
+            .max_decode_rows = 4, .max_request_count = 1,
+            .max_mtp_draft_depth = 3,
+        };
+        const std::array targets{2, 3, 4, 5};
+        const auto local = makeMoEOverlayRankLocalInferenceTopologyIdentity(
+            owners, family, 0, targets);
+        ASSERT_TRUE(local.valid());
+        EXPECT_EQ(local.source_world_rank, 0);
+        EXPECT_EQ(local.target_world_rank, 0);
+        EXPECT_EQ(local, makeMoEOverlayRankLocalInferenceTopologyIdentity(
+            owners, family, 0, targets));
+        EXPECT_THROW((void)makeMoEOverlayInferenceTopologyIdentity(
+            owners, family, 0, 0), std::invalid_argument)
+            << "The original distributed constructor still requires distinct ranks";
+        const std::array continuation_peer{1};
+        const std::array duplicate{2, 2};
+        const std::array missing{99};
+        for (const auto invalid : {std::span<const int>(continuation_peer),
+                                  std::span<const int>(duplicate),
+                                  std::span<const int>(missing), std::span<const int>()})
+            EXPECT_THROW((void)makeMoEOverlayRankLocalInferenceTopologyIdentity(
+                owners, family, 0, invalid), std::invalid_argument);
+        EXPECT_THROW((void)makeMoEOverlayRankLocalInferenceTopologyIdentity(
+            heterogeneousOwnerMap(), family, 0, std::array{1}), std::invalid_argument);
+        auto changed = family;
+        changed.max_decode_rows = 3;
+        EXPECT_NE(local, makeMoEOverlayRankLocalInferenceTopologyIdentity(
+            owners, changed, 0, targets));
+        MoEOverlayInferenceTransactionProtocol owner({
+            .topology = local, .slot_count = 4,
+            .max_request_count = 1, .max_rows_per_request = 16,
+            .max_mtp_draft_depth = 3,
+        });
+        for (std::uint64_t generation = 1; generation <= 2; ++generation)
+        {
+            const auto current = command(generation, generation, 41);
+            ASSERT_TRUE(owner.beginCommand(current));
+            const auto ticket = makeMoEOverlayInferenceExecutionTicket(
+                local, current, 1, 0, 41,
+                MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+                1, 4, 4, 3);
+            completeSlot(owner, owner.accept(ticket), ticket);
+            EXPECT_FALSE(owner.accept(ticket).accepted()) << "Retired identities remain stale";
+            const auto terminal = makeMoEOverlayInferenceTerminalTicket(
+                local, current, 2, 41, MoEOverlayInferenceTransactionAction::Complete);
+            EXPECT_EQ(owner.accept(terminal).status, MoEOverlayInferenceAdmissionStatus::Complete);
+        }
+    }
+
+    /** Admitted expert participation does not erase the original physical role inventory. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RankLocalGPUExpertParticipationUsesFrozenAdmittedTiersAndOriginalRoles)
+    {
+        auto placement = rankLocalHeterogeneousPlan();
+        RoutedExpertDomain cpu;
+        cpu.name = "cpu-backing";
+        cpu.scope = ExecutionDomainScope::SINGLE;
+        cpu.backend = CollectiveBackendType::HOST;
+        cpu.participants = {GlobalDeviceAddress::cpu(0, "node")};
+        cpu.owner_rank = 0;
+        placement.domains.push_back(cpu);
+        placement.routed_tiers[1].fallback = false;
+        placement.routed_tiers.push_back(RoutedExpertTier{
+            .name = "cpu-backing", .domain = cpu.name, .priority = 2,
+            .fallback = true, .resolved_live_experts_per_layer = {0, 0, 0},
+        });
+        placement.routed_tiers[0].resolved_live_experts_per_layer = {2, 2, 2};
+        placement.routed_tiers[1].resolved_live_experts_per_layer = {2, 2, 2};
+        ClusterInventory inventory;
+        inventory.world_size = 1;
+        inventory.ranks.resize(1);
+        inventory.ranks[0].rank = 0;
+        inventory.ranks[0].node_id = 0;
+        inventory.ranks[0].hostname = "node";
+        const auto owners = MoEExpertOwnerMap::build(placement);
+        const auto planned = MoEOverlayHostServiceContract::resolve(
+            placement, owners.participants(), inventory);
+        EXPECT_TRUE(planned.hasHostBoundary()) << "Pre-quota CPU admission stays conservative";
+        const auto admitted = MoEOverlayHostServiceContract::resolveAdmitted(
+            placement, owners, inventory);
+        EXPECT_FALSE(admitted.hasHostBoundary());
+        EXPECT_TRUE(admitted.mappedActivationTopology());
+        EXPECT_TRUE(admitted.localParticipants().empty());
+        ASSERT_EQ(admitted.externalParticipants().size(), 4u);
+        for (const int id : admitted.externalParticipants())
+        {
+            const auto *participant = owners.participantForId(id);
+            ASSERT_NE(participant, nullptr);
+            EXPECT_EQ(participant->world_rank, 0);
+            EXPECT_EQ(participant->domain_name, "follower");
+            EXPECT_TRUE(participant->device.is_gpu());
+        }
+        EXPECT_FALSE(admitted.hasHostBoundary())
+            << "GPU-only heterogeneous publication does not invent a CPU service";
+        EXPECT_TRUE(admitted.requiresRankLocalInferencePublisher());
+        EXPECT_EQ(admitted.captureEnvelope(true),
+                  GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction);
+        EXPECT_EQ(admitted.captureEnvelope(false),
+                  GraphNativeCaptureEnvelope::HeterogeneousTicketFollowerTransaction);
+
+        auto cpu_positive = placement;
+        cpu_positive.placements[1].routed_expert_tier = {0, 0, 1, 2};
+        cpu_positive.routed_tiers[1].resolved_live_experts_per_layer[1] = 1;
+        cpu_positive.routed_tiers[2].resolved_live_experts_per_layer[1] = 1;
+        const auto positive_owners = MoEExpertOwnerMap::buildTransition(cpu_positive, owners);
+        const auto positive = MoEOverlayHostServiceContract::resolveAdmitted(
+            cpu_positive, positive_owners, inventory);
+        EXPECT_TRUE(positive.hasHostBoundary());
+        EXPECT_EQ(positive.localParticipants().size(), 1u);
+        EXPECT_EQ(positive.externalParticipants().size(), 4u)
+            << "Positive tiers keep every declared GPU, including initially empty lanes";
+        EXPECT_EQ(positive.captureEnvelope(true),
+                  GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction);
+
+        auto unresolved = placement;
+        unresolved.routed_tiers[2].resolved_live_experts_per_layer.clear();
+        EXPECT_TRUE(MoEOverlayHostServiceContract::resolveAdmitted(
+            unresolved, owners, inventory).hasHostBoundary());
+        auto contradictory = placement;
+        contradictory.routed_tiers[1].resolved_live_experts_per_layer = {0, 0, 0};
+        EXPECT_THROW((void)MoEOverlayHostServiceContract::resolveAdmitted(
+            contradictory, owners, inventory), std::logic_error);
+
+        auto empty = contradictory;
+        empty.routed_tiers[0].resolved_live_experts_per_layer = {4, 4, 4};
+        for (auto &layer : empty.placements)
+            layer.routed_expert_tier = {0, 0, 0, 0};
+        const auto empty_owners = MoEExpertOwnerMap::buildTransition(empty, owners);
+        const auto no_expert_packets = MoEOverlayHostServiceContract::resolveAdmitted(
+            empty, empty_owners, inventory);
+        EXPECT_TRUE(no_expert_packets.externalParticipants().empty());
+        EXPECT_FALSE(no_expert_packets.hasHostBoundary());
+        EXPECT_FALSE(no_expert_packets.requiresRankLocalInferencePublisher());
+        EXPECT_EQ(no_expert_packets.captureEnvelope(true),
+                  GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
+        EXPECT_EQ(empty.domains[1].participants.size(), 4u);
+        EXPECT_EQ(empty_owners.participants().size(), owners.participants().size())
+            << "Expert packet omission never erases physical storage/context membership";
+    }
+
+    /** Missing native proof never permits later peers or physical receipt publication to be skipped. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         LocalEndpointRetirementAttemptsEveryPeerAndPreservesFirstNativeFailure)
+    {
+        for (const std::array<int, 3> order : {std::array{0, 1, 2}, std::array{2, 1, 0}})
+        {
+            std::array<MoEOverlayInferenceBoundaryReceipt, 3> receipts;
+            for (auto &receipt : receipts)
+                ASSERT_EQ(receipt.beginSubmission(), 1u);
+            std::vector<int> visited;
+            int aborts = 0;
+            std::string error;
+            const bool proved = MoEOverlayParticipantNativeRetirementReplayAccess::join(
+                order,
+                [&](int endpoint)
+                {
+                    visited.push_back(endpoint);
+                    if (endpoint != 1)
+                        throw std::logic_error("missing-native-" + std::to_string(endpoint));
+                }, [&]() noexcept { ++aborts; }, &error);
+            EXPECT_FALSE(proved);
+            EXPECT_EQ(visited, (std::vector<int>(order.begin(), order.end())));
+            EXPECT_EQ(error, "missing-native-" + std::to_string(order.front()));
+            EXPECT_EQ(aborts, 2);
+            for (const auto &receipt : receipts)
+                EXPECT_EQ(receipt.completedGeneration(), 0u);
+        }
+        std::array<MoEOverlayInferenceBoundaryReceipt, 3> receipts;
+        for (auto &receipt : receipts)
+            ASSERT_EQ(receipt.beginSubmission(), 1u);
+        ASSERT_TRUE(receipts[2].cancelUnsubmitted(1u));
+        const std::array submitted{0, 1};
+        int observed = 0;
+        std::string error;
+        ASSERT_TRUE(MoEOverlayParticipantNativeRetirementReplayAccess::join(
+            submitted, [&](int) { ++observed; }, []() noexcept {}, &error));
+        for (const int endpoint : submitted)
+            ASSERT_TRUE(receipts[endpoint].completeSubmission(1u));
+        EXPECT_EQ(observed, 2);
+        EXPECT_EQ(receipts[2].submittedGeneration(), 0u);
+        EXPECT_EQ(receipts[2].completedGeneration(), 0u);
+    }
+
+    /** A subordinate role borrows the full rank's same original prepared-bank owner. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RankLocalExpertSubsetRequiresOriginalFullRankRegistryAndEpoch)
+    {
+        const auto owners = MoEExpertOwnerMap::build(rankLocalHeterogeneousPlan());
+        const auto make_registry = [&](std::vector<int> ids, std::uint64_t epoch)
+        {
+            return std::make_unique<MoEOverlayParticipantResidencyRegistry>(
+                MoEOverlayParticipantResidencyRegistry::Config{
+                    .owner_map = owners, .local_participant_ids = std::move(ids),
+                    .num_layers = 3, .num_experts = 4, .initial_epoch = epoch,
+                });
+        };
+        const auto original = make_registry({0, 1, 2, 3, 4, 5}, 41u);
+        EXPECT_NO_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *original, 0, 41u));
+        const auto subset = make_registry({2, 3, 4, 5}, 41u);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *subset, 0, 41u), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *original, 0, 42u), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *original, 1, 41u), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRegistry(
+            owners, *original, -1, 41u), std::invalid_argument);
+        EXPECT_EQ(original->localParticipantIds(), (std::vector<int>{0, 1, 2, 3, 4, 5}));
     }
 
     /** Stage slicing retains only terminal NextN banks at every admitted depth. */
@@ -784,6 +1062,109 @@ namespace llaminar2::test
         EXPECT_EQ(publisher->retireCount(), sessions * 3);
         EXPECT_EQ(publisher->completeCount(), sessions);
         PerfStatsCollector::reset();
+    }
+
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RankLocalExpertsShareOriginalCoordinatorWithoutAliasingDenseSegments)
+    {
+        const auto graph_plan = coordinatorGraphPlan(2, {0, 2});
+        EXPECT_EQ(graph_plan.segmentForWorldRank(0), nullptr)
+            << "Rank-only lookup must reject real mixed role ambiguity";
+        ASSERT_NE(graph_plan.segmentForWorldRank(0,
+            MoEOverlayInferenceCoordinatorSegmentRole::Continuation), nullptr);
+        ASSERT_NE(graph_plan.segmentForWorldRank(0,
+            MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower), nullptr);
+        EXPECT_EQ(graph_plan.nativeParticipantCount(), 3u)
+            << "This device-free controller fixture seals two dense and one local endpoint";
+        auto first_target = std::make_shared<RecordingPublisher>(0);
+        auto second_target = std::make_shared<RecordingPublisher>(2);
+        auto coordinator =
+            std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {first_target, second_target},
+                    .graph_plan = coordinatorGraphPlan(2, {0, 2}),
+                    .continuation_participant_count = 2,
+                    .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                    },
+                    .max_transactions_per_command = 4,
+                    .max_mtp_draft_depth = 3,
+                });
+        ASSERT_TRUE(coordinator->beginCommand(command()));
+        ASSERT_TRUE(coordinator->beginGraphSequence(2));
+
+        const MoEOverlayInferenceExecutionDescriptor sidecar{
+            .graph_role = MoEOverlayInferenceGraphRole::MTPDraft,
+            .placement_epoch = 41,
+            .request_count = 1,
+            .logical_rows_per_request = 1,
+            .physical_rows_per_request = 1,
+        };
+        auto first = coordinator->beginParticipantGraph(sidecar, 0);
+        ASSERT_TRUE(first.ok) << first.error;
+        ASSERT_TRUE(first.active);
+        EXPECT_EQ(first.descriptor.draft_depth, 2);
+        EXPECT_EQ(first.descriptor.sidecar_depth, 0);
+        EXPECT_EQ(first_target->publishCount(), 0u)
+            << "Graph entry reserves identity but must not wake a follower during cold capture";
+        EXPECT_EQ(second_target->publishCount(), 0u);
+
+        auto second = coordinator->beginParticipantGraph(sidecar, 1);
+        ASSERT_TRUE(second.ok) << second.error;
+        EXPECT_EQ(second.group_id, first.group_id);
+        EXPECT_EQ(second.descriptor, first.descriptor);
+        ASSERT_TRUE(coordinator->armParticipantGraph(first));
+        EXPECT_EQ(first_target->publishCount(), 1u)
+            << "The first executable launch edge publishes one target ticket";
+        EXPECT_EQ(second_target->publishCount(), 1u);
+        EXPECT_EQ(first_target->publishCount(), 1u)
+            << "A LocalTP sibling must not own another ticket edge";
+        ASSERT_TRUE(coordinator->finishParticipantGraph(first, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(second, true));
+
+        auto third = coordinator->beginParticipantGraph(sidecar, 0);
+        auto fourth = coordinator->beginParticipantGraph(sidecar, 1);
+        ASSERT_TRUE(third.ok) << third.error;
+        ASSERT_TRUE(fourth.ok) << fourth.error;
+        EXPECT_EQ(third.descriptor.sidecar_depth, 1);
+        ASSERT_TRUE(coordinator->armParticipantGraph(third));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(third, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(fourth, true));
+
+        const MoEOverlayInferenceExecutionDescriptor verifier{
+            .graph_role =
+                MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+            .placement_epoch = 41,
+            .request_count = 1,
+            .logical_rows_per_request = 3,
+            .physical_rows_per_request = 4,
+            .draft_depth = 2,
+        };
+        auto verifier_first =
+            coordinator->beginParticipantGraph(verifier, 0);
+        auto verifier_second =
+            coordinator->beginParticipantGraph(verifier, 1);
+        ASSERT_TRUE(verifier_first.ok) << verifier_first.error;
+        ASSERT_TRUE(verifier_second.ok) << verifier_second.error;
+        ASSERT_TRUE(coordinator->armParticipantGraph(verifier_first));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(
+            verifier_first, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(
+            verifier_second, true));
+
+        EXPECT_EQ(first_target->retireCount(), 0u)
+            << "Asynchronous graph slots remain live until terminal output";
+        ASSERT_TRUE(coordinator->completeCommand(41));
+        EXPECT_EQ(first_target->publishCount(), 3u);
+        EXPECT_EQ(second_target->publishCount(), 3u);
+        EXPECT_EQ(first_target->retireCount(), 3u);
+        EXPECT_EQ(second_target->retireCount(), 3u);
+        EXPECT_EQ(first_target->completeCount(), 1u);
+        EXPECT_EQ(second_target->completeCount(), 1u);
     }
 
     TEST(Test__MoEOverlayInferenceTransaction,
@@ -2750,3 +3131,7 @@ namespace llaminar2::test
     }
 
 } // namespace llaminar2::test
+
+#include "RankLocalPublisherStateReplay.inc"
+
+#include "RankLocalSubmissionResetReplay.inc"

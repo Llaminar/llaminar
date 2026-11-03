@@ -993,6 +993,72 @@ TEST(Qwen4ExpSourceAdmissionCases, CPUStorageMaterializationRejectsMissingLiveOw
     EXPECT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(rows));
 }
 
+/** @test Frozen empty CPU tiers retain capacity without inventing live computation. */
+TEST(Qwen4ExpSourceAdmissionCases, CPUStorageMaterializationUsesFrozenComputeOwners)
+{
+    using Owner = PhysicalMemoryOwner;
+    const PhysicalMemoryAllocatorIdentity cpu{0, DeviceId::cpu()};
+    for (const int first : {0, 17})
+    {
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>(
+            *qwen4ExpHardwareTargetDefinition(Qwen4ExpHardwareTarget::ROCm4).topology.expert_overlay_plan);
+        ASSERT_EQ(plan->routed_tiers.size(), 2u);
+        plan->first_model_layer = first;
+        plan->placements = {{.layer = first, .routed_expert_tier = {0, 0}},
+                            {.layer = first + 1, .routed_expert_tier = {0, 0}}};
+        plan->routed_tiers.front().resolved_live_experts_per_layer = {2, 2};
+        plan->routed_tiers.back().resolved_live_experts_per_layer = {0, 0};
+        std::vector<PhysicalMemoryOwnerAttestation> rows{
+            {.identity = cpu, .owner = Owner::ActivationArena, .planned_new_bytes = 4096},
+            {.identity = cpu, .owner = Owner::ExecutionWorkspace, .planned_new_bytes = 8192},
+            {.identity = cpu, .owner = Owner::PrefixHostTier, .planned_new_bytes = 16384}};
+        // This is the old capacity-only assertion's exact failing observation.
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows), std::logic_error);
+        EXPECT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(rows, plan));
+        const auto changed = [&] { return std::make_shared<MoERoutedExpertPlacementPlan>(*plan); };
+        auto unresolved = changed();
+        unresolved->routed_tiers.back().resolved_live_experts_per_layer.clear();
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, unresolved), std::logic_error);
+        auto prequota = changed();
+        prequota->placements.clear();
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, prequota), std::logic_error);
+        auto incomplete = changed();
+        incomplete->routed_tiers.back().resolved_live_experts_per_layer = {0};
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, incomplete), std::logic_error);
+        auto later = changed();
+        later->routed_tiers.front().resolved_live_experts_per_layer = {2, 1};
+        later->routed_tiers.back().resolved_live_experts_per_layer = {0, 1};
+        later->placements.back().routed_expert_tier = {0, 1};
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, later), std::logic_error);
+        auto contradicted = changed();
+        contradicted->placements.back().routed_expert_tier = {0, 1};
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, contradicted), std::logic_error);
+        auto shared = changed();
+        shared->shared_expert_domain = shared->routed_tiers.back().domain;
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, shared), std::logic_error);
+
+        // Absence from the admitted compute list is not permission to drop
+        // actual weight claims, a different CPU's claims or another rank's rows.
+        auto foreign = rows;
+        foreign.front().identity.device = DeviceId{DeviceType::CPU, 1};
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(foreign, plan), std::logic_error);
+        foreign = rows;
+        foreign.front().identity.world_rank = 1;
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(foreign, plan), std::logic_error);
+        for (const auto owner : {Owner::RoutedExpertWeights, Owner::PrimaryModelWeights})
+        {
+            auto missing_weights = rows;
+            missing_weights.push_back({.identity = cpu, .owner = owner, .planned_new_bytes = 4096});
+            EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(missing_weights, plan), std::logic_error);
+        }
+        rows[0].materialized_new_bytes = rows[0].committed_new_bytes = 64;
+        rows[1].materialized_new_bytes = rows[1].committed_new_bytes = 128;
+        EXPECT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(rows, later));
+        EXPECT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(rows, shared));
+        EXPECT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(rows, plan));
+    }
+}
+
 /** @test Explicit depth3 source families do not reduce the unchanged full15 default. */
 TEST(Qwen4ExpSourceAdmissionCases, ExplicitRetainedThreeFamilyPreservesFullDefaultAndSourceProvenance)
 {

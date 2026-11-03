@@ -1164,3 +1164,109 @@ TEST(RankMemoryPlanInputs, ReadAheadSelectionSnapshotSurvivesDebugMutationAndAda
     EXPECT_EQ(RankOrchestrator::Config::fromRuntime(frozen).ngram_lookup_schedule,frozen.ngram_lookup_schedule);
     EXPECT_EQ(InferenceRunnerConfig::fromRuntime(frozen).ngram_lookup_schedule,frozen.ngram_lookup_schedule);
 }
+
+/** @test Original Rank TP coordinates stay authored while one third GPU serves shared storage. */
+TEST(RankMemoryPlanInputs, SharedCoordinatorTP2KeepsOriginalComputeAndStorageRoles)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    Fixture fixture(DeviceType::ROCm,2);
+    fixture.model=source.metadata().memoryProfile();fixture.plan.last_layer=47;
+    auto storage=fixture.inventory.gpus.front();storage.local_device_id=2;storage.uuid="storage-only-2";
+    fixture.inventory.gpus.push_back(storage);
+    fixture.inventory.p2p_rocm_count=3;fixture.inventory.p2p_rocm.assign(9,false);
+    fixture.plan.runtime.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    fixture.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
+        parseAdaptiveGPUCachePlacement("0:rocm:2/64/1048576@0:rocm:1");
+    std::reverse(fixture.plan.local_tp_devices.begin(),fixture.plan.local_tp_devices.end());
+    fixture.plan.primary_device=fixture.plan.local_tp_devices.front();
+    const auto inputs=buildRankMemoryPlanInputs(fixture.request());
+    ASSERT_EQ(inputs.size(),2u);
+    for(size_t coordinate=0;coordinate<inputs.size();++coordinate){
+        EXPECT_EQ(inputs[coordinate].device,fixture.plan.local_tp_devices[coordinate].toLocalDeviceId());
+        EXPECT_EQ(inputs[coordinate].shard_index,int(coordinate));
+        EXPECT_EQ(inputs[coordinate].ngram_tp_topology,ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal);
+        ASSERT_TRUE(inputs[coordinate].ngram_execution_policy);
+        EXPECT_EQ(inputs[coordinate].ngram_execution_policy->lookupIOConsumer(inputs[coordinate].device,2),DeviceId::rocm(1));
+        EXPECT_EQ(inputs[coordinate].ngram_gpu_peer_access,PeerAccessCoverage::None);
+        EXPECT_NE(inputs[coordinate].device,DeviceId::rocm(2));
+    }
+    auto missing=fixture;
+    missing.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
+        parseAdaptiveGPUCachePlacement("0:rocm:1/64/1048576@0:rocm:1");
+    EXPECT_THROW(buildRankMemoryPlanInputs(missing.request()),std::invalid_argument);
+    auto foreign=fixture;
+    foreign.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
+        parseAdaptiveGPUCachePlacement("0:rocm:2/64/1048576@0:rocm:3");
+    EXPECT_THROW(buildRankMemoryPlanInputs(foreign.request()),std::invalid_argument);
+    auto partial=fixture;partial.plan.first_layer=1;
+    EXPECT_THROW(buildRankMemoryPlanInputs(partial.request()),std::invalid_argument);
+    auto wrongBackend=fixture;
+    wrongBackend.plan.local_tp_devices[0]=GlobalDeviceAddress::cuda(0,-1,"node");
+    EXPECT_THROW(buildRankMemoryPlanInputs(wrongBackend.request()),std::invalid_argument);
+    auto tooMany=fixture;
+    tooMany.plan.local_tp_devices.push_back(GlobalDeviceAddress::rocm(2,-1,"node"));
+    EXPECT_THROW(buildRankMemoryPlanInputs(tooMany.request()),std::invalid_argument);
+    auto cuda=Fixture(DeviceType::CUDA,2);cuda.model=fixture.model;cuda.plan.last_layer=47;
+    cuda.plan.runtime.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    cuda.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
+        parseAdaptiveGPUCachePlacement("0:cuda:2/64/1048576@0:cuda:1");
+    EXPECT_THROW(buildRankMemoryPlanInputs(cuda.request()),std::invalid_argument);
+}
+
+/** @test CUDA readers retain their original NoPeer edge and a distinct ROCm storage-only owner. */
+TEST(RankMemoryPlanInputs, SharedCoordinatorCUDATP2KeepsOppositeVendorStorageAndNoPeerReader)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    Fixture fixture(DeviceType::CUDA,2);
+    fixture.model=source.metadata().memoryProfile();
+    fixture.plan.last_layer=47;
+    auto storage=fixture.inventory.gpus.front();
+    storage.type=DeviceType::ROCm;
+    storage.local_device_id=0;
+    storage.uuid="storage-only-rocm-0";
+    fixture.inventory.gpus.push_back(storage);
+    fixture.inventory.p2p_cuda_count=2;
+    fixture.inventory.p2p_cuda.assign(4,false);
+    fixture.plan.runtime.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    fixture.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
+        parseAdaptiveGPUCachePlacement("0:rocm:0/64/1048576@0:cuda:1");
+    std::reverse(fixture.plan.local_tp_devices.begin(),fixture.plan.local_tp_devices.end());
+    fixture.plan.primary_device=fixture.plan.local_tp_devices.front();
+    const auto inputs=buildRankMemoryPlanInputs(fixture.request());
+    ASSERT_EQ(inputs.size(),2u);
+    for(std::size_t coordinate=0;coordinate<inputs.size();++coordinate){
+        const auto& input=inputs[coordinate];
+        EXPECT_EQ(input.device,fixture.plan.local_tp_devices[coordinate].toLocalDeviceId());
+        EXPECT_EQ(input.shard_index,static_cast<int>(coordinate));
+        EXPECT_EQ(input.ngram_tp_topology,ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal);
+        EXPECT_FALSE(input.ngram_gpu_peer_access); // Cross-vendor storage has no same-vendor observation.
+        ASSERT_EQ(input.ngram_reader_peer_access.size(),1u);
+        EXPECT_EQ(input.ngram_reader_peer_access.front(),(ImmutableRowTableReaderPeerAccess{
+            {0,DeviceId::cuda(1)},{0,DeviceId::cuda(0)},PeerAccessCoverage::None}));
+        ASSERT_TRUE(input.ngram_execution_policy);
+        EXPECT_EQ(input.ngram_execution_policy->lookupIOConsumer(input.device,2),DeviceId::cuda(1));
+        EXPECT_NE(input.device,DeviceId::rocm(0));
+    }
+    auto partial=fixture;
+    partial.inventory.p2p_cuda[1]=true;
+    EXPECT_THROW(buildRankMemoryPlanInputs(partial.request()),std::invalid_argument);
+    auto computeOwner=fixture;
+    computeOwner.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
+        parseAdaptiveGPUCachePlacement("0:cuda:0/64/1048576@0:cuda:1");
+    EXPECT_THROW(buildRankMemoryPlanInputs(computeOwner.request()),std::invalid_argument);
+    auto unsupportedStorage=fixture;
+    unsupportedStorage.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
+        parseAdaptiveGPUCachePlacement("0:cuda:2/64/1048576@0:cuda:1");
+    EXPECT_THROW(buildRankMemoryPlanInputs(unsupportedStorage.request()),std::invalid_argument);
+    EXPECT_THROW({
+        auto wrongRank=fixture;
+        wrongRank.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
+            parseAdaptiveGPUCachePlacement("1:rocm:0/64/1048576@0:cuda:1");
+        (void)buildRankMemoryPlanInputs(wrongRank.request());
+    },std::invalid_argument);
+    auto partialModel=fixture;
+    partialModel.plan.first_layer=1;
+    EXPECT_THROW(buildRankMemoryPlanInputs(partialModel.request()),std::invalid_argument);
+}

@@ -72,7 +72,8 @@ HostImmutableRowMode HostImmutableRowProvider::mode() const noexcept
     if (const auto *table = std::get_if<WholeOwner>(&owner_))
         return (*table)->storage() == ImmutableRowStorage::RAM
             ? HostImmutableRowMode::WholeRAM : HostImmutableRowMode::WholeMemoryMapped;
-    return HostImmutableRowMode::AdaptiveRAMSSD;
+    return std::get<AdaptiveOwner>(owner_)->sourceStorage()==ImmutableRowStorage::RAM
+        ? HostImmutableRowMode::AdaptiveFullRAM : HostImmutableRowMode::AdaptiveRAMSSD;
 }
 
 std::optional<std::size_t> HostImmutableRowProvider::maximumLiveRows() const noexcept

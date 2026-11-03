@@ -102,14 +102,73 @@ QFN_ADAPTIVE_HD inline bool admitProtocol(const DeviceArgs& a,std::uint64_t gene
 /** @return Actual original source frontier consumed by the nominal owner/coordinator phase operations. */
 QFN_ADAPTIVE_HD inline n::SourceFrontier& frontier(const DeviceArgs& a)
 {return *n::at<n::SourceFrontier>(a.native,a.plan.offsets.frontier);}
-/** @brief Fail only this source outcome; existing canonical request publication prevents output escape. */
-QFN_ADAPTIVE_HD inline bool reject(const DeviceArgs& a,ImmutableLookupStatus status)
+/**
+ * @brief Fail only this source outcome; canonical request publication prevents output escape.
+ * @note Keep GPU rejection inline: an outlined cold error call would make the
+ * entire source argument addressable and copy it to private memory on success.
+ * Host scalar replay retains the identical body and ordinary inline semantics.
+ */
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define QFN_SOURCE_REJECT_INLINE __forceinline__
+#else
+#define QFN_SOURCE_REJECT_INLINE inline
+#endif
+QFN_ADAPTIVE_HD QFN_SOURCE_REJECT_INLINE bool reject(const DeviceArgs& a,ImmutableLookupStatus status)
 {
     protocol(a).status=static_cast<std::uint64_t>(status);
     frontier(a).status=status==ImmutableLookupStatus::Cancelled?Status::Cancelled:Status::SourceFailure;
     *n::at<std::uint64_t>(a.native,a.plan.offsets.record_bytes)=0;
     *n::at<std::uint64_t>(a.native,a.plan.offsets.payload_bytes)=0;
     return false;
+}
+#undef QFN_SOURCE_REJECT_INLINE
+/** @brief Preserve the canonical first error while suppressing successful source publication.
+ * @param a Original source/controller operands; no new health authority is created.
+ * @note Native failure writers race only through the original first-error CAS.
+ */
+QFN_ADAPTIVE_HD inline void publishFirstError(const DeviceArgs& a)
+{
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    atomicCAS(a.error,0,static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+    atomicExch(a.healthy,0);
+#else
+    int expected=0;
+    __atomic_compare_exchange_n(a.error,&expected,
+        static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure),false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+    __atomic_store_n(a.healthy,0,__ATOMIC_RELEASE);
+#endif
+}
+/** @brief Reject publication without replacing a prior I/O or canonical controller error.
+ * @param a Original source/controller operands. @param status New failure if no earlier I/O error exists.
+ * @return False after publishing only failure and zero transport extents.
+ */
+QFN_ADAPTIVE_HD inline bool rejectRequestPublication(const DeviceArgs& a,ImmutableLookupStatus status)
+{
+    const auto first=protocol(a).status;
+    reject(a,first?static_cast<ImmutableLookupStatus>(first):status);
+    stage(a)=ResponseStage::Rejected;publishFirstError(a);return false;
+}
+/** @brief Validate the original source frontier before any request or no-request success path.
+ * @param a Original source, canonical error row and sealed allocation lifetime.
+ * @param cancelledInvocation System-acquired original CPU cancellation publication.
+ * @param cancelledGeneration Its generation body, loaded after the publication.
+ * @return True only for a valid positive source request; empty success advances to Acquired.
+ * @note Cancellation is not worker retirement. Failure leaves the original
+ * source lifetime for the existing retireAborted witness/drain path.
+ */
+QFN_ADAPTIVE_HD inline bool prepareRequestPublication(const DeviceArgs& a,std::uint64_t cancelledInvocation,
+    std::uint64_t cancelledGeneration)
+{
+    auto& io=protocol(a);const auto& coordinator=*n::coordinatorView(a.coordinator).frame;
+    if(stage(a)==ResponseStage::Rejected){publishFirstError(a);return false;}
+    if(io.status)return rejectRequestPublication(a,static_cast<ImmutableLookupStatus>(io.status));
+    if(stage(a)!=ResponseStage::Planned || progress(a).seals!=a.plan.coordinator.policy.participants() ||
+       coordinator.phase!=p::LookupPhase::Source || !n::same(coordinator.source,frontier(a).source))
+        return rejectRequestPublication(a,ImmutableLookupStatus::InvalidProtocol);
+    if(!forwardValid(a) || ImmutableLookupProtocol::matchesInvocation(cancelledInvocation,cancelledGeneration,
+        io.admissionGeneration,invocation(a)))return rejectRequestPublication(a,ImmutableLookupStatus::Cancelled);
+    if(!io.idCount){stage(a)=ResponseStage::Acquired;return false;}
+    return true;
 }
 /** @return This unique coordinate has an actual accepted owner reservation rather than source-only delivery. */
 QFN_ADAPTIVE_HD inline bool reserved(p::UniquePhase phase)

@@ -19,6 +19,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <charconv>
+#include <array>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -577,6 +578,49 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Authenticate one native response-continuation admission witness.
+         * @param record Original counter with three bounded lifecycle words.
+         * @param depthTag Original producer spelling for the selected draft depth.
+         * @return True only for ticket-zero, positive epoch/workspace and exact-row family.
+         * @note This is terminal evidence interpretation, not a live execution ledger.
+         */
+        inline bool validContinuationAdmission(const PerfStatRecord& record, const char* depthTag)
+        {
+            if (record.phase != "decode" || !tagEquals(record, "entry_source", "native_continue_response_admission") ||
+                !positiveIntegerTag(record, depthTag) || !positiveIntegerTag(record, "physical_rows") ||
+                !tagEquals(record, "family", "exact_rows") || record.tags.count("transaction") ||
+                !record.count || record.count > std::numeric_limits<uint64_t>::max()/3 ||
+                record.value != static_cast<double>(record.count) || record.sequence_word_count != record.count*3 ||
+                record.sequence_minimum_words.size()!=3 || record.sequence_maximum_words.size()!=3)
+                return false;
+            long long depth=0, rows=0;
+            const auto& depthText=record.tags.at(depthTag);
+            const auto& rowsText=record.tags.at("physical_rows");
+            std::from_chars(depthText.data(),depthText.data()+depthText.size(),depth);
+            std::from_chars(rowsText.data(),rowsText.data()+rowsText.size(),rows);
+            if(depth>=std::numeric_limits<int32_t>::max() || rows!=depth+1 ||
+                record.sequence_minimum_words[0]!=0 || record.sequence_maximum_words[0]!=0)
+                return false;
+            for(size_t i=1;i<3;++i)
+                if(!record.sequence_minimum_words[i] ||
+                   record.sequence_minimum_words[i]>record.sequence_maximum_words[i])return false;
+            return true;
+        }
+
+        /**
+         * @brief Match all ordered witness words without inventing a replacement observation.
+         * @param a Original admission producer's bounded sequence.
+         * @param b Original observed-ticket or first-branch producer's bounded sequence.
+         * @return Whether both producers captured identical counts, order, epoch and workspace.
+         */
+        inline bool sameContinuationWitness(const PerfStatRecord& a,const PerfStatRecord& b)
+        {
+            return a.count==b.count && a.value==b.value && a.sequence_word_count==b.sequence_word_count &&
+                a.sequence_digest_lo==b.sequence_digest_lo && a.sequence_digest_hi==b.sequence_digest_hi &&
+                a.sequence_minimum_words==b.sequence_minimum_words && a.sequence_maximum_words==b.sequence_maximum_words;
+        }
+
+        /**
          * @brief Per-participant ledger used to certify HIP ticket dispatch.
          *
          * Boolean fields validate the shape and provenance of the captured
@@ -601,6 +645,12 @@ namespace llaminar2::test::parity
             bool terminal_submissions_valid = true;
             bool compact_reducer_observed = false;
             bool compact_reducers_valid = true;
+            // Original admission, observation and first-branch producers must
+            // agree per exact depth. Their transaction-zero words are not
+            // committed transactions or extra terminal reductions.
+            std::map<std::string,std::array<const PerfStatRecord*,3>> continuation_witnesses;
+            bool continuation_witnesses_valid=true;
+            double continuation_admissions=0.0;
             double ticket_submissions = 0.0;
             double ticket_observations = 0.0;
             double transaction_submissions = 0.0;
@@ -637,14 +687,14 @@ namespace llaminar2::test::parity
                          launches == terminal_response_bridges) ||
                         distributed_launch_certified) &&
                        ticket_observed &&
-                       tickets_valid && observation_observed &&
+                       tickets_valid && continuation_witnesses_valid && observation_observed &&
                        observations_valid &&
                        continuation_submissions_certified &&
                        terminal_submission_observed &&
                        terminal_submissions_valid &&
                        compact_reducer_observed && compact_reducers_valid &&
                        terminal_transactions > 0.0 &&
-                       ticket_submissions == terminal_transactions &&
+                       ticket_submissions == terminal_transactions + continuation_admissions &&
                        ticket_observations == terminal_transactions &&
                        transaction_submissions + terminal_submissions ==
                            terminal_transactions &&
@@ -895,6 +945,25 @@ namespace llaminar2::test::parity
                         tagEquals(record, "state_payload", "false");
                     device.ticket_submissions += record.value;
                 }
+                else if (record.name == "device_generation_continuation_admission_tickets" ||
+                    ((record.name == "device_generation_dispatch_tickets_observed" ||
+                      record.name == "hosted_device_generation_transaction_submissions") &&
+                     tagEquals(record,"entry_source","native_continue_response_admission")))
+                {
+                    const size_t role=record.name=="device_generation_continuation_admission_tickets"?0:
+                        record.name=="device_generation_dispatch_tickets_observed"?1:2;
+                    const char* depthTag=role==1?"next_depth":"depth";
+                    const bool valid=validContinuationAdmission(record,depthTag) &&
+                        (role!=1 || (tagEquals(record,"complete","false") && tagEquals(record,"maintenance_due","false"))) &&
+                        (role!=2 || (positiveIntegerTag(record,"fragments") &&
+                         tagEquals(record,"dynamic_depth_source","device_controller_ticket")));
+                    device.continuation_witnesses_valid &= valid;
+                    if(valid){
+                        auto& witness=device.continuation_witnesses[record.tags.at(depthTag)][role];
+                        if(witness)device.continuation_witnesses_valid=false;
+                        else witness=&record;
+                    }
+                }
                 else if (
                     record.name ==
                     "device_generation_dispatch_tickets_observed")
@@ -902,6 +971,7 @@ namespace llaminar2::test::parity
                     device.observation_observed = true;
                     device.observations_valid =
                         device.observations_valid &&
+                        (!record.tags.count("entry_source") || tagEquals(record,"entry_source","committed_transaction_ticket")) &&
                         record.count > 0 && record.value == static_cast<double>(record.count) &&
                         record.sequence_word_count == record.count &&
                         record.tags.count("transaction") == 0 &&
@@ -925,6 +995,7 @@ namespace llaminar2::test::parity
                     device.transaction_submission_observed = true;
                     device.transaction_submissions_valid =
                         device.transaction_submissions_valid &&
+                        (!record.tags.count("entry_source") || tagEquals(record,"entry_source","committed_transaction_ticket")) &&
                         positiveIntegerTag(record, "depth") &&
                         positiveIntegerTag(record, "fragments") &&
                         tagEquals(
@@ -993,6 +1064,18 @@ namespace llaminar2::test::parity
                         : "malformed_pre_first_draft_policy_selection");
             }
 
+            for(auto& [name,device]:devices){
+                for(const auto& [depth,witness]:device.continuation_witnesses){
+                    if(!witness[0] || !witness[1] || !witness[2] ||
+                       !sameContinuationWitness(*witness[0],*witness[1]) ||
+                       !sameContinuationWitness(*witness[0],*witness[2])){
+                        device.continuation_witnesses_valid=false;
+                        continue;
+                    }
+                    device.continuation_admissions+=witness[0]->value;
+                }
+            }
+
             // Mirrored participants must report exactly the same controller
             // ledger. An equality break proves rank divergence even if each
             // participant looked locally plausible.
@@ -1015,6 +1098,7 @@ namespace llaminar2::test::parity
                            << rank_launch_valid << '/' << rank_launches
                            << ":ticket=" << device.ticket_observed << '/'
                            << device.tickets_valid
+                           << ":continuation_admission=" << device.continuation_witnesses_valid << '/' << device.continuation_admissions
                            << ":observation="
                            << device.observation_observed << '/'
                            << device.observations_valid
@@ -1039,6 +1123,7 @@ namespace llaminar2::test::parity
                 }
                 if (device.ticket_submissions != first.ticket_submissions ||
                     device.ticket_observations != first.ticket_observations ||
+                    device.continuation_admissions != first.continuation_admissions ||
                     device.transaction_submissions !=
                         first.transaction_submissions ||
                     device.terminal_submissions !=

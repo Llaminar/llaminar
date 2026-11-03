@@ -388,6 +388,9 @@ namespace
         int prefill_participant_id = 0;
         uint64_t prefill_topology_signature = 0;
         int mock_resident_graph_rows = 0;
+        std::function<void(const ComputeGraph&)> workspace_graph_observer; ///< Original callback address, before native sealing.
+        bool publication_should_fail=false; ///< Exact post-capture publication failure, preserving original cleanup.
+        bool workspace_should_fail=false; ///< Exact cold workspace failure, never a fallback execution path.
 
         // ----- IForwardExecutionHost Interface -----
 
@@ -469,15 +472,16 @@ namespace
 
         bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
 
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph, int workspace_seq_len) override
         {
             ensure_workspace_calls++;
             last_workspace_seq_len = workspace_seq_len;
-            return true;
+            if(workspace_graph_observer)workspace_graph_observer(graph);
+            return !workspace_should_fail;
         }
 
         bool ensureDeviceWorkspaceAllocated(
-            const ComputeGraph &,
+            const ComputeGraph &graph,
             int workspace_seq_len,
             WorkspaceGraphFamilyPolicy graph_family_policy,
             WorkspaceGraphParticipantRole participant_role) override
@@ -487,7 +491,8 @@ namespace
             typed_workspace_role_seen = true;
             last_workspace_family_policy = graph_family_policy;
             last_workspace_participant_role = participant_role;
-            return true;
+            if(workspace_graph_observer)workspace_graph_observer(graph);
+            return !workspace_should_fail;
         }
 
         int residentGraphRows() const override
@@ -502,7 +507,7 @@ namespace
             last_published_logits = output.logits;
             (void)ctx;
             sync_logits_calls++;
-            return true;
+            return !publication_should_fail;
         }
 
         void commitSuccessfulForwardOutput(
@@ -4321,5 +4326,125 @@ TEST_F(Test__ForwardExecutionEngine, AttentionEvidenceFailedPrefillCaptureAborts
         EXPECT_EQ(transitions, (std::vector<GraphCaptureActivityTransition>{
             GraphCaptureActivityTransition::Entering, GraphCaptureActivityTransition::Aborted}));
         EXPECT_FALSE(llaminar2::testing::sharedMockWorkerGPUContext().isDeviceGraphCaptureActive());
+    }
+}
+
+
+namespace {
+/** @brief Observe actual stage ownership through engine cache commit and failed cold cleanup. */
+class StableForwardGraphLifetimeStage final:public llaminar2::testing::MockComputeStage {
+public:
+    /** @param name Original graph node name.
+     * @param device Original participant identity.
+     * @param retired Counter retained beyond the actual cache/stage lifetime.
+     * @param onRetire Optional observation after native cache borrowers must have retired.
+     */
+    StableForwardGraphLifetimeStage(std::string name,DeviceId device,int& retired,std::function<void()> onRetire={})
+        :MockComputeStage(ComputeStageType::GEMM,std::move(name),device),retired_(retired),onRetire_(std::move(onRetire)){}
+    /** @brief Count only actual sole-stage destruction, never a copied graph observation. */
+    ~StableForwardGraphLifetimeStage()override{++retired_;if(onRetire_)onRetire_();}
+private:
+    int& retired_;
+    std::function<void()> onRetire_;
+};
+}
+
+/** @test Cold workspace/capture identity survives either real engine cache commit and repeated reuse. */
+TEST_F(Test__ForwardExecutionEngine, CacheableGraphAddressRemainsStableAcrossCommitAndReuse)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS","1"},{"LLAMINAR_PREFILL_GRAPH_BUCKETS","0"},
+        {"LLAMINAR_VALIDATE_BUFFERS","0"},{"LLAMINAR_VALIDATE_INPUTS","0"},{"LLAMINAR_FAIL_ON_ZERO","0"}});
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})for(const bool decode:{false,true}){
+        SCOPED_TRACE(device.toString());
+        SCOPED_TRACE(decode);
+        int retired=0;
+        std::vector<const ComputeGraph*> prepared;
+        auto engine=makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,device.is_cpu()?ComputeBackendType::CPU:
+            device.is_cuda()?ComputeBackendType::GPU_CUDA:ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.workspace_graph_observer=[&](const ComputeGraph& graph){prepared.push_back(&graph);};
+        host.graph_stage_factories.push_back([&](const std::string& name,DeviceId owner){
+            return std::make_unique<StableForwardGraphLifetimeStage>(name,owner,retired);
+        });
+        std::array<int,4> tokens{1,2,3,4},positions{0,1,2,3};
+        auto input=makeTestInput(decode?1:4,1,device,tokens.data(),positions.data());
+        input.execution_phase=decode?ForwardExecutionPhase::Decode:ForwardExecutionPhase::Prefill;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input,output,host));
+        const auto original=engine.lastExecutedForwardGraph();ASSERT_TRUE(original);
+        ASSERT_FALSE(prepared.empty());
+        EXPECT_EQ(original->graph,prepared.front())<<"Cache publication moved the graph after its original identity escaped";
+        for(const auto* graph:prepared)EXPECT_EQ(graph,original->graph);
+        const auto topology=original->graph->topologyGeneration();
+        engine.resetSessionReplayState(true);
+        for(unsigned replay=0;replay<3;++replay){
+            ASSERT_TRUE(engine.execute(input,output,host));
+            const auto current=engine.lastExecutedForwardGraph();ASSERT_TRUE(current);
+            EXPECT_EQ(current->graph,original->graph);EXPECT_EQ(current->graph->topologyGeneration(),topology);
+            EXPECT_EQ(host.build_forward_graph_calls,1);EXPECT_EQ(retired,0);
+        }
+        engine.invalidateAll();EXPECT_EQ(retired,1);EXPECT_FALSE(engine.lastExecutedForwardGraph());
+    }
+}
+
+/** @test Failed pending construction releases the sole graph and never exports a stale cache identity. */
+TEST_F(Test__ForwardExecutionEngine, FailedColdGraphOwnerRetiresBeforeRetryAndUncachedExit)
+{
+    int retired=0;
+    std::vector<const ComputeGraph*> prepared;
+    auto engine=makeEngine();MockForwardExecutionHost host(&mock_ctx_);
+    host.workspace_should_fail=true;
+    host.workspace_graph_observer=[&](const ComputeGraph& graph){prepared.push_back(&graph);};
+    host.graph_stage_factories.push_back([&](const std::string& name,DeviceId owner){
+        return std::make_unique<StableForwardGraphLifetimeStage>(name,owner,retired);
+    });
+    std::array<int,4> tokens{1,2,3,4},positions{0,1,2,3};
+    auto input=makeTestInput(4,1,DeviceId::cpu(),tokens.data(),positions.data());
+    input.execution_phase=ForwardExecutionPhase::Prefill;
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input,output,host));EXPECT_EQ(retired,1);EXPECT_FALSE(engine.lastExecutedForwardGraph());
+    host.workspace_should_fail=false;prepared.clear();
+    ASSERT_TRUE(engine.execute(input,output,host));const auto current=engine.lastExecutedForwardGraph();ASSERT_TRUE(current);
+    ASSERT_FALSE(prepared.empty());EXPECT_EQ(current->graph,prepared.front());EXPECT_EQ(retired,1);
+    engine.invalidateAll();EXPECT_EQ(retired,2);
+    auto uncached=makeEngine(false);prepared.clear();
+    EXPECT_TRUE(uncached.execute(input,output,host));EXPECT_EQ(retired,3);EXPECT_FALSE(uncached.lastExecutedForwardGraph());
+}
+
+
+/** @test A real failed first-use recording retires native borrowers before its sole graph/stage owner. */
+TEST_F(Test__ForwardExecutionEngine, FailedCapturePublicationRetiresNativeBorrowersBeforeGraph)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS","1"},{"LLAMINAR_VALIDATE_BUFFERS","0"},
+        {"LLAMINAR_VALIDATE_INPUTS","0"},{"LLAMINAR_FAIL_ON_ZERO","0"}});
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}){
+        SCOPED_TRACE(device.toString());
+        auto& worker=llaminar2::testing::sharedMockWorkerGPUContext();
+        int nativeLive=0,created=0,retired=0;
+        struct RestoreHooks {
+            llaminar2::testing::MockWorkerGPUContext& worker;
+            std::function<void()> created,destroyed;
+            /** @brief Restore the original worker observations after every engine/cache has retired. */
+            ~RestoreHooks(){worker.capture_created=std::move(created);worker.capture_destroyed=std::move(destroyed);}
+        } restore{worker,worker.capture_created,worker.capture_destroyed};
+        worker.capture_created=[&]{++nativeLive;++created;};
+        worker.capture_destroyed=[&]{--nativeLive;};
+        auto engine=makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,device.is_cuda()?ComputeBackendType::GPU_CUDA:ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.mock_capture_policy.allow_fast_decode=true;
+        host.mock_capture_policy.allow_cached_graph_replay=true;
+        host.publication_should_fail=true;
+        host.graph_stage_factories.push_back([&](const std::string& name,DeviceId owner){
+            return std::make_unique<StableForwardGraphLifetimeStage>(name,owner,retired,[&]{EXPECT_EQ(nativeLive,0);});
+        });
+        int token=1,position=0;auto input=makeTestInput(1,1,device,&token,&position);ForwardOutput output{};
+        EXPECT_FALSE(engine.execute(input,output,host));
+        EXPECT_GT(created,0);EXPECT_EQ(nativeLive,0);EXPECT_EQ(retired,1);EXPECT_FALSE(engine.lastExecutedForwardGraph());
+        host.publication_should_fail=false;
+        ASSERT_TRUE(engine.execute(input,output,host));
+        EXPECT_EQ(retired,1);EXPECT_GT(nativeLive,0);
+        engine.invalidateAll();EXPECT_EQ(nativeLive,0);EXPECT_EQ(retired,2);
     }
 }

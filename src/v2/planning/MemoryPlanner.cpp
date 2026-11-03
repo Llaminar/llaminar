@@ -457,7 +457,8 @@ void requireGPUAdaptiveDomain(const ModelMemoryProfile &profile,const DevicePlan
 {
     const bool grouped = cfg.total_shards > 1 && cfg.ngram_execution_policy &&
         cfg.ngram_execution_policy->isGPUAdaptive() &&
-        cfg.ngram_execution_policy->gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal;
+        (cfg.ngram_execution_policy->gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal ||
+         cfg.ngram_execution_policy->gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::DeclaredRankLocal);
     const bool exactTP = grouped && cfg.ngram_tp_topology == ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal &&
         cfg.local_tp_backend && *cfg.local_tp_backend == (cfg.device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL) &&
         cfg.shard_index >= 0 && cfg.shard_index < cfg.total_shards && cfg.tensor_parallel_assignment &&
@@ -473,7 +474,7 @@ void requireGPUAdaptiveDomain(const ModelMemoryProfile &profile,const DevicePlan
         !cfg.captured_pipeline_boundaries.empty() || (!exactTP && cfg.ngram_tp_topology!=ImmutableRowTableTPTopology::None) ||
         !cfg.associated_host_memory || !cfg.associated_host_memory->valid() ||
         !cfg.associated_host_memory->device.is_cpu() || cfg.associated_host_memory->world_rank!=cfg.world_rank)
-        throw std::invalid_argument("AdaptiveVRAMRAMSSD requires full-main rank-local singleton or exact homogeneous ConsumerLocal compute provenance and one original CPU source");
+        throw std::invalid_argument("AdaptiveVRAMRAMSSD requires full-main rank-local singleton or exact homogeneous adaptive compute provenance and one original CPU source");
 }
 /** @return Original selected storage observations, never synthetic compute configs or fresh probes. */
 std::vector<PhysicalMemoryResource> ngramGPUResources(const DevicePlanConfig &cfg)
@@ -499,6 +500,13 @@ std::vector<PhysicalMemoryResource> ngramGPUResources(const DevicePlanConfig &cf
         if(participant.world_rank!=cfg.world_rank)throw std::invalid_argument("Declared storage cannot cross original rank authority");
         result.push_back(cfg.native_context_preparation->originalResource(participant.device()));
     }
+    const auto append=[&](DeviceId device){
+        if(std::none_of(result.begin(),result.end(),[&](const auto& resource){return resource.device==device;}))
+            result.push_back(cfg.native_context_preparation->originalResource(device));
+    };
+    append(cfg.device);
+    if(cfg.ngram_table_placement && cfg.ngram_table_placement->isGPUAdaptive())
+        for(const auto reader:cfg.ngram_table_placement->gpuAdaptiveLayout().consumers())append(reader.device);
     return result;
 }
 /** @return Exact original loader geometry equality without reading struct padding. */
@@ -794,10 +802,10 @@ std::shared_ptr<const RetainedHostServiceDeclarations> declareHostServiceRoles(
             const auto storage=cfg.ngram_execution_policy->storage;
             if(storage!=ImmutableRowStoragePreference::VRAM){
                 const RetainedHostServiceInstance instance{rank, ngramIOConsumer(cfg), RetainedHostServiceRole::ImmutableLookupIO};
-                if (!instance.consumer.is_cpu() ||
-                    std::find(groupedSources.begin(), groupedSources.end(), instance) == groupedSources.end()) {
+                const bool sharedSource=cfg.ngram_execution_policy->isGPUAdaptive() && cfg.total_shards>1;
+                if (!sharedSource || std::find(groupedSources.begin(),groupedSources.end(),instance)==groupedSources.end()) {
                     add(instance);
-                    if (instance.consumer.is_cpu()) groupedSources.push_back(instance);
+                    if(sharedSource)groupedSources.push_back(instance);
                 }
             }
         }
@@ -946,8 +954,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             (!cfg.associated_host_memory || !cfg.associated_host_memory->valid() ||
              !cfg.associated_host_memory->device.is_cpu() || cfg.associated_host_memory->world_rank!=cfg.world_rank))
             throw std::invalid_argument("Adaptive GPU lookup requires its exact existing rank-local host allocator");
-        const bool groupedGPUAdaptive = gpu_adaptive && cfg.total_shards > 1 && cfg.ngram_execution_policy &&
-            cfg.ngram_execution_policy->gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal;
+        const bool groupedGPUAdaptive = gpu_adaptive && cfg.total_shards > 1 && cfg.ngram_execution_policy;
         if (groupedGPUAdaptive && ownsNgramLookup(profile, cfg)) {
             const auto key = std::pair{cfg.world_rank, cfg.device.toString()};
             if (shared.native_table_allocators.insert(key).second) {
@@ -959,18 +966,38 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 native_table_bytes = gpu->bytes(PhysicalMemoryOwner::ImmutableTableStorage);
                 adaptive_request_bytes = gpu->bytes(PhysicalMemoryOwner::ImmutableLookupStaging);
                 adaptive_request_credit = cfg.retained_immutable_lookup_staging_bytes;
-                PhysicalMemoryPlanBuilder ordering;
-                ordering.add(gpu->resource(), PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
+                PhysicalMemoryPlanBuilder ordering,additional,storage;
+                const auto& request=cfg.ngram_execution_policy->gpu_adaptive;
+                const bool sharedReaders=request.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+                const bool sourceOwner=!sharedReaders || cfg.device==request.placement.coordinator->device();
+                const auto appendExtra=[&](const PhysicalMemoryBOM& line){
+                    for(size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i){
+                        const auto owner=static_cast<PhysicalMemoryOwner>(i);
+                        if(owner==PhysicalMemoryOwner::ImmutableTableStorage || owner==PhysicalMemoryOwner::ImmutableLookupStaging ||
+                           owner==PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent)continue;
+                        if(line.bytes(owner))additional.add(line.resource(),owner,line.bytes(owner));
+                    }
+                };
+                ordering.add(gpu->resource(),PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
                     gpu->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent));
-                if (shared.native_table_allocators.emplace(cfg.world_rank, DeviceId::cpu().toString()).second) {
-                    mixed_source_table = host->bytes(PhysicalMemoryOwner::ImmutableTableStorage);
-                    mixed_source_staging = host->bytes(PhysicalMemoryOwner::ImmutableLookupStaging);
-                    mixed_source_table_credit = cfg.retained_immutable_source_table_bytes;
-                    mixed_source_staging_credit = cfg.retained_immutable_source_lookup_staging_bytes;
-                    ordering.add(host->resource(), PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
+                appendExtra(*gpu);
+                if(sourceOwner && shared.native_table_allocators.emplace(cfg.world_rank,DeviceId::cpu().toString()).second){
+                    mixed_source_table=host->bytes(PhysicalMemoryOwner::ImmutableTableStorage);
+                    mixed_source_staging=host->bytes(PhysicalMemoryOwner::ImmutableLookupStaging);
+                    mixed_source_table_credit=cfg.retained_immutable_source_table_bytes;
+                    mixed_source_staging_credit=cfg.retained_immutable_source_lookup_staging_bytes;
+                    ordering.add(host->resource(),PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
                         host->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent));
+                    appendExtra(*host);
                 }
-                adaptive_ordering_bom = ordering.build();
+                if(sourceOwner)for(const auto& line:complete.resources()){
+                    const auto resourceKey=std::pair{line.resource().world_rank,line.resource().device.toString()};
+                    if(line.resource().device.is_gpu() && !shared.gpu_adaptive_grouped.contains(resourceKey) &&
+                       shared.native_table_allocators.insert(resourceKey).second)storage.add(line);
+                }
+                adaptive_ordering_bom=ordering.build();
+                remote_participant_bom=additional.build();
+                storage_only_bom=storage.build();
                 if ((adaptive_request_credit && adaptive_request_credit != adaptive_request_bytes) ||
                     (mixed_source_table_credit && mixed_source_table_credit != mixed_source_table) ||
                     (mixed_source_staging_credit && mixed_source_staging_credit != mixed_source_staging))
@@ -2470,8 +2497,7 @@ std::vector<MemoryPlan> MemoryPlanner::planGroups(
 
     }
     for (const auto& [sourceKey, placement] : resolved_host_providers) {
-        if (!placement->isGPUAdaptive() ||
-            placement->gpuAdaptiveLayout().adaptiveGPUDomain() != ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal) continue;
+        if (!placement->isGPUAdaptive() || placement->gpuAdaptiveLayout().consumers().size()<2)continue;
         const DevicePlanConfig* original = nullptr;
         for (const auto& group : device_groups) for (const auto& cfg : group)
             if (ownsNgramLookup(profile, cfg) && cfg.ngram_table_placement == placement) {
@@ -2481,13 +2507,22 @@ std::vector<MemoryPlan> MemoryPlanner::planGroups(
         if (!original) throw std::logic_error("Grouped resolved source has no original consumer");
         const auto devices = ngramGPUResources(*original);
         const auto& layout = placement->gpuAdaptiveLayout();
-        PhysicalMemoryPlanBuilder complete(AdaptiveImmutableLookupGeometry::consumerLocalMandatoryBOM(
-            layout, ngramNativeSource(profile), placement->gpuAdaptiveRequest(), devices,
-            *original->associated_host_memory, original->native_ordering_events));
-        const auto optional = AdaptiveImmutableLookupGeometry::consumerLocalSlotDependentBOM(
-            layout, ngramNativeSource(profile), placement->gpuAdaptiveRequest(), devices,
-            *original->associated_host_memory, original->native_ordering_events);
-        for (const auto& row : optional.resources()) complete.add(row);
+        PhysicalMemoryPlanBuilder complete;
+        if(layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal){
+            const auto mandatory=AdaptiveImmutableLookupGeometry::consumerLocalMandatoryBOM(layout,ngramNativeSource(profile),
+                placement->gpuAdaptiveRequest(),devices,*original->associated_host_memory,original->native_ordering_events);
+            const auto optional=AdaptiveImmutableLookupGeometry::consumerLocalSlotDependentBOM(layout,ngramNativeSource(profile),
+                placement->gpuAdaptiveRequest(),devices,*original->associated_host_memory,original->native_ordering_events);
+            for(const auto& row:mandatory.resources())complete.add(row);
+            for(const auto& row:optional.resources())complete.add(row);
+        }else{
+            const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,ngramNativeSource(profile),placement->gpuAdaptiveRequest());
+            const auto mandatory=geometry.mandatoryBOMWithOrderingProjection(devices,*original->associated_host_memory,original->native_ordering_events);
+            const auto optional=geometry.cacheBOM(devices,*original->associated_host_memory);
+            const auto remote=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,
+                original->native_context_preparation->originalResource(DeviceId::cpu()),devices,original->native_ordering_events);
+            for(const auto& plan:{mandatory,optional,remote})for(const auto& row:plan.resources())complete.add(row);
+        }
         const auto plan = complete.build();
         for (const auto consumer : layout.consumers())
             shared.gpu_adaptive_grouped.emplace(std::pair{consumer.world_rank, consumer.device.toString()}, plan);
@@ -2534,9 +2569,18 @@ std::vector<MemoryPlan> MemoryPlanner::planGroups(
                     coordinates[cfg.shard_index] = true;
                 }
                 const auto layout = input.gpuAdaptiveLayout(policy, 0, 0, maximum);
-                const auto mandatory = AdaptiveImmutableLookupGeometry::consumerLocalMandatoryBOM(
-                    layout, ngramNativeSource(profile), policy.gpu_adaptive, input.gpuResources(), host,
-                    first.native_ordering_events);
+                PhysicalMemoryPlan mandatory;
+                if(policy.gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::ConsumerLocal)
+                    mandatory=AdaptiveImmutableLookupGeometry::consumerLocalMandatoryBOM(layout,ngramNativeSource(profile),policy.gpu_adaptive,
+                        input.gpuResources(),host,first.native_ordering_events);
+                else{
+                    const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,ngramNativeSource(profile),policy.gpu_adaptive);
+                    PhysicalMemoryPlanBuilder complete(geometry.mandatoryBOMWithOrderingProjection(input.gpuResources(),host,first.native_ordering_events));
+                    const auto remote=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,
+                        first.native_context_preparation->originalResource(DeviceId::cpu()),input.gpuResources(),first.native_ordering_events);
+                    for(const auto& line:remote.resources())complete.add(line);
+                    mandatory=complete.build();
+                }
                 for (const auto consumer : input.consumers())
                     shared.gpu_adaptive_grouped.emplace(std::pair{consumer.world_rank, consumer.device.toString()}, mandatory);
                 continue;
@@ -2747,10 +2791,20 @@ std::optional<ImmutableRowTablePlacementInput> MemoryPlanner::immutableRowTableP
     auto input=ImmutableRowTablePlacementInput::forConsumers(ngramExtent(profile),host,consumers,host_placement);
     std::optional<ImmutableRowTablePolicy> policy;
     std::vector<PhysicalMemoryResource> originals;
+    std::optional<PeerAccessCoverage> peerAccess;
+    bool hasPeerObservation = false;
+    std::vector<ImmutableRowTableReaderPeerAccess> readerPeerAccess;
     for(const auto &group:groups)for(const auto &cfg:group)if(ownsNgramLookup(profile,cfg) && cfg.ngram_execution_policy && cfg.ngram_execution_policy->isGPUAdaptive())
     {
         if(policy && *policy!=*cfg.ngram_execution_policy)throw std::invalid_argument("Declared source owners require one unchanged consumer policy");
         policy=*cfg.ngram_execution_policy;
+        if (hasPeerObservation && peerAccess != cfg.ngram_gpu_peer_access)
+            throw std::invalid_argument("Pooled consumers changed the original peer observation");
+        peerAccess = cfg.ngram_gpu_peer_access;
+        if (hasPeerObservation && readerPeerAccess != cfg.ngram_reader_peer_access)
+            throw std::invalid_argument("Pooled consumers changed their original reader-edge observations");
+        readerPeerAccess = cfg.ngram_reader_peer_access;
+        hasPeerObservation = true;
         const auto devices=ngramGPUResources(cfg);
         for (const auto& device : devices) {
             const auto prior = std::find_if(originals.begin(), originals.end(), [&](const auto& value) {
@@ -2762,6 +2816,8 @@ std::optional<ImmutableRowTablePlacementInput> MemoryPlanner::immutableRowTableP
         }
     }
     if(policy)input=input.withGPUCacheResources(*policy,originals);
+    if (peerAccess) input = input.withGPUCachePeerAccess(*peerAccess);
+    if (!readerPeerAccess.empty()) input = input.withReaderPeerAccess(readerPeerAccess);
     return input;
 }
 std::vector<ImmutableRowTableUploadBinding> MemoryPlanner::immutableRowTableUploadBindings(
@@ -2931,10 +2987,8 @@ std::optional<ImmutableRowTableAdmissionRequest> MemoryPlanner::immutableRowTabl
             const DevicePlanConfig* originalConsumer=nullptr;
             for(const auto& group:groups)for(const auto& cfg:group)
                 if(ownsNgramLookup(profile,cfg)) {
-                    if(originalConsumer && originalConsumer->device!=cfg.device &&
-                        layout.adaptiveGPUDomain()!=ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal)
-                        throw std::invalid_argument("Shared-cohort ordering projection has multiple actual PLE consumers");
-                    originalConsumer=&cfg;
+                    if(requested.gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::ConsumerLocal ||
+                       cfg.device==requested.gpu_adaptive.placement.coordinator->device())originalConsumer=&cfg;
                 }
             if(!originalConsumer)throw std::invalid_argument("Adaptive ordering projection lost its actual PLE consumer");
             if (layout.adaptiveGPUDomain() == ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal) {
@@ -3056,7 +3110,7 @@ std::shared_ptr<const ImmutableRowTableExecutionProvision> MemoryPlanner::restor
             throw std::invalid_argument("Remote ngram common descriptor contradicts canonical whole-storage/sharding geometry");
         DevicePlanConfig cfg;cfg.native_ordering_events=ordering;cfg.world_rank=identity.resource.world_rank;cfg.device=identity.resource.device;
         cfg.device_total_bytes=identity.resource.total_bytes;cfg.device_free_bytes=identity.resource.admission_available_bytes;
-        cfg.ngram_execution_policy=requested;cfg.associated_host_memory=input.host();cfg.total_shards=identity.shards;
+        cfg.ngram_execution_policy=requested;cfg.ngram_gpu_peer_access=input.gpuCachePeerAccess();cfg.ngram_reader_peer_access.assign(input.readerPeerAccess().begin(),input.readerPeerAccess().end());cfg.associated_host_memory=input.host();cfg.total_shards=identity.shards;
         const bool needsService=cfg.device.is_gpu()&&requested.storage!=ImmutableRowStoragePreference::VRAM;
         if(needsService){
             if(!identity.host_service_declaration)throw std::invalid_argument("Ngram wire omitted exact CPU service declaration");

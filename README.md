@@ -271,10 +271,10 @@ implemented by this host mode.
 `--ngram-storage gpu-adaptive-vram-ram-ssd` is the explicit experimental
 GPU-coordinated native cache over a local subordinate CPU RAM/SSD source. Its
 admission scope includes one full-main CUDA or ROCm continuation and homogeneous
-ConsumerLocal TP2, request batch1. TP2 retains one CPU provider, RAM cache and I/O
+ConsumerLocal TP2/4/8, request batch1. The cohort retains one CPU provider, optional RAM cache and I/O
 worker, with disjoint request frames and a local GPU cache for each participant.
-PP, shared-owner TP, mixed-vendor compute and no-SSD remain unsupported. Auto
-and host-adaptive storage do not select it. The new TP2 path still requires native
+This source-backing choice does not expand admitted compute/transport topology. Auto
+and host-adaptive storage do not select it. Each newly admitted degree still requires native
 admission, execution, numerical and performance qualification; its declaration
 alone does not establish any of those results.
 
@@ -294,7 +294,17 @@ source-owner initialization and checked geometry alone do not qualify inference.
 Use `--ngram-gpu-cache-max-rows` / `--ngram-gpu-cache-bytes` for GPU payload plus
 metadata, and `--ngram-source-cache-max-rows` / `--ngram-source-cache-bytes` for
 the subordinate CPU cache. Both ceilings per cache default to zero, preserving
-the same explicit mode and mandatory SSD response path. Mandatory source,
+the same explicit mode and mandatory original source response path. `--ngram-source-backing ssd`
+(the default; YAML `ngram.source_backing: ssd`) retains bounded SSD mappings with
+the optional bounded RAM cache. `--ngram-source-backing ram` materializes the
+entire original native table once in the existing host source owner, shared by
+all declared consumers; it is not an oversized cache or a separate table per
+GPU. Full-RAM backing requires both source-cache ceilings to be zero and rejects
+redundant RAM caching. GPU cache placement/ceilings and all existing source,
+PMA, graph/event and terminal-retirement requirements stay in force. Insufficient
+RAM is a hard admission failure, never a switch to SSD. Full-RAM source observations
+use `gpu_subordinate_full_ram` and must report zero mapping-window work.
+Mandatory source,
 protocol and request scratch precede expert/KV grants; optional GPU slots then
 RAM slots fit only after higher priorities freeze. Positive requested limits
 are ceilings, not guaranteed reservations. Each prefix has independent

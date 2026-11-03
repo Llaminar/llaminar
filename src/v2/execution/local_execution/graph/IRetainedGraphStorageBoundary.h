@@ -20,6 +20,33 @@
 
 namespace llaminar2
 {
+class RankOrchestrator;
+namespace qwen4exp { class ImmutableLookupExecutionBoundary; }
+namespace test { struct RankRetainedStorageRetirementReplayAccess; }
+/**
+ * @brief A failed request whose original native and adopted storage duties retired.
+ * This never authorizes request success, data reset or prepared-context reuse.
+ * Construct only after the exact native terminal proof and worker join succeed;
+ * unproven retirement must retain its original exception type instead.
+ */
+class RetiredStorageRequestFailure final : public std::runtime_error
+{
+public:
+    /** @brief Preserve a proven outcome when an exception is copied or rethrown. */
+    RetiredStorageRequestFailure(const RetiredStorageRequestFailure &) noexcept = default;
+    /** @brief Preserve a proven outcome when replacing an existing exception value. */
+    RetiredStorageRequestFailure &operator=(const RetiredStorageRequestFailure &) noexcept = default;
+private:
+    friend class qwen4exp::ImmutableLookupExecutionBoundary;
+    friend class RankOrchestrator;
+    friend struct test::RankRetainedStorageRetirementReplayAccess;
+    /**
+     * @brief Only the original retirement owners may classify failed IO after native proof.
+     * @param message Original service failure retained after all retirement duties complete.
+     */
+    explicit RetiredStorageRequestFailure(const std::string &message)
+        : std::runtime_error(message) {}
+};
 class RetainedGraphParticipantParentStream;
 /** @brief Immutable addresses of canonical generation failure publication words. */
 struct RetainedStorageGenerationControl

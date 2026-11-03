@@ -78,6 +78,8 @@ public:
     { return requester_ == adaptive_lookup::None ? std::nullopt : std::optional(requester_); }
     /** @return Independent coordinator allocator; it need not own physical slots. */
     PhysicalMemoryAllocatorIdentity coordinator() const noexcept { return coordinator_; }
+    /** @return Original shared-cohort peer observation, never a hardware probe or mutable cache. */
+    std::optional<PeerAccessCoverage> peerAccess() const noexcept { return peer_access_; }
     /** @return Actual declared K bound, not a per-step live count or source-row quota. */
     std::uint32_t maximumUniqueRows() const noexcept { return maximum_unique_; }
     /** @return Exactly P ordered owner declarations, including C0. */
@@ -115,6 +117,7 @@ private:
     /** @return Exact declaration after validating both coordinate and resource identity. */
     const PooledPhysicalOwnerDeclaration &require(std::uint32_t coordinate,
                                                   PhysicalMemoryResource observed) const;
+    std::optional<PeerAccessCoverage> peer_access_;
     PhysicalMemoryAllocatorIdentity coordinator_;
     ImmutableRowTableExtent extent_;
     std::size_t stride_ = 0;

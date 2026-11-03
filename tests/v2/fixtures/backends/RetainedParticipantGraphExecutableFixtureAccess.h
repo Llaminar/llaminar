@@ -8,6 +8,7 @@
 #pragma once
 #include "backends/RetainedParticipantGraphExecutable.h"
 #include <memory>
+#include "execution/local_execution/graph/IGraphCaptureAuxiliaryBranch.h"
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/qwen4exp/PooledImmutableDirectedTransport.h"
 #include "fixtures/backends/PooledNativeProgramTerminalOrder.h"
@@ -52,6 +53,31 @@ struct RetainedParticipantGraphExecutableFixtureAccess final {
             throw std::logic_error("ACK splice requires the original recorded, uninstantiated definition");
         try{mutate(*owner->capture_);}
         catch(...){owner->phase_=RetainedParticipantGraphExecutable::Phase::Failed;throw;}
+    }
+    /**
+     * @brief Replay native finite-body assembly using two original admitted General fixture definitions.
+     * @param parent Original recorded native execution owner; only its ordinary submit API launches.
+     * @param body Original same-PMA/native-worker recording, never an anonymous SDK graph.
+     * @param progress Existing CUDA progress branch, or null for native SDMA.
+     * @return Exact native assembly result. Deliberate invalid controls must prove no mutation.
+     * @note This proves native composition, not a source/ModelContext witness or the remote69 recipe.
+     */
+    static bool composeRecordedNativeFixtureBodies(const std::shared_ptr<RetainedParticipantGraphExecutable>& parent,
+        std::span<const std::shared_ptr<RetainedParticipantGraphExecutable>> bodies,IGraphCaptureAuxiliaryBranch* progress){
+        if(!parent)throw std::invalid_argument("Native finite-body replay omitted its original parent");
+        parent->requireRecordingAuthority();
+        if(parent->phase_!=RetainedParticipantGraphExecutable::Phase::Recorded)
+            throw std::logic_error("Native finite-body replay parent is not an original recording");
+        std::vector<const IGPUGraphCapture*> definitions;
+        for(const auto& body:bodies){
+            if(!body){definitions.push_back(nullptr);continue;}
+            body->requireLiveOriginal();
+            const auto a=parent->memory_,b=body->memory_;
+            if(a.get()!=b.get() || a.owner_before(b) || b.owner_before(a))
+                throw std::logic_error("Native finite-body fixture substituted physical-memory authority");
+            definitions.push_back(body->capture_.get());
+        }
+        return progress?progress->attachWithFiniteBody(*parent->capture_,definitions):parent->capture_->appendFiniteBodySiblings(definitions);
     }
     /** @return Owner-controlled original enqueue; the recording facade cannot launch independently. */
     static bool submit(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,std::uint64_t ordinal){return owner->submit(ordinal);}

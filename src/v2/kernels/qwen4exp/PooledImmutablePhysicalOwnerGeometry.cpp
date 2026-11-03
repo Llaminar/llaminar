@@ -61,10 +61,18 @@ PooledImmutablePhysicalOwnerGeometry PooledImmutablePhysicalOwnerGeometry::fromL
     PhysicalMemoryAllocatorIdentity requester)
 {
     const auto participants = orderedOwners.size();
+    // The checked layout owns source eligibility. Full RAM has one complete
+    // immutable host source and no redundant RAM cache; it needs the SAME GPU
+    // participant/coordinator checks as bounded SSD, not an invented SSD tier.
+    const bool hostSource = !layout.sourceServices().empty() &&
+        ((layout.tiers().contains(ImmutableRowStorage::MemoryMapped) &&
+          std::all_of(layout.sourceServices().begin(),layout.sourceServices().end(),[](const auto& source){return source.windows.storage()==ImmutableRowStorage::MemoryMapped;})) ||
+         (!layout.tiers().contains(ImmutableRowStorage::MemoryMapped) && layout.tiers().contains(ImmutableRowStorage::RAM) &&
+          layout.sourceServices().size()==1 && layout.sourceServices().front().windows.storage()==ImmutableRowStorage::RAM));
     if ((!participants || participants > a::MaximumSlots) ||
         layout.residency() != ImmutableRowTableResidency::Adaptive ||
         !layout.tiers().contains(ImmutableRowStorage::VRAM) ||
-        !layout.tiers().contains(ImmutableRowStorage::MemoryMapped) ||
+        !hostSource ||
         !layout.fixedRanges().empty() || !layout.replicaGroups().empty() ||
         layout.sourceServices().empty() ||
         !layout.maximumInflightRows() || layout.maximumInflightRows() > a::MaximumSlots ||
@@ -78,6 +86,7 @@ PooledImmutablePhysicalOwnerGeometry PooledImmutablePhysicalOwnerGeometry::fromL
         throw std::invalid_argument("Pooled coordinator is not an original declared endpoint");
     PooledImmutablePhysicalOwnerGeometry result(layout.extent());
     result.coordinator_ = requester;
+    result.peer_access_ = layout.peerAccess();
     result.maximum_unique_ = static_cast<std::uint32_t>(layout.maximumInflightRows());
     result.stride_ = align(result.rowBytes(), 4);
     result.width_ = result.extent_.rows() <= 0x100000000ULL ? a::RowKeyWidth::UInt32 : a::RowKeyWidth::UInt64;

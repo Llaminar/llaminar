@@ -68,7 +68,7 @@ TEST(PooledImmutableParticipantPin, OrderedUnevenAndEmptyOwnersKeepExactOriginal
                 EXPECT_EQ(edge.incomingCount()->offset,owner.parameters().native.ingress+48);
                 EXPECT_NE(edge.incomingCount()->offset,owner.parameters().native.progress+offsetof(n::OwnerProgress,reply_bytes));
             }else EXPECT_FALSE(edge.incomingCount());
-            if(edge.capturedCrossVendor())EXPECT_NO_THROW(edge.channelMemory());else EXPECT_THROW(edge.channelMemory(),std::invalid_argument);
+            if(edge.capturedChannelTransport())EXPECT_NO_THROW(edge.channelMemory());else EXPECT_THROW(edge.channelMemory(),std::invalid_argument);
         }
     }
 }
@@ -129,7 +129,7 @@ TEST(PooledImmutableParticipantPin, NativeAndCrossRankTransportPrerequisitesStay
         const auto physical=declared(capacities,std::vector{target},source);const auto geometry=policy(physical);
         auto edge=q::PooledImmutablePinEdge::fromPlans(q::PooledImmutableCoordinatorNativePlan::fromGeometry(physical,geometry,701,17),
             q::PooledImmutableOwnerNativePlan::fromGeometry(physical,geometry,0,701,17));
-        EXPECT_FALSE(edge.capturedCrossVendor());EXPECT_THROW(edge.channelMemory(),std::invalid_argument);
+        EXPECT_FALSE(edge.capturedChannelTransport());EXPECT_THROW(edge.channelMemory(),std::invalid_argument);
         if(!edge.remote()){
             ASSERT_TRUE(edge.incomingCount());EXPECT_EQ(edge.incomingCount()->buffer,BufferId::QFN_POOLED_COORDINATOR_NATIVE);
             EXPECT_EQ(edge.incomingCount()->offset,edge.commandSlice().offset+8);EXPECT_EQ(edge.invocationSource(),edge.invocationDestination());

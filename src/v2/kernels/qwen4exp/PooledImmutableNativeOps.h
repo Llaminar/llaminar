@@ -49,6 +49,33 @@ QFN_ADAPTIVE_HD inline p::Grant* grants(const OwnerArgs& a)
 /** @return Native-only protocol output validity; this never supplies physical occupancy or pin permission. */
 QFN_ADAPTIVE_HD inline OwnerProgress& progress(const OwnerArgs& a)
 {return *at<OwnerProgress>(a.native,a.plan.native.progress);}
+/**
+ * @brief Check original duty-free owner state after an invocation receiver cancellation.
+ * @param a Original prepared native roots and their once-bound invocation receiver.
+ * @return True only for authenticated initialized Idle state with no physical duties.
+ * @note This neither releases pins nor publishes success/source retirement. Active or prior-failed
+ * owner state stays on the original fatal path. Rank separately proves all native endpoints.
+ */
+template<class Slot> QFN_ADAPTIVE_HD bool idleOwnerForCancelledInvocation(const OwnerArgs& a)
+{
+    const auto& native = progress(a);
+    const auto& frame = *ownerView<Slot>(a).frame;
+    return native.initialized == 2 && native.setup_identity == a.plan.identity &&
+        (frame.interval.table == 0 || frame.interval.table == a.plan.table) &&
+        frame.phase == p::OwnerPhase::Idle && frame.held_pins == 0 && frame.reservations == 0 &&
+        (frame.status == Status::Success || frame.status == Status::Cancelled) &&
+        allocationFrame(a).phase == p::AllocationPhase::Idle;
+}
+/**
+ * @brief Combine original channel cancellation with original physical owner duty validation.
+ * @param a Original prepared native roots and their once-bound invocation receiver.
+ * @param cancellation System-acquired original channel nonce, never consumer-only state.
+ * @return Only an exact cancelled receive plus the original duty-free owner state may drain.
+ */
+template<class Slot> QFN_ADAPTIVE_HD bool cancelledIdleOwner(const OwnerArgs& a, std::uint64_t cancellation)
+{
+    return a.original_invocation.cancelledReceive(cancellation) && idleOwnerForCancelledInvocation<Slot>(a);
+}
 /** @return One actual typed owner plan executor over original admitted banks. */
 template<class Slot> QFN_ADAPTIVE_HD p::OwnerPlanOperations<Slot> allocation(const OwnerArgs& a)
 {

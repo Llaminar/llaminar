@@ -41,9 +41,11 @@ private:
 using PooledImmutableRetirementParticipant=std::variant<std::shared_ptr<const PooledImmutableLocalOwnerBinding>,std::shared_ptr<const PooledImmutableCapturedRetirementWave>>;
 }
 namespace llaminar2 {
+struct PooledImmutableReplicatedReaderCompletion;
 /** @brief Concrete original terminal producer/read inventory; no physical pin or execution-state shadow. */
 struct PooledImmutableRetirementCompletion {
     PooledImmutableReadCompletion read;
+    std::shared_ptr<const PooledImmutableReplicatedReaderCompletion> readers; ///< Exact actual compute ACK frontiers, independent of physical owner count.
     std::vector<qwen4exp::PooledImmutableRetirementParticipant> owners;
     std::vector<std::string> gatePacked,gateSent,releaseReceived,releaseImported,retiredReceived,retiredImported;
     std::string readersRetired,planned,reconciled,snapshot,finished,observed;

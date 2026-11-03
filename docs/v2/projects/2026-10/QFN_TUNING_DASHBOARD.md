@@ -1,12 +1,12 @@
 # QFN tuning dashboard
 
-Updated 2026-11-02. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-03. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
-**Checkpoint `2cf99995d`:** fresh finite-trajectory MTP comparison and full OpenCode
+**Earlier checkpoint `2cf99995d`:** finite-trajectory MTP comparison and full OpenCode
 session complete on accepted ROCm TP4. [Contract and live MTP table](QFN_MTP_TP4_TUNING.md).
 The A1 rates below are historical **MTP-off** results.
 
@@ -29,114 +29,68 @@ logits; component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Admission | [Matrix](QFN_SOURCE_ADMISSION_MATRIX.md): 64 adaptive cells open. Focused policy/lifecycle checks green; full gate pending. |
+| Admission | [Six-row target][target-matrix]: TP4 and genuine six-GPU follower RAM/SSD source controls each pass 2/2. Matched SSD TP2 passes 8/12; shared-pool continuation owners need native transport completion. Fresh RAM-backed ConsumerLocal controls pass 4/4. Complete regression collection is retained in the follow-up. The focused repair run now passes all 57 registrations, with no skips and clean native retirement/driver checks. Six TP4 cache source controls pass with clean driver/retirement checks. Four rebalancing source controls pass their cases, but two AMD user-pointer workqueue warnings keep that run unqualified. |
 | Native lifetime | [Review](QFN_NATIVE_RESOURCE_ALLOWANCE_REVIEW_2026-11-01.md): r65 passes all four source controls, final retirement and driver checks. |
-| Continuation / ngrams | [TP2 evidence](QFN_CONSUMER_LOCAL_QUALIFICATION_2026-11-02.md): source16/MTP12 green. Candidate Unit974 and four byte-exact model panels pass; native107 green, gfx1100 14 green. GPU-hit lookup: CUDA1.34x/ROCm1.87x; model decode -1.64% to +1.00%. Movement gate next. |
+| Continuation / ngrams | Checkpoint `c4cad1534` pushed. [Follow-up](QFN_CONTINUATION_FOLLOWUP_2026-11-02.md): complete r199 prerequisites 4,042 passes, zero failures, 29 absent-hardware skips. A later reboot-related file-device identity fix passes focused checks; full prerequisites need refreshing. All six CPU1-backed TP4 cache diagnostics pass the existing absolute pilot with identical metrics over 178 scored rows; Release timing and full approval remain pending. Per-engine RSS attribution needs to include the MPI engine descendant. Shared native ownership, hot replicas and CPU2 per-expert TP remain private candidates; no policy winner is promoted. |
 
 QSA temporal/page certificates did not repay their costs through **64K/128K**;
 no pruning policy is installed. [Study][certificates]. CUDA hardware profiling
 is paused after a profiler/driver assertion; native events remain available.
 
-## Topology and performance matrix
+## Canonical functional and performance matrix
 
-Rates are **tok/s**: prefill (**P**) and after-prefill decode (**D**).
-🟢 = accuracy passed; 🔴 = numerical failure; ⚪ = pending.
-**— means unmeasured/unavailable, never zero.** Accuracy green does not certify
-speed or an image. G60 is the last complete topology gate; later A1 gates are scoped.
+The current target is these **six hardware rows**, across RAM/SSD ngram backing
+and bounded RAM/VRAM row caches with promotion/demotion. [Coverage plan][target-matrix]
+owns the pairing strategy; the existing typed test definitions own commands.
+Q6 tests ngram ownership on continuation GPUs, follower GPUs, and both. Its four
+MI50s must execute real expert work. Any required CPU expert backing is explicit.
 
-### A — implemented and admitted
+Rates are tok/s: prefill **P**, after-prefill decode **D**. ⚪ means the revised
+cell is pending; **— means unmeasured, never zero**. Earlier measurements below
+remain controls and do not qualify the new tier/ownership combinations.
 
-| ID | Topology and ngrams | Accuracy | Llaminar P | Reference P | Strata P | Llaminar D | Reference D | Strata D | Next / limitation |
-|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | ROCm TP4; all GPU experts; RAM ngrams | 🟢 serial panel + MTP HTTP | 821.373 | 466.222 C | — | 43.360 | 42.668 C | — | Fresh Dynamic101.367 D / C100.098; EOS caveat above. |
-| A2 | ROCm1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a2] | 156.707 | 159.177 C | 45.270≈ | 15.164 | 11.600 C | 24.024≈ | Prefill trails Castagna; decode trails Strata. |
-| A3 | CUDA1 + CPU1; 8 GPU / 504 CPU experts per layer; adaptive tiers, zero-cache control | [🟢 G60][a3] | 180.920 | 129.020 U⚠ | 74.301≈ | 18.231 | 13.059 U⚠ | 31.253≈ | Resolve upstream variance; decode trails Strata. |
-| A4 | CPU1, 28 physical workers; SSD mmap ngrams | [🟢 G60][a4] | 98.466 | 48.408 C | n/a | 5.797 | 4.611 C | n/a | Both recorded phases lead Castagna. |
-| A5 | PP(CUDA1, ROCm1, CPU1), 8/12/28 layers; SSD mmap ngrams | [🟢 G60][a5] | — | — | — | — | — | — | Exact GPU→GPU→CPU-tail reference unavailable at current pins. |
+| Row | Topology | Accuracy | Llaminar P | Reference P | Strata P | Llaminar D | Reference D | Strata D |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| Q1 | 1× MI50 | ⚪ | — | — | — | — | — | — |
+| Q2 | 2× MI50 | ⚪ | — | — | — | — | — | — |
+| Q3 | 4× MI50 | ⚪ | — | — | — | — | — | — |
+| Q4 | 1× RTX 3090 | ⚪ | — | — | — | — | — | — |
+| Q5 | 2× RTX 3090 | ⚪ | — | — | — | — | — | — |
+| Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ | — | — | — | — | — | — |
 
-**A1 policy:** `TensorParallel` dense compute + `GateUpOwnedDownColumns` experts,
-`VocabularySharded` terminal head, Automatic-resolved Four-worker owner gate/up,
-shape-selected Q5 down publication, ValueMajor GDN and FP16 Prefill8/Decode33
-attention. The feature branch selects that attention policy through admission
-instead of diagnostic overrides. Do not mix it with the policy pairs
-below or substitute their throughput.
+Functional coverage retains MTP off/1/3/dynamic and dynamic expert balancing.
+Small C0/C64 row-cache fixtures force movement; performance uses useful admitted
+capacities and reports exact tier bytes, hit rates and working set. Current
+native transfer floor: retained Release 22/28 green; six CUDA memory-observation
+failures traced to collective first-use lifetime. Original-owner Integration
+rerun passes all six RCCL cases; ordinary NCCL fixed P2P still needs an admitted
+device-stack contract. No default transport is promoted. RCCL small-message event round trips
+are about 48 µs versus mapped 65–66 µs; full lookup/inference remains unmeasured.
+[Timings, scope and failures](QFN_NGRAM_NATIVE_TRANSFER_FLOORS_2026-11-02.md).
 
-| A1 policy variant | Dense compute | Experts | Accuracy | Llaminar P | Castagna P | Llaminar D | Castagna D | Decision |
-|---|---|---|---|---:|---:|---:|---:|---|
-| A1.1 | `TensorParallel` | `Apportioned` | 🟢 L64 | 561.867 | 467.821 | 30.515 | 42.959 | Slower than A1. |
-| A1.2 | `PrefillTensorParallelDecodeReplicated` | `GateUpOwnedDownColumns` | 🔴 L65 | — | 467.821 | — | 42.959 | One forced decode row KL 1.119 exceeds the unchanged 1.0 ceiling; diagnose before timing. |
-| A1.3 | `PrefillTensorParallelDecodeReplicated` | `Apportioned` | 🟢 L65 | 382.757 | 467.821 | 30.761 | 42.959 | Ornith arrangement; slower than A1. |
+### Earlier measured controls
 
-**Reference labels:** C = Castagna Veloce; U = separately labeled upstream
-llama.cpp for CUDA because the pinned Castagna fork does not build for SM86.
-⚠ Upstream A3 decode samples span 12.293–17.417 tok/s; tensor placement and
-repeatability still need closure. A2/A3 expert partition and mmap policies
-differ between engines, so these are disclosed engine comparisons, not matched
-kernel measurements. [Baseline details and ranges][history].
+| Control | Original policy | Accuracy | Llaminar P / D | Reference P / D | Strata P / D |
+|---|---|---|---:|---:|---:|
+| A1 | MI50 TP4; all GPU experts; RAM ngrams, MTP off | 🟢 short panel | 821.373 / 43.360 | 466.222 / 42.668 C | — |
+| A2 | MI50×1 + CPU; 8/504 GPU/CPU experts, adaptive zero cache | [🟢 G60][a2] | 156.707 / 15.164 | 159.177 / 11.600 C | 45.270 / 24.024≈ |
+| A3 | RTX 3090×1 + CPU; same 8/504 expert split | [🟢 G60][a3] | 180.920 / 18.231 | 129.020 / 13.059 U⚠ | 74.301 / 31.253≈ |
+| C2a | MI50×2 + CPU, independent ConsumerLocal C64 | 🟢 four panels | 111.211 / 14.611 | — | — |
+| C3a | RTX 3090×2 + CPU, independent ConsumerLocal C64 | 🟢 four panels | 116.941 / 17.988 | — | — |
 
-**Strata ≈** uses the approved BF16 compatibility pack and default tail7 expert
-skipping (about 29.5% fewer decode expert contributions). It has no inherited
-accuracy badge. Full top-10 controls are **44.235 P / 19.750 D** on MI50 and
-**73.508 P / 24.791 D** on RTX 3090. Preserve these arithmetic/routing distinctions;
-the faster approximation is a labeled comparison, not equivalent work.
-[Strata variants and staging analysis][strata-history].
+C = Castagna Veloce; U = upstream llama.cpp because the pinned Castagna fork
+does not build for SM86. ⚠ Upstream A3 decode spans12.293–17.417tok/s; placement
+and repeatability still need closure. A2/A3 partition/mmap policies differ
+between engines. Strata≈ uses the approved BF16 pack and default tail7 skipping
+(about29.5% fewer expert contributions); it has no inherited accuracy badge.
+Full top10 Strata controls are44.235P/19.750D on MI50 and73.508P/24.791D on3090.
+[Baseline details][history]; [Strata distinctions][strata-history].
 
-### B — explicitly requested compositions
-
-Two CPUs mean two physical NUMA/socket participants. These expert-domain
-compositions do **not** imply mixed-vendor TP. B2/B3 use a ROCm TP4 continuation
-domain; a PP composition of ROCm TP4 and CUDA TP2 is a different configuration.
-
-| ID | Topology | Ngrams | Accuracy | Llaminar P | Ref P | Llaminar D | Ref D | Reference / prerequisite |
-|---|---|---|---|---:|---:|---:|---:|---|
-| B1 | CUDA2 + CPU2; CUDA TP2 continuation, both CPUs own experts | RAM | ⚪ | — | — | — | — | Upstream; MPI2 admission and real owner/path proof. |
-| B2 | CUDA2 + ROCm4; CUDA expert domain | **Fully GPU**, sharded on ROCm lookup cohort | ⚪ | — | — | — | — | Mixed-vendor reference unproved; source capacity/MPI2 proof. No CPU tier substitution. |
-| B3 | CUDA2 + ROCm4 + CPU2; CUDA and both CPUs own experts | **RAM** | ⚪ | — | — | — | — | Mixed-vendor reference unproved; positive work on every requested domain. |
-
-[Exact composition intent and tier caps][compositions] remain planning inputs,
-not admitted memory grants. Strata measurements for these rows are pending.
-
-### C — remaining local topology coverage
-
-RAM ngrams are the initial control. Admit two-card capacity explicitly; any
-necessary CPU offload changes the row identity and must be disclosed and matched.
-Never switch GGUF or placement silently. Strata baselines remain pending.
-
-| ID | Topology / storage variant | Accuracy | Llaminar P | Ref P | Llaminar D | Ref D | Reference / next prerequisite |
-|---|---|---|---:|---:|---:|---:|---|
-| C1 | CPU1; RAM ngrams | ⚪ | — | — | — | — | C; qualify independently of SSD row A4. |
-| C2 | ROCm TP2 | ⚪ | — | — | — | — | C; source partition/capacity. |
-| C3 | CUDA TP2 | ⚪ | — | — | — | — | U; source partition/capacity. |
-| C2a | ROCm2 + CPU1 experts; ConsumerLocal C64 | 🟢 four-panel slice | 111.211 | — | 14.611 | — | 8 GPU experts/layer; reference pending. |
-| C3a | CUDA2 + CPU1 experts; ConsumerLocal C64 | 🟢 four-panel slice | 116.941 | — | 17.988 | — | Same source/policy; reference pending. |
-| C4 | ROCm TP4; Castagna within-expert F split | ⚪ | — | — | — | — | C; exact F slices 128/128/128/256; distinct from A1. |
-| C5 | ROCm PP2; equal contiguous layer ranges | ⚪ | — | — | — | — | C; pipeline admission and ranges. |
-| C6 | ROCm PP2; unequal contiguous layer ranges | ⚪ | — | — | — | — | C; pipeline admission and ranges. |
-| C7 | CUDA PP2; equal contiguous layer ranges | ⚪ | — | — | — | — | U; pipeline admission and ranges. |
-| C8 | CUDA PP2; unequal contiguous layer ranges | ⚪ | — | — | — | — | U; pipeline admission and ranges. |
-| C9 | ROCm PP4; equal ranges, one stage/card | ⚪ | — | — | — | — | C; lifecycle green; accuracy/perf pending. |
-| C10 | ROCm PP4; unequal layer ranges | ⚪ | — | — | — | — | C; source owners/capacity. |
-| C11 | ROCm PP(TP2, TP2) | ⚪ | — | — | — | — | C; TP cohorts and pipeline boundary. |
-| C12 | ROCm interleaved PP; 12 stages, 0/1/2/3 repeated ×3 | ⚪ | — | — | — | — | C; repeated ownership/concurrency-aware admission. |
-| C13 | CPU prefix + CUDA suffix; partial-layer offload | ⚪ | — | — | — | — | U; exact layer/source placement. |
-| C14 | CPU prefix + ROCm suffix; partial-layer offload | ⚪ | — | — | — | — | C; exact layer/source placement. |
-| C15 | CUDA + CPU; whole-expert-tensor offload | ⚪ | — | — | — | — | U; tensor overrides, distinct from A3 expert-ID ownership. |
-| C16 | ROCm + CPU; whole-expert-tensor offload | ⚪ | — | — | — | — | C; tensor overrides, distinct from A2 expert-ID ownership. |
-
-### D — additional hardware required
-
-This host has four MI50s and two RTX 3090s. Six mixed GPUs cannot satisfy TP8.
-Initial ngram placement is RAM; bind the eight-card backend before admission.
-
-| ID | Topology | Accuracy | Llaminar P | Ref P | Llaminar D | Ref D | Block / reference |
-|---|---|---|---:|---:|---:|---:|---|
-| D1 | CUDA TP4 | ⚪ | — | — | — | — | Need four CUDA cards; U. |
-| D2 | CUDA PP4; equal ranges | ⚪ | — | — | — | — | Need four CUDA cards; U. |
-| D3 | CUDA PP4; unequal ranges | ⚪ | — | — | — | — | Need four CUDA cards; U. |
-| D4 | CUDA PP(TP2, TP2) | ⚪ | — | — | — | — | Need four CUDA cards; U. |
-| D5 | Homogeneous TP8 | ⚪ | — | — | — | — | Need eight same-backend cards. |
-| D6 | Homogeneous TP2 × PP4 | ⚪ | — | — | — | — | Need eight same-backend cards. |
-| D7 | Homogeneous TP4 × PP2 | ⚪ | — | — | — | — | Need eight same-backend cards. |
+A1 uses `TensorParallel`, `GateUpOwnedDownColumns`, `VocabularySharded`,
+Automatic Four-worker gate/up, shape-selected Q5 down, ValueMajor GDN and
+FP16 Prefill8/Decode33 attention. Its fresh accepted Dynamic result is above.
+Earlier alternative policies, CPU/PP controls and the superseded topology list
+are preserved in the [target note][target-matrix], not expanded here.
 
 ## Accuracy and measurement contract
 
@@ -205,3 +159,5 @@ owns full geometry, ownership and live-communication coverage.
 [a3]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/cuda-cpu-static8-adaptive-hc-up-two-term/report.json
 [a4]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/cpu-mmap-hc-up-two-term/report.json
 [a5]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/hybrid-cpu-tail-mmap-hc-up-two-term/report.json
+
+[target-matrix]: QFN_FUNCTIONAL_PERFORMANCE_TARGET_2026-11-02.md

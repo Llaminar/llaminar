@@ -1,12 +1,14 @@
 /**
  * @file MoEOverlayParticipantGraphRunner.h
- * @brief Expert-only graph runner for one heterogeneous MoE overlay rank.
+ * @brief Retained expert graph family for original rank or subordinate endpoint ownership.
  *
  * A continuation rank owns token embedding, attention, routing, shared-expert
  * work, and logits.  Every other rank owns only the routed experts assigned to
- * its rank-local participants. This runner materializes that smaller authority as a
- * declarative graph: for every layer and target participant it enters the same
- * sparse MPI dispatch boundary as the continuation graph, optionally executes
+ * its rank-local participants. A continuation Rank may also own this same
+ * smaller expert family on genuine off-continuation GPUs. Those endpoints do
+ * not become continuation TP members or an independent inference runner.
+ * This runner materializes that authority as a declarative graph: for every layer and target participant it enters the same
+ * original sparse dispatch boundary as the continuation graph, optionally executes
  * the locally owned expert stage, and enters the matching return boundary.
  *
  * No token or activation tensor is carried by the public runner API.  Hidden
@@ -30,12 +32,19 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
+#include <exception>
+#include <algorithm>
+#include <type_traits>
 
 namespace llaminar2
 {
+    namespace test { struct MoEOverlayParticipantNativeRetirementReplayAccess; }
     class ComputeGraph;
     class ModelContext;
     class MoELocalExpertSerialBufferArena;
@@ -63,6 +72,13 @@ namespace llaminar2
         DynamicPlacement = 1, ///< Dynamic promotion/rebalance may retire a bank.
     };
 
+    /** @brief Original owner which submits and retires the expert graph family. */
+    enum class MoEOverlayParticipantGraphOwnership : std::uint8_t
+    {
+        ExpertOnlyRank, ///< Existing remote command/ticket follower lifecycle.
+        RankLocalAuxiliary, ///< Subordinate endpoints of the real continuation Rank.
+    };
+
     /**
      * @brief Construction contract for one rank-local expert graph.
      *
@@ -74,6 +90,9 @@ namespace llaminar2
     {
         /** @brief Immutable model/weight authority for this rank-local graph. */
         std::shared_ptr<ModelContext> model_context;
+        /** Original rank lifecycle; endpoint membership still comes from placement. */
+        MoEOverlayParticipantGraphOwnership ownership =
+            MoEOverlayParticipantGraphOwnership::ExpertOnlyRank;
         /// Frozen CPU roots for every admitted endpoint/controller on this rank.
         std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         /**
@@ -322,6 +341,81 @@ namespace llaminar2
         moeOverlayDeviceControllerRuntimeBindings() const override;
 
     private:
+        friend struct test::MoEOverlayParticipantNativeRetirementReplayAccess;
+        friend class OrchestrationRunner; // Original cold coordinator construction owns the sole binding.
+        /**
+         * @brief Bind the existing coordinator publisher to original same-rank endpoints.
+         * @param original Fully prepared auxiliary runner retained through all native joins.
+         * @return Existing publisher interface; no MPI self-channel or progress thread.
+         * @throws std::invalid_argument For an ordinary follower or foreign endpoint topology.
+         */
+        static std::shared_ptr<IMoEOverlayInferenceTransactionPublisher>
+        createRankLocalInferencePublisher(std::shared_ptr<MoEOverlayParticipantGraphRunner> original);
+
+        /**
+         * @brief Authenticate the complete original rank registry before selecting a role subset.
+         * @param owners Complete immutable owner map used by this model instance.
+         * @param registry Original shared prepared-bank registry, never a cloned subset.
+         * @param world_rank Actual process rank owning these endpoint banks.
+         * @param epoch Exact original residency snapshot epoch.
+         * @throws std::invalid_argument For stale epochs or missing/foreign rank participants.
+         */
+        template <typename Owners, typename Registry>
+        static void requireOriginalRankRegistry(
+            const Owners &owners, const Registry &registry, int world_rank, std::uint64_t epoch)
+        {
+            std::vector<int> original;
+            for (const auto &participant : owners.participants())
+                if (participant.world_rank_known && participant.world_rank == world_rank)
+                    original.push_back(participant.participant_id);
+            std::sort(original.begin(), original.end());
+            if (world_rank < 0 || epoch == 0u || registry.initialEpoch() != epoch ||
+                registry.localParticipantIds() != original)
+                throw std::invalid_argument(
+                    "MoE overlay participant registry differs from the original full rank topology or epoch");
+        }
+        /**
+         * @brief Join every original endpoint even after an earlier native proof fails.
+         * @param terminals Original submitted endpoint/ticket records, in stable order.
+         * @param wait Exact existing terminal-event observer for one record.
+         * @param abort Nonthrowing original-lane cancellation, preserving first errors.
+         * @param error First native proof failure, never a semantic-success receipt.
+         * @return True only if every original native observation succeeded.
+         *
+         * Callers may publish physical completion receipts only after true. No
+         * semantic success, source retirement, or reuse is inferred here.
+         */
+        template <typename Terminals, typename Wait, typename Abort>
+        static bool joinAllOriginalNativeTerminals(
+            Terminals &terminals, Wait wait, Abort abort, std::string *error)
+        {
+            static_assert(std::is_nothrow_invocable_v<Abort>);
+            std::exception_ptr first;
+            for (auto &terminal : terminals)
+            {
+                try { wait(terminal); }
+                catch (...)
+                {
+                    if (!first)
+                        first = std::current_exception();
+                    abort();
+                }
+            }
+            if (!first)
+                return true;
+            try { std::rethrow_exception(first); }
+            catch (const std::exception &failure)
+            {
+                if (error)
+                    *error = failure.what();
+            }
+            catch (...)
+            {
+                if (error)
+                    *error = "Unknown native expert endpoint retirement failure";
+            }
+            return false;
+        }
         /**
          * @brief Semantic request phase for one sparse participant transaction.
          *
@@ -437,6 +531,286 @@ namespace llaminar2
             int mtp_graph_depth = -1,
             uint64_t placement_epoch = 0);
         /**
+         * @brief Fixed metadata lifecycle of the original same-rank publisher.
+         *
+         * Native submission and retirement remain on the original Runner. This
+         * helper composes its existing protocol, owns no transport, and cannot
+         * certify native work. Typed callbacks run at the actual submit/join
+         * boundary; only their successful return permits protocol advancement.
+         */
+        class RankLocalPublicationState
+        {
+        public:
+            /** @brief Allocate the original fixed protocol ring during cold setup. */
+            explicit RankLocalPublicationState(MoEOverlayInferenceTransactionProtocol::Config config)
+                : protocol_(std::move(config))
+            {
+            }
+            /** @brief Open only after the prior original command retired successfully. */
+            bool begin(const MoEOverlayInferenceCommandIdentity &command, std::string *error)
+            {
+                if (active_ || failed_)
+                    return reject(error, "Original local expert command is active or failed");
+                if (!protocol_.beginCommand(command, error))
+                    return false;
+                command_ = command;
+                return true;
+            }
+            /**
+             * @brief Authenticate a ticket, retain its slot, then submit its original endpoints.
+             * @param descriptor Original continuation graph descriptor.
+             * @param submit Original runner's exact family validation and all-submit operation.
+             * @return Handle retained even after partial failure until abort drains the original work.
+             */
+            template <class Submit>
+            MoEOverlayPublishedInferenceTransaction publish(
+                const MoEOverlayInferenceExecutionDescriptor &descriptor, Submit submit)
+            {
+                MoEOverlayPublishedInferenceTransaction out;
+                if (active_ || failed_ || !command_.valid())
+                {
+                    out.error = "Local publisher has no reusable original command slot";
+                    return out;
+                }
+                try
+                {
+                    out.ticket = makeMoEOverlayInferenceExecutionTicket(topology(), command_,
+                        protocol_.nextTransactionOrdinal(), descriptor.logical_step_id,
+                        descriptor.placement_epoch, descriptor.graph_role, descriptor.request_count,
+                        descriptor.logical_rows_per_request, descriptor.physical_rows_per_request,
+                        descriptor.draft_depth, descriptor.sidecar_depth,
+                        descriptor.prefill_schedule_workload, descriptor.retired_decode_progress_tokens);
+                    const auto admission = protocol_.accept(out.ticket);
+                    if (!admission.accepted())
+                    {
+                        out.error = admission.error;
+                        failed_ = true;
+                        return out;
+                    }
+                    out.slot_index = admission.slot_index;
+                    active_ = out;
+                    if (!protocol_.markSubmitted(out.slot_index, out.ticket, &out.error) ||
+                        !submit(out.ticket, &out.error))
+                    {
+                        failed_ = true;
+                        return out;
+                    }
+                    out.ok = true;
+                    active_ = out;
+                }
+                catch (const std::exception &exception)
+                {
+                    failed_ = true;
+                    out.error = exception.what();
+                }
+                return out;
+            }
+            /** @brief Join the exact original handle before advancing its existing protocol slot. */
+            template <class Join>
+            bool retire(const MoEOverlayPublishedInferenceTransaction &handle, Join join, std::string *error)
+            {
+                if (!active_ || !handle.ok || !active_->ok || handle.ticket != active_->ticket ||
+                    handle.slot_index != active_->slot_index)
+                    return reject(error, "Local retirement lost its exact original publication");
+                if (failed_)
+                    return reject(error, "Original local expert command has failed");
+                try
+                {
+                    if (!join(error))
+                    {
+                        failed_ = true;
+                        return false;
+                    }
+                }
+                catch (const std::exception &exception)
+                {
+                    failed_ = true;
+                    return reject(error, exception.what());
+                }
+                if (!protocol_.markReturnReady(handle.slot_index, handle.ticket, error) ||
+                    !protocol_.retire(handle.slot_index, handle.ticket, error))
+                {
+                    failed_ = true;
+                    return false;
+                }
+                active_.reset();
+                return true;
+            }
+            /** @brief Successful completion is impossible while any slot or failure remains. */
+            bool complete(std::uint64_t epoch, std::uint64_t progress, std::string *error)
+            {
+                if (active_ || failed_)
+                    return reject(error, "Original local expert work is not successfully retired");
+                return terminal(MoEOverlayInferenceTransactionAction::Complete, epoch, progress, 0, error);
+            }
+            /**
+             * @brief Drain every partial original submission before accepting absorbing abort.
+             * @param drain Original cancellation plus all-native-proof operation, not semantic success.
+             */
+            template <class Drain>
+            bool abort(std::uint64_t epoch, int code, Drain drain, std::string *error)
+            {
+                if (!command_.valid() || epoch < protocol_.currentPlacementEpoch() || code <= 0)
+                    return reject(error, "Local abort lost its original command epoch or failure code");
+                failed_ = true;
+                if (active_)
+                {
+                    try
+                    {
+                        if (!drain(error))
+                            return false;
+                    }
+                    catch (const std::exception &exception)
+                    {
+                        return reject(error, exception.what());
+                    }
+                    active_.reset();
+                }
+                if (protocol_.state() == MoEOverlayInferenceProtocolState::Failed)
+                    return true;
+                return terminal(MoEOverlayInferenceTransactionAction::Abort, epoch, 0u, code, error);
+            }
+            /** @return Whether original work still needs its exact native retirement. */
+            bool active() const noexcept
+            {
+                return active_.has_value();
+            }
+            /** @return Original active ticket, never a mutable device-state observation. */
+            const MoEOverlayInferenceTransactionTicket *activeTicket() const noexcept
+            {
+                return active_ ? &active_->ticket : nullptr;
+            }
+            /** @return The same original topology retained by the protocol ring. */
+            const MoEOverlayInferenceTopologyIdentity &topology() const noexcept
+            {
+                return protocol_.topologyIdentity();
+            }
+        private:
+            /** @brief Submit a terminal through the original ticket validator, without transport. */
+            bool terminal(MoEOverlayInferenceTransactionAction action, std::uint64_t epoch,
+                          std::uint64_t progress, int code, std::string *error)
+            {
+                try
+                {
+                    const auto ticket = makeMoEOverlayInferenceTerminalTicket(topology(), command_,
+                        protocol_.nextTransactionOrdinal(), epoch, action, code, progress);
+                    const auto admission = protocol_.accept(ticket);
+                    const bool expected = action == MoEOverlayInferenceTransactionAction::Complete ?
+                        admission.status == MoEOverlayInferenceAdmissionStatus::Complete :
+                        admission.status == MoEOverlayInferenceAdmissionStatus::Aborted;
+                    if (!expected)
+                        return reject(error, admission.error);
+                    return true;
+                }
+                catch (const std::exception &exception)
+                {
+                    return reject(error, exception.what());
+                }
+            }
+            /** @brief Publish a stable diagnostic without altering original protocol state. */
+            static bool reject(std::string *error, const std::string &message)
+            {
+                if (error)
+                    *error = message;
+                return false;
+            }
+            MoEOverlayInferenceTransactionProtocol protocol_;
+            MoEOverlayInferenceCommandIdentity command_{};
+            std::optional<MoEOverlayPublishedInferenceTransaction> active_;
+            bool failed_ = false;
+        };
+        class RankLocalInferencePublisher;
+        struct RetainedGraphSelection;
+        /**
+         * @brief Select the original main/sidecar family from exact ticket geometry.
+         * @param ticket Existing validated scheduler transaction.
+         * @param error Precise unsupported role/geometry diagnostic.
+         * @return Original retained family, or empty without launching any work.
+         */
+        std::optional<RetainedGraphSelection> selectRetainedGraph(
+            const MoEOverlayInferenceTransactionTicket &ticket, std::string *error);
+        /**
+         * @brief Publish the same immutable successful transaction evidence for either original owner role.
+         * @param ticket Exact original ticket whose native work and returns have retired.
+         * @param selection Original role/family/geometry selected before submission.
+         */
+        void recordSuccessfulRetainedTransaction(const MoEOverlayInferenceTransactionTicket &ticket,
+                                                const RetainedGraphSelection &selection);
+        struct MappedFollowerTransaction;
+        struct MappedFollowerEnqueueJoin;
+        /**
+         * @brief Validate the original submission before clearing any queued-worker metadata.
+         * @param enqueues Original queued/joined worker handles; worker-written fields are read only after join.
+         * @param boundaries Original physical admission/launch receipts.
+         * @param native_proven Whether every exact submitted native terminal was successfully observed.
+         * @throws std::logic_error For a pending worker, unproven launch, failed/unretired admission or missing owner.
+         */
+        template <class Enqueues, class Boundaries>
+        static void requireOriginalSubmissionRetired(const Enqueues &enqueues,
+            const Boundaries &boundaries, bool native_proven)
+        {
+            for (const auto &pending : enqueues)
+                if (pending.queued && !pending.joined)
+                    throw std::logic_error("Cannot replace an original queued worker before its enqueue joined");
+            for (const auto &pending : enqueues)
+                if (pending.joined && pending.launch_attempted && !native_proven)
+                    throw std::logic_error("Cannot replace an attempted original launch without native proof");
+            for (const auto &boundary : boundaries)
+            {
+                if (!boundary.runtime || boundary.generation == 0u)
+                    throw std::logic_error("Original expert admission lost its runtime owner or generation");
+                const auto &receipt = boundary.runtime->inference_boundary_receipt;
+                if (boundary.graph_submitted)
+                {
+                    if (!native_proven || receipt.completedGeneration() != boundary.generation)
+                        throw std::logic_error("Cannot replace an unretired original expert submission");
+                }
+                else if (receipt.submittedGeneration() != boundary.generation - 1u ||
+                         receipt.completedGeneration() != boundary.generation - 1u)
+                    throw std::logic_error("Cannot replace an original unlaunched admission before rollback");
+            }
+        }
+        /** @brief Cancel exact original lane identities without changing their first error. */
+        void cancelMappedFollowerTransaction(MappedFollowerTransaction &submission) noexcept;
+        /** @brief Join every bounded original worker enqueue before consuming its native terminal. */
+        MappedFollowerEnqueueJoin joinMappedFollowerEnqueues(MappedFollowerTransaction &submission);
+        /**
+         * @brief Publish original cancellation immediately when an actual worker enqueue fails.
+         * @param work Actual original worker-native submission body.
+         * @param cancel Nonthrowing original source/follower lane cancellation.
+         * @return Actual enqueue success; exceptions retain their original identity after cancellation.
+         */
+        template <class Work, class Cancel>
+        static bool runOriginalEndpointEnqueue(Work work, Cancel cancel)
+        {
+            static_assert(std::is_nothrow_invocable_v<Cancel>);
+            try
+            {
+                const bool success = work();
+                if (!success)
+                    cancel();
+                return success;
+            }
+            catch (...)
+            {
+                cancel();
+                throw;
+            }
+        }
+        /** @brief Arm and submit every original native endpoint without awaiting peers. */
+        bool submitMappedFollowerTransaction(MappedFollowerTransaction &submission, std::string *error);
+        /** @brief Service only the explicit CPU endpoints after native all-submit. */
+        bool serviceMappedCPUFollowers(MappedFollowerTransaction &submission, std::string *error);
+        /** @brief Join every original terminal and retire the exact activation lease. */
+        bool retireMappedFollowerTransaction(MappedFollowerTransaction &submission, std::string *error);
+        /**
+         * @brief Join a cancelled partial submission without publishing successful service evidence.
+         * @param submission Original retained native tickets and admission receipts.
+         * @param error First missing/failed native proof, preserving all-peer join attempts.
+         * @return True only when every submitted parent and unlaunched rollback is proven.
+         */
+        bool drainCancelledMappedFollowerTransaction(MappedFollowerTransaction &submission, std::string *error);
+        /**
          * @brief Arm and execute one node-local mapped follower epoch.
          *
          * Every physical GPU parent is submitted before the first terminal
@@ -489,6 +863,8 @@ namespace llaminar2
         std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
             interference_probe_;
         std::vector<const MoEExpertOwnerParticipant *> local_participants_;
+        /** Frozen expert packet participation; physical controller/storage owners remain separate. */
+        std::vector<int> admitted_rank_local_endpoint_ids_;
         std::shared_ptr<PreparedWeightStore> prepared_store_;
         std::unique_ptr<FrozenModelWeightSet> frozen_weights_;
         /**

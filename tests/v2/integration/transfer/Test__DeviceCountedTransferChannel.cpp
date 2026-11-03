@@ -32,26 +32,7 @@
 
 using namespace llaminar2;
 
-namespace llaminar2
-{
-    /**
-     * @brief Test-only observation of actual mapped payload writes after both exact terminal joins.
-     *
-     * The probe exposes no control/cursor/count fields. The fixture poisons the
-     * complete payload while the lane is idle, then checks its inactive tail
-     * after real captured execution; consumer output alone could hide a
-     * producer that wrongly copied source capacity into the mapped slot.
-     */
-    struct CapturedTransferChannelReplayProbe
-    {
-        /** @return Exact payload span; callers join both endpoints before reading or poisoning it. */
-        static std::span<std::byte> payload(const CapturedTransferChannel &channel)
-        {
-            return {static_cast<std::byte *>(channel.mapped_->mutableHostData(CapturedTransferChannel::payload_offset)),
-                channel.capacityBytes()};
-        }
-    };
-}
+#include "CapturedTransferChannelReplayProbe.h"
 
 namespace
 {
@@ -128,7 +109,8 @@ namespace
      * @param tensor_source Use an original Tensor source instead of its existing workspace control.
      * @param source_origin Frozen original descriptor coordinate; only local offsets select payload bytes. */
     void verifyCountedRoundTrip(DeviceId first, DeviceId second, size_t capacity = 1024 * 1024 + 3,
-        bool sliced = false, bool batched = false, bool tensor_source = false, std::uint64_t source_origin = 0)
+        bool sliced = false, bool batched = false, bool tensor_source = false, std::uint64_t source_origin = 0,
+        CapturedTransferPayloadStorage payload_storage = CapturedTransferPayloadStorage::MappedHost)
     {
         const auto mpi = MPIContextFactory::global();
         const auto inventory = mpi->clusterInventory();
@@ -169,7 +151,7 @@ namespace
         if (tensor_source) first_requirements.buffers.erase(first_requirements.buffers.begin());
         const std::array workspace_requirements{first_requirements, requirements};
         const std::array workspace_bytes{first_requirements.total_bytes_with_alignment(), requirements.total_bytes_with_alignment()};
-        const auto geometry = CapturedTransferChannel::memoryFor(capacity);
+        const auto geometry = CapturedTransferChannel::memoryFor(capacity, payload_storage);
         PhysicalMemoryPlanBuilder builder;
         builder.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
             2 * geometry.mapped_host_bytes);
@@ -177,7 +159,7 @@ namespace
         {
             const auto device = devices[participant];
             const auto resource = planningObservedResource(rank, device);
-            builder.add(resource, PhysicalMemoryOwner::ActivationTransportStaging, 2 * geometry.cursor_bytes_per_device);
+            builder.add(resource, PhysicalMemoryOwner::ActivationTransportStaging, 2 * geometry.cursor_bytes_per_device + geometry.producer_payload_bytes);
             builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, workspace_bytes[participant]);
             builder.add(resource, PhysicalMemoryOwner::NativeGraphExecutable, GPUGraphMemoryContract::reservationBytesPerExecutable(device));
         }
@@ -192,8 +174,15 @@ namespace
             std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()), rank.rank);
         auto &transfer = TransferEngine::instance();
         {
-            auto forward = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), first, streams[0], second, streams[1], capacity);
-            auto backward = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), second, streams[1], first, streams[0], capacity);
+            const auto create=[&](DeviceId producer,void* producerStream,DeviceId consumer,void* consumerStream){
+                if(payload_storage==CapturedTransferPayloadStorage::PeerDevice)
+                    return transfer.createPeerCapturedTransferChannel(*authority,DeviceId::cpu(),
+                        producer,producerStream,consumer,consumerStream,capacity,rank);
+                return transfer.createCapturedTransferChannel(*authority,DeviceId::cpu(),
+                    producer,producerStream,consumer,consumerStream,capacity);
+            };
+            auto forward=create(first,streams[0],second,streams[1]);
+            auto backward=create(second,streams[1],first,streams[0]);
             std::array<std::shared_ptr<const WorkspaceBufferLease>, 2> payloads, returned, counts;
             for (size_t i = 0; i < 2; ++i)
             {
@@ -312,13 +301,25 @@ namespace
                     });
                 std::array<std::vector<std::uint8_t>, 2> actual{std::vector<std::uint8_t>(storage_bytes), std::vector<std::uint8_t>(storage_bytes)};
                 std::array<std::uint64_t, 3> observed_counts{};
+                std::array<std::vector<std::byte>,2> wireObservations;
+                if(sliced && payload_storage==CapturedTransferPayloadStorage::PeerDevice)
+                    for(auto& bytes:wireObservations)bytes.resize(capacity);
                 for (size_t replay = 0; replay < 128; ++replay)
                 {
                     if (sliced)
                         for (const auto &channel : {forward, backward})
                         {
-                            auto wire = CapturedTransferChannelReplayProbe::payload(*channel);
-                            std::fill(wire.begin(), wire.end(), std::byte{0xa5});
+                            if(payload_storage==CapturedTransferPayloadStorage::PeerDevice){
+                                const auto index=channel==forward?0u:1u;
+                                const auto wire=CapturedTransferChannelReplayProbe::terminalPeerPayload(*channel);
+                                workers[index]->submitAndWait([&]{
+                                    require(backends[index]->memset(wire->mutableDeviceData(),0xa5,capacity,
+                                        devices[index].ordinal,streams[index]),"Poison original peer payload before replay");
+                                });
+                            }else{
+                                auto wire=CapturedTransferChannelReplayProbe::payload(*channel);
+                                std::fill(wire.begin(),wire.end(),std::byte{0xa5});
+                            }
                         }
                     const auto input_sequence = sliced ? replay % 64 : replay;
                     if (sliced && replay == 64)
@@ -352,6 +353,11 @@ namespace
                                 require(backends[i]->deviceToHostOnStream(observed_counts.data() + (sliced ? 1 : 0),
                                     counts[0]->data((sliced ? 1 : 0) * sizeof(std::uint64_t)),
                                     (sliced ? 2 : 3) * sizeof(std::uint64_t), first.ordinal, streams[i]), "Observe terminal counts");
+                            if(sliced && payload_storage==CapturedTransferPayloadStorage::PeerDevice){
+                                const auto wire=CapturedTransferChannelReplayProbe::terminalPeerPayload(i==0?*forward:*backward);
+                                require(backends[i]->deviceToHostOnStream(wireObservations[i].data(),wire->deviceData(),
+                                    capacity,devices[i].ordinal,streams[i]),"Observe original peer payload after complete captured exchange");
+                            }
                             require(backends[i]->recordEvent(i == 0 ? first_done.event : second_done.event, devices[i].ordinal, streams[i]), "Counted terminal event");
                         });
                     first_done.await(); second_done.await();
@@ -363,7 +369,10 @@ namespace
                     if (sliced)
                         for (const auto &channel : {forward, backward})
                         {
-                            const auto wire = CapturedTransferChannelReplayProbe::payload(*channel);
+                            const auto index=channel==forward?0u:1u;
+                            const auto wire=payload_storage==CapturedTransferPayloadStorage::PeerDevice
+                                ? std::span<const std::byte>(wireObservations[index])
+                                : std::span<const std::byte>(CapturedTransferChannelReplayProbe::payload(*channel));
                             for (size_t byte = 0; byte < wire.size(); ++byte)
                                 ASSERT_EQ(wire[byte], byte < bytes
                                     ? static_cast<std::byte>(counted_channel_test::byte(input_sequence, source_offset + byte))
@@ -695,3 +704,23 @@ TEST(DeviceCountedTransferChannel, ROCm_CUDA_SourceSlices) { verifySourceSlices(
 TEST(DeviceCountedTransferChannel, CUDA_ROCm_FusedBoundaries) { verifyFusedBoundaries(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(DeviceCountedTransferChannel, ROCm_CUDA_FusedBoundaries) { verifyFusedBoundaries(DeviceId::rocm(0), DeviceId::cuda(0)); }
 #endif
+
+#ifdef HAVE_CUDA
+/** @brief Actual device-selected full/empty/odd extents on the native peer route, no host count. */
+TEST(DeviceCountedTransferChannel, CUDA_CUDA_PeerPayload)
+{ verifyCountedRoundTrip(DeviceId::cuda(0), DeviceId::cuda(1), 4099, true, true, true, 0,
+    CapturedTransferPayloadStorage::PeerDevice); }
+#endif
+#ifdef HAVE_ROCM
+/** @brief Symmetric device-selected peer-VRAM extents and retained request reset. */
+TEST(DeviceCountedTransferChannel, ROCm_ROCm_PeerPayload)
+{ verifyCountedRoundTrip(DeviceId::rocm(0), DeviceId::rocm(1), 4099, true, true, true, 0,
+    CapturedTransferPayloadStorage::PeerDevice); }
+#endif
+
+namespace llaminar2::counted_channel_test {
+void verifyPeerPayloadReplay(DeviceId first,DeviceId second)
+{
+    verifyCountedRoundTrip(first,second,4099,true,true,true,0,CapturedTransferPayloadStorage::PeerDevice);
+}
+} // namespace llaminar2::counted_channel_test

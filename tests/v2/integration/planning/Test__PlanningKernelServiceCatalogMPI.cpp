@@ -6,6 +6,8 @@
  * shared GPU visibility. Only root opens the tiny source fixture; the loaded
  * reader retires before preparation. Functional assertions prove complete CPU,
  * CUDA and ROCm evidence and collective rejection, not a performance threshold.
+ * The heterogeneous idle-rank case requires a duplicate socket-bound reporter;
+ * absent hardware or a malformed rank placement is a failure, never a skip.
  * Source-free services also run separately across all discovered endpoints so
  * driver diagnostics can distinguish bandwidth setup from arithmetic setup.
  */
@@ -372,6 +374,7 @@ namespace
 
     /**
      * @brief Prove source-free GPU measurement does not invent PMA work on idle ranks.
+     * @param backends Both GPU backends required by this heterogeneous MPI registration.
      *
      * A physical GPU is intentionally measured by one affinity-selected MPI
      * reporter.  Other discovery ranks still join publication and receipt
@@ -388,15 +391,19 @@ namespace
         ASSERT_GE(mpi->world_size(), 2);
         const AutomaticOrchestrationRequest selection({.only_backends = std::move(backends)});
         const auto expected = PlanningKernelServiceCatalog::observers(*inventory, selection);
-        if (expected.empty()) GTEST_SKIP() << "No selected GPU is available";
+        ASSERT_FALSE(expected.empty()) << "No selected GPU is available";
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+            ASSERT_TRUE(std::any_of(expected.begin(), expected.end(), [&](const auto& observer) {
+                return observer.device().type == backend;
+            })) << "The heterogeneous source-free probe requires both selected backends";
         const bool has_idle_rank = std::any_of(inventory->ranks.begin(), inventory->ranks.end(),
             [&](const RankInventory &rank) {
                 return std::none_of(expected.begin(), expected.end(), [&](const auto &observer) {
                     return observer.discoveryRank() == rank.rank;
                 });
             });
-        if (!has_idle_rank)
-            GTEST_SKIP() << "Every discovery rank is an actual selected GPU reporter";
+        ASSERT_TRUE(has_idle_rank)
+            << "The local MPI registration must include a duplicate socket-bound reporter";
 
         const auto streaming = PlanningKernelServiceCatalog::collect(
             mpi, *inventory, selection, PlanningStreamingServicePlan{});

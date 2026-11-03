@@ -9,6 +9,7 @@
  */
 
 #pragma once
+#include "collective/LocalTPCaptureSourceDefinition.h"
 #include "IRetainedGraphParticipants.h"
 
 #include "../../compute_stages/ComputeStages.h"
@@ -270,6 +271,16 @@ namespace llaminar2
         /** @brief Retain complete I/O lifetime when exporting this graph into a native parent. */
         const std::shared_ptr<IRetainedGraphStorageBoundary> &retainedStorageBoundary() const noexcept
         {return storage_boundary_;}
+
+        /** @brief Declare the actual source/reader transport relation; this is metadata, not query authority. */
+        void setRetainedParticipantDefinitionDomain(RetainedGraphParticipantDefinitionDomain domain){
+            if(!domain.source.is_gpu() || !domain.authority ||
+               (participant_definition_domain_ && *participant_definition_domain_!=domain))
+                throw std::invalid_argument("Graph changed its original source definition domain");
+            if(!participant_definition_domain_){participant_definition_domain_=domain;noteTopologyMutation();}
+        }
+        /** @return Original graph-declared source relation; no-PLE graphs have none. */
+        const auto& retainedParticipantDefinitionDomain()const noexcept{return participant_definition_domain_;}
 
         /** @brief Declare one actual collective participant plan before source capture.
          * @param plan Original closed source/participant declaration, never a substitute source executable.
@@ -654,6 +665,7 @@ namespace llaminar2
         ReadAheadRecordingBinding read_ahead_recording_binding_; ///< Exact recording/submission lifecycle, not GPU execution state.
         std::uint64_t read_ahead_phase_identity_=0; ///< Typed phase and selected implementation, independent of M.
         std::optional<GraphReadAheadBranch> read_ahead_branch_; ///< Immutable native stream/event topology. ///< Explicit retained native I/O lane.
+        std::optional<RetainedGraphParticipantDefinitionDomain> participant_definition_domain_;
     };
 
 } // namespace llaminar2

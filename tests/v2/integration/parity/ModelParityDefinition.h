@@ -82,7 +82,7 @@ namespace llaminar2::test::parity
                         "C"+std::to_string(owner.maximum_cache_rows)+"B"+std::to_string(owner.cache_physical_byte_limit)+"_";
                 placement+="CoordinatorR"+std::to_string(g.placement.coordinator->world_rank)+(g.placement.coordinator->backend==DeviceType::CUDA?std::string{"CUDA"}:std::string{"ROCm"})+std::to_string(g.placement.coordinator->ordinal)+"_";
             }
-            return prefix+placement+"G"+std::to_string(g.maximum_gpu_cache_rows)+"_B"+std::to_string(g.gpu_cache_physical_byte_limit)+
+            return prefix+(g.source_backing==AdaptiveImmutableRowBacking::RAM?"SourceRAM_":"")+placement+"G"+std::to_string(g.maximum_gpu_cache_rows)+"_B"+std::to_string(g.gpu_cache_physical_byte_limit)+
                 "_A"+std::to_string(g.gpu_policy.aging_accesses)+"_P"+std::to_string(g.gpu_policy.protected_numerator)+
                 "of"+std::to_string(g.gpu_policy.protected_denominator)+"_H"+std::to_string(h.maximum_cache_rows)+
                 "_B"+std::to_string(h.cache_physical_byte_limit)+"_A"+std::to_string(h.policy.aging_accesses)+
@@ -1020,6 +1020,24 @@ namespace llaminar2::test::parity
                 participants.reserve(topology.participants.size());
                 for (const auto &participant : topology.participants)
                     participants.push_back(participant.address);
+                // Declared ngram storage is an independent physical endpoint.
+                // It contributes hardware prerequisites without joining the
+                // compute participants, collectives or snapshot device list.
+                if (ngram_table_policy && ngram_table_policy->isGPUAdaptive() &&
+                    ngram_table_policy->gpu_adaptive.placement.mode ==
+                        AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+                {
+                    for (const auto &storage :
+                         ngram_table_policy->gpu_adaptive.placement.declaredParticipants())
+                    {
+                        if (storage.world_rank != 0)
+                            throw std::invalid_argument(
+                                "Rank-local parity storage endpoint belongs to another rank");
+                        participants.push_back(storage.backend == DeviceType::CUDA
+                            ? GlobalDeviceAddress::cuda(storage.ordinal)
+                            : GlobalDeviceAddress::rocm(storage.ordinal));
+                    }
+                }
                 config.local_hardware_requirements =
                     ParityHardwareRequirements::fromParticipants(participants);
             }

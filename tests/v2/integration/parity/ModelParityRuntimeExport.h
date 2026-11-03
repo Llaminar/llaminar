@@ -291,6 +291,7 @@ namespace llaminar2::test::parity
         if(policy.isGPUAdaptive())
         {
             const auto &g=policy.gpu_adaptive;const auto &h=g.host;
+            if(g.source_backing==AdaptiveImmutableRowBacking::RAM)arguments.insert(arguments.end(),{"--ngram-source-backing","ram"});
             arguments.insert(arguments.end(),{
                 "--ngram-gpu-cache-max-rows",std::to_string(g.maximum_gpu_cache_rows),
                 "--ngram-gpu-cache-bytes",std::to_string(g.gpu_cache_physical_byte_limit),

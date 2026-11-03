@@ -1,7 +1,12 @@
 /** @file MoEOverlayHostServiceContract.cpp
- * @brief Preserve existing routed endpoint/transport decisions before quotas and during lowering.
+ * @brief Preserve pre-quota service demand and project immutable admitted execution.
+ *
+ * An empty runtime route mask is not evidence that an endpoint can disappear.
+ * Only an original, complete, frozen zero quota removes an external tier from
+ * capture; its conservative pre-quota service reservation remains unchanged.
  */
 #include "MoEOverlayHostServiceContract.h"
+#include "execution/local_execution/graph/ComputeGraph.h"
 #include "MoEOverlayRankBatchTransport.h"
 #include "MoEOverlayNodeLocalRankBatchTransport.h"
 #include "interfaces/IMPIContext.h"
@@ -18,6 +23,53 @@ MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolve(const MoERo
 }
 MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolve(const MoERoutedExpertPlacementPlan& plan,std::span<const MoEExpertOwnerParticipant> participants,const ClusterInventory& inventory){
     return resolveImpl(plan,participants,inventory.world_size,[&](int a,int b){return inventory.connectionBetweenRanks(a,b).locality()!=RankConnectionLocality::CrossNode;});
+}
+std::vector<MoEExpertOwnerParticipant> MoEOverlayHostServiceContract::admittedExpertParticipants(
+    const MoERoutedExpertPlacementPlan& plan, const MoEExpertOwnerMap& owners)
+{
+    std::vector<bool> permanently_empty(plan.routed_tiers.size(), false);
+    for (std::size_t tier = 0; tier < plan.routed_tiers.size(); ++tier) {
+        const auto& declaration = plan.routed_tiers[tier];
+        if (declaration.domain == plan.continuation_domain) continue;
+        const auto& quotas = declaration.resolved_live_experts_per_layer;
+        if (quotas.empty() || !std::all_of(quotas.begin(), quotas.end(), [](auto value) { return value == 0; }))
+            continue;
+        if (plan.placements.empty() || std::any_of(plan.placements.begin(), plan.placements.end(), [&](const auto& layer) {
+                return layer.layer < plan.first_model_layer ||
+                    static_cast<std::size_t>(layer.layer - plan.first_model_layer) >= quotas.size();
+            }))
+            throw std::logic_error("Admitted empty host tier has no complete frozen layer quota");
+        permanently_empty[tier] = true;
+    }
+    for (const auto& owner : owners.owners()) {
+        if (owner.tier_idx < 0 || static_cast<std::size_t>(owner.tier_idx) >= permanently_empty.size() ||
+            owner.domain_name != plan.routed_tiers[static_cast<std::size_t>(owner.tier_idx)].domain)
+            throw std::logic_error("Admitted host service changed original expert tier identity");
+        if (permanently_empty[static_cast<std::size_t>(owner.tier_idx)])
+            throw std::logic_error("Admitted zero host tier still owns an expert contribution");
+    }
+    std::vector<MoEExpertOwnerParticipant> result;
+    result.reserve(owners.participants().size());
+    for (const auto& participant : owners.participants()) {
+        if (participant.tier_idx < 0 || static_cast<std::size_t>(participant.tier_idx) >= permanently_empty.size() ||
+            participant.domain_name != plan.routed_tiers[static_cast<std::size_t>(participant.tier_idx)].domain)
+            throw std::logic_error("Admitted host service changed original participant tier identity");
+        if (!permanently_empty[static_cast<std::size_t>(participant.tier_idx)])
+            result.push_back(participant);
+    }
+    return result;
+}
+MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolveAdmitted(
+    const MoERoutedExpertPlacementPlan& plan, const MoEExpertOwnerMap& owners, const IMPIContext& world)
+{
+    const auto participants = admittedExpertParticipants(plan, owners);
+    return resolve(plan, participants, world);
+}
+MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolveAdmitted(
+    const MoERoutedExpertPlacementPlan& plan, const MoEExpertOwnerMap& owners, const ClusterInventory& inventory)
+{
+    const auto participants = admittedExpertParticipants(plan, owners);
+    return resolve(plan, participants, inventory);
 }
 MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolveImpl(const MoERoutedExpertPlacementPlan& plan,std::span<const MoEExpertOwnerParticipant> participants,int worldSize,const std::function<bool(int,int)>& sameNode){
     if(worldSize<=0)throw std::invalid_argument("CPU service topology world population is inconsistent");
@@ -36,12 +88,23 @@ MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolveImpl(const M
     for(const auto& p:participants){
         if(!p.world_rank_known||p.world_rank<0||p.world_rank>=worldSize)throw std::logic_error("Routed host service topology has unresolved physical rank");
         if(p.tier_idx==result.continuationTier_){result.continuationParticipants_.push_back(p);continue;}
-        if(p.world_rank==source->world_rank)result.local_.push_back(p.participant_id);
-        else {result.remote_.push_back(p.participant_id);
-            if(!sameNode(source->world_rank,p.world_rank))
-                result.allRemoteNodeLocal_=false;}
+        if(p.world_rank==source->world_rank && p.device.is_cpu())
+            result.local_.push_back(p.participant_id);
+        else {result.external_.push_back(p.participant_id);
+            if (p.world_rank == source->world_rank && p.device.is_gpu() && source->device.is_gpu() &&
+                p.device.type != source->device.type)
+                result.rankLocalCrossVendor_ = true;
+            if(p.world_rank!=source->world_rank && !sameNode(source->world_rank,p.world_rank))
+                result.allExternalNodeLocal_=false;}
     }
     return result;
+}
+GraphNativeCaptureEnvelope MoEOverlayHostServiceContract::captureEnvelope(bool dispatchAuthority) const noexcept {
+    if (!hasHostBoundary() && !requiresRankLocalInferencePublisher())
+        return GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
+    return dispatchAuthority
+        ? GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction
+        : GraphNativeCaptureEnvelope::HeterogeneousTicketFollowerTransaction;
 }
 bool MoEOverlayHostServiceContract::requiresExecutorService(int rank,DeviceId device,int degree,int index)const{
     if(!continuation_||!device.is_gpu()||!hasHostBoundary())return false;

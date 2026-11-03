@@ -9,14 +9,30 @@
 #pragma once
 #include <memory>
 #include <string>
+#include <vector>
+#include "backends/DeviceId.h"
 
 namespace llaminar2
 {
     struct MoERoutedExpertPlacementPlan;
+    struct MoEExpertOverlayExecutionPlan;
     struct OrchestrationConfig;
     class ResolvedRankOrchestration;
     class AdmittedMoEPipelineMemory;
     struct MTPRuntimeConfig;
+
+    /**
+     * @brief Project only actual prepared-weight owners from original admitted tier semantics.
+     * @param plan Original placement with frozen quotas and complete expert ownership.
+     * @param execution Original resolved rank/domain descriptors and dense weight roles.
+     * @return Ordered unique local devices, excluding only exclusively proven-empty routed owners.
+     * @throws std::logic_error For inconsistent original tier or resolved endpoint identity.
+     *
+     * This projection affects prepared-record requirements only. It never removes
+     * execution workers, ngram storage, sources, runtime arenas or physical lifetimes.
+     */
+    std::vector<DeviceId> admittedOverlayPreparedWeightDevices(
+        const MoERoutedExpertPlacementPlan& plan, const MoEExpertOverlayExecutionPlan& execution);
 
     /**
      * @brief Compare the physical MTP preparation contract for dense and MoE reuse.

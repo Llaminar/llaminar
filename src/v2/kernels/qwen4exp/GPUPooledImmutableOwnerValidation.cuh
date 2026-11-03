@@ -7,6 +7,7 @@
  * CPU scalar operations retain their independent validation and mutation ordering.
  */
 #pragma once
+#include "PooledImmutableOwnerRecordValidation.h"
 namespace llaminar2::qwen4exp::pooled_native {
 /** @brief Internal friend of the existing allocation owner, never a public validation bypass. */
 template<class Slot> struct CooperativeOwnerValidation final {
@@ -38,7 +39,13 @@ template<class Slot> struct CooperativeOwnerValidation final {
                 else if(gate==SourceGate::Skip)state=2;
                 else if constexpr(Action==OwnerAction::Pin){
                     output.reply_bytes=0;
-                    if(!pinCommandSpan<Slot>(a,commands,count) || !validatePinFields<Slot>(a,commands,count))state=0;
+                    if(!pinCommandSpan<Slot>(a,commands,count))state=0;
+                    else{
+                        const auto view=ownerView<Slot>(a);
+                        if(view.frame->phase!=p::OwnerPhase::Pinning || view.frame->initial_pin_count || view.frame->held_pins){
+                            fail<Slot>(a);state=0;
+                        }
+                    }
                 }else{
                     constexpr auto wave=Action==OwnerAction::AcceptFree?p::AllocationWave::Free:p::AllocationWave::Victim;
                     if(!allocationDecisionSpan<Action,Slot>(a,lease,decisions,count) ||
@@ -48,6 +55,21 @@ template<class Slot> struct CooperativeOwnerValidation final {
         }
         __syncthreads();
         if(state!=1)return state==2;
+        if constexpr(Action==OwnerAction::Pin){
+            if(threadIdx.x==0)scratch.invalid=0;
+            __syncthreads();
+            for(std::uint64_t i=threadIdx.x;i<count;i+=gpu::Threads){
+                const auto prior=i?commands[i-1].ordinal.value:ownerView<Slot>(a).frame->last_command;
+                if(!record_validation::pin<Slot>(a,commands[i],prior))atomicOr(&scratch.invalid,1u);
+            }
+            __syncthreads();
+            // Every immutable field rejection has the same original Invariant
+            // status. Publish it once after all lanes converge, before any key
+            // validation or physical pinInitial mutation can begin.
+            if(threadIdx.x==0 && scratch.invalid){fail<Slot>(a);state=0;}
+            __syncthreads();
+            if(!state)return false;
+        }
         auto* first=at<std::uint64_t>(a.frame,a.plan.frame.validation_a);
         auto* second=at<std::uint64_t>(a.frame,a.plan.frame.validation_b);
         for(unsigned key=0;key<3;++key){
@@ -55,8 +77,32 @@ template<class Slot> struct CooperativeOwnerValidation final {
                 for(std::uint64_t i=threadIdx.x;i<count;i+=gpu::Threads)
                     first[i]=key==0?commands[i].target.row:key==1?commands[i].target.unique:commands[i].target.slot;
                 if(threadIdx.x==0)total=count;
-            }else if(threadIdx.x==0){
-                if(!plan.prepareUniqueKeys(decisions,count,key,total)){plan.fail();state=0;}
+            }else{
+                if(threadIdx.x==0){
+                    scratch.invalid=0;
+                    const auto pins=key==2?0u:plan.owner_.frame->initial_pin_count+plan.frame_.count;
+                    if(pins>plan.owner_.declaration.maximumUnique()-count){plan.fail();state=0;}
+                    else total=count+pins;
+                }
+                __syncthreads();
+                if(!state)return false;
+                const auto pins=total-count;
+                for(std::uint64_t i=threadIdx.x;i<total;i+=gpu::Threads){
+                    if(i<pins){
+                        const auto initial=plan.owner_.frame->initial_pin_count;
+                        const auto& pin=i<initial?plan.owner_.initial_pins[i]:plan.grants_[i-initial];
+                        if(!record_validation::retained(pin,plan.frame_.lease.interval,
+                            i<initial?p::GrantKind::Read:p::GrantKind::Reservation,plan.owner_.declaration.coordinate()))
+                            atomicOr(&scratch.invalid,1u);
+                        else first[i]=key==0?pin.row:pin.unique;
+                    }else{
+                        const auto& decision=decisions[i-pins];
+                        first[i]=key==0?decision.row:key==1?decision.unique:
+                            decision.kind==p::CommandKind::ReserveVictim?decision.victim.slot:adaptive_lookup::None;
+                    }
+                }
+                __syncthreads();
+                if(threadIdx.x==0 && scratch.invalid){plan.fail();state=0;}
             }
             __syncthreads();
             if(!state)return false;

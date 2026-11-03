@@ -8,7 +8,9 @@
  */
 #include "fixtures/execution/RetainedHostServiceFixture.h"
 #include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "fixtures/backends/NativeLookupCaseAdmission.h"
 #include "backends/NativeOrderingEventBudgetProjection.h"
+#include "backends/NativeOrderingEventGroup.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "kernels/qwen4exp/ImmutableLookupDecode.h"
@@ -83,33 +85,36 @@ void abandonOrdinaryAdmission(DeviceId device)
     require(backend && backend->deviceCount()>device.ordinal,"Explicit ordinary preparation GPU unavailable");
     if (!hasCPUBackend())
         initCPUBackend(-1);
-    auto &worker = GPUDeviceContextPool::instance().getContext(device);
-    worker.submitAndWait(
-        [&]
-        {
-            const auto resource = [](DeviceId id)
-            {
-                return PhysicalMemoryResource{.world_rank = 0,
-                                              .device = id,
-                                              .total_bytes = std::size_t{1} << 28,
-                                              .admission_available_bytes = std::size_t{1} << 28};
-            };
+    auto session=PreparedNativeLookupFixture::prepare(std::array{device});
+    auto &worker=*session->permit(device).worker();
+    const auto resource=[&](DeviceId id){return session->resource(id);};
+    std::vector<RetainedHostServiceFixture> services;
+    std::vector<PhysicalMemoryPlan> cases;
+    for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
+        for(int iteration=0;iteration<20;++iteration){
+            Source source(iq4Source(97,160),97,160,GGUFTensorType::IQ4_NL);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+            const auto layout=ImmutableLookupLayout::create(16,90);
+            services.push_back(RetainedHostServiceFixture::original(RetainedHostServiceRole::ImmutableLookupIO,{0,device},services.size()));
+            PhysicalMemoryPlanBuilder plan(services.back().bom(resource(DeviceId::cpu())));
+            plan.add(resource(DeviceId::cpu()),PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(source.descriptor(),policy));
+            plan.add(resource(DeviceId::cpu()),PhysicalMemoryOwner::ImmutableLookupStaging,ImmutableLookupService::hostBytes(layout));
+            plan.add(resource(DeviceId::cpu()),PhysicalMemoryOwner::ActivationArena,64);
+            plan.add(resource(device),PhysicalMemoryOwner::ActivationArena,64);
+            const auto ordering=NativeOrderingEventGroup::bom(NativeOrderingEventProgram::lookupSubmissionRetirement(),resource(DeviceId::cpu()),resource(device));
+            for(const auto& row:ordering.resources())plan.add(row);
+            cases.push_back(plan.build());
+        }
+    session->admit(serialNativeLookupCaseEnvelope(cases));
+    const auto memory=session->memory();
+    worker.submitAndWait([&]{
+            std::size_t ordinal=0;
             for (const auto mode : {ImmutableRowStorage::RAM, ImmutableRowStorage::MemoryMapped})
                 for (int iteration = 0; iteration < 20; ++iteration)
                 {
                     Source source(iq4Source(97, 160), 97, 160, GGUFTensorType::IQ4_NL);
                     const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode, 4096, 2);
-                    const auto layout = ImmutableLookupLayout::create(16, 90);
-                    auto io=llaminar2::test::RetainedHostServiceFixture::original(RetainedHostServiceRole::ImmutableLookupIO,{0,device});
-                    PhysicalMemoryPlanBuilder plan;const auto workerBOM=io.bom(resource(DeviceId::cpu()));for(const auto& row:workerBOM.resources())plan.add(row);
-                    plan.add(resource(DeviceId::cpu()), PhysicalMemoryOwner::ImmutableTableStorage,
-                             ImmutableRowTable::physicalBytes(source.descriptor(), policy));
-                    plan.add(resource(DeviceId::cpu()), PhysicalMemoryOwner::ImmutableLookupStaging,
-                             ImmutableLookupService::hostBytes(layout));
-                    plan.add(resource(DeviceId::cpu()), PhysicalMemoryOwner::ActivationArena, 64);
-                    plan.add(resource(device), PhysicalMemoryOwner::ActivationArena, 64);
-                    auto memory = std::make_shared<PhysicalMemoryAuthority>(
-                        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+                    auto &io=services.at(ordinal++);
                     auto hostClaim =
                         memory->claimNewAllocation(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, 64);
                     auto deviceClaim =
@@ -133,6 +138,9 @@ void abandonOrdinaryAdmission(DeviceId device)
                     table.reset();
                 }
         });
+    session->requirePayloadRetired();
+    session->retire();
+    session->requireExactRetired();
 }
 /**
  * @brief Abandon native initialization or request admission before any graph.

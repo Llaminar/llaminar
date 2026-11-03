@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -181,6 +182,27 @@ namespace llaminar2
         const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
         int source_world_rank,
         int target_world_rank);
+
+    /**
+     * @brief Bind one original rank-local continuation to its expert endpoints.
+     * @param owner_map Complete frozen placement authority.
+     * @param graph_family Existing admitted main/MTP graph family.
+     * @param source_participant_id Actual continuation participant identifier.
+     * @param target_participant_ids Strictly ordered non-continuation endpoints.
+     * @return Existing transaction identity with the same real rank at both ends.
+     * @throws std::invalid_argument for missing, foreign, or duplicate endpoints.
+     *
+     * This construction does not create an MPI follower or confer native
+     * submission permission. The original Rank owner retains admission and all
+     * endpoint terminals; distributed channel constructors still require two
+     * different world ranks.
+     */
+    [[nodiscard]] MoEOverlayInferenceTopologyIdentity
+    makeMoEOverlayRankLocalInferenceTopologyIdentity(
+        const MoEExpertOwnerMap &owner_map,
+        const MoEOverlayInferenceGraphFamilyIdentity &graph_family,
+        int source_participant_id,
+        std::span<const int> target_participant_ids);
 
     /**
      * @brief Dynamic identity of one root-published outer inference command.

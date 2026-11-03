@@ -231,6 +231,18 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Cancel the original scheduler invocation without writing device-owned endpoint status.
+         * @param identity Complete original published generation/ticket identity.
+         * @param code Terminal scheduler reason; an earlier scheduler failure is preserved.
+         * @param error Exact missing/foreign/stale identity diagnostic.
+         * @return True for the same absorbing cancelled invocation, false without mutation for a foreign one.
+         * Concurrent original workers may request cancellation; all existing
+         * admission and timeline fields remain the sole progress authority.
+         */
+        bool cancelOriginalInvocation(const MoEOverlayActivationEpochIdentity &identity,
+            MoEOverlayActivationStatusCode code, std::string *error = nullptr);
+
+        /**
          * @brief Record that one endpoint observed its peer's terminal abort.
          * @return False unless the peer already published Aborted.
          */
@@ -310,6 +322,8 @@ namespace llaminar2
         }
 
     private:
+        /** @brief Authenticate every immutable published field independently of active/failed scheduler state. */
+        bool matchesPublishedIdentity(const MoEOverlayActivationEpochIdentity &identity) const noexcept;
         /** @return Whether identity exactly matches the active authenticated value. */
         [[nodiscard]] bool matchesActiveIdentity(
             const MoEOverlayActivationEpochIdentity &identity) const noexcept;

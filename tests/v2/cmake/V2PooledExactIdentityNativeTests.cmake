@@ -1,3 +1,5 @@
+# @file V2PooledExactIdentityNativeTests.cmake
+# @brief Original native identity/immutable-field/ordered-commit replay gates and independent scalar controls.
 # Actual integer identity dispatch neighbors, each a short complete native replay
 # rather than another all-format sweep. Missing selected hardware is a failure.
 foreach(_identity_backend CUDA ROCm)
@@ -24,6 +26,20 @@ foreach(_identity_backend CUDA ROCm)
                         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "${_identity_lock}"
                         ENVIRONMENT "${_identity_startup}")
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_identity_reject})
+                endforeach()
+            endforeach()
+        endforeach()
+        foreach(_record_fault PinSlotBounds PinOrdinal PinCommitFlags)
+            foreach(_record_position Early Late)
+                foreach(_record_width 32 64)
+                    set(_record_test "V2_Integration_${_identity_backend}_PooledImmutable_Record_${_record_fault}_${_record_position}_Row${_record_width}")
+                    add_v2_test(${_record_test}
+                        COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                            --gtest_filter=PooledImmutableProviderSourceDevice.CooperativeFields${_identity_backend}${_record_fault}${_record_position}Row${_record_width}
+                        LABELS "V2;Integration;ProductionTestPreflight;${_identity_backend};Ngram;Ownership;TraceReplay;Capture;ByteExact;Regression"
+                        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "${_identity_lock}"
+                        ENVIRONMENT "${_identity_startup}")
+                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_record_test})
                 endforeach()
             endforeach()
         endforeach()
@@ -62,4 +78,16 @@ if(TARGET v2_test_qwen4exp_primitives)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledRecordedSnapshotAlignmentReplay)
+endif()
+
+# Actual GPU-used immutable predicates versus the independent scalar state/commit oracle.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledCooperativeRecordPredicatesReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableNative.CooperativePinRecordFieldsMatchIndependentScalarReplay:PooledImmutableNative.CooperativeRetainedRecordFieldsMatchZeroIncomingScalarReplay
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledCooperativeRecordPredicatesReplay)
 endif()

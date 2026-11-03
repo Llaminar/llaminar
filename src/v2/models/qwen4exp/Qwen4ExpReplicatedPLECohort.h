@@ -15,11 +15,29 @@
 #include "collective/ILocalTPContext.h"
 #include "kernels/qwen4exp/Qwen4ExpKernels.h"
 #include <memory>
+#include <functional>
 namespace llaminar2 {
+namespace test { struct Qwen4ExpReplicatedPLECohortReplayAccess; }
 class RankOrchestrator;class IModelContext;class ResidentImmutableRowTable;struct DeviceGenerationAdmissionRequest;struct ForwardInput;class Qwen4ExpAuxiliaryState;
 /** @brief One immutable source/cohort relation privately issued by its actual Rank owner. */
 class Qwen4ExpReplicatedPLECohort final {
 public:
+    /** @return Whether this declaration requires the original Rank-issued replicated query producer. */
+    static bool requiresReplicatedQuery(const ResolvedImmutableRowTablePlacement &placement);
+    /**
+     * @brief Authenticate a replicated consumer independently of physical table/head storage assignment.
+     * @param device Actual original compute participant.
+     * @param participant Original communicator coordinate, never physical ordinal.
+     * @throws std::invalid_argument For changed/reordered/foreign native membership.
+     */
+    void requireConsumer(DeviceId device,int participant) const;
+    /**
+     * @brief Order the original shared-source cold phase without serializing TP constructors.
+     * @param device Actual participant in this Rank-issued replicated query cohort.
+     * @param prepare Original factory operation using this participant's genuine GraphConfig.
+     * @throws std::exception On source preparation failure, membership drift, or original LocalTP abort.
+     */
+    void prepareSharedSource(DeviceId device, const std::function<void()>& prepare) const;
     /** @brief Check original source/head coordinates against an actual collective declaration.
      * @param context Existing communicator, never constructed or modified here.
      * @param placement Sole resolved source/range metadata.
@@ -72,6 +90,7 @@ public:
     const IModelContext *modelOwner() const noexcept {return model_;}
 private:
     friend class RankOrchestrator;
+    friend struct test::Qwen4ExpReplicatedPLECohortReplayAccess;
     /** @brief Bind only from the actual Rank's original model and owned native TP context. */
     Qwen4ExpReplicatedPLECohort(ILocalTPContext &context,const IModelContext &model,
         std::shared_ptr<const ResolvedImmutableRowTablePlacement> placement,const Qwen4ExpConfig &source);

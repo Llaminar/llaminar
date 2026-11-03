@@ -25,6 +25,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "loaders/ResidentImmutableRowTable.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
+#include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
 #include "transfer/TransferEngine.h"
 #include "loaders/GPUHostLoadPreflight.h"
 #include "loaders/GPUVramPreflight.h"
@@ -253,7 +254,7 @@ namespace llaminar2
          * generation across copies. Reuse requires the same placement/PMA and
          * performs no new allocation or payload transfer.
          */
-        void prepareParticipantImmutableRowTable(
+        void prepareParticipantImmutableRowTableOriginal(
             const std::shared_ptr<IModelContext> &context, const GraphConfig &graph)
         {
             if (!graph.flash_next) return;
@@ -315,6 +316,42 @@ namespace llaminar2
                     ImmutableRowTableDevicePreparation{device, stream, staging}, transfers);
             });
         }
+
+        /**
+         * @brief Prepare one original shared source before any query-only peer captures.
+         * @param context Original shared model lifetime, not a replacement source registry.
+         * @param graph Genuine participant graph policy produced by this factory.
+         * @throws std::exception On foreign membership, source failure, or original LocalTP abort.
+         *
+         * Every member of the replicated query cohort takes both cold boundaries.
+         * Constructors remain concurrent: only this source-owned materialization
+         * phase is ordered, before the ordinary graph family is captured. The
+         * second boundary prevents source capture racing a peer's cold setup.
+         */
+        void prepareParticipantImmutableRowTable(
+            const std::shared_ptr<IModelContext>& context, const GraphConfig& graph)
+        {
+            // Predictor/no-PLE graphs own no reader role and must not enter
+            // a main-model cohort generation merely because policy is retained.
+            if (!graph.flash_next) return;
+            const int ple = static_cast<int>(graph.flash_next->ngrams().decoder_layer);
+            if (ple < graph.pp_layer_offset || ple >= graph.pp_layer_offset + graph.n_layers) return;
+            const auto& placement = graph.ngram_table_placement;
+            if (!placement || !placement->isGPUAdaptive() ||
+                placement->gpuAdaptiveRequest().placement.mode != AdaptiveGPUCachePlacementMode::DeclaredRankLocal ||
+                placement->gpuAdaptiveLayout().consumers().size() <= 1)
+            {
+                prepareParticipantImmutableRowTableOriginal(context, graph);
+                return;
+            }
+            const auto& cohort = graph.ngram_replicated_ple_cohort;
+            if (!cohort)
+                throw std::logic_error("Shared source materialization requires its original replicated LocalTP cohort");
+            cohort->prepareSharedSource(graph.default_device, [&] {
+                prepareParticipantImmutableRowTableOriginal(context, graph);
+            });
+        }
+
 
         /**
          * @brief Resolve the immutable flattened-row envelope for one graph family.

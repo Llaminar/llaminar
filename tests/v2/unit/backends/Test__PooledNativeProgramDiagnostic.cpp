@@ -6,11 +6,19 @@
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include "backends/RetainedParticipantGraphExecutable.h"
 #include "backends/GPUGraphMemoryContract.h"
+#include "planning/PlanningExecutionMeasurement.h"
+#include "mocks/MockBackend.h"
 #include "mocks/MockWorkerGPUContext.h"
 #include <gtest/gtest.h>
 namespace llaminar2::test {
 struct RetainedParticipantGraphExecutableReplayAccess {
     static auto create(const PreparedGPUContextUsePermit& original,void* stream){return RetainedParticipantGraphExecutable::createDeviceBound(original,stream);}
+    /** @return Actual closed calibration-purpose factory, with no invented source permit. */
+    static auto calibration(const PreparedGPUContextUsePermit& original,void* stream){return RetainedParticipantGraphExecutable::createPreparedCalibration(original,stream);}
+    /** @brief Exercise actual cold reset; it cannot alter ordinary participant purposes. */
+    static void resetCalibration(RetainedParticipantGraphExecutable& owner){owner.resetPreparedCalibration();}
+    /** @brief Restore only recorded stale-generation test input before final original teardown. */
+    static void restoreGeneration(RetainedParticipantGraphExecutable& owner){--owner.generation_;}
     static IGPUGraphCapture& recording(RetainedParticipantGraphExecutable& owner){return owner.capture();}
     static bool submit(RetainedParticipantGraphExecutable& owner,std::uint64_t ordinal){return owner.submit(ordinal);}
     static void ready(RetainedParticipantGraphExecutable& owner){owner.worker_->submitAndWait([&]{auto& recording=owner.capture();
@@ -37,7 +45,7 @@ public:
     bool hasExecutable()const override{return inner_.hasExecutable();}
     std::size_t residentMemoryBytes()const noexcept override{return 0;}
     std::size_t nodeCount()const override{return nodes_.value_or(inner_.nodeCount());}
-    void reset()override{inner_.reset();}
+    void reset()override{check(7);inner_.reset();}
     const char* backendName()const override{return "recorded-fault";}
 protected:
     /** @brief Only native SDK kind inspection is doubled; class/count policy stays production-owned. */
@@ -56,12 +64,14 @@ class ProgramWorker final:public testing::MockWorkerGPUContext {
 public:
     ProgramWorker(int ordinal,std::shared_ptr<PreparedGPUWorkerStack>):MockWorkerGPUContext(ordinal){}
     int calls=0,fail=0,streamsDestroyed=0,eventsDestroyed=0,capturesDestroyed=0;
+    int timingEventsCreated=0;
+    int queueClosures=0;
     int graphFault=0,graphCalls=0;
     std::optional<std::size_t> graphNodes;bool graphFlatKinds=true;int graphKindInspections=0;
     bool ready=true,failSubmit=false;GPUStreamExecutionState streamState=GPUStreamExecutionState::Complete;
-    void submitAndWait(std::function<void()> work)override{if(failSubmit)throw std::runtime_error("recorded enqueue failure before native creator");MockWorkerGPUContext::submitAndWait(std::move(work));}
+    void submitAndWait(std::function<void()> work)override{if(failSubmit)throw std::runtime_error("recorded enqueue failure before native creator");++queueClosures;MockWorkerGPUContext::submitAndWait(std::move(work));}
     void* createStream()override{if(++calls==fail)return nullptr;return MockWorkerGPUContext::createStream();}
-    void* createEvent(GPUEventPurpose purpose)override{if(++calls==fail)return nullptr;return MockWorkerGPUContext::createEvent(purpose);}
+    void* createEvent(GPUEventPurpose purpose)override{if(++calls==fail)return nullptr;if(purpose==GPUEventPurpose::Timing)++timingEventsCreated;return MockWorkerGPUContext::createEvent(purpose);}
     void destroyStream(void* value)override{++streamsDestroyed;MockWorkerGPUContext::destroyStream(value);}
     void destroyEvent(void* value)override{++eventsDestroyed;MockWorkerGPUContext::destroyEvent(value);}
     bool queryEventChecked(void* value,bool& observed)override{observed=ready;return value!=nullptr;}
@@ -77,7 +87,7 @@ struct Source {
     std::optional<PreparedGPUContextUsePermit> original;
     std::shared_ptr<PhysicalMemoryAuthority> memory;
     std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> certificate;
-    Source(DeviceId device,std::size_t graphs=0,bool admit=true,std::size_t gpuCapacity=64u<<20,bool originalGeneral=false){
+    Source(DeviceId device,std::size_t graphs=0,bool admit=true,std::size_t gpuCapacity=64u<<20,bool originalGeneral=false,std::size_t calibrationSlots=0){
         NativeContextPreparationReplayAccess::seed(device,[device](auto stack){return NativeContextPreparationReplayAccess::construct<ProgramWorker>(std::move(stack),device.ordinal);});
         if(originalGeneral){
             const std::array observed{PhysicalMemoryResource{0,DeviceId::cpu(),4ULL<<30,4ULL<<30},PhysicalMemoryResource{0,device,gpuCapacity,gpuCapacity}};
@@ -90,6 +100,11 @@ struct Source {
             if(originalGeneral){const auto general=RetainedParticipantGraphExecutable::generalBOM(source->originalResource(DeviceId::cpu()),observed,graphs);for(const auto& row:general.resources())extra.add(row);}
             else extra.add(observed,PhysicalMemoryOwner::NativeGraphExecutable,
                 graphs*GPUGraphMemoryContract::reservationBytesPerExecutable(device,GPUGraphExecutableClass::General));}
+        for(std::size_t slot=0;slot<calibrationSlots;++slot){
+            const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(
+                source->originalResource(DeviceId::cpu()),source->originalResource(device));
+            for(const auto& row:calibration.resources())extra.add(row);
+        }
         certificate=std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(extra.build());
         if(admit)source->admitFinal(certificate);
     }
@@ -357,5 +372,167 @@ TEST(PooledNativeProgramDiagnostic, RecordingDelegatesBoundedFlatNativeValidatio
         },::testing::ExitedWithCode(0),"");
     }
 }
+
+/** @test Fully committed serving graph capacity cannot consume the separate admitted calibration slot. */
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationBOMIsolatedFromServingReservation)
+{
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}){
+        const PhysicalMemoryResource host{0,DeviceId::cpu(),4ULL<<30,4ULL<<30};
+        const PhysicalMemoryResource gpu{0,device,256u<<20,256u<<20};
+        const auto serving=RetainedParticipantGraphExecutable::generalBOM(host,gpu);
+        const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(host,gpu);
+        PhysicalMemoryPlanBuilder plan;
+        for(const auto& row:serving.resources())plan.add(row);
+        for(const auto& row:calibration.resources())plan.add(row);
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+        for(const auto resource:{host,gpu}){
+            const auto key=PhysicalMemoryAllocatorIdentity{resource.world_rank,resource.device};
+            const auto servingBytes=serving.find(key)->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
+            const auto calibrationBytes=calibration.find(key)->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable);
+            EXPECT_EQ(servingBytes,calibrationBytes);
+            EXPECT_EQ(serving.find(key)->totalBytes(),calibration.find(key)->totalBytes());
+            EXPECT_EQ(calibration.find(key)->bytes(PhysicalMemoryOwner::NativeGraphExecutable),0u);
+            auto committed=memory->reserveNewAllocations(resource.device,PhysicalMemoryOwner::NativeGraphExecutable,servingBytes);
+            // Original-owner control: the former calibration charge collides
+            // after the model has committed all its own named graph budget.
+            EXPECT_THROW((void)memory->reserveNewAllocations(resource.device,
+                PhysicalMemoryOwner::NativeGraphExecutable,calibrationBytes),std::logic_error);
+            auto preparation=memory->reserveNewAllocations(resource.device,
+                PhysicalMemoryOwner::NativePreparationGraphExecutable,calibrationBytes);
+            EXPECT_EQ(memory->reservedBytes(resource.device,PhysicalMemoryOwner::NativeGraphExecutable),servingBytes);
+            EXPECT_EQ(memory->reservedBytes(resource.device,PhysicalMemoryOwner::NativePreparationGraphExecutable),calibrationBytes);
+        }
+        EXPECT_EQ(toString(PhysicalMemoryOwner::NativePreparationGraphExecutable),"native_preparation_graph_executable");
+    }
+}
+
+namespace {
+/** @brief Recorded reset/submit behavior through one actual original General owner. */
+void sequentialPreparedCalibration(DeviceId device)
+{
+    Source source(device,1,true,256u<<20,true,1);auto& worker=source.worker();
+    const auto servingBOM=RetainedParticipantGraphExecutable::generalBOM(
+        source.source->originalResource(DeviceId::cpu()),source.source->originalResource(device));
+    const auto servingHost=servingBOM.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
+    const auto servingGPU=servingBOM.find({0,device})->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
+    auto modelHost=source.memory->reserveNewAllocations(DeviceId::cpu(),PhysicalMemoryOwner::NativeGraphExecutable,servingHost);
+    auto modelGPU=source.memory->reserveNewAllocations(device,PhysicalMemoryOwner::NativeGraphExecutable,servingGPU);
+    auto owner=RetainedParticipantGraphExecutableReplayAccess::calibration(*source.original,worker.defaultStream());
+    EXPECT_EQ(source.memory->reservedBytes(device,PhysicalMemoryOwner::NativeGraphExecutable),servingGPU);
+    const auto calls=worker.calls;
+    const auto destroyedEvents=worker.eventsDestroyed;
+    EXPECT_EQ(worker.timingEventsCreated,2);
+    const auto host=source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable);
+    const auto gpu=source.memory->reservedBytes(device,PhysicalMemoryOwner::NativePreparationGraphExecutable);
+    for(std::uint64_t definition=0;definition<12;++definition){
+        RetainedParticipantGraphExecutableReplayAccess::ready(*owner);
+        EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*owner),std::logic_error);
+        if(definition)EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::submit(*owner,definition),std::logic_error);
+        ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::submit(*owner,definition+1));
+        EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*owner),std::logic_error);
+        worker.streamState=GPUStreamExecutionState::Pending;
+        EXPECT_FALSE(RetainedParticipantGraphExecutableReplayAccess::observe(*owner));
+        EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*owner),std::logic_error);
+        worker.streamState=GPUStreamExecutionState::Complete;
+        ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::observe(*owner));
+        RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*owner);
+        EXPECT_EQ(worker.calls,calls); // Same physical wrapper; no hidden creator/token per class.
+        EXPECT_EQ(worker.capturesDestroyed,0);
+        EXPECT_EQ(worker.timingEventsCreated,2);
+        EXPECT_EQ(worker.eventsDestroyed,destroyedEvents);
+        EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable),host);
+        EXPECT_EQ(source.memory->reservedBytes(device,PhysicalMemoryOwner::NativePreparationGraphExecutable),gpu);
+        EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::submit(*owner,definition+1),std::logic_error);
+    }
+    owner.reset();EXPECT_EQ(worker.capturesDestroyed,1);
+    EXPECT_EQ(worker.eventsDestroyed,destroyedEvents+2);
+    EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable),
+        GPUGraphMemoryContract::generalHostReservationBytesPerExecutable(device));
+    modelHost={};modelGPU={};
+    source.reset();
+}
+/** @brief Native timing doubles require every operation on the original worker. */
+class CalibrationTimingBackend final:public MockBackend {
+public:
+    CalibrationTimingBackend(DeviceType type,ProgramWorker& worker):MockBackend(type),worker_(worker){}
+    void* createTimingEvent(int)override{ADD_FAILURE()<<"Measurement replaced original owner timing pair";return nullptr;}
+    void destroyEvent(void*,int)override{ADD_FAILURE()<<"Measurement destroyed original owner timing pair";}
+    bool recordEvent(void*,int,void* stream)override{EXPECT_TRUE(worker_.ownsCurrentThread());EXPECT_EQ(stream,worker_.defaultStream());recordClosures.push_back(worker_.queueClosures);++records;return true;}
+    bool queryEvent(void*,int,bool* ready)override{EXPECT_TRUE(worker_.ownsCurrentThread());*ready=true;return true;}
+    bool eventElapsedTimeMs(void*,void*,int,float* elapsed)override{EXPECT_TRUE(worker_.ownsCurrentThread());*elapsed=3;return true;}
+    int records=0;
+    std::vector<int> recordClosures;
+private:ProgramWorker& worker_;
+};
+/** @brief Actual timing owner borrows one persistent pair and marshals only native operations. */
+void measuredPreparedCalibration(DeviceId device)
+{
+    Source source(device,0,true,256u<<20,true,1);auto& worker=source.worker();
+    auto owner=RetainedParticipantGraphExecutableReplayAccess::calibration(*source.original,worker.defaultStream());
+    CalibrationTimingBackend backend(device.type,worker);
+    const PlanningMeasurementWork work(PlanningWorkUnit::ArithmeticOperations,64,"original recorded prepared phase");
+    for(int phase=0;phase<3;++phase){
+        RetainedParticipantGraphExecutableReplayAccess::ready(*owner);
+        const auto before=worker.queueClosures;
+        const auto observed=PlanningExecutionMeasurement::gpu(work,backend,device,*owner);
+        EXPECT_EQ(worker.queueClosures-before,6); // warmup, query, timed batch, query, elapsed, terminal.
+        ASSERT_EQ(backend.recordClosures.size(),size_t((phase+1)*3));
+        EXPECT_EQ(backend.recordClosures[phase*3],before+1);
+        EXPECT_EQ(backend.recordClosures[phase*3+1],before+3);
+        EXPECT_EQ(backend.recordClosures[phase*3+2],before+3);
+        EXPECT_EQ(observed.elapsedSeconds(),0.003);
+        EXPECT_EQ(worker.timingEventsCreated,2);
+        RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*owner);
+    }
+    EXPECT_EQ(backend.records,9);
+    owner.reset();source.reset();
+}
+/** @brief Ordinary immutability, stale generation and failed reset stay absorbing. */
+void rejectedPreparedCalibration(DeviceId device)
+{
+    Source source(device,1,true,256u<<20,true,2);auto& worker=source.worker();
+    auto ordinary=RetainedParticipantGraphExecutable::create(*source.original,worker.defaultStream());
+    RetainedParticipantGraphExecutableReplayAccess::ready(*ordinary);
+    ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::submit(*ordinary,1));
+    ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::observe(*ordinary));
+    const auto prior=worker.graphCalls;
+    EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*ordinary),std::logic_error);
+    EXPECT_EQ(worker.graphCalls,prior);
+    ordinary.reset();
+    auto owner=RetainedParticipantGraphExecutableReplayAccess::calibration(*source.original,worker.defaultStream());
+    RetainedParticipantGraphExecutableReplayAccess::ready(*owner);
+    ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::submit(*owner,1));
+    ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::observe(*owner));
+    RetainedParticipantGraphExecutableReplayAccess::staleGeneration(*owner);
+    EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*owner),std::invalid_argument);
+    EXPECT_EQ(worker.graphCalls,prior+3);
+    RetainedParticipantGraphExecutableReplayAccess::restoreGeneration(*owner);
+    worker.graphFault=7;
+    EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*owner),std::runtime_error);
+    worker.graphFault=0;
+    EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*owner),std::logic_error);
+    EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::ready(*owner),std::logic_error);
+    EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::submit(*owner,2),std::logic_error);
+    owner.reset();EXPECT_EQ(worker.capturesDestroyed,2);
+    const auto retiredEvents=worker.eventsDestroyed;
+    const auto retiredCaptures=worker.capturesDestroyed;
+    worker.fail=worker.calls+3; // Wrapper and first timing event succeed; second event fails.
+    EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::calibration(*source.original,worker.defaultStream()),std::runtime_error);
+    worker.fail=0;
+    EXPECT_EQ(worker.eventsDestroyed,retiredEvents+1);
+    EXPECT_EQ(worker.capturesDestroyed,retiredCaptures+1);
+    source.reset();
+}
+}
+/** @test Same original slot across every bounded class/phase, with exact terminal proof and monotonic submit identity. */
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationCUDASequential){EXPECT_EXIT({sequentialPreparedCalibration(DeviceId::cuda(281));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationROCmSequential){EXPECT_EXIT({sequentialPreparedCalibration(DeviceId::rocm(281));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+/** @test Actual event loop keeps native timing operations on the original worker and reuses its pair. */
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationCUDATimingOwner){EXPECT_EXIT({measuredPreparedCalibration(DeviceId::cuda(283));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationROCmTimingOwner){EXPECT_EXIT({measuredPreparedCalibration(DeviceId::rocm(283));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+/** @test Normal graph definitions, stale provenance and failed native reset never gain a re-record capability. */
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationCUDARejectsUnproved){EXPECT_EXIT({rejectedPreparedCalibration(DeviceId::cuda(282));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationROCmRejectsUnproved){EXPECT_EXIT({rejectedPreparedCalibration(DeviceId::rocm(282));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
 
 }

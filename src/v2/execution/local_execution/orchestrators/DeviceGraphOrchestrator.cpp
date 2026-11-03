@@ -4998,22 +4998,39 @@ namespace llaminar2
         return ok;
     }
 
-    bool DeviceGraphOrchestrator::waitAtPrefillGraphCaptureBoundary(
+    bool DeviceGraphOrchestrator::waitAtPrefillGraphCaptureBoundary(const ForwardInput& input,DeviceId device,
+        const std::string& name,void* stream)
+    {return waitAtPrefillGraphCaptureBoundaryImpl(input,device,name,stream,nullptr);}
+    bool DeviceGraphOrchestrator::waitAtPrefillGraphCaptureBoundary(const ForwardInput& input,DeviceId device,
+        const std::string& name,void* stream,LocalTPCaptureSourceDefinition& definition)
+    {return waitAtPrefillGraphCaptureBoundaryImpl(input,device,name,stream,&definition);}
+
+    bool DeviceGraphOrchestrator::waitAtPrefillGraphCaptureBoundaryImpl(
         const ForwardInput &input,
         DeviceId execution_device,
         const std::string &boundary_name,
-        void *capture_stream)
+        void *capture_stream,LocalTPCaptureSourceDefinition* definition)
     {
         (void)input;
-        if (pipeline_forward_edges_)
+        if (pipeline_forward_edges_){
+            if(definition)throw std::logic_error("Source definition handoff requires its original LocalTP capture boundary");
             return pipeline_forward_edges_->captureBoundary(boundary_name, capture_stream);
-        if (!graph_builder_)
+        }
+        if (!graph_builder_){
+            if(definition)throw std::logic_error("Source definition handoff lost its original graph builder");
             return true;
+        }
 
         auto *local_tp =
             dynamic_cast<ILocalTPContext *>(graph_builder_->config().tp_ctx);
-        if (!local_tp || local_tp->degree() <= 1)
-            return true;
+        if (!local_tp || local_tp->degree() <= 1){
+            if(!definition)return true;
+            if(!definition->publication || definition->publication->stream()!=capture_stream ||
+                reinterpret_cast<std::uintptr_t>(capture_stream)<=2 || definition->domain.source!=execution_device ||
+                definition->publication->definition().domain!=definition->domain)
+                throw std::logic_error("Singleton source definition lost its actual source cache");
+            definition->publication->requireDefinition();definition->result=definition->publication;return true;
+        }
 
         const int participant = graph_builder_->config().tp_device_idx;
         if (participant < 0 || participant >= local_tp->degree())
@@ -5061,11 +5078,8 @@ namespace llaminar2
                       << " boundary=" << domain_boundary);
             return false;
         }
-        const bool ok = local_tp->graphCaptureBoundaryOnStream(
-            domain_boundary,
-            participant,
-            capture_stream,
-            timeout_ms);
+        const bool ok = definition?local_tp->graphCaptureBoundaryOnStream(domain_boundary,participant,capture_stream,timeout_ms,*definition):
+            local_tp->graphCaptureBoundaryOnStream(domain_boundary,participant,capture_stream,timeout_ms);
         if (!ok)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Prefill graph capture boundary rendezvous failed on "
@@ -5076,20 +5090,35 @@ namespace llaminar2
         return ok;
     }
 
-    bool DeviceGraphOrchestrator::waitAtDecodeGraphCaptureBoundary(
+    bool DeviceGraphOrchestrator::waitAtDecodeGraphCaptureBoundary(const ForwardInput& input,DeviceId device,
+        const std::string& name,void* stream)
+    {return waitAtDecodeGraphCaptureBoundaryImpl(input,device,name,stream,nullptr);}
+    bool DeviceGraphOrchestrator::waitAtDecodeGraphCaptureBoundary(const ForwardInput& input,DeviceId device,
+        const std::string& name,void* stream,LocalTPCaptureSourceDefinition& definition)
+    {return waitAtDecodeGraphCaptureBoundaryImpl(input,device,name,stream,&definition);}
+
+    bool DeviceGraphOrchestrator::waitAtDecodeGraphCaptureBoundaryImpl(
         const ForwardInput &input,
         DeviceId execution_device,
         const std::string &boundary_name,
-        void *capture_stream)
+        void *capture_stream,LocalTPCaptureSourceDefinition* definition)
     {
         (void)input;
-        if (!graph_builder_)
+        if (!graph_builder_){
+            if(definition)throw std::logic_error("Source definition handoff lost its original graph builder");
             return true;
+        }
 
         auto *local_tp =
             dynamic_cast<ILocalTPContext *>(graph_builder_->config().tp_ctx);
-        if (!local_tp || local_tp->degree() <= 1)
-            return true;
+        if (!local_tp || local_tp->degree() <= 1){
+            if(!definition)return true;
+            if(!definition->publication || definition->publication->stream()!=capture_stream ||
+                reinterpret_cast<std::uintptr_t>(capture_stream)<=2 || definition->domain.source!=execution_device ||
+                definition->publication->definition().domain!=definition->domain)
+                throw std::logic_error("Singleton source definition lost its actual source cache");
+            definition->publication->requireDefinition();definition->result=definition->publication;return true;
+        }
 
         const int participant = graph_builder_->config().tp_device_idx;
         if (participant < 0 || participant >= local_tp->degree())
@@ -5137,11 +5166,8 @@ namespace llaminar2
                       << " boundary=" << domain_boundary);
             return false;
         }
-        const bool ok = local_tp->graphCaptureBoundaryOnStream(
-            domain_boundary,
-            participant,
-            capture_stream,
-            timeout_ms);
+        const bool ok = definition?local_tp->graphCaptureBoundaryOnStream(domain_boundary,participant,capture_stream,timeout_ms,*definition):
+            local_tp->graphCaptureBoundaryOnStream(domain_boundary,participant,capture_stream,timeout_ms);
         if (!ok)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Decode graph capture boundary rendezvous failed on "

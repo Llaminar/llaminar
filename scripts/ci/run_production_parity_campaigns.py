@@ -80,7 +80,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from model_kld_history_replay import HANDOFF_FIELDS, prepare_history_replay
-from mpi_session_retirement import owned_session_bases, retirement_scope
+from mpi_session_retirement import owned_session_bases, require_retired, retirement_scope
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -3805,6 +3805,12 @@ def run_production_test_preflight(
             ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1"],
             check=True, text=True, capture_output=True)
         native_session_bases = owned_session_bases(json.loads(inventory.stdout))
+
+    # Authenticate the WHOLE selected transaction before spending time in Unit.
+    # A dirty later/exclusive lane is still an unretired predecessor, not work
+    # this campaign may clean or defer discovering until its lane is reached.
+    require_retired((native_session_bases[name] for name in tests
+                     if name in native_session_bases), timeout_seconds=0)
 
     def process_scope(names: tuple[str, ...]):
         """Keep this lane closed until its original native owners remove backing."""

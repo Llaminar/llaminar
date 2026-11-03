@@ -16,7 +16,7 @@ namespace {
 namespace q=qwen4exp;
 static_assert(!std::is_constructible_v<PooledRemoteGraphProgram,PooledRemoteGraphGeometry,std::array<std::uint8_t,32>,GPUFlatGraphLimits>);
 /** @return Checked storage coordinates and request geometry with no compute-domain substitution. */
-auto declare(DeviceId source,DeviceId remote,std::uint32_t capacity,std::uint64_t rows=4096){
+auto declare(DeviceId source,DeviceId remote,std::uint32_t capacity,std::uint64_t rows=4096,std::optional<PeerAccessCoverage> peerAccess=std::nullopt){
     const PhysicalMemoryAllocatorIdentity coordinator{0,source},owner{0,remote};
     const std::array order{coordinator,owner};
     std::vector<ImmutableRowTableLayoutOwner> owners{{{coordinator,ImmutableRowStorage::VRAM},0,0,{}},{{owner,ImmutableRowStorage::VRAM},0,capacity,{}}};
@@ -24,7 +24,7 @@ auto declare(DeviceId source,DeviceId remote,std::uint32_t capacity,std::uint64_
     const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,rows,9000),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,std::move(owners),{coordinator},{},
         {{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},{},
-        capacity?std::optional(coordinator):std::nullopt,16);
+        capacity?std::optional(coordinator):std::nullopt,16,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,peerAccess);
     auto physical=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,order,coordinator);
     auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},32);
     return std::pair{std::move(physical),std::move(policy)};
@@ -49,6 +49,24 @@ TEST(PooledImmutableDirectedOwnerProgram,ResetPartialAndPlacementClassReplay){
                 remote.is_cuda()?DeviceId::cuda(4):DeviceId::rocm(4),capacity);
             const auto other=q::PooledImmutableDirectedOwnerProgram::declare(otherPhysical,otherPolicy,1);
             EXPECT_NE(original.captureIdentity(),other.captureIdentity());EXPECT_EQ(original.qualificationClass(),other.qualificationClass());
+        }
+}
+/** @test NoPeer keeps the exact owner recipe and source scope; observation changes remain capture identity. */
+TEST(PooledImmutableDirectedOwnerProgram, ExplicitNoPeerBindsOriginalPlansWithoutChangingKernelPopulation)
+{
+    for (const auto source : {DeviceId::cuda(0),DeviceId::rocm(0)})
+        for (const auto capacity : {0u,64u}) {
+            const DeviceId remote{source.type,1};
+            const auto [physical,policy] = declare(source,remote,capacity,4096,PeerAccessCoverage::None);
+            const auto authored = q::PooledImmutableDirectedOwnerProgram::declare(physical,policy,1);
+            const auto coordinator = q::PooledImmutableCoordinatorNativePlan::fromGeometry(physical,policy,701,17);
+            const auto owner = q::PooledImmutableOwnerNativePlan::fromGeometry(physical,policy,1,701,17);
+            EXPECT_EQ(authored,q::PooledImmutableDirectedOwnerProgram::fromOriginalPlans(owner,coordinator));
+            EXPECT_EQ(authored.geometry().peerAccess,PeerAccessCoverage::None);
+            EXPECT_EQ(authored.geometry().owner.device,remote);
+            EXPECT_EQ(authored.limits().allowedKinds,GPUFlatGraphLimits::bit(GPUFlatGraphNodeKind::Kernel));
+            const auto [unobserved,unobservedPolicy] = declare(source,remote,capacity);
+            EXPECT_THROW(q::PooledImmutableDirectedOwnerProgram::declare(unobserved,unobservedPolicy,1),std::invalid_argument);
         }
 }
 TEST(PooledImmutableDirectedOwnerProgram,CompiledRowKeyABIChangesPortableScope){

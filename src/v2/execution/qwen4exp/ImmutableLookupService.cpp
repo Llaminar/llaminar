@@ -549,6 +549,14 @@ void ImmutableLookupService::abandonGroup(const GroupAdmission& group) noexcept 
         (void)cancel(group.ticket_);(void)finishGroup(group);
     }catch(...){std::terminate();}
 }
+std::function<void()> ImmutableLookupService::failureCallback(const GroupAdmission& group) const
+{
+    std::lock_guard lock(lifecycle_);
+    if(group.owner_.get()!=this || !group.valid() || state_!=Lifecycle::Serving ||
+       group.ticket_.generation!=outstanding_.generation || group.ticket_.invocation!=outstanding_.invocation)
+        throw std::logic_error("Source failure callback requires its original active group");
+    return [original=group.owner_,ticket=group.ticket_]{(void)original->cancel(ticket);};
+}
 bool ImmutableLookupService::finishGroup(const GroupAdmission& group) {
     bool cancelMissing=false;
     {

@@ -43,14 +43,49 @@ __device__ __forceinline__ std::uint64_t capturedTransferWallClock()
 #endif
 }
 
+/** @return Only this physical channel's original CPU parent requested terminal drain. */
+__device__ __forceinline__ bool capturedTransferCancellationRequested(
+    CapturedTransferChannelDeviceBinding binding)
+{
+    return binding.expected.valid() && binding.control->identity.nonce == binding.expected.nonce &&
+        binding.control->identity.capacity == binding.expected.capacity &&
+        mappedSystemAcquire64(&binding.control->cancelled_nonce) == binding.expected.nonce;
+}
+
 /** @brief Publish a terminal peer-visible abort before trapping the failed device work. */
 __device__ __forceinline__ void capturedTransferFail(
     CapturedTransferChannelDeviceBinding binding, CapturedTransferStatus status)
 {
-    binding.cursor->phase = CapturedTransferPhase::Failed;
+    auto *phase = reinterpret_cast<unsigned int *>(&binding.cursor->phase);
+    bool drain = false;
+    if (status == CapturedTransferStatus::Cancelled)
+    {
+        const bool original = capturedTransferCancellationRequested(binding);
+        for (;;)
+        {
+            const auto previous = atomicCAS(phase, 0u, 0u);
+            drain = CapturedTransferChannelProtocol::drainsCancellation(
+                static_cast<CapturedTransferPhase>(previous), status, original);
+            if (!drain)
+            {
+                atomicExch(phase, static_cast<unsigned int>(CapturedTransferPhase::Failed));
+                break;
+            }
+            if (atomicCAS(phase, previous, static_cast<unsigned int>(CapturedTransferPhase::Cancelled)) == previous)
+                break;
+        }
+    }
+    else
+        atomicExch(phase, static_cast<unsigned int>(CapturedTransferPhase::Failed));
     auto *publication = binding.role == CapturedTransferEndpoint::Producer
         ? &binding.control->producer : &binding.control->consumer;
     mappedSystemRelease64(&publication->epoch, kCapturedTransferAbortEpoch);
+    if (drain)
+    {
+        if (binding.extent_source == CapturedTransferExtentSource::ProducerPublication)
+            *binding.device_extent = 0;
+        return;
+    }
     printf("captured_transfer_channel_failure status=%u role=%u nonce=%llu key=%llu completed=%llu\n",
         static_cast<unsigned>(status), static_cast<unsigned>(binding.role),
         static_cast<unsigned long long>(binding.expected.nonce),
@@ -75,11 +110,14 @@ __device__ __forceinline__ void capturedTransferFail(
 __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelDeviceBinding binding)
 {
     auto *phase = reinterpret_cast<unsigned int *>(&binding.cursor->phase);
-    if (atomicCAS(phase, static_cast<unsigned int>(CapturedTransferPhase::Idle),
-            static_cast<unsigned int>(CapturedTransferPhase::Acquired)) !=
-        static_cast<unsigned int>(CapturedTransferPhase::Idle))
+    const auto previous = atomicCAS(phase, static_cast<unsigned int>(CapturedTransferPhase::Idle),
+        static_cast<unsigned int>(CapturedTransferPhase::Acquired));
+    if (previous != static_cast<unsigned int>(CapturedTransferPhase::Idle))
     {
-        capturedTransferFail(binding, CapturedTransferStatus::InvalidPhase);
+        if (previous == static_cast<unsigned int>(CapturedTransferPhase::Cancelled) && capturedTransferCancellationRequested(binding))
+            capturedTransferFail(binding, CapturedTransferStatus::Cancelled);
+        else
+            capturedTransferFail(binding, CapturedTransferStatus::InvalidPhase);
         return;
     }
     auto cursor = *binding.cursor;
@@ -108,7 +146,8 @@ __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelD
         }
         const auto decision = CapturedTransferChannelProtocol::acquire(
             binding.role, binding.expected, actual, cursor, observed, binding.message,
-            binding.extent_source, producer_bytes, source_slice.byte_offset, binding.source_span_bytes, binding.source_offset_origin);
+            binding.extent_source, producer_bytes, source_slice.byte_offset, binding.source_span_bytes, binding.source_offset_origin,
+            mappedSystemAcquire64(&binding.control->cancelled_nonce));
         if (decision.ready())
         {
             binding.cursor->acquired_message = cursor.acquired_message;
@@ -160,17 +199,13 @@ __device__ __forceinline__ void capturedTransferPublish(CapturedTransferChannelD
     }
     auto cursor = *binding.cursor;
     cursor.phase = CapturedTransferPhase::Acquired;
-    if (cursor.acquired_message.key != binding.message.key ||
-        (binding.extent_source == CapturedTransferExtentSource::FixedMessage
-            ? cursor.acquired_message.bytes != binding.message.bytes : cursor.acquired_message.bytes > binding.message.bytes))
-    {
-        capturedTransferFail(binding, CapturedTransferStatus::MessageMismatch);
-        return;
-    }
     auto *owned = binding.role == CapturedTransferEndpoint::Producer
         ? &binding.control->producer : &binding.control->consumer;
     CapturedTransferPublication publication{.epoch = mappedSystemAcquire64(&owned->epoch)};
-    const auto decision = CapturedTransferChannelProtocol::publish(cursor, cursor.completed_epoch + 1, publication);
+    // Existing phase, message and epoch faults win before explicit cancellation.
+    // Copies have all joined this final publisher; no CTA barrier can diverge.
+    const auto decision = CapturedTransferChannelProtocol::preparePublication(cursor, publication,
+        binding.message,binding.extent_source,mappedSystemAcquire64(&binding.control->cancelled_nonce),binding.expected.nonce);
     if (!decision.ready())
     {
         capturedTransferFail(binding, decision.status);
@@ -211,6 +246,11 @@ __device__ __forceinline__ void capturedTransferCopyAndPublish(
     CapturedTransferChannelDeviceBinding binding, void *destination, const void *source,
     unsigned copy_block, unsigned copy_blocks)
 {
+    if (binding.cursor->phase == CapturedTransferPhase::Cancelled && capturedTransferCancellationRequested(binding))
+    {
+        if (threadIdx.x == 0) capturedTransferFail(binding, CapturedTransferStatus::Cancelled);
+        return;
+    }
     const auto bytes = binding.cursor->acquired_message.bytes;
     if (binding.cursor->phase != CapturedTransferPhase::Acquired || bytes > binding.message.bytes || !copy_blocks || copy_block >= copy_blocks ||
         binding.cursor->acquired_message.key != binding.message.key)

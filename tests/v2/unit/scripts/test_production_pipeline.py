@@ -1777,6 +1777,127 @@ class BenchmarkPolicyTests(unittest.TestCase):
         bad=copy.deepcopy(workload);bad['measurement_iterations']=2
         with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,"Exact",record,bad)
 
+    @staticmethod
+    def _passive_lookup_fixture(backing='RAM', shared=False, positive=True):
+        """Recorded original setup/terminal schemas; no native-success or numerical evidence is minted."""
+        config={'routed_expert_owner_order':'Ordinal','moe_routed_expert_plan':{
+            'continuation_domain':'original','dense_domains':[{'name':'original','owner_rank':0,
+                'participants':[{'device_type':'CUDA','device_ordinal':i} for i in range(2)]}],
+            'first_model_layer':0,'routed_tiers':[{'domain':'original','resolved_live_experts_per_layer':[128]}],
+            'domains':[{'name':'original','participants':[{'device_type':'CUDA','device_ordinal':i} for i in range(2)]}]}}
+        maximum,ceiling=(100,4096) if positive else (0,0)
+        participants=[{'world_rank':0,'backend':'CUDA','ordinal':i} for i in range(2)]
+        placement={'mode':'DeclaredRankLocal','coordinator':participants[1],
+            'owners':[{'participant':p,'maximum_cache_rows':maximum,'cache_physical_byte_limit':ceiling} for p in participants]} if shared else {'mode':'ConsumerLocal','owners':[]}
+        config['ngram_table_policy']={'storage':'AdaptiveVRAMRAMSSD','gpu_adaptive':{
+            'source_backing':backing,'maximum_gpu_cache_rows':maximum,'gpu_cache_physical_byte_limit':ceiling,
+            'placement':placement,'host':{'maximum_cache_rows':0,'cache_physical_byte_limit':0}}}
+        mode='gpu_subordinate_full_ram' if backing=='RAM' else 'host_adaptive_ram_ssd'
+        records=[]
+        def record(domain,name,device,tags,phase,count=3,value=0):
+            row=dict(domain=domain,name=name,device=device,tags=tags,phase=phase,count=count,value=value,
+                kind='counter',total_ns=0,min_ns=0,max_ns=0)
+            records.append(row);return row
+        common={'storage':mode,'source_path':'/original/table.gguf','source_tensor':'per_layer_token_embd.weight',
+            'source_format':'2','source_generation':'17','source_file_offset':'37','source_rows':'1000','source_row_elements':'32','source_row_bytes':'90'}
+        def owner(device,role,slots,payload,metadata,source,staging):
+            tags={**common,'world_rank':'0','role':role,'admitted_slots':str(slots),'payload_bytes':str(payload),
+                'metadata_bytes':str(metadata),'source_storage_bytes':str(source),
+                'table_storage_bytes':str(payload+metadata+source),'lookup_staging_bytes':str(staging)}
+            return record('immutable_lookup_setup','admitted_owner',device,tags,'setup',1,1)
+        sources=['CUDA:1'] if shared else ['CUDA:0','CUDA:1']
+        for i in range(2):
+            owner(f'CUDA:{i}','gpu_cache',2 if positive else 0,192 if positive else 0,64 if positive else 0,0,256)
+        for device in sources:
+            owner(device,'gpu_policy',0,0,128 if positive else 0,0,64)
+            owner(device,'gpu_source_staging',0,0,0,0,512)
+        owner('CPU','shared_host_source',0,0,0,8192,512)
+        device_names=('adaptive_lookup_calls','adaptive_completed_live_ids','adaptive_cache_hit_rows','adaptive_cache_miss_rows',
+            'adaptive_source_rows','adaptive_source_native_bytes','adaptive_promotions','adaptive_evictions','adaptive_failed_frames')
+        host_names=('intervals','requests','ids','id_bytes','native_bytes','metadata_bytes','acknowledgement_bytes','terminal_bytes','failures',
+            'window_hits','window_misses','window_evictions','adaptive_batches','ram_rows','source_rows','duplicate_rows','cache_admissions',
+            'cache_evictions','cache_admission_rejections','all_pinned_responses')
+        for device in sources:
+            for name in device_names:record('immutable_lookup',name,device,{'request':'0','storage':'vram','transport':'pooled_subordinate',
+                'authority':'terminal_device_generation_control'},'generation_terminal')
+            for name in host_names:record('immutable_lookup',name,device,{'storage':mode,'transport':'pooled_subordinate'},
+                'generation_terminal',value=3 if name=='intervals' else 72 if name=='terminal_bytes' else 0)
+            for name in ('reset_terminal_closes','reset_terminal_waits'):
+                record('immutable_lookup',name,device,{},'request_reset',3,3)
+            for name in ('retained_source_native_invocations','retained_remote_native_enqueues'):
+                record('ngram_lookup',name,device,{'policy':'retained_hosted'},'hosted_transaction')
+        for i in range(2):record('moe_placement','routed_expert_weight_selection',f'CUDA:{i}',
+            {'layer':'0','participant':str(i),'owner_order':'ordinal','selection_layout':'contiguous'},'load',3,384)
+        return {'runtime_configuration':{'configuration':config},
+            'perf_stats':{'schema':'llaminar.perf_stats.v1','enabled':True,'records':records}}
+
+    def test_declared_passive_environment_overrides_caller_profiling_before_startup(self):
+        supplied={'PATH':'/original','HOME':'/home/original','OMP_NUM_THREADS':'56','LD_PRELOAD':'/foreign',
+            'LLAMINAR_PERF_STATS_JSON':'/foreign/all.json','LLAMINAR_PERF_STATS_FILTER':'*',
+            'LLAMINAR_PERF_STATS_CPU_STAGE_TIMING':'1','LLAMINAR_PERF_STATS_GPU_STAGE_TIMING':'1',
+            'LLAMINAR_GPU_STAGE_TIMING':'1','LLAMINAR_PROFILE':'1'}
+        environment=benchmark.declared_environment(supplied,{'measurement_iterations':3,'warmup_iterations':1},{},Path('/owned'))
+        self.assertEqual(environment['LLAMINAR_PERF_STATS_FILTER'],','.join(benchmark.DECLARED_PASSIVE_FILTERS))
+        self.assertEqual(environment['LLAMINAR_PERF_STATS_JSON'],'/owned/passive-perfstats-rank-{rank}.json')
+        for name in ('LLAMINAR_PERF_STATS_CPU_STAGE_TIMING','LLAMINAR_PERF_STATS_GPU_STAGE_TIMING','LLAMINAR_GPU_STAGE_TIMING'):
+            self.assertEqual(environment[name],'0')
+        self.assertNotIn('LLAMINAR_PROFILE',environment);self.assertNotIn('LD_PRELOAD',environment)
+        self.assertEqual(environment['OMP_NUM_THREADS'],'56')
+
+    def test_declared_passive_adaptive_setup_and_zero_activity_are_complete(self):
+        for backing in ('RAM','SSD'):
+            for shared in (False,True):
+                for positive in (False,True):
+                    data=self._passive_lookup_fixture(backing,shared,positive)
+                    result=benchmark.validate_declared_passive_evidence(data)
+                    self.assertEqual(result['collection_policy'],benchmark.DECLARED_PASSIVE_POLICY)
+                    self.assertEqual(result['backing'],backing)
+                    self.assertEqual(len([r for r in result['setup'] if r['tags']['role']=='shared_host_source']),1)
+                    self.assertIn('aggregate_gpu_hits_do_not_identify_locality',result['qualification_limits'])
+                    self.assertEqual(result['terminal_observations'][0]['counters']['adaptive_lookup_calls'],0)
+
+        # Real nonzero recorded source work uses the original emitted width;
+        # no Python format table or row-size estimate substitutes for it.
+        active=self._passive_lookup_fixture('SSD')
+        values={'adaptive_lookup_calls':1,'adaptive_completed_live_ids':3,'adaptive_cache_hit_rows':1,
+            'adaptive_cache_miss_rows':2,'adaptive_source_rows':2,'adaptive_source_native_bytes':180,
+            'adaptive_promotions':1,'requests':1,'ids':2,'id_bytes':16,'native_bytes':180,'source_rows':2}
+        for record in active['perf_stats']['records']:
+            if record['device']=='CUDA:0' and record['name'] in values:record['value']=values[record['name']]
+        self.assertTrue(benchmark.validate_declared_passive_evidence(active)['adaptive'])
+        for name in ('adaptive_source_native_bytes','native_bytes','id_bytes'):
+            wrong=copy.deepcopy(active)
+            next(record for record in wrong['perf_stats']['records'] if record['device']=='CUDA:0' and record['name']==name)['value']+=1
+            with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(wrong)
+
+    def test_declared_passive_rejects_partial_wrong_grants_and_foreign_setup(self):
+        original=self._passive_lookup_fixture()
+        cases=[]
+        d=copy.deepcopy(original);d['perf_stats']['enabled']=False;cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records'].pop();cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records']=[r for r in d['perf_stats']['records'] if r['domain']!='moe_placement'];cases.append(d)
+        for field,value in [('admitted_slots','0'),('admitted_slots','101'),('table_storage_bytes','4097'),
+                ('storage','host_adaptive_ram_ssd'),('source_generation','18'),('source_row_bytes','91'),('role','foreign'),('world_rank','1')]:
+            d=copy.deepcopy(original);d['perf_stats']['records'][0]['tags'][field]=value;cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records'].append(copy.deepcopy(d['perf_stats']['records'][0]));cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records']=[r for r in d['perf_stats']['records'] if not (r['domain']=='immutable_lookup_setup' and r['tags']['role']=='shared_host_source')];cases.append(d)
+        d=copy.deepcopy(original);d['runtime_configuration']['configuration']['ngram_table_policy']['gpu_adaptive']['placement']['mode']='Unsupported';cases.append(d)
+        for d in cases:
+            with self.subTest(d=d['perf_stats']['records'][0]):
+                with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(d)
+
+    def test_declared_passive_rejects_warmup_partial_failed_and_mapping_claims(self):
+        original=self._passive_lookup_fixture()
+        cases=[]
+        for name,field,value in [('adaptive_lookup_calls','phase','warmup'),('failures','value',1),
+                ('adaptive_failed_frames','value',1),('window_misses','value',1),('cache_admissions','value',1),
+                ('requests','count',4),('adaptive_source_rows','value',1),('ids','value',1),('reset_terminal_waits','value',2)]:
+            d=copy.deepcopy(original);next(r for r in d['perf_stats']['records'] if r['name']==name)[field]=value;cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records']=[r for r in d['perf_stats']['records'] if r['name']!='adaptive_source_native_bytes'];cases.append(d)
+        d=copy.deepcopy(original);d['perf_stats']['records'].append(dict(domain='stage_gpu',name='elapsed',kind='timer',phase='decode',device='CUDA:0',count=1,value=0,total_ns=5,tags={}));cases.append(d)
+        for d in cases:
+            with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(d)
+
     def test_declared_benchmark_preserves_original_thread_controls_and_strips_loader_environment(self):
         """The actual declared runner keeps accepted CPU policy while dropping hostile loader/SDK controls."""
         from types import SimpleNamespace
@@ -1849,6 +1970,9 @@ class BenchmarkPolicyTests(unittest.TestCase):
             self.assertEqual(environment['LLAMINAR_BENCHMARK_ITERATIONS'], '3')
             self.assertEqual(environment['LLAMINAR_BENCHMARK_WARMUP_ITERATIONS'], '1')
             self.assertEqual(environment[owner.SELECTORS['hc_up']], 'two_term_q8')
+            self.assertEqual(environment['LLAMINAR_PERF_STATS_FILTER'],','.join(benchmark.DECLARED_PASSIVE_FILTERS))
+            self.assertEqual(environment['LLAMINAR_PERF_STATS_GPU_STAGE_TIMING'],'0')
+            self.assertIn('passive-perfstats-rank-{rank}.json',environment['LLAMINAR_PERF_STATS_JSON'])
 
     def test_declared_benchmark_preserves_retirement_after_validation_failure(self):
         """Successful guardian retirement survives a later measurement or configuration rejection."""
@@ -1903,10 +2027,12 @@ class BenchmarkPolicyTests(unittest.TestCase):
             helper.chmod(0o700)
             workload.update(seed=42, temperature=0, top_k=1, top_p=1)
             workload_path.write_text(json.dumps(workload))
-            for failure_stage in ('measurement', 'configuration'):
+            for failure_stage in ('measurement', 'configuration', 'passive', 'success'):
                 args.report = root / (failure_stage + '.json')
                 def guardian(command, environment, output):
-                    (output / 'benchmark.json').write_text('{}')
+                    self.assertEqual(environment['LLAMINAR_PERF_STATS_FILTER'],','.join(benchmark.DECLARED_PASSIVE_FILTERS))
+                    self.assertEqual(environment['LLAMINAR_PERF_STATS_GPU_STAGE_TIMING'],'0')
+                    (output / 'benchmark.json').write_text(json.dumps(self._passive_lookup_fixture()) if failure_stage=='success' else '{}')
                 with patch.object(benchmark.e2e, 'release_binary_cpu_isa'), \
                      patch.object(benchmark, 'declared_inventory', return_value=(('original', 'Exact', record), {})), \
                      patch.object(owner.PairedCorpusSelection, 'from_export', return_value=selection), \
@@ -1918,15 +2044,22 @@ class BenchmarkPolicyTests(unittest.TestCase):
                      patch.object(benchmark, 'declared_config_identity', return_value={}), \
                      patch.object(benchmark, 'run_declared_guardian', side_effect=guardian) as retired, \
                      patch.object(benchmark, 'validate_measurement', side_effect=(ValueError('measurement rejected') if failure_stage == 'measurement' else None), return_value={}), \
-                     patch.object(benchmark, 'declared_runtime_configuration', side_effect=ValueError('configuration rejected')):
-                    with self.assertRaisesRegex(ValueError, failure_stage + ' rejected'):
-                        benchmark.run_declared_diagnostic(args)
+                     patch.object(benchmark, 'declared_runtime_configuration', side_effect=(ValueError('configuration rejected') if failure_stage=='configuration' else None)):
+                    if failure_stage=='success':
+                        self.assertEqual(benchmark.run_declared_diagnostic(args),0)
+                    else:
+                        with self.assertRaisesRegex(ValueError, failure_stage if failure_stage=='passive' else failure_stage+' rejected'):
+                            benchmark.run_declared_diagnostic(args)
                 result = json.loads(args.report.read_text())
                 self.assertTrue(result['native_retired'])
-                self.assertFalse(result['passed'])
-                self.assertFalse(result['complete'])
+                self.assertEqual(result['passed'],failure_stage=='success')
+                self.assertEqual(result['complete'],failure_stage=='success')
                 self.assertTrue(result['driver_window_clean'])
-                self.assertIn(failure_stage + ' rejected', result['error'])
+                if failure_stage=='success':
+                    self.assertEqual(result['collection_policy'],benchmark.DECLARED_PASSIVE_POLICY)
+                    self.assertTrue(result['passive_evidence']['adaptive'])
+                else:
+                    self.assertIn(failure_stage if failure_stage=='passive' else failure_stage+' rejected', result['error'])
                 retired.assert_called_once()
                 finish.assert_called_once()
 

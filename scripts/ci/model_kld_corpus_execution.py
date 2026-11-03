@@ -11,7 +11,7 @@ import hashlib
 import json
 
 import model_kld_corpus_v2 as corpus_v2
-from model_kld_corpus import identity, metadata_digest, require, unchanged
+from model_kld_corpus import identity, metadata_digest, require, unchanged, require_reference_file_identity
 
 SELECTORS = {
     'gdn_projection': 'LLAMINAR_GDN_PROJECTION_ARITHMETIC',
@@ -32,19 +32,17 @@ def file_sha256(path):
 
 
 def original_source_identity(path, descriptor):
-    """Authenticate the reference owner's exact stat descriptor without payload reads.
+    """Authenticate durable reference metadata and pin this run's full physical identity.
 
-    A current before/after pin alone cannot detect replacement that predates
-    admission. Reference generation owns these six immutable metadata fields.
+    The stored device number is observational across reboots. All file metadata
+    must match, and the returned current device number stays strict for this run.
     """
     pin = identity(path)
     observed = dict(path=pin[0],device=pin[1],inode=pin[2],bytes=pin[3],mtime_ns=pin[4],ctime_ns=pin[5])
     try:expected = json.loads(descriptor['object_identity'])
     except (KeyError,TypeError,ValueError) as error:
         raise ValueError('Original source needs reference-issued stat identity') from error
-    require(type(expected) is dict and set(expected) == set(observed) and expected == observed and
-            all(type(expected[k]) is type(v) for k,v in observed.items()),
-            'Original source no longer matches reference-issued metadata identity')
+    require_reference_file_identity(expected, observed)
     return pin
 
 

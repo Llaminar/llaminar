@@ -363,6 +363,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finishForwardOnly", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGenerationImpl", "backend_event", 1),
+        # Rank's private final aggregation re-observes the query-only reader's
+        # exact published terminal event after ALL participant result bridges.
+        # This never authorizes ticket dispatch, transaction or PLE-stage waits.
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::awaitGroupedRetainedStorageTerminal", "backend_event", 1),
         # Explicit bounded diagnostics first authenticate the ordinary terminal
         # controller, then copy only the populated transaction trace. This one
         # additional terminal wait never belongs to generation or dispatch.
@@ -400,6 +404,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # terminal event before authenticating close and retiring the worker.
         # Native regressions prove inactive/repeated reset adds no extra wait.
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::retireRetainedStorageForRequestReset", "backend_event", 1),
+        # Rank's two-phase request reset first joins original native producers,
+        # then records/observes THIS reader's terminal frontier before any
+        # shared channel retirement or data clearing. No hot replay may call it.
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::prepareGroupedRetainedStorageReset", "backend_event", 1),
         # Metadata initialization/admission can enqueue before runner publication
         # fails. Only failed submission or last setup-owner teardown waits its
         # exact pre-created event. Successful admission/capture/terminal paths

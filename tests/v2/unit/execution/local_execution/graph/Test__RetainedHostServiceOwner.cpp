@@ -174,8 +174,8 @@ TEST(RetainedHostServiceOwner, DelayedTokenRejectsChangedOriginalDefaultsBeforeM
     }()),::testing::ExitedWithCode(0),"");
 }
 #ifdef LLAMINAR_HOST_SERVICE_TLS_CONTROL
-/** @test Same-file unload/reload changes loader generation even when final file populations match. */
-TEST(RetainedHostServiceOwner, OriginalEvidenceRejectsSameModuleReloadAndNeverRehashesRoles){
+/** @test Same immutable TLS reload is equivalent exactly when its actual observable resource identity is unchanged. */
+TEST(RetainedHostServiceOwner, OriginalEvidenceRequiresCurrentTLSResourceAcrossReloadAndNeverRehashesRoles){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
     ASSERT_EXIT(([]{
         void* module=dlopen(LLAMINAR_HOST_SERVICE_TLS_CONTROL,RTLD_NOW|RTLD_LOCAL);ASSERT_NE(module,nullptr);
@@ -188,8 +188,15 @@ TEST(RetainedHostServiceOwner, OriginalEvidenceRejectsSameModuleReloadAndNeverRe
         auto token=RetainedHostServiceReplayAccess::claim(memory,first);
         EXPECT_EQ(RetainedHostServiceProgram::nativeEvidenceHashAttempts(),hashCount);
         ASSERT_EQ(dlclose(module),0);module=dlopen(LLAMINAR_HOST_SERVICE_TLS_CONTROL,RTLD_NOW|RTLD_LOCAL);ASSERT_NE(module,nullptr);
-        EXPECT_THROW(PreparedRetainedHostService::materialize(std::move(token)),std::logic_error);
-        EXPECT_THROW(RetainedHostServiceReplayAccess::claim(memory,second),std::logic_error);
+        const auto current=RetainedHostServiceReplayAccess::withEvidence(RetainedHostServiceRole::ExecutorParentTicket,RetainedHostServiceProgram::originalEvidence());
+        if(current.identity()==first.identity()){
+            // GNU may reuse the same TLS module ID: identical current file/layout
+            // and provider policy requires no different allocation or re-admission.
+            auto owner=PreparedRetainedHostService::materialize(std::move(token));owner.reset();
+        }else{
+            EXPECT_THROW(PreparedRetainedHostService::materialize(std::move(token)),std::logic_error);
+            EXPECT_THROW(RetainedHostServiceReplayAccess::claim(memory,second),std::logic_error);
+        }
         EXPECT_EQ(RetainedHostServiceProgram::nativeEvidenceHashAttempts(),hashCount);
         EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RetainedHostServiceStorage,PhysicalMemoryMaterializationKind::NewAllocation),0u);
         ASSERT_EQ(dlclose(module),0);

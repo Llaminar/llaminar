@@ -5,7 +5,8 @@
  * The topology compiler owns stage boundaries; the GGUF manifest owns routed
  * source geometry. This adapter composes their existing fixed and expert BOM
  * builders before publishing any result. It owns no allocator, live byte ledger,
- * GPU context, weight payload or mutable inference state.
+ * GPU context, weight payload or mutable inference state. A serving policy only
+ * retains the original already-created native source through its planning copies.
  * CPU serial storage declarations survive admission and runtime projection.
  */
 #pragma once
@@ -17,6 +18,7 @@ namespace llaminar2
 {
     class ModelLoader;
     class PlanningModelMetadata;
+    class NativeContextPreparation;
 
     /** @brief Frozen setup policy shared by discovery and live runner admission. */
     struct MoEPipelineMemoryPolicy
@@ -29,6 +31,8 @@ namespace llaminar2
         NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
         /** Same original rank evidence is shared by stage declarations before quota search. */
         RetainedHostServiceBudgetProjection retained_host_services=RetainedHostServiceBudgetProjection::installed({});
+        /** @brief Exact serving source created after topology compilation; null only for source-free planning/CPU admission. */
+        std::shared_ptr<NativeContextPreparation> native_context_preparation;
     };
 
     /**
@@ -104,6 +108,7 @@ namespace llaminar2
          * immutable setup decision. Preserve all active request policies: retained
          * MTP capacity permits different enabled/depth choices on later requests.
          * This operation neither allocates nor reopens any admission decision.
+         * @throws std::logic_error Before mutation if publication would omit/replace an existing native source.
          */
         void publishRuntimeCapacity(RuntimeConfig &runtime) const;
         /** @return Immutable ordered stages; no borrowed setup references survive. */

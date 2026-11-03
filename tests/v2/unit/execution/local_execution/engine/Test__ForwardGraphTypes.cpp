@@ -29,6 +29,7 @@
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
 #include "execution/moe/MoEOverlayRetainedParentComposer.h"
+#include "execution/compute_stages/stages/MoEOverlayActivationPacketStages.h"
 #include "memory/BufferArena.h"
 #include "memory/StageBufferContract.h"
 #include "backends/IGPUGraphCapture.h"
@@ -8088,4 +8089,137 @@ TEST(Test__GraphSegmentCache, NativeTransferReplayRetainsCaptureStreamTerminalAu
  ASSERT_TRUE(result.success);EXPECT_EQ(worker.synchronize_stream_checked_calls_,0);EXPECT_EQ(worker.synchronize_stream_calls_,0);EXPECT_EQ(worker.events_synchronized_,0);
  cache.reset(); // Retire the exact deferred terminal while its original worker is still live.
  EXPECT_EQ(worker.events_created_,worker.events_destroyed_);EXPECT_EQ(worker.destroy_stream_calls_,1);
+}
+
+/**
+ * @brief Real endpoint metadata declares movement without claiming unprepared capture.
+ *
+ * GPU MoE kernel construction enters the native SDK. CPU-invalid instances keep
+ * this negative readiness proof device-free; explicit native suites own actual
+ * GPU endpoint capture/data verification.
+ */
+TEST(Test__GraphSegmentCache, MoEEndpointMetadataKeepsNativeAuthorityAndReadinessSeparate)
+{
+    const auto check = []<typename Stage>()
+    {
+        Stage stage(typename Stage::Params{.device_id = DeviceId::cpu()});
+        EXPECT_TRUE(stage.isCollectiveStage());
+        EXPECT_TRUE(isCollectiveComputeStageType(stage.type()));
+        EXPECT_EQ(stage.collectiveGraphCaptureAuthority(),
+                  CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer);
+        EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::CPU));
+        EXPECT_FALSE(stage.isGraphCapturable());
+        EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+        EXPECT_THROW((void)stage.isParticipantLocalCapturedTransfer(), std::logic_error)
+            << "A native authority tag never makes an invalid CPU endpoint capture-ready";
+    };
+    check.template operator()<MoEOverlayActivationDispatchPackStage>();
+    check.template operator()<MoEOverlayActivationDispatchPackBatchStage>();
+    check.template operator()<MoEOverlayActivationDispatchConsumeStage>();
+    check.template operator()<MoEOverlayActivationReturnPackStage>();
+    check.template operator()<MoEOverlayActivationReturnConsumeStage>();
+    check.template operator()<MoEOverlayActivationReturnConsumeBatchStage>();
+}
+
+/** @brief Retained full replay accepts real native endpoint policy, not runtime CCL. */
+TEST(Test__GraphSegmentCache, RetainedFullNativeEndpointRequiresExactExecutableAndDeferredOwner)
+{
+    using Cache = DeviceGraphExecutor::GraphSegmentCache;
+    using Policy = DeviceGraphExecutor::GraphReplayPlanPolicy;
+    const auto probe = [](bool ready, CollectiveGraphCaptureAuthority authority,
+                          bool runtime_capture, bool deferred, bool null_context,
+                          bool null_stream, bool null_worker, bool expect_success)
+    {
+        ComputeGraph graph;
+        addFakeSegmentStage(graph, "endpoint", ready, false,
+            ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_PACK,
+            false, false, false, nullptr, DeviceId::cuda(0));
+        auto *stage = dynamic_cast<FakeSegmentStage *>(graph.getNode("endpoint")->stage.get());
+        ASSERT_NE(stage, nullptr);
+        stage->collective_authority_ = authority;
+        const auto collectives = graph.collectiveNodeNames();
+        ASSERT_TRUE(collectives.contains("endpoint"));
+        FakeReplayGPUContext worker;
+        FakeReplayGPUContext foreign_worker;
+        BufferArena arena;
+        DeviceGraphExecutor executor;
+        executor.setArena(&arena);
+        executor.setWorkerGPUContextResolver([&](DeviceId) { return &worker; });
+        llaminar2::testing::MockDeviceContext context(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+        Cache cache;
+        cache.steady_replay_host_policy = Cache::SteadyReplayHostPolicy::RetainedFullGraph;
+        ASSERT_TRUE(cache.bindBorrowedCaptureStream(&worker, worker.defaultStream(), DeviceId::cuda(0)));
+        ASSERT_TRUE(cache.prepareCaptureStreamTerminal(&worker));
+        const auto submit = [&](IDeviceContext *ctx, void *stream, IWorkerGPUContext *gpu)
+        {
+            graph.reset();
+            bool result = false;
+            Cache::CaptureStreamTerminalTicket terminal;
+            worker.submitAndWait([&]
+            {
+                result = executor.executeWithCachedGraphReplay(
+                    graph, ctx, cache, stream, gpu, &collectives, runtime_capture,
+                    false, deferred, {}, Policy::RequireFullGraph);
+                if (result)
+                    terminal = cache.publishCaptureStreamTerminal();
+            });
+            if (result)
+                cache.waitForPublishedCaptureStreamTerminal(terminal, Cache::HostFenceWaitPolicy::ActiveProgress);
+            return result;
+        };
+        bool first = false;
+        const auto initial = [&]
+        {
+            first = submit(null_context ? nullptr : &context,
+                           null_stream ? nullptr : worker.defaultStream(),
+                           null_worker ? nullptr : &worker);
+        };
+        if (expect_success)
+            EXPECT_NO_THROW(initial());
+        else
+        {
+            try { initial(); }
+            catch (const std::invalid_argument &) { }
+            catch (const std::runtime_error &) { }
+        }
+        EXPECT_EQ(first, expect_success);
+        if (!expect_success)
+        {
+            EXPECT_TRUE(worker.created_graph_captures_.empty());
+            return;
+        }
+        ASSERT_TRUE(cache.retained_full_graph_replay.valid());
+        ASSERT_EQ(cache.segments.size(), 1u);
+        ASSERT_EQ(worker.created_graph_captures_.size(), 1u);
+        auto *capture = worker.created_graph_captures_.front();
+        ASSERT_NE(capture, nullptr);
+        EXPECT_TRUE(capture->hasExecutable());
+        const int captures = capture->begin_capture_calls_;
+        const int instantiations = capture->instantiate_calls_;
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            ASSERT_TRUE(submit(&context, worker.defaultStream(), &worker));
+        }
+        EXPECT_EQ(capture->begin_capture_calls_, captures);
+        EXPECT_EQ(capture->instantiate_calls_, instantiations);
+        EXPECT_EQ(worker.created_graph_captures_.size(), 1u);
+        EXPECT_FALSE(submit(&context, foreign_worker.defaultStream(), &foreign_worker))
+            << "A sealed native executable cannot adopt another worker";
+        EXPECT_EQ(worker.synchronize_stream_checked_calls_, 0);
+        EXPECT_EQ(worker.synchronize_stream_calls_, 0);
+        EXPECT_EQ(worker.device_synchronize_calls_, 0);
+        cache.reset();
+        EXPECT_EQ(worker.events_created_, worker.events_destroyed_);
+    };
+    const auto native = CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;
+    const auto runtime = CollectiveGraphCaptureAuthority::RuntimeBackend;
+    probe(true, native, false, true, false, false, false, true);
+    probe(false, native, false, true, false, false, false, false);
+    probe(true, runtime, false, true, false, false, false, false);
+    probe(true, runtime, true, true, false, false, false, false);
+    probe(true, native, true, true, false, false, false, false);
+    probe(true, native, false, false, false, false, false, false);
+    probe(true, native, false, true, true, false, false, false);
+    probe(true, native, false, true, false, true, false, false);
+    probe(true, native, false, true, false, false, true, false);
 }

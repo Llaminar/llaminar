@@ -118,6 +118,45 @@ inline const std::vector<ModelParityCase>& qwen4ExpConsumerLocalTP2AdaptiveSourc
     return cases;
 }
 
+/** @return Six original ROCm4 source controls/cache requests; setup MTP expansion stays in the original owner. */
+inline const std::vector<ModelParityCase>& qwen4ExpConsumerLocalTP4AdaptiveSourceAdmissionSeeds()
+{
+    static const auto cases=[] {
+        auto definition=qwen4ExpConsumerLocalTP4AdaptiveDefinition();
+        definition.features.mtp=ModelParityAxisProfile::Disabled;
+        definition.features.dynamic_speedup_witness=ModelParityDynamicSpeedupWitness::Disabled;
+        definition.model.shared_predictor.reset();definition.model.maximum_mtp_draft_depth=0;
+        std::vector<ModelParityCase> result;
+        for(auto cell:expandModelParityDefinition(definition))
+            if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{}})result.push_back(std::move(cell));
+        if(result.size()!=6)throw std::logic_error("ConsumerLocal TP4 source seed product changed");
+        return result;
+    }();return cases;
+}
+/**
+ * @return Four separately named TP4 movement setup seeds; real execution proof is not a setup result.
+ * @details Preserve original dynamic ordinal/random policies and positive GPU/CPU
+ * tiers. The existing expander adds Off/1/3/Dynamic without a second topology list.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpConsumerLocalTP4MovementSourceAdmissionSeeds()
+{
+    static const auto cases=[]{
+        std::vector<ModelParityCase> result;
+        for(const auto order:{RoutedExpertOwnerOrder::Ordinal,RoutedExpertOwnerOrder::Random})
+            for(const auto backing:{AdaptiveImmutableRowBacking::SSD,AdaptiveImmutableRowBacking::RAM}){
+                auto definition=qwen4ExpConsumerLocalTP4MovementDefinition(backing);
+                definition.features.mtp=ModelParityAxisProfile::Disabled;
+                definition.features.dynamic_speedup_witness=ModelParityDynamicSpeedupWitness::Disabled;
+                definition.model.shared_predictor.reset();definition.model.maximum_mtp_draft_depth=0;
+                for(auto cell:expandModelParityDefinition(definition))
+                    if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{
+                        .owner_order=order,.movement=ModelParityExpertMovement::Dynamic}})
+                        result.push_back(std::move(cell));
+            }
+        if(result.size()!=4)throw std::logic_error("TP4 movement lost its exact original setup seeds");
+        return result;
+    }();return cases;
+}
 /**
  * @return Source-only GPU-adaptive seeds retaining all existing expert policies.
  * @note The numerical GPU-adaptive family intentionally remains its original
@@ -555,5 +594,34 @@ inline const std::vector<ModelParityCase> &qwen4ExpRejectedSourceAdmissionCases(
         return result;
     }();
     return cases;
+}
+/** @return Original StaticOrdinal C0/C64 shared-source seeds; existing expansion supplies Off/1/3/Dynamic. */
+inline const std::vector<ModelParityCase>& qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds()
+{
+    static const auto cases=[] {
+        std::vector<ModelParityCase> result;
+        for(auto cell:expandModelParityDefinition(qwen4ExpSharedCoordinatorTP2AdaptiveDefinition()))
+            if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{}})result.push_back(std::move(cell));
+        if(result.size()!=2)throw std::logic_error("Shared coordinator source family lost its C0/C64 original product");
+        return result;
+    }();
+    return cases;
+}
+/** @return Distinct CUDA TP2 +ROCm-storage C0/C64 source seeds; original MTP expansion retains all four lanes. */
+inline const std::vector<ModelParityCase>& qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmissionSeeds()
+{
+    static const auto cases=[] {
+        std::vector<ModelParityCase> result;
+        for(auto cell:expandModelParityDefinition(qwen4ExpSharedCoordinatorCUDATP2AdaptiveDefinition()))
+            if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{}})result.push_back(std::move(cell));
+        if(result.size()!=2)throw std::logic_error("CUDA shared coordinator source family lost its C0/C64 original product");
+        return result;
+    }();
+    return cases;
+}
+/** @return The same twelve production-default source controls, without speculative policy expansion. */
+inline const std::vector<ModelParityCase>& qwen4ExpHardwareProductionSourceAdmissionCases()
+{
+    return qwen4ExpHardwareProductionSourceCases();
 }
 } // namespace llaminar2::test::parity::qwen4exp

@@ -70,7 +70,7 @@ void IPooledImmutableNativeKernels::enqueue(n::OwnerAction action,PooledImmutabl
     stream(exact);storage.roots_->requireInitialized();inputs.require(action,storage.plan_);
     if(backend()!=storage.plan_.parameters().device.type)throw std::invalid_argument("Pooled owner phase selected a foreign backend bundle");
     ownerAliases(action,inputs,storage.roots(),storage.plan_);
-    launch(action,{storage.plan_.parameters(),storage.roots_->address(0),storage.roots_->address(1),storage.roots_->address(2),inputs.native()},exact);
+    launch(action,{storage.plan_.parameters(),storage.roots_->address(0),storage.roots_->address(1),storage.roots_->address(2),inputs.native(),storage.invocationReceiveCompletion(exact)},exact);
 }
 void IPooledImmutableNativeKernels::enqueue(n::CoordinatorAction action,PooledImmutableCoordinatorPreparedStorage& storage,
     const PooledImmutableCoordinatorOperands& inputs,void* exact)const

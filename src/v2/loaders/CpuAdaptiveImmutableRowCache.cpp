@@ -2,7 +2,8 @@
  * @file CpuAdaptiveImmutableRowCache.cpp
  * @brief Exact PMA-backed native host caching with bounded hashed lookup and deterministic replacement.
  *
- * The private SSD source authenticates original bytes even for warm cache hits.
+ * The private original RAM or bounded-SSD source authenticates bytes even for warm cache hits.
+ * Full RAM owns the table once and has no redundant bounded RAM cache slots.
  * Miss responses use caller storage. Pins remove slots from a fixed eligibility
  * heap, permitting immediate all-pinned progress without allocation or waiting.
  * Lazy frequency aging follows published logical accesses, never a wall clock.
@@ -122,7 +123,7 @@ CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::forSu
     if((gpu_slots && layout.gpuCoordinator()!=requester) || (!gpu_slots && layout.gpuCoordinator()))
         throw std::invalid_argument("Subordinate CPU source requester differs from the actual GPU coordinator");
     if(layout.sourceServices().size()!=1 || layout.sourceServices().front().allocator!=host)
-        throw std::invalid_argument("Subordinate CPU source requires its sole original rank-local SSD service");
+        throw std::invalid_argument("Subordinate CPU source requires its sole original rank-local host service");
     return project(layout,host,static_cast<std::size_t>(layout.maximumInflightRows()),policy,requester);
 }
 CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPUs(
@@ -154,17 +155,17 @@ CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::proje
     if(host.world_rank<0 || !host.device.is_cpu() || !maximum_live_rows || maximum_live_rows>=None ||
         !policy.aging_accesses || !policy.protected_denominator || policy.protected_numerator>policy.protected_denominator)
         throw std::invalid_argument("CPU row cache requires exact host, representable live rows and valid policy");
-    if(layout.residency()!=ImmutableRowTableResidency::Adaptive || !layout.tiers().contains(ImmutableRowStorage::MemoryMapped) ||
+    if(layout.residency()!=ImmutableRowTableResidency::Adaptive || layout.sourceServices().empty() ||
         ((!requester) && (layout.gpuCoordinator() || layout.gpuDirectoryRecordBound())) ||
         !layout.replicaGroups().empty() || !layout.fixedRanges().empty())
-        throw std::invalid_argument("CPU row cache requires a host-coordinated adaptive SSD domain, not GPU grants or fixed copies");
+        throw std::invalid_argument("CPU row cache requires a host-coordinated adaptive native host domain, not GPU grants or fixed copies");
     // A resolved layout's request bound is the sole capacity authority. Raw
     // component geometry may leave it unspecified and bind it here once.
     if(layout.maximumInflightRows() && layout.maximumInflightRows()!=maximum_live_rows)
         throw std::invalid_argument("CPU row cache live-row capacity differs from its declared request envelope");
     const ImmutableRowTableSourceService *service=nullptr;
     for(const auto &s:layout.sourceServices())if(s.allocator==host)service=&s;
-    if(!service)throw std::invalid_argument("CPU row cache has no exact local original SSD source service");
+    if(!service)throw std::invalid_argument("CPU row cache has no exact local original host source service");
     CpuAdaptiveImmutableRowCacheGeometry g(layout.extent(),host,service->windows,
         ImmutableRowTableHostPlacement::taskPolicy(),policy);
     g.requester_=requester;
@@ -721,4 +722,8 @@ void CpuAdaptiveImmutableRowCache::ReadGrant::release() noexcept {
         rows[i].slot=None;
     }
 }
+}
+
+namespace llaminar2 {
+ImmutableRowStorage CpuAdaptiveImmutableRowCache::sourceStorage() const noexcept {return impl_->geometry.sourceStorage();}
 }

@@ -365,12 +365,14 @@ inline nlohmann::json qfnOriginalSourceStat(const std::filesystem::path &path)
  * @brief Bind an actual source owner to its frozen reference metadata.
  * @param descriptor Original shard or inactive predictor descriptor.
  * @param path Actual ordered ModelContext source path.
- * @return Actual passive stat descriptor, after exact original identity equality.
+ * @return Complete current stat descriptor after persistent reference metadata validation.
  * @throws std::invalid_argument For malformed or replaced original source metadata.
  *
  * object_identity remains the shared schema's JSON-serialized string. Comparing
- * all six stat fields prevents a same-size pre-admission replacement from
- * borrowing a reference source identity. No whole-model content hash is used.
+ * path/inode/extent/timestamps prevents a same-size pre-admission replacement
+ * from borrowing a reference source identity. Linux may renumber st_dev across
+ * boots; its original value is observational, while the complete returned current
+ * descriptor remains strict for before/after runtime checks. No payload is hashed.
  */
 inline nlohmann::json qfnRequireOriginalSourceStat(const nlohmann::json &descriptor,
                                                 const std::filesystem::path &path)
@@ -383,8 +385,11 @@ inline nlohmann::json qfnRequireOriginalSourceStat(const nlohmann::json &descrip
     for (const char *field : {"device", "inode", "bytes", "mtime_ns", "ctime_ns"})
         requireQFN(original.contains(field) && original.at(field).is_number_integer(),
                    "QFN original source stat fields must retain integer precision");
-    requireQFN(original == actual && descriptor.at("path") == actual.at("path") &&
-               descriptor.at("bytes") == actual.at("bytes"),
+    requireQFN(original.at("device") >= 0, "QFN original device number is invalid");
+    for (const char *field : {"path", "inode", "bytes", "mtime_ns", "ctime_ns"})
+        requireQFN(original.at(field) == actual.at(field),
+                   "QFN original source stat identity changed since reference publication");
+    requireQFN(descriptor.at("path") == actual.at("path") && descriptor.at("bytes") == actual.at("bytes"),
                "QFN original source stat identity changed since reference publication");
     return actual;
 }

@@ -358,3 +358,22 @@ TEST(GPUAdaptiveImmutableLookupCohortGeometry, ExistingSingleOwnerSpellingRetain
             EXPECT_EQ(original.mandatoryDeviceBytes(), explicit_cohort.mandatoryDeviceBytes(fixture.coordinator));
         }
 }
+
+/** @test Complete RAM source eligibility preserves exact GPU owner/coordinator and C0/positive slot contracts. */
+TEST(GPUAdaptiveImmutableLookupCohortGeometry, FullRAMSourceKeepsOriginalPhysicalOwnerAndCoordinatorGuards){
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(const auto count:{1u,2u,4u})for(const bool positive:{false,true}){
+        Cohort original(count,backend,false,0);std::vector<std::uint32_t> slots(count,positive?3u:0u);
+        const auto ssd=original.layout(slots);auto owners=std::vector<ImmutableRowTableLayoutOwner>(ssd.owners().begin(),ssd.owners().end());
+        for(auto& owner:owners)if(owner.key.tier==ImmutableRowStorage::RAM)owner.cache_rows=0;
+        const auto ram=ImmutableRowTableLayoutGeometry::checked(ssd.extent(),
+            ImmutableRowTableTiers::of(std::array{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM}),ssd.residency(),owners,
+            std::vector<Allocator>(ssd.consumers().begin(),ssd.consumers().end()),{},
+            {{original.host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM)}},{},ssd.gpuCoordinator(),ssd.maximumInflightRows());
+        const auto actual=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(ram,original.order,original.coordinator);
+        EXPECT_EQ(actual.coordinator(),original.coordinator);ASSERT_EQ(actual.owners().size(),count);
+        for(std::size_t index=0;index<count;++index){EXPECT_EQ(actual.owners()[index].allocator,original.order[index]);EXPECT_EQ(actual.owners()[index].slots,slots[index]);}
+        EXPECT_THROW(q::PooledImmutablePhysicalOwnerGeometry::fromLayout(ram,original.order,{0,DeviceId(backend,99)}),std::invalid_argument);
+        EXPECT_THROW(q::PooledImmutablePhysicalOwnerGeometry::fromLayout(ram,original.order,original.host),std::invalid_argument);
+        if(count>1){auto duplicate=original.order;duplicate.back()=duplicate.front();EXPECT_THROW(q::PooledImmutablePhysicalOwnerGeometry::fromLayout(ram,duplicate,original.coordinator),std::invalid_argument);}
+    }
+}

@@ -1,4 +1,3 @@
-#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 /**
  * @file Qwen4ExpPLEBuilder.cpp
  * @brief Wire native lexical lookup and prepared projections as one flat model block.
@@ -10,6 +9,8 @@
  * state crosses to a second authority while constructing or running the graph.
  */
 #include "Qwen4ExpPLEBuilder.h"
+#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
+#include "execution/qwen4exp/PooledImmutableReplicatedReaderGraph.h"
 #include "backends/ReadAheadNativeResourceFamily.h"
 #include "../GEMMStage.h"
 #include "../NativeAllGatherStage.h"
@@ -248,10 +249,48 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
                 std::forward<decltype(operands)>(operands)...);
         };
         const auto edge=appendSource(
-            original,qwen4exp::PooledNativeTensorSpan{ids,b.ids.buffer,b.ids.byteOffset,std::size_t{expanded.physicalRows()}*sizeof(std::uint64_t)},
+            original,qwen4exp::PooledNativeTensorSpan{ids,b.ids.buffer,b.ids.byteOffset,static_cast<std::size_t>(expanded.physicalRows())*sizeof(std::uint64_t)},
             std::move(countSpan),pooled->control,
-            qwen4exp::PooledNativeTensorSpan{output,b.embedding.buffer,b.embedding.byteOffset,std::size_t{expanded.physicalRows()}*c.nativeRowElements*sizeof(float)},
+            qwen4exp::PooledNativeTensorSpan{output,b.embedding.buffer,b.embedding.byteOffset,static_cast<std::size_t>(expanded.physicalRows())*c.nativeRowElements*sizeof(float)},
             c.prefix+"pooled",gather);
+        lookupTerminal=edge.last;
+    }
+    else if(auto* reader=std::get_if<Qwen4ExpPooledReaderLookupStorage>(&storage))
+    {
+        require(reader->arena && reader->participants,
+            "PLE reader requires its original shared source participants and local arena");
+        const auto transport=reader->participants->transport();
+        require(transport && transport->readerGeometry() &&
+            transport->readerGeometry()->coordinator().device!=c.device,
+            "PLE reader cannot replace the original source coordinator");
+        const auto* native=c.rows.liveRows?std::get_if<Qwen4ExpNativeIntInput>(&c.rows.liveRows->value):nullptr;
+        require(!c.rows.liveRows || (native && native->owner==c.device && native->capacity==1 && native->data),
+            "PLE reader requires its original native query-count producer");
+        const auto original=native?DeviceRowRange::deviceCounted(c.rows.capacity,native->data):
+            DeviceRowRange::fullyActive(c.rows.capacity);
+        require(original.captureIdentity()==reader->originalRows.captureIdentity(),
+            "PLE reader changed its original query-count authority");
+        const auto expanded=original.repeatEachRow(16);
+        const auto output=reader->arena->getSharedTensor(b.embedding.buffer);
+        require(output && output.get()==b.embedding.tensor,
+            "PLE reader embedding must belong to its actual participant arena");
+        std::optional<qwen4exp::PooledNativeTensorSpan> count;
+        require(bool(reader->count)==bool(original.countOwner()),
+            "PLE reader lost its original arena-owned query-count root");
+        if(reader->count)
+        {
+            const auto root=reader->arena->getSharedTensor(reader->count->buffer);
+            require(root && root.get()==reader->count->tensor,
+                "PLE reader count must belong to its actual participant arena");
+            count=qwen4exp::PooledNativeTensorSpan{root,reader->count->buffer,
+                reader->count->byteOffset,sizeof(std::int32_t)};
+        }
+        pooledGraph.emplace();
+        const auto edge=appendPooledReplicatedReader(*pooledGraph,*reader->arena,transport,
+            reader->control,expanded,
+            qwen4exp::PooledNativeTensorSpan{output,b.embedding.buffer,b.embedding.byteOffset,
+                static_cast<std::size_t>(expanded.physicalRows())*c.nativeRowElements*sizeof(float)},
+            c.prefix+"pooled_reader",gather,std::move(count));
         lookupTerminal=edge.last;
     }
     else if(auto *fixed=std::get_if<Qwen4ExpFixedHeadLookupStorage>(&storage))

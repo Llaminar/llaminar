@@ -7,7 +7,11 @@
  * resources; no weight/KV allocation or full-model capacity claim is made.
  * Tests initialize actual CUDA/HIP metadata and source owners but never execute
  * a model, lookup arithmetic, generation graph or performance workload.
+ * C0 and positive-cache cases run in distinct registered native processes.
+ * Each owns one immutable source/PMA and one-shot host service; a process root
+ * cannot be transferred to a fresh authority after a physical context reset.
  */
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
 #include "backends/BackendManager.h"
 #include "backends/ExplicitGPUStream.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -27,6 +31,7 @@
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 #include <unistd.h>
 using namespace llaminar2;
 namespace
@@ -34,9 +39,12 @@ namespace
 /** @brief Retire every diagnostic submit before test owners on normal and exceptional exits. */
 struct SetupRetirement final
 {
-    IBackend *backend;DeviceId device;void *stream;
+    IBackend *backend;DeviceId device;void *stream;IWorkerGPUContext &worker;
     /** @brief This is ordinary setup/terminal retirement; no captured hot path is synchronized. */
-    ~SetupRetirement() { if(!backend->synchronizeStream(stream,device.ordinal))std::terminate(); }
+    ~SetupRetirement() noexcept {
+        const auto join=[&]{if(!backend->synchronizeStream(stream,device.ordinal))std::terminate();};
+        try{if(worker.ownsCurrentThread())join();else worker.submitAndWait(join);}catch(...){std::terminate();}
+    }
 };
 /** @return Original source words, never a requantized table or fabricated full resident view. */
 ImmutableRowTableSource nativeSource(const ModelMemoryProfile &profile)
@@ -55,16 +63,14 @@ DevicePlanConfig metadataConsumer(DeviceId device,std::size_t slots)
     policy.window_bytes=65536;policy.window_count=2;
     policy.gpu_adaptive={slots,1u<<20,{}, {4,1u<<20,{}}};c.ngram_execution_policy=policy;return c;
 }
-/** @return Exact observed host capacity without subtracting another subsystem's allocations. */
-PhysicalMemoryResource hostResource()
-{
-    const auto pages=::sysconf(_SC_PHYS_PAGES),available=::sysconf(_SC_AVPHYS_PAGES),page=::sysconf(_SC_PAGESIZE);
-    if(pages<=0 || available<=0 || page<=0)throw std::runtime_error("Native owner fixture has no actual CPU capacity observation");
-    return {0,DeviceId::cpu(),static_cast<std::size_t>(pages)*static_cast<std::size_t>(page),
-        static_cast<std::size_t>(available)*static_cast<std::size_t>(page)};
-}
-/** @brief Validate actual retained claims, source identity and C0/nonzero lifetime on the selected native backend. */
-void prove(DeviceId device)
+/**
+ * @brief Validate original claims and source lifetime for one registered native policy.
+ * @param device Exact CUDA/ROCm participant selected by the native registration.
+ * @param slots Original cache capacity: zero or the positive four-row control.
+ * All native owners and the one-shot host service share this case's original
+ * source/PMA; every original binding, poison, borrow and retirement assertion runs.
+ */
+void prove(DeviceId device,std::size_t slots)
 {
     auto *backend=getBackendFor(device);
     if(!backend || backend->deviceCount()<=device.ordinal)
@@ -73,31 +79,48 @@ void prove(DeviceId device)
     }
     test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());
     const auto &profile=source.metadata().memoryProfile();
-    auto &worker=GPUDeviceContextPool::instance().getContext(device);
-    worker.submitAndWait([&] {
+    if(!hasCPUBackend())initCPUBackend(-1);
+    {
+        SCOPED_TRACE(::testing::Message() << "original cache slots=" << slots);
+        // This registered process owns one admitted source policy. A second
+        // immutable policy is a separate native case: payload retirement cannot
+        // reissue its one-shot CPU service or transfer its persistent process root.
+        auto session=test::PreparedNativeLookupFixture::prepare(std::array{device});
+        auto &worker=*session->permit(device).worker();
         void *stream=ExplicitGPUStream(worker.defaultStream()).get();
-        for(const std::size_t slots:{0u,4u})
+        const auto gpu=session->resource(device),host=session->resource(DeviceId::cpu());
+        auto c=metadataConsumer(device,slots);
+        RetainedHostServiceDeclarations::Builder declaration(0);
+        declaration.addOriginal({0,device,RetainedHostServiceRole::ImmutableLookupIO});
+        c.retained_host_services=std::move(declaration).freeze();
+        const std::vector<std::vector<DevicePlanConfig>> groups{{c}};
+        auto request=MemoryPlanner::immutableRowTableAdmissionRequest(
+            profile,*c.ngram_execution_policy,groups,{},c.ngram_host_placement);
+        ASSERT_TRUE(request);
+        const auto selected=ImmutableRowTablePlacementPlanner::select(*request,MemoryPlanner::plan(profile,{c}).physicalPlan());
+        const auto placement=selected.placement;
+        const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(placement->gpuAdaptiveLayout(),
+            nativeSource(profile),placement->gpuAdaptiveRequest());
+        PhysicalMemoryPlanBuilder payload(geometry.mandatoryBOM(gpu,host));
+        const auto optional=geometry.cacheBOM(gpu,host);
+        for(const auto &bom:optional.resources())payload.add(bom);
+        const auto service=c.retained_host_services->bom({0,device,RetainedHostServiceRole::ImmutableLookupIO},host);
+        for(const auto &bom:service.resources())payload.add(bom);
+        const auto component=payload.build();
+        session->admit(component);
+        const auto memory=session->memory();
         {
-            auto c=metadataConsumer(device,slots);const std::vector<std::vector<DevicePlanConfig>> groups{{c}};
-            auto request=MemoryPlanner::immutableRowTableAdmissionRequest(
-                profile,*c.ngram_execution_policy,groups,{},c.ngram_host_placement);
-            ASSERT_TRUE(request);const auto frozen=MemoryPlanner::plan(profile,{c}).physicalPlan();
-            const auto selected=ImmutableRowTablePlacementPlanner::select(*request,frozen);
-            const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),
-                nativeSource(profile),selected.placement->gpuAdaptiveRequest());
-            const PhysicalMemoryResource gpu{0,device,backend->deviceMemoryTotal(device.ordinal),backend->deviceMemoryFree(device.ordinal)};
-            const auto host=hostResource();PhysicalMemoryPlanBuilder admitted(geometry.mandatoryBOM(gpu,host));
-            const auto optional=geometry.cacheBOM(gpu,host);for(const auto &bom:optional.resources())admitted.add(bom);
-            const auto component=admitted.build();
-            auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(component),0);
             auto context=ModelContext::create(file.path());ASSERT_TRUE(context);
+            context->bindNativeContextPreparation(session->source());
+            const RetainedHostServiceInstance service{0,device,RetainedHostServiceRole::ImmutableLookupIO};
+            context->bindRetainedHostServices(c.retained_host_services,memory,std::array{service});
             GraphConfig graphConfig;
             graphConfig.default_device = device;
             graphConfig.max_seq_len = c.max_seq_len;
             graphConfig.max_activation_rows = c.activation_seq_len;
             graphConfig.max_request_count = 1;
             Qwen4ExpGraphConfigBuilder::populateFromDirectory(context->model(), graphConfig);
-            graphConfig.ngram_table_placement = selected.placement;
+            graphConfig.ngram_table_placement = placement;
             auto graph = std::make_unique<Qwen4ExpGraph>(graphConfig);
             graph->setModelContext(context);
             graph->bindStorageMemoryAuthority(memory);
@@ -107,7 +130,7 @@ void prove(DeviceId device)
             // All owners declared above survive this guard's terminal wait on
             // exceptional assertion exits. Successful boundary teardown also
             // independently retains/proves its ordinary setup frontier.
-            SetupRetirement retire{backend,device,stream};
+            SetupRetirement retire{backend,device,stream,worker};
             ASSERT_FALSE(context->resolvedImmutableRowTablePlacement());
             ASSERT_NO_THROW(graph->setArena(declarationArena.get()));
             EXPECT_FALSE(context->adaptiveImmutableLookupBoundary(device));
@@ -131,9 +154,9 @@ void prove(DeviceId device)
                 PhysicalMemoryMaterializationKind::NewAllocation),0u);
             EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,
                 PhysicalMemoryMaterializationKind::NewAllocation),0u);
-            context->prepareImmutableRowTableForConsumer(*selected.placement,memory,device,std::nullopt,
+            context->prepareImmutableRowTableForConsumer(*placement,memory,device,std::nullopt,
                 TransferEngine::instance(),AdaptiveImmutableLookupDevicePreparation{device,stream});
-            context->requireImmutableRowTablePlacementComplete(*selected.placement,memory);
+            context->requireImmutableRowTablePlacementComplete(*placement,memory);
             boundary=context->adaptiveImmutableLookupBoundary(device);ASSERT_TRUE(boundary);
             roots={boundary->pooledStorage()->owner()->roots(),boundary->pooledStorage()->coordinator()->roots(),boundary->pooledStorage()->roots()};
             ASSERT_TRUE(boundary->isPooled());ASSERT_TRUE(roots[0].frame);ASSERT_TRUE(roots[0].native);
@@ -154,7 +177,7 @@ void prove(DeviceId device)
                 ASSERT_TRUE(differentRequest);
                 const auto differentPlacement=ImmutableRowTablePlacementPlanner::select(
                     *differentRequest,MemoryPlanner::plan(profile,{different}).physicalPlan()).placement;
-                ASSERT_NE(*differentPlacement,*selected.placement);
+                ASSERT_NE(*differentPlacement,*placement);
                 auto differentConfig=graphConfig;
                 differentConfig.ngram_table_placement=differentPlacement;
                 Qwen4ExpGraph differentGraph(differentConfig);
@@ -202,18 +225,18 @@ void prove(DeviceId device)
             EXPECT_EQ(actualHost.tableStorageBytes(),hostLines->bytes(PhysicalMemoryOwner::ImmutableTableStorage));
             EXPECT_EQ(actualHost.lookupStagingBytes(),hostLines->bytes(PhysicalMemoryOwner::ImmutableLookupStaging));
             const auto identity=boundary->captureIdentity();const auto frame=roots[0].frame.get();const auto protocol=roots[0].native.get();
-            context->prepareImmutableRowTableForConsumer(*selected.placement,memory,device,std::nullopt,TransferEngine::instance());
+            context->prepareImmutableRowTableForConsumer(*placement,memory,device,std::nullopt,TransferEngine::instance(),AdaptiveImmutableLookupDevicePreparation{device,stream});
             EXPECT_EQ(context->adaptiveImmutableLookupBoundary(device).get(),boundary.get());
             EXPECT_EQ(boundary->captureIdentity(),identity);EXPECT_EQ(boundary->pooledStorage()->owner()->roots().frame.get(),frame);
             EXPECT_EQ(boundary->pooledStorage()->owner()->roots().native.get(),protocol);
             auto foreign=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(component),0);
-            EXPECT_THROW(context->prepareImmutableRowTableForConsumer(*selected.placement,foreign,device,std::nullopt,TransferEngine::instance()),std::logic_error);
+            EXPECT_THROW(context->prepareImmutableRowTableForConsumer(*placement,foreign,device,std::nullopt,TransferEngine::instance(),AdaptiveImmutableLookupDevicePreparation{device,stream}),std::logic_error);
             EXPECT_THROW(boundary->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),nativeSource(profile),foreign),std::logic_error);
-            auto changed=selected.placement->gpuAdaptiveRequest();++changed.gpu_policy.aging_accesses;
-            const auto changedPlan=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),nativeSource(profile),changed);
+            auto changed=placement->gpuAdaptiveRequest();++changed.gpu_policy.aging_accesses;
+            const auto changedPlan=AdaptiveImmutableLookupGeometry::fromLayout(placement->gpuAdaptiveLayout(),nativeSource(profile),changed);
             EXPECT_THROW(boundary->pooledStorage()->requireFor(changedPlan.physical(),changedPlan.coordinator(),nativeSource(profile),memory),std::logic_error);
             EXPECT_EQ(boundary->captureIdentity(),identity);
-            EXPECT_TRUE(backend->synchronizeStream(stream,device.ordinal));
+            worker.submitAndWait([&]{EXPECT_TRUE(backend->synchronizeStream(stream,device.ordinal));});
             graph.reset();
             context.reset();provider.reset();
             // Every component root/provider/channel above was issued through
@@ -244,12 +267,20 @@ void prove(DeviceId device)
             EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableTableStorage,
                 PhysicalMemoryMaterializationKind::NewAllocation),0u);
         }
-    });
+        // All model, graph, service and inspected-root borrows end before the
+        // original preparation is retired. Physical context reset is observed;
+        // its process-runtime commitment remains with this original source/PMA.
+        session->requirePayloadRetired();
+        session->retire();
+        session->requireExactRetired();
+    }
 }
 }
 #ifdef HAVE_CUDA
-TEST(GPUAdaptiveImmutableLookupOwners, CUDA){prove(DeviceId::cuda(0));}
+TEST(GPUAdaptiveImmutableLookupOwners, CUDA){prove(DeviceId::cuda(0),0);}
+TEST(GPUAdaptiveImmutableLookupOwners, CUDAPositive){prove(DeviceId::cuda(0),4);}
 #endif
 #ifdef HAVE_ROCM
-TEST(GPUAdaptiveImmutableLookupOwners, ROCm){prove(DeviceId::rocm(0));}
+TEST(GPUAdaptiveImmutableLookupOwners, ROCm){prove(DeviceId::rocm(0),0);}
+TEST(GPUAdaptiveImmutableLookupOwners, ROCmPositive){prove(DeviceId::rocm(0),4);}
 #endif

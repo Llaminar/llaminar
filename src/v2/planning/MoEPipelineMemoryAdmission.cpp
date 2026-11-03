@@ -9,6 +9,7 @@
  * CPU serial storage declarations survive admission and runtime projection.
  */
 #include "planning/MoEPipelineMemoryAdmission.h"
+#include "backends/NativeContextPreparation.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PlanningHostServiceEvidence.h"
@@ -19,8 +20,38 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Bind one original cold source into a runtime copy without changing topology.
+         * @param plan Parent or child runtime projection, still before fixed/optional planning.
+         * @param source Exact serving source; null preserves source-free discovery only.
+         * @throws std::logic_error For an absent/replaced inherited owner or an unfrozen/foreign source.
+         */
+        void bindOriginalPipelineSource(RankExecutionPlan& plan,
+            const std::shared_ptr<NativeContextPreparation>& source)
+        {
+            const auto& inherited=plan.runtime.native_context_preparation;
+            if(inherited && (!source || inherited.get()!=source.get() ||
+                inherited.owner_before(source) || source.owner_before(inherited)))
+                throw std::logic_error("Pipeline admission cannot omit or replace its original native source");
+            if(source){
+                if(source->memory()->worldRank()!=plan.rank ||
+                    source->memory()->phase()!=PhysicalMemoryAuthorityPhase::Preparing)
+                    throw std::logic_error("Pipeline admission requires its original Preparing rank source");
+                (void)source->mandatoryBOM(); // Requires the original closed planning snapshot.
+            }
+            plan.runtime.native_context_preparation=source;
+        }
+    }
     void AdmittedMoEPipelineMemory::publishRuntimeCapacity(RuntimeConfig &runtime) const
     {
+        const auto& original=rank_plan_.runtime.native_context_preparation;
+        const auto& current=runtime.native_context_preparation;
+        if(current && (!original || current.get()!=original.get() ||
+            current.owner_before(original) || original.owner_before(current)))
+            throw std::logic_error("Pipeline capacity publication cannot replace its original native source");
+        runtime.native_context_preparation=original;
         runtime.resident_graph_rows = rank_plan_.runtime.resident_graph_rows;
         runtime.moe_routed_prefill.overlay_segment_rows = rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows;
         runtime.ngram_table_placement = rank_plan_.runtime.ngram_table_placement;
@@ -35,7 +66,7 @@ namespace llaminar2
         const MoEPipelineMemoryPolicy &policy)
     {
         const auto &profile = model.memoryProfile();
-        const auto &parent = topology.rankPlan();
+        auto parent = topology.rankPlan();
         if (topology.pipelineStages().size() < 2 || topology.overlayExecution() ||
             topology.config().moe_routed_expert_plan || !parent.usesLocalPP() ||
             inventory.world_size != 1 || inventory.ranks.size() != 1 || parent.rank != 0 ||
@@ -46,6 +77,10 @@ namespace llaminar2
                 [](int rows) { return rows <= 0; }))
             throw std::invalid_argument("MoE pipeline admission requires one complete local topology, source and capture policy");
 
+        // The immutable topology predates serving-context preparation. Carry
+        // the actual already-created owner through runtime copies before the
+        // existing shared fixed-BOM planner deduplicates it across all stages.
+        bindOriginalPipelineSource(parent,policy.native_context_preparation);
         AdmittedMoEPipelineMemory result(parent);
         result.stages_.reserve(topology.pipelineStages().size());
         const auto &mtp = parent.runtime.mtp;
@@ -62,6 +97,7 @@ namespace llaminar2
             // Stage storage is reserved before borrowed planner inputs exist.
             // Nonterminal children retain verifier rows but no predictor weights.
             AdmittedMoEPipelineStage stage(child);
+            bindOriginalPipelineSource(stage.rank_plan_,policy.native_context_preparation);
             const auto &scope = child.scope();
             const int routed_count = scope.has_lm_head
                 ? family.routedLayerCapacity() - scope.first_layer : scope.layerCount();

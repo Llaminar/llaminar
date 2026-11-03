@@ -193,6 +193,9 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         std::shared_ptr<const ResolvedImmutableRowTablePlacement> resolvedImmutableRowTablePlacement() const override;
 
 
+        /** @return Immutable complete original lookup setup capacities, absent before validation. */
+        std::shared_ptr<const ImmutableLookupSetupObservation> immutableLookupSetupObservation()const override;
+
         /** @brief Borrow one original-format whole/range GPU owner; every graph family shares its exact storage. */
         std::shared_ptr<const ResidentImmutableRowTable> residentImmutableRowTable(DeviceId device) const override;
         /** @brief Borrow the source-owned adaptive boundary; original roots and live claims survive the last graph borrow. */
@@ -364,6 +367,8 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
                      WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED);
 
         std::string model_path_;
+        /** Original rank inventory owner retained for cold transport-policy authentication. */
+        std::shared_ptr<IMPIContext> immutable_source_mpi_;
         std::unique_ptr<TensorFactory> owned_test_factory_; // For createForTesting() only - must be declared BEFORE loader_!
         ModelLoader loader_;
         std::shared_ptr<WeightManager> weight_manager_;
@@ -403,7 +408,11 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         std::exception_ptr immutable_row_table_preparation_failure_;
 
         std::shared_ptr<HostImmutableRowProvider> host_row_provider_;
-        /** @brief Original GPU-local roots and remote companion preparation for one actual PLE consumer. */
+        /**
+         * @brief Original per-compute preparation entry, never a duplicate source authority.
+         * ConsumerLocal and the shared coordinator retain a real boundary. A shared
+         * foreign reader retains only the SAME participant authority, with no CPU channel.
+         */
         struct AdaptiveLookupConsumer
         {
             std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
@@ -414,6 +423,7 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         std::map<DeviceId,AdaptiveLookupConsumer> adaptive_lookup_consumers_;
         std::shared_ptr<qwen4exp::ImmutableLookupService> adaptive_lookup_service_; ///< One original shared provider/worker and closed channel population.
         std::shared_ptr<const ResolvedImmutableRowTablePlacement> immutable_row_table_placement_;
+        mutable std::shared_ptr<const ImmutableLookupSetupObservation> immutable_lookup_setup_observation_;
         std::map<DeviceId, std::shared_ptr<const ResidentImmutableRowTable>> resident_row_tables_;
         std::shared_ptr<PhysicalMemoryAuthority> immutable_row_table_authority_;
 

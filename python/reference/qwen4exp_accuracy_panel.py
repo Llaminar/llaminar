@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # Reuse existing CI metadata identity and v2 row schema authority, not a duplicate
 # digest or teacher-position formula. These imports do not start native work.
 sys.path.insert(0, str(ROOT/'scripts/ci'))
-from model_kld_corpus import metadata_digest
+from model_kld_corpus import metadata_digest, require_reference_file_identity
 from model_kld_corpus_v2 import expected_rows
 
 ORIGINAL_PROMPT = 'The quick brown fox jumps over the lazy dog'
@@ -167,6 +167,32 @@ def original_source(model, tokenizer_path, shared_predictor=None):
             name=Path(stat['path']).name, path=stat['path'], bytes=stat['bytes'],
             object_identity=json.dumps(stat, sort_keys=True, separators=(',', ':')))
     return source
+
+
+
+def require_frozen_source(reference, actual):
+    """Validate frozen source policy and file identities without rewriting the reference.
+
+    File device numbers may change between boots; every other source/descriptor
+    field remains exact. The actual source is retained for strict runtime reuse.
+    """
+    if type(reference) is not dict or type(actual) is not dict or set(reference) != set(actual):
+        raise ValueError('Actual admitted reference source differs from frozen original')
+    for key in reference:
+        if key not in ('shards', 'shared_predictor'):
+            if reference[key] != actual[key]:
+                raise ValueError('Actual admitted reference source differs from frozen original')
+            continue
+        old = reference[key] if key == 'shards' else [reference[key]]
+        new = actual[key] if key == 'shards' else [actual[key]]
+        if type(old) is not list or type(new) is not list or len(old) != len(new):
+            raise ValueError('Frozen original source inventory changed')
+        for expected, observed in zip(old, new):
+            if (type(expected) is not dict or type(observed) is not dict or set(expected) != set(observed) or
+                    'object_identity' not in expected or
+                    any(expected[field] != observed[field] for field in expected if field != 'object_identity')):
+                raise ValueError('Frozen original source descriptor changed')
+            require_reference_file_identity(json.loads(expected['object_identity']), json.loads(observed['object_identity']))
 
 
 def _publish_json(path, document):

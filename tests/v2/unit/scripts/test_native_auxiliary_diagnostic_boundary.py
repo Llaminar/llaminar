@@ -187,6 +187,16 @@ class DiagnosticBoundary(unittest.TestCase):
         errors=self.mutation("Unrelated.cpp","void rogue(){test::PooledNativeProgramDiagnosticAccess::side();}\n")
         self.assertTrue(any("raw diagnostic friend" in error for error in errors),errors)
 
+    def test_remote_diagnostic_friend_cannot_authorize_source_graph_lifecycle(self):
+        """Neither ordinary source tokens nor auxiliary branches grant raw replay access."""
+        for name in ("IRetainedGraphParticipants.h", "IGraphCaptureAuxiliaryBranch.h"):
+            with self.subTest(header=name):
+                relative = "local_execution/graph/" + name
+                body = (SOURCE / "src/v2/execution" / relative).read_text()
+                body += "\nnamespace llaminar2 { namespace test { struct PooledRemoteGraphHostReplayAccess; } }\n"
+                errors = self.mutation(relative, body)
+                self.assertTrue(any("remote host replay friend" in error for error in errors), errors)
+
     def test_negative_macro_from_unrelated_production_header(self):
         errors=self.mutation("Unrelated.h","#define LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC 1\n")
         self.assertTrue(any("diagnostic target macro" in error for error in errors),errors)

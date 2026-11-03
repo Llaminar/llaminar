@@ -205,6 +205,17 @@ public:
         const WorkspaceMemoryGeometry& geometry);
 
     /**
+     * @brief Serial startup envelope for one original resident GPU expert.
+     * @param profile Original stacked expert metadata; its expert count is not rewritten.
+     * @param geometry Exact physical device and owned model-layer interval.
+     * @return Shared named workspace for the actual decode/prefill/verifier probe rows.
+     * @throws std::invalid_argument For incomplete source metadata or a non-GPU owner.
+     */
+    static size_t estimatePreparedExpertService(
+        const ModelMemoryProfile& profile,
+        const WorkspaceMemoryGeometry& geometry);
+
+    /**
      * @brief Estimate one sparse ExpertOverlay endpoint's invocation workspace.
      *
      * This covers both legal endpoint graph forms without charging terminal

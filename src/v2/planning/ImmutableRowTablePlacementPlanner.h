@@ -47,7 +47,26 @@ public:
      */
     ImmutableRowTablePlacementInput withGPUCacheResources(const ImmutableRowTablePolicy &requested,
         std::span<const PhysicalMemoryResource> original_resources) const;
-    /** @return Exact owner/coordinator observations; ConsumerLocal returns its original consumers. */
+    /** @brief Attach the original exact-subset peer classification before any source BOM is produced.
+     * @param coverage Inventory-owned classification; None selects mapped payload; Complete selects producer-owned peer payload.
+     * @return Same immutable source input retaining the explicit observed topology.
+     * @throws std::invalid_argument For Partial/unknown coverage or absent declared storage membership.
+     */
+    ImmutableRowTablePlacementInput withGPUCachePeerAccess(PeerAccessCoverage coverage) const;
+    /** @return Frozen peer observation; it is metadata, not local materialization authority. */
+    std::optional<PeerAccessCoverage> gpuCachePeerAccess() const noexcept { return gpu_peer_access_; }
+    /**
+     * @brief Retain the exact original coordinator-to-reader transport facts before BOM pricing.
+     * @param edges Complete foreign-reader population, separately from storage-owner facts.
+     * @return Same input with canonical checked endpoint ordering.
+     * @throws std::invalid_argument For foreign, missing, duplicate or Partial observations.
+     */
+    ImmutableRowTablePlacementInput withReaderPeerAccess(
+        std::span<const ImmutableRowTableReaderPeerAccess> edges) const;
+    /** @return Frozen reader-edge facts, never local native construction authority. */
+    std::span<const ImmutableRowTableReaderPeerAccess> readerPeerAccess() const noexcept
+    { return reader_peer_access_; }
+    /** @return Exact owner/coordinator/reader observations; ConsumerLocal returns its original consumers. */
     std::span<const PhysicalMemoryResource> gpuResources() const noexcept
     { return gpu_resources_.empty()?std::span<const PhysicalMemoryResource>{consumers_}:std::span<const PhysicalMemoryResource>{gpu_resources_}; }
     /**
@@ -84,7 +103,7 @@ public:
      * @param host_slots Final candidate subordinate RAM slots, including zero.
      * @param maximum_live_ids Original pre-quota ID envelope, never compact miss count.
      * @return Sole checked source/owner/consumer layout; no allocation/admission is issued.
-     * @throws std::invalid_argument For multiple/non-GPU consumers or excessive slot/request geometry.
+     * @throws std::invalid_argument For unauthenticated/non-GPU consumers or excessive slot/request geometry.
      */
     ImmutableRowTableLayoutGeometry gpuAdaptiveLayout(const ImmutableRowTablePolicy &requested,
         std::size_t gpu_slots,std::size_t host_slots,std::size_t maximum_live_ids) const;
@@ -107,6 +126,8 @@ private:
     PhysicalMemoryResource host_;
     std::vector<PhysicalMemoryResource> consumers_;
     std::optional<AdaptiveGPUCachePlacementRequest> gpu_placement_; ///< Exact declaration authenticated against original observations.
+    std::optional<PeerAccessCoverage> gpu_peer_access_;
+    std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access_;
     std::vector<PhysicalMemoryResource> gpu_resources_; ///< Source participants never become graph consumers.
 };
 /**

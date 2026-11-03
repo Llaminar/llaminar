@@ -47,16 +47,20 @@ namespace llaminar2
             "rank-batch transport does not own node-local shared return rows");
     }
 
-    std::string makeMoEOverlayRankBatchChannelIdentity(
+    namespace
+    {
+    /** @brief Canonical identity shared by independently typed endpoint scopes. */
+    std::string rankBatchChannelIdentity(
         int tier_index,
         int domain_ordinal,
         int source_world_rank,
         int target_world_rank,
-        std::span<const int> participant_ids)
+        std::span<const int> participant_ids,
+        bool rank_local)
     {
         if (tier_index < 0 || domain_ordinal < 0 ||
             source_world_rank < 0 || target_world_rank < 0 ||
-            source_world_rank == target_world_rank || participant_ids.empty())
+            ((source_world_rank == target_world_rank) != rank_local) || participant_ids.empty())
         {
             throw std::invalid_argument(
                 "MoE rank-batch channel identity requires complete remote-rank topology");
@@ -81,6 +85,25 @@ namespace llaminar2
         return identity.str();
     }
 
+    } // namespace
+
+    std::string makeMoEOverlayRankBatchChannelIdentity(
+        int tier_index, int domain_ordinal,
+        int source_world_rank, int target_world_rank,
+        std::span<const int> participant_ids)
+    {
+        return rankBatchChannelIdentity(tier_index, domain_ordinal,
+            source_world_rank, target_world_rank, participant_ids, false);
+    }
+
+    std::string makeMoEOverlayRankLocalGPUChannelIdentity(
+        int tier_index, int domain_ordinal, int original_world_rank,
+        std::span<const int> participant_ids)
+    {
+        return rankBatchChannelIdentity(tier_index, domain_ordinal,
+            original_world_rank, original_world_rank, participant_ids, true);
+    }
+
     void MoEOverlayRankBatchTransportRegistry::install(
         std::string channel_identity,
         std::shared_ptr<IMoEOverlayRankBatchTransport> transport)
@@ -88,7 +111,6 @@ namespace llaminar2
         if (channel_identity.empty() || !transport ||
             transport->sourceWorldRank() < 0 ||
             transport->targetWorldRank() < 0 ||
-            transport->sourceWorldRank() == transport->targetWorldRank() ||
             transport->participantIds().empty())
         {
             throw std::invalid_argument(
@@ -517,7 +539,7 @@ namespace llaminar2
     {
         if (generation_id == 0 || layer_idx < 0 || tier_idx < 0 ||
             domain_ordinal < 0 || source_world_rank < 0 ||
-            target_world_rank < 0 || source_world_rank == target_world_rank)
+            target_world_rank < 0)
         {
             return false;
         }

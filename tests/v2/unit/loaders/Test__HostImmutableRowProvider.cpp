@@ -321,3 +321,39 @@ TEST(HostImmutableRowProvider, RetainedOwnerObservationRejectsStaleSourceWithout
     }
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Full native RAM is owned once across two/four original consumer aliases and final source retirement. */
+TEST(HostImmutableRowProvider, FullRAMSubordinateSourceSharesExactOriginalOwnerAcrossConsumers){
+    for(const std::size_t count:{2u,4u}){
+        NativeFile file;std::vector<PhysicalMemoryAllocatorIdentity> consumers;
+        std::vector<ImmutableRowTableLayoutOwner> owners{{{hostId,Storage::RAM},0,0,{}}};
+        for(std::size_t i=0;i<count;++i){consumers.push_back({0,DeviceId::cuda(i)});owners.push_back({{consumers.back(),Storage::VRAM},0,0,{}});}
+        const auto layout=ImmutableRowTableLayoutGeometry::checked(
+            ImmutableRowTableExtent::fromNative(file.source.format,file.source.rows,file.source.rowBytes()),
+            ImmutableRowTableTiers::of(std::array{Storage::VRAM,Storage::RAM}),ImmutableRowTableResidency::Adaptive,
+            owners,consumers,{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(Storage::RAM)}},{},std::nullopt,8,
+            ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal);
+        const auto declared=Geometry::forSubordinateGPUs(layout,hostId);
+        EXPECT_EQ(declared.sourceStorage(),Storage::RAM);EXPECT_EQ(declared.slots(),0u);EXPECT_EQ(declared.storageBytes(),0u);
+        EXPECT_EQ(declared.sourceBytes(),ImmutableRowTable::physicalBytes(file.source,ImmutableRowTableStoragePolicy::forStorage(Storage::RAM)));
+        auto authority=memory(declared.bom(hostResource()));
+        auto original=Provider::fromSubordinateAdaptiveCache(Cache::create(file.source,declared,authority));
+        EXPECT_EQ(original->mode(),HostImmutableRowMode::AdaptiveFullRAM);
+        const auto observation=original->retainedOwnerObservation();EXPECT_EQ(observation.tableStorageBytes(),declared.sourceBytes());
+        EXPECT_EQ(observation.lookupStagingBytes(),declared.executionBytes());EXPECT_EQ(original->subordinateRequesters().size(),count);
+        std::vector<std::shared_ptr<Provider>> readers(count,original);
+        for(const auto& reader:readers){EXPECT_EQ(reader.get(),original.get());EXPECT_EQ(reader->identity(),original->identity());
+            EXPECT_EQ(reader->retainedOwnerObservation().authority(),observation.authority());}
+        EXPECT_EQ(claimed(authority,PhysicalMemoryOwner::ImmutableTableStorage),declared.sourceBytes());
+        original.reset();
+        for(std::size_t i=0;i<count-1;++i){readers[i].reset();EXPECT_EQ(claimed(authority,PhysicalMemoryOwner::ImmutableTableStorage),declared.sourceBytes());}
+        const auto source=readers.back()->sourceStats();EXPECT_EQ(source.storage,Storage::RAM);EXPECT_EQ(source.window_misses,0u);
+        ASSERT_EQ(::ftruncate(file.fd,file.original.size()+1),0);
+        EXPECT_THROW(readers.back()->authenticateSource(),std::runtime_error);
+        EXPECT_EQ(claimed(authority,PhysicalMemoryOwner::ImmutableTableStorage),declared.sourceBytes());
+        readers.back().reset();EXPECT_EQ(claimed(authority,PhysicalMemoryOwner::ImmutableTableStorage),0u);
+        EXPECT_EQ(claimed(authority,PhysicalMemoryOwner::ImmutableLookupStaging),0u);
+    }
+}
+}

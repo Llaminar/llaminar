@@ -2,7 +2,8 @@
  * @file ImmutableRowTableAdmissionWire.cpp
  * @brief Authenticate bounded setup-only table candidate metadata with no payload reads.
  *
- * Version10 also retains predictor head ownership beside resolved arithmetic and
+ * Version16 carries explicit adaptive host backing; older frames cannot silently
+ * supply SSD defaults. Predictor head ownership remains beside resolved arithmetic and
  * the original attention schedule. Unknown values reject before narrowing; reloadable debug
  * state is never consulted when restoring an admitted remote provision.
  * Sender frames serialize and authenticate within readiness consensus before
@@ -18,7 +19,7 @@ namespace llaminar2
 {
 namespace
 {
-    constexpr std::uint32_t Magic = 0x4e475231u, Version = 13;
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 16;
     /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
     constexpr std::array QfnLayoutWords{
         &Qwen4ExpMemoryGeometry::residual_width,
@@ -178,6 +179,7 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
         append(out,a.maximum_cache_rows);append(out,static_cast<std::uint64_t>(a.cache_physical_byte_limit));
         append(out,a.policy.aging_accesses);append(out,a.policy.protected_numerator);append(out,a.policy.protected_denominator);
         const auto &g=request.requested.gpu_adaptive;
+        append(out,static_cast<std::uint32_t>(g.source_backing));
         append(out,g.maximum_gpu_cache_rows);append(out,static_cast<std::uint64_t>(g.gpu_cache_physical_byte_limit));
         append(out,g.gpu_policy.aging_accesses);append(out,g.gpu_policy.protected_numerator);append(out,g.gpu_policy.protected_denominator);
         append(out,g.host.maximum_cache_rows);append(out,static_cast<std::uint64_t>(g.host.cache_physical_byte_limit));
@@ -200,6 +202,14 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
         for(const auto &consumer:request.input.consumers()) resource(out,consumer);
         append(out,count(request.input.gpuResources().size()));
         for(const auto &device:request.input.gpuResources())resource(out,device);
+        append(out, static_cast<std::uint32_t>(request.input.gpuCachePeerAccess().has_value()));
+        if (request.input.gpuCachePeerAccess()) append(out, static_cast<std::uint32_t>(*request.input.gpuCachePeerAccess()));
+        append(out, count(request.input.readerPeerAccess().size()));
+        for (const auto &edge : request.input.readerPeerAccess()) {
+            participant(out, {edge.coordinator.world_rank, edge.coordinator.device.type, edge.coordinator.device.ordinal});
+            participant(out, {edge.reader.world_rank, edge.reader.device.type, edge.reader.device.ordinal});
+            append(out, static_cast<std::uint32_t>(edge.coverage));
+        }
         append(out,static_cast<std::uint32_t>(request.contributions.vram.has_value()));
         if(request.contributions.vram) plan(out,*request.contributions.vram);
         plan(out,request.contributions.ram);plan(out,request.contributions.mmap);
@@ -316,13 +326,24 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
         policy.host_adaptive.policy.protected_numerator=in.read<std::uint32_t>();
         policy.host_adaptive.policy.protected_denominator=in.read<std::uint32_t>();
         auto &g=policy.gpu_adaptive;
+        const auto backing=in.read<std::uint32_t>();
+        // Validate the complete wire value before narrowing to the uint8 enum;
+        // 256/257 must never alias the declared SSD/RAM arms.
+        if(backing!=static_cast<std::uint32_t>(AdaptiveImmutableRowBacking::SSD) &&
+           backing!=static_cast<std::uint32_t>(AdaptiveImmutableRowBacking::RAM))
+            throw std::invalid_argument("Unknown full-width adaptive source backing in ngram wire");
+        g.source_backing=static_cast<AdaptiveImmutableRowBacking>(backing);
         g.maximum_gpu_cache_rows=in.read<std::uint64_t>();g.gpu_cache_physical_byte_limit=size(in);
         g.gpu_policy.aging_accesses=in.read<std::uint64_t>();g.gpu_policy.protected_numerator=in.read<std::uint32_t>();
         g.gpu_policy.protected_denominator=in.read<std::uint32_t>();
         g.host.maximum_cache_rows=in.read<std::uint64_t>();g.host.cache_physical_byte_limit=size(in);
         g.host.policy.aging_accesses=in.read<std::uint64_t>();g.host.policy.protected_numerator=in.read<std::uint32_t>();
         g.host.policy.protected_denominator=in.read<std::uint32_t>();
-        g.placement.mode=static_cast<AdaptiveGPUCachePlacementMode>(in.read<std::uint32_t>());
+        const auto placementMode=in.read<std::uint32_t>();
+        if(placementMode!=static_cast<std::uint32_t>(AdaptiveGPUCachePlacementMode::ConsumerLocal) &&
+           placementMode!=static_cast<std::uint32_t>(AdaptiveGPUCachePlacementMode::DeclaredRankLocal))
+            throw std::invalid_argument("Unknown full-width adaptive GPU placement in ngram wire");
+        g.placement.mode=static_cast<AdaptiveGPUCachePlacementMode>(placementMode);
         const auto owner_count=in.read<std::uint32_t>();
         if(owner_count>in.remaining()/28u)throw std::invalid_argument("GPU owner declaration exceeds its wire frame");
         for(std::uint32_t i=0;i<owner_count;++i)
@@ -361,6 +382,23 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                    gpu_resources[i].total_bytes!=observed[i].total_bytes || gpu_resources[i].admission_available_bytes!=observed[i].admission_available_bytes)
                     throw std::invalid_argument("Non-adaptive wire changed original consumer observations");
         }
+        const auto peerArm = in.read<std::uint32_t>();
+        if (peerArm > 1) throw std::invalid_argument("Invalid pooled peer observation arm");
+        if (peerArm) {
+            const auto coverage = static_cast<PeerAccessCoverage>(in.read<std::uint32_t>());
+            input = input.withGPUCachePeerAccess(coverage);
+        }
+        const auto reader_edges = in.read<std::uint32_t>();
+        if (reader_edges > in.remaining() / 28u)
+            throw std::invalid_argument("Shared reader edge count exceeds its admission frame");
+        std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access;
+        for (std::uint32_t i = 0; i < reader_edges; ++i) {
+            const auto coordinator = participant(in, expected_rank);
+            const auto reader = participant(in, expected_rank);
+            reader_peer_access.push_back({{coordinator.world_rank, coordinator.device()},
+                {reader.world_rank, reader.device()}, static_cast<PeerAccessCoverage>(in.read<std::uint32_t>())});
+        }
+        if (reader_edges) input = input.withReaderPeerAccess(reader_peer_access);
         const auto available=in.read<std::uint32_t>();
         if(available>1u) throw std::invalid_argument("Ngram admission wire eligibility is invalid");
         std::optional<PhysicalMemoryPlan> vram;

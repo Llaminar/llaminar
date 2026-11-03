@@ -6005,6 +6005,15 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDABackend::enableCapturedTransferPeerAccess(int device_id, int peer_device_id)
+    {
+        if (device_id < 0 || peer_device_id < 0 || device_id == peer_device_id) return false;
+        if (cudaSetDevice(device_id) != cudaSuccess) return false;
+        const auto status = cudaDeviceEnablePeerAccess(peer_device_id, 0);
+        if (status == cudaErrorPeerAccessAlreadyEnabled) { (void)cudaGetLastError(); return true; }
+        return status == cudaSuccess;
+    }
+
     bool CUDABackend::prepareCapturedTransferChannelKernels(
         int device_id, int timeout_ms, std::uint64_t *timeout_ticks)
     {

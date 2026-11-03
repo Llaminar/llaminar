@@ -9,6 +9,9 @@
  * retains one complete transaction, never a host-submitted list of model stages.
  */
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
+#include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
+#include "interfaces/IModelContext.h"
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include "DeviceGraphOrchestrator.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
@@ -126,22 +129,70 @@ DeviceGraphOrchestrator::retainedStorageSourceAdmission() const
     return {declared,session_epoch_};
 }
 
+bool DeviceGraphOrchestrator::sharedPooledQueryOnlyReader() const
+{
+    if (!graph_builder_) return false;
+    const auto& graph = graph_builder_->config();
+    const auto& placement = graph.ngram_table_placement;
+    if (!placement || !placement->isGPUAdaptive() ||
+        placement->gpuAdaptiveLayout().consumers().size() <= 1 ||
+        placement->gpuAdaptiveRequest().placement.mode != AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+        return false;
+    const auto& declaration = placement->gpuAdaptiveRequest().placement;
+    if (!declaration.coordinator)
+        throw std::logic_error("Shared reader terminal lost its authored source coordinator");
+    if (declaration.coordinator->device() == state_.device_id) return false;
+    const auto& cohort = graph.ngram_replicated_ple_cohort;
+    if (!cohort || !injected_model_ctx_ || cohort->modelOwner() != injected_model_ctx_.get() ||
+        cohort->placement() != *placement || &cohort->context() != graph.tp_ctx)
+        throw std::logic_error("Shared reader terminal lost its original Rank/model/native collective");
+    cohort->requireConsumer(state_.device_id, graph.tp_device_idx);
+    const auto original = injected_model_ctx_->adaptiveImmutableLookupParticipants(state_.device_id);
+    if (!original || !original->transport()->readerGeometry() ||
+        retained_storage_boundary_ || graph_builder_->retainedStorageBoundary(state_.device_id))
+        throw std::logic_error("Shared reader terminal cannot borrow or invent a CPU source boundary");
+    original->requireForPolicy(graph);
+    return true;
+}
+
 bool DeviceGraphOrchestrator::finishGroupedDeviceResidentGeneration(DeviceGenerationTerminalResult* result)
 {
     const auto boundary=std::dynamic_pointer_cast<qwen4exp::ImmutableLookupExecutionBoundary>(retained_storage_boundary_);
-    if(!boundary||!boundary->requiresSourceGroupAdmission())
-        throw std::logic_error("Grouped terminal materialization requires its original grouped source boundary");
-    return finishDeviceResidentGenerationImpl(result,RetainedStorageTerminalPhase::PublishOnly);
+    if (boundary && boundary->requiresSourceGroupAdmission())
+        return finishDeviceResidentGenerationImpl(result,RetainedStorageTerminalPhase::PublishOnly);
+    if (!sharedPooledQueryOnlyReader())
+        throw std::logic_error("Grouped terminal materialization requires its original source or query-only reader");
+    // No CPU close belongs to this participant. Its existing terminal bridge
+    // still records/joins the exact native endpoint completion before returning.
+    return finishDeviceResidentGenerationImpl(result,RetainedStorageTerminalPhase::PublishAndAwait);
 }
 void DeviceGraphOrchestrator::awaitGroupedRetainedStorageTerminal()
 {
-    const auto boundary=std::dynamic_pointer_cast<qwen4exp::ImmutableLookupExecutionBoundary>(retained_storage_boundary_);
-    if(!boundary||!boundary->requiresSourceGroupAdmission())
+    const auto [declared, epoch] = retainedStorageSourceAdmission();
+    (void)epoch;
+    const auto boundary = std::dynamic_pointer_cast<qwen4exp::ImmutableLookupExecutionBoundary>(declared);
+    if (!boundary) {
+        if (!sharedPooledQueryOnlyReader())
+            throw std::logic_error("Grouped terminal await lost its original query-only reader");
+        // Rank reaches this private aggregation edge only after every ordinary
+        // terminal bridge, or after its reset producer-join phase below. Both
+        // record this same original event for the current invocation. No CPU
+        // service close, zero byte count or cancellation flag supplies proof.
+        auto* backend = getBackendFor(state_.device_id);
+        if (!backend || !backend->setDevice(state_.device_id.ordinal) ||
+            !device_generation_terminal_host_ready_event_ ||
+            !backend->waitForEvent(device_generation_terminal_host_ready_event_.get(), state_.device_id.ordinal))
+            throw std::runtime_error("Shared reader original native terminal completion is unproven");
+        return;
+    }
+    if (!boundary->requiresSourceGroupAdmission())
         throw std::logic_error("Grouped terminal await requires its original grouped source boundary");
     if(!boundary->hasActiveInterval()){
         retained_storage_reset_close_prepared_=false;
         return;
     }
+    if (retained_storage_boundary_ != boundary)
+        throw std::logic_error("Active grouped terminal lost its original admitted boundary");
     try{awaitRetainedStorageTerminal();}
     catch(...){
         if(!boundary->hasActiveInterval())retained_storage_reset_close_prepared_=false;
@@ -155,7 +206,8 @@ void DeviceGraphOrchestrator::prepareGroupedRetainedStorageReset(const Inference
     const auto [declared,epoch]=retainedStorageSourceAdmission();
     (void)epoch;
     const auto boundary=std::dynamic_pointer_cast<qwen4exp::ImmutableLookupExecutionBoundary>(declared);
-    if(!boundary||!boundary->requiresSourceGroupAdmission()||!boundary->hasActiveInterval())return;
+    const bool reader = !boundary && sharedPooledQueryOnlyReader();
+    if (!reader && (!boundary || !boundary->requiresSourceGroupAdmission() || !boundary->hasActiveInterval())) return;
     auto* backend=getBackendFor(state_.device_id);
     if(!backend||!backend->setDevice(state_.device_id.ordinal))
         throw std::runtime_error("Original grouped reset could not activate its exact GPU");
@@ -166,6 +218,15 @@ void DeviceGraphOrchestrator::prepareGroupedRetainedStorageReset(const Inference
     auto* stream=explicitGPUStreamForOperation("requestStateResetTransaction");
     if(!joinPriorDeviceWorkForRequestStateReset(stream,"grouped-source-terminal",RetainedStorageTerminalPhase::PublishOnly))
         throw std::runtime_error("Original grouped reset could not join prior GPU producers");
+    if (reader) {
+        // The same original reset stream has joined all queued producers. An
+        // unlaunched peer has no work to fabricate; recording its existing
+        // event here proves this exact frontier before any channel is retired.
+        if (!device_generation_terminal_host_ready_event_ ||
+            !backend->recordEvent(device_generation_terminal_host_ready_event_.get(), state_.device_id.ordinal, stream) ||
+            !backend->waitForEvent(device_generation_terminal_host_ready_event_.get(), state_.device_id.ordinal))
+            throw std::runtime_error("Shared reader reset could not prove its original native endpoint frontier");
+    }
 }
 
 void DeviceGraphOrchestrator::prepareRetainedStorageBinding()
@@ -430,7 +491,17 @@ bool DeviceGraphOrchestrator::bindRetainedStorageSubmissionStream(
     if (!graph_builder_)
         return fail("Retained storage parent binding requires its original graph builder");
     const auto boundary = graph_builder_->retainedStorageBoundary(state_.device_id);
-    if (!boundary) return true;
+    if (!boundary){
+        if(!sharedPooledQueryOnlyReader())return true;
+        const auto participants=injected_model_ctx_->adaptiveImmutableLookupParticipants(state_.device_id);
+        if(!participants->hasEmbeddedParticipant(state_.device_id))return true;
+        const auto original=participants->originalParticipant(state_.device_id);
+        if(original.memory().get()!=physical_memory_authority_.get() ||
+           original.memory().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(original.memory()))
+            return fail("Embedded reader parent lost its original physical-memory authority");
+        participants->bindEmbeddedParentSubmissionStream(RetainedGraphParticipantParentStream(original,stream));
+        return true;
+    }
     auto original = boundary->retainedParticipantSource();
     if (!original) return true;
     const auto& config = graph_builder_->config();

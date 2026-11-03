@@ -8,6 +8,7 @@
  */
 #include "fixtures/qwen4exp/PooledImmutableNativeReplayBytes.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOps.h"
+#include "kernels/qwen4exp/PooledImmutableOwnerRecordValidation.h"
 #include "kernels/qwen4exp/PooledImmutableNativePlan.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOperands.h"
 #include "kernels/qwen4exp/PooledImmutableSourceOps.h"
@@ -2340,4 +2341,224 @@ TEST(PooledImmutableNative, RecordedSnapshotAlignmentAndActualOwnerReplay)
     EXPECT_EQ(n::ownerView<a::Slot64>(original).frame->phase,p::OwnerPhase::Reserving);
 }
 
+/** @test GPU-used per-record fields match the independent scalar oracle before any physical mutation. */
+TEST(PooledImmutableNative, CooperativePinRecordFieldsMatchIndependentScalarReplay)
+{
+    constexpr unsigned count=257;
+    Pool pool(std::array{count},count,a::Policy{65536,1,2},std::nullopt,count);
+    std::vector<std::uint64_t> rows(count);
+    for(unsigned i=0;i<count;++i)rows[i]=100+i;
+    ASSERT_NO_THROW(pool.complete(rows));
+    auto& x=pool.owners.front()->args;
+    auto coordinator=p::CoordinatorOperations(pool.view());
+    ASSERT_TRUE(coordinator.begin(2,rows.data(),rows.size()));
+    n::invocation(pool.args);
+    x.input={pool.invocation(),nullptr,nullptr,nullptr,nullptr,nullptr};
+    ASSERT_TRUE((n::owner<n::OwnerAction::Begin,a::Slot64>(x)));
+    std::vector<p::OwnerCommand> original(count);
+    for(unsigned i=0;i<count;++i)ASSERT_TRUE(coordinator.pinCommand(i,original[i]));
+    const auto view=n::ownerView<a::Slot64>(x);
+    for(const auto position:{0u,count-1})for(unsigned defect=0;defect<18;++defect){
+        SCOPED_TRACE(::testing::Message()<<"position="<<position<<" defect="<<defect);
+        auto commands=original;
+        auto& command=commands[position];
+        auto& grant=command.target;
+        auto& slot=view.slots[grant.slot];
+        const auto originalSlot=slot;
+        const auto prior=position?commands[position-1].ordinal.value:view.frame->last_command;
+        switch(defect){
+        case 1:command.kind=p::CommandKind::ReserveFree;break;
+        case 2:command.reserved=1;break;
+        case 3:++grant.interval.table;break;
+        case 4:grant.kind=p::GrantKind::Reservation;break;
+        case 5:grant.destination_token=1;break;
+        case 6:grant.unique=x.input.invocation->unique_rows;break;
+        case 7:grant.row=x.plan.owner.sourceRows();break;
+        case 8:++grant.owner;break;
+        case 9:grant.slot=x.plan.owner.capacity();break;
+        case 10:grant.generation=0;break;
+        case 11:++command.requested_row;break;
+        case 12:command.ordinal.value=prior;break;
+        case 13:++slot.row;break;
+        case 14:++slot.generation;break;
+        case 15:slot.flags=0;break;
+        case 16:a::PhysicalSlot<a::Slot64>::pin(slot);break;
+        case 17:slot.flags|=0x80000000u;break;
+        default:break;
+        }
+        const auto expectedSlot=slot;
+        view.frame->status=a::Status::Success;
+        bool recordsValid=true;
+        for(unsigned i=0;i<count;++i){
+            const auto previous=i?commands[i-1].ordinal.value:view.frame->last_command;
+            recordsValid=n::record_validation::pin<a::Slot64>(x,commands[i],previous) && recordsValid;
+        }
+        EXPECT_EQ(view.frame->status,a::Status::Success);
+        const bool scalarValid=n::validatePinFields<a::Slot64>(x,commands.data(),commands.size());
+        EXPECT_EQ(recordsValid,scalarValid);
+        EXPECT_EQ(recordsValid,defect==0 || defect==17);
+        EXPECT_EQ(std::memcmp(&slot,&expectedSlot,sizeof(slot)),0);
+        EXPECT_EQ(view.frame->held_pins,0u);
+        EXPECT_EQ(view.frame->initial_pin_count,0u);
+        if(defect && defect!=17){
+            view.frame->status=a::Status::SourceFailure;
+            EXPECT_FALSE((n::validatePinFields<a::Slot64>(x,commands.data(),commands.size())));
+            EXPECT_EQ(view.frame->status,a::Status::SourceFailure);
+        }
+        slot=originalSlot;
+    }
+    auto invalid=original.front();invalid.target.slot=x.plan.owner.capacity();
+    auto inaccessible=x;inaccessible.cache=nullptr;
+    EXPECT_FALSE((n::record_validation::pin<a::Slot32>(inaccessible,invalid,0)));
+    EXPECT_FALSE((n::record_validation::pin<a::Slot64>(inaccessible,invalid,0)));
 }
+/** @test Retained-field projection checks remain mandatory with zero incoming allocation decisions. */
+TEST(PooledImmutableNative, CooperativeRetainedRecordFieldsMatchZeroIncomingScalarReplay)
+{
+    for(const bool victim:{false,true})for(const unsigned position:{0u,64u})for(unsigned defect=0;defect<4;++defect){
+        Pool pool(std::array{65u},65,a::Policy{65536,1,2},std::nullopt,65);
+        std::vector<std::uint64_t> rows(65);
+        for(unsigned i=0;i<65;++i)rows[i]=100+i;
+        ASSERT_NO_THROW(pool.complete(rows));
+        ASSERT_NO_THROW(pool.begin(rows,2));
+        if(victim)ASSERT_NO_THROW(pool.wave<false>());
+        auto& x=pool.owners.front()->args;
+        auto slots=pool.owners.front()->cache;
+        const auto corrupt=[&](std::size_t){
+            const auto view=n::ownerView<a::Slot64>(x);
+            auto& pin=view.initial_pins[position];
+            if(defect==0)++pin.interval.sequence;
+            if(defect==1)++pin.owner;
+            if(defect==2)pin.kind=p::GrantKind::Reservation;
+            if(defect==3)pin.kind=p::GrantKind::Absent;
+            EXPECT_EQ(n::allocationFrame(x).count,0u);
+            for(unsigned key=0;key<2;++key){
+                bool valid=true;
+                for(unsigned i=0;i<view.frame->initial_pin_count;++i)
+                    valid=n::record_validation::retained(view.initial_pins[i],n::allocationFrame(x).lease.interval,
+                        p::GrantKind::Read,x.plan.owner.coordinate()) && valid;
+                EXPECT_FALSE(valid);
+            }
+        };
+        if(victim)EXPECT_THROW(pool.receivedVictims(corrupt),std::logic_error);
+        else EXPECT_THROW(pool.receivedFree({},corrupt),std::logic_error);
+        EXPECT_EQ(n::allocationFrame(x).count,0u);
+        EXPECT_EQ(n::ownerView<a::Slot64>(x).frame->held_pins,65u);
+        EXPECT_EQ(std::memcmp(pool.owners.front()->cache.data(),slots.data(),slots.blocks.size()*64),0);
+    }
+    const p::Interval interval{701,17,3};
+    p::Grant reservation{};reservation.interval=interval;reservation.owner=2;reservation.kind=p::GrantKind::Reservation;
+    EXPECT_TRUE(n::record_validation::retained(reservation,interval,p::GrantKind::Reservation,2));
+    EXPECT_FALSE(n::record_validation::retained(reservation,interval,p::GrantKind::Read,2));
+}
+
+}
+
+namespace llaminar2::test {
+/** @test Exact original cancellation vetoes empty/positive source success before any request publication. */
+TEST(PooledImmutableNative, OriginalParentCancellationSuppressesSourcePublicationAndSuccess)
+{
+    namespace source=q::pooled_source;
+    for(const bool positive:{false,true})for(const bool cancel:{false,true}){
+        DistributedSourceReplay c({0u,0u});
+        const std::array<std::uint64_t,2> rows{101,102};
+        c.plan(positive?std::span<const std::uint64_t>(rows):std::span<const std::uint64_t>{});c.seals();
+        c.healthy=0; // Original standalone prefill is valid before response admission.
+        auto& io=source::protocol(c.args);
+        const auto issued=io.issuedSequence;
+        EXPECT_EQ(source::prepareRequestPublication(c.args,cancel?23:22,17),positive&&!cancel);
+        if(!cancel){EXPECT_EQ(c.error,0);EXPECT_EQ(io.status,0u);continue;}
+        EXPECT_EQ(source::stage(c.args),source::ResponseStage::Rejected);
+        EXPECT_EQ(io.status,static_cast<std::uint64_t>(q::ImmutableLookupStatus::Cancelled));
+        EXPECT_EQ(io.issuedSequence,issued);
+        EXPECT_EQ(c.error,static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+        EXPECT_EQ(*n::at<std::uint64_t>(c.args.native,c.args.plan.offsets.record_bytes),0u);
+        EXPECT_EQ(*n::at<std::uint64_t>(c.args.native,c.args.plan.offsets.payload_bytes),0u);
+        EXPECT_FALSE(source::beforeReady(c.args));
+        EXPECT_EQ(source::readableRow<a::Slot64>(c.args,0),nullptr);
+        /** @brief Replay acquired worker retirement, not the cancellation flag, as the original drain witness. */
+        struct Retired {
+            std::uint64_t generation=17;
+            std::uint64_t retiredInvocation()const{return 23;}
+            std::uint64_t retiredGeneration()const{return generation;}
+            std::uint64_t completion()const{return 0;}
+        } observed;
+        observed.generation=16;EXPECT_FALSE(source::retireAborted(c.args,observed));
+        observed.generation=17;ASSERT_TRUE(source::retireAborted(c.args,observed));
+        const auto& frontier=source::frontier(c.args);const auto& coordinator=*c.pool.view().frame;
+        EXPECT_EQ(n::sourceGate(n::SourceCondition::AfterSuccess,&frontier,coordinator.interval,
+            c.args.plan.owner.table,coordinator.source),n::SourceGate::Skip);
+        EXPECT_EQ(c.error,static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+    }
+}
+/** @test Original I/O/controller faults remain first when cancellation arrives concurrently. */
+TEST(PooledImmutableNative, OriginalSourcePublicationPreservesFirstErrorOnCancellation)
+{
+    namespace source=q::pooled_source;
+    for(const auto first:{q::ImmutableLookupStatus::TimedOut,q::ImmutableLookupStatus::InvalidProtocol}){
+        DistributedSourceReplay c({0u});c.plan({});c.seals();
+        auto& io=source::protocol(c.args);io.status=static_cast<std::uint64_t>(first);
+        const auto original=static_cast<int>(sampling_math::DeviceGenerationError::InvalidVerifierCounts);
+        c.error=original;
+        EXPECT_FALSE(source::prepareRequestPublication(c.args,23,17));
+        EXPECT_EQ(io.status,static_cast<std::uint64_t>(first));EXPECT_EQ(c.error,original);
+        EXPECT_EQ(source::frontier(c.args).status,a::Status::SourceFailure);
+        EXPECT_FALSE(source::forwardValid(c.args));
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @test Cancellation cannot replace outstanding owner duties or prior errors with an Idle drain. */
+TEST(PooledImmutableNative, CancelledUnlaunchedOwnerRequiresOriginalInitializedDutyFreeIdle)
+{
+    for (const std::uint32_t capacity : {0u, 4u})
+    {
+        const std::array capacities{capacity};
+        Pool pool(capacities);
+        auto& args = pool.owners.front()->args;
+        auto& frame = *n::ownerView<a::Slot64>(args).frame;
+        auto& allocation = n::allocationFrame(args);
+        auto& native = n::progress(args);
+        ASSERT_TRUE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        // Absence of an original cancelled receive never authorizes a drain.
+        EXPECT_FALSE(n::cancelledIdleOwner<a::Slot64>(args, 1));
+        const auto originalFrame = frame;
+        const auto originalAllocation = allocation;
+        const auto originalNative = native;
+        for (const auto phase : {p::OwnerPhase::Pinning, p::OwnerPhase::PinsSealed,
+                 p::OwnerPhase::Filling, p::OwnerPhase::Draining})
+        {
+            frame.phase = phase;
+            EXPECT_FALSE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        }
+        frame = originalFrame;
+        frame.held_pins = 1;
+        EXPECT_FALSE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        frame = originalFrame;
+        frame.reservations = 1;
+        EXPECT_FALSE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        frame = originalFrame;
+        frame.status = a::Status::Invariant;
+        EXPECT_FALSE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        frame = originalFrame;
+        ++frame.interval.table;
+        EXPECT_FALSE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        frame = originalFrame;
+        allocation.phase = p::AllocationPhase::Leased;
+        EXPECT_FALSE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        allocation = originalAllocation;
+        native.initialized = 1;
+        EXPECT_FALSE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        native = originalNative;
+        ++native.setup_identity;
+        EXPECT_FALSE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        native = originalNative;
+        EXPECT_TRUE(n::idleOwnerForCancelledInvocation<a::Slot64>(args));
+        EXPECT_EQ(frame.held_pins, 0u);
+        EXPECT_EQ(frame.reservations, 0u);
+        EXPECT_EQ(frame.status, originalFrame.status);
+    }
+}
+
+} // namespace llaminar2::test

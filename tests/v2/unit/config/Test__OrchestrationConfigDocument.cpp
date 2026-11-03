@@ -565,9 +565,9 @@ namespace
     }
 }
 
-TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtSchemaEleven)
+TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtCurrentSchema)
 {
-    static_assert(kOrchestrationConfigDocumentSchemaVersion == 11);
+    static_assert(kOrchestrationConfigDocumentSchemaVersion == 12);
     for (const auto width : {MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket,
                              MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope,
                              MTPVerifierPhysicalWidthPolicy::ExactLogicalRows})
@@ -582,7 +582,7 @@ TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtSchem
         EXPECT_EQ(decoded.mtp.depth_policy.scope, internal.mtp.depth_policy.scope);
         EXPECT_EQ(serializeOrchestrationConfig(decoded), document);
         const auto json = Json::parse(document);
-        EXPECT_EQ(json.at("schema_version"), 11);
+        EXPECT_EQ(json.at("schema_version"), 12);
         const auto &scope = json.at("configuration").at("mtp").at("depth_policy").at("scope");
         EXPECT_EQ(scope.size(), 10);
         EXPECT_TRUE(scope.at("verifier_width_policy").is_string());
@@ -620,7 +620,9 @@ TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRejectsMalformedFieldsAndOl
         malformed[location][field] = replacement;
         EXPECT_THROW((void)deserializeOrchestrationConfig(malformed.dump()), std::invalid_argument) << field;
     }
-    for (const Json version : {Json(10), Json(12), Json(11.0)})
+    for (const Json version : {Json(kOrchestrationConfigDocumentSchemaVersion - 1),
+                               Json(kOrchestrationConfigDocumentSchemaVersion + 1),
+                               Json(static_cast<double>(kOrchestrationConfigDocumentSchemaVersion))})
     {
         auto old = valid;
         old["schema_version"] = version;
@@ -670,4 +672,17 @@ TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeCannotAuthorStartupOrReques
         request.depth_policy.scope = candidate.mtp.depth_policy.scope;
         EXPECT_TRUE(validateMTPRequestPolicy(request, candidate.mtp).has_value());
     }
+}
+
+/** @test A new explicit backing field never obtains a default from an older or incomplete lossless document. */
+TEST(OrchestrationConfigDocument, AdaptiveFullRAMBackingRejectsOldSchemaAndMissingField){
+    OrchestrationConfig config;config.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    config.ngram_table_policy.gpu_adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;
+    const auto valid=nlohmann::json::parse(serializeOrchestrationConfig(config));EXPECT_EQ(valid.at("schema_version"),12);
+    EXPECT_EQ(deserializeOrchestrationConfig(valid.dump()).ngram_table_policy,config.ngram_table_policy);
+    auto old=valid;old["schema_version"]=11;EXPECT_THROW(deserializeOrchestrationConfig(old.dump()),std::invalid_argument);
+    auto missing=valid;missing["configuration"]["ngram_table_policy"]["gpu_adaptive"].erase("source_backing");
+    EXPECT_THROW(deserializeOrchestrationConfig(missing.dump()),std::invalid_argument);
+    auto foreign=valid;foreign["configuration"]["ngram_table_policy"]["gpu_adaptive"]["source_backing"]="Foreign";
+    EXPECT_THROW(deserializeOrchestrationConfig(foreign.dump()),std::invalid_argument);
 }

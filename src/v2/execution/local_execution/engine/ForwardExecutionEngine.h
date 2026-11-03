@@ -352,6 +352,7 @@ namespace llaminar2
             size_t copy_bytes = 0;
             DeviceId device;
             bool needs_copy = false;
+
         };
 
         /** Resolve exact PP metadata for this invocation, before any copy or graph build. */
@@ -750,6 +751,14 @@ namespace llaminar2
          * resources and live tensors remain untouched.
          */
         virtual void cancelPrefillChunkSnapshotDiagnostics() noexcept {}
+        /** @brief Carry the exact optional source definition through the existing prefill cold boundary. */
+        virtual bool waitAtPrefillGraphCaptureBoundary(const ForwardInput&,DeviceId,const std::string&,void*,
+            LocalTPCaptureSourceDefinition&)
+        {throw std::logic_error("Forward host has no typed prefill source-definition handoff");}
+        /** @brief Carry the exact optional source definition through the existing decode cold boundary. */
+        virtual bool waitAtDecodeGraphCaptureBoundary(const ForwardInput&,DeviceId,const std::string&,void*,
+            LocalTPCaptureSourceDefinition&)
+        {throw std::logic_error("Forward host has no typed decode source-definition handoff");}
     };
 
     /**

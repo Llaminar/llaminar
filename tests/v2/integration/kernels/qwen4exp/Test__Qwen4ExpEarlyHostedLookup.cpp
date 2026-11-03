@@ -9,6 +9,7 @@
  * This component proof does not certify a full model or claim measured overlap.
  */
 #include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
 #include "backends/NativeOrderingEventGroup.h"
 #include "../../../utils/GraphArenaTestHarness.h"
 #include "backends/BackendManager.h"
@@ -116,7 +117,9 @@ void proveEarlyHostedLookup(DeviceId device)
     auto *backend = getBackendFor(device);
     if (!backend || backend->deviceCount() <= device.ordinal)
         GTEST_SKIP() << "Requested native participant unavailable";
-    auto &worker = GPUDeviceContextPool::instance().getContext(device);
+    if(!hasCPUBackend())initCPUBackend(-1);
+    auto session=test::PreparedNativeLookupFixture::prepare(std::array{device});
+    auto &worker=*session->permit(device).worker();
     auto cpu = llaminar::v2::kernels::KernelFactory::createQwen4Exp(DeviceId::cpu());
     worker.submitAndWait([&] {
         constexpr int capacity = 17, hidden = Source::width;
@@ -125,8 +128,8 @@ void proveEarlyHostedLookup(DeviceId device)
         constexpr auto idPoison = std::bit_cast<std::int64_t>(std::uint64_t{0xa5a5a5a5a5a5a5a5});
         const std::array<int, 10> liveSequence{capacity, 1, 0, 15, 2, capacity, 0, 3, 16, 1};
         Source source;
-        const PhysicalMemoryResource host{0,DeviceId::cpu(),1u<<26,1u<<26};
-        const PhysicalMemoryResource gpu{0,device,backend->deviceMemoryTotal(device.ordinal),backend->deviceMemoryFree(device.ordinal)};
+        const auto host=session->resource(DeviceId::cpu());
+        const auto gpu=session->resource(device);
         const auto io=RetainedHostServiceProgram::original(RetainedHostServiceRole::ImmutableLookupIO);
         const auto caseBudget=[&](ImmutableRowStorage tier) {
             const auto policy=ImmutableRowTableStoragePolicy::forStorage(tier,4096,2);
@@ -150,7 +153,8 @@ void proveEarlyHostedLookup(DeviceId device)
         const auto ioBOM=io.bom(host);
         for(const auto& row:ioBOM.resources())joint.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceStorage,row.bytes(PhysicalMemoryOwner::RetainedHostServiceStorage));
         for(std::size_t i=0;i<cases.size();++i)for(const auto& row:ioBOM.resources())joint.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceRuntime,row.bytes(PhysicalMemoryOwner::RetainedHostServiceRuntime));
-        auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(joint.build()),0);
+        session->admit(joint.build());
+        const auto memory=session->memory();
         std::uint64_t ioOrdinal=0;
         for (const auto tier : {ImmutableRowStorage::RAM, ImmutableRowStorage::MemoryMapped}) {
             SCOPED_TRACE(::testing::Message() << device.toString() << " tier=" << static_cast<int>(tier));
@@ -352,6 +356,9 @@ void proveEarlyHostedLookup(DeviceId device)
                 PhysicalMemoryMaterializationKind::NewAllocation), 0u);
         }
     });
+    session->requirePayloadRetired();
+    session->retire();
+    session->requireExactRetired();
 }
 } // namespace
 

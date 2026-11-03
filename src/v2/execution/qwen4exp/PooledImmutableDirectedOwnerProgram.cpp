@@ -127,32 +127,34 @@ std::optional<PooledImmutableDirectedTransferOperation> actualTransfer(const ICo
     return std::nullopt;
 }
 /** @brief Require the exact supported participant relationship before authoring a flat graph. */
-void requirePlacement(PhysicalMemoryAllocatorIdentity coordinator,PhysicalMemoryAllocatorIdentity owner,std::uint32_t coordinate,std::uint32_t participants){
-    if(coordinate>=participants || coordinator.world_rank!=owner.world_rank || !coordinator.device.is_gpu() || !owner.device.is_gpu() ||
-        coordinator.device.type==owner.device.type)
-        throw std::invalid_argument("Directed owner graph program requires its declared rank-local opposite-vendor storage participant");
+void requirePlacement(PhysicalMemoryAllocatorIdentity coordinator, PhysicalMemoryAllocatorIdentity owner,
+    std::uint32_t coordinate, std::uint32_t participants, std::optional<PeerAccessCoverage> observation)
+{
+    if (coordinate >= participants || owner == coordinator)
+        throw std::invalid_argument("Directed owner graph requires its distinct declared storage participant");
+    ImmutableRowTableDirectedTransportPolicy::require(coordinator, owner, observation);
 }
 }
 PooledRemoteGraphProgram PooledImmutableDirectedOwnerProgram::declare(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate){
     const auto native=PooledImmutableOwnerNativePlan::rootOffsets(physical,coordinator,coordinate);const auto& owner=physical.owners()[coordinate];
-    const auto policy=coordinator.parameters();requirePlacement(coordinator.coordinator(),owner.allocator,coordinate,policy.participants());
+    const auto policy=coordinator.parameters();requirePlacement(coordinator.coordinator(),owner.allocator,coordinate,policy.participants(),physical.peerAccess());
     const auto mask=NativeOrderingEventProgram::pooledOwner(owner.cache.bytes!=0).nonemptyRootMask();
     const std::uint32_t bits=physical.rowKeyWidth()==adaptive_lookup::RowKeyWidth::UInt32?32u:64u;
     const PooledRemoteGraphGeometry geometry{coordinator.coordinator(),owner.allocator,coordinate,policy.participants(),owner.slots,
         policy.maximumOriginal(),policy.maximumUnique(),physical.extent().rows(),physical.rowBytes(),physical.slotStride(),
-        layoutIdentity(owner.cache,owner.frame,native),bits,mask};
+        layoutIdentity(owner.cache,owner.frame,native),bits,mask,physical.peerAccess()};
     const auto [digest,limits]=seal(recipe(PooledImmutableDirectedMessageGeometry::fromGeometry(physical,coordinator,coordinate)),native.reply_capacity,bits,mask);
     return PooledRemoteGraphProgram(geometry,digest,limits);
 }
 PooledRemoteGraphProgram PooledImmutableDirectedOwnerProgram::fromOriginalPlans(const PooledImmutableOwnerNativePlan& owner,
     const PooledImmutableCoordinatorNativePlan& coordinator){
     coordinator.requireOwnerPlan(owner);const auto& o=owner.parameters();
-    requirePlacement(coordinator.allocator(),owner.allocator(),o.owner.coordinate(),o.owner.participants());
+    requirePlacement(coordinator.allocator(),owner.allocator(),o.owner.coordinate(),o.owner.participants(),owner.peerAccess());
     const auto mask=NativeOrderingEventProgram::pooledOwner(o.cache.bytes!=0).nonemptyRootMask();
     const std::uint32_t bits=o.owner.rowWidth()==adaptive_lookup::RowKeyWidth::UInt32?32u:64u;
     const PooledRemoteGraphGeometry geometry{coordinator.allocator(),owner.allocator(),o.owner.coordinate(),o.owner.participants(),o.owner.capacity(),
-        o.maximum_original,o.owner.maximumUnique(),o.owner.sourceRows(),o.row_bytes,o.slot_stride,layoutIdentity(o.cache,o.frame,o.native),bits,mask};
+        o.maximum_original,o.owner.maximumUnique(),o.owner.sourceRows(),o.row_bytes,o.slot_stride,layoutIdentity(o.cache,o.frame,o.native),bits,mask,owner.peerAccess()};
     const auto [digest,limits]=seal(recipe(PooledImmutableDirectedMessageGeometry::fromPlan(owner)),o.native.reply_capacity,bits,mask);
     return PooledRemoteGraphProgram(geometry,digest,limits);
 }

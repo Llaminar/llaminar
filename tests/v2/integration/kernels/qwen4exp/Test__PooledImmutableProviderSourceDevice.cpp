@@ -18,6 +18,7 @@
  */
 #include "fixtures/qwen4exp/PooledImmutableNativeReplayBytes.h"
 #include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "planning/ClusterInventoryGatherer.h"
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
 #include "fixtures/execution/RetainedHostServiceCalibrationAccess.h"
 #endif
@@ -260,6 +261,16 @@ TEST(PooledImmutableProviderSourceDevice,ROCmACKReadyCancellationReplay){pooledA
 TEST(PooledImmutableProviderSourceDevice,ROCmProductionColdArenaSealReplay){productionColdArenaSealReplay(DeviceId::rocm(0));}
 TEST(PooledImmutableProviderSourceDevice,ROCmProductionSourceAuthorityRejection){productionSourceAuthorityRejection(DeviceId::rocm(0));}
 #endif
+#ifdef HAVE_CUDA
+/** @test Explicit observed NoPeer mode reuses production capture, live-byte and reset oracles. */
+TEST(PooledImmutableProviderSourceDevice,NoPeerCapturedCUDAConsumerCUDAStorageC0ReadAllFormats){crossVendorReadFormats(DeviceId::cuda(0),DeviceId::cuda(1),0);}
+TEST(PooledImmutableProviderSourceDevice,NoPeerCapturedCUDAConsumerCUDAStoragePositiveReadAllFormats){crossVendorReadFormats(DeviceId::cuda(0),DeviceId::cuda(1),3);}
+#endif
+#ifdef HAVE_ROCM
+/** @test Symmetric ROCm NoPeer mode rejects incompatible hardware rather than substituting transport. */
+TEST(PooledImmutableProviderSourceDevice,NoPeerCapturedROCmConsumerROCmStorageC0ReadAllFormats){crossVendorReadFormats(DeviceId::rocm(0),DeviceId::rocm(1),0);}
+TEST(PooledImmutableProviderSourceDevice,NoPeerCapturedROCmConsumerROCmStoragePositiveReadAllFormats){crossVendorReadFormats(DeviceId::rocm(0),DeviceId::rocm(1),3);}
+#endif
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 /** @test Actual cold reset words, response admission, repeated captured reset and sticky failure across opposite-vendor source owners. */
 TEST(PooledImmutableProviderSourceDevice,CrossVendorCUDAConsumerROCmStorageColdPrefillFirstError){crossVendorColdPrefillLifecycle(DeviceId::cuda(0),DeviceId::rocm(0));}
@@ -419,6 +430,132 @@ TEST(PooledImmutableProviderSourceDevice,CrossVendorROCmConsumer2CUDAOwnersMixed
 /** @test Complete actual cross-vendor 2-owner AllC0 trajectory; hardware absence fails explicitly. */
 TEST(PooledImmutableProviderSourceDevice,CrossVendorROCmConsumer2CUDAOwnersAllC0Replay){crossVendorMultiOwnerTrajectory(DeviceId::rocm(0),{DeviceId::cuda(1),DeviceId::cuda(0)},{0,0});}
 
+#endif
+
+/** @test Immutable record rejection and ordered partial pin commit use the actual captured owner. */
+#ifdef HAVE_CUDA
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinSlotBoundsEarlyRow32)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinSlotBounds,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinSlotBoundsEarlyRow64)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinSlotBounds,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinSlotBoundsLateRow32)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinSlotBounds,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinSlotBoundsLateRow64)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinSlotBounds,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinOrdinalEarlyRow32)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinOrdinal,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinOrdinalEarlyRow64)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinOrdinal,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinOrdinalLateRow32)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinOrdinal,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinOrdinalLateRow64)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinOrdinal,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinCommitFlagsEarlyRow32)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinCommitFlags,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinCommitFlagsEarlyRow64)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinCommitFlags,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinCommitFlagsLateRow32)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinCommitFlags,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsCUDAPinCommitFlagsLateRow64)
+{
+    exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinCommitFlags,false);
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinSlotBoundsEarlyRow32)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinSlotBounds,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinSlotBoundsEarlyRow64)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinSlotBounds,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinSlotBoundsLateRow32)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinSlotBounds,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinSlotBoundsLateRow64)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinSlotBounds,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinOrdinalEarlyRow32)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinOrdinal,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinOrdinalEarlyRow64)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinOrdinal,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinOrdinalLateRow32)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinOrdinal,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinOrdinalLateRow64)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinOrdinal,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinCommitFlagsEarlyRow32)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinCommitFlags,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinCommitFlagsEarlyRow64)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinCommitFlags,true);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinCommitFlagsLateRow32)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,false,identity_fixture::IdentityFault::PinCommitFlags,false);
+}
+/** @test Actual captured immutable-field rejection or original partial-prefix commit. */
+TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinCommitFlagsLateRow64)
+{
+    exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinCommitFlags,false);
+}
 #endif
 
 }

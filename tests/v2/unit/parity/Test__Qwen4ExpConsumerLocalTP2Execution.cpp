@@ -85,3 +85,113 @@ TEST(Qwen4ExpConsumerLocalTP2Execution, ActualExpertMovementAndEconomyRemainSepa
     }
 }
 }
+
+namespace llaminar2::test::parity {
+TEST(Qwen4ExpConsumerLocalTP4Execution, OriginalProductionExpertsBackingAndAllFunctionalAxesRemainExact){
+    const auto definition=qwen4exp::qwen4ExpConsumerLocalTP4AdaptiveDefinition();
+    const auto& plan=*definition.topology.expert_overlay_plan;
+    ASSERT_EQ(plan.domains.front().participants.size(),4u);
+    for(const auto& tier:plan.routed_tiers){EXPECT_EQ(tier.max_experts_per_layer,0);EXPECT_EQ(tier.memory_budget_bytes,0u);}
+    ASSERT_EQ(definition.features.ngram_storage.size(),6u);
+    ASSERT_EQ(qwen4exp::qwen4ExpConsumerLocalTP4AdaptiveSourceAdmissionSeeds().size(),6u);
+    EXPECT_EQ(qwen4exp::qwen4ExpExpandSourceAdmissionMTP(qwen4exp::qwen4ExpConsumerLocalTP4AdaptiveSourceAdmissionSeeds()).size(),24u);
+    {
+        const auto& cells=qwen4exp::qwen4ExpConsumerLocalTP4ExecutionCases();
+        ASSERT_EQ(cells.size(),24u);EXPECT_EQ(qwen4exp::qwen4ExpConsumerLocalTP4NativeExactCases().size(),18u);
+        std::set<std::string> ids;std::map<std::string,ModelParityCase> controls;
+        for(const auto& cell:cells)if(cell.mtp==ModelParityMTP::Off)controls.emplace(cell.testName(),cell);
+        ASSERT_EQ(controls.size(),6u);
+        for(const auto& cell:cells){
+            EXPECT_TRUE(ids.insert(cell.testName()).second);EXPECT_EQ(cell.retained_mtp_draft_capacity,15);
+            EXPECT_FALSE(cell.requiresPhysicalExpertMovement());
+            const auto record=exported(cell);
+            const auto control=record.at("runtime").at("generation").at("serial_control_id").get<std::string>();
+            ASSERT_TRUE(controls.contains(control));
+            EXPECT_EQ(cell.ngram_table_policy,controls.at(control).ngram_table_policy);
+            EXPECT_EQ(cell.topology.expert_overlay_plan,controls.at(control).topology.expert_overlay_plan);
+            EXPECT_FALSE(modelParityDiagnosticBenchmarkArguments(cell).empty());
+            EXPECT_FALSE(cell.e2e_certification);EXPECT_FALSE(cell.paired_workload);
+            if(cell.ngram_table_policy->isGPUAdaptive()){
+                const auto& cache=cell.ngram_table_policy->gpu_adaptive;
+                EXPECT_EQ(cache.placement.mode,AdaptiveGPUCachePlacementMode::ConsumerLocal);
+                EXPECT_TRUE(cache.gpu_cache_physical_byte_limit==(std::size_t{256}<<20) || cache.gpu_cache_physical_byte_limit==(std::size_t{1}<<30));
+                EXPECT_EQ(cache.host.maximum_cache_rows,0u);
+            }
+        }
+    }
+}
+}
+
+namespace llaminar2::test::parity {
+/** @test Positive original tiers and physical-movement obligations survive every MTP view. */
+TEST(Qwen4ExpConsumerLocalTP4Movement, ExactTierBackingAndSerialControlProduct)
+{
+    std::set<std::string> names;
+    for(const auto order:{RoutedExpertOwnerOrder::Ordinal,RoutedExpertOwnerOrder::Random}){
+        const auto& cells=qwen4ExpConsumerLocalTP4MovementCases(order);
+        ASSERT_EQ(cells.size(),8u);
+        EXPECT_EQ(qwen4ExpConsumerLocalTP4MovementNativeExactCases(order).size(),6u);
+        std::map<std::string,ModelParityCase> controls;
+        for(const auto& cell:cells)if(cell.mtp==ModelParityMTP::Off)controls.emplace(cell.testName(),cell);
+        ASSERT_EQ(controls.size(),2u);
+        for(const auto& cell:cells){
+            EXPECT_TRUE(names.insert(cell.testName()).second);
+            EXPECT_TRUE(cell.requiresPhysicalExpertMovement());
+            EXPECT_EQ(cell.requiresObservedConvergenceSpeedup(),cell.mtp==ModelParityMTP::Off);
+            EXPECT_EQ(cell.expert_overlay->owner_order,order);
+            EXPECT_EQ(cell.retained_mtp_draft_capacity,15);
+            const auto& plan=*cell.topology.expert_overlay_plan;
+            ASSERT_EQ(plan.domains.size(),2u);ASSERT_EQ(plan.routed_tiers.size(),2u);
+            EXPECT_EQ(plan.domains.front().participants,(std::vector{GlobalDeviceAddress::rocm(0),
+                GlobalDeviceAddress::rocm(1),GlobalDeviceAddress::rocm(2),GlobalDeviceAddress::rocm(3)}));
+            EXPECT_EQ(plan.domains.back().participants,(std::vector{GlobalDeviceAddress::cpu(0)}));
+            EXPECT_EQ(plan.routed_tiers.front().max_experts_per_layer,384);
+            EXPECT_EQ(plan.routed_tiers.back().max_experts_per_layer,128);
+            EXPECT_TRUE(plan.routed_tiers.back().fallback);
+            ASSERT_TRUE(cell.ngram_table_policy->isGPUAdaptive());
+            const auto& cache=cell.ngram_table_policy->gpu_adaptive;
+            EXPECT_EQ(cache.placement.mode,AdaptiveGPUCachePlacementMode::ConsumerLocal);
+            EXPECT_EQ(cache.gpu_cache_physical_byte_limit,std::size_t{256}<<20);
+            EXPECT_EQ(cache.host.maximum_cache_rows,0u);
+            const auto config=cell.makeOrchestrationConfig(cell.model.model_path,0);
+            EXPECT_EQ(config.moe_rebalance.mode,MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_EQ(config.moe_rebalance.device_min_maintenance_period_tokens,16u);
+            EXPECT_EQ(config.moe_rebalance.device_initial_maintenance_period_tokens,16u);
+            const auto record=exported(cell);
+            const auto id=record.at("runtime").at("generation").at("serial_control_id").get<std::string>();
+            ASSERT_TRUE(controls.contains(id));const auto& control=controls.at(id);
+            EXPECT_EQ(control.topology.expert_overlay_plan,cell.topology.expert_overlay_plan);
+            EXPECT_EQ(control.ngram_table_policy,cell.ngram_table_policy);
+            EXPECT_EQ(control.model.token_ids,cell.model.token_ids);
+            EXPECT_EQ(control.thresholds.kl_threshold,cell.thresholds.kl_threshold);
+            EXPECT_EQ(control.thresholds.cosine_threshold,cell.thresholds.cosine_threshold);
+            EXPECT_FALSE(cell.paired_workload);EXPECT_FALSE(cell.e2e_certification);
+            EXPECT_FALSE(modelParityDiagnosticBenchmarkArguments(cell).empty());
+        }
+    }
+    EXPECT_EQ(names.size(),16u);
+    // The all-resident comparison stays separate and never inherits movement evidence.
+    ASSERT_EQ(qwen4ExpConsumerLocalTP4ExecutionCases().size(),24u);
+    for(const auto& cell:qwen4ExpConsumerLocalTP4ExecutionCases()){
+        EXPECT_FALSE(cell.requiresPhysicalExpertMovement());EXPECT_FALSE(names.contains(cell.testName()));
+        for(const auto& tier:cell.topology.expert_overlay_plan->routed_tiers)EXPECT_EQ(tier.max_experts_per_layer,0);
+    }
+}
+/** @test Setup has all original policies but cannot fabricate request-time movement or panel acceptance. */
+TEST(Qwen4ExpConsumerLocalTP4Movement, SetupProjectionAndRejectedForeignSelectors)
+{
+    const auto& seeds=qwen4ExpConsumerLocalTP4MovementSourceAdmissionSeeds();ASSERT_EQ(seeds.size(),4u);
+    const auto source=qwen4ExpExpandSourceAdmissionMTP(seeds);ASSERT_EQ(source.size(),16u);
+    std::set<std::string> names;
+    for(const auto& cell:source){
+        EXPECT_TRUE(names.insert(cell.testName()).second);EXPECT_TRUE(cell.requiresPhysicalExpertMovement());
+        EXPECT_FALSE(cell.requiresObservedConvergenceSpeedup());
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,cell.mtp==ModelParityMTP::Off?0:15);
+        EXPECT_FALSE(cell.paired_workload);
+        EXPECT_EQ(cell.topology.expert_overlay_plan->routed_tiers.front().max_experts_per_layer,384);
+        EXPECT_EQ(cell.topology.expert_overlay_plan->routed_tiers.back().max_experts_per_layer,128);
+    }
+    EXPECT_THROW(qwen4ExpConsumerLocalTP4MovementDefinition(static_cast<AdaptiveImmutableRowBacking>(99)),std::invalid_argument);
+    EXPECT_THROW(qwen4ExpConsumerLocalTP4MovementCases(static_cast<RoutedExpertOwnerOrder>(99)),std::invalid_argument);
+}
+}

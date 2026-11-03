@@ -46,7 +46,7 @@ if(NOT V2_PERF_TESTS_ONLY)
                 ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "GTEST_DEATH_TEST_STYLE=threadsafe")
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_allowance_gate})
         endforeach()
-        set(_remote_host_cases FlatPreparationRejectsForeignAuthorityAndRetainsNativeFailures RecordedOriginalC0ClaimsSealReplayAndSurviveReset RecordedOriginalPositiveClaimsSealReplayAndSurviveReset
+        set(_remote_host_cases StoragePurposeSurvivesFullyReservedModelAndFailedCreation FlatPreparationRejectsForeignAuthorityAndRetainsNativeFailures RecordedOriginalC0ClaimsSealReplayAndSurviveReset RecordedOriginalPositiveClaimsSealReplayAndSurviveReset
             WrongSourceAndFlatShapeRejectBeforeNativeInstantiation MissingPlannedBytesAndCreatorPrefixKeepPreciseOriginalOwnership
             ExplicitRawDescriptorUsesSameSealWithoutInventedHostLimit FamilySelectionKeepsExactCaptureAndAdmitsOnlyPlannedInstances)
         foreach(_remote_host_case IN LISTS _remote_host_cases)
@@ -60,11 +60,10 @@ if(NOT V2_PERF_TESTS_ONLY)
         endforeach()
     endif()
 
-    add_executable(v2_test_pooled_remote_family_scope unit/backends/Test__PooledRemoteFamilyScope.cpp
-        "${REPO_ROOT}/src/v2/backends/PooledRemoteGraphProgram.cpp")
+    add_executable(v2_test_pooled_remote_family_scope unit/backends/Test__PooledRemoteFamilyScope.cpp)
     if(TARGET v2_test_pooled_remote_family_scope)
         target_include_directories(v2_test_pooled_remote_family_scope PRIVATE "${REPO_ROOT}/src/v2")
-        target_link_libraries(v2_test_pooled_remote_family_scope PRIVATE GTest::gtest_main)
+        target_link_libraries(v2_test_pooled_remote_family_scope PRIVATE llaminar2_core GTest::gtest_main)
         target_compile_features(v2_test_pooled_remote_family_scope PRIVATE cxx_std_23)
         foreach(_family_scope_suite Unit Integration)
             set(_family_scope_gate "V2_${_family_scope_suite}_PooledRemoteFamilyScopeReplay")

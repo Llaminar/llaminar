@@ -15,6 +15,7 @@
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
+#include "backends/RetainedParticipantGraphExecutable.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
@@ -417,8 +418,12 @@ namespace llaminar2
                 .max_graph_rows = 4096, .max_decode_rows = 1, .max_request_count = 1};
         }
 
-        /** @brief Add exact expert matrices for CPU metadata-only workspace admission. */
-        void addRoutedExpertMetadata(ModelMemoryProfile &profile)
+        /**
+         * @brief Add exact expert matrices for metadata-only workspace admission.
+         * @param profile Original fixture geometry receiving the source declarations.
+         * @param format Source format; floating fixtures may use small unquantized widths.
+         */
+        void addRoutedExpertMetadata(ModelMemoryProfile &profile, std::string_view format = "Q8_0")
         {
             for (int layer = 0; layer < profile.n_layers; ++layer)
             for (const auto suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
@@ -426,7 +431,7 @@ namespace llaminar2
                 const int k = std::string_view(suffix) == "ffn_down_exps.weight"
                     ? profile.expert_feed_forward_length : profile.d_model;
                 profile.tensors.push_back({.name = "blk." + std::to_string(layer) + "." + suffix,
-                    .quant_type = "Q8_0", .elements = size_t(profile.expert_count) * profile.d_model *
+                    .quant_type = std::string(format), .elements = size_t(profile.expert_count) * profile.d_model *
                         profile.expert_feed_forward_length, .K = size_t(k), .layer_index = layer});
             }
         }
@@ -1692,6 +1697,170 @@ namespace llaminar2
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,
+         RankLocalGPUActivationBOMKeepsOnePhysicalOwnerAndExactEndpointGrants)
+    {
+        MoERoutedExpertPlacementPlan overlay;
+        overlay.enabled = true;
+        overlay.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        overlay.continuation_domain = "opaque-primary";
+        overlay.base_model_domain = "opaque-primary";
+        overlay.shared_expert_domain = "opaque-primary";
+        overlay.continuation_domain_spec.domain = "opaque-primary";
+        overlay.continuation_domain_spec.logical_root_participant = 0;
+
+        RoutedExpertDomain primary;
+        primary.name = "opaque-primary";
+        primary.scope = ExecutionDomainScope::RANK_LOCAL;
+        primary.participants = {
+            GlobalDeviceAddress::cuda(0),
+            GlobalDeviceAddress::cuda(1),
+        };
+        primary.world_ranks = {0, 0};
+        primary.owner_rank = 0;
+        primary.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+
+        RoutedExpertDomain secondary;
+        secondary.name = "opaque-secondary";
+        secondary.scope = ExecutionDomainScope::RANK_LOCAL;
+        secondary.participants = {
+            GlobalDeviceAddress::rocm(0),
+            GlobalDeviceAddress::rocm(1),
+            GlobalDeviceAddress::rocm(2),
+            GlobalDeviceAddress::rocm(3),
+        };
+        secondary.world_ranks = {0, 0, 0, 0};
+        secondary.owner_rank = 0;
+        secondary.routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+
+        RoutedExpertDomain inter_node;
+        inter_node.name = "opaque-inter-node";
+        inter_node.scope = ExecutionDomainScope::SINGLE;
+        inter_node.participants = {GlobalDeviceAddress::cuda(2)};
+        inter_node.world_ranks = {2};
+        inter_node.owner_rank = 2;
+        inter_node.routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+        RoutedExpertDomain cpu;
+        cpu.name = "original-cpu";
+        cpu.scope = ExecutionDomainScope::SINGLE;
+        cpu.participants = {GlobalDeviceAddress::cpu(0)};
+        cpu.world_ranks = {0};
+        cpu.owner_rank = 0;
+        overlay.domains = {primary, secondary, inter_node, cpu};
+        overlay.routed_tiers = {
+            RoutedExpertTier{
+                .name = "priority-minus-seven",
+                .domain = primary.name,
+                .priority = -7,
+            },
+            RoutedExpertTier{
+                .name = "priority-eleven",
+                .domain = secondary.name,
+                .priority = 11,
+            },
+            RoutedExpertTier{
+                .name = "priority-ninety",
+                .domain = inter_node.name,
+                .priority = 90,
+                .fallback = true,
+            },
+        };
+
+        overlay.routed_tiers.push_back(RoutedExpertTier{
+            .name = "cpu-backing", .domain = cpu.name, .priority = 100,
+        });
+
+        ClusterInventory cluster;
+        cluster.world_size = 3;
+        cluster.ranks.resize(3);
+        for (int rank = 0; rank < 3; ++rank)
+        {
+            cluster.ranks[static_cast<std::size_t>(rank)].rank = rank;
+            cluster.ranks[static_cast<std::size_t>(rank)].node_id =
+                rank == 2 ? 9 : 4;
+            cluster.ranks[static_cast<std::size_t>(rank)].hostname =
+                rank == 2 ? "other-node" : "shared-node";
+        }
+
+        constexpr std::size_t kRows = 8;
+        constexpr int kDModel = 16;
+        constexpr int kTopK = 2;
+        constexpr std::size_t kFamilies = 3;
+        constexpr std::size_t kMatrixBytes =
+            kRows * static_cast<std::size_t>(kDModel) * sizeof(float);
+        constexpr std::size_t kLaneBytes = kFamilies * kMatrixBytes;
+        constexpr std::size_t kCanonicalRouteBytes =
+            kRows * static_cast<std::size_t>(kTopK) *
+            static_cast<std::size_t>(kDModel) * sizeof(float);
+        const auto channel_plan =
+            MoEOverlayActivationChannelPlanner::plan({
+                .placement_plan = &overlay,
+                .cluster_inventory = &cluster,
+                .row_capacity = kRows,
+                .d_model = kDModel,
+                .top_k = kTopK,
+                .graph_family_count = kFamilies,
+            });
+
+        EXPECT_EQ(channel_plan.payload_matrix_bytes, kMatrixBytes);
+        const std::size_t kGrantBytes =
+            channel_plan.device_grant_bytes_per_lane;
+        EXPECT_EQ(
+            channel_plan.canonical_route_matrix_bytes,
+            kCanonicalRouteBytes);
+        ASSERT_EQ(channel_plan.channels.size(), 1u)
+            << "the different-node tier must remain on the MPI path";
+        const auto &channel = channel_plan.channels.front();
+        EXPECT_EQ(channel.tier_index, 1);
+        EXPECT_EQ(channel.domain_ordinal, 1);
+        EXPECT_EQ(channel.source_world_rank, 0);
+        EXPECT_EQ(channel.target_world_rank, 0);
+        EXPECT_EQ(channel.source_device, DeviceId::cuda(0));
+        EXPECT_EQ(
+            channel.targetParticipantIds(),
+            (std::vector<int>{2, 3, 4, 5}));
+        ASSERT_EQ(channel.source_lanes.size(), 4u);
+        ASSERT_EQ(channel.target_lanes.size(), 4u);
+        for (std::size_t lane = 0; lane < 4u; ++lane)
+        {
+            EXPECT_EQ(channel.source_lanes[lane].device, DeviceId::cuda(0));
+            EXPECT_EQ(
+                channel.target_lanes[lane].device,
+                DeviceId::rocm(static_cast<int>(lane)));
+        }
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(0, DeviceId::cuda(0)),
+            4u * (kLaneBytes + kGrantBytes));
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(0, DeviceId::cuda(1)), 0u);
+        for (int device = 0; device < 4; ++device)
+        {
+            EXPECT_EQ(
+                channel_plan.stagingBytesFor(0, DeviceId::rocm(device)),
+                kLaneBytes + kGrantBytes + kCanonicalRouteBytes);
+        }
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(0, DeviceId::cpu()),
+            channel.mapping_layout.sourceOwnedBytes() + channel.mapping_layout.targetOwnedBytes());
+        EXPECT_EQ(channel_plan.stagingBytesFor(1, DeviceId::cpu()), 0u);
+        const auto &local = channel.localLanes(0);
+        ASSERT_EQ(local.size(), 8u);
+        for (std::size_t i = 0; i < local.size(); ++i)
+        {
+            EXPECT_TRUE(local[i].valid());
+            for (std::size_t j = 0; j < i; ++j)
+                EXPECT_FALSE(local[i].participant_id == local[j].participant_id &&
+                             local[i].device == local[j].device);
+        }
+        EXPECT_THROW((void)channel.localLanes(1), std::invalid_argument);
+        EXPECT_TRUE(MoEOverlayActivationChannelPlanner::requiresActivationChannels(overlay));
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(2, DeviceId::cuda(2)), 0u);
+
+    }
+
+    TEST(MoEOverlayLocalCapacityPlanner,
          NodeLocalActivationBOMPricesExactRootTargetAndMTPFamilyLanes)
     {
         MoERoutedExpertPlacementPlan overlay;
@@ -1839,6 +2008,10 @@ namespace llaminar2
          * independent model-upload ring. */
         auto profile = smallModelProfile();
         profile.d_model = kDModel;
+        // Dynamic expert service admission consumes the same original source
+        // geometry as execution. This 16-column channel fixture uses floating
+        // sources because its width does not form a complete Q8 block.
+        addRoutedExpertMetadata(profile, "F32");
         RankExecutionPlan rank_plan;
         rank_plan.rank = 0;
         rank_plan.first_layer = 0;
@@ -2089,7 +2262,7 @@ namespace llaminar2
         }
 
         EXPECT_TRUE(
-            MoEOverlayActivationChannelPlanner::hasRemoteRankParticipants(
+            MoEOverlayActivationChannelPlanner::requiresActivationChannels(
                 overlay));
         const auto plan = MoEOverlayActivationChannelPlanner::plan({
             .placement_plan = &overlay,
@@ -2568,6 +2741,40 @@ namespace llaminar2
         }
     }
 
+    /** @test Probe geometry preserves original stacked shapes in one serial scratch envelope. */
+    TEST(MoEOverlayLocalCapacityPlanner, PreparedGPUServiceOriginalGeometryAndSerialEnvelope)
+    {
+        for (const auto format : {"Q8_0", "Q4_K", "F16", "BF16", "F32"})
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            SCOPED_TRACE(format);
+            SCOPED_TRACE(device.toString());
+            auto profile = smallModelProfile();
+            profile.d_model = profile.expert_feed_forward_length = 256;
+            addRoutedExpertMetadata(profile);
+            for (auto& tensor : profile.tensors) tensor.quant_type = format;
+            const WorkspaceMemoryGeometry geometry{
+                .device = device, .device_compute_units = device.is_cuda() ? 82 : 60,
+                .resident_graph_rows = 8, .first_layer = 0, .last_layer = 1,
+                .apportioned_routed_experts = true};
+            const auto original = WorkspaceMemoryEstimator::estimatePreparedExpertService(profile, geometry);
+            EXPECT_GT(original, 0u);
+            auto doubled_bank = profile;
+            doubled_bank.expert_count *= 2;
+            for (auto& tensor : doubled_bank.tensors) tensor.elements *= 2;
+            EXPECT_EQ(WorkspaceMemoryEstimator::estimatePreparedExpertService(doubled_bank, geometry), original);
+            auto incomplete = profile;
+            incomplete.tensors.front().elements += 1;
+            EXPECT_THROW((void)WorkspaceMemoryEstimator::estimatePreparedExpertService(incomplete, geometry),
+                std::invalid_argument);
+            const auto allocation = MoEOverlayCPUServiceMeasurement::gpuAllocationBytes(
+                {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, original);
+            EXPECT_GT(allocation.host_bytes, 0u);
+            EXPECT_GT(allocation.device_bytes, original);
+        }
+
+    }
+
     TEST(MoEOverlayLocalCapacityPlanner,
          GroupsContinuationAndEndpointFixedBytesByBoundPhysicalResource)
     {
@@ -2677,6 +2884,13 @@ namespace llaminar2
             .initial_window_rows = rank_plan.runtime.moe_rebalance.window_size,
             .maximum_window_rows = rank_plan.runtime.moe_rebalance.max_window_size,
             .maximum_invocation_rows = 8});
+        // Conservative General host commitments are real setup resources;
+        // enlarge this metadata observation explicitly rather than inventing a
+        // tiny graph allowance for the original planner.
+        inventory.cpu_memory_bytes = inventory.cpu.memory_bytes = 64ULL * 1024 * 1024 * 1024;
+        inventory.cpu.free_memory_bytes = 32ULL * 1024 * 1024 * 1024;
+        cluster.ranks[5] = inventory;
+        capacity_input.max_cpu_memory_bytes = 32ULL * 1024 * 1024 * 1024;
         const auto dynamic = test::planWithRecordedHostServices(capacity_input);
         ASSERT_TRUE(dynamic.host_demand_memory);
         EXPECT_FALSE(result.host_demand_memory);
@@ -2705,6 +2919,12 @@ namespace llaminar2
                       .intermediate = profile.expert_feed_forward_length},
                       WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(probe_profile, probe_geometry)) +
                       capacity_input.host_demand_memory->allocationBytes());
+        const auto graph_bom = RetainedParticipantGraphExecutable::calibrationBOM(
+            dynamic_bom->resource(),
+            dynamic.physical_memory_admission->plan().find({5, DeviceId::cuda(0)})->resource());
+        EXPECT_EQ(dynamic_bom->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable) -
+                      static_bom->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable),
+                  graph_bom.find(cpu_identity)->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable));
         // Missing evidence is an admission defect; an all-GPU authority or
         // Static policy must not silently acquire a host routing mirror either.
         EXPECT_THROW((void)test::planWithRecordedHostServices(capacity_input), std::invalid_argument);
@@ -2813,6 +3033,8 @@ namespace llaminar2
             catch (const std::invalid_argument &) {}
             observed.free_memory_bytes = original;
         }
+
+
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,

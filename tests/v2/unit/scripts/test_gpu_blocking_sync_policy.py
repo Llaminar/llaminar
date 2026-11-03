@@ -269,6 +269,42 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
                 with temporary:
                     self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
 
+    def test_grouped_reader_terminal_and_reset_waits_are_exact(self) -> None:
+        """Only the two private Rank terminal/reset edges may await one original event."""
+        for caller, category in (
+            ("awaitGroupedRetainedStorageTerminal", "host_result"),
+            ("prepareGroupedRetainedStorageReset", "lifecycle"),
+        ):
+            with self.subTest(owner=caller):
+                allowance, = (entry for entry in ALLOWANCES
+                              if entry.caller == "DeviceGraphOrchestrator::" + caller)
+                self.assertEqual((allowance.category, allowance.kind, allowance.count),
+                                 (category, "backend_event", 1))
+                self.assertEqual(allowance.path,
+                    "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp")
+                fixture = dataclasses.replace(allowance, path="src/v2/example.cpp")
+                for actual_caller, count, accepted in (
+                    (caller, 1, True), (caller, 2, False),
+                    ("beginRetainedStorageAdmission", 1, False),
+                    ("launchOrdinaryGenerationForward", 1, False),
+                    ("submitHostScheduledDeviceGenerationFragment", 1, False),
+                    ("recordTerminalClose", 1, False),
+                ):
+                    with self.subTest(caller=actual_caller, count=count):
+                        temporary, root = self.make_repo(
+                            f"void DeviceGraphOrchestrator::{actual_caller}() {{"
+                            + "backend->waitForEvent(event, ordinal);" * count + "}")
+                        with temporary:
+                            self.assertEqual(not validate(root, (fixture,)), accepted)
+                for operation in ("backend->synchronize(ordinal);",
+                                  "worker->synchronizeStream(stream);",
+                                  "cudaDeviceSynchronize();"):
+                    with self.subTest(operation=operation):
+                        temporary, root = self.make_repo(
+                            f"void DeviceGraphOrchestrator::{caller}() {{" + operation + "}")
+                        with temporary:
+                            self.assertTrue(validate(root, (fixture,)))
+
     def test_pooled_setup_wait_cannot_escape_into_native_phase_or_capture(self) -> None:
         """Only final/failed setup retirement can wait once on its original event."""
         allowance, = (entry for entry in ALLOWANCES if entry.caller == "retirePooledNativeSetupOwner")

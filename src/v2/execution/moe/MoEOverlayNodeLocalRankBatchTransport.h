@@ -338,9 +338,20 @@ namespace llaminar2
     /**
      * @brief Complete immutable contract used by topology-aware transport selection.
      */
+    /** @brief Physical endpoint ownership; this does not alter MPI membership. */
+    enum class MoEOverlayActivationEndpointScope : std::uint8_t
+    {
+        DistinctRanks, ///< Original bilateral MPI-rank channel construction.
+        RankLocalGPU, ///< Original continuation and foreign GPU endpoints on one rank.
+    };
+
     struct MoEOverlayRankBatchTransportConfig
     {
         std::shared_ptr<IMPIContext> mpi_ctx; ///< World/topology authority.
+        MoEOverlayActivationEndpointScope endpoint_scope =
+            MoEOverlayActivationEndpointScope::DistinctRanks;
+        /** Exact original source device required by same-rank GPU construction. */
+        DeviceId rank_local_source_device = DeviceId::invalid();
         int source_world_rank = -1; ///< Continuation rank.
         int target_world_rank = -1; ///< Endpoint-owner rank.
         std::shared_ptr<MoEOverlayRankBatchWireWorkspace> workspace;
@@ -622,6 +633,19 @@ namespace llaminar2
      */
     std::shared_ptr<IMoEOverlayRankBatchTransport>
     createMoEOverlayRankBatchTransport(
+        MoEOverlayRankBatchTransportConfig config);
+
+    /**
+     * @brief Construct one mapped channel for actual same-rank GPU endpoints.
+     * @param config Original placement-derived source, targets and exact lane BOM.
+     * @return One shared channel retaining all original registration lifetimes.
+     * @throws std::invalid_argument for different ranks, absent or aliased GPU roles.
+     *
+     * This is a named construction, never a transport retry. Distributed channel
+     * creation remains restricted to distinct world ranks.
+     */
+    std::shared_ptr<IMoEOverlayRankBatchTransport>
+    createMoEOverlayRankLocalGPUActivationTransport(
         MoEOverlayRankBatchTransportConfig config);
 
 } // namespace llaminar2

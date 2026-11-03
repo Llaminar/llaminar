@@ -16,7 +16,7 @@ namespace {
 namespace q=qwen4exp;
 struct Shape {q::PooledImmutablePhysicalOwnerGeometry physical;q::PooledImmutableCoordinatorGeometry coordinator;std::vector<PhysicalMemoryResource> resources;};
 /** @return Original declared owner order, never compute-rank order or an admission permission. */
-Shape shape(DeviceId source,std::span<const std::uint32_t> slots,bool sameVendor=false){
+Shape shape(DeviceId source,std::span<const std::uint32_t> slots,bool sameVendor=false,std::optional<PeerAccessCoverage> peerAccess=std::nullopt){
     const PhysicalMemoryAllocatorIdentity coordinator{0,source};std::vector<PhysicalMemoryAllocatorIdentity> order;
     std::vector<ImmutableRowTableLayoutOwner> owners;std::vector<PhysicalMemoryResource> resources{{0,source,1ULL<<34,1ULL<<34}};bool positive=false;
     // Include actual local C0 owner followed by storage-only opposite-vendor owners.
@@ -28,7 +28,7 @@ Shape shape(DeviceId source,std::span<const std::uint32_t> slots,bool sameVendor
     const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::MemoryMapped};
     const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,0x100000100ULL,90),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,std::move(owners),{coordinator},{},
-        {{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},{},positive?std::optional(coordinator):std::nullopt,512);
+        {{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},{},positive?std::optional(coordinator):std::nullopt,512,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,peerAccess);
     auto physical=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,order,coordinator);
     auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},1024);
     return {std::move(physical),std::move(policy),std::move(resources)};
@@ -72,6 +72,30 @@ TEST(PooledImmutableDirectedTransport, PlanningAndOriginalRuntimePinEdgeUseIdent
         }
         EXPECT_EQ(bytes(q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,host,s.resources)).at(DeviceId::cpu()),hostBytes);
     }
+}
+/** @test Explicit NoPeer retains compact mapped channel costs and original per-device graph identity. */
+TEST(PooledImmutableDirectedTransport, ExplicitNoPeerKeepsExactFloorGrowthAndNativeOwnerIdentity)
+{
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto count : {1u, 3u, 7u})
+            for (const auto capacity : {0u, 64u}) {
+                const DeviceId source{type,static_cast<int>(count)};
+                const std::vector<std::uint32_t> slots(count, capacity);
+                const auto s = shape(source, slots, true, PeerAccessCoverage::None);
+                auto floor = bytes(q::PooledImmutableDirectedTransport::mandatoryBOM(s.physical,s.coordinator,host,s.resources));
+                const auto growth = bytes(q::PooledImmutableDirectedTransport::slotDependentBOM(s.physical,s.coordinator,host,s.resources));
+                const auto full = bytes(q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,host,s.resources));
+                for (const auto& [device, value] : growth) floor[device] += value;
+                EXPECT_EQ(floor, full);
+                const auto coordinator = q::PooledImmutableCoordinatorNativePlan::fromGeometry(s.physical,s.coordinator,701,17);
+                for (std::uint32_t i = 1; i < s.physical.owners().size(); ++i) {
+                    const auto owner = q::PooledImmutableOwnerNativePlan::fromGeometry(s.physical,s.coordinator,i,701,17);
+                    const auto edge = q::PooledImmutablePinEdge::fromPlans(coordinator,owner);
+                    EXPECT_EQ(owner.peerAccess(), PeerAccessCoverage::None);
+                    EXPECT_TRUE(edge.capturedChannelTransport());
+                    EXPECT_NO_THROW(edge.channelMemory());
+                }
+            }
 }
 TEST(PooledImmutableDirectedTransport, ForeignResourcesAndUnsupportedNativeRoutesCannotAcquireMappedBOM){
     const std::array slots{64u,0u};const auto s=shape(DeviceId::cuda(7),slots);

@@ -25,9 +25,11 @@
 #include <vector>
 
 namespace llaminar2::test { struct ImmutableLookupSourceAdmissionReplayAccess; }
+namespace llaminar2 { class RankOrchestrator; }
 
 namespace llaminar2::qwen4exp
 {
+class PooledImmutableDirectedTransport;
 class ImmutableLookupSubmissionRetirement;
 class PooledImmutableCompleteCohort;
 /** @brief Immutable capture bindings plus explicit admission/terminal lifecycle. */
@@ -54,18 +56,28 @@ public:
         bool reuses(std::span<const SourceAdmissionParticipant>)const;
         /** @brief Observe all original closes and retire unadmitted channel tickets only. */
         bool finish();
+        /** @return Strong original source/ticket cancellation, captured before participant launch. */
+        std::function<void()> failureCallback() const;
+
     private:
         friend class ImmutableLookupExecutionBoundary;
+        friend class ::llaminar2::RankOrchestrator;
+        friend struct ::llaminar2::test::ImmutableLookupSourceAdmissionReplayAccess;
+        /** @brief Cancel original storage edges only after every submitted source producer terminal is proven. */
+        void cancelStorageChannelsAfterSourceProof();
+        /** @brief Retire channels only after Rank's complete original native-proof aggregation. */
+        bool finishNativeChannelsAfterProof();
         /** @brief Retain only the original service/group and original native boundary owners. */
         SourceGroupAdmission(std::shared_ptr<ImmutableLookupService> service,
             ImmutableLookupService::GroupAdmission admission,std::vector<SourceAdmissionParticipant> participants);
         std::shared_ptr<ImmutableLookupService> service_;
         std::vector<SourceAdmissionParticipant> participants_;
         ImmutableLookupService::GroupAdmission admission_;
+        std::shared_ptr<const PooledImmutableDirectedTransport> shared_reader_transport_;
         bool finished_=false,result_=false;
     };
-    /** @return Whether this exact predeclared CPU service requires complete-group admission. */
-    bool requiresSourceGroupAdmission()const noexcept{return service_->channelDevices().size()>1;}
+    /** @return Whether actual CPU channels or compute readers require the original parent admission. */
+    bool requiresSourceGroupAdmission()const noexcept;
     /**
      * @brief Arm the complete original CPU source group before any participant submits GPU work.
      * @param participants Actual parent members and their unchanged host request epochs.

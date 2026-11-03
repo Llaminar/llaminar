@@ -2305,6 +2305,24 @@ namespace llaminar2
     // Cached GPU Graph Replay
     // =========================================================================
 
+    bool DeviceGraphExecutor::attachRetainedParticipantStorageParent(ComputeGraph& graph,GraphSegmentCache& cache,
+        DeviceId receiver,IGPUGraphCapture& parent){
+        const auto& domain=graph.retainedParticipantDefinitionDomain();
+        const auto& definition=cache.recorded_source_definition;
+        if(domain || definition){
+            if(!domain || !definition || definition->definition().domain!=*domain || cache.capture_device!=receiver ||
+               parent.hasExecutable() || !parent.nodeCount() || reinterpret_cast<std::uintptr_t>(cache.capture_stream)<=2 ||
+               parent.executionStream()!=cache.capture_stream)
+                throw std::logic_error("Original finite storage attachment has a foreign source/domain/parent/stream");
+            definition->requireDefinition();
+            if(cache.original_storage_attachment)throw std::logic_error("Original finite storage body already attached to this cache");
+            cache.original_storage_attachment=definition->definition().plan->prepareOriginalStorageAttachment(
+                receiver,parent,cache.auxiliary_branch.get(),definition);
+            if(cache.original_storage_attachment)return cache.original_storage_attachment->attachTo(parent,cache.auxiliary_branch.get());
+        }
+        return !cache.auxiliary_branch || cache.auxiliary_branch->attach(parent);
+    }
+
     void DeviceGraphExecutor::bindRetainedParticipantPreparationStream(
         ComputeGraph& graph,GraphSegmentCache& cache,IWorkerGPUContext* worker){
         const auto source=graph.retainedParticipantSourcePlan();
@@ -2321,7 +2339,9 @@ namespace llaminar2
             if(!worker->ownsCurrentThread())
                 throw std::logic_error("Original source preparation dispatch did not enter its actual worker");
             if(!cache.participant_preparation_stream)
-                cache.participant_preparation_stream.reset(new RetainedGraphParticipantPreparationStream(original,cache.capture_stream));
+                cache.participant_preparation_stream.reset(new RetainedGraphParticipantPreparationStream(original,cache.capture_stream,
+                    RetainedGraphParticipantPreparationStream::Definition{&graph,arena_,graph.topologyGeneration(),
+                        cache.capture_variant_signature,source->definitionDomain(),source}));
             cache.participant_preparation_stream->requireLive(original);
             if(cache.participant_preparation_stream->stream()!=cache.capture_stream)
                 throw std::logic_error("Original source cache replaced its preparation stream without retirement");
@@ -2411,6 +2431,8 @@ namespace llaminar2
                 capture_boundary,plan_policy,launch_dependency,event_published_outputs,
                 retained_parent_composer,initial_submission,auxiliary_branch_factory);
         }
+
+        if(segment_cache.original_storage_attachment)segment_cache.original_storage_attachment->requireCurrent();
 
         const bool has_collective_nodes = (collective_nodes && !collective_nodes->empty());
         const bool retained_parent_requested =
@@ -2558,14 +2580,20 @@ namespace llaminar2
             return false;
         }
 
+        const bool retained_full_requires_runtime_collectives = retained_full_graph_requested &&
+            (segment_cache.retained_full_graph_replay.valid() &&
+             segment_cache.initialized && !segment_cache.needs_capture
+                ? segment_cache.runtime_collective_capture_requirement ==
+                    GraphSegmentCache::RuntimeCollectiveCaptureRequirement::Required
+                : graph.requiresCollectiveRuntimeCapture(collective_nodes));
         if (retained_full_graph_requested &&
-            (!ctx || has_collective_nodes || collectives_graph_capturable ||
+            (!ctx || retained_full_requires_runtime_collectives || collectives_graph_capturable ||
              plan_policy != GraphReplayPlanPolicy::RequireFullGraph ||
              !defer_final_sync))
         {
             LOG_ERROR(
                 "[DeviceGraphExecutor] Retained full-graph host replay requires "
-                "one non-collective executable, an exact device context, and "
+                "one executable without runtime collective capture, an exact device context, and "
                 "deferred completion ownership");
             return false;
         }
@@ -2951,6 +2979,7 @@ namespace llaminar2
                     bound->invocation->requireCurrent(bound->seal);
                     participant_submission.emplace(bound->invocation->enqueueOriginalParticipants());
                 }
+                if(segment_cache.original_storage_attachment)segment_cache.original_storage_attachment->requireCurrent();
                 const bool parent_submission_ok =
                     service_segments.empty()
                         ? segment_cache.retained_parent_capture->launch()
@@ -3694,6 +3723,30 @@ namespace llaminar2
             .plan_capture_dependencies = plan_capture_dependencies,
         };
 
+        const auto recorded_source_boundary = [&](const std::string& name,void* stream){
+            const auto& domain=graph.retainedParticipantDefinitionDomain();
+            if(!domain || name.find(":phase=capture_end:")==std::string::npos)
+                return capture_boundary?capture_boundary(name,stream):true;
+            if(!auxiliary_branch_factory.source_definition_boundary)
+                throw std::logic_error("Graph-declared source definition has no original cold TP boundary");
+            LocalTPCaptureSourceDefinition handoff{*domain,
+                graph.retainedParticipantSourcePlan()?segment_cache.participant_preparation_stream:nullptr,{}};
+            if(!auxiliary_branch_factory.source_definition_boundary(name,stream,handoff))return false;
+            if(!handoff.result || handoff.result->definition().domain!=*domain)
+                throw std::logic_error("Original recorded TP boundary returned a foreign source definition");
+            handoff.result->requireDefinition();
+            if(segment_cache.recorded_source_definition && segment_cache.recorded_source_definition!=handoff.result)
+                throw std::logic_error("One native parent crossed original source definition owners");
+            segment_cache.recorded_source_definition=std::move(handoff.result);
+            if(segment_cache.auxiliary_branch)
+                segment_cache.auxiliary_branch->bindOriginalSourceDefinition(segment_cache.recorded_source_definition);
+            return true;
+        };
+
+        const auto attach_original_parent = [&](IGPUGraphCapture& parent){
+            return attachRetainedParticipantStorageParent(graph,segment_cache,ctx->deviceId(),parent);
+        };
+
         // Capture and replay share the same post-launch lifecycle. All mutable
         // GPU state is published by captured kernels and explicit event edges.
         DeviceGraphCaptureController::ReplayHooks capture_hooks{
@@ -3722,8 +3775,13 @@ namespace llaminar2
                         mark_arena_write_dirty(id, device);
                     });
             },
-            .capture_boundary = capture_boundary,
-            .launch_dependency = launch_dependency,
+            .capture_boundary = phase_transition.phase == DeviceGraphCaptureController::Phase::Capture
+                ? GraphCaptureBoundaryHook{recorded_source_boundary} : GraphCaptureBoundaryHook{},
+            .launch_dependency = phase_transition.phase == DeviceGraphCaptureController::Phase::Capture && graph.retainedParticipantDefinitionDomain()
+                ? GraphLaunchDependencyHook{[&](GraphExecutableLaunchPhase phase,void* stream){
+                    if(segment_cache.original_storage_attachment)segment_cache.original_storage_attachment->requireCurrent();
+                    return !launch_dependency || launch_dependency(phase,stream);
+                }} : launch_dependency,
             .retained_parent_composer = retained_parent_composer,
             .submit_parent_with_concurrent_ticket_service =
                 [&](IGPUGraphCapture &parent,
@@ -3740,6 +3798,8 @@ namespace llaminar2
                         segments);
                 },
             .auxiliary_branch = segment_cache.auxiliary_branch.get(),
+            .attach_original_parent = phase_transition.phase == DeviceGraphCaptureController::Phase::Capture
+                ? std::function<bool(IGPUGraphCapture&)>{attach_original_parent} : std::function<bool(IGPUGraphCapture&)>{},
             .plan_capture_dependencies = plan_capture_dependencies,
         };
 

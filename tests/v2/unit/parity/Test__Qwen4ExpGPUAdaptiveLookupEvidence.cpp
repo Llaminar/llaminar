@@ -369,3 +369,23 @@ TEST(Qwen4ExpGPUAdaptiveLookupEvidence, CompletedWorkerRetirementRetainsExactTer
     }
 }
 } // namespace llaminar2::test::parity::qwen4exp
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Full-RAM source observations bind actual original backing, never redundant cache/mapping work. */
+TEST(Qwen4ExpGPUAdaptiveLookupEvidence, FullRAMSourceRequiresExactModeAndZeroWindowWork){
+    auto records=example(DeviceId::cuda(0),true);
+    for(auto& record:records)if(record.tags.at("storage")!="vram"){
+        record.tags["storage"]=std::string(hostImmutableRowModeName(HostImmutableRowMode::AdaptiveFullRAM));
+        if(record.name.starts_with("window_"))record.value=0;
+    }
+    EXPECT_NO_THROW(requireQwen4ExpGPUAdaptiveLookupEvidence(records,DeviceId::cuda(0),90,8192,0,0,AdaptiveImmutableRowBacking::RAM));
+    EXPECT_THROW(requireQwen4ExpGPUAdaptiveLookupEvidence(records,DeviceId::cuda(0),90,8192,0,0),std::invalid_argument);
+    EXPECT_THROW(requireQwen4ExpGPUAdaptiveLookupEvidence(records,DeviceId::cuda(0),90,8192,0,1,AdaptiveImmutableRowBacking::RAM),std::invalid_argument);
+    for(const auto name:{"cache_admission_rejections","all_pinned_responses"}){
+        auto invalid=records;for(auto& record:invalid)if(record.name==name)record.value=1;
+        EXPECT_THROW(requireQwen4ExpGPUAdaptiveLookupEvidence(invalid,DeviceId::cuda(0),90,8192,0,0,AdaptiveImmutableRowBacking::RAM),std::invalid_argument)<<name;
+    }
+    for(auto& record:records)if(record.name=="window_misses")record.value=1;
+    EXPECT_THROW(requireQwen4ExpGPUAdaptiveLookupEvidence(records,DeviceId::cuda(0),90,8192,0,0,AdaptiveImmutableRowBacking::RAM),std::invalid_argument);
+}
+}

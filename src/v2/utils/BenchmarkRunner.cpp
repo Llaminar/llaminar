@@ -483,6 +483,8 @@ namespace llaminar2
      *
      * The exact terminal depth-policy family carries eligible window counts;
      * unrelated per-transaction MTP counters remain outside this snapshot.
+     * Immutable lookup and native submission counters are terminal observations,
+     * not live probes. Their existing measured reset excludes warmup work.
      * Selection records survive the measured reset as setup observations; their
      * submission counts never represent measured replays, tokens or movement.
      */
@@ -491,6 +493,9 @@ namespace llaminar2
         static const std::vector<std::string> filters{
             "kernel",
             "memory",
+            "immutable_lookup",
+            "ngram_lookup",
+            "immutable_lookup_setup.admitted_owner",
             "moe_overlay",
             "moe_overlay_controller",
             "moe_placement.routed_expert_weight_selection",
@@ -2377,6 +2382,8 @@ namespace llaminar2
                 // Immutable per-layer physical bank selections are setup evidence;
                 // preserve this exact family, never unrelated placement/movement.
                 {"moe_placement", "routed_expert_weight_selection"},
+                // Original admitted capacity survives; cache activity is measured-only.
+                {"immutable_lookup_setup", "admitted_owner"},
                 {"forward_graph", "full_graph_plan_graphs"},
                 {"forward_graph", "graph_replay_plan_graphs"},
                 {"forward_graph", "full_graph_capture_executable_nodes"},

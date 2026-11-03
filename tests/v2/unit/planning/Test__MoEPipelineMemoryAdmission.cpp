@@ -29,6 +29,10 @@
 #include "../../utils/QuantizedVerifierFormats.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <gtest/gtest.h>
+#include "fixtures/backends/NativeContextPreparationReplayAccess.h"
+#include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
+#include "mocks/MockWorkerGPUContext.h"
+#include "backends/GPUDeviceProcessLifetime.h"
 #include <map>
 #include <set>
 
@@ -904,5 +908,153 @@ TEST(PreparedWeightAuthorityIdentity, Qwen4ExpGDNQKVSelectionSeparatesRetainedAu
     EXPECT_TRUE(routedWeightAuthorityRequestIdentity(nullptr, config).empty());
     setup.qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
     EXPECT_EQ(ordinary, routedWeightAuthorityRequestIdentity(plan, config));
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+namespace {
+/** @brief Only native constructor results are doubled; actual source/pool/PMA planning remains unchanged. */
+class PipelineSourceWorker final:public testing::MockWorkerGPUContext {
+public:
+    /** @param ordinal Original selected device. @param root Exact source-owned context object extent. */
+    PipelineSourceWorker(int ordinal,std::shared_ptr<PreparedGPUWorkerStack> root):MockWorkerGPUContext(ordinal){(void)root;}
+};
+/** @brief Retire actual recorded source generations through the existing original reset observer. */
+struct PipelineSourceRetirement final {
+    std::shared_ptr<NativeContextPreparation> source;
+    std::vector<DeviceId> devices;
+    /** @brief No direct native SDK reset or alternate capacity owner is created. */
+    ~PipelineSourceRetirement(){
+        for(const auto device:devices){auto reset=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
+            NativeContextPreparationReplayAccess::physicalReset(reset);}
+        if(source->memory()->phase()==PhysicalMemoryAuthorityPhase::Preparing)source->retireUnadmitted();
+    }
+};
+/** @return The original public pipeline producer with actual same-vendor consecutive endpoints. */
+OrchestrationConfig originalNativePipeline(const PlanningModelSource& source,DeviceType backend,bool cpuTail=false){
+    auto config=proposal(source,1,backend==DeviceType::ROCm).config;
+    config.domain_definitions.back().devices={GlobalDeviceAddress::fromLocalDeviceId(DeviceId(backend,1),"localhost",0)};
+    config.domain_definitions.back().backend=backend==DeviceType::CUDA?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;
+    if(cpuTail){config.domain_definitions.back().devices={GlobalDeviceAddress::cpu(0)};config.domain_definitions.back().backend=CollectiveBackendType::HOST;}
+    config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+    config.mtp_activation_policy=MTPActivationPolicy::Disabled;
+    config.mtp.graph_capacity_draft_tokens=0;
+    return config;
+}
+/** @return Exact original physical observation registry; no free-memory query or capacity arithmetic. */
+std::vector<PhysicalMemoryResource> sourceResources(const ClusterInventory& observed,std::span<const DeviceId> devices){
+    const auto& rank=observed.ranks.front();
+    std::vector<PhysicalMemoryResource> result{{0,DeviceId::cpu(),rank.cpu.memory_bytes,rank.cpu.free_memory_bytes}};
+    for(const auto device:devices){const auto it=std::find_if(rank.gpus.begin(),rank.gpus.end(),[&](const auto& gpu){return gpu.type==device.type && gpu.local_device_id==device.ordinal;});
+        if(it==rank.gpus.end())throw std::logic_error("Recorded pipeline omitted selected device");
+        result.push_back({0,device,it->memory_bytes,it->free_memory_bytes});}
+    return result;
+}
+/** @brief Bind recorded constructor bodies before the actual source attempts them. */
+void seedPipelineWorkers(std::span<const DeviceId> devices,bool failLast=false){
+    for(std::size_t i=0;i<devices.size();++i){const auto device=devices[i];const bool fail=failLast && i+1==devices.size();
+        NativeContextPreparationReplayAccess::seed(device,[device,fail](std::shared_ptr<PreparedGPUWorkerStack> root){
+            auto worker=NativeContextPreparationReplayAccess::construct<PipelineSourceWorker>(std::move(root),device.ordinal);
+            if(fail)throw std::runtime_error("original pipeline native prefix construction failed");return worker;});}
+}
+/** @brief Existing compiler injection preserves the entire production topology and binds only an inherited runtime owner. */
+class SourceBoundPlanBuilder final:public ExecutionPlanBuilder {
+public:
+    /** @param source Original closed source, never a fake Ready capability. */
+    explicit SourceBoundPlanBuilder(std::shared_ptr<NativeContextPreparation> source):source_(std::move(source)){}
+    RankExecutionPlan buildPlanForRank(const OrchestrationConfig& cfg,const ModelConfig& model,const ClusterInventory& inv,int rank)override{
+        auto plan=ExecutionPlanBuilder::buildPlanForRank(cfg,model,inv,rank);plan.runtime.native_context_preparation=source_;return plan;
+    }
+private:std::shared_ptr<NativeContextPreparation> source_;
+};
+/** @return One exact existing memory policy with a separately passed original serving source. */
+MoEPipelineMemoryPolicy sourcePolicy(std::span<const DeviceId> devices,const ModelLoader& loader,std::shared_ptr<NativeContextPreparation> source={}){
+    static constexpr std::array rows{1,8};
+    return {.prefill={.bucket_rows=rows,.minimum_sequence_rows=1,.maximum_cached_buckets=4},
+        .gpu_weight_load={.policy=configuredGPUWeightLoadMemoryPolicy(),.maximum_source_bytes=maximumGGUFTensorPayloadBytes(loader.getModel())},
+        .native_ordering_events=NativeOrderingEventGroupReplayAccess::projection(devices),
+        .retained_host_services=planningHostServiceProjection(),.native_context_preparation=std::move(source)};
+}
+}
+/** @test Actual original source backing survives immutable topology compilation and is charged once across every stage. */
+TEST(MoEPipelineNativePreparation, OriginalSourceReachesParentAllStagesAndFinalPMAOnce){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(const bool cpuTail:{false,true})ASSERT_EXIT(([&]{
+        {PlanningGGUFFixture file(true);PlanningModelSource model(file.path());auto context=metadataContext(file.path());
+         auto observed=inventory(2);observed.ranks.front().cpu.numa_node=0;observed.ranks.front().numa_nodes=1;observed.buildNodeAggregations();
+         const auto config=originalNativePipeline(model,backend,cpuTail);
+         ExecutionPlanBuilder compiler;const auto topology=ResolvedRankOrchestration::resolve(config,model.metadata(),observed,compiler,0);
+         ASSERT_FALSE(topology.rankPlan().runtime.native_context_preparation);
+         std::vector<DeviceId> devices{DeviceId(backend,0)};if(!cpuTail)devices.push_back(DeviceId(backend,1));seedPipelineWorkers(devices);
+         auto source=NativeContextPreparationReplayAccess::source<PipelineSourceWorker>(devices,sourceResources(observed,devices));
+         PipelineSourceRetirement retirement{source,{devices.begin(),devices.end()}};
+         for(const auto device:devices){auto permit=source->acquire(device);}
+         source->freezeForPlanning();
+         const auto admission=AdmittedMoEPipelineMemory::admit(topology,model.metadata(),context->concreteLoader(),observed,sourcePolicy(devices,context->concreteLoader(),source));
+         EXPECT_EQ(admission.rankPlan().runtime.native_context_preparation,source);
+         ASSERT_EQ(admission.stages().size(),2u);
+         for(const auto& stage:admission.stages()){
+             EXPECT_EQ(stage.rankPlan().runtime.native_context_preparation,source);
+             for(const auto& cfg:stage.devicePlans())EXPECT_EQ(cfg.native_context_preparation,source);
+             EXPECT_FALSE(stage.topology().rankPlan().runtime.native_context_preparation); // Arithmetic topology stays immutable.
+         }
+         for(const auto& original:source->mandatoryBOM().resources()){
+             const auto* actual=admission.physicalAdmission()->plan().find({original.resource().world_rank,original.resource().device});
+             ASSERT_NE(actual,nullptr);
+             EXPECT_EQ(actual->charge(PhysicalMemoryOwner::NativeExecutionContext).incrementalBytes(),
+                 original.charge(PhysicalMemoryOwner::NativeExecutionContext).incrementalBytes());
+         }
+         auto runtime=topology.rankPlan().runtime;admission.publishRuntimeCapacity(runtime);
+         EXPECT_EQ(runtime.native_context_preparation,source);
+         auto foreign=std::shared_ptr<NativeContextPreparation>(source.get(),[](auto*){});
+         auto wrong=runtime;wrong.native_context_preparation=foreign;const auto rows=wrong.resident_graph_rows;
+         EXPECT_THROW(admission.publishRuntimeCapacity(wrong),std::logic_error);EXPECT_EQ(wrong.resident_graph_rows,rows);
+         SourceBoundPlanBuilder inherited(source);const auto originalBound=ResolvedRankOrchestration::resolve(config,model.metadata(),observed,inherited,0);
+         EXPECT_THROW((void)AdmittedMoEPipelineMemory::admit(originalBound,model.metadata(),context->concreteLoader(),observed,sourcePolicy(devices,context->concreteLoader())),std::logic_error);
+         EXPECT_THROW((void)AdmittedMoEPipelineMemory::admit(originalBound,model.metadata(),context->concreteLoader(),observed,sourcePolicy(devices,context->concreteLoader(),foreign)),std::logic_error);
+         EXPECT_NO_THROW(source->admitFinal(admission.physicalAdmission()));
+         EXPECT_EQ(source->memory()->phase(),PhysicalMemoryAuthorityPhase::Admitted);
+        }
+        GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+/** @test Source-free discovery remains legitimate but cannot publish over an existing serving owner. */
+TEST(MoEPipelineNativePreparation, DiscoveryStaysSourceFreeAndCannotEraseServingSource){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");ASSERT_EXIT(([&]{
+        {PlanningGGUFFixture file(true);PlanningModelSource model(file.path());auto context=metadataContext(file.path());const auto observed=inventory(2);
+         const auto config=originalNativePipeline(model,DeviceType::CUDA);ExecutionPlanBuilder compiler;
+         const auto topology=ResolvedRankOrchestration::resolve(config,model.metadata(),observed,compiler,0);
+         const std::array devices{DeviceId::cuda(0),DeviceId::cuda(1)};seedPipelineWorkers(devices);
+         auto source=NativeContextPreparationReplayAccess::source<PipelineSourceWorker>(devices,sourceResources(observed,devices));
+         PipelineSourceRetirement retirement{source,{devices.begin(),devices.end()}};
+         for(const auto device:devices){auto permit=source->acquire(device);}source->freezeForPlanning();
+         const auto discovery=AdmittedMoEPipelineMemory::admit(topology,model.metadata(),context->concreteLoader(),observed,sourcePolicy(devices,context->concreteLoader()));
+         EXPECT_FALSE(discovery.rankPlan().runtime.native_context_preparation);
+         RuntimeConfig bound;bound.native_context_preparation=source;
+         EXPECT_THROW(discovery.publishRuntimeCapacity(bound),std::logic_error);EXPECT_EQ(bound.native_context_preparation,source);
+         try{source->admitFinal(discovery.physicalAdmission());FAIL()<<"Source-free certificate admitted retained native backing";}
+         catch(const std::logic_error& error){EXPECT_EQ(std::string(error.what()),"Final source plan omitted/relabelled preparation backing as residency");}
+         EXPECT_EQ(source->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
+        }
+        GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+/** @test A failed original constructor prefix cannot be frozen/admitted and retains both reset obligations. */
+TEST(MoEPipelineNativePreparation, PartialOriginalPreparationRejectsBeforePlanningAndRetiresEveryAttempt){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");ASSERT_EXIT(([&]{
+        {PlanningGGUFFixture file(true);PlanningModelSource model(file.path());auto context=metadataContext(file.path());const auto observed=inventory(2);
+         const auto config=originalNativePipeline(model,DeviceType::CUDA);ExecutionPlanBuilder compiler;
+         const auto topology=ResolvedRankOrchestration::resolve(config,model.metadata(),observed,compiler,0);
+         const std::array devices{DeviceId::cuda(0),DeviceId::cuda(1)};seedPipelineWorkers(devices,true);
+         auto source=NativeContextPreparationReplayAccess::source<PipelineSourceWorker>(devices,sourceResources(observed,devices));
+         PipelineSourceRetirement retirement{source,{devices.begin(),devices.end()}};
+         {auto first=source->acquire(devices[0]);}
+         EXPECT_THROW(source->acquire(devices[1]),std::runtime_error);
+         EXPECT_THROW(source->freezeForPlanning(),std::logic_error);
+         EXPECT_THROW((void)AdmittedMoEPipelineMemory::admit(topology,model.metadata(),context->concreteLoader(),observed,sourcePolicy(devices,context->concreteLoader(),source)),std::logic_error);
+         EXPECT_EQ(source->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
+        }
+        GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
 } // namespace llaminar2::test

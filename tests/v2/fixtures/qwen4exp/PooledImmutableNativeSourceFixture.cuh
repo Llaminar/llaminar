@@ -71,6 +71,15 @@ __global__ void corruptIdentity(Args x)
         bad.target=original.target;bad.target.unique=unique;bad.requested_row=original.requested_row;
     }else if(x.identity_fault==IdentityFault::DuplicateUnique)bad.target.unique=original.target.unique;
     else if(x.identity_fault==IdentityFault::DuplicateSlot)bad.target.slot=original.target.slot;
+    else if(x.identity_fault==IdentityFault::PinSlotBounds)bad.target.slot=x.owner.owner.capacity();
+    else if(x.identity_fault==IdentityFault::PinOrdinal)bad.ordinal.value=0;
+    else if(x.identity_fault==IdentityFault::PinCommitFlags && bad.target.slot<x.owner.owner.capacity()){
+        // Unknown physical flags are intentionally NOT an immutable field
+        // rejection: original pinInitial must still commit its preceding pins.
+        if(x.owner.owner.rowWidth()==a::RowKeyWidth::UInt32)
+            n::at<a::Slot32>(x.cache,x.owner.cache.slots)[bad.target.slot].flags|=0x80000000u;
+        else n::at<a::Slot64>(x.cache,x.owner.cache.slots)[bad.target.slot].flags|=0x80000000u;
+    }
 }
 /** @brief Deliver only actual directed pin bytes and preserve every unused record byte. */
 __global__ __launch_bounds__(256,2) void pins(Args x){
@@ -146,7 +155,8 @@ void QFN_FIXTURE_FUNCTION(Action action,const Args& x,void* exact){
     int current=-1;if(x.owner.device.type!=QFN_FIXTURE_BACKEND || !exact || reinterpret_cast<std::uintptr_t>(exact)<=2 || QFN_FIXTURE_DEVICE(&current)!=QFN_FIXTURE_SUCCESS || current!=x.owner.device.ordinal)
         throw std::invalid_argument("Native source fixture requires its exact current device and non-default stream");
     if(action==Action::CorruptIdentity && (x.identity_fault==IdentityFault::None || x.identity_position>=x.owner.owner.maximumUnique() ||
-        (x.retained_identity?x.identity_fault==IdentityFault::DuplicateSlot:
+        (x.retained_identity?(x.identity_fault==IdentityFault::DuplicateSlot || x.identity_fault==IdentityFault::PinSlotBounds ||
+            x.identity_fault==IdentityFault::PinOrdinal || x.identity_fault==IdentityFault::PinCommitFlags):
             (x.identity_fault==IdentityFault::ForeignOwner || x.identity_fault==IdentityFault::ForeignInterval))))
         throw std::invalid_argument("Native identity fault has incompatible original role/geometry");
     if(action==Action::ReadRows && x.owner.owner.rowWidth()!=a::RowKeyWidth::UInt32)throw std::invalid_argument("Native diagnostic byte reader requires its declared UInt32 source trace");

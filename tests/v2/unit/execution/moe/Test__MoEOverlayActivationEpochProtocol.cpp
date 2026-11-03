@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -714,4 +715,111 @@ namespace llaminar2::test
                 << reset_error << ", generation=" << generation;
         }
     }
+    /** Scheduler failure never becomes a second writer of either device endpoint. */
+    TEST(Test__MoEOverlayActivationEpochProtocol,
+         SchedulerCancellationPreservesOriginalEndpointErrorsAndRejectsForeignIdentity)
+    {
+        for (const bool same_rank : {false, true})
+        {
+            auto config = makeConfig({1, 2});
+            if (same_rank) config.target.world_rank = config.source.world_rank;
+            MoEOverlayActivationEpochControl control;
+            MoEOverlayActivationEpochProtocol::initialize(control, config);
+            MoEOverlayActivationEpochProtocol protocol(control, config);
+            std::string error;
+            ASSERT_FALSE(protocol.cancelOriginalInvocation({}, MoEOverlayActivationStatusCode::ExplicitAbort, &error));
+            const auto identity = protocol.arm(makeTicket(config), 44u, 5000u, &error);
+            ASSERT_TRUE(identity.has_value()) << error;
+            auto foreign = *identity;
+            ++foreign.epoch_generation;
+            const auto untouched = control;
+            EXPECT_FALSE(protocol.cancelOriginalInvocation(foreign, MoEOverlayActivationStatusCode::ExplicitAbort, &error));
+            EXPECT_FALSE(protocol.cancelOriginalInvocation(*identity, MoEOverlayActivationStatusCode::Success, &error));
+            EXPECT_EQ(std::memcmp(&untouched, &control, sizeof(control)), 0);
+            activateBoth(protocol, *identity);
+            // Replay the documented native fail() publication window: the GPU
+            // writes its first diagnostic before the final release-store of
+            // Aborted. Scheduler cancellation must preserve that in-flight
+            // record, not become another writer because state is still Active.
+            control.follower_status.operation = static_cast<std::uint32_t>(MoEOverlayActivationOperation::ConsumeDispatch);
+            control.follower_status.code = static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::PayloadMismatch);
+            const auto original_continuation = control.continuation_status;
+            const auto original_follower = control.follower_status;
+            ASSERT_TRUE(protocol.cancelOriginalInvocation(*identity, MoEOverlayActivationStatusCode::ExplicitAbort, &error));
+            EXPECT_EQ(protocol.admissionState(), MoEOverlayActivationAdmissionState::Failed);
+            EXPECT_EQ(control.admission.ready_signal, kMoEOverlayActivationAbortTimeline);
+            for (const auto &buffer : control.buffers)
+            {
+                EXPECT_EQ(buffer.dispatch_signal.value, kMoEOverlayActivationAbortTimeline);
+                EXPECT_EQ(buffer.return_signal.value, kMoEOverlayActivationAbortTimeline);
+            }
+            EXPECT_EQ(std::memcmp(&original_continuation, &control.continuation_status,
+                                  sizeof(original_continuation)), 0);
+            EXPECT_EQ(std::memcmp(&original_follower, &control.follower_status, sizeof(original_follower)), 0);
+            EXPECT_TRUE(protocol.cancelOriginalInvocation(*identity, MoEOverlayActivationStatusCode::OutOfOrder, &error));
+            EXPECT_EQ(control.admission.code, static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::ExplicitAbort));
+            EXPECT_FALSE(protocol.completedTraffic(*identity, &error).has_value());
+            EXPECT_FALSE(protocol.reset(*identity, &error));
+            EXPECT_FALSE(protocol.arm(makeTicket(config, 2u), 45u, 6000u, &error).has_value());
+        }
+    }
+
+    /** Multiple original worker failures retain the already published watchdog reason. */
+    TEST(Test__MoEOverlayActivationEpochProtocol,
+         SchedulerCancellationIsConcurrentAbsorbingAndPreservesWatchdogReason)
+    {
+        auto config = makeConfig({1});
+        config.target.world_rank = config.source.world_rank;
+        MoEOverlayActivationEpochControl control;
+        MoEOverlayActivationEpochProtocol::initialize(control, config);
+        MoEOverlayActivationEpochProtocol protocol(control, config);
+        std::string error;
+        const auto identity = protocol.arm(makeTicket(config), 44u, 5000u, &error);
+        ASSERT_TRUE(identity.has_value()) << error;
+        ASSERT_TRUE(protocol.markTimedOut(44u, 5000u, &error));
+        const auto original_continuation = control.continuation_status;
+        const auto original_follower = control.follower_status;
+        std::atomic<int> failed{0};
+        std::vector<std::thread> workers;
+        for (int worker = 0; worker < 4; ++worker)
+            workers.emplace_back([&]
+            {
+                std::string local_error;
+                if (!protocol.cancelOriginalInvocation(*identity, MoEOverlayActivationStatusCode::ExplicitAbort, &local_error))
+                    ++failed;
+            });
+        for (auto &worker : workers) worker.join();
+        EXPECT_EQ(failed.load(), 0);
+        EXPECT_EQ(control.admission.code, static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::TimedOut));
+        EXPECT_EQ(control.admission.ready_signal, kMoEOverlayActivationAbortTimeline);
+        EXPECT_EQ(std::memcmp(&original_continuation, &control.continuation_status, sizeof(original_continuation)), 0);
+        EXPECT_EQ(std::memcmp(&original_follower, &control.follower_status, sizeof(original_follower)), 0);
+        EXPECT_FALSE(protocol.markTimedOut(44u, 6000u, &error));
+        EXPECT_FALSE(protocol.reset(*identity, &error));
+        EXPECT_FALSE(protocol.completedTraffic(*identity, &error).has_value());
+    }
+
+    /** A queued-but-unlaunched endpoint stays device-owned; cancellation proves no native completion. */
+    TEST(Test__MoEOverlayActivationEpochProtocol,
+         SchedulerCancellationBeforeActivationDoesNotForgeGPUCompletion)
+    {
+        auto config = makeConfig({1});
+        config.target.world_rank = config.source.world_rank;
+        MoEOverlayActivationEpochControl control;
+        MoEOverlayActivationEpochProtocol::initialize(control, config);
+        MoEOverlayActivationEpochProtocol protocol(control, config);
+        std::string error;
+        const auto identity = protocol.arm(makeTicket(config), 44u, 5000u, &error);
+        ASSERT_TRUE(identity.has_value()) << error;
+        const auto continuation = control.continuation_status;
+        const auto follower = control.follower_status;
+        ASSERT_TRUE(protocol.cancelOriginalInvocation(*identity, MoEOverlayActivationStatusCode::ExplicitAbort, &error));
+        EXPECT_EQ(std::memcmp(&continuation, &control.continuation_status, sizeof(continuation)), 0);
+        EXPECT_EQ(std::memcmp(&follower, &control.follower_status, sizeof(follower)), 0);
+        EXPECT_EQ(protocol.admissionState(), MoEOverlayActivationAdmissionState::Failed);
+        EXPECT_EQ(control.admission.ready_signal, kMoEOverlayActivationAbortTimeline);
+        EXPECT_FALSE(protocol.completedTraffic(*identity, &error).has_value());
+        EXPECT_FALSE(protocol.reset(*identity, &error));
+    }
+
 } // namespace llaminar2::test

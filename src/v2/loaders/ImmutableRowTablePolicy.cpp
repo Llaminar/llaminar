@@ -24,8 +24,9 @@ void AdaptiveGPUCachePlacementRequest::validate() const
     }
     if(mode!=AdaptiveGPUCachePlacementMode::DeclaredRankLocal || owners.empty() || !coordinator)
         throw std::invalid_argument("DeclaredRankLocal GPU cache placement needs ordered owners and exact coordinator");
-    if(std::none_of(owners.begin(),owners.end(),[&](const auto &o){return o.participant==*coordinator;}))
-        throw std::invalid_argument("Declared GPU cache coordinator requires its own explicit owner ceiling, including C0");
+    // The query/coalescer source is not a cache replica. Its exact typed
+    // directory/frame cost is charged on its own PMA even when every physical
+    // cache slot belongs to a distinct declared storage-only endpoint.
     const auto valid=[](const AdaptiveGPUCacheParticipant &p) { return p.world_rank>=0 && p.device().is_gpu(); };
     if(!valid(*coordinator))throw std::invalid_argument("GPU cache coordinator must be an exact rank-local CUDA/ROCm endpoint");
     for(std::size_t i=0;i<owners.size();++i)
@@ -35,8 +36,9 @@ void AdaptiveGPUCachePlacementRequest::validate() const
             throw std::invalid_argument("GPU cache owner requires bounded slots on the coordinator rank; cross-rank materialization is unimplemented");
         for(std::size_t j=0;j<i;++j)if(owners[j].participant==o.participant)
             throw std::invalid_argument("GPU cache owner declaration duplicates a physical endpoint");
-        if(o.participant!=*coordinator && o.participant.backend==coordinator->backend)
-            throw std::invalid_argument("Same-vendor remote GPU cache materialization is unimplemented; no native P2P substitute is admitted");
+        // Same-vendor requests remain lossless intent here. Their original
+        // inventory must select the explicit NoPeer transport before BOM or
+        // materialization; request parsing cannot manufacture that observation.
     }
 }
 std::vector<AdaptiveGPUCacheParticipant> AdaptiveGPUCachePlacementRequest::declaredParticipants() const
@@ -155,6 +157,11 @@ void ImmutableRowTablePolicy::validate() const
     if (isGPUAdaptive())
     {
         gpu_adaptive.placement.validate();
+        if(gpu_adaptive.source_backing!=AdaptiveImmutableRowBacking::SSD && gpu_adaptive.source_backing!=AdaptiveImmutableRowBacking::RAM)
+            throw std::invalid_argument("Unknown adaptive native host backing");
+        if(gpu_adaptive.source_backing==AdaptiveImmutableRowBacking::RAM &&
+           (gpu_adaptive.host.maximum_cache_rows || gpu_adaptive.host.cache_physical_byte_limit))
+            throw std::invalid_argument("Full-RAM adaptive source forbids a redundant bounded RAM row cache");
         if(gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal &&
             (gpu_adaptive.maximum_gpu_cache_rows || gpu_adaptive.gpu_cache_physical_byte_limit))
             throw std::invalid_argument("Declared GPU cache owners cannot mix ConsumerLocal scalar GPU ceilings");

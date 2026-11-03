@@ -920,11 +920,19 @@ namespace llaminar2
     struct RankOrchestrator::RetainedSourceAdmission
     {
         std::unique_ptr<qwen4exp::ImmutableLookupExecutionBoundary::SourceGroupAdmission> original;
-        /** @brief Abort only the original source invocation when an actual participant launch/admission fails. */
+        bool failed = false;
+        std::exception_ptr retired_failure;
+        std::function<void()> cancel;
+        /** @brief Cancel failed execution without discarding any original adopted retirement right. */
         struct Attempt {
-            std::unique_ptr<RetainedSourceAdmission>& owner;
-            bool keep=false;
-            ~Attempt(){if(!keep)owner.reset();}
+            std::unique_ptr<RetainedSourceAdmission> &owner;
+            bool keep = false;
+            ~Attempt() {
+                if (!keep && owner) {
+                    owner->failed = true;
+                    owner->cancel();
+                }
+            }
         };
     };
 
@@ -940,15 +948,69 @@ namespace llaminar2
             if(boundary&&boundary->requiresSourceGroupAdmission())participants.push_back({boundary,epoch});
         }
         if(participants.empty())return;
+        if (retained_source_admission_ && retained_source_admission_->retired_failure)
+            std::rethrow_exception(retained_source_admission_->retired_failure);
+        if (retained_source_admission_ && retained_source_admission_->failed)
+            throw std::logic_error("Failed original source group requires terminal retirement before another launch");
         if(retained_source_admission_&&retained_source_admission_->original->reuses(participants))return;
         if(retained_source_admission_){
-            if(!retained_source_admission_->original->finish())
-                throw std::logic_error("Original TP source group did not close every channel");
-            retained_source_admission_.reset();
+            // A different epoch/member set cannot replace a still-owned
+            // invocation merely because its CPU worker can be joined. Only
+            // the original terminal/reset aggregation retires native channels.
+            retained_source_admission_->failed = true;
+            retained_source_admission_->cancel();
+            throw std::logic_error("Original source group requires full native retirement before replacement");
         }
         auto retained=std::make_unique<RetainedSourceAdmission>();
         retained->original=Boundary::armSourceGroup(participants);
+        retained->cancel = retained->original->failureCallback();
+        // Bind the independent failure worker before any participant can launch.
+        // The callback owns the original source/ticket, never this mutable slot.
+        if (!tp_worker_pool_)
+            tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
+        tp_worker_pool_->setFailureCallback([cancel = retained->cancel, context = tp_ctx_.get()] {
+            std::exception_ptr failure;
+            try { cancel(); } catch (...) { failure = std::current_exception(); }
+            // A source failure must still unblock original TP rendezvous even
+            // when cancellation itself discovers an earlier ownership fault.
+            if (context) context->requestAbort();
+            if (failure) std::rethrow_exception(failure);
+        });
         retained_source_admission_=std::move(retained);
+    }
+
+    void RankOrchestrator::awaitRetainedSourceAdmission(std::exception_ptr prior_unproven)
+    {
+        if (retained_source_admission_ && retained_source_admission_->retired_failure)
+            std::rethrow_exception(retained_source_admission_->retired_failure);
+        if (!retained_source_admission_) return;
+        try {
+            retireOriginalStorageParticipants(device_runners_, [](const auto &runner) {
+                if (auto *device = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+                    device->awaitGroupedRetainedStorageTerminal();
+            }, [&] {
+                const bool success = retained_source_admission_->original->finish();
+                if (!success)
+                    throw RetiredStorageRequestFailure("Original TP source group failed terminal request retirement");
+            }, [&] {
+                // The actual aggregation owner calls this only after every
+                // original GPU/native proof, including semantic-failure peers.
+                // A lost cancellation identity also forbids host channel
+                // retirement, but never skips another original peer's join.
+                if (prior_unproven) std::rethrow_exception(prior_unproven);
+                if (!retained_source_admission_->original->finishNativeChannelsAfterProof())
+                    throw RetiredStorageRequestFailure("Original shared reader channels retired a cancelled request");
+            });
+            retained_source_admission_.reset();
+        } catch (const RetiredStorageRequestFailure &) {
+            if (!retained_source_admission_)
+                throw std::logic_error("Retired failed source group lost its original owner");
+            retained_source_admission_->retired_failure = std::current_exception();
+            throw;
+        } catch (...) {
+            if (prior_unproven) std::rethrow_exception(prior_unproven);
+            throw;
+        }
     }
 
     RankOrchestrator::~RankOrchestrator()
@@ -1063,13 +1125,14 @@ namespace llaminar2
         }
 
         const auto &devices = tp_ctx_->devices();
-        const bool fixed_consumer=config_.ngram_table_placement && config_.ngram_table_placement->isFixedHeadShards() &&
+        const bool replicated_consumer=config_.ngram_table_placement &&
+            Qwen4ExpReplicatedPLECohort::requiresReplicatedQuery(*config_.ngram_table_placement) &&
             std::any_of(devices.begin(),devices.end(),[&](const auto &member){
                 const auto owner=PhysicalMemoryAllocatorIdentity{config_.ngram_table_placement->worldRank(),member.toLocalDeviceId()};
                 const auto &consumers=config_.ngram_table_placement->consumers();
                 return std::find(consumers.begin(),consumers.end(),owner)!=consumers.end();
             });
-        if(fixed_consumer)
+        if(replicated_consumer)
         {
             const auto loader=model_ctx_?model_ctx_->loader():nullptr;
             if(!loader || !loader->ggufDirectory())
@@ -1886,6 +1949,28 @@ namespace llaminar2
             device_runners_.push_back(std::move(result.runner));
 
             LOG_DEBUG("RankOrchestrator: Successfully created runner for device " << result.device_idx);
+        }
+
+        // Continuation banks are now published in the same original registry.
+        // Prepare auxiliary experts before releasing any remaining source tensors;
+        // these devices are genuine expert endpoints, not additional TP members.
+        if (config_.rank_local_expert_endpoints)
+        {
+            const auto &auxiliary = *config_.rank_local_expert_endpoints;
+            const auto same_original = [](const auto &left, const auto &right)
+            {
+                return left.get() == right.get() &&
+                    !left.owner_before(right) && !right.owner_before(left);
+            };
+            if (auxiliary.ownership != MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary ||
+                !same_original(auxiliary.model_context, model_ctx_) ||
+                !same_original(auxiliary.placement_plan, config_.moe_routed_expert_plan) ||
+                !same_original(auxiliary.residency_authority, config_.moe_expert_overlay_residency_authority) ||
+                !same_original(auxiliary.participant_residency, config_.moe_expert_overlay_participant_residency) ||
+                !same_original(auxiliary.rank_batch_transport_registry, config_.moe_rank_batch_transport_registry) ||
+                !same_original(auxiliary.device_controller_fabric, config_.moe_device_controller_fabric))
+                throw std::invalid_argument("Rank auxiliary experts require the same original model, residency, controller and transport owners");
+            rank_local_expert_endpoints_ = std::make_shared<MoEOverlayParticipantGraphRunner>(auxiliary);
         }
 
         // =====================================================================
@@ -3046,6 +3131,10 @@ namespace llaminar2
             std::rethrow_exception(first_exception);
         }
         if (!all_success)
+            return false;
+
+        if (rank_local_expert_endpoints_ &&
+            !rank_local_expert_endpoints_->materializeServingGraphFamilyWithoutLaunch(plan))
             return false;
 
         PerfStatsCollector::addCounter(
@@ -13497,15 +13586,8 @@ namespace llaminar2
 
         // Each original result event has completed, including its captured close.
         // A fast participant cannot cancel a peer whose terminal is still queued.
-        if(retained_source_admission_)
-            retireOriginalStorageParticipants(participants,
-                [](const auto& participant){
-                    dynamic_cast<DeviceGraphOrchestrator&>(*participant).awaitGroupedRetainedStorageTerminal();
-                },[&]{
-                    const bool success=retained_source_admission_->original->finish();
-                    retained_source_admission_.reset();
-                    if(!success)throw std::runtime_error("Original TP source group failed terminal retirement");
-                });
+        if (retained_source_admission_)
+            awaitRetainedSourceAdmission();
 
         const auto &authoritative_requests =
             participant_results.front().requests;
@@ -16153,6 +16235,9 @@ namespace llaminar2
                   << pp_stage_runners_.size() << " PP stages"
                   << " reason=" << (request.reason ? request.reason : "request-boundary"));
 
+        if (retained_source_admission_ && retained_source_admission_->retired_failure)
+            std::rethrow_exception(retained_source_admission_->retired_failure);
+
         // Close publication is a separate native-proof phase. A missing proof
         // still fails before any participant's data reset can start.
         if(retained_source_admission_){
@@ -16160,7 +16245,7 @@ namespace llaminar2
                 retireOriginalStorageParticipants(device_runners_,[&](const auto& runner){
                     if(auto* device=dynamic_cast<DeviceGraphOrchestrator*>(runner.get()))
                         device->prepareGroupedRetainedStorageReset(request);
-                },[]{});
+                },[]{},[]{});
             }catch(...){
                 const auto original=std::current_exception();
                 // Only cancel/join the original CPU owner. Adopted GPU duties
@@ -16169,22 +16254,20 @@ namespace llaminar2
                 retained_source_admission_.reset();
                 std::rethrow_exception(original);
             }
+            std::exception_ptr cancellationFailure;
+            if (retained_source_admission_->failed) {
+                try { retained_source_admission_->original->cancelStorageChannelsAfterSourceProof(); }
+                catch (...) { cancellationFailure = std::current_exception(); }
+            }
             // Drain every adopted right before full DGO reset: its generic
             // reset transaction deliberately terminates on missing prior work.
             // A recoverable service failure must not enter that data-clearing
             // transaction or prevent an original peer from retiring its right.
-            retireOriginalStorageParticipants(device_runners_,[](const auto& runner){
-                if(auto* device=dynamic_cast<DeviceGraphOrchestrator*>(runner.get()))
-                    device->awaitGroupedRetainedStorageTerminal();
-            },[&]{
-                const bool success=retained_source_admission_->original->finish();
-                retained_source_admission_.reset();
-                if(!success)throw std::runtime_error("Original TP source group failed terminal request retirement");
-            });
+            awaitRetainedSourceAdmission(cancellationFailure);
             // Only successful original IO retirement permits model-state clear.
             retireOriginalStorageParticipants(device_runners_,[&](const auto& runner){
                 if(runner)runner->resetInferenceState(request);
-            },[]{});
+            },[]{},[]{});
         }else{
             for(auto& runner:device_runners_)if(runner)runner->resetInferenceState(request);
         }
@@ -16197,6 +16280,9 @@ namespace llaminar2
                 runner->resetInferenceState(request);
             }
         }
+
+        if (rank_local_expert_endpoints_)
+            rank_local_expert_endpoints_->resetInferenceState(request);
 
         current_position_ = 0;
         current_padded_seq_len_ = 0;
@@ -16354,6 +16440,11 @@ namespace llaminar2
         };
         append(device_runners_);
         append(pp_stage_runners_);
+        if (rank_local_expert_endpoints_)
+        {
+            auto endpoints = rank_local_expert_endpoints_->moeOverlayDeviceControllerRuntimeBindings();
+            result.insert(result.end(), endpoints.begin(), endpoints.end());
+        }
         std::sort(
             result.begin(),
             result.end(),
@@ -16404,8 +16495,21 @@ namespace llaminar2
             }
             return true;
         };
-        if (!find_owner(device_runners_) || !find_owner(pp_stage_runners_) ||
-            !owner)
+        if (!find_owner(device_runners_) || !find_owner(pp_stage_runners_)) return false;
+        if (rank_local_expert_endpoints_)
+        {
+            const auto devices = rank_local_expert_endpoints_->localDevices();
+            if (std::find(devices.begin(), devices.end(), epoch->device()) != devices.end())
+            {
+                if (owner)
+                {
+                    LOG_ERROR("Rank auxiliary expert device aliases a continuation parent");
+                    return false;
+                }
+                owner = rank_local_expert_endpoints_.get();
+            }
+        }
+        if (!owner)
         {
             LOG_ERROR(
                 "RankOrchestrator could not resolve the exact child for ExpertOverlay transfer progress on "
@@ -17440,17 +17544,19 @@ namespace llaminar2
         return true;
     }
 
-    std::vector<const IInferenceRunner *> RankOrchestrator::fixedHeadPLEPrefixOwners() const
+    std::vector<const IInferenceRunner *> RankOrchestrator::replicatedPLEPrefixOwners() const
     {
         if(!replicated_ple_cohort_ || !pp_stage_runners_.empty() ||
             device_runners_.size()!=static_cast<std::size_t>(replicated_ple_cohort_->degree()))
-            throw std::invalid_argument("Fixed-head rollback requires its actual complete full-main Rank child set");
+            throw std::invalid_argument("Replicated PLE rollback requires its actual complete full-main Rank child set");
         std::vector<const IInferenceRunner *> owners;owners.reserve(device_runners_.size());
         for(std::size_t p=0;p<device_runners_.size();++p) {
             const auto *runner=device_runners_[p].get();
             if(!dynamic_cast<const DeviceGraphOrchestrator *>(runner))
-                throw std::invalid_argument("Fixed-head rollback requires actual device-owned child producers");
-            (void)replicated_ple_cohort_->requireParticipant(runner->primaryDeviceId(),static_cast<int>(p));
+                throw std::invalid_argument("Replicated PLE rollback requires actual device-owned child producers");
+            if (replicated_ple_cohort_->placement().isFixedHeadShards())
+                (void)replicated_ple_cohort_->requireParticipant(runner->primaryDeviceId(),static_cast<int>(p));
+            else replicated_ple_cohort_->requireConsumer(runner->primaryDeviceId(),static_cast<int>(p));
             owners.push_back(runner);
         }
         return owners;
@@ -17545,7 +17651,7 @@ namespace llaminar2
                                                : PrefixStateProvenance::PayloadCheckpoint;
         if(replicated_ple_cohort_)
             aggregate.fixed_head_rollback_origin=std::shared_ptr<const Qwen4ExpReplicatedPLEPrefixOrigin>(
-                new Qwen4ExpReplicatedPLEPrefixOrigin(this,replicated_ple_cohort_,fixedHeadPLEPrefixOwners(),aggregate,seq_idx));
+                new Qwen4ExpReplicatedPLEPrefixOrigin(this,replicated_ple_cohort_,replicatedPLEPrefixOwners(),aggregate,seq_idx));
         return aggregate;
     }
 
@@ -17645,7 +17751,7 @@ namespace llaminar2
                                           : PrefixStateProvenance::PayloadCheckpoint);
         if(replicated_ple_cohort_)
             aggregate.fixed_head_rollback_origin=std::shared_ptr<const Qwen4ExpReplicatedPLEPrefixOrigin>(
-                new Qwen4ExpReplicatedPLEPrefixOrigin(this,replicated_ple_cohort_,fixedHeadPLEPrefixOwners(),aggregate,request.sequence_index));
+                new Qwen4ExpReplicatedPLEPrefixOrigin(this,replicated_ple_cohort_,replicatedPLEPrefixOwners(),aggregate,request.sequence_index));
         return aggregate;
     }
 
@@ -17660,7 +17766,7 @@ namespace llaminar2
         if(replicated_ple_cohort_) {
             if(!snapshot.fixed_head_rollback_origin)return false;
             snapshot.fixed_head_rollback_origin->require(this,*replicated_ple_cohort_,
-                fixedHeadPLEPrefixOwners(),snapshot,seq_idx);
+                replicatedPLEPrefixOwners(),snapshot,seq_idx);
         }
 
         size_t participant_index = 0;

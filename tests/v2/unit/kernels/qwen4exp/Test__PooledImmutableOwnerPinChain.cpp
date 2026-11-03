@@ -6,6 +6,7 @@
  * identities, and same-PMA reservations. Canonical runners isolate process roots.
  */
 #include "fixtures/qwen4exp/PooledImmutableOriginalProgramReplay.h"
+#include "loaders/ImmutableLookupSetupObservation.h"
 namespace llaminar2::test {
 TEST(PooledImmutableOwnerPinChain, OriginalConcretePositiveAndC0ChainsPass){for(uint32_t capacity:{0u,3u}){OwnerChainCase c(capacity);
     EXPECT_NO_THROW(requirePooledPinOwnerCompletion(c.graph,c.returned,c.complete.last));const auto before=c.graph.getExecutionOrder().size();
@@ -501,3 +502,83 @@ TEST(PooledImmutableOwnerPinChain, RecordedOrderingPartialCreationAndFinalAliasK
     }
 }
 }
+
+namespace llaminar2::test {
+/** @test Actual original source/root leases partition setup capacities once, independent of request-data replay. */
+TEST(PooledImmutableOwnerPinChain, ImmutableSetupCapacityUsesOriginalDisjointRootsAndRejectsPartialSources) {
+    struct CollectorScope {
+        std::optional<std::string> enabled,filter;
+        CollectorScope() {
+            if(const auto* old=std::getenv("LLAMINAR_PERF_STATS_JSON"))enabled=old;
+            if(const auto* old=std::getenv("LLAMINAR_PERF_STATS_FILTER"))filter=old;
+            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup_setup.*",1);
+            PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
+        }
+        ~CollectorScope() {
+            if(enabled)::setenv("LLAMINAR_PERF_STATS_JSON",enabled->c_str(),1);else ::unsetenv("LLAMINAR_PERF_STATS_JSON");
+            if(filter)::setenv("LLAMINAR_PERF_STATS_FILTER",filter->c_str(),1);else ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
+            PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
+        }
+    } collector;
+    const std::vector<PooledOriginalRecipe> recipes{{{0},false},{{2,0},true},{{2,1,0,3},false,0}};
+    PooledImmutableOriginalPrograms programs(recipes);
+    for(const auto& recipe:recipes) {
+        auto c=programs.make(recipe);
+        const std::array<std::shared_ptr<const q::PooledImmutableSourcePreparedStorage>,1> sources{c.boundary->pooledStorage()};
+        const auto capture=[&](const auto& population) {
+            return ImmutableLookupSetupObservation::captureAdaptive(c.layout,c.cpuGeometry,c.service,population);
+        };
+        const auto observed=capture(sources);
+        PerfStatsCollector::reset();observed.publish();
+        const auto records=PerfStatsCollector::snapshot({"immutable_lookup_setup"});ASSERT_EQ(records.size(),observed.owners().size());
+        for(const auto& record:records){EXPECT_EQ(record.name,"admitted_owner");EXPECT_EQ(record.count,1u);EXPECT_EQ(record.value,1);EXPECT_EQ(record.tags.at("source_row_bytes"),std::to_string(c.file.descriptor().rowBytes()));}
+        PerfStatsCollector::addCounter("immutable_lookup_setup","unrelated_warmup",7,"warmup","CPU");
+        PerfStatsCollector::resetPreserving({},{{"immutable_lookup_setup","admitted_owner"}});
+        const auto retained=PerfStatsCollector::snapshot({"immutable_lookup_setup"});EXPECT_EQ(retained.size(),records.size());
+        std::size_t hostRows=0,cacheRows=0,tableBytes=0,stagingBytes=0;
+        for(const auto& row:observed.owners()) {
+            EXPECT_EQ(row.table_storage_bytes,row.source_storage_bytes+row.payload_bytes+row.metadata_bytes);
+            tableBytes+=row.table_storage_bytes;stagingBytes+=row.lookup_staging_bytes;
+            if(row.role==ImmutableLookupSetupObservation::Role::SharedHostSource) {
+                ++hostRows;EXPECT_EQ(row.allocator.device,DeviceId::cpu());
+                EXPECT_EQ(row.source_storage_bytes,c.cpuGeometry.sourceBytes());
+                EXPECT_EQ(row.admitted_slots,c.cpuGeometry.slots());
+            }
+            if(row.role==ImmutableLookupSetupObservation::Role::GPUCache) {
+                ++cacheRows;
+                const auto owner=std::find_if(c.owners.begin(),c.owners.end(),[&](const auto& owner){return owner->plan().allocator()==row.allocator;});
+                ASSERT_NE(owner,c.owners.end());EXPECT_EQ(row.admitted_slots,(*owner)->plan().parameters().owner.capacity());
+                EXPECT_EQ(row.table_storage_bytes,(*owner)->retainedOwnerObservation().tableStorageBytes());
+            }
+        }
+        EXPECT_EQ(hostRows,1u);EXPECT_EQ(cacheRows,c.owners.size());
+        std::size_t actualTable=0,actualStaging=0;
+        for(const auto& lease:c.memory->rankAttestation()) {
+            if(lease.owner==PhysicalMemoryOwner::ImmutableTableStorage)actualTable+=lease.materialized_new_bytes+lease.adopted_resident_bytes;
+            if(lease.owner==PhysicalMemoryOwner::ImmutableLookupStaging)actualStaging+=lease.materialized_new_bytes+lease.adopted_resident_bytes;
+        }
+        EXPECT_EQ(tableBytes,actualTable);
+        // Fixture query/control tensors are other original staging owners; setup reports only lookup roots/service.
+        EXPECT_LE(stagingBytes,actualStaging);
+        for(unsigned replay=0;replay<20;++replay)EXPECT_TRUE(observed.sameCapacity(capture(sources)));
+        const std::span<const std::shared_ptr<const q::PooledImmutableSourcePreparedStorage>> missing;
+        EXPECT_THROW(capture(missing),std::invalid_argument);
+        const std::array<std::shared_ptr<const q::PooledImmutableSourcePreparedStorage>,1> null{nullptr};
+        EXPECT_THROW(capture(null),std::invalid_argument);
+        const std::array duplicate{sources[0],sources[0]};EXPECT_THROW(capture(duplicate),std::invalid_argument);
+        EXPECT_THROW(ImmutableLookupSetupObservation::captureAdaptive(c.layout,c.cpuGeometry,{},sources),std::invalid_argument);
+        auto foreignCapacities=recipe.capacities;++foreignCapacities[0];
+        const auto foreign=SourceGraphCase::declare(c.file.descriptor(),foreignCapacities,recipe.reverse,recipe.local,recipe.source);
+        EXPECT_THROW(ImmutableLookupSetupObservation::captureAdaptive(foreign,c.cpuGeometry,c.service,sources),std::invalid_argument);
+        const auto host=ImmutableLookupSetupObservation::hostOwner(c.cpuGeometry,c.service);
+        EXPECT_EQ(host.source_storage_bytes,c.cpuGeometry.sourceBytes());
+        // The emitted historical value survives request resets; a changed actual
+        // source cannot issue a fresh observation or replace its provenance.
+        {std::ofstream changed(c.file.path,std::ios::binary|std::ios::app);changed.put('x');}
+        EXPECT_THROW(capture(sources),std::exception);
+        EXPECT_TRUE(observed.sameCapacity(observed));
+
+
+    }
+}
+} // namespace llaminar2::test

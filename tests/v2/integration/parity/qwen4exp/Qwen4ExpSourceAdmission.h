@@ -26,6 +26,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "config/OrchestrationStartupPolicy.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/ModelContext.h"
@@ -33,6 +34,7 @@
 #include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "utils/PerfStatsCollector.h"
+#include "loaders/ImmutableLookupSetupObservation.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "utils/TestOrchestrationHelper.h"
 #include <gtest/gtest.h>
@@ -189,11 +191,97 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
     const auto host=layout.sourceServices().front().allocator;
     ASSERT_TRUE(gpu.device.is_gpu());ASSERT_TRUE(host.device.is_cpu());EXPECT_EQ(gpu.world_rank,host.world_rank);
     EXPECT_EQ(placement->lookupForConsumer(gpu),ImmutableRowLookupExecution::AdaptiveGPUCache);
+    const bool shared = declared && layout.consumers().size() > 1;
+    if (shared) {
+        ASSERT_TRUE(request.placement.coordinator);
+        const PhysicalMemoryAllocatorIdentity coordinator{request.placement.coordinator->world_rank,
+            request.placement.coordinator->device()};
+        if (gpu != coordinator) {
+            // A replicated query reader owns its result/ACK endpoints, never a
+            // duplicate source service, table, pin authority or provider grant.
+            EXPECT_FALSE(context->adaptiveImmutableLookupBoundary(gpu.device));
+            const auto participants = context->adaptiveImmutableLookupParticipants(gpu.device);
+            ASSERT_TRUE(participants);
+            const auto sourceParticipants = context->adaptiveImmutableLookupParticipants(coordinator.device);
+            ASSERT_EQ(participants, sourceParticipants);
+            EXPECT_FALSE(participants.owner_before(sourceParticipants));
+            EXPECT_FALSE(sourceParticipants.owner_before(participants));
+            const auto transport = participants->transport();
+            ASSERT_TRUE(transport);
+            ASSERT_NO_THROW(transport->requireCurrent());
+            ASSERT_TRUE(transport->readerGeometry());
+            const auto& readers = *transport->readerGeometry();
+            EXPECT_EQ(readers.coordinator(), coordinator);
+            EXPECT_EQ(std::vector<PhysicalMemoryAllocatorIdentity>(readers.consumers().begin(),readers.consumers().end()),
+                std::vector<PhysicalMemoryAllocatorIdentity>(layout.consumers().begin(),layout.consumers().end()));
+            const auto sourceBoundary = participants->boundary();
+            ASSERT_TRUE(sourceBoundary);
+            EXPECT_EQ(sourceBoundary->device(), coordinator.device);
+            EXPECT_EQ(context->adaptiveImmutableLookupBoundary(coordinator.device), sourceBoundary);
+            ASSERT_EQ(sourceBoundary->pooledStorage()->geometry().parameters().consumers, layout.consumers().size());
+            const auto& workers = sourceBoundary->pooledStorage()->retainedPreparedSourceWorkers();
+            const auto originalSource = context->nativeContextPreparation();
+            ASSERT_NO_THROW((void)requireQwen4ExpConsumedPreparedSource(originalSource,workers));
+            const auto& memory = original.physical_memory_authority;
+            ASSERT_TRUE(memory);
+            EXPECT_EQ(originalSource->memory(),memory);
+            EXPECT_FALSE(originalSource->memory().owner_before(memory));
+            EXPECT_FALSE(memory.owner_before(originalSource->memory()));
+            const auto reader = std::find_if(transport->readers().begin(),transport->readers().end(),[&](const auto& actual) {
+                return actual->originalReader().device() == gpu.device;
+            });
+            ASSERT_NE(reader,transport->readers().end());
+            ASSERT_NO_THROW((*reader)->requireCurrent());
+            for (const auto* permit : {&(*reader)->originalSource(), &(*reader)->originalReader()}) {
+                EXPECT_EQ(permit->memory(), memory);
+                EXPECT_FALSE(permit->memory().owner_before(memory));
+                EXPECT_FALSE(memory.owner_before(permit->memory()));
+                const auto existing = GPUDeviceContextPool::instance().retainExistingPreparedContext(permit->device(),memory);
+                EXPECT_EQ(permit->generation(),existing.generation());
+                EXPECT_NE(permit->generation(),0u);
+                EXPECT_NO_THROW(permit->requireWorker(existing.worker()));
+            }
+            EXPECT_EQ((*reader)->originalSource().device(),coordinator.device);
+            EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Producer),coordinator.device);
+            EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Consumer),gpu.device);
+            EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Producer),gpu.device);
+            EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Consumer),coordinator.device);
+            EXPECT_EQ((*reader)->result()->capacityBytes(),std::max(readers.resultMaximum(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
+            EXPECT_EQ((*reader)->result()->payloadStorage(), readers.payloadStorage(gpu));
+            EXPECT_EQ((*reader)->acknowledgement()->payloadStorage(), readers.payloadStorage(gpu));
+            EXPECT_EQ((*reader)->acknowledgement()->capacityBytes(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
+            const auto& control = (*reader)->control(CapturedTransferEndpoint::Consumer);
+            ASSERT_TRUE(control);
+            EXPECT_TRUE(control->isBound());
+            EXPECT_EQ(control->device(),gpu.device);
+            EXPECT_EQ(control->sizeBytes(),sizeof(::llaminar2::qwen4exp::replicated_reader::Control));
+            EXPECT_EQ(reinterpret_cast<std::uintptr_t>(control->deviceData()) % alignof(::llaminar2::qwen4exp::replicated_reader::Control),0u);
+            const auto provider = context->hostImmutableRowProvider();
+            ASSERT_TRUE(provider);
+            EXPECT_EQ(provider->subordinateRequester(),std::optional{coordinator});
+            EXPECT_EQ(provider->subordinateRequesters().size(),1u);
+            EXPECT_EQ(context->residentImmutableRowTable(gpu.device),nullptr);
+            EXPECT_EQ(context->residentImmutableRowTableBytes(gpu.device),0u);
+            const auto geometry = AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),request);
+            EXPECT_EQ(geometry.gpuCacheBytes(gpu),0u);
+            EXPECT_EQ(geometry.mandatoryDeviceBytes(gpu),0u);
+            for (const auto& row : memory->rankAttestation()) {
+                if (row.identity != gpu || (row.owner != PhysicalMemoryOwner::ImmutableTableStorage &&
+                    row.owner != PhysicalMemoryOwner::ImmutableLookupStaging)) continue;
+                EXPECT_EQ(row.materialized_new_bytes + row.adopted_resident_bytes,0u);
+            }
+            // The coordinator iteration below authenticates shared source and
+            // provider statistics exactly once. Reader observations do not add
+            // those bytes or channel counts to another consumer's totals.
+            return;
+        }
+    }
     const auto boundary=context->adaptiveImmutableLookupBoundary(gpu.device);ASSERT_TRUE(boundary);
     ASSERT_TRUE(boundary->isPooled());EXPECT_EQ(boundary->device(),gpu.device);
     EXPECT_EQ(context->adaptiveImmutableLookupBoundary(gpu.device).get(),boundary.get());
     const auto provider=context->hostImmutableRowProvider();ASSERT_TRUE(provider);
-    EXPECT_EQ(provider->mode(),HostImmutableRowMode::AdaptiveRAMSSD);
+    EXPECT_EQ(provider->mode(),request.sourceStorage()==ImmutableRowStorage::RAM
+        ? HostImmutableRowMode::AdaptiveFullRAM : HostImmutableRowMode::AdaptiveRAMSSD);
     if (grouped) {
         EXPECT_FALSE(provider->subordinateRequester());
         const auto requesters=provider->subordinateRequesters();
@@ -215,6 +303,23 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
     const auto geometry=grouped ? AdaptiveImmutableLookupGeometry::forRequester(layout,provider->source(),request,gpu)
         : AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),request);
     const auto ram_slots=geometry.host().slots();EXPECT_LE(ram_slots,request.host.maximum_cache_rows);
+    const auto setup=context->immutableLookupSetupObservation();
+    ASSERT_NE(setup,nullptr) << "Ready source requires original immutable admitted-capacity evidence";
+    EXPECT_EQ(setup->mode(),provider->mode());EXPECT_EQ(setup->source(),provider->source());
+    std::size_t setupHostOwners=0;
+    for(const auto& row:setup->owners()) {
+        EXPECT_EQ(row.table_storage_bytes,row.payload_bytes+row.metadata_bytes+row.source_storage_bytes);
+        if(row.role==ImmutableLookupSetupObservation::Role::SharedHostSource) {
+            ++setupHostOwners;
+            EXPECT_EQ(row.allocator,layout.sourceServices().front().allocator);
+            EXPECT_EQ(row.admitted_slots,ram_slots);
+            const auto actual=boundary->retainedSourceOwnerObservation();
+            EXPECT_EQ(row.table_storage_bytes,actual.tableStorageBytes());
+            EXPECT_EQ(row.lookup_staging_bytes,actual.lookupStagingBytes());
+        }
+    }
+    EXPECT_EQ(setupHostOwners,1u); // Per-consumer borrows never multiply the shared source/channel block.
+
     ASSERT_EQ(geometry.physical().owners().size(),expected_owner_count);
     for(std::size_t coordinate=0;coordinate<expected_owner_count;++coordinate)
     {
@@ -227,6 +332,14 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
         if(maximum && ceiling)EXPECT_GT(owner.slots,0u)<<"Positive owner cell cannot certify a zero optional grant";
         else EXPECT_EQ(owner.slots,0u);
         EXPECT_LE(geometry.gpuSlotDependentBytes(endpoint),ceiling);
+        const auto recorded=std::find_if(setup->owners().begin(),setup->owners().end(),[&](const auto& row){
+            return row.role==ImmutableLookupSetupObservation::Role::GPUCache && row.allocator==endpoint;});
+        ASSERT_NE(recorded,setup->owners().end());
+        EXPECT_EQ(recorded->admitted_slots,owner.slots);
+        EXPECT_EQ(recorded->table_storage_bytes,owner.cache.bytes);
+        EXPECT_EQ(recorded->metadata_bytes,owner.cache.payload);
+        EXPECT_EQ(recorded->payload_bytes,owner.cache.bytes-owner.cache.payload);
+
     }
     if(request.host.maximum_cache_rows && request.host.cache_physical_byte_limit)
     {
@@ -319,7 +432,8 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
     EXPECT_EQ(source_owner.tableStorageBytes(),provider_owner.tableStorageBytes());
     EXPECT_GE(source_owner.lookupStagingBytes(),provider_owner.lookupStagingBytes());
     std::vector<DeviceId> channelDevices;
-    for(const auto consumer:layout.consumers())channelDevices.push_back(consumer.device);
+    if (shared) channelDevices.push_back(gpu.device);
+    else for(const auto consumer:layout.consumers())channelDevices.push_back(consumer.device);
     EXPECT_EQ(source_owner.lookupStagingBytes()-provider_owner.lookupStagingBytes(),
         grouped ? ::llaminar2::qwen4exp::ImmutableLookupServiceGeometry::checked(geometry.channelLayout(),channelDevices).hostBytes()
                 : ::llaminar2::qwen4exp::ImmutableLookupService::hostBytes(geometry.channelLayout()));
@@ -716,7 +830,8 @@ inline void expectQwen4ExpSourceMTPMaterialization(const ModelParityCase &cell,
                             setup_before, PerfStatsCollector::snapshot(), expected));
     }
     ASSERT_NO_THROW(
-        requireQwen4ExpCPUStorageMaterialization(reuse->physical_memory_authority->rankAttestation()));
+        requireQwen4ExpCPUStorageMaterialization(reuse->physical_memory_authority->rankAttestation(),
+            reuse->prepared_routed_weight_plan));
     std::ofstream mtp_setup(output / "mtp-setup.csv");
     ASSERT_TRUE(mtp_setup.is_open());
     mtp_setup
@@ -874,11 +989,24 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell)
     for (const auto &resource : reuse->physical_memory_authority->admission()->plan().resources())
         EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::GraphSnapshotArena), 0u);
     ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLookup(cell, *runner, *reuse));
+    if(const auto setup=model->immutableLookupSetupObservation()) {
+        // Serialize the SAME passive setup value used by the assertions and
+        // benchmark family, once per rank, independent of consumer borrows.
+        std::ofstream grants(output / "ngram-admitted-setup.csv");ASSERT_TRUE(grants.is_open());
+        grants << "world_rank,device,role,admitted_slots,payload_bytes,metadata_bytes,source_storage_bytes,table_storage_bytes,lookup_staging_bytes,source_file_offset,source_rows,source_row_elements\n";
+        for(const auto& row:setup->owners())
+            grants << row.allocator.world_rank << ',' << row.allocator.device.toString() << ',' << static_cast<unsigned>(row.role)
+                << ',' << row.admitted_slots << ',' << row.payload_bytes << ',' << row.metadata_bytes << ',' << row.source_storage_bytes
+                << ',' << row.table_storage_bytes << ',' << row.lookup_staging_bytes << ',' << setup->source().file_offset
+                << ',' << setup->source().rows << ',' << setup->source().row_elements << '\n';
+        grants.flush();ASSERT_TRUE(grants.good());
+    }
+
     std::ofstream memory(output / "admission_memory.txt");
     ASSERT_TRUE(memory.is_open());
     memory << reuse->physical_memory_authority->rankAttestationSummary(true);
     ASSERT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(
-        reuse->physical_memory_authority->rankAttestation()));
+        reuse->physical_memory_authority->rankAttestation(), reuse->prepared_routed_weight_plan));
     memory.flush();
     ASSERT_TRUE(memory.good());
     std::ofstream csv(output / "admission.csv");

@@ -15,6 +15,8 @@
 
 namespace llaminar2
 {
+    class MoEOverlayPreparedExpertPayload;
+    class RetainedParticipantGraphExecutable;
     /** @brief One complete captured FFN, including routing/activation work. */
     struct PlanningGPUExpertPhaseObservation final
     {
@@ -77,6 +79,37 @@ namespace llaminar2
         /** @brief Same exact-worker BOM from published source identity; no remote file access. */
         static void contributeMemory(const PlanningExpertSamplePlan &plan, PlanningSampleOrigin origin,
             PhysicalMemoryResource host, PhysicalMemoryResource gpu, PhysicalMemoryPlanBuilder &builder);
+
+        /**
+         * @brief Acquire one original General owner for serial cold prepared-kernel definitions.
+         * @param device Original prepared GPU.
+         * @param memory Same admitted source authority whose one-slot BOM preceded admission.
+         * @return Closed calibration-purpose owner; no serving graph can enter this purpose.
+         * @throws std::exception For stale/missing original source or insufficient admission.
+         */
+        static std::shared_ptr<RetainedParticipantGraphExecutable> beginPreparedCalibration(
+            DeviceId device,const std::shared_ptr<PhysicalMemoryAuthority>& memory);
+
+        /**
+         * @brief Capture/time one original resident expert without reading or repacking model weights.
+         * @param payload Complete gate/up/down family borrowed under its original bank lease.
+         * @param device Exact original prepared GPU, owned by the same admitted authority.
+         * @param layer Original logical layer identity.
+         * @param phase Original priced production phase, independent of row count.
+         * @param width Full expert input/output width.
+         * @param intermediate Full expert intermediate width.
+         * @param memory Same original admitted PMA for scratch and General graph obligations.
+         * @param declared_workspace_bytes Same original source estimator's admitted serial workspace envelope.
+         * @param calibration Same original cold-only owner reused after each exact terminal/native reset.
+         * @return One completed GPU-event interval spanning three invocations, in nanoseconds, excluding warmup.
+         * @throws std::exception For stale source, geometry, admission, capture or timing failure.
+         * @note Caller runs off-worker; this method records on the original worker,
+         * then joins and destroys native graph handles before releasing any bank/view storage.
+         */
+        static uint64_t measurePrepared(const MoEOverlayPreparedExpertPayload &payload,
+            DeviceId device, int layer, ExpertHistogramSource phase, int width, int intermediate,
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory, size_t declared_workspace_bytes,
+            const std::shared_ptr<RetainedParticipantGraphExecutable> &calibration);
 
         /**
          * @brief Prepare once and measure retained decode, prefill and verifier graphs.
