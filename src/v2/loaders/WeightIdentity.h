@@ -77,6 +77,10 @@ namespace llaminar2
         PerLayerEmbeddingConvolution,
         /** Predictor embedding/hidden mixing projection. */
         PredictorProjection,
+        /** DeepSeek-V4 immutable FP32 operator tensors (compressor APE, sinks, HC base/scale, routing bias). */
+        DeepSeekV4Operator,
+        /** DeepSeek-V4 INT32 token-id -> expert hash-routing table; never a GEMM weight. */
+        DeepSeekV4HashTable,
     };
 
     /**
@@ -97,6 +101,7 @@ namespace llaminar2
     inline constexpr bool isImmutableFP32WeightRole(WeightRole role) noexcept
     {
         return role == WeightRole::HyperConnectionNorm ||
+               role == WeightRole::DeepSeekV4Operator ||
                role == WeightRole::SparseIndexerNorm ||
                role == WeightRole::PerLayerEmbeddingNorm ||
                role == WeightRole::PerLayerEmbeddingConvolution;

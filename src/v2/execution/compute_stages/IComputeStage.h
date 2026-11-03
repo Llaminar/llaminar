@@ -435,6 +435,19 @@ namespace llaminar2
         QWEN4EXP_POOLED_SOURCE_PHASE, ///< Actual provider request/acquire/private-copy/original-order consumer.
         QWEN4EXP_QSA_PREPARE_REPLAY,
 
+        // DeepSeek-V4 participant-local primitives (hyper-connections, compressed sparse attention, routing).
+        DEEPSEEK_V4_HC_READ,
+        DEEPSEEK_V4_HC_WRITE,
+        DEEPSEEK_V4_HC_EXPAND,
+        DEEPSEEK_V4_HEAD_NORM_ROPE,
+        DEEPSEEK_V4_COMPRESSOR_STORE,
+        DEEPSEEK_V4_COMPRESSOR_POOL,
+        DEEPSEEK_V4_RAW_STORE,
+        DEEPSEEK_V4_INDEXER_TOPK,
+        DEEPSEEK_V4_SPARSE_ATTENTION,
+        DEEPSEEK_V4_GROUPED_PROJECTION,
+        DEEPSEEK_V4_ROUTE,
+
         // GDN (Gated Delta Network) stages
         ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output
         GATED_RMS_NORM,        ///< RMSNorm with learned multiplicative gate

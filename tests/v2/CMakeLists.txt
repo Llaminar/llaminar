@@ -874,6 +874,16 @@ add_v2_test(V2_Integration_MXFP4ExactPreparation_CPU
     NO_MODELS
     NO_MPI
 )
+add_executable(v2_test_deepseek4_cpu_kernels
+    unit/kernels/deepseek4/Test__DeepSeekV4CPUKernels.cpp)
+target_link_libraries(v2_test_deepseek4_cpu_kernels PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_DeepSeekV4CPUKernels
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_cpu_kernels>
+    LABELS "V2;Unit;Kernels;DeepSeekV4;CPU"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
 add_v2_test(V2_Unit_Qwen4ExpMetadata
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
     LABELS "V2;Unit;Models;Qwen4Exp;Loaders"

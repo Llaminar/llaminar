@@ -399,6 +399,8 @@ namespace llaminar2
             return TensorType::IQ1_M;
         case GGUFTensorType::MXFP4:
             return TensorType::MXFP4;
+        case GGUFTensorType::I32:
+            return TensorType::INT32;
         default:
             throw std::invalid_argument(
                 "[ModelLoader] Unsupported GGUF tensor type " +
@@ -447,6 +449,8 @@ namespace llaminar2
             return 2;
         case GGUFTensorType::BF16:
             return 2;
+        case GGUFTensorType::I32:
+            return 4;
         case GGUFTensorType::Q4_0:
             return 18;
         case GGUFTensorType::Q4_1:
@@ -1115,6 +1119,17 @@ namespace llaminar2
                 ? std::shared_ptr<TensorBase>(factory_->createFP16Owned(shape, std::move(fp16_storage)))
                 : std::make_shared<FP16Tensor>(shape, std::move(fp16_storage));
             break;
+
+        case GGUFTensorType::I32:
+        {
+            // Integer tables (DeepSeek-V4 token-id hash routing) keep exact
+            // native INT32 values; they are never dequantized or packed.
+            AlignedVector<int32_t> values;
+            values.resize_uninitialized(raw.size() / sizeof(int32_t));
+            std::memcpy(values.data(), raw.data(), values.size() * sizeof(int32_t));
+            tensor = std::make_shared<INT32Tensor>(shape, std::move(values));
+            break;
+        }
 
         case GGUFTensorType::BF16:
             tensor = factory_
@@ -3189,6 +3204,10 @@ namespace llaminar2
             else if (tensor.type == GGUFTensorType::BF16)
             {
                 tensor.size_bytes = n_elems * 2;
+            }
+            else if (tensor.type == GGUFTensorType::I32)
+            {
+                tensor.size_bytes = n_elems * 4;
             }
             else if (tensor.isQuantized())
             {

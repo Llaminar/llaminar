@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2
@@ -245,6 +246,34 @@ namespace llaminar2
     };
 
     /**
+     * @brief Router scoring function and expert-selection policy.
+     *
+     * Softmax is the ordinary Qwen router (softmax probabilities, top-k by
+     * logit, optional renormalization). SqrtSoftplus is DeepSeek-V4: scores
+     * s = sqrt(softplus(logit)); experts are selected by the top-k of
+     * s + selection_bias (ascending expert id on ties), or by hash_table[token]
+     * for hash-routed layers; weights are the unbiased s of the selected
+     * experts, normalized to sum 1 and multiplied by route_scale.
+     *
+     * Pointers are stable graph-construction addresses in the routing
+     * device's address space (host for CPU, device for GPU); the policy is
+     * fixed for the lifetime of the routed pipeline kernel that stores it.
+     */
+    struct MoERouterScoringPolicy
+    {
+        enum class Function : uint8_t { Softmax, SqrtSoftplus };
+        Function function = Function::Softmax;
+        const float *selection_bias = nullptr;   ///< [num_experts] FP32 (SqrtSoftplus score routing).
+        float route_scale = 1.0f;                ///< Multiplier after normalization.
+        const int32_t *hash_table = nullptr;     ///< [vocab, top_k] INT32 (hash routing) or null.
+        int hash_vocab = 0;                      ///< Rows of @c hash_table.
+        const int32_t *token_ids = nullptr;      ///< [rows] routed token ids (hash routing).
+
+        /** @return Whether this is the ordinary softmax router. */
+        [[nodiscard]] bool isSoftmax() const noexcept { return function == Function::Softmax; }
+    };
+
+    /**
      * @brief Device-agnostic MoE kernel interface
      *
      * Encapsulates all non-GEMM MoE operations. GEMM (gate/up/down projections)
@@ -259,6 +288,22 @@ namespace llaminar2
     class IMoEKernel : public ITensorKernel
     {
     public:
+        /**
+         * @brief Install this routed pipeline's router scoring policy before any launch.
+         * @throws std::invalid_argument when the backend does not implement @p policy.
+         */
+        virtual void setRouterScoringPolicy(const MoERouterScoringPolicy &policy)
+        {
+            if (!policy.isSoftmax())
+                throw std::invalid_argument("MoE router scoring policy is not implemented by this backend");
+        }
+        /** @brief Routed-expert and shared-expert SwiGLU clamp (0 = unclamped). */
+        virtual void setSwiGLULimit(float limit)
+        {
+            if (limit != 0.0f)
+                throw std::invalid_argument("MoE SwiGLU clamp is not implemented by this backend");
+        }
+
         ~IMoEKernel() override = default;
 
         // =================================================================

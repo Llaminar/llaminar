@@ -19,6 +19,7 @@
 
 #include "execution/moe/MoEOverlayHostServiceContract.h"
 #include "Qwen35MoEGraph.h"
+#include "../deepseek4/DeepSeekV4Config.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "execution/moe/MoECPUExpertWorkspaceSource.h"
@@ -7251,8 +7252,8 @@ namespace llaminar2
         // =====================================================================
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
         // =====================================================================
-        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> residual_read;
-        if (config_.flash_next)
+        std::optional<ResidualBlockRead> residual_read;
+        if (config_.usesResidualTrunk())
         {
             residual_read.emplace(addBranchBlockRead(graph, prefix, buffers,
                 layer_idx, total_tokens, device, ResidualBlock::FeedForward, predictor));
@@ -7366,6 +7367,30 @@ namespace llaminar2
                 device.is_gpu() && batch_size == 1
                     ? sequence_lengths_device
                     : nullptr;
+            if (config_.deepseek_v4)
+            {
+                // DeepSeek-V4 sqrt(softplus) routing: bias-shifted top-k on
+                // score layers, token-id hash rows on the first hash layers.
+                const auto &dsv4 = *config_.deepseek_v4;
+                route_params.scoring_function = MoERouterScoringPolicy::Function::SqrtSoftplus;
+                route_params.scoring_route_scale = dsv4.routeScale();
+                if (dsv4.layer(layer_idx).hashRouted)
+                {
+                    const auto &input = modelForwardInput();
+                    route_params.scoring_hash_table = layer.deepseek_v4.hash_table;
+                    route_params.scoring_token_ids = device.is_gpu()
+                        ? static_cast<const int32_t *>(input.token_ids_device)
+                        : reinterpret_cast<const int32_t *>(input.token_ids);
+                    if (!route_params.scoring_hash_table || !route_params.scoring_token_ids)
+                        throw std::invalid_argument("DeepSeek-V4 hash routing requires its table and execution-device token ids");
+                }
+                else
+                {
+                    route_params.scoring_selection_bias = layer.deepseek_v4.router_bias;
+                    if (!route_params.scoring_selection_bias)
+                        throw std::invalid_argument("DeepSeek-V4 score routing requires exp_probs_b.bias");
+                }
+            }
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);

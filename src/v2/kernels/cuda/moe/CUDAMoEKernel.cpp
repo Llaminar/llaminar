@@ -1257,6 +1257,15 @@ extern "C"
         const int *device_effective_seq_len,
         void *deferred_selected_route_ledger = nullptr);
 
+    bool cudaMoE_scored_router_logit_transform(
+        float *logits, int seq_len, int num_experts, int top_k,
+        const float *bias, const int32_t *hash_table, int hash_vocab, const int32_t *token_ids,
+        const int *effective_seq_len, int device_idx, void *stream);
+    bool cudaMoE_scale_route_weights(float *weights, int seq_len, int top_k, float scale,
+                                     const int *effective_seq_len, int device_idx, void *stream);
+    bool cudaMoE_scale_runtime_route_weights(void *runtime_layer, float *legacy_weights, int top_k, float scale,
+                                             int device_idx, void *stream);
+
     bool cudaMoE_softmax_topk_decode_runtime(
         float *logits, void *runtime_layer,
         float *legacy_indices, float *legacy_weights,
@@ -4730,6 +4739,11 @@ namespace llaminar2
         // cache and hidden bank; capture only consumes their retained addresses.
         const bool q8_prefill = gate_is_fp32 &&
             debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8;
+        if (!router_scoring_.isSoftmax() && (owned || q8_prefill))
+        {
+            LOG_ERROR("[CUDAMoEKernel] scored (sqrt-softplus) routing supports only the ordinary complete-row router");
+            return false;
+        }
         invalidateRouterQ8HiddenPublication();
         if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
             return false;
@@ -4826,10 +4840,20 @@ namespace llaminar2
                  {"d_model", std::to_string(d_model)},
                  {"num_experts", std::to_string(num_experts)}});
         }
+        const bool scored = !router_scoring_.isSoftmax();
+        if (scored &&
+            !cudaMoE_scored_router_logit_transform(d_route_logits_, seq_len, num_experts, top_k,
+                router_scoring_.selection_bias, router_scoring_.hash_table, router_scoring_.hash_vocab,
+                router_scoring_.token_ids, device_effective_seq_len, device_ordinal_, getStream()))
+            return false;
         if (!cudaMoE_softmax_topk(d_route_logits_, output_indices, output_weights,
-                                  seq_len, num_experts, top_k, normalize_weights,
+                                  seq_len, num_experts, top_k, normalize_weights || scored,
                                   device_ordinal_, getStream(),
                                   device_effective_seq_len))
+            return false;
+        if (scored && router_scoring_.route_scale != 1.0f &&
+            !cudaMoE_scale_route_weights(output_weights, seq_len, top_k, router_scoring_.route_scale,
+                                         device_effective_seq_len, device_ordinal_, getStream()))
             return false;
         return true;
     }
@@ -5449,6 +5473,20 @@ namespace llaminar2
             if (!route_ok)
                 return false;
         }
+        const bool scored = !router_scoring_.isSoftmax();
+        if (scored)
+        {
+            if (q8_router_requested)
+            {
+                LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] scored routing does not support the Q8 router");
+                return false;
+            }
+            if (!cudaMoE_scored_router_logit_transform(d_route_logits_, 1, num_experts, top_k,
+                    router_scoring_.selection_bias, router_scoring_.hash_table, router_scoring_.hash_vocab,
+                    router_scoring_.token_ids, nullptr, device_ordinal_, stream))
+                return false;
+            normalize_weights = true;
+        }
         const bool unique_owner_route =
             prepared_decode_resident_set_policy_ ==
             RoutedExpertResidentSetPolicy::UniqueOwner;
@@ -5492,6 +5530,10 @@ namespace llaminar2
                                            device_ordinal_,
                                            stream);
         if (!route_ready)
+            return false;
+        if (scored && router_scoring_.route_scale != 1.0f &&
+            !cudaMoE_scale_runtime_route_weights(runtime_layer, legacy_weights, top_k,
+                                                 router_scoring_.route_scale, device_ordinal_, stream))
             return false;
 
         if (write_legacy_outputs)

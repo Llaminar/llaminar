@@ -239,12 +239,23 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
     formulas["mtp_gather_rows"] = gather.rows();
     formulas["mtp_gather_vocab"] = gather.columns();
 
-    const bool hybrid = profile.flash_next || hasHybridRecurrentLayer(profile, 0, std::max(0, profile.n_layers - 1));
+    const bool hybrid = profile.flash_next || profile.deepseek_v4 ||
+        hasHybridRecurrentLayer(profile, 0, std::max(0, profile.n_layers - 1));
     GraphSchema schema = hybrid ? (profile.expert_count > 0
         ? Qwen35MoESchemaFactory{}.createSchema() : Qwen35SchemaFactory{}.createSchema())
         : Qwen2SchemaFactory{}.createSchema();
     if (hybrid)
     {
+        if (profile.deepseek_v4)
+        {
+            // Attention-only hybrid schema: GDN roles are removed by the DeepSeek-V4 layout.
+            formulas["fa_q_full_dim"] = checkedMultiply(2, query_columns, "CPU FA query/gate");
+            formulas["mtp_fa_q_full_dim"] = checkedMultiply(2, formulas.at("mtp_q_dim"), "CPU predictor query/gate");
+            formulas["attn_output_dim"] = query_columns;
+            formulas["mtp_attn_output_dim"] = std::max(formulas.at("mtp_q_dim"), query_columns);
+        }
+        else
+        {
         if (profile.gdn_state_size <= 0 || profile.gdn_group_count <= 0 ||
             profile.gdn_time_step_rank <= 0 || profile.gdn_inner_size <= 0)
             throw std::invalid_argument("CPU hybrid arena requires complete source GDN metadata");
@@ -262,6 +273,7 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
         formulas["mtp_fa_q_full_dim"] = checkedMultiply(2, formulas.at("mtp_q_dim"), "CPU predictor query/gate");
         formulas["attn_output_dim"] = std::max(query_columns, inner);
         formulas["mtp_attn_output_dim"] = std::max(formulas.at("mtp_q_dim"), formulas.at("attn_output_dim"));
+        }
     }
     if (hybrid && profile.expert_count > 0)
     {
@@ -283,12 +295,29 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
         applyQwen4ExpBufferLayout(schema, *profile.flash_next, dimensions);
         applyQwen4ExpBufferGeometry(resolver, *profile.flash_next, dimensions);
     }
+    if (profile.deepseek_v4)
+    {
+        if (geometry.context_tokens <= 0)
+            throw std::invalid_argument("DeepSeek-V4 activation admission requires explicit runtime context capacity");
+        applyDeepSeekV4BufferLayout(schema);
+        applyDeepSeekV4BufferGeometry(resolver, *profile.deepseek_v4, resolver.seq_len, geometry.context_tokens);
+    }
     const bool retained_mtp = geometry.retained_mtp_candidate_rows > 0;
-    return GraphArenaStorageLayout::resolve(schema, resolver, {
+    auto layout = GraphArenaStorageLayout::resolve(schema, resolver, {
         .full_prefill_kv_handoff = geometry.replicated_dense_decode,
         .terminal_hidden_rows = retained_mtp ? std::max(static_cast<size_t>(geometry.batch_size), target_rows) : 0,
         .terminal_hidden_columns = retained_mtp ? (profile.flash_next
-            ? static_cast<size_t>(profile.flash_next->residual_width) : static_cast<size_t>(profile.d_model)) : 0});
+            ? static_cast<size_t>(profile.flash_next->residual_width)
+            : profile.deepseek_v4 ? static_cast<size_t>(profile.deepseek_v4->hc) * profile.d_model
+            : static_cast<size_t>(profile.d_model)) : 0});
+    for (const auto &entry : layout.entries())
+    {
+        std::size_t elements = 1;
+        for (const auto dimension : entry.descriptor.shape) elements *= dimension;
+        LOG_DEBUG("[ActivationMemoryEstimator] Planned arena root: '" << entry.descriptor.name << "' -> "
+                  << bufferIdName(entry.id) << " elements=" << elements);
+    }
+    return layout;
 }
 
 size_t ActivationMemoryEstimator::estimate(
@@ -605,6 +634,16 @@ size_t ActivationMemoryEstimator::estimate(
         const Qwen35MoESchemaFactory common_factory;
         bytes = checkedAdd(bytes, qwen4ExpArenaExtensionBytes(common_factory.createSchema(), resolver,
             *profile.flash_next, dimensions), "Flash Next declared arena/state extensions");
+    }
+    if (profile.deepseek_v4)
+    {
+        if (geometry.batch_size <= 0 || geometry.resident_graph_rows <= 0 || geometry.context_tokens <= 0)
+            throw std::invalid_argument("DeepSeek-V4 activation admission requires positive rows and context");
+        const auto flattened = checkedMultiply(static_cast<std::size_t>(geometry.batch_size),
+            static_cast<std::size_t>(geometry.resident_graph_rows), "DeepSeek-V4 flattened graph rows");
+        bytes = checkedAdd(bytes, deepSeekV4ArenaExtensionBytes(*profile.deepseek_v4,
+            static_cast<int>(std::max(flattened, static_cast<std::size_t>(geometry.mtp_target_query_rows))),
+            geometry.context_tokens), "DeepSeek-V4 declared arena/state extensions");
     }
     return bytes;
 }

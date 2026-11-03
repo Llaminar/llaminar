@@ -18,7 +18,12 @@
 namespace llaminar2
 {
     /** @brief Supported, distinct GGUF byte-BPE pre-tokenization contracts. */
-    enum class TextPreTokenizerProfile { GPT2, Qwen2, Qwen35, Llama3 };
+    /**
+     * @brief Unicode splitting policy. DeepSeekV4 (GGUF "joyai-llm") is a
+     *        Hugging Face Sequence of three isolated Split regexes applied in
+     *        turn to every piece of the previous split, with no normalizer.
+     */
+    enum class TextPreTokenizerProfile { GPT2, Qwen2, Qwen35, Llama3, DeepSeekV4 };
 
     /**
      * @brief Resolve an exact tokenizer.ggml.pre value without guessing a model family.

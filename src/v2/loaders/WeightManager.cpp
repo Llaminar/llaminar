@@ -983,7 +983,8 @@ namespace llaminar2
     bool WeightManager::isGemmWeight(const std::string &name) const
     {
         const auto role = inferWeightRole(name);
-        if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role)) return false;
+        if (role == WeightRole::ImmutableRowTable || role == WeightRole::DeepSeekV4HashTable ||
+            isImmutableFP32WeightRole(role)) return false;
         if (isFlashNextProjectionRole(role)) return true;
         if (!has_sharding_config_)
         {

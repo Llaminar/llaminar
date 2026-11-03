@@ -17,6 +17,7 @@
 
 #include "KernelFactory.h"
 #include "qwen4exp/Qwen4ExpKernels.h"
+#include "deepseek4/DeepSeekV4Kernels.h"
 #include "qwen4exp/QwenSparseAttention.h"
 #include "../transfer/TransferEngine.h"
 #include <cstring>
@@ -1846,6 +1847,22 @@ namespace llaminar
                     return ::llaminar2::qwen4exp::createROCmQwen4ExpKernels();
 #endif
                 throw std::invalid_argument("Qwen4Exp kernels are not compiled for " + device.toString());
+            }
+
+            std::unique_ptr<llaminar2::deepseek4::IDeepSeekV4Kernels>
+            KernelFactory::createDeepSeekV4(::llaminar2::DeviceId device)
+            {
+                if (!device.is_valid())
+                    throw std::invalid_argument("DeepSeek V4 kernels require a valid participant device");
+                if (device.is_cpu())
+                    return ::llaminar2::deepseek4::createCPUDeepSeekV4Kernels();
+#ifdef HAVE_CUDA
+                if (device.is_cuda())
+                    return ::llaminar2::deepseek4::createCUDADeepSeekV4Kernels();
+#endif
+                if (device.is_rocm())
+                    throw std::invalid_argument(::llaminar2::deepseek4::kROCmUnimplemented);
+                throw std::invalid_argument("DeepSeek V4 kernels are not compiled for " + device.toString());
             }
 
             std::unique_ptr<llaminar2::qwen4exp::IQwenSparseAttentionKernels>
