@@ -29,6 +29,7 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tests/v2/e2e/server'))
 import gpu_driver_diagnostics as driver
 import resource_usage_observer as resources
+from resource_owned_process_tree import OwnedProcessTree
 import docker_paths
 from model_kld_canary import DEFAULT_GDN_POLICY, definition
 from model_kld_corpus import (CATALOG,identity,load_corpus,physical_workers,require,
@@ -36,6 +37,19 @@ from model_kld_corpus import (CATALOG,identity,load_corpus,physical_workers,requ
 from production_artifacts import image_identity,image_cpu_isa,write_json
 
 FILTER='kernel,forward_graph,gpu_graph_inventory,weight_loading,gemm,cuda_moe,rocm_moe,moe'
+
+
+def observe_native_resources(manifest,local_owner):
+    """Include actual local descendants, keeping each process's memory separate.
+
+    Image runs retain exact cgroup ownership. A local launch uses its original
+    PID/start-time tree instead of mistaking the MPI wrapper's RSS for the
+    engine. The journal deliberately makes no sum of shared process mappings.
+    """
+    sample=resources.collect(manifest)
+    if local_owner is not None:
+        sample['local_process_tree']=local_owner.snapshot()
+    return sample
 
 
 def engine_arguments(model,backend,threads):
@@ -159,11 +173,10 @@ def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=Non
         manifest=dict(backends=[backend] if adapter is None else adapter.backends,cells={'canary':{'controller':str(controller)}},filesystems={'output':str(output)})
         with (output/'native.log').open('x') as log,(output/'resources.jsonl').open('x') as observations:
             process=subprocess.Popen(command,env=env if not image else None,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+            local_owner=OwnedProcessTree(process.pid) if image is None else None
             started=time.monotonic()
             while True:
-                sample=resources.collect(manifest)
-                if not image and Path(f'/proc/{process.pid}/status').exists():
-                    sample['local_process']=resources.numeric_fields(Path(f'/proc/{process.pid}/status'),kilobytes=True)
+                sample=observe_native_resources(manifest,local_owner)
                 observations.write(json.dumps(sample)+'\n');observations.flush()
                 require(not sample['errors'] and not any(v['errors'] for v in sample['cells'].values()),'Resource observation failed')
                 require(sample['filesystems']['output']['available_bytes']>256*1024*1024,'Canary artifact filesystem exhausted')

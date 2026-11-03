@@ -3702,6 +3702,15 @@ add_test(NAME V2_Unit_ServerExecutionContract
 )
 
 # App lifecycle evidence is device-free; real sessions consume these contracts.
+add_test(NAME V2_Unit_OwnedProcessTreeResources
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_resource_owned_process_tree.py)
+set_tests_properties(V2_Unit_OwnedProcessTreeResources PROPERTIES
+    LABELS "V2;Unit;DeviceFree;Resources;ProcessOwnership" TIMEOUT 15)
+add_test(NAME V2_Integration_ModelKLDLocalProcessResources
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_resource_owned_process_tree.py)
+set_tests_properties(V2_Integration_ModelKLDLocalProcessResources PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Resources;ProcessOwnership;Regression" TIMEOUT 15)
+
 add_test(NAME V2_Unit_ResourceObserverScope
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_resource_observer_scope.py)
 set_tests_properties(V2_Unit_ResourceObserverScope PROPERTIES

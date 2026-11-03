@@ -48,11 +48,27 @@ completed baseline/calibration approval or a production certificate. Evidence:
 `/tmp/qfn-read-ahead-root-integration-r1/tp4-numerical-diagnostics-r205/summary.json`
 and `row-comparison.json` in that directory. No new Release speed is claimed.
 
-The local resource observer exposed a measurement gap: its extra RSS sample
-tracks the outer MPI wrapper rather than the engine descendant. Host RAM,
-device VRAM and disk observations remain available, but per-engine RSS growth
-is not yet qualified. Correct the owned-descendant attribution before treating
-these runs as complete memory-growth or economy evidence.
+The six historical runs exposed a resource-observation gap: their extra RSS
+sample followed the outer MPI wrapper rather than the engine descendant. The
+local canary observer now follows actual child links from its original launched
+PID and pins each descendant to kernel start ticks. It samples memory per
+process, follows children created by helper threads, retains known descendants
+after parent exit, and rejects PID reuse. Shared RSS is never summed into a
+second physical-memory total. Fourteen focused tests pass, including an actual
+spawned child with its own allocation; six canonical related CTest registrations
+pass. Evidence is in `/tmp/qfn-local-process-observer-r215/`.
+
+This improves subsequent observations; it does not retroactively supply the
+missing engine RSS in the six earlier runs, nor qualify a memory-growth envelope
+without the corresponding admission baseline and workload observations.
+
+Checkpoint `31449ce1a` contains the qualified continuation follow-up and source
+identity repair; `726049c38` adds the explicit `expert_*` CLI keys. Both are
+pushed to `feat/qfn-ngram-continuation`. The CLI slice passed all 981 Unit
+registrations in its latest complete run. Earlier attempts exposed intermittent
+CPU packed-weight retirement and MPI root-publication failures that remain
+under investigation; passing isolated repeats is not a fix. Full production
+prerequisites after r199 still need refreshing.
 
 ## Current correctness boundary
 
