@@ -20,6 +20,8 @@
 #include "qwen35moe/Qwen35MoESchema.h"
 #include "qwen4exp/Qwen4ExpGraph.h"
 #include "qwen4exp/Qwen4ExpSchema.h"
+#include "deepseek4/DeepSeekV4Graph.h"
+#include "deepseek4/DeepSeekV4Schema.h"
 #include "../execution/local_execution/graph/GraphBuilderRegistry.h"
 #include "../execution/local_execution/graph/SchemaFactoryRegistry.h"
 
@@ -30,6 +32,18 @@ namespace llaminar2
 
     static void doRegisterBuiltinModels()
     {
+        // =================================================================
+        // DeepSeek-V4 (Sinkhorn hyper-connections + compressed sparse MQA + sqrt-softplus MoE)
+        // =================================================================
+        GraphBuilderRegistry::registerFactory("deepseek4",
+                                              [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
+                                              {
+                                                  return std::make_shared<DeepSeekV4Graph>(cfg, std::move(mpi));
+                                              });
+        SchemaFactoryRegistry::registerFactory("deepseek4",
+                                               []()
+                                               { return std::make_unique<DeepSeekV4SchemaFactory>(); });
+
         // =================================================================
         // Qwen2 (also serves Qwen3 which reuses QwenStandardGraph)
         // =================================================================

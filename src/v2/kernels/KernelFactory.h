@@ -89,6 +89,7 @@
 namespace llaminar2
 {
     namespace qwen4exp { class IQwen4ExpKernels; class IQwenSparseAttentionKernels; }
+    namespace deepseek4 { class IDeepSeekV4Kernels; }
     // KVCache types
     class IKVCache;
     class ICPUKVCache;
@@ -883,6 +884,15 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::qwen4exp::IQwen4ExpKernels>
                 createQwen4Exp(::llaminar2::DeviceId device);
+
+            /**
+             * @brief Create the stateless DeepSeek-V4 primitive bundle for one participant.
+             * @param device Exact CPU or CUDA participant.
+             * @throws std::invalid_argument "DeepSeek V4: ROCm unimplemented" for ROCm and for
+             *         backends not compiled into this binary.
+             */
+            static std::unique_ptr<::llaminar2::deepseek4::IDeepSeekV4Kernels>
+                createDeepSeekV4(::llaminar2::DeviceId device);
 
                 /**
                  * @brief Bind sparse indexer/attention kernels to one graph participant.

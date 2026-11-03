@@ -61717,6 +61717,8 @@ namespace llaminar2
             {
                 if (binding.identity.role == WeightRole::Norm ||
                     binding.identity.role == WeightRole::Bias ||
+                    binding.identity.role == WeightRole::DeepSeekV4HashTable ||
+                    binding.identity.role == WeightRole::DeepSeekV4Operator ||
                     tensor->shape().size() != 2)
                 {
                     return;
