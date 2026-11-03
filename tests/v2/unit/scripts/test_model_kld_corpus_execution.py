@@ -188,6 +188,11 @@ class CorpusExecutionTests(unittest.TestCase):
             a=SimpleNamespace(topology={'id':'fixture'},devices=['cpu:0'],backends=['cpu'],environment={},
                 prepare=Mock(return_value=(root/'workload',[])),score=Mock())
             child=Mock(pid=123);child.wait.return_value=1
+            # This fixture owns a simulated launch; process traversal itself is
+            # exercised with real proc children in OwnedProcessTreeResources.
+            local_owner=Mock(spec=runner.OwnedProcessTree)
+            local_owner.snapshot.return_value={'root':{'pid':123,'start_ticks':1},
+                'processes':[],'retired':[],'memory_scope':'individual_processes_not_summed'}
             events=[]
             def launch(*unused,**kwargs):
                 self.assertFalse((output/'logits').exists())
@@ -197,9 +202,13 @@ class CorpusExecutionTests(unittest.TestCase):
             sample=dict(errors=[],cells={'canary':{'errors':[]}},filesystems={'output':{'available_bytes':10**9}})
             with patch.object(runner,'retire',side_effect=retire),patch.object(runner.driver,'begin'),\
                  patch.object(runner.driver,'finish',return_value=True),patch.object(runner.driver,'validate_evidence'),\
-                 patch.object(runner.resources,'collect',return_value=sample),patch.object(runner.subprocess,'Popen',side_effect=launch):
+                 patch.object(runner.resources,'collect',return_value=sample),patch.object(runner.subprocess,'Popen',side_effect=launch),\
+                 patch.object(runner,'OwnedProcessTree',return_value=local_owner) as observe:
                 with self.assertRaisesRegex(ValueError,'observer failed'):
                     runner.execute_cell(args,{'inputs':{}},'qwen4exp','cpu',None,output,None,adapter=a)
+            observe.assert_called_once_with(child.pid);local_owner.snapshot.assert_called_once_with()
+            self.assertEqual(json.loads((output/'resources.jsonl').read_text())['local_process_tree'],
+                local_owner.snapshot.return_value)
             self.assertEqual(events,['retired']);a.score.assert_not_called()
             self.assertFalse((output/'logits').exists())
             self.assertEqual(json.loads((output/'native-observation.json').read_text())['complete'],False)

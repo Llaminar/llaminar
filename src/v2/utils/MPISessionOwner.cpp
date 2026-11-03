@@ -903,6 +903,34 @@ namespace
             if(::poll(&live,1,0)!=0)throw BrokenBorrow("original immutable loan peer retired");
             return OriginalBorrow{creator.pid,observed};
         }
+        /**
+         * @brief Preserve the exact failed root syscall before another open/stat can overwrite errno.
+         * @param operation Failed native operation (open or fstat).
+         * @param root Original published physical-root role.
+         * @param path Exact borrowed publication path, without adopting another directory.
+         * @param failure Errno captured immediately at the failed syscall.
+         * @throws std::logic_error Always; diagnostics never retry or authorize cleanup.
+         */
+        [[noreturn]] void nativeRootFailure(const char* operation,RuntimeRoot root,
+            const std::string& path,int failure)
+        {
+            throw std::logic_error(std::string("Owned MPI rank lost its original opened root publication")+
+                "; operation="+operation+"; root="+(root==RuntimeRoot::Temporary?"temporary":"shared")+
+                "; path="+path+"; errno="+std::to_string(failure)+" ("+
+                std::error_code(failure,std::generic_category()).message()+")");
+        }
+        /**
+         * @brief Open only the original native root and preserve its immediate failure evidence.
+         * @param root Published physical-root role, used only for fatal attribution.
+         * @param path Exact original publication path.
+         * @return Original non-following directory descriptor; failure never substitutes another root.
+         */
+        FD openOriginalNativeRoot(RuntimeRoot root,const std::string& path)
+        {
+            const int descriptor=::open(path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+            if(descriptor<0)nativeRootFailure("open",root,path,errno);
+            return FD(descriptor);
+        }
         /** @brief Exact opened native shared root authenticated against its daemon publication. */
         struct NativeSharedRoot final { FD directory;std::string path;RootIdentity original; };
         /** @return One original opened shared directory, never a post-authentication pathname adoption. */
@@ -916,11 +944,11 @@ namespace
             if(std::string_view(required)!=kProtocol || !ready || !temporary || !shared)
                 throw std::logic_error("Owned MPI rank has no native environment publication");
             const std::string expected_publication=ready,temporary_path=temporary,shared_path=shared;
-            FD temporary_fd(::open(temporary_path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
-            FD shared_fd(::open(shared_path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
+            FD temporary_fd=openOriginalNativeRoot(RuntimeRoot::Temporary,temporary_path);
+            FD shared_fd=openOriginalNativeRoot(RuntimeRoot::Shared,shared_path);
             struct stat t{},h{};
-            if(temporary_fd.value<0 || shared_fd.value<0 || ::fstat(temporary_fd.value,&t)!=0 || ::fstat(shared_fd.value,&h)!=0)
-                throw std::logic_error("Owned MPI rank lost its original opened root publication");
+            if(::fstat(temporary_fd.value,&t)!=0)nativeRootFailure("fstat",RuntimeRoot::Temporary,temporary_path,errno);
+            if(::fstat(shared_fd.value,&h)!=0)nativeRootFailure("fstat",RuntimeRoot::Shared,shared_path,errno);
             const std::string actual=std::string(kProtocol)+":"+std::to_string(t.st_dev)+":"+std::to_string(t.st_ino)+":"+
                 std::to_string(h.st_dev)+":"+std::to_string(h.st_ino);
             if(actual!=expected_publication)

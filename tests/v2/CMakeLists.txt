@@ -37447,3 +37447,20 @@ add_v2_test(V2_Integration_RetainedFullNativeEndpointCaptureReplay
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedFullNativeEndpointCaptureReplay)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ModelKLDSourceIdentityTests.cmake)
+
+# Preserve the original failed native-root syscall before another probe changes errno.
+# Deliberately invalid child publications never create native MPI readiness.
+add_executable(v2_test_mpi_root_publication unit/utils/Test__MPISessionRootPublication.cpp)
+target_compile_features(v2_test_mpi_root_publication PRIVATE cxx_std_20)
+target_link_libraries(v2_test_mpi_root_publication PRIVATE llaminar_mpi_session_owner)
+foreach(V2_MPI_ROOT_SCOPE IN ITEMS Unit Integration)
+    set(V2_MPI_ROOT_PREFLIGHT_LABEL "")
+    if(V2_MPI_ROOT_SCOPE STREQUAL "Integration")
+        set(V2_MPI_ROOT_PREFLIGHT_LABEL "ProductionTestPreflight")
+    endif()
+    add_v2_test(V2_${V2_MPI_ROOT_SCOPE}_MPIOriginalRootFailureDiagnostics
+        COMMAND $<TARGET_FILE:v2_test_mpi_root_publication>
+        LABELS "V2;${V2_MPI_ROOT_SCOPE};${V2_MPI_ROOT_PREFLIGHT_LABEL};CPU;DeviceFree;MPI;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIOriginalRootFailureDiagnostics)
